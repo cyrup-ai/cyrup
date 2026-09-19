@@ -498,6 +498,7 @@ mod tests {
             runner: None,
             acceptance_role: None,
             default_acceptance: None,
+            file_path: None,
         }
     }
 

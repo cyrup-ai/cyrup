@@ -33,8 +33,10 @@
 //! a dynamic group therefore stays addressable as a single child, exactly as it is today.
 
 use std::ops::Range;
+use std::path::PathBuf;
 
 use crate::background::StepStatus;
+use crate::background::runner_main::RunnerConfig;
 use crate::spawn::chain_graph::RunnerStep;
 
 /// How many entries `step` contributes to `RunStatus::steps` — pi's `flatStepCount` increment per
@@ -112,6 +114,33 @@ pub fn pending_step_statuses_for(step: &RunnerStep) -> Vec<StepStatus> {
             ))]
         }
     }
+}
+
+/// Where the child dispatched into flat slot `flat_index` writes its live transcript — pi
+/// `resolveAsyncStepTranscriptPath` (`subagent-runner.ts:1806-1821` @v0.68.0), under the runner's
+/// three-term transcript gate (`artifactsDir && artifactConfig?.enabled !== false &&
+/// includeTranscript !== false`, `:1814`). `None` when any term is off, so a status step never
+/// names a transcript that will not exist.
+///
+/// **[CYRUP-DELTA]** always `Some(flat_index)`, never upstream's `flatStepCount > 1 ? flatIndex :
+/// undefined` (`:1819`): this hop's `run_sync` bundle is minted with `child_index:
+/// Some(ctx.step_slot.index())` unconditionally (`runner_main/executor.rs`, both the `RunOptions`
+/// literal and `write_step_input_artifact`), so a one-step run's transcript is
+/// `<run>_<agent>_0_transcript.jsonl`, and the status must name the file the writer opens.
+#[must_use]
+pub fn resolve_async_step_transcript_path(
+    config: &RunnerConfig,
+    agent: &str,
+    flat_index: usize,
+) -> Option<PathBuf> {
+    config
+        .artifacts_dir
+        .as_ref()
+        .filter(|_| config.artifact_config.enabled && config.artifact_config.include_transcript)
+        .map(|dir| {
+            crate::artifacts::artifact_paths(dir, config.run_id.as_str(), agent, Some(flat_index))
+                .transcript_path
+        })
 }
 
 #[cfg(test)]
@@ -232,5 +261,99 @@ mod tests {
             .map(|s| s.agent)
             .collect();
         assert_eq!(single_agents, ["solo".to_string()]);
+    }
+
+    // ---- resolve_async_step_transcript_path (pi `resolveAsyncStepTranscriptPath`) ----
+
+    fn config(
+        artifacts_dir: Option<PathBuf>,
+        artifact_config: crate::artifacts::ArtifactConfig,
+    ) -> RunnerConfig {
+        RunnerConfig {
+            usage_budget: None,
+            turn_budget: None,
+            permission_rules: None,
+            timeout_ms: None,
+            deadline_at_ms: None,
+            share: None,
+            artifacts_dir,
+            artifact_config,
+            run_id: crate::background::RunId::from_token("run00001"),
+            mode: crate::background::RunMode::Single,
+            steps: vec![single("worker")],
+            cwd: PathBuf::from("/w"),
+            session_file: None,
+            session_id: None,
+            completion_owner_id: None,
+            global_concurrency_limit: 20,
+            worktree_base_dir: None,
+            max_subagent_depth: 2,
+            async_root: PathBuf::new(),
+            results_dir: PathBuf::new(),
+            resolved_agents: std::collections::BTreeMap::new(),
+            original_task: String::new(),
+            chain_dir: None,
+            orchestrator_intercom_target: None,
+            inherited_session_model: None,
+            inherited_session_thinking: None,
+            host_available_builtins: None,
+            model_scope: None,
+            nested_route: None,
+            nested_self: None,
+            dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
+        }
+    }
+
+    #[test]
+    fn the_transcript_stamp_names_the_file_the_writer_opens_at_that_flat_index() {
+        let config = config(
+            Some(PathBuf::from("/art")),
+            crate::artifacts::ArtifactConfig::default(),
+        );
+        assert_eq!(
+            resolve_async_step_transcript_path(&config, "worker", 0),
+            Some(PathBuf::from("/art/run00001_worker_0_transcript.jsonl"))
+        );
+        // Always suffixed by the flat index, even for a one-step run (see the delta on the fn).
+        assert_eq!(
+            resolve_async_step_transcript_path(&config, "team/reviewer", 3),
+            Some(PathBuf::from(
+                "/art/run00001_team_reviewer_3_transcript.jsonl"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_transcript_stamp_is_absent_when_any_gate_term_is_off() {
+        let on = crate::artifacts::ArtifactConfig::default();
+        assert_eq!(
+            resolve_async_step_transcript_path(&config(None, on), "worker", 0),
+            None,
+            "no artifacts dir"
+        );
+        let disabled = crate::artifacts::ArtifactConfig {
+            enabled: false,
+            ..on
+        };
+        assert_eq!(
+            resolve_async_step_transcript_path(&config(Some("/art".into()), disabled), "worker", 0),
+            None,
+            "artifacts disabled"
+        );
+        let no_transcript = crate::artifacts::ArtifactConfig {
+            include_transcript: false,
+            ..on
+        };
+        assert_eq!(
+            resolve_async_step_transcript_path(
+                &config(Some("/art".into()), no_transcript),
+                "worker",
+                0
+            ),
+            None,
+            "include_transcript: false"
+        );
     }
 }

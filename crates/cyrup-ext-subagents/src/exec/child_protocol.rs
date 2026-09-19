@@ -905,9 +905,10 @@ impl BoundedLineReader {
         )
     }
 
-    /// A stderr reader with the 128 KiB cap and NO projector — upstream's stderr wiring
-    /// (`execution.ts:1047-1052`); an oversized stderr line is a diagnostic problem, never a
-    /// protocol record worth reconstructing.
+    /// A stderr reader with the 128 KiB cap and NO projector — cyrup's own diagnostic wiring
+    /// (upstream's foreground path has no per-line stderr reader at v0.68.0; see
+    /// `spawn/mod.rs`'s `CapturedStderr` doc); an oversized stderr line is a diagnostic problem,
+    /// never a protocol record worth reconstructing.
     #[must_use]
     pub fn stderr() -> Self {
         Self::new(ProtocolStream::Stderr, MAX_CHILD_STDERR_BYTES, false)

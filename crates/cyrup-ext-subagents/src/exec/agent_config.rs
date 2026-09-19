@@ -293,6 +293,15 @@ pub struct ResolvedAgentPersona {
     /// on-disk config deserializable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_acceptance: Option<serde_json::Value>,
+    /// The definition file this persona was projected from ([`AgentDefinition::file_path`]),
+    /// carried so the async recovery descriptor can record pi's `agentFilePath`
+    /// (`recoveryAgentConfig.filePath`, `runs/background/async-execution.ts:2028` @v0.68.0). Read
+    /// back only when a revive finds the agent gone from discovery and synthesises the persona
+    /// from the descriptor instead (`subagent-executor.ts:1903`). `#[serde(default)]` keeps an
+    /// older on-disk config deserializable; `skip_serializing_if` keeps a persona that never
+    /// knew its file byte-identical on the hand-off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<PathBuf>,
 }
 
 impl ResolvedAgentPersona {
@@ -327,6 +336,7 @@ impl ResolvedAgentPersona {
             runner: agent.runner.clone(),
             acceptance_role: agent.acceptance_role,
             default_acceptance: agent.default_acceptance.clone(),
+            file_path: Some(agent.file_path.clone()),
         }
     }
 
@@ -638,6 +648,19 @@ pub struct RunOptions {
     /// `artifacts: false` opt-out (SUBA-041) — executes every verify[] command for real, exactly
     /// as this crate did before G80.
     pub artifacts_dir: Option<PathBuf>,
+    /// Whether, and as which executor, this run writes the live `_transcript.jsonl` — pi's
+    /// `includeTranscript` gate (`subagent-runner.ts:872-878`, `execution.ts:1831-1840`) folded
+    /// with the creator-known `source` (`:874` / `:1835`). `None` is `includeTranscript ===
+    /// false`: no writer, no file, [`crate::exec::SingleResult::transcript_path`] stays `None`.
+    /// `Some(source)` writes, PROVIDED [`Self::artifacts_dir`] is also `Some`: upstream's first
+    /// two terms (`artifactsDir && artifactConfig?.enabled !== false`) are already folded into
+    /// that field by both producers, so the writer exists iff both fields are `Some`.
+    ///
+    /// **[CYRUP-DELTA]** one enum-typed field in place of upstream's two facts. `RunOptions`
+    /// carries no `artifact_config` (nothing on this struct names one), and `run_sync` has no
+    /// other way to learn which executor it serves, so the source rides here beside the switch
+    /// rather than as a second bool plus an out-of-band lookup.
+    pub transcript: Option<crate::exec::child_transcript::TranscriptSource>,
     /// pi `options.onControlEvent` (`execution.ts:255`): the per-raise callback the ORCHESTRATOR
     /// installs (`createForegroundControlNotifier`, `subagent-executor.ts:1222-1229` @v0.34.0) to fan a
     /// raised event out to the notice channels. `None` (every non-tool caller, and tests) still
@@ -871,6 +894,7 @@ mod tests {
             )),
             acceptance_role: None,
             default_acceptance: None,
+            file_path: None,
         };
         let json = serde_json::to_string(&persona).expect("serialize");
         let back: ResolvedAgentPersona = serde_json::from_str(&json).expect("deserialize");
@@ -915,6 +939,7 @@ mod tests {
             )),
             acceptance_role: None,
             default_acceptance: None,
+            file_path: None,
         };
         let live_depth = DepthEnvelope {
             current_depth: 1,

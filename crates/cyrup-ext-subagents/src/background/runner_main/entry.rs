@@ -12,7 +12,9 @@ use super::finish::{WorkflowResultFields, finish_run, settle_loop_outcome};
 use super::status::{SharedStatus, TelemetryMsg, lock_status, spawn_telemetry_task};
 use super::turn_loop::run_inner;
 use crate::background::atomic::write_atomic_json;
-use crate::background::flat_index::pending_step_statuses_for;
+use crate::background::flat_index::{
+    pending_step_statuses_for, resolve_async_step_transcript_path,
+};
 use crate::background::{RunId, RunPaths, RunState, RunStatus};
 use crate::error::SubagentError;
 use std::path::Path;
@@ -266,6 +268,16 @@ pub(super) async fn publish_initial_status(
         .steps
         .iter()
         .flat_map(pending_step_statuses_for)
+        .enumerate()
+        .map(|(flat_index, mut step)| {
+            // pi `transcriptPath: resolveAsyncStepTranscriptPath(...)` on every declared status
+            // step (`subagent-runner.ts:1965-1986`): stamped BEFORE any child spawns, so a status
+            // reader can open the live transcript of a step that is still `Running` — the file
+            // that step's own `run_sync` creates at exactly this path.
+            step.transcript_path =
+                resolve_async_step_transcript_path(config, &step.agent, flat_index);
+            step
+        })
         .collect();
     // Queued -> Running is always legal (RunState::can_transition_to).
     if status.advance_state(RunState::Running).is_err() {

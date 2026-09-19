@@ -21,6 +21,7 @@ use crate::background::cascade;
 use crate::background::child_stop::{ChildStatusWord, child_status_event};
 use crate::background::control;
 use crate::background::control::ChainAppendRequest;
+use crate::background::flat_index::resolve_async_step_transcript_path;
 use crate::background::flat_index::{flat_base, flat_range, flat_total, pending_step_statuses_for};
 use crate::background::{RunId, RunMode, RunPaths, RunStatus};
 use crate::error::SubagentError;
@@ -411,6 +412,9 @@ fn build_chain_context(
         usage_budget: config.usage_budget,
         artifacts_dir: config.artifacts_dir.clone(),
         artifact_config: config.artifact_config,
+        // This is the detached hop-2 runner, so every child it dispatches is an async child
+        // (pi `subagent-runner.ts:881` `source: "async"` @v0.68.0).
+        transcript_source: crate::exec::child_transcript::TranscriptSource::Async,
         // G90 (pi `subagent-runner.ts:2313,2600,2797` @v0.34.0): the async run dir every
         // dispatched step derives its own `steer-targets/<flatIndex>/` inbox from. This is the
         // detached hop-2 runner, so it is exactly the process upstream gives `steerInboxDir` to.
@@ -703,7 +707,7 @@ async fn absorb_pending_appends(
         for (path, parsed) in pending {
             if let Some(request) = parsed {
                 let mut guard = lock_status(status);
-                append_steps(steps, &mut guard, &request);
+                append_steps(io.config, steps, &mut guard, &request);
             }
             // Delete-then-act, at-most-once (R-SA-095: "MUST list, read, and DELETE all
             // pending request files... and only then extend its own in-loop step list").
@@ -802,6 +806,10 @@ pub(super) async fn run_import_async_root(
         // An imported async root's recovery evidence lives on ITS own terminal `ResultFile`
         // (pi's import copy, `subagent-runner.ts:760-790`, carries no `timeoutRecovery`).
         timeout_recovery: None,
+        // An imported root's live transcript belongs to the run that was attached and is
+        // published on ITS own status/result; nothing to re-attribute here.
+        transcript_path: None,
+        transcript_error: None,
     };
     // Register the imported output under its named key (pi's `outputName`/`as`) so a later
     // `{outputs.name}` reference in this chain resolves to it — a validated structured
@@ -852,6 +860,7 @@ pub(super) async fn run_import_async_root(
 /// (R-SA-095's "only then extend its own in-loop step list/`status.json`'s `steps`/
 /// `chain_step_count`" — both updated together so they never observably diverge).
 pub(super) fn append_steps(
+    config: &RunnerConfig,
     steps: &mut Vec<RunnerStep>,
     status: &mut RunStatus,
     request: &ChainAppendRequest,
@@ -859,7 +868,20 @@ pub(super) fn append_steps(
     for step in &request.steps {
         // SUBA-093: an appended step extends the FLAT list by its own width, and only at the tail,
         // so no already-published flat base is disturbed.
-        status.steps.extend(pending_step_statuses_for(step));
+        let base = status.steps.len();
+        let appended =
+            pending_step_statuses_for(step)
+                .into_iter()
+                .enumerate()
+                .map(|(offset, mut entry)| {
+                    // The same declaration-time transcript stamp `entry.rs` applies to the initial
+                    // list (pi `resolveAsyncStepTranscriptPath`, `subagent-runner.ts:1965-1986`), at
+                    // the flat index this entry will occupy.
+                    entry.transcript_path =
+                        resolve_async_step_transcript_path(config, &entry.agent, base + offset);
+                    entry
+                });
+        status.steps.extend(appended);
         steps.push(step.clone());
     }
 }

@@ -8,6 +8,9 @@
 //!
 //! - [`ndjson`] — the `SubagentEvent` tagged union and `consume_stdout`, the sole NDJSON parser
 //!   this module folds progress/usage state from (R-SA-026/057/058).
+//! - [`child_transcript`] — the live `_transcript.jsonl` writer, fed one [`ndjson::SubagentEvent`]
+//!   at a time from [`drive_attempt`]'s single parse point, so the FleetView pane and
+//!   `/subagents status` can show a RUNNING child.
 //! - [`output`] — final-output extraction, file-only output-path handoff, UTF-8-safe truncation
 //!   (R-SA-024/025/029/031/042).
 //! - [`structured`] — structured-output extraction from the child's event stream + parent-side
@@ -38,6 +41,9 @@ pub mod acceptance;
 pub mod agent_refinements;
 pub mod capability_ceiling;
 pub mod child_protocol;
+/// The live `_transcript.jsonl` writer fed from the parsed child-event stream (pi
+/// `shared/child-transcript.ts`).
+pub mod child_transcript;
 pub mod completion_guard;
 pub mod control;
 pub mod fallback;
@@ -449,6 +455,49 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         .as_ref()
         .map(|guard| guard.runtime().clone());
 
+    // pi `result.artifactPaths` (`shared/types.ts:1349`, computed at `execution.ts:1826-1830`)
+    // under pi's own gate: `RunOptions::artifacts_dir` is only ever `Some` when the caller's
+    // artifact config is enabled (`artifactsDir && artifactConfig?.enabled !== false` — both the
+    // foreground dispatch and the step executor apply it before constructing the options), so the
+    // presence of the dir IS the gate. Same base/run-id/agent/index quadruple the artifact writers
+    // use, so the published bundle names the files actually written. Computed HERE, above the
+    // ladder, because the live transcript writer opens `transcript_path` BEFORE the first child
+    // spawns (pi creates it at `execution.ts:1841-1849`, ahead of `runSingleAttempt`), and the
+    // recovery summary below names the transcript/output/metadata artifacts
+    // (pi `mutation-evidence.ts:180-182`) — a pure derivation over `opts`/`agent`.
+    let run_token = opts
+        .run_id
+        .as_ref()
+        .map_or("run", crate::background::RunId::as_str);
+    let artifact_paths = opts
+        .artifacts_dir
+        .as_ref()
+        .map(|dir| crate::artifacts::artifact_paths(dir, run_token, &agent.name, opts.child_index));
+
+    // pi `shared.transcriptWriter` (`execution.ts:1841-1849`; async `subagent-runner.ts:879-889`):
+    // ONE writer per run, created before the ladder and shared by every fallback attempt, under
+    // upstream's three-term gate — the first two terms are `artifacts_dir` (above), the third is
+    // `RunOptions::transcript`. Its first record is the redacted sentinel, never the task.
+    let mut transcript = match (artifact_paths.as_ref(), opts.transcript) {
+        (Some(paths), Some(source)) => Some(
+            crate::exec::child_transcript::ChildTranscriptWriter::create(
+                &paths.transcript_path,
+                crate::exec::child_transcript::TranscriptIdentity {
+                    source,
+                    run_id: run_token.to_string(),
+                    agent: agent.name.clone(),
+                    child_index: opts.child_index,
+                    cwd: opts.cwd.clone(),
+                },
+            )
+            .await,
+        ),
+        _ => None,
+    };
+    if let Some(writer) = transcript.as_mut() {
+        writer.write_initial_prompt_sentinel().await;
+    }
+
     // pi `execution.ts:568` — the tracked-file baseline is taken BEFORE the first child spawns, so
     // a deadline kill can be characterised against a known-good starting state. Deliberately
     // outside the ladder: a relaunch on the next model must be measured against the ORIGINAL
@@ -465,6 +514,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         setup.skill_injection,
         structured_runtime.clone(),
         setup.resolved_skill_names.is_some(),
+        &mut transcript,
     )
     .await;
 
@@ -502,26 +552,6 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         &mutation_snapshot,
         &opts.cwd,
     );
-
-    // pi `result.artifactPaths` (`shared/types.ts:1349`, computed at `execution.ts:1826-1830`)
-    // under pi's own gate: `RunOptions::artifacts_dir` is only ever `Some` when the caller's
-    // artifact config is enabled (`artifactsDir && artifactConfig?.enabled !== false` — both the
-    // foreground dispatch and the step executor apply it before constructing the options), so the
-    // presence of the dir IS the gate. Same base/run-id/agent/index quadruple the artifact writers
-    // use, so the published bundle names the files actually written. Computed HERE, above the
-    // terminal preamble, because the recovery summary below names the transcript/output/metadata
-    // artifacts (pi `mutation-evidence.ts:180-182`) — a pure derivation over `opts`/`agent`, so
-    // hoisting it above the preamble changes nothing else.
-    let artifact_paths = opts.artifacts_dir.as_ref().map(|dir| {
-        crate::artifacts::artifact_paths(
-            dir,
-            opts.run_id
-                .as_ref()
-                .map_or("run", crate::background::RunId::as_str),
-            &agent.name,
-            opts.child_index,
-        )
-    });
 
     // pi `execution.ts:1481-1488` — is the run's REQUESTED report missing? `None` when the run
     // declared no output contract at all, which the summary reports as `not-requested` rather
@@ -574,12 +604,11 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
                     // answers a different question).
                     session_file: opts.fork_context.session_file_path.as_deref(),
                     // pi `transcriptPath: shared.transcriptWriter ? shared.artifactPaths?.
-                    // transcriptPath : undefined` (`:1512`) — cyrup's artifact gate is the
-                    // presence of `artifacts_dir` (see `artifact_paths` above), so the bundle's
-                    // presence is the writer's presence.
-                    transcript_path: artifact_paths
-                        .as_ref()
-                        .map(|paths| paths.transcript_path.as_path()),
+                    // transcriptPath : undefined` (`:1512`) — the WRITER's presence, not the
+                    // bundle's: `RunOptions::transcript = None` leaves the bundle minted and the
+                    // transcript unwritten, and the summary must not name a file that does not
+                    // exist.
+                    transcript_path: transcript.as_ref().map(|writer| writer.path()),
                     artifact_paths: artifact_paths.as_ref(),
                 },
             ),
@@ -727,6 +756,17 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         },
         // pi `result.artifactPaths` (`execution.ts:1826-1830`, stamped under the artifacts gate).
         artifact_paths,
+        // pi `result.transcriptPath` / `result.transcriptError` (`execution.ts:1966-1967`): the
+        // WRITER's path — `Some` iff a writer existed, i.e. the three-term gate above, not merely
+        // whether the bundle names the file — and its latched error rendered at this boundary
+        // exactly as `error` is (upstream `transcriptWriter?.getError()`).
+        transcript_path: transcript
+            .as_ref()
+            .map(|writer| writer.path().to_path_buf()),
+        transcript_error: transcript
+            .as_ref()
+            .and_then(|writer| writer.last_error())
+            .map(ToString::to_string),
         acceptance: acceptance_ledger,
         detached,
         interrupted,
@@ -838,9 +878,11 @@ fn resolve_model_candidates(
 /// Step 4: drive the model-fallback ladder, spawning one REAL child OS process per attempt via
 /// [`SpawnedChildAttemptRunner`], and hand back the settled [`fallback::FallbackOutcome`].
 ///
-/// Nine parameters is over clippy's threshold; they are `run_sync`'s own pre-ladder state handed
+/// Ten parameters is over clippy's threshold; they are `run_sync`'s own pre-ladder state handed
 /// through verbatim, exactly like `evaluate_acceptance_with_cancel`'s own allow in
-/// `acceptance/lattice/gate.rs`.
+/// `acceptance/lattice/gate.rs`. `transcript` is the run's ONE live-transcript writer (pi
+/// `shared.transcriptWriter`), lent to every attempt in turn so a fallback keeps appending to the
+/// same file.
 #[allow(clippy::too_many_arguments)]
 async fn drive_fallback_ladder<'a>(
     agent: &'a AgentConfig,
@@ -852,6 +894,7 @@ async fn drive_fallback_ladder<'a>(
     skill_injection: String,
     structured_runtime: Option<crate::exec::structured::StructuredOutputRuntime>,
     require_read_tool: bool,
+    transcript: &'a mut Option<crate::exec::child_transcript::ChildTranscriptWriter>,
 ) -> fallback::FallbackOutcome<AttemptRecord> {
     let mut runner = SpawnedChildAttemptRunner {
         agent,
@@ -862,6 +905,7 @@ async fn drive_fallback_ladder<'a>(
         skill_injection,
         attempt_index: 0,
         structured_runtime,
+        transcript,
         // SUBA-014 / pi `runs/foreground/execution.ts:322,357` @v0.43.0:
         // `requireReadTool: Boolean(shared.resolvedSkillNames?.length)`. `resolved_skill_names` is
         // `Some` exactly when at least one declared skill resolved to a `SKILL.md`, so `is_some()`
@@ -1012,6 +1056,9 @@ pub(crate) fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) 
         session_file: None,
         structured_output_path: None,
         artifact_paths: None,
+        // Nothing spawned ⇒ no transcript writer was ever created.
+        transcript_path: None,
+        transcript_error: None,
         acceptance: None,
         detached: false,
         interrupted: false,

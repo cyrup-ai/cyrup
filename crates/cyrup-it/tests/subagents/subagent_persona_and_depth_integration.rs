@@ -133,6 +133,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     // orchestrator produces via `exec::resolve_step_agent_config` for a discovered `reviewer`
     // agent.
     let reviewer = ResolvedAgentPersona {
+        file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: "reviewer".to_string(),
@@ -359,6 +360,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     // A Replace-mode persona with an empty system prompt so the child's task text is the raw
     // (substituted) step task — no appended prompt to obscure the marker.
     let worker = ResolvedAgentPersona {
+        file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: "worker".to_string(),
@@ -551,6 +553,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         control_config: None,
         on_control_event: None,
         artifacts_dir: None,
+        transcript: None,
         // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
         model_scope: None,
     }
@@ -724,6 +727,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     resolved_agents.insert(
         "reviewer".to_string(),
         ResolvedAgentPersona {
+            file_path: None,
             acceptance_role: None, // SUBA-082: no declared role, the name decides
             default_acceptance: None,
             name: "reviewer".to_string(),
@@ -901,6 +905,7 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
     // heuristic is NotRequired and the completion guard — also disabled here — never fires): the run
     // stays exit 0, which is what gates the saved-output reference.
     let reporter = ResolvedAgentPersona {
+        file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: "reporter".to_string(),
@@ -1040,6 +1045,7 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
     let script_path = write_script(dir.path(), "script-chain-timeout.json", &script);
 
     let reporter = ResolvedAgentPersona {
+        file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: "reporter".to_string(),
@@ -1203,6 +1209,9 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
                 usage_budget: None,
                 // SCOPE_9: a fresh run, not a resume — nothing to transfer a capacity slot from.
                 transfer_from: None,
+                thinking_ceiling: None,
+                capability_ceiling: None,
+                model_origin: None,
                 // SUBA-N03: this fixture drives the generic step-graph entry point, which
                 // carries none of the SINGLE-mode overrides.
                 run_id: cyrup_ext_subagents::background::RunId::new(),
@@ -1274,6 +1283,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
 /// these two tests is the `verify[]` command's own real exit code.
 fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: name.to_string(),

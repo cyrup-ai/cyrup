@@ -195,6 +195,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         // artifacts root configured => no memoization), which is what this bridge fixture wants:
         // its subject is the intercom child bridge, not the acceptance gate.
         artifacts_dir: None,
+        transcript: None,
     }
 }
 

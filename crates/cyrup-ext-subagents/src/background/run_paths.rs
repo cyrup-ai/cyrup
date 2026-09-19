@@ -22,6 +22,13 @@ const EVENTS_FILE_NAME: &str = "events.jsonl";
 /// ([`crate::background::async_retention`]) alike.
 const HANDOFF_FILE_NAME: &str = "handoff.json";
 
+/// `recovery-descriptor.json` — the async recovery descriptor's file name (pi
+/// `path.join(asyncDir, "recovery-descriptor.json")`, `runs/background/async-execution.ts:2051`,
+/// `async-resume.ts:312`, `async-retention.ts:194` @v0.68.0), spelled ONCE for the writer
+/// ([`crate::background::RecoveryDescriptor::write`], via [`RunDir::recovery_descriptor`]) and
+/// both readers (`action: "resume"` and [`crate::background::async_retention`]) alike.
+const RECOVERY_DESCRIPTOR_FILE_NAME: &str = "recovery-descriptor.json";
+
 /// The filesystem directory, keyed by run id, holding one background run's `status.json`,
 /// `events.jsonl`, control-inbox files, append-request files, output/log files, and (once
 /// terminal) its human-readable run-log — everything **except** the terminal [`ResultFile`](crate::background::ResultFile)
@@ -88,6 +95,19 @@ impl RunDir {
     #[must_use]
     pub fn handoff(&self) -> PathBuf {
         self.0.join(HANDOFF_FILE_NAME)
+    }
+
+    /// `<run_dir>/recovery-descriptor.json` — the async recovery descriptor
+    /// ([`crate::background::RecoveryDescriptor`]) every async SINGLE launch writes before it
+    /// spawns, and pi `path.join(asyncDir, "recovery-descriptor.json")`.
+    ///
+    /// The fourth accessor in the `status()`/`events()`/`handoff()` family, and the SINGLE place
+    /// the literal is spelled. [`crate::background::async_retention`]'s scan carried its own copy
+    /// of the constant while no writer existed; now that the launch path writes the file, the
+    /// scan calls this, for exactly the drift-prevention reason [`RunDir::handoff`] gives.
+    #[must_use]
+    pub fn recovery_descriptor(&self) -> PathBuf {
+        self.0.join(RECOVERY_DESCRIPTOR_FILE_NAME)
     }
 }
 
@@ -227,6 +247,25 @@ mod tests {
         assert_eq!(
             dir.as_path(),
             Path::new("/var/tmp/cyrup-subagents/abc12345")
+        );
+    }
+
+    /// The four `RunDir` accessors are the one place each file name is spelled: a writer and a
+    /// reader that both go through them cannot disagree on the path.
+    #[test]
+    fn run_dir_spells_every_well_known_file_once() {
+        let dir = RunDir::new(Path::new("/a"), &RunId::from_token("abc12345"));
+        assert_eq!(dir.status(), PathBuf::from("/a/abc12345/status.json"));
+        assert_eq!(dir.events(), PathBuf::from("/a/abc12345/events.jsonl"));
+        assert_eq!(dir.handoff(), PathBuf::from("/a/abc12345/handoff.json"));
+        assert_eq!(
+            dir.recovery_descriptor(),
+            PathBuf::from("/a/abc12345/recovery-descriptor.json")
+        );
+        assert_eq!(
+            RunDir::for_existing(Path::new("/a/abc12345")).recovery_descriptor(),
+            dir.recovery_descriptor(),
+            "both constructors agree on the descriptor path"
         );
     }
 

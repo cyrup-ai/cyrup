@@ -380,6 +380,14 @@ pub(super) fn record_step_outcome(
                         // pi `setOptionalProperty(requiredStatusStep(…), "timeoutRecovery",
                         // singleResult.timeoutRecovery)` (`subagent-runner.ts:4165`).
                         entry.timeout_recovery = outcome.timeout_recovery.clone();
+                        // pi `transcriptPath: singleResult.transcriptPath ??
+                        // step.transcriptPath` / `transcriptError` (`subagent-runner.ts:3829-3830`):
+                        // the writer's own path wins; the declaration-time stamp stays when the
+                        // child produced none.
+                        if let Some(path) = outcome.transcript_path.clone() {
+                            entry.transcript_path = Some(path);
+                        }
+                        entry.transcript_error = outcome.transcript_error.clone();
                     }
                     None => {
                         entry.status = StepState::Failed;
@@ -415,6 +423,12 @@ pub(super) fn record_step_outcome(
                 // pi `subagent-runner.ts:3750`/`:4645` — the single-step and chain-step status
                 // writes of `timeoutRecovery` (the FULL summary; a status step is local state).
                 entry.timeout_recovery = result.timeout_recovery.clone();
+                // pi `subagent-runner.ts:3829-3830` on the single-slot shape (see the per-member
+                // arm above).
+                if let Some(path) = result.transcript_path.clone() {
+                    entry.transcript_path = Some(path);
+                }
+                entry.transcript_error = result.transcript_error.clone();
             }
         }
         None => {}
@@ -863,6 +877,8 @@ mod tests {
             output_state: Default::default(),
             structured_output_path: None,
             artifact_paths: None,
+            transcript_path: None,
+            transcript_error: None,
             acceptance: None,
             detached: false,
             interrupted,

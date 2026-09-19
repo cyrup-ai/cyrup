@@ -154,6 +154,7 @@ fn run_options(cwd: &Path, output_path: &Path) -> RunOptions {
         on_control_event: None,
         model_scope: None,
         artifacts_dir: None,
+        transcript: None,
     }
 }
 

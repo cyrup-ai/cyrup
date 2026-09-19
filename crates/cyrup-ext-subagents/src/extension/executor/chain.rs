@@ -431,6 +431,11 @@ impl SubagentExecutor {
                         permission_rules: None,
                         // SCOPE_9: a fresh background chain/parallel run, never a resume.
                         transfer_from: None,
+                        // A chain/parallel/graph launch inherits this process's ceilings through
+                        // env; only a single-run revive carries explicit ones to re-apply.
+                        thinking_ceiling: None,
+                        capability_ceiling: None,
+                        model_origin: None,
                         steps: graph,
                         mode,
                         session_file: first_session_file,

@@ -49,9 +49,6 @@ use super::{RUN_TOMBSTONE_PREFIX, maintenance_root};
 /// probed at `:298`. cyrup's own constant, re-used rather than re-spelled.
 use crate::missions::MISSION_BINDING_FILE;
 
-/// `<run_dir>/recovery-descriptor.json` — pi `hasResumableContract` (`:196`).
-const RECOVERY_DESCRIPTOR_FILE: &str = "recovery-descriptor.json";
-
 /// One pass's inputs. A struct rather than upstream's five positional arguments because three of
 /// the five are roots that must agree with each other, and a positional list of `&Path`s is the
 /// shape in which they get transposed.
@@ -375,11 +372,13 @@ async fn existing_regular_file(path: Option<&Path>) -> bool {
 
 /// pi `hasResumableContract` (`:191-203`).
 ///
-/// [CYRUP-DELTA] no cyrup writer produces `recovery-descriptor.json` today
-/// (`grep -rn "recovery.descriptor" src/ --include=*.rs` finds only two prose mentions of pi's
-/// own). The probe is ported anyway rather than hard-coded to `false`, for
-/// [`active_marker_exists`]'s reason: it costs one `stat`, it is correct either way, and hiding
-/// the guard behind a constant is the change that is silently wrong the day a writer lands.
+/// The descriptor is written by every async SINGLE launch
+/// ([`crate::background::RecoveryDescriptor`], `extension/executor/background.rs`) and probed
+/// here through the same [`RunDir::recovery_descriptor`] accessor, so writer and reader cannot
+/// drift on the file name. The read itself stays pi's tolerant `readJson` (`:196-197`): only
+/// `sourceRunId` and `sessionFile` are inspected — the two keys that are the on-disk
+/// compatibility floor — and a present-but-unreadable descriptor is a contract this pass cannot
+/// disprove, so it protects.
 async fn has_resumable_contract(run_dir: &Path, status: &RunStatus) -> bool {
     if existing_regular_file(status.session_file.as_deref()).await {
         return true;
@@ -389,7 +388,7 @@ async fn has_resumable_contract(run_dir: &Path, status: &RunStatus) -> bool {
             return true;
         }
     }
-    let descriptor_path = run_dir.join(RECOVERY_DESCRIPTOR_FILE);
+    let descriptor_path = RunDir::for_existing(run_dir).recovery_descriptor();
     if !tokio::fs::try_exists(&descriptor_path)
         .await
         .unwrap_or(false)

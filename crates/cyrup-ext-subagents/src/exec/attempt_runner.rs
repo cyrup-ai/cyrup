@@ -60,6 +60,12 @@ pub(crate) struct SpawnedChildAttemptRunner<'a> {
     /// every earlier note in the one ring pi shows each note in exactly once (pi re-seeds a FRESH
     /// `recentOutput` per attempt, `execution.ts:542`, so it never faces the question).
     pub(crate) live_notes_emitted: usize,
+    /// The run's live `_transcript.jsonl` writer (pi `shared.transcriptWriter`,
+    /// `execution.ts:1905`), or `None` when the run has no artifacts dir or
+    /// [`RunOptions::transcript`] is `None`. ONE per run, shared across every fallback attempt so
+    /// a retry keeps appending to the same file rather than opening a second one; borrowed
+    /// mutably because the drive loop writes through it on every parsed child event.
+    pub(crate) transcript: &'a mut Option<crate::exec::child_transcript::ChildTranscriptWriter>,
 }
 
 /// The richer per-attempt payload [`SpawnedChildAttemptRunner::run_attempt`] returns alongside its
@@ -137,6 +143,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             self.opts,
             deadline_sleep,
             &mut control,
+            self.transcript.as_mut(),
         )
         .await;
 

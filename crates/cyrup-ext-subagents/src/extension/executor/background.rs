@@ -298,6 +298,12 @@ impl SubagentExecutor {
                 // SCOPE_9: a fresh top-level async run, never a resume — it charges the
                 // session's cap in its own right.
                 transfer_from: None,
+                // A fresh launch inherits this process's ceilings through env; only a revive
+                // carries an explicit ceiling to re-apply.
+                thinking_ceiling: None,
+                capability_ceiling: None,
+                // …and only a revive carries a stored `modelOrigin`; a fresh launch derives it.
+                model_origin: None,
                 steps: vec![RunnerStep::SingleStep(step)],
                 mode: RunMode::Single,
                 session_file: fork_context.session_file_path,
@@ -444,6 +450,9 @@ impl SubagentExecutor {
             permission_rules,
             usage_budget,
             transfer_from,
+            thinking_ceiling: requested_thinking_ceiling,
+            capability_ceiling: requested_capability_ceiling,
+            model_origin: stored_model_origin,
         } = spec;
         let cfg = self.config_snapshot().await;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before run-directory creation
@@ -516,6 +525,34 @@ impl SubagentExecutor {
 
         // Hoisted out of the `RunnerConfig` literal below: see `model_scope` there.
         let model_scope = Self::resolve_model_scope(cwd, &cfg.roots)?;
+
+        // The two ceilings this LAUNCHING process is bound by, resolved once, parent-side, and
+        // BEFORE the capacity claim below for `model_scope`'s reason: every fallible step past the
+        // claim must roll the slot back explicitly, and a `?` here cannot. They feed the recovery
+        // descriptor (pi `thinkingCeiling`/`capabilityCeiling`, `async-execution.ts:2013,2049`
+        // @v0.68.0) and, on a REVIVE, the detached runner's env overlay below (pi
+        // `subagent-executor.ts:2151,2183`). Intersected with whatever the caller handed over so a
+        // revive can only ever tighten (pi `applySteeringRecoveryAgentConfig`, `async-resume.ts:610`,
+        // and the three-way intersection at `:2183`); fail-CLOSED on a malformed inherited value,
+        // exactly as `exec::run_sync` is — a bound that vanished is worse than a refused launch.
+        let revive_carries_thinking_ceiling = requested_thinking_ceiling.is_some();
+        let revive_carries_capability_ceiling = requested_capability_ceiling.is_some();
+        let own_thinking_ceiling = crate::exec::thinking_ceiling::inherited_thinking_ceiling()
+            .map_err(SubagentError::ThinkingCeilingViolation)?;
+        let thinking_ceiling = crate::exec::thinking_ceiling::intersect_thinking_ceilings(&[
+            requested_thinking_ceiling.as_deref(),
+            own_thinking_ceiling.as_deref(),
+        ])
+        .map_err(SubagentError::ThinkingCeilingViolation)?;
+        let own_capability_ceiling =
+            crate::exec::capability_ceiling::resolve_current_capability_ceiling(
+                self.current_session_id().as_deref(),
+            )
+            .map_err(SubagentError::CapabilityCeilingViolation)?;
+        let capability_ceiling = crate::exec::capability_ceiling::intersect_capability_ceilings(&[
+            requested_capability_ceiling,
+            own_capability_ceiling,
+        ]);
 
         // =========================================================================================
         // SCOPE_9/SUBTASK4 — the per-SESSION active-async capacity gate
@@ -728,6 +765,34 @@ impl SubagentExecutor {
             artifact_config,
         };
 
+        // pi `async-execution.ts:1993-2055` @v0.68.0: the RESOLVED launch contract, persisted as
+        // `recovery-descriptor.json` BEFORE `runner-config.json` and before any process exists, so
+        // a failed descriptor leaves no config and no runner — and, like the two fallible steps
+        // after it, rolls the capacity slot back. A write failure FAILS THE LAUNCH (`:2053`): a
+        // run that cannot be recovered is refused up front rather than discovered at resume time.
+        // Built from `runner_config` itself because that literal IS the resolved launch — the same
+        // locals pi projects (`recoveryAgentConfig`, `params.*`, `deadlineAt`, `shareEnabled`,
+        // `artifactsDir`, `artifactConfig`, `controlConfig`); on a revive the persona map already
+        // holds the OVERLAID persona, so the revived run's own descriptor records the contract it
+        // was revived under (pi `recoveryAgentConfig`, `:1992`). `None` for every non-single
+        // launch: pi writes one only from `executeAsyncSingle`.
+        if let Some(descriptor) = crate::background::RecoveryDescriptor::for_single_launch(
+            &runner_config,
+            crate::background::LaunchInputs {
+                thinking_ceiling: thinking_ceiling.as_deref(),
+                capability_ceiling: capability_ceiling.as_ref(),
+                stored_model_origin,
+            },
+        ) && let Err(error) = descriptor
+            .write(
+                &crate::background::RunDir::for_existing(&run_paths.run_dir).recovery_descriptor(),
+            )
+            .await
+        {
+            Self::rollback_capacity(capacity.as_mut(), &run_id).await;
+            return Err(error.into());
+        }
+
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         // SCOPE_9: first of the two fallible steps between the claim and `Ok(run_id)`. A
         // held-but-never-spawned slot is a PERMANENT leak no reconcile can clear — there is no
@@ -748,12 +813,36 @@ impl SubagentExecutor {
             .spawn_command
             .clone()
             .unwrap_or_else(crate::spawn::resolve_spawn_command);
+        // A REVIVE re-applies the source run's persisted ceilings to its runner through the same
+        // two env vars the runner already reads (pi `thinkingCeiling`/`capabilityCeiling` on the
+        // revived launch, `subagent-executor.ts:2151,2183` @v0.68.0). Inserted ONLY when the caller
+        // carried one: an ordinary launch keeps the inherit-only overlay byte-for-byte, so its
+        // runner sees exactly the environment it always did. The values are the intersections
+        // computed above the capacity claim — never wider than what THIS process is bound by.
+        let mut env_overlay =
+            crate::background::parent_anchor::detached_runner_env_overlay_in(&cfg.roots);
+        if revive_carries_thinking_ceiling && let Some(level) = &thinking_ceiling {
+            env_overlay.insert(
+                crate::exec::thinking_ceiling::THINKING_CEILING_ENV.to_string(),
+                level.clone(),
+            );
+        }
+        if revive_carries_capability_ceiling
+            && let Some(encoded) = crate::exec::capability_ceiling::encode_capability_ceiling(
+                capability_ceiling.as_ref(),
+            )
+        {
+            env_overlay.insert(
+                crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV.to_string(),
+                encoded,
+            );
+        }
         let pid = match crate::background::spawn_detached::spawn_detached_runner_with_command(
             &resolved_command,
             &cfg_path,
             &run_paths.runner_stdout_log,
             &run_paths.runner_stderr_log,
-            &crate::background::parent_anchor::detached_runner_env_overlay_in(&cfg.roots),
+            &env_overlay,
         ) {
             Ok(pid) => pid,
             Err(error) => {
@@ -2086,5 +2175,1258 @@ mod tests {
             crate::exec::control::DEFAULT_FAILED_TOOL_ATTEMPTS_BEFORE_ATTENTION,
             "and an entirely unmentioned field falls through to DEFAULT_CONTROL_CONFIG"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The recovery descriptor — pi `SteeringRecoveryDescriptor` (`shared/types.ts:805` @v0.68.0):
+    // written by `spawn_background_steps` before the runner exists, consumed by `action: "resume"`.
+    // Every test below drives the PRODUCTION verbs (`spawn_background` → `control_resume`) and
+    // asserts at the `runner-config.json` boundary of the REVIVED run — the entire hop-1 → hop-2
+    // contract (R-SA-073), written before its spawn, so no runner or model is needed.
+    // ---------------------------------------------------------------------------------------
+    mod recovery_descriptor {
+        use super::*;
+        use crate::artifacts::ArtifactConfig;
+        use crate::background::runner_main::RunnerConfig;
+        use crate::background::{
+            DescriptorVersion, ModelOrigin, RecoveryDescriptor, RecoveryDescriptorError, RunDir,
+            RunState, RunStatus, StepState, StepStatus,
+        };
+        use crate::discovery::types::{
+            AgentMemoryConfig, MemoryScope, OutputMode, ResolvedToolBudget, SystemPromptMode,
+            ToolBudgetBlock, ToolRef,
+        };
+        use crate::exec::control::ResolvedControlConfig;
+        use crate::exec::turn_budget::ResolvedTurnBudget;
+        use crate::exec::usage_budget::{UsageBudgetConfig, UsageBudgetLimit};
+        use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
+        use crate::extension::testsupport::FixedSessionHost;
+        use crate::fork_context::ContextMode;
+        use crate::paths::Roots;
+        use crate::spawn::SpawnCommand;
+        use crate::watchdog::permission_arbiter::PermissionRuleDecision;
+        use std::collections::BTreeSet;
+
+        /// The NARROW persona the round trip launches with. Every capability-shaped row (tools,
+        /// excludeTools, maxSubagentDepth, completionGuard, subagentOnlyExtensions, …) is TIGHTER
+        /// than the wide rewrite below, so a revive that consults the file instead of the
+        /// descriptor fails on every one of them. Every row is also NON-default for its type:
+        /// `inheritProjectContext`/`inheritSkills` are `true` because the parser's default for a
+        /// non-`delegate` name is `false`, and a writer that emits the bool default must be
+        /// visible — the rewrite flips them back. `modelProvider` is absent because the
+        /// frontmatter parser projects none — see row 10 in the table.
+        const NARROW_MD: &str = "---\nname: worker\ndescription: The launch persona\n\
+model: fixture/persona-model\nthinking: low\nsystemPromptMode: replace\n\
+inheritProjectContext: true\ninheritSkills: true\ntools: read, grep\nexcludeTools: bash\n\
+allowNestedSubagents: true\nextensions: ext-a\nsubagentOnlyExtensions: ./child-only.ts\n\
+skills: alpha\nmaxSubagentDepth: 2\ncompletionGuard: false\n\
+toolBudget: {\"hard\": 7, \"soft\": 3}\nmemory: {scope: project, path: notes.md}\n---\n\
+Launch body.\n";
+
+        /// The WIDE rewrite of the persona file between launch and resume: every row differs from
+        /// the launch contract and the capability rows are WIDER. This is the load-bearing trick
+        /// of the mutation table — without it, persona-derived rows would pass by re-discovery
+        /// even if the writer dropped them.
+        const WIDE_MD: &str = "---\nname: worker\ndescription: The widened persona\n\
+model: fixture/other-model\nthinking: medium\nsystemPromptMode: append\n\
+inheritProjectContext: false\ninheritSkills: false\ntools: read, grep, bash\n\
+allowNestedSubagents: false\nextensions: ext-z\nsubagentOnlyExtensions: ./other-child.ts\n\
+skills: zeta\nmaxSubagentDepth: 9\ncompletionGuard: true\ntoolBudget: {\"hard\": 99}\n\
+memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
+
+        /// Write `<cwd>/.cyrup/agents/<agent>.md` from one of the templates above.
+        fn write_persona(cwd: &Path, agent: &str, template: &str) -> PathBuf {
+            let agents_dir = cwd.join(".cyrup").join("agents");
+            std::fs::create_dir_all(&agents_dir).expect("mkdir agents dir");
+            let path = agents_dir.join(format!("{agent}.md"));
+            std::fs::write(
+                &path,
+                template.replace("name: worker", &format!("name: {agent}")),
+            )
+            .expect("write persona fixture");
+            path
+        }
+
+        fn launch_tool_budget() -> ResolvedToolBudget {
+            ResolvedToolBudget {
+                hard: 5,
+                soft: None,
+                block: ToolBudgetBlock::Names(vec!["read".to_string()]),
+            }
+        }
+
+        fn launch_turn_budget() -> ResolvedTurnBudget {
+            ResolvedTurnBudget {
+                max_turns: 9,
+                grace_turns: 1,
+            }
+        }
+
+        fn launch_usage_budget() -> UsageBudgetConfig {
+            UsageBudgetConfig {
+                tokens: Some(UsageBudgetLimit {
+                    soft: None,
+                    hard: 1000.0,
+                }),
+                cost_usd: None,
+            }
+        }
+
+        fn launch_memory() -> AgentMemoryConfig {
+            AgentMemoryConfig {
+                scope: MemoryScope::Project,
+                path: "notes.md".to_string(),
+            }
+        }
+
+        fn narrow_tools() -> Option<Vec<ToolRef>> {
+            Some(vec![
+                ToolRef::Builtin("read".to_string()),
+                ToolRef::Builtin("grep".to_string()),
+            ])
+        }
+
+        /// A host that reports a live session id AND a live model — what a launch under a running
+        /// session sees, so a persona with no `model:` of its own INHERITS the session's (pi
+        /// `ctx.currentModel` → `modelOrigin: "inherited"`). The model can be switched after the
+        /// launch to play the session having moved to another model by the time it revives
+        /// (`set_host_services` binds once, so the host itself must change its answer).
+        struct InheritingHost {
+            session: &'static str,
+            model: std::sync::Mutex<&'static str>,
+        }
+
+        impl InheritingHost {
+            fn new(session: &'static str, model: &'static str) -> Arc<Self> {
+                Arc::new(Self {
+                    session,
+                    model: std::sync::Mutex::new(model),
+                })
+            }
+
+            fn switch_model(&self, model: &'static str) {
+                *self
+                    .model
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = model;
+            }
+        }
+
+        impl cyrup_ext::host::HostServices for InheritingHost {
+            fn session_id(&self) -> Option<String> {
+                Some(self.session.to_string())
+            }
+            fn current_model(&self) -> Option<String> {
+                Some(
+                    self.model
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .to_string(),
+                )
+            }
+        }
+
+        /// What varies between the descriptor tests' launches: the host they bind, the persona
+        /// they write and the per-call model they pass. Everything else on the request is fixed
+        /// in [`launch_with`], with an explicit NON-default value on every per-call field.
+        struct LaunchSpec {
+            session: &'static str,
+            agent: &'static str,
+            host: Arc<dyn cyrup_ext::host::HostServices>,
+            persona: String,
+            model_override: Option<ModelId>,
+        }
+
+        impl LaunchSpec {
+            /// The round trip's launch: a fixed session with no live model, the NARROW persona,
+            /// and an EXPLICIT per-call model.
+            fn standard(session: &'static str, agent: &'static str) -> Self {
+                Self {
+                    session,
+                    agent,
+                    host: Arc::new(FixedSessionHost(session)),
+                    persona: NARROW_MD.to_string(),
+                    model_override: Some(ModelId::from("anthropic/override")),
+                }
+            }
+        }
+
+        /// One launch every descriptor test starts from: a sandboxed executor with a fixed
+        /// session, the NARROW persona on disk, and a `spawn_background` carrying an explicit
+        /// value on EVERY per-call field so that no row of the mutation table can be satisfied by
+        /// the `None`/default the revive would otherwise fall back to.
+        struct Launch {
+            dir: tempfile::TempDir,
+            executor: SubagentExecutor,
+            session: &'static str,
+            agent: &'static str,
+            run_id: RunId,
+            source_paths: RunPaths,
+            schema: serde_json::Value,
+            acceptance: serde_json::Value,
+        }
+
+        impl Launch {
+            fn cwd(&self) -> &Path {
+                self.dir.path()
+            }
+
+            fn descriptor_path(&self) -> PathBuf {
+                RunDir::for_existing(&self.source_paths.run_dir).recovery_descriptor()
+            }
+
+            /// Settle the source run exactly as `finish_run` does: a terminal status whose one
+            /// step carries a persisted transcript — what `control::resume` needs to resolve a
+            /// revival. `cwd` is what the runner would have recorded, or `None` for a
+            /// synthesized status that never observed it.
+            async fn settle(&self, cwd: Option<PathBuf>) -> PathBuf {
+                let session_file = self.cwd().join("source-session.jsonl");
+                std::fs::write(&session_file, "").expect("write dummy transcript");
+                let mut status =
+                    RunStatus::queued(self.run_id.clone(), RunMode::Single, Some(4242));
+                status
+                    .advance_state(RunState::Running)
+                    .expect("Queued -> Running");
+                let mut step = StepStatus::pending(self.agent);
+                step.status = StepState::Complete;
+                step.session_file = Some(session_file.clone());
+                status.steps = vec![step];
+                status
+                    .advance_state(RunState::Complete)
+                    .expect("Running -> Complete");
+                status.cwd = cwd;
+                status.session_id = crate::identity::SessionId::parse(self.session);
+                write_atomic_json(&self.source_paths.status, &status)
+                    .await
+                    .expect("write terminal status fixture");
+                session_file
+            }
+
+            /// `action: "resume"` — the production verb, exactly as the tool and RPC surfaces
+            /// reach it.
+            async fn resume(&self) -> Result<String, String> {
+                self.executor
+                    .control_resume(
+                        self.cwd(),
+                        Some(self.run_id.as_str()),
+                        Some("carry on"),
+                        None,
+                        None,
+                    )
+                    .await
+            }
+
+            /// The revived run's paths under `cwd`'s async root (the revive spawns in its
+            /// effective cwd, and cyrup's async root is per-cwd).
+            fn run_paths_under(&self, cwd: &Path, run_id: &RunId) -> RunPaths {
+                let roots = Roots::sandboxed(self.cwd());
+                RunPaths::for_run(
+                    &default_async_root_in(&roots, cwd),
+                    &default_results_dir_in(&roots, cwd),
+                    run_id,
+                )
+            }
+        }
+
+        fn revived_id(confirmation: &str) -> RunId {
+            RunId::from_token(
+                confirmation
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Revived run: "))
+                    .expect("the confirmation names the revived run")
+                    .to_string(),
+            )
+        }
+
+        /// The REVIVED run's one-shot config — the whole hop-1 → hop-2 contract, written by
+        /// `spawn_background_steps` before its spawn.
+        fn read_runner_config(run_dir: &Path) -> RunnerConfig {
+            let raw = std::fs::read_to_string(run_dir.join("runner-config.json"))
+                .expect("the revive writes runner-config.json before spawning hop 1");
+            serde_json::from_str(&raw).expect("runner-config.json must deserialize")
+        }
+
+        fn single_step(cfg: &RunnerConfig) -> &SingleStepSpec {
+            match cfg.steps.as_slice() {
+                [RunnerStep::SingleStep(step)] => step,
+                other => panic!("a revive is one SingleStep, got {other:?}"),
+            }
+        }
+
+        async fn launch(session: &'static str, agent: &'static str) -> Launch {
+            launch_with(LaunchSpec::standard(session, agent)).await
+        }
+
+        async fn launch_with(spec: LaunchSpec) -> Launch {
+            let LaunchSpec {
+                session,
+                agent,
+                host,
+                persona,
+                model_override,
+            } = spec;
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_persona(dir.path(), agent, &persona);
+            let executor = SubagentExecutor::new();
+            executor.set_host_services(host);
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = Roots::sandboxed(dir.path());
+                cfg.max_active_async_runs_per_session = Some(1);
+                cfg.max_subagent_depth = 4;
+                cfg.permissions = Some(serde_json::json!({"rules": {"write": "deny"}}));
+                // `true(1)` execs and exits immediately: both hops are genuinely spawned and
+                // confirmed without a runner writing into the sandbox.
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+            }
+            let schema =
+                serde_json::json!({"type": "object", "properties": {"ok": {"type": "boolean"}}});
+            let acceptance = serde_json::json!({
+                "level": "verified",
+                "verify": [{"id": "unit", "command": "true"}]
+            });
+            let run_id = executor
+                .spawn_background(BackgroundSingleRequest {
+                    structured_output_schema: Some(schema.clone()),
+                    tool_budget: Some(launch_tool_budget()),
+                    turn_budget: Some(launch_turn_budget()),
+                    usage_budget: Some(launch_usage_budget()),
+                    cwd: dir.path(),
+                    agent_name: agent,
+                    task: "do the thing",
+                    context: Some(ContextRequest::Fresh),
+                    model_override,
+                    thinking: Some("high".to_string()),
+                    agent_scope: AgentReadScope::Both,
+                    acceptance: Some(acceptance.clone()),
+                    control: Some(crate::registration::ControlConfig {
+                        needs_attention_after_ms: Some(1234),
+                        ..crate::registration::ControlConfig::default()
+                    }),
+                    include_progress: Some(true),
+                    output: Some(serde_json::json!("out.md")),
+                    output_mode: Some("file-only".to_string()),
+                    skills: Some(vec!["beta".to_string()]),
+                    share: Some(true),
+                    session_dir: Some(dir.path().join("sessions").display().to_string()),
+                    // ENABLED, so row 47 lands a real directory and row 48 the `foreground()`
+                    // config (jsonl on) — `false` would make both rows indistinguishable from a
+                    // dropped field (`None` / `default()`).
+                    artifacts: Some(true),
+                    timeout_ms: Some(60_000),
+                })
+                .await
+                .expect("the launch succeeds and writes its descriptor");
+            let roots = Roots::sandboxed(dir.path());
+            let source_paths = RunPaths::for_run(
+                &default_async_root_in(&roots, dir.path()),
+                &default_results_dir_in(&roots, dir.path()),
+                &run_id,
+            );
+            Launch {
+                dir,
+                executor,
+                session,
+                agent,
+                run_id,
+                source_paths,
+                schema,
+                acceptance,
+            }
+        }
+
+        /// **The round trip, through production** — pi `async-execution.ts:1993-2055` (write) →
+        /// `async-resume.ts:310-632` (read + overlay) → `subagent-executor.ts:2059-2185` (the
+        /// revived launch), all @v0.68.0.
+        ///
+        /// Assert A checks the WRITE: the file the launch leaves behind, its mode, pi's key
+        /// spelling, and the typed reader's view of it field for field. Then the run is settled,
+        /// the persona file is REWRITTEN WIDER, and `action: "resume"` is driven. Assert B is the
+        /// mutation table, read off the REVIVED run's `runner-config.json`. Every launch value is
+        /// NON-default for its type and differs from what the widened file would give, so a
+        /// writer that drops a field — emitting `None`, an empty list, `false`, or the config's
+        /// raw value in its place — fails that field's own row here.
+        ///
+        /// Six descriptor fields have NO row in this table and are pinned elsewhere:
+        /// `modelOverrideFromParent` and `modelOrigin` by
+        /// `a_revive_keeps_the_stored_model_origin_rather_than_re_deriving_it`;
+        /// `capabilityCeiling` and `thinkingCeiling` by
+        /// `a_revive_re_applies_the_launch_s_ceilings_to_its_runner_s_environment`;
+        /// `launchContractDigest` by `the_launch_digest_binds_the_task` (Assert A checks only
+        /// its shape); `lane` and `runFanoutBudget` are always `None` on a single run and have no
+        /// discriminating test (disclosed in `[EXEC — descriptor]`). Trimming those sibling tests
+        /// would silently lose the only production coverage of those fields.
+        ///
+        /// Two rows here are known-vacuous through production and pinned by unit tests instead:
+        /// `modelProvider` (row 10: the frontmatter parser projects none, so no in-crate launch can
+        /// seed one) and `thinkingCeiling` (row 13: its only launch source is the process env, which
+        /// `forbid(unsafe_code)` keeps a test from setting). Those two are caught by
+        /// `recovery_descriptor::tests::for_single_launch_projects_every_field_of_the_resolved_launch`.
+        /// The per-field mutation record (field → the test that failed) is the task's
+        /// `[FIX — descriptor]` section.
+        #[tokio::test]
+        async fn a_revived_run_keeps_every_field_of_the_launch_contract_not_the_file_s() {
+            let launch = launch("descriptor-round-trip", "worker").await;
+            let descriptor_path = launch.descriptor_path();
+
+            // ---------------------------------------------------------------- Assert A: the write
+            let raw: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&descriptor_path)
+                    .expect("the launch writes recovery-descriptor.json before it spawns"),
+            )
+            .expect("JSON");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(&descriptor_path)
+                        .expect("metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600,
+                    "pi `writePrivateAtomicJson`: the file carries the system prompt"
+                );
+            }
+            assert_eq!(raw["version"], 1);
+            assert_eq!(raw["sourceRunId"], launch.run_id.as_str());
+            assert_eq!(raw["agent"], "worker");
+            assert_eq!(raw["cwd"], launch.cwd().display().to_string());
+            assert_eq!(raw["outputMode"], "file-only");
+            assert_eq!(
+                raw["tools"],
+                serde_json::json!(["read", "grep"]),
+                "pi's string form"
+            );
+            assert_eq!(raw["maxSubagentDepth"], 2);
+            assert_eq!(raw["share"], true);
+            assert_eq!(raw["modelOrigin"], "explicit");
+
+            let written = RecoveryDescriptor::read(&descriptor_path)
+                .await
+                .expect("the typed reader accepts the writer's output")
+                .expect("present");
+            // Evidence rows, asserted by shape (their exact values derive from the tempdir and
+            // the clock) and then copied into the field-for-field expectation below.
+            let digest = written.launch_contract_digest.as_str();
+            assert!(
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "launchContractDigest is 64 lower-hex: {digest}"
+            );
+            let now = u64::try_from(crate::time::now_epoch_millis()).expect("epoch");
+            let deadline = written
+                .absolute_deadline_at
+                .expect("timeoutMs arms an absolute deadline");
+            assert!(
+                deadline <= now + 60_000 && deadline + 5 * 60_000 > now + 60_000,
+                "absoluteDeadlineAt ≈ launch + 60s: {deadline} vs now {now}"
+            );
+            assert!(
+                written
+                    .agent_file_path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with(".cyrup/agents/worker.md")),
+                "agentFilePath is the discovered definition: {:?}",
+                written.agent_file_path
+            );
+            assert!(
+                written
+                    .output_path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("out.md")),
+                "outputPath is the resolved absolute file: {:?}",
+                written.output_path
+            );
+            let artifacts_dir = crate::artifacts::project_artifacts_dir(launch.cwd());
+            let expected = RecoveryDescriptor {
+                version: DescriptorVersion,
+                launch_contract_digest: written.launch_contract_digest.clone(),
+                source_run_id: launch.run_id.clone(),
+                agent: "worker".to_string(),
+                cwd: launch.cwd().to_path_buf(),
+                session_file: None,
+                model: Some(ModelId::from("anthropic/override")),
+                model_origin: ModelOrigin::Explicit,
+                model_override_from_parent: None,
+                model_provider: None,
+                thinking: Some("high".to_string()),
+                thinking_ceiling: None,
+                tools: narrow_tools(),
+                exclude_tools: vec!["bash".to_string()],
+                allow_nested_subagents: Some(true),
+                extensions: Some(vec!["ext-a".to_string()]),
+                subagent_only_extensions: vec!["./child-only.ts".to_string()],
+                system_prompt: Some("Launch body.".to_string()),
+                system_prompt_mode: SystemPromptMode::Replace,
+                inherit_project_context: true,
+                inherit_skills: true,
+                skills: vec!["beta".to_string()],
+                agent_file_path: written.agent_file_path.clone(),
+                completion_guard: Some(false),
+                memory: Some(launch_memory()),
+                output_path: written.output_path.clone(),
+                output_mode: OutputMode::FileOnly,
+                structured_output_schema: Some(launch.schema.clone()),
+                acceptance: Some(launch.acceptance.clone()),
+                control_config: Some(ResolvedControlConfig {
+                    needs_attention_after_ms: 1234,
+                    ..ResolvedControlConfig::default()
+                }),
+                context: Some(ContextMode::Fresh),
+                lane: None,
+                absolute_deadline_at: written.absolute_deadline_at,
+                initial_tool_budget: Some(launch_tool_budget()),
+                max_subagent_depth: 2,
+                capability_ceiling: None,
+                share: true,
+                session_dir: Some(launch.cwd().join("sessions").join("run-0")),
+                artifacts_dir: Some(artifacts_dir.clone()),
+                artifact_config: ArtifactConfig::foreground(),
+                run_fanout_budget: None,
+                turn_budget: Some(launch_turn_budget()),
+                usage_budget: Some(launch_usage_budget()),
+                permission_rules: Some(BTreeMap::from([(
+                    "write".to_string(),
+                    PermissionRuleDecision::Deny,
+                )])),
+                include_progress: Some(true),
+            };
+            assert_eq!(
+                written, expected,
+                "the descriptor IS the resolved launch, field for field"
+            );
+
+            // ------------------------------------------ settle, WIDEN the file, then resume
+            let session_file = launch.settle(Some(launch.cwd().to_path_buf())).await;
+            write_persona(launch.cwd(), "worker", WIDE_MD);
+            let confirmation = launch
+                .resume()
+                .await
+                .expect("a settled run with a descriptor revives");
+            let revived = revived_id(&confirmation);
+            assert_ne!(revived, launch.run_id);
+            let revived_paths = launch.run_paths_under(launch.cwd(), &revived);
+            let cfg = read_runner_config(&revived_paths.run_dir);
+            let step = single_step(&cfg);
+            let persona = cfg
+                .resolved_agents
+                .get("worker")
+                .expect("the revived persona map carries the agent");
+
+            // -------------------------------------------------- Assert B: the mutation table
+            // rows 7/8 — model: an EXPLICIT launch model is the step's override again, and pi
+            // pins it on the agent config too (the file now says fixture/other-model).
+            assert_eq!(
+                step.model.as_ref().map(ModelId::as_str),
+                Some("anthropic/override")
+            );
+            assert_eq!(
+                persona.model.as_ref().map(ModelId::as_str),
+                Some("anthropic/override")
+            );
+            // row 10 — modelProvider. The frontmatter parser projects none, so the launch value
+            // is `None` and the file rewrite cannot make this row non-vacuous here; the `Some`
+            // path is proven by `recovery_descriptor::tests::for_single_launch_projects_every_
+            // field_of_the_resolved_launch` and `apply_to_persona_overlays_the_descriptor_over_
+            // the_file`.
+            assert_eq!(persona.model_provider, None);
+            // row 12 — thinking (file now says medium)
+            assert_eq!(persona.thinking.as_deref(), Some("high"));
+            // row 14 — tools: THE capability-widening fix (the file now grants bash)
+            assert_eq!(persona.tools, narrow_tools());
+            // row 15 — excludeTools (file now [])
+            assert_eq!(persona.exclude_tools, vec!["bash".to_string()]);
+            // row 16 — allowNestedSubagents (file now false)
+            assert_eq!(persona.allow_nested_subagents, Some(true));
+            // row 17 — extensions (file now ext-z)
+            assert_eq!(persona.extensions, Some(vec!["ext-a".to_string()]));
+            // row 18 — subagentOnlyExtensions (file now ./other-child.ts; a dropped field lands
+            // an empty list)
+            assert_eq!(
+                persona.subagent_only_extensions,
+                vec!["./child-only.ts".to_string()]
+            );
+            // row 21 — systemPrompt (file body rewritten)
+            assert_eq!(persona.system_prompt_body, "Launch body.");
+            // row 22 — systemPromptMode (file now append)
+            assert_eq!(persona.system_prompt_mode, SystemPromptMode::Replace);
+            // rows 23/25 — inheritProjectContext / inheritSkills: `true` at launch (the parser's
+            // default is `false`), `false` in the file now — a writer emitting the bool default
+            // and a re-discovery both land `false` here
+            assert!(persona.inherit_project_context);
+            assert!(persona.inherit_skills);
+            // row 26 — skills: the EFFECTIVE launch list, on the step (pi passes it as the
+            // per-call override) and on the persona (pi overlays it too)
+            assert_eq!(step.skills, Some(vec!["beta".to_string()]));
+            assert_eq!(persona.skills, vec!["beta".to_string()]);
+            // row 28 — agentFilePath
+            assert_eq!(persona.file_path, written.agent_file_path);
+            // row 29 — completionGuard (file now true)
+            assert_eq!(persona.completion_guard, Some(false));
+            // row 30 — memory (file now user/other.md)
+            assert_eq!(persona.memory, Some(launch_memory()));
+            // row 31 — outputPath
+            assert_eq!(step.output_path, written.output_path);
+            // row 32 — outputMode (the default would be Inline)
+            assert_eq!(step.output_mode, Some(OutputMode::FileOnly));
+            // row 33 — structuredOutputSchema
+            assert_eq!(step.structured_output_schema, Some(launch.schema.clone()));
+            // row 34 — acceptance
+            assert_eq!(step.acceptance, Some(launch.acceptance.clone()));
+            // row 35 — controlConfig (a dropped field re-folds from config → the 60s default)
+            assert_eq!(
+                cfg.control.as_ref().map(|c| c.needs_attention_after_ms),
+                Some(1234)
+            );
+            // row 36 — context (the old hard-coded Fork would fail)
+            assert_eq!(step.context, Some(ContextMode::Fresh));
+            // row 40 — initialToolBudget (file now says 99)
+            assert_eq!(persona.tool_budget, Some(launch_tool_budget()));
+            // row 41 — maxSubagentDepth: the second widening fix (file now 9; re-discovery
+            // would give 9)
+            assert_eq!(step.max_depth_override, Some(2));
+            assert_eq!(persona.max_subagent_depth, Some(2));
+            // row 45 — share
+            assert_eq!(cfg.share, Some(true));
+            // row 46 — sessionDir (the launch leaf)
+            assert_eq!(
+                step.session_dir,
+                Some(launch.cwd().join("sessions").join("run-0"))
+            );
+            // rows 47/48 — artifactsDir / artifactConfig: artifacts were ENABLED at launch, so
+            // the dir is the project artifacts root under the launch cwd and the config is
+            // `foreground()` (jsonl on); the old revive sent `None` / `default()` (jsonl off),
+            // which is exactly what a dropped field lands
+            assert_eq!(cfg.artifacts_dir.as_deref(), Some(artifacts_dir.as_path()));
+            assert_eq!(cfg.artifact_config, ArtifactConfig::foreground());
+            assert!(
+                cfg.artifact_config.include_jsonl,
+                "the one bit on which foreground() differs from default()"
+            );
+            // row 4 — cwd, with `status.cwd` recorded (the descriptor rung is proven separately)
+            assert_eq!(cfg.cwd.as_path(), launch.cwd());
+            // the four cyrup-only run-level keys
+            assert_eq!(cfg.turn_budget, Some(launch_turn_budget()));
+            assert_eq!(cfg.usage_budget, Some(launch_usage_budget()));
+            assert_eq!(
+                cfg.permission_rules
+                    .as_ref()
+                    .and_then(|rules| rules.get("write")),
+                Some(&PermissionRuleDecision::Deny)
+            );
+            assert_eq!(cfg.include_progress, Some(true));
+            // the transcript the revive is seeded from (pi `revivalSessionFile`)
+            assert_eq!(step.session_file.as_deref(), Some(session_file.as_path()));
+            assert_eq!(cfg.session_file.as_deref(), Some(session_file.as_path()));
+            // tools/extensions ride the persona, never the step (pi overlays `agentConfig.*`)
+            assert_eq!(step.tools, None);
+            assert_eq!(step.extensions, None);
+
+            // pi `recoveryAgentConfig` (`async-execution.ts:1992`): the revived run writes its
+            // OWN descriptor from the OVERLAID persona, so a second revive sees the same contract
+            // — and row 6 through production: its sessionFile is the transcript it was seeded
+            // from.
+            let revived_descriptor = RecoveryDescriptor::read(
+                &RunDir::for_existing(&revived_paths.run_dir).recovery_descriptor(),
+            )
+            .await
+            .expect("readable")
+            .expect("pi writes one per revive");
+            assert_eq!(revived_descriptor.source_run_id, revived);
+            assert_eq!(
+                revived_descriptor.session_file.as_deref(),
+                Some(session_file.as_path())
+            );
+            assert_eq!(revived_descriptor.tools, narrow_tools());
+            assert_eq!(revived_descriptor.max_subagent_depth, 2);
+            assert_eq!(revived_descriptor.model, written.model);
+            assert_eq!(revived_descriptor.model_origin, ModelOrigin::Explicit);
+            assert_eq!(revived_descriptor.system_prompt, written.system_prompt);
+            assert_eq!(
+                revived_descriptor.permission_rules,
+                written.permission_rules
+            );
+            assert_eq!(
+                revived_descriptor.initial_tool_budget,
+                written.initial_tool_budget
+            );
+        }
+
+        /// Row 4 through production: with no recorded `status.cwd` the revive runs in the cwd the
+        /// WRITER recorded, and records it again on its own descriptor. cyrup's async root is
+        /// keyed by the exact cwd (`background::artifact_roots::cwd_key`), so a resume can only
+        /// be requested from the launch cwd — which is why a wrong recorded cwd shows up here as
+        /// the revived run landing under some OTHER key (its `runner-config.json` is then absent
+        /// from this root), not as a different request cwd being chosen. The reader's rung ORDER
+        /// (descriptor over request) is the next test's, with a deliberately re-pointed
+        /// descriptor.
+        #[tokio::test]
+        async fn a_revive_without_a_recorded_cwd_runs_in_the_cwd_the_writer_recorded() {
+            let launch = launch("descriptor-cwd-written", "worker").await;
+            launch.settle(None).await;
+
+            let confirmation = launch.resume().await.expect("revives in the recorded cwd");
+            let revived = revived_id(&confirmation);
+            let revived_paths = launch.run_paths_under(launch.cwd(), &revived);
+            let cfg = read_runner_config(&revived_paths.run_dir);
+            assert_eq!(cfg.cwd.as_path(), launch.cwd());
+            let revived_descriptor = RecoveryDescriptor::read(
+                &RunDir::for_existing(&revived_paths.run_dir).recovery_descriptor(),
+            )
+            .await
+            .expect("readable")
+            .expect("written per revive");
+            assert_eq!(
+                revived_descriptor.cwd.as_path(),
+                launch.cwd(),
+                "the revived run records the same cwd for the revive after it"
+            );
+        }
+
+        /// Row 4, the reader's rung ORDER — pi `async-resume.ts:579`: with no recorded
+        /// `status.cwd` the revive runs in the descriptor's cwd, not the request's. Because a
+        /// production descriptor always records the launch cwd (the test above), the two rungs
+        /// can only be told apart by RE-POINTING the descriptor by hand at a sibling directory
+        /// (which has its own copy of the persona): the revived run then demonstrably lands under
+        /// THAT cwd's async root and not the request's.
+        #[tokio::test]
+        async fn a_revive_without_a_recorded_cwd_falls_back_to_the_descriptor_s() {
+            let launch = launch("descriptor-cwd-rung", "worker").await;
+            launch.settle(None).await;
+            let elsewhere = launch.cwd().join("elsewhere");
+            write_persona(&elsewhere, "worker", NARROW_MD);
+            let path = launch.descriptor_path();
+            let mut descriptor = RecoveryDescriptor::read(&path)
+                .await
+                .expect("readable")
+                .expect("present");
+            descriptor.cwd = elsewhere.clone();
+            descriptor.write(&path).await.expect("rewrite");
+
+            let confirmation = launch
+                .resume()
+                .await
+                .expect("revives in the descriptor's cwd");
+            let revived = revived_id(&confirmation);
+            let cfg = read_runner_config(&launch.run_paths_under(&elsewhere, &revived).run_dir);
+            assert_eq!(cfg.cwd, elsewhere);
+            assert!(
+                !launch
+                    .run_paths_under(launch.cwd(), &revived)
+                    .run_dir
+                    .exists(),
+                "the request cwd's async root must not hold the revived run"
+            );
+        }
+
+        /// The reader's refusals, each driven through `action: "resume"` with pi's exact
+        /// sentences (`async-resume.ts:566`, `subagent-executor.ts:1493`, `:2060`, and the
+        /// reader's own `Invalid …` family) — and none of them revives anything: the session's
+        /// one capacity slot stays the SOURCE run's.
+        #[tokio::test]
+        async fn a_revive_refuses_a_descriptor_that_is_missing_foreign_or_malformed() {
+            let launch = launch("descriptor-refusals", "worker").await;
+            launch.settle(Some(launch.cwd().to_path_buf())).await;
+            let path = launch.descriptor_path();
+            let pristine = std::fs::read(&path).expect("the launch wrote it");
+            let mutate = |edit: &dyn Fn(&mut serde_json::Value)| {
+                let mut doc: serde_json::Value =
+                    serde_json::from_slice(&pristine).expect("pristine JSON");
+                edit(&mut doc);
+                std::fs::write(&path, serde_json::to_vec_pretty(&doc).expect("JSON"))
+                    .expect("rewrite descriptor");
+            };
+
+            mutate(&|doc| doc["agent"] = serde_json::json!("other"));
+            assert_eq!(
+                launch.resume().await.expect_err("agent mismatch"),
+                format!(
+                    "Async run '{}' has a recovery descriptor for 'other', not 'worker'.",
+                    launch.run_id
+                )
+            );
+
+            mutate(&|doc| doc["sourceRunId"] = serde_json::json!("run-other"));
+            let foreign = launch.resume().await.expect_err("source-run mismatch");
+            assert!(foreign.contains("different source run"), "{foreign}");
+
+            mutate(&|doc| doc["version"] = serde_json::json!(2));
+            let version = launch.resume().await.expect_err("version 2");
+            assert!(version.contains("version 2"), "{version}");
+
+            mutate(&|doc| doc["bogus"] = serde_json::json!(1));
+            let unknown = launch.resume().await.expect_err("unknown key");
+            assert!(unknown.contains("bogus"), "{unknown}");
+
+            std::fs::remove_file(&path).expect("delete descriptor");
+            assert_eq!(
+                launch.resume().await.expect_err("missing descriptor"),
+                format!(
+                    "Async child '{}' is missing its required run fan-out recovery identity. \
+                     Start a new run instead.",
+                    launch.run_id
+                )
+            );
+
+            let owner = only_capacity_owner(launch.cwd(), launch.session).await;
+            assert_eq!(
+                owner.run_id, launch.run_id,
+                "a refused revive transfers nothing: the slot is still the source's"
+            );
+            assert_eq!(owner.generation, 0);
+        }
+
+        /// pi `async-execution.ts:2051-2053`: a descriptor that cannot be persisted FAILS THE
+        /// LAUNCH — no `runner-config.json`, no process, and the capacity slot rolled back like
+        /// the two fallible steps after it. Forced by pre-creating the descriptor path as a
+        /// DIRECTORY, so the atomic rename fails; driven through `spawn_background_steps` with a
+        /// caller-minted run id (the production entry point `spawn_background` delegates to),
+        /// because that is the only way to know the run directory before the call.
+        #[tokio::test]
+        async fn a_descriptor_that_cannot_be_written_fails_the_launch_before_any_config_or_process()
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_persona(dir.path(), "worker", NARROW_MD);
+            let executor = SubagentExecutor::new();
+            executor.set_host_services(Arc::new(FixedSessionHost("descriptor-write-failure")));
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = Roots::sandboxed(dir.path());
+                cfg.max_active_async_runs_per_session = Some(1);
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+            }
+            let roots = Roots::sandboxed(dir.path());
+            let run_id = RunId::new();
+            let run_paths = RunPaths::for_run(
+                &default_async_root_in(&roots, dir.path()),
+                &default_results_dir_in(&roots, dir.path()),
+                &run_id,
+            );
+            std::fs::create_dir_all(RunDir::for_existing(&run_paths.run_dir).recovery_descriptor())
+                .expect("occupy the descriptor path with a directory");
+            let agent = executor
+                .resolve_agent(dir.path(), "worker", AgentReadScope::Both, &roots)
+                .expect("the persona resolves");
+            let persona = crate::exec::resolve_step_agent_config(&agent);
+            let step = SingleStepSpec {
+                agent: "worker".to_string(),
+                task: "do the thing".to_string(),
+                cwd: None,
+                model: None,
+                tools: None,
+                extensions: None,
+                session_file: None,
+                max_depth_override: None,
+                structured_output_schema: None,
+                output: None,
+                output_path: None,
+                output_mode: None,
+                reads: None,
+                acceptance: None,
+                skills: None,
+                session_dir: None,
+                context: Some(ContextMode::Fresh),
+                agent_scope: None,
+            };
+
+            let error = executor
+                .spawn_background_steps(
+                    dir.path(),
+                    BackgroundStepsSpec {
+                        usage_budget: None,
+                        turn_budget: None,
+                        permission_rules: None,
+                        transfer_from: None,
+                        thinking_ceiling: None,
+                        capability_ceiling: None,
+                        model_origin: None,
+                        steps: vec![RunnerStep::SingleStep(step)],
+                        mode: RunMode::Single,
+                        session_file: None,
+                        resolved_agents: BTreeMap::from([("worker".to_string(), persona)]),
+                        original_task: "do the thing".to_string(),
+                        chain_dir: None,
+                        control: None,
+                        include_progress: None,
+                        run_id: run_id.clone(),
+                        timeout_ms: None,
+                        share: None,
+                        artifacts_dir: None,
+                        artifact_config: ArtifactConfig::default(),
+                    },
+                )
+                .await
+                .expect_err("a launch whose descriptor cannot be persisted must fail");
+            assert!(
+                matches!(
+                    error,
+                    SubagentError::RecoveryDescriptor(RecoveryDescriptorError::Persist { .. })
+                ),
+                "{error:?}"
+            );
+            assert!(
+                error.to_string().starts_with(&format!(
+                    "Failed to persist async recovery descriptor for '{run_id}': "
+                )),
+                "pi `:2053`'s sentence: {error}"
+            );
+            assert!(
+                !run_paths.run_dir.join("runner-config.json").exists(),
+                "the descriptor is written BEFORE runner-config.json, so a failed one leaves none"
+            );
+            assert_eq!(
+                capacity_slots(dir.path(), "descriptor-write-failure").await,
+                0,
+                "the claim is rolled back on this early return like every other past it"
+            );
+        }
+
+        /// pi `subagent-executor.ts:1894-1905`: when discovery no longer finds the agent, the
+        /// revive synthesises the persona from the descriptor instead of refusing. `courier` is
+        /// not a builtin, so deleting its file leaves discovery with nothing.
+        #[tokio::test]
+        async fn a_revive_whose_agent_file_vanished_runs_on_the_descriptor_s_synthesised_persona() {
+            let launch = launch("descriptor-synthesised", "courier").await;
+            launch.settle(Some(launch.cwd().to_path_buf())).await;
+            let file = launch
+                .cwd()
+                .join(".cyrup")
+                .join("agents")
+                .join("courier.md");
+            std::fs::remove_file(&file).expect("delete the persona file");
+
+            let confirmation = launch
+                .resume()
+                .await
+                .expect("the descriptor is the contract; the file is not required");
+            let cfg = read_runner_config(
+                &launch
+                    .run_paths_under(launch.cwd(), &revived_id(&confirmation))
+                    .run_dir,
+            );
+            let persona = cfg
+                .resolved_agents
+                .get("courier")
+                .expect("the synthesised persona is in the map");
+            assert_eq!(persona.name, "courier");
+            assert_eq!(persona.tools, narrow_tools());
+            assert_eq!(persona.exclude_tools, vec!["bash".to_string()]);
+            assert_eq!(persona.system_prompt_body, "Launch body.");
+            assert_eq!(persona.system_prompt_mode, SystemPromptMode::Replace);
+            assert_eq!(persona.max_subagent_depth, Some(2));
+            assert_eq!(persona.tool_budget, Some(launch_tool_budget()));
+            assert!(persona.inherit_project_context && persona.inherit_skills);
+            assert_eq!(
+                persona.subagent_only_extensions,
+                vec!["./child-only.ts".to_string()]
+            );
+            assert_eq!(persona.file_path.as_deref(), Some(file.as_path()));
+            assert!(
+                persona.fallback_models.is_empty(),
+                "nothing the descriptor lacks is invented"
+            );
+        }
+
+        /// pi `storedOrigin` (`model-resolution.ts:382`, fed by `modelOrigin:
+        /// recoveryDescriptor?.modelOrigin`, `subagent-executor.ts:2149`): a run whose model was
+        /// INHERITED from the launching session revives on that same model — pinned by the
+        /// overlay, so neither the widened file's model nor the REVIVING session's leaks in — and
+        /// its revived descriptor still says `inherited` with `modelOverrideFromParent`, rather
+        /// than the `configured` a re-derivation over the pinned persona would produce. Without
+        /// the carry a second revive would read a different origin than the first.
+        #[tokio::test]
+        async fn a_revive_keeps_the_stored_model_origin_rather_than_re_deriving_it() {
+            let session = "descriptor-stored-origin";
+            let host = InheritingHost::new(session, "session/launch-model");
+            let launch = launch_with(LaunchSpec {
+                host: host.clone(),
+                persona: NARROW_MD.replace("model: fixture/persona-model\n", ""),
+                model_override: None,
+                ..LaunchSpec::standard(session, "worker")
+            })
+            .await;
+            let written = RecoveryDescriptor::read(&launch.descriptor_path())
+                .await
+                .expect("readable")
+                .expect("present");
+            assert_eq!(
+                written.model.as_ref().map(ModelId::as_str),
+                Some("session/launch-model")
+            );
+            assert_eq!(written.model_origin, ModelOrigin::Inherited);
+            assert_eq!(written.model_override_from_parent, Some(true));
+
+            launch.settle(Some(launch.cwd().to_path_buf())).await;
+            // The file now declares a model of its own and the reviving session runs another:
+            // neither may displace the launch's.
+            write_persona(launch.cwd(), "worker", WIDE_MD);
+            host.switch_model("session/reviving-model");
+            let confirmation = launch.resume().await.expect("revives");
+            let revived_paths = launch.run_paths_under(launch.cwd(), &revived_id(&confirmation));
+            let cfg = read_runner_config(&revived_paths.run_dir);
+            let step = single_step(&cfg);
+            let persona = cfg
+                .resolved_agents
+                .get("worker")
+                .expect("the revived persona map carries the agent");
+            assert_eq!(
+                step.model, None,
+                "an inherited model is not a per-call override"
+            );
+            assert_eq!(
+                persona.model.as_ref().map(ModelId::as_str),
+                Some("session/launch-model"),
+                "pinned: not the file's, not the reviving session's"
+            );
+            assert_eq!(
+                cfg.inherited_session_model.as_ref().map(ModelId::as_str),
+                Some("session/reviving-model"),
+                "the reviving session's rung is carried, and outranked by the pinned persona"
+            );
+            let revived_descriptor = RecoveryDescriptor::read(
+                &RunDir::for_existing(&revived_paths.run_dir).recovery_descriptor(),
+            )
+            .await
+            .expect("readable")
+            .expect("written per revive");
+            assert_eq!(
+                revived_descriptor.model.as_ref().map(ModelId::as_str),
+                Some("session/launch-model")
+            );
+            assert_eq!(
+                revived_descriptor.model_origin,
+                ModelOrigin::Inherited,
+                "pi storedOrigin: carried, not re-derived over the pinned persona"
+            );
+            assert_eq!(revived_descriptor.model_override_from_parent, Some(true));
+        }
+
+        /// The retention reader against the PRODUCTION writer — pi `hasResumableContract`
+        /// (`async-retention.ts:196-203`); the spec's "a descriptor written by
+        /// `spawn_background`, not a hand-written map". The production descriptor that carries a
+        /// `sessionFile` is the REVIVED run's (its transcript is the one it was seeded from; a
+        /// fresh in-crate launch has no persisted parent session to fork). The status the scan
+        /// reads is a fixture — terminal, past the window, with no transcript of its own, the
+        /// exact shape whose verdict rests on the descriptor alone — while every byte of the
+        /// descriptor is the writer's.
+        #[tokio::test]
+        async fn a_production_written_descriptor_s_transcript_is_a_resumable_contract() {
+            use crate::background::async_retention::{
+                ASYNC_RETENTION_MS, ASYNC_RETENTION_TOMBSTONE_GRACE_MS, RetentionDecision,
+                RunScanRequest, SkipReason, decide, scan_run_candidates,
+            };
+
+            let launch = launch("descriptor-retention", "worker").await;
+            let session_file = launch.settle(Some(launch.cwd().to_path_buf())).await;
+            let confirmation = launch.resume().await.expect("revives");
+            let revived = revived_id(&confirmation);
+            let revived_paths = launch.run_paths_under(launch.cwd(), &revived);
+            let descriptor_path =
+                RunDir::for_existing(&revived_paths.run_dir).recovery_descriptor();
+            let written = RecoveryDescriptor::read(&descriptor_path)
+                .await
+                .expect("readable")
+                .expect("the revive wrote one");
+            assert_eq!(
+                written.session_file.as_deref(),
+                Some(session_file.as_path()),
+                "row 6 through production: the transcript the revive was seeded from"
+            );
+
+            // A terminal status past the window with NO transcript of its own, for each run the
+            // scan will meet.
+            let now = 1_900_000_000_000i64;
+            let old = now - ASYNC_RETENTION_MS - 60_000;
+            let settle_old = |run_id: RunId, status_path: PathBuf| async move {
+                let mut status = RunStatus::queued(run_id, RunMode::Single, Some(7));
+                status.state = RunState::Complete;
+                status.started_at = old;
+                status.last_update = old;
+                status.ended_at = Some(old);
+                write_atomic_json(&status_path, &status)
+                    .await
+                    .expect("write the terminal status fixture");
+            };
+            settle_old(revived.clone(), revived_paths.status.clone()).await;
+            // pi `:201` — a descriptor for ANOTHER source run: the writer's own bytes, copied
+            // verbatim under a second run.
+            let foreign = RunId::new();
+            let foreign_paths = launch.run_paths_under(launch.cwd(), &foreign);
+            std::fs::create_dir_all(&foreign_paths.run_dir).expect("mkdir foreign run dir");
+            std::fs::copy(
+                &descriptor_path,
+                RunDir::for_existing(&foreign_paths.run_dir).recovery_descriptor(),
+            )
+            .expect("copy the production descriptor");
+            settle_old(foreign.clone(), foreign_paths.status.clone()).await;
+            // The SOURCE run's launch descriptor records no sessionFile (a fresh context), and
+            // this status no longer carries the step transcript `settle` gave it.
+            settle_old(launch.run_id.clone(), launch.source_paths.status.clone()).await;
+
+            let roots = Roots::sandboxed(launch.cwd());
+            let async_root = default_async_root_in(&roots, launch.cwd());
+            let results_dir = default_results_dir_in(&roots, launch.cwd());
+            let scan = || async {
+                scan_run_candidates(RunScanRequest {
+                    async_root: &async_root,
+                    results_dir: &results_dir,
+                    maintenance_root: None,
+                    after: None,
+                    budget: 100,
+                })
+                .await
+                .expect("the scan reads the sandbox's async root")
+            };
+            let none = BTreeSet::new();
+            let verdict = |window: &crate::background::async_retention::RunScanWindow,
+                           run_id: &RunId| {
+                let facts = window
+                    .candidates
+                    .iter()
+                    .find(|facts| facts.dir_name == run_id.as_str())
+                    .unwrap_or_else(|| panic!("{run_id} was not a candidate"));
+                decide(
+                    facts,
+                    now,
+                    ASYNC_RETENTION_MS,
+                    ASYNC_RETENTION_TOMBSTONE_GRACE_MS,
+                    &none,
+                    &none,
+                )
+            };
+
+            let window = scan().await;
+            assert_eq!(
+                verdict(&window, &revived),
+                RetentionDecision::Keep(SkipReason::Resumable),
+                "the writer's sessionFile exists: a resumable contract"
+            );
+            assert_eq!(
+                verdict(&window, &foreign),
+                RetentionDecision::Keep(SkipReason::Resumable),
+                "pi `:201`: a descriptor for another source run cannot be disproved"
+            );
+            assert_eq!(
+                verdict(&window, &launch.run_id),
+                RetentionDecision::Tombstone,
+                "a fresh launch's descriptor records no sessionFile, and nothing else protects it"
+            );
+
+            std::fs::remove_file(&session_file).expect("delete the transcript");
+            let window = scan().await;
+            assert_eq!(
+                verdict(&window, &revived),
+                RetentionDecision::Tombstone,
+                "a descriptor whose transcript is gone protects nothing"
+            );
+        }
+
+        /// Rows 13/43 — the only two whose landing is an env var on the revived RUNNER process
+        /// (pi `thinkingCeiling`/`capabilityCeiling` on the revived launch,
+        /// `subagent-executor.ts:2151,2183`). The revive's hop-1 command is a script that prints
+        /// its environment to stdout, which the detached spawn redirects to
+        /// `runner.stdout.log` — a real process, still no runner, no model, no network.
+        ///
+        /// A ceiling REGISTERED for the session is the one launch-time source that needs no env
+        /// mutation (the crate is `forbid(unsafe_code)`), so row 43 is written by production.
+        /// Row 13's only source is the environment, which this test cannot set; the writer's
+        /// projection of a `Some` is `recovery_descriptor::tests::for_single_launch_projects_
+        /// every_field…`, and the LANDING is proven here by stamping one onto the persisted
+        /// contract before the resume.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_revive_re_applies_the_launch_s_ceilings_to_its_runner_s_environment() {
+            use crate::exec::capability_ceiling::{
+                CAPABILITY_CEILING_ENV, CAPABILITY_CEILING_VERSION, ResolvedCapabilityCeiling,
+                decode_capability_ceiling, register_capability_ceiling,
+            };
+            use crate::exec::thinking_ceiling::THINKING_CEILING_ENV;
+
+            let session = "descriptor-ceilings";
+            let _registered = register_capability_ceiling(
+                session,
+                "test-policy",
+                &serde_json::json!({"allowedAgents": ["worker"], "denyExtensions": true}),
+            )
+            .expect("registers");
+            let launch = launch(session, "worker").await;
+            let expected_ceiling = ResolvedCapabilityCeiling {
+                version: CAPABILITY_CEILING_VERSION,
+                allowed_tools: None,
+                allowed_agents: Some(vec!["worker".to_string()]),
+                deny_extensions: true,
+                sources: vec!["test-policy".to_string()],
+            };
+            let path = launch.descriptor_path();
+            let mut written = RecoveryDescriptor::read(&path)
+                .await
+                .expect("readable")
+                .expect("present");
+            assert_eq!(
+                written.capability_ceiling,
+                Some(expected_ceiling.clone()),
+                "row 43: the launching session's registered ceiling is persisted"
+            );
+            assert_eq!(
+                written.thinking_ceiling, None,
+                "this process inherits no CYRUP_SUBAGENT_THINKING_CEILING"
+            );
+            written.thinking_ceiling = Some("low".to_string());
+            written.write(&path).await.expect("rewrite");
+            launch.settle(Some(launch.cwd().to_path_buf())).await;
+
+            let script = launch.cwd().join("dump-env.sh");
+            std::fs::write(&script, "#!/bin/sh\nexec env\n").expect("write script");
+            std::fs::set_permissions(
+                &script,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .expect("chmod");
+            {
+                let mut cfg = launch.executor.config_cell().lock().await;
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: script,
+                    base_args: Vec::new(),
+                });
+            }
+
+            let confirmation = launch.resume().await.expect("revives");
+            let revived_paths = launch.run_paths_under(launch.cwd(), &revived_id(&confirmation));
+            let mut dump = String::new();
+            for _ in 0..200 {
+                dump =
+                    std::fs::read_to_string(&revived_paths.runner_stdout_log).unwrap_or_default();
+                if dump.contains(&format!("{CAPABILITY_CEILING_ENV}=")) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let env_value = |key: &str| {
+                dump.lines()
+                    .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                    .map(str::to_string)
+            };
+            assert_eq!(
+                env_value(THINKING_CEILING_ENV).as_deref(),
+                Some("low"),
+                "row 13 lands on the runner's env: {dump}"
+            );
+            let encoded = env_value(CAPABILITY_CEILING_ENV)
+                .unwrap_or_else(|| panic!("row 43 lands on the runner's env: {dump}"));
+            assert_eq!(
+                decode_capability_ceiling(Some(&encoded)).expect("decodes"),
+                Some(expected_ceiling),
+                "the revive's ceiling is the launch's, intersected with the reviver's own"
+            );
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! The live-run control verbs kept at this layer: interrupt, resume and append-step. `stop`,
 //! `steer` and `dismiss` moved to [`crate::extension::executor::foreground_actions`] (WORKFLOW_8).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::background::control::{self, AppendOutcome, InterruptOutcome, ResumeOutcome};
@@ -302,6 +303,23 @@ impl SubagentExecutor {
             .ok_or_else(|| {
                 SubagentError::AgentNotFound(format!("no step at index {step_index} to revive"))
             })?;
+        // The persisted launch contract (pi `readAsyncRecoveryDescriptor`, `async-resume.ts:310`
+        // @v0.68.0, consumed at `subagent-executor.ts:2059-2065`): a terminal async revive
+        // REQUIRES it. A missing descriptor refuses with pi's own sentence (`:2060`) rather than
+        // falling back to the bare agent name — the capability-WIDENING revive this replaces, where
+        // a child launched with a narrowed tool set resumed with the persona file's full default
+        // set. Runs launched before the descriptor existed have none and are refused exactly as
+        // upstream refuses them. A descriptor for another agent (`async-resume.ts:566`) or another
+        // source run (`subagent-executor.ts:1493`) refuses likewise.
+        let source_id = RunId::from_token(source_run_id.to_string());
+        let descriptor = crate::background::RecoveryDescriptor::read(
+            &crate::background::RunDir::new(&async_root, &source_id).recovery_descriptor(),
+        )
+        .await?
+        .ok_or_else(|| crate::background::RecoveryDescriptorError::Missing {
+            run_id: source_id.clone(),
+        })?;
+        descriptor.assert_belongs_to(&status, &agent)?;
         // pi `effectiveCwd = target.cwd ?? requestCwd` (`subagent-executor.ts:890`, fed by
         // `target.cwd` = `status.cwd ?? result.cwd`, `background/async-resume.ts:373`): the revived
         // child's persona discovery AND its actual spawn cwd prefer the ORIGINAL run's own working
@@ -359,47 +377,84 @@ impl SubagentExecutor {
             }
             Err(_) => None,
         };
+        // pi `async-resume.ts:579`: `managedWorktreeCwd ?? status?.cwd ?? result?.cwd ??
+        // recoveryDescriptor?.cwd`. The descriptor's recorded cwd is the last rung, and because a
+        // terminal async revive always HAS a descriptor here (above), pi's final `?? requestCwd`
+        // (`subagent-executor.ts:890`) is unreachable in cyrup and is not reproduced.
         let effective_cwd = managed_worktree_cwd
             .or_else(|| status.cwd.clone())
-            .unwrap_or_else(|| cwd.to_path_buf());
-        let resolved_agents = self.resolve_plan_personas(
+            .unwrap_or_else(|| descriptor.cwd.clone());
+        // pi `subagent-executor.ts:1893-1905` + `:2065`: discover the persona as before and, when
+        // discovery no longer finds the agent, SYNTHESISE its base from the descriptor rather than
+        // refusing — then, either way, the descriptor OVERLAYS the base field-for-field
+        // (`applySteeringRecoveryAgentConfig`, `async-resume.ts:604-632`). The file on disk does
+        // not win: the revived run keeps the model, tools, budgets, prompt and depth ceiling it was
+        // LAUNCHED with, however the persona file has changed since. Only `AgentNotFound` is
+        // synthesised over — a malformed file that claims the name still refuses (SUBA-086), as it
+        // does on every other launch path.
+        let mut resolved_agents = match self.resolve_plan_personas(
             &effective_cwd,
             [agent.clone()],
             AgentReadScope::Both,
             &roots,
-        )?;
+        ) {
+            Ok(personas) => personas,
+            Err(SubagentError::AgentNotFound(_)) => {
+                BTreeMap::from([(agent.clone(), descriptor.synthesised_persona())])
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(persona) = resolved_agents.get_mut(&agent) {
+            descriptor.apply_to_persona(persona);
+        }
         let revived_task =
             Self::build_revived_async_task(source_run_id, &agent, session_file, follow_up);
+        // Every per-call field comes back off the descriptor (pi `subagent-executor.ts:2111-2185`:
+        // `structuredOutputSchema`, `acceptance`, `sessionDir`, `context`, `modelOverride`,
+        // `outputPath`, `outputMode`, `skills`, `maxSubagentDepth`). `tools`/`extensions` stay
+        // `None` on the step: the launch values ARE the persona's and rode the overlay above (pi
+        // overlays `agentConfig.tools`/`.extensions`, never a per-call param).
         let step = SingleStepSpec {
-            skills: None,
-            session_dir: None,
+            skills: (!descriptor.skills.is_empty()).then(|| descriptor.skills.clone()),
+            session_dir: descriptor.session_dir.clone(),
             agent: agent.clone(),
             task: revived_task,
             cwd: None,
-            model: None,
+            // pi `modelOverride: recoveryDescriptor?.model` (`:2146`). An EXPLICIT launch model is
+            // the per-call override again; a configured/inherited one is already pinned on the
+            // persona by the overlay, which is what keeps the revived ladder on the SAME primary
+            // rather than the reviving session's.
+            model: (descriptor.model_origin == crate::background::ModelOrigin::Explicit)
+                .then(|| descriptor.model.clone())
+                .flatten(),
             tools: None,
             extensions: None,
             session_file: Some(session_file.to_path_buf()),
-            max_depth_override: None,
-            structured_output_schema: None,
+            // pi `maxSubagentDepth: recoveryDescriptor?.maxSubagentDepth` (`:2155`): the EFFECTIVE
+            // child ceiling the run was launched under, re-applied as a tightening-only override.
+            max_depth_override: Some(descriptor.max_subagent_depth),
+            structured_output_schema: descriptor.structured_output_schema.clone(),
             output: None,
-            output_path: None,
-            output_mode: None,
+            output_path: descriptor.output_path.clone(),
+            output_mode: Some(descriptor.output_mode),
             reads: None,
-            acceptance: None,
-            context: Some(ContextMode::Fork),
+            acceptance: descriptor.acceptance.clone(),
+            // pi `recoveryContext = recoveryDescriptor?.context ?? …` (`:1883`). `Fork` is what a
+            // revive seeded from a transcript meant before the descriptor recorded the launch's
+            // own resolved context.
+            context: Some(descriptor.context.unwrap_or(ContextMode::Fork)),
             agent_scope: None,
         };
         let new_id = self
             .spawn_background_steps(
                 &effective_cwd,
                 BackgroundStepsSpec {
-                    // SUBA-021: unbudgeted on this path (see the field doc).
-                    usage_budget: None,
-                    turn_budget: None,
-                    // SUBA-073: no policy on this path — same pre-existing incompleteness as
-                    // `turn_budget` immediately above; not this task's fix to extend.
-                    permission_rules: None,
+                    // The four cyrup-only run-level keys the descriptor carries (SUBA-021/008/073/
+                    // N06). Before the descriptor every one of these was `None` on a revive — the
+                    // exact degradation this contract exists to remove.
+                    usage_budget: descriptor.usage_budget,
+                    turn_budget: descriptor.turn_budget,
+                    permission_rules: descriptor.permission_rules.clone(),
                     // SCOPE_9 — pi `target.source === "async"` selecting
                     // `transferActiveAsyncCapacity` (`subagent-executor.ts:2086-2093` @v0.68.0).
                     // THIS is cyrup's `source == "async"` moment: `control::resume` resolved this
@@ -410,7 +465,7 @@ impl SubagentExecutor {
                     // run on ONE slot across a revive — acquiring afresh would double-charge the
                     // session, and at a cap of 1 the source's own retained slot would make this
                     // revive refuse itself with the exhausted sentence.
-                    transfer_from: Some(RunId::from_token(source_run_id.to_string())),
+                    transfer_from: Some(source_id),
                     steps: vec![RunnerStep::SingleStep(step)],
                     mode: RunMode::Single,
                     session_file: Some(session_file.to_path_buf()),
@@ -418,28 +473,43 @@ impl SubagentExecutor {
                     // The revival's follow-up is its `{task}`; a single revived run has no chain dir.
                     original_task: follow_up.to_string(),
                     chain_dir: None,
-                    // SUBA-N05: a revival carries no per-call `control` object of its own — pi's
-                    // revive path likewise resolves `resolveControlConfig(deps.config.control,
-                    // input.params.control)` where `params` is the ACTION's params
-                    // (`subagent-executor.ts:1179` @v0.34.0), and cyrup's `resume` action exposes no
-                    // `control` field. The extension-level `subagents.control` block still applies.
-                    control: Some(crate::exec::control::resolve_control_config(
-                        self.config_snapshot().await.control.as_ref(),
-                        None,
-                    )),
-                    // SUBA-N06: a revival exposes no `includeProgress` param either, for the same
-                    // reason — the `resume` action's params carry no such field.
-                    include_progress: None,
-                    // SUBA-N03: the `resume` action's params carry none of the SINGLE-mode
-                    // overrides either — a revival re-runs an EXISTING run's persona against a
-                    // follow-up, and pi's revive path likewise forwards no `output`/`skill`/
-                    // `share`/`sessionDir`/`artifacts`/`timeoutMs`. The revived run's own session
-                    // file (above) is what keeps its transcript continuous.
+                    // pi `resolveRevivalControlConfig({ globalConfig, requestedControl,
+                    // recoveryControlConfig })` (`subagent-executor.ts:2168`): cyrup's `resume`
+                    // action carries no `control` of its own, so the descriptor's resolved config
+                    // is the only requested rung; a descriptor without one still gets the
+                    // extension-level `subagents.control` block.
+                    control: Some(match descriptor.control_config.clone() {
+                        Some(control) => control,
+                        None => crate::exec::control::resolve_control_config(
+                            self.config_snapshot().await.control.as_ref(),
+                            None,
+                        ),
+                    }),
+                    // SUBA-N06: the launch's own `includeProgress`, back off the descriptor.
+                    include_progress: descriptor.include_progress,
                     run_id: RunId::new(),
+                    // pi's plain `resume` does not re-arm the launch deadline
+                    // (`subagent-executor.ts:2180-2181`); only the unported steering-recovery path
+                    // does. The descriptor's `absoluteDeadlineAt` is evidence, not a limit here.
                     timeout_ms: None,
-                    share: None,
-                    artifacts_dir: None,
-                    artifact_config: crate::artifacts::ArtifactConfig::default(),
+                    // pi `shareEnabled: recoveryDescriptor?.share` (`:2135`), `artifactsDir` and
+                    // `artifactConfig` (`:2106-2107`): the launch's own, never `default()`.
+                    share: Some(descriptor.share),
+                    artifacts_dir: descriptor.artifacts_dir.clone(),
+                    artifact_config: descriptor.artifact_config,
+                    // pi `thinkingCeiling: recoveryDescriptor?.thinkingCeiling` (`:2151`) and the
+                    // three-way capability intersection (`:2183`): handed over raw, intersected
+                    // with the reviver's own inside `spawn_background_steps`, landed on the
+                    // runner's env.
+                    thinking_ceiling: descriptor.thinking_ceiling.clone(),
+                    capability_ceiling: descriptor.capability_ceiling.clone(),
+                    // pi `modelOrigin: recoveryDescriptor?.modelOrigin` (`:2149`), consumed as
+                    // `storedOrigin` (`model-resolution.ts:382`): the revived run's OWN descriptor
+                    // records the origin this run was LAUNCHED with, not a re-derivation over the
+                    // persona the overlay just pinned the model on — which would turn `inherited`
+                    // into `configured` on the first revive and make a second revive read a
+                    // different origin than the first.
+                    model_origin: Some(descriptor.model_origin),
                 },
             )
             .await?;

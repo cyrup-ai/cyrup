@@ -453,6 +453,37 @@ pub struct BackgroundStepsSpec {
     /// admission there (pi `:513`), which is what a revive of a run whose slot reconciliation
     /// already reclaimed must do.
     pub transfer_from: Option<RunId>,
+    /// The thinking ceiling a REVIVE re-applies to its spawn — pi `thinkingCeiling:
+    /// recoveryDescriptor?.thinkingCeiling` on the revived launch (`subagent-executor.ts:2151`
+    /// @v0.68.0). `None` from every ordinary producer; `Some` only from
+    /// [`crate::extension::SubagentExecutor::control_resume`]'s terminal-revival arm, which hands
+    /// over the source run's persisted ceiling. `spawn_background_steps` intersects it with THIS
+    /// process's own inherited ceiling (a revive never widens, pi `applySteeringRecoveryAgentConfig`
+    /// `async-resume.ts:610`) and, only when this is `Some`, writes the result into the detached
+    /// runner's env overlay as [`crate::exec::thinking_ceiling::THINKING_CEILING_ENV`] — the
+    /// runner already reads that variable, so no `RunnerConfig` field is needed.
+    pub thinking_ceiling: Option<String>,
+    /// The capability ceiling a REVIVE re-applies to its spawn — pi
+    /// `intersectSubagentCapabilityCeilings(target, recoveryDescriptor?.capabilityCeiling,
+    /// resolveCurrentSubagentCapabilityCeiling(...))` (`subagent-executor.ts:2183`), landing as
+    /// [`crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV`] on the env overlay exactly as
+    /// [`Self::thinking_ceiling`] does. `None` from every ordinary producer.
+    pub capability_ceiling: Option<crate::exec::capability_ceiling::ResolvedCapabilityCeiling>,
+    /// The `modelOrigin` a REVIVE carries forward from the source run's recovery descriptor — pi
+    /// `modelOrigin: recoveryDescriptor?.modelOrigin` on the revived launch
+    /// (`subagent-executor.ts:2149` @v0.68.0), consumed as `storedOrigin` by `resolveModelOrigin`
+    /// (`runs/shared/model-resolution.ts:382`: `if (input.storedOrigin) return
+    /// input.storedOrigin;`). `None` from every ordinary producer, which derives the origin from
+    /// the launch itself; `Some` only from
+    /// [`crate::extension::SubagentExecutor::control_resume`]'s terminal-revival arm.
+    ///
+    /// Read by `spawn_background_steps` when it writes the revived run's OWN descriptor
+    /// ([`crate::background::LaunchInputs::stored_model_origin`]) and by nothing else: the
+    /// overlay has already pinned the model itself on the persona, so what the origin decides is
+    /// the provenance that descriptor records and the slot the model lands on at the NEXT
+    /// revive. Without it an `inherited` launch would be re-recorded as `configured` on its
+    /// first revive, and a second revive would read a different origin than the first.
+    pub model_origin: Option<crate::background::ModelOrigin>,
 }
 
 /// G92: the three optional `status` VIEW selectors pi carries as separate params

@@ -73,6 +73,7 @@ fn message_end_line(text: &str) -> String {
 /// is decided by the child's own exit code and nothing else.
 fn reporter_persona() -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        file_path: None,
         name: "reporter".to_string(),
         model: Some(ModelId::from("fixture-model")),
         model_provider: None,

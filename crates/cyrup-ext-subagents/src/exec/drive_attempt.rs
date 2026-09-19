@@ -8,6 +8,7 @@ use std::time::Duration;
 use cyrup_core::CancelToken;
 
 use crate::exec::agent_config::RunOptions;
+use crate::exec::child_transcript::ChildTranscriptWriter;
 use crate::exec::ndjson::SubagentEvent;
 use crate::exec::output::{is_terminal_assistant_stop, message_end_has_error_message};
 use crate::exec::progress::AgentProgress;
@@ -275,14 +276,19 @@ async fn pending_until(at: Option<tokio::time::Instant>) {
 
 /// One NDJSON line off the child's stdout: tee it to the live sink, parse it exactly once, fold it
 /// into the terminal-stop/settled witnesses, arm or disarm the final-stop grace window, surface a
-/// blocking `contact_supervisor` ask, feed the control heuristics, and record it on `progress`.
-/// Returns what the drive loop should do next.
-fn handle_child_line(
+/// blocking `contact_supervisor` ask, append it to the live transcript, feed the control
+/// heuristics, and record it on `progress`. Returns what the drive loop should do next.
+///
+/// `async` only for the transcript append: [`ChildTranscriptWriter::write_child_event`] goes
+/// through the crate's async capped appender, the same per-line await the raw `.jsonl` tee
+/// already pays in `spawn::SpawnedChild::next_event`.
+async fn handle_child_line(
     line: &str,
     state: &mut DriveState,
     progress: &mut AgentProgress,
     control: &mut crate::exec::control::ControlMonitor,
     opts: &RunOptions,
+    transcript: Option<&mut ChildTranscriptWriter>,
 ) -> LineAction {
     // NOTE: the raw NDJSON envelope deliberately does NOT enter `progress.recent_output` — pi
     // appends only EXTRACTED text, from an assistant `message_end`'s content and a finished tool
@@ -365,6 +371,14 @@ fn handle_child_line(
                 },
             );
         }
+    }
+    // pi `shared.transcriptWriter?.writeChildEvent(evt)` (`execution.ts:980`; the async runner's
+    // `run-child-session.ts:410`): the live `_transcript.jsonl` is fed from THIS parsed event, at
+    // the crate's one parse point, so the foreground executor and the detached runner (which
+    // reaches here through `run_sync`) both write it while the child is still running. Placed
+    // before the control/progress folds because `record_event` consumes the event by value.
+    if let Some(writer) = transcript {
+        writer.write_child_event(&event).await;
     }
     // pi `processLine` (`execution.ts:775-890`): every parsed child event is fresh activity for the
     // control heuristics, and the tool-start / tool-result / assistant-turn folds feed the
@@ -531,6 +545,7 @@ pub(crate) async fn drive_attempt(
     opts: &RunOptions,
     deadline_sleep: Option<tokio::time::Sleep>,
     control: &mut crate::exec::control::ControlMonitor,
+    mut transcript: Option<&mut ChildTranscriptWriter>,
 ) -> DriveOutcome {
     tokio::pin!(deadline_sleep);
     let cancel = opts.cancel.clone();
@@ -586,7 +601,16 @@ pub(crate) async fn drive_attempt(
             step = child.next_event_or_exit() => {
                 match step {
                     crate::spawn::ChildStep::Line(Ok(line)) => {
-                        match handle_child_line(&line, &mut state, progress, control, opts) {
+                        match handle_child_line(
+                            &line,
+                            &mut state,
+                            progress,
+                            control,
+                            opts,
+                            transcript.as_deref_mut(),
+                        )
+                        .await
+                        {
                             LineAction::Continue => {}
                             LineAction::TurnBudgetAbort(message) => {
                                 return turn_budget_abort(child, &cancel, message, &state).await;

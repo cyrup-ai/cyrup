@@ -1130,10 +1130,10 @@ impl Drop for SpawnedChild {
 ///
 /// # Why the tail is fed RAW CHUNKS
 ///
-/// Note which of pi's two consumers produces the error text: `stderrTail`, a
-/// `createBoundedByteTail` fed the raw `chunk` (`execution.ts:1057`) with no notion of lines at
-/// all. The line-bounded `stderrReader` beside it (`execution.ts:1047-1052`) exists only to feed
-/// `shared.transcriptWriter?.writeStderrLine` and has no say over the error.
+/// The error text comes from the BYTE tail, fed raw chunks with no notion of lines at all; the
+/// line-bounded reader beside it is a separate diagnostic consumer and has no say over the error.
+///
+/// At v0.68.0 upstream's foreground path has NO per-line stderr reader and NO byte tail (`execution.ts:1047-1057` is the `tool_execution_start` arm; `git grep BoundedByteTail -- src/` over the pinned tag is empty); the only upstream stderr capture is `subagent-runner.ts:716-721`'s plain `stderr.slice(-4096)` for a herdr hint. The bounded tail here is cyrup's OWN diagnostic design — ported from an earlier tag and since removed upstream — and the tail-vs-truncation argument stands on its own, not on a pi citation.
 ///
 /// That separation is what makes the bound a TAIL rather than a truncation. A child's fatal error
 /// is the LAST thing it writes, so a capture that stopped at the first over-long line would report
@@ -1142,9 +1142,14 @@ impl Drop for SpawnedChild {
 /// — or not to.
 ///
 /// The per-line reader is ported alongside it, on the same chunks, for the same reason pi keeps
-/// both: it bounds what a single pathological line can cost the diagnostic path. cyrup has no
-/// `ChildTranscriptWriter` port yet, so its lines go to `tracing` at debug level — the same
-/// discard-if-nobody-is-listening shape as pi's own optional-chained `transcriptWriter?.`.
+/// both: it bounds what a single pathological line can cost the diagnostic path. Its lines go to
+/// `tracing` at debug level, not to the live transcript: pi never records a child's stderr
+/// stream either — at v0.68.0 its `writeStderrLine` has one caller, the in-process child
+/// session's `onExtensionError` hook (`src/runs/shared/child-hooks.ts:30-34`), which writes one
+/// `stderr` record per contained extension fault. cyrup's child reports those faults as lines on
+/// this very stream (`cyrup_modes::print::extension_error_sink`, `eprintln!`), not as a parsed
+/// event, and [`crate::exec::child_transcript::ChildTranscriptWriter`] records parsed stdout
+/// events only (see that module's "Scope").
 pub struct CapturedStderr {
     /// The last [`MAX_CHILD_STDERR_BYTES`] the child has written so far, shared with the pump task
     /// that is still appending to it. `None` for an [`CapturedStderr::empty`] capture.
@@ -1172,7 +1177,8 @@ impl CapturedStderr {
         let pump_tail = Arc::clone(&tail);
         let pump = tokio::spawn(async move {
             let mut reader = stderr;
-            // pi's second consumer (`execution.ts:1047-1052`), fed the identical chunks.
+            // cyrup's own per-line diagnostic reader, fed the identical chunks. No upstream
+            // analogue at v0.68.0 (see the type doc above).
             let mut lines = BoundedLineReader::stderr();
             let mut buf = vec![0u8; STDERR_PUMP_CHUNK_BYTES];
             loop {
@@ -1227,8 +1233,12 @@ impl CapturedStderr {
     }
 }
 
-/// Forward whatever [`BoundedLineReader::stderr`] has completed to `tracing`, cyrup's stand-in for
-/// pi's `shared.transcriptWriter?.writeStderrLine` (`execution.ts:1050-1051`). Debug level because
+/// Forward whatever [`BoundedLineReader::stderr`] has completed to `tracing`. pi has no stderr
+/// feed to stand in for: at v0.68.0 `writeStderrLine` is called only from the child session's
+/// `onExtensionError` hook (`src/runs/shared/child-hooks.ts:32`), and cyrup's child emits that
+/// notice on stderr (`cyrup_modes::print::extension_error_sink`) rather than as an event, so it
+/// arrives here as one of these lines and in the failure tail — the live transcript writer
+/// ([`crate::exec::child_transcript`]) takes parsed stdout events only. Debug level because
 /// this is a child's ordinary diagnostic chatter; the over-long-line diagnostic is a warning
 /// because it means the reader has permanently closed and later lines will not appear here (the
 /// error path is unaffected — it reads the raw byte tail, not this).

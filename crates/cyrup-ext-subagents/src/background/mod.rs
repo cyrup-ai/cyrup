@@ -57,6 +57,10 @@ pub mod delivery;
 pub mod flat_index;
 pub mod parent_anchor;
 pub mod reconcile;
+// The async recovery descriptor — the persisted launch contract of an async SINGLE run, written
+// by `spawn_background_steps` before the runner exists and read back by `action: "resume"` and
+// the retention scan. A BACKGROUND-artifact writer/reader like the index modules above it.
+pub mod recovery_descriptor;
 pub mod result_index;
 pub mod runner_main;
 pub mod spawn_detached;
@@ -121,6 +125,10 @@ pub use artifact_roots::{
 };
 pub(crate) use artifact_roots::{cwd_key, temp_root_dir, temp_root_dir_from};
 pub use records::{ParallelGroupStatus, ResultFile, RunStatus, ScheduleOrigin, StepStatus};
+pub use recovery_descriptor::{
+    DescriptorVersion, LaunchContractDigest, LaunchInputs, ModelOrigin, RecoveryDescriptor,
+    RecoveryDescriptorError,
+};
 pub use run_history::{
     RunHistoryEntry, record_run_history, run_history_path, run_history_path_for,
 };

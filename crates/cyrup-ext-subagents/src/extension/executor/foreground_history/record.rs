@@ -103,11 +103,13 @@ pub(crate) struct ForegroundHistoryChild {
     pub(crate) artifact_output_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
-    /// cyrup's [`SingleResult`] carries no output/transcript WRITE-FAILURE field yet (pi
-    /// `outputSaveError`/`transcriptError`) — always `None` until a producer exists, exactly like
-    /// [`crate::tui::fleet_state::ForegroundResumeChildView`]'s own same-named fields.
+    /// cyrup's [`SingleResult`] carries no output WRITE-FAILURE field yet (pi `outputSaveError`)
+    /// — always `None` until a producer exists, exactly like
+    /// [`crate::tui::fleet_state::ForegroundResumeChildView`]'s own same-named field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) output_save_error: Option<String>,
+    /// pi `transcriptError` — [`SingleResult::transcript_error`], the live transcript writer's
+    /// latched failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) transcript_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,10 +227,9 @@ impl SubagentExecutor {
                 model: result.model.as_ref().map(|m| m.as_str().to_string()),
                 thinking: None,
                 session_file: result.session_file.clone(),
-                transcript_path: result
-                    .artifact_paths
-                    .as_ref()
-                    .map(|p| p.transcript_path.clone()),
+                // pi `transcriptPath: result.transcriptPath` — the WRITER's path, `Some` only
+                // when a live transcript was actually written (not merely named by the bundle).
+                transcript_path: result.transcript_path.clone(),
                 saved_output_path: result.saved_output_path.as_ref().map(PathBuf::from),
                 artifact_output_path: result
                     .artifact_paths
@@ -236,7 +237,7 @@ impl SubagentExecutor {
                     .map(|p| p.output_path.clone()),
                 error: result.error.clone(),
                 output_save_error: None,
-                transcript_error: None,
+                transcript_error: result.transcript_error.clone(),
                 final_output: result.final_output.clone(),
                 tokens: (result.usage.total_tokens > 0).then_some(result.usage.total_tokens),
                 tool_count: {
@@ -366,6 +367,8 @@ pub(crate) fn test_single_result(agent: &str, exit_code: i32) -> SingleResult {
         output_state: Default::default(),
         structured_output_path: None,
         artifact_paths: None,
+        transcript_path: None,
+        transcript_error: None,
         acceptance: None,
         detached: false,
         interrupted: false,

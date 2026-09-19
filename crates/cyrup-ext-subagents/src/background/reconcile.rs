@@ -680,6 +680,10 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             output_state: crate::exec::output_state::SubagentOutputState::Unknown,
             structured_output_path: None,
             artifact_paths: None,
+            // The step's declaration-time transcript stamp survives a crashed runner exactly as
+            // `session_file` does: the file (if any) is on disk whether or not the run settled.
+            transcript_path: step.transcript_path.clone(),
+            transcript_error: step.transcript_error.clone(),
             acceptance: None,
             detached: false,
             interrupted: false,
@@ -745,6 +749,8 @@ pub(crate) fn placeholder_result(
         output_state: crate::exec::output_state::SubagentOutputState::Unknown,
         structured_output_path: None,
         artifact_paths: None,
+        transcript_path: None,
+        transcript_error: None,
         acceptance: None,
         detached: false,
         interrupted: false,

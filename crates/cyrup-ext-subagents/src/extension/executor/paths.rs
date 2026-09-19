@@ -898,6 +898,9 @@ mod tests {
                     turn_budget: None,
                     permission_rules: None,
                     transfer_from: None,
+                    thinking_ceiling: None,
+                    capability_ceiling: None,
+                    model_origin: None,
                     steps: vec![step],
                     mode: RunMode::Single,
                     session_file: None,
@@ -1501,6 +1504,40 @@ mod tests {
         );
     }
 
+    /// The recovery descriptor every terminal async revive now REQUIRES (pi
+    /// `subagent-executor.ts:2059-2061` @v0.68.0, `control.rs::revive_from_transcript`): the
+    /// minimal typed contract — only the keys pi writes unconditionally — written through the
+    /// production writer, so the two cwd-rung tests below exercise the ladder they are about
+    /// rather than the missing-descriptor refusal.
+    async fn write_minimal_recovery_descriptor(
+        run_dir: &std::path::Path,
+        run_id: &str,
+        agent: &str,
+        cwd: &std::path::Path,
+    ) {
+        let descriptor: crate::background::RecoveryDescriptor =
+            serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "launchContractDigest": "0".repeat(64),
+                "sourceRunId": run_id,
+                "agent": agent,
+                "cwd": cwd,
+                "modelOrigin": "configured",
+                "systemPromptMode": "replace",
+                "inheritProjectContext": false,
+                "inheritSkills": false,
+                "outputMode": "inline",
+                "maxSubagentDepth": 2,
+                "share": false,
+                "artifactConfig": crate::artifacts::ArtifactConfig::default(),
+            }))
+            .expect("a valid minimal descriptor");
+        descriptor
+            .write(&crate::background::RunDir::for_existing(run_dir).recovery_descriptor())
+            .await
+            .expect("write the recovery descriptor fixture");
+    }
+
     /// pi `target.cwd ?? requestCwd` (`subagent-executor.ts:890`, fed by `status.cwd ?? result.cwd`
     /// at `background/async-resume.ts:373`): a terminal-revival `resume` must resolve the revived
     /// child's persona against the ORIGINAL run's own cwd (persisted onto `status.json` by
@@ -1553,6 +1590,13 @@ mod tests {
         status
             .advance_state(RunState::Complete)
             .expect("Running -> Complete");
+        write_minimal_recovery_descriptor(
+            &paths.run_dir,
+            "run0revive",
+            "orig-only-agent",
+            orig_dir.path(),
+        )
+        .await;
         status.cwd = Some(orig_dir.path().to_path_buf());
         write_atomic_json(&paths.status, &status)
             .await
@@ -1655,6 +1699,13 @@ mod tests {
             .advance_state(RunState::Complete)
             .expect("Running -> Complete");
         // Deliberately the repo, NOT the worktree: the manifest must beat it.
+        write_minimal_recovery_descriptor(
+            &paths.run_dir,
+            "run0lanecwd",
+            "lane-only-agent",
+            repo_dir.path(),
+        )
+        .await;
         status.cwd = Some(repo_dir.path().to_path_buf());
         write_atomic_json(&paths.status, &status)
             .await

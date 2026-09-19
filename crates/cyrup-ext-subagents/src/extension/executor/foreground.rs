@@ -137,6 +137,10 @@ struct ForegroundRunOptionsInput<'a> {
     session_dir: Option<PathBuf>,
     /// `art_cfg.enabled` — G80 gates verify memoization on the SAME flag as the quadruple.
     artifacts_enabled: bool,
+    /// `art_cfg.include_transcript` — pi's third transcript gate term (`includeTranscript !==
+    /// false`, `execution.ts:1838`), carried beside `artifacts_enabled` so the transcript switch
+    /// reads the SAME resolved config as the quadruple.
+    include_transcript: bool,
     /// Borrowed: the caller writes the artifact quadruple into the same root.
     art_dir: &'a Path,
     /// WORKFLOW_14 — [`ForegroundRunRequest::workflow_steer`], borrowed. The three
@@ -338,6 +342,7 @@ impl SubagentExecutor {
             output_mode,
             session_dir,
             artifacts_enabled: art_cfg.enabled,
+            include_transcript: art_cfg.include_transcript,
             art_dir: &art_dir,
             workflow_steer: workflow_steer.as_ref(),
         });
@@ -770,6 +775,7 @@ impl SubagentExecutor {
             output_mode,
             session_dir,
             artifacts_enabled,
+            include_transcript,
             art_dir,
             workflow_steer,
         } = input;
@@ -950,6 +956,11 @@ impl SubagentExecutor {
             // gated by the SAME `art_cfg.enabled` the caller passed as `artifacts_enabled`, so
             // SUBA-041's `artifacts: false` turns verify memoization off with everything else.
             artifacts_dir: artifacts_enabled.then(|| art_dir.to_path_buf()),
+            // pi `execution.ts:1831-1840`: the live transcript writer exists iff `artifactsDir &&
+            // artifactConfig?.enabled !== false && includeTranscript !== false`, as `foreground`.
+            // The first two terms are `artifacts_dir` above; this is the third.
+            transcript: (artifacts_enabled && include_transcript)
+                .then_some(crate::exec::child_transcript::TranscriptSource::Foreground),
         }
     }
 

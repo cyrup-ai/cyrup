@@ -1141,12 +1141,11 @@ pub fn transcript_target(item: &FleetItem, state: &FleetState) -> Option<Transcr
                 .clone()
                 .unwrap_or_else(|| state.base_cwd.clone());
             let artifacts_root = fleet_artifacts_root(state, &cwd);
-            // Delta 3 of `fleet_transcript`: `ArtifactPaths::transcript_path` now EXISTS
-            // (SCOPE_3a made the bundle five-field, matching `shared/artifacts.ts:190`), but no
-            // writer emits `_transcript.jsonl` yet — the `.jsonl` event stream is still the
-            // artifact cyrup actually writes, so it remains the correct live-transcript target.
-            // When a transcript writer lands, switch this to `paths.transcript_path` under
-            // upstream's `transcriptWriter ? … : undefined` gate (`execution.ts:513`).
+            // pi `fleet.ts:649-654`: `getArtifactPaths(root, runId, agent, index ?? 0)
+            // .transcriptPath`, ungated — the live `_transcript.jsonl` the run's
+            // `exec::child_transcript::ChildTranscriptWriter` is appending to right now. The same
+            // quadruple `run_sync` mints its bundle from (`child_index: Some(0)` on the single
+            // foreground path), so this names the file the writer actually opened.
             let paths = crate::artifacts::artifact_paths(
                 &artifacts_root,
                 &item.run_id,
@@ -1154,7 +1153,7 @@ pub fn transcript_target(item: &FleetItem, state: &FleetState) -> Option<Transcr
                 Some(item.index.unwrap_or(0)),
             );
             Some(TranscriptTarget {
-                path: paths.jsonl_path,
+                path: paths.transcript_path,
                 trusted_roots: vec![artifacts_root],
             })
         }
@@ -1181,8 +1180,15 @@ pub fn transcript_target(item: &FleetItem, state: &FleetState) -> Option<Transcr
                 None
             })?;
             let step = run.status.steps.get(index)?;
-            // cyrup's step records its output log rather than a separate transcript file.
-            let transcript_path = step.telemetry.output_file.clone()?;
+            // pi `fleet.ts:669-671`: `step?.transcriptPath ?? (step?.sessionFile ??
+            // run.sessionFile)` — the live transcript the runner stamped at declaration
+            // (`runner_main/entry.rs`), else the child's session file for a run launched without
+            // artifacts.
+            let transcript_path = step
+                .transcript_path
+                .clone()
+                .or_else(|| step.session_file.clone())
+                .or_else(|| run.status.session_file.clone())?;
             let resolved = if transcript_path.is_absolute() {
                 transcript_path
             } else {
@@ -3564,6 +3570,8 @@ mod tests {
         );
     }
 
+    /// pi `fleet.ts:669-671`: the async pane opens the step's declaration-time `transcriptPath`
+    /// — the live `_transcript.jsonl` the runner stamped before the child spawned.
     #[test]
     fn transcript_target_for_a_background_step_trusts_the_run_dir() {
         let mut run = async_run(
@@ -3573,7 +3581,7 @@ mod tests {
             100,
         );
         if let Some(first) = run.status.steps.first_mut() {
-            first.telemetry.output_file = Some(PathBuf::from("output-0.log"));
+            first.transcript_path = Some(PathBuf::from("bg_a_0_transcript.jsonl"));
         }
         let state = FleetState {
             tracked_jobs: vec![run],
@@ -3581,8 +3589,46 @@ mod tests {
         };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
         let target = transcript_target(&snapshot.items[0], &state).unwrap();
-        assert!(target.path.ends_with("output-0.log"));
+        assert!(target.path.ends_with("bg_a_0_transcript.jsonl"));
         assert!(target.trusted_roots.iter().any(|r| r.ends_with("bg")));
+    }
+
+    /// pi `fleet.ts:670`: with no `transcriptPath` on the step (a run launched without
+    /// artifacts), the pane falls back to the step's session file; with neither, there is no
+    /// target at all — never the telemetry output log.
+    #[test]
+    fn transcript_target_for_a_background_step_falls_back_to_the_session_file() {
+        let mut run = async_run(
+            "bg",
+            RunState::Running,
+            vec![step("a", StepState::Running)],
+            100,
+        );
+        if let Some(first) = run.status.steps.first_mut() {
+            first.session_file = Some(PathBuf::from("session-a.jsonl"));
+            first.telemetry.output_file = Some(PathBuf::from("output-0.log"));
+        }
+        let state = FleetState {
+            tracked_jobs: vec![run.clone()],
+            ..FleetState::default()
+        };
+        let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
+        let target = transcript_target(&snapshot.items[0], &state).unwrap();
+        assert!(
+            target.path.ends_with("session-a.jsonl"),
+            "{:?}",
+            target.path
+        );
+
+        if let Some(first) = run.status.steps.first_mut() {
+            first.session_file = None;
+        }
+        let state = FleetState {
+            tracked_jobs: vec![run],
+            ..FleetState::default()
+        };
+        let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
+        assert!(transcript_target(&snapshot.items[0], &state).is_none());
     }
 
     /// The single style carried by a one-span detail line.

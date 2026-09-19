@@ -379,6 +379,9 @@ pub(super) fn child_stopped_step_result() -> StepResult {
         // No child ever ran — there is no worktree evidence to summarize (upstream's
         // `childStopResult` carries no `timeoutRecovery` either, `subagent-runner.ts:3011-3014`).
         timeout_recovery: None,
+        // No child ran, so no transcript writer ever existed.
+        transcript_path: None,
+        transcript_error: None,
     }
 }
 
@@ -413,6 +416,9 @@ pub(super) fn stopped_single_result(step: &RunnerStep) -> SingleResult {
             // `timeoutRecovery`: the stop was applied outside the child (or before it spawned),
             // so there is no run-scoped snapshot to measure against.
             timeout_recovery: None,
+            // No child ran, so no transcript writer ever existed.
+            transcript_path: None,
+            transcript_error: None,
         },
     );
     single.exit_code = 1;
@@ -616,6 +622,11 @@ pub(super) fn step_result_to_single_result_with(
         output_state: result.output_state,
         structured_output_path: result.structured_output_path.clone(),
         artifact_paths: result.artifact_paths.clone(),
+        // pi `transcriptPath` / `transcriptError` on the runner's results copy
+        // (`subagent-runner.ts:1590-1591`): the live transcript's path and its writer's error,
+        // carried onto the terminal `ResultFile` so a `wait`/`collect` reader can open the file.
+        transcript_path: result.transcript_path.clone(),
+        transcript_error: result.transcript_error.clone(),
         acceptance: None,
         detached: false,
         // R-SA-084: carry the mid-flight interrupt flag through to the terminal per-step
@@ -704,6 +715,8 @@ pub(super) fn imported_root_to_single_result(
         ),
         structured_output_path: None,
         artifact_paths: None,
+        transcript_path: None,
+        transcript_error: None,
         acceptance: None,
         detached: false,
         interrupted: false,

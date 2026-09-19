@@ -208,6 +208,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         control_config: None,
         on_control_event: None,
         artifacts_dir: None,
+        transcript: None,
         model_scope: None,
     }
 }
@@ -568,6 +569,7 @@ async fn stopping_a_nested_run_gets_pis_own_scope_refusal_not_the_not_found_text
 /// `background_runner_main_integration.rs`'s own `fixture_persona`).
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: name.to_string(),
