@@ -179,6 +179,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         control_config: None,
         on_control_event: None,
         artifacts_dir: None,
+        transcript: None,
         model_scope: None,
     }
 }

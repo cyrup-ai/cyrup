@@ -169,6 +169,18 @@ pub(crate) struct ExecSingleStepExecutor {
     /// `ctx.artifactConfig`). Read together with [`Self::artifacts_dir`]; `enabled: false` disables
     /// the write just as an absent dir does.
     pub(crate) artifact_config: crate::artifacts::ArtifactConfig,
+    /// The live transcript's `source` label for every child this executor dispatches
+    /// ([`crate::exec::child_transcript::TranscriptSource`]), threaded onto
+    /// [`crate::exec::RunOptions::transcript`] beside the `include_transcript` switch.
+    ///
+    /// pi's two writer creators each know their label statically because each lives in exactly
+    /// one process: `subagent-runner.ts:881` writes `"async"`, `execution.ts:1843` writes
+    /// `"foreground"` (@v0.68.0). cyrup has ONE `ExecSingleStepExecutor` for both the detached
+    /// hop-2 runner (`turn_loop` builds it from `RunnerConfig`) and the foreground `/chain`//
+    /// `/parallel` walk (`extension::executor::chain` builds it through [`Self::foreground`]), so
+    /// the label is a fact about WHICH PROCESS built the executor, not about [`Self::run_single`]
+    /// — a constant there labelled every foreground chain child `async`. Each constructor sets it.
+    pub(crate) transcript_source: crate::exec::child_transcript::TranscriptSource,
     /// G90 — this run's async run directory, the root of the steer control inbox
     /// (`<run_dir>/control/steer-targets/<flatIndex>/`). Each dispatched step derives its OWN
     /// per-child inbox from it and hands the path to the child in
@@ -309,6 +321,11 @@ impl ExecSingleStepExecutor {
             usage_budget: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
+            // Built by the foreground `/chain`//`/parallel` walk, so its children are foreground
+            // children (pi `execution.ts:1843` `source: "foreground"`). Inert on disk today —
+            // `artifacts_dir: None` above means `run_sync` opens no writer — but the label rides
+            // `RunOptions::transcript` regardless and must not say `async`.
+            transcript_source: crate::exec::child_transcript::TranscriptSource::Foreground,
             // G90: a foreground walk has no async run directory, hence no steer inbox — the same
             // reason upstream supplies `steerInboxDir` only from the background runner.
             run_dir: None,
@@ -793,6 +810,14 @@ impl ExecSingleStepExecutor {
                 .artifacts_dir
                 .clone()
                 .filter(|_| self.artifact_config.enabled),
+            // pi `subagent-runner.ts:872-878` / `execution.ts:1831-1840`: the transcript writer
+            // exists iff `artifactsDir && artifactConfig?.enabled !== false && includeTranscript
+            // !== false`. The first two terms are `artifacts_dir` above; this is the third, and
+            // the first production reader of `ArtifactConfig::include_transcript`. The label is
+            // [`Self::transcript_source`] — set by the constructor that knows which process built
+            // this executor — never a constant of this method, which serves both.
+            transcript: (self.artifact_config.enabled && self.artifact_config.include_transcript)
+                .then_some(self.transcript_source),
             // pi `createStructuredOutputRuntime(step.structuredOutputSchema,
             // path.join(path.dirname(ctx.outputFile), "structured-output"), …)`
             // (`subagent-runner.ts:783-785`): a dispatched step's structured capture is RUN-SCOPED
@@ -1012,6 +1037,8 @@ fn build_step_result(
         context_overflow,
         saved_output_path,
         control_events,
+        transcript_path,
+        transcript_error,
         ..
     } = result;
     let mut step_result = if exit_code == 0 {
@@ -1050,6 +1077,13 @@ fn build_step_result(
     // after it has already advanced. Assigned as the typed struct: the untyped `to_value` hop
     // this replaces is what let the four/five field divergence go unnoticed.
     step_result.artifact_paths = artifact_paths.map(|(paths, _)| paths.clone());
+    // pi `transcriptPath: singleResult.transcriptPath` / `transcriptError` on the chain-results
+    // copy (`subagent-runner.ts:1590-1591`) and the post-step status write (`:3829-3830`): the
+    // live transcript's path and its writer's latched error cross this waist beside the bundle,
+    // so `record_step_outcome` and `step_result_to_single_result` can publish them. Same trailing
+    // `..` caveat as the fields above: dropping these lines builds clean and loses the path.
+    step_result.transcript_path = transcript_path;
+    step_result.transcript_error = transcript_error;
     // SUBA-N05: carry the events this step's control monitor raised out of `run_sync` so
     // `step_result_to_single_result` can put them on the terminal `ResultFile`. Without this
     // hop the whole async control path is inert: the thresholds are honoured, the events are
@@ -1115,6 +1149,7 @@ mod tests {
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
+            transcript_source: crate::exec::child_transcript::TranscriptSource::Async,
             resolved_agents: Arc::new(BTreeMap::new()),
             orchestrator_intercom_target: None,
             run_id: None,
@@ -1328,6 +1363,7 @@ mod tests {
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
+            transcript_source: crate::exec::child_transcript::TranscriptSource::Async,
             resolved_agents: Arc::new(BTreeMap::new()),
             orchestrator_intercom_target: None,
             run_id: None,
@@ -1392,6 +1428,124 @@ mod tests {
             opts.host_available_builtins,
             Some(vec!["read".to_string()]),
             "and must then be forwarded onto every step this foreground walk dispatches"
+        );
+    }
+
+    /// An executor shaped as `turn_loop` builds it for the detached runner, with the given
+    /// artifact config.
+    fn runner_shaped(
+        artifacts_dir: Option<PathBuf>,
+        artifact_config: crate::artifacts::ArtifactConfig,
+    ) -> ExecSingleStepExecutor {
+        ExecSingleStepExecutor {
+            spawn_command: None,
+            child_env: std::collections::HashMap::new(),
+            host_available_builtins: None,
+            usage_budget: None,
+            turn_budget: None,
+            permission_rules: None,
+            depth: DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            interrupt_cancel: cyrup_core::CancelToken::new(),
+            child_stops: None,
+            telemetry: None,
+            share: None,
+            artifacts_dir,
+            artifact_config,
+            transcript_source: crate::exec::child_transcript::TranscriptSource::Async,
+            resolved_agents: Arc::new(BTreeMap::new()),
+            orchestrator_intercom_target: None,
+            run_id: None,
+            inherited_session_model: None,
+            inherited_session_thinking: None,
+            model_scope: None,
+            control: None,
+            include_progress: None,
+            run_dir: None,
+        }
+    }
+
+    /// The transcript's `source` label follows which PROCESS built the executor, not which
+    /// method dispatches the step: `run_single` serves both the detached runner and the
+    /// foreground `/chain`//`/parallel` walk, and a constant there labelled every foreground
+    /// chain child `async` (pi `execution.ts:1843` writes `"foreground"` for a foreground child).
+    /// Pinned at the `RunOptions` seam because that is the last point the label is observable
+    /// for a foreground walk: its executor carries `artifacts_dir: None` (SUBA-N03), so
+    /// `run_sync` never opens a writer that would put the label on disk.
+    #[test]
+    fn the_transcript_source_follows_the_executor_s_origin_not_the_dispatch_method() {
+        use crate::exec::child_transcript::TranscriptSource;
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let step = single_step("reviewer", "review the change");
+
+        // The foreground walk's constructor — what `extension::executor::chain` builds.
+        let foreground = ExecSingleStepExecutor::foreground(
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            Arc::new(BTreeMap::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let opts = foreground.build_step_run_options(
+            &step,
+            &host_test_ctx(dir.path()),
+            Vec::new(),
+            crate::exec::fallback::ModelOverride::Inherit,
+            None,
+        );
+        assert_eq!(
+            opts.transcript,
+            Some(TranscriptSource::Foreground),
+            "a foreground chain child is a foreground child"
+        );
+        assert_eq!(
+            opts.artifacts_dir, None,
+            "even though no writer opens for it today (SUBA-N03: the foreground walk carries no \
+             artifacts dir), the label it would write must be right"
+        );
+
+        // The detached runner's shape, as `turn_loop` builds it from `RunnerConfig`.
+        let runner = runner_shaped(
+            Some(dir.path().to_path_buf()),
+            crate::artifacts::ArtifactConfig::default(),
+        );
+        let opts = runner.build_step_run_options(
+            &step,
+            &host_test_ctx(dir.path()),
+            Vec::new(),
+            crate::exec::fallback::ModelOverride::Inherit,
+            None,
+        );
+        assert_eq!(opts.transcript, Some(TranscriptSource::Async));
+        assert_eq!(opts.artifacts_dir.as_deref(), Some(dir.path()));
+
+        // The switch still turns the label off on either shape (pi's third gate term).
+        let off = runner_shaped(
+            Some(dir.path().to_path_buf()),
+            crate::artifacts::ArtifactConfig {
+                include_transcript: false,
+                ..crate::artifacts::ArtifactConfig::default()
+            },
+        );
+        let opts = off.build_step_run_options(
+            &step,
+            &host_test_ctx(dir.path()),
+            Vec::new(),
+            crate::exec::fallback::ModelOverride::Inherit,
+            None,
+        );
+        assert_eq!(
+            opts.transcript, None,
+            "`include_transcript: false` is `None`"
         );
     }
 }

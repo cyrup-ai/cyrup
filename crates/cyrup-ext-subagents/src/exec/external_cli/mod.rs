@@ -341,6 +341,11 @@ pub async fn run_external_cli(
         session_file: None,
         structured_output_path: None,
         artifact_paths: None,
+        // A foreign process has no parsed NDJSON child-event stream to feed the live transcript
+        // writer from (it attaches in `exec::drive_attempt`, the native child's drive loop), so an
+        // external-cli run never has one.
+        transcript_path: None,
+        transcript_error: None,
         // A foreign-CLI child has no cyrup run id of its own.
         child_run_id: None,
         final_output,

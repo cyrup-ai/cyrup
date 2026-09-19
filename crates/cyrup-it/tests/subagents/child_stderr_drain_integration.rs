@@ -23,10 +23,11 @@
 //!   [`a_child_writing_more_stderr_than_the_pipe_buffer_does_not_deadlock_the_parent`] scripts a
 //!   child that writes 200 KiB — comfortably past Linux's ~64 KiB pipe buffer — and asserts the
 //!   run RETURNS.
-//! - **The tail is fed RAW CHUNKS, independent of any line bounding.** `stderrTail.push(chunk)`
-//!   never sees a line at all, so an over-long stderr line cannot truncate the capture; the
-//!   separate `stderrReader` (`execution.ts:1047-1052`) is the only thing bounded per line, and it
-//!   feeds the transcript, not the error.
+//! - **The tail is fed RAW CHUNKS, independent of any line bounding.** The byte tail never sees
+//!   a line at all, so an over-long stderr line cannot truncate the capture; the separate per-line
+//!   reader is a diagnostic consumer with no say over the error. This is cyrup's own design —
+//!   at v0.68.0 upstream's foreground path has no stderr reader and no byte tail (see
+//!   `spawn/mod.rs`'s `CapturedStderr` doc for the citation).
 //!   [`an_over_limit_stderr_line_surfaces_its_tail_not_a_truncation`] scripts one stderr line
 //!   larger than `MAX_CHILD_STDERR_BYTES` and asserts the END of it — where a fatal error actually
 //!   is — is what reaches the run's error.
@@ -167,6 +168,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         control_config: None,
         on_control_event: None,
         artifacts_dir: None,
+        transcript: None,
         model_scope: None,
     }
 }
@@ -244,10 +246,10 @@ async fn a_child_writing_more_stderr_than_the_pipe_buffer_does_not_deadlock_the_
 
 /// An over-limit stderr line must surface its TAIL, not be truncated away.
 ///
-/// pi feeds `stderrTail` RAW CHUNKS (`execution.ts:1057`), never lines, so its per-line stderr
-/// bound (`stderrReader`, `execution.ts:1047-1052`) has no say over what the error says: the tail
-/// keeps the last `MAX_CHILD_STDERR_BYTES` of everything written, full stop
-/// (`createBoundedByteTail`, `child-protocol.ts:377-392`).
+/// The byte tail is fed RAW CHUNKS, never lines, so the per-line stderr bound has no say over
+/// what the error says: the tail keeps the last `MAX_CHILD_STDERR_BYTES` of everything written,
+/// full stop. cyrup's own design — `BoundedByteTail` has no upstream counterpart at v0.68.0
+/// (`spawn/mod.rs`, `CapturedStderr` doc).
 ///
 /// This matters because a child's fatal error is the LAST thing it writes. A capture that stops at
 /// the first over-long line reports the child's warm-up chatter and drops the cause of death.

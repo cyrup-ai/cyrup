@@ -61,6 +61,19 @@ pub struct StepStatus {
     /// `shared/types.ts:1962-1965`) — never republish this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_recovery: Option<crate::exec::mutation_evidence::TimeoutRecoverySummary>,
+    /// Where this step's live child transcript is (or will be) written — pi
+    /// `AsyncStatus.steps[].transcriptPath`, written at declaration by
+    /// `resolveAsyncStepTranscriptPath` (`subagent-runner.ts:1806-1821`, applied at `:1965-1986`)
+    /// and overwritten post-step from `singleResult.transcriptPath ?? step.transcriptPath`
+    /// (`:3829`). Stamped BEFORE the child spawns, so the FleetView pane and `/subagents status`
+    /// can open the file while the step is still `Running`; `None` when the run has no artifacts
+    /// dir, `enabled: false`, or `include_transcript: false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<PathBuf>,
+    /// The transcript writer's latched failure for this step — pi `step.transcriptError`
+    /// (`subagent-runner.ts:3830`), from [`crate::exec::SingleResult::transcript_error`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_error: Option<String>,
     /// The step's own error message, if `status == Failed`.
     pub error: Option<String>,
     /// Run-ids of any further background runs this step itself spawned (R-SA-104's nested
@@ -156,6 +169,8 @@ impl StepStatus {
             turns: 0,
             context_overflow: false,
             timeout_recovery: None,
+            transcript_path: None,
+            transcript_error: None,
             error: None,
             nested_run_ids: Vec::new(),
             started_at: None,
@@ -834,6 +849,96 @@ mod tests {
         assert!(step.ended_at.is_none());
         assert!(step.attempted_models.is_empty());
         assert!(step.nested_run_ids.is_empty());
+    }
+
+    /// The live-transcript stamps ride `status.json` under pi's own key names
+    /// (`transcriptPath` / `transcriptError`, `subagent-runner.ts:3829-3830`), are omitted while
+    /// absent, and a `status.json` written before the fields existed still reads back as `None`.
+    #[test]
+    fn step_transcript_fields_round_trip_under_pis_wire_names_and_default_when_absent() {
+        let mut step = StepStatus::pending("worker");
+        let wire = serde_json::to_value(&step).expect("serializes");
+        assert!(wire.get("transcriptPath").is_none(), "{wire}");
+        assert!(wire.get("transcriptError").is_none(), "{wire}");
+
+        step.transcript_path = Some(PathBuf::from("/art/run_worker_0_transcript.jsonl"));
+        step.transcript_error = Some("Failed to write child transcript '/art/x': EIO".into());
+        let wire = serde_json::to_value(&step).expect("serializes");
+        assert_eq!(wire["transcriptPath"], "/art/run_worker_0_transcript.jsonl");
+        assert_eq!(
+            wire["transcriptError"],
+            "Failed to write child transcript '/art/x': EIO"
+        );
+        let back: StepStatus = serde_json::from_value(wire).expect("round-trips");
+        assert_eq!(back, step);
+
+        // Pre-field JSON: only the keys an older writer emitted.
+        let legacy: StepStatus = serde_json::from_value(serde_json::json!({
+            "agent": "worker", "status": "pending", "sessionFile": null, "model": null,
+            "attemptedModels": [], "usage": cyrup_core::Usage::default(), "error": null,
+            "nestedRunIds": [], "startedAt": null, "endedAt": null
+        }))
+        .expect("a status written before the transcript fields still parses");
+        assert_eq!(legacy.transcript_path, None);
+        assert_eq!(legacy.transcript_error, None);
+    }
+
+    /// A `SingleResult` decoded from a payload written BEFORE the transcript fields existed —
+    /// only the keys an older writer emitted — which is itself the pre-field-JSON half of the
+    /// contract below.
+    fn pre_transcript_single_result() -> crate::exec::SingleResult {
+        serde_json::from_value(serde_json::json!({
+            "agent": "worker",
+            "task": "",
+            "exitCode": 0,
+            "usage": cyrup_core::Usage::default(),
+            "model": null,
+            "attemptedModels": [],
+            "modelAttempts": [],
+            "finalOutput": null,
+            "structuredOutput": null,
+            "acceptance": null,
+            "detached": false,
+            "interrupted": false,
+            "timedOut": false,
+            "error": null,
+            "toolCalls": [],
+            "outputTruncated": false,
+            "controlEvents": [],
+            "progress": null,
+        }))
+        .expect("a result payload written before the transcript fields still decodes")
+    }
+
+    /// Same contract on the per-child `SingleResult` inside a `ResultFile` (pi
+    /// `SingleResult.transcriptPath` / `transcriptError`, `subagent-runner.ts:276-277`).
+    #[test]
+    fn single_result_transcript_fields_round_trip_under_pis_wire_names_and_default_when_absent() {
+        let mut result = pre_transcript_single_result();
+        let wire = serde_json::to_value(&result).expect("serializes");
+        assert!(wire.get("transcriptPath").is_none(), "{wire}");
+        assert!(wire.get("transcriptError").is_none(), "{wire}");
+
+        result.transcript_path = Some(PathBuf::from("/art/run_worker_0_transcript.jsonl"));
+        result.transcript_error =
+            Some("Failed to initialize child transcript '/art/x': EACCES".into());
+        let wire = serde_json::to_value(&result).expect("serializes");
+        assert_eq!(wire["transcriptPath"], "/art/run_worker_0_transcript.jsonl");
+        assert_eq!(
+            wire["transcriptError"],
+            "Failed to initialize child transcript '/art/x': EACCES"
+        );
+        let back: crate::exec::SingleResult = serde_json::from_value(wire).expect("round-trips");
+        assert_eq!(back, result);
+
+        let mut legacy = serde_json::to_value(&result).expect("serializes");
+        let object = legacy.as_object_mut().expect("object");
+        object.remove("transcriptPath");
+        object.remove("transcriptError");
+        let legacy: crate::exec::SingleResult = serde_json::from_value(legacy)
+            .expect("a result written before the fields still parses");
+        assert_eq!(legacy.transcript_path, None);
+        assert_eq!(legacy.transcript_error, None);
     }
 
     #[test]

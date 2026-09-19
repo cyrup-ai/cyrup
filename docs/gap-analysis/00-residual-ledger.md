@@ -85,9 +85,9 @@ next work item**.
 > | 6 | **`VL-S8`** (§1b) | a **pi-authored agent's prompt that calls `subagent_wait` stops getting "unknown tool"**. `extension/wait_tool.rs:16` is `"wait"`. One const plus a compat alias — **the best value-per-line row in the directory** | XS | no |
 > | 7 | **`SUBA-096`** (09a) | an operator's **`acceptanceRole` override actually sets the acceptance gate's strictness** instead of being silently dropped so `infer_level` decides. Three fields (`acceptanceRole`, `outputMode`, `fast`) missing from `AgentOverrideConfig`, which has no `deny_unknown_fields` | S | no |
 > | 8 | **`PB-14`** (§1b) | creating or running an agent with a **mistyped skill name says so** instead of reporting success on both surfaces | S | no |
-> | 9 | **`VL-S5`** (§1b) | a **revived async run keeps its per-call `model`/`tools`/`toolBudget`**, and the retention scan's resumable-contract check can fire at all. The READ half shipped (`async_retention/scan.rs:56`); `:381` carries `[CYRUP-DELTA] no cyrup writer produces recovery-descriptor.json today` — **strictly worse than before it half-landed** | S | no |
+> | ~~9~~ | **~~`VL-S5`~~** (§1b) — **CLOSED 2026-09-19** | `background/recovery_descriptor.rs` writes the resolved launch contract at async launch and `revive_from_transcript` reads it back. **Not three fields and not small**: upstream's descriptor is 54 fields; 13 have no cyrup concept and are named per field; two of the restored ones are capability constraints, so the old fallback WIDENED. The retention reader now finds real files | ~~S~~ | — |
 > | 10 | **`VL-S12`** (§1b) | the palette **stops advertising four commands upstream deleted at v0.41.0** (`slash_commands.rs:83`/`:84`/`:85`/`:101`). **Its blocker is discharged** — `VL-S2` landed — so this is now a clean deletion | XS | no |
-> | 11 | **`PB-12`** (§1b, partial) | the FleetView pane for a **RUNNING** child has something to read. `transcript_path` is a real field now (`artifacts.rs:75`) and **nothing writes the file live** | M | no |
+> | ~~11~~ | **~~`PB-12`~~** (§1b) — **CLOSED 2026-09-19** | `exec/child_transcript.rs` over `BoundedJsonlWriter`, fed from the parsed child-event stream on both the foreground and background paths; the first record is the redacted sentinel, never the prompt; `transcript_path` published at both runner sites and read by the fleet pane. Mid-run read proven in cyrup-it | ~~M~~ | — |
 > | 12 | **`VL-S3` + `VL-S4`** (§1b) | many-agent correctness: no two runners owning one session file, and a **definite terminal cause** instead of a reconciled "stale" guess. `VL-S4` is now LOAD-BEARING — `active_async_capacity` substituted runner-pid liveness for the missing `processTerminal` proof | M each | no |
 > | 13 | **`PB-9`** (§1b) | `clarify: true` **shows the preview/edit UI its own tool description promises**. The seam is live (`open_overlay`) | L | no |
 > | 14 | **`VL-S11` = `SUBA-026`**, **`VL-S6`** (§1b) | the `/subagents` admin surface and the herdr inspector's advertised `H` key. Real delight, large, and behind everything above it | L each | no |
@@ -244,12 +244,12 @@ next work item**.
 >   artifact root), `PB-31` (`requireReadTool`), `VL-S1` (capability ceiling), `VL-S2`
 >   (`workflowScript` runtime), `VL-S7` (authority policy), `VL-S9` (`usageBudget`), `VL-S14`
 >   (`runner: external-cli`), `VL-S15` (`register_shortcut`).
-> * **Partially closed, and the halves are named rather than rounded:** `PB-12` — `ArtifactPaths`
->   now carries a fifth field, `transcript_path` (`artifacts.rs:75`, minted `:310`, consumed
->   `exec/mod.rs:580`), so the row's "four fields" claim is false; **but nothing writes the file
->   live** — `spawn/mod.rs:1144` says there is no `ChildTranscriptWriter` port, two status writers
->   publish `transcript_path: None`, and `tui/fleet.rs:1148` carries the note "When a transcript
->   writer lands". The FleetView pane for a RUNNING child still has nothing to read.
+> * **Partially closed on 2026-09-16, CLOSED 2026-09-19:** `PB-12` — `ArtifactPaths` carries the
+>   fifth field, `transcript_path`, AND the file is now written live by
+>   `exec/child_transcript.rs` (`ChildTranscriptWriter`), fed from `exec/drive_attempt.rs`'s one
+>   parse point on both the foreground and the background path; the FleetView pane reads
+>   `paths.transcript_path` / `step.transcript_path` for a RUNNING child (`tui/fleet.rs:1156`,
+>   `:1186-1191`). See the row's `CLOSED 2026-09-19` bullet in `PARITY-GAPS.md`.
 > * **Still open, evidence refreshed to current addresses:** `PB-8`, `PB-9`, `PB-14`, `VL-S3`,
 >   `VL-S4`, `VL-S5`, `VL-S6`, `VL-S8`, `VL-S10`, `VL-S11`, `VL-S12`, `VL-S13`.
 >

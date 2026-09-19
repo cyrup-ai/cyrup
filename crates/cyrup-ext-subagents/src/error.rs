@@ -263,6 +263,17 @@ pub enum SubagentError {
     #[error(transparent)]
     Handoff(#[from] crate::handoff::HandoffError),
 
+    /// Propagated from [`crate::background::recovery_descriptor`] — persisting, reading,
+    /// validating or matching an async run's recovery descriptor.
+    ///
+    /// `#[error(transparent)]` for [`Self::Handoff`]'s reason: every variant of
+    /// [`crate::background::RecoveryDescriptorError`] carries pi's verbatim sentence — the
+    /// agent-mismatch and missing-descriptor refusals are what the model reads back from a refused
+    /// `action: "resume"` — plus the structured run/agent a caller branches on, which a `String`
+    /// would throw away at the one boundary the tool surface reads it across.
+    #[error(transparent)]
+    RecoveryDescriptor(#[from] crate::background::RecoveryDescriptorError),
+
     /// Propagated from [`crate::spawn::cleanup_plan`] — building or persisting a worktree cleanup
     /// plan.
     ///

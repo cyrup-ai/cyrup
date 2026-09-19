@@ -1388,8 +1388,25 @@ the behaviour was available to be ported and was not.
 - ~~cyrup: zero hits for `scheduled_runs`; the 27-verb enum at `extension.rs:6557` has nothing beginning `schedule.`; `extension.rs:3909` states "The `schedule.*` family is unported"~~ — **all three claims false at `cc7818b`, see above**
 - ~~observable: `subagent({action:"schedule.create", at:…})` is refused as an unknown action **after its schedule parameters are silently discarded**~~ — **no longer observable**; the verb dispatches, and a disabled install answers pi's own `"Scheduled runs are disabled by scheduledRuns.enabled=false."` (`background/scheduled_runs/tool.rs:48-49`)
 
-**PB-12 · No live child transcript writer; the `transcriptPath` artifact is missing** — *medium* · **PARTIALLY CLOSED 2026-09-16 — say which half**
-- **The ARTIFACT half shipped; the WRITER half did not.** `ArtifactPaths` now carries a fifth field — `artifacts.rs:75` `pub transcript_path: PathBuf`, documented as pi's `transcriptPath` and minted at `artifacts.rs:310` as `<base>_transcript.jsonl` — so **the "four fields (input/output/jsonl/metadata)" claim below is false at HEAD** and the field is consumed at `exec/mod.rs:580-582` and rendered by `tui/fleet.rs:916`/`:1162`. **What is still open is the thing the row is named for:** nothing writes that file live. `spawn/mod.rs:1144` states in-tree that there is no `ChildTranscriptWriter` port and that the lines go to `tracing` at debug level; `background/runner_main/status.rs:593` and `executor.rs:1218` both publish `transcript_path: None`; and `tui/fleet.rs:1144-1148` carries the explicit note "When a transcript writer lands, switch this to `paths.transcript_path`". **Do not round this to closed** — the FleetView transcript pane for a RUNNING child still has nothing to read
+**~~PB-12 · No live child transcript writer; the `transcriptPath` artifact is missing~~** — ~~*medium*~~ **CLOSED 2026-09-19**
+- **CLOSED 2026-09-19.** The WRITER half shipped: `crates/cyrup-ext-subagents/src/exec/child_transcript.rs`
+  (`ChildTranscriptWriter`, pi `src/shared/child-transcript.ts` @v0.68.0) is created by `exec::run_sync`
+  before the first spawn (`exec/mod.rs:481-498`, sentinel first) and fed from the crate's ONE parse
+  point, `exec/drive_attempt.rs:380-382` `handle_child_line`, which both the foreground executor and
+  the detached runner reach — so `<base>_transcript.jsonl` grows WHILE the child runs on both paths.
+  Gate: `RunOptions::transcript` (`exec/agent_config.rs:663`), produced at
+  `extension/executor/foreground.rs:962` and `background/runner_main/executor.rs:800` (the first reader
+  of `ArtifactConfig::include_transcript`). Published: `SingleResult::{transcript_path, transcript_error}`
+  (`exec/run_result.rs:242,249`), `StepStatus` stamped at declaration (`runner_main/entry.rs:270-281`,
+  `flat_index::resolve_async_step_transcript_path`) and post-step (`runner_main/status.rs:387-390,
+  428-431`), `ResultFile` via `settle.rs:628-629`. The FleetView pane now opens `paths.transcript_path`
+  for a running foreground child and `step.transcript_path` for an async one (`tui/fleet.rs:1156,
+  1186-1191`). Proven mid-run by `crates/cyrup-it/tests/subagents/child_transcript_live_integration.rs`
+  (a real fixture child parked behind a 30 s sleep, the file read with the run future still pending,
+  gutting mutation observed). Not ported, disclosed in the module doc: upstream's stdout/stderr
+  transcript records (`child-transcript.ts:249-259`) — the stderr pump is a separate task
+- **Previous state, kept as history (2026-09-16):** the ARTIFACT half had shipped, the WRITER half had not.
+- ~~**The ARTIFACT half shipped; the WRITER half did not.**~~ `ArtifactPaths` now carries a fifth field — `artifacts.rs:75` `pub transcript_path: PathBuf`, documented as pi's `transcriptPath` and minted at `artifacts.rs:310` as `<base>_transcript.jsonl` — so **the "four fields (input/output/jsonl/metadata)" claim below is false at HEAD** and the field is consumed at `exec/mod.rs:580-582` and rendered by `tui/fleet.rs:916`/`:1162`. **What is still open is the thing the row is named for:** nothing writes that file live. `spawn/mod.rs:1144` states in-tree that there is no `ChildTranscriptWriter` port and that the lines go to `tracing` at debug level; `background/runner_main/status.rs:593` and `executor.rs:1218` both publish `transcript_path: None`; and `tui/fleet.rs:1144-1148` carries the explicit note "When a transcript writer lands, switch this to `paths.transcript_path`". **Do not round this to closed** — the FleetView transcript pane for a RUNNING child still has nothing to read
 - upstream: `src/shared/child-transcript.ts:102` (`createChildTranscriptWriter`, per-record `fs.appendFileSync` at `:133`), created at `runs/background/subagent-runner.ts:1200-1201`; the field is the **fourth** `ArtifactPaths` member (`src/shared/types.ts:1048`, interface opens `:1044`); reported by `runs/background/run-status.ts:128`. First tag **v0.33.0**
 - cyrup: `crates/cyrup-ext-subagents/src/artifacts.rs:61-70` — `ArtifactPaths` has four fields (input/output/jsonl/metadata) and `:58` says so; the substitute `.jsonl` is written only after the run settles (`extension.rs:4925-4928` foreground, `background/runner_main.rs:2611-2614` background). A live NDJSON stream exists but goes elsewhere: `exec/mod.rs:2113-2118` writes `<cwd>/.cyrup-subagent-scratch/attempt-N.jsonl`
 - observable: the FleetView transcript pane for a RUNNING foreground child points at `paths.jsonl_path` (`tui/fleet.rs:1041-1058`), a file that does not exist until the child finishes, so it renders empty where upstream's fills in real time; `status`/`run-status` never print a `Transcript:` line.
@@ -1430,7 +1447,42 @@ the behaviour was available to be ported and was not.
 - **New consequence, filed here because it is this row's cost and not a new gap.** `active_async_capacity`'s own module doc (`background/active_async_capacity/mod.rs`, §D3) records that upstream releases a capacity slot on ONE positive proof — a `processTerminal` artifact whose `state === "observed"` matches the owner's `runnerProcessInstanceId` — and that **cyrup has neither input**, so the release rung had to be substituted with runner-pid liveness (`background::reconcile::check_pid_liveness`). Ported verbatim it would have retained a successful run's slot forever. **So VL-S4 is no longer only a status-reporting gap: a second subsystem now runs on a substitute for it**, and closing VL-S4 should revisit that substitution
 `src/runs/background/process-terminal.ts:52`, `:163`, `:216` (280 lines); present at v0.47.1 — vs zero hits crate-wide; run state comes from `background/run_status.rs` and `background/reconcile.rs`. Area 09 `SUBA-023` adds the missing half: `TerminationOutcome` (`spawn/signal.rs:90-106`) carries only `status` + `stage`, with no `ExitStatus::signal()` name mapping. **Observable**: when a runner dies without writing a result, upstream still reports a definite terminal cause; cyrup can only report the reconciled "stale" guess, so `status` cannot distinguish a crash from a slow start.
 
-**VL-S5 · Revival does not restore the child's effective config** — *small* · id retained, class corrected (v0.35.0) · **STILL OPEN at `cc7818b`; re-greped 2026-09-16**
+**~~VL-S5 · Revival does not restore the child's effective config~~** — ~~*small*~~ **CLOSED 2026-09-19**
+- **CLOSED.** `background/recovery_descriptor.rs` writes `<run_dir>/recovery-descriptor.json` from
+  the RESOLVED launch inside `spawn_background_steps` (`extension/executor/background.rs`), gated
+  to single async runs as upstream is, **failing the launch** on a write error (pi
+  `async-execution.ts:2053`) and written private (`atomic.rs:148` `write_private_atomic_json`,
+  0600 — the file carries a system prompt). `revive_from_transcript`
+  (`extension/executor/control.rs`) reads it back: a missing descriptor **refuses** the revive with
+  pi's sentence (`subagent-executor.ts:2059-2061`), an agent-mismatched one refuses
+  (`async-resume.ts:566`), and the carried fields land on the revived `SingleStepSpec` /
+  `BackgroundStepsSpec` and the persona overlay, so `model: None, tools: None, …` is no longer what
+  a resumed run gets
+- **This row's "*small*" and its three-field framing were both wrong.** Upstream's
+  `SteeringRecoveryDescriptor` (`src/shared/types.ts:805-864` @v0.68.0) has **54** field
+  declarations — the launch contract, not `model`/`tools`/`toolBudget`. Of those, **13 have no
+  cyrup concept** (`fast`, `mcpDirectTools`, `mutationTools`, `inheritGlobalContext`, `skillPath`,
+  `intercomBridge`, `maxOutput`, `launchResolvedExtensions`, `modelResponseAliases`,
+  `extensionBindings`, `requiredExtensions`, `agentContract`, `baseRef`) and are named per field in
+  the source rather than dropped; `runFanoutBudget` and `lane` are carried as `Option` and are
+  always `None` on a single run (no async launch allocates a fanout ledger; lanes attach to
+  parallel groups). Three run-level fields cyrup has and pi's descriptor does not —
+  `turnBudget`, `usageBudget`, `permissionRules` — are an explicit additive `[CYRUP-DELTA]`
+- **Two of the restored fields are capability constraints** (`tools`/`excludeTools`,
+  `maxSubagentDepth`), so before this the fallback WIDENED: a child launched with a narrowed tool
+  set resumed with the agent file's full set. And PR #142's RPC bridge exposes `resume`, so the
+  path was reachable programmatically, not only by a human typing a verb
+- `has_resumable_contract` (`async_retention/scan.rs`) now finds real files; its no-writer
+  `[CYRUP-DELTA]` is deleted. `RunDir::recovery_descriptor()` joins `status()`/`events()`/`handoff()`
+- **Visible behaviour change, stated rather than hidden:** a terminal async run launched BEFORE this
+  feature has no descriptor and will not revive via the old bare-agent path. That is upstream's
+  stance and no grace path was added
+- **Pinned** by a production round trip: N explicit overrides in, N asserted out on the revived
+  spec, with a per-field writer-drop mutation table recorded in `.flux/done/RECOVERY_DESCRIPTOR.md`
+- upstream: `src/shared/types.ts:805` (type), `src/runs/background/async-execution.ts:1993-2053`
+  (write), `src/runs/background/async-resume.ts:310-440` and `:560-632` (read + overlay),
+  `src/runs/background/async-retention.ts:191-203` (retention). This row's `:1358`/`:1401`/`:276`/
+  `:501-524` cite v0.35.0 and are dead
 - **Re-greped this pass, and cyrup now says so in its own source:** `background/async_retention/scan.rs:56` defines `RECOVERY_DESCRIPTOR_FILE = "recovery-descriptor.json"` as a *reader* (it is one of the resumability signals the retention scan honours, pi `hasResumableContract`), and `:381` carries the explicit `[CYRUP-DELTA] no cyrup writer produces recovery-descriptor.json today`. **The read half now exists and the write half still does not** — which is strictly worse than before, because the retention scan's resumable-contract check can never fire. The `extension.rs:4269-4285` citation below is dead
 `runs/background/async-execution.ts:1358` builds a `SteeringRecoveryDescriptor` and `:1401` persists it as `recovery-descriptor.json`; `async-resume.ts:276` reads it back and `:501-524` re-applies model, fallbackModels, thinking, tools, extensions, mcpDirectTools, systemPrompt, skills, completionGuard, memory, output, toolBudget and maxSubagentDepth — vs cyrup, which writes no descriptor and rebuilds the revived step with `model: None, tools: None, extensions: None` at `extension.rs:4269-4285`. **Observable**: a run launched with per-call `model`/`tools`/`toolBudget` overrides revives without them. *(Revival ITSELF is ported and works — `ResumeOutcome::RespawnFromTranscript` at `background/control.rs:1214` → `revive_from_transcript` at `extension.rs:4232`.)*
 

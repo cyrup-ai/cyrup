@@ -322,6 +322,35 @@ impl SubagentEvent {
     }
 }
 
+/// The displayable text of a wire `content` value — pi `extractTextFromContent`
+/// (`src/shared/utils.ts`): a bare string, or the concatenation of the `text` members of an array
+/// of typed blocks (`cyrup_core::Content`, `{"type":"text","text":…}`).
+///
+/// Non-text blocks contribute nothing — a `thinking` block is not part of the visible transcript
+/// (pi's transcript writer records assistant TEXT), a `toolCall` block is already rendered as its
+/// own tool row, and an `image` block has no textual form. Lives here, beside
+/// [`SubagentEvent::assistant_usage`], because it is an accessor over the wire's own `content`
+/// shape: the live child-transcript writer ([`crate::exec::child_transcript`]) and the fleet
+/// transcript reader ([`crate::tui::fleet_transcript`]) both read it through this one function, so
+/// the two sides of the `_transcript.jsonl` file cannot disagree about what "the text" of a
+/// message is.
+#[must_use]
+pub fn content_text(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(s) => (!s.trim().is_empty()).then(|| s.clone()),
+        serde_json::Value::Array(blocks) => {
+            let joined = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            (!joined.trim().is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
 /// One line of a spawned child's raw NDJSON stdout, alongside whatever [`SubagentEvent`] it
 /// parsed to (or did not, R-SA-026).
 #[derive(Debug, Clone)]

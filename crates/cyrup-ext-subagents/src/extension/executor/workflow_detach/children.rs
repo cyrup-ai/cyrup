@@ -341,6 +341,9 @@ fn step_child(step: &StepStatus, output: &str) -> SingleResult {
         output_state: output_state_for(output),
         structured_output_path: None,
         artifact_paths: None,
+        // The step's own live-transcript stamps, exactly as `session_file` above is the step's.
+        transcript_path: step.transcript_path.clone(),
+        transcript_error: step.transcript_error.clone(),
         tool_calls: Vec::new(),
         output_truncated: false,
         tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),

@@ -1,4 +1,8 @@
-//! Seam tests drained from **`crates/cyrup-ext-subagents`** — all 35 files.
+//! Seam tests drained from **`crates/cyrup-ext-subagents`** — 37 files today: the 35 the
+//! migration below drained, minus `verify_redaction_inherited_env` (removed when the workspace
+//! grew a safe env seam), plus `watchdog_model_turn_integration`,
+//! `watchdog_permission_arbiter_integration` and `child_transcript_live_integration`, added
+//! since under the same rule.
 //!
 //! What makes a test belong here: it drives a real subagent CHILD PROCESS, or it mutates this
 //! process's environment so that the library's own in-process spawn resolver picks up a test
@@ -74,6 +78,7 @@ mod support;
 // ---- child process protocol: what the parent reads off a live child's stdio ----
 mod child_protocol_stream_integration;
 mod child_stderr_drain_integration;
+mod child_transcript_live_integration;
 mod child_written_output_authorship;
 mod foreground_progress_stream_integration;
 

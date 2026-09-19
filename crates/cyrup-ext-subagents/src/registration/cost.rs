@@ -1228,6 +1228,8 @@ mod tests {
             turns: 0,
             context_overflow: false,
             timeout_recovery: None,
+            transcript_path: None,
+            transcript_error: None,
             error: None,
             nested_run_ids: Vec::new(),
             started_at: Some(0),

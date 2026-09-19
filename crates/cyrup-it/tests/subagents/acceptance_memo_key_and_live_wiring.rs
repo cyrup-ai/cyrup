@@ -780,6 +780,7 @@ async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: name.to_string(),

@@ -233,6 +233,8 @@ mod tests {
                 output_state: Default::default(),
                 structured_output_path: None,
                 artifact_paths: None,
+                transcript_path: None,
+                transcript_error: None,
                 acceptance: None,
                 detached: false,
                 interrupted: false,

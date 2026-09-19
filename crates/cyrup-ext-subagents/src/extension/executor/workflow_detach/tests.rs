@@ -198,6 +198,8 @@ fn child_result(child_run_id: &str) -> SingleResult {
         output_state: SubagentOutputState::Present,
         structured_output_path: None,
         artifact_paths: None,
+        transcript_path: None,
+        transcript_error: None,
         tool_calls: Vec::new(),
         output_truncated: false,
         tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),

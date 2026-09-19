@@ -1258,6 +1258,17 @@ pub struct StepResult {
     /// and then discarded at this boundary. `None` for every step whose child ended on its own and
     /// for every executor that runs no child. No serde attribute: this struct is not serialized.
     pub timeout_recovery: Option<crate::exec::mutation_evidence::TimeoutRecoverySummary>,
+    /// Where the child's live transcript was written
+    /// ([`crate::exec::SingleResult::transcript_path`], pi `transcriptPath:
+    /// singleResult.transcriptPath` on the chain-results copy, `subagent-runner.ts:1590`) —
+    /// carried across this waist so `record_step_outcome` can stamp it on the step's `StepStatus`
+    /// and `step_result_to_single_result` on the terminal `ResultFile`. `None` for every step
+    /// whose run had no writer and for every executor that runs no child.
+    pub transcript_path: Option<std::path::PathBuf>,
+    /// The transcript writer's latched failure
+    /// ([`crate::exec::SingleResult::transcript_error`], pi `transcriptError`, `:1591`), carried
+    /// for the same reason.
+    pub transcript_error: Option<String>,
 }
 
 impl StepResult {
@@ -1288,6 +1299,8 @@ impl StepResult {
             output_state: crate::exec::output_state::SubagentOutputState::Unknown,
             structured_output_path: None,
             timeout_recovery: None,
+            transcript_path: None,
+            transcript_error: None,
         }
     }
 
@@ -1316,6 +1329,8 @@ impl StepResult {
             output_state: crate::exec::output_state::SubagentOutputState::Unknown,
             structured_output_path: None,
             timeout_recovery: None,
+            transcript_path: None,
+            transcript_error: None,
         }
     }
 }
@@ -2550,6 +2565,8 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
             output_state: aggregate_output_state,
             structured_output_path: None,
             timeout_recovery: None,
+            transcript_path: None,
+            transcript_error: None,
         },
         children,
         fail_fast_skipped,

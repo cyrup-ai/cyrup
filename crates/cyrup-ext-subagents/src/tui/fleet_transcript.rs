@@ -51,17 +51,21 @@
 //!    branch pi itself takes for an unknown extension rather than a shape it never produces.
 //! 3. **Record schema: pi's `recordType` PLUS a rewrite of cyrup's own records.** pi's transcript
 //!    file is written by its own transcript writer as `{"recordType":"message"|"tool_start"|
-//!    "tool_end"|"stderr"|"truncated", …}`, and pi's fifth `ArtifactPaths` field `transcriptPath`
-//!    has no cyrup analogue (`artifacts.rs:58`). [`parse_transcript_lines`] therefore recognises
+//!    "tool_end"|"stderr"|"truncated", …}`, and cyrup's [`crate::exec::child_transcript`] writes
+//!    that same vocabulary to `ArtifactPaths::transcript_path`, which is what
+//!    [`super::fleet::transcript_target`] points the pane at for a live or recent child. The
+//!    rewrite stays because two OTHER files still reach this reader in cyrup's own shapes — the
+//!    settled `.jsonl` artifact written by [`crate::artifacts::run_artifact_jsonl_lines`] and a
+//!    child's raw event stream. [`parse_transcript_lines`] therefore recognises
 //!    pi's vocabulary verbatim and first, and otherwise runs [`rewrite_cyrup_record`], which maps
 //!    the two record shapes cyrup really writes onto pi's — TAG AND FIELDS. That second clause is
 //!    the whole point: a tag rename alone left this module correctly ported and permanently EMPTY,
 //!    because cyrup's message body is a `content` array where pi's is a flat string, its tool
 //!    output rides inside `tool_execution_end.result` where pi's is a separate `toolResult`
-//!    message, its tool arguments are an object where pi's are preview strings — and the file
-//!    [`super::fleet::transcript_target`] actually points at is written by
-//!    [`crate::artifacts::run_artifact_jsonl_lines`], whose `tool_call`/`result` tags the rename
-//!    did not mention at all. See [`rewrite_cyrup_record`] for the per-shape mapping.
+//!    message, its tool arguments are an object where pi's are preview strings — and the settled
+//!    `.jsonl` artifact [`crate::artifacts::run_artifact_jsonl_lines`] writes carries
+//!    `tool_call`/`result` tags the rename did not mention at all. See [`rewrite_cyrup_record`]
+//!    for the per-shape mapping.
 
 use std::path::{Path, PathBuf};
 
@@ -69,6 +73,7 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use super::fleet_theme::{self as th, Role};
+use crate::exec::ndjson::content_text;
 
 // =================================================================================================
 // Tunables (pi `fleet-transcript.ts:6-10`)
@@ -1092,28 +1097,6 @@ fn rewrite_cyrup_record(
     }
 }
 
-/// The displayable text of a `content` value: a bare string, or the concatenation of the `text`
-/// members of an array of typed blocks (`cyrup_core::Content`, `{"type":"text","text":…}`).
-///
-/// Non-text blocks contribute nothing — a `thinking` block is not part of the visible transcript
-/// (pi's transcript writer records assistant TEXT), a `toolCall` block is already rendered as its
-/// own tool row, and an `image` block has no textual form.
-fn content_text(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(s) => (!s.trim().is_empty()).then(|| s.clone()),
-        Value::Array(blocks) => {
-            let joined = blocks
-                .iter()
-                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("");
-            (!joined.trim().is_empty()).then_some(joined)
-        }
-        _ => None,
-    }
-}
-
 /// Split one [`crate::exec::tool_call_summary::format_tool_call`] preview back into its tool name
 /// and its argument text.
 ///
@@ -1663,6 +1646,8 @@ mod tests {
             output_state: Default::default(),
             structured_output_path: None,
             artifact_paths: None,
+            transcript_path: None,
+            transcript_error: None,
             acceptance: None,
             detached: false,
             interrupted: false,

@@ -106,6 +106,7 @@ pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions
         control_config: None,
         on_control_event: None,
         artifacts_dir: None,
+        transcript: None,
     }
 }
 

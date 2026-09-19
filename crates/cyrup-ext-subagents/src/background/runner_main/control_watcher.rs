@@ -804,6 +804,7 @@ mod tests {
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
+            transcript_source: crate::exec::child_transcript::TranscriptSource::Async,
             resolved_agents: Arc::new(BTreeMap::new()),
             orchestrator_intercom_target: None,
             run_id: None,

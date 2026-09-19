@@ -232,6 +232,21 @@ pub struct SingleResult {
     /// what let cyrup's four-field struct diverge unnoticed from upstream's five.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_paths: Option<crate::artifacts::ArtifactPaths>,
+    /// Where this child's live transcript was written — pi `SingleResult.transcriptPath`
+    /// (`subagent-runner.ts:276`, stamped at `execution.ts:1966`). `Some` iff a
+    /// [`crate::exec::child_transcript::ChildTranscriptWriter`] existed for the run, i.e. the
+    /// artifacts gate AND [`crate::exec::RunOptions::transcript`] were both on — NOT merely
+    /// whether [`Self::artifact_paths`] names the file. Published even when the writer failed, so
+    /// a reader sees where the transcript was meant to be beside [`Self::transcript_error`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<PathBuf>,
+    /// The transcript writer's latched failure, if any — pi `SingleResult.transcriptError`
+    /// (`subagent-runner.ts:277`; `transcriptError: transcriptWriter?.getError()` at `:1559`):
+    /// the `Display` of [`crate::exec::child_transcript::ChildTranscriptError`], rendered at this
+    /// boundary exactly as [`Self::error`] is. A transcript that stopped writing is reported
+    /// here, not silent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_error: Option<String>,
     /// Summarized `{text, expandedText}` tool-call previews observed across the winning attempt's
     /// transcript — R-SA-043's "only summarized `tool_calls`" compaction requirement (pi's
     /// `ToolCallSummary[]`, `utils.ts:368-373`). Each carries a short and an expanded argument
