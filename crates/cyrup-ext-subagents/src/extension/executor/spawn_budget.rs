@@ -254,6 +254,7 @@ mod tests {
                         concurrency: 3,
                         fail_fast: false,
                         worktree: false,
+                        lane: None,
                     },
                 )],
                 3,

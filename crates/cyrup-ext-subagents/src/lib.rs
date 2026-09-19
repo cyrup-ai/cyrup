@@ -34,6 +34,9 @@ pub mod fork_context;
 /// The crate's single port of pi's `shared/formatters.ts` (`formatTokens`,
 /// `formatModelThinking`, the run-mode label) — see [`formatters`].
 pub mod formatters;
+/// The parallel-handoff manifest: the coordination layer over a worktree fan-out. See
+/// [`handoff`].
+pub mod handoff;
 pub mod identity;
 pub mod jsonl;
 pub mod missions;

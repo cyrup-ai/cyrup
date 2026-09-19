@@ -14,12 +14,26 @@
 //!
 //! # Severity note, carried from the item so it is not rediscovered
 //!
-//! This is `medium` only because of WHICH actions cyrup can currently dispatch: of upstream's six
-//! `AUTHORITY_ACTIONS`, only `stopRun` and `steerRun` are implemented here. `discardWorktree`,
-//! `destructiveCleanup`, `spawnBudgetGrant` and `scheduleCreate` have no dispatch to bypass.
-//! **Whoever lands `worktree.discard` or `destructiveCleanup` must wire them through
-//! [`resolve_authority_decision`] in the same change** — shipping a destructive verb behind a
-//! config key that is parsed and ignored is a permission bypass.
+//! This started `medium` only because of WHICH actions cyrup could dispatch. As of LANES_2 four
+//! of upstream's six `AUTHORITY_ACTIONS` are consulted from a real dispatch: `stopRun`/`steerRun`
+//! (`route_control_action`), `scheduleCreate` (`route_action`'s `schedule.*` arm) and now
+//! `discardWorktree` — `route_action`'s `worktree.discard` arm, mirroring
+//! `subagent-executor.ts:6249` @v0.68.0, plus a SECOND consult inside
+//! [`crate::spawn::worktree::cleanup_worktrees`] (pi `worktree.ts:1232-1234`) that refuses to
+//! `--force`-remove a worktree holding uncommitted work unless the user confirmed it.
+//!
+//! **CORRECTION, with its evidence.** This note used to read *"whoever lands `worktree.discard`
+//! or `destructiveCleanup` must wire them through [`resolve_authority_decision`] in the same
+//! change"*. The `worktree.discard` half is now discharged. The `destructiveCleanup` half was
+//! never payable, and the note was wrong to imply it was: `git grep -n destructiveCleanup
+//! v0.68.0 -- src` returns **exactly two hits, both inside `policy/authority.ts`** — `:3` (the
+//! `AUTHORITY_ACTIONS` list) and `:18` (the `confirm` default). Upstream DECLARES the action and
+//! never consults it anywhere. The only candidate verb here, `worktree.cleanup`, is plan-only
+//! (`subagent-executor.ts:6217-6222`) and removes nothing, so gating it would prompt a user to
+//! authorize a deletion that cannot occur — which teaches operators to click through prompts.
+//! `destructiveCleanup` therefore stays parsed-and-inert **by parity, not by omission**.
+//! `spawnBudgetGrant` remains genuinely unwired. Anyone landing a cleanup APPLY phase must wire
+//! `destructiveCleanup` through here in that change.
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +89,13 @@ impl AuthorityAction {
             "stop" => Some(Self::StopRun),
             "steer" => Some(Self::SteerRun),
             "schedule.create" => Some(Self::ScheduleCreate),
+            // LANES_2 — pi `subagent-executor.ts:6249` @v0.68.0:
+            // `resolveAuthorityDecision({ action: "discardWorktree", ... })`, consulted by the
+            // `worktree.discard` block and by nothing else in that family.
+            //
+            // `worktree.cleanup` is deliberately absent and must stay absent: upstream gates it
+            // on nothing, and it is plan-only. See the module doc's correction.
+            "worktree.discard" => Some(Self::DiscardWorktree),
             _ => None,
         }
     }
@@ -263,11 +284,18 @@ mod tests {
         );
     }
 
-    /// The tool-verb → policy-key mapping pi performs at `subagent-executor.ts:4412`. Anything else
-    /// is ungated, which is why the `None` arm is asserted too — a mapping that accidentally
-    /// matched, say, `status` would put a read-only verb behind a confirmation dialog.
+    /// The tool-verb → policy-key mapping: the three pi performs at
+    /// `subagent-executor.ts:4412` plus `worktree.discard`, which pi gates separately at
+    /// `subagent-executor.ts:6249`. Every OTHER verb the tool advertises is ungated, which is why
+    /// the `None` arm enumerates them — a mapping that accidentally matched, say, `status` would
+    /// put a read-only verb behind a confirmation dialog, and one that stopped matching
+    /// `worktree.discard` would take the only destructive verb out from behind one.
+    ///
+    /// The negative list names every other verb `route_action` dispatches, including all four
+    /// remaining [`crate::extension::tool::lane_actions::LaneAction`] wire names, so the test
+    /// pins the completeness its name claims instead of sampling around the new verb.
     #[test]
-    fn only_stop_steer_and_schedule_create_map_to_a_policy_action() {
+    fn only_the_four_privileged_verbs_map_to_a_policy_action() {
         assert_eq!(
             AuthorityAction::for_tool_action("stop"),
             Some(AuthorityAction::StopRun)
@@ -280,6 +308,10 @@ mod tests {
             AuthorityAction::for_tool_action("schedule.create"),
             Some(AuthorityAction::ScheduleCreate)
         );
+        assert_eq!(
+            AuthorityAction::for_tool_action("worktree.discard"),
+            Some(AuthorityAction::DiscardWorktree)
+        );
         for ungated in [
             "status",
             "interrupt",
@@ -287,6 +319,14 @@ mod tests {
             "append-step",
             "list",
             "delete",
+            // The other four lane verbs (`LaneAction::from_wire`). `worktree.cleanup` is
+            // plan-only and upstream gates it on nothing; `lane.status` is read-only; the two
+            // `lane.record*` attestations are gated by their own evidence rules, not by the
+            // authority policy.
+            "worktree.cleanup",
+            "lane.status",
+            "lane.recordMerge",
+            "lane.recordSupersession",
         ] {
             assert_eq!(AuthorityAction::for_tool_action(ungated), None, "{ungated}");
         }

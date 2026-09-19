@@ -309,7 +309,59 @@ impl SubagentExecutor {
         // `background/runner_main.rs`) over whatever cwd happens to be current at resume time —
         // never silently reroute a revived agent into a different directory than the one it was
         // originally invoked from.
-        let effective_cwd = status.cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
+        // LANES — pi `async-resume.ts:576-579`, where the retained worktree OUTRANKS the run's
+        // own recorded cwd:
+        //
+        // ```ts
+        // const managedWorktreeCwd = location.asyncDir
+        //     ? resolveRetainedWorktreeCwd(parallelHandoffPath(location.asyncDir), runId, index)
+        //     : undefined;
+        // const resumeCwd = validateResumeCwd(runId, managedWorktreeCwd ?? status?.cwd ?? …);
+        // ```
+        //
+        // This is the rule `handoff/mod.rs`'s safety table names: a child of a `worktree: true`
+        // group whose worktrees were RETAINED must resume inside its own worktree. Falling through
+        // to `status.cwd` would resume it in the project checkout, where it would read a tree its
+        // transcript never saw and write into the developer's working copy — the same directory
+        // the group was isolated from in the first place.
+        //
+        // Failure to read the manifest is not fatal and must not be: a run with no retained
+        // worktrees has no manifest at all, which is the overwhelmingly common case, and a
+        // corrupt one must not make an otherwise-revivable child unrevivable. Either way the
+        // precedence below falls through to what the run itself recorded.
+        let managed_worktree_cwd = match crate::handoff::LaneId::parse(source_run_id) {
+            Ok(lane) => {
+                let manifest = crate::background::RunDir::new(
+                    &async_root,
+                    &RunId::from_token(source_run_id.to_string()),
+                )
+                .handoff();
+                match crate::handoff::resolve_retained_worktree_cwd(
+                    &manifest,
+                    &lane,
+                    u32::try_from(step_index).unwrap_or(u32::MAX),
+                )
+                .await
+                {
+                    Ok(found) => found,
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "cyrup_ext_subagents::handoff",
+                            run_id = %source_run_id,
+                            child_index = step_index,
+                            %error,
+                            "no retained worktree could be resolved for this revive; \
+                             falling back to the run's recorded cwd"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        };
+        let effective_cwd = managed_worktree_cwd
+            .or_else(|| status.cwd.clone())
+            .unwrap_or_else(|| cwd.to_path_buf());
         let resolved_agents = self.resolve_plan_personas(
             &effective_cwd,
             [agent.clone()],

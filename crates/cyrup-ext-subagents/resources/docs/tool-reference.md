@@ -42,6 +42,11 @@ With an `action`, the tool is in **management** or **control** mode.
 | `mission.resolve-decision` | management | Resolve one open mission decision |
 | `mission.attach-run` | management | Bind a run to a mission |
 | `mission.close` | management | Close a mission |
+| `worktree.discard` | management | Remove the worktrees a fan-out preserved. **Destructive; confirmed by default.** |
+| `worktree.cleanup` | management | Plan which fan-out worktrees are safe to remove. **Plan-only: nothing is removed.** |
+| `lane.status` | management | Show one handoff manifest's cleanup eligibility. Read-only |
+| `lane.recordMerge` | management | Attest that a lane merged, with evidence |
+| `lane.recordSupersession` | management | Attest that another lane superseded this one |
 | `watchdog.status` | management | Report the effective watchdog config |
 | `watchdog.check` | management | Run one watchdog review now |
 | `watchdog.configure` | management | Change the watchdog config |
@@ -99,7 +104,14 @@ deliberately stricter rule, so a loose typo is never nudged toward a destructive
 | `view`, `lines` | `status`, `inspect` | Fleet or transcript view, and transcript/message line cap |
 | `childId` | `stop`, `inspect` | Address one child by its workflow key, child run id, or `step:<n>` |
 | `message` | `steer`, `resume` | Guidance or follow-up text |
-| `mode` | `steer` | `steer`, `follow_up` or `auto` |
+| `mode` | `steer`, `worktree.cleanup` | `steer`, `follow_up` or `auto`; `worktree.cleanup` requires `plan` and refuses `apply` |
+| `repo` | `worktree.cleanup` | Repository to plan for; omitted, the request `cwd` |
+| `handoffPath` | `worktree.*`, `lane.*` | An existing parallel-handoff manifest. Required by every verb except `worktree.cleanup` |
+| `planId` | `worktree.cleanup` | Reserved; a value is refused because apply does not exist |
+| `laneId` | `lane.*` | The manifest's exact `runId`; a mismatch is refused |
+| `merge` | `lane.recordMerge` | `{prNumber, reviewedHead, mergeCommit, treeEquivalent, postMergeChecks, attestedBy, attestedAt}` |
+| `supersession` | `lane.recordSupersession` | `{supersededBy, attestedBy, attestedAt}` |
+| `lane` | parallel, workflow | Launch-declared lane metadata: `{version, key, mode, sourceRef, claims, outputPaths}` |
 | `additional` | `grant-spawn-budget` | Positive launches to add |
 | `scope`, `target`, `thinking` | `watchdog.configure` | Watchdog scope and target |
 | `missionId`, `mission`, `missionUpdate`, `missionStatus`, `missionScope` | `mission.*` | Mission payloads |
@@ -114,6 +126,86 @@ deliberately stricter rule, so a loose typo is never nudged toward a destructive
 | `baseRef` | `schedule.create` | Reserved; refused rather than run against the wrong tree |
 | `args` | workflow, `schedule.create` | Arguments object the `workflowScript` runs with |
 | `config` | management | Extension config fragment for the call |
+
+### Lanes: recording convergence
+
+A `worktree: true` fan-out publishes a **parallel-handoff manifest** and reports its path on the
+group's output (and on an async run's status, as `parallelHandoff.path`). That path is the
+`handoffPath` every verb below takes.
+
+```
+{ action: "lane.status", laneId: "<run id>", handoffPath: "<manifest>" }
+```
+
+`lane.status` renders whether removing that fan-out's worktrees is safe, and why not when it is
+not. It is **read-only and stays available to a child-safe fanout tool** — a delegated child can
+read its own lane graph. Every other verb in this feature — `lane.recordMerge`,
+`lane.recordSupersession`, `worktree.cleanup` and `worktree.discard` — is refused there.
+
+```
+{ action: "lane.recordMerge", laneId, handoffPath,
+  merge: { prNumber: 42, reviewedHead: "<40 hex>", mergeCommit: "<40 hex>",
+           treeEquivalent: true, postMergeChecks: "recorded",
+           attestedBy: "reviewer", attestedAt: "2026-09-18T00:00:00Z" } }
+```
+
+The attestation is **digest-bound**: the recorder stamps `manifestDigest` itself from the
+manifest's own facts, so evidence cannot be carried over to a manifest it was not made for, and a
+stale digest blocks cleanup rather than passing silently. `treeEquivalent` must be `true` and
+`postMergeChecks` must be `recorded` for the lane to become eligible; anything else is reported as
+a named blocker. Recording merge evidence for a lane that still has a non-terminal child is
+refused. `lane.recordSupersession` is the same shape with `{supersededBy, attestedBy, attestedAt}`,
+and a lane cannot supersede itself.
+
+A stored eligibility read back off disk is **never believed on its own** — it is re-derived from
+the evidence, and a disagreement collapses to `unknown`, which reads as "removal is not safe".
+
+### Worktree discard
+
+`worktree.discard` removes the worktrees and temporary branches a fan-out deliberately preserved.
+
+```
+{ action: "worktree.discard", handoffPath: "<manifest>" }
+```
+
+**It deletes things, and it asks first.** The `discardWorktree` authority action defaults to
+`confirm`, so a default install prompts; `"authorityPolicy": {"discardWorktree": "forbid"}` refuses
+outright, and a `confirm` in a session with no interactive UI is a refusal, never an implicit yes.
+Declining the prompt is not an error — nothing is changed and the call succeeds saying so.
+
+A worktree that still holds uncommitted work, untracked files, or commits the run's base does not
+have is checked a second time: under a `confirm` policy it is removed only when a human actually
+confirmed, and otherwise it is preserved with the reason recorded. So is one the manifest can no
+longer inspect — if `git status` cannot answer, the worktree is kept, never removed on the
+assumption that it was empty. Anything left behind is reported with the exact
+`git worktree remove --force` / `git branch -D` commands to finish by hand.
+
+### Worktree cleanup
+
+`worktree.cleanup` answers one question: **of the git worktrees a `worktree: true` fan-out left
+behind, which is it safe to remove?** It cross-checks `git worktree list --porcelain` against the
+parallel-handoff manifests under `.cyrup-subagents/artifacts/`, gives every worktree a state and a
+decision, and writes the result to `.cyrup-subagents/cleanup-plans/<planId>.json`.
+
+```
+{ action: "worktree.cleanup", mode: "plan" }
+```
+
+**It removes nothing.** `mode` must be `plan`; `apply` and `planId` are both refused, and the
+rendered plan ends with `Plan-only mode: no worktrees or branches were removed.` Removal is a
+separate, not-yet-built phase, and the plan is the evidence that phase would check.
+
+A worktree is only ever proposed for removal when every one of these holds: it is a strict child of
+this build's managed worktree base directory and carries the `cyrup-worktree-` prefix; it is not the
+repository root, not a symlink, and not inside the extensions directory; a manifest claims it, marks
+it `preserved`, and records its group's cleanup as `partial`; its branch is not checked out anywhere
+else; its owning run is provably finished, with every child settled; `git status --porcelain=v1
+--untracked-files=all` is empty (the flag is explicit so a `status.showUntrackedFiles` setting cannot
+silence it); any committed divergence from the base commit is either already
+merged into the local `HEAD` or preserved by a `.patch` that still validates against the worktree;
+and none of its own durable evidence — the manifest, the output, the transcript, the patch — lives
+inside it. Anything unreadable or ambiguous is reported as `unknown` and kept. Absence of proof is
+never treated as proof of safety.
 
 ### Schedules
 

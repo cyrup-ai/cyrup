@@ -344,6 +344,20 @@ pub struct RunStatus {
     /// `(state == RunState::Stopped).then_some(true)` at every reader).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_receipt_path: Option<std::path::PathBuf>,
+    /// pi `AsyncStatus.parallelHandoff` (`shared/types.ts:920`, mirrored onto `Details` `:1468`
+    /// and the result record `:1994`) — the compact reference to the parallel-handoff manifest a
+    /// `worktree: true` fan-out wrote, set at each of upstream's four write sites
+    /// (`subagent-runner.ts:3293,:3308,:4427,:4810`).
+    ///
+    /// Not decorative. It is HOW a caller learns the `handoffPath` to pass to a later
+    /// `worktree.cleanup` / `lane.*` verb — `extension/schemas.ts:298` @v0.68.0 describes that
+    /// parameter as *"Existing manifest for worktree/lane actions"*, and
+    /// `subagent-executor.ts:6247` refuses with *"requires handoffPath from parallelHandoff.path
+    /// or async status"*. It is also the first of the two path sources
+    /// [`crate::background::async_retention`]'s `hasUnresolvedRunHandoff` consults, which could
+    /// not be ported while this field was absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_handoff: Option<crate::handoff::HandoffReference>,
     /// Run-wide live activity roll-ups + the workflow-graph snapshot (pi's top-level
     /// `statusPayload` telemetry, `subagent-runner.ts:2085-2120`) — flattened so its members
     /// serialize at the same top level of `status.json` pi writes them at.
@@ -384,6 +398,7 @@ impl RunStatus {
             tool_call_id: None,
             workflow_children: None,
             workflow_receipt_path: None,
+            parallel_handoff: None,
             telemetry: RunTelemetry::default(),
         }
     }

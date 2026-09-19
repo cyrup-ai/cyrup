@@ -22,7 +22,7 @@ use crate::background::child_stop::{ChildStatusWord, child_status_event};
 use crate::background::control;
 use crate::background::control::ChainAppendRequest;
 use crate::background::flat_index::{flat_base, flat_range, flat_total, pending_step_statuses_for};
-use crate::background::{RunId, RunPaths, RunStatus};
+use crate::background::{RunId, RunMode, RunPaths, RunStatus};
 use crate::error::SubagentError;
 use crate::exec::SingleResult;
 use crate::jsonl::BoundedJsonlWriter;
@@ -460,8 +460,34 @@ fn build_chain_context(
         // SUBA-093: re-stamped by `run_inner` before every dispatch (and again per member by
         // `dispatch_group`); the initial value is only the first step's own base.
         step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
+        // The ASYNC manifest shape — pi `parallelHandoffPath(asyncDir)` with no run id
+        // (`parallel-handoff.ts:615` @v0.68.0), i.e. `<run_dir>/handoff.json`. THIS is the field
+        // that makes `crate::background::async_retention`'s `has_unresolved_run_handoff` find a
+        // real file: it reads exactly this path, and until a writer existed it always found
+        // nothing.
+        handoff: Some(crate::spawn::chain_graph::HandoffBinding {
+            manifest_path: crate::background::RunDir::for_existing(&run_paths.run_dir).handoff(),
+            run_id: crate::handoff::LaneId::from(&config.run_id),
+            mode: handoff_mode(config.mode),
+            source: crate::handoff::HandoffSource::Async,
+        }),
     };
     (executor, ctx)
+}
+
+/// pi `(config.resultMode ?? statusPayload.mode) === "parallel" ? "parallel" : "chain"`
+/// (`subagent-runner.ts:4417` @v0.68.0), widened to cyrup's four-variant [`RunMode`].
+///
+/// [`crate::handoff::HandoffMode`] deliberately has no `Workflow` variant (upstream's manifest
+/// union does not admit one), so a workflow run's manifest records the shape its fan-out actually
+/// has: a workflow drives its children through the same chain walker, which is what `Chain`
+/// names.
+fn handoff_mode(mode: RunMode) -> crate::handoff::HandoffMode {
+    match mode {
+        RunMode::Single => crate::handoff::HandoffMode::Single,
+        RunMode::Parallel => crate::handoff::HandoffMode::Parallel,
+        RunMode::Chain | RunMode::Workflow => crate::handoff::HandoffMode::Chain,
+    }
 }
 
 /// G77 — the stop flag, read at the very top of every loop iteration ahead of the other two.

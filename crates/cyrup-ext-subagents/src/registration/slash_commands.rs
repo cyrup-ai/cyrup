@@ -1510,6 +1510,7 @@ pub fn parse_chain_command(raw_args: &str) -> Result<ParsedChainCommand, SlashPa
                     concurrency: config.concurrency.unwrap_or(4),
                     fail_fast: config.fail_fast.unwrap_or(false),
                     worktree: config.worktree.unwrap_or(false),
+                    lane: None,
                 }))
             }
             ParsedChainElement::Step(step) => {

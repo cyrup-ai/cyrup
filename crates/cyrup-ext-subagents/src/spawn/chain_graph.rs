@@ -209,6 +209,21 @@ pub struct ParallelGroupSpec {
     /// cwd (R-SA-060/061), rather than a shared cwd. Enforced by `spawn/worktree.rs` +
     /// `spawn/parallel.rs`, not this type.
     pub worktree: bool,
+    /// LANES_2 — the launch-declared lane this fan-out runs as (pi `params.lane`,
+    /// `extension/schemas.ts:355` @v0.68.0), recorded onto every child row of the handoff
+    /// manifest so a later `lane.status` can say what the lane CLAIMED and where it wrote.
+    ///
+    /// Carried on the SPEC rather than on `ChainRunContext` deliberately: a spec is what crosses
+    /// the process boundary into the detached runner (`RunnerConfig.steps` is serialized), so one
+    /// field serves the foreground walk and the async runner without a second plumbing path.
+    ///
+    /// [CYRUP-DELTA] pi attaches `params.lane` to the ONE result its single path produces
+    /// (`subagent-executor.ts:3734`) and derives per-child lanes from workflow children
+    /// (`:4394`). cyrup's entry point for a run-level lane is a fan-out with N children, and a
+    /// lane declared for the run describes all of them — attaching it to child 0 alone would make
+    /// `lane.status` report the other N-1 children as belonging to no lane at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<crate::workflows::WorkflowLaneMetadata>,
 }
 
 /// A runtime-width fan-out whose item count resolves from a prior step's validated structured
@@ -1346,6 +1361,19 @@ pub struct GroupStepResult {
     /// (`collectDynamicResults`, `chain-execution.ts:976`), while a cancellation skip has no
     /// upstream analog at all.
     pub fail_fast_skipped: Vec<bool>,
+    /// The parallel-handoff manifest this group published, when it ran under `worktree: true` and
+    /// the run carried a [`HandoffBinding`] — pi's
+    /// `statusPayload.parallelHandoff = writeParallelHandoffGroup(…)`
+    /// (`subagent-runner.ts:4427` @v0.68.0).
+    ///
+    /// Carried on the group result for the same declared reason `StepResult::exit_code` and
+    /// `control_events` are: it is known HERE, at the fan-out, and the thing that needs it —
+    /// [`crate::background::RunStatus::parallel_handoff`], which is how a caller learns the
+    /// `handoffPath` to pass to a later `worktree.cleanup`/`lane.*` verb — lives one layer out
+    /// with no other channel to reach it. `None` for every non-worktree group and for a group
+    /// whose manifest write failed (the diagnostic then rides on the output text instead, pi
+    /// `:4432`).
+    pub handoff: Option<crate::handoff::HandoffReference>,
 }
 
 /// Everything [`walk_chain`] needs to dispatch one [`SingleStepSpec`] inline, threaded straight
@@ -1416,6 +1444,39 @@ pub struct ChainRunContext {
     /// A foreground walk (no `status.json`, no control inbox) leaves this at
     /// `StepSlot::Exclusive(0)`; nothing on that path reads it.
     pub step_slot: StepSlot,
+    /// Where a `worktree: true` group publishes its parallel-handoff manifest, and the identity
+    /// it publishes under (pi's `manifestPath`/`runId`/`mode`/`source` quadruple, passed at each
+    /// `writeParallelHandoffGroup` call site — `subagent-runner.ts:4415-4419` @v0.68.0).
+    ///
+    /// A struct rather than the bare `handoff_manifest_path: PathBuf` the path alone would
+    /// suggest: `runId`, `mode` AND `source` are all manifest IDENTITY (`parallel-handoff.ts:514-516`
+    /// refuses a write whose triple disagrees with the file on disk), and a context that carried
+    /// only the path would force `run_parallel_group` to re-derive the other three from whatever
+    /// it had to hand — which is exactly how a chain run's manifest ends up claiming to be a
+    /// parallel run's.
+    ///
+    /// `None` for every chain with no worktree group and for every test context; the fan-out then
+    /// runs exactly as before and publishes nothing.
+    pub handoff: Option<HandoffBinding>,
+}
+
+/// Where and under what identity a `worktree: true` group publishes its manifest.
+///
+/// Populated at both real construction sites: the detached background runner
+/// (`background/runner_main/turn_loop.rs`, writing `<run_dir>/handoff.json` so
+/// `crate::background::async_retention`'s retention scan finds it) and the foreground executor
+/// (`extension/executor/chain.rs`, writing `<artifacts_dir>/handoffs/<run_id>.json`, pi
+/// `subagent-executor.ts:3718`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffBinding {
+    /// The manifest file this run's groups are merged into.
+    pub manifest_path: PathBuf,
+    /// The owning run id — the manifest's `runId`.
+    pub run_id: crate::handoff::LaneId,
+    /// How the run was launched.
+    pub mode: crate::handoff::HandoffMode,
+    /// Which process is writing.
+    pub source: crate::handoff::HandoffSource,
 }
 
 /// SUBA-093 — whether one dispatch OWNS its flat status slot or shares it with concurrently
@@ -1584,7 +1645,8 @@ pub async fn walk_chain(
                 result
             }
             RunnerStep::ParallelGroup(spec) => {
-                run_parallel_group(spec, registry, single, ctx, &mut group_results).await?
+                run_parallel_group(spec, registry, single, ctx, step_index, &mut group_results)
+                    .await?
             }
             RunnerStep::DynamicGroup(spec) => {
                 run_dynamic_group(spec, registry, single, ctx, step_index, &mut group_results)
@@ -1638,6 +1700,7 @@ async fn run_parallel_group(
     registry: &mut OutputRegistry,
     single: &Arc<dyn SingleStepExecutor>,
     ctx: &ChainRunContext,
+    step_index: usize,
     group_results: &mut Vec<GroupStepResult>,
 ) -> Result<StepResult, SubagentError> {
     let mut resolved_steps: Vec<SingleStepSpec> = Vec::with_capacity(spec.steps.len());
@@ -1651,9 +1714,11 @@ async fn run_parallel_group(
         });
     }
 
-    if spec.worktree {
-        assign_worktree_cwds(&mut resolved_steps, ctx).await?;
-    }
+    let worktree_setup = if spec.worktree {
+        Some(assign_worktree_cwds(&mut resolved_steps, ctx).await?)
+    } else {
+        None
+    };
 
     // Capture per-task named-output keys and agents before the step list is moved into
     // dispatch_group, so a successful group can register each child's output (C11) and
@@ -1662,7 +1727,7 @@ async fn run_parallel_group(
         resolved_steps.iter().map(|s| s.output.clone()).collect();
     let agents: Vec<String> = resolved_steps.iter().map(|s| s.agent.clone()).collect();
 
-    let group_result = dispatch_group(
+    let mut group_result = dispatch_group(
         resolved_steps,
         spec.concurrency,
         spec.fail_fast,
@@ -1674,7 +1739,7 @@ async fn run_parallel_group(
         GroupSlotLayout::PerMember,
     )
     .await;
-    let collapsed = group_result.aggregate.clone();
+    let mut collapsed = group_result.aggregate.clone();
     if collapsed.success {
         for (name, child) in output_names.iter().zip(group_result.children.iter()) {
             if let (Some(name), Some(child_result)) = (name.as_deref(), child.as_ref()) {
@@ -1683,8 +1748,194 @@ async fn run_parallel_group(
         }
         registry.set_previous(aggregate_group_previous(&group_result.children, &agents));
     }
+
+    // The manifest write, immediately after the group settles — pi `subagent-runner.ts:4389-4434`
+    // @v0.68.0. This is the ONLY worktree fan-out in cyrup, so it is the only place the writer
+    // can attach. A failure here NEVER fails the group: the children already ran and their
+    // patches are already on disk, so upstream appends `formatParallelHandoffError` to the output
+    // and continues (`:4432`), which is what the `Err` arm below does.
+    if let (Some(setup), Some(binding)) = (worktree_setup.as_ref(), ctx.handoff.as_ref()) {
+        let published = publish_worktree_handoff(
+            binding,
+            ctx,
+            setup,
+            u32::try_from(step_index).unwrap_or(u32::MAX),
+            &agents,
+            &group_result.children,
+            spec.lane.as_ref(),
+        )
+        .await;
+        let note = match &published {
+            Ok(reference) => crate::handoff::format_reference(reference),
+            Err(err) => crate::handoff::format_error(err),
+        };
+        group_result.handoff = published.ok();
+        registry.set_previous(format!("{}\n\n{note}", registry.previous()));
+        collapsed.final_output = Some(match collapsed.final_output.take() {
+            Some(existing) => format!("{existing}\n\n{note}"),
+            None => note,
+        });
+    }
+
     group_results.push(group_result);
     Ok(collapsed)
+}
+
+/// Capture this group's diffs, publish the manifest, clean the worktrees up, and publish AGAIN
+/// with the cleanup report — pi `subagent-runner.ts:4423-4433`.
+///
+/// **The manifest is written TWICE and the two writes must never be collapsed into one.** The
+/// first write records every worktree as `preserved: true` with
+/// [`crate::handoff::CLEANUP_PENDING_REASON`] BEFORE any removal is attempted; the second records
+/// what removal actually achieved. A crash between them leaves a complete, `partial`-state
+/// manifest that the retention scan reports correctly and a later `worktree.cleanup` plan can act
+/// on. A single post-cleanup write leaves NOTHING if the process dies during removal — the
+/// worktrees are then orphaned with no record that they ever existed.
+///
+/// Returns the published reference on success. A failure is NOT propagated: the children already
+/// ran and their patches are already on disk, so the caller renders
+/// [`crate::handoff::format_error`] into the group's output and the run continues (pi `:4432`).
+async fn publish_worktree_handoff(
+    binding: &HandoffBinding,
+    ctx: &ChainRunContext,
+    setup: &crate::spawn::worktree::WorktreeSetup,
+    step_index: u32,
+    agents: &[String],
+    children: &[Option<StepResult>],
+    // LANES_2 — the group's launch-declared lane, recorded onto every child row (pi attaches
+    // `params.lane` to its single path's one result, `subagent-executor.ts:3734`; see
+    // `ParallelGroupSpec::lane` for why cyrup binds it across the fan-out instead).
+    lane: Option<&crate::workflows::WorkflowLaneMetadata>,
+) -> Result<crate::handoff::HandoffReference, crate::handoff::HandoffError> {
+    // LANES_2 — the finalization turn. pi's own doc on `withWorktreeTransaction`
+    // (`worktree.ts:207-216` @v0.68.0) is *"later async finalization owners wrap their synchronous
+    // diff/cleanup as ONE turn"*, and this function IS that owner: it diffs, writes the manifest,
+    // removes, and writes the manifest again. Holding the turn across all four is what stops a
+    // concurrent `subagent({action:"worktree.discard"})` from removing these worktrees between
+    // the diff and the removal ledger, which would publish a manifest claiming worktrees that no
+    // longer exist. `create_worktrees` takes the SAME turn, so nothing here may allocate one.
+    let _turn = crate::spawn::worktree::worktree_turn().await;
+    let diffs_dir = binding
+        .manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("worktree-diffs-step-{step_index}"));
+    let diffs = crate::spawn::worktree::diff_worktrees(setup, agents, &diffs_dir).await;
+
+    let results: Vec<crate::handoff::HandoffResult> = agents
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| {
+            let child = children.get(index).and_then(Option::as_ref);
+            crate::handoff::HandoffResult {
+                agent: agent.clone(),
+                status: Some(handoff_child_status(child)),
+                summary: child
+                    .and_then(|result| {
+                        result
+                            .final_output
+                            .clone()
+                            .filter(|text| !text.is_empty())
+                            .or_else(|| result.error.clone())
+                    })
+                    .unwrap_or_else(|| "(no output)".to_string()),
+                output_path: child
+                    .and_then(|result| result.saved_output_path.clone())
+                    .map(PathBuf::from),
+                structured_output: child.and_then(|result| result.structured_output.clone()),
+                structured_output_path: child
+                    .and_then(|result| result.structured_output_path.clone()),
+                session_path: child.and_then(|result| result.session_file.clone()),
+                workflow_key: None,
+                run_id: None,
+                lane: lane.cloned(),
+            }
+        })
+        .collect();
+
+    // The two calls differ in exactly one field (`cleanup`), and that field is the whole point,
+    // so the literal is spelled twice rather than hidden behind a helper: the reader must be able
+    // to see that phase 1 publishes with NO cleanup report and phase 2 publishes the same group
+    // WITH one.
+    let flat_start_index = u32::try_from(ctx.step_slot.index()).unwrap_or(u32::MAX);
+
+    // Phase 1 — durable capture BEFORE removal. Every task lands `preserved: true`.
+    crate::handoff::write_group(crate::handoff::WriteGroup {
+        manifest_path: &binding.manifest_path,
+        run_id: &binding.run_id,
+        mode: binding.mode,
+        source: binding.source,
+        cwd: &ctx.cwd,
+        step_index,
+        flat_start_index,
+        setup,
+        diffs: &diffs,
+        cleanup: None,
+        results: &results,
+        lane_bindings: None,
+        now: crate::time::now_epoch_millis(),
+    })
+    .await?;
+
+    // The evidence phase 1 just made durable, handed to the gate that decides whether each
+    // worktree may be removed: the capture rows say what was harvested and whether the harvest
+    // FAILED, and the manifest path says those rows are on disk rather than only in this heap.
+    // Passing them is what makes `cleanup_worktrees` refuse to `--force`-remove a worktree whose
+    // work the harvest did not actually capture (pi `subagent-runner.ts:4426` @v0.68.0).
+    let report = crate::spawn::worktree::cleanup_worktrees(
+        setup,
+        &crate::handoff::WorktreeCleanupIntent::Preserve(crate::handoff::PreserveEvidence {
+            captured_diffs: diffs.clone(),
+            handoff_manifest_path: Some(binding.manifest_path.clone()),
+        }),
+    )
+    .await;
+
+    // Phase 2 — the same group, re-merged by `stepIndex`, now carrying the removal ledger.
+    crate::handoff::write_group(crate::handoff::WriteGroup {
+        manifest_path: &binding.manifest_path,
+        run_id: &binding.run_id,
+        mode: binding.mode,
+        source: binding.source,
+        cwd: &ctx.cwd,
+        step_index,
+        flat_start_index,
+        setup,
+        diffs: &diffs,
+        cleanup: Some(&report),
+        results: &results,
+        lane_bindings: None,
+        now: crate::time::now_epoch_millis(),
+    })
+    .await
+}
+
+/// pi's child-status mapping (`subagent-runner.ts:4411-4416`):
+/// `stopped -> "stopped"`, `interrupted -> "paused"`, `exitCode === 0 -> "completed"`,
+/// else `"failed"`.
+///
+/// [CYRUP-DELTA] the `stopped` arm is NOT produced here, and that is deliberate rather than an
+/// omission. [`StepResult`] carries `success`/`interrupted`/`timed_out`/`exit_code` and no stop
+/// marker: a stop in cyrup is a RUN-level verdict (`RunState::Stopped`, raised by the background
+/// runner's control inbox, `background/runner_main/turn_loop.rs`) that tears the walk down rather
+/// than settling an individual step. Synthesizing [`crate::handoff::ChildStatus::Stopped`] from
+/// `success == false` would report a crashed lane as an operator-stopped one — the opposite of the
+/// distinction `lane.status` exists to show — so the three arms cyrup can actually observe are the
+/// three it writes. The variant remains in [`crate::handoff::ChildStatus`] because pi's READER
+/// accepts it and cyrup must not refuse a pi-written manifest.
+fn handoff_child_status(child: Option<&StepResult>) -> crate::handoff::ChildStatus {
+    let Some(child) = child else {
+        // A slot that never dispatched (fail-fast skip, cancellation) has no outcome at all.
+        return crate::handoff::ChildStatus::Failed;
+    };
+    if child.interrupted {
+        return crate::handoff::ChildStatus::Paused;
+    }
+    if child.success {
+        crate::handoff::ChildStatus::Completed
+    } else {
+        crate::handoff::ChildStatus::Failed
+    }
 }
 
 /// The [`RunnerStep::DynamicGroup`] arm of [`walk_chain`] (C16, pi
@@ -1778,6 +2029,9 @@ async fn run_dynamic_group(
             ),
             children: Vec::new(),
             fail_fast_skipped: Vec::new(),
+            // A dynamic fan-out has no `worktree` flag at all, so it allocates nothing and
+            // publishes nothing (see `run_dynamic_group`'s own note).
+            handoff: None,
         });
         // SUBA-C14: the group gate runs on the EMPTY path too, over an aggregate report
         // built from zero children (`chain-execution.ts:869-891`: `aggregateAcceptanceReport
@@ -2065,19 +2319,18 @@ async fn evaluate_dynamic_group_acceptance(
 async fn assign_worktree_cwds(
     steps: &mut [SingleStepSpec],
     ctx: &ChainRunContext,
-) -> Result<(), SubagentError> {
-    let base_dir = ctx.worktree_base_dir.as_deref().ok_or_else(|| {
-        SubagentError::WorktreeSetup(
-            "worktree: true group requires ChainRunContext::worktree_base_dir to be configured"
-                .to_string(),
-        )
-    })?;
-
+) -> Result<crate::spawn::worktree::WorktreeSetup, SubagentError> {
+    // `ctx.worktree_base_dir` is passed THROUGH as an `Option` rather than being required.
+    // `registration/mod.rs` defaults `subagents.worktreeBaseDir` to `None` and nothing computes a
+    // fallback, so erroring on `None` here made `subagent({tasks:[…], worktree:true})` fail in
+    // every default install — while `worktree::resolve_worktree_base_dir` has always implemented
+    // the `$CYRUP_SUBAGENTS_WORKTREE_DIR` -> `temp_dir()` ladder for exactly this case, and
+    // `create_worktrees` has always called it.
     let overrides: Vec<Option<&std::path::Path>> = steps.iter().map(|s| s.cwd.as_deref()).collect();
     let group_id = uuid::Uuid::now_v7().as_simple().to_string();
     let config = crate::spawn::worktree::WorktreeGroupConfig {
         group_id: &group_id,
-        worktree_base_dir: base_dir,
+        worktree_base_dir: ctx.worktree_base_dir.as_deref(),
         setup_hook: None,
         setup_hook_timeout_ms: None,
     };
@@ -2087,7 +2340,7 @@ async fn assign_worktree_cwds(
     for (step, assignment) in steps.iter_mut().zip(plan.assignments.iter()) {
         step.cwd = Some(assignment.path.clone());
     }
-    Ok(())
+    Ok(plan.setup)
 }
 
 /// Delegate one group's already-resolved step list to [`crate::spawn::parallel::run_bounded`]
@@ -2300,6 +2553,9 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
         },
         children,
         fail_fast_skipped,
+        // Set by `run_parallel_group` after the group settles, if it published a manifest: the
+        // fan-out collapse itself knows nothing about worktrees.
+        handoff: None,
     }
 }
 
@@ -2352,7 +2608,291 @@ mod tests {
             chain_dir: None,
             dynamic_fanout_max_items: None,
             step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
+            // No worktree group in this context, so nothing publishes a handoff manifest.
+            handoff: None,
         }
+    }
+
+    // =============================================================================================
+    // LANES_2 — the harvest's dirty-worktree gate.
+    //
+    // These drive the REAL production harvest, `publish_worktree_handoff`, because the defect
+    // being pinned is not in `cleanup_worktrees` alone: it is in what this call site hands it.
+    // A test that built the intent itself would keep passing while the call site reverted.
+    // =============================================================================================
+
+    /// A real repo with one commit, mirroring `spawn::worktree`'s own fixture.
+    fn harvest_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .expect("git spawns");
+            assert!(status.success(), "git {args:?} must succeed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Harvest Gate Tests"]);
+        std::fs::write(dir.path().join("tracked.txt"), "initial\n").expect("tracked");
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "initial commit"]);
+        dir
+    }
+
+    fn git_out(cwd: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("git runs")
+    }
+
+    /// Everything `publish_worktree_handoff` needs besides the worktree allocation itself.
+    struct HarvestFixture {
+        repo: tempfile::TempDir,
+        _base: tempfile::TempDir,
+        binding: HandoffBinding,
+        ctx: ChainRunContext,
+    }
+
+    async fn harvest_fixture(
+        run_id: &str,
+        count: u32,
+    ) -> (HarvestFixture, crate::spawn::worktree::WorktreeSetup) {
+        let repo = harvest_repo();
+        let base = tempfile::tempdir().expect("base tempdir");
+        let options = crate::spawn::worktree::CreateWorktreesOptions {
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup =
+            crate::spawn::worktree::create_worktrees(repo.path(), run_id, count, Some(&options))
+                .await
+                .expect("worktrees allocate");
+        let binding = HandoffBinding {
+            manifest_path: repo.path().join("artifacts").join("handoff.json"),
+            run_id: crate::handoff::LaneId::parse(run_id).expect("lane id"),
+            mode: crate::handoff::HandoffMode::Chain,
+            source: crate::handoff::HandoffSource::Foreground,
+        };
+        let ctx = ChainRunContext {
+            cwd: repo.path().to_path_buf(),
+            ..run_ctx(CancelToken::new())
+        };
+        (
+            HarvestFixture {
+                repo,
+                _base: base,
+                binding,
+                ctx,
+            },
+            setup,
+        )
+    }
+
+    /// The per-worktree git dir (`<repo>/.git/worktrees/<name>`), where a worktree's own
+    /// `index.lock` lives.
+    fn worktree_git_dir(worktree_path: &Path) -> PathBuf {
+        let raw = git_out(worktree_path, &["rev-parse", "--absolute-git-dir"]);
+        assert!(raw.status.success(), "rev-parse --absolute-git-dir");
+        PathBuf::from(String::from_utf8_lossy(&raw.stdout).trim().to_string())
+    }
+
+    /// LANES_2 / QA-BLOCKING — a `worktree: true` settle must NOT force-delete a worktree whose
+    /// work the harvest failed to capture.
+    ///
+    /// THE USER ACTION: a fan-out child writes its output into its own worktree. The harvest's
+    /// `git add -A` then fails the way it ordinarily fails — a stale `index.lock` left behind by
+    /// the child's own git process (also: an unreadable file, ENOSPC on the patch write). Before
+    /// this gate, `publish_worktree_handoff` went straight on to `git worktree remove --force`
+    /// plus `git branch -D`, and the child's entire uncommitted output was gone, with the manifest
+    /// recording `filesChanged: 0` — evidence that nothing was lost, fabricated by the failure.
+    ///
+    /// The worktree is dirtied BOTH ways on purpose. `git status --porcelain` is the only probe
+    /// that sees the untracked file; `git diff --quiet <base>` is the only one that would see
+    /// committed divergence. Dropping either probe leaves a real class of work unprotected.
+    ///
+    /// The mutation this pins: pass an intent that skips the gate at
+    /// `publish_worktree_handoff`'s `cleanup_worktrees` call, and this test fails on the very
+    /// first assertion — the worktree directory is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_harvest_whose_capture_failed_preserves_the_dirty_worktree_and_its_branch() {
+        let (fixture, setup) = harvest_fixture("harvestgate", 1).await;
+        let worktree = setup.worktrees[0].clone();
+
+        // The child's work: one uncommitted modification and one untracked file.
+        std::fs::write(worktree.path.join("tracked.txt"), "child work\n").unwrap();
+        std::fs::write(worktree.path.join("untracked.txt"), "only here\n").unwrap();
+
+        // Make the capture fail exactly as production does: a stale index lock.
+        let lock = worktree_git_dir(&worktree.path).join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        let reference = publish_worktree_handoff(
+            &fixture.binding,
+            &fixture.ctx,
+            &setup,
+            0,
+            &["agent-a".to_string()],
+            &[None],
+            None,
+        )
+        .await
+        .expect("the harvest publishes its manifest");
+
+        assert!(
+            worktree.path.exists(),
+            "the worktree holding uncaptured work must still be on disk: {}",
+            worktree.path.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("tracked.txt")).unwrap(),
+            "child work\n",
+            "the uncommitted modification must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("untracked.txt")).unwrap(),
+            "only here\n",
+            "the untracked file must survive"
+        );
+        assert!(
+            git_out(
+                fixture.repo.path(),
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/heads/{}", worktree.branch)
+                ],
+            )
+            .status
+            .success(),
+            "the branch must survive a refused removal: {}",
+            worktree.branch
+        );
+
+        let manifest = crate::handoff::read_manifest(&fixture.binding.manifest_path)
+            .await
+            .expect("manifest reads")
+            .expect("manifest exists");
+        let group = &manifest.groups[0];
+        let task = &group.cleanup.tasks[0];
+        assert_eq!(task.preserved, Some(true), "{task:?}");
+        assert!(!task.worktree_removed, "{task:?}");
+        assert!(!task.branch_removed, "{task:?}");
+        assert_eq!(
+            task.reason.as_deref(),
+            Some("worktree contains changes that are not represented by a captured handoff patch"),
+            "{task:?}"
+        );
+        assert_eq!(
+            group.cleanup.state,
+            crate::handoff::CleanupState::Partial,
+            "a refused removal is never a complete cleanup"
+        );
+        // The failed capture is recorded AS a failure, not as a clean zero-change patch — which
+        // is what stops the gate above from certifying its own placeholder.
+        assert!(
+            group.children[0].patch.error.is_some(),
+            "{:?}",
+            group.children[0].patch
+        );
+        assert!(!group.children[0].patch.changed);
+        assert!(reference.path.exists());
+
+        let _ = std::fs::remove_file(&lock);
+    }
+
+    /// The gate's other half: a harvest that DID capture the work removes the worktree.
+    ///
+    /// Without this, "preserve everything, always" would pass the test above — and a cleanup that
+    /// never cleans up is how every fan-out leaks a worktree and a branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_harvest_with_a_validated_captured_patch_removes_the_dirty_worktree() {
+        let (fixture, setup) = harvest_fixture("harvestok", 1).await;
+        let worktree = setup.worktrees[0].clone();
+
+        std::fs::write(worktree.path.join("tracked.txt"), "child work\n").unwrap();
+        std::fs::write(worktree.path.join("untracked.txt"), "only here\n").unwrap();
+
+        publish_worktree_handoff(
+            &fixture.binding,
+            &fixture.ctx,
+            &setup,
+            0,
+            &["agent-a".to_string()],
+            &[None],
+            None,
+        )
+        .await
+        .expect("the harvest publishes its manifest");
+
+        assert!(
+            !worktree.path.exists(),
+            "a captured, manifest-recorded, validated patch clears the gate"
+        );
+        assert!(
+            !git_out(
+                fixture.repo.path(),
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/heads/{}", worktree.branch)
+                ],
+            )
+            .status
+            .success(),
+            "the branch goes with the worktree"
+        );
+
+        let manifest = crate::handoff::read_manifest(&fixture.binding.manifest_path)
+            .await
+            .expect("manifest reads")
+            .expect("manifest exists");
+        let group = &manifest.groups[0];
+        assert!(group.cleanup.tasks[0].worktree_removed);
+        assert!(group.cleanup.tasks[0].branch_removed);
+        // Both kinds of work made it into the durable patch.
+        let patch = std::fs::read_to_string(&group.children[0].patch.path).unwrap();
+        assert!(patch.contains("tracked.txt"), "{patch}");
+        assert!(patch.contains("untracked.txt"), "{patch}");
+    }
+
+    /// The manifest is the OTHER half of the evidence, and it is checked independently of the
+    /// in-memory capture row: a patch that no durable record names cannot be found by any
+    /// recovery path, so a worktree holding work is never removed on the strength of it.
+    ///
+    /// Reproduced by pointing the gate's manifest at the harvest's patch after deleting the
+    /// harvest's own record of it — the shape a crash between the two phase writes leaves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_patch_no_manifest_records_does_not_clear_the_preserve_gate() {
+        let (fixture, setup) = harvest_fixture("harvestrec", 1).await;
+        let worktree = setup.worktrees[0].clone();
+        std::fs::write(worktree.path.join("untracked.txt"), "only here\n").unwrap();
+
+        let diffs_dir = fixture.repo.path().join("diffs");
+        let diffs =
+            crate::spawn::worktree::diff_worktrees(&setup, &["agent-a".to_string()], &diffs_dir)
+                .await;
+        assert!(diffs[0].error.is_none(), "the capture itself succeeds");
+
+        // No manifest was ever written, so nothing records the patch.
+        let report = crate::spawn::worktree::cleanup_worktrees(
+            &setup,
+            &crate::handoff::WorktreeCleanupIntent::Preserve(crate::handoff::PreserveEvidence {
+                captured_diffs: diffs,
+                handoff_manifest_path: None,
+            }),
+        )
+        .await;
+
+        assert!(worktree.path.exists(), "undurable evidence preserves");
+        assert_eq!(report.tasks[0].preserved, Some(true));
+        assert_eq!(
+            report.tasks[0].reason.as_deref(),
+            Some("worktree contains changes that are not represented by a captured handoff patch")
+        );
     }
 
     /// A [`run_ctx`] variant that sets the run-wide `{task}` (original task) and `{chain_dir}` values
@@ -2498,6 +3038,7 @@ mod tests {
                 concurrency: 2,
                 fail_fast: false,
                 worktree: false,
+                lane: None,
             }),
             RunnerStep::SingleStep(single_step("c", "step-3")),
         ];
@@ -2576,12 +3117,15 @@ mod tests {
             concurrency: 3,
             fail_fast: false,
             worktree: false,
+            lane: None,
         })];
         let executor = Arc::new(SlotRecordingExecutor::default());
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
         // The group's base is 4, as it would be after a chain step and a 3-wide group ahead of it.
         let ctx = ChainRunContext {
             step_slot: StepSlot::Exclusive(4),
+            // No worktree group in this context, so nothing publishes a handoff manifest.
+            handoff: None,
             ..run_ctx(CancelToken::new())
         };
         let mut registry = OutputRegistry::new();
@@ -2656,6 +3200,7 @@ mod tests {
             concurrency: 3,
             fail_fast: false,
             worktree: false,
+            lane: None,
         })];
         let executor = Arc::new(RecordingExecutor::default());
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
@@ -2734,6 +3279,7 @@ mod tests {
             concurrency: 3,
             fail_fast: false,
             worktree: false,
+            lane: None,
         })];
         let executor = Arc::new(VariableDelayExecutor);
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
@@ -3207,6 +3753,7 @@ mod tests {
                 concurrency: 2,
                 fail_fast: false,
                 worktree: false,
+                lane: None,
             }),
             RunnerStep::SingleStep(single_step(
                 "writer",
@@ -3936,6 +4483,7 @@ mod tests {
                 concurrency: 1,
                 fail_fast: true,
                 worktree: false,
+                lane: None,
             }),
             RunnerStep::DynamicGroup(DynamicGroupSpec {
                 expand: "outputs.x".to_string(),

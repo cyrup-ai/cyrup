@@ -252,6 +252,27 @@ pub enum SubagentError {
     #[error("spawn failed: {0}")]
     Spawn(#[from] std::io::Error),
 
+    /// Propagated from [`crate::handoff`] — reading, validating, writing or attesting a
+    /// parallel-handoff manifest.
+    ///
+    /// Bridged with `#[from]` rather than stringified, because every one of
+    /// [`crate::handoff::HandoffError`]'s variants already carries pi's verbatim prose AND the
+    /// structured data a caller branches on (which lane, which reviewed head, which path);
+    /// collapsing that to a `String` here would throw the second half away at the one boundary
+    /// the tool surface reads it across.
+    #[error(transparent)]
+    Handoff(#[from] crate::handoff::HandoffError),
+
+    /// Propagated from [`crate::spawn::cleanup_plan`] — building or persisting a worktree cleanup
+    /// plan.
+    ///
+    /// `#[error("{0}")]` with NO prefix, matching the [`Self::Management`] convention at the top
+    /// of this enum: upstream surfaces every one of these six conditions as `isError: true` prose
+    /// the model reads (`subagent-executor.ts:6238-6240` @v0.68.0 renders `error.message`
+    /// verbatim), so adding a prefix would corrupt a string this crate pins against pi.
+    #[error("{0}")]
+    WorktreeCleanupPlan(#[from] crate::spawn::cleanup_plan::CleanupPlanError),
+
     /// Propagated from `cyrup-session` (fork-context branching, session opening).
     #[error(transparent)]
     Session(#[from] cyrup_session::SessionError),

@@ -336,6 +336,13 @@ pub(super) fn record_step_outcome(
 ) {
     let now = crate::time::now_epoch_millis();
     let index = slots.start;
+    // pi `statusPayload.parallelHandoff = writeParallelHandoffGroup(…)`
+    // (`subagent-runner.ts:4427` @v0.68.0), set at the same moment the group settles. This is how
+    // a caller learns the `handoffPath` to hand a later `worktree.cleanup`/`lane.*` verb, and it
+    // is the first of the two path sources `async_retention`'s unresolved-handoff probe consults.
+    if let Some(reference) = group_result.and_then(|group| group.handoff.as_ref()) {
+        status.parallel_handoff = Some(reference.clone());
+    }
     let per_member = match (step, group_result) {
         (RunnerStep::ParallelGroup(_), Some(group)) if slots.len() > 1 => Some(group),
         _ => None,
@@ -502,6 +509,7 @@ mod tests {
             concurrency: 3,
             fail_fast: false,
             worktree: false,
+            lane: None,
         });
         status.steps = crate::background::flat_index::pending_step_statuses_for(&group_step);
         assert_eq!(
@@ -515,6 +523,7 @@ mod tests {
         );
 
         let group_result = crate::spawn::chain_graph::GroupStepResult {
+            handoff: None,
             aggregate: StepResult::failure("1 of 3 group step(s) failed or were skipped"),
             children: vec![
                 Some(StepResult::success(Some("out-a".to_string()), None)),
@@ -570,6 +579,7 @@ mod tests {
             concurrency: 2,
             fail_fast: false,
             worktree: false,
+            lane: None,
         });
         status.steps = crate::background::flat_index::pending_step_statuses_for(&group_step);
 
@@ -599,6 +609,7 @@ mod tests {
         timed_out_member.timeout_recovery = Some(summary.clone());
 
         let group_result = crate::spawn::chain_graph::GroupStepResult {
+            handoff: None,
             aggregate: StepResult::failure("1 of 2 group step(s) failed or were skipped"),
             children: vec![
                 Some(StepResult::success(Some("out-a".to_string()), None)),
@@ -642,6 +653,7 @@ mod tests {
                 concurrency: 2,
                 fail_fast: false,
                 worktree: false,
+                lane: None,
             }),
             RunnerStep::SingleStep(single_step("tail", "t")),
         ];
@@ -683,6 +695,7 @@ mod tests {
                 concurrency: 2,
                 fail_fast: false,
                 worktree: false,
+                lane: None,
             }),
             RunnerStep::SingleStep(single_step("tail", "t")),
         ];

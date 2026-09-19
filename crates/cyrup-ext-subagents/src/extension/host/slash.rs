@@ -685,6 +685,9 @@ impl SubagentsExtension {
             concurrency: cfg.parallel_concurrency(),
             fail_fast: false,
             worktree: false,
+            // The slash surface carries no `lane` argument, matching pi (`lane` is a tool param,
+            // `extension/schemas.ts:355`, not a `/parallel` flag).
+            lane: None,
         });
         // `/parallel` carries no separate top-level task arg — `{task}` falls back to the
         // group's first task (`first_step_task`).

@@ -1590,6 +1590,176 @@ mod tests {
         );
     }
 
+    /// LANES / pi `async-resume.ts:576-579`: when a `worktree: true` group's worktrees were
+    /// RETAINED, a revived child must resume INSIDE ITS OWN WORKTREE — the retained cwd outranks
+    /// even the run's own recorded `status.cwd`.
+    ///
+    /// This is the rule `handoff/mod.rs`'s safety table names. Until this test existed the table
+    /// claimed it while nothing enforced it: `resolve_retained_worktree_cwd` had no production
+    /// caller at all, so a resumed child was sent to the project checkout — reading a tree its
+    /// transcript never saw and writing into the developer's working copy, the very directory the
+    /// group was isolated from.
+    ///
+    /// Proven the same way as
+    /// [`control_resume_revive_prefers_the_original_runs_cwd_over_the_request_cwd`] above, with the
+    /// probe moved: the custom agent exists ONLY inside the retained worktree, and `status.cwd`
+    /// points at a DIFFERENT directory that also has a `.cyrup/agents` dir (so "found nothing
+    /// anywhere" cannot masquerade as success). Reaching the depth ceiling proves the worktree was
+    /// searched; `agent not found` proves it was not.
+    #[tokio::test]
+    async fn control_resume_revive_prefers_a_retained_worktree_over_the_runs_own_cwd() {
+        use crate::handoff::{
+            Child, ChildStatus, Group, HandoffMode, HandoffSource, LaneId, Manifest,
+            ManifestVersion, Patch, WorktreeCleanupReport, WorktreeCleanupTask,
+        };
+
+        let request_dir = tempfile::tempdir().expect("request tempdir");
+        // The run's OWN recorded cwd — a real repo checkout with its own agents dir, which must
+        // LOSE to the retained worktree.
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        std::fs::create_dir_all(repo_dir.path().join(".cyrup").join("agents"))
+            .expect("mkdir repo agents dir");
+        // The retained worktree, where the probe agent lives.
+        let worktree_dir = tempfile::tempdir().expect("worktree tempdir");
+        let worktree_agents = worktree_dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&worktree_agents).expect("mkdir worktree agents dir");
+        std::fs::write(
+            worktree_agents.join("lane-only-agent.md"),
+            "---\nname: lane-only-agent\ndescription: Only inside the retained worktree\n---\nB.\n",
+        )
+        .expect("write lane-only-agent fixture");
+
+        let session_file = repo_dir.path().join("session.jsonl");
+        std::fs::write(&session_file, "").expect("write dummy session file");
+
+        let async_root =
+            default_async_root_in(&crate::paths::Roots::from_env(), request_dir.path());
+        let results_dir =
+            default_results_dir_in(&crate::paths::Roots::from_env(), request_dir.path());
+        let run_id = RunId::from_token("run0lanecwd");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
+
+        let mut status =
+            crate::background::RunStatus::queued(run_id.clone(), RunMode::Single, Some(4243));
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
+        let mut step = crate::background::StepStatus::pending("lane-only-agent");
+        step.status = crate::background::StepState::Complete;
+        step.session_file = Some(session_file.clone());
+        status.steps = vec![step];
+        status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
+        // Deliberately the repo, NOT the worktree: the manifest must beat it.
+        status.cwd = Some(repo_dir.path().to_path_buf());
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write terminal status fixture");
+
+        // The handoff manifest the harvest would have written, built from the REAL types so the
+        // writer's schema and this fixture cannot drift apart.
+        let manifest = Manifest {
+            version: ManifestVersion,
+            run_id: LaneId::parse("run0lanecwd").expect("lane id"),
+            mode: HandoffMode::Parallel,
+            source: HandoffSource::Async,
+            cwd: repo_dir.path().to_path_buf(),
+            created_at: 1,
+            updated_at: 1,
+            groups: vec![Group {
+                step_index: 0,
+                base_commit: "0000000000000000000000000000000000000000".to_string(),
+                repo_root: repo_dir.path().to_path_buf(),
+                children: vec![Child {
+                    index: 0,
+                    task_index: 0,
+                    agent: "lane-only-agent".to_string(),
+                    workflow_key: None,
+                    run_id: None,
+                    lane: None,
+                    status: ChildStatus::Completed,
+                    summary: "done".to_string(),
+                    output_path: None,
+                    structured_output: None,
+                    structured_output_path: None,
+                    session_path: None,
+                    patch: Patch {
+                        path: worktree_dir.path().join("lane-0.patch"),
+                        branch: "cyrup-parallel-lane-0".to_string(),
+                        changed: false,
+                        diff_stat: String::new(),
+                        files_changed: 0,
+                        insertions: 0,
+                        deletions: 0,
+                        error: None,
+                    },
+                }],
+                lane_bindings: None,
+                cleanup: WorktreeCleanupReport {
+                    state: crate::handoff::CleanupState::Partial,
+                    tasks: vec![WorktreeCleanupTask {
+                        index: 0,
+                        path: worktree_dir.path().to_path_buf(),
+                        branch: "cyrup-parallel-lane-0".to_string(),
+                        provider: None,
+                        naming: None,
+                        // RETAINED: neither removal happened, which is what makes the worktree
+                        // resumable at all.
+                        worktree_removed: false,
+                        branch_removed: false,
+                        preserved: Some(true),
+                        reason: Some("preserved for follow-up".to_string()),
+                        errors: None,
+                    }],
+                    pruned: false,
+                    errors: None,
+                },
+            }],
+            merge: None,
+            supersession: None,
+            cleanup_eligibility: None,
+        };
+        tokio::fs::write(
+            crate::background::RunDir::new(&async_root, &run_id).handoff(),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .await
+        .expect("write handoff manifest fixture");
+
+        let executor = SubagentExecutor::new();
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.max_subagent_depth = 0;
+        }
+
+        let err = executor
+            .control_resume(
+                request_dir.path(),
+                Some("run0lanecwd"),
+                Some("please continue"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("the blocked depth ceiling must still reject this revive");
+
+        assert!(
+            err.contains("depth limit exceeded"),
+            "the revived child must resolve against its RETAINED WORKTREE (where \
+             'lane-only-agent' lives), reaching the depth ceiling; got: {err}"
+        );
+        assert!(
+            !err.contains("agent not found"),
+            "the revive fell back to `status.cwd` (the repo checkout, which has an agents dir but \
+             not this agent) instead of the retained worktree named by the handoff manifest — a \
+             resumed child would write into the developer's working copy; got: {err}"
+        );
+    }
+
     // =====================================================================================
     // Tier-2 (c): package-tier enumeration -> a package agent is discovered at Package scope.
     // =====================================================================================

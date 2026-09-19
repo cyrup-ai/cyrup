@@ -33,7 +33,7 @@
 //! **any other** fault propagates. Every errno decision goes through that module; there is no
 //! fresh `matches!` on [`std::io::ErrorKind`] in this file.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::background::result_index::errno;
 use crate::background::terminal_run_index::is_reserved_async_root_entry;
@@ -48,9 +48,6 @@ use super::{RUN_TOMBSTONE_PREFIX, maintenance_root};
 /// pi `MISSION_BINDING_FILE` (`missions/lifecycle.ts:10`), imported by `async-retention.ts:9` and
 /// probed at `:298`. cyrup's own constant, re-used rather than re-spelled.
 use crate::missions::MISSION_BINDING_FILE;
-
-/// `<run_dir>/handoff.json` — pi's local handoff manifest (`hasUnresolvedRunHandoff`, `:274`).
-const HANDOFF_MANIFEST_FILE: &str = "handoff.json";
 
 /// `<run_dir>/recovery-descriptor.json` — pi `hasResumableContract` (`:196`).
 const RECOVERY_DESCRIPTOR_FILE: &str = "recovery-descriptor.json";
@@ -279,7 +276,7 @@ async fn gather_facts(
                 read_run_tombstone_marker_self_healing(maintenance, &status.run_id).await,
                 active_marker_exists(request.async_root, &status.run_id).await,
                 mission_reference(&run_dir, request.results_dir, &status.run_id).await,
-                has_unresolved_run_handoff(&run_dir).await,
+                has_unresolved_run_handoff(&run_dir, status).await,
                 has_resumable_contract(&run_dir, status).await,
             ),
             // pi never reaches any of these probes without a status (`:289` returns first), so
@@ -422,17 +419,42 @@ async fn has_resumable_contract(run_dir: &Path, status: &RunStatus) -> bool {
 
 /// pi `hasUnresolvedRunHandoff` (`:268-277`) + `unresolvedHandoff` (`:258-266`).
 ///
-/// [CYRUP-DELTA] [`RunStatus`] has no `parallel_handoff` field, so upstream's first path source
-/// (`status.parallelHandoff.path`, `:270-273`) has nothing to read on this side and is not
-/// simulated. The local `<run_dir>/handoff.json` half is ported in full, on
-/// [`has_resumable_contract`]'s reasoning: no cyrup writer produces the file today, the probe is
-/// one `stat`, and a guard written as a constant `false` is the one that fails silently later.
-async fn has_unresolved_run_handoff(run_dir: &Path) -> bool {
-    let manifest_path = run_dir.join(HANDOFF_MANIFEST_FILE);
-    if !tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
-        return false;
+/// Both of upstream's path sources are consulted, as a set: the run's own
+/// [`RunDir::handoff`] file, and — for a run whose manifest lives under the artifacts directory
+/// rather than the run directory — [`RunStatus::parallel_handoff`]'s recorded path. A status that
+/// claims a handoff but names a blank path is unresolved outright (`:270-272`), because the run
+/// asserted it has worktrees and then gave nothing to check.
+async fn has_unresolved_run_handoff(run_dir: &Path, status: &RunStatus) -> bool {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(reference) = status.parallel_handoff.as_ref() {
+        if reference.path.as_os_str().is_empty() {
+            return true;
+        }
+        paths.push(reference.path.clone());
     }
-    let Some(manifest) = read_json_object(&manifest_path).await else {
+    let local = RunDir::for_existing(run_dir).handoff();
+    if tokio::fs::try_exists(&local).await.unwrap_or(false) && !paths.contains(&local) {
+        paths.push(local);
+    }
+    for path in paths {
+        if unresolved_handoff(&path).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// pi `unresolvedHandoff` (`:258-266`) — the per-file half.
+///
+/// Reads the manifest as a raw JSON object rather than through
+/// [`crate::handoff::read_manifest`] DELIBERATELY: retention must answer "is anything still on
+/// disk?" for a manifest this build cannot fully parse (a newer writer, a hand-edit, a partial
+/// file), and every one of those cases must resolve to KEEP. A typed read would return `Err` and
+/// the caller would have to invent the same fallback. The three spellings touched here —
+/// `version`, a non-empty `groups`, and `groups[].cleanup.state` — are the compatibility floor
+/// [`crate::handoff::model`] must never regress.
+async fn unresolved_handoff(manifest_path: &Path) -> bool {
+    let Some(manifest) = read_json_object(manifest_path).await else {
         return true;
     };
     if manifest.get("version").and_then(serde_json::Value::as_u64) != Some(1) {

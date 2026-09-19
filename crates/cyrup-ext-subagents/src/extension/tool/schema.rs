@@ -411,10 +411,89 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // with its consumer in this same change (`SteerDeliveryMode` is read by `control_steer`, written
     // onto the `SteerRequest`, and honoured by the child-side inbox), per the crate's
     // advertise-vs-dispatch invariant.
+    // LANES_2 — the `mode` enum is WIDENED to upstream's five (`extension/schemas.ts:313`
+    // @v0.68.0: `["steer", "follow_up", "auto", "plan", "apply"]`), because `worktree.cleanup`
+    // addresses this same property and a model told the verb requires `mode='plan'` but shown a
+    // three-value enum that excludes `plan` cannot call it at all.
+    //
+    // Widening is safe for `steer`, and that was checked rather than assumed:
+    // `SteerDeliveryMode::parse` (`background/control.rs`) is a CLOSED three-arm match that
+    // returns `None` for anything else, so `action='steer'` with `mode='plan'` is still refused
+    // at the boundary with its own sentence. The description carries both verbs, as upstream's
+    // does.
     props.insert("mode".to_string(), serde_json::json!({
         "type": "string",
-        "enum": ["steer", "follow_up", "auto"],
-        "description": "Delivery mode for action='steer'. steer interrupts at the next safe point (default), follow_up waits for the next turn boundary, and auto follows up mid-turn but delivers immediately between turns."
+        "enum": ["steer", "follow_up", "auto", "plan", "apply"],
+        "description": "Delivery mode for action='steer'. steer interrupts at the next safe point (default), follow_up waits for the next turn boundary, and auto follows up mid-turn but delivers immediately between turns. worktree.cleanup supports plan only, no apply/removal."
+    }));
+    // LANES_2 — the three properties `worktree.cleanup` is addressed through
+    // (`extension/schemas.ts:298-300` @v0.68.0, descriptions VERBATIM), advertised in the same
+    // change that gives `route_action` its dispatch arm.
+    //
+    // `handoffPath` is shared with the `lane.*` and `worktree.discard` verbs a sibling change
+    // lands; it is advertised here because this arm already reads it (pi `:6228`) and
+    // `every_advertised_schema_property_is_read_outside_provided_keys` below would otherwise have
+    // nothing to find.
+    //
+    // `planId` is advertised although the dispatch REFUSES every value: that is upstream's own
+    // shape (`schemas.ts:300` says "Reserved; cleanup is plan-only.") and it is the honest one —
+    // a model that tries to apply a saved plan gets pi's sentence explaining that apply does not
+    // exist yet, instead of a schema rejection it cannot act on.
+    props.insert("handoffPath".to_string(), serde_json::json!({ "type": "string", "description": "Existing manifest for worktree/lane actions." }));
+    props.insert("repo".to_string(), serde_json::json!({ "type": "string", "description": "worktree.cleanup repo; default cwd." }));
+    props.insert(
+        "planId".to_string(),
+        serde_json::json!({ "type": "string", "description": "Reserved; cleanup is plan-only." }),
+    );
+    // LANES_2 — the four properties the `worktree.discard` / `lane.*` verbs are addressed
+    // through (`extension/schemas.ts:301-303,355` @v0.68.0, descriptions VERBATIM), advertised in
+    // the same change that gives `route_action` its arms for them.
+    //
+    // `merge`/`supersession` are open objects at THIS layer, exactly as upstream declares them
+    // (`Type.Unsafe({type:"object", additionalProperties:true})`): the per-field contract belongs
+    // to the recorder, whose rejections are sentences a model can act on. Advertising a closed
+    // object here would move those rejections into the schema validator, which answers with a
+    // path and a keyword rather than "merged tree equivalence was not attested".
+    props.insert(
+        "laneId".to_string(),
+        serde_json::json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Exact manifest run id for lane actions."
+        }),
+    );
+    props.insert("merge".to_string(), serde_json::json!({
+        "type": "object",
+        "additionalProperties": true,
+        "description": "lane.recordMerge evidence: prNumber, reviewedHead, mergeCommit, treeEquivalent, postMergeChecks, attestedBy, attestedAt."
+    }));
+    props.insert(
+        "supersession".to_string(),
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": true,
+            "description": "lane.recordSupersession evidence: supersededBy, attestedBy, attestedAt."
+        }),
+    );
+    // pi `:355` -> the `WorkflowLaneMetadata` TypeBox at `:103-110`. The property is advertised
+    // with its real structure because cyrup already HAS the validated record
+    // (`crate::workflows::WorkflowLaneMetadata`) and its normalizer, so the schema and the
+    // validator cannot drift; the normalizer still answers, with upstream's own sentences, at the
+    // dispatch boundary.
+    props.insert("lane".to_string(), serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "key"],
+        "properties": {
+            "version": { "type": "integer", "enum": [1] },
+            "key": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "mode": { "type": "string", "enum": ["mutation", "review", "scout", "gate"] },
+            "sourceRef": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "claims": { "type": "array", "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 160 } },
+            "outputPaths": { "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 256 } }
+        },
+        "description": "Launch-declared lane metadata: key, mode, sourceRef, claims, outputPaths."
     }));
     props.insert("chainName".to_string(), serde_json::json!({ "type": "string", "description": "Chain name for get/update/delete management actions" }));
     props.insert("config".to_string(), serde_json::json!({
@@ -895,6 +974,16 @@ mod tests {
                 "mission.resolve-decision",
                 "mission.attach-run",
                 "mission.close",
+                // LANES_2 — pi's own indices for the five convergence verbs
+                // (`shared/types.ts:2801` @v0.68.0: `… "mission.close", "worktree.discard",
+                // "worktree.cleanup", "lane.status", "lane.recordMerge",
+                // "lane.recordSupersession", "refine", …`; cyrup omits `refine*` and everything
+                // after it, so the five are contiguous here too).
+                "worktree.discard",
+                "worktree.cleanup",
+                "lane.status",
+                "lane.recordMerge",
+                "lane.recordSupersession",
                 "watchdog.status",
                 "watchdog.check",
                 "watchdog.configure",

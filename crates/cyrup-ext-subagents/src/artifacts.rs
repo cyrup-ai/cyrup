@@ -32,7 +32,14 @@ use crate::background::{cwd_key, temp_root_dir};
 use crate::exec::SingleResult;
 use crate::paths::agent_dir;
 
-/// Project-local artifact root (pi `PROJECT_ARTIFACT_ROOT = ".pi-subagents"`, rebranded).
+/// Project-local artifact root, rebranded from pi.
+///
+/// The old citation here — `PROJECT_ARTIFACT_ROOT = ".pi-subagents"` — is dead: at
+/// **v0.68.0** the constant is `PROJECT_SUBAGENTS_RELATIVE_DIR = ".pi/subagents"`
+/// (`src/shared/artifacts.ts:6`), i.e. upstream moved from a flat dotted directory to a
+/// nested one under `.pi/`. cyrup keeps the FLAT spelling deliberately: the path is the
+/// on-disk location of every existing install's artifacts, and renaming it would strand
+/// them for no user-visible gain. `[CYRUP-DELTA, naming]`.
 const PROJECT_ARTIFACT_ROOT: &str = ".cyrup-subagents";
 /// The `artifacts` leaf under both the project root and the scoped temp root.
 const ARTIFACTS_SUBDIR: &str = "artifacts";

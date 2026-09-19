@@ -1063,6 +1063,8 @@ pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u3
             concurrency: chain_concurrency(step, default_concurrency),
             fail_fast: step.fail_fast.unwrap_or(false),
             worktree: step.worktree.unwrap_or(false),
+            // A named chain declares no lane — the lane is a per-CALL declaration.
+            lane: None,
         });
     }
 

@@ -20,6 +20,7 @@ use crate::extension::host::slash_render::{
     describe_chain, format_async_started_message, plan_step_agent_names, render_chain_results,
 };
 use crate::extension::tool::SubagentTool;
+use crate::extension::tool::lane_actions;
 use crate::extension::tool::params::{
     SubagentToolParams, WATCHDOG_MUTATING_ACTION, foreground_timeout_default,
     format_failed_single_run_output, lower_launch_thinking, resolve_execution_agent_scope,
@@ -1232,6 +1233,149 @@ impl SubagentTool {
                     ..Default::default()
                 })
             }
+            // LANES_2 — the FIVE convergence verbs, in the dispatch position upstream gives
+            // them: `subagent-executor.ts:6213-6293` @v0.68.0 sits between the `mission.*` block
+            // and the policy-action chain that reaches `schedule.create`.
+            //
+            // ONE guard arm for the family, through `LaneAction::from_wire` — the same shape the
+            // `schedule.*` arm below uses. The three properties that differ between the verbs
+            // (`is_mutating`, `authority_action`, `requires_handoff_path`) are decided by
+            // exhaustive matches on the enum rather than by five independent string comparisons
+            // that can drift; see `extension/tool/lane_actions.rs`.
+            lane_action if lane_actions::LaneAction::from_wire(lane_action).is_some() => {
+                use crate::extension::tool::lane_actions::{
+                    LaneAction, LaneActionRefusal, is_lane_evidence_verb,
+                    missing_handoff_path_refusal, resolve_against_request_cwd, trimmed_lane_id,
+                };
+
+                let Some(verb) = LaneAction::from_wire(lane_action) else {
+                    // Unreachable: the guard above already resolved it.
+                    return Err(ToolError::new(format!(
+                        "unknown subagent action '{action}'"
+                    )));
+                };
+
+                // THE ORDER IS UPSTREAM'S AND IS LOAD-BEARING. The child-safe gate is checked
+                // FIRST (`:6214`, `:6243`, `:6271`) — above `mode`, above `planId`, above
+                // `laneId`, above `handoffPath`. Reordering would leak the shape of the refusal,
+                // and through it the fact that this repository holds preserved worktrees, to a
+                // caller not permitted to invoke the verb at all.
+                //
+                // `lane.status` is deliberately exempt: `:6271` is
+                // `action !== "lane.status" && allowMutatingManagementActions === false`, so a
+                // delegated child CAN read its own lane graph. That exemption lives in exactly
+                // one place, `LaneAction::is_mutating`, and is tested directly.
+                if !self.allow_mutating_management && verb.is_mutating() {
+                    return Err(ToolError::new(
+                        LaneActionRefusal::ChildSafe(verb.as_str()).to_string(),
+                    ));
+                }
+
+                let params = p.lane_action_params();
+                // pi `:6274-6275` — `laneId`, for the three `lane.*` verbs only, and checked
+                // BEFORE `handoffPath` (`:6276`). The order is upstream's: a `lane.recordMerge`
+                // missing both parameters is told about `laneId`, not about `handoffPath`.
+                let lane_id = trimmed_lane_id(params.lane_id.as_deref()).map(str::to_string);
+                if is_lane_evidence_verb(verb) && lane_id.is_none() {
+                    return Err(ToolError::new(
+                        LaneActionRefusal::LaneRequiresLaneId(verb.as_str()).to_string(),
+                    ));
+                }
+                // pi `:6226`, `:6260`, `:6278` — resolved against the REQUEST cwd, never the
+                // process cwd. `worktree.cleanup` is the ONE verb that tolerates its absence
+                // (`:6228` is a spread, so absent means "discover every manifest under repo"),
+                // which is exactly what `requires_handoff_path()` says.
+                let handoff_path = resolve_against_request_cwd(params.handoff_path.as_deref(), cwd);
+                if handoff_path.is_none() && verb.requires_handoff_path() {
+                    return Err(ToolError::new(
+                        missing_handoff_path_refusal(verb).to_string(),
+                    ));
+                }
+
+                match verb {
+                    LaneAction::WorktreeCleanup => {
+                        let params = p.cleanup_plan_params();
+                        // The ONE verb `requires_handoff_path()` is false for, so `None` here
+                        // reaches the plan builder as "discover every manifest under `repo`"
+                        // rather than as a refusal (pi `:6228` is a spread).
+                        let handoff_path = handoff_path.as_deref();
+                        // pi `:6217-6219`, verbatim. This refusal IS the "a stale plan must never
+                        // be executed" guard: upstream has no apply phase, no plan reader and no
+                        // TTL enforcement anywhere at v0.68.0, so the only thing standing between
+                        // a saved plan and an unchecked removal is that `apply` is refused at the
+                        // boundary.
+                        if params.mode.as_deref() != Some("plan") {
+                            return Err(ToolError::new(
+                                LaneActionRefusal::CleanupPlanOnly.to_string(),
+                            ));
+                        }
+                        // pi `:6220-6222`, verbatim.
+                        if params.plan_id.is_some() {
+                            return Err(ToolError::new(
+                                LaneActionRefusal::CleanupNoPlanId.to_string(),
+                            ));
+                        }
+                        // pi `:6225-6228`: both paths resolve against the REQUEST cwd, never the
+                        // process cwd.
+                        let repo = resolve_against_request_cwd(params.repo.as_deref(), cwd)
+                            .unwrap_or_else(|| cwd.to_path_buf());
+                        let config = self.executor.config_snapshot().await;
+                        let worktree_base_dir = config
+                            .worktree_base_dir
+                            .as_deref()
+                            .map(|path| path.to_string_lossy().into_owned());
+                        // pi `:6230-6235`. Required, not optional — see
+                        // `ForegroundOwnershipProbe`.
+                        let executor = std::sync::Arc::clone(&self.executor);
+                        let ownership =
+                            move |run_id: &str| executor.foreground_run_ownership(run_id);
+
+                        let created = crate::spawn::cleanup_plan::create_worktree_cleanup_plan(
+                            crate::spawn::cleanup_plan::BuildCleanupPlanInput {
+                                repo: &repo,
+                                handoff_path,
+                                handoff_paths: &[],
+                                worktree_base_dir: worktree_base_dir.as_deref(),
+                                now: crate::time::now_epoch_millis(),
+                                plan_id: None,
+                                foreground_ownership: &ownership,
+                            },
+                        )
+                        .await
+                        // pi `:6238-6240` renders `error.message` with `isError: true`; cyrup's
+                        // error channel is `Err(ToolError)`, which the runtime renders the same
+                        // way. The text is `CleanupPlanError`'s own `Display`, unprefixed.
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+
+                        Ok(ToolResult {
+                            content: vec![cyrup_core::Content::text(
+                                crate::spawn::cleanup_plan::format_worktree_cleanup_plan(&created),
+                            )],
+                            // pi `:6237` — the shape every management arm returns. `results` is a
+                            // present empty array, not an omitted key.
+                            details: Some(
+                                serde_json::json!({ "mode": "management", "results": [] }),
+                            ),
+                            terminate: TerminateHint::Unspecified,
+                            ..Default::default()
+                        })
+                    }
+                    LaneAction::WorktreeDiscard => {
+                        // `handoff_path` is `Some` for this verb (the guard above).
+                        let manifest_path = handoff_path.unwrap_or_default();
+                        self.route_worktree_discard(verb, &manifest_path).await
+                    }
+                    LaneAction::LaneStatus
+                    | LaneAction::LaneRecordMerge
+                    | LaneAction::LaneRecordSupersession => {
+                        // Both `Some` for these verbs (the two guards above).
+                        let lane_id = lane_id.unwrap_or_default();
+                        let manifest_path = handoff_path.unwrap_or_default();
+                        self.route_lane_evidence(verb, &lane_id, &manifest_path, params)
+                            .await
+                    }
+                }
+            }
             // SUBA-016 — the nine `schedule.*` actions, in the dispatch position upstream gives
             // them: after the `mission.*` arm, before `validate`. `subagent-executor.ts` dispatches
             // `schedule.*` between `append-step` and `dismiss`, which is the neighbourhood
@@ -1706,6 +1850,214 @@ impl SubagentTool {
         }
     }
 
+    /// LANES_2 — `worktree.discard` (pi `subagent-executor.ts:6242-6268` @v0.68.0).
+    ///
+    /// The only verb in this family that consults the authority policy, and the only one that
+    /// removes anything from disk. Four things here are load-bearing and easy to lose:
+    ///
+    /// 1. **The authority consult is not optional and its absence is not `auto`.**
+    ///    [`crate::registration::authority::resolve_authority_decision`] falls back to
+    ///    `default_decision`, which is `Confirm` for `discardWorktree`, so a default install
+    ///    prompts. A `Confirm` with no UI is a REFUSAL (`:6255`), never an implicit yes.
+    /// 2. **A decline is `Ok`, not `Err`** (`:6258` carries no `isError`). A deliberate "no" that
+    ///    reads as a failure to an orchestrator retry loop gets the user re-prompted.
+    /// 3. **How it was authorized is DATA.** pi passes `kind: "confirmed" | "policy"` down
+    ///    (`:6263`), and `cleanup_worktrees` consults it again for any worktree that still holds
+    ///    uncommitted work (`worktree.ts:1232-1234`) — under a `confirm` policy, only an
+    ///    authorization that actually came from a human clears such a worktree.
+    /// 4. **It runs inside the worktree-mutation turn** (`:6261`'s `withWorktreeTransaction`),
+    ///    so a discard cannot interleave with a `git worktree add` in flight.
+    async fn route_worktree_discard(
+        &self,
+        verb: crate::extension::tool::lane_actions::LaneAction,
+        manifest_path: &Path,
+    ) -> Result<ToolResult, ToolError> {
+        use crate::extension::tool::lane_actions::{
+            DISCARD_CONFIRM_PROMPT, DISCARD_DECLINED, LaneActionRefusal, discard_confirm_message,
+        };
+        use crate::registration::authority as auth;
+
+        let Some(policy_action) = verb.authority_action() else {
+            // Unreachable: `authority_action()` is `Some` for exactly this variant, and the test
+            // `only_worktree_discard_consults_the_authority_policy` pins that.
+            return Err(ToolError::new(
+                LaneActionRefusal::DiscardForbidden.to_string(),
+            ));
+        };
+        let policy = self.executor.config_snapshot().await.authority_policy;
+        let decision = auth::resolve_authority_decision(policy_action, policy.as_ref());
+        let confirmed = match decision {
+            auth::AuthorityDecision::Auto => true,
+            // pi `:6250-6252`. Verb-specific prose, NOT `auth::forbidden_message`'s generic
+            // `Authority policy forbids action '<x>'.`
+            auth::AuthorityDecision::Forbid => {
+                return Err(ToolError::new(
+                    LaneActionRefusal::DiscardForbidden.to_string(),
+                ));
+            }
+            auth::AuthorityDecision::Confirm => {
+                // pi `:6254-6256`.
+                //
+                // [CYRUP-DELTA] the confirm BODY names the RESOLVED manifest path, where pi
+                // interpolates the raw `handoffPath` the caller sent (`:6256` uses
+                // `paramsWithResolvedCwd.handoffPath`, while the path it then acts on is
+                // absolutized at `:6260`). A relative path in a destructive prompt is ambiguous —
+                // the person answering cannot tell which repository's worktrees are about to go —
+                // and showing something other than what will be touched is the wrong half of the
+                // pair to show. The prompt TITLE and every other sentence stay verbatim.
+                let Some(services) = self.executor.host_services() else {
+                    return Err(ToolError::new(LaneActionRefusal::DiscardNoUi.to_string()));
+                };
+                services.confirm(
+                    DISCARD_CONFIRM_PROMPT,
+                    &discard_confirm_message(manifest_path),
+                    &cyrup_ext::host::DialogOptions::default(),
+                )
+            }
+        };
+        if !confirmed {
+            // pi `:6258` — `Ok`, not `Err`.
+            return Ok(ToolResult {
+                content: vec![cyrup_core::Content::text(DISCARD_DECLINED)],
+                details: Some(serde_json::json!({ "mode": "management", "results": [] })),
+                terminate: TerminateHint::Unspecified,
+                ..Default::default()
+            });
+        }
+
+        // pi `:6261` — `withWorktreeTransaction`. Held across the whole read-modify-write, not
+        // just the `git` calls: two discards that each read the manifest, remove, and write it
+        // back would otherwise lose one of the two removal ledgers.
+        let _turn = crate::spawn::worktree::worktree_turn().await;
+        let discarded = crate::handoff::discard_preserved(
+            manifest_path,
+            crate::handoff::DiscardAuthorization {
+                // pi `:6263` — `decision === "confirm" ? "confirmed" : "policy"`.
+                kind: if decision == auth::AuthorityDecision::Confirm {
+                    crate::handoff::DiscardAuthorizationKind::Confirmed
+                } else {
+                    crate::handoff::DiscardAuthorizationKind::Policy
+                },
+                policy,
+            },
+        )
+        .await
+        // pi `:6266-6268` renders `error.message` with `isError: true`.
+        .map_err(|error| ToolError::new(error.to_string()))?;
+
+        Ok(ToolResult {
+            content: vec![cyrup_core::Content::text(discarded.text)],
+            details: Some(serde_json::json!({ "mode": "management", "results": [] })),
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
+    }
+
+    /// LANES_2 — `lane.status` / `lane.recordMerge` / `lane.recordSupersession` (pi
+    /// `subagent-executor.ts:6280-6292` @v0.68.0), after the shared `laneId`/`handoffPath`
+    /// validation the caller has already applied.
+    ///
+    /// Two asymmetries are upstream's and are deliberate:
+    ///
+    /// * **`lane.status` swallows a read error** (`:6282`'s bare `catch { manifest = undefined; }`),
+    ///   so a missing or corrupt manifest renders as "removal is not safe" prose rather than an
+    ///   error. That swallow is scoped to this verb ALONE — the run-id mismatch at `:6283` and
+    ///   every `lane.record*` failure are errors. It is the one place in this feature where
+    ///   discarding an error is correct.
+    /// * **The two recorders emit `details.parallelHandoff`** (`:6289`), which is not decoration:
+    ///   `missions/lifecycle.rs`'s `artifacts_for_result` and `sync_mission_from_async_completion`
+    ///   both read `parallelHandoff.path` and file a `MissionArtifactKind::Manifest`. Dropping
+    ///   the key as "unused" would re-deaden two landed production readers.
+    async fn route_lane_evidence(
+        &self,
+        verb: crate::extension::tool::lane_actions::LaneAction,
+        lane_id: &str,
+        manifest_path: &Path,
+        params: crate::extension::tool::lane_actions::LaneActionParams,
+    ) -> Result<ToolResult, ToolError> {
+        use crate::extension::tool::lane_actions::{LaneAction, parse_evidence};
+
+        let management_details = || serde_json::json!({ "mode": "management", "results": [] });
+
+        if verb == LaneAction::LaneStatus {
+            // pi `:6282`. See this function's doc for why the error is dropped HERE and nowhere
+            // else.
+            let manifest = crate::handoff::read_manifest(manifest_path)
+                .await
+                .unwrap_or(None);
+            // pi `:6283` — thrown, so an error.
+            if let Some(stored) = manifest.as_ref()
+                && stored.run_id.as_str() != lane_id
+            {
+                return Err(ToolError::new(
+                    crate::handoff::HandoffError::LaneRunMismatch {
+                        lane: lane_id.to_string(),
+                        run: stored.run_id.as_str().to_string(),
+                    }
+                    .to_string(),
+                ));
+            }
+            return Ok(ToolResult {
+                content: vec![cyrup_core::Content::text(
+                    crate::handoff::format_stored_cleanup(manifest_path, manifest.as_ref()),
+                )],
+                details: Some(management_details()),
+                terminate: TerminateHint::Unspecified,
+                ..Default::default()
+            });
+        }
+
+        let lane = crate::handoff::LaneId::parse(lane_id)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let now = crate::time::now_epoch_millis();
+        // pi `:6286-6288`. The attestation object reaches the recorder byte-identical to what the
+        // caller sent — its `manifestDigest` is overwritten there (`:442`/`:461`) and every other
+        // field is evidence, so normalizing on the way in would change what it attests to.
+        let recorded = match verb {
+            LaneAction::LaneRecordMerge => {
+                let merge = parse_evidence::<crate::handoff::MergeEvidence>("merge", params.merge)
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                crate::handoff::record_merge(crate::handoff::RecordMerge {
+                    manifest_path,
+                    lane_id: &lane,
+                    merge,
+                    now,
+                })
+                .await
+            }
+            _ => {
+                let supersession = parse_evidence::<crate::handoff::SupersessionEvidence>(
+                    "supersession",
+                    params.supersession,
+                )
+                .map_err(|error| ToolError::new(error.to_string()))?;
+                crate::handoff::record_supersession(crate::handoff::RecordSupersession {
+                    manifest_path,
+                    lane_id: &lane,
+                    supersession,
+                    now,
+                })
+                .await
+            }
+        }
+        // pi `:6290-6292`.
+        .map_err(|error| ToolError::new(error.to_string()))?;
+
+        let reference = serde_json::to_value(&recorded.reference)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        Ok(ToolResult {
+            content: vec![cyrup_core::Content::text(recorded.text)],
+            details: Some(serde_json::json!({
+                "mode": "management",
+                "results": [],
+                // pi `:6289`. Read today by `missions/lifecycle.rs:431` and `:893`.
+                "parallelHandoff": reference,
+            })),
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
+    }
+
     /// Tier-1 dispatch arm (C5): route `status`/`interrupt`/`resume`/`append-step` to the
     /// [`crate::background::control`] primitives + the [`crate::background::run_status`] report shape
     /// (including the no-id "list active runs" form) — pi `subagent-executor.ts:2845-2912` +
@@ -1937,11 +2289,21 @@ impl SubagentTool {
             .and_then(|c| u32::try_from(c).ok())
             .filter(|c| *c > 0)
             .unwrap_or(cfg.parallel_concurrency());
+        // LANES_2 — pi `:3805-3808`: the lane is normalized at the dispatch boundary and an
+        // invalid one is answered with the normalizer's own sentence, not a schema rejection. The
+        // normalizer is landed (`crate::workflows::normalize_workflow_lane_metadata`, an exact
+        // port of `lane-metadata.ts:49-70`) and already carries upstream's eight messages
+        // verbatim, which is why this is one line and not a second validator.
+        let lane = crate::workflows::normalize_workflow_lane_metadata(p.lane.as_ref(), "lane")
+            .map_err(|error| ToolError::new(error.message().to_string()))?;
         let group = RunnerStep::ParallelGroup(ParallelGroupSpec {
             steps: specs,
             concurrency,
             fail_fast: false,
             worktree: p.worktree.unwrap_or(false),
+            // Recorded onto every child row of the handoff manifest by `run_parallel_group`, so
+            // the lane's `claims` and `outputPaths` survive the fan-out as durable evidence.
+            lane,
         });
 
         let context = p.context_override();
@@ -2309,3 +2671,16 @@ mod tests;
 #[cfg(test)]
 #[path = "scheduled_runs_tests.rs"]
 mod scheduled_runs_tests;
+
+/// LANES_2's end-to-end suite — a `#[path]` sibling for the same reason the two above are: it
+/// drives `Tool::execute` against the `worktree.cleanup` arm in this file.
+#[cfg(test)]
+#[path = "worktree_cleanup_tests.rs"]
+mod worktree_cleanup_tests;
+
+/// LANES_2's second end-to-end suite — `worktree.discard` and the three `lane.*` verbs, against a
+/// real git worktree and a real manifest. A `#[path]` sibling for the same reason the three above
+/// are: every row drives `Tool::execute` against the arms in this file.
+#[cfg(test)]
+#[path = "lane_actions_tests.rs"]
+mod lane_actions_tests;

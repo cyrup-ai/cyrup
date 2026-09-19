@@ -1136,6 +1136,8 @@ mod tests {
             chain_dir: None,
             dynamic_fanout_max_items: None,
             step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
+            // No worktree group in this context, so nothing publishes a handoff manifest.
+            handoff: None,
         };
         let step = single_step("nonexistent-reviewer", "review the change");
 
@@ -1298,6 +1300,8 @@ mod tests {
             chain_dir: None,
             dynamic_fanout_max_items: None,
             step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
+            // No worktree group in this context, so nothing publishes a handoff manifest.
+            handoff: None,
         }
     }
 
