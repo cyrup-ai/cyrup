@@ -179,6 +179,83 @@ mod tests {
         );
     }
 
+    /// The packaged tool reference is read by a MODEL, through the production `{action:"guide",
+    /// topic:"tool-reference"}` path, and it is the only place that tells that model which verbs
+    /// stand behind a confirmation. A row that advertises a gate the dispatcher does not have is
+    /// a security-relevant falsehood, not a typo: the model issues the verb believing a human
+    /// will be asked, and nobody is.
+    ///
+    /// So the sentence is made checkable. Every row of the served table that says "confirmed by
+    /// default" must name a verb that [`crate::registration::authority::AuthorityAction::
+    /// for_tool_action`] maps to an authority action whose `default_decision` is
+    /// [`AuthorityDecision::Confirm`] — which is the mapping every `services.confirm()` site in
+    /// the crate is reached through.
+    ///
+    /// Pre-fix this failed on `refine.rollback`, whose row carried the sentence copied from
+    /// `worktree.discard` while `for_tool_action("refine.rollback")` returns `None` (as it does
+    /// upstream: `policy/authority.ts:1-10` @v0.68.0 has no `refine*` member either).
+    #[test]
+    fn every_confirmed_by_default_row_names_a_verb_that_really_confirms() {
+        use crate::registration::authority::{AuthorityAction, AuthorityDecision};
+
+        let served = read_subagent_guide(Some("tool-reference"));
+        let mut checked = 0_usize;
+        for line in served.lines() {
+            if !line.contains("confirmed by default") {
+                continue;
+            }
+            let verb = line
+                .split('`')
+                .nth(1)
+                .expect("a table row naming a gate must name its verb in backticks");
+            let decision =
+                AuthorityAction::for_tool_action(verb).map(AuthorityAction::default_decision);
+            assert_eq!(
+                decision,
+                Some(AuthorityDecision::Confirm),
+                "tool-reference.md advertises `{verb}` as confirmed by default, but \
+                 AuthorityAction::for_tool_action({verb:?}) resolves to {decision:?} — and every \
+                 services.confirm() site in this crate is behind that mapping, so nothing would \
+                 ask"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no row claims a confirmation gate any more; if that is deliberate delete this test, \
+             but do not let it pass vacuously"
+        );
+    }
+
+    /// The other half: a verb the dispatcher DOES gate must not be described as ungated. Together
+    /// with the test above this makes the served sentence an exact predicate rather than a
+    /// one-way lint, so neither dropping `worktree.discard`'s true sentence nor restoring
+    /// `refine.rollback`'s false one passes.
+    #[test]
+    fn every_authority_gated_verb_that_the_table_lists_says_so() {
+        use crate::registration::authority::{AuthorityAction, AuthorityDecision};
+
+        let served = read_subagent_guide(Some("tool-reference"));
+        for line in served.lines() {
+            let Some(verb) = line
+                .strip_prefix("| `")
+                .and_then(|rest| rest.split('`').next())
+            else {
+                continue;
+            };
+            if AuthorityAction::for_tool_action(verb).map(AuthorityAction::default_decision)
+                != Some(AuthorityDecision::Confirm)
+            {
+                continue;
+            }
+            assert!(
+                line.contains("confirmed by default"),
+                "`{verb}` is authority-gated to Confirm but its tool-reference row does not say \
+                 so: {line}"
+            );
+        }
+    }
+
     /// The verb is ADVERTISED, in pi's own position. Pre-fix `rg '"guide"'` over the crate was
     /// zero-hit and `{action:"guide"}` landed on the unknown-action arm.
     #[test]

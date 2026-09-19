@@ -121,6 +121,43 @@ pub(crate) async fn write_atomic_json_creating_parent<T: serde::Serialize + Sync
     write_atomic_json(path, value).await
 }
 
+/// The TEXT sibling of [`write_atomic_json`], for the one file this crate writes that is not
+/// JSON: the per-agent refinement overlay
+/// ([`crate::exec::agent_refinements::action::write_refinement_file`]), a markdown document with
+/// two embedded JSON fences whose FORMAT is shared with pi.
+///
+/// Reuses [`unique_temp_path`] and [`rename_with_backoff`] rather than adding a second
+/// temp-then-rename implementation — this module's own doc requires exactly one. pi's writer is
+/// the same shape: `${filePath}.${process.pid}.${randomUUID()}.tmp` then `renameSync`
+/// (`agents/agent-refinements.ts:262-267`), and [`unique_temp_path`] already produces a
+/// pid-plus-UUIDv7 name in the destination's own directory.
+///
+/// Creates the parent, as pi's `fs.mkdirSync(path.dirname(filePath), { recursive: true })`
+/// (`:263`) does — the same implicit mkdir [`write_atomic_json_creating_parent`] carries.
+///
+/// # Errors
+///
+/// A directory-creation failure, a temp-file write failure, or a rename that does not succeed
+/// within the retry budget. On any error path the temp file is best-effort removed, so a failed
+/// write never leaves a stray `*.tmp-*` file beside the destination.
+pub(crate) async fn write_atomic_text(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = unique_temp_path(path)?;
+    if let Err(write_err) = tokio::fs::write(&tmp, contents.as_bytes()).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(write_err);
+    }
+    match rename_with_backoff(&tmp, path).await {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(rename_err)
+        }
+    }
+}
+
 /// The ASYNC, owner-only (`0600`) sibling of [`write_atomic_json`] — pi `writePrivateAtomicJson`
 /// (`shared/atomic-json.ts:62`) for callers that are already inside an async context.
 ///

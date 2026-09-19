@@ -47,6 +47,9 @@ With an `action`, the tool is in **management** or **control** mode.
 | `lane.status` | management | Show one handoff manifest's cleanup eligibility. Read-only |
 | `lane.recordMerge` | management | Attest that a lane merged, with evidence |
 | `lane.recordSupersession` | management | Attest that another lane superseded this one |
+| `refine` | management | Propose and write a bounded, evidence-cited refinement overlay for one agent |
+| `refine.show` | management | Show one agent's refinement overlay, its revision history and base-prompt drift. Read-only |
+| `refine.rollback` | management | Undo the last overlay revision by appending a rollback revision. **Destructive and NOT confirmed** — it rewrites the overlay immediately, and that overlay is folded into every later spawn of the agent. |
 | `watchdog.status` | management | Report the effective watchdog config |
 | `watchdog.check` | management | Run one watchdog review now |
 | `watchdog.configure` | management | Change the watchdog config |
@@ -141,6 +144,36 @@ group's output (and on an async run's status, as `parallelHandoff.path`). That p
 not. It is **read-only and stays available to a child-safe fanout tool** — a delegated child can
 read its own lane graph. Every other verb in this feature — `lane.recordMerge`,
 `lane.recordSupersession`, `worktree.cleanup` and `worktree.discard` — is refused there.
+
+## Refinement overlays
+
+A refinement overlay is a project-local file at
+`.cyrup-subagents/refinements/<agent>.md` holding accumulated, evidence-cited guidance for ONE
+agent. Its `current` block is folded into that agent's system prompt on **every subsequent spawn**,
+inside a `<pi-subagents-refinement>` region that explicitly does not override tool, developer,
+task, output, acceptance or safety instructions.
+
+```
+{ action: "refine", agent: "reviewer" }
+```
+
+`refine` collects a bounded packet of recent, this-project evidence for that agent — at most 8
+items, at most 14 days old, at most 2 KiB per item and 16 KiB in total — and, only if the packet is
+non-empty, launches a read-only proposal child constrained by a JSON schema and a
+`{hard: 1, block: ["write","edit","bash"]}` tool budget. Every proposed edit must carry a title, a
+rationale and at least one evidence id **from that packet**, and guidance that tries to widen its
+own scope (`all agents`, `global`), to disable acceptance/safety/tool/policy instructions, or to
+name the base persona file, `settings.json` or the agent directory is REFUSED. On any refusal —
+no evidence, a failed child, an invalid proposal, or zero edits — **no overlay is written**, and
+the reply says so.
+
+`refine.show` prints the overlay's path, revision, base source and whether the base prompt has
+changed since the overlay was written, plus the current guidance and the last five revisions. It
+is **read-only and stays available to a child-safe fanout tool**; `refine` and `refine.rollback`
+are refused there.
+
+`refine.rollback` restores the previous guidance by **appending** a new `rollback` revision rather
+than popping history, so a second consecutive rollback returns to where it started.
 
 ```
 { action: "lane.recordMerge", laneId, handoffPath,

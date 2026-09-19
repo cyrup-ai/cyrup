@@ -55,6 +55,9 @@ pub mod ndjson;
 pub mod output;
 pub mod output_state;
 pub mod permissions;
+/// pi `collectBoundedRefinementEvidence` (`agents/agent-refinements.ts:349`) — the bounded,
+/// recent, this-cwd evidence packet the `refine` verb puts in front of a proposal child.
+pub mod refinement_evidence;
 pub mod result_summary;
 pub mod spawn_budget;
 pub mod structured;

@@ -157,11 +157,36 @@ pub(crate) const CHILD_SESSION_NOT_RUNNING_YET: &str = "Child session is not run
 ///   is what upstream's own child would get were its denylist not consulted first.
 ///   [`crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS`] is still deliberately NOT
 ///   extended to match: it gates [`crate::extension::SubagentTool::route_management_action`], which
-///   `grant-spawn-budget` does not route through, and upstream's v0.43.0 set has 26 entries
-///   (`subagent-executor.ts:151`), almost all of them naming actions this crate has not ported
-///   (`watchdog.configure`, `mission.*`, `inspector.*`, `project.*`, `schedule.*`, `refine*`), and
-///   grafting one of them onto a 7-entry port would make the runtime denylist message advertise a
-///   verb with no handler.
+///   `grant-spawn-budget` does not route through, and upstream's set (26 entries at v0.43.0,
+///   `subagent-executor.ts:151`; 31 at the v0.68.0 pin this crate now reads, `:213`) names
+///   actions this crate has not ported — exactly four of them, `inspector.open`,
+///   `inspector.close`, `project.open` and `project.close` — and grafting one of those onto a
+///   7-entry port would make the runtime denylist message advertise a verb with no handler.
+///   (`debug.run` is NOT a member: enumerate `:213` and it is absent. It lives in
+///   `SUBAGENT_ACTIONS` (`shared/types.ts:2801`) — which is the list the sibling note in
+///   [`crate::extension::tool::schema::subagent_tool_parameters`] names it as an unported member
+///   of — and it is READ-ONLY upstream, dispatched by `if (action === "status" || action ===
+///   "debug.run")` at `:6515`. Adding it here would gate a verb upstream deliberately leaves
+///   open to a child.)
+///
+///   Every OTHER member of upstream's 31 that cyrup does dispatch is refused in this mode, each
+///   at its own site rather than through the 7-entry slice, and the sites are not all shaped
+///   alike:
+///
+///   - `watchdog.configure`, the mutating `mission.*`, the mutating `schedule.*`, and
+///     `refine`/`refine.rollback` check `!allow_mutating_management && verb.is_mutating()` inline
+///     in their own [`crate::extension::SubagentTool::route_action`] arm — the pattern this note
+///     established.
+///   - `worktree.discard` and `worktree.cleanup` are covered by the same inline check, but on the
+///     `LaneAction` guard (`extension/tool/routing.rs:1273`), which they reach under their own
+///     spellings rather than as `lane.*`.
+///   - `dismiss` is gated in `route_control_action`'s own `"dismiss"` arm
+///     (`extension/tool/routing.rs:2236`), not in a `route_action` arm at all. Upstream likewise
+///     handles it in its own `if (action === "dismiss")` arm (`subagent-executor.ts:6687`
+///     @v0.68.0) rather than in the shared management gate, and lists it in
+///     `MUTATING_MANAGEMENT_ACTIONS` at `:213`.
+///
+///   That list is exhaustive against `:213`; anything appearing there and not here is a gap.
 /// * The **allowed** line names `steer` (which the dispatcher genuinely answers) and, since this
 ///   change, no longer names `stop` — upstream's allowed list has NEVER carried `stop`, at
 ///   `fanout-child.ts:161` @v0.34.0 nor `:179` @v0.43.0. This is an ADVERTISING change only, and
@@ -286,8 +311,7 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     // LANES_2 — the five convergence verbs, at pi's own indices: upstream `SUBAGENT_ACTIONS`
     // (`shared/types.ts:2801` @v0.68.0) reads `… "mission.close", "worktree.discard",
     // "worktree.cleanup", "lane.status", "lane.recordMerge", "lane.recordSupersession",
-    // "refine", …`. cyrup omits `refine*`/`inspector.*`/`project.*`, so the five land
-    // contiguously between `mission.close` and `watchdog.status`.
+    // "refine", "refine.show", "refine.rollback", "inspector.open", …`.
     //
     // `worktree.discard` slots ABOVE `worktree.cleanup`, which is why the cleanup verb's own
     // note (landed one change earlier) said it would. All five are dispatched by
@@ -304,6 +328,21 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     "lane.status",
     "lane.recordMerge",
     "lane.recordSupersession",
+    // VL-S13 — the three `refine*` verbs, at pi's own indices: upstream's list reads
+    // `… "lane.recordSupersession", "refine", "refine.show", "refine.rollback",
+    // "inspector.open", …`, so they slot here and are NOT appended. cyrup still omits
+    // `inspector.*`/`project.*`, so the band from `worktree.discard` to `refine.rollback` is the
+    // contiguous stretch between `mission.close` and `watchdog.status` — the LANES_2 note above
+    // said "the five", and this is the re-derivation of that claim from the v0.68.0 list rather
+    // than a patch of it.
+    //
+    // All three are dispatched by `route_action`'s ONE `RefinementAction::from_wire` guard arm
+    // (`extension/tool/refinement.rs`), per the advertise-vs-dispatch invariant.
+    // `DESTRUCTIVE_MANAGEMENT_ACTIONS` below has carried `refine.rollback` since before this
+    // dispatch, so the stricter did-you-mean rule applies to it from the first call.
+    "refine",
+    "refine.show",
+    "refine.rollback",
     "watchdog.status",
     "watchdog.check",
     "watchdog.configure",

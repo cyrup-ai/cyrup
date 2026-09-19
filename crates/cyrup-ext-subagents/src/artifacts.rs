@@ -580,6 +580,35 @@ pub(crate) fn run_artifact_metadata(run_id: &str, result: &SingleResult) -> serd
         "modelAttempts": model_attempts,
         "toolCount": result.tool_calls.len(),
         "error": result.error,
+        // VL-S13 — pi's artifact-evidence read (`agents/agent-refinements.ts:417`) calls
+        // `acceptanceFields(metadata.acceptance)` to recover `acceptanceStatus`/`reviewFindings`/
+        // `residualRisks` for a SETTLED run. None of the three has a live-state source in cyrup
+        // (the ledger hangs off `SingleResult`, not `StepStatus`), so without this key
+        // `crate::exec::refinement_evidence`'s `acceptance_fields` would have no producer
+        // anywhere and would ship as tested machinery with no caller.
+        //
+        // What it actually recovers TODAY is `acceptanceStatus`, and only that.
+        // `SingleResult::acceptance` is `exec::acceptance::AcceptanceLedger` — the LATTICE
+        // ledger, whose fields are `status`/`evidenceStatus`/`detail`/`verifyResults` — not
+        // `exec::acceptance::model::AcceptanceLedger`, the faithful upstream shape that carries
+        // `childReport`/`reviewResult`. `acceptance_fields` reads `childReport.reviewFindings`,
+        // `reviewResult.findings[].issue` and `childReport.residualRisks`, so on this producer
+        // those two lists come back EMPTY. That is the remaining half of the convergence
+        // `exec::acceptance::lattice::AcceptanceLedger`'s own doc describes, not a bug in this
+        // key: routing the status through is strictly better than routing nothing, and
+        // `refinement_evidence.rs`'s `run_artifact_metadatas_own_output_feeds_acceptance_fields`
+        // pins exactly this — status present, both lists empty — so the day the ledgers merge,
+        // that test is what says so.
+        //
+        // Additive and safe: `RunMetadata`'s reader carries `#[serde(default)]` on every field
+        // and deliberately omits `deny_unknown_fields` (`registration/cost.rs:174-177`), so a
+        // reader that predates this key is unaffected. `controlEvents` (pi `:418`) is
+        // deliberately NOT added beside it: cyrup's `ControlEvent` has no `message`/`reason`, so
+        // `controlSignals` would be empty however it were written.
+        "acceptance": result
+            .acceptance
+            .as_ref()
+            .and_then(|ledger| serde_json::to_value(ledger).ok()),
         "timestamp": SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())

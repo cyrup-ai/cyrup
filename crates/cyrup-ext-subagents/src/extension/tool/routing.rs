@@ -1087,6 +1087,11 @@ impl SubagentTool {
         action: &str,
         p: &SubagentToolParams,
         cwd: &Path,
+        // VL-S13 — pi threads `signal` into `RefinementActionContext` (`subagent-executor.ts:6369`)
+        // and on into the proposal-child launch (`:6370`). `Tool::execute` already holds the
+        // host's own token for this call; passing a fresh `CancelToken::new()` here instead would
+        // be a silent divergence — an interrupted turn would leave the proposal child running.
+        cancel: &CancelToken,
     ) -> Result<ToolResult, ToolError> {
         match action {
             // Read-only diagnostics — already faithfully implemented (`run_doctor`), so wired here.
@@ -1375,6 +1380,55 @@ impl SubagentTool {
                             .await
                     }
                 }
+            }
+            // VL-S13 — the three `refine*` verbs. ONE guard arm through
+            // `RefinementAction::from_wire`, the same shape the `lane.*` and `schedule.*` arms use.
+            //
+            // Upstream's own dispatch block for them is `subagent-executor.ts:6358`, which sits
+            // after the `lane.*` block (`:6213-6293`) and before `grant-spawn-budget` (`:6381`).
+            // cyrup does NOT reproduce that relative layout and does not need to: this file's
+            // `"grant-spawn-budget"` arm is at `:1189`, roughly two hundred lines ABOVE this one.
+            // The arms of a `match` on `action` are disjoint string patterns, so their order is
+            // inert here in a way upstream's chain of `if (action === …)` returns is not.
+            //
+            // Authority is deliberately NOT consulted, and that is a finding rather than an
+            // omission: upstream's whole dispatch block's only gate is the child-safe one at
+            // `:6359`. cyrup's `AUTHORITY_ACTIONS` (`registration/authority.rs:47-54`) is a closed
+            // SIX-entry list and upstream's (`policy/authority.ts:1-10` @v0.68.0) a closed EIGHT
+            // — cyrup omits `inspectorOpen`/`projectOpen`, whose verbs it has not ported — and
+            // NEITHER list has a member for any `refine*` verb.
+            // `AuthorityAction::for_tool_action` therefore keeps returning `None`
+            // for all three, and the read/mutate split is carried entirely by
+            // `RefinementAction::is_mutating` at the child-safe gate below — the same inline shape
+            // the `mission.*`, `lane.*` and `schedule.*` arms use, rather than growing
+            // `discovery::management::MUTATING_MANAGEMENT_ACTIONS` (a 7-entry set scoped to
+            // `route_management_action`'s CRUD, which these verbs do not route through).
+            refinement_action
+                if crate::exec::agent_refinements::action::RefinementAction::from_wire(
+                    refinement_action,
+                )
+                .is_some() =>
+            {
+                let Some(verb) =
+                    crate::exec::agent_refinements::action::RefinementAction::from_wire(
+                        refinement_action,
+                    )
+                else {
+                    // Unreachable: the guard above already resolved it.
+                    return Err(ToolError::new(format!(
+                        "unknown subagent action '{action}'"
+                    )));
+                };
+                // pi `:6359`, FIRST — above agent resolution and above the file read. The order is
+                // upstream's: a child-safe caller is told the verb is unavailable, not told which
+                // agents exist. `refine.show` is exempt because upstream's
+                // `MUTATING_MANAGEMENT_ACTIONS` does not carry it.
+                if !self.allow_mutating_management && verb.is_mutating() {
+                    return Err(ToolError::new(format!(
+                        "Action '{action}' is not available from child-safe subagent fanout mode."
+                    )));
+                }
+                self.route_refinement_action(verb, p, cwd, cancel).await
             }
             // SUBA-016 — the nine `schedule.*` actions, in the dispatch position upstream gives
             // them: after the `mission.*` arm, before `validate`. `subagent-executor.ts` dispatches

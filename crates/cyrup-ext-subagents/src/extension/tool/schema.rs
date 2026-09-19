@@ -977,13 +977,21 @@ mod tests {
                 // LANES_2 — pi's own indices for the five convergence verbs
                 // (`shared/types.ts:2801` @v0.68.0: `… "mission.close", "worktree.discard",
                 // "worktree.cleanup", "lane.status", "lane.recordMerge",
-                // "lane.recordSupersession", "refine", …`; cyrup omits `refine*` and everything
-                // after it, so the five are contiguous here too).
+                // "lane.recordSupersession", "refine", "refine.show", "refine.rollback",
+                // "inspector.open", …`).
                 "worktree.discard",
                 "worktree.cleanup",
                 "lane.status",
                 "lane.recordMerge",
                 "lane.recordSupersession",
+                // VL-S13 — pi's own indices for the three `refine*` verbs, immediately after
+                // `lane.recordSupersession` and before `inspector.open`. cyrup omits
+                // `inspector.*`/`project.*`/`debug.run`, so the band from `worktree.discard`
+                // through `refine.rollback` is what is contiguous here now — re-derived from the
+                // v0.68.0 list, not patched.
+                "refine",
+                "refine.show",
+                "refine.rollback",
                 "watchdog.status",
                 "watchdog.check",
                 "watchdog.configure",
