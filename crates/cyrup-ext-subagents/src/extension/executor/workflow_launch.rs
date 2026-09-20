@@ -630,7 +630,15 @@ async fn settle_foreground_workflow(
             .map_err(|_| "workflow status lock was poisoned".to_string())?;
         // The engine's returned `children` is the COMPLETE settled list — authoritative over
         // whatever `publish_steps` last managed to write.
-        guard.steps = crate::workflows::workflow_step_statuses(children);
+        let mut steps = crate::workflows::workflow_step_statuses(children);
+        // Each row keeps the `ended_at` `publish_steps` stamped when its child settled; a row
+        // `publish_steps` never saw (the engine settled it in the same tick) is stamped now.
+        crate::workflows::carry_step_settle_times(
+            &guard.steps,
+            &mut steps,
+            crate::time::now_epoch_millis(),
+        );
+        guard.steps = steps;
         guard.current_step = guard.steps.len().checked_sub(1);
         guard.advance_state(terminal).map_err(|e| e.to_string())?;
         guard.clone()

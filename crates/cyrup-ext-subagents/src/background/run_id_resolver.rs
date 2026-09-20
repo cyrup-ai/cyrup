@@ -46,12 +46,92 @@ pub enum ResolveRunIdError {
         /// Every matched `async:<id>` label, in sorted order.
         matches: Vec<String>,
     },
+    /// A `dir` that does not sit under the async root (pi `assertInsideRoot(asyncRoot, asyncDir,
+    /// "Async run directory")`, `async-resume.ts:178-184,:229` @v0.68.0).
+    #[error("Async run directory must be inside {}.", root.display())]
+    OutsideAsyncRoot {
+        /// The async root the directory had to be under.
+        root: PathBuf,
+    },
+    /// Both `id` and `dir` were given and disagree (pi `async-resume.ts:231-233`).
+    #[error("Async run id '{id}' does not match directory '{basename}'.")]
+    DirectoryMismatch {
+        /// The `id`/`runId` as supplied.
+        id: String,
+        /// The directory's basename.
+        basename: String,
+    },
+    /// A `dir` whose last component is not a run-id token (a bare root, `..`, or a non-UTF-8 name).
+    #[error("async dir has no run-id basename: {}", dir.display())]
+    NoBasename {
+        /// The directory as supplied.
+        dir: PathBuf,
+    },
 }
 
 /// A safe run-id token (pi `assertSafeNestedId`, `nested-events.ts`): non-empty, no path separator,
 /// no `..`.
 fn is_safe_run_id_token(token: &str) -> bool {
     !token.is_empty() && !token.contains('/') && !token.contains('\\') && !token.contains("..")
+}
+
+/// The `dir` form of pi `resolveAsyncRunLocation` (`async-resume.ts:227-235` @v0.68.0): `dir`
+/// is resolved (relative to `cwd`, dot-segments normalised — Node `path.resolve`), asserted to sit
+/// under `async_root` (`:229`; the root itself passes, as upstream's `relative === ""` does), and
+/// when `requested_id` (`id ?? runId`) is also given it must equal the directory's basename
+/// (`:231-233`). The location's `async_dir` is the directory AS GIVEN — not `<root>/<basename>` —
+/// and `result_path` is `exactResultPath(resultsDir, resolvedId)` (`:234`), present only when the
+/// result exists.
+///
+/// # Errors
+///
+/// [`ResolveRunIdError::NoBasename`], [`ResolveRunIdError::OutsideAsyncRoot`] and
+/// [`ResolveRunIdError::DirectoryMismatch`], each carrying pi's sentence.
+pub fn resolve_async_run_dir(
+    dir: &Path,
+    requested_id: Option<&str>,
+    cwd: &Path,
+    async_root: &Path,
+    results_dir: &Path,
+) -> Result<AsyncRunLocation, ResolveRunIdError> {
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        cwd.join(dir)
+    };
+    let async_dir = crate::exec::output::normalize_lexically(&absolute);
+    let root = crate::exec::output::normalize_lexically(&if async_root.is_absolute() {
+        async_root.to_path_buf()
+    } else {
+        cwd.join(async_root)
+    });
+    if !async_dir.starts_with(&root) {
+        return Err(ResolveRunIdError::OutsideAsyncRoot { root });
+    }
+    let basename = async_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| ResolveRunIdError::NoBasename {
+            dir: dir.to_path_buf(),
+        })?;
+    if let Some(id) = requested_id
+        && id != basename
+    {
+        return Err(ResolveRunIdError::DirectoryMismatch {
+            id: id.to_string(),
+            basename,
+        });
+    }
+    let resolved_id = RunId::from_token(basename);
+    let result_path = results_dir.join(format!("{}.json", resolved_id.as_str()));
+    let result_exists = result_path.exists()
+        || crate::background::result_index::indexed_result_exists(results_dir, &resolved_id);
+    Ok(AsyncRunLocation {
+        async_dir: Some(async_dir),
+        result_path: result_exists.then_some(result_path),
+        resolved_id,
+    })
 }
 
 /// The exact-id location for `id`, if either its run dir or its terminal result file exists (pi

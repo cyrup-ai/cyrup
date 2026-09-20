@@ -144,6 +144,9 @@ next work item**.
 > `inspector.{open,command,status,close}`, `project.{open,status,close}`, `debug.run` — plus **2
 > cyrup-only** (`append-step`, `inspect`). **That 17, plus `PB-8`, plus `UW-4`/`UW-5`, is the whole
 > remaining subagents story**, and none of it has an area-09 id today.
+> *(2026-09-19: `children.list` and `debug.run` are off that list — landed as
+> `background/retained_children.rs` and `background/run_lifecycle_debug.rs`; see `PARITY-GAPS.md`'s
+> two CLOSED rows. Seven remain, all `inspector.*`/`project.*`.)*
 >
 > **So: do NOT schedule another general area-09 reconciliation pass.** Schedule the ranked rows above
 > by name. **Intercom (area 11) is the opposite case** — 3 open lows and 51 closed, *but* `UW-10` is a
@@ -309,7 +312,8 @@ next work item**.
 >    `lane.{status,recordMerge,recordSupersession}`, `refine{,.show,.rollback}`,
 >    `inspector.{open,command,status,close}`, `project.{open,status,close}`, `debug.run` — and
 >    carries two of its own (`append-step`, `inspect`). **Seventeen is the live verb-level gap; 27
->    was never a gap figure at all.**
+>    was never a gap figure at all.** *(2026-09-19: `children.list` and `debug.run` landed; see
+>    `PARITY-GAPS.md`.)*
 > 3. **The upstream pin moved again, and this pass re-measured rather than inherited it.**
 >    `git -C tmp/pi-subagents tag --sort=-v:refname | head -1` returns **`v0.68.0`**, superseding the
 >    `v0.67.0` recorded 2026-09-14. Every upstream read in this pass used

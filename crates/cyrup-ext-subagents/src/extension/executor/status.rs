@@ -324,6 +324,128 @@ impl SubagentExecutor {
         state
     }
 
+    /// `debug.run` — pi `inspectSubagentStatus`'s `debug.run` arms (`run-status.ts:406-410`,
+    /// `:463-468`, `:472-475`, `:512-519`, `:714-721`, `:781-785` @v0.68.0): resolve the run's
+    /// location WITHOUT the foreground/nested ladder `status` uses (`:406-410` calls
+    /// `resolveAsyncRunLocation` directly, no session filter), run the FULL stale-run reconciler
+    /// (`:475`), inspect the run's active-capacity slot with the three identities upstream passes
+    /// (`:515`), probe the recorded runner pid, and render
+    /// [`crate::background::run_lifecycle_debug::format_run_lifecycle_debug`].
+    ///
+    /// The display-dismissed marker is NOT a refusal here (`:485-492` dumps over the on-disk
+    /// status regardless), which is why this does not route through `inspect_paths`.
+    ///
+    /// # Errors
+    ///
+    /// Each of pi's refusal sentences, verbatim: an unresolvable id (`:463-468`), a run with no
+    /// `status.json` but a result file (`:714-721`), a directory with neither (`:781-785`), the
+    /// `dir` form's two `resolveAsyncRunLocation` refusals (outside the async root, `id`/`dir`
+    /// disagree — `async-resume.ts:229-233`), plus the resolver's own ambiguity sentence and any
+    /// genuine I/O failure.
+    pub async fn control_debug_run(
+        &self,
+        cwd: &Path,
+        id: Option<&str>,
+        dir: Option<&str>,
+    ) -> Result<String, String> {
+        use crate::background::active_async_capacity::inspect_active_async_capacity_owner;
+        use crate::background::reconcile::{check_pid_liveness, reconcile_now};
+        use crate::background::run_lifecycle_debug::{
+            DEBUG_RUN_NEEDS_STATUS_DIR, RunLifecycleDebug, RunnerLiveness,
+            format_run_lifecycle_debug,
+        };
+
+        let cfg = self.config_snapshot().await;
+        let async_root = default_async_root_in(&cfg.roots, cwd);
+        let results_dir = default_results_dir_in(&cfg.roots, cwd);
+
+        // pi `resolveAsyncRunLocation` (`async-resume.ts:223-259`): the `dir` form (`:227-235`)
+        // takes the directory as given, asserts it is inside the async root, and refuses an `id`
+        // that disagrees with its basename; the id form resolves exact-then-prefix with no
+        // session filter (`None`), which is what lets an operator debug another session's stuck
+        // run. Both forms yield a location whose `result_path` is `exactResultPath` (`:234`,
+        // `:240`), which the no-`status.json` split below needs.
+        let location = match (dir, id) {
+            (Some(dir), requested) => crate::background::resolve_async_run_dir(
+                Path::new(dir),
+                requested,
+                cwd,
+                &async_root,
+                &results_dir,
+            )
+            .map_err(|error| error.to_string())?,
+            (None, Some(id)) => {
+                let location =
+                    crate::background::resolve_async_run_id(id, &async_root, &results_dir, None)
+                        .map_err(|error| error.to_string())?;
+                let Some(location) = location else {
+                    // pi `:463-468`.
+                    return Err("Async run not found. Provide id or dir.".to_string());
+                };
+                location
+            }
+            (None, None) => {
+                return Err(
+                    crate::background::run_lifecycle_debug::DEBUG_RUN_REQUIRES_TARGET.to_string(),
+                );
+            }
+        };
+        let Some(async_dir) = location.async_dir else {
+            // pi `:714-721` — a result file alone is not a directory to dump.
+            return Err(DEBUG_RUN_NEEDS_STATUS_DIR.to_string());
+        };
+        let paths = RunPaths::for_run(
+            async_dir.parent().unwrap_or(&async_dir),
+            &results_dir,
+            &location.resolved_id,
+        );
+
+        // pi `:472-475` — `readStatus` then the FULL reconciler — over a directory that exists.
+        // Upstream's `reconcileAsyncRun` returns `status: null` when no `status.json` exists
+        // (`stale-run-reconciler.ts:369`) and never repairs one, so the verb then reaches
+        // `:714-721` when a result file exists and the `:781-785` fall-through when none does.
+        // cyrup's `reconcile_now` differs exactly there: with no `status.json` and a result it
+        // repairs one INTO the directory (`background/reconcile.rs`, `repair_from_result`,
+        // `existing: None => needs_repair`) and files it in the active-run index. A diagnostic
+        // must not create the record it reports, so the split is made on the file's existence
+        // BEFORE the reconciler runs, and the reconciler runs only over a `status.json` that was
+        // already there.
+        let status_existed = tokio::fs::try_exists(&paths.status)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !status_existed {
+            return Err(if location.result_path.is_some() {
+                DEBUG_RUN_NEEDS_STATUS_DIR.to_string()
+            } else {
+                "Status file not found.".to_string()
+            });
+        }
+        let status = reconcile_now(&paths, None)
+            .await
+            .map_err(|error| error.to_string())?
+            .status;
+
+        // pi `:515` — `{ runId, sessionId, asyncDir }` against `{ rootDir, liveWorkflowRunIds,
+        // abandonedSlotReleaseAfterMs }`, the latter resolved ONCE by `capacity_options`.
+        let options = Self::capacity_options(&cfg, self.live_workflow_run_ids());
+        let capacity = inspect_active_async_capacity_owner(
+            &status.run_id,
+            status.session_id.as_ref(),
+            Some(&paths.run_dir),
+            &options,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let runner = RunnerLiveness::probe(&status, check_pid_liveness);
+
+        Ok(format_run_lifecycle_debug(&RunLifecycleDebug {
+            status: &status,
+            paths: &paths,
+            runner,
+            capacity: &capacity,
+        }))
+    }
+
     pub async fn control_status_view(
         &self,
         cwd: &Path,

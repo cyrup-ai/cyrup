@@ -1,8 +1,9 @@
-//! Seam tests drained from **`crates/cyrup-ext-subagents`** — 38 files today: the 35 the
+//! Seam tests drained from **`crates/cyrup-ext-subagents`** — 39 files today: the 35 the
 //! migration below drained, minus `verify_redaction_inherited_env` (removed when the workspace
 //! grew a safe env seam), plus `watchdog_model_turn_integration`,
-//! `watchdog_permission_arbiter_integration`, `child_transcript_live_integration` and
-//! `refinement_proposal_refusal_integration`, added since under the same rule.
+//! `watchdog_permission_arbiter_integration`, `child_transcript_live_integration`,
+//! `refinement_proposal_refusal_integration` and `debug_run_lifecycle_integration`, added since
+//! under the same rule.
 //!
 //! What makes a test belong here: it drives a real subagent CHILD PROCESS, or it mutates this
 //! process's environment so that the library's own in-process spawn resolver picks up a test
@@ -125,6 +126,7 @@ mod single_mode_overrides_integration;
 mod subagent_persona_and_depth_integration;
 
 // ---- operator surface: slash commands, prompt workflows, rendering, fleet inspection ----
+mod debug_run_lifecycle_integration;
 mod fleet_inspector_integration;
 mod prompt_workflow_commands_integration;
 mod refinement_proposal_refusal_integration;

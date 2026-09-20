@@ -35,6 +35,10 @@ were NOT re-walked** and keep whatever staleness they already carried.
    `lane.recordSupersession`, `refine`, `refine.show`, `refine.rollback`, `inspector.{open,command,status,close}`,
    `project.{open,status,close}`, `debug.run`) and carries two of its own (`append-step`, `inspect`).
    Those seventeen are the live verb-level gap; use this number, not 27.
+   **Update 2026-09-19:** `children.list` landed (`background/retained_children.rs`, advertised at
+   pi's own index; see the CLOSED row below), and `debug.run` landed the same day
+   (`background/run_lifecycle_debug.rs`, its own CLOSED row below) — of that seventeen, only
+   `inspector.*` and `project.*` remain: **seven**, every one needing a third-party terminal binary.
 
 **Tag re-measured this pass, not inherited.** `git -C tmp/pi-subagents tag --sort=-v:refname | head -1`
 returns **`v0.68.0`**, superseding the `v0.67.0` the 2026-09-14 pin correction below recorded. Every
@@ -1538,13 +1542,90 @@ the behaviour was available to be ported and was not.
 - **Re-read this pass:** all four are still there — `SlashCommandName::Chain` `registration/slash_commands.rs:83`, `Parallel` `:84`, `RunChain` `:85`, `ChainPrompts` `:101` (the `:128`-`:142` citations below are stale). **The blocker this row names is now DISCHARGED**: VL-S2's `workflowScript` runtime landed, so the capability no longer disappears if these four are deleted. This is now a straightforward deletion and should be scheduled as one
 `git grep -oh 'registerCommand("[a-z-]*"' <tag> -- src` gives 19 unique names at v0.40.0 including `chain`, `parallel`, `run-chain`, `chain-prompts`, and 15 at v0.41.0 with all four gone (still gone at v0.43.0 and v0.47.1) — vs `registration/slash_commands.rs:128` (`Chain`), `:129` (`Parallel`), `:130` (`RunChain`), `:142` (`ChainPrompts`). **Observable**: cyrup's palette advertises four commands upstream no longer has, whose function moved into `workflowScript` (VL-S2). Do not delete them before VL-S2 lands or the capability disappears entirely.
 
+**~~`debug.run` · run-lifecycle diagnostic dump~~** — ~~*low*~~ **CLOSED 2026-09-19**
+- **CLOSED.** `background/run_lifecycle_debug.rs` ports `run-status.ts:47-108` @v0.68.0
+  (`formatCapacityOwner`, `formatWorkflowDebug`, `formatRunLifecycleDebug`) and
+  `SubagentExecutor::control_debug_run` (`extension/executor/status.rs`) ports the verb's four
+  arms (`:406-410` location without the foreground/nested ladder, `:472-475` the FULL
+  reconciler, `:512-519` the dump over the reconciled status with
+  `inspect_active_async_capacity_owner`'s three identities, `:714-721`/`:781-785` the two
+  refusals); advertised at pi's own index (`shared/types.ts:2801`, directly after `status`) and
+  dispatched through the control band's own arm with pi's target-before-view refusal order
+  (`subagent-executor.ts:6532-6536`). `SUBAGENT_ACTIONS` 51 → 52.
+- **Over cyrup's data, and it says so.** Upstream's dump prints `Process terminal file:` plus a
+  `Status process terminal:` / `Sidecar process terminal:` pair; cyrup has no sidecar, no status
+  overlay, no reader and no writer (VL-S4 — every crate hit for `process-terminal` is a comment or
+  string; `RunDir`/`RunStatus`/`StepStatus` carry nothing). The dump therefore prints ONE
+  `Process terminal: not recorded — …` line and ONE `Runner pid: <pid> (<alive|dead|unknown>)` line
+  from the real `check_pid_liveness` probe — the same §D3 substitute the capacity verdict already
+  uses — and `Capacity runner pid: <n>` where upstream prints a `runnerProcessInstanceId` cyrup
+  does not mint. `Workflow parent:` / `Workflow key:` / `Lane:` are absent because `RunStatus` has
+  none of those fields (upstream itself omits them when undefined). The integration test pins that
+  the dump never names a `process-terminal.json`. **VL-S4 is neither closed nor narrowed by this.**
+- **Reachability:** `cyrup-it/tests/subagents/debug_run_lifecycle_integration.rs` drives the
+  PRODUCTION claim path (`spawn_background_steps` at `max_active_async_runs_per_session: 1` →
+  `slot-0/owner.json` + `mark_started(pid)`), then `SubagentTool::execute({action:"debug.run"})` by
+  id and by dir, asserting the real slot, pid and `(dead)` liveness line by line.
+- **2026-09-20 (remediation round 1):** the `dir` form ports the rest of
+  `resolveAsyncRunLocation` (`background::resolve_async_run_dir`): `assertInsideRoot`
+  (`async-resume.ts:229`, `Async run directory must be inside <root>.`) and the `id`/`dir`
+  mismatch throw (`:231-233`). A run directory WITHOUT `status.json` is refused BEFORE the
+  reconciler runs — `:714-721` when a result file exists, `:781-785` otherwise — because
+  upstream's reconciler returns `status: null` there (`stale-run-reconciler.ts:369`) while
+  cyrup's `reconcile_now` would repair and WRITE one from the result; a diagnostic must not
+  create the record it reports.
+
+**~~`children.list` · retained workflow children~~** — ~~*low*~~ **CLOSED 2026-09-19**
+- **CLOSED.** `background/retained_children.rs` ports `retained-children.ts` @v0.68.0 (135 lines):
+  `listRetainedChildren`, `childResumability` rung by rung, `boundedTaskSummary`,
+  `formatRetainedChildren` with the keep-one-resumable window rule; advertised at pi's own index
+  (`shared/types.ts:2801`, between `models` and `guide`) and dispatched from `route_action`'s own
+  read arm before `doctor` (`subagent-executor.ts:6467`). `SUBAGENT_ACTIONS` 50 → 51.
+- **The in-tree premise it replaced was stale three ways, and each note is corrected, not
+  reworded:** `text.rs`'s "this build retains nothing" (a workflow's settled children ARE retained,
+  as step rows of the workflow's own `status.json`); `goal_driver.rs`'s and `notices.rs`'s "cyrup
+  has no `workflowScript` runtime" (it has had one since WORKFLOW_2 — both `[CYRUP-DELTA]`s
+  deleted, and `raise_goal_continuation_notices` now passes the real list); `handoff/read.rs`'s
+  "upstream's only caller of `resolveParallelHandoffChild` is `retained-children.ts:68`" (that
+  line calls `resolveRetainedWorktreeCwd`, which cyrup has and which this verb now calls too).
+- **The port is over cyrup's shape, and says so.** A cyrup workflow child is FOREGROUND — no async
+  dir, no `parentWorkflowRunId` on disk (`async_retention/policy.rs`'s note stays true) — so one
+  upstream retained run is one `(workflow status, step index)` pair, the descriptor is read at the
+  workflow's dir (the same file `resume { id, index }` reads), and the resume hint names
+  `id: "<workflow>", index: N`. `workflow_step_statuses` now fills `sessionFile`/`model`/`usage`
+  from `results[0]`, without which every row answered `no persisted session file`.
+- **2026-09-20 (remediation round 1):** the row's `state`/`completedAt` are the CHILD's — the step
+  row's own `status` and `ended_at` (upstream's `run` at `retained-children.ts:85-104` is the child
+  async run) — so a settled child of a still-`Running` workflow is listed and a `failed` child of a
+  workflow that caught the failure prints `failed`; `carry_step_settle_times` stamps `ended_at` on
+  the row when the child settles. The candidate source is the async root's DIRECTORY SCAN
+  (`tui::fleet::collect_async_runs_by_scan`, pi `repairScan`), not the indexed fleet history: a
+  foreground workflow run is in neither run index, so the indexed source hid every workflow status
+  file once any async single run of the session had settled. That scan applies the `sessionId`
+  filter BEFORE its 100-candidate bound (upstream's `repairScan` arm is unbounded and its
+  `entryLimit` reaches only the per-session terminal-index read, `async-status.ts:519`), so a
+  hundred newer runs from other sessions cannot push this session's own out of the window. A deleted cwd prints upstream's
+  `catch` sentence (`resume dependency unavailable: ENOENT: …`). `details` is
+  `{ mode: "management", results: [] }` (`:6471`).
+- **Residuals with TRUE premises (not closed here):** R1 — no producer writes a recovery
+  descriptor for a workflow launch, so in production every row lists `not resumable (missing
+  recovery descriptor)` (pi's own reason sentence; `resume` refuses the same absence with
+  `RecoveryDescriptorError::Missing`'s different sentence, "Async child '<id>' is missing its
+  required run fan-out recovery identity. Start a new run instead." — same file, same verdict,
+  not the same words), until a per-child descriptor location is chosen; R2 — *(closed 2026-09-20)* `StepStatus::runner` now carries the child's
+  `SingleResult::runner` (pi `AsyncJobStep.runner`, `shared/types.ts:1315`) off `results[0]` at
+  settle, and the external-runner rung (`:54`) refuses `external-cli`/`external-job` before the
+  session rung; R3 — no task text on the step row, so `task:` is upstream's own
+  `(no task summary)` branch.
+
 **~~VL-S13 · Agent refinement WRITE half~~** — ~~*medium*~~ **CLOSED 2026-09-19**
 - **CLOSED.** `exec/agent_refinements/` (evidence, proposal, action) + `exec/refinement_evidence.rs`
   port the three functions the READ half's own module doc named as missing —
   `collectBoundedRefinementEvidence`, `validateRefinementProposal`, `handleRefinementAction` — so
   cyrup can now GENERATE and REVERT the overlay it has always applied at spawn. `SUBAGENT_ACTIONS`
   47 → 50; the remaining gap is **9** verbs (`children.list`, `inspector.*`, `project.*`,
-  `debug.run`)
+  `debug.run`) — `children.list` and `debug.run` both closed 2026-09-19 (the two rows below),
+  leaving **7**.
 - **This was the FOURTH reader-without-writer, and the last one known.** The handoff manifest was
   the first (PR #143), the recovery descriptor and the child transcript the second and third
   (PR #144). `exec/agent_refinements.rs` (673 lines) declared its own gap in its module doc —

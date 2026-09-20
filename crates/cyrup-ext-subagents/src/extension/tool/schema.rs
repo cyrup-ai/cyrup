@@ -929,19 +929,15 @@ mod tests {
         assert_eq!(
             action_values,
             vec![
-                // SUBA-055 added `guide` with `registration::guide::read_subagent_guide`, at pi's
-                // own position for it: upstream reads `… "models", "children.list", "guide",
-                // "create", …` (`shared/types.ts:2084` @v0.47.1). `children.list` is still NOT
-                // ported — but WORKFLOW_2 changed the REASON, so restate it rather than let a
-                // reader conclude the verb is now free to add: `workflowScript` IS ported now, so
-                // the old "this build has no concept of a `parentWorkflowRunId`" no longer holds.
-                // What `children.list` needs is RETAINED children, and this build retains none —
-                // `WorkflowRunHost`'s `settled` vec dies with the tool call, and retention arrives
-                // with the async/detached workflow shape (WORKFLOW_3/WORKFLOW_13). So `guide`
-                // still follows `models` directly here.
+                // pi's own indices: upstream reads `… "models", "children.list", "guide",
+                // "validate", "create", …` (`shared/types.ts:2801` @v0.68.0). `children.list`
+                // dispatches to `background::retained_children` (the settled step rows of this
+                // session's workflow status files); SUBA-055 added `guide` with
+                // `registration::guide::read_subagent_guide`.
                 "list",
                 "get",
                 "models",
+                "children.list",
                 "guide",
                 // WORKFLOW_2 — pi's own index for `validate`: upstream `SUBAGENT_ACTIONS`
                 // (`shared/types.ts:2760`) reads `… "guide", "validate", "create", …`.
@@ -954,6 +950,9 @@ mod tests {
                 "enable",
                 "reset",
                 "status",
+                // pi's own index for `debug.run` (`shared/types.ts:2801` @v0.68.0), immediately
+                // after `status`.
+                "debug.run",
                 "grant-spawn-budget",
                 "interrupt",
                 "resume",
@@ -986,9 +985,9 @@ mod tests {
                 "lane.recordSupersession",
                 // VL-S13 — pi's own indices for the three `refine*` verbs, immediately after
                 // `lane.recordSupersession` and before `inspector.open`. cyrup omits
-                // `inspector.*`/`project.*`/`debug.run`, so the band from `worktree.discard`
-                // through `refine.rollback` is what is contiguous here now — re-derived from the
-                // v0.68.0 list, not patched.
+                // `inspector.*`/`project.*`, so the band from `worktree.discard` through
+                // `refine.rollback` is what is contiguous here now — re-derived from the v0.68.0
+                // list, not patched.
                 "refine",
                 "refine.show",
                 "refine.rollback",

@@ -27,16 +27,10 @@
 //! …and if a RETAINED CHILD matches the latest run, the whole thing is wrapped in
 //! `Resume retained child <runId> (<agent>) for: <action>`.
 //!
-//! # [CYRUP-DELTA] `RetainedChild` has no producer in cyrup yet
-//!
-//! [`RetainedChild`] is ported here as an input type. Its upstream producer is
-//! `listRetainedChildren` (`runs/background/retained-children.ts:34-55`), which selects async runs
-//! having a `parentWorkflowRunId` and exactly one step — i.e. children of a **`workflowScript`**
-//! run. cyrup has no `workflowScript` runtime (the identifier appears nowhere in this crate), so
-//! no cyrup async run can carry that field and the list is necessarily empty here; the production
-//! call site passes `&[]` and gains the retained-resume wrapping for free the day the
-//! `workflowScript` port lands. The retained-child logic itself is ported and tested below against
-//! synthesized input, so it is the CALL that needs changing then, not this module.
+//! [`RetainedChild`] is the three-field projection this module reads; the producer is
+//! [`crate::background::retained_children::list_retained_children`] (pi `listRetainedChildren`,
+//! `runs/background/retained-children.ts:83` @v0.68.0), mapped by [`From`] at the one production
+//! call site, `SubagentExecutor::raise_goal_continuation_notices`.
 
 use std::path::Path;
 
@@ -58,11 +52,11 @@ const MAX_ACTION_LENGTH: usize = 180;
 /// The `readyActionFromValue` recursion bound (`goal-driver.ts:63`).
 const MAX_STATE_SEARCH_DEPTH: usize = 8;
 
-/// pi `RetainedChild` (`runs/background/retained-children.ts:8-16`) — a completed child whose
-/// session file survives, so a follow-up can RESUME it rather than starting fresh.
+/// pi `RetainedChild` (`runs/background/retained-children.ts:16-27` @v0.68.0) — a settled child
+/// whose session file survives, so a follow-up can RESUME it rather than starting fresh.
 ///
-/// Only the three fields this module reads are modelled; see the module's `[CYRUP-DELTA]` note on
-/// why nothing in cyrup produces one yet.
+/// Only the three fields this module reads are modelled; produced by
+/// [`crate::background::retained_children`] and mapped by [`From`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedChild {
     /// The retained child's own run id.
@@ -71,6 +65,19 @@ pub struct RetainedChild {
     pub parent_run_id: Option<String>,
     /// The agent persona it ran.
     pub agent: String,
+}
+
+impl From<&crate::background::RetainedChild> for RetainedChild {
+    fn from(child: &crate::background::RetainedChild) -> Self {
+        Self {
+            run_id: child.run_id.as_str().to_string(),
+            // Always `Some`: a cyrup retained child is a step of a workflow run (the producer's
+            // module doc), which is the `parent_run_id == latest_run.run_id` arm of
+            // [`retained_resume_target`].
+            parent_run_id: Some(child.parent_run_id.as_str().to_string()),
+            agent: child.agent.clone(),
+        }
+    }
 }
 
 /// pi `GoalContinuationNotice` (`goal-driver.ts:13-17`).

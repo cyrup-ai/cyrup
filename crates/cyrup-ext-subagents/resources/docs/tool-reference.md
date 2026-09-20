@@ -17,6 +17,7 @@ With an `action`, the tool is in **management** or **control** mode.
 | `list` | management | List discoverable agents |
 | `get` | management | Show one agent |
 | `models` | management | Report the model each agent resolves to |
+| `children.list` | management | List this session's settled workflow children, newest first, with whether each can be resumed |
 | `create` | management | Write a new agent file |
 | `update` | management | Edit an agent file |
 | `delete` | management | Remove an agent file |
@@ -25,6 +26,7 @@ With an `action`, the tool is in **management** or **control** mode.
 | `enable` | management | Re-enable a disabled agent |
 | `reset` | management | Drop an agent's settings overrides |
 | `status` | control | List active runs; `view` selects fleet or transcript |
+| `debug.run` | control | Run-lifecycle diagnostic dump for one async run (`id`/`runId`/`dir`): status file, session, state, runner pid liveness, active-capacity slot, workflow steps; refuses `view` |
 | `grant-spawn-budget` | management | Add launches to an exhausted per-session cap |
 | `interrupt` | control | Interrupt a run |
 | `resume` | control | Deliver a follow-up, or revive a terminal run from its transcript |
