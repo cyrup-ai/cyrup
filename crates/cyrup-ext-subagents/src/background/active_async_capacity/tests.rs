@@ -3,7 +3,8 @@
 //! The §D1/§D2/§D3 findings each have a named guard here: §D1 is pinned in
 //! [`super::config`]'s own tests (the resolver returns an out-of-range value VERBATIM),
 //! §D2 by [`a_slot_is_released_when_the_run_reaches_terminal`] (there is no `release()` to call),
-//! and §D3 by [`a_completed_run_with_a_dead_runner_pid_releases_its_slot`] — the one test a
+//! and §D3's no-proof fallback by [`a_completed_run_with_a_dead_runner_pid_releases_its_slot`]
+//! (the proof rung above it has its own guards) — the one test a
 //! verbatim upstream port fails.
 
 #![allow(
@@ -130,7 +131,9 @@ fn owner_record(
         kind,
         async_dir: async_dir.to_path_buf(),
         reserved_at: 0,
+        runner_process_instance_id: None,
         runner_pid: None,
+        runner_process_start_identity: None,
         runner_started_at: None,
     }
 }
@@ -290,7 +293,13 @@ async fn a_slot_is_released_when_the_run_reaches_terminal() {
     .await
     .expect("admitted")
     .expect("a slot");
-    handle.mark_started(pid).await.expect("bind");
+    handle
+        .mark_started(
+            pid,
+            crate::background::process_terminal::RunnerProcessInstanceId::new(),
+        )
+        .await
+        .expect("bind");
     assert_eq!(handle.owner().runner_pid, Some(pid));
 
     // Still running: the slot is held.
@@ -336,9 +345,13 @@ async fn a_slot_is_released_when_the_run_reaches_terminal() {
 
 #[tokio::test]
 async fn a_completed_run_with_a_dead_runner_pid_releases_its_slot() {
-    // §D3's regression guard. A verbatim upstream port makes this `retained` FOREVER: a
-    // `Complete` run has no observed process-terminal proof and is not `failed`, so after `limit`
-    // successful runs the session could never spawn again.
+    // §D3's regression guard, and it covers the NO-PROOF path specifically: this run wrote no
+    // `process-terminal.json` at all, which is exactly what a runner killed before its own close
+    // leaves behind. Without the fallback ladder beneath the proof rung the verdict is `retained`
+    // FOREVER — a `Complete` run with no proof is not `failed`, so the abandoned-timeout ladder
+    // never takes it either — and after `limit` such runs the session could never spawn again.
+    // The proof rung's own positive case is pinned separately, in
+    // `a_matching_observed_proof_releases_the_slot_before_the_pid_is_ever_probed`.
     let tmp = tempfile::tempdir().expect("tempdir");
     let options = options(tmp.path());
     let s = session("s");
@@ -439,9 +452,9 @@ async fn a_reservation_with_no_runner_identity_is_retained() {
 
 /// The one shape that reaches the abandoned ladder: a reservation whose `runnerStartedAt` landed
 /// but whose durable pid bind did not (pi names this window at `:392-393`). It is `is_started`, so
-/// it passes the identity rung; it has no owner pid, so the §D3 proof rung cannot fire; and the
-/// RUN's own `status.pid` is what the ladder probes — pi's own split between `owner
-/// .runnerProcessInstanceId` (`:230`) and `status.pid` (`:244`).
+/// it passes the identity rung; it has no owner pid, so the no-proof FALLBACK ladder cannot fire
+/// either; and the RUN's own `status.pid` is what the abandoned ladder probes — pi's own split
+/// between `owner.runnerProcessInstanceId` (`:230`) and `status.pid` (`:244`).
 async fn seed_abandoned(
     tmp: &Path,
     options: &CapacityOptions,
@@ -540,8 +553,14 @@ async fn an_abandoned_slot_does_not_release_before_the_configured_delay() {
                 assert_eq!(
                     reason,
                     format!(
-                        "runner pid was never recorded; last activity age {age}ms has not \
-                         exceeded abandoned-timeout {DEFAULT_ABANDONED_SLOT_RELEASE_AFTER_MS}ms"
+                        // pi `:239` prefixes EVERY retained reason on this ladder with the
+                        // proof state it fell through — `process-terminal proof is
+                        // ${proofState}`. cyrup's own pid rung appends to that prefix rather than
+                        // replacing it, so an operator reading the sentence can tell "there was no
+                        // proof" from "the proof said something this rung did not accept".
+                        "process-terminal proof is missing; runner pid was never recorded; last \
+                         activity age {age}ms has not exceeded abandoned-timeout \
+                         {DEFAULT_ABANDONED_SLOT_RELEASE_AFTER_MS}ms"
                     ),
                 );
             }
@@ -1055,7 +1074,13 @@ async fn rollback_returns_an_unstarted_slot_and_refuses_a_started_one() {
     .await
     .expect("admitted")
     .expect("a slot");
-    handle.mark_started(4242).await.expect("bind");
+    handle
+        .mark_started(
+            4242,
+            crate::background::process_terminal::RunnerProcessInstanceId::new(),
+        )
+        .await
+        .expect("bind");
     assert!(
         !handle.rollback().await,
         "a started run's slot is reconciliation's, never a rollback's"
@@ -1086,7 +1111,13 @@ async fn a_transfer_moves_one_slot_and_bumps_its_generation() {
     .await
     .expect("admitted")
     .expect("a slot");
-    handle.mark_started(4242).await.expect("bind");
+    handle
+        .mark_started(
+            4242,
+            crate::background::process_terminal::RunnerProcessInstanceId::new(),
+        )
+        .await
+        .expect("bind");
 
     // pi `:495-496` — a still-running source is a HARD error, never a second admission.
     let refused = transfer(
@@ -1324,7 +1355,10 @@ async fn mark_started_refuses_once_the_slot_has_moved_on() {
     .expect("a handle");
 
     let error = stale
-        .mark_started(4242)
+        .mark_started(
+            4242,
+            crate::background::process_terminal::RunnerProcessInstanceId::new(),
+        )
         .await
         .expect_err("ownership changed");
     assert_eq!(
@@ -1341,4 +1375,248 @@ async fn mark_started_refuses_once_the_slot_has_moved_on() {
         "the stale handle's pid never landed on the new owner"
     );
     assert_eq!(pool_slot_count(&options, &s).await, 1);
+}
+
+// =================================================================================================
+// The proof rung — pi `active-async-capacity.ts:222-235`, now real
+// =================================================================================================
+
+/// DoD 6, first half — the process-terminal proof is the FIRST rung, and it is consulted before
+/// the pid is ever probed.
+///
+/// The injected liveness probe PANICS. A verdict that reached it at all fails the test, so this
+/// cannot pass by accident on a run whose pid happens to be gone.
+///
+/// Gutted (the proof rung moved below the pid ladder, or dropped): the probe panics. Gutted the
+/// other way — the match on run id / instance id removed — is covered by the second half below,
+/// where a proof belonging to ANOTHER runner must NOT release this slot.
+#[tokio::test]
+async fn a_matching_observed_proof_releases_the_slot_before_the_pid_is_ever_probed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = options(tmp.path()).with_pid_liveness(Arc::new(|_| {
+        panic!("the pid ladder must not be reached when a matching observed proof exists")
+    }));
+    let s = session("s");
+    let run_id = RunId::from_token("proven");
+    // A live pid, so every fallback rung would RETAIN: only the proof can release this.
+    let dir = write_run(tmp.path(), &run_id, &s, RunState::Complete, Some(1)).await;
+
+    let instance = crate::background::process_terminal::RunnerProcessInstanceId::new();
+    seed_observed_proof(&dir, &run_id, &instance).await;
+
+    let mut owner = owner_record(&s, &run_id, &dir, ActiveAsyncCapacityKind::Runner);
+    owner.runner_process_instance_id = Some(instance);
+    owner.runner_pid = Some(1);
+    owner.runner_started_at = Some(1);
+    seed_slot(&options, &owner).await;
+
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert!(verdict.is_releasable(), "got {verdict:?}");
+    assert_eq!(
+        verdict.reason(),
+        "matching observed process-terminal proof is present",
+        "pi `:233`'s own sentence"
+    );
+}
+
+/// The other half of the same rung: a proof written by a DIFFERENT runner in the same directory
+/// must not release this slot.
+///
+/// This is what the whole `RunnerProcessInstanceId` mint exists to make meaningful. Gutted (the
+/// identity match dropped), a proof left behind by a previous run in a reused directory releases
+/// a live run's slot, and the cap starts admitting over its limit.
+#[tokio::test]
+async fn a_proof_from_another_runner_instance_does_not_release_the_slot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = probing(Liveness::Alive, options(tmp.path()));
+    let s = session("s");
+    let run_id = RunId::from_token("foreign-proof");
+    let dir = write_run(tmp.path(), &run_id, &s, RunState::Complete, Some(1)).await;
+
+    // The proof on disk belongs to a runner instance this slot never bound.
+    let stranger = crate::background::process_terminal::RunnerProcessInstanceId::new();
+    seed_observed_proof(&dir, &run_id, &stranger).await;
+
+    let mut owner = owner_record(&s, &run_id, &dir, ActiveAsyncCapacityKind::Runner);
+    owner.runner_process_instance_id =
+        Some(crate::background::process_terminal::RunnerProcessInstanceId::new());
+    owner.runner_pid = Some(1);
+    owner.runner_started_at = Some(1);
+    seed_slot(&options, &owner).await;
+
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert!(!verdict.is_releasable(), "got {verdict:?}");
+    // `read_process_terminal` runs the sidecar through `validate_proof` with this reader's own
+    // expectation, so a foreign proof degrades to `unknown` rather than being believed.
+    assert!(
+        verdict
+            .reason()
+            .starts_with("process-terminal proof is unknown;"),
+        "got {}",
+        verdict.reason()
+    );
+}
+
+/// P12 — pi's early-failure carve-out (`:222-226`). The `[CYRUP-DELTA]` that called this rung
+/// "unrepresentable and dropped" is now FALSE and has been deleted.
+///
+/// A run that failed before its child ever started has no close to observe, so no proof will ever
+/// be written for it. Without this rung its slot waits out the entire abandoned timeout for no
+/// information gained — and with a live pid, never releases at all.
+///
+/// Gutted: the probe below panics, exactly as in the proof-rung test, because the carve-out sits
+/// above the pid ladder too.
+#[tokio::test]
+async fn a_pre_startup_failure_releases_on_the_not_started_carve_out() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = options(tmp.path()).with_pid_liveness(Arc::new(|_| {
+        panic!("the pid ladder must not be reached for a run that never started")
+    }));
+    let s = session("s");
+    let run_id = RunId::from_token("never-started");
+    let dir = write_run(tmp.path(), &run_id, &s, RunState::Failed, Some(1)).await;
+
+    let instance = crate::background::process_terminal::RunnerProcessInstanceId::new();
+    let not_started = crate::background::process_terminal::ProcessTerminal::NotStarted {
+        base: crate::background::process_terminal::ProcessTerminalBase::new(
+            run_id.clone(),
+            instance.clone(),
+        ),
+    };
+    patch_status(&dir, |status| {
+        status.process_terminal = Some(not_started);
+        status.error = Some("spawn failed before the child started".to_string());
+    })
+    .await;
+
+    let mut owner = owner_record(&s, &run_id, &dir, ActiveAsyncCapacityKind::Runner);
+    owner.runner_process_instance_id = Some(instance);
+    owner.runner_pid = Some(1);
+    owner.runner_started_at = Some(1);
+    seed_slot(&options, &owner).await;
+
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert!(verdict.is_releasable(), "got {verdict:?}");
+    assert_eq!(
+        verdict.reason(),
+        "run failed before child startup completed"
+    );
+}
+
+/// The carve-out's own counter-rung (pi `:225`): a `not-started` proof with NO error does not
+/// release. An empty error string does not either — pi tests `typeof … === "string" && status
+/// .error`, so the empty string is falsy there too.
+///
+/// Gutted (the error test dropped), a run still sitting in `not-started` because its runner has
+/// not yet published anything releases its slot to a second admission while it is alive.
+#[tokio::test]
+async fn a_not_started_proof_without_an_error_does_not_release() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = probing(Liveness::Alive, options(tmp.path()));
+    let s = session("s");
+    let run_id = RunId::from_token("not-started-clean");
+    let dir = write_run(tmp.path(), &run_id, &s, RunState::Failed, Some(1)).await;
+
+    let instance = crate::background::process_terminal::RunnerProcessInstanceId::new();
+    let not_started = crate::background::process_terminal::ProcessTerminal::NotStarted {
+        base: crate::background::process_terminal::ProcessTerminalBase::new(
+            run_id.clone(),
+            instance.clone(),
+        ),
+    };
+    patch_status(&dir, |status| {
+        status.process_terminal = Some(not_started.clone());
+        status.error = Some(String::new());
+    })
+    .await;
+
+    let mut owner = owner_record(&s, &run_id, &dir, ActiveAsyncCapacityKind::Runner);
+    owner.runner_process_instance_id = Some(instance);
+    owner.runner_pid = Some(1);
+    owner.runner_started_at = Some(1);
+    seed_slot(&options, &owner).await;
+
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert!(
+        !verdict.is_releasable(),
+        "an empty error is falsy: {verdict:?}"
+    );
+}
+
+/// DoD 8, at the capacity seam — the fallback ladder probes with
+/// [`check_pid_identity_with`](crate::background::reconcile::check_pid_identity_with), not bare liveness.
+///
+/// The runner's pid is ALIVE, so `kill(pid, 0)` alone says "keep the slot" forever. The owner
+/// recorded the identity that pid held at the bind, and the identity it holds NOW differs — the
+/// number was recycled. That is `PARITY-GAPS.md:1451`'s named defect, and this is the test that
+/// pins it closed at the place the ledger row names.
+///
+/// Gutted back to `options.pid_liveness(pid)`: the recycled pid reads `Alive`, the verdict falls
+/// to the abandoned-timeout ladder, and a `Complete` run is never `Failed` — so the slot is
+/// retained for the life of the machine.
+#[tokio::test]
+async fn the_fallback_ladder_releases_a_recycled_runner_pid() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let s = session("s");
+    let run_id = RunId::from_token("recycled");
+    let dir = write_run(tmp.path(), &run_id, &s, RunState::Complete, Some(4242)).await;
+
+    let options = options(tmp.path())
+        .with_pid_liveness(Arc::new(|_| Liveness::Alive))
+        .with_pid_start_identity(Arc::new(|_| {
+            Some(crate::background::session_lease::ProcessStartIdentity::from_token("linux:999"))
+        }));
+
+    let mut owner = owner_record(&s, &run_id, &dir, ActiveAsyncCapacityKind::Runner);
+    owner.runner_process_instance_id =
+        Some(crate::background::process_terminal::RunnerProcessInstanceId::new());
+    owner.runner_pid = Some(4242);
+    owner.runner_process_start_identity =
+        Some(crate::background::session_lease::ProcessStartIdentity::from_token("linux:100"));
+    owner.runner_started_at = Some(1);
+    seed_slot(&options, &owner).await;
+
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert!(verdict.is_releasable(), "got {verdict:?}");
+    assert_eq!(
+        verdict.reason(),
+        "process-terminal proof is missing; runner pid 4242 is confirmed gone and the run is \
+         terminal"
+    );
+
+    // The counter-rung: the SAME live pid under the identity the owner recorded is NOT gone, and
+    // the slot is retained. An over-eager rung here reclaims a live run's slot.
+    let options = options.with_pid_start_identity(Arc::new(|_| {
+        Some(crate::background::session_lease::ProcessStartIdentity::from_token("linux:100"))
+    }));
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert!(!verdict.is_releasable(), "got {verdict:?}");
+}
+
+/// Write an `observed` process-terminal sidecar for `run_id`/`instance`, in the shape
+/// `finalize_process_terminal` writes one.
+async fn seed_observed_proof(
+    async_dir: &Path,
+    run_id: &RunId,
+    instance: &crate::background::process_terminal::RunnerProcessInstanceId,
+) {
+    let proof = crate::background::process_terminal::ProcessTerminal::Observed {
+        base: crate::background::process_terminal::ProcessTerminalBase::new(
+            run_id.clone(),
+            instance.clone(),
+        ),
+        observed_at: 1_700_000_000_000,
+        instances: vec![
+            crate::background::process_terminal::ProcessInstanceExit::Runner {
+                process_instance_id: instance.clone(),
+                close_observed_at: 1_700_000_000_000,
+                exit_code: Some(0),
+                signal: None,
+            },
+        ],
+        canonical_session: None,
+    };
+    write_atomic_json(&RunDir::for_existing(async_dir).process_terminal(), &proof)
+        .await
+        .expect("proof write");
 }

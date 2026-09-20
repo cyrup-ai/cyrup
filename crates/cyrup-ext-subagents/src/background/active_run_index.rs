@@ -46,20 +46,19 @@
 //! them all at once, whereas cyrup's four production call sites all land after it. Shipping the
 //! racy arm as a reachable option would reproduce a hole upstream has just closed, for no caller.
 //!
-//! # Two upstream behaviours have no cyrup analog and are recorded rather than invented
+//! # One upstream behaviour has no cyrup analog and is recorded rather than invented
 //!
 //! * `retryCapacityErrors` (pi `:103`) rethrows a *storage-capacity* error from the terminal-index
 //!   write instead of logging it. There is no `isStorageCapacityError` in this crate and no errno
 //!   classifier to build one from; this port returns [`std::io::Result`] and lets the caller —
 //!   which already logs-and-continues at every site — decide. That is the same outcome for every
 //!   error class cyrup can currently distinguish.
-//! * `readProcessTerminal(asyncDir)?.state === "observed"` is the OTHER disjunct of the reader's
-//!   staleness rung (`async-status.ts:575`). cyrup's [`RunStatus`] carries no process-terminal
-//!   record at all, so [`read_live_active_run_ids`] applies the age disjunct alone — see its own
-//!   note.
 
 use std::path::{Path, PathBuf};
 
+use crate::background::process_terminal::{
+    ProcessTerminal, ProcessTerminalState, ProofExpectation, read_process_terminal,
+};
 use crate::background::{RunId, RunState, RunStatus};
 use crate::identity::IndexSegment;
 
@@ -356,13 +355,25 @@ pub async fn read_active_run_index(async_root: &Path) -> Option<Vec<String>> {
 ///   `!status`); [`mark_active_run_failed`] is that call, and it releases the marker so the next
 ///   read is not paying for it again.
 /// * **The staleness rung** — a marker whose run reads back NON-active. pi releases it when the
-///   run's process-terminal record was observed, or when
-///   [`active_run_marker_age_ms`] exceeds [`DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS`] (`:573-577`).
-///   cyrup's [`RunStatus`] carries no process-terminal record, so only the age disjunct is
-///   available — and it is the one that matters here, since a run killed hard enough to skip its
-///   own terminal transition is precisely what leaves a marker behind. Below 24 hours the marker
-///   is left alone: the terminal write may simply not have landed yet, and releasing early is how
-///   a run ends up in neither index.
+///   run's process-terminal record was OBSERVED, or when [`active_run_marker_age_ms`] exceeds
+///   [`DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS`] (`:573-577`). Both disjuncts are applied here,
+///   in upstream's order, and they answer two different situations:
+///
+///   - The **proof** disjunct is the fast, POSITIVE one. A run whose runner reached its close
+///     wrote `process-terminal.json` with `state: "observed"`
+///     ([`finalize_process_terminal`](crate::background::process_terminal::finalize_process_terminal)),
+///     which is a definite statement that the process that owned the run is gone. Its marker is
+///     released on the very next read — not 24 hours later — so a run that ended a second ago
+///     stops being reported as live by every listing that goes through this reader.
+///   - The **age** disjunct is the fallback for a run that could not make that statement: a
+///     runner killed hard enough to skip its own close writes no proof, and its `pending` sidecar
+///     never becomes `observed`. Below 24 hours the marker is left alone, because the terminal
+///     write may simply not have landed yet, and releasing early is how a run ends up in neither
+///     index.
+///
+///   The proof is read against upstream's own expectation (`:574`): this run's id, and the runner
+///   instance the status itself names. A sidecar belonging to another run or another runner
+///   degrades to `unknown` at the read and releases nothing.
 ///
 /// Both repairs are best-effort and logged: this is a READ, and a listing that cannot tidy the
 /// index must still answer. Repaired or not, a non-active entry is never reported as live.
@@ -387,9 +398,24 @@ pub async fn read_live_active_run_ids(async_root: &Path) -> Option<Vec<RunId>> {
             live.push(RunId::from_token(name));
             continue;
         }
-        if active_run_marker_age_ms(&async_dir, now)
-            .await
-            .is_some_and(|age| age > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS)
+        // pi `:574-576` — the proof first, the age threshold second.
+        let run_dir = crate::background::RunDir::for_existing(&async_dir);
+        let observed = read_process_terminal(
+            &run_dir,
+            ProofExpectation {
+                run_id: Some(&status.run_id),
+                runner_process_instance_id: status
+                    .process_terminal
+                    .as_ref()
+                    .map(ProcessTerminal::runner_process_instance_id),
+            },
+        )
+        .await
+        .is_some_and(|proof| proof.state() == ProcessTerminalState::Observed);
+        if (observed
+            || active_run_marker_age_ms(&async_dir, now)
+                .await
+                .is_some_and(|age| age > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS))
             && let Err(error) = update_active_run_index(&async_dir, &status).await
         {
             tracing::warn!(
@@ -884,6 +910,96 @@ mod tests {
                 .is_some_and(|n| n.starts_with("0000000000000077-")),
             "the repair writes the TERMINAL index before releasing: {markers:?}"
         );
+    }
+
+    /// pi `async-status.ts:574-576`'s FIRST disjunct. A run that closed cleanly one second ago
+    /// has an `observed` sidecar, and its marker is released on the very next read — without
+    /// waiting out the 24-hour age rung, and without ever being reported as live.
+    ///
+    /// The counter-rung is in the same test: a `pending` sidecar — the shape a runner that was
+    /// killed leaves behind — releases NOTHING, because the age rung is the only thing that may
+    /// speak for a run whose process never made a statement about itself.
+    #[tokio::test]
+    async fn an_observed_proof_releases_the_marker_before_the_age_rung() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let async_dir = tmp.path().join("run1");
+        let running = status(RunState::Running, None);
+        write_status(&async_dir, &running).await;
+        update_active_run_index(&async_dir, &running)
+            .await
+            .expect("active");
+
+        let mut done = status(RunState::Complete, None);
+        done.ended_at = Some(77);
+        write_status(&async_dir, &done).await;
+
+        // A runner that was killed leaves the launch's `pending` sidecar in place.
+        write_sidecar(&async_dir, &pending_proof()).await;
+        assert_eq!(read_live_active_run_ids(tmp.path()).await, Some(Vec::new()));
+        assert_eq!(
+            read_active_run_index(tmp.path()).await,
+            Some(vec!["run1".to_string()]),
+            "a pending proof is not a statement that the runner is gone"
+        );
+        assert!(terminal_markers(tmp.path()).is_empty());
+
+        // The runner reached its close and proved it.
+        write_sidecar(&async_dir, &observed_proof()).await;
+        assert_eq!(read_live_active_run_ids(tmp.path()).await, Some(Vec::new()));
+        assert_eq!(
+            read_active_run_index(tmp.path()).await,
+            Some(Vec::new()),
+            "an observed proof releases the marker the moment it is read"
+        );
+        assert_eq!(
+            terminal_markers(tmp.path()).len(),
+            1,
+            "the repair still writes the terminal index BEFORE releasing"
+        );
+    }
+
+    /// A sidecar in `run_dir`, in the state named — built through the same typed
+    /// [`ProcessTerminal`] the production writer encodes, so the file is exactly the shape
+    /// [`finalize_process_terminal`](crate::background::process_terminal::finalize_process_terminal)
+    /// writes and `validate_proof` accepts (`process-terminal.ts:170-175`).
+    async fn write_sidecar(async_dir: &Path, proof: &ProcessTerminal) {
+        tokio::fs::create_dir_all(async_dir).await.expect("mkdir");
+        tokio::fs::write(
+            crate::background::RunDir::for_existing(async_dir).process_terminal(),
+            serde_json::to_vec(proof).expect("encode"),
+        )
+        .await
+        .expect("write sidecar");
+    }
+
+    fn proof_base() -> crate::background::process_terminal::ProcessTerminalBase {
+        crate::background::process_terminal::ProcessTerminalBase::new(
+            RunId::from_token("run1"),
+            crate::background::process_terminal::RunnerProcessInstanceId::from_token("inst-1"),
+        )
+    }
+
+    fn pending_proof() -> ProcessTerminal {
+        ProcessTerminal::Pending { base: proof_base() }
+    }
+
+    fn observed_proof() -> ProcessTerminal {
+        ProcessTerminal::Observed {
+            base: proof_base(),
+            observed_at: 1_700_000_000_000,
+            instances: vec![
+                crate::background::process_terminal::ProcessInstanceExit::Runner {
+                    process_instance_id:
+                        crate::background::process_terminal::RunnerProcessInstanceId::from_token(
+                            "inst-1",
+                        ),
+                    close_observed_at: 1_700_000_000_000,
+                    exit_code: Some(0),
+                    signal: None,
+                },
+            ],
+            canonical_session: None,
+        }
     }
 
     #[tokio::test]

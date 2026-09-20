@@ -133,6 +133,16 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         // its closed write end guarantees a prompt EOF.
         let stderr_reader = child.take_stderr();
 
+        // Taken BEFORE `drive_attempt` consumes the child: once the child has been reaped its pid
+        // is no longer exposed, and the pid is also this child's process-GROUP id (every subagent
+        // child is spawned with `command.process_group(0)`, `spawn/mod.rs:795`, which makes it its
+        // own group leader — `getpgid(pid) == pid`). That equality is what lets the close
+        // observation below verify the whole TREE rather than only the direct child.
+        let child_pid = child.id();
+        // `prepare_attempt` has already advanced the counter past this attempt, so the ordinal
+        // this child belongs to is the value before that increment.
+        let attempt_ordinal = self.attempt_index.saturating_sub(1);
+
         let deadline_sleep = self
             .opts
             .deadline_at
@@ -146,6 +156,11 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             self.transcript.as_mut(),
         )
         .await;
+
+        // The child is gone (or was force-terminated). Report its close — including the
+        // process-group teardown verdict — on EVERY path out of this function, which is why it sits
+        // above the two early returns below rather than beside the ordinary one.
+        report_writer_process_close(self.opts, child_pid, attempt_ordinal, &outcome).await;
 
         // pi returns from `runSingleAttempt` on an interrupt BEFORE any exit-code re-diagnosis, so
         // this branch stays ahead of every diagnosis below.
@@ -445,6 +460,9 @@ impl SpawnedChildAttemptRunner<'_> {
         let child = match SpawnedChild::spawn(plan.spec, &jsonl_path).await {
             Ok(child) => child,
             Err(err) => {
+                // A spawn that FAILED launched no writer process, so nothing is reported: the
+                // candidate's expected count must stay equal to the number of children that really
+                // exist, or every run with one failed spawn would report `writer-close-unverified`.
                 return Err(Box::new(attempt_setup_failure(
                     err.to_string(),
                     progress,
@@ -452,6 +470,15 @@ impl SpawnedChildAttemptRunner<'_> {
                 )));
             }
         };
+        // A real OS child now exists. Reported BEFORE anything is known about it (pi has no
+        // equivalent — see `WriterProcessObservation`), so a child whose close is never observed
+        // still raises `expectedWriters` and leaves the runner's proof `writer-close-unverified`
+        // rather than silently `observed`.
+        if let Some(sink) = self.opts.live_events.as_ref() {
+            sink.emit_writer_process(crate::exec::WriterProcessObservation::Launched {
+                pid: child.id(),
+            });
+        }
 
         Ok(PreparedAttempt {
             child,
@@ -581,6 +608,108 @@ impl SpawnedChildAttemptRunner<'_> {
             error_is_placeholder,
         }
     }
+}
+
+/// Report one launched writer child's CLOSE to the run's live sink, with a real verdict about
+/// whether its whole process GROUP was torn down.
+///
+/// `[CYRUP-DELTA]` — this has no upstream counterpart, and the absence is the point. pi's children
+/// run inside the runner process, so `subagent-runner.ts:5168-5190` writes every step's `writers`
+/// as `[]` and every `expectedWriters` as `0`, with its own comment at `:5169` stating the reason:
+/// *"Children run inside this process, so no step has writer processes to prove terminal."* cyrup's
+/// children are real OS processes in their own process groups, so cyrup can prove exactly what
+/// upstream cannot — and a proof that reports `observed` while having verified NOTHING about the
+/// children that actually wrote the session would be a hollow answer to the only question the
+/// artifact exists to answer.
+///
+/// # The three `processTree` reasons, and what each one really means here
+///
+/// pi `ProcessTreeTerminal` (`shared/types.ts:653-670`) offers `unsupported-platform`,
+/// `signal-failed` and `verification-failed`. The probe is `kill(-pgid, 0)`, so the mapping is
+/// exact rather than approximate:
+///
+/// * **no group could be addressed** (the child's pid was already gone from `tokio`'s handle) —
+///   the verification signal could not be SENT at all: `signal-failed`.
+/// * **the group still has members**, or the probe came back `EPERM` — the signal went out and the
+///   answer was negative or inconclusive: `verification-failed`.
+/// * **not a Unix** — there are no process groups: `unsupported-platform`.
+///
+/// Only an empty group yields `observed`, and it carries the group id and the instant it was
+/// verified, which is upstream's `{mechanism: "posix-process-group", processGroupId, verifiedAt}`
+/// shape unchanged.
+///
+/// A sink-less run (the whole foreground path, and every test that installs no live events) skips
+/// the probe entirely rather than paying for an answer nobody will read.
+async fn report_writer_process_close(
+    opts: &RunOptions,
+    child_pid: Option<u32>,
+    attempt: u32,
+    outcome: &DriveOutcome,
+) {
+    let Some(sink) = opts.live_events.as_ref() else {
+        return;
+    };
+    let process_tree = match crate::spawn::signal::verify_process_group_terminated(child_pid).await
+    {
+        crate::spawn::signal::ProcessGroupTerminal::Gone { process_group_id } => {
+            crate::background::process_terminal::ProcessTreeTerminal::ObservedProcessGroup {
+                process_group_id,
+                verified_at: crate::time::now_epoch_millis(),
+            }
+        }
+        crate::spawn::signal::ProcessGroupTerminal::Alive { process_group_id } => {
+            crate::background::process_terminal::ProcessTreeTerminal::Unknown {
+                reason:
+                    crate::background::process_terminal::ProcessTreeUnknownReason::VerificationFailed,
+                diagnostic: Some(format!(
+                    "process group {process_group_id} still has live members after the child exited"
+                )),
+            }
+        }
+        crate::spawn::signal::ProcessGroupTerminal::ProbeFailed {
+            process_group_id,
+            diagnostic,
+        } => crate::background::process_terminal::ProcessTreeTerminal::Unknown {
+            reason:
+                crate::background::process_terminal::ProcessTreeUnknownReason::VerificationFailed,
+            diagnostic: Some(format!(
+                "process group {process_group_id} could not be verified: {diagnostic}"
+            )),
+        },
+        crate::spawn::signal::ProcessGroupTerminal::Unaddressable { diagnostic } => {
+            crate::background::process_terminal::ProcessTreeTerminal::Unknown {
+                reason: crate::background::process_terminal::ProcessTreeUnknownReason::SignalFailed,
+                diagnostic: Some(diagnostic),
+            }
+        }
+        crate::spawn::signal::ProcessGroupTerminal::Unsupported => {
+            crate::background::process_terminal::ProcessTreeTerminal::Unknown {
+                reason:
+                    crate::background::process_terminal::ProcessTreeUnknownReason::UnsupportedPlatform,
+                diagnostic: None,
+            }
+        }
+    };
+    // The RAW observed status, not the ladder's re-diagnosed `exitCode`: this record is about the
+    // PROCESS, not about whether the agent's work was acceptable. A child force-terminated through
+    // the escalation ladder reports no code and the signal that ended it; a child that exited on
+    // its own reports its real code.
+    let (exit_code, signal) = match &outcome.exit_status {
+        Ok(Some(status)) => (status.code(), process_signal_name(status)),
+        _ => (None, None),
+    };
+    sink.emit_writer_process(crate::exec::WriterProcessObservation::Closed(Box::new(
+        crate::background::process_terminal::ProcessInstanceExit::PiWriter {
+            // One fresh token per launched child, for the same reason the runner's own identity is
+            // a fresh uuid: a pid is reusable and two writers must never be able to present one id.
+            process_instance_id: uuid::Uuid::new_v4().as_simple().to_string(),
+            attempt,
+            close_observed_at: crate::time::now_epoch_millis(),
+            exit_code,
+            signal,
+            process_tree,
+        },
+    )));
 }
 
 /// The failure pair both of [`SpawnedChildAttemptRunner::prepare_attempt`]'s early exits return:

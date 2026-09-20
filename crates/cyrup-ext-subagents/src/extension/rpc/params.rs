@@ -230,8 +230,11 @@ pub(crate) fn spawn_params(params: Option<&Value>) -> Result<Map<String, Value>,
 /// Upstream forces `steeringRecovery: false` (`:539`); its schema declares the flag as
 /// *"forced false by extension RPC for exact ownership"* (`extension/schemas.ts:314` @v0.68.0).
 /// cyrup's steer has no pause/revive-after-missed-ack mode to turn OFF —
-/// `grep -rn 'steering_recovery' crates/` is empty — so there is no flag to force and none is
-/// invented. The `mode` check above is kept even though
+/// [`crate::background::control::SteerDeliveryMode`] is `Steer | FollowUp | Auto`, every arm of
+/// which delivers, and none parks a run awaiting an acknowledgement — so there is no flag to force
+/// and none is invented. (The `steering_recovery` spelling occurs in this crate only here and in
+/// [`super::ping::ping_data`]'s delta block, so a grep for it quotes itself; the three-arm enum is
+/// the evidence.) The `mode` check above is kept even though
 /// [`crate::background::control::SteerDeliveryMode`] validates it one level down, so an RPC caller
 /// reads the RPC's own sentence rather than the tool's.
 pub(crate) fn steer_params(params: Option<&Value>) -> Result<Map<String, Value>, SubagentRpcError> {

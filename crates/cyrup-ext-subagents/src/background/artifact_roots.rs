@@ -86,6 +86,21 @@ const SUBSCRIPTIONS_SUBDIR: &str = "wait-subscriptions";
 /// is why the convention's own doc block carries the reciprocal pointer back here.
 const CAPACITY_SUBDIR: &str = "session-active-async-capacity";
 
+/// Path segment, under [`temp_root_dir`], holding one directory per CANONICAL SESSION FILE's
+/// revival lease ([`crate::background::session_lease`]) — pi `SESSION_LEASES_DIR`,
+/// `path.join(TEMP_ROOT_DIR, "session-leases")` (`runs/shared/session-lease.ts:8` @v0.68.0). The
+/// leaf name is upstream's, byte for byte.
+///
+/// # The SECOND root in this crate keyed by neither `cwd_key` nor `SessionId`
+///
+/// [`CAPACITY_SUBDIR`]'s block states why that convention is written down rather than assumed.
+/// This one goes further: it is keyed by the sha256 of the REALPATH of the session file, so two
+/// cyrup instances in DIFFERENT working directories that revive the SAME session file contend for
+/// the SAME lease directory — which is the entire hazard the lease exists to prevent. Keying it by
+/// `cwd_key` would give each instance its own lease and let both revivals run, interleaving their
+/// writes into one transcript.
+const SESSION_LEASES_SUBDIR: &str = "session-leases";
+
 /// One segment of a temp-scope id, with every character outside the keep-set — ASCII
 /// alphanumerics plus `.`, `_` and `-`, i.e. [`crate::workflows::WorkflowKey`]'s alphabet —
 /// collapsed to a single `-` and leading/trailing `-` stripped; an empty result becomes
@@ -383,6 +398,24 @@ pub fn wait_subscriptions_dir_in(roots: &crate::paths::Roots, cwd: &Path) -> Pat
 #[must_use]
 pub fn active_async_capacity_root_in(roots: &crate::paths::Roots) -> PathBuf {
     roots.run_scratch().join(CAPACITY_SUBDIR)
+}
+
+/// The session-lease root — `<run scratch>/session-leases`, pi `SESSION_LEASES_DIR`
+/// (`runs/shared/session-lease.ts:8` @v0.68.0).
+///
+/// The same arithmetic, against the same resolved [`crate::paths::Roots`], as
+/// [`active_async_capacity_root_in`] — and, like it, deliberately without the [`cwd_key`] join.
+/// See [`SESSION_LEASES_SUBDIR`] for why that omission is the feature.
+///
+/// **This function is the ONLY place production resolves a lease root.** Every lease and
+/// process-terminal API takes its root as an explicit argument with no default (upstream's
+/// `rootDir = SESSION_LEASES_DIR` default parameter is deliberately NOT ported), so a test
+/// passes a `Roots::sandboxed` tempdir and there is no path by which it can reach this shared,
+/// machine-wide directory by omission. A `#[test]` that names this function is a bug —
+/// `crate::paths::Roots`'s own doc records that an unconfined root once left 59,321 files behind.
+#[must_use]
+pub fn session_leases_root_in(roots: &crate::paths::Roots) -> PathBuf {
+    roots.run_scratch().join(SESSION_LEASES_SUBDIR)
 }
 
 /// One session's capacity pool: `<capacity root>/<IndexSegment(session)>` — pi `sessionDir`

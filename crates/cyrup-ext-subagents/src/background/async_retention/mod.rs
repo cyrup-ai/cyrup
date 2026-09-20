@@ -109,8 +109,7 @@ mod wait_refs;
 
 pub use cursor::{CURSOR_NAME, RetentionCursor, cursor_path, read_cursor, write_cursor};
 pub use lock::{
-    LOCK_NAME, LOCK_STALE_MS, RetentionLockIdentity, RetentionLockOwner, lock_dir,
-    machine_hostname, process_start_identity,
+    LOCK_NAME, LOCK_STALE_MS, RetentionLockIdentity, RetentionLockOwner, lock_dir, machine_hostname,
 };
 pub use policy::{
     RECHECK_REASON_PREFIX, RetentionDecision, RunRetentionFacts, SkipReason, decide, skip_reason,

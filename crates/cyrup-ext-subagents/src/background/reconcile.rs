@@ -39,11 +39,46 @@
 //!    - **Alive or Unknown, still within the staleness threshold**: the run is presumed genuinely
 //!      still in progress — return `status.json` unmodified.
 //!
+//! # The reconciler stamps `status.processTerminal` on BOTH of its repair paths
+//!
+//! Steps 1 and 4 each write a record besides the repaired state, and they are the ONLY producers
+//! of two of [`ProcessTerminalReason`]'s ten arms (pi `stale-run-reconciler.ts:186-188` and
+//! `:248-250`). Step 1's is `observer-unavailable` — the result file proves the RUN ended and
+//! says nothing about its processes, and the runner that would have proved that never reached its
+//! own close. Step 4's is `stale-repair` — this reconciler declaring a run failed off a pid probe,
+//! with no result file and no proof. Both go through
+//! [`stamp_reconciled_process_terminal`], which reproduces upstream's gate: only an ABSENT overlay
+//! or the launch's `pending` placeholder is replaced, so a repair pass can never overwrite a
+//! verdict `finalize_process_terminal` already reached. Without this, `debug.run` would print
+//! `Status process terminal: missing` for a crashed run where pi prints the reason.
+//!
 //! `Unknown` (a permission-denied-class probe failure, e.g. under sandboxing) is deliberately
 //! treated identically to `Alive` for staleness purposes — R-SA-089 is explicit that "Unknown MUST
 //! NOT be treated as dead": a probe that cannot confirm liveness is not evidence of death, only of
 //! an inconclusive check, so it only tips over into a synthesized failure via the SAME staleness
 //! path `Alive` does, never immediately.
+//!
+//! # The start-identity rung, and the callers that deliberately do NOT take it
+//!
+//! [`check_pid_liveness`] is `kill(pid, 0)` and nothing else, so a RECYCLED pid — the number
+//! handed to an unrelated process after the original died — reads [`Liveness::Alive`] forever.
+//! [`check_pid_identity_with`] closes that: on `Alive`, when the caller holds the start identity the
+//! pid was recorded under, it re-reads
+//! [`process_start_identity`](crate::background::session_lease::process_start_identity) and
+//! answers [`Liveness::Dead`] when the two DIFFER. It is a SIBLING of [`check_pid_liveness`], not
+//! a replacement, because the rung is only sound for a caller that recorded an identity at the
+//! same moment it recorded the pid.
+//!
+//! Who takes it, and who does not:
+//!
+//! | caller | rung |
+//! |---|---|
+//! | [`crate::background::session_lease::acquire_session_lease`]'s staleness ladder | **yes** — it is pi `processDemonstrablyGone` (`session-lease.ts:162-172`) and the whole reason the lease can be reclaimed at all |
+//! | [`crate::background::async_retention::lock`]'s rung 4 (`lock.rs`) | **yes** — the owner record already carries `processStartIdentity`, and a recycled pid there retains the retention sweep lock forever |
+//! | [`crate::background::active_async_capacity`]'s release verdict | **yes** — that is the defect VL-S4 named; the owner records the identity beside the pid and the verdict compares both |
+//! | [`crate::background::control`]'s pre-signal probe | **no.** It asks "is there anything to signal" immediately before a stop/interrupt, not "is this run stale". There is no recorded identity to compare against, and the answer is consumed in the same breath. |
+//! | `extension/executor/foreground_actions/dismiss.rs` | **no.** It gates a dismissal on `is_possibly_alive()`; a false `Dead` would dismiss a live run. |
+//! | **step 4 of this module's own algorithm** | **no, deliberately.** Its `Dead` arm SYNTHESISES A FAILURE, and its 24-hour [`DEFAULT_STALE_AFTER`] threshold exists *precisely because* "OS pid reuse makes indefinite alive trust unsound" — the slow, evidence-light answer to the same hazard. Adding a same-tick identity rung here would make a run whose runner is genuinely alive-under-a-different-identity fail INSTANTLY, and reconciliation has no recorded identity to compare against in the first place ([`RunStatus`] carries `pid`, not a start identity). That is a behaviour change no ledger row asks for. **Stated here so the next reader does not "complete" the rollout and break it.** |
 //!
 //! # Injectable clock (testability)
 //!
@@ -59,6 +94,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use crate::background::process_terminal::ProcessTerminalReason;
 use crate::background::{ResultFile, RunPaths, RunState, RunStatus, StepState};
 
 // =================================================================================================
@@ -119,6 +155,56 @@ pub fn check_pid_liveness(pid: u32) -> Liveness {
     {
         let _ = pid;
         Liveness::Unknown
+    }
+}
+/// The `runnerProcessInstanceId` upstream stamps on BOTH reconciler-written process-terminal
+/// records (`stale-run-reconciler.ts:187`, `:249` @v0.68.0). It is a fixed literal there, not a
+/// restatement of the record's `reason`: the reconciler observed no runner instance at all, and
+/// that is the same fact on either repair path.
+pub(crate) const RECONCILER_UNOBSERVED_INSTANCE: &str = "observer-unavailable";
+
+/// pi `processDemonstrablyGone` (`session-lease.ts:162-172` @v0.68.0) — "this pid is
+/// demonstrably gone": DEAD, or ALIVE under a start identity that no longer matches the one
+/// recorded, which is process-id reuse.
+///
+/// Both ambient probes are INJECTED, which is pi's own shape (`:165` takes `isProcessAlive` and
+/// `getProcessStartIdentity` as required options); production callers pass
+/// [`check_pid_liveness`] and
+/// [`start_identity_of`](crate::background::session_lease::start_identity_of).
+///
+/// This is the single expression of the ladder, and
+/// [`process_demonstrably_gone`](crate::background::session_lease::process_demonstrably_gone) is
+/// this function compared against [`Liveness::Dead`]; neither re-states the rungs, so the lease's
+/// staleness verdict and reconciliation's liveness verdict can never drift apart.
+///
+/// Generic over the two probes rather than taking `fn` pointers, because its three callers carry
+/// them differently and none should have to re-state the ladder to fit: the session lease and the
+/// retention lock hold plain `fn` pointers (which coerce), while
+/// [`CapacityOptions`](crate::background::active_async_capacity::CapacityOptions) holds
+/// `Arc<dyn Fn>` probes it hands over as closures.
+#[must_use]
+pub fn check_pid_identity_with(
+    pid: u32,
+    expected: Option<&crate::background::session_lease::ProcessStartIdentity>,
+    liveness: impl FnOnce(u32) -> Liveness,
+    start_identity_of: impl FnOnce(
+        u32,
+    )
+        -> Option<crate::background::session_lease::ProcessStartIdentity>,
+) -> Liveness {
+    let observed = liveness(pid);
+    // pi `:168` — `alive === false` is the only early `true`, and `:169`'s `alive !== true` folds
+    // `Unknown` in with "no evidence".
+    if observed != Liveness::Alive {
+        return observed;
+    }
+    let Some(recorded) = expected else {
+        return Liveness::Alive;
+    };
+    // pi `:171` — `currentIdentity !== undefined && currentIdentity !== startIdentity`.
+    match start_identity_of(pid) {
+        Some(current) if current != *recorded => Liveness::Dead,
+        _ => Liveness::Alive,
     }
 }
 
@@ -347,6 +433,72 @@ pub async fn reconcile_now(
 // Internal helpers
 // =================================================================================================
 
+// =================================================================================================
+// The reconciler's own process-terminal overlay (pi `stale-run-reconciler.ts:187`, `:249`)
+// =================================================================================================
+
+/// pi `stale-run-reconciler.ts:186-188` and `:248-250` — the two places upstream's stale-run
+/// reconciler stamps `status.processTerminal` on a run it just repaired.
+///
+/// This is the ONLY producer of [`ProcessTerminalReason::ObserverUnavailable`] and
+/// [`ProcessTerminalReason::StaleRepair`]. Both say the same thing from two directions: the run's
+/// own runner never finalized its close, so the answer on the status is a REPAIR, not a proof.
+/// `finalize_process_terminal` can never write either, because a runner that reached that line by
+/// definition had an observer — itself.
+///
+/// # The gate, and what it means here
+///
+/// Upstream's condition is
+/// `status.lifecycleArtifactVersion === 3 && (!status.processTerminal || status.processTerminal.state === "pending")`.
+/// cyrup has no `lifecycleArtifactVersion` FIELD on [`RunStatus`] — every status this build writes
+/// is the current lifecycle version by construction (the constant lives at
+/// [`SUBAGENT_LIFECYCLE_ARTIFACT_VERSION`](crate::background::process_terminal::SUBAGENT_LIFECYCLE_ARTIFACT_VERSION)
+/// and is stamped on the `events.jsonl` line and on the RPC `ping`), so that conjunct is
+/// vacuously true and only the second one survives.
+///
+/// The second conjunct is the load-bearing one and is reproduced exactly: an `observed` or
+/// `unknown` overlay is a real verdict somebody already reached, and a repair pass must not
+/// overwrite it with a guess. Only an ABSENT overlay, or the `pending` placeholder
+/// `initialize_process_terminal` wrote, is replaced.
+///
+/// # `[CYRUP-DELTA]` — the run's real runner instance, where upstream writes a literal
+///
+/// Upstream sets `runnerProcessInstanceId: "observer-unavailable"` in both records — a placeholder
+/// in an identity field, because at that point its reconciler has no instance id to hand. cyrup
+/// does: the launch minted one before the spawn and `initialize_process_terminal` stamped it onto
+/// the `pending` overlay this function is replacing, so the repair keeps it. That is not cosmetic.
+/// Every reader of this field re-applies pi `run-status.ts:53`'s expectation check — `debug.run`'s
+/// `debug_process_terminal` does, and
+/// [`runner_release_verdict`](crate::background::active_async_capacity::runner_release_verdict)
+/// does — and a record carrying a literal where an instance belongs FAILS that check, degrading
+/// the operator's line from `unknown (stale-repair) · runner <id>` to
+/// `unknown (proof-write-failed)` and throwing away the very reason this record exists to carry.
+/// Upstream's literal is kept only for the case cyrup genuinely matches it: a status with no
+/// recorded instance at all.
+fn stamp_reconciled_process_terminal(status: &mut RunStatus, reason: ProcessTerminalReason) {
+    use crate::background::process_terminal::{
+        ProcessTerminal, ProcessTerminalBase, ProcessTerminalState, RunnerProcessInstanceId,
+    };
+
+    // pi `(!status.processTerminal || status.processTerminal.state === "pending")`.
+    let instance = match status.process_terminal.as_ref() {
+        Some(existing) if existing.state() != ProcessTerminalState::Pending => return,
+        Some(existing) => existing.runner_process_instance_id().clone(),
+        // pi's own literal, for the one case cyrup has nothing better: a run whose status never
+        // carried an overlay, so no instance was ever recorded on it. Upstream writes
+        // `runnerProcessInstanceId: "observer-unavailable"` in BOTH reconciler records
+        // (`stale-run-reconciler.ts:187` and `:249` @v0.68.0) and varies only `reason`, so this is
+        // the fixed literal and NOT `reason.as_str()` — which would write `stale-repair` here on
+        // the `synthesize_failure` path and diverge from the shape pi's own readers expect.
+        None => RunnerProcessInstanceId::from_token(RECONCILER_UNOBSERVED_INSTANCE),
+    };
+    status.process_terminal = Some(ProcessTerminal::Unknown {
+        base: ProcessTerminalBase::new(status.run_id.clone(), instance),
+        reason,
+        diagnostic: None,
+    });
+}
+
 /// Step 1's repair action: a [`ResultFile`] exists on disk, so it is authoritative. If
 /// `status.json` (read fresh here, independent of whatever the caller may already have loaded)
 /// still claims a non-terminal state, repair it in place to match the result file's own `state`
@@ -419,6 +571,12 @@ async fn repair_from_result(
         .ended_at
         .or_else(|| Some(crate::time::epoch_millis(SystemTime::now())));
     repaired.last_update = crate::time::epoch_millis(SystemTime::now());
+    // pi `terminalStatusFromResult`'s `:186-188` (`reason: "observer-unavailable"` at `:187`). The result file proves the run ENDED; it proves
+    // nothing about the runner's processes, and the runner that would have proved that never
+    // reached its own close. `observer-unavailable` is that distinction, and it is what makes
+    // `debug.run` print `unknown (observer-unavailable)` instead of `missing` for a run whose
+    // result landed but whose runner was killed.
+    stamp_reconciled_process_terminal(&mut repaired, ProcessTerminalReason::ObserverUnavailable);
 
     crate::background::atomic::write_atomic_json(&paths.status, &repaired).await?;
 
@@ -543,6 +701,11 @@ async fn synthesize_failure(
     status.state = RunState::Failed;
     status.last_update = now_ms;
     status.ended_at = Some(now_ms);
+    // pi `buildFailedRepair`'s `:248-250` (`reason: "stale-repair"` at `:249`). This is the reconciler declaring a run failed on a pid
+    // probe, with no result file and no proof — so the overlay says `stale-repair` and NOT
+    // `observed`, and every reader that branches on the proof (the capacity release rung, the
+    // active-run index's staleness disjunct) correctly declines to treat it as one.
+    stamp_reconciled_process_terminal(status, ProcessTerminalReason::StaleRepair);
 
     crate::background::atomic::write_atomic_json(&paths.status, status).await?;
 
@@ -833,6 +996,116 @@ mod tests {
     use super::*;
     use crate::background::{RunId, RunMode, StepStatus};
     use std::process::Stdio;
+
+    // =============================================================================================
+    // check_pid_identity_with — the start-identity rung (VL-S4's named defect)
+    // =============================================================================================
+
+    use crate::background::session_lease::{ProcessStartIdentity, process_start_identity};
+
+    fn identity(token: &str) -> ProcessStartIdentity {
+        ProcessStartIdentity::from_token(token)
+    }
+
+    /// DoD 8 — `check_pid_liveness` is `kill(pid, 0)` and nothing else, so a RECYCLED pid reads
+    /// [`Liveness::Alive`] forever. `check_pid_identity_with` is what closes that.
+    ///
+    /// Gutted to plain [`check_pid_liveness`]: the recycled pid reads `Alive`, the capacity slot
+    /// whose runner died is retained for the life of the machine, and the retention lock whose
+    /// owner died is never broken. That is exactly the defect `PARITY-GAPS.md` records for VL-S4.
+    ///
+    /// The three cases after the first are the COUNTER-gutting. An over-eager rung that read a
+    /// missing identity, an absent expectation or an inconclusive probe as death would kill live
+    /// runs — strictly worse than the hole it closes.
+    #[test]
+    fn check_pid_identity_with_reports_dead_for_a_recycled_pid() {
+        const PID: u32 = 4242;
+        let recorded = identity("linux:100");
+
+        // Alive, under a DIFFERENT identity: the number was recycled onto another process.
+        assert_eq!(
+            check_pid_identity_with(
+                PID,
+                Some(&recorded),
+                |_| Liveness::Alive,
+                |_| Some(identity("linux:999")),
+            ),
+            Liveness::Dead,
+        );
+
+        // Alive, under the SAME identity: still the same process.
+        assert_eq!(
+            check_pid_identity_with(
+                PID,
+                Some(&recorded),
+                |_| Liveness::Alive,
+                |_| Some(identity("linux:100")),
+            ),
+            Liveness::Alive,
+        );
+
+        // Alive, and this platform cannot read an identity at all: absence is not evidence.
+        assert_eq!(
+            check_pid_identity_with(PID, Some(&recorded), |_| Liveness::Alive, |_| None),
+            Liveness::Alive,
+        );
+
+        // Alive, and the caller recorded NO identity: there is nothing to compare.
+        assert_eq!(
+            check_pid_identity_with(
+                PID,
+                None,
+                |_| Liveness::Alive,
+                |_| Some(identity("linux:9"))
+            ),
+            Liveness::Alive,
+        );
+
+        // `Unknown` (an `EPERM`-class probe under sandboxing) is NEVER upgraded — R-SA-089.
+        assert_eq!(
+            check_pid_identity_with(
+                PID,
+                Some(&recorded),
+                |_| Liveness::Unknown,
+                |_| Some(identity("linux:999")),
+            ),
+            Liveness::Unknown,
+        );
+
+        // And `Dead` stays `Dead` without the probe ever being consulted.
+        assert_eq!(
+            check_pid_identity_with(
+                PID,
+                Some(&recorded),
+                |_| Liveness::Dead,
+                |_| panic!("a confirmed-dead pid must not be asked for a start identity")
+            ),
+            Liveness::Dead,
+        );
+    }
+
+    /// The production probes, over THIS process: alive, and its real recorded identity matches
+    /// itself, so the rung must not fire. A `Dead` here would mean this build declares every live
+    /// process gone.
+    #[test]
+    fn check_pid_identity_with_over_this_live_process_is_alive() {
+        let pid = std::process::id();
+        let current = process_start_identity(pid);
+        let ambient = |expected: Option<&ProcessStartIdentity>| {
+            check_pid_identity_with(pid, expected, check_pid_liveness, process_start_identity)
+        };
+        assert_eq!(ambient(current.as_ref()), Liveness::Alive);
+        assert_eq!(ambient(None), Liveness::Alive);
+        // A fabricated identity for a pid that really is this process IS the recycled shape, and
+        // is the one arm that must answer `Dead` — on a platform that can read one at all.
+        let fabricated = identity("linux:0");
+        let expected = if current.is_some() {
+            Liveness::Dead
+        } else {
+            Liveness::Alive
+        };
+        assert_eq!(ambient(Some(&fabricated)), expected);
+    }
 
     fn temp_paths() -> (tempfile::TempDir, RunPaths) {
         let dir = tempfile::tempdir().expect("real tempdir");
@@ -1266,6 +1539,197 @@ mod tests {
         assert!(
             !reread_result.results.is_empty(),
             "a synthesized diagnostic result must be present"
+        );
+    }
+
+    /// pi `stale-run-reconciler.ts:186-188` and `:248-250` — the reconciler's own
+    /// `status.processTerminal`, which is the ONLY producer of two of the ten
+    /// [`ProcessTerminalReason`] arms.
+    ///
+    /// Without it `debug.run` prints `Status process terminal: missing` for a run whose runner was
+    /// killed, where pi prints the reason — the diagnostic is simply absent, and the two arms are
+    /// unreachable code sitting in an enum. Both repair paths are driven here, plus the GATE that
+    /// keeps a repair pass from overwriting a verdict the ladder already reached.
+    #[tokio::test]
+    async fn both_repair_paths_stamp_the_reconcilers_own_process_terminal() {
+        use crate::background::process_terminal::{
+            ProcessTerminal, ProcessTerminalBase, ProcessTerminalState, RunnerProcessInstanceId,
+        };
+
+        // ---- step 4: the pid-probe failure synthesis -> `stale-repair` -------------------------
+        let (_dir, paths) = temp_paths();
+        let run_id = run_id_from_paths(&paths);
+        let dead_pid = spawn_and_reap_dead_pid();
+        let instance = RunnerProcessInstanceId::from_token("minted-at-launch");
+        let mut status = running_status(
+            run_id.clone(),
+            dead_pid,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
+        status.session_id = crate::identity::SessionId::parse("test-session");
+        // The launch's own placeholder, exactly as `initialize_process_terminal` leaves it.
+        status.process_terminal = Some(ProcessTerminal::Pending {
+            base: ProcessTerminalBase::new(run_id.clone(), instance.clone()),
+        });
+        crate::background::atomic::write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
+
+        let outcome = reconcile(
+            &paths,
+            None,
+            SystemTime::now(),
+            check_pid_liveness,
+            DEFAULT_SPAWN_GRACE,
+            DEFAULT_STALE_AFTER,
+        )
+        .await
+        .expect("reconcile succeeds");
+        assert_eq!(outcome.action, ReconcileAction::SynthesizedFailure);
+        let stamped = outcome
+            .status
+            .process_terminal
+            .as_ref()
+            .expect("the repair stamps its own record");
+        assert_eq!(
+            stamped.state(),
+            ProcessTerminalState::Unknown,
+            "{stamped:?}"
+        );
+        assert_eq!(
+            stamped.reason(),
+            Some(ProcessTerminalReason::StaleRepair),
+            "{stamped:?}"
+        );
+        // `[CYRUP-DELTA]` — the run's REAL minted instance, not upstream's literal placeholder,
+        // so `debug.run`'s `:53` expectation check passes and the line reads
+        // `unknown (stale-repair) · runner <id>` instead of degrading to `proof-write-failed`.
+        assert_eq!(
+            *stamped.runner_process_instance_id(),
+            instance,
+            "{stamped:?}"
+        );
+        // It is on DISK, not merely on the returned value.
+        let reread: RunStatus =
+            serde_json::from_slice(&tokio::fs::read(&paths.status).await.expect("status.json"))
+                .expect("valid JSON");
+        assert_eq!(
+            reread
+                .process_terminal
+                .as_ref()
+                .and_then(ProcessTerminal::reason),
+            Some(ProcessTerminalReason::StaleRepair)
+        );
+
+        // ---- step 1: the result-file repair -> `observer-unavailable` --------------------------
+        let (_dir2, paths2) = temp_paths();
+        let run_id2 = run_id_from_paths(&paths2);
+        let mut status2 = running_status(
+            run_id2.clone(),
+            999_999,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
+        status2.process_terminal = Some(ProcessTerminal::Pending {
+            base: ProcessTerminalBase::new(run_id2.clone(), instance.clone()),
+        });
+        crate::background::atomic::write_atomic_json(&paths2.status, &status2)
+            .await
+            .expect("write status");
+        let result = ResultFile {
+            schedule_origin: None,
+            id: run_id2.clone(),
+            run_id: run_id2.clone(),
+            agent: "researcher".to_string(),
+            mode: RunMode::Single,
+            state: RunState::Complete,
+            success: true,
+            cwd: paths2.run_dir.clone(),
+            session_file: None,
+            session_id: None,
+            completion_owner_id: None,
+            results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
+        };
+        crate::background::atomic::write_atomic_json(&paths2.legacy_result_root, &result)
+            .await
+            .expect("write result");
+        let repaired = reconcile(
+            &paths2,
+            None,
+            SystemTime::now(),
+            check_pid_liveness,
+            DEFAULT_SPAWN_GRACE,
+            DEFAULT_STALE_AFTER,
+        )
+        .await
+        .expect("reconcile succeeds");
+        assert_eq!(repaired.status.state, RunState::Complete);
+        assert_eq!(
+            repaired
+                .status
+                .process_terminal
+                .as_ref()
+                .and_then(ProcessTerminal::reason),
+            Some(ProcessTerminalReason::ObserverUnavailable),
+            "the result proves the RUN ended, never that its processes did: {:?}",
+            repaired.status.process_terminal
+        );
+
+        // ---- the GATE: an existing verdict is never overwritten --------------------------------
+        let (_dir3, paths3) = temp_paths();
+        let run_id3 = run_id_from_paths(&paths3);
+        let mut status3 = running_status(
+            run_id3.clone(),
+            spawn_and_reap_dead_pid(),
+            crate::time::epoch_millis(SystemTime::now()),
+        );
+        status3.session_id = crate::identity::SessionId::parse("test-session");
+        // A VALID observed proof: `validate_proof` refuses an observed record with no matching
+        // runner instance (`:174`), and the status decoder applies it on the way back in — a
+        // proof without this would degrade to `proof-write-failed` at READ time and the gate
+        // would be tested against the wrong shape.
+        status3.process_terminal = Some(ProcessTerminal::Observed {
+            base: ProcessTerminalBase::new(run_id3.clone(), instance.clone()),
+            observed_at: 1_700_000_000_000,
+            instances: vec![
+                crate::background::process_terminal::ProcessInstanceExit::Runner {
+                    process_instance_id: instance.clone(),
+                    close_observed_at: 1_700_000_000_000,
+                    exit_code: Some(0),
+                    signal: None,
+                },
+            ],
+            canonical_session: None,
+        });
+        crate::background::atomic::write_atomic_json(&paths3.status, &status3)
+            .await
+            .expect("write status");
+        let guarded = reconcile(
+            &paths3,
+            None,
+            SystemTime::now(),
+            check_pid_liveness,
+            DEFAULT_SPAWN_GRACE,
+            DEFAULT_STALE_AFTER,
+        )
+        .await
+        .expect("reconcile succeeds");
+        assert_eq!(
+            guarded.status.state,
+            RunState::Failed,
+            "the repair still ran"
+        );
+        assert_eq!(
+            guarded
+                .status
+                .process_terminal
+                .as_ref()
+                .map(ProcessTerminal::state),
+            Some(ProcessTerminalState::Observed),
+            "pi's `!status.processTerminal || state === \"pending\"` gate: a proof somebody \
+             already reached outranks a repair's guess: {:?}",
+            guarded.status.process_terminal
         );
     }
 

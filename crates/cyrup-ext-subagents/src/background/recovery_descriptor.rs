@@ -1100,6 +1100,8 @@ mod tests {
 
     fn runner_config(step: SingleStepSpec, persona: ResolvedAgentPersona) -> RunnerConfig {
         RunnerConfig {
+            runner_process_instance_id: None,
+            revival_lease: None,
             run_id: RunId::from_token("run-launch".to_string()),
             mode: RunMode::Single,
             steps: vec![RunnerStep::SingleStep(step)],

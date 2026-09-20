@@ -1,8 +1,9 @@
-//! Seam tests drained from **`crates/cyrup-ext-subagents`** — 39 files today: the 35 the
+//! Seam tests drained from **`crates/cyrup-ext-subagents`** — 41 files today: the 35 the
 //! migration below drained, minus `verify_redaction_inherited_env` (removed when the workspace
 //! grew a safe env seam), plus `watchdog_model_turn_integration`,
 //! `watchdog_permission_arbiter_integration`, `child_transcript_live_integration`,
-//! `refinement_proposal_refusal_integration` and `debug_run_lifecycle_integration`, added since
+//! `refinement_proposal_refusal_integration`, `debug_run_lifecycle_integration`,
+//! `process_terminal_lifecycle_integration` and `session_lease_revival_integration`, added since
 //! under the same rule.
 //!
 //! What makes a test belong here: it drives a real subagent CHILD PROCESS, or it mutates this
@@ -87,7 +88,9 @@ mod foreground_progress_stream_integration;
 mod background_cascade_integration;
 mod background_runner_main_integration;
 mod background_spawn_detached_integration;
+mod process_terminal_lifecycle_integration;
 mod run_state_signal_and_stop_parity;
+mod session_lease_revival_integration;
 mod startup_retry_lifecycle_integration;
 
 // ---- exec: the synchronous run path, step chaining, parallelism, artifacts ----

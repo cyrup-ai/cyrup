@@ -445,6 +445,11 @@ impl SubagentExecutor {
             context: Some(descriptor.context.unwrap_or(ContextMode::Fork)),
             agent_scope: None,
         };
+        // Minted here rather than inline in the spec: the revival LEASE names the same run id the
+        // launch uses, and a second `RunId::new()` would give the lease's owner record a run id
+        // that appears nowhere else — so a reader of a refused revival's conflict sentence could
+        // not find the run it names.
+        let revived_run_id = RunId::new();
         let new_id = self
             .spawn_background_steps(
                 &effective_cwd,
@@ -465,7 +470,26 @@ impl SubagentExecutor {
                     // run on ONE slot across a revive — acquiring afresh would double-charge the
                     // session, and at a cap of 1 the source's own retained slot would make this
                     // revive refuse itself with the exhausted sentence.
-                    transfer_from: Some(source_id),
+                    transfer_from: Some(source_id.clone()),
+                    // VL-S3 — pi `config.revivalLease` (`subagent-runner.ts:219`, acquired at
+                    // `:5242`). THIS is the one cyrup path that reopens a stored session
+                    // transcript for writing, and the lease is what stops a second revival of the
+                    // same file from running beside this one: upstream's own hazard statement is
+                    // the conflict sentence itself — *"Wait for that revival to finish or start a
+                    // separate continuation without reusing this session file."*
+                    //
+                    // All four fields are already in hand here and none is derived: the session
+                    // file is this call's own argument, the run id is the one just minted for the
+                    // revived run, the source is the settled async run being revived FROM, and the
+                    // parent session is this orchestrator's. The RUNNER acquires it — see
+                    // `RunnerConfig::revival_lease` — because the claim's lifetime is the
+                    // runner's, not this call's.
+                    revival_lease: Some(crate::background::session_lease::SessionLeaseRequest {
+                        session_file: session_file.to_path_buf(),
+                        run_id: revived_run_id.clone(),
+                        source_run_id: source_id,
+                        parent_session_id: self.current_session_id(),
+                    }),
                     steps: vec![RunnerStep::SingleStep(step)],
                     mode: RunMode::Single,
                     session_file: Some(session_file.to_path_buf()),
@@ -487,7 +511,7 @@ impl SubagentExecutor {
                     }),
                     // SUBA-N06: the launch's own `includeProgress`, back off the descriptor.
                     include_progress: descriptor.include_progress,
-                    run_id: RunId::new(),
+                    run_id: revived_run_id,
                     // pi's plain `resume` does not re-arm the launch deadline
                     // (`subagent-executor.ts:2180-2181`); only the unported steering-recovery path
                     // does. The descriptor's `absoluteDeadlineAt` is evidence, not a limit here.

@@ -898,6 +898,7 @@ mod tests {
                     turn_budget: None,
                     permission_rules: None,
                     transfer_from: None,
+                    revival_lease: None,
                     thinking_ceiling: None,
                     capability_ceiling: None,
                     model_origin: None,

@@ -298,6 +298,8 @@ impl SubagentExecutor {
                 // SCOPE_9: a fresh top-level async run, never a resume — it charges the
                 // session's cap in its own right.
                 transfer_from: None,
+                // VL-S3: a fresh launch, not a revival of a stored session file — no lease.
+                revival_lease: None,
                 // A fresh launch inherits this process's ceilings through env; only a revive
                 // carries an explicit ceiling to re-apply.
                 thinking_ceiling: None,
@@ -450,6 +452,7 @@ impl SubagentExecutor {
             permission_rules,
             usage_budget,
             transfer_from,
+            revival_lease,
             thinking_ceiling: requested_thinking_ceiling,
             capability_ceiling: requested_capability_ceiling,
             model_origin: stored_model_origin,
@@ -653,6 +656,13 @@ impl SubagentExecutor {
         // `cfg` below by the struct literal — `dynamic_fanout_max_items()` takes `&self` on the
         // whole (by-then-partially-moved) `cfg`, so it must be evaluated first.
         let dynamic_fanout_max_items = cfg.dynamic_fanout_max_items();
+        // pi `async-execution.ts:707`: ONE fresh v4 uuid per launch, minted in the PARENT before
+        // anything is written, because it has to reach four places that must all agree — the
+        // runner's config, the process-terminal candidate, the pending proof sidecar, and the
+        // runner's own `status.json`. Minting it inside the runner would make the orchestrator's
+        // own record of the launch unmatched against the proof the runner later writes.
+        let runner_process_instance_id =
+            crate::background::process_terminal::RunnerProcessInstanceId::new();
         let runner_config = crate::background::runner_main::RunnerConfig {
             // SUBA-021 — the run-level usage budget the orchestrator validated, carried verbatim
             // onto hop 2 (pi `spawnRunner({ …, usageBudget })`, `async-execution.ts:1471`).
@@ -663,6 +673,16 @@ impl SubagentExecutor {
             // carried verbatim.
             permission_rules,
             run_id: run_id.clone(),
+            // pi `async-execution.ts:707` `const runnerProcessInstanceId = randomUUID();` — minted
+            // HERE, in the parent, before the config is written, and carried into the child at
+            // `:710`. This one value is the identity every process-terminal artifact this run
+            // produces is keyed on.
+            runner_process_instance_id: Some(runner_process_instance_id.clone()),
+            // VL-S3 — pi `config.revivalLease` (`subagent-runner.ts:5241`). The ORCHESTRATOR
+            // decides that a launch is a revival; the RUNNER is the process that holds the claim,
+            // for exactly as long as it runs. Carried verbatim, never derived here: see
+            // `BackgroundStepsSpec::revival_lease`.
+            revival_lease,
             mode,
             steps,
             cwd: cwd.to_path_buf(),
@@ -837,6 +857,37 @@ impl SubagentExecutor {
                 encoded,
             );
         }
+        // pi `initializeProcessTerminal(launchAsyncDir, launchRunId, runnerProcessInstanceId)`
+        // (`async-execution.ts:851`), whose own contract is *"Establish ownership before
+        // authorizing a runner to start any child session."* (`process-terminal.ts:118`).
+        //
+        // [CYRUP-DELTA — placement, not behaviour.] Upstream calls it AFTER the spawn because its
+        // runner is held at a startup barrier: it blocks on
+        // `waitForStartupControl(startupProceedPath, launchBarrierToken, "proceed")`
+        // (`subagent-runner.ts:5233-5240`) and cannot touch a child session until the parent
+        // writes the proceed token at `async-execution.ts:868`. cyrup has NO such barrier —
+        // `grep -rn 'launch_barrier\|startup-proceed\|runner-startup' crates/cyrup-ext-subagents/src`
+        // matches no CODE (only this comment and `initialize_process_terminal`'s, each quoting the
+        // grep), and `spawn_detached_runner_with_command` returns with the runner already
+        // running — so in cyrup the SPAWN *is* the authorization and the only placement that
+        // satisfies that contract is before it. Nothing in `initialize_process_terminal` needs the
+        // runner's pid, so there is no obstacle.
+        //
+        // A failure REFUSES THE LAUNCH, exactly as upstream's own `catch` does (`:853-857`
+        // terminates the runner and returns the error): a run whose ownership could not be
+        // established has no proof anyone can read, and every later reader would be left to guess.
+        // Refusing here is cheaper than upstream's equivalent — no process exists yet to kill.
+        if let Err(error) = crate::background::process_terminal::initialize_process_terminal(
+            &crate::background::RunDir::for_existing(&run_paths.run_dir),
+            &run_id,
+            &runner_process_instance_id,
+        )
+        .await
+        {
+            Self::rollback_capacity(capacity.as_mut(), &run_id).await;
+            return Err(SubagentError::Spawn(error));
+        }
+
         let pid = match crate::background::spawn_detached::spawn_detached_runner_with_command(
             &resolved_command,
             &cfg_path,
@@ -854,16 +905,21 @@ impl SubagentExecutor {
         };
 
         // SCOPE_9 — pi `markStarted` (`async-execution.ts:1409`, `:1422`), at its exact position:
-        // the first statement after the spawn is CONFIRMED. §D3: the identity bound is the runner
-        // pid, cyrup's only start-proof, and binding it is what promotes the slot from a
-        // rollbackable reservation to a real run whose slot only reconciliation may reclaim.
+        // the first statement after the spawn is CONFIRMED. The bind carries pi's own
+        // `runnerProcessInstanceId` — the uuid minted above, the value the release verdict matches
+        // this run's process-terminal proof against — together with the runner pid and that pid's
+        // start identity, which are the no-proof fallback ladder beneath it. Binding is what
+        // promotes the slot from a rollbackable reservation to a real run whose slot only
+        // reconciliation may reclaim.
         //
         // A failure here is logged and NOT propagated: the detached runner is already running, and
         // failing the spawn over a bookkeeping write would orphan a live process. The handle
         // releases the slot itself when the durable bind cannot land (see `mark_started`), so the
         // worst case is one extra admission, never a permanently held slot.
         if let Some(handle) = capacity.as_mut()
-            && let Err(error) = handle.mark_started(pid).await
+            && let Err(error) = handle
+                .mark_started(pid, runner_process_instance_id.clone())
+                .await
         {
             tracing::warn!(
                 run_id = %run_id,
@@ -2824,6 +2880,29 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
             // the transcript the revive is seeded from (pi `revivalSessionFile`)
             assert_eq!(step.session_file.as_deref(), Some(session_file.as_path()));
             assert_eq!(cfg.session_file.as_deref(), Some(session_file.as_path()));
+            // VL-S3, the ORCHESTRATOR half — pi `config.revivalLease` (`subagent-runner.ts:219`,
+            // acquired at `:5242`), built in `control.rs::revive_from_transcript`. This is the one
+            // path in cyrup that reopens a stored transcript for WRITING, and without the request
+            // on the config the runner takes no lease at all: two revives of one session file
+            // would both spawn, both open the same `.jsonl` for writing, and interleave turns —
+            // VL-S3's exact hazard, reintroduced by one word. Asserted at the `runner-config.json`
+            // boundary because that file IS the whole hop-1 -> hop-2 contract; the lease
+            // integration test builds the request by hand and so cannot see this seam.
+            let lease = cfg
+                .revival_lease
+                .as_ref()
+                .expect("a revive must carry a session lease request to its runner");
+            assert_eq!(lease.session_file.as_path(), session_file.as_path());
+            assert_eq!(
+                lease.run_id, revived,
+                "the claim is recorded against the REVIVED run, which is the process that will \
+                 hold it"
+            );
+            assert_eq!(
+                lease.source_run_id, launch.run_id,
+                "the breadcrumb names the settled run this revive continues, which is what the \
+                 conflict sentence reads back to the operator"
+            );
             // tools/extensions ride the persona, never the step (pi overlays `agentConfig.*`)
             assert_eq!(step.tools, None);
             assert_eq!(step.extensions, None);
@@ -3046,6 +3125,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                         turn_budget: None,
                         permission_rules: None,
                         transfer_from: None,
+                        revival_lease: None,
                         thinking_ceiling: None,
                         capability_ceiling: None,
                         model_origin: None,
@@ -3087,6 +3167,195 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                 capacity_slots(dir.path(), "descriptor-write-failure").await,
                 0,
                 "the claim is rolled back on this early return like every other past it"
+            );
+        }
+
+        /// Builds the `BackgroundStepsSpec` this module's process-terminal tests launch with — a
+        /// single step against the `worker` persona, nothing else set.
+        fn process_terminal_launch_spec(
+            run_id: RunId,
+            persona: ResolvedAgentPersona,
+        ) -> BackgroundStepsSpec {
+            BackgroundStepsSpec {
+                usage_budget: None,
+                turn_budget: None,
+                permission_rules: None,
+                transfer_from: None,
+                revival_lease: None,
+                thinking_ceiling: None,
+                capability_ceiling: None,
+                model_origin: None,
+                steps: vec![RunnerStep::SingleStep(SingleStepSpec {
+                    agent: "worker".to_string(),
+                    task: "do the thing".to_string(),
+                    cwd: None,
+                    model: None,
+                    tools: None,
+                    extensions: None,
+                    session_file: None,
+                    max_depth_override: None,
+                    structured_output_schema: None,
+                    output: None,
+                    output_path: None,
+                    output_mode: None,
+                    reads: None,
+                    acceptance: None,
+                    skills: None,
+                    session_dir: None,
+                    context: Some(ContextMode::Fresh),
+                    agent_scope: None,
+                })],
+                mode: RunMode::Single,
+                session_file: None,
+                resolved_agents: BTreeMap::from([("worker".to_string(), persona)]),
+                original_task: "do the thing".to_string(),
+                chain_dir: None,
+                control: None,
+                include_progress: None,
+                run_id,
+                timeout_ms: None,
+                share: None,
+                artifacts_dir: None,
+                artifact_config: ArtifactConfig::default(),
+            }
+        }
+
+        /// P1 + P2 — pi `async-execution.ts:707` (`const runnerProcessInstanceId = randomUUID();`),
+        /// `:710` (carried into the child's launch config) and `:851`
+        /// (`initializeProcessTerminal`).
+        ///
+        /// THE USER ACTION: an agent delegates a background run, the runner is SIGKILLed a moment
+        /// later, and the agent asks what happened. Everything that can answer that question is
+        /// keyed on ONE value minted here, before the process exists — so this test asserts that
+        /// the orchestrator really mints it, really writes it onto the runner's config, and really
+        /// establishes both lifecycle artifacts BEFORE the spawn. Without the last part the runner
+        /// could reach its own candidate write first and the launch would clobber it.
+        #[tokio::test]
+        async fn a_launch_mints_one_identity_and_establishes_both_lifecycle_artifacts() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_persona(dir.path(), "worker", NARROW_MD);
+            let executor = SubagentExecutor::new();
+            executor.set_host_services(Arc::new(FixedSessionHost("process-terminal-launch")));
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = Roots::sandboxed(dir.path());
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+            }
+            let roots = Roots::sandboxed(dir.path());
+            let run_id = RunId::new();
+            let run_paths = RunPaths::for_run(
+                &default_async_root_in(&roots, dir.path()),
+                &default_results_dir_in(&roots, dir.path()),
+                &run_id,
+            );
+            let agent = executor
+                .resolve_agent(dir.path(), "worker", AgentReadScope::Both, &roots)
+                .expect("the persona resolves");
+            let persona = crate::exec::resolve_step_agent_config(&agent);
+            executor
+                .spawn_background_steps(
+                    dir.path(),
+                    process_terminal_launch_spec(run_id.clone(), persona),
+                )
+                .await
+                .expect("the launch succeeds");
+
+            let run_dir = RunDir::for_existing(&run_paths.run_dir);
+            let config = read_runner_config(&run_paths.run_dir);
+            let minted = config
+                .runner_process_instance_id
+                .clone()
+                .expect("the orchestrator mints an identity and carries it to the runner");
+
+            // The candidate: 0600, this run, this identity, and EMPTY — the emptiness is what
+            // makes a runner that dies before declaring anything distinguishable from one that
+            // finished (see `initialize_process_terminal`).
+            let candidate =
+                crate::background::process_terminal::read_process_terminal_candidate(&run_dir)
+                    .await
+                    .expect("the candidate reads")
+                    .expect("the launch wrote a candidate before spawning the runner");
+            assert_eq!(candidate.run_id, run_id);
+            assert_eq!(candidate.runner_process_instance_id, minted);
+            assert!(candidate.writers.is_empty(), "{candidate:?}");
+            assert!(candidate.expected_writers.is_none(), "{candidate:?}");
+
+            // The pending sidecar, carrying the SAME identity — the value every later reader
+            // matches a proof against.
+            let proof = crate::background::process_terminal::read_process_terminal(
+                &run_dir,
+                crate::background::process_terminal::ProofExpectation::new(&run_id, &minted),
+            )
+            .await
+            .expect("the launch wrote a pending proof");
+            assert_eq!(
+                proof.state(),
+                crate::background::process_terminal::ProcessTerminalState::Pending,
+                "a launch has observed nothing yet: {proof:?}"
+            );
+            assert_eq!(*proof.runner_process_instance_id(), minted);
+        }
+
+        /// The other half of P2's placement: establishing ownership is a FALLIBLE PRE-SPAWN step,
+        /// so a launch that cannot write its lifecycle artifacts is REFUSED and its capacity claim
+        /// rolled back — upstream terminates the runner and fails the launch on the same error
+        /// (`async-execution.ts:853-857`), which cyrup can do more cheaply because no process
+        /// exists yet.
+        ///
+        /// Forced the same way the recovery-descriptor test forces its own failure: the candidate
+        /// path is pre-occupied by a DIRECTORY, so the atomic rename cannot land.
+        #[tokio::test]
+        async fn a_launch_that_cannot_establish_ownership_is_refused_and_rolls_back_its_slot() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_persona(dir.path(), "worker", NARROW_MD);
+            let executor = SubagentExecutor::new();
+            executor.set_host_services(Arc::new(FixedSessionHost("process-terminal-refusal")));
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = Roots::sandboxed(dir.path());
+                cfg.max_active_async_runs_per_session = Some(1);
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+            }
+            let roots = Roots::sandboxed(dir.path());
+            let run_id = RunId::new();
+            let run_paths = RunPaths::for_run(
+                &default_async_root_in(&roots, dir.path()),
+                &default_results_dir_in(&roots, dir.path()),
+                &run_id,
+            );
+            std::fs::create_dir_all(
+                RunDir::for_existing(&run_paths.run_dir).process_terminal_candidate(),
+            )
+            .expect("occupy the candidate path with a directory");
+            let agent = executor
+                .resolve_agent(dir.path(), "worker", AgentReadScope::Both, &roots)
+                .expect("the persona resolves");
+            let persona = crate::exec::resolve_step_agent_config(&agent);
+
+            let error = executor
+                .spawn_background_steps(
+                    dir.path(),
+                    process_terminal_launch_spec(run_id.clone(), persona),
+                )
+                .await
+                .expect_err("a launch that cannot establish ownership must fail");
+            assert!(matches!(error, SubagentError::Spawn(_)), "{error:?}");
+            assert_eq!(
+                capacity_slots(dir.path(), "process-terminal-refusal").await,
+                0,
+                "the claim is rolled back on this early return like every other past it"
+            );
+            assert!(
+                !RunDir::for_existing(&run_paths.run_dir)
+                    .process_terminal()
+                    .exists(),
+                "a refused launch leaves no proof for a reader to trust"
             );
         }
 

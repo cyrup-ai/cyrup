@@ -663,6 +663,8 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         .expect("mkdir run dir");
 
     let config = RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
         host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,

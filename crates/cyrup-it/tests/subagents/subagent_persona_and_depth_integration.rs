@@ -180,6 +180,8 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
         host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
@@ -404,6 +406,8 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
         host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
@@ -773,6 +777,8 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     // already blocked — the same terminal state a genuinely deep chain reaches once the T0.3
     // increment has walked the inherited depth up to the ceiling across successive spawns.
     let config = RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
         host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
@@ -1209,6 +1215,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
                 usage_budget: None,
                 // SCOPE_9: a fresh run, not a resume — nothing to transfer a capacity slot from.
                 transfer_from: None,
+                revival_lease: None,
                 thinking_ceiling: None,
                 capability_ceiling: None,
                 model_origin: None,

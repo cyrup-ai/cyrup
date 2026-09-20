@@ -5,9 +5,10 @@
 //!
 //! `pingData` is both the `ping` reply and the payload of the one-shot
 //! [`super::SUBAGENT_RPC_READY_EVENT`], so it is the document a client integrates against. A key
-//! advertised and not implemented is a lie the client will act on, which is why five of upstream's
-//! capability keys and two of its event keys are DROPPED here rather than copied — each with the
-//! missing seam named.
+//! advertised and not implemented is a lie the client will act on, which is why three of
+//! upstream's capability keys and one of its event keys are DROPPED here rather than copied —
+//! each with the missing seam named. Every key that IS advertised is paid for by a production
+//! writer or emitter in this crate, named in the doc on [`ping_data`].
 
 use std::path::Path;
 
@@ -17,6 +18,8 @@ use crate::background::async_status_snapshot::{
     ASYNC_STATUS_SNAPSHOT_KIND, ASYNC_STATUS_SNAPSHOT_VERSION,
 };
 use crate::background::watch::SUBAGENT_ASYNC_COMPLETE_EVENT;
+
+use crate::background::watch::SUBAGENT_PROCESS_TERMINAL_EVENT;
 use crate::extension::SubagentExecutor;
 
 use super::{
@@ -49,21 +52,21 @@ fn session_data(executor: &SubagentExecutor, cwd: &Path) -> Value {
 
 /// pi `pingData(ctx)` (`rpc.ts:440-470`).
 ///
-/// # `[CYRUP-DELTA]` — five capability keys and two event keys are DROPPED
+/// # `[CYRUP-DELTA]` — three capability keys and one event key are DROPPED
 ///
 /// * **`nonRecoveringSteer`** (`:452`) advertises that the RPC forces `steeringRecovery: false`.
-///   cyrup's steer has no recovery mode to turn off (`grep -rn 'steering_recovery' crates/` is
-///   empty), so there is nothing to promise — see [`super::params::steer_params`].
+///   cyrup's steer has no recovery mode to turn off: [`crate::background::control::SteerDeliveryMode`]
+///   is `Steer | FollowUp | Auto`, all three of which DELIVER, and no arm parks a run awaiting an
+///   acknowledgement it could later be revived from. So there is nothing to promise — see
+///   [`super::params::steer_params`]. (A grep for `steering_recovery` is NOT the evidence: its only
+///   hits in this crate are this bullet and that function's delta block, so the grep quotes itself.
+///   The three-arm enum is the evidence.)
 /// * **`launchResolvedExtensions`** / **`runtimeAcknowledgedExtensions`** (`:456-457`) advertise
 ///   the child extension-resolution reporting surface and the
 ///   `subagent:acknowledge-extension` child-runtime event. Neither exists here.
-/// * **`processTerminalProof`** (`:458`) advertises the process-terminal lifecycle artifact.
-///   cyrup has no process-terminal artifact at all — already recorded at
-///   `background/active_async_capacity/key.rs:93-99` and `.../inspect.rs:33`.
 /// * **`events.childStatus`** (`:465`) is `subagent:child-status`, emitted only by upstream's
 ///   inline `stopAsyncRun`. cyrup routes `stop` through the tool arm instead (see
 ///   [`super`]'s module doc), so nothing emits it.
-/// * **`events.processTerminal`** (`:466`) is the same missing artifact as above.
 ///
 /// `events.asyncComplete` is KEPT, and that is not free: it is a promise this task pays for by
 /// registering [`crate::background::watch::BusAnnouncingCompletionObserver`] in the production
@@ -94,12 +97,28 @@ pub(crate) fn ping_data(executor: &SubagentExecutor, cwd: &Path) -> Value {
             "interrupt": true,
             "stop": true,
             "resume": true,
+            // `rpc.ts:458` — the process-terminal lifecycle artifact, stamped with the schema
+            // generation its event lines carry (`shared/types.ts:629`). Advertising it is a real
+            // promise: [`crate::background::process_terminal`] writes the candidate and the proof
+            // on every background launch, and the `events.processTerminal` key below names the
+            // event a client can tail to learn a proof landed.
+            "processTerminalProof": {
+                "version": 1,
+                "lifecycleArtifactVersion":
+                    crate::background::process_terminal::SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
+            },
         },
         "events": {
             "ready": SUBAGENT_RPC_READY_EVENT,
             "request": SUBAGENT_RPC_REQUEST_EVENT,
             "replyPrefix": SUBAGENT_RPC_REPLY_EVENT_PREFIX,
             "asyncComplete": SUBAGENT_ASYNC_COMPLETE_EVENT,
+            // `rpc.ts:466` / `shared/types.ts:2356` — `"subagent:process-terminal"`, owned and
+            // published by
+            // [`crate::background::watch::ProcessTerminalAnnouncingCompletionObserver`]
+            // (pi `emitProcessTerminalEvent`, `async-execution.ts:666-672`). Like
+            // `asyncComplete`, this key is a promise a registered emitter pays for.
+            "processTerminal": SUBAGENT_PROCESS_TERMINAL_EVENT,
         },
         "session": session_data(executor, cwd),
     })

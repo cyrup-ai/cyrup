@@ -137,7 +137,8 @@ pub use message::{
 };
 pub use observer::{
     BusAnnouncingCompletionObserver, CompletionBus, CompletionEvent, CompletionObserver,
-    CompositeCompletionObserver, SUBAGENT_ASYNC_COMPLETE_EVENT,
+    CompositeCompletionObserver, ProcessTerminalAnnouncingCompletionObserver,
+    SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_PROCESS_TERMINAL_EVENT,
 };
 pub use results_watcher::{
     CompletionBand, CompletionNotification, DEDUP_TTL, LossReport, MAX_PROCESSING_ATTEMPTS,

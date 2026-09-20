@@ -786,6 +786,8 @@ mod tests {
 
         // The executor built for THIS run, exactly as `run` builds it.
         let executor = ExecSingleStepExecutor {
+            writer_ledgers: None,
+            lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
             host_available_builtins: None,

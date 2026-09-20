@@ -1219,6 +1219,7 @@ mod tests {
 
     fn step_with_usage(agent: &str, input: u64, output: u64, cost_total: f64) -> StepStatus {
         StepStatus {
+            process_terminal: None,
             agent: agent.to_string(),
             status: StepState::Complete,
             session_file: None,

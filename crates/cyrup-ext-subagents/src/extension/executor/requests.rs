@@ -453,6 +453,22 @@ pub struct BackgroundStepsSpec {
     /// admission there (pi `:513`), which is what a revive of a run whose slot reconciliation
     /// already reclaimed must do.
     pub transfer_from: Option<RunId>,
+    /// VL-S3 — the canonical-session revival lease this launch's RUNNER must hold, when the launch
+    /// is a revival of a stored session transcript (pi `config.revivalLease`,
+    /// `subagent-runner.ts:5241`).
+    ///
+    /// `Some` has exactly one producer, the same one as [`Self::transfer_from`]:
+    /// [`crate::extension::SubagentExecutor::control_resume`]'s terminal-revival arm. That is
+    /// cyrup's whole `target.source == "async"` population, and reviving is the only operation
+    /// that reopens a session file another run may still be writing.
+    ///
+    /// **Explicit, and deliberately NOT derived from [`Self::session_file`].** A seeded
+    /// (non-revival) launch carries a session file too — that is what `ContextMode::Fork` means —
+    /// so `session_file.is_some()` is true far more often than "this is a revival". Deriving the
+    /// lease from it would put one on every forked launch, which upstream does not do and which
+    /// would make two independent forks of one parent transcript refuse each other with a
+    /// conflict sentence naming a run that is not competing with them at all.
+    pub revival_lease: Option<crate::background::session_lease::SessionLeaseRequest>,
     /// The thinking ceiling a REVIVE re-applies to its spawn — pi `thinkingCeiling:
     /// recoveryDescriptor?.thinkingCeiling` on the revived launch (`subagent-executor.ts:2151`
     /// @v0.68.0). `None` from every ordinary producer; `Some` only from

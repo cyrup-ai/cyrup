@@ -1160,3 +1160,210 @@ mod tests {
         );
     }
 }
+
+// -------------------------------------------------------------------------------------------
+// Process-GROUP teardown verification — the evidence behind `ProcessTreeTerminal`
+// -------------------------------------------------------------------------------------------
+
+/// How long [`verify_process_group_terminated`] keeps re-probing a group that still has members.
+///
+/// A child's own descendants are reaped by the kernel a moment after the child itself exits, and a
+/// group that is empty 8ms later was never "not torn down" in any sense a reader cares about. Long
+/// enough to absorb that, short enough that a genuinely surviving subtree is reported promptly —
+/// and it is only ever spent when the answer is going to be negative.
+const PROCESS_GROUP_VERIFY_BUDGET: Duration = Duration::from_millis(250);
+
+/// How often the budget above is re-probed. `kill(-pgid, 0)` is a single syscall with no side
+/// effects, so the interval is chosen for latency rather than cost.
+const PROCESS_GROUP_VERIFY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// What [`verify_process_group_terminated`] could establish about one process group.
+///
+/// This is the evidence behind a `pi-writer` instance's `processTree` field in the
+/// process-terminal proof (pi `ProcessTreeTerminal`, `shared/types.ts:653-670` @v0.68.0). The four
+/// arms map onto upstream's shapes at the one call site that builds that field, which is where the
+/// mapping is documented — this type deliberately says only what was OBSERVED, not what it means.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessGroupTerminal {
+    /// `kill(-pgid, 0)` answered `ESRCH`: NO process remains in the group. Since
+    /// [`crate::spawn::SpawnedChild::spawn`] makes every child its own group leader, that is the
+    /// whole subtree the child could reach without deliberately detaching — the child, and every
+    /// descendant it spawned.
+    Gone {
+        /// The group that was verified empty.
+        process_group_id: u32,
+    },
+    /// The group still has at least one member after the whole verification budget. The direct
+    /// child is gone (its close is what triggered this probe), so what remains is an orphaned
+    /// descendant — precisely the case `process_group(0)` exists to make visible.
+    Alive {
+        /// The group that still has members.
+        process_group_id: u32,
+    },
+    /// This platform has no process groups to verify.
+    Unsupported,
+    /// No group could be ADDRESSED at all — there was no pid to derive one from. Nothing was
+    /// sent, so nothing was learned.
+    Unaddressable {
+        /// Why the group could not be addressed.
+        diagnostic: String,
+    },
+    /// The probe was sent and failed for a reason that is not `ESRCH` — overwhelmingly `EPERM`,
+    /// which means a process DOES hold the group but this process may not signal it.
+    ProbeFailed {
+        /// The group that was probed.
+        process_group_id: u32,
+        /// The underlying `errno` rendering.
+        diagnostic: String,
+    },
+}
+
+/// Verify that the process GROUP led by `pid` holds no surviving member.
+///
+/// # Why this is the honest question to ask
+///
+/// A subagent child is a re-exec'd `cyrup` binary that spends most of its life blocked in
+/// `wait(2)` on descendants it spawned (a bash-tool command, `cargo`, a nested subagent). Reaping
+/// the direct child therefore proves almost nothing about whether the run's processes are gone —
+/// which is the exact question the process-terminal proof exists to answer. Because
+/// [`crate::spawn::SpawnedChild::spawn`] puts each child in its own group with
+/// `command.process_group(0)` (so `pgid == pid`), the group is a name for "this child and every
+/// descendant it did not deliberately detach", and `kill(-pgid, 0)` asks about all of them at once.
+///
+/// `pid` is the CHILD's pid, used directly as the group id. This function must not be handed a pid
+/// that is not a group leader: `kill(-pgid, …)` against a group this process merely belongs to
+/// would ask about the orchestrator (and, under a test runner, about the test harness).
+///
+/// A group that still has members is re-probed for [`PROCESS_GROUP_VERIFY_BUDGET`] before the
+/// negative answer is returned, because the kernel reaps a just-exited child's descendants
+/// asynchronously and an empty-a-moment-later group was never a surviving subtree.
+#[cfg(unix)]
+pub async fn verify_process_group_terminated(pid: Option<u32>) -> ProcessGroupTerminal {
+    let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        return ProcessGroupTerminal::Unaddressable {
+            diagnostic: "the child's pid was no longer exposed when its close was observed"
+                .to_string(),
+        };
+    };
+    let raw = pid as nix::libc::pid_t;
+    // The NEGATED pid is the group, exactly as `send_signal` targets it for the kill ladder. The
+    // `None` signal is POSIX signal 0: the existence check, which delivers nothing.
+    let group = nix::unistd::Pid::from_raw(-raw);
+    let deadline = std::time::Instant::now() + PROCESS_GROUP_VERIFY_BUDGET;
+    loop {
+        match nix::sys::signal::kill(group, None) {
+            // A process still holds the group. Keep probing until the budget is spent — a
+            // descendant the kernel has not finished reaping is not a surviving subtree.
+            Ok(()) => {
+                if std::time::Instant::now() >= deadline {
+                    return ProcessGroupTerminal::Alive {
+                        process_group_id: pid,
+                    };
+                }
+                tokio::time::sleep(PROCESS_GROUP_VERIFY_INTERVAL).await;
+            }
+            // `ESRCH` — no such process group. This is the POSITIVE answer.
+            Err(nix::errno::Errno::ESRCH) => {
+                return ProcessGroupTerminal::Gone {
+                    process_group_id: pid,
+                };
+            }
+            // Anything else (`EPERM`, overwhelmingly) means a process DOES hold the group and we
+            // are not entitled to signal it. Reporting that as "gone" would be a lie in the one
+            // direction that matters.
+            Err(errno) => {
+                return ProcessGroupTerminal::ProbeFailed {
+                    process_group_id: pid,
+                    diagnostic: errno.to_string(),
+                };
+            }
+        }
+    }
+}
+
+/// Non-Unix has no process groups, so nothing can be verified — which is exactly what upstream's
+/// `unsupported-platform` reason is for.
+#[cfg(not(unix))]
+pub async fn verify_process_group_terminated(pid: Option<u32>) -> ProcessGroupTerminal {
+    let _ = pid;
+    ProcessGroupTerminal::Unsupported
+}
+
+#[cfg(all(test, unix))]
+mod process_group_verification_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::{ProcessGroupTerminal, verify_process_group_terminated};
+
+    /// Spawn a real child in its OWN process group — exactly as
+    /// [`crate::spawn::SpawnedChild::spawn`] does (`spawn/mod.rs:795`) — so `pgid == pid` and the
+    /// negated pid names the whole subtree.
+    fn spawn_group_leader(args: &[&str]) -> tokio::process::Child {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(args.join(" "))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.process_group(0);
+        command.spawn().expect("spawn group leader")
+    }
+
+    /// THE CLAIM THE PROOF MAKES. A `pi-writer` instance carrying
+    /// `{state: "observed", mechanism: "posix-process-group", …}` asserts that the child AND every
+    /// descendant it spawned are gone. This test is what makes that assertion true rather than
+    /// decorative: an exited child with no survivors verifies GONE, and a child whose descendant
+    /// outlived it does NOT.
+    #[tokio::test]
+    async fn an_empty_group_verifies_gone_and_a_surviving_descendant_does_not() {
+        // (a) A child that exits leaving nothing behind.
+        let mut clean = spawn_group_leader(&["exit", "0"]);
+        let pid = clean.id();
+        let _ = clean.wait().await.expect("wait");
+        assert_eq!(
+            verify_process_group_terminated(pid).await,
+            ProcessGroupTerminal::Gone {
+                process_group_id: pid.expect("a live child exposes its pid"),
+            },
+            "a child that left no survivors must verify as torn down"
+        );
+
+        // (b) A child that forks a long-lived descendant into its own group and then exits. This
+        //     is the orphaned-subtree case `process_group(0)` exists to make visible, and the one
+        //     a pid-only probe reports as "gone" when it is not.
+        let mut orphaning = spawn_group_leader(&["sleep 30 &", "exit 0"]);
+        let orphan_pgid = orphaning.id().expect("a live child exposes its pid");
+        let _ = orphaning.wait().await.expect("wait");
+        let verdict = verify_process_group_terminated(Some(orphan_pgid)).await;
+        assert_eq!(
+            verdict,
+            ProcessGroupTerminal::Alive {
+                process_group_id: orphan_pgid,
+            },
+            "a descendant that outlived its parent leaves the tree unverified, not torn down"
+        );
+        // Do not leak the survivor into the rest of the suite.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(orphan_pgid as nix::libc::pid_t)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+
+    /// No pid means no group could be ADDRESSED, so no verification signal was ever sent — which
+    /// is `signal-failed` and not `verification-failed`. The distinction matters: one says the
+    /// probe answered badly, the other says it never ran.
+    #[tokio::test]
+    async fn an_unknown_pid_is_unaddressable_rather_than_alive() {
+        assert!(matches!(
+            verify_process_group_terminated(None).await,
+            ProcessGroupTerminal::Unaddressable { .. }
+        ));
+        // pid 0 addresses the CALLER's own group under `kill(2)`; refusing it is what stops this
+        // probe ever asking about the test runner (or, in production, the orchestrator).
+        assert!(matches!(
+            verify_process_group_terminated(Some(0)).await,
+            ProcessGroupTerminal::Unaddressable { .. }
+        ));
+    }
+}

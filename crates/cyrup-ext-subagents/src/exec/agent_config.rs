@@ -778,11 +778,47 @@ pub struct LiveEventSink {
     /// `None` for a sink that only cares about child output (the background telemetry forwarder),
     /// in which case notes are dropped.
     notes: Option<LiveEventCallback>,
+    /// PARENT-side observations about the child PROCESS itself — see
+    /// [`LiveEventSink::emit_writer_process`].
+    ///
+    /// `None` for every sink that has no process-terminal candidate to build (the foreground path,
+    /// and every test), in which case the observations are dropped.
+    writer_processes: Option<WriterProcessCallback>,
 }
 
-/// One installed live-event callback. Named so [`LiveEventSink`]'s two fields do not each have to
+/// One installed live-event callback. Named so [`LiveEventSink`]'s fields do not each have to
 /// spell the full `Arc<dyn Fn…>` out.
 type LiveEventCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The [`WriterProcessObservation`] callback half of [`LiveEventSink`].
+type WriterProcessCallback = std::sync::Arc<dyn Fn(WriterProcessObservation) + Send + Sync>;
+
+/// One PARENT-side fact about a step's writer CHILD PROCESS, reported as it happens so the
+/// background runner can assemble this step's
+/// [`WriterProcessLedger`](crate::background::process_terminal::WriterProcessLedger).
+///
+/// The two arms are reported at deliberately different moments — see that type's doc for why the
+/// gap between them is the whole point.
+#[derive(Clone, Debug)]
+pub enum WriterProcessObservation {
+    /// A real OS child was launched for this step. Reported at the spawn, BEFORE anything can be
+    /// observed about it, so a child whose close is never seen still raises the expected count.
+    ///
+    /// `pid` is the child's, when the platform reports one. It is what the background runner's
+    /// session lease records as
+    /// [`WriterUpdate::Running`](crate::background::session_lease::WriterUpdate::Running) — the
+    /// state the lease's fourth staleness rung (`session-lease.ts:179-180`) probes before it will
+    /// let a dead owner's lease be reclaimed. `None` (a child already reaped before `id()` was
+    /// asked) leaves the lease in `spawning`, which is NEVER stale: the safe direction, and the
+    /// same one the count itself takes.
+    Launched {
+        /// The launched child's pid.
+        pid: Option<u32>,
+    },
+    /// A launched child's close was observed, with its exit code, its POSIX signal name and a
+    /// verdict about whether its whole process GROUP was seen torn down.
+    Closed(Box<crate::background::process_terminal::ProcessInstanceExit>),
+}
 
 impl std::fmt::Debug for LiveEventSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -797,6 +833,41 @@ impl LiveEventSink {
         Self {
             lines: std::sync::Arc::new(sink),
             notes: None,
+            writer_processes: None,
+        }
+    }
+
+    /// Also route PARENT-side writer-process observations to `sink` (additive; a sink without one
+    /// drops them).
+    ///
+    /// Installed only by the background runner, which is the only caller that has a
+    /// process-terminal candidate to assemble. This is the transport by which the pid, exit status
+    /// and process-group verdict of a step's real OS child — facts that exist ONLY inside
+    /// [`crate::exec::run_sync`]'s attempt loop — reach the runner that must prove the run's
+    /// processes are gone.
+    ///
+    /// # `[CYRUP-DELTA]` — upstream has no such channel because it has nothing to send
+    ///
+    /// pi's children run INSIDE the runner process (`subagent-runner.ts:5169`), so its candidate's
+    /// `writers` map is written all-empty and its `expectedWriters` all-zero
+    /// (`:5168-5190`). cyrup's children are real OS processes in their own process groups, so this
+    /// channel carries real
+    /// [`ProcessInstanceExit::PiWriter`](crate::background::process_terminal::ProcessInstanceExit::PiWriter)
+    /// records and the `process-tree-unverified` / `writer-close-unverified` rungs of
+    /// `finalizeProcessTerminal` become live verdicts instead of arms nothing can reach.
+    #[must_use]
+    pub fn with_writer_process_sink(
+        mut self,
+        sink: impl Fn(WriterProcessObservation) + Send + Sync + 'static,
+    ) -> Self {
+        self.writer_processes = Some(std::sync::Arc::new(sink));
+        self
+    }
+
+    /// Deliver one writer-process observation to the installed callback, if there is one.
+    pub fn emit_writer_process(&self, observation: WriterProcessObservation) {
+        if let Some(sink) = self.writer_processes.as_ref() {
+            sink(observation);
         }
     }
 

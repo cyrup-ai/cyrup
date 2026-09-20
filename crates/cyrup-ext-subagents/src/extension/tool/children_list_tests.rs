@@ -65,6 +65,8 @@ async fn write_descriptor_with_the_production_writer(
         )
         .expect("the builtin persona resolves");
     let runner_config = RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
         run_id: RunId::from_token(workflow_run_id.to_string()),
         mode: RunMode::Single,
         steps: vec![RunnerStep::SingleStep(bare_single_step(agent, "T"))],

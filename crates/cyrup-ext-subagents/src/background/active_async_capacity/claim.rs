@@ -263,9 +263,11 @@ async fn set_private_dir_mode(dir: &Path) {
 ///   creates one (see [`ActiveAsyncCapacityKind::Workflow`]), so it would have no call site and
 ///   no way to be exercised.
 /// * `rollbackBeforeRunnerProceed` (`:426-446`) unwinds a reservation during upstream's
-///   runner-proceed handshake, keyed on a `runnerProcessInstanceId` cyrup does not mint (§D3).
-///   cyrup learns the pid the instant `spawn_detached_runner_with_command` returns, so the window
-///   that method covers does not exist here.
+///   runner-proceed HANDSHAKE — its runner blocks on `waitForStartupControl`
+///   (`subagent-runner.ts:5233-5240`) until the parent writes a proceed token. cyrup has no such
+///   barrier: `spawn_detached_runner_with_command` returns with the runner already running and
+///   its pid and instance id already bound, so the window that method covers does not exist and
+///   there is no call site for it.
 #[derive(Debug)]
 pub struct ActiveAsyncCapacityHandle {
     owner: ActiveAsyncCapacityOwner,
@@ -293,10 +295,17 @@ impl ActiveAsyncCapacityHandle {
 
     /// pi `markStarted` (`:388-397`) — bind the reservation to a real runner.
     ///
-    /// §D3: the identity bound is the detached runner's OS **pid**, the value
-    /// `spawn_detached_runner_with_command` returns and the only start-proof cyrup has. Binding it
-    /// is what promotes the slot from "rollbackable reservation" to "real run", which is exactly
-    /// the distinction [`remove_owned_slot`]'s `require_unstarted` guard turns on.
+    /// Binds FOUR facts, in one record: the launch's minted
+    /// [`RunnerProcessInstanceId`](crate::background::process_terminal::RunnerProcessInstanceId)
+    /// (pi's own `runnerProcessInstanceId`, which the release verdict matches a process-terminal
+    /// proof against), the detached runner's OS pid, that pid's
+    /// [`ProcessStartIdentity`](crate::background::session_lease::ProcessStartIdentity), and the
+    /// bind timestamp. The last three are cyrup's no-proof fallback ladder and are ADDITIVE — a
+    /// runner killed before it can write a proof still has a pid whose death is observable, and
+    /// the start identity is what stops a RECYCLED pid from reading alive forever.
+    ///
+    /// Binding is what promotes the slot from "rollbackable reservation" to "real run", which is
+    /// exactly the distinction [`remove_owned_slot`]'s `require_unstarted` guard turns on.
     ///
     /// In-memory first, then durable (pi's own comment at `:392-393`), so a failed durable bind is
     /// distinguishable from an unrelated unstarted reservation.
@@ -305,11 +314,14 @@ impl ActiveAsyncCapacityHandle {
     ///
     /// [`SubagentError::Management`] if ownership of the slot changed under us — upstream throws
     /// the same way (`:396`). If the durable write itself fails the slot is RELEASED before the
-    /// error is returned: an owner record with no pid can never be reconciled (the runner verdict's
-    /// "runner process identity has not been recorded" rung retains it forever), so keeping it
-    /// would leak the slot permanently. Upstream's answer to the same window is
-    /// `rollbackBeforeRunnerProceed`, which has no cyrup analog (§D3).
-    pub async fn mark_started(&mut self, pid: u32) -> Result<(), SubagentError> {
+    /// error is returned: an owner record with no bind can never be reconciled (the runner
+    /// verdict's "runner process identity has not been recorded" rung retains it forever), so
+    /// keeping it would leak the slot permanently.
+    pub async fn mark_started(
+        &mut self,
+        pid: u32,
+        instance: crate::background::process_terminal::RunnerProcessInstanceId,
+    ) -> Result<(), SubagentError> {
         let dir = self.dir();
         let Some(claim) = SlotClaim::acquire(&dir)
             .await
@@ -320,7 +332,7 @@ impl ActiveAsyncCapacityHandle {
                 self.owner.run_id
             )));
         };
-        let outcome = self.mark_started_locked(&dir, pid).await;
+        let outcome = self.mark_started_locked(&dir, pid, instance).await;
         claim.release().await;
         match outcome {
             Ok(true) => Ok(()),
@@ -337,12 +349,24 @@ impl ActiveAsyncCapacityHandle {
     }
 
     /// The body of [`Self::mark_started`], run under the claim.
-    async fn mark_started_locked(&mut self, dir: &Path, pid: u32) -> std::io::Result<bool> {
+    async fn mark_started_locked(
+        &mut self,
+        dir: &Path,
+        pid: u32,
+        instance: crate::background::process_terminal::RunnerProcessInstanceId,
+    ) -> std::io::Result<bool> {
         let Some(current) = matching_owner(dir, &self.owner).await else {
             return Ok(false);
         };
         let next = ActiveAsyncCapacityOwner {
+            runner_process_instance_id: Some(instance),
             runner_pid: Some(pid),
+            // Read HERE, at the bind, not at the verdict: the identity is only meaningful paired
+            // with the pid it was read for, and reading it later would read whatever process holds
+            // that number by then — which is the exact confusion it exists to prevent.
+            runner_process_start_identity: crate::background::session_lease::process_start_identity(
+                pid,
+            ),
             runner_started_at: Some(self.options.now()),
             ..current
         };
@@ -480,7 +504,9 @@ pub async fn acquire(
             kind: input.kind,
             async_dir: input.async_dir.to_path_buf(),
             reserved_at: options.now(),
+            runner_process_instance_id: None,
             runner_pid: None,
+            runner_process_start_identity: None,
             runner_started_at: None,
         };
         if create_slot(&pool_dir, &owner)

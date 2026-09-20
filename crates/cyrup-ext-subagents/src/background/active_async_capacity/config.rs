@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::background::RunId;
 use crate::background::reconcile::Liveness;
+use crate::background::session_lease::ProcessStartIdentity;
 use crate::registration::{AbandonedSlotRelease, CapacityConfig};
 
 /// pi `DEFAULT_ABANDONED_SLOT_RELEASE_AFTER_MS` (`:11`) — 20 minutes.
@@ -120,6 +121,7 @@ pub struct CapacityOptions {
     abandoned_slot_release: AbandonedSlotRelease,
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     pid_liveness: Arc<dyn Fn(u32) -> Liveness + Send + Sync>,
+    pid_start_identity: Arc<dyn Fn(u32) -> Option<ProcessStartIdentity> + Send + Sync>,
 }
 
 impl std::fmt::Debug for CapacityOptions {
@@ -147,6 +149,7 @@ impl CapacityOptions {
             ),
             now: Arc::new(crate::time::now_epoch_millis),
             pid_liveness: Arc::new(crate::background::reconcile::check_pid_liveness),
+            pid_start_identity: Arc::new(crate::background::session_lease::process_start_identity),
         }
     }
 
@@ -185,6 +188,23 @@ impl CapacityOptions {
         self
     }
 
+    /// Overrides the start-identity probe the no-proof fallback ladder pairs with
+    /// [`Self::with_pid_liveness`].
+    ///
+    /// The two travel together and must be overridden together: the ladder is
+    /// [`crate::background::reconcile::check_pid_identity_with`], which upgrades an `Alive` answer
+    /// to `Dead` only when THIS probe reports an identity different from the one the owner record
+    /// carries. A test that injects a liveness constant and leaves this one at the real `/proc`
+    /// reader would be asking the kernel about a pid its fake liveness invented.
+    #[must_use]
+    pub fn with_pid_start_identity(
+        mut self,
+        probe: Arc<dyn Fn(u32) -> Option<ProcessStartIdentity> + Send + Sync>,
+    ) -> Self {
+        self.pid_start_identity = probe;
+        self
+    }
+
     /// The capacity root every pool hangs off — pi `options.rootDir ?? ACTIVE_ASYNC_CAPACITY_DIR`.
     #[must_use]
     pub fn root_dir(&self) -> &Path {
@@ -207,6 +227,12 @@ impl CapacityOptions {
     #[must_use]
     pub fn now(&self) -> i64 {
         (self.now)()
+    }
+
+    /// The start identity `pid` is running under RIGHT NOW, for the recycled-pid rung.
+    #[must_use]
+    pub fn pid_start_identity(&self, pid: u32) -> Option<ProcessStartIdentity> {
+        (self.pid_start_identity)(pid)
     }
 
     /// Classifies `pid` — **[`Liveness::Unknown`] is never death**, see

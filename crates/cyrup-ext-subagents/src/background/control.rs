@@ -303,6 +303,10 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         tool_call_id: None,
         workflow_children: result.workflow_children.clone(),
         workflow_receipt_path: result.workflow_receipt.as_ref().map(|r| r.path.clone()),
+        // A repaired status is synthesized from the terminal `ResultFile`, which carries no
+        // process-terminal record. Asserting one here would be a claim about a runner process this
+        // function never observed.
+        process_terminal: None,
         telemetry: crate::background::RunTelemetry::default(),
         // A repaired status cannot know where the run's worktree handoff landed: the `ResultFile`
         // does not carry the reference. Absent is the honest answer, and the retention scan's

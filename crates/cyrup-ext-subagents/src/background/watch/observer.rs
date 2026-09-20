@@ -162,6 +162,223 @@ impl CompletionObserver for BusAnnouncingCompletionObserver {
     }
 }
 
+/// pi `SUBAGENT_PROCESS_TERMINAL_EVENT` (`src/shared/types.ts:2356` @v0.68.0) — the
+/// INTER-EXTENSION topic a run's process-terminal PROOF is republished on by
+/// [`ProcessTerminalAnnouncingCompletionObserver`].
+///
+/// Owned here, by the emitter, for the reason [`SUBAGENT_ASYNC_COMPLETE_EVENT`]'s own doc gives:
+/// a topic constant belongs to whatever publishes on it, so an advertisement
+/// ([`crate::extension::rpc`]'s `pingData`, `events.processTerminal`) can never name a topic
+/// nothing emits.
+///
+/// Distinct from [`crate::background::process_terminal::PROCESS_TERMINAL_EVENT_TYPE`], which is
+/// the `events.jsonl` LINE type (`subagent.run.process_terminal`, `process-terminal.ts:305`)
+/// written by the RUNNER into the run's own log. Upstream keeps the two spellings apart for the
+/// same reason: one is a bus topic, the other a record tag.
+pub const SUBAGENT_PROCESS_TERMINAL_EVENT: &str = "subagent:process-terminal";
+
+/// How long [`ProcessTerminalAnnouncingCompletionObserver`] keeps re-reading a `pending` sidecar
+/// before accepting `pending` as the answer.
+///
+/// It covers ONE gap and is sized for it: the runner's own `finish_run` -> lease release ->
+/// candidate write -> `finalize_process_terminal` tail, which is a handful of small local writes.
+/// A budget of zero is the defect this constant exists to fix (a clean run's event dropped
+/// forever); an unbounded wait would hold the observers registered after this one behind a runner
+/// that hung. Neither direction is reached in practice, because the pid short-circuit below
+/// answers the crash case long before the deadline.
+const PROCESS_TERMINAL_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2_000);
+
+/// The re-read cadence inside [`PROCESS_TERMINAL_SETTLE_BUDGET`] — far finer than the results
+/// watcher's own poll, because this is waiting on a write that has already been ordered rather
+/// than on a run.
+const PROCESS_TERMINAL_SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// pi `emitProcessTerminalEvent` (`runs/background/async-execution.ts:666-672` @v0.68.0) —
+/// republish a finished run's process-terminal proof on the inter-extension bus, so a host that
+/// delegated work learns HOW the run's process ended and not merely that it ended.
+///
+/// Upstream's subscriber is `extension/index.ts:897-900`: `refreshActiveAsyncCapacity()` and a
+/// fleet refresh. Both are decisions a consumer can only make once it knows the owning process is
+/// gone — which is the fact [`crate::background::process_terminal`] exists to establish and the
+/// one [`SUBAGENT_ASYNC_COMPLETE_EVENT`] cannot carry, because a terminal
+/// [`crate::background::ResultFile`] says the RUN ended, not that its RUNNER did.
+///
+/// # `[CYRUP-DELTA]` — the emit site moves from the launcher to the completion fan-out
+///
+/// Upstream emits from the PARENT, in `async-execution.ts:668`, immediately after
+/// `finalizeProcessTerminal` returns on the runner's `close` event: its runner is a child it keeps
+/// a handle to. cyrup's runner is genuinely detached — `spawn_detached_runner_with_command` puts
+/// it in its own process group and drops the handle without ever awaiting it
+/// (`crates/cyrup/src/subagent_runner_cmd.rs:1-7`, R-SA-078) — so `finalize_process_terminal` runs
+/// inside the RUNNER's own process ([`crate::background::runner_main`]), which has no bus.
+///
+/// The parent's first in-process edge after that write is the completion watcher observing the
+/// run's terminal result file, which is exactly where [`BusAnnouncingCompletionObserver`] already
+/// sits. So the proof is read off disk here and published there. The delta is the LATENCY (bounded
+/// below by the watcher's poll cadence, the same delta [`CompletionBus`] documents), never the
+/// payload: what is published is the sidecar the runner wrote, verbatim.
+///
+/// # The delta has a RACE in it, and this is where it is paid for
+///
+/// Moving the emit onto the completion watcher moves it onto a DIFFERENT trigger. The runner's
+/// tail is `finish_run` — `status.json`, then the `ResultFile` (R-SA-077's ordering) — and only
+/// then the lease release and `finalize_process_terminal`'s sidecar write
+/// (`runner_main/entry.rs`). The completion watcher fires on the ResultFile. So a poll tick that
+/// lands in the millisecond gap between those two writes reads the launch's `pending` placeholder
+/// for a run that is closing perfectly cleanly — and because the watcher dedups a dispatched
+/// result for its whole TTL, a naive `pending => publish nothing` would drop that run's event
+/// PERMANENTLY. A subscriber refreshing capacity or fleet state off `events.processTerminal`
+/// (advertised at `extension/rpc/ping.rs`) would wait forever.
+///
+/// So a `pending` read is not an answer here; it is "not yet". This observer re-probes for
+/// [`PROCESS_TERMINAL_SETTLE_BUDGET`] at [`PROCESS_TERMINAL_SETTLE_INTERVAL`], and stops the
+/// moment either half of the question is genuinely answered:
+///
+/// * a NON-pending sidecar appears — the runner finalized; publish it, verbatim.
+/// * the runner's recorded pid is demonstrably gone while the sidecar is still `pending` — the
+///   runner died between its result write and its proof write, and no proof is ever coming.
+///
+/// **That wait runs on a DETACHED task and `observe` returns immediately.** It has to:
+/// `install.rs:373-384` calls this in the watcher's phase-1 synchronous band, whose own comment
+/// records that starving it was `ASYNC_NOTIFY_BUG_REPORT` RC1 — the `wait` wake-up and the mission
+/// sync are behind it. An observer that parked that scan for up to two seconds per completion
+/// would trade this defect for that one. The detached task is best effort, exactly like every
+/// other publisher on this bus: a process that exits inside the window loses the event, and the
+/// capacity rung's pid ladder is what speaks for that run instead — the same fallback the
+/// `pending` case already relies on.
+///
+/// # What is NOT published, and why that is upstream's shape too
+///
+/// A sidecar that is STILL `pending` when that settles is skipped. `pending` is what
+/// [`initialize_process_terminal`](crate::background::process_terminal::initialize_process_terminal)
+/// writes at launch and what a runner that was killed leaves behind; upstream has no emit for that
+/// case either, because its emit is downstream of a `finalizeProcessTerminal` that never ran. A
+/// subscriber must not be told "a proof landed" about a file that is still the launch's
+/// placeholder — the absence of the event is itself the crash signal, and the capacity release
+/// rung's pid ladder is what speaks for that run instead
+/// ([`crate::background::active_async_capacity`]).
+pub struct ProcessTerminalAnnouncingCompletionObserver {
+    /// This session's async root, so a completed run's sidecar can be located from the run id
+    /// alone — the same derivation `MissionSyncCompletionObserver` makes for `mission.json`.
+    async_root: std::path::PathBuf,
+    /// The executor's own late-bound host-services slot, shared rather than copied, for the
+    /// reason [`BusAnnouncingCompletionObserver`]'s field doc gives.
+    host_services: Arc<std::sync::OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
+}
+
+impl ProcessTerminalAnnouncingCompletionObserver {
+    /// Read this run's sidecar, treating `pending` as *not yet* rather than as an answer — see the
+    /// type's own "The delta has a RACE in it" section.
+    ///
+    /// `None` means there is nothing to publish: no readable sidecar at all, or one that was
+    /// still `pending` when the question was genuinely settled.
+    async fn settled_proof(
+        run_dir: &crate::background::RunDir,
+        expectation: crate::background::process_terminal::ProofExpectation<'_>,
+    ) -> Option<crate::background::process_terminal::ProcessTerminal> {
+        use crate::background::process_terminal::{ProcessTerminalState, read_process_terminal};
+
+        let deadline = std::time::Instant::now() + PROCESS_TERMINAL_SETTLE_BUDGET;
+        loop {
+            let proof = read_process_terminal(run_dir, expectation).await;
+            match proof.as_ref().map(|proof| proof.state()) {
+                // A real verdict — observed, unknown, or the launch's not-started record.
+                Some(state) if state != ProcessTerminalState::Pending => return proof,
+                // No sidecar at all is not this race: `initialize_process_terminal` writes the
+                // `pending` placeholder BEFORE the spawn, so a run that reached a terminal
+                // ResultFile without one was launched by a build that writes neither, and no
+                // amount of waiting produces one.
+                None => return None,
+                Some(_) => {}
+            }
+            // The crash short-circuit. A runner whose pid is demonstrably gone while its sidecar
+            // still reads `pending` died between its result write and its proof write; that
+            // `pending` IS the final answer and the rest of the budget would buy nothing.
+            if !Self::runner_may_still_be_writing(run_dir).await {
+                return None;
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(PROCESS_TERMINAL_SETTLE_INTERVAL).await;
+        }
+    }
+
+    /// `true` while the run's recorded runner pid could still reach its proof write.
+    ///
+    /// Deliberately permissive in both unknowable directions, because the cost of each is
+    /// asymmetric: a status that cannot be read or carries no pid yields `true` (wait out the
+    /// budget and re-read, which at worst delays this one event by
+    /// [`PROCESS_TERMINAL_SETTLE_BUDGET`]), and only
+    /// [`Liveness::Dead`](crate::background::reconcile::Liveness::Dead) — a real `ESRCH` — ends
+    /// the wait. `Unknown` (an `EPERM`-class probe under sandboxing) is NOT death, per R-SA-089.
+    async fn runner_may_still_be_writing(run_dir: &crate::background::RunDir) -> bool {
+        use crate::background::reconcile::{Liveness, check_pid_liveness};
+
+        let Ok(Some(status)) =
+            crate::background::control::read_status_file(&run_dir.status()).await
+        else {
+            return true;
+        };
+        status
+            .pid
+            .is_none_or(|pid| check_pid_liveness(pid) != Liveness::Dead)
+    }
+
+    /// Announce proofs found under `async_root` onto whatever backend `host_services` resolves to
+    /// at observation time.
+    #[must_use]
+    pub fn new(
+        async_root: std::path::PathBuf,
+        host_services: Arc<std::sync::OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
+    ) -> Self {
+        Self {
+            async_root,
+            host_services,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CompletionObserver for ProcessTerminalAnnouncingCompletionObserver {
+    async fn observe(&self, notification: &CompletionNotification) -> bool {
+        let Some(services) = self.host_services.get().map(Arc::clone) else {
+            return true;
+        };
+        // The run is known; the runner instance is not, because the result file does not carry
+        // one — so the read below asks for well-formedness and THIS run, which is the strongest
+        // expectation this reader can honestly state. A sidecar belonging to another run degrades
+        // to `unknown` at the read rather than being republished as this run's.
+        let run_id = &notification.result.run_id;
+        // Detached, for the reason on this type's doc: the watcher's phase-1 band must not be
+        // parked while a runner finishes writing.
+        let run_id = run_id.clone();
+        let async_root = self.async_root.clone();
+        tokio::spawn(async move {
+            let run_dir = crate::background::RunDir::new(&async_root, &run_id);
+            let expectation = crate::background::process_terminal::ProofExpectation {
+                run_id: Some(&run_id),
+                runner_process_instance_id: None,
+            };
+            let Some(proof) = Self::settled_proof(&run_dir, expectation).await else {
+                return;
+            };
+            match serde_json::to_value(&proof) {
+                Ok(payload) => services.emit_event(SUBAGENT_PROCESS_TERMINAL_EVENT, &payload),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cyrup_ext_subagents::rpc",
+                        run_id = %run_id,
+                        %error,
+                        "process-terminal proof could not be encoded for the inter-extension bus"
+                    );
+                }
+            }
+        });
+        true
+    }
+}
+
 /// SUBA-034 — the payload published on [`CompletionBus`] when a background run reaches a terminal
 /// state: pi's `SUBAGENT_ASYNC_COMPLETE_EVENT` payload, narrowed to the fields a subscriber can act
 /// on without re-reading the run tree.
@@ -332,6 +549,86 @@ mod tests {
         let event = rx.try_recv().expect("one event published");
         assert_eq!(event.run_id.as_str(), "run-bus-1");
         assert_eq!(event.outcome, ClassifiedOutcome::Failed);
+    }
+
+    /// D13 — the LOSING interleaving of the announce race, which is the one the naive reader gets
+    /// wrong and the one that actually happens.
+    ///
+    /// The runner publishes its `ResultFile` — which is what wakes the completion watcher — BEFORE
+    /// it writes its process-terminal proof (`runner_main::entry`'s tail: finish_run, lease
+    /// release, candidate write, then `finalize_own_process_terminal`). So the observer routinely
+    /// arrives while the sidecar still reads `pending`. A reader that accepts `pending` as an
+    /// answer publishes nothing, and the run's proof is lost forever even though it landed
+    /// milliseconds later.
+    ///
+    /// This test forces exactly that order: `pending` on disk when [`settled_proof`] is entered,
+    /// `observed` written after it has already re-read at least twice. It fails if `pending` is
+    /// ever treated as the answer — whether by returning it or by giving up and returning `None`.
+    #[tokio::test]
+    async fn a_pending_sidecar_that_settles_within_the_budget_is_still_announced() {
+        use crate::background::process_terminal::{
+            ProcessInstanceExit, ProcessTerminal, ProcessTerminalBase, ProcessTerminalState,
+            ProofExpectation, RunnerProcessInstanceId, initialize_process_terminal,
+        };
+        use crate::background::{RunDir, RunId, RunMode, RunStatus};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_id = RunId::from_token("run-race-1");
+        let instance = RunnerProcessInstanceId::from_token("instance-race-1");
+        let run_dir = RunDir::new(tmp.path(), &run_id);
+        tokio::fs::create_dir_all(run_dir.as_path())
+            .await
+            .expect("run dir");
+
+        // The launch placeholder: `pending`, exactly as `initialize_process_terminal` leaves it
+        // before the spawn.
+        initialize_process_terminal(&run_dir, &run_id, &instance)
+            .await
+            .expect("initialize");
+
+        // A status with NO recorded pid keeps `runner_may_still_be_writing` permissive, so the
+        // crash short-circuit cannot end the wait early and what is under test is the `pending`
+        // re-read itself rather than the pid probe.
+        let status = RunStatus::queued(run_id.clone(), RunMode::Single, None);
+        crate::background::atomic::write_atomic_json(&run_dir.status(), &status)
+            .await
+            .expect("status");
+
+        // The runner's proof write, landing well inside PROCESS_TERMINAL_SETTLE_BUDGET but after
+        // several PROCESS_TERMINAL_SETTLE_INTERVAL re-reads.
+        let writer_dir = run_dir.clone();
+        let writer_run = run_id.clone();
+        let writer_instance = instance.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let observed = ProcessTerminal::Observed {
+                base: ProcessTerminalBase::new(writer_run, writer_instance.clone()),
+                observed_at: 1_700_000_000_000,
+                instances: vec![ProcessInstanceExit::Runner {
+                    process_instance_id: writer_instance,
+                    close_observed_at: 1_700_000_000_000,
+                    exit_code: Some(0),
+                    signal: None,
+                }],
+                canonical_session: None,
+            };
+            crate::background::atomic::write_atomic_json(&writer_dir.process_terminal(), &observed)
+                .await
+                .expect("observed proof");
+        });
+
+        let proof = ProcessTerminalAnnouncingCompletionObserver::settled_proof(
+            &run_dir,
+            ProofExpectation::new(&run_id, &instance),
+        )
+        .await;
+        writer.await.expect("writer task");
+
+        let proof = proof.expect(
+            "a sidecar that was `pending` on entry and `observed` 150ms later must be announced, \
+             not dropped: the runner writes its ResultFile before its proof",
+        );
+        assert_eq!(proof.state(), ProcessTerminalState::Observed);
     }
 
     /// Publishing with nobody listening is a no-op, not an error: `wait` only subscribes while a

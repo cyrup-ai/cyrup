@@ -707,6 +707,7 @@ mod tests {
                 hostname: "test-host".to_string(),
                 process_start_identity: None,
                 liveness: |_| Liveness::Alive,
+                start_identity_of: |_| None,
             }
         }
 

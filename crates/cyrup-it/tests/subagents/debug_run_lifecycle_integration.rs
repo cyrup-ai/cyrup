@@ -10,13 +10,16 @@
 //!    carrying that same pid — the record the fixture-as-runner does not write itself.
 //! 3. `{ action: "debug.run", id }` and `{ action: "debug.run", dir }` go through
 //!    `SubagentTool::execute` → `route_action` → `route_control_action` →
-//!    `SubagentExecutor::control_debug_run`, which reconciles the status, inspects the slot, probes
-//!    the pid and renders the dump — and the assertions pin the slot, the pid and the liveness the
-//!    production spawn produced, line by line.
+//!    `SubagentExecutor::control_debug_run`, which reconciles the status, inspects the slot, reads
+//!    the run's process-terminal PAIR and renders the dump — and the assertions pin the slot, the
+//!    minted runner instance and both process-terminal records the production spawn produced, line
+//!    by line.
 //!
-//! The dump prints the process-terminal proof this build HAS (the pid probe) and says the sidecar
-//! is not recorded; the negative assertion at the end pins that it never names a
-//! `process-terminal.json` no code path writes.
+//! The dump prints upstream's three process-terminal lines (`run-status.ts:95`, `:102-103`), and
+//! the file the first of them names is asserted to EXIST on disk: `initialize_process_terminal`
+//! writes the `pending` sidecar before the runner is spawned, so a diagnostic that names it is
+//! naming a real file. The negative assertion at the end pins that the old substitute line —
+//! `Process terminal: not recorded` — is gone, along with the premise under it.
 
 #![allow(
     clippy::unwrap_used,
@@ -35,6 +38,9 @@ use cyrup_ext_subagents::background::active_async_capacity::{
     read_owner, session_pool_dir, slot_dir,
 };
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
+use cyrup_ext_subagents::background::process_terminal::{
+    ProcessTerminal, ProcessTerminalBase, RunnerProcessInstanceId,
+};
 use cyrup_ext_subagents::background::reconcile::{Liveness, check_pid_liveness};
 use cyrup_ext_subagents::background::{
     RunId, RunMode, RunPaths, RunState, RunStatus, StepState, StepStatus,
@@ -103,6 +109,7 @@ fn background_spec(run_id: RunId) -> BackgroundStepsSpec {
         permission_rules: None,
         usage_budget: None,
         transfer_from: None,
+        revival_lease: None,
         thinking_ceiling: None,
         capability_ceiling: None,
         model_origin: None,
@@ -127,8 +134,22 @@ fn wait_until_dead(pid: u32) {
 
 /// The terminal record the detached runner writes when it finishes: `Queued` → `Running` →
 /// `Complete`, attributed to `SESSION`, carrying the runner's own pid, with its one step complete.
-async fn write_terminal_status(paths: &RunPaths, run_id: &RunId, pid: u32) {
+///
+/// It also carries the `pending` process-terminal OVERLAY `publish_initial_status` writes from
+/// `RunnerConfig::runner_process_instance_id` (pi `subagent-runner.ts:2102`), built from the SAME
+/// minted instance the launch bound onto the capacity slot — because the scripted fixture that
+/// stands in for the runner here writes no `status.json` of its own, and an overlay invented from
+/// a different id would not be the record the production runner writes.
+async fn write_terminal_status(
+    paths: &RunPaths,
+    run_id: &RunId,
+    pid: u32,
+    instance: &RunnerProcessInstanceId,
+) {
     let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(pid));
+    status.process_terminal = Some(ProcessTerminal::Pending {
+        base: ProcessTerminalBase::new(run_id.clone(), instance.clone()),
+    });
     status
         .advance_state(RunState::Running)
         .expect("Queued -> Running");
@@ -174,7 +195,7 @@ fn assert_line(text: &str, expected: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn debug_run_prints_the_real_capacity_slot_for_a_real_async_run() {
+async fn debug_run_prints_the_real_sidecar_overlay_pair_and_capacity_slot() {
     let home = tempfile::tempdir().expect("home tempdir");
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let roots = Roots::sandboxed(home.path());
@@ -228,7 +249,11 @@ async fn debug_run_prints_the_real_capacity_slot_for_a_real_async_run() {
         "the spawn created {}",
         paths.run_dir.display()
     );
-    write_terminal_status(&paths, &run_id, pid).await;
+    let instance = owner
+        .runner_process_instance_id
+        .clone()
+        .expect("mark_started bound the minted runner instance onto the slot");
+    write_terminal_status(&paths, &run_id, pid, &instance).await;
 
     // (3) The id form, through the production tool.
     let text = debug_run(
@@ -244,17 +269,46 @@ async fn debug_run_prints_the_real_capacity_slot_for_a_real_async_run() {
     assert_line(&text, &format!("Session: {SESSION}"));
     assert_line(&text, "State: complete");
     assert_line(&text, "Mode: single");
+    // pi `:95` — and the file it names is REALLY there: `initialize_process_terminal` wrote the
+    // `pending` sidecar before `spawn_detached_runner_with_command` was called, which is the whole
+    // point of that ordering. A diagnostic that names a file nothing writes is lying; this one
+    // names a file the launch wrote.
+    let sidecar_path =
+        cyrup_ext_subagents::background::RunDir::for_existing(&paths.run_dir).process_terminal();
     assert!(
-        text.lines()
-            .any(|line| line.starts_with("Process terminal: not recorded")),
-        "{text}"
+        sidecar_path.is_file(),
+        "the launch wrote {}",
+        sidecar_path.display()
     );
-    assert_line(&text, &format!("Runner pid: {pid} (dead)"));
-    // The proof rung's own sentence (`active_async_capacity/inspect.rs`, `runner_release_verdict`).
+    assert_line(
+        &text,
+        &format!("Process terminal file: {}", sidecar_path.display()),
+    );
+    // pi `:102-103`, both fed by `debugProcessTerminal` (`:52-58`). The runner here never reached
+    // a close, so BOTH records are the launch's `pending` — and they name the instance the
+    // orchestrator minted, which is what makes them matchable at all.
+    assert_line(
+        &text,
+        &format!("Status process terminal: pending · runner {instance}"),
+    );
+    assert_line(
+        &text,
+        &format!("Sidecar process terminal: pending · runner {instance}"),
+    );
+    // The NO-PROOF FALLBACK ladder's sentence, carrying pi's own
+    // `process-terminal proof is ${proofState}` prefix (`active-async-capacity.ts:239`).
+    //
+    // This run has a `pending` sidecar — the launch established ownership, and the orchestrator
+    // simulator that stands in for the runner here never reaches a close to observe — so
+    // `runner_release_verdict`'s proof rung finds nothing to match and falls THROUGH to the pid
+    // ladder beneath it. That fall-through is the behaviour under test: a runner that dies before
+    // it can write a proof must still release its slot, or after `limit` such runs the session
+    // could never spawn again.
     assert_line(
         &text,
         &format!(
-            "Active capacity: releasable — runner pid {pid} is confirmed gone and the run is terminal"
+            "Active capacity: releasable — process-terminal proof is pending; runner pid {pid} \
+             is confirmed gone and the run is terminal"
         ),
     );
     assert_line(
@@ -272,11 +326,12 @@ async fn debug_run_prints_the_real_capacity_slot_for_a_real_async_run() {
             .any(|line| line.starts_with("Capacity runner started: 20")),
         "{text}"
     );
+    // pi `:69` — the capacity owner's runner identity, which is the value the release verdict
+    // matches the proof against.
+    assert_line(&text, &format!("Capacity runner: {instance}"));
     assert!(
-        !text
-            .lines()
-            .any(|line| line.starts_with("Process terminal file:")),
-        "the dump must not name a sidecar this build never writes:\n{text}"
+        !text.contains("Process terminal: not recorded"),
+        "the substitute line is gone, and so is the premise under it:\n{text}"
     );
     assert!(
         !text.contains("Workflow children:"),

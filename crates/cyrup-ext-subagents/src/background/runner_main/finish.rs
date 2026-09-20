@@ -592,6 +592,8 @@ mod tests {
             .expect("pre-create a blocking file where the control dir needs to go");
 
         let config = RunnerConfig {
+            runner_process_instance_id: None,
+            revival_lease: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::background::RunId;
+use crate::background::session_lease::ProcessStartIdentity;
 use crate::identity::{IndexSegment, SessionId};
 
 /// The `owner.json` leaf inside every occupied slot directory (pi `:106`, `:124`, `:378`).
@@ -100,15 +101,21 @@ pub struct ActiveAsyncCapacitySnapshot {
 
 /// One session's claim on one async-run slot — pi `ActiveAsyncCapacityOwner` (`:15-29`).
 ///
-/// # The one field that is NOT upstream's, and why
+/// # Upstream's identity, and the two fields beside it that upstream does not have
 ///
-/// Upstream carries `runnerProcessInstanceId?: string`, minted by its process-terminal protocol
-/// (`runs/background/process-terminal.ts`) and the sole positive proof `runnerReleaseVerdict`
-/// accepts. **cyrup has neither the artifact nor the identity** — see [`super`]'s module doc §D3 —
-/// so this record carries [`Self::runner_pid`] instead: the real OS pid
-/// `spawn_detached_runner_with_command` returns, which is the only start-proof cyrup has and is
-/// exactly the value [`crate::background::reconcile::check_pid_liveness`] consumes.
-/// [`Self::runner_started_at`] is upstream's own field, unchanged.
+/// [`Self::runner_process_instance_id`] IS upstream's `runnerProcessInstanceId` (`:27`): the v4
+/// uuid the orchestrator mints per launch, and the value `runnerReleaseVerdict` matches a
+/// `processTerminal` proof against before it will release a slot
+/// (`active-async-capacity.ts:230-234`). [`Self::runner_started_at`] is upstream's `:28`.
+///
+/// [`Self::runner_pid`] and [`Self::runner_process_start_identity`] are cyrup's own, and they are
+/// ADDITIVE — they never replace the identity above. They exist because the proof is written at
+/// the runner's own close, so a runner that was `SIGKILL`ed never writes one, and a slot with no
+/// proof and no fallback would be retained forever. Together they are the no-proof ladder beneath
+/// the real proof: the pid `spawn_detached_runner_with_command` returns, plus the
+/// [`ProcessStartIdentity`] it held at that moment, which is what lets
+/// [`crate::background::reconcile::check_pid_identity_with`] tell a live runner from a RECYCLED pid.
+/// See [`super::inspect::runner_release_verdict`] for the rung order.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveAsyncCapacityOwner {
@@ -144,12 +151,32 @@ pub struct ActiveAsyncCapacityOwner {
     pub async_dir: PathBuf,
     /// pi `reservedAt` (`:26`) — epoch milliseconds at which the slot was claimed.
     pub reserved_at: i64,
-    /// §D3's substitution for pi `runnerProcessInstanceId` (`:27`): the detached runner's real OS
-    /// pid, bound by [`super::ActiveAsyncCapacityHandle::mark_started`] once the spawn is
-    /// confirmed. Its presence is what promotes the slot from "rollbackable reservation" to "real
-    /// run".
+    /// pi `runnerProcessInstanceId` (`:27`) — the launch's minted
+    /// [`RunnerProcessInstanceId`](crate::background::process_terminal::RunnerProcessInstanceId),
+    /// bound by [`super::ActiveAsyncCapacityHandle::mark_started`] once the spawn is confirmed.
+    ///
+    /// This is the value the release verdict's FIRST rung matches a process-terminal proof
+    /// against. A proof that names a different instance belongs to a different runner — the whole
+    /// reason `validate_proof` performs the same match — and must not release this slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_process_instance_id:
+        Option<crate::background::process_terminal::RunnerProcessInstanceId>,
+    /// The detached runner's real OS pid, bound alongside the identity above. Input to the
+    /// no-proof fallback ladder, and, with [`Self::runner_started_at`], what
+    /// [`Self::is_started`] reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_pid: Option<u32>,
+    /// [`ProcessStartIdentity`] for [`Self::runner_pid`] at the moment it was bound.
+    ///
+    /// Without it the fallback ladder is bare `kill(pid, 0)`, and a RECYCLED pid reads alive
+    /// forever — so a run whose runner was `SIGKILL`ed and whose pid was handed to something else
+    /// would hold its slot permanently. That is the defect ledger row VL-S4 names, and this field
+    /// is what closes it: see [`crate::background::reconcile::check_pid_identity_with`].
+    ///
+    /// `None` on a platform that cannot answer, and on a slot written by a build older than this
+    /// field. Absent, the ladder degrades to bare liveness — never to a wrong `Dead`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_process_start_identity: Option<ProcessStartIdentity>,
     /// pi `runnerStartedAt` (`:28`), unchanged — epoch milliseconds of the bind above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_started_at: Option<i64>,
@@ -159,9 +186,17 @@ impl ActiveAsyncCapacityOwner {
     /// `true` once a runner has been bound to this reservation — pi's
     /// `owner.runnerProcessInstanceId || owner.runnerStartedAt` (`:180`, `:183`, `:424`), the
     /// exact distinction `requireUnstarted` turns on.
+    ///
+    /// The disjunct is deliberately WIDE, exactly as upstream's is: `mark_started` writes all four
+    /// bind fields in one record, so any one of them present means a runner was bound. Narrowing
+    /// it to the instance id alone would make a slot written by an older build — which has a pid
+    /// and a `runnerStartedAt` but no instance id — look unstarted, and an unstarted slot is one a
+    /// rollback may remove out from under a live run.
     #[must_use]
     pub fn is_started(&self) -> bool {
-        self.runner_pid.is_some() || self.runner_started_at.is_some()
+        self.runner_process_instance_id.is_some()
+            || self.runner_pid.is_some()
+            || self.runner_started_at.is_some()
     }
 }
 
@@ -335,8 +370,11 @@ mod tests {
         let json = serde_json::to_string(&owner).expect("ser");
         assert!(json.contains("\"ownerSessionKey\""), "got {json}");
         assert!(json.contains("\"version\":1"), "got {json}");
-        // The two optional §D3 fields are omitted while unset.
+        // Every optional bind field is omitted while unset, so a reservation that never became a
+        // run round-trips through a build that has them without acquiring any.
         assert!(!json.contains("runnerPid"), "got {json}");
+        assert!(!json.contains("runnerProcessInstanceId"), "got {json}");
+        assert!(!json.contains("runnerProcessStartIdentity"), "got {json}");
         assert_eq!(parse_owner(json.as_bytes()).expect("round-trips"), owner);
     }
 
