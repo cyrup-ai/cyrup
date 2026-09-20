@@ -56,19 +56,28 @@
 //! verdict. A terminal run's slot is therefore freed by the NEXT spawn attempt in that session, or
 //! by an explicit reconcile/snapshot read. See [`sweep`]'s own module doc.
 //!
-//! # §D3 — the release verdict could not be ported as written
+//! # §D3 — the release verdict is upstream's proof, with a fallback ladder beneath it
 //!
 //! Upstream releases a runner's slot on one positive proof: a `processTerminal` artifact whose
-//! `state === "observed"` matches the owner's `runnerProcessInstanceId`. **cyrup has neither
-//! input** — `runs/background/process-terminal.ts` has no port, and nothing in this crate mints a
-//! `runnerProcessInstanceId`. Ported verbatim, a run that finishes SUCCESSFULLY would have no
-//! proof and is not `failed`, so its verdict would be `retained` forever: after `limit` successful
-//! background runs the session could never spawn again, which is strictly worse than having no cap
-//! at all.
+//! `state === "observed"` matches the owner's `runnerProcessInstanceId`. cyrup has BOTH inputs —
+//! [`crate::background::process_terminal`] is the ported artifact, and
+//! [`key::ActiveAsyncCapacityOwner::runner_process_instance_id`] carries the launch's minted
+//! identity — so that proof is [`inspect::runner_release_verdict`]'s FIRST rung, matched on run id
+//! and instance id exactly as upstream matches it.
 //!
-//! The substitute is cyrup's own start-proof, the runner **pid** — real, already recorded, and
-//! exactly the value [`crate::background::reconcile::check_pid_liveness`] consumes. The full rung
-//! table, and the two upstream rungs that are unrepresentable and dropped, are on
+//! Beneath it, and permanently, sits a fallback upstream does not need: **the run is terminal, no
+//! proof exists, and the runner's pid is demonstrably gone.** The proof is written by the RUNNER
+//! at its own close, because cyrup's orchestrator detaches its runner and drops the child handle
+//! unawaited — there is no parent left to observe the close (R-SA-078). A runner that was
+//! `SIGKILL`ed therefore writes no proof, ever, and a verdict with no fallback would retain its
+//! slot forever: after `limit` such runs the session could never spawn again, which is strictly
+//! worse than having no cap at all. The fallback is not a substitute for the proof; it is the
+//! answer to a different question, asked only when the first has no answer.
+//!
+//! "Demonstrably gone" is [`crate::background::reconcile::check_pid_identity_with`] — `kill(pid, 0)`
+//! plus the [`ProcessStartIdentity`](crate::background::session_lease::ProcessStartIdentity) the
+//! owner recorded at the bind — not bare liveness, because a RECYCLED pid reads alive forever and
+//! would hold the slot just as permanently. The full rung table is on
 //! [`inspect::runner_release_verdict`].
 //!
 //! # No `allow(dead_code)` lives in this module, and that is checkable

@@ -32,6 +32,48 @@ pub struct RunnerConfig {
     /// cross-check the two, since the config file's `run_id` is the sole authoritative source
     /// once read).
     pub run_id: RunId,
+    /// pi `runnerProcessInstanceId` — the identity this run's process-terminal proof is keyed on,
+    /// MINTED BY THE ORCHESTRATOR immediately before this config is written and carried into the
+    /// runner through it (`runs/background/async-execution.ts:707` `const
+    /// runnerProcessInstanceId = randomUUID();`, spread into `launchConfig` at `:710`, @v0.68.0).
+    ///
+    /// The runner stamps it onto `status.processTerminal`, onto its own
+    /// `process-terminal-candidate.json`, and onto the close observation
+    /// [`finalize_process_terminal`](crate::background::process_terminal::finalize_process_terminal)
+    /// judges — so every reader of the proof can MATCH it against the value the launch recorded.
+    /// That match is the whole point: it is what refuses a stale proof left in a reused directory
+    /// by a different runner.
+    ///
+    /// Never minted inside the runner. A value the runner chose for itself would agree with
+    /// nothing the orchestrator recorded, and `validate_proof`'s two identity checks would compare
+    /// a number against itself.
+    ///
+    /// `Option` for ONE reason: a `runner-config.json` written by a build older than this field
+    /// must still be readable (the config is a one-shot file, but a runner can outlive an upgrade
+    /// of the orchestrator that spawned it). `None` means "this launch predates the proof", and
+    /// the runner then writes no candidate and no proof at all, rather than inventing an identity
+    /// no reader holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_process_instance_id:
+        Option<crate::background::process_terminal::RunnerProcessInstanceId>,
+    /// pi `config.revivalLease` (`subagent-runner.ts:5241`) — the canonical-session lease this
+    /// run must hold, when it is a REVIVAL of a stored session transcript.
+    ///
+    /// Built by the ORCHESTRATOR (`extension/executor/control.rs`'s `revive_from_transcript`,
+    /// which is the only cyrup path that resumes an async run from its session file) and carried
+    /// here, because the process that must HOLD the lease is the runner: upstream acquires it
+    /// inside `runConfiguredSubagent` and releases it in that function's own `finally`
+    /// (`:5278-5293`), so the claim's lifetime is exactly the runner's.
+    ///
+    /// **Explicit, never derived from [`RunnerConfig::session_file`].** A seeded non-revival
+    /// launch carries a session file too, and deriving the lease from its presence would put one
+    /// on every forked run — which upstream does not do, and which would make two independent
+    /// forks of one parent transcript refuse each other.
+    ///
+    /// `None` is every ordinary launch, and a `runner-config.json` written by a build older than
+    /// this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revival_lease: Option<crate::background::session_lease::SessionLeaseRequest>,
     /// Which shape of run this is (func-SA §4.5).
     pub mode: RunMode,
     /// The already fully-resolved step list — a flat [`RunnerStep`] sequence for a `Chain` run
@@ -544,6 +586,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            runner_process_instance_id: None,
+            revival_lease: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
@@ -609,6 +653,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            runner_process_instance_id: None,
+            revival_lease: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

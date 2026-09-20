@@ -157,6 +157,27 @@ pub struct StepStatus {
     /// the detach reconciler and carried into the public child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_path_mapping: Option<crate::workflows::WorkflowOutputPathMapping>,
+    /// pi `AsyncStatusStep.processTerminal` — this step's slice of the run's process-terminal
+    /// proof, written by the overlay pass
+    /// ([`overlay_status`](crate::background::process_terminal::overlay_status), pi
+    /// `process-terminal.ts:234`) once the runner's close has been judged.
+    ///
+    /// Carries a `childIndex`, a per-step `state` derived from this step's declared-vs-recorded
+    /// writer counts, and this step's own `resumeDisposition`. `None` on every status written
+    /// before the run closed, and on every status written by a build older than this field —
+    /// which is why the key is both `default` and skipped while absent.
+    ///
+    /// Decoded leniently: one corrupt overlay must not fail the whole `status.json` read. It goes
+    /// through a DIFFERENT decoder from [`RunStatus::process_terminal`]'s, because a per-step proof
+    /// carries only that step's writer instances and upstream's own `validateProof` demands a
+    /// matching RUNNER instance on the observed arm — see `deserialize_step_overlay` for the full
+    /// reason, and for why unifying the two decoders would degrade every observed step.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::background::process_terminal::deserialize_step_overlay"
+    )]
+    pub process_terminal: Option<crate::background::process_terminal::ProcessTerminal>,
     /// Live activity telemetry folded from this step's child events (pi
     /// `subagent-runner.ts:2706-2861`) — flattened so its members serialize at the same top level
     /// of the `status.json` step object pi writes them at (`shared/types.ts:598-632`).
@@ -193,6 +214,8 @@ impl StepStatus {
             session_name: None,
             interrupted: false,
             output_path_mapping: None,
+            // No proof exists until the run closes and the overlay pass runs.
+            process_terminal: None,
             telemetry: StepTelemetry::default(),
         }
     }
@@ -383,6 +406,25 @@ pub struct RunStatus {
     /// not be ported while this field was absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_handoff: Option<crate::handoff::HandoffReference>,
+    /// pi `AsyncStatus.processTerminal` (`shared/types.ts`, written at
+    /// `process-terminal.ts:228`) — the run-level process-terminal proof, overlaid onto the status
+    /// so a reader answering "is the runner process actually gone?" needs no second file.
+    ///
+    /// Seeded as [`ProcessTerminal::Pending`](crate::background::process_terminal::ProcessTerminal::Pending)
+    /// by the runner's first status write and replaced by the finalized proof at its close. A
+    /// proof that stays `pending` forever IS the crash signal: a runner killed by a signal never
+    /// reaches its own close observation, so nothing ever overwrites the pending record — which is
+    /// exactly the crash-versus-slow-start distinction `status.state` alone could not make.
+    ///
+    /// Decoded through
+    /// [`sanitize_process_terminal`](crate::background::process_terminal::sanitize_process_terminal),
+    /// for [`StepStatus::process_terminal`]'s reason.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::background::process_terminal::deserialize_overlay"
+    )]
+    pub process_terminal: Option<crate::background::process_terminal::ProcessTerminal>,
     /// Run-wide live activity roll-ups + the workflow-graph snapshot (pi's top-level
     /// `statusPayload` telemetry, `subagent-runner.ts:2085-2120`) — flattened so its members
     /// serialize at the same top level of `status.json` pi writes them at.
@@ -424,6 +466,10 @@ impl RunStatus {
             workflow_children: None,
             workflow_receipt_path: None,
             parallel_handoff: None,
+            // Seeded by the runner's own first status write (from its `RunnerConfig`), not here:
+            // a `queued` status is built by the orchestrator, which does not yet know the proof
+            // shape the runner will publish.
+            process_terminal: None,
             telemetry: RunTelemetry::default(),
         }
     }

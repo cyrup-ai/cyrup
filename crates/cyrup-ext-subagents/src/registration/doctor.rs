@@ -1016,14 +1016,21 @@ impl ActiveAsyncCapacityDoctor {
             "- scope: top-level async runs in the current parent session; foreground and nested \
              children are not charged again"
                 .to_string(),
-            // [CYRUP-DELTA] — upstream's sentence names its process-terminal proof, which cyrup
-            // does not have (SCOPE_9 §D3). Saying so is the operator-visible half of that
-            // substitution: the slot comes back when the run is terminal AND its runner pid is
-            // confirmed gone, or on the abandoned-timeout ladder for a failed run with a dead pid
-            // and stale activity; `false` keeps unknown-liveness slots.
-            "- release: terminal state plus a confirmed-gone runner pid, or abandoned-timeout for \
-             failed runs with a dead runner pid and stale activity when enabled; false keeps \
-             unknown-liveness slots"
+            // Upstream's sentence (`doctor.ts:198`) is reproduced, because it is now TRUE here:
+            // `runner_release_verdict`'s first rung is the run's own `process-terminal.json`,
+            // matched against the owner's run id and runner instance
+            // (`active_async_capacity/inspect.rs`).
+            //
+            // [CYRUP-DELTA] — one clause is ADDED, and it is operator-visible for a reason. cyrup
+            // detaches its runner, so the proof is written by the runner at its own close; a
+            // runner that was killed writes none, ever. The confirmed-gone-pid rung beneath the
+            // proof is what releases those slots, and an operator reading this line needs to know
+            // a slot can come back on a pid verdict rather than on a proof — that is the
+            // difference between this build and upstream when a run dies hard.
+            "- release: terminal state plus matching observed process-terminal proof, or a \
+             confirmed-gone runner pid when the runner died before writing one, or \
+             abandoned-timeout for failed runs with a dead runner PID and stale activity when \
+             enabled; false keeps unknown-proof slots"
                 .to_string(),
         ]
     }
@@ -1951,6 +1958,39 @@ mod tests {
         assert!(
             report.contains("the whole async root was covered this pass"),
             "{report}"
+        );
+    }
+
+    /// The capacity block's `release:` line is what an operator reads to know WHY a slot has not
+    /// come back. It must name upstream's proof first (`doctor.ts:198`) — because that is the rung
+    /// `runner_release_verdict` consults first — and cyrup's pid fallback second, because a runner
+    /// killed before it could finalize writes no proof and only the pid rung can speak for it.
+    ///
+    /// Pinned because it is a SENTENCE, not a computation: nothing else would notice it drifting
+    /// away from the ladder it describes, and an operator acting on a stale one looks for a proof
+    /// that is never coming.
+    #[test]
+    fn the_capacity_block_states_the_proof_rung_before_the_pid_fallback() {
+        let doctor = ActiveAsyncCapacityDoctor {
+            snapshot: crate::background::active_async_capacity::ActiveAsyncCapacitySnapshot {
+                used: 1,
+                limit: 0,
+            },
+        };
+        let lines = doctor.lines();
+        assert_eq!(lines[0], "- usage: 1/unlimited used");
+        let release = &lines[2];
+        let proof = release
+            .find("matching observed process-terminal proof")
+            .expect(release);
+        let pid = release.find("confirmed-gone runner pid").expect(release);
+        assert!(
+            proof < pid,
+            "the proof is the FIRST rung and the sentence must say so: {release}"
+        );
+        assert!(
+            release.contains("false keeps unknown-proof slots"),
+            "{release}"
         );
     }
 

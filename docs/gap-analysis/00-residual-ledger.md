@@ -59,7 +59,9 @@ next work item**.
 >   `PB-9`, `PB-12`, `PB-14`, `VL-S3`…`VL-S6`, `VL-S8`, `VL-S10`…`VL-S13`, `UW-3`, `UW-4`, `UW-5`,
 >   `UW-7`, `UW-10`, `UW-16`, `UW-18`, `UW-21`. **`count_open_items.py` cannot see any of them**, and
 >   **the highest-value delegation work in this directory is in that set, not in the 76.** Ranking
->   only the 76 would have produced a worklist of mostly cosmetic lows.
+>   only the 76 would have produced a worklist of mostly cosmetic lows. (That list is the census's
+>   own snapshot and is kept verbatim; `PB-8`, `PB-12`, `VL-S3`, `VL-S4`, `VL-S5` and `VL-S13` have
+>   closed since it was taken.)
 > * **Area 13 (`cyrup-mcp`) is outside the census entirely and carries ~198 open units — 8 critical
 >   and 73 high** (`13-cyrup-mcp-STATUS.md`, 98 missing + 100 partial of 437). Its pins are stale
 >   (`v2.26.1`/`v2.32.1` against a current `v2.33.0`) and `v2.32.1..v2.33.0` — 123 files,
@@ -88,7 +90,7 @@ next work item**.
 > | ~~9~~ | **~~`VL-S5`~~** (§1b) — **CLOSED 2026-09-19** | `background/recovery_descriptor.rs` writes the resolved launch contract at async launch and `revive_from_transcript` reads it back. **Not three fields and not small**: upstream's descriptor is 54 fields; 13 have no cyrup concept and are named per field; two of the restored ones are capability constraints, so the old fallback WIDENED. The retention reader now finds real files | ~~S~~ | — |
 > | 10 | **`VL-S12`** (§1b) | the palette **stops advertising four commands upstream deleted at v0.41.0** (`slash_commands.rs:83`/`:84`/`:85`/`:101`). **Its blocker is discharged** — `VL-S2` landed — so this is now a clean deletion | XS | no |
 > | ~~11~~ | **~~`PB-12`~~** (§1b) — **CLOSED 2026-09-19** | `exec/child_transcript.rs` over `BoundedJsonlWriter`, fed from the parsed child-event stream on both the foreground and background paths; the first record is the redacted sentinel, never the prompt; `transcript_path` published at both runner sites and read by the fleet pane. Mid-run read proven in cyrup-it | ~~M~~ | — |
-> | 12 | **`VL-S3` + `VL-S4`** (§1b) | many-agent correctness: no two runners owning one session file, and a **definite terminal cause** instead of a reconciled "stale" guess. `VL-S4` is now LOAD-BEARING — `active_async_capacity` substituted runner-pid liveness for the missing `processTerminal` proof | M each | no |
+> | ~~12~~ | **~~`VL-S3` + `VL-S4`~~** (§1b) — **CLOSED 2026-09-20** | `background/session_lease/` + `background/process_terminal/` (15 modules, 5,912 LOC) port both upstream files whole. Two runners can no longer own one session file: the runner acquires a revival lease and a second revival is refused with upstream's sentence, proven against a genuinely live incumbent in `cyrup-it`. A killed runner is now DISTINGUISHABLE from a clean one — its sidecar stays `pending` where a clean close writes `observed` — so `status` reports a definite terminal cause instead of the reconciler's guess. **The substitution this row named is resolved, not deleted**: the capacity release rung reads the real proof FIRST and keeps the pid ladder beneath it, because a runner killed before it can finalize writes no proof and would otherwise hold its slot forever | ~~M each~~ | — |
 > | 13 | **`PB-9`** (§1b) | `clarify: true` **shows the preview/edit UI its own tool description promises**. The seam is live (`open_overlay`) | L | no |
 > | 14 | **`VL-S11` = `SUBA-026`**, **`VL-S6`** (§1b) | the `/subagents` admin surface and the herdr inspector's advertised `H` key. Real delight, large, and behind everything above it | L each | no |
 >
@@ -253,8 +255,9 @@ next work item**.
 >   parse point on both the foreground and the background path; the FleetView pane reads
 >   `paths.transcript_path` / `step.transcript_path` for a RUNNING child (`tui/fleet.rs:1156`,
 >   `:1186-1191`). See the row's `CLOSED 2026-09-19` bullet in `PARITY-GAPS.md`.
-> * **Still open, evidence refreshed to current addresses:** `PB-8`, `PB-9`, `PB-14`, `VL-S3`,
->   `VL-S4`, `VL-S5`, `VL-S6`, `VL-S8`, `VL-S10`, `VL-S11`, `VL-S12`, `VL-S13`.
+> * **Still open at that sweep, evidence refreshed to current addresses:** `PB-8`, `PB-9`, `PB-14`,
+>   `VL-S3`, `VL-S4`, `VL-S5`, `VL-S6`, `VL-S8`, `VL-S10`, `VL-S11`, `VL-S12`, `VL-S13`. **Four
+>   have closed since:** `PB-8`, `VL-S5`, `VL-S13`, and `VL-S3` + `VL-S4` together on 2026-09-20.
 >
 > **`PARITY-GAPS.md` §2 (the unwired register) — all twenty entries re-greped. It was the stalest
 > section in the file.** `UW-1`, `UW-6`, `UW-8`, `UW-9`, `UW-11`, `UW-15`, `UW-17`, `UW-19` and
@@ -365,9 +368,12 @@ next work item**.
 >    would decide it is still `NoDecisionPermissionAgent` (`watchdog/permission_arbiter.rs:600`, bound
 >    at `prompt_runtime.rs:2407`), so every `ask` denies. **Wiring an input to an inert decider raised
 >    this row's blast radius without raising its severity.**
-> 5. **`VL-S4`, for the same reason.** `active_async_capacity` had to substitute runner-pid liveness
->    for upstream's `processTerminal` proof (`active_async_capacity/mod.rs` §D3) because the port does
->    not exist. A second subsystem now runs on a workaround for this row.
+> 5. ~~**`VL-S4`, for the same reason.**~~ **DISCHARGED 2026-09-20.** `active_async_capacity` had
+>    substituted runner-pid liveness for upstream's `processTerminal` proof because the port did not
+>    exist; the port landed and §D3 was rewritten. The release rung now reads the real proof as its
+>    FIRST rung and keeps the pid ladder BENEATH it — which is not the old workaround surviving, but
+>    the answer to a different question: cyrup's runner is detached and finalizes its own proof, so a
+>    runner that was killed writes none and only the pid ladder can speak for its slot.
 > 6. **The `v0.47.1..v0.68.0` window.** It is owned by nothing. §3b is spent — fourteen of seventeen
 >    closed — and the range that replaced it has never been opened.
 > 7. **Area 13 is still outside the census**, unchanged by anything here.

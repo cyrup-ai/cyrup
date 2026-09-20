@@ -329,7 +329,9 @@ impl SubagentExecutor {
     /// location WITHOUT the foreground/nested ladder `status` uses (`:406-410` calls
     /// `resolveAsyncRunLocation` directly, no session filter), run the FULL stale-run reconciler
     /// (`:475`), inspect the run's active-capacity slot with the three identities upstream passes
-    /// (`:515`), probe the recorded runner pid, and render
+    /// (`:515`), read the run's process-terminal pair
+    /// ([`debug_process_terminal`](crate::background::run_lifecycle_debug::debug_process_terminal),
+    /// pi `:514`'s `debugProcessTerminal(asyncDir, status)`), and render
     /// [`crate::background::run_lifecycle_debug::format_run_lifecycle_debug`].
     ///
     /// The display-dismissed marker is NOT a refusal here (`:485-492` dumps over the on-disk
@@ -349,9 +351,9 @@ impl SubagentExecutor {
         dir: Option<&str>,
     ) -> Result<String, String> {
         use crate::background::active_async_capacity::inspect_active_async_capacity_owner;
-        use crate::background::reconcile::{check_pid_liveness, reconcile_now};
+        use crate::background::reconcile::reconcile_now;
         use crate::background::run_lifecycle_debug::{
-            DEBUG_RUN_NEEDS_STATUS_DIR, RunLifecycleDebug, RunnerLiveness,
+            DEBUG_RUN_NEEDS_STATUS_DIR, RunLifecycleDebug, debug_process_terminal,
             format_run_lifecycle_debug,
         };
 
@@ -436,12 +438,18 @@ impl SubagentExecutor {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let runner = RunnerLiveness::probe(&status, check_pid_liveness);
+        // pi `:514` — the sidecar and the status overlay, read against `:53`'s expectation.
+        let terminal = debug_process_terminal(
+            &crate::background::RunDir::for_existing(&paths.run_dir),
+            &status,
+        )
+        .await;
 
         Ok(format_run_lifecycle_debug(&RunLifecycleDebug {
             status: &status,
             paths: &paths,
-            runner,
+            sidecar: terminal.sidecar.as_ref(),
+            overlay: terminal.overlay.as_ref(),
             capacity: &capacity,
         }))
     }

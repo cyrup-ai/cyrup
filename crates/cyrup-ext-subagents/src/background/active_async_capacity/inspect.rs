@@ -2,11 +2,13 @@
 //!
 //! Ports pi `active-async-capacity.ts:50-68` (the verdict/inspection types), `:212-297` (the four
 //! verdict functions) and `:311-336` (`inspectActiveAsyncCapacityOwner`) @`v0.66.0`, with the
-//! §D3 process-terminal substitution described on [`runner_release_verdict`].
+//! process-terminal proof rung and the no-proof fallback ladder beneath it, both described on
+//! [`runner_release_verdict`].
 
 use std::path::{Path, PathBuf};
 
-use crate::background::reconcile::Liveness;
+use crate::background::process_terminal::ProcessTerminalState;
+use crate::background::reconcile::{Liveness, check_pid_identity_with};
 use crate::background::{RunDir, RunId, RunMode, RunStatus};
 use crate::identity::SessionId;
 use crate::registration::AbandonedSlotRelease;
@@ -30,8 +32,11 @@ use super::key::{
 pub struct ActiveAsyncCapacityReleaseEvidence {
     /// Always `"abandoned-timeout"` (pi `:51`).
     pub released_by: &'static str,
-    /// Always `"unknown"` (pi `:52`) — cyrup has no process-terminal artifact at all (§D3), so
-    /// this is the only value the field can honestly take here.
+    /// Always `"unknown"` (pi `:52`), and that is a TRUE statement on this path rather than a
+    /// placeholder: the abandoned-timeout ladder is only reached when the run's own
+    /// `process-terminal.json` was missing, `pending` or refused — a matching `observed` proof
+    /// releases the slot several rungs earlier, on [`runner_release_verdict`]'s proof rung, and
+    /// never reaches this evidence shape at all.
     pub process_proof: &'static str,
     /// Always `"gone"` (pi `:53`) — the ladder is unreachable unless the probe said
     /// [`Liveness::Dead`].
@@ -176,41 +181,52 @@ pub(super) async fn read_run_status(async_dir: &Path) -> Option<RunStatus> {
         .flatten()
 }
 
-/// pi `runnerReleaseVerdict` (`:216-236`), with the ONE substitution this whole task turns on.
+/// pi `runnerReleaseVerdict` (`:216-236`) — the rung ladder that decides whether a terminated
+/// run's capacity slot may be handed to someone else.
 ///
-/// # §D3 — why the proof rung is a pid probe and not a ported artifact
+/// # The rungs, in order
 ///
-/// Upstream releases a runner slot on exactly one positive proof: a `processTerminal` record whose
-/// `state === "observed"` and whose `runnerProcessInstanceId` matches the owner's
-/// (`:230-235`). **cyrup has neither input** — there is no port of
-/// `runs/background/process-terminal.ts` (`ProcessTerminalCandidate`, `writers`, `expectedWriters`,
-/// `revivalLeaseToken`), and nothing in this crate mints a `runnerProcessInstanceId`;
-/// [`RunStatus`] has no such field.
+/// 1..5 are upstream's identity and terminality guards (`:217-221`), unchanged.
 ///
-/// Ported verbatim, that has a specific and fatal consequence: a run that finishes `Complete` has
-/// no observed proof and is not `failed`, so
-/// [`abandoned_runner_release_verdict`]'s `status.state != Failed` rung retains it **forever**.
-/// After `limit` SUCCESSFUL background runs the session could never spawn again — strictly worse
-/// than having no cap at all.
+/// 6. **The early-failure carve-out** (`:222-226`): a `not-started` proof on `status`, for THIS
+///    run and THIS runner instance, beside a non-empty `status.error`. A run that failed before
+///    its child ever started has no close to observe and must not wait out the abandoned timeout.
+/// 7. **THE PROOF** (`:227-235`): the run's own `process-terminal.json`, read back and matched
+///    against the owner's run id AND
+///    [`ActiveAsyncCapacityOwner::runner_process_instance_id`]. `observed` with both matching is
+///    upstream's single positive release proof, and it is consulted BEFORE the pid ladder below —
+///    never the other way round. It is NOT the first rung of the ladder as a whole: rungs 1-5's
+///    identity and terminality guards and rung 6's carve-out all answer before the sidecar is even
+///    opened, and a rung added above this one must keep that order.
+/// 8. **The no-proof fallback ladder — cyrup's, and it STAYS** (see below).
+/// 9. [`abandoned_runner_release_verdict`], upstream's `:238-263` tail.
 ///
-/// The substitute is cyrup's own start-proof, the runner pid: real, already recorded
-/// ([`ActiveAsyncCapacityOwner::runner_pid`], bound by
-/// [`super::ActiveAsyncCapacityHandle::mark_started`] from the value
-/// `spawn_detached_runner_with_command` returns), and exactly the value
-/// [`crate::background::reconcile::check_pid_liveness`] consumes. "The run is terminal AND its
-/// runner pid is confirmed gone" is the strongest gone-ness proof this implementation can produce.
+/// # Why the pid ladder remains beneath the proof
 ///
-/// # Two upstream rungs are unrepresentable and are dropped, deliberately
+/// The proof is written by the RUNNER at its own close
+/// ([`crate::background::runner_main`]'s tail), because cyrup's orchestrator detaches its runner
+/// and drops the child handle unawaited — there is no parent left to observe the close
+/// (R-SA-078). So a runner that was `SIGKILL`ed, OOM-killed, or lost with its machine writes NO
+/// proof, ever. Deleting the fallback when the real proof landed would retain every such run's
+/// slot forever, and after `limit` of them the session could never spawn again — which is
+/// strictly worse than having no cap at all. The fallback is therefore not a substitute any more;
+/// it is the answer to a genuinely different question, asked only when the first has no answer:
+/// *the run is terminal, no proof exists, and the runner's pid is demonstrably gone.*
 ///
-/// * The early-failure carve-out (`:222-226`) is expressed entirely through `processTerminal`.
-///   Its EFFECT survives in the proof rung below: a run that failed before child startup has a
-///   dead runner pid, so it releases here rather than waiting out the abandoned timeout.
-/// * `rollbackBeforeRunnerProceed` (`:426-446`) re-binds a reservation against a
-///   `runnerProcessInstanceId` during upstream's runner-proceed handshake. cyrup has no such
-///   handshake — the pid is known the instant `spawn_detached_runner_with_command` returns — so
-///   there is no call site and the method is not ported.
-#[must_use]
-pub fn runner_release_verdict(
+/// "Demonstrably gone" is [`crate::background::reconcile::check_pid_identity_with`], not bare
+/// `kill(pid, 0)`: the owner records the pid's [`ProcessStartIdentity`] at the bind, so a RECYCLED
+/// pid — live, but a different process — reads `Dead` here instead of holding the slot forever.
+/// That recycled-pid hole is the defect ledger row VL-S4 named.
+///
+/// # One upstream method still has no cyrup call site
+///
+/// `rollbackBeforeRunnerProceed` (`:426-446`) re-binds a reservation during upstream's
+/// runner-proceed HANDSHAKE. cyrup has no startup barrier — `spawn_detached_runner_with_command`
+/// returns with the runner already running — so there is no window for it to cover. See
+/// [`super::ActiveAsyncCapacityHandle`]'s own doc.
+///
+/// [`ProcessStartIdentity`]: crate::background::session_lease::ProcessStartIdentity
+pub async fn runner_release_verdict(
     owner: &ActiveAsyncCapacityOwner,
     status: Option<&RunStatus>,
     options: &CapacityOptions,
@@ -219,8 +235,9 @@ pub fn runner_release_verdict(
     let Some(status) = status else {
         return ActiveAsyncCapacityReleaseVerdict::retained("status file is missing or unreadable");
     };
-    // pi `:218` — `!owner.runnerProcessInstanceId`. §D3: the start proof is the pid/started-at
-    // pair, and EITHER half present means a runner was bound (pi tests both at `:180`).
+    // pi `:218` — `!owner.runnerProcessInstanceId`. [`ActiveAsyncCapacityOwner::is_started`] is
+    // the wide disjunct pi tests at `:180`: any bind field present means a runner was bound, which
+    // keeps a slot written by a build older than the instance-id field from reading as unstarted.
     if !owner.is_started() {
         return ActiveAsyncCapacityReleaseVerdict::retained(
             "runner process identity has not been recorded",
@@ -254,23 +271,97 @@ pub fn runner_release_verdict(
             state_word(status.state)
         ));
     }
-    // THE PROOF (§D3). Upstream: an observed process-terminal record. cyrup: the owner's own
-    // runner pid, confirmed gone.
+    // pi `:222-226` — the early-failure carve-out. A run that failed before its child ever
+    // started HAS no close to observe, so the ladder below would never release it and it would sit
+    // out the whole abandoned timeout for no information gained.
+    if let Some(proof) = status.process_terminal.as_ref()
+        && proof.state() == ProcessTerminalState::NotStarted
+        && *proof.run_id() == owner.run_id
+        && owner
+            .runner_process_instance_id
+            .as_ref()
+            .is_some_and(|instance| proof.runner_process_instance_id() == instance)
+        // pi `typeof status.error === "string" && status.error` (`:225`) — an EMPTY error string
+        // does not satisfy it either, which `Option::is_some_and` reproduces exactly.
+        && status.error.as_ref().is_some_and(|error| !error.is_empty())
+    {
+        return ActiveAsyncCapacityReleaseVerdict::releasable(
+            "run failed before child startup completed",
+        );
+    }
+
+    // pi `:227-235` — THE PROOF. It is the first rung to consult the run's own artifacts, and it
+    // answers BEFORE the pid ladder beneath it; the guards at `:217-221` and the carve-out above
+    // still run first. `read_process_terminal` runs
+    // the sidecar through `validate_proof` with this expectation, so a proof left behind by a
+    // DIFFERENT runner in a reused directory degrades to `unknown` rather than releasing this
+    // run's slot.
+    let proof = match owner.runner_process_instance_id.as_ref() {
+        Some(instance) => {
+            crate::background::process_terminal::read_process_terminal(
+                &RunDir::for_existing(&owner.async_dir),
+                crate::background::process_terminal::ProofExpectation::new(&owner.run_id, instance),
+            )
+            .await
+        }
+        // A slot written before the identity existed has nothing to match a proof against, and
+        // `validate_proof`'s whole job is that match. Reading one anyway would accept a proof this
+        // record cannot vouch for.
+        None => None,
+    };
+    if let Some(proof) = proof.as_ref()
+        && proof.state() == ProcessTerminalState::Observed
+        && *proof.run_id() == owner.run_id
+        && owner
+            .runner_process_instance_id
+            .as_ref()
+            .is_some_and(|instance| proof.runner_process_instance_id() == instance)
+    {
+        return ActiveAsyncCapacityReleaseVerdict::releasable(
+            "matching observed process-terminal proof is present",
+        );
+    }
+    // pi `:235` — `proof?.state ?? "missing"`, the word the fallback ladder's every retained
+    // reason interpolates.
+    let proof_reason = format!(
+        "process-terminal proof is {}",
+        proof
+            .as_ref()
+            .map_or("missing", |proof| proof.state().as_str())
+    );
+
+    // The no-proof FALLBACK ladder — cyrup's own, and the reason it stays is on this function's
+    // doc: a runner killed before it could write a proof would otherwise hold its slot forever.
     let proof_reason = match owner.runner_pid {
-        Some(pid) => match options.pid_liveness(pid) {
-            Liveness::Dead => {
-                return ActiveAsyncCapacityReleaseVerdict::releasable(format!(
-                    "runner pid {pid} is confirmed gone and the run is terminal"
-                ));
+        Some(pid) => {
+            // `check_pid_identity_with`, not a bare liveness probe: the owner recorded this pid's
+            // start identity at the bind, so a RECYCLED pid answers `Dead` here rather than
+            // holding the slot for the life of the machine. That is VL-S4's named defect, closed.
+            let liveness = check_pid_identity_with(
+                pid,
+                owner.runner_process_start_identity.as_ref(),
+                |pid| options.pid_liveness(pid),
+                |pid| options.pid_start_identity(pid),
+            );
+            match liveness {
+                Liveness::Dead => {
+                    return ActiveAsyncCapacityReleaseVerdict::releasable(format!(
+                        "{proof_reason}; runner pid {pid} is confirmed gone and the run is terminal"
+                    ));
+                }
+                // NEVER read `Unknown` as dead (`background/reconcile.rs`'s `Liveness`): an
+                // `EPERM`-class probe failure commonly means the process is alive and merely
+                // unobservable, and reclaiming a live run's slot is the failure mode the whole cap
+                // exists to avoid.
+                liveness => format!(
+                    "{proof_reason}; runner pid {pid} liveness is {}",
+                    liveness_word(liveness)
+                ),
             }
-            // NEVER read `Unknown` as dead (`background/reconcile.rs:68-71`): an `EPERM`-class
-            // probe failure commonly means the process is alive and merely unobservable, and
-            // reclaiming a live run's slot is the failure mode the whole cap exists to avoid.
-            liveness => format!("runner pid {pid} liveness is {}", liveness_word(liveness)),
-        },
+        }
         // The durable bind stamped `runnerStartedAt` but never landed the pid (pi's `markStarted`
-        // comment at `:410-411` names exactly this window). There is no proof to read.
-        None => "runner pid was never recorded".to_string(),
+        // comment at `:410-411` names exactly this window).
+        None => format!("{proof_reason}; runner pid was never recorded"),
     };
     abandoned_runner_release_verdict(status, &proof_reason, options)
 }
@@ -357,14 +448,17 @@ pub fn abandoned_runner_release_verdict(
 /// pi `workflowReleaseVerdict` (`:265-290` @`v0.66.0`, plus the `v0.68.0` not-started guard folded
 /// in at `:283-286`).
 ///
-/// # The two substitutions
+/// # The one substitution, and the one fallback
 ///
 /// 1. The live-controller check (`:271`) is
 ///    [`crate::extension::SubagentExecutor::live_workflow_run_ids`]'s set. A live workflow's slot
 ///    is NEVER reclaimed, which is why a leaked registry entry withholds capacity forever and a
 ///    missing one reclaims a live run's slot.
-/// 2. Each async child's process-terminal proof (`:287-289`) becomes the same pid probe §D3
-///    substitutes upstream, over that child's own [`RunStatus::pid`].
+/// 2. Each async child's process-terminal proof (`:287-289`) is upstream's own, read off that
+///    child's `process-terminal.json` and matched against the identity its `status.json`
+///    published. Beneath it sits the same no-proof fallback [`runner_release_verdict`] keeps —
+///    the child's recorded pid, confirmed gone — because a child killed before it could write a
+///    proof would otherwise pin its parent's slot forever.
 ///
 /// # Q5 — cyrup has no `step.async`, because cyrup has no async workflow child
 ///
@@ -464,24 +558,74 @@ pub async fn workflow_release_verdict(
                 state_word(child_status.state)
             ));
         }
-        // §1.1a(b) — pi's `v0.68.0` not-started guard (`:283-286`): a child that never started but
-        // recorded an error must NOT pin its parent's slot. Expressed upstream through
-        // `processTerminal.state === "not-started"`; cyrup's substitute proof is the absence of a
-        // runner pid, which is the same fact. It is tested BEFORE the identity rung below, and
-        // must be: in cyrup "never started" and "has no runner identity" are the same observation,
-        // so evaluating them in upstream's order would retain the slot the guard exists to free.
-        if child_status.pid.is_none() && child_status.error.as_ref().is_some_and(|e| !e.is_empty())
+        // pi `:283-286` — a child that never started but recorded an error must NOT pin its
+        // parent's slot, and upstream expresses "never started" through the child's own
+        // `processTerminal.state === "not-started"`. That record now exists here, so the guard is
+        // upstream's own, tested against the child's proof rather than against a substitute.
+        //
+        // The pid-absence disjunct is kept BESIDE it, not instead of it: a child launched by a
+        // build older than the overlay field carries no `processTerminal` at all, and without the
+        // second reading its parent's slot would be retained forever — which is the defect the
+        // whole fallback ladder exists to prevent.
+        let child_never_started = child_status.process_terminal.as_ref().is_some_and(|proof| {
+            proof.state() == ProcessTerminalState::NotStarted && proof.run_id() == child_run_id
+        }) || child_status.pid.is_none();
+        if child_never_started
+            && child_status
+                .error
+                .as_ref()
+                .is_some_and(|error| !error.is_empty())
         {
             continue;
         }
-        // pi `:282` — no runner identity at all, and no error to explain it.
-        let Some(child_pid) = child_status.pid else {
+        // pi `:282` — `!childStatus.processTerminal?.runnerProcessInstanceId`: no runner identity
+        // at all, and no error to explain it. cyrup reads the identity off the child's own status
+        // overlay, exactly as upstream does, and falls back to the recorded pid for a child
+        // launched before the overlay field existed.
+        let child_instance = child_status
+            .process_terminal
+            .as_ref()
+            .map(crate::background::process_terminal::ProcessTerminal::runner_process_instance_id);
+        if child_instance.is_none() && child_status.pid.is_none() {
             return ActiveAsyncCapacityReleaseVerdict::retained(format!(
                 "async workflow child {label} has no runner process identity"
             ));
-        };
-        // pi `:287-289`, with §D3's pid probe standing in for the process-terminal proof.
-        if options.pid_liveness(child_pid) != Liveness::Dead {
+        }
+        // pi `:287-289` — THE PROOF, the child's own `process-terminal.json`, matched against the
+        // run id the parent's step recorded and the instance the child's status published.
+        if let Some(instance) = child_instance {
+            let proof = crate::background::process_terminal::read_process_terminal(
+                &RunDir::for_existing(&child_dir),
+                crate::background::process_terminal::ProofExpectation::new(child_run_id, instance),
+            )
+            .await;
+            match proof {
+                Some(proof)
+                    if proof.state() == ProcessTerminalState::Observed
+                        && proof.run_id() == child_run_id =>
+                {
+                    continue;
+                }
+                // pi `:288`'s retained reason, with pi's own `?? "missing"`.
+                proof => {
+                    let state = proof
+                        .as_ref()
+                        .map_or("missing", |proof| proof.state().as_str());
+                    // The no-proof FALLBACK, for the same reason the runner verdict keeps one: a
+                    // workflow child killed before it could write a proof would otherwise pin its
+                    // parent's slot forever. A pid the kernel says is gone is the evidence.
+                    if !child_pid_is_gone(&child_status, options) {
+                        return ActiveAsyncCapacityReleaseVerdict::retained(format!(
+                            "async workflow child {label} process-terminal proof is {state}"
+                        ));
+                    }
+                    continue;
+                }
+            }
+        }
+        // No published identity: the fallback ladder is all there is.
+        if !child_pid_is_gone(&child_status, options) {
+            let child_pid = child_status.pid.unwrap_or_default();
             return ActiveAsyncCapacityReleaseVerdict::retained(format!(
                 "async workflow child {label} runner pid {child_pid} is not confirmed gone"
             ));
@@ -489,8 +633,20 @@ pub async fn workflow_release_verdict(
     }
     // pi `:291`.
     ActiveAsyncCapacityReleaseVerdict::releasable(
-        "workflow is terminal, controller is gone, and async children have confirmed-gone runners",
+        "workflow is terminal, controller is gone, and async children have observed proof or confirmed-gone runners",
     )
+}
+
+/// The workflow loop's no-proof fallback rung, spelled once — the same ladder
+/// [`runner_release_verdict`] falls to, over the CHILD's recorded pid.
+///
+/// A child's `status.json` carries a pid but no start identity (that pair lives on the capacity
+/// OWNER record, and a workflow child holds no slot of its own), so this rung is bare liveness and
+/// is honest about it: `Dead` only, never [`Liveness::Unknown`].
+fn child_pid_is_gone(child_status: &RunStatus, options: &CapacityOptions) -> bool {
+    child_status
+        .pid
+        .is_some_and(|pid| options.pid_liveness(pid) == Liveness::Dead)
 }
 
 /// pi `ownerReleaseVerdict` (`:292-297`) — reads the owner's own `status.json` once and dispatches
@@ -501,7 +657,9 @@ pub async fn owner_release_verdict(
 ) -> ActiveAsyncCapacityReleaseVerdict {
     let status = read_run_status(&owner.async_dir).await;
     match owner.kind {
-        ActiveAsyncCapacityKind::Runner => runner_release_verdict(owner, status.as_ref(), options),
+        ActiveAsyncCapacityKind::Runner => {
+            runner_release_verdict(owner, status.as_ref(), options).await
+        }
         ActiveAsyncCapacityKind::Workflow => {
             workflow_release_verdict(owner, status.as_ref(), options).await
         }

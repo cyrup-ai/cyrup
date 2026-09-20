@@ -453,6 +453,8 @@ mod tests {
             allow: Some(vec!["anthropic/*".to_string()]),
         };
         let config = crate::background::runner_main::RunnerConfig {
+            runner_process_instance_id: None,
+            revival_lease: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
@@ -505,6 +507,8 @@ mod tests {
     /// above; only `host_available_builtins` differs.
     fn config_with_host(host: Option<Vec<String>>) -> crate::background::runner_main::RunnerConfig {
         crate::background::runner_main::RunnerConfig {
+            runner_process_instance_id: None,
+            revival_lease: None,
             usage_budget: None,
             turn_budget: None,
             permission_rules: None,

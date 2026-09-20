@@ -121,6 +121,8 @@ pub(super) async fn run_inner(
     flags: &ControlFlags,
     interrupt_cancel: &cyrup_core::CancelToken,
     telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
+    writer_ledgers: super::executor::WriterProcessLedgers,
+    lease_writer: Option<super::executor::LeaseWriterSender>,
     events: &mut Option<BoundedJsonlWriter>,
 ) -> Result<LoopOutcome, SubagentError> {
     let mut steps = config.steps.clone();
@@ -139,6 +141,8 @@ pub(super) async fn run_inner(
         flags,
         interrupt_cancel,
         telemetry,
+        writer_ledgers,
+        lease_writer,
         depth,
     );
 
@@ -347,6 +351,8 @@ fn build_chain_context(
     flags: &ControlFlags,
     interrupt_cancel: &cyrup_core::CancelToken,
     telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
+    writer_ledgers: super::executor::WriterProcessLedgers,
+    lease_writer: Option<super::executor::LeaseWriterSender>,
     depth: DepthEnvelope,
 ) -> (Arc<dyn SingleStepExecutor>, ChainRunContext) {
     let global_limit = GlobalConcurrencyLimit::new(config.global_concurrency_limit.max(1));
@@ -368,6 +374,15 @@ fn build_chain_context(
         interrupt_cancel: interrupt_cancel.clone(),
         child_stops: Some(flags.child_stops.clone()),
         telemetry: Some(telemetry),
+        // The run's per-step writer-process ledgers, created by `run_with` and shared with every
+        // dispatched step's live sink — what makes this run's process-terminal candidate carry
+        // REAL writer records instead of upstream's structurally empty ones.
+        writer_ledgers: Some(writer_ledgers),
+        // The revival lease's writer channel, when this run holds a lease. `None` on every
+        // ordinary launch — upstream acquires a lease on the revival path alone
+        // (`subagent-runner.ts:5241`), and a step that reported into a channel nobody drains would
+        // be recording a writer state no lease exists to carry.
+        lease_writer,
         resolved_agents,
         // Intercom child-bridge (pi `subagent-runner.ts:779-783`): the orchestrator's presence target
         // + this run's id, carried in the one-shot config, so every step's spawned child activates

@@ -31,7 +31,10 @@
 //!    [`Liveness::Unknown`] (`EPERM` under sandboxing) must NOT be read as dead (R-SA-089), which
 //!    is upstream's own `alive === false` vs `alive === undefined` split;
 //! 4. **owner pid alive but its start identity changed** → stale. This is pid REUSE: the number is
-//!    live, but it is a different process. See [`process_start_identity`];
+//!    live, but it is a different process. Rungs 3 and 4 are ONE call —
+//!    [`check_pid_identity_with`](crate::background::reconcile::check_pid_identity_with) — shared
+//!    with the session lease's `processDemonstrablyGone`, over
+//!    [`process_start_identity`](crate::background::session_lease::process_start_identity);
 //! 5. otherwise stale only after [`LOCK_STALE_MS`] since the owner took it.
 //!
 //! # The owner token is re-verified AFTER the work
@@ -42,8 +45,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::background::reconcile::{Liveness, check_pid_liveness};
+use crate::background::reconcile::{Liveness, check_pid_identity_with, check_pid_liveness};
 use crate::background::result_index::errno;
+use crate::background::session_lease::{ProcessStartIdentity, process_start_identity};
 
 /// pi `LOCK_NAME` (`:20`) — `<maintenance_root>/.async-retention.lock`, a DIRECTORY.
 pub const LOCK_NAME: &str = ".async-retention.lock";
@@ -77,11 +81,19 @@ pub struct RetentionLockIdentity {
     pub hostname: String,
     /// [`process_start_identity`] for [`Self::pid`], when this platform can answer. `None` simply
     /// disables rung 4 for locks this process takes — never a reason to widen any other rung.
-    pub process_start_identity: Option<String>,
+    pub process_start_identity: Option<ProcessStartIdentity>,
     /// The liveness probe rung 3 uses. A plain `fn` pointer rather than a boxed closure because
     /// the only two implementations are [`check_pid_liveness`] and a test's constant, and a
     /// pointer keeps this type [`Clone`] and allocation-free.
     pub liveness: fn(u32) -> Liveness,
+    /// The start-identity probe rung 4 uses, injected for the same reason [`Self::liveness`] is:
+    /// a test cannot own a pid that has been recycled, so it presents one.
+    ///
+    /// Rung 4 is
+    /// [`check_pid_identity_with`](crate::background::reconcile::check_pid_identity_with)'s
+    /// upgrade of an `Alive` answer to [`Liveness::Dead`] — the SAME ladder the session lease's
+    /// `processDemonstrablyGone` runs, spelled once in `reconcile` rather than twice here.
+    pub start_identity_of: fn(u32) -> Option<ProcessStartIdentity>,
 }
 
 impl RetentionLockIdentity {
@@ -94,6 +106,7 @@ impl RetentionLockIdentity {
             hostname: machine_hostname(),
             process_start_identity: process_start_identity(pid),
             liveness: check_pid_liveness,
+            start_identity_of: process_start_identity,
         }
     }
 }
@@ -132,33 +145,6 @@ pub fn machine_hostname() -> String {
     "unknown-host".to_string()
 }
 
-/// pi `computeProcessStartIdentity` (`:332-350`) — the Linux arm, which is the one that matters
-/// here.
-///
-/// Field 22 of `/proc/<pid>/stat` (1-based; index 19 of the fields AFTER the parenthesised
-/// command, which is how upstream counts it at `:340`) is `starttime`, the number of clock ticks
-/// after boot at which the process started. A pid plus its `starttime` is unique for the life of a
-/// boot, so comparing it is how rung 4 tells "the lock owner is still running" from "its pid was
-/// recycled onto something else".
-///
-/// The command field is skipped from the LAST `)` rather than the first, because a process name
-/// may itself contain parentheses — that is why upstream uses `lastIndexOf` and why this uses
-/// [`str::rfind`].
-///
-/// Returns `None` on any platform or any pid this cannot answer for, which disables rung 4 without
-/// affecting any other rung. Upstream's Windows arm spawns `powershell.exe`; this crate does not
-/// shell out for a diagnostic, and the 24 h floor covers that platform.
-#[must_use]
-pub fn process_start_identity(pid: u32) -> Option<String> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_command = stat.get(stat.rfind(')')? + 1..)?;
-    let start_time = after_command.split_whitespace().nth(19)?;
-    Some(format!("linux:{start_time}"))
-}
-
 /// pi `RetentionLockOwner` (`:71-78`) — the `owner.json` record.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -176,8 +162,11 @@ pub struct RetentionLockOwner {
     /// Epoch millis at acquire, for rung 5.
     pub started_at: i64,
     /// [`process_start_identity`] at acquire, for rung 4. Absent when the platform cannot answer.
+    ///
+    /// [`ProcessStartIdentity`] is `#[serde(transparent)]` over its token, so this record's
+    /// on-disk shape is a plain string exactly as upstream writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_start_identity: Option<String>,
+    pub process_start_identity: Option<ProcessStartIdentity>,
 }
 
 /// The owner record's on-disk version, as a TYPE — [`super::TombstoneMarkerVersion`]'s shape and
@@ -259,16 +248,17 @@ async fn stale_lock(
     if owner.hostname != identity.hostname {
         return (false, Some(owner.token));
     }
-    let liveness = (identity.liveness)(owner.pid);
-    // Rung 3 — `Dead` ONLY. `Unknown` falls through to rung 5 (R-SA-089).
-    if liveness == Liveness::Dead {
-        return (true, Some(owner.token));
-    }
-    // Rung 4 — pid reuse.
-    if liveness == Liveness::Alive
-        && let Some(recorded) = owner.process_start_identity.as_deref()
-        && let Some(current) = process_start_identity(owner.pid)
-        && current != recorded
+    // Rungs 3 AND 4, as one ladder: `check_pid_identity_with` is `kill(pid, 0)` (rung 3, `Dead`
+    // ONLY — `Unknown` falls through to rung 5, R-SA-089) with the start-identity upgrade on top
+    // (rung 4 — the pid is live but recycled). It is the same expression the session lease's
+    // `processDemonstrablyGone` uses, so the two subsystems can never disagree about whether a
+    // given pid is demonstrably gone.
+    if check_pid_identity_with(
+        owner.pid,
+        owner.process_start_identity.as_ref(),
+        identity.liveness,
+        identity.start_identity_of,
+    ) == Liveness::Dead
     {
         return (true, Some(owner.token));
     }
@@ -383,7 +373,13 @@ pub async fn release_retention_lock(lock_dir: &Path, token: &str) {
 ///
 /// The token becomes part of a file name, so anything that is not plainly safe in one becomes `-`.
 /// This is a path-component guard, not a cosmetic one.
-fn sanitise_stale_key(token: &str) -> String {
+///
+/// `pub(crate)` because upstream spells this exact regex twice — here and at
+/// `runs/shared/session-lease.ts:281`, for the session lease's own per-owner tombstone — and
+/// [`crate::background::session_lease`] calls THIS one rather than carrying a second copy. Two
+/// sanitisers that drifted would produce two different names for one token, and the whole point
+/// of a per-owner tombstone is that every contender computes the SAME destination.
+pub(crate) fn sanitise_stale_key(token: &str) -> String {
     token
         .chars()
         .map(|ch| {
@@ -400,7 +396,13 @@ fn sanitise_stale_key(token: &str) -> String {
 ///
 /// [`Path::with_extension`] would replace `.lock`, producing `.async-retention.stale-<key>` and
 /// silently colliding with anything else in that directory; this appends instead.
-fn with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
+///
+/// `pub(crate)` for the same reason as [`sanitise_stale_key`]: the session lease builds both its
+/// `.candidate-<token>` and its `.stale-<token>` siblings with exactly this rule
+/// (`session-lease.ts:184`, `:281`), and a lease directory whose name is a 64-character sha256
+/// digest has no extension for [`Path::with_extension`] to replace — it would append one and
+/// produce a DIFFERENT path than this does.
+pub(crate) fn with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
@@ -426,8 +428,9 @@ mod tests {
         RetentionLockIdentity {
             pid: 4242,
             hostname: hostname.to_string(),
-            process_start_identity: Some("linux:1".to_string()),
+            process_start_identity: Some(ProcessStartIdentity::from_token("linux:1")),
             liveness,
+            start_identity_of: process_start_identity,
         }
     }
 
@@ -555,7 +558,7 @@ mod tests {
         // number was recycled onto a different process.
         let mut owner = owner_for(&id, "recycled", NOW);
         owner.pid = std::process::id();
-        owner.process_start_identity = Some("linux:0".to_string());
+        owner.process_start_identity = Some(ProcessStartIdentity::from_token("linux:0"));
         seed_lock(&lock, &owner).await;
 
         let mut mine = owner_for(&id, "mine", NOW);
@@ -672,6 +675,7 @@ mod tests {
             // lock this process takes, so the shape is asserted rather than tolerated.
             let identity = identity.expect("Linux answers /proc/<pid>/stat for its own pid");
             let ticks = identity
+                .as_str()
                 .strip_prefix("linux:")
                 .expect("the platform tag upstream also writes");
             assert!(

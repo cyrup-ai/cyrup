@@ -488,6 +488,25 @@ impl SubagentExecutor {
                             Arc::clone(&self.host_services),
                         ),
                     ),
+                    // VL-S4 — pi's `emitProcessTerminalEvent`
+                    // (`async-execution.ts:666-672` @v0.68.0), whose subscriber
+                    // (`extension/index.ts:897-900`) refreshes the active-async capacity and the
+                    // fleet on the strength of it. Upstream emits from the launcher, on the
+                    // runner's `close`; cyrup's runner is detached and finalizes its own proof, so
+                    // the parent's first in-process edge after that write is this fan-out. Without
+                    // this member `pingData`'s `events.processTerminal` would name a topic nothing
+                    // publishes.
+                    //
+                    // Position: after the bus announcer, so a subscriber that reacts to both sees
+                    // the completion before the proof — the proof is the second, narrower fact,
+                    // and a consumer that refreshes capacity on it should be refreshing over a
+                    // completion it has already been told about.
+                    Arc::new(
+                        crate::background::watch::ProcessTerminalAnnouncingCompletionObserver::new(
+                            default_async_root_in(&roots, cwd),
+                            Arc::clone(&self.host_services),
+                        ),
+                    ),
                     // SCOPE_11: pi's FOURTH listener (`wait-subscriptions.ts`'s own
                     // `pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, reconcile)`, `:285`).
                     //

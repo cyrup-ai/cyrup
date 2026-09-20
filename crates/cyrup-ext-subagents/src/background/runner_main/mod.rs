@@ -111,6 +111,38 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    /// A minimal resolved persona, for the tests that need a dispatch to get PAST the
+    /// persona-map lookup and reach the spawn.
+    pub(super) fn resolved_persona(name: &str) -> crate::exec::ResolvedAgentPersona {
+        crate::exec::ResolvedAgentPersona {
+            file_path: None,
+            acceptance_role: None,
+            default_acceptance: None,
+            name: name.to_string(),
+            model: Some(cyrup_core::ModelId::from("fixture-model")),
+            model_provider: None,
+            fallback_models: Vec::new(),
+            thinking: None,
+            system_prompt_mode: crate::discovery::types::SystemPromptMode::Replace,
+            system_prompt_body: String::new(),
+            tools: None,
+            extensions: None,
+            subagent_only_extensions: Vec::new(),
+            exclude_tools: Vec::new(),
+            allow_nested_subagents: None,
+            output: None,
+            inherit_project_context: false,
+            inherit_skills: true,
+            skills: Vec::new(),
+            completion_guard: Some(false),
+            max_subagent_depth: None,
+            default_context: None,
+            memory: None,
+            tool_budget: None,
+            runner: None,
+        }
+    }
+
     pub(super) fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
             skills: None,
@@ -272,6 +304,8 @@ mod tests {
             .expect("mkdir results_dir");
 
         let config = RunnerConfig {
+            runner_process_instance_id: None,
+            revival_lease: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

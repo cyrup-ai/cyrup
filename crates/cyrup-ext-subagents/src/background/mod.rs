@@ -56,6 +56,7 @@ pub mod control;
 pub mod delivery;
 pub mod flat_index;
 pub mod parent_anchor;
+pub mod process_terminal;
 pub mod reconcile;
 // The async recovery descriptor — the persisted launch contract of an async SINGLE run, written
 // by `spawn_background_steps` before the runner exists and read back by `action: "resume"` and
@@ -70,6 +71,7 @@ pub mod retained_children;
 // and its active-capacity slot. A BACKGROUND-artifact reader like `retained_children` above it.
 pub mod run_lifecycle_debug;
 pub mod runner_main;
+pub mod session_lease;
 pub mod spawn_detached;
 pub mod terminal_run_index;
 pub mod watch;
@@ -128,7 +130,7 @@ mod workflow_graph;
 pub use artifact_roots::{
     RunArtifactRoots, active_async_capacity_root_in, active_async_capacity_session_dir,
     attempt_scratch_dir, attempt_scratch_dir_in, ensure_accessible_dir, results_dir_for_async_root,
-    run_artifact_roots, run_artifact_roots_in, wait_subscriptions_dir_in,
+    run_artifact_roots, run_artifact_roots_in, session_leases_root_in, wait_subscriptions_dir_in,
 };
 pub(crate) use artifact_roots::{cwd_key, temp_root_dir, temp_root_dir_from};
 pub use records::{ParallelGroupStatus, ResultFile, RunStatus, ScheduleOrigin, StepStatus};

@@ -35,6 +35,72 @@ use std::sync::Arc;
 /// [`SingleStepExecutor`] this hop-2 background runner uses, rather than hand-rolling a second
 /// `SingleStepSpec` -> `AgentConfig`/`RunOptions` adapter that could silently drift out of sync
 /// with this one.
+/// The run's per-step writer-process ledgers, keyed by FLAT step index — the accumulator behind
+/// `process-terminal-candidate.json`'s `writers` and `expectedWriters` maps.
+///
+/// A plain `Mutex` rather than a `tokio::sync::Mutex`: every touch is a map lookup and a push
+/// behind a lock held for a handful of instructions, with no `.await` inside it, which is the same
+/// discipline the run's `SharedStatus` already uses.
+pub(crate) type WriterProcessLedgers = Arc<
+    std::sync::Mutex<
+        std::collections::BTreeMap<usize, crate::background::process_terminal::WriterProcessLedger>,
+    >,
+>;
+
+/// Fold one [`WriterProcessObservation`](crate::exec::WriterProcessObservation) into the flat
+/// step's ledger.
+///
+/// A poisoned lock is SWALLOWED, deliberately: this ledger feeds a diagnostic proof, and losing one
+/// writer record degrades that run's proof to `writer-close-unverified` — the safe direction —
+/// where propagating the panic would take down a step that had otherwise succeeded.
+/// The runner's end of the session lease's writer channel — pi `updateWriter`'s call site, which
+/// upstream does not have.
+///
+/// Sends rather than awaits, for the reason the telemetry channel does: the observations arrive
+/// inside a `LiveEventSink` callback, which is a synchronous `Fn`, while
+/// [`SessionLeaseHandle::update_writer`](crate::background::session_lease::SessionLeaseHandle::update_writer)
+/// is an `async` filesystem write. The handle therefore lives in ONE task that drains this
+/// channel, which is also what keeps its four-attempt claim and its release on a single owner.
+pub(crate) type LeaseWriterSender =
+    tokio::sync::mpsc::UnboundedSender<crate::background::session_lease::WriterUpdate>;
+
+/// Which lease writer state an observation puts the lease into — the three-state ladder
+/// `session-lease.ts:27` declares, driven by cyrup's real OS children.
+///
+/// * a dispatch about to spawn ⇒ `spawning`, sent by [`ExecSingleStepExecutor::run_single`]
+///   itself, because the unobservable window opens BEFORE `SpawnedChild::spawn` is called;
+/// * [`Launched`](crate::exec::WriterProcessObservation::Launched) with a pid ⇒ `running`;
+/// * a close ⇒ `none`.
+///
+/// A `Launched` with NO pid deliberately leaves the lease in `spawning`: that state is never
+/// stale (`:177`), so an unreportable pid withholds a reclaim rather than inviting one.
+fn lease_update_for(
+    observation: &crate::exec::WriterProcessObservation,
+) -> Option<crate::background::session_lease::WriterUpdate> {
+    use crate::background::session_lease::WriterUpdate;
+    match observation {
+        crate::exec::WriterProcessObservation::Launched { pid } => {
+            pid.map(|pid| WriterUpdate::Running { pid })
+        }
+        crate::exec::WriterProcessObservation::Closed(_) => Some(WriterUpdate::None),
+    }
+}
+
+pub(crate) fn record_writer_process_observation(
+    ledgers: &WriterProcessLedgers,
+    flat_index: usize,
+    observation: crate::exec::WriterProcessObservation,
+) {
+    let Ok(mut ledgers) = ledgers.lock() else {
+        return;
+    };
+    let ledger = ledgers.entry(flat_index).or_default();
+    match observation {
+        crate::exec::WriterProcessObservation::Launched { .. } => ledger.record_launch(),
+        crate::exec::WriterProcessObservation::Closed(exit) => ledger.record_exit(*exit),
+    }
+}
+
 pub(crate) struct ExecSingleStepExecutor {
     pub(crate) depth: DepthEnvelope,
     pub(crate) interrupted: Arc<std::sync::atomic::AtomicBool>,
@@ -64,6 +130,36 @@ pub(crate) struct ExecSingleStepExecutor {
     /// [`crate::spawn::chain_graph::ChainRunContext::step_slot`] index, for the runner's own
     /// telemetry task to fold into `status.json` (pi `updateStepFromChildEvent`).
     pub(crate) telemetry: Option<tokio::sync::mpsc::UnboundedSender<TelemetryMsg>>,
+    /// The run's per-step writer-process ledgers — one
+    /// [`WriterProcessLedger`](crate::background::process_terminal::WriterProcessLedger) per flat
+    /// step index, accumulated from the
+    /// [`WriterProcessObservation`](crate::exec::WriterProcessObservation)s each dispatched step's
+    /// sink reports, and read back at the run's close to build
+    /// `process-terminal-candidate.json`'s `writers`/`expectedWriters` maps.
+    ///
+    /// `None` for a foreground executor, which writes no candidate. Shared behind a `Mutex`
+    /// because a `ParallelGroup` dispatches its members CONCURRENTLY and each member's sink writes
+    /// its own flat slot.
+    pub(crate) writer_ledgers: Option<WriterProcessLedgers>,
+    /// The REVIVAL lease's writer channel, when this run holds a lease.
+    ///
+    /// `Some` only on a background runner whose launch carried a
+    /// [`SessionLeaseRequest`](crate::background::session_lease::SessionLeaseRequest) — the
+    /// revival path, which is the only path upstream acquires a lease on
+    /// (`subagent-runner.ts:5241`). Every dispatched step reports `spawning` before its spawn and
+    /// `running`/`none` from its own writer observations, which is what makes the lease's
+    /// `spawning` and `running` staleness rungs (`session-lease.ts:177`, `:179-180`) REACHABLE
+    /// rather than serde-only.
+    ///
+    /// **`[CYRUP-DELTA]`** — upstream never calls `updateWriter` at v0.68.0 at all
+    /// (`git grep -n updateWriter v0.68.0 -- 'src/**/*.ts'` finds the definition and nothing
+    /// else), because its children run INSIDE the runner process
+    /// (`subagent-runner.ts:5169`: *"Children run inside this process, so no step has writer
+    /// processes to prove terminal."*). cyrup's children are real OS processes with real pids, so
+    /// the field upstream defined and never fed is fed here — a strictly stronger statement of the
+    /// same fact, and the reason a lease held by a crashed runner whose child is still writing the
+    /// session file is not reclaimed.
+    pub(crate) lease_writer: Option<LeaseWriterSender>,
     /// The fully-resolved persona for every agent any dispatched step may name (T0.1 / C13), keyed
     /// by the exact [`SingleStepSpec::agent`] string — resolved EAGERLY at plan time by the
     /// orchestrator (via [`crate::exec::resolve_step_agent_config`]) and threaded in here so
@@ -276,6 +372,10 @@ impl ExecSingleStepExecutor {
             // A foreground executor's child env comes from its own `RunOptions`, not from here.
             child_env: std::collections::HashMap::new(),
             interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // A foreground run writes no process-terminal candidate: it has no detached runner
+            // whose close anyone has to prove, and nothing would ever read the ledger.
+            writer_ledgers: None,
+            lease_writer: None,
             resolved_agents,
             // A foreground executor has no control-inbox watcher, so this token is never cancelled;
             // foreground cancellation flows through `ChainRunContext::cancel`/`RunOptions::cancel`.
@@ -600,16 +700,48 @@ impl ExecSingleStepExecutor {
         // The flat index this sink tags events with is published by `run_inner` into
         // `self.current_flat_index` immediately before each dispatch (a `SingleStepSpec` carries no
         // index of its own), so the sink reads the CURRENT step's index at event time.
-        let live_events = self.telemetry.as_ref().map(|sender| {
-            let sender = sender.clone();
-            let flat_index = ctx.step_slot.index();
-            crate::exec::LiveEventSink::new(move |raw: &str| {
-                let _ = sender.send(TelemetryMsg {
-                    flat_index,
-                    raw: raw.to_string(),
+        //
+        // The SAME sink also carries this step's writer-PROCESS observations back to the runner
+        // (`with_writer_process_sink`), which is how the pid, exit status and process-group
+        // teardown verdict of the step's real OS child — facts that exist only inside
+        // `exec::run_sync`'s attempt loop — reach the process-terminal candidate. Upstream needs no
+        // such channel because its children run in-process (`subagent-runner.ts:5169`); cyrup's do
+        // not, and a proof that verified nothing about them would be hollow.
+        let flat_index = ctx.step_slot.index();
+        let live_events = if self.telemetry.is_none()
+            && self.writer_ledgers.is_none()
+            && self.lease_writer.is_none()
+        {
+            None
+        } else {
+            let telemetry = self.telemetry.clone();
+            let mut sink = crate::exec::LiveEventSink::new(move |raw: &str| {
+                if let Some(sender) = telemetry.as_ref() {
+                    let _ = sender.send(TelemetryMsg {
+                        flat_index,
+                        raw: raw.to_string(),
+                    });
+                }
+            });
+            let ledgers = self.writer_ledgers.clone();
+            let lease_writer = self.lease_writer.clone();
+            if ledgers.is_some() || lease_writer.is_some() {
+                sink = sink.with_writer_process_sink(move |observation| {
+                    // The lease first: it is the record another PROCESS reads to decide whether
+                    // this run's lease may be reclaimed, and it must reflect a live writer before
+                    // the ledger that only this process reads back at its own close.
+                    if let Some(sender) = lease_writer.as_ref()
+                        && let Some(update) = lease_update_for(&observation)
+                    {
+                        let _ = sender.send(update);
+                    }
+                    if let Some(ledgers) = ledgers.as_ref() {
+                        record_writer_process_observation(ledgers, flat_index, observation);
+                    }
                 });
-            })
-        });
+            }
+            Some(sink)
+        };
 
         let fork_context = match &step.session_file {
             Some(path) => ForkContext {
@@ -983,6 +1115,14 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         let artifact_paths =
             self.write_step_input_artifact(step, resolved_task, ctx.step_slot.index());
 
+        // pi `session-lease.ts:177`'s unobservable window opens HERE, not at the spawn: between
+        // this line and the child reporting its pid there is a real OS process being forked that
+        // no probe can see. A lease in `spawning` is NEVER stale, so a runner killed inside that
+        // window keeps its lease until an operator or a later revival can prove the writer gone.
+        if let Some(sender) = self.lease_writer.as_ref() {
+            let _ = sender.send(crate::background::session_lease::WriterUpdate::Spawning);
+        }
+
         let result = exec::run_sync(&agent, resolved_task, &opts).await;
 
         self.write_step_result_artifacts(artifact_paths.as_ref(), &result);
@@ -1125,12 +1265,113 @@ mod tests {
     // (`chain-execution.ts:1011-1019`).
     // ---------------------------------------------------------------------------------------
 
+    /// P7 — the lease's `spawning` window opens at the DISPATCH, not at the spawn.
+    ///
+    /// Between `run_single` deciding to dispatch and the child reporting a pid there is a real OS
+    /// process being forked that no probe can see. pi `session-lease.ts:177` makes a lease in
+    /// `spawning` NEVER stale precisely because of that window, so a runner killed inside it keeps
+    /// its lease. This test pins the window's OPENING: a dispatch whose spawn FAILS emits
+    /// `Spawning` and nothing else — the child never existed, so there is no `running` to report
+    /// and no close to observe, and the lease correctly stays in the state that withholds a
+    /// reclaim.
+    ///
+    /// Deterministic where the integration test cannot be: the `Spawning`→`Running` transition is
+    /// a race against a real child's startup, while a failed spawn leaves exactly one observation
+    /// on the channel, every time.
+    ///
+    /// Gutted (the send moved below `exec::run_sync`, or dropped): the channel is empty, and a
+    /// lease whose owner dies mid-fork is reclaimed out from under a child that is about to write
+    /// the session file.
+    #[tokio::test]
+    async fn a_dispatch_reports_spawning_before_the_child_exists() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let (lease_tx, mut lease_rx) = tokio::sync::mpsc::unbounded_channel::<
+            crate::background::session_lease::WriterUpdate,
+        >();
+        let executor = ExecSingleStepExecutor {
+            writer_ledgers: None,
+            lease_writer: Some(lease_tx),
+            // A binary that does not exist: `SpawnedChild::spawn` fails, so no `Launched` and no
+            // `Closed` observation is ever produced.
+            spawn_command: Some(crate::spawn::SpawnCommand {
+                binary: dir.path().join("no-such-binary"),
+                base_args: Vec::new(),
+            }),
+            child_env: std::collections::HashMap::new(),
+            host_available_builtins: None,
+            usage_budget: None,
+            turn_budget: None,
+            permission_rules: None,
+            depth: DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            interrupt_cancel: cyrup_core::CancelToken::new(),
+            child_stops: None,
+            telemetry: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
+            transcript_source: crate::exec::child_transcript::TranscriptSource::Async,
+            resolved_agents: Arc::new(
+                [(
+                    "worker".to_string(),
+                    super::super::tests::resolved_persona("worker"),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            orchestrator_intercom_target: None,
+            run_id: None,
+            inherited_session_model: None,
+            inherited_session_thinking: None,
+            model_scope: None,
+            control: None,
+            include_progress: None,
+            run_dir: None,
+        };
+        let ctx = ChainRunContext {
+            cwd: dir.path().to_path_buf(),
+            deadline_at: None,
+            timeout_ms: None,
+            cancel: cyrup_core::CancelToken::new(),
+            global_limit: GlobalConcurrencyLimit::new(4),
+            worktree_base_dir: None,
+            original_task: String::new(),
+            chain_dir: None,
+            dynamic_fanout_max_items: None,
+            step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
+            handoff: None,
+        };
+        let step = single_step("worker", "do the thing");
+
+        let result = executor
+            .run_single(&step, "do the thing", &ctx)
+            .await
+            .expect("run_single itself returns Ok");
+        assert!(!result.success, "the spawn could not succeed: {result:?}");
+
+        drop(executor);
+        let mut updates = Vec::new();
+        while let Ok(update) = lease_rx.try_recv() {
+            updates.push(update);
+        }
+        assert_eq!(
+            updates,
+            vec![crate::background::session_lease::WriterUpdate::Spawning],
+            "the dispatch opens the unobservable window and nothing closes it"
+        );
+    }
+
     #[tokio::test]
     async fn run_single_rejects_an_unresolved_agent_as_unknown_before_any_spawn() {
         let dir = tempfile::tempdir().expect("real tempdir");
         // The executor carries an EMPTY persona map — exactly the state that must NOT dispatch a
         // placeholder.
         let executor = ExecSingleStepExecutor {
+            writer_ledgers: None,
+            lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
             host_available_builtins: None,
@@ -1346,6 +1587,8 @@ mod tests {
     fn the_step_executor_forwards_the_observation_to_every_step() {
         let dir = tempfile::tempdir().expect("real tempdir");
         let executor = ExecSingleStepExecutor {
+            writer_ledgers: None,
+            lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
             host_available_builtins: Some(vec!["read".to_string()]),
@@ -1438,6 +1681,8 @@ mod tests {
         artifact_config: crate::artifacts::ArtifactConfig,
     ) -> ExecSingleStepExecutor {
         ExecSingleStepExecutor {
+            writer_ledgers: None,
+            lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
             host_available_builtins: None,

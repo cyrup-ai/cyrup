@@ -104,6 +104,27 @@ pub enum RunState {
 }
 
 impl RunState {
+    /// The camelCase word this state is spelled as on disk — the exact string
+    /// `#[serde(rename_all = "camelCase")]` writes into `status.json`.
+    ///
+    /// Added so [`resume_disposition`](crate::background::process_terminal::resume_disposition)
+    /// can test the run's state against pi's own literal set
+    /// (`process-terminal.ts:145-146`: `"stopped"`, `"complete"`/`"completed"`, `"failed"`,
+    /// `"paused"`) without re-serializing the value through `serde_json` on every call, and
+    /// WITHOUT a second, drift-prone copy of the spelling: this function and the derive are
+    /// pinned against each other by a test.
+    #[must_use]
+    pub fn as_wire_word(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
     /// A rank used only to describe "how far along" a state is for documentation/diagnostic
     /// purposes (e.g. UI ordering). **Not** consulted by [`RunState::can_transition_to`] — the
     /// actual transition table is the explicit adjacency list below, because the true allowed-
@@ -241,6 +262,21 @@ pub enum StepState {
 }
 
 impl StepState {
+    /// The camelCase word this step state is spelled as on disk — [`RunState::as_wire_word`]'s
+    /// sibling, and used for the same reason: the per-step overlay derives each step's
+    /// `resumeDisposition` from `step.status` (pi `process-terminal.ts:234`).
+    #[must_use]
+    pub fn as_wire_word(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
     /// `true` for `Complete`/`Failed`/`Stopped` — mirrors [`RunState::is_terminal`]'s exclusion of
     /// `Paused` for the identical reason (R-SA-084: pause is soft and resumable, never terminal),
     /// and its inclusion of `Stopped` for the reason documented there (pi

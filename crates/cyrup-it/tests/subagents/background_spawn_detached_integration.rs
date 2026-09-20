@@ -573,6 +573,8 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     // fragile against this type's own serde shape) — one SingleStep, matching
     // `background_runner_main_integration.rs`'s own identical `single_step` helper shape.
     let runner_config = RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
         host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
@@ -814,6 +816,8 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // has real remaining work to cut short (R-SA-084 marks the NOT-yet-dispatched step(s) Paused
     // too — see `mark_remaining_paused`'s own doc).
     let runner_config = RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
         host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,

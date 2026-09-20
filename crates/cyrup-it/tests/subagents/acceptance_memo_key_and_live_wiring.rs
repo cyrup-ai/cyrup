@@ -838,6 +838,8 @@ fn runner_config(
     step: SingleStepSpec,
 ) -> RunnerConfig {
     RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
         host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,

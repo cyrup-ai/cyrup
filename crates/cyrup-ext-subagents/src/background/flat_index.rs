@@ -270,6 +270,8 @@ mod tests {
         artifact_config: crate::artifacts::ArtifactConfig,
     ) -> RunnerConfig {
         RunnerConfig {
+            runner_process_instance_id: None,
+            revival_lease: None,
             usage_budget: None,
             turn_budget: None,
             permission_rules: None,

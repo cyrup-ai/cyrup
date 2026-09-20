@@ -356,8 +356,14 @@ impl Harness {
             kind: ActiveAsyncCapacityKind::Runner,
             async_dir: paths.run_dir.clone(),
             reserved_at: 0,
-            // THE PROOF rung: a bound runner pid the kernel says is gone.
+            // A bound runner, with NO process-terminal proof on disk: this run reaches the
+            // no-proof FALLBACK ladder, where a runner pid the kernel says is gone is the
+            // release evidence.
+            runner_process_instance_id: Some(
+                crate::background::process_terminal::RunnerProcessInstanceId::new(),
+            ),
             runner_pid: Some(a_reaped_pid()),
+            runner_process_start_identity: None,
             runner_started_at: Some(1),
         };
         let pool = session_pool_dir(
@@ -514,19 +520,36 @@ async fn a_host_drives_ping_over_the_inter_extension_bus_and_gets_a_reply() {
         "nonRecoveringSteer",
         "launchResolvedExtensions",
         "runtimeAcknowledgedExtensions",
-        "processTerminalProof",
     ] {
         assert!(
             data["capabilities"].get(dropped).is_none(),
             "{dropped} has no backing seam and must not be advertised: {data}"
         );
     }
-    for dropped in ["childStatus", "processTerminal"] {
-        assert!(
-            data["events"].get(dropped).is_none(),
-            "{dropped} is emitted by nothing and must not be advertised: {data}"
-        );
-    }
+    // `events.childStatus` (`rpc.ts:465`) is `subagent:child-status`, emitted only by upstream's
+    // inline `stopAsyncRun`; cyrup routes `stop` through the tool arm, so nothing emits it.
+    assert!(
+        data["events"].get("childStatus").is_none(),
+        "childStatus is emitted by nothing and must not be advertised: {data}"
+    );
+    // ...and it must advertise the ones that DO have a backing seam. `processTerminalProof` moved
+    // out of the dropped list above when `background::process_terminal` landed: the candidate and
+    // the proof are written on every background launch, so the promise is now paid for. pi
+    // `rpc.ts:458` / `shared/types.ts:629`.
+    assert_eq!(
+        data["capabilities"]["processTerminalProof"],
+        json!({ "version": 1, "lifecycleArtifactVersion": 3 }),
+        "the process-terminal capability must carry upstream's lifecycle artifact version: {data}"
+    );
+    // pi `rpc.ts:466` / `shared/types.ts:2356`. Like `asyncComplete`, this topic is advertised
+    // only because a production member of the completion composite publishes on it —
+    // `ProcessTerminalAnnouncingCompletionObserver`, pinned by
+    // `a_process_terminal_proof_is_announced_on_the_inter_extension_bus` below.
+    assert_eq!(
+        data["events"]["processTerminal"],
+        json!("subagent:process-terminal"),
+        "the process-terminal event topic must be advertised: {data}"
+    );
 }
 
 // =================================================================================================
@@ -960,6 +983,200 @@ async fn a_completion_is_announced_on_the_inter_extension_bus() {
     assert_eq!(topic, SUBAGENT_ASYNC_COMPLETE_EVENT);
     assert_eq!(payload["runId"], json!("pb8completion"));
     assert_eq!(payload["success"], json!(true));
+}
+
+/// VL-S4 — the proof a finished run's RUNNER PROCESS is gone reaches the inter-extension bus, so
+/// `pingData`'s `events.processTerminal` advertisement is not a lie either.
+///
+/// This is pi `emitProcessTerminalEvent` (`async-execution.ts:666-672` @v0.68.0) at cyrup's own
+/// seam: upstream emits from the launcher on the runner's `close`, cyrup's runner is detached and
+/// writes the sidecar itself, so the parent republishes it from the completion fan-out.
+///
+/// Two facts are asserted, and they are different facts: a completion says the RUN ended, the
+/// proof says the PROCESS that owned it ended. A subscriber that refreshes capacity — upstream's
+/// own subscriber, `extension/index.ts:897-900` — needs the second one.
+///
+/// The fixture reproduces PRODUCTION ORDERING, and that is the point of it. The runner writes its
+/// `pending` sidecar before the spawn, then `status.json`, then the `ResultFile` — and only then,
+/// after the lease release, the real proof (`runner_main/entry.rs`). The completion watcher fires
+/// on the ResultFile, so at the moment this observer runs the sidecar on disk is still `pending`
+/// for a run that is closing perfectly cleanly. An earlier revision of this test wrote the proof
+/// BEFORE publishing the result, which inverted that order and made the test unable to fail on the
+/// race at all.
+///
+/// So run `pb8terminal` below publishes its result FIRST and only upgrades its sidecar to
+/// `observed` ~800 ms later, inside
+/// `ProcessTerminalAnnouncingCompletionObserver`'s settle budget and well after the watcher's
+/// 500 ms poll has already dispatched it. It must STILL be announced.
+///
+/// The counter-rung is in the same test: run `pb8pending` never upgrades, and its `status.json`
+/// names a pid that is genuinely reaped — a killed runner — so the observer's crash short-circuit
+/// ends the wait at once and NOTHING is published. Announcing it would tell a subscriber a proof
+/// had landed about a file that is still the launch's placeholder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_process_terminal_proof_is_announced_on_the_inter_extension_bus() {
+    use crate::background::process_terminal::{
+        ProcessInstanceExit, ProcessTerminal, ProcessTerminalBase, RunnerProcessInstanceId,
+    };
+    use crate::background::watch::{
+        SUBAGENT_PROCESS_TERMINAL_EVENT,
+        tests::{child_result, publish_result, result_with_children},
+    };
+    use crate::background::{ResultFile, RunId, RunState};
+
+    let harness = Harness::full().await;
+    harness.listen(SUBAGENT_PROCESS_TERMINAL_EVENT);
+
+    let executor = harness.extension.executor();
+    executor.install_completion_watcher(&harness.cwd).await;
+    let roots = crate::background::run_artifact_roots_in(&harness.config.roots, &harness.cwd);
+
+    let instance = RunnerProcessInstanceId::from_token("pb8-instance");
+    let base =
+        |run: &str| ProcessTerminalBase::new(RunId::from_token(run.to_string()), instance.clone());
+    let write_sidecar = async |run: &str, proof: &ProcessTerminal| {
+        let run_dir = crate::background::RunDir::new(&roots.async_root, &RunId::from_token(run));
+        tokio::fs::create_dir_all(run_dir.as_path())
+            .await
+            .expect("mkdir run dir");
+        tokio::fs::write(
+            run_dir.process_terminal(),
+            serde_json::to_vec(proof).expect("encode"),
+        )
+        .await
+        .expect("write sidecar");
+    };
+    let complete = |run: &str| {
+        let mut result = result_with_children(
+            run,
+            RunState::Complete,
+            true,
+            None,
+            vec![child_result("worker", Some("all done"), 0)],
+        );
+        result.session_id = crate::identity::SessionId::parse(TEST_SESSION_ID);
+        result.completion_owner_id = Some(crate::identity::current_completion_owner_id());
+        let result: ResultFile = result;
+        result
+    };
+
+    // A pid that is GENUINELY gone: spawned, exited, and reaped, so `kill(pid, 0)` answers
+    // `ESRCH` for real rather than by mock. This is what makes run (1)'s short-circuit a real
+    // crash rather than a timeout.
+    let reaped_pid = {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a throwaway child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    };
+    let write_status = async |run: &str, pid: u32| {
+        let run_dir = crate::background::RunDir::new(&roots.async_root, &RunId::from_token(run));
+        let mut status = crate::background::RunStatus::queued(
+            RunId::from_token(run),
+            crate::background::RunMode::Single,
+            Some(pid),
+        );
+        status.state = RunState::Complete;
+        crate::background::atomic::write_atomic_json(&run_dir.status(), &status)
+            .await
+            .expect("write status");
+    };
+
+    // (1) A run whose runner was killed between its result write and its proof write: the
+    // launch's `pending` sidecar is all there ever will be, and the runner's pid is gone.
+    write_sidecar(
+        "pb8pending",
+        &ProcessTerminal::Pending {
+            base: base("pb8pending"),
+        },
+    )
+    .await;
+    write_status("pb8pending", reaped_pid).await;
+    publish_result(&roots.results_dir, &complete("pb8pending")).await;
+
+    // (2) A run closing cleanly, in the RUNNER'S OWN ORDER: the `pending` sidecar written at
+    // launch, `status.json` naming a LIVE pid, the ResultFile — and the real proof only
+    // afterwards. Inverting these last two is what made this test unfalsifiable before.
+    write_sidecar(
+        "pb8terminal",
+        &ProcessTerminal::Pending {
+            base: base("pb8terminal"),
+        },
+    )
+    .await;
+    write_status("pb8terminal", std::process::id()).await;
+    publish_result(&roots.results_dir, &complete("pb8terminal")).await;
+    let upgrade = {
+        let async_root = roots.async_root.clone();
+        let instance = instance.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            let run_dir =
+                crate::background::RunDir::new(&async_root, &RunId::from_token("pb8terminal"));
+            let proof = ProcessTerminal::Observed {
+                base: ProcessTerminalBase::new(RunId::from_token("pb8terminal"), instance.clone()),
+                observed_at: 1_700_000_000_000,
+                instances: vec![ProcessInstanceExit::Runner {
+                    process_instance_id: instance,
+                    close_observed_at: 1_700_000_000_000,
+                    exit_code: Some(0),
+                    signal: None,
+                }],
+                canonical_session: None,
+            };
+            tokio::fs::write(
+                run_dir.process_terminal(),
+                serde_json::to_vec(&proof).expect("encode"),
+            )
+            .await
+            .expect("upgrade sidecar");
+        })
+    };
+
+    // Bounded wait on the watcher's own filesystem tick, then one drain for the bus.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        harness.host.deliver_bus_events(&CancelToken::new()).await;
+        if !harness.client.deliveries().is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no process-terminal proof was ever announced on {SUBAGENT_PROCESS_TERMINAL_EVENT}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    upgrade.await.expect("the upgrade task ran");
+    // One more settled drain, so a SECOND (wrong) announcement for the killed run is caught rather
+    // than raced past by the break above.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    harness.host.deliver_bus_events(&CancelToken::new()).await;
+
+    let announced = harness.client.deliveries();
+    // Exactly ONE of the two runs made a statement about its process. The count of statements is
+    // deliberately NOT asserted: the results watcher re-surfaces a candidate whose fleet delivery
+    // was deferred (`results_watcher.rs::record_processing_failure`, the retry-in-place
+    // mechanism), and this harness never acks, so the clean run is legitimately re-observed. What
+    // must hold is that every announcement is the observed proof for `pb8terminal` and that the
+    // killed run is never announced at all.
+    assert!(
+        !announced.is_empty(),
+        "the clean run's proof reached the bus"
+    );
+    for (topic, payload) in &announced {
+        assert_eq!(topic, SUBAGENT_PROCESS_TERMINAL_EVENT);
+        assert_eq!(
+            payload["runId"],
+            json!("pb8terminal"),
+            "a run whose sidecar never left `pending` must publish nothing: {payload:?}"
+        );
+        assert_eq!(payload["state"], json!("observed"));
+        assert_eq!(payload["runnerProcessInstanceId"], json!("pb8-instance"));
+    }
 }
 
 // =================================================================================================

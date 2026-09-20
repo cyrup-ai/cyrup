@@ -199,6 +199,8 @@ async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -
     tokio::fs::create_dir_all(&run_paths.run_dir).await.unwrap();
 
     let config = RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
         host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,

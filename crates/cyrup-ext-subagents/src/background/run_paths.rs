@@ -29,6 +29,22 @@ const HANDOFF_FILE_NAME: &str = "handoff.json";
 /// both readers (`action: "resume"` and [`crate::background::async_retention`]) alike.
 const RECOVERY_DESCRIPTOR_FILE_NAME: &str = "recovery-descriptor.json";
 
+/// `process-terminal-candidate.json` — the runner's DECLARATION of what it will have to prove
+/// about its own close (pi `processTerminalCandidatePath(asyncDir)`,
+/// `runs/background/process-terminal.ts:63-65` @v0.68.0), spelled ONCE for its writer
+/// ([`crate::background::process_terminal::write_process_terminal_candidate`], via
+/// [`RunDir::process_terminal_candidate`]) and its reader
+/// ([`crate::background::process_terminal::read_process_terminal_candidate`]) alike — the fifth
+/// member of the [`STATUS_FILE_NAME`] family, for the drift-prevention reason
+/// [`RunDir::handoff`] states.
+const PROCESS_TERMINAL_CANDIDATE_FILE_NAME: &str = "process-terminal-candidate.json";
+
+/// `process-terminal.json` — the proof itself (pi `processTerminalPath(asyncDir)`,
+/// `runs/background/process-terminal.ts:67-69` @v0.68.0). The sixth member of the family, and the
+/// one with the most readers: the runner writes it twice (pending at launch, final at close), the
+/// capacity release rung reads it, and `debug.run` renders it.
+const PROCESS_TERMINAL_FILE_NAME: &str = "process-terminal.json";
+
 /// The filesystem directory, keyed by run id, holding one background run's `status.json`,
 /// `events.jsonl`, control-inbox files, append-request files, output/log files, and (once
 /// terminal) its human-readable run-log — everything **except** the terminal [`ResultFile`](crate::background::ResultFile)
@@ -108,6 +124,28 @@ impl RunDir {
     #[must_use]
     pub fn recovery_descriptor(&self) -> PathBuf {
         self.0.join(RECOVERY_DESCRIPTOR_FILE_NAME)
+    }
+
+    /// `<run_dir>/process-terminal-candidate.json` — the process-terminal CANDIDATE, written
+    /// privately (0600) because it can carry a session-transcript path.
+    ///
+    /// The fifth accessor in the `status()`/`events()`/`handoff()`/`recovery_descriptor()` family,
+    /// and the SINGLE place its literal is spelled.
+    #[must_use]
+    pub fn process_terminal_candidate(&self) -> PathBuf {
+        self.0.join(PROCESS_TERMINAL_CANDIDATE_FILE_NAME)
+    }
+
+    /// `<run_dir>/process-terminal.json` — the process-terminal PROOF sidecar.
+    ///
+    /// The sixth accessor in that family. Its absence is meaningful and must stay
+    /// distinguishable from an unreadable file: a run that never reached
+    /// [`initialize_process_terminal`](crate::background::process_terminal::initialize_process_terminal)
+    /// has no proof, and the capacity release rung falls through to its pid ladder rather than
+    /// treating absence as a refusal.
+    #[must_use]
+    pub fn process_terminal(&self) -> PathBuf {
+        self.0.join(PROCESS_TERMINAL_FILE_NAME)
     }
 }
 
