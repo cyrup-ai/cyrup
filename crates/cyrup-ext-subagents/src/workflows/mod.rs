@@ -94,8 +94,9 @@ pub use checklist::{
 };
 pub use child_summary::{
     WorkflowChildLiveProgress, WorkflowChildProgressInput, WorkflowChildSummaryError,
-    WorkflowChildSummaryInput, parse_workflow_child_summary, workflow_child_activity,
-    workflow_child_progress, workflow_child_summary, workflow_step_statuses,
+    WorkflowChildSummaryInput, carry_step_settle_times, parse_workflow_child_summary,
+    workflow_child_activity, workflow_child_progress, workflow_child_summary,
+    workflow_step_statuses,
 };
 pub use display_text::{sanitize_display_text, truncate_display, truncate_to_bytes};
 pub use host_command::{

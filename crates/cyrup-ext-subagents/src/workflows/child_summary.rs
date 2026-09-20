@@ -686,6 +686,15 @@ impl RawChildShape {
 /// The `agent ?? key` fallback is safe by construction: a child with no resolved agent also has no
 /// `run_id`, so [`workflow_child_summary`]'s `launch_resolved` guard (`:272`) drops the field
 /// before it can be displayed as an agent name.
+///
+/// `session_file` / `model` / `usage` / `runner` come from the child's `results[0]` — the
+/// `serde_json::to_value(&SingleResult)` the host settles with (`extension/executor/workflow.rs`),
+/// camelCase, the same first element pass 3 above reads `sessionName`/`model`/`thinking` off.
+/// Upstream's step summary carries `sessionFile`/`tokens`/`model`/`runner` (`async-status.ts:30-80`
+/// @v0.68.0), the detached settlement path already persists the session file onto its step row
+/// (`workflow_detach/children.rs`), and `children.list`'s session rung
+/// ([`crate::background::retained_children`]) reads `step.session_file` — a row that left it
+/// empty answered `no persisted session file` for every settled child.
 #[must_use]
 pub fn workflow_step_statuses(children: &[WorkflowScriptChildResult]) -> Vec<StepStatus> {
     children
@@ -693,6 +702,22 @@ pub fn workflow_step_statuses(children: &[WorkflowScriptChildResult]) -> Vec<Ste
         .map(|child| {
             let mut step =
                 StepStatus::pending(child.agent.clone().unwrap_or_else(|| child.key.clone()));
+            let result = child.results.first().and_then(Value::as_object);
+            step.session_file = result
+                .and_then(|map| map.get("sessionFile"))
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from);
+            step.model = result
+                .and_then(|map| map.get("model"))
+                .and_then(Value::as_str)
+                .map(cyrup_core::ModelId::from);
+            step.usage = result
+                .and_then(|map| map.get("usage"))
+                .and_then(|usage| serde_json::from_value(usage.clone()).ok())
+                .unwrap_or_default();
+            step.runner = result
+                .and_then(|map| map.get("runner"))
+                .and_then(|runner| serde_json::from_value(runner.clone()).ok());
             // Precedence matches `workflow_child_summary`'s pass 3 (`:302-312`) minus `detached`
             // and `rejected`, neither of which `StepState` can represent: a detached child is
             // reported through the receipt's resume entry, and acceptance rejection is a pass-3
@@ -715,6 +740,33 @@ pub fn workflow_step_statuses(children: &[WorkflowScriptChildResult]) -> Vec<Ste
         .collect()
 }
 
+/// Stamp `ended_at` on the rows [`workflow_step_statuses`] just rebuilt — pi's child run
+/// `endedAt`, which `children.list` reads as `completedAt` (`retained-children.ts:90` @v0.68.0:
+/// `run.endedAt ?? run.lastUpdate`, `run` being the CHILD).
+///
+/// [`workflow_step_statuses`] derives every row from a [`WorkflowScriptChildResult`], which
+/// carries no settle time, and BOTH writers of a workflow's `status.json` — `publish_steps` on
+/// each settle and the terminal write — rebuild the whole vector, so a stamp that lived only on
+/// the row would be lost on the next rebuild. This carries it: a terminal row keeps the
+/// `ended_at` its predecessor (matched by `workflow_key`, then `run_id`) already recorded, and a
+/// terminal row with no predecessor — the child that settled just now — is stamped `now`. A
+/// non-terminal row is left alone.
+pub fn carry_step_settle_times(previous: &[StepStatus], steps: &mut [StepStatus], now: i64) {
+    for step in steps.iter_mut() {
+        if !step.status.is_terminal() && step.status != StepState::Paused {
+            continue;
+        }
+        let predecessor = previous
+            .iter()
+            .find(|prior| match (&step.workflow_key, &step.run_id) {
+                (Some(key), _) => prior.workflow_key.as_ref() == Some(key),
+                (None, Some(run_id)) => prior.run_id.as_ref() == Some(run_id),
+                (None, None) => false,
+            });
+        step.ended_at = predecessor.and_then(|prior| prior.ended_at).or(Some(now));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -727,6 +779,92 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// `workflow_step_statuses` carries the four upstream step-summary witnesses off the child's
+    /// `results[0]` (`async-status.ts:30-80`): `sessionFile`, `model`, `usage` and `runner` — the
+    /// last being what `children.list`'s external-runner rung reads. A child without them leaves
+    /// each `None`/default.
+    #[test]
+    fn step_rows_carry_session_model_usage_and_runner_from_the_first_result() {
+        let runner = crate::runner::status::resolve_external_cli_runner_status(None, "claude", &[]);
+        let usage = cyrup_core::Usage {
+            input: 3,
+            output: 4,
+            ..cyrup_core::Usage::default()
+        };
+        let child = WorkflowScriptChildResult {
+            key: "coder".to_string(),
+            ok: true,
+            agent: Some("coder".to_string()),
+            run_id: Some("run-1".to_string()),
+            results: vec![json!({
+                "sessionFile": "/tmp/s/child.jsonl",
+                "model": "claude-sonnet-5",
+                "usage": serde_json::to_value(&usage).unwrap(),
+                "runner": serde_json::to_value(&runner).unwrap(),
+            })],
+            ..WorkflowScriptChildResult::default()
+        };
+        let bare = WorkflowScriptChildResult {
+            key: "bare".to_string(),
+            ok: true,
+            ..WorkflowScriptChildResult::default()
+        };
+        let steps = workflow_step_statuses(&[child, bare]);
+        assert_eq!(
+            steps[0].session_file.as_deref(),
+            Some(std::path::Path::new("/tmp/s/child.jsonl"))
+        );
+        assert_eq!(
+            steps[0].model.as_ref().map(ToString::to_string).as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!((steps[0].usage.input, steps[0].usage.output), (3, 4));
+        assert_eq!(steps[0].runner.as_ref(), Some(&runner));
+        assert_eq!(steps[0].status, StepState::Complete);
+        assert!(steps[1].session_file.is_none() && steps[1].model.is_none());
+        assert!(steps[1].runner.is_none());
+        assert_eq!(steps[1].usage, cyrup_core::Usage::default());
+    }
+
+    /// `carry_step_settle_times`: a terminal row keeps its predecessor's stamp (matched by key,
+    /// then by run id), a newly terminal row is stamped `now`, a non-terminal row is untouched.
+    #[test]
+    fn settle_times_are_carried_by_key_then_run_id_and_stamped_once() {
+        let mut prior_a = StepStatus::pending("worker");
+        prior_a.workflow_key = WorkflowKey::parse("a").ok();
+        prior_a.status = StepState::Complete;
+        prior_a.ended_at = Some(1_000);
+        let mut prior_b = StepStatus::pending("worker");
+        prior_b.run_id = Some(RunId::from_token("run-b"));
+        prior_b.status = StepState::Failed;
+        prior_b.ended_at = Some(2_000);
+        let previous = vec![prior_a, prior_b];
+
+        let mut a = StepStatus::pending("worker");
+        a.workflow_key = WorkflowKey::parse("a").ok();
+        a.status = StepState::Complete;
+        let mut b = StepStatus::pending("worker");
+        b.run_id = Some(RunId::from_token("run-b"));
+        b.status = StepState::Failed;
+        let mut c = StepStatus::pending("worker");
+        c.workflow_key = WorkflowKey::parse("c").ok();
+        c.status = StepState::Stopped;
+        let mut d = StepStatus::pending("worker");
+        d.workflow_key = WorkflowKey::parse("d").ok();
+        d.status = StepState::Running;
+        let mut steps = vec![a, b, c, d];
+
+        carry_step_settle_times(&previous, &mut steps, 9_000);
+        assert_eq!(steps[0].ended_at, Some(1_000), "kept by workflow key");
+        assert_eq!(steps[1].ended_at, Some(2_000), "kept by run id");
+        assert_eq!(
+            steps[2].ended_at,
+            Some(9_000),
+            "newly terminal: stamped now"
+        );
+        assert_eq!(steps[3].ended_at, None, "still running: untouched");
+    }
 
     fn key(raw: &str) -> WorkflowKey {
         WorkflowKey::parse(raw).expect("valid key")

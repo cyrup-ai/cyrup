@@ -62,6 +62,13 @@ pub mod reconcile;
 // the retention scan. A BACKGROUND-artifact writer/reader like the index modules above it.
 pub mod recovery_descriptor;
 pub mod result_index;
+// `children.list` — the retained children of a session's workflow runs, read off the workflow
+// status files the async root holds, with resumability computed by the same descriptor/handoff
+// readers `resume` uses. A BACKGROUND-artifact reader like `async_status_snapshot` beside it.
+pub mod retained_children;
+// `debug.run` — the run-lifecycle diagnostic dump over one async run's reconciled `status.json`
+// and its active-capacity slot. A BACKGROUND-artifact reader like `retained_children` above it.
+pub mod run_lifecycle_debug;
 pub mod runner_main;
 pub mod spawn_detached;
 pub mod terminal_run_index;
@@ -129,12 +136,17 @@ pub use recovery_descriptor::{
     DescriptorVersion, LaunchContractDigest, LaunchInputs, ModelOrigin, RecoveryDescriptor,
     RecoveryDescriptorError,
 };
+pub use retained_children::{
+    Resumability, RetainedChild, RetainedChildState, format_retained_children,
+    list_retained_children,
+};
 pub use run_history::{
     RunHistoryEntry, record_run_history, run_history_path, run_history_path_for,
 };
 pub use run_id::RunId;
 pub use run_id_resolver::{
-    AsyncRunLocation, ResolveRunIdError, find_async_run_prefix_matches, resolve_async_run_id,
+    AsyncRunLocation, ResolveRunIdError, find_async_run_prefix_matches, resolve_async_run_dir,
+    resolve_async_run_id,
 };
 pub use run_paths::{RunDir, RunPaths};
 pub use state::{RunMode, RunState, RunStateTransitionError, StepState};

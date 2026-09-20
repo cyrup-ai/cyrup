@@ -347,10 +347,16 @@ impl WorkflowRunHost {
             let Ok(settled) = self.settled.lock() else {
                 return;
             };
-            let steps = crate::workflows::workflow_step_statuses(&settled);
+            let mut steps = crate::workflows::workflow_step_statuses(&settled);
             let Ok(mut status) = self.status.lock() else {
                 return;
             };
+            // The child that just settled is stamped `ended_at` now; earlier rows keep theirs.
+            crate::workflows::carry_step_settle_times(
+                &status.steps,
+                &mut steps,
+                crate::time::now_epoch_millis(),
+            );
             status.steps = steps;
             status.current_step = status.steps.len().checked_sub(1);
             // NOT `advance_state` — the state is not changing. `touch()` (`records.rs:471`) is the

@@ -1239,6 +1239,7 @@ mod tests {
             stopped: false,
             workflow_key: None,
             run_id: None,
+            runner: None,
             session_name: None,
             interrupted: false,
             output_path_mapping: None,

@@ -267,10 +267,10 @@ mod tests {
             .expect("`guide` must be in SUBAGENT_ACTIONS");
         assert_eq!(
             actions.get(at - 1).copied(),
-            Some("models"),
-            "pi `shared/types.ts:2760` orders `… \"models\", \"children.list\", \"guide\", \
-             \"validate\", \"create\", …`; cyrup omits the unported `children.list`, so `guide` \
-             follows `models` directly"
+            Some("children.list"),
+            "pi `shared/types.ts:2801` @v0.68.0 orders `… \"models\", \"children.list\", \
+             \"guide\", \"validate\", \"create\", …`; `children.list` is dispatched by \
+             `route_action` (`background::retained_children`), so `guide` follows it"
         );
         // WORKFLOW_2: `validate` now occupies pi's own slot between `guide` and `create`
         // (`shared/types.ts:2760`). Before it was ported this asserted `create`, which is what

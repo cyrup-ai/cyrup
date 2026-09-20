@@ -1094,6 +1094,39 @@ impl SubagentTool {
         cancel: &CancelToken,
     ) -> Result<ToolResult, ToolError> {
         match action {
+            // pi `subagent-executor.ts:6467-6473` @v0.68.0, the arm immediately before `doctor`:
+            // `listRetainedChildren(DIRS.async, resolveCurrentSessionId(ctx.sessionManager))`
+            // rendered by `formatRetainedChildren`. A READ — absent from
+            // `MUTATING_MANAGEMENT_ACTIONS` (`:213`), so it is its own arm rather than a member of
+            // the control band below, for the reason the `inspect` arm states: it must not pass
+            // through `route_control_action`'s authority consult. The session is
+            // `current_session_id()` (pi's `resolveCurrentSessionId`); `None` means no filter,
+            // exactly pi's falsy `sessionId`.
+            "children.list" => {
+                let cfg = self.executor.config_snapshot().await;
+                let async_root =
+                    crate::extension::executor::paths::default_async_root_in(&cfg.roots, cwd);
+                let results_dir =
+                    crate::extension::executor::paths::default_results_dir_in(&cfg.roots, cwd);
+                let session = self.executor.current_session_id();
+                let children = crate::background::list_retained_children(
+                    &async_root,
+                    &results_dir,
+                    session.as_deref(),
+                )
+                .await
+                .map_err(ToolError::new)?;
+                Ok(ToolResult {
+                    content: vec![cyrup_core::Content::text(
+                        crate::background::format_retained_children(&children),
+                    )],
+                    // pi `:6471` — `details: { mode: "management", results: [] }`, the shape
+                    // every management reply here carries.
+                    details: Some(serde_json::json!({ "mode": "management", "results": [] })),
+                    terminate: TerminateHint::Unspecified,
+                    ..Default::default()
+                })
+            }
             // Read-only diagnostics — already faithfully implemented (`run_doctor`), so wired here.
             // pi threads the call's own `sessionDir` override into the report (`buildDoctorReport`'s
             // `requestedSessionDir: paramsWithResolvedCwd.sessionDir`, `subagent-executor.ts:2828`).
@@ -1148,9 +1181,13 @@ impl SubagentTool {
             // SUBA-057: `dismiss` joins the control arm, in pi's own dispatch position immediately
             // after `stop` (`subagent-executor.ts:5872`, the `if (action === "dismiss")` block that
             // sits between the `append-step`/`schedule.*` blocks and the `stop` block).
-            "status" | "interrupt" | "stop" | "dismiss" | "resume" | "steer" | "append-step" => {
-                self.route_control_action(action, p, cwd).await
-            }
+            // `debug.run` shares `status`'s dispatch arm upstream (`if (action === "status" ||
+            // action === "debug.run")`, `subagent-executor.ts:6515` @v0.68.0), so it joins the
+            // control band here; it is absent from `MUTATING_MANAGEMENT_ACTIONS` (`:213`) and the
+            // authority consult maps it to `None` (`registration/authority.rs`), so the band
+            // gates nothing for it — exactly as upstream leaves it.
+            "status" | "debug.run" | "interrupt" | "stop" | "dismiss" | "resume" | "steer"
+            | "append-step" => self.route_control_action(action, p, cwd).await,
             // SCOPE_12 — [CYRUP-DELTA]: `inspect` is cyrup's own verb (see `text.rs`'s
             // `SUBAGENT_ACTIONS` entry for why upstream has none), and it is its OWN arm rather
             // than a member of the control band above. That placement is the point: inspect is a
@@ -2174,6 +2211,24 @@ impl SubagentTool {
 
         let index = p.index.and_then(|value| usize::try_from(value).ok());
         let outcome = match action {
+            // pi `subagent-executor.ts:6517-6538` @v0.68.0: the target is `id ?? runId` (`:6517`),
+            // and the two refusals come in upstream's order — no target (`:6532`) BEFORE a view
+            // (`:6535`) — so `{ view }` alone is refused for the missing target, not the view.
+            "debug.run" => {
+                use crate::background::run_lifecycle_debug::{
+                    DEBUG_RUN_NO_VIEWS, DEBUG_RUN_REQUIRES_TARGET,
+                };
+                let target = p.id.as_deref().or(p.run_id.as_deref());
+                if target.is_none() && p.dir.is_none() {
+                    Err(DEBUG_RUN_REQUIRES_TARGET.to_string())
+                } else if p.view.is_some() {
+                    Err(DEBUG_RUN_NO_VIEWS.to_string())
+                } else {
+                    self.executor
+                        .control_debug_run(cwd, target, p.dir.as_deref())
+                        .await
+                }
+            }
             "status" => {
                 // pi `params.id ?? params.runId` (`subagent-executor.ts:2846`): `id` takes priority,
                 // but a caller using `runId` alone must still resolve to that run's report instead of
@@ -2286,8 +2341,8 @@ impl SubagentTool {
                     .control_append_step(cwd, target, p.chain.as_deref().unwrap_or(&[]))
                     .await
             }
-            // SUBA-038 residual 3: this arm is defensively unreachable (only the six control verbs
-            // reach `route_control_action`), but it listed "status, interrupt, resume, steer,
+            // SUBA-038 residual 3: this arm is defensively unreachable (only the control band's
+            // verbs in `route_action` reach `route_control_action`), but it listed "status, interrupt, resume, steer,
             // append-step" and omitted `stop` — which IS advertised and IS dispatched two arms up.
             // Upstream has no separate control-arm message at all: every unknown action lands on
             // the one `unknownSubagentActionMessage` (`subagent-executor.ts:195`), so routing here
@@ -2738,3 +2793,9 @@ mod worktree_cleanup_tests;
 #[cfg(test)]
 #[path = "lane_actions_tests.rs"]
 mod lane_actions_tests;
+
+// `children.list` — the reachability tests for the retained-children listing, a `#[path]`
+// sibling like the two above so `routing_tests.rs` does not grow past its already-largest size.
+#[cfg(test)]
+#[path = "children_list_tests.rs"]
+mod children_list_tests;

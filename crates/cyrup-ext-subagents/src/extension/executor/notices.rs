@@ -587,16 +587,28 @@ impl SubagentExecutor {
             .goal_turn_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        let config = self.config_snapshot().await.missions.clone();
-        let location = crate::missions::resolve_mission_store_location(cwd, config.as_ref(), None);
-        // [CYRUP-DELTA] pi passes `listRetainedChildren(DIRS.async, ownerSessionId)`. That list is
-        // built from async runs carrying a `parentWorkflowRunId` — a `workflowScript` concept this
-        // crate has no runtime for — so it is necessarily empty here and is passed as such rather
-        // than faked. See `missions::goal_driver`'s own note.
+        let snapshot = self.config_snapshot().await;
+        let location =
+            crate::missions::resolve_mission_store_location(cwd, snapshot.missions.as_ref(), None);
+        // pi `listRetainedChildren(DIRS.async, ownerSessionId)` (`extension/index.ts:840`
+        // @v0.68.0): the retained children of THIS session's workflow runs, so a goal whose latest
+        // linked run is a workflow gets the `Resume retained child …` wrapping. Best-effort like
+        // the rest of this block — a scan error lists nothing rather than failing the turn.
+        let retained: Vec<crate::missions::RetainedChild> =
+            crate::background::list_retained_children(
+                &default_async_root_in(&snapshot.roots, cwd),
+                &default_results_dir_in(&snapshot.roots, cwd),
+                Some(&owner_session_id),
+            )
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(crate::missions::RetainedChild::from)
+            .collect();
         let notices = match crate::missions::collect_goal_continuation_notices(
             &location,
             &owner_session_id,
-            &[],
+            &retained,
             turn_id,
             None,
         ) {
@@ -1943,6 +1955,156 @@ mod tests {
         assert_eq!(
             err,
             "action='stop' supports async runs only. Use action='interrupt' for foreground runs."
+        );
+    }
+}
+
+/// `children.list`'s second consumer — pi `extension/index.ts:840-841` @v0.68.0, where the
+/// turn-end goal scan is handed `listRetainedChildren(DIRS.async, ownerSessionId)`.
+#[cfg(test)]
+mod retained_children_goal_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+    use crate::extension::testsupport::{
+        FixedSessionIdHost, arm_scoped_missions, dispatch_tool, scoped_missions,
+        write_completing_child_binary,
+    };
+    use crate::extension::tool::SubagentTool;
+
+    /// THE REACHABILITY PROOF for `raise_goal_continuation_notices` passing the REAL retained
+    /// list: a goal mission owned by this session whose latest linked run is a settled WORKFLOW
+    /// gets its notice wrapped as `Resume retained child <child> (<agent>) for: …`
+    /// (`goal_driver.rs::next_ready_action`, reachable only with a non-empty list whose
+    /// `parent_run_id` matches). The child is a real workflow child settled through the real
+    /// dispatch and read back off the workflow's `status.json`.
+    ///
+    /// Gutted: revert the call to `&[]` → the message lacks the `Resume retained child` prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_settled_workflow_child_wraps_the_goal_notice_as_a_retained_resume() {
+        use crate::tui::notices::ControlNoticeSink;
+
+        #[derive(Default)]
+        struct Recording {
+            delivered: std::sync::Mutex<Vec<crate::tui::ControlNotice>>,
+        }
+        impl ControlNoticeSink for Recording {
+            fn emit_control_notice(&self, notice: crate::tui::ControlNotice, _trigger_turn: bool) {
+                self.delivered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(notice);
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_completing_child_binary(dir.path());
+        let sink = Arc::new(Recording::default());
+        let executor = Arc::new(SubagentExecutor::with_control_notice_sink(sink.clone()));
+        arm_scoped_missions(&executor, dir.path()).await;
+        executor.set_host_services(Arc::new(FixedSessionIdHost {
+            id: Some("session-children".to_string()),
+            file: None,
+        }));
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                binary: script,
+                base_args: Vec::new(),
+            });
+        }
+        let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+        let result = dispatch_tool(
+            &tool,
+            serde_json::json!({
+                "workflowScript":
+                    "await runs.run(\"a\", { agent: \"worker\", task: \"T\", model: \"sonnet\" });\n\
+                     return \"done\";"
+            }),
+        )
+        .await
+        .expect("a completing child must not fail the workflow");
+        let workflow_run_id = result.details.as_ref().expect("details")["workflowRunId"]
+            .as_str()
+            .expect("the settlement stamps the run id")
+            .to_string();
+        let cfg = executor.config_snapshot().await;
+        let status: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                default_async_root_in(&cfg.roots, dir.path())
+                    .join(&workflow_run_id)
+                    .join("status.json"),
+            )
+            .expect("the workflow's status.json is on disk"),
+        )
+        .unwrap();
+        let child_run_id = status["steps"][0]["runId"]
+            .as_str()
+            .expect("the settled row carries the child's run id")
+            .to_string();
+
+        // A goal mission owned by the same session, with the WORKFLOW run as its latest link —
+        // the shape `mission.attach-run` of a workflow id produces.
+        let location = crate::missions::resolve_mission_store_location(
+            dir.path(),
+            Some(&scoped_missions(dir.path())),
+            None,
+        );
+        let record = crate::missions::create_mission(
+            &location,
+            &crate::missions::MissionCreateInput {
+                title: "Keep going".to_string(),
+                objective: "finish the long thing".to_string(),
+                goal: Some(true),
+                budget: Some(crate::missions::MissionTokenBudget { tokens: 5_000 }),
+                status: Some(crate::missions::MissionStatus::Active),
+                labels: None,
+                owner_session_id: Some("session-children".to_string()),
+            },
+            0,
+            None,
+        )
+        .expect("create goal mission");
+        crate::missions::update_mission(
+            &location,
+            &record.id,
+            &crate::missions::MissionUpdateInput {
+                add_runs: vec![crate::missions::MissionRunLink {
+                    run_id: workflow_run_id.clone(),
+                    mode: crate::missions::MissionRunMode::Workflow,
+                    async_dir: None,
+                    child_index: None,
+                    agent: None,
+                    status: Some("complete".to_string()),
+                    started_at: None,
+                    completed_at: None,
+                    usage: None,
+                }],
+                ..Default::default()
+            },
+            crate::time::now_epoch_millis(),
+            None,
+        )
+        .expect("attach the workflow run");
+
+        assert_eq!(
+            executor.raise_goal_continuation_notices(dir.path()).await,
+            1,
+            "one idle goal mission, one notice"
+        );
+        let delivered = sink
+            .delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            delivered[0].message.contains(&format!(
+                "Next ready action: Resume retained child {child_run_id} (worker) for: Continue \
+                 objective: finish the long thing"
+            )),
+            "the real retained list must reach the goal driver and wrap the action: {}",
+            delivered[0].message
         );
     }
 }

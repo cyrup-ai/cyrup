@@ -321,3 +321,47 @@ pub(crate) fn seed_scope_fixture(cwd: &Path, agent: &str, settings_json: Option<
         std::fs::write(agents_dir.join("settings.json"), json).expect("write settings.json");
     }
 }
+
+// =========================================================================================
+// `children.list` — a child that SETTLES cleanly, the shape a retained child needs
+// =========================================================================================
+
+/// A scripted child binary that completes: the NDJSON success shape (`exec/ndjson.rs`) —
+/// `agent_start`, one assistant `message_end`, `agent_settled`, exit 0 — the mirror of
+/// `routing_tests::write_detaching_child_binary`'s failure shape. A workflow child driven by it
+/// settles `ok`, which is what lands it on the workflow's `status.json` as a `complete` step row
+/// with a `runId` — the row `children.list` lists.
+pub(crate) fn write_completing_child_binary(dir: &Path) -> PathBuf {
+    write_scripted_child_binary(dir, "completing-child.sh", 0)
+}
+
+/// [`write_completing_child_binary`]'s failing twin: the same NDJSON shape, exit 1. A workflow
+/// child driven by it settles `ok: false` (`WorkflowRunHost::map_child_result`: `exit_code == 0`
+/// is one of `ok`'s conjuncts), which `workflow_step_statuses` writes as a `failed` step row —
+/// the row `children.list` must print as `failed` even when the workflow caught the failure and
+/// completed.
+pub(crate) fn write_failing_child_binary(dir: &Path) -> PathBuf {
+    write_scripted_child_binary(dir, "failing-child.sh", 1)
+}
+
+fn write_scripted_child_binary(dir: &Path, name: &str, exit_code: u8) -> PathBuf {
+    let script = dir.join(name);
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+printf '%s\\n' '{{\"type\":\"agent_start\"}}'\n\
+printf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\
+\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}'\n\
+printf '%s\\n' '{{\"type\":\"agent_settled\"}}'\n\
+exit {exit_code}\n"
+        ),
+    )
+    .expect("write the scripted child");
+    std::fs::set_permissions(
+        &script,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("make the scripted child executable");
+    script
+}

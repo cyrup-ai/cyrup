@@ -90,6 +90,27 @@ impl ActiveAsyncCapacityReleaseVerdict {
         matches!(self, Self::Releasable { .. })
     }
 
+    /// pi `release.state` (`:58-61`) — the literal `releasable` / `retained` / `not-owned` word
+    /// `debug.run`'s `Active capacity:` line interpolates (`run-status.ts:61`).
+    #[must_use]
+    pub fn state_word(&self) -> &'static str {
+        match self {
+            Self::Releasable { .. } => "releasable",
+            Self::Retained { .. } => "retained",
+            Self::NotOwned { .. } => "not-owned",
+        }
+    }
+
+    /// pi `release.reason` — the rung that decided the verdict, whichever variant carries it.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Releasable { reason, .. }
+            | Self::Retained { reason }
+            | Self::NotOwned { reason } => reason,
+        }
+    }
+
     fn retained(reason: impl Into<String>) -> Self {
         Self::Retained {
             reason: reason.into(),
@@ -114,6 +135,19 @@ pub enum CapacityRelation {
     Source,
     /// No slot in any scanned pool records this run.
     None,
+}
+
+impl CapacityRelation {
+    /// pi's literal `"current" | "source" | "none"` (`:65`), as `debug.run`'s `Capacity owner:`
+    /// line interpolates it (`run-status.ts:65`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Source => "source",
+            Self::None => "none",
+        }
+    }
 }
 
 /// pi `ActiveAsyncCapacityInspection` (`:63-68`).
@@ -570,7 +604,7 @@ fn mode_word(mode: RunMode) -> &'static str {
 
 /// pi's `PidLiveness` string union (`stale-run-reconciler.ts`), which its reason strings
 /// interpolate directly.
-fn liveness_word(liveness: Liveness) -> &'static str {
+pub(crate) fn liveness_word(liveness: Liveness) -> &'static str {
     match liveness {
         Liveness::Alive => "alive",
         Liveness::Dead => "dead",

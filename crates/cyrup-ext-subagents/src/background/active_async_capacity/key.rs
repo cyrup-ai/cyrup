@@ -71,6 +71,18 @@ pub enum ActiveAsyncCapacityKind {
     Workflow,
 }
 
+impl ActiveAsyncCapacityKind {
+    /// The lowercase word `owner.json` already serializes this as (`rename_all = "lowercase"`),
+    /// and the one `debug.run`'s `Capacity owner:` line interpolates (`run-status.ts:65`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runner => "runner",
+            Self::Workflow => "workflow",
+        }
+    }
+}
+
 /// `{ used, limit }` — pi `ActiveAsyncCapacitySnapshot` (`shared/types.ts:2200-2204` @`v0.66.0`).
 ///
 /// `limit: 0` means the opt-in cap is DISABLED, which is why upstream's own renderer prints

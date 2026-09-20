@@ -126,6 +126,15 @@ pub struct StepStatus {
     /// [`crate::exec::SingleResult::child_run_id`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
+    /// The external runner this step's child executed under, when it was not a native child — pi
+    /// `AsyncJobStep.runner?: ExternalCliRunnerStatus | ExternalJobRunnerStatus`
+    /// (`shared/types.ts:1315`), carried onto the step summary as `runner?` (`async-status.ts:51`)
+    /// and read by `children.list`'s external-runner rung (`retained-children.ts:54`), which
+    /// refuses to call such a child resumable. Filled at settle time from the child's own
+    /// [`SingleResult::runner`]; `None` for every native child and omitted from the wire, so a
+    /// status written before this field existed still round-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<crate::runner::status::ExternalCliRunnerStatus>,
     /// Human-readable display name for the child session, when derived at launch — pi
     /// `AsyncStatus.steps[].sessionName` (`shared/types.ts:1868`) /
     /// `WorkflowChildSummary.children[].sessionName` (`shared/types.ts:200-201`), bounded to 256
@@ -180,6 +189,7 @@ impl StepStatus {
             stopped: false,
             workflow_key: None,
             run_id: None,
+            runner: None,
             session_name: None,
             interrupted: false,
             output_path_mapping: None,

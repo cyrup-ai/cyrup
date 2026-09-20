@@ -482,7 +482,47 @@ pub async fn collect_fleet_history(
     current_session_id: Option<&str>,
 ) -> Result<Vec<AsyncRunView>, String> {
     let candidates = fleet_history_candidates(async_root, results_dir, current_session_id).await?;
+    Ok(read_candidate_views(candidates, current_session_id).await)
+}
 
+/// [`collect_fleet_history`]'s twin over the DIRECTORY SCAN alone — pi `listAsyncRuns(root, {
+/// sessionId, repairScan: true })` (`async-status.ts:486` is the signature, `:503-504` the
+/// `repairScan` arm, @v0.68.0): the candidates are every run directory under `async_root`, never
+/// the active/terminal indexes. Upstream's `repairScan` arm is an unbounded `readdirSync`, and its
+/// `entryLimit` reaches only the per-session terminal-index read (`:519`); so the bound here is
+/// applied AFTER the `sessionId` filter — the newest [`MAX_FLEET_HISTORY_CANDIDATES`] of the
+/// caller's own runs, by `status.json` mtime — rather than before it, which would let a hundred
+/// newer runs from other sessions push the caller's own out of the window.
+///
+/// This is the candidate source for a caller whose runs are NOT indexed. A foreground workflow
+/// run writes `<async_root>/<wf>/status.json` and its receipt (`workflow_launch.rs`
+/// `settle_foreground_workflow`) and never calls
+/// [`crate::background::active_run_index::update_active_run_index`], the one writer both indexes
+/// are filed through — its production callers are listed, with the single one that can reach a
+/// crashed foreground workflow, in [`crate::background::retained_children`]'s module doc. So
+/// under [`fleet_history_candidates`] a settled workflow run is visible only while BOTH indexes
+/// happen to be empty. `children.list` reads workflow status files and therefore scans.
+///
+/// # Errors
+///
+/// The directory-listing error when `async_root` exists but cannot be read.
+pub async fn collect_async_runs_by_scan(
+    async_root: &Path,
+    results_dir: &Path,
+    current_session_id: Option<&str>,
+) -> Result<Vec<AsyncRunView>, String> {
+    let candidates = scan_async_root_candidates(async_root, results_dir, None).await?;
+    let mut runs = read_candidate_views(candidates, current_session_id).await;
+    runs.truncate(MAX_FLEET_HISTORY_CANDIDATES);
+    Ok(runs)
+}
+
+/// Read each candidate's `status.json` into an [`AsyncRunView`], dropping unreadable ones and —
+/// with a current session — every run recorded under another session.
+async fn read_candidate_views(
+    candidates: Vec<RunPaths>,
+    current_session_id: Option<&str>,
+) -> Vec<AsyncRunView> {
     let mut runs: Vec<AsyncRunView> = Vec::new();
     for paths in candidates {
         let Ok(bytes) = tokio::fs::read(&paths.status).await else {
@@ -510,7 +550,7 @@ pub async fn collect_fleet_history(
             nested_children: Vec::new(),
         });
     }
-    Ok(runs)
+    runs
 }
 
 /// The candidate run paths for [`collect_fleet_history`], newest first and bounded by
@@ -571,16 +611,33 @@ async fn fleet_history_candidates(
             .map(|run_id| RunPaths::for_run(async_root, results_dir, run_id))
             .collect());
     }
+    scan_async_root_candidates(async_root, results_dir, Some(MAX_FLEET_HISTORY_CANDIDATES)).await
+}
 
+/// The directory-scan candidate source: every run directory under `async_root` that carries a
+/// `status.json`, newest first by that file's mtime, cut to `limit` when one is given.
+/// [`fleet_history_candidates`]'s fallback (bounded, before any session filter — the same cut the
+/// index path takes) and [`collect_async_runs_by_scan`]'s only source (unbounded; that caller
+/// filters by session first and bounds afterwards).
+///
+/// # Errors
+///
+/// The directory-listing error when `async_root` exists but cannot be read.
+async fn scan_async_root_candidates(
+    async_root: &Path,
+    results_dir: &Path,
+    limit: Option<usize>,
+) -> Result<Vec<RunPaths>, String> {
     let mut entries = match tokio::fs::read_dir(async_root).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.to_string()),
     };
-    // pi's `entryLimit` pass (`async-status.ts:388-405`): collect every candidate with its
-    // `status.json` mtime FIRST, sort newest-first, and only then take the limit. A directory whose
-    // status file is missing is dropped here rather than counted against the budget, exactly as
-    // upstream's `isNotFoundError ⇒ undefined` filter does.
+    // Upstream's `repairScan` arm (`async-status.ts:503-504`) is a plain `readdirSync` with no
+    // ordering and no limit; the bound is cyrup's own, so it is applied honestly: collect every
+    // candidate with its `status.json` mtime FIRST, sort newest-first, and only then cut. A
+    // directory whose status file is missing is dropped here rather than counted against the
+    // budget.
     let mut candidates: Vec<(i128, RunPaths)> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let Ok(file_type) = entry.file_type().await else {
@@ -611,7 +668,9 @@ async fn fleet_history_candidates(
         candidates.push((mtime, paths));
     }
     candidates.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
-    candidates.truncate(MAX_FLEET_HISTORY_CANDIDATES);
+    if let Some(limit) = limit {
+        candidates.truncate(limit);
+    }
     Ok(candidates.into_iter().map(|(_, paths)| paths).collect())
 }
 

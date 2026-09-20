@@ -181,18 +181,17 @@ fn lane_key_agrees(
     })
 }
 
-// pi's `resolveParallelHandoffChild` (`parallel-handoff.ts:128-160`) and its `workflowKey`/
-// `childRunId` selector are NOT ported here, and the omission is deliberate rather than an
-// oversight. Upstream's only caller is `runs/background/retained-children.ts:68`, which serves the
-// `children.list` verb — a verb cyrup does not have, and does not have for a stated reason:
-// `extension/tool/text.rs`'s SUBAGENT_ACTIONS records that `children.list` needs RETENTION of
-// settled children, which this build does not do (the foreground `WorkflowRunHost`'s `settled`
-// list is dropped with the tool call), so the listing would always be empty.
+// pi's `resolveParallelHandoffChild` (`parallel-handoff.ts:128-160` @v0.68.0) and its
+// `workflowKey`/`childRunId` selector are NOT ported here, and the omission is deliberate rather
+// than an oversight: at v0.68.0 it has NO production caller — `git grep resolveParallelHandoffChild
+// v0.68.0 -- src` finds only its own definition. (An earlier note here named
+// `retained-children.ts:68` as its caller; that line calls `resolveRetainedWorktreeCwd`, which is
+// ported directly below.) Landing a selector nothing invokes is the "tested machinery with no
+// production caller" failure this programme has shipped five times.
 //
-// They were written in this batch and then removed, because landing a selector whose only caller
-// is a verb nobody can invoke is the "tested machinery with no production caller" failure this
-// programme has shipped five times. Whoever ports `children.list` wants pi `:128-160` and
-// `retained-children.ts:60-75`; the manifest reader below already gives them the groups.
+// `children.list` IS ported (`background/retained_children.rs`); its cwd rung is
+// [`resolve_retained_worktree_cwd`], which therefore has two production callers: the `resume`
+// revive (`extension/executor/control.rs`) and the retained-children predicate.
 
 /// The manifest must be the one the caller named — pi's `manifest.runId !== runId` throw
 /// (`parallel-handoff.ts:141`).

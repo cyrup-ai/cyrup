@@ -3066,3 +3066,217 @@ async fn every_refine_verb_names_both_surfaces_when_agent_is_missing() {
         }
     }
 }
+
+// =================================================================================================
+// `debug.run` — pi `subagent-executor.ts:6515-6538` + `run-status.ts:406-410,:463-468,:714-721,
+// :781-785` @v0.68.0: the refusals, in upstream's order, through the production dispatch.
+// =================================================================================================
+mod debug_run_refusals {
+    use super::*;
+    use crate::background::run_lifecycle_debug::{
+        DEBUG_RUN_NEEDS_STATUS_DIR, DEBUG_RUN_NO_VIEWS, DEBUG_RUN_REQUIRES_TARGET,
+    };
+    use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
+    use std::path::Path;
+
+    /// A tool whose executor roots are SANDBOXED into `dir`, so the async root and results dir
+    /// the verb resolves against are this test's own tree and nothing is written outside it.
+    async fn sandboxed_tool(dir: &Path) -> (SubagentTool, std::path::PathBuf, std::path::PathBuf) {
+        let executor = Arc::new(SubagentExecutor::new());
+        arm_scoped_missions(&executor, dir).await;
+        executor.config_cell().lock().await.roots = crate::paths::Roots::sandboxed(dir);
+        let cfg = executor.config_snapshot().await;
+        let async_root = default_async_root_in(&cfg.roots, dir);
+        let results_dir = default_results_dir_in(&cfg.roots, dir);
+        (
+            SubagentTool::new(executor, dir.to_path_buf()),
+            async_root,
+            results_dir,
+        )
+    }
+
+    /// The advertise-vs-dispatch invariant: `debug.run` sits at pi's own index — directly after
+    /// `status` (`shared/types.ts:2801`) — and the schema enum is derived from that list.
+    #[test]
+    fn debug_run_is_advertised_directly_after_status() {
+        let actions = crate::extension::tool::text::subagent_actions();
+        let status = actions
+            .iter()
+            .position(|a| *a == "status")
+            .expect("`status` is advertised");
+        assert_eq!(
+            actions.get(status + 1).copied(),
+            Some("debug.run"),
+            "`debug.run` must follow `status` as it does in pi's SUBAGENT_ACTIONS"
+        );
+    }
+
+    /// pi `:6532` before `:6535`: no target is refused first, a view second — so `{ view }`
+    /// alone is refused for the MISSING TARGET, and `{ id, view }` for the view.
+    #[tokio::test]
+    async fn the_target_refusal_comes_before_the_view_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tool, _, _) = sandboxed_tool(dir.path()).await;
+
+        let err = dispatch_tool(&tool, serde_json::json!({ "action": "debug.run" }))
+            .await
+            .expect_err("no target is refused");
+        assert_eq!(err.to_string(), DEBUG_RUN_REQUIRES_TARGET);
+
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "debug.run", "view": "fleet" }),
+        )
+        .await
+        .expect_err("a view without a target is refused for the target");
+        assert_eq!(err.to_string(), DEBUG_RUN_REQUIRES_TARGET);
+
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "debug.run", "id": "x", "view": "fleet" }),
+        )
+        .await
+        .expect_err("a view with a target is refused for the view");
+        assert_eq!(err.to_string(), DEBUG_RUN_NO_VIEWS);
+    }
+
+    /// pi `run-status.ts:463-468`, `:714-721`, `:781-785` — the three on-disk refusals, each
+    /// against a real tree under this test's sandboxed roots.
+    #[tokio::test]
+    async fn the_three_location_refusals_are_pis_sentences() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tool, async_root, results_dir) = sandboxed_tool(dir.path()).await;
+
+        // Unknown id: neither a run dir nor a result file.
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "debug.run", "id": "nope" }),
+        )
+        .await
+        .expect_err("an unknown id is refused");
+        assert_eq!(err.to_string(), "Async run not found. Provide id or dir.");
+
+        // Result-only run: `<results_dir>/<id>.json` exists, no run dir (`:714-721`).
+        std::fs::create_dir_all(&results_dir).expect("results dir");
+        std::fs::write(results_dir.join("result-only.json"), "{}").expect("result file");
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "debug.run", "id": "result-only" }),
+        )
+        .await
+        .expect_err("a result-only run has no directory to dump");
+        assert_eq!(err.to_string(), DEBUG_RUN_NEEDS_STATUS_DIR);
+
+        // A directory with neither `status.json` nor a result (`:781-785`).
+        let empty_dir = async_root.join("empty-run");
+        std::fs::create_dir_all(&empty_dir).expect("empty run dir");
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "debug.run", "dir": empty_dir.to_string_lossy() }),
+        )
+        .await
+        .expect_err("a directory without status.json is refused");
+        assert_eq!(err.to_string(), "Status file not found.");
+        assert!(
+            !empty_dir.join("status.json").exists(),
+            "the refusal must not synthesise a status file into the directory"
+        );
+
+        // A directory WITHOUT `status.json` but WITH a result file: upstream's reconciler
+        // returns `status: null` (`stale-run-reconciler.ts:369`) and the `resultPath` arm refuses
+        // (`:714-721`); cyrup's `reconcile_now` would repair a `status.json` from the result, so
+        // the verb must refuse BEFORE reconciling and leave the directory untouched.
+        let repairable = async_root.join("result-no-status");
+        std::fs::create_dir_all(&repairable).expect("run dir");
+        std::fs::write(repairable.join("events.jsonl"), "").expect("events file");
+        std::fs::write(results_dir.join("result-no-status.json"), "{}").expect("result file");
+        for params in [
+            serde_json::json!({ "action": "debug.run", "id": "result-no-status" }),
+            serde_json::json!({ "action": "debug.run", "dir": repairable.to_string_lossy() }),
+        ] {
+            let err = dispatch_tool(&tool, params.clone())
+                .await
+                .expect_err("a run dir without status.json is refused even with a result");
+            assert_eq!(err.to_string(), DEBUG_RUN_NEEDS_STATUS_DIR, "{params}");
+            assert!(
+                !repairable.join("status.json").exists(),
+                "the diagnostic must not repair a status file it then reports: {params}"
+            );
+        }
+    }
+
+    /// pi `resolveAsyncRunLocation`'s `dir` form (`async-resume.ts:227-235`): `assertInsideRoot`
+    /// (`:229`) refuses a directory outside the async root, and an `id`/`runId` that disagrees
+    /// with the directory's basename is refused by name (`:231-233`) — the directory is not
+    /// silently dumped for a caller who asked about another run.
+    #[tokio::test]
+    async fn the_dir_form_refuses_an_outside_directory_and_a_mismatched_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tool, async_root, _) = sandboxed_tool(dir.path()).await;
+
+        let outside = dir.path().join("elsewhere").join("run-x");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "debug.run", "dir": outside.to_string_lossy() }),
+        )
+        .await
+        .expect_err("a directory outside the async root is refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Async run directory must be inside {}.",
+                async_root.display()
+            )
+        );
+
+        // `..` is normalised before the check, as Node `path.resolve` does.
+        let escaping = async_root.join("..").join("elsewhere").join("run-x");
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "debug.run", "dir": escaping.to_string_lossy() }),
+        )
+        .await
+        .expect_err("a dot-segment escape is refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Async run directory must be inside {}.",
+                async_root.display()
+            )
+        );
+
+        let run_b = async_root.join("bbbb2222");
+        std::fs::create_dir_all(&run_b).expect("run dir");
+        for id_field in ["id", "runId"] {
+            let err = dispatch_tool(
+                &tool,
+                serde_json::json!({
+                    "action": "debug.run",
+                    id_field: "aaaa1111",
+                    "dir": run_b.to_string_lossy(),
+                }),
+            )
+            .await
+            .expect_err("a mismatched id is refused");
+            assert_eq!(
+                err.to_string(),
+                "Async run id 'aaaa1111' does not match directory 'bbbb2222'.",
+                "{id_field}"
+            );
+        }
+
+        // The matching id passes the check and reaches the on-disk refusal for an empty dir.
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({
+                "action": "debug.run",
+                "id": "bbbb2222",
+                "dir": run_b.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect_err("an empty run dir is refused");
+        assert_eq!(err.to_string(), "Status file not found.");
+    }
+}

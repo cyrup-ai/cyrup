@@ -162,12 +162,11 @@ pub(crate) const CHILD_SESSION_NOT_RUNNING_YET: &str = "Child session is not run
 ///   actions this crate has not ported — exactly four of them, `inspector.open`,
 ///   `inspector.close`, `project.open` and `project.close` — and grafting one of those onto a
 ///   7-entry port would make the runtime denylist message advertise a verb with no handler.
-///   (`debug.run` is NOT a member: enumerate `:213` and it is absent. It lives in
-///   `SUBAGENT_ACTIONS` (`shared/types.ts:2801`) — which is the list the sibling note in
-///   [`crate::extension::tool::schema::subagent_tool_parameters`] names it as an unported member
-///   of — and it is READ-ONLY upstream, dispatched by `if (action === "status" || action ===
-///   "debug.run")` at `:6515`. Adding it here would gate a verb upstream deliberately leaves
-///   open to a child.)
+///   (`debug.run` is NOT a member: enumerate `:213` and it is absent. It is READ-ONLY upstream,
+///   dispatched by `if (action === "status" || action === "debug.run")` at `:6515`, and cyrup
+///   dispatches it the same way — through the control band into
+///   [`crate::extension::SubagentExecutor::control_debug_run`]. Adding it here would gate a verb
+///   upstream deliberately leaves open to a child.)
 ///
 ///   Every OTHER member of upstream's 31 that cyrup does dispatch is refused in this mode, each
 ///   at its own site rather than through the 7-entry slice, and the sites are not all shaped
@@ -241,19 +240,16 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     "list",
     "get",
     "models",
+    // pi's own position for this verb (`shared/types.ts:2801` @v0.68.0: `… "models",
+    // "children.list", "guide", "validate", …`). Lists the retained children of this session's
+    // workflow runs — in cyrup the settled step rows of each workflow's own `status.json`, which
+    // is where a foreground workflow child is retained (`background/retained_children.rs`'s module
+    // doc has the shape). Dispatched by `route_action`'s `"children.list"` arm, a read placed
+    // immediately before `doctor` as upstream's is (`subagent-executor.ts:6467`).
+    "children.list",
     // SUBA-055 — pi's own position for this verb (`shared/types.ts:1968` @v0.47.1:
-    // `… "models", "children.list", "guide", "create", …`). `children.list` is NOT added with it
-    // and the reason is recorded rather than left to inference: upstream's `children.list` lists
-    // RETAINED children — completed single runs held open for follow-up under a
-    // `parentWorkflowRunId`.
-    //
-    // WORKFLOW_2 UPDATE: `workflowScript` is no longer unported, so the old wording ("part of the
-    // unported `workflowScript` shape") is retired — but the verb still stays out, for a reason
-    // that outlived it. `children.list` needs RETENTION, and this build retains nothing: the
-    // foreground `WorkflowRunHost`'s `settled` list is dropped with the tool call, so the listing
-    // would still always be empty. Retention arrives with the async/detached workflow shape
-    // (WORKFLOW_3/WORKFLOW_13); until then the residual stays open under SUBA-005's unowned-verb
-    // list. This half is the `guide` action and its packaged docs.
+    // `… "models", "children.list", "guide", "create", …`): the `guide` action and its packaged
+    // docs.
     "guide",
     // WORKFLOW_2 — pi `action: "validate"` with `workflowScript` (`extension/schemas.ts:337`;
     // dispatched at `runs/foreground/subagent-executor.ts:4929`): structurally check a script
@@ -261,9 +257,8 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     // the advertise-vs-dispatch invariant.
     //
     // POSITION VERIFIED against upstream `SUBAGENT_ACTIONS` (`shared/types.ts:2760`), which reads
-    // `… "models", "children.list", "guide", "validate", "create", …`. cyrup omits
-    // `children.list` (see the note above), so `validate` follows `guide` directly here — pi's own
-    // index, not an append.
+    // `… "models", "children.list", "guide", "validate", "create", …` — `validate` follows
+    // `guide` at pi's own index.
     "validate",
     "create",
     "update",
@@ -273,6 +268,10 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     "enable",
     "reset",
     "status",
+    // pi's own index for `debug.run` (`shared/types.ts:2801` @v0.68.0: `… "status", "debug.run",
+    // "grant-spawn-budget", …`), dispatched by the shared `status || debug.run` arm
+    // (`subagent-executor.ts:6515`) — here, the control band's own `"debug.run"` arm.
+    "debug.run",
     // SUBA-046 — pi's own position for this verb (`shared/types.ts:1885` @v0.43.0: `… "status",
     // "grant-spawn-budget", "interrupt", …`). It was already advertised in the child-safe tool
     // description while landing on the unknown-action arm; now it dispatches.
