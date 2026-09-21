@@ -1,12 +1,12 @@
 # Tool reference
 
-The extension registers two tools: `subagent` and `wait`.
+The extension registers two tools: `subagent` and `bg_wait`.
 
 ## `subagent`
 
 With no `action`, the tool is in **execution** mode and the shape of the call selects the workflow:
-`agent` + `task` for single, `tasks[]` for parallel, `chain[]` for a chain, `chainName` for a named
-chain.
+`agent` + `task` for single, `tasks[]` for parallel, `chain[]` for a chain. These are the only
+surfaces for the parallel and chain shapes — no slash command carries them.
 
 With an `action`, the tool is in **management** or **control** mode.
 
@@ -88,7 +88,7 @@ deliberately stricter rule, so a loose typo is never nudged toward a destructive
 | `action` | management, control | See the table above; omit for execution mode |
 | `tasks` | parallel | Array of `{agent, task, …}` |
 | `chain` | chain | Array of ordered steps |
-| `chainName` | chain | A named chain from `~/.cyrup/chains` or `<project>/.cyrup/chains` |
+| `chainName` | management | The target of a `get`/`update`/`delete` on a named chain in `~/.cyrup/chains` or `<project>/.cyrup/chains` |
 | `concurrency` | parallel | How many children run at once |
 | `async` | all | Detach the run |
 | `timeoutMs` | all | Wall-clock timeout for the run |
@@ -367,12 +367,15 @@ the missing-structured-output error rather than returning free text.
 `acceptance` attaches criteria and verify commands to a run. Verify commands are memoized per run, so
 re-evaluating acceptance does not re-run a passing command, and evaluation can be cancelled.
 
-## `wait`
+## `bg_wait`
 
-`wait` blocks until background runs finish. `id` waits for one run, `all` waits for every run that
+`bg_wait` blocks until background runs finish. `id` waits for one run, `all` waits for every run that
 was in flight when the wait began, and `timeoutMs` bounds it (30 minutes by default). It is gated by
 `waitTool` in `config.json` and by `CYRUP_SUBAGENT_WAIT_TOOL_ENABLED`; an unrecognised value for that
 variable is a hard configuration error rather than a silent default.
+
+The tool is registered under the single name `bg_wait`. There is no `wait` alias — a call to `wait`
+is an unknown tool.
 
 ## Child-safe mode
 

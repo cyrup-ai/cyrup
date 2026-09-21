@@ -8,6 +8,7 @@
 pub(crate) mod background;
 pub(crate) mod chain;
 pub(crate) mod control;
+pub(crate) mod detach;
 pub(crate) mod foreground;
 pub(crate) mod foreground_actions;
 pub(crate) mod foreground_control;

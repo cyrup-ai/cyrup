@@ -5,6 +5,135 @@ next work item**.
 
 ---
 
+# FILED 2026-09-21 — four residuals from the VL-S11/S12/S8 batch, each with a TRUE premise and the grep that proves it
+
+> **This block files, it does not rank.** `VL-S8`, `VL-S11` and `VL-S12` all CLOSED in this batch
+> (their ranked rows below are struck), and `SUBA-026` narrowed to its UI half. These four are what
+> the batch left behind. Every one was greped at HEAD before it was written: several "findings" this
+> batch turned out to have false premises, and a residual with a false premise is worse than no
+> residual, because it sends the next reader to fix something that is not broken.
+>
+> ## R-VLS11b-01 — a user detach aimed at a WORKFLOW child is not refused, and its reconciliation is provisional
+>
+> **medium** · `crates/cyrup-ext-subagents/src/extension/executor/foreground.rs`,
+> `extension/host/slash_detach.rs` · area 09 / §1b `VL-S11`
+>
+> `/subagents-detach` refuses anything that is not a single-subagent run, and that refusal reads the
+> control's `mode`:
+>
+> ```text
+> $ grep -n 'mode != RunMode::Single' crates/cyrup-ext-subagents/src/extension/host/slash_detach.rs
+> 81:        if mode != RunMode::Single {
+> ```
+>
+> **The guard cannot fire for a workflow child, because nothing ever stamps anything else.**
+> `register_foreground_controls` (`foreground.rs:1169`) is the ONE construction site on the
+> production path — it takes a `ForegroundControlIdentity` carrying `parent_workflow_run_id` and
+> `workflow_key`, so a workflow child goes through it too — and it stamps the mode unconditionally:
+>
+> ```text
+> $ sed -n '1201p' crates/cyrup-ext-subagents/src/extension/executor/foreground.rs
+>                 mode: crate::background::RunMode::Single,
+> ```
+>
+> So a human can detach a workflow child, and the continuation then reconciles it as an ordinary
+> remembered foreground run. Upstream closes exactly this with `resolveDetachedWorkflowChild`
+> (`subagent-executor.ts:4078-4081`), which routes the settle back to the workflow handle. cyrup's
+> continuation has no workflow handle to route to, so its reconciliation is provisional rather than
+> wrong: the run settles and becomes addressable, but the parent workflow is not told.
+>
+> **Two ways to close it, and they are not equivalent.** Either stamp the real mode at registration
+> (which makes the existing refusal correct and is the smaller change), or port
+> `resolveDetachedWorkflowChild` (which makes the detach WORK for a workflow child and is the
+> bigger one). Do not do the first and call the second closed.
+>
+> ## R-VLS11b-02 — the detach continuation cannot persist foreground history
+>
+> **low** · `extension/executor/foreground_history/persist.rs` · area 09
+>
+> `spawn_detached_foreground_continuation` holds the `Arc` to the foreground-runs map, not the
+> executor. Both persist entry points want the executor:
+>
+> ```text
+> $ grep -rn 'fn persist_foreground_run_history' crates/cyrup-ext-subagents/src/
+> .../foreground_history/persist.rs:93:    pub(crate) fn persist_foreground_run_history(&self, results_dir: &Path, limit: usize)
+> .../foreground_history/persist.rs:120:    pub(crate) async fn persist_foreground_run_history_for(&self, cwd: &Path)
+> ```
+>
+> and the merge/eligibility helpers the continuation would otherwise reimplement are module-private
+> (`history_path:20`, `compact_child:59`, `compact_run:72`, `is_persistable:81` — `read_index:35`
+> and `sort_and_bound:46` are `pub(crate)`, the rest are not).
+>
+> **Scope it honestly: IN-SESSION READERS ARE UNAFFECTED.** `status`, `bg_wait` and
+> `ExecutorForegroundProbe` all read the in-memory map, which the continuation DOES update. What is
+> delayed is only a CROSS-RESTART restore of a run that settles after the session's last ordinary
+> foreground run — because the reconciled run reaches disk at the session's next foreground settle,
+> which calls the same writer over the same map, and if there is no next settle before the restart
+> there is nothing to read back. `persist.rs`'s `is_persistable` refuses any run with a `"detached"`
+> child, so a run that never re-remembered would be skipped anyway; this residual is about the one
+> that DID reconcile and then had no settle behind it.
+>
+> **Estimated at ~5 lines**: a `&self`-free persist entry point taking the map and the results dir.
+>
+> ## R-VLS11b-03 — the detach chord is env-tier only and defaults ON, where upstream registers nothing unless configured
+>
+> **low** · `extension/host/shortcuts.rs`, `registration/mod.rs` · area 09
+>
+> Upstream's chord is a SETTINGS key, validated as one (`extension/config.ts:152-154`:
+> *"config.foregroundDetachShortcut must be a valid keybinding string such as \"ctrl+b\""*), and it
+> registers nothing at all when the key is absent — `if (options.foregroundDetachShortcut)`
+> (`slash-commands.ts:1007`) is a truthiness test around the whole `registerShortcut` call.
+>
+> cyrup has no such settings field:
+>
+> ```text
+> $ grep -n 'shortcut' crates/cyrup-ext-subagents/src/registration/mod.rs
+> $ (no output — SubagentExtensionConfig at :81 has no foreground_detach_shortcut)
+> ```
+>
+> The chord is read from `CYRUP_SUBAGENT_FOREGROUND_DETACH_SHORTCUT` alone
+> (`shortcuts.rs:65`), and with the env unset it DEFAULTS TO `ctrl+alt+d` (`shortcuts.rs:89`,
+> `shortcuts.rs:109`'s `None => Some(DEFAULT_…)` arm) — i.e. it is ON in a default install, which is
+> the opposite of upstream's default. Setting the env to the empty string is the only way to reach
+> upstream's "no chord" state. **The chord choice itself is well-argued and collision-checked** (see
+> `DEFAULT_FOREGROUND_DETACH_SHORTCUT`'s own doc); what is missing is the settings tier and the
+> off-by-default. W6 was blocked from adding the field by file ownership in this batch.
+>
+> ## R-SUBA087-01 — `step.childId`, the unported 4th identity rung
+>
+> **low** · `background/child_identity.rs`, `background/records.rs` · area 09 `SUBA-087`
+>
+> Upstream's child-identity candidate list is FOUR rungs, not three:
+>
+> ```text
+> $ git -C tmp/pi-subagents show v0.68.0:src/runs/shared/child-identity.ts | sed -n '20,22p'
+> export function asyncStatusChildIdentityCandidates(step: AsyncStatusStep, index: number): string[] {
+> 	return [...new Set([step.childId, step.workflowKey, step.runId, `step:${index}`].filter(...))];
+> }
+> ```
+>
+> cyrup emits three, because `StepStatus` has no field for the first:
+>
+> ```text
+> $ grep -n 'child_id' crates/cyrup-ext-subagents/src/background/records.rs
+> $ (no output — the struct at :24 has no such field)
+> ```
+>
+> **Bounded, and stated as such:** this changes which child NO existing caller resolves, because
+> cyrup never mints a `childId`, so upstream's first rung would be `undefined` and filtered out for
+> every step cyrup produces. What it costs is that the ladder cannot widen — a caller holding an
+> explicit child id has no rung to land on — and that the port is narrower than the file it claims
+> to be a port of. The module doc said "three spellings"; it now says four and names this gap.
+>
+> **Not a residual, and struck here so it is not re-filed:** the same module's claim that
+> `includeNested` "is not ported" was TRUE when written and is FALSE now. `/subagents-steer` is
+> upstream's other `includeNested: true` caller and supplies the nested rung through
+> `resolve_by_candidates`' caller-supplied candidate function
+> (`extension/host/slash_steer.rs:129` `candidates_including_nested`). The doc is corrected in
+> place.
+
+---
+
 # NAVIGATION — 2026-09-16 (twelfth edition, RANKING pass) — the area tables are now reconciled too; the census is **76 open**, and the ranked set below is what a builder should read first
 
 > **Read this block first; it supersedes the eleventh edition's counts and nothing else.** The
@@ -84,15 +213,15 @@ next work item**.
 > | 3 | **`UW-10`** (§2, **no area-11 id — file one**) | `/intercom <target>` **opens a live compose box and session picker** instead of printing a picture of one and asking the user to retype the command. **Both blockers this row named are discharged** (`register_message_renderer` = `cyrup-ext/src/native.rs:270`; `VL-S15`/`register_shortcut` closed) and `HostServices::open_overlay` is production-consumed by three other crates — intercom simply never calls it. The `handle_input` state machines are ported and unit-tested | S–M | no |
 > | ~~4~~ | **~~`VL-S13`~~** (§1b) — **CLOSED 2026-09-19** | `exec/agent_refinements/` + `exec/refinement_evidence.rs` port the three functions the READ half's module doc named as missing, so an agent can now be refined from its own run evidence and rolled back. Two production surfaces (the tool verbs and `/subagents-refine`), authority-gated as pi gates them. `SUBAGENT_ACTIONS` 47 → 50, **9** verbs left. NB the validator is a privilege boundary: a U+FEFF bypass of the blocked-guidance regex was found and closed in-batch | ~~L~~ | — |
 > | ~~5~~ | **~~`VL-S10` = `SUBA-024`~~** (§1b / 09) — **CLOSED 2026-09-19** | `handoff/` writes the manifest the retention reader had been looking for since it landed, from `spawn/chain_graph.rs`'s `publish_worktree_handoff` on every `worktree: true` settle. **FIVE verbs, not the two this row named** — `lane.{status,recordMerge,recordSupersession}` share the same manifest and were filed separately; `SUBAGENT_ACTIONS` 42 → 47. `VL-S7`'s authority arms are attached. NB `worktree: true` did not WORK in a default install before this, which this row did not know | ~~L~~ | — |
-> | 6 | **`VL-S8`** (§1b) | a **pi-authored agent's prompt that calls `subagent_wait` stops getting "unknown tool"**. `extension/wait_tool.rs:16` is `"wait"`. One const plus a compat alias — **the best value-per-line row in the directory** | XS | no |
+> | ~~6~~ | **~~`VL-S8`~~** (§1b) — **CLOSED 2026-09-21** | `WAIT_TOOL_NAME` is `"bg_wait"`, asserted off the REGISTERED tool object rather than off the const. **AMENDED: "one const plus a compat alias" was wrong and no alias shipped.** Upstream registers exactly ONE tool — `wait-tool.ts:37-44` @v0.68.0 builds a single `primaryTool` with `name: "bg_wait"` (`:38`) and calls `pi.registerTool` once (`:44`); there is no alias anywhere in that file, and adding one here would be a cyrup invention that widens the tool surface a child sees. **Do not re-add one.** NB the row's real value was never the rename: `watchdog/permission_arbiter.rs`'s `INTERNAL_TOOLS` — the set a permission policy may NOT gate — held the literal `"subagent_wait"`, a name this crate has never registered, so `{"bg_wait": "deny"}` was ACCEPTED and could strand a launched child. The set now holds `WAIT_TOOL_NAME` itself | ~~XS~~ | — |
 > | 7 | **`SUBA-096`** (09a) | an operator's **`acceptanceRole` override actually sets the acceptance gate's strictness** instead of being silently dropped so `infer_level` decides. Three fields (`acceptanceRole`, `outputMode`, `fast`) missing from `AgentOverrideConfig`, which has no `deny_unknown_fields` | S | no |
 > | 8 | **`PB-14`** (§1b) | creating or running an agent with a **mistyped skill name says so** instead of reporting success on both surfaces | S | no |
 > | ~~9~~ | **~~`VL-S5`~~** (§1b) — **CLOSED 2026-09-19** | `background/recovery_descriptor.rs` writes the resolved launch contract at async launch and `revive_from_transcript` reads it back. **Not three fields and not small**: upstream's descriptor is 54 fields; 13 have no cyrup concept and are named per field; two of the restored ones are capability constraints, so the old fallback WIDENED. The retention reader now finds real files | ~~S~~ | — |
-> | 10 | **`VL-S12`** (§1b) | the palette **stops advertising four commands upstream deleted at v0.41.0** (`slash_commands.rs:83`/`:84`/`:85`/`:101`). **Its blocker is discharged** — `VL-S2` landed — so this is now a clean deletion | XS | no |
+> | ~~10~~ | **~~`VL-S12`~~** (§1b) — **CLOSED 2026-09-21** | `Chain`, `Parallel`, `RunChain` and `ChainPrompts` are gone from the enum, the table, the parsers and the prose that taught them, and the deletion is pinned NEGATIVELY (`the_four_commands_upstream_deleted_at_v0_41_0_are_not_registered`), which is the only way a removal can be pinned. The blocker was genuinely discharged first — `VL-S2`'s `workflowScript` runtime landed — so the capability moved rather than disappeared, exactly as upstream's own v0.41.0 move did | ~~XS~~ | — |
 > | ~~11~~ | **~~`PB-12`~~** (§1b) — **CLOSED 2026-09-19** | `exec/child_transcript.rs` over `BoundedJsonlWriter`, fed from the parsed child-event stream on both the foreground and background paths; the first record is the redacted sentinel, never the prompt; `transcript_path` published at both runner sites and read by the fleet pane. Mid-run read proven in cyrup-it | ~~M~~ | — |
 > | ~~12~~ | **~~`VL-S3` + `VL-S4`~~** (§1b) — **CLOSED 2026-09-20** | `background/session_lease/` + `background/process_terminal/` (15 modules, 5,912 LOC) port both upstream files whole. Two runners can no longer own one session file: the runner acquires a revival lease and a second revival is refused with upstream's sentence, proven against a genuinely live incumbent in `cyrup-it`. A killed runner is now DISTINGUISHABLE from a clean one — its sidecar stays `pending` where a clean close writes `observed` — so `status` reports a definite terminal cause instead of the reconciler's guess. **The substitution this row named is resolved, not deleted**: the capacity release rung reads the real proof FIRST and keeps the pid ladder beneath it, because a runner killed before it can finalize writes no proof and would otherwise hold its slot forever | ~~M each~~ | — |
 > | 13 | **`PB-9`** (§1b) | `clarify: true` **shows the preview/edit UI its own tool description promises**. The seam is live (`open_overlay`) | L | no |
-> | 14 | **`VL-S11` = `SUBA-026`**, **`VL-S6`** (§1b) | the `/subagents` admin surface and the herdr inspector's advertised `H` key. Real delight, large, and behind everything above it | L each | no |
+> | ~~14~~ | **~~`VL-S11`~~ = `SUBA-026` (partial), ~~`VL-S6`~~** (§1b) — **BOTH CLOSED** (`VL-S6` 2026-09-21, `VL-S11` 2026-09-21) | `VL-S11` closed with all four remaining commands: `/subagents`, `/subagents-detach`, `/subagents-steer`, `/subagents-inspect-rpc`; the palette is **18** and a test names every entry in order. `/subagents-detach` was the only one that was not a registration over an existing capability — cyrup's foreground child is a real OS process, so detaching had to SPLIT `run_foreground_impl` rather than snapshot a receipt, and both reader halves (`status`-by-id, `bg_wait`) were dead from production until this. **`SUBA-026` is NARROWED, not closed**: its interactive admin UI and selector half survives (`src/slash/selector.ts`, 147 L @v0.68.0 — **not** `src/tui/selector.ts`, which exists at no tag) | ~~L each~~ | — |
 >
 > **Rows whose `medium` label overstates what they deliver**, said plainly so nobody schedules by the
 > column: `CFG-020` (no `ModelRuntime` type — a refactor absorption with no user-visible gain),

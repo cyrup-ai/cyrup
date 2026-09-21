@@ -14,7 +14,7 @@ use crate::extension::executor::requests::{
     StatusViewSelector,
 };
 use crate::extension::host::SubagentsExtension;
-use crate::extension::host::slash_render::{render_chain_results, seed_first_step_task};
+use crate::extension::host::slash_render::render_chain_results;
 use crate::extension::models::classify::render_profile_check_report;
 use crate::extension::tool::task_items::count_graph_requested_spawns;
 use crate::fork_context::ContextMode;
@@ -30,7 +30,13 @@ impl SubagentsExtension {
     /// the tool itself does for `/run`; the remaining commands route to their own
     /// already-implemented subsystem entry points (`registration::doctor`/`cost`/`profiles`).
     /// pi `showFleet(ctx)` (`slash/slash-commands.ts:633-649`) — the `/subagents-fleet` handler at
-    /// v0.43.0, and the handler `pi.registerShortcut(Key.ctrlAlt("f"), …)` shares (`:719-722`).
+    /// v0.43.0.
+    ///
+    /// This note used to add that `pi.registerShortcut(Key.ctrlAlt("f"), …)` at `:719-722` shares
+    /// the handler. That was true at v0.43.0 and is FALSE at the pinned tag: `:719-722` is
+    /// `collectResultPaths`, and `registerShortcut` appears exactly once in the whole upstream
+    /// tree — the `/subagents-detach` binding at `:1008`, which this port carries in
+    /// [`crate::extension::host::shortcuts`]. There is no fleet chord to port.
     ///
     /// Three outcomes, upstream's own:
     /// 1. **No UI** → `runSlashSubagent(pi, ctx, { action: "status", view: "fleet" })` (`:635-638`),
@@ -399,9 +405,6 @@ impl SubagentsExtension {
             SlashCommandName::SubagentsProfiles => self.slash_subagents_profiles(),
             SlashCommandName::SubagentsLoadProfile => self.slash_load_profile(args).await,
             SlashCommandName::SubagentCost => Ok(self.executor.run_cost_report(cwd).await),
-            SlashCommandName::Chain => self.slash_chain(args, cwd).await,
-            SlashCommandName::Parallel => self.slash_parallel(args, cwd).await,
-            SlashCommandName::RunChain => self.slash_run_chain(args, cwd).await,
             SlashCommandName::SubagentsModels => self.slash_models(args, cwd),
             SlashCommandName::SubagentsRefreshProviderModels => {
                 self.slash_refresh_provider_models(args, cwd).await
@@ -409,7 +412,12 @@ impl SubagentsExtension {
             SlashCommandName::SubagentsGenerateProfiles => self.slash_generate_profiles(args).await,
             SlashCommandName::SubagentsCheckProfile => self.slash_check_profile(args).await,
             SlashCommandName::PromptWorkflow => self.slash_prompt_workflow(args, cwd).await,
-            SlashCommandName::ChainPrompts => self.slash_chain_prompts(args, cwd).await,
+            SlashCommandName::Subagents => self.slash_subagents(args, cwd, has_ui).await,
+            SlashCommandName::SubagentsDetach => self.slash_subagents_detach(args).await,
+            SlashCommandName::SubagentsSteer => self.slash_subagents_steer(args, cwd, has_ui).await,
+            SlashCommandName::SubagentsInspectRpc => {
+                self.slash_subagents_inspect_rpc(args, has_ui).await
+            }
         }
     }
 
@@ -454,8 +462,8 @@ impl SubagentsExtension {
         // ceiling at `subagent-executor.ts:3297-3312`, ahead of `reserveSubagentSpawns` at
         // `:3434-3441`). `/run`'s own R-SA-055 guard lives inside `run_foreground`/
         // `spawn_background`, i.e. strictly after this charge, so a depth-blocked `/run`
-        // was billed and then refused. `/run-chain` already checks here for its own
-        // (discovery-ordering) reason; this is the same rung for the `/run` surface.
+        // was billed and then refused; this rung fixes that for the `/run` surface, exactly
+        // as [`Self::run_or_background_chain`] does for the multi-step surface.
         let depth = resolve_effective_depth(run_cfg.max_subagent_depth);
         if crate::spawn::depth::is_blocked(&depth) {
             return Err(SubagentError::DepthExceeded {
@@ -521,7 +529,8 @@ impl SubagentsExtension {
                     // pi's own `/run` handler forwards `output`/`outputMode`/`skill`/`model`
                     // and NOTHING else (`slash/slash-commands.ts:678-681`) — the
                     // inline `acceptance=` token it parses is only ever consumed by the
-                    // `/chain`//`/parallel` step builders. Faithful parity: `None` here.
+                    // multi-step builders the `subagent` tool's `chain`/`parallel` actions
+                    // drive. Faithful parity: `None` here.
                     acceptance: None,
                     // SUBA-N06: nor an `includeProgress=` token.
                     include_progress: None,
@@ -686,135 +695,6 @@ impl SubagentsExtension {
         self.load_profile_into_settings(&name).await
     }
 
-    /// /chain — linear sequence (with optional inline parallel groups), R-SA-129/§5.1/§5.3.
-    /// Routes into the SAME chain-graph walker (`spawn::chain_graph::walk_chain`) and the
-    /// SAME `ExecSingleStepExecutor` subprocess-spawning adapter the hop-2 background
-    /// runner uses for a saved/async chain (R-SA-130: one execution code path, never a
-    /// second divergent implementation for the foreground slash-command shape).
-    async fn slash_chain(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
-        let parsed = slash_commands::parse_chain_command(args)
-            .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-        let context = if parsed.flags.fork {
-            Some(ContextMode::Fork)
-        } else {
-            None
-        };
-        // `/chain` carries no separate top-level task arg — the first step's task seeds the
-        // chain, so `{task}` falls back to it (`first_step_task`).
-        self.run_or_background_chain(
-            cwd,
-            parsed.chain,
-            RunMode::Chain,
-            context,
-            parsed.flags.background,
-            None,
-        )
-        .await
-    }
-
-    /// /parallel — a single static-width fan-out group (R-SA-129/§5.3). Represented as a
-    /// ONE-element `ChainGraph` whose sole element is a `RunnerStep::ParallelGroup`, so it
-    /// is dispatched by the identical `walk_chain`/`run_bounded` machinery a parallel GROUP
-    /// inside a longer `/chain` uses — never a second, parallel-only dispatch path.
-    async fn slash_parallel(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
-        let parsed = slash_commands::parse_parallel_command(args)
-            .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-        let context = if parsed.flags.fork {
-            Some(ContextMode::Fork)
-        } else {
-            None
-        };
-        let cfg = self.executor.config_snapshot().await;
-        let group = RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
-            steps: parsed.tasks,
-            concurrency: cfg.parallel_concurrency(),
-            fail_fast: false,
-            worktree: false,
-            // The slash surface carries no `lane` argument, matching pi (`lane` is a tool param,
-            // `extension/schemas.ts:355`, not a `/parallel` flag).
-            lane: None,
-        });
-        // `/parallel` carries no separate top-level task arg — `{task}` falls back to the
-        // group's first task (`first_step_task`).
-        self.run_or_background_chain(
-            cwd,
-            vec![group],
-            RunMode::Parallel,
-            context,
-            parsed.flags.background,
-            None,
-        )
-        .await
-    }
-
-    /// /run-chain — invoke a saved chain (`.chain.md`/`.chain.json`) by name (R-SA-129).
-    /// Resolves the chain through the REAL discovery pipeline (R-SA-019/020), then routes
-    /// into the identical `walk_chain` machinery `/chain` itself uses.
-    async fn slash_run_chain(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
-        let parsed = slash_commands::parse_run_chain_command(args)
-            .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-        let context = if parsed.flags.fork {
-            Some(ContextMode::Fork)
-        } else {
-            None
-        };
-        // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before `resolve_chain`
-        // below, which is a real discovery filesystem scan (R-SA-019/020) — so a blocked
-        // call never touches discovery at all, not even for the saved-chain lookup this
-        // command performs ahead of `run_or_background_chain`'s own (correct, but
-        // necessarily later) independent re-check.
-        let cfg = self.executor.config_snapshot().await;
-        let depth = resolve_effective_depth(cfg.max_subagent_depth);
-        if crate::spawn::depth::is_blocked(&depth) {
-            return Err(SubagentError::DepthExceeded {
-                current: depth.current_depth,
-                max: depth.max_depth,
-            });
-        }
-        let chain = self.executor.resolve_chain(
-            cwd,
-            &parsed.chain_name,
-            &self.executor.config_snapshot().await.roots,
-        )?;
-        // The functionality spec's own usage grammar (`/run-chain <chainName> -- <task>`)
-        // gives no further detail on how the supplied task text combines with a saved
-        // chain's own per-step task text beyond pi-subagents' `mapSavedChainSteps`
-        // reference (`registration/slash_commands.rs`'s own module doc). The most complete
-        // honest reading: the supplied task text seeds the FIRST step only (mirroring
-        // `/chain`'s own "first element's task is what starts the chain" convention,
-        // R-SA-053's own "cross-step data flows via named outputs from here forward"
-        // model) — every later step keeps its saved, fixed task text verbatim.
-        // A saved chain parses into `ChainStepConfig` authoring shapes (T0.2); lower each
-        // to the runtime `RunnerStep` union here via the structural bridge — it carries the
-        // real agent NAME (never a placeholder persona; name resolution stays the
-        // executor's job) and defers plan-time model/acceptance enrichment. A group step's
-        // omitted `concurrency` falls back to `cfg.parallel_concurrency()`, mirroring
-        // `/parallel`'s own default above.
-        let graph: Vec<RunnerStep> = chain
-            .steps
-            .iter()
-            .map(|step| {
-                crate::discovery::chains::chain_step_to_runner_step(
-                    step,
-                    cfg.parallel_concurrency(),
-                )
-            })
-            .collect();
-        let steps = seed_first_step_task(graph, &parsed.task);
-        // `/run-chain <name> -- <task>`: the supplied task seeds the first step AND is the
-        // run-wide `{task}` value (pi `originalTask = params.task`).
-        let task = (!parsed.task.trim().is_empty()).then(|| parsed.task.clone());
-        self.run_or_background_chain(
-            cwd,
-            steps,
-            RunMode::Chain,
-            context,
-            parsed.flags.background,
-            task,
-        )
-        .await
-    }
-
     /// /subagents-models — report the RUNTIME builtin-agent -> model mapping (pi
     /// `handleModels`, slash-commands.ts:802-823), NOT a dump of the static provider
     /// catalog: each discovered builtin persona's effective model + provenance, optionally
@@ -914,8 +794,10 @@ impl SubagentsExtension {
             )));
         };
         let runtime = prompt_workflows::parse_runtime_options(&words);
-        // pi `:286-295`: a recipe carrying `chain:` expands to a chain of OTHER recipes and
-        // never runs its own body.
+        // pi `:286-295` @v0.34.0, `:271-278` @v0.68.0: a recipe carrying `chain:` expands to a
+        // chain of OTHER recipes and never runs its own body. VL-S12 — this branch is now the ONLY
+        // producer of a multi-step prompt-workflow run: `/chain-prompts`, which did the same thing
+        // from an inline ` -> ` declaration, was deleted upstream at v0.41.0 and deleted here.
         if let Some(chain) = workflow.chain.as_deref() {
             let names = prompt_workflows::split_prompt_chain(chain);
             let steps = prompt_workflows::build_chain_steps(
@@ -923,7 +805,7 @@ impl SubagentsExtension {
                 &names,
                 &runtime.args,
                 &runtime,
-                Some(&workflow.name),
+                &workflow.name,
             )
             .map_err(SubagentError::MalformedSettings)?;
             return self.run_prompt_workflow_chain(cwd, steps, &runtime).await;
@@ -932,35 +814,15 @@ impl SubagentsExtension {
         self.run_prompt_workflow_single(cwd, &run).await
     }
 
-    /// /chain-prompts — the same recipes [`Self::slash_prompt_workflow`] runs, chained by an
-    /// inline ` -> ` declaration (pi `prompt-workflows.ts:303-329` @v0.34.0).
-    async fn slash_chain_prompts(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
-        let (declaration, args_text) = prompt_workflows::split_chain_declaration(args);
-        let workflows = prompt_workflows::discover_prompt_workflows(cwd);
-        // pi `:308-311`: an empty declaration, or the literal `list`, prints the list.
-        if declaration.is_empty() || declaration == "list" {
-            return Ok(prompt_workflows::format_workflow_list(&workflows));
-        }
-        let runtime =
-            prompt_workflows::parse_runtime_options(&prompt_workflows::shell_words(&args_text));
-        let names = prompt_workflows::split_prompt_chain(&declaration);
-        if names.is_empty() {
-            // pi `:315` — the usage line, verbatim.
-            return Err(SubagentError::MalformedSettings(
-                "Usage: /chain-prompts prompt-a -> prompt-b -- args".to_string(),
-            ));
-        }
-        let steps =
-            prompt_workflows::build_chain_steps(&workflows, &names, &runtime.args, &runtime, None)
-                .map_err(SubagentError::MalformedSettings)?;
-        self.run_prompt_workflow_chain(cwd, steps, &runtime).await
-    }
-
     // ---------------------------------------------------------------------------------------
-    // /prompt-workflow + /chain-prompts execution (pi's `run:` callback, which both handlers
-    // share — `slash-commands.ts:795-800` binds it to the SAME `runSlashSubagent` every other slash
-    // command uses, so R-SA-130's single-executor rule holds for these two exactly as it does for
-    // `/run` and `/chain`).
+    // /prompt-workflow execution (pi's `run:` callback — `slash-commands.ts:795-800` binds it to
+    // the SAME `runSlashSubagent` every other slash command uses, so R-SA-130's single-executor
+    // rule holds for it exactly as it does for `/run`).
+    //
+    // `/chain-prompts` shared this callback until upstream deleted it at v0.41.0; the recipe
+    // CHAIN shape it exercised survives as `/prompt-workflow`'s own `chain:` frontmatter branch
+    // (pi `prompt-workflows.ts:286-295`), which is the only remaining producer of
+    // [`Self::run_prompt_workflow_chain`].
     // ---------------------------------------------------------------------------------------
 
     /// Run one non-chain recipe. Routes into the identical foreground/background entry points
@@ -1067,9 +929,9 @@ impl SubagentsExtension {
         Ok(format_slash_run_completion(&result))
     }
 
-    /// Run an expanded recipe chain through the SAME `run_or_background_chain` walker `/chain`
-    /// uses (pi lowers each recipe to a `ChainStep` and hands the whole `chain` array to the one
-    /// executor, `prompt-workflows.ts:288-293`).
+    /// Run an expanded recipe chain through the SAME [`Self::run_or_background_chain`] walker the
+    /// `subagent` tool's `chain` action uses (pi lowers each recipe to a `ChainStep` and hands the
+    /// whole `chain` array to the one executor, `prompt-workflows.ts:288-293`).
     async fn run_prompt_workflow_chain(
         &self,
         cwd: &Path,
@@ -1127,10 +989,18 @@ impl SubagentsExtension {
     }
 
     // ---------------------------------------------------------------------------------------
-    // /chain, /parallel, /run-chain shared foreground-vs-background dispatch (R-SA-129/130)
+    // The slash surface's multi-step foreground-vs-background dispatch (R-SA-129/130).
+    //
+    // `/chain`, `/parallel` and `/run-chain` were this wrapper's original three callers; upstream
+    // deleted all three at v0.41.0. Its one surviving production caller is
+    // [`Self::run_prompt_workflow_chain`] — i.e. `/prompt-workflow` run against a recipe carrying
+    // `chain:` frontmatter (pi `prompt-workflows.ts:286-295`). The `subagent` TOOL's `chain`/
+    // `parallel` actions do NOT come through here: they reserve their own budget in
+    // `SubagentTool::execute` and reach `run_or_background_graph` via
+    // `route_chain_mode`/`route_parallel_mode`.
     // ---------------------------------------------------------------------------------------
 
-    /// Shared tail for `/chain`, `/parallel`, and `/run-chain`: resolve every step's effective
+    /// Shared tail for the slash surface's multi-step shapes: resolve every step's effective
     /// fork-context (R-SA-137's eager whole-batch rule) — an omitted call-site `context` defers to
     /// each step's agent's own `default_context`, and each forking step gets its OWN per-index branch
     /// (R-SA-138: a sibling step's own explicit choice is never overridden) — then either walk the
@@ -1148,9 +1018,9 @@ impl SubagentsExtension {
             return Ok("chain has no steps to run".to_string());
         }
 
-        // SUBA-002 — charge the per-SESSION spawn budget for the chain-shaped SLASH surfaces
-        // (`/chain`, `/parallel`, `/run-chain`), which all funnel through this one wrapper. Upstream
-        // needs no charge here because those handlers call `runSlashSubagent` -> `requestSlashRun`
+        // SUBA-002 — charge the per-SESSION spawn budget for the chain-shaped SLASH surface
+        // (`/prompt-workflow`'s `chain:` branch), which funnels through this one wrapper. Upstream
+        // needs no charge here because that handler calls `runSlashSubagent` -> `requestSlashRun`
         // -> the bridge at `extension/index.ts:512-517` -> `executeSubagentCollapsed` -> the SAME
         // `executor.execute` the tool uses, so its `reserveSubagentSpawns`
         // (`subagent-executor.ts:266-282`, called at `:3434-3441`) already covers them; this crate
@@ -1168,10 +1038,9 @@ impl SubagentsExtension {
         // `subagent-executor.ts:3297-3312`, well ahead of `reserveSubagentSpawns` (`:3434-3441`),
         // so a dispatch the ceiling will reject never spends a spawn. `run_or_background_graph`'s
         // own R-SA-055 guard (the SAFETY-CRITICAL one, ahead of persona/fork IO) runs strictly
-        // AFTER this reserve, so `/chain` and `/parallel` were billed and then refused — the
-        // budget drained while nothing could ever be spawned. `/run-chain` was already immune: it
-        // checks depth itself before `resolve_chain`. Re-checking here (a pure env+config read)
-        // leaves the downstream guard untouched and changes no charge count.
+        // AFTER this reserve, so a chain-shaped slash dispatch was billed and then refused — the
+        // budget drained while nothing could ever be spawned. Re-checking here (a pure env+config
+        // read) leaves the downstream guard untouched and changes no charge count.
         let depth = resolve_effective_depth(budget_cfg.max_subagent_depth);
         if crate::spawn::depth::is_blocked(&depth) {
             return Err(SubagentError::DepthExceeded {
@@ -1192,7 +1061,7 @@ impl SubagentsExtension {
         // persona resolution (T0.1/C13), fork-context resolution (R-SA-137), and the foreground-vs-
         // background fork all live inside `run_or_background_graph` now, so both call sites share
         // them verbatim rather than each re-implementing the tail.
-        // The slash-command surface (`/chain`, `/parallel`, `/run-chain`) has no host
+        // The slash-command surface has no host
         // `ToolCallId`/cancellation seam of its own (`NativeExtension::execute_command` takes no
         // cancel token) — a fresh, never-cancelled token here preserves this path's pre-existing
         // behavior exactly; only the `subagent` TOOL's `execute` threads the live host token
@@ -1208,8 +1077,8 @@ impl SubagentsExtension {
                 background,
                 task,
                 CancelToken::new(),
-                // The slash-command surface (`/chain`/`/parallel`/`/run-chain`) exposes no timeout
-                // param at all (pi's `timeoutMs`/`maxRuntimeMs` are tool-only) — always `None`.
+                // The slash-command surface exposes no timeout param at all (pi's
+                // `timeoutMs`/`maxRuntimeMs` are tool-only) — always `None`.
                 None,
                 // ...and no `control` token either (same rule, same reason): the extension-level
                 // `subagents.control` block is still folded in one layer down.

@@ -42,8 +42,9 @@ An empty `{}` in either file is enough.
 
 Children run in the **foreground** (you wait) or in the **background** (you keep working and collect
 the result later). They can be strung into a **chain** where each step feeds the next, or fanned out
-in **parallel** across a batch of tasks. A run can be isolated in its own git worktree so a child
-editing files does not collide with your working tree.
+in **parallel** across a batch of tasks — both through the `subagent` tool's `chain` and `parallel`
+actions. A run can be isolated in its own git worktree so a child editing files does not collide
+with your working tree.
 
 Each child has a depth budget, so a subagent that spawns its own subagent eventually runs out of
 room. The default ceiling is two levels, and a per-session spawn cap sits above it.
@@ -51,8 +52,8 @@ room. The default ceiling is two levels, and a per-session spawn cap sits above 
 ## The three surfaces
 
 - The **`subagent` tool**, which the orchestrating model calls on its own.
-- The **`wait` tool**, which blocks on a background run until it finishes.
-- The **slash commands**, which are for you — `/run`, `/chain`, `/parallel`, `/run-chain`,
+- The **`bg_wait` tool**, which blocks on a background run until it finishes.
+- The **slash commands**, which are for you — `/run`, `/prompt-workflow`, `/subagents`,
   `/subagents-fleet`, `/subagents-doctor` and the rest. See `workflows` and `observability`.
 
 ## Turning it off

@@ -366,23 +366,58 @@ pub fn append_permission_audit(file_path: Option<&Path>, record: &Value) {
 }
 
 // =================================================================================================
-// The policy the arbiter answers FOR (`runs/shared/permissions.ts:4-61`)
+// The policy the arbiter answers FOR (`runs/shared/permissions.ts:4-65` @v0.64.0)
 // =================================================================================================
+//
+// **Version pin, and why these three citations carry one while the rest of this file does not.**
+// Upstream transported the policy to the child through two env vars and decoded it on the far side.
+// That transport is GONE at v0.68.0 — `PERMISSION_POLICY_ENV`, `PERMISSION_AUDIT_PATH_ENV` and
+// `decodePermissionRules` do not exist anywhere in the tree any more:
+//
+// ```text
+// $ git -C tmp/pi-subagents grep -n 'PERMISSION_POLICY_ENV\|PERMISSION_AUDIT_PATH_ENV\|decodePermissionRules' v0.68.0
+// $ (no output)
+// ```
+//
+// They were live and unchanged from `v0.45.2` through `v0.64.0` and were dropped in the
+// `v0.64.0..v0.65.0` window. The line numbers below are therefore pinned to `@v0.64.0`, which is
+// the last revision where they resolve, and they are NOT `[CYRUP-DELTA]`s: cyrup ported real
+// upstream symbols, and upstream has since retired the mechanism. What survives at v0.68.0 in that
+// file is `INTERNAL_TOOLS` — now at `:8`, the line `PERMISSION_POLICY_ENV` used to hold, which is
+// exactly the coincidence that makes an unpinned `permissions.ts:8` read as correct when it is not.
+// Re-porting the removal is its own decision and is not made here.
 
-/// `PERMISSION_POLICY_ENV` (`permissions.ts:8`), under cyrup's `CYRUP_SUBAGENT_*` spelling — the
-/// same rename every other member of that family carries (`CYRUP_SUBAGENT_TOOL_BUDGET`,
-/// `CYRUP_SUBAGENT_STEER_INBOX`, …).
+/// `PERMISSION_POLICY_ENV` (`permissions.ts:8` @v0.64.0; removed upstream by v0.65.0 — see the
+/// version pin above), under cyrup's `CYRUP_SUBAGENT_*` spelling — the same rename every other
+/// member of that family carries (`CYRUP_SUBAGENT_TOOL_BUDGET`, `CYRUP_SUBAGENT_STEER_INBOX`, …).
 pub const PERMISSION_POLICY_ENV: &str = "CYRUP_SUBAGENT_PERMISSION_POLICY";
 
-/// `PERMISSION_AUDIT_PATH_ENV` (`permissions.ts:9`).
+/// `PERMISSION_AUDIT_PATH_ENV` (`permissions.ts:9` @v0.64.0; removed upstream by v0.65.0).
 pub const PERMISSION_AUDIT_PATH_ENV: &str = "CYRUP_SUBAGENT_PERMISSION_AUDIT_PATH";
 
-/// `INTERNAL_TOOLS` (`permissions.ts:10`) — the child's own coordination surface, which a policy
-/// may not gate at all: gating it would let a rule strand a child that cannot report back.
+/// `INTERNAL_TOOLS` (`permissions.ts:8` @v0.68.0) — the child's OWN coordination surface, which a
+/// permission policy may not gate at all.
+///
+/// What the set is FOR: a parent writes rules about the tools a child uses to do WORK, not about
+/// the tools it uses to report back. Gating one of these strands the child mid-run — it cannot
+/// contact its supervisor, cannot answer on the intercom, cannot block on its own background work,
+/// cannot emit its structured result — with no way for anyone to unstick it. So the set is
+/// enforced twice: [`validate_permission_rules`] refuses to RECORD a rule for a member
+/// (`permissions.ts:26`), and [`permission_decision`] short-circuits to
+/// [`PermissionRuleDecision::Allow`] for one anyway (`permissions.ts:49`), because rules can also
+/// arrive from a parent running a different version.
+///
+/// The wait entry is DERIVED from the registered tool name
+/// (`crate::extension::wait_tool::WAIT_TOOL_NAME`) rather than repeated as a literal here. That is
+/// this port's one structural divergence from upstream's inline `new Set([...])`, and it is the
+/// point: the set is only protective if it names the tool that is actually registered. This port
+/// previously carried the literal `"subagent_wait"`, a name cyrup has never registered, so the set
+/// ungated a phantom while the real wait tool stayed gateable and a `{"wait": "deny"}` rule could
+/// strand a child. A second literal is exactly how that happens.
 const INTERNAL_TOOLS: [&str; 4] = [
     "contact_supervisor",
     "intercom",
-    "subagent_wait",
+    crate::extension::wait_tool::WAIT_TOOL_NAME,
     "structured_output",
 ];
 
@@ -415,7 +450,7 @@ impl PermissionRuleDecision {
         }
     }
 
-    /// `DECISIONS.has(decision)` (`permissions.ts:11`).
+    /// `DECISIONS.has(decision)` (`permissions.ts:9` @v0.68.0).
     fn parse(value: &str) -> Option<Self> {
         match value {
             "allow" => Some(Self::Allow),
@@ -429,7 +464,7 @@ impl PermissionRuleDecision {
 /// `PermissionRules` (`permissions.ts:5`) — tool name to decision.
 pub type PermissionRules = std::collections::BTreeMap<String, PermissionRuleDecision>;
 
-/// `validatePermissionRules(value, label)` (`permissions.ts:17-29`).
+/// `validatePermissionRules(value, label)` (`permissions.ts:19-31` @v0.68.0).
 ///
 /// # Errors
 ///
@@ -470,8 +505,11 @@ pub fn validate_permission_rules(
     Ok((!result.is_empty()).then_some(result))
 }
 
-/// `decodePermissionRules(encoded)` (`permissions.ts:58-61`) — the child's side of the policy: a
-/// blank value is the same as unset.
+/// `decodePermissionRules(encoded)` (`permissions.ts:62-65` @v0.64.0 — the body is
+/// `if (!encoded?.trim()) return undefined; return validatePermissionRules(JSON.parse(encoded),
+/// PERMISSION_POLICY_ENV);`; removed upstream by v0.65.0, see the version pin on
+/// [`PERMISSION_POLICY_ENV`]) — the child's side of the policy: a blank value is the same as
+/// unset.
 ///
 /// # Errors
 ///
@@ -485,7 +523,7 @@ pub fn decode_permission_rules(encoded: Option<&str>) -> Result<Option<Permissio
     validate_permission_rules(Some(&value), PERMISSION_POLICY_ENV)
 }
 
-/// `permissionDecision(rules, toolName)` (`permissions.ts:46-49`).
+/// `permissionDecision(rules, toolName)` (`permissions.ts:48-51` @v0.68.0).
 ///
 /// `bash` and the internal coordination tools are ALWAYS allowed here regardless of the rules —
 /// [`validate_permission_rules`] already refuses to record a rule for any of them, so this is the
@@ -1116,6 +1154,7 @@ enum ArbiterOutcome {
 )]
 mod tests {
     use super::*;
+    use crate::extension::wait_tool::WAIT_TOOL_NAME;
     use crate::watchdog::child_status::{
         encode_child_watchdog_config, resolve_child_watchdog_config,
     };
@@ -1724,13 +1763,15 @@ mod tests {
     #[test]
     fn bash_and_the_internal_tools_are_allowed_even_when_a_rule_says_otherwise() {
         // A rule set that validation would refuse, built directly — a parent on another version
-        // could still ship it, which is why the decision function checks again.
+        // could still ship it, which is why the decision function checks again. The wait tool is
+        // named through the const the registration uses, so this loop covers whatever
+        // `INTERNAL_TOOLS` actually holds rather than a copy of it.
         let mut rules = PermissionRules::new();
         for tool in [
             "bash",
             "contact_supervisor",
             "intercom",
-            "subagent_wait",
+            WAIT_TOOL_NAME,
             "structured_output",
         ] {
             rules.insert(tool.to_string(), PermissionRuleDecision::Deny);
@@ -1754,6 +1795,64 @@ mod tests {
             permission_decision(None, "write"),
             PermissionRuleDecision::Allow
         );
+    }
+
+    /// SLASH_SURFACE §I.2 — the internal-tools ungate must protect the tool that is actually
+    /// REGISTERED. pi `permissions.ts:49` @v0.68.0:
+    /// `if (toolName === "bash" || INTERNAL_TOOLS.has(toolName)) return "allow";`
+    ///
+    /// This is the assert that makes the `bg_wait` rename observable rather than cosmetic. Before
+    /// it, `INTERNAL_TOOLS` held the literal `"subagent_wait"` — a name this crate has never
+    /// registered — so the set ungated nothing while the real wait tool stayed gateable, and a
+    /// parent shipping a `{"bg_wait": "deny"}` rule could strand a child that had already launched
+    /// background work: it would be refused the only tool that can collect it.
+    ///
+    /// **The mutation that fails this test:** replace
+    /// `crate::extension::wait_tool::WAIT_TOOL_NAME` in `INTERNAL_TOOLS` with any literal that is
+    /// not the registered name (`"subagent_wait"`, `"wait"`, a typo). The deny rule below is then
+    /// honoured and the assert reads `Deny` instead of `Allow`.
+    #[test]
+    fn a_deny_rule_on_the_registered_wait_tool_cannot_strand_a_child() {
+        let mut rules = PermissionRules::new();
+        rules.insert(WAIT_TOOL_NAME.to_string(), PermissionRuleDecision::Deny);
+        assert_eq!(
+            permission_decision(Some(&rules), WAIT_TOOL_NAME),
+            PermissionRuleDecision::Allow,
+            "a parent policy must not be able to gate `{WAIT_TOOL_NAME}`"
+        );
+        // The same map still gates an ordinary tool, so the ungate is targeted rather than a
+        // blanket "deny rules are ignored".
+        rules.insert("write".to_string(), PermissionRuleDecision::Deny);
+        assert_eq!(
+            permission_decision(Some(&rules), "write"),
+            PermissionRuleDecision::Deny
+        );
+    }
+
+    /// SLASH_SURFACE §I.2, the validation half — a policy may not even RECORD a rule keyed on the
+    /// registered wait tool. pi `permissions.ts:26` @v0.68.0:
+    /// ``if (INTERNAL_TOOLS.has(tool)) throw new Error(`${label}.${tool} is reserved for child
+    /// coordination and cannot be gated.`);``
+    ///
+    /// The sentence is asserted byte-for-byte because it is upstream's, unchanged: it carries no
+    /// product name, so there is nothing to rebrand and no licence to reword it.
+    ///
+    /// **The mutation that fails this test:** the same one as
+    /// `a_deny_rule_on_the_registered_wait_tool_cannot_strand_a_child` — a literal in
+    /// `INTERNAL_TOOLS` that is not the registered name. `validate_permission_rules` then ACCEPTS
+    /// the rule and returns `Ok`, so `unwrap_err` panics. Dropping the `INTERNAL_TOOLS` check from
+    /// `validate_permission_rules` altogether fails it the same way.
+    #[test]
+    fn a_rule_keyed_on_the_registered_wait_tool_is_refused_at_validation() {
+        let mut object = serde_json::Map::new();
+        object.insert(WAIT_TOOL_NAME.to_string(), Value::from("deny"));
+        let error = validate_permission_rules(Some(&Value::Object(object)), "config.permissions")
+            .expect_err("a rule on the wait tool must be refused");
+        let expected = format!(
+            "config.permissions.{WAIT_TOOL_NAME} is reserved for child coordination and cannot \
+             be gated."
+        );
+        assert_eq!(error, expected);
     }
 
     #[test]

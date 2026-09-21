@@ -75,7 +75,7 @@ use std::path::PathBuf;
 pub const SUBAGENT_SAFETY_GUIDANCE: &str = r#"SAFETY-CRITICAL SUBAGENT GUIDANCE:
 • Run only executable/non-disabled agents or chains; builtins (delegate, oracle, researcher, reviewer, scout, worker) are always executable — use { action: "list" } to check anything else.
 • Keep execution and management separate: omit action for SINGLE/PARALLEL/CHAIN execution; use action only for list/get/models/create/update/delete/status/interrupt/resume/append-step/doctor.
-• Async/background runs: launch with async:true only when work can proceed independently. Do not sleep or poll status just to wait; if this turn must block, use the wait tool. Otherwise continue useful work or respond and let completion notifications arrive.
+• Async/background runs: launch with async:true only when work can proceed independently. Do not sleep or poll status just to wait; if this turn must block, use the bg_wait tool. Otherwise continue useful work or respond and let completion notifications arrive.
 • Child-safety boundary: ordinary child subagents are not orchestrators and must not run subagents. Only explicitly configured fanout children may use the child-safe subagent tool, still bounded by depth/session limits.
 • Writing/review safety: keep one writer for the same cwd/worktree. Use fresh-context read-only reviewers/validators for independent review, then have the parent synthesize and apply fixes as the sole writer unless an isolated worktree was intentionally requested.
 • Artifacts/status essentials: chain outputs live under {chain_dir}; async runs expose asyncId/asyncDir with status.json, events.jsonl, output logs, and status via { action: "status", id }. Include output paths and residual risks when reporting results."#;
@@ -108,7 +108,13 @@ pub const SUBAGENT_SAFETY_GUIDANCE: &str = r#"SAFETY-CRITICAL SUBAGENT GUIDANCE:
 /// upstream's own position — the management-discovery bullet. A nine-verb list was written first
 /// and then cut to the wildcard, and the reason is a pin rather than taste: the compact form is
 /// held under 2 KiB by `compact_mode_returns_the_short_form_and_full_mode_returns_the_full_one`,
-/// which IS the reason the compact form exists, and that budget had 33 bytes left. The compact
+/// which IS the reason the compact form exists, and that budget is nearly spent. **Measured, not
+/// remembered: the text below is 2035 bytes against the 2048 the assert allows — 13 left.** An
+/// earlier revision of this note claimed 33; it was never true. Before VL-S8 the text was 2046
+/// bytes (2 left), and renaming the wait tool inside it (`the wait tool` → `the bg_wait tool`,
+/// +3) put it at 2049 — one byte OVER, which is what took the assert red. The 14 bytes this
+/// paid for came from the last SAFETY bullet's *"intentionally"*, which qualified nothing the
+/// sentence did not already say. Anything added here must be paid for the same way. The compact
 /// text already names only a SUBSET of what dispatches — it names neither `mission.*` nor
 /// `watchdog.*` at all — so a wildcard here is the form it was already using implicitly, made
 /// explicit and made checkable.
@@ -123,7 +129,8 @@ pub const SUBAGENT_SAFETY_GUIDANCE: &str = r#"SAFETY-CRITICAL SUBAGENT GUIDANCE:
 ///
 /// Every other verb this text names — `list`, `get`, `models`, `create`, `update`, `delete`,
 /// `eject`, `disable`, `enable`, `reset`, `doctor`, `status`, `interrupt`, `resume`, `steer`,
-/// `append-step` — plus `status view:"fleet"` / `view:"transcript"` and the `wait` tool, is live in
+/// `append-step` — plus `status view:"fleet"` / `view:"transcript"` and the `bg_wait` tool
+/// (`extension::wait_tool::WAIT_TOOL_NAME`, pi `wait-tool.ts:38` @v0.68.0), is live in
 /// cyrup today.
 pub const COMPACT_SUBAGENT_TOOL_DESCRIPTION: &str = r#"Delegate to subagents or manage definitions. Use exactly one mode per call.
 
@@ -139,12 +146,12 @@ MANAGE / CONTROL:
 • Async control actions: status, interrupt, resume, steer, append-step. Use status view:"fleet" for active-run overview, view:"transcript" to tail child output, and steer for non-terminal live guidance. Use id/runId prefixes carefully; use index for a specific child.
 
 ASYNC / WAIT:
-• async:true detaches background work. Do not sleep or poll just to wait; use the wait tool only when this turn must block. Otherwise continue useful work or respond and let completion notifications arrive.
+• async:true detaches background work. Do not sleep or poll just to wait; use the bg_wait tool only when this turn must block. Otherwise continue useful work or respond and let completion notifications arrive.
 • Status and artifacts live under asyncId/asyncDir with status.json, events.jsonl, output logs, session files, and { action:"status", id:"..." }.
 
 SAFETY:
 • Ordinary child subagents are not orchestrators and must not run subagents. Only explicit fanout children may use child-safe subagent, still bounded by depth/session limits.
-• Keep one writer per cwd/worktree. Use fresh read-only review/validation fanout, then synthesize and apply fixes from the parent unless isolated worktrees were intentionally requested."#;
+• Keep one writer per cwd/worktree. Use fresh read-only review/validation fanout, then synthesize and apply fixes from the parent unless isolated worktrees were requested."#;
 
 /// pi `CUSTOM_TOOL_DESCRIPTION_FILE` (`tool-description.ts:6`).
 pub const CUSTOM_TOOL_DESCRIPTION_FILE: &str = "subagent-tool-description.md";
@@ -520,9 +527,20 @@ mod tests {
             FULL
         );
         assert!(warnings.is_empty(), "{warnings:?}");
+        // The budget, and the DOC's arithmetic about it, in one place. The `<` is the contract —
+        // the compact form exists to save context — and the `assert_eq!` is what keeps
+        // [`COMPACT_SUBAGENT_TOOL_DESCRIPTION`]'s own "13 left" honest, because a note that only
+        // prose defends drifts silently. It already did: it read "33 bytes left" while the real
+        // headroom was 2, and VL-S8's `wait` -> `bg_wait` rename then spent 3 it did not have.
+        // Changing the text is fine; changing this number in the same commit is the price.
         assert!(
             COMPACT_SUBAGENT_TOOL_DESCRIPTION.len() < 2_048,
             "the compact form exists to save context"
+        );
+        assert_eq!(
+            COMPACT_SUBAGENT_TOOL_DESCRIPTION.len(),
+            2_035,
+            "if you changed the compact text, update the byte count in its doc comment too"
         );
     }
 
@@ -826,9 +844,11 @@ mod tests {
     /// carry, so an edit to it is a change to what every orchestrator is told it may do.
     ///
     /// SCOPE_19/§5.1: the pinned length moved (1333 → 1427) with the first bullet's rewording —
-    /// see the constant's `[CYRUP-DELTA]`. The pin's job is unchanged: any FURTHER edit must be a
-    /// deliberate, recorded act, and the builtins assertion below keeps the reworded bullet
-    /// honest.
+    /// see the constant's `[CYRUP-DELTA]`. VL-S8 moved it again (1427 → **1430**), by exactly the
+    /// three bytes of `wait` → `bg_wait` in the async bullet; the sentence is otherwise untouched,
+    /// and upstream spells the same tool the same way (`wait-tool.ts:38` @v0.68.0). The pin's job
+    /// is unchanged: any FURTHER edit must be a deliberate, recorded act, and the builtins
+    /// assertion below keeps the reworded bullet honest.
     #[test]
     fn the_safety_guidance_is_pinned_to_pis_v0_34_0_text() {
         assert!(SUBAGENT_SAFETY_GUIDANCE.starts_with("SAFETY-CRITICAL SUBAGENT GUIDANCE:\n"));
@@ -839,7 +859,7 @@ mod tests {
         );
         assert_eq!(
             SUBAGENT_SAFETY_GUIDANCE.len(),
-            1427,
+            1430,
             "byte length is pinned"
         );
         assert!(

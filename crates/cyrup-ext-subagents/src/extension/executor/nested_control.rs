@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::discovery::discover_agents;
 use crate::extension::executor::SubagentExecutor;
+use crate::extension::executor::detach::{DetachTarget, ForegroundDetachHandle};
 
 impl SubagentExecutor {
     // ---------------------------------------------------------------------------------------
@@ -224,6 +225,118 @@ impl SubagentExecutor {
         Some(first.clone())
     }
 
+    /// VL-S11b — pi `selectForegroundDetachControl` (`slash-commands.ts:237-250`), the resolver
+    /// `/subagents-detach` uses instead of [`Self::resolve_live_foreground_run`].
+    ///
+    /// # Why this is a second resolver and not a widening of the first
+    ///
+    /// [`Self::resolve_live_foreground_run`] returns `Option<String>` and so collapses AMBIGUOUS
+    /// into NOT-FOUND — deliberately, because its callers (`is_live_foreground_run`, SCOPE_10's
+    /// live transcript) WANT that collapse: an ambiguous prefix there must fall through to the
+    /// async resolver, whose [`crate::error::SubagentError::AmbiguousRunId`] is the accurate
+    /// diagnosis. Detach needs the opposite: upstream THROWS on ambiguity (`:241`) and the handler
+    /// renders that throw as an `error` notify (`:982`), distinct from the `info` notify absence
+    /// gets (`:987`). Three outcomes at two severities cannot come out of a two-valued `Option`,
+    /// so the rule is stated once more here rather than the existing one being made lossy for its
+    /// current callers.
+    ///
+    /// # The two branches, verbatim
+    ///
+    /// * **An id was given** (`:239-243`): every control whose run id equals it OR starts with it.
+    ///   `> 1` is [`DetachTarget::Ambiguous`]; `0` is [`DetachTarget::NoMatch`]; exactly one
+    ///   resolves. Upstream does NOT filter this branch by `mode` — the mode check is the caller's
+    ///   next guard (`:990`), which is why a non-single run named by id gets
+    ///   [`crate::extension::executor::detach::DETACH_NOT_SINGLE_MESSAGE`] rather than "not
+    ///   found".
+    /// * **No id** (`:244-249`): the live `single`-mode controls, most recently updated first.
+    ///
+    /// # `state.lastForegroundControlId` — the delta is already recorded; this cites it
+    ///
+    /// Upstream's `:245-248` prefers the control the host last activated before falling back to
+    /// `:249`'s `updatedAt` DESC sort. cyrup writes no such field, and that is documented as
+    /// `[CYRUP-DELTA, unrepresentable]` on
+    /// [`SubagentExecutor::most_recent_live_foreground_run`](crate::extension::executor::SubagentExecutor)
+    /// (`extension/executor/status.rs`, in its own `# [CYRUP-DELTA, unrepresentable]` section, and
+    /// again at the fleet projection). No second delta is written here: upstream's fallback when
+    /// the field is absent is EXACTLY `singleControls.sort(updatedAt desc)[0]`, which
+    /// [`ForegroundControlEntry::updated_at`] gives verbatim.
+    ///
+    /// The run-id tie-break is cyrup's, for the same reason the sibling above states it: upstream
+    /// sorts a `Map` whose iteration order is insertion order, and a `HashMap` has none, so equal
+    /// `updated_at` resolves ascending by id rather than unpredictably.
+    ///
+    /// [`ForegroundControlEntry::updated_at`]: crate::extension::executor::notices::ForegroundControlEntry::updated_at
+    pub(crate) fn resolve_foreground_detach_target(&self, requested: &str) -> DetachTarget {
+        let controls = self
+            .foreground_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !requested.is_empty() {
+            let mut matched: Vec<String> = controls
+                .keys()
+                .filter(|id| id.as_str() == requested || id.starts_with(requested))
+                .cloned()
+                .collect();
+            matched.sort();
+            return match matched.len() {
+                0 => DetachTarget::NoMatch(requested.to_string()),
+                // `swap_remove(0)` on a one-element vector is `remove(0)` without the shift; the
+                // plain form reads better and the vector is length one.
+                1 => DetachTarget::Resolved(matched.remove(0)),
+                _ => DetachTarget::Ambiguous(matched),
+            };
+        }
+        controls
+            .iter()
+            .filter(|(_, entry)| entry.mode == crate::background::RunMode::Single)
+            .max_by(|(left_id, left), (right_id, right)| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    // Ascending by id on a tie, so the `max` picks the SMALLEST id — the same
+                    // tie-break `most_recent_live_foreground_run` applies.
+                    .then_with(|| right_id.cmp(left_id))
+            })
+            .map_or(DetachTarget::NoneLive, |(id, _)| {
+                DetachTarget::Resolved(id.clone())
+            })
+    }
+
+    /// Test-only: seed one live foreground control.
+    ///
+    /// `foreground_controls` is a private field of [`SubagentExecutor`], so only this directory
+    /// can write it — and `/subagents-detach`'s handler, which lives in `extension/host/`, is the
+    /// first surface whose tests need a live control they did not drive a real child to create.
+    /// A seeding helper here is the alternative to widening the field, which would let any module
+    /// mutate the live-run registry.
+    #[cfg(test)]
+    pub(crate) fn insert_foreground_control_for_test(
+        &self,
+        run_id: &str,
+        entry: crate::extension::executor::notices::ForegroundControlEntry,
+    ) {
+        self.foreground_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(run_id.to_string(), entry);
+    }
+
+    /// The two facts `/subagents-detach` needs off a resolved control, read under ONE lock so the
+    /// mode it checks and the handle it fires cannot come from different snapshots of the map.
+    ///
+    /// `None` means the entry is gone — it settled between
+    /// [`Self::resolve_foreground_detach_target`] and this read, which is upstream's
+    /// `sessionSettled` guard (`execution.ts:613`) arriving one step later.
+    pub(crate) fn foreground_detach_control(
+        &self,
+        run_id: &str,
+    ) -> Option<(crate::background::RunMode, Option<ForegroundDetachHandle>)> {
+        self.foreground_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(run_id)
+            .map(|entry| (entry.mode, entry.detach.clone()))
+    }
+
     /// G77 — `resolveSubagentRunId(...).kind === "nested"` for the one caller that has to refuse it
     /// ([`Self::control_stop`], pi `subagent-executor.ts:4791,4796` @v0.43.0, whose nested scope is
     /// `nestedResolutionScopeForExecutor(deps)`).
@@ -319,5 +432,108 @@ impl SubagentExecutor {
             format!("Nested child intercom target is not registered: {intercom_target}")
         };
         (ok, message)
+    }
+}
+
+#[cfg(test)]
+mod detach_target_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::background::RunMode;
+    use crate::extension::executor::notices::ForegroundControlEntry;
+
+    fn executor_with(controls: &[(&str, RunMode, i64)]) -> SubagentExecutor {
+        let executor = SubagentExecutor::new();
+        for (run_id, mode, updated_at) in controls {
+            executor.insert_foreground_control_for_test(
+                run_id,
+                ForegroundControlEntry::for_test(*mode, *updated_at, None),
+            );
+        }
+        executor
+    }
+
+    /// All four [`DetachTarget`] outcomes, from one constructed control map — pi
+    /// `selectForegroundDetachControl` (`slash-commands.ts:237-250`).
+    ///
+    /// **Gutting mutation this fails on:** reuse [`SubagentExecutor::resolve_live_foreground_run`],
+    /// whose `Option<String>` returns `None` for BOTH "no match" and "ambiguous prefix". The
+    /// `Ambiguous` assertion then collapses into `NoMatch` and fires — which is exactly the
+    /// user-visible bug the second resolver exists to prevent: an ambiguous prefix answered with
+    /// "no active foreground run found" instead of the list of candidates.
+    #[test]
+    fn the_resolver_produces_all_four_outcomes() {
+        let empty = executor_with(&[]);
+        assert_eq!(
+            empty.resolve_foreground_detach_target(""),
+            DetachTarget::NoneLive
+        );
+        assert_eq!(
+            empty.resolve_foreground_detach_target("zzz"),
+            DetachTarget::NoMatch("zzz".to_string())
+        );
+
+        let live = executor_with(&[
+            ("run-alpha", RunMode::Single, 10),
+            ("run-beta", RunMode::Single, 20),
+        ]);
+        // An exact id resolves, and so does a UNIQUE prefix.
+        assert_eq!(
+            live.resolve_foreground_detach_target("run-alpha"),
+            DetachTarget::Resolved("run-alpha".to_string())
+        );
+        assert_eq!(
+            live.resolve_foreground_detach_target("run-a"),
+            DetachTarget::Resolved("run-alpha".to_string())
+        );
+        // A SHARED prefix is ambiguous, and every match is named (pi `:241`).
+        assert_eq!(
+            live.resolve_foreground_detach_target("run-"),
+            DetachTarget::Ambiguous(vec!["run-alpha".to_string(), "run-beta".to_string()])
+        );
+    }
+
+    /// The no-id branch takes the most recently updated SINGLE control — pi `:249`'s
+    /// `singleControls.sort((l, r) => r.updatedAt - l.updatedAt)[0]`, which is upstream's own
+    /// fallback when `state.lastForegroundControlId` is absent (the `[CYRUP-DELTA,
+    /// unrepresentable]` already recorded on `most_recent_live_foreground_run`).
+    ///
+    /// **Gutting mutation this fails on:** drop the `mode == Single` filter and the chain run
+    /// wins on `updated_at`; drop the `updated_at` ordering and the `HashMap`'s arbitrary
+    /// iteration order resolves the older single.
+    #[test]
+    fn the_no_id_branch_picks_the_newest_single_and_ignores_other_modes() {
+        let mixed = executor_with(&[
+            ("run-old-single", RunMode::Single, 10),
+            ("run-new-single", RunMode::Single, 30),
+            ("run-newest-chain", RunMode::Chain, 99),
+        ]);
+        assert_eq!(
+            mixed.resolve_foreground_detach_target(""),
+            DetachTarget::Resolved("run-new-single".to_string())
+        );
+
+        // Only non-single controls live: upstream's `singleControls` is empty, so the answer is
+        // NONE-LIVE (an `info`), never the chain run.
+        let chain_only = executor_with(&[("run-chain", RunMode::Chain, 5)]);
+        assert_eq!(
+            chain_only.resolve_foreground_detach_target(""),
+            DetachTarget::NoneLive
+        );
+        // …but naming it by id DOES resolve, so the caller can render pi `:990`'s
+        // "single-subagent runs only" error rather than "not found".
+        assert_eq!(
+            chain_only.resolve_foreground_detach_target("run-chain"),
+            DetachTarget::Resolved("run-chain".to_string())
+        );
+        let (mode, handle) = chain_only
+            .foreground_detach_control("run-chain")
+            .expect("the control is live");
+        assert_eq!(mode, RunMode::Chain);
+        assert!(
+            handle.is_none(),
+            "this fixture publishes no gate, which is the `None`-handle refusal path"
+        );
     }
 }

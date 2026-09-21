@@ -324,6 +324,7 @@ fn step_child(step: &StepStatus, output: &str) -> SingleResult {
         structured_output: None,
         acceptance: None,
         detached: false,
+        detached_reason: None,
         interrupted: step.interrupted,
         timed_out: false,
         timeout_recovery: None,

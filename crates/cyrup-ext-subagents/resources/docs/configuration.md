@@ -38,7 +38,7 @@ Three stores shape the extension, and they are separate on purpose.
 | `worktreeSetupHookTimeoutMs` | number | `30000` | Timeout for that hook |
 | `fleetView` | bool | `true` | The persistent fleet widget; only explicit `false` disables |
 | `fleetViewPlacement` | string | below | `"aboveEditor"`; anything else is below the editor |
-| `waitTool` | bool or `{enabled}` | enabled | The `wait` tool gate |
+| `waitTool` | bool or `{enabled}` | enabled | The `bg_wait` tool gate |
 | `missions` | object | *unset* | Durable mission store |
 | `artifactConfig.cleanupDays` | number | `7` | Artifact retention; `0` disables cleanup |
 | `artifactDir` | `"project"`, `"session"`, `"temp"` | `project` | Where artifact files are written |
@@ -106,7 +106,7 @@ These are the ones you set:
 | `CYRUP_SUBAGENT_MAX_DEPTH` | Recursion ceiling; overrides `maxSubagentDepth` |
 | `CYRUP_SUBAGENT_MAX_SPAWNS_PER_SESSION` | Per-session spawn cap |
 | `CYRUP_SUBAGENT_TOOL_BUDGET` | Tool budget handed to children, as JSON |
-| `CYRUP_SUBAGENT_WAIT_TOOL_ENABLED` | Enable or disable the `wait` tool; an unrecognised value is a hard error |
+| `CYRUP_SUBAGENT_WAIT_TOOL_ENABLED` | Enable or disable the `bg_wait` tool; an unrecognised value is a hard error |
 | `CYRUP_SUBAGENT_BINARY`, `CYRUP_SUBAGENT_STEP_BINARY` | Override the binary used to spawn children |
 | `CYRUP_SUBAGENTS_WORKTREE_DIR` | Git-worktree root for isolated runs |
 | `CYRUP_SUBAGENTS_TEMP_ROOT` | Root for nested-run temporary artifacts |

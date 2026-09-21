@@ -59,6 +59,8 @@ pub mod profiles;
 pub mod prompt_workflows;
 pub mod resources;
 pub mod slash_commands;
+/// VL-S11a — the `/subagents` admin surface (pi `src/slash/subagents-admin.ts` @v0.68.0).
+pub(crate) mod subagents_admin;
 pub mod tool_description;
 
 // -------------------------------------------------------------------------------------------

@@ -181,6 +181,7 @@ fn child_result(child_run_id: &str) -> SingleResult {
         structured_output: None,
         acceptance: None,
         detached: true,
+        detached_reason: None,
         interrupted: false,
         timed_out: false,
         timeout_recovery: None,

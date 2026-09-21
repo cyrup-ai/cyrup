@@ -8,6 +8,14 @@
 //! multi-child foreground steering. Port it verbatim from pi alongside that task's first call
 //! site rather than shipping it as dead code ahead of one.
 //!
+//! **Re-verified for VL-S11b (`/subagents-detach`) and still true.** A detach was the one lifecycle
+//! that could have introduced a "retire one child, keep the entry" moment, and it does not: the
+//! detach branch of `run_foreground_impl` (`foreground.rs`) calls the SAME
+//! `settle_foreground_run` the ordinary settle does, dropping the whole
+//! [`ForegroundControlEntry`] — which is upstream's behaviour too, and the reason
+//! `fleet-view.ts:406-408` re-checks `!activeForegroundIds.has(runId)` before rendering a
+//! remembered run.
+//!
 //! Port of [`runs/foreground/foreground-control.ts`
 //! (`:39-157`)](../../../../../../workspace/pi-subagents/src/runs/foreground/foreground-control.ts),
 //! reduced to the fields cyrup's control entry actually carries.
@@ -325,6 +333,7 @@ mod tests {
 
     fn base_entry() -> ForegroundControlEntry {
         ForegroundControlEntry {
+            detach: None,
             interrupt: CancelToken::new(),
             current_agent: None,
             current_index: None,

@@ -1559,7 +1559,34 @@ the behaviour was available to be ported and was not.
 - **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `registration/authority.rs` is the port and names the upstream file in its own header; `validate_authority_policy` exists; the gate is consulted from the live `stop`/`steer` path and, since `7e41cf9`, from `schedule.create` through the SAME three-arm gate (`extension/tool/routing.rs:1268-1275` → `AuthorityAction::for_tool_action`, mapping at `registration/authority.rs:77`). **The scope caveat this row records STILL HOLDS and is the reason it was rated medium:** `worktree.discard` and `worktree.cleanup` are among the seventeen verbs cyrup's action list is still missing, so those arms have nothing to attach to. **The body below is the original filing and is kept as history.**
 `src/policy/authority.ts:1-8` (`AUTHORITY_ACTIONS`), `:14-21` (defaults — discardWorktree/destructiveCleanup/spawnBudgetGrant default to `confirm`), `:23`, `:30`; consumed by `inspectors/herdr/actions.ts:205-206` (`allowSteer`/`allowStop`) and validated at `src/extension/config.ts:26` — vs `extension.rs:7574` (a doc line naming upstream's dispatch arm) and no `authorityPolicy` config key anywhere. **Area 09 sharpened this**: the `stop`/`steer` gate it drives is **live-reachable** in cyrup today, so the missing policy is not merely unconfigurable — it is an unguarded live path. Scope caveat: upstream's `discardWorktree` gate hangs off a `worktree.discard` action cyrup does not have, so that arm has nothing to attach to yet. **`SUBA-064` stays medium only because of that caveat — it becomes critical the day `worktree.discard` or `destructiveCleanup` lands**, and its Fix now carries that as a hard prerequisite.
 
-**VL-S8 · Wait tool is still `wait`** — *medium* (was *large*) · id retained, class corrected (v0.35.0/v0.41.0) · **narrowed, NOT closed**
+**~~VL-S8 · Wait tool is still `wait`~~** — ~~*medium*~~ **CLOSED 2026-09-21** · id retained, class corrected (v0.35.0/v0.41.0)
+- **CLOSED.** `extension/wait_tool.rs`'s `WAIT_TOOL_NAME` is `"bg_wait"`, and that is the name the
+  registered tool object carries — an integration test resolves the tool out of the real extension
+  and asserts `name() == "bg_wait"` rather than reading the const, so the registration and the
+  const cannot drift apart
+- **THE ROW'S REAL VALUE WAS NOT THE RENAME.** It was a gating bug the rename exposed:
+  `watchdog/permission_arbiter.rs`'s `INTERNAL_TOOLS` — the set a permission policy may not gate,
+  because gating one of its members strands a child that cannot then report back — carried the
+  literal `"subagent_wait"`, **a name this crate has never registered at any point in its
+  history.** So the protection was aimed at a phantom: a parent shipping `{"bg_wait": "deny"}`
+  was ACCEPTED by `validate_permission_rules` and could strand a launched child. The set now
+  holds `crate::extension::wait_tool::WAIT_TOOL_NAME` itself rather than a copy of it, so the
+  two cannot diverge again, and the deny rule is refused with upstream's own sentence
+- **NO COMPAT ALIAS SHIPPED, AND NONE SHOULD.** `00-residual-ledger.md`'s prescription for this
+  row was *"one const plus a compat alias"*. Upstream registers exactly one tool:
+  `wait-tool.ts:37-44` @v0.68.0 builds a single `primaryTool` with `name: "bg_wait"` (`:38`) and
+  calls `pi.registerTool(primaryTool)` once (`:44`). There is no second registration and no
+  aliasing anywhere in that file. An alias here would be a cyrup invention that widens the tool
+  surface a child sees; the ledger row is amended so the next reader does not add one
+- **Three other sites moved with the name, and each is now pinned by a literal rather than by the
+  const**, so a revert is caught in more than one place: `background/wait.rs`'s no-manager refusal
+  (*"…can only use blocking bg_wait calls."*, byte-identical to `subagent-wait.ts:706`),
+  `SUBAGENT_SAFETY_GUIDANCE` (pin 1427 → 1430) and `COMPACT_SUBAGENT_TOOL_DESCRIPTION`
+- **The evidence line below cited `wait-tool.ts:9` and `name: "subagent_wait"`.** Both are wrong at
+  `v0.68.0`: `:9` is the `pi: ExtensionAPI` parameter of `registerWaitTool`, and the name literal
+  is `bg_wait` on `:38`. `subagent_wait` was upstream's name at the tag this row was FIRST written
+  against and has not been upstream's name for many tags. **The body below is the original filing
+  and is kept as history.**
 `src/runs/background/wait-tool.ts:9` (`name: "subagent_wait"`), backed by `subagent-wait.ts` (651), `wait-config.ts` (36) and `auto-drain.ts` (67) at v0.35.0 plus `wait-subscriptions.ts` (348 @ `7fe9dee1`; 253 at v0.41.0, the tag this row was first written against) — vs `extension/wait_tool.rs:16` (`WAIT_TOOL_NAME: &str = "wait"`; `extension.rs` no longer exists as a monolith, so the old `extension.rs:6704` citation is stale). **Still observable**: a child prompted by upstream's tool description calls `subagent_wait` — or, at `7fe9dee1`, `bg_wait` — and gets "unknown tool". **Closed since**: the `{id, nonBlocking:true}` wake subscription is ported as `background/wait_subscriptions/` (SCOPE_11) and armed from `background/wait.rs`'s own arming site, rendered by `extension/executor/status.rs`'s no-id branch, and reconciled as the FOURTH member of the completion watcher's composite observer; auto-drain at `agent_end` is ported as `background/auto_drain.rs` and driven from `extension/host/native_impl.rs`'s `AgentEnd` arm. Related residuals now filed in area 09: `SUBA-034` (event-bus wake) and `SUBA-031` (`wait` scoping) are both **CLOSED**. `SUBA-056` (durable completion replay) is **CLOSED** — `background/completion_replay/` is the port, and `collect_wait_completions`' third rung reads it; `wait_subscriptions`' own settle reads through the same three rungs. **What remains in this row is the tool RENAME and nothing else.**
 
 **~~VL-S9 · `usageBudget`~~** — ~~*small*~~ **CLOSED** · id retained · area 09 `SUBA-021`, closed there 2026-08-15 (sweep 10)
@@ -1595,12 +1622,68 @@ the behaviour was available to be ported and was not.
 - **Re-greped this pass:** `grep -rn '"handoffPath"' crates/cyrup-ext-subagents/src/` returns **0** — the param is still unadvertised and there is still no manifest writer. Adjacent and also still missing: `worktree.discard` / `worktree.cleanup` are two of the seventeen verbs absent from cyrup's action list, which is why VL-S7's authority arms for them have nothing to attach to
 `src/runs/shared/parallel-handoff.ts:74`, `:158`, `:162`, `:183` (238 lines), present at v0.47.1; `handoffPath` tool param at `src/extension/schemas.ts:274` — vs `spawn/parallel.rs` (no manifest writer) and three incidental mentions only. **Observable**: after a parallel run with `worktree: true` there is no handoff manifest, no `handoffPath` to hand preserved worktrees to a follow-up, and no `discardPreservedWorktrees` cleanup — the branches are left for the user to find by hand.
 
-**VL-S11 · Three slash commands missing: `/subagents`, `/subagents-refine`, `/subagents-detach`** — *medium* · id retained, class corrected (v0.35.0/v0.43.0/v0.39.0) · area 09 `SUBA-026` (still open there) · **STILL OPEN at `cc7818b`; re-read 2026-09-16**
-- **Re-read this pass:** the match is now **17** variants at `registration/slash_commands.rs:83-121` (the "16-variant match at `:127-145`" citation below is stale on both count and line), and none of the three is among them. **One correction to this row's own note:** the "fourth is now known — `/subagents-guide`, filed as `SUBA-066`" clause is **discharged** — `SlashCommandName::SubagentsGuide` is `registration/slash_commands.rs:121` and `SUBA-066` is closed in area 09. `/subagents-stop` is `:117`, as this row already records
+**~~VL-S11 · Three slash commands missing: `/subagents`, `/subagents-refine`, `/subagents-detach`~~** — ~~*medium*~~ **CLOSED 2026-09-21** · id retained, class corrected (v0.35.0/v0.43.0/v0.39.0) · area 09 `SUBA-026`
+- **CLOSED, not narrowed.** All four remaining commands landed in the VL-S11/S12/S8 batch:
+  `/subagents` (the admin surface), `/subagents-detach`, `/subagents-steer` and
+  `/subagents-inspect-rpc`. `/subagents-refine` closed earlier with `VL-S13`
+- **This row's own count was stale in both directions and is corrected here.** The "17 variants at
+  `registration/slash_commands.rs:83-121`" note above was written against a table that has since
+  moved and grown: `SlashCommandName` is now `:95-158` and `SLASH_COMMANDS` is `:228`, and the
+  table is **18** — `Run`, `SubagentCost`, `SubagentsDoctor`, `SubagentsModels`,
+  `SubagentsProfiles`, `SubagentsLoadProfile`, `SubagentsRefreshProviderModels`,
+  `SubagentsGenerateProfiles`, `SubagentsCheckProfile`, `PromptWorkflow`, `SubagentsFleet`,
+  `SubagentsStop`, `SubagentsGuide`, `SubagentsRefine`, `Subagents`, `SubagentsDetach`,
+  `SubagentsSteer`, `SubagentsInspectRpc`. **The "17" was already stale before this batch** — the
+  table held 18 at `2647f68`, the batch's own base. It still holds 18 after it, and that is
+  arithmetic rather than coincidence: `VL-S12` deleted four (`Chain`, `Parallel`, `RunChain`,
+  `ChainPrompts`) and `VL-S11` added four, in the same batch.
+  `slash_commands_table_is_exactly_upstreams_eighteen_commands` now asserts the full ordered list,
+  and `the_four_commands_upstream_deleted_at_v0_41_0_are_not_registered` asserts the length and
+  each deleted name's absence, so neither the count nor the membership can drift again silently
+- **`/subagents-detach` is the one that is not a registration over an existing capability.**
+  Upstream's detach is cheap — pi's child is an in-process session object, so `detachForeground`
+  snapshots a receipt and returns while the session's callbacks keep firing. cyrup's child is a
+  REAL OS PROCESS owned by the `drive_foreground_run_sync` future, so the same move would kill the
+  thing the feature exists to preserve. `run_foreground_impl` is split: the future is built from
+  owned inputs, boxed `Pin<Box<dyn Future + Send>>` so it is movable, raced in a biased `select!`,
+  and on an accepted detach the WHOLE VALUE moves into `tokio::spawn`. Proved by an OS-level
+  `/proc/<pid>/stat` liveness probe taken immediately after the receipt returns, against a real
+  scripted child, with a receipt budget deliberately far shorter than the child's own sleep
+- **Both READER halves were dead from production before this**, which is what made the detached
+  run unaddressable: `status`-by-id gained a second arm over `foreground_runs` (a detached run is
+  by construction absent from `foreground_controls`), and `bg_wait` gained the whole
+  detached-foreground candidate set. `WaitTool::execute` never chained
+  `.with_detached_foreground(…)` and `DetachedForegroundRunsSource` had no implementation anywhere
+  in the tree, so `active_detached_foreground_runs` always returned empty. Found by the
+  integration test that asserts `bg_wait` BLOCKS — committed knowingly red and now green
+- **`/subagents-steer`'s "no-id opens a selector" hypothesis is REFUTED, not unported.** Upstream's
+  `/subagents-stop` opens `ctx.ui.custom(…)` on its no-id branch (`:1044-1047`);
+  `/subagents-steer` does not — `:1065-1068` is `sendSlashText(pi, usage)` and nothing else
+- **The wrong path this row shares with area 09 `SUBA-026`** — `src/tui/selector.ts` — is still
+  wrong; the real file is `src/slash/selector.ts`. Noted rather than silently fixed, because the
+  selector itself remains unported and `SUBA-026`'s UI half is what keeps that row open
+- **Gates at closure** (`53f0c25`): fmt `--check` clean; clippy `--workspace --all-targets
+  --features test-fixtures -- -D warnings` clean; `nextest --workspace` **11 074 passed**, 9
+  skipped; `cyrup-it` **594 passed**. Five gutting mutations, all RED, each restored byte-for-byte
+  — the table is in `.flux/done/SLASH_SURFACE_AND_WAIT_RENAME.md`. Two flakes seen under parallel
+  load on the way there (the scheduled-runs armed tick, and an ACP dispatch test last touched
+  before this batch's base) are recorded there too rather than retried away
 `src/slash/slash-commands.ts:651`, `:701`, `:724`; the admin surface is `src/slash/subagents-admin.ts` (432 lines) — vs the 16-variant match at `registration/slash_commands.rs:127-145`, which has none of the three. **A fourth is now known**: `/subagents-guide`, filed separately as area 09 `SUBA-066` because it sits outside both this entry and `SUBA-055`. **Observable**: no interactive admin surface for an agent's model/thinking/prompt, no way to detach a live foreground run from a slash command, no refinement overlay generation.
 
-**VL-S12 · Four slash commands upstream deleted at v0.41.0 are still registered** — *small* · **reverse lag**, not a port bug and not lag · **STILL OPEN at `cc7818b`; re-read 2026-09-16**
-- **Re-read this pass:** all four are still there — `SlashCommandName::Chain` `registration/slash_commands.rs:83`, `Parallel` `:84`, `RunChain` `:85`, `ChainPrompts` `:101` (the `:128`-`:142` citations below are stale). **The blocker this row names is now DISCHARGED**: VL-S2's `workflowScript` runtime landed, so the capability no longer disappears if these four are deleted. This is now a straightforward deletion and should be scheduled as one
+**~~VL-S12 · Four slash commands upstream deleted at v0.41.0 are still registered~~** — ~~*small*~~ **CLOSED 2026-09-21** · **reverse lag**, not a port bug and not lag
+- **CLOSED. Four commands deleted**: `SlashCommandName::Chain`, `Parallel`, `RunChain` and
+  `ChainPrompts` are gone from the enum, from `SLASH_COMMANDS`, from the parsers and from the
+  prose that taught them. `git grep -n 'SlashCommandName::\(Chain\|Parallel\|RunChain\|ChainPrompts\)'`
+  is empty
+- **The deletion is pinned NEGATIVELY**, which is the only way a removal can be: a test asserts
+  each of the four names resolves to nothing in `SLASH_COMMANDS`, so re-adding one is red
+- **The blocker was genuinely discharged first.** `VL-S2`'s `workflowScript` runtime landed before
+  this, so the capability these four exposed did not disappear with them — it moved, which is
+  exactly what upstream did at v0.41.0
+- **Collateral, triaged rather than deleted wholesale:** the five pure slash-surface tests over the
+  deleted commands are gone, but `tool_parallel_chain`'s inline-group fan-out counting and both
+  recipe-chain tests were RE-POINTED onto the surviving surfaces, because the machinery under them
+  is real and still reachable. Six retired, nine new
 `git grep -oh 'registerCommand("[a-z-]*"' <tag> -- src` gives 19 unique names at v0.40.0 including `chain`, `parallel`, `run-chain`, `chain-prompts`, and 15 at v0.41.0 with all four gone (still gone at v0.43.0 and v0.47.1) — vs `registration/slash_commands.rs:128` (`Chain`), `:129` (`Parallel`), `:130` (`RunChain`), `:142` (`ChainPrompts`). **Observable**: cyrup's palette advertises four commands upstream no longer has, whose function moved into `workflowScript` (VL-S2). Do not delete them before VL-S2 lands or the capability disappears entirely.
 
 **~~`debug.run` · run-lifecycle diagnostic dump~~** — ~~*low*~~ **CLOSED 2026-09-19**
@@ -2141,7 +2224,7 @@ All 17 items live in area 09 with two-sided evidence:
 > item here, which is a larger hole than the seventeen items this section counts.
 
 - **medium** — ~~`SUBA-044`~~ **CLOSED** (the bundled `reviewer` agent's tool grant), ~~`SUBA-050` (`subagents.modelScope.strict`)~~ — **CLOSED**, ported as `exec/model_scope.rs` and enforced over the whole fallback ladder at `exec/fallback.rs:279`, `:417`, `:437`, `:457` (landed `2bd76ac`, SCOPE batch 1), ~~`SUBA-051`~~ **CLOSED** (default wall-clock bound; `exec/mod.rs:215` `DEFAULT_FOREGROUND_TIMEOUT_MS = 30 * 60 * 1000` and `workflows/scripted/engine.rs:2178` the workflow twin), ~~`SUBA-052`~~ **CLOSED** (YAML block scalars — `discovery/frontmatter.rs:337` folds `>`/`>-` and `:507` takes the dedented literal block verbatim), ~~`SUBA-053`~~ **CLOSED** (`~` expansion — `extension/executor/paths.rs:152` `expand_tilde`, `spawn/chain_graph.rs:710` `expand_home_path`, both with live callers), **`SUBA-054` (`defaultReads` never reaches a single run — also UW-16) — STILL OPEN, and it is one of only three mediums left in area 09**, ~~`SUBA-055` (the `guide` action)~~ — **CLOSED**, `guide` is in the 42-verb list at `extension/tool/text.rs:215` and `/subagents-guide` is `registration/slash_commands.rs:121`, ~~`SUBA-056` (durable completion replay and output archives)~~ — **CLOSED**, ported as `background/completion_replay/` (5 files, 1 810 LOC, landed `2bd76ac`) and read as the THIRD rung of `collect_wait_completions`; `background/inspect_rpc/read_output.rs` is a second consumer. **Area 09's table still carries this row as an open medium — see §0's thirteenth edition**, ~~`SUBA-057` (`dismiss`)~~ — **CLOSED**, `dismiss` is in the advertised verb list
-- **low** — ~~**`SUBA-023` (async lifecycle hardening; no signal-name attribution)**~~ — **CLOSED 2026-09-20**; §1b's VL-S3/VL-S4 were its two halves and both closed that day (`background/session_lease/` and `background/process_terminal/`, 5,912 LOC across 15 modules, both reachable from production callers). Its signal-name half closed in sweep 1 and the "no `ExitStatus::signal()` name mapping" observation was REFUTED long before that, **`SUBA-024` (`parallel-handoff` / `agent-contract`) — STILL OPEN**, `"handoffPath"` is still zero-hit (§1b VL-S10), **`SUBA-026` (interactive admin UI and selector) — STILL OPEN**, three slash commands still absent from the now-17-variant match at `registration/slash_commands.rs:83-121` (§1b VL-S11), ~~`SUBA-058`~~ **CLOSED**, ~~`SUBA-059`~~ **CLOSED**, ~~`SUBA-060`~~ **CLOSED**, ~~`SUBA-065` (`unknownSubagentActionMessage`)~~ — **CLOSED**, and its `DESTRUCTIVE_MANAGEMENT_ACTIONS` gate (`extension/tool/text.rs:317`) had carried `schedule.delete` since before that verb dispatched — deliberately, so the stricter did-you-mean rule applied from the first call, ~~`SUBA-066` (`/subagents-guide`)~~ — **CLOSED**, `registration/slash_commands.rs:121`
+- **low** — ~~**`SUBA-023` (async lifecycle hardening; no signal-name attribution)**~~ — **CLOSED 2026-09-20**; §1b's VL-S3/VL-S4 were its two halves and both closed that day (`background/session_lease/` and `background/process_terminal/`, 5,912 LOC across 15 modules, both reachable from production callers). Its signal-name half closed in sweep 1 and the "no `ExitStatus::signal()` name mapping" observation was REFUTED long before that, **`SUBA-024` (`parallel-handoff` / `agent-contract`) — STILL OPEN**, `"handoffPath"` is still zero-hit (§1b VL-S10), **`SUBA-026` (interactive admin UI and selector) — NARROWED 2026-09-21, still open for its UI half**: the three slash commands this clause names all landed with §1b `VL-S11`, and the table is now **18** at `registration/slash_commands.rs:228` (the "17-variant match at `:83-121`" was stale on count AND line). What keeps `SUBA-026` open is the interactive admin UI and the selector — `src/slash/selector.ts`, 147 L @v0.68.0, NOT `src/tui/selector.ts`, which exists at no tag, ~~`SUBA-058`~~ **CLOSED**, ~~`SUBA-059`~~ **CLOSED**, ~~`SUBA-060`~~ **CLOSED**, ~~`SUBA-065` (`unknownSubagentActionMessage`)~~ — **CLOSED**, and its `DESTRUCTIVE_MANAGEMENT_ACTIONS` gate (`extension/tool/text.rs:317`) had carried `schedule.delete` since before that verb dispatched — deliberately, so the stricter did-you-mean rule applied from the first call, ~~`SUBA-066` (`/subagents-guide`)~~ — **CLOSED**, `registration/slash_commands.rs:121`
 - **The still-open rows are ALL in §1b as well** (VL-S10, VL-S11, UW-16 — VL-S3 and VL-S4 were on this list until they closed on 2026-09-20), which means §3b now records no work §1b does not. That is a sign this section has been fully absorbed, not a sign it should be deleted: ids are retained.
 
 **Not filed by rule**: `run-fanout-budget.ts` (257 lines — a whole per-run logical fan-out cap with

@@ -314,6 +314,7 @@ pub(super) async fn finish_run(
             transcript_error: None,
             acceptance: None,
             detached: false,
+            detached_reason: None,
             interrupted: terminal_state == RunState::Paused,
             timed_out: false,
             // A synthesized placeholder for a run that produced no step results at all — no child
@@ -717,6 +718,7 @@ mod tests {
                 transcript_error: None,
                 acceptance: None,
                 detached: false,
+                detached_reason: None,
                 interrupted: false,
                 timed_out: false,
                 timeout_recovery: None,

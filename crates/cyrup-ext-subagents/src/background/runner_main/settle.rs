@@ -629,6 +629,7 @@ pub(super) fn step_result_to_single_result_with(
         transcript_error: result.transcript_error.clone(),
         acceptance: None,
         detached: false,
+        detached_reason: None,
         // R-SA-084: carry the mid-flight interrupt flag through to the terminal per-step
         // `SingleResult` (pi's `interrupted` field), so a `ResultFile` reader sees which step was
         // the pause point rather than a hard-coded `false`.
@@ -719,6 +720,7 @@ pub(super) fn imported_root_to_single_result(
         transcript_error: None,
         acceptance: None,
         detached: false,
+        detached_reason: None,
         interrupted: false,
         timed_out: false,
         // pi's import copy (`subagent-runner.ts:760-790`) carries `sessionFile`/`contextOverflow`

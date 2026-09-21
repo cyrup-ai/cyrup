@@ -1,12 +1,26 @@
-//! The 12 slash-command descriptors and their argument parsers (func-SA §5.6 R-SA-129; arch-SA
+//! The 18 slash-command descriptors and their argument parsers (func-SA §5.6 R-SA-129; arch-SA
 //! §2.2/§6.8).
 //!
 //! # Scope of this file
 //!
-//! This file defines, for all 12 commands listed by R-SA-129 (`/run`, `/chain`, `/parallel`,
-//! `/run-chain`, `/subagent-cost`, `/subagents-doctor`, `/subagents-models`,
-//! `/subagents-profiles`, `/subagents-load-profile`, `/subagents-refresh-provider-models`,
-//! `/subagents-generate-profiles`, `/subagents-check-profile`):
+//! This file defines, for all 18 registered commands (`/run`, `/subagent-cost`,
+//! `/subagents-doctor`, `/subagents-models`, `/subagents-profiles`, `/subagents-load-profile`,
+//! `/subagents-refresh-provider-models`, `/subagents-generate-profiles`,
+//! `/subagents-check-profile`, `/prompt-workflow`, `/subagents-fleet`, `/subagents-stop`,
+//! `/subagents-guide`, `/subagents-refine`, `/subagents`, `/subagents-detach`,
+//! `/subagents-steer`, `/subagents-inspect-rpc`):
+//!
+//! VL-S12 — R-SA-129's original twelve also listed `/chain`, `/parallel` and `/run-chain`, and
+//! `registerPromptWorkflowCommands` added `/chain-prompts` alongside `/prompt-workflow`. Upstream
+//! DELETED all four at v0.41.0: at the pinned v0.68.0 tag `slash-commands.ts` registers exactly
+//! seventeen commands (`:869-1283`, none of them `chain`/`parallel`/`run-chain`) and
+//! `prompt-workflows.ts:254` registers only `/prompt-workflow` — `"chain-prompts"` survives there
+//! solely as a RESERVED recipe name (`:24`) so no `prompts/*.md` file can claim it. The multi-step
+//! shapes they exposed did not go away with them: the `subagent` tool's `chain`/`parallel` actions
+//! and `/prompt-workflow`'s own `chain:` frontmatter branch (`prompt-workflows.ts:271-278`) still
+//! reach the same chain-graph walker, so this file keeps the step/group grammar helpers
+//! ([`parse_chain_expression`], [`parse_group_segment`], [`step_token_to_spec`]) that lowered them
+//! and drops only the four deleted commands' own top-level parsers.
 //!
 //! `/subagents-companions` was the thirteenth until upstream DELETED
 //! `src/extension/companion-suggestions.ts` wholesale in `3ac0ef5` ("Make supervisor coordination
@@ -18,8 +32,8 @@
 //!   (name/usage/description) suitable for driving `InitApi::register_command` registration,
 //! - pure, side-effect-free **argument parsers** that turn a command's raw trailing argument
 //!   string into a strongly-typed `Parsed*Command` value,
-//! - for `/run`, `/chain`, and `/parallel`: the shared `--bg`/`--fork`/`[key=value,...]`
-//!   inline-override grammar (R-SA-129), including `/chain`'s inline parallel-group
+//! - for `/run` and the multi-step shapes: the shared `--bg`/`--fork`/`[key=value,...]`
+//!   inline-override grammar (R-SA-129), including the inline parallel-group
 //!   `(a "task" | b "task")[opts]` chain-expression syntax, faithfully ported from
 //!   `pi-subagents/src/slash/slash-commands.ts` (`parseChainExpression`/`parseGroupSegment`/
 //!   `splitOnArrow`/`splitGroupTasks`/`mapParsedTaskToStepObject`) — verified line-for-line
@@ -29,10 +43,10 @@
 //!   functionality.md §5.6, which itself defers to the pi-subagents source tree per this
 //!   document's own "source of truth" rule (func-SA header).
 //!
-//! Every parser here produces [`SingleStepSpec`]/[`ParallelGroupSpec`]/[`RunnerStep`] values
-//! directly (`crate::spawn::chain_graph`'s already-landed types) rather than a bespoke
-//! intermediate shape this file would otherwise need a second conversion pass for later — chain
-//! and parallel commands parse straight into a `Vec<RunnerStep>`/`ChainGraph`.
+//! Every parser here produces [`SingleStepSpec`]/[`crate::spawn::chain_graph::ParallelGroupSpec`]/
+//! [`crate::spawn::chain_graph::RunnerStep`] values directly (`crate::spawn::chain_graph`'s
+//! already-landed types) rather than a bespoke intermediate shape this file would otherwise need a
+//! second conversion pass for later — step tokens lower straight into a `Vec<RunnerStep>`.
 //!
 //! # What is explicitly deferred to later phases (NOT implemented in this file)
 //!
@@ -68,7 +82,7 @@ use std::path::PathBuf;
 use cyrup_core::ModelId;
 
 use crate::discovery::types::OutputMode;
-use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec};
+use crate::spawn::chain_graph::SingleStepSpec;
 
 // =================================================================================================
 // SlashCommandName / SLASH_COMMANDS descriptor table (R-SA-129)
@@ -80,9 +94,6 @@ use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec};
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum SlashCommandName {
     Run,
-    Chain,
-    Parallel,
-    RunChain,
     SubagentCost,
     SubagentsDoctor,
     SubagentsModels,
@@ -96,9 +107,6 @@ pub enum SlashCommandName {
     /// `registerPromptWorkflowCommands`, which `registerSlashCommands` calls at
     /// `slash-commands.ts:795-800`, so it is a real upstream command on the same surface.
     PromptWorkflow,
-    /// `/chain-prompts a -> b -- args` — run several recipes as one native subagent chain (pi
-    /// `prompt-workflows.ts:303` @v0.34.0).
-    ChainPrompts,
     /// `/subagents-fleet` — the live fleet inspector (pi
     /// `pi.registerCommand("subagents-fleet", …)`, `slash-commands.ts:714-717` @v0.43.0, whose
     /// handler is exactly `showFleet(ctx)`; at the v0.34.0 baseline the same command was
@@ -125,6 +133,28 @@ pub enum SlashCommandName {
     /// It dispatches `refine` only; `refine.show`/`refine.rollback` have no slash surface
     /// upstream either.
     SubagentsRefine,
+    /// VL-S11a — `/subagents` (pi `slash-commands.ts:869-875` @v0.68.0), handler
+    /// `openSubagentsAdmin(pi, ctx, args)` (`subagents-admin.ts:396`). The admin surface: inspect
+    /// an agent's resolved metadata and persist a model / thinking / system-prompt override
+    /// through the settings writer, with upstream's read-only refusals intact.
+    Subagents,
+    /// VL-S11b — `/subagents-detach` (pi `slash-commands.ts:1002-1005` @v0.68.0). Hands the live
+    /// foreground single run to the background WITHOUT terminating its child; the run stays
+    /// addressable by `subagent({ action: "status", id })` and
+    /// [`crate::extension::wait_tool::WAIT_TOOL_NAME`]. Its whole vocabulary — the four refusal
+    /// sentences, the success sentence, the reasons and the accept-or-refuse handshake — is
+    /// `extension/executor/detach.rs`.
+    SubagentsDetach,
+    /// VL-S11 R1 — `/subagents-steer` (pi `slash-commands.ts:1057-1119` @v0.68.0). A slash
+    /// registration over the `steer` action, which is already advertised
+    /// (`extension/tool/text.rs:281`), already routed (`extension/tool/routing.rs:2316`) and
+    /// already behind the `allowSteer` authority gate.
+    SubagentsSteer,
+    /// VL-S11 R2 — `/subagents-inspect-rpc` (pi `slash-commands.ts:928-943` @v0.68.0). The host
+    /// integration bridge over the already-ported request parser
+    /// (`background/inspect_rpc/request.rs:80`). Never a model turn: it answers one correlated
+    /// inspection request with a widget payload and immediately retracts it.
+    SubagentsInspectRpc,
 }
 
 impl SlashCommandName {
@@ -135,9 +165,6 @@ impl SlashCommandName {
     pub const fn as_str(self) -> &'static str {
         match self {
             SlashCommandName::Run => "run",
-            SlashCommandName::Chain => "chain",
-            SlashCommandName::Parallel => "parallel",
-            SlashCommandName::RunChain => "run-chain",
             SlashCommandName::SubagentCost => "subagent-cost",
             SlashCommandName::SubagentsDoctor => "subagents-doctor",
             SlashCommandName::SubagentsModels => "subagents-models",
@@ -147,11 +174,14 @@ impl SlashCommandName {
             SlashCommandName::SubagentsGenerateProfiles => "subagents-generate-profiles",
             SlashCommandName::SubagentsCheckProfile => "subagents-check-profile",
             SlashCommandName::PromptWorkflow => "prompt-workflow",
-            SlashCommandName::ChainPrompts => "chain-prompts",
             SlashCommandName::SubagentsFleet => "subagents-fleet",
             SlashCommandName::SubagentsStop => "subagents-stop",
             SlashCommandName::SubagentsGuide => "subagents-guide",
             SlashCommandName::SubagentsRefine => "subagents-refine",
+            SlashCommandName::Subagents => "subagents",
+            SlashCommandName::SubagentsDetach => "subagents-detach",
+            SlashCommandName::SubagentsSteer => "subagents-steer",
+            SlashCommandName::SubagentsInspectRpc => "subagents-inspect-rpc",
         }
     }
 
@@ -182,32 +212,24 @@ pub struct SlashCommandDescriptor {
     pub description: &'static str,
 }
 
-/// All 12 commands R-SA-129 mandates, in the order that requirement lists them. `extension.rs`
-/// (Phase 9) is expected to iterate this table once at `init()` time and call
-/// `InitApi::register_command` once per entry (arch-SA §3.2's `for cmd in
-/// registration::SLASH_COMMANDS { api.register_command(...) }` sketch) — this table is the single
-/// source of truth for "which 12 commands exist," so an omission here is a compile-visible gap
-/// rather than a silently-missing registration.
+/// All **18** commands this extension registers — R-SA-129's original twelve as amended by the
+/// upstream palette itself, which is the real authority: the four v0.41.0 removals (`/chain`,
+/// `/parallel`, `/run-chain`, `/chain-prompts`) are gone and `/subagents`, `/subagents-detach`,
+/// `/subagents-steer` and `/subagents-inspect-rpc` are added.
+///
+/// 18 is upstream's own count at v0.68.0: the 17 `pi.registerCommand` calls in
+/// `slash/slash-commands.ts:869-1283`, plus `prompt-workflow`, which the same
+/// `registerSlashCommands` registers via its `registerPromptWorkflowCommands` hop at `:1121`
+/// (`slash/prompt-workflows.ts:254`).
+///
+/// `extension.rs` iterates this table once at `init()` time and calls `InitApi::register_command`
+/// per entry (arch-SA §3.2), so this table is the single source of truth for which commands exist
+/// and an omission is a compile-visible gap rather than a silently-missing registration.
 pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
     SlashCommandDescriptor {
         name: SlashCommandName::Run,
         usage: "Usage: /run <agent>[key=value,...] [task] [--bg] [--fork]",
         description: "Run a subagent directly",
-    },
-    SlashCommandDescriptor {
-        name: SlashCommandName::Chain,
-        usage: "Usage: /chain agent1 \"task1\" -> agent2 \"task2\" [--bg] [--fork]",
-        description: "Run agents in sequence, with optional inline parallel groups",
-    },
-    SlashCommandDescriptor {
-        name: SlashCommandName::Parallel,
-        usage: "Usage: /parallel agent1 \"task1\" -> agent2 \"task2\" [--bg] [--fork]",
-        description: "Run agents in parallel",
-    },
-    SlashCommandDescriptor {
-        name: SlashCommandName::RunChain,
-        usage: "Usage: /run-chain <chainName> -- <task> [--bg] [--fork]",
-        description: "Run a saved chain",
     },
     SlashCommandDescriptor {
         name: SlashCommandName::SubagentCost,
@@ -257,11 +279,6 @@ pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
         usage: "Usage: /prompt-workflow <name> [args] [--fork|--fresh] [--worktree] [--bg] [--subagent <agent>]",
         description: "Run a prompt template through native subagents: /prompt-workflow <name> [args]",
     },
-    SlashCommandDescriptor {
-        name: SlashCommandName::ChainPrompts,
-        usage: "Usage: /chain-prompts prompt-a -> prompt-b -- args",
-        description: "Run prompt templates as a native subagent chain: /chain-prompts analyze -> fix -- args",
-    },
     // G92: `/subagents-fleet` (`slash-commands.ts:714-717` @v0.43.0). `description` is upstream's
     // verbatim text at that tag; its handler is `showFleet(ctx)`, ported by
     // `extension.rs::show_fleet` over `crate::tui::fleet`.
@@ -294,6 +311,37 @@ pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
         name: SlashCommandName::SubagentsRefine,
         usage: "Usage: /subagents-refine <agent>",
         description: "Generate a bounded project-local refinement overlay for one subagent",
+    },
+    // VL-S11a: `/subagents` (`slash/slash-commands.ts:869-875` @v0.68.0). `description` is
+    // upstream's verbatim (`:870`). Upstream registers no usage line for it — the command is a
+    // selector, not a parser — so `usage` here is the in-tree convention's one-liner.
+    SlashCommandDescriptor {
+        name: SlashCommandName::Subagents,
+        usage: "Usage: /subagents [agent]",
+        description: "Administer subagents: inspect metadata and update models, thinking, or prompts",
+    },
+    // VL-S11b: `/subagents-detach` (`slash/slash-commands.ts:1002-1005` @v0.68.0). `description`
+    // is upstream's verbatim (`:1003`).
+    SlashCommandDescriptor {
+        name: SlashCommandName::SubagentsDetach,
+        usage: "Usage: /subagents-detach [run-id]",
+        description: "Detach the active foreground single-subagent run without terminating it",
+    },
+    // VL-S11 R1: `/subagents-steer` (`slash/slash-commands.ts:1057-1119` @v0.68.0).
+    // `description` is upstream's verbatim (`:1058`); `usage` is upstream's own error text
+    // (`:1061`), reused exactly as `/subagents-refine` above reuses `:966`.
+    SlashCommandDescriptor {
+        name: SlashCommandName::SubagentsSteer,
+        usage: "Usage: /subagents-steer <run-id> [--child <child-id>] <message>",
+        description: "Steer a live async subagent run with a message, or one child of it with --child <child-id>",
+    },
+    // VL-S11 R2: `/subagents-inspect-rpc` (`slash/slash-commands.ts:928-943` @v0.68.0).
+    // `description` is upstream's verbatim (`:929`). It takes a correlated request payload, not
+    // words a human types, so `usage` names that rather than inventing a grammar.
+    SlashCommandDescriptor {
+        name: SlashCommandName::SubagentsInspectRpc,
+        usage: "Usage: /subagents-inspect-rpc <request-json>",
+        description: "Host integration bridge: answer an async child inspection request with a correlated widget payload (no model turn)",
     },
 ];
 
@@ -1200,8 +1248,8 @@ pub fn step_token_to_spec(
     };
     let cwd = step.config.cwd.as_ref().map(PathBuf::from);
     let _ = in_group; // `count` is a fan-out WIDTH multiplier, not a per-step field: it has no
-    // `SingleStepSpec`-level home, so it is applied by the GROUP builder (`parse_chain_command`'s
-    // parallel-group arm) that repeats this spec `count` times, exactly as pi's
+    // `SingleStepSpec`-level home, so it is applied by whichever GROUP builder consumes this
+    // spec, repeating it `count` times — exactly as pi's
     // `expandChainParallelCounts` does — mirroring source's `opts.inGroup && config.count` gate,
     // which likewise only ever attaches `count` to a task INSIDE a parallel group.
 
@@ -1306,362 +1354,12 @@ pub fn parse_run_command(raw_args: &str) -> Result<ParsedRunCommand, SlashParseE
 }
 
 // =================================================================================================
-// /chain and /parallel — shared "agent1 task1 -> agent2 task2" / "agent1 agent2 -- task" grammar
-// =================================================================================================
-
-/// Which of the two sibling commands is calling [`parse_agent_args`] — selects the exact
-/// first-step/at-least-one-task validation rule that differs between `/chain` and `/parallel`
-/// (source: `command === "chain"` vs. `command === "parallel"` branches,
-/// `slash-commands.ts:807-814`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AgentArgsCommand {
-    Chain,
-    Parallel,
-}
-
-/// The non-group-syntax parse result shared by `/chain` and `/parallel`: a list of step tokens
-/// plus the resolved shared task (empty string if every step carries its own task). Faithful port
-/// of `parseAgentArgs`'s return shape (`slash-commands.ts:760`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParsedAgentArgs {
-    pub steps: Vec<ParsedStepToken>,
-    pub task: String,
-}
-
-/// Parse the shared `/chain`/`/parallel` non-group grammar: either `agent1 "task1" -> agent2
-/// "task2"` (per-step tasks, `" -> "`-delimited) or `agent1 agent2 -- shared task` (a
-/// space-delimited agent list, then one `" -- "`-delimited shared task applied to every step with
-/// no task of its own).
-///
-/// Faithful port of `parseAgentArgs` (`slash-commands.ts:755-816`), MINUS the
-/// `discoverAgents(...).agents.find(...)` existence check (source lines 800-806) — deferred to
-/// `extension.rs` per this file's module header, since it requires live discovery/`ctx` this pure
-/// parser has no access to.
-///
-/// # Errors
-///
-/// Returns [`SlashParseError`] when: no steps parse out at all; `/chain`'s first step has no task
-/// (neither its own nor a shared fallback); or `/parallel` has no task anywhere (neither any
-/// step's own nor a shared one); or (the `" -- "` branch) the shared-task delimiter is missing, or
-/// either side of it is empty.
-pub fn parse_agent_args(
-    args: &str,
-    command: AgentArgsCommand,
-) -> Result<ParsedAgentArgs, SlashParseError> {
-    let input = args.trim();
-    let usage = format!(
-        "Usage: /{} agent1 \"task1\" -> agent2 \"task2\"",
-        match command {
-            AgentArgsCommand::Chain => "chain",
-            AgentArgsCommand::Parallel => "parallel",
-        }
-    );
-
-    let (steps, shared_task, per_step) = if input.contains(" -> ") {
-        let mut steps = Vec::new();
-        for seg in input.split(" -> ") {
-            let trimmed = seg.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            steps.push(parse_single_task_token(trimmed));
-        }
-        let shared_task = steps
-            .iter()
-            .find_map(|s| s.task.clone())
-            .unwrap_or_default();
-        (steps, shared_task, true)
-    } else {
-        let Some(delim_idx) = find_top_level_delimiter(input, " -- ") else {
-            return Err(SlashParseError::new(usage));
-        };
-        let agents_part = input.get(..delim_idx).unwrap_or_default().trim();
-        let shared_task = input
-            .get(delim_idx + 4..)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if agents_part.is_empty() || shared_task.is_empty() {
-            return Err(SlashParseError::new(usage));
-        }
-        let steps: Vec<ParsedStepToken> = agents_part
-            .split_whitespace()
-            .map(parse_single_task_token)
-            .collect();
-        (steps, shared_task, false)
-    };
-
-    if steps.is_empty() {
-        return Err(SlashParseError::new(usage));
-    }
-
-    match command {
-        AgentArgsCommand::Chain => {
-            let first_has_task = steps.first().is_some_and(|s| s.task.is_some());
-            if !first_has_task && (per_step || shared_task.is_empty()) {
-                return Err(SlashParseError::new(
-                    "First step must have a task: /chain agent \"task\" -> agent2",
-                ));
-            }
-        }
-        AgentArgsCommand::Parallel => {
-            let any_step_has_task = steps.iter().any(|s| s.task.is_some());
-            if !any_step_has_task && shared_task.is_empty() {
-                return Err(SlashParseError::new("At least one step must have a task"));
-            }
-        }
-    }
-
-    Ok(ParsedAgentArgs {
-        steps,
-        task: shared_task,
-    })
-}
-
-/// The fully parsed `/chain` command: a [`RunnerStep`] sequence ready for the chain graph walker,
-/// plus the resolved overall task text (for display) and execution flags.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ParsedChainCommand {
-    pub chain: Vec<RunnerStep>,
-    pub task: String,
-    pub flags: ExecutionFlags,
-}
-
-/// Parse `/chain agent1 "task1" -> agent2 "task2"` (or the inline-parallel-group variant `/chain
-/// agent1 "task1" -> (agent2 "task2" | agent3 "task3") -> agent4`) into a [`ParsedChainCommand`]
-/// (R-SA-129). Faithful port of `buildChainExpressionSteps` (`slash-commands.ts:892-974` @v0.34.0) composed
-/// with the `pi.registerCommand("chain", ...)` handler's flag extraction
-/// (`slash-commands.ts:1010-1022` @v0.34.0).
-///
-/// # Errors
-///
-/// Returns [`SlashParseError`] for any of the syntax failures [`parse_agent_args`] /
-/// [`parse_chain_expression`] / [`parse_group_segment`] / [`step_token_to_spec`] can raise, plus:
-/// every task inside a parallel group must have its own task (no shared-task fallback inside a
-/// group, source lines 932-938); the first element (whether a bare step or a group) must have at
-/// least one task among its members (source lines 939-947).
-pub fn parse_chain_command(raw_args: &str) -> Result<ParsedChainCommand, SlashParseError> {
-    let (cleaned, flags) = extract_execution_flags(raw_args);
-
-    if !has_group_syntax(&cleaned) {
-        let parsed = parse_agent_args(&cleaned, AgentArgsCommand::Chain)?;
-        let fallback = if parsed.task.is_empty() {
-            None
-        } else {
-            Some(parsed.task.as_str())
-        };
-        let chain = parsed
-            .steps
-            .iter()
-            .enumerate()
-            .map(|(i, step)| {
-                step_token_to_spec(step, fallback, i == 0, false).map(RunnerStep::SingleStep)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(ParsedChainCommand {
-            chain,
-            task: parsed.task,
-            flags,
-        });
-    }
-
-    let expression = parse_chain_expression(&cleaned)?;
-
-    for element in &expression.elements {
-        if let ParsedChainElement::Group { tasks, .. } = element
-            && tasks.iter().any(|t| t.task.is_none())
-        {
-            return Err(SlashParseError::new(
-                "Each task in a parallel group needs a task: (agent \"a\" | agent \"b\")",
-            ));
-        }
-    }
-
-    let first_has_task = match expression.elements.first() {
-        Some(ParsedChainElement::Group { tasks, .. }) => tasks.iter().any(|t| t.task.is_some()),
-        Some(ParsedChainElement::Step(step)) => step.task.is_some(),
-        None => false,
-    };
-    if !first_has_task {
-        return Err(SlashParseError::new(
-            "First step must have a task: /chain agent \"task\" -> agent2",
-        ));
-    }
-
-    let shared_task = match expression.elements.first() {
-        Some(ParsedChainElement::Group { tasks, .. }) => tasks
-            .iter()
-            .find_map(|t| t.task.clone())
-            .unwrap_or_default(),
-        Some(ParsedChainElement::Step(step)) => step.task.clone().unwrap_or_default(),
-        None => String::new(),
-    };
-    let fallback = if shared_task.is_empty() {
-        None
-    } else {
-        Some(shared_task.as_str())
-    };
-
-    let chain = expression
-        .elements
-        .iter()
-        .map(|element| match element {
-            ParsedChainElement::Group { tasks, config } => {
-                // T1 (count fan-out, `slash-commands.ts:884` `opts.inGroup && config.count` +
-                // `subagent-executor.ts:2002` `expandChainParallelCounts`): an inline group task's
-                // `[count=N]` repeats that concrete task N times, widening the fan-out — the
-                // parse-time analogue of pi's `expandChainParallelCounts`, applied here where the
-                // group's static width is known. `count` is validated `>= 1` at parse time
-                // (`parse_inline_config` drops a non-positive `count`), so `unwrap_or(1)` is the
-                // "no `count` given → one instance" default, never a silent zero-width group.
-                let mut steps = Vec::new();
-                for t in tasks {
-                    let spec = step_token_to_spec(t, None, false, true)?;
-                    let repeats = t.config.count.unwrap_or(1);
-                    for _ in 0..repeats {
-                        steps.push(spec.clone());
-                    }
-                }
-                Ok(RunnerStep::ParallelGroup(ParallelGroupSpec {
-                    steps,
-                    concurrency: config.concurrency.unwrap_or(4),
-                    fail_fast: config.fail_fast.unwrap_or(false),
-                    worktree: config.worktree.unwrap_or(false),
-                    lane: None,
-                }))
-            }
-            ParsedChainElement::Step(step) => {
-                step_token_to_spec(step, fallback, false, false).map(RunnerStep::SingleStep)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(ParsedChainCommand {
-        chain,
-        task: shared_task,
-        flags,
-    })
-}
-
-/// The fully parsed `/parallel` command: a flat list of [`SingleStepSpec`] tasks to fan out over,
-/// plus execution flags.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ParsedParallelCommand {
-    pub tasks: Vec<SingleStepSpec>,
-    pub flags: ExecutionFlags,
-}
-
-/// Parse `/parallel agent1 "task1" -> agent2 "task2"` (R-SA-129). `/parallel` does NOT accept the
-/// `(a | b)` inline-group syntax — it IS already an implicit single-level parallel group over
-/// however many steps `parse_agent_args` returns; nesting a further group inside it has no
-/// well-formed meaning and pi-subagents' own `/parallel` handler
-/// (`slash-commands.ts:1054-1076` @v0.34.0) never calls `buildChainExpressionSteps`/`hasGroupSyntax` at
-/// all, confirming this is not an oversight.
-///
-/// # Errors
-///
-/// Returns [`SlashParseError`] for any failure [`parse_agent_args`] can raise.
-pub fn parse_parallel_command(raw_args: &str) -> Result<ParsedParallelCommand, SlashParseError> {
-    let (cleaned, flags) = extract_execution_flags(raw_args);
-    let parsed = parse_agent_args(&cleaned, AgentArgsCommand::Parallel)?;
-    let tasks = parsed
-        .steps
-        .iter()
-        .map(|step| {
-            let task = step.task.clone().unwrap_or_else(|| parsed.task.clone());
-            SingleStepSpec {
-                skills: None,
-                session_dir: None,
-                agent: step.name.clone(),
-                task,
-                cwd: step.config.cwd.as_ref().map(PathBuf::from),
-                // T1: `/parallel`'s per-step `[model=…]` override reaches the child (pi
-                // `slash-commands.ts:1067` @v0.34.0 `config.model ? {model} : {}`), previously dropped.
-                model: step.config.model.clone().map(ModelId::from),
-                tools: None,
-                extensions: None,
-                session_file: None,
-                max_depth_override: None,
-                structured_output_schema: None,
-                output: None,
-                // pi's inline `[output=<path>]` output FILE path (`InlineOutput::Path`); the
-                // `output=false` sentinel / empty path map to `None` (no file).
-                output_path: match &step.config.output {
-                    Some(InlineOutput::Path(path)) if !path.is_empty() => Some(path.clone()),
-                    _ => None,
-                },
-                output_mode: step.config.output_mode,
-                reads: match &step.config.reads {
-                    Some(InlineReads::Paths(paths)) => {
-                        Some(paths.iter().map(PathBuf::from).collect())
-                    }
-                    _ => None,
-                },
-                acceptance: None,
-                context: None,
-                agent_scope: None,
-            }
-        })
-        .collect();
-    Ok(ParsedParallelCommand { tasks, flags })
-}
-
-// =================================================================================================
-// /run-chain — invoke a saved chain by name
-// =================================================================================================
-
-/// The fully parsed `/run-chain` command header: the saved chain's name, the task to run it with,
-/// and execution flags. Resolving `chain_name` against discovered saved chains (and expanding its
-/// steps into concrete [`RunnerStep`]s, `mapSavedChainSteps` in source) is a later-phase concern
-/// requiring live discovery this pure parser has no access to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParsedRunChainCommand {
-    pub chain_name: String,
-    pub task: String,
-    pub flags: ExecutionFlags,
-}
-
-/// Parse `/run-chain <chainName> -- <task> [--bg] [--fork]` (R-SA-129). Faithful port of the
-/// `pi.registerCommand("run-chain", ...)` handler's argument-parsing portion
-/// (`slash-commands.ts:1024-1052` @v0.34.0).
-///
-/// # Errors
-///
-/// Returns [`SlashParseError`] if the mandatory `" -- "` delimiter is missing, or either the chain
-/// name or the task is empty after trimming.
-pub fn parse_run_chain_command(raw_args: &str) -> Result<ParsedRunChainCommand, SlashParseError> {
-    let (cleaned, flags) = extract_execution_flags(raw_args);
-    let usage = "Usage: /run-chain <chainName> -- <task> [--bg] [--fork]";
-    let Some(delim_idx) = find_top_level_delimiter(&cleaned, " -- ") else {
-        return Err(SlashParseError::new(usage));
-    };
-    let chain_name = cleaned
-        .get(..delim_idx)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let task = cleaned
-        .get(delim_idx + 4..)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if chain_name.is_empty() || task.is_empty() {
-        return Err(SlashParseError::new(usage));
-    }
-    Ok(ParsedRunChainCommand {
-        chain_name,
-        task,
-        flags,
-    })
-}
-
-// =================================================================================================
 // /subagent-cost, /subagents-doctor — no arguments
 // =================================================================================================
 
 /// `/subagent-cost` and `/subagents-doctor` take no arguments at all (R-SA-129's per-command
 /// argument-shape contract; source: both handlers ignore `_args` entirely,
-/// `slash-commands.ts:685-697`). This parser exists purely so every one of the 12 commands has a
+/// `slash-commands.ts:685-697`). This parser exists purely so every registered command has a
 /// uniform `parse_*` entry point `extension.rs` can dispatch through — it always succeeds.
 pub fn parse_no_args_command(_raw_args: &str) {}
 
@@ -1826,52 +1524,81 @@ mod tests {
     use super::*;
 
     // ---------------------------------------------------------------------------------------
-    // SLASH_COMMANDS table completeness (R-SA-129's 12, plus the 2 prompt-template commands
-    // and /subagents-fleet)
+    // SLASH_COMMANDS table completeness (the 18 commands upstream registers at v0.68.0)
     // ---------------------------------------------------------------------------------------
 
-    /// R-SA-129's twelve, which occupy the table's leading positions and are asserted verbatim by
-    /// [`slash_commands_table_matches_r_sa_129s_exact_list`].
-    const R_SA_129_COMMAND_COUNT: usize = 12;
+    /// Every command name this crate registers, in table order. Upstream registers seventeen in
+    /// `slash/slash-commands.ts:869-1283` @v0.68.0 plus `/prompt-workflow` in
+    /// `slash/prompt-workflows.ts:254`, which `registerSlashCommands` reaches through
+    /// `registerPromptWorkflowCommands({ pi, run })` — eighteen on one command surface.
+    const EXPECTED_COMMAND_NAMES: [&str; 18] = [
+        "run",
+        "subagent-cost",
+        "subagents-doctor",
+        "subagents-models",
+        "subagents-profiles",
+        "subagents-load-profile",
+        "subagents-refresh-provider-models",
+        "subagents-generate-profiles",
+        "subagents-check-profile",
+        "prompt-workflow",
+        "subagents-fleet",
+        "subagents-stop",
+        "subagents-guide",
+        "subagents-refine",
+        "subagents",
+        "subagents-detach",
+        "subagents-steer",
+        "subagents-inspect-rpc",
+    ];
 
-    /// Upstream's `registerSlashCommands` registers R-SA-129's twelve AND — at
-    /// `pi-subagents/src/slash/slash-commands.ts:795-800` @v0.43.0 —
-    /// `registerPromptWorkflowCommands({ pi, run })`, which registers two more on the SAME command
-    /// surface: `pi.registerCommand("prompt-workflow", …)` (`slash/prompt-workflows.ts:269`) and
-    /// `pi.registerCommand("chain-prompts", …)` (`:303`). G92 adds a THIRD such command,
-    /// `pi.registerCommand("subagents-fleet", …)` (`slash-commands.ts:714-717` @v0.43.0), which
-    /// `registerSlashCommands` registers DIRECTLY, three lines above that
-    /// `registerPromptWorkflowCommands` hop. G77 adds a FOURTH, `pi.registerCommand(
-    /// "subagents-stop", …)` (`slash-commands.ts:751-792` @v0.43.0), registered by that same
-    /// `registerSlashCommands` call. SUBA-066 adds a FIFTH, `pi.registerCommand("subagents-guide",
-    /// …)` (`slash-commands.ts:706-719` @v0.47.1). This table registers all seventeen, so the count
-    /// is seventeen. The twelve are still pinned exactly, as a prefix, below.
+    /// The registered palette is exactly upstream's eighteen, in this order.
     ///
-    /// **Pre-SUBA-066 this asserted `+ 4` and the tail had four entries**, because
-    /// `/subagents-guide` did not exist — a user who read pi's docs and typed it got an unknown
-    /// command.
+    /// *Fails if gutted:* adding a nineteenth descriptor, dropping one of the eighteen, or
+    /// reordering the table all change `actual` — this is the single assertion that keeps the
+    /// registration table and upstream's own `registerCommand` list from drifting apart, in either
+    /// direction.
     #[test]
-    fn slash_commands_table_has_the_twelve_plus_the_six_extra_commands() {
-        assert_eq!(SLASH_COMMANDS.len(), R_SA_129_COMMAND_COUNT + 6);
-        let tail: Vec<&str> = SLASH_COMMANDS
-            .iter()
-            .skip(R_SA_129_COMMAND_COUNT)
-            .map(|d| d.name.as_str())
-            .collect();
-        assert_eq!(
-            tail,
-            [
-                "prompt-workflow",
-                "chain-prompts",
-                "subagents-fleet",
-                "subagents-stop",
-                "subagents-guide",
-                // VL-S13 — `/subagents-refine` (pi `slash/slash-commands.ts:960` @v0.68.0). Like
-                // the five above it, NOT one of R-SA-129's twelve; registered by the same
-                // `registerSlashCommands` call.
-                "subagents-refine",
-            ]
-        );
+    fn slash_commands_table_is_exactly_upstreams_eighteen_commands() {
+        let actual: Vec<&str> = SLASH_COMMANDS.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(actual, EXPECTED_COMMAND_NAMES);
+    }
+
+    /// VL-S12 (spec §I.4) — the four commands upstream DELETED at v0.41.0 are gone from the
+    /// palette, and the palette is the eighteen that replaced them.
+    ///
+    /// `/chain`, `/parallel` and `/run-chain` were R-SA-129 commands; `/chain-prompts` was
+    /// `registerPromptWorkflowCommands`' second registration. At the pinned v0.68.0 tag none of
+    /// the four is registered: `slash-commands.ts:869-1283` lists seventeen `pi.registerCommand`
+    /// calls with no `chain`/`parallel`/`run-chain` among them, and `prompt-workflows.ts:254`
+    /// registers only `prompt-workflow` (`"chain-prompts"` appears there solely in the
+    /// RESERVED_COMMAND_NAMES set at `:24`, so no `prompts/*.md` recipe can claim the name).
+    ///
+    /// The surviving eighteen, all named by [`EXPECTED_COMMAND_NAMES`]: `/run`, `/subagent-cost`,
+    /// `/subagents-doctor`, `/subagents-models`, `/subagents-profiles`, `/subagents-load-profile`,
+    /// `/subagents-refresh-provider-models`, `/subagents-generate-profiles`,
+    /// `/subagents-check-profile`, `/prompt-workflow`, `/subagents-fleet`, `/subagents-stop`,
+    /// `/subagents-guide`, `/subagents-refine`, `/subagents`, `/subagents-detach`,
+    /// `/subagents-steer`, `/subagents-inspect-rpc`.
+    ///
+    /// *Fails if gutted:* restoring any one of the four deleted variants gives it a descriptor,
+    /// which makes [`SlashCommandName::from_str_exact`] answer `Some(..)` for that name AND bumps
+    /// `SLASH_COMMANDS.len()` to 19 — the mutation this test exists to catch is exactly a revert
+    /// of the VL-S12 deletion, whether it comes back through the enum or only through the table.
+    #[test]
+    fn the_four_commands_upstream_deleted_at_v0_41_0_are_not_registered() {
+        for deleted in ["chain", "parallel", "run-chain", "chain-prompts"] {
+            assert_eq!(
+                SlashCommandName::from_str_exact(deleted),
+                None,
+                "/{deleted} was deleted upstream at v0.41.0 and must not resolve to a variant"
+            );
+            assert!(
+                !SLASH_COMMANDS.iter().any(|d| d.name.as_str() == deleted),
+                "/{deleted} must not have a descriptor in the registration table"
+            );
+        }
+        assert_eq!(SLASH_COMMANDS.len(), 18);
     }
 
     /// SUBA-055/SUBA-066: the slash surface and the tool surface must resolve the SAME topics. A
@@ -1907,30 +1634,6 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), original_len, "duplicate command name found");
-    }
-
-    #[test]
-    fn slash_commands_table_matches_r_sa_129s_exact_list() {
-        let expected = [
-            "run",
-            "chain",
-            "parallel",
-            "run-chain",
-            "subagent-cost",
-            "subagents-doctor",
-            "subagents-models",
-            "subagents-profiles",
-            "subagents-load-profile",
-            "subagents-refresh-provider-models",
-            "subagents-generate-profiles",
-            "subagents-check-profile",
-        ];
-        let actual: Vec<&str> = SLASH_COMMANDS
-            .iter()
-            .take(R_SA_129_COMMAND_COUNT)
-            .map(|d| d.name.as_str())
-            .collect();
-        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2415,58 +2118,6 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
-    // parse_agent_args (shared /chain, /parallel grammar)
-    // ---------------------------------------------------------------------------------------
-
-    #[test]
-    fn parse_agent_args_chain_arrow_form() {
-        let parsed =
-            parse_agent_args("scout \"a\" -> writer \"b\"", AgentArgsCommand::Chain).expect("ok");
-        assert_eq!(parsed.steps.len(), 2);
-    }
-
-    #[test]
-    fn parse_agent_args_dash_delimited_shared_task_form() {
-        let parsed =
-            parse_agent_args("scout writer -- shared task", AgentArgsCommand::Chain).expect("ok");
-        assert_eq!(parsed.steps.len(), 2);
-        assert_eq!(parsed.task, "shared task");
-    }
-
-    #[test]
-    fn parse_agent_args_chain_requires_first_step_task() {
-        let err = parse_agent_args("scout -> writer \"b\"", AgentArgsCommand::Chain)
-            .expect_err("first step has no task");
-        assert!(err.message.contains("First step must have a task"));
-    }
-
-    #[test]
-    fn parse_agent_args_parallel_requires_at_least_one_task() {
-        let err = parse_agent_args("scout -> writer", AgentArgsCommand::Parallel)
-            .expect_err("no task anywhere");
-        assert!(err.message.contains("At least one step must have a task"));
-    }
-
-    #[test]
-    fn parse_agent_args_parallel_allows_first_step_without_task_if_another_has_one() {
-        let parsed = parse_agent_args("scout -> writer \"b\"", AgentArgsCommand::Parallel)
-            .expect("parallel does not require the FIRST step specifically to have a task");
-        assert_eq!(parsed.steps.len(), 2);
-    }
-
-    #[test]
-    fn parse_agent_args_missing_dash_delimiter_errors() {
-        let err = parse_agent_args("scout writer", AgentArgsCommand::Chain).expect_err("no --");
-        assert!(err.message.starts_with("Usage:"));
-    }
-
-    #[test]
-    fn parse_agent_args_empty_input_errors() {
-        let err = parse_agent_args("", AgentArgsCommand::Chain).expect_err("empty");
-        assert!(err.message.starts_with("Usage:"));
-    }
-
-    // ---------------------------------------------------------------------------------------
     // parse_run_command
     // ---------------------------------------------------------------------------------------
 
@@ -2513,141 +2164,6 @@ mod tests {
         let parsed = parse_run_command("scout[reads=a.md+b.md] summarize").expect("ok");
         assert!(parsed.task.starts_with("[Read from: a.md, b.md]"));
         assert!(parsed.task.ends_with("summarize"));
-    }
-
-    // ---------------------------------------------------------------------------------------
-    // parse_chain_command (end-to-end, both grammar branches)
-    // ---------------------------------------------------------------------------------------
-
-    #[test]
-    fn parse_chain_command_simple_chain_produces_single_steps() {
-        let parsed = parse_chain_command("scout \"a\" -> writer \"b\"").expect("ok");
-        assert_eq!(parsed.chain.len(), 2);
-        assert!(matches!(parsed.chain[0], RunnerStep::SingleStep(_)));
-        assert!(matches!(parsed.chain[1], RunnerStep::SingleStep(_)));
-    }
-
-    #[test]
-    fn parse_chain_command_with_inline_group_produces_parallel_group_step() {
-        let parsed =
-            parse_chain_command("scout \"a\" -> (writer \"b\" | reviewer \"c\") -> planner \"d\"")
-                .expect("ok");
-        assert_eq!(parsed.chain.len(), 3);
-        assert!(matches!(parsed.chain[0], RunnerStep::SingleStep(_)));
-        match &parsed.chain[1] {
-            RunnerStep::ParallelGroup(spec) => assert_eq!(spec.steps.len(), 2),
-            other => panic!("expected ParallelGroup, got {other:?}"),
-        }
-        assert!(matches!(parsed.chain[2], RunnerStep::SingleStep(_)));
-    }
-
-    #[test]
-    fn parse_chain_command_propagates_bg_and_fork_flags() {
-        let parsed = parse_chain_command("scout \"a\" -> writer \"b\" --bg --fork").expect("ok");
-        assert!(parsed.flags.background && parsed.flags.fork);
-    }
-
-    #[test]
-    fn parse_chain_command_shared_dash_task_applies_only_to_the_first_step() {
-        // Faithful port of source's `mapParsedTaskToStepObject(step, parsed.task || undefined, i
-        // === 0, ...)` (`slash-commands.ts:901-903`): the shared `-- task` fallback is applied
-        // ONLY to the first step (`isFirst`), never to every step in the chain — a later step
-        // with no task of its own is left with an empty task. This may look surprising for a
-        // "shared task" but is exactly source's own documented precedence
-        // (`mapParsedTaskToStepObject`'s doc comment, `slash-commands.ts:863-866`), preserved here
-        // deliberately rather than "fixed" to a friendlier-seeming behavior this port must not
-        // silently diverge from.
-        let parsed = parse_chain_command("scout writer -- shared").expect("ok");
-        assert_eq!(parsed.chain.len(), 2);
-        match &parsed.chain[0] {
-            RunnerStep::SingleStep(spec) => assert_eq!(spec.task, "shared"),
-            other => panic!("expected SingleStep, got {other:?}"),
-        }
-        match &parsed.chain[1] {
-            RunnerStep::SingleStep(spec) => assert_eq!(spec.task, ""),
-            other => panic!("expected SingleStep, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_chain_command_group_task_without_its_own_task_errors() {
-        let err = parse_chain_command("scout \"a\" -> (writer \"b\" | reviewer)")
-            .expect_err("reviewer has no task of its own inside the group");
-        assert!(
-            err.message
-                .contains("Each task in a parallel group needs a task")
-        );
-    }
-
-    #[test]
-    fn parse_chain_command_rejects_invalid_inline_acceptance() {
-        let err = parse_chain_command("scout[acceptance=verified] \"a\" -> writer \"b\"")
-            .expect_err("verified is not allowed on the slash surface");
-        assert!(err.message.contains("supports auto, attested, or checked"));
-    }
-
-    #[test]
-    fn parse_chain_command_group_options_thread_through_to_parallel_group_spec() {
-        let parsed = parse_chain_command(
-            "scout \"a\" -> (writer \"b\" | reviewer \"c\")[concurrency=2,worktree] -> planner \"d\"",
-        )
-        .expect("ok");
-        match &parsed.chain[1] {
-            RunnerStep::ParallelGroup(spec) => {
-                assert_eq!(spec.concurrency, 2);
-                assert!(spec.worktree);
-            }
-            other => panic!("expected ParallelGroup, got {other:?}"),
-        }
-    }
-
-    // ---------------------------------------------------------------------------------------
-    // parse_parallel_command
-    // ---------------------------------------------------------------------------------------
-
-    #[test]
-    fn parse_parallel_command_two_tasks() {
-        let parsed = parse_parallel_command("scout \"a\" -> writer \"b\"").expect("ok");
-        assert_eq!(parsed.tasks.len(), 2);
-        assert_eq!(parsed.tasks[0].task, "a");
-        assert_eq!(parsed.tasks[1].task, "b");
-    }
-
-    #[test]
-    fn parse_parallel_command_shared_task_applied_to_steps_without_their_own() {
-        let parsed = parse_parallel_command("scout writer -- shared").expect("ok");
-        assert_eq!(parsed.tasks.len(), 2);
-        assert!(parsed.tasks.iter().all(|t| t.task == "shared"));
-    }
-
-    // ---------------------------------------------------------------------------------------
-    // parse_run_chain_command
-    // ---------------------------------------------------------------------------------------
-
-    #[test]
-    fn parse_run_chain_command_basic() {
-        let parsed = parse_run_chain_command("my-chain -- do the thing").expect("ok");
-        assert_eq!(parsed.chain_name, "my-chain");
-        assert_eq!(parsed.task, "do the thing");
-    }
-
-    #[test]
-    fn parse_run_chain_command_with_flags() {
-        let parsed = parse_run_chain_command("my-chain -- do it --bg").expect("ok");
-        assert_eq!(parsed.task, "do it");
-        assert!(parsed.flags.background);
-    }
-
-    #[test]
-    fn parse_run_chain_command_missing_delimiter_errors() {
-        let err = parse_run_chain_command("my-chain do the thing").expect_err("no --");
-        assert!(err.message.starts_with("Usage:"));
-    }
-
-    #[test]
-    fn parse_run_chain_command_empty_chain_name_errors() {
-        let err = parse_run_chain_command(" -- do the thing").expect_err("empty chain name");
-        assert!(err.message.starts_with("Usage:"));
     }
 
     // ---------------------------------------------------------------------------------------

@@ -371,6 +371,7 @@ pub(crate) fn test_single_result(agent: &str, exit_code: i32) -> SingleResult {
         transcript_error: None,
         acceptance: None,
         detached: false,
+        detached_reason: None,
         interrupted: false,
         timed_out: false,
         timeout_recovery: None,

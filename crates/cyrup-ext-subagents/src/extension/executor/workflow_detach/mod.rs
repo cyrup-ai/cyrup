@@ -9,18 +9,38 @@
 //!
 //! Upstream's caller is the `onDetachedExit` closure (`subagent-executor.ts:3951-3976`), fired by
 //! `execution.ts:2364` when a child detached through `detachForeground` eventually terminates.
-//! **cyrup's equivalent moment is earlier, not absent.** `detachForeground` returns the tool call
-//! early and leaves the child running, so upstream has to wait for an exit it no longer drives;
-//! cyrup's drive loop keeps driving a detached child to its real exit — a blocking
-//! `contact_supervisor` ask fires `spawn_clarify` and the loop CONTINUES
-//! (`exec/drive_attempt.rs:345-367`), the answer riding back over the broker rather than this
-//! stdout pipe — so [`crate::exec::SingleResult::detached`] arrives on an ALREADY-SETTLED result.
-//! Upstream's two moments ("the workflow parks at paused", "its detached child exits") therefore
-//! collapse into one, at the foreground workflow's settlement:
+//! **For the detach this module reconciles — the INTERCOM one — cyrup's equivalent moment is
+//! earlier, not absent.**
+//!
+//! Upstream has TWO detach producers and cyrup now has both, but only one of them reaches this
+//! module. `detachForeground("intercom coordination")` (`execution.ts:762`) returns upstream's
+//! tool call early and leaves the child running, so upstream has to wait for an exit it no longer
+//! drives; **cyrup's intercom detach does not return early** — a blocking `contact_supervisor` ask
+//! fires `spawn_clarify` and the drive loop CONTINUES (`exec/drive_attempt.rs:345-367`), the answer
+//! riding back over the broker rather than this stdout pipe — so on THAT path
+//! [`crate::exec::SingleResult::detached`] arrives on an ALREADY-SETTLED result. Upstream's two
+//! moments ("the workflow parks at paused", "its detached child exits") therefore collapse into
+//! one, at the foreground workflow's settlement:
 //! [`crate::extension::executor::workflow::WorkflowRunHost`] records each detached child's settled
 //! result as it is returned from `launch`, `extension/tool/routing.rs`'s failure arm parks a
 //! `detached-child` rejection at `Paused` (pi's own shape, `subagent-executor.ts:5757-5763`), and
 //! its `reconcile_detached_workflow_children` drives this reconciler over each of them.
+//!
+//! **The other producer does return early, and this module is not its reconciler.**
+//! `/subagents-detach` (VL-S11b, `extension/host/slash_detach.rs`) hands a live foreground child to
+//! a continuation task and returns a receipt immediately — cyrup's only split-`await` detach, and
+//! upstream's shape exactly. Its reconciler is upstream's OTHER one,
+//! `updateRememberedForegroundChild` (`subagent-executor.ts:850-899`), ported as
+//! `reconcile_detached_foreground_child` next to the producer that owns it
+//! (`extension/executor/foreground.rs`), because the run it targets is a plain `/run` SINGLE with
+//! no workflow status to settle, no `WorkflowKey` and no `find_workflow_settlement_step` to find.
+//!
+//! A user detach aimed at a workflow CHILD is not refused (every control this crate publishes
+//! carries `mode: Single`), and its receipt then arrives here looking exactly like an
+//! intercom-detached settled result. What this module writes is correct for that moment and
+//! provisional for the exit that has not happened yet — see
+//! `workflow_launch.rs`'s `reconcile_detached_workflow_children` doc for the full statement of
+//! what is and is not closed there.
 //!
 //! So the reconciler's input is the run DIRECTORY plus a settled child result. Every value
 //! upstream reads off in-process state has a durable source — `state.asyncJobs.get(id)?.asyncDir`

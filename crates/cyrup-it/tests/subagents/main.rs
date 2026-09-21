@@ -53,8 +53,16 @@
 //! `env_overlay`, `NativeSupervisorChannel::with_root`, and the `_in`/`_with`/`_from` injected
 //! cores across `nested_events`, `registration` and `paths`. No `unsafe` and no lock is involved.
 //!
-//! NOTHING in this binary mutates the process environment any more, so there is no `unsafe` and no
-//! lock left to reason about. The last holdout was `background_cascade_integration`, whose root is
+//! Exactly ONE file in this binary still mutates the process environment, and it says why at its
+//! own `unsafe` block: `subagents_admin_integration`'s
+//! `an_extra_agent_dirs_agent_refuses_a_model_edit_as_read_only` sets
+//! `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS`, which `AgentDiscoveryConfig::with_env_extras`
+//! (`discovery/mod.rs:741-744`) reads from `std::env` directly with no injected lookup — and which
+//! pi's `isReadOnlyExtraAgent` check reads from the same place, so the behaviour under test IS the
+//! variable. It is sound because `cargo nextest` gives every test its own process (see the
+//! invocation note below) and nothing else in this binary reads that key. Every OTHER file names
+//! what it needs explicitly, through the seams listed above; the last holdout was
+//! `background_cascade_integration`, whose root is
 //! read MID-RUN by the cascade: `paths::Roots` is resolved once in `run_with` and carried on the
 //! per-run `TurnLoopIo` that `check_stop_flag`, `check_timeout_flag`, `check_interrupt_flag` and
 //! `settle_step_result` already share, so that read sees the caller's tree with no signature change
@@ -112,6 +120,9 @@ mod discovery_project_root_wiring_integration;
 mod extension_end_to_end_smoke;
 mod management_actions_tool_dispatch_integration;
 mod registration_commands_integration;
+// VL-S11a — `/subagents`, the admin surface. It writes real `settings.json` files under a
+// sandboxed root and, in its extra-dirs case, is this binary's one environment mutator.
+mod subagents_admin_integration;
 mod subagents_optin_gate_integration;
 mod wait_tool_registration_integration;
 mod watchdog_model_turn_integration;
@@ -142,4 +153,13 @@ mod inspector_runner_subcommand_integration;
 mod prompt_workflow_commands_integration;
 mod refinement_proposal_refusal_integration;
 mod slash_command_dispatch_integration;
+// VL-S11b — `/subagents-detach`. Drives a real foreground child to the point of detachment and
+// then proves, through `/proc`, that the child outlived the command. `#[cfg(unix)]` because that
+// liveness probe is `/proc`- and `kill(1)`-based, exactly as
+// `background_spawn_detached_integration`'s is.
+#[cfg(unix)]
+mod subagents_detach_integration;
+// VL-S11's two closing registrations: `/subagents-steer` over a live async run, and
+// `/subagents-inspect-rpc`'s emit-then-retract widget pair.
 mod subagent_tool_renderer_integration;
+mod subagents_steer_and_inspect_rpc_integration;

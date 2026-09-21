@@ -1,7 +1,12 @@
 //! Integration tests for Tier-1 (P1): the `subagent` tool's top-level PARALLEL (`tasks[]`) and
 //! CHAIN (`chain[]`) dispatch arms, the per-task `count` fan-out multiplier, duplicate-output-path
-//! rejection, and the inline `[k=v]` step-override application path (`/run [model=…]`, `/chain`
-//! inline-group `[count=…]`, per-step `[model=…]`).
+//! rejection, and the step-override application path — `/run`'s surviving inline `[model=…]`, and
+//! the tool-side `count`/`model` overrides on a chain step.
+//!
+//! VL-S12 note: the mixed-group `count` case (test 6) used to drive `/chain`, which upstream
+//! deleted at v0.41.0. It now drives the same accounting through `subagent({ chain: […] })` — see
+//! that test's own doc for why this is a re-point rather than a deletion. `/run` is untouched:
+//! upstream keeps it.
 //!
 //! No mocking anywhere (this crate's standing convention): every dispatch below drives the REAL
 //! `cyrup_core::Tool::execute` / `NativeExtension::execute_command` path, which spawns REAL child OS
@@ -382,48 +387,67 @@ async fn slash_run_inline_model_override_reaches_the_child() {
 }
 
 // =============================================================================================
-// (6) /chain inline group `[count=N]`: the slash inline-override count fan-out.
+// (6) chain[] mixed group `count`: a counted task ALONGSIDE a sibling, behind a seed step.
 // =============================================================================================
 
-/// `/chain worker "seed" -> (worker[count=2] "a" | worker "b")` widens the inline parallel group:
-/// the `[count=2]` task expands to two children which, with the sibling `worker "b"`, makes THREE
-/// real children in the group (the slash `[count=…]` inline-override path, previously
-/// parsed-then-dropped). A parallel group needs ≥2 declared tasks (pi grammar), so `count` is
-/// exercised alongside a sibling task rather than as a lone single-task group.
+/// A seed step followed by a parallel group in which ONE task carries `count: 2` and another does
+/// not: the counted task expands to two children which, with the sibling, makes THREE real
+/// children in the group.
+///
+/// # VL-S12: re-pointed, not deleted
+///
+/// This test used to drive `/chain worker "seed" -> (worker[count=2] "a" | worker "b")` — the
+/// slash inline-override `[k=v]` path. Upstream deleted `/chain` at v0.41.0 and VL-S12 removes it
+/// here, so that entry point is gone. What the test actually pinned is NOT the entry point: it is
+/// the COUNT ACCOUNTING inside a mixed parallel group (a counted task expands to exactly `count`
+/// children and its uncounted sibling still contributes one), and that accounting is still
+/// reached, through the `subagent` tool's own `chain[]` arm — `parse_tool_chain_items`
+/// (`extension/tool/task_items.rs:522`) → `chain_step_to_runner_step`
+/// (`discovery/chains.rs:1057`). So the shape is re-pointed at the surviving surface and the
+/// coverage is kept rather than lost with the command.
+///
+/// It is NOT a duplicate of (4). (4) is a lone single-task group with no seed step, so it can only
+/// ever prove that `count` multiplies; this one proves the counted task does not SWALLOW its
+/// sibling (the `child 3` assertion) and does not over-expand (the `child 4` assertion), and that
+/// the group is the chain's SECOND step rather than its first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn slash_chain_inline_group_count_multiplies_fan_out() {
+async fn tool_chain_mixed_group_count_multiplies_only_the_counted_task() {
     let work_dir = tempfile::tempdir().expect("real tempdir");
     write_fixture_persona(work_dir.path(), "worker");
-    let script_path = write_script(work_dir.path(), &echo_argv_script("SLASH_COUNT_CHILD"));
+    let script_path = write_script(work_dir.path(), &echo_argv_script("MIXED_COUNT_CHILD"));
 
     let ext = SubagentsExtension::with_config_and_cwd(
         scoped_config(work_dir.path(), &script_path),
         work_dir.path().to_path_buf(),
     );
-    let ctx = command_ctx(work_dir.path());
 
-    let output = ext
-        .execute_command(
-            "chain",
-            "worker \"seed\" -> (worker[count=2] \"a\" | worker \"b\")",
-            &ctx,
-        )
-        .await
-        .expect("execute_command does not error")
-        .expect("chain produces textual output");
+    let result = dispatch_tool(
+        &ext,
+        serde_json::json!({
+            "chain": [
+                { "agent": "worker", "task": "seed" },
+                { "parallel": [
+                    { "agent": "worker", "task": "a", "count": 2 },
+                    { "agent": "worker", "task": "b" },
+                ] },
+            ]
+        }),
+    )
+    .await;
+    let output = tool_result_text(&result);
 
-    // step 1 is the seed single-step; step 2 is the group, widened to 3 children by [count=2] + 1.
+    // step 1 is the seed single-step; step 2 is the group, widened to 3 children by count 2 + 1.
     assert!(
         output.contains("step 2: ok (parallel group)"),
         "got: {output}"
     );
     assert!(
         output.contains("child 3: ok"),
-        "the [count=2] task + its sibling must fan out to three group children: {output}"
+        "the counted task + its uncounted sibling must fan out to three group children: {output}"
     );
     assert!(
         !output.contains("child 4:"),
-        "exactly three children — [count=2] must expand to two, not more: {output}"
+        "exactly three children — `count: 2` must expand to two, not more: {output}"
     );
 }
 

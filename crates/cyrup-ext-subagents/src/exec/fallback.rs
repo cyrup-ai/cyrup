@@ -1524,6 +1524,23 @@ pub struct AttemptSignal {
     /// `AskLock` degrades to its no-live-channel fallback (`ClarifyOutcome::NoLiveChannel`), never
     /// blocking. **Do not fabricate a synthetic trigger** from output-text heuristics — the trigger
     /// is a real `contact_supervisor` blocking-ask event on the child's own wire.
+    ///
+    /// # VL-S11b — this flag is upstream's INTERCOM producer, and it is now named as such
+    ///
+    /// This flag being `true` IS upstream's `detachForeground("intercom coordination")`
+    /// (`execution.ts:762`) and nothing else — it is the only detach `run_sync` can observe. So
+    /// `extension::executor::detach::DetachReason::IntercomCoordination` is the reason a
+    /// result carrying it detached for, and `run_foreground_impl`'s
+    /// `stamp_intercom_detach_reason` (`extension/executor/foreground.rs`) writes exactly that
+    /// onto [`crate::exec::SingleResult::detached_reason`]. The stamp lives up there rather than
+    /// beside the flag because `crate::exec` sits BELOW `crate::extension` and cannot name that
+    /// module's closed vocabulary; `run_sync`'s own `detached_reason: None` carries the same note.
+    ///
+    /// The OTHER producer, `/subagents-detach`, never sets this flag: it never reaches the ladder
+    /// at all. It mints its receipt in `extension/executor/foreground.rs`'s `detach_receipt` and
+    /// returns while the same child keeps being driven in a continuation task, so its `detached`
+    /// result is a receipt this ladder never produced rather than an attempt outcome it
+    /// classified.
     pub detached: bool,
     /// SUBA-089 — the `errorMessage` of every message the child emitted this attempt, in order
     /// (pi `messageError(message)` over `result.messages`/`run.messages`, `model-fallback.ts:524-528`

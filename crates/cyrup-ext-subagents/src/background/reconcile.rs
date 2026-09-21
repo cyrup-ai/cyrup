@@ -849,6 +849,7 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             transcript_error: step.transcript_error.clone(),
             acceptance: None,
             detached: false,
+            detached_reason: None,
             interrupted: false,
             timed_out: false,
             // Synthesized from a status step cyrup could not read a result for — any recovery
@@ -916,6 +917,7 @@ pub(crate) fn placeholder_result(
         transcript_error: None,
         acceptance: None,
         detached: false,
+        detached_reason: None,
         interrupted: false,
         timed_out: false,
         timeout_recovery: None,

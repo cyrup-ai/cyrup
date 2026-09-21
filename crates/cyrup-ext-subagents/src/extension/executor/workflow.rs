@@ -1732,6 +1732,7 @@ mod tests {
         let run_id = crate::background::RunId::new().as_str().to_string();
         let (turn_count, tool_count, tokens) = counters;
         let entry = ForegroundControlEntry {
+            detach: None,
             interrupt: CancelToken::new(),
             current_agent: Some("worker".to_string()),
             current_index: Some(0),

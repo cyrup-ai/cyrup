@@ -1,11 +1,24 @@
-//! Integration test: `/prompt-workflow` and `/chain-prompts` are REACHABLE (G93).
+//! Integration test: `/prompt-workflow` is REACHABLE (G93).
 //!
 //! The crate shipped seven `prompts/*.md` recipes under `resources/prompts/` and a discovery
 //! function for them (`registration::resources::bundled_prompt_files`) whose only caller was that
-//! module's own `#[cfg(test)]` block. Upstream reaches those recipes through two slash commands
-//! registered by `registerPromptWorkflowCommands` (`pi-subagents/src/slash/prompt-workflows.ts:269,
-//! 303` @v0.34.0), itself called from `registerSlashCommands` (`slash/slash-commands.ts:795-800`)
-//! which the extension entry point calls at `extension/index.ts:605`.
+//! module's own `#[cfg(test)]` block. Upstream reaches those recipes through
+//! `registerPromptWorkflowCommands` (`pi-subagents/src/slash/prompt-workflows.ts:269` @v0.34.0),
+//! itself called from `registerSlashCommands` (`slash/slash-commands.ts:795-800`) which the
+//! extension entry point calls at `extension/index.ts:605`.
+//!
+//! # VL-S12: `/chain-prompts` is gone, its capability is not
+//!
+//! This file registered and drove `/chain-prompts` alongside `/prompt-workflow`. Upstream DELETED
+//! that command at v0.41.0 and VL-S12 removes it here, so the three tests that named it are gone
+//! with it. The capability under it survives on the OTHER command: a recipe whose own `chain:`
+//! frontmatter names further recipes still expands to a multi-step chain through
+//! `slash_prompt_workflow` (pi `prompt-workflows.ts:286-295`), reaching the SAME
+//! `build_chain_steps`/`split_prompt_chain`/`run_prompt_workflow_chain` trio. That surviving
+//! branch is pinned in-crate, at
+//! `extension/host/mod.rs::prompt_workflows_chain_frontmatter_still_expands_to_multiple_steps`,
+//! which asserts the step counts through a spawn cap and so needs no child process; duplicating it
+//! here would buy nothing.
 //!
 //! Every test here drives the REAL user entry point, not the ported functions:
 //! `ExtensionHost::execute_native_command` — the exact call
@@ -70,10 +83,15 @@ async fn slash(host: &ExtensionHost, name: &str, args: &str) -> String {
         .expect("the handler returns transcript text")
 }
 
-/// Registration proof: both commands are in the host's native command table after `init`, so the
-/// session's `try_execute_extension_command` can route `/prompt-workflow` at all.
+/// Registration proof: `/prompt-workflow` is in the host's native command table after `init`, so
+/// the session's `try_execute_extension_command` can route it at all — and the four commands
+/// upstream deleted at v0.41.0 are NOT.
+///
+/// The negative half is VL-S12's palette assertion at the surface that actually matters. A
+/// deleted `SlashCommandName` variant whose descriptor was left behind in `SLASH_COMMANDS` still
+/// shows up here, advertised to the user and dispatching into nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn both_prompt_commands_are_registered_with_the_host() {
+async fn prompt_workflow_is_registered_and_the_four_deleted_commands_are_not() {
     let dir = tempfile::tempdir().unwrap();
     let host = host_at(dir.path(), None).await;
     let names = host.native_command_names();
@@ -81,10 +99,13 @@ async fn both_prompt_commands_are_registered_with_the_host() {
         names.iter().any(|n| n == "prompt-workflow"),
         "/prompt-workflow must be registered: {names:?}"
     );
-    assert!(
-        names.iter().any(|n| n == "chain-prompts"),
-        "/chain-prompts must be registered: {names:?}"
-    );
+    for gone in ["chain", "parallel", "run-chain", "chain-prompts"] {
+        assert!(
+            !names.iter().any(|n| n == gone),
+            "/{gone} was deleted upstream at v0.41.0 and must not be advertised by the host: \
+             {names:?}"
+        );
+    }
 }
 
 /// THE reachability proof for the seven bundled recipes: typing `/prompt-workflow list` names every
@@ -124,10 +145,6 @@ async fn prompt_workflow_list_names_every_bundled_recipe() {
         bare, output,
         "a bare invocation lists exactly as `list` does"
     );
-
-    // pi `:308-310` — `/chain-prompts` with an empty declaration lists the same set.
-    let chain_list = slash(&host, "chain-prompts", "").await;
-    assert_eq!(chain_list, output);
 }
 
 /// A PROJECT recipe is discovered through the same command, and shadows a bundled one by name
@@ -168,27 +185,41 @@ async fn an_unknown_recipe_name_is_refused() {
     );
 }
 
-/// A `/chain-prompts` declaration naming an unresolvable recipe fails the WHOLE expansion with
-/// pi's exact message (`:321`), rather than silently running the steps that did resolve.
+/// A chain naming an unresolvable recipe fails the WHOLE expansion with pi's exact message
+/// (`prompt-workflows.ts:290`), rather than silently running the steps that did resolve.
 ///
-/// (Upstream's `names.length === 0` usage-line branch at `:314-316` is not exercised here because
-/// it is unreachable through this entry point: `splitChainDeclaration` trims the declaration
-/// (`:216`), the empty declaration is already handled by the `list` branch at `:308`, and
-/// `splitPromptChain` splits on the literal `" -> "` — so any surviving declaration yields at
-/// least one name. The branch is ported for fidelity; the reachable failure is this one.)
+/// # VL-S12: re-pointed from `/chain-prompts`, not deleted
+///
+/// This assertion used to be made through `/chain-prompts a -> no-such -- args` (pi `:321`'s
+/// owner-less wording). That command is gone, but the refusal is not: `build_chain_steps` is
+/// still reached from `slash_prompt_workflow`'s `chain:` frontmatter branch (`:286-295`), which
+/// names the OWNING recipe, so the surviving sentence is upstream's `:290` form —
+/// `Unknown prompt workflow in chain '<owner>': <step>`. Same guard, same failure mode, the one
+/// entry point that still exists.
+///
+/// Gutted: let `build_chain_steps` skip an unresolvable step instead of failing → the expansion
+/// succeeds with one step and this assertion sees a run report instead of the refusal. Drop the
+/// `chain:` branch entirely → `outer`'s own (empty) body runs as a single recipe and the
+/// assertion sees that instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chain_prompts_refuses_a_chain_containing_an_unknown_recipe() {
+async fn a_recipe_chain_naming_an_unknown_recipe_refuses_the_whole_expansion() {
     let dir = tempfile::tempdir().unwrap();
-    let host = host_at(dir.path(), None).await;
-    let output = slash(
-        &host,
-        "chain-prompts",
-        "parallel-research -> no-such -- do it",
+    let prompts = dir.path().join(".cyrup").join("prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(
+        prompts.join("outer.md"),
+        "---\ndescription: an outer recipe whose chain names a missing step\n\
+         chain: parallel-research -> no-such\n---\nnever runs\n",
     )
-    .await;
+    .unwrap();
+
+    // No fixture binary is configured: if the expansion wrongly SUCCEEDED and tried to run, the
+    // spawn would fail loudly rather than quietly passing this assertion.
+    let host = host_at(dir.path(), None).await;
+    let output = slash(&host, "prompt-workflow", "outer do it").await;
     assert!(
-        output.contains("Unknown prompt workflow: no-such"),
-        "got: {output}"
+        output.contains("Unknown prompt workflow in chain 'outer': no-such"),
+        "pi `:290`'s sentence, naming the owning recipe; got: {output}"
     );
 }
 
@@ -253,22 +284,35 @@ async fn a_recipe_runs_through_a_real_child_process() {
     );
 }
 
-/// `/chain-prompts a -> b -- args` runs BOTH recipes as one native chain through the same
-/// `run_or_background_chain` walker `/chain` uses (pi hands the lowered `chain` array to the one
-/// executor, `prompt-workflows.ts:319-324` @v0.34.0).
+/// A recipe whose own `chain:` frontmatter names two further recipes runs BOTH of them as one
+/// native chain, through the same `run_prompt_workflow_chain` walker (pi hands the lowered
+/// `chain` array to the one executor, `prompt-workflows.ts:286-295` @v0.34.0).
+///
+/// # VL-S12: re-pointed from `/chain-prompts`, not deleted
+///
+/// The declaration used to be typed at `/chain-prompts flow-a -> flow-b -- the backlog`. That
+/// command is gone; the frontmatter form is upstream's other producer of the identical step list
+/// and it reaches `split_prompt_chain` → `build_chain_steps` → `run_prompt_workflow_chain`
+/// unchanged.
+///
+/// This is NOT a duplicate of the in-crate step-count proof at
+/// `extension/host/mod.rs::prompt_workflows_chain_frontmatter_still_expands_to_multiple_steps`,
+/// which counts steps through a one-spawn cap and deliberately spawns nothing. The half only an
+/// IT can make is this one: TWO REAL CHILD PROCESSES ran, and both of their outputs are in the
+/// rendered report.
 // MIGRATION: the original `#[cfg(feature = "test-fixtures")]` here named
 // cyrup-ext-subagents' own bin-gating feature. In cyrup-it that spelling names THIS crate's
 // features, where no `test-fixtures` exists — so this item would have compiled OUT and the
 // test would have passed vacuously. build.rs always builds the fixture binaries, so the gate
 // is now a build-script postcondition. See this target's main.rs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn chain_prompts_runs_every_recipe_as_one_native_chain() {
+async fn a_recipe_chain_declared_in_frontmatter_runs_every_step_as_a_real_child() {
     let dir = tempfile::tempdir().unwrap();
     let agents = dir.path().join(".cyrup").join("agents");
     std::fs::create_dir_all(&agents).unwrap();
     std::fs::write(
         agents.join("recipe-worker.md"),
-        "---\nname: recipe-worker\ndescription: fixture persona for chain-prompts dispatch\n\
+        "---\nname: recipe-worker\ndescription: fixture persona for recipe-chain dispatch\n\
          model: fixture/model\n---\n\nYou are a trivial test persona.\n",
     )
     .unwrap();
@@ -301,13 +345,20 @@ async fn chain_prompts_runs_every_recipe_as_one_native_chain() {
     let script_path = dir.path().join("fixture-script.json");
     std::fs::write(&script_path, script.to_string()).unwrap();
 
-    // SAFETY: as above.
+    // The recipe whose `chain:` frontmatter names the two above — pi `prompt-workflows.ts:286`.
+    std::fs::write(
+        prompts.join("outer.md"),
+        "---\ndescription: outer\nchain: flow-a -> flow-b\n---\nnever runs: $ARGUMENTS\n",
+    )
+    .unwrap();
+
     let host = host_at(dir.path(), Some(&script_path)).await;
-    let output = slash(&host, "chain-prompts", "flow-a -> flow-b -- the backlog").await;
+    let output = slash(&host, "prompt-workflow", "outer the backlog").await;
 
     assert_eq!(
         output.matches("CHAINED_RECIPE_RAN").count(),
         2,
-        "both recipes must have run as chain steps: {output}"
+        "both chained recipes must have run as real children — one occurrence means the \
+         `chain:` branch was skipped and `outer`'s own body ran instead: {output}"
     );
 }

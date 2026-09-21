@@ -28,7 +28,7 @@
 //! `Vec<AgentDefinition>` per tier/scan-scope (each individually already in R-SA-004 alphabetical
 //! scan order) — this module performs no filesystem I/O of its own.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use super::types::{
@@ -139,9 +139,9 @@ pub fn discover_and_merge(
 // -------------------------------------------------------------------------------------------
 
 /// Apply the `subagents.*` settings layer to an already-merged agent map, in place (arch-SA
-/// §6.2.1; a direct port of pi's `applySubagentDefaultModel` + `applyBuiltinOverrides` +
-/// `applyCustomAgentOverrides`, `agents.ts:935-1213`, driven from `discoverAgents`,
-/// `agents.ts:1731-1780`).
+/// §6.2.1; a direct port of pi's `applySubagentDefaultModel` + `applyBuiltinOverrides`
+/// (`agents.ts:1472-1525`) + `applyCustomAgentOverrides` (`agents.ts:1538-1559`), both @v0.68.0,
+/// driven from `discoverAgents`).
 ///
 /// **Tier 7 — real two-scope threading.** [`LayeredOverrideSettings`] carries the user- and
 /// project-scope settings UNFLATTENED (each with its own `settings.json` path), so this function
@@ -157,14 +157,30 @@ pub fn discover_and_merge(
 /// - `applySubagentDefaultModel` (`agents.ts:935-944`; `:1266-1279` @v0.64.0): fill every
 ///   model-less agent from the resolved (project-over-user) `defaultModel`, and (SUBA-088) stamp
 ///   the resolved `defaultProvider` as `model_provider` onto every agent that has not pinned one.
-/// - `applyBuiltinOverrides` (`agents.ts:1039-1092`): for each [`AgentSource::Builtin`] agent, in
-///   pi's exact branch order — project override ▷ project bulk-disable ▷ user override ▷ user
-///   bulk-disable ▷ none — then the `disableThinking` clear (BUILTINS ONLY, skipped when the
-///   winning-scope override already set `thinking`).
-/// - `applyCustomAgentOverrides` (`agents.ts:1193-1213`): for each [`AgentSource::User`]/
-///   [`AgentSource::Project`] agent, project override ▷ user override (fill-unset-only; the applied
-///   `scope` is the SETTINGS scope, never the agent's own source). `systemPrompt` and
-///   `disableBuiltins`/`disableThinking` are BUILTIN-only — custom agents never see them.
+/// - `applyBuiltinOverrides` (`agents.ts:1472-1525` @v0.68.0): for each [`AgentSource::Builtin`]
+///   agent, in pi's exact branch order — project override ▷ project bulk-disable ▷ user override ▷
+///   user bulk-disable ▷ none (`:1492-1524`) — then the `disableThinking` clear (BUILTINS ONLY,
+///   skipped when the winning-scope override already set `thinking`). This ladder is
+///   **winner-take-all**: exactly ONE `applyBuiltinOverride` call runs per builtin agent, and a
+///   project entry therefore drops a user entry's fields outright.
+/// - `applyCustomAgentOverrides` (`agents.ts:1538-1559` @v0.68.0): for each [`AgentSource::User`]/
+///   [`AgentSource::Project`] agent, **user THEN project, cumulatively** — upstream's own comment
+///   at `:1545` reads *"Apply user then project so project fields win without dropping user-only
+///   fields"*, and `:1546-1558` calls `applyCustomAgentOverride` once for the user entry and then
+///   again, on that result, for the project entry. It is NOT winner-take-all, and it is not the
+///   same shape as the builtin ladder above.
+///
+///   **A previous revision of this comment claimed `applyCustomAgentOverrides` lives at
+///   `agents.ts:1193-1213` with "project override ▷ user override" semantics. Both halves were
+///   wrong at the pinned tag** — the line range and the precedence rule — and the code below
+///   implemented the wrong rule, dropping a user-scope key the project entry did not restate.
+///   That is corrected here and in [`apply_custom_agent`]; see that function for what the
+///   cumulative order buys ([`AgentOverrideInfo::field_scopes`] holding two scopes for one field).
+///
+///   The applied `scope`/`settings_path` are the SETTINGS scope, never the agent's own source, and
+///   the LAST pass that applied anything wins them (pi spreads `...meta` last, `agents.ts:1416`).
+///   `systemPrompt` and `disableBuiltins`/`disableThinking` are BUILTIN-only — custom agents never
+///   see them.
 pub fn apply_overrides(
     merged: &mut HashMap<String, AgentDefinition>,
     settings: &LayeredOverrideSettings,
@@ -355,12 +371,21 @@ fn apply_default_extensions(
     }
 }
 
-/// pi `applyBuiltinOverrides`' per-agent body (`agents.ts:1059-1090`) for ONE builtin agent: pick the
-/// single winning override / bulk-disable in pi's exact branch order (project override ▷ project
-/// bulk-disable ▷ user override ▷ user bulk-disable ▷ none), apply it with the true settings scope +
-/// path, then run the `disableThinking` clear unless the winning-scope override explicitly set
-/// `thinking`. Every project-scope branch is additionally gated on the project scope actually
-/// existing (`project_settings_path.is_some()`), matching pi's `projectSettingsPath !== null` guard.
+/// pi `applyBuiltinOverrides`' per-agent body (`agents.ts:1492-1524` @v0.68.0) for ONE builtin
+/// agent: pick the single winning override / bulk-disable in pi's exact branch order (project
+/// override `:1493-1499` ▷ project bulk-disable `:1501-1506` ▷ user override `:1508-1514` ▷ user
+/// bulk-disable `:1516-1521` ▷ none `:1523`), apply it with the true settings scope + path, then
+/// run the `disableThinking` clear unless the winning-scope override explicitly set `thinking`.
+/// Every project-scope branch is additionally gated on the project scope actually existing
+/// (`project_settings_path.is_some()`), matching pi's `projectSettingsPath !== null` guard.
+///
+/// **WINNER-TAKE-ALL, and deliberately unlike [`apply_custom_agent`].** Each upstream branch is its
+/// own `return`, so at most ONE `applyBuiltinOverride` call runs per builtin agent and a project
+/// entry discards a user entry's fields wholesale. The cumulative user-THEN-project rule belongs to
+/// `applyCustomAgentOverrides` (`agents.ts:1538-1559`) alone; applying it here would change
+/// R-SA-012's precedence for builtins, which upstream does not do at any revision of this file.
+/// One consequence worth naming: [`AgentOverrideInfo::field_scopes`] can therefore only ever hold a
+/// SINGLE scope per key for a builtin agent.
 fn apply_builtin_agent(
     agent: &mut AgentDefinition,
     settings: &LayeredOverrideSettings,
@@ -425,9 +450,136 @@ fn disable_delta() -> AgentOverrideConfig {
     }
 }
 
-/// pi `applyBuiltinOverride` (`agents.ts:998-1031`): full-replace every field the delta states
-/// (`Value` sets, `ExplicitClear` resets to the field's absent value, `Unset` is left alone), and
-/// record [`AgentOverrideInfo`] provenance with `base` = the agent snapshot BEFORE this override.
+/// The settings-key spellings [`AgentOverrideInfo::fields`] and
+/// [`AgentOverrideInfo::field_scopes`] are keyed by, for the FULL-REPLACE (builtin) apply path.
+///
+/// pi computes this set as `Object.keys(override)` (`agents.ts:1418` for the union, `:1421` for the
+/// per-field scope accumulation) — the literal JSON keys of the `BuiltinAgentOverrideConfig` entry
+/// as it was written in `settings.json` (`agents.ts:85-112`). They are therefore the **on-disk
+/// camelCase spellings, not this crate's Rust field names**, and they have to stay that way:
+/// `subagents-admin.ts`'s `EditableOverrideField` (`:117`) is the string union
+/// `"model" | "thinking" | "systemPrompt"`, and `savesThroughSettings` (`:129`) tests membership
+/// with `agent.override.fields?.includes(field)` using exactly those strings. Keeping this list in
+/// lockstep with [`AgentOverrideConfig`]'s `#[serde(rename_all = "camelCase")]` field names is what
+/// makes that test mean the same thing here as upstream.
+///
+/// **Divergence, deliberate:** pi keys on *stated*, this keys on *applied*. The two differ on
+/// exactly one key — `description`, whose [`OverrideField::ExplicitClear`] state is reachable from
+/// a settings file here (see [`AgentOverrideConfig::description`]) and is IGNORED by both apply
+/// paths. Recording `description` as an applied field when nothing was written would tell
+/// `savesThroughSettings` that settings own a key settings did not touch, so a bare `false` is
+/// excluded from the set rather than counted. Every other key applies whenever it is present in
+/// any of its three states, so for them "stated" and "applied" coincide.
+///
+/// The list below is [`AgentOverrideConfig`]'s 21 fields, which is NOT upstream's 26 keys: the six
+/// pi declares and this crate does not model (`machine` `:87`, `outputMode` `:89`, `fast` `:93`,
+/// `inheritGlobalContext` `:97`, `acceptanceRole` `:100`, `mutationTools` `:109` — see that type's
+/// doc for why each) cannot be stated in a delta here and so can never be recorded, and
+/// `fallbackModels` runs the other way: it is this crate's own key, with no upstream counterpart in
+/// `BuiltinAgentOverrideConfig`, so pi's `fields` never carries it and pi's
+/// `EditableOverrideField` never asks for it. Neither gap reaches `/subagents`, which edits only
+/// `model`/`thinking`/`systemPrompt` (`subagents-admin.ts:117`) — all three modeled here under
+/// pi's own spelling.
+fn builtin_applied_keys(delta: &AgentOverrideConfig) -> BTreeSet<String> {
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    if matches!(delta.description, OverrideField::Value(_)) {
+        keys.insert("description".to_string());
+    }
+    for (key, present) in [
+        ("output", delta.output.is_present()),
+        ("defaultReads", delta.default_reads.is_present()),
+        ("model", delta.model.is_present()),
+        ("fallbackModels", delta.fallback_models.is_present()),
+        ("defaultProvider", delta.default_provider.is_present()),
+        ("thinking", delta.thinking.is_present()),
+        ("systemPromptMode", delta.system_prompt_mode.is_present()),
+        (
+            "inheritProjectContext",
+            delta.inherit_project_context.is_present(),
+        ),
+        ("inheritSkills", delta.inherit_skills.is_present()),
+        ("defaultContext", delta.default_context.is_present()),
+        ("disabled", delta.disabled.is_present()),
+        ("systemPrompt", delta.system_prompt.is_present()),
+        ("skills", delta.skills.is_present()),
+        ("tools", delta.tools.is_present()),
+        ("excludeTools", delta.exclude_tools.is_present()),
+        (
+            "allowNestedSubagents",
+            delta.allow_nested_subagents.is_present(),
+        ),
+        ("extensions", delta.extensions.is_present()),
+        (
+            "subagentOnlyExtensions",
+            delta.subagent_only_extensions.is_present(),
+        ),
+        ("completionGuard", delta.completion_guard.is_present()),
+        ("toolBudget", delta.tool_budget.is_present()),
+    ] {
+        if present {
+            keys.insert(key.to_string());
+        }
+    }
+    keys
+}
+
+/// Stamp (or EXTEND) an agent's [`AgentOverrideInfo`] after a pass applied `applied_keys` at
+/// `scope`, porting the three accumulation rules pi writes inline at `agents.ts:1415-1424`:
+///
+/// 1. **`base` is sticky** — `agent.override?.base ?? cloneOverrideBase(agent)` (`:1417`). The
+///    snapshot belongs to the state before the FIRST override touched the agent, so a second pass
+///    reuses the first pass's base and `fresh_base` is dropped. `/subagents` compares the effective
+///    value against this base to decide whether an edit is settings-owned
+///    (`subagents-admin.ts:136`), and comparing against a half-overridden intermediate would make
+///    a user-scope override invisible to that test.
+/// 2. **`fields` is a UNION across passes** — `[...new Set([...(agent.override?.fields ?? []),
+///    ...Object.keys(override)])]` (`:1418`), never a replacement.
+/// 3. **`field_scopes[key]` ACCUMULATES** — `:1421-1424` seeds each entry from the previous info
+///    (`:1419`) and unions `meta.scope` into it, so a key set at user scope and then again at
+///    project scope ends up carrying BOTH. That two-element set is the sole input to
+///    `persistSettingsField`'s `shadowsLowerScope` branch (`subagents-admin.ts:283`).
+///
+/// `scope`/`settings_path` are NOT accumulated: they are the last-writer's, matching pi's
+/// `{ ...meta, ... }` spread at `:1416`, which puts the current pass's meta first and lets nothing
+/// overwrite it.
+///
+/// pi sorts both collections (`:1418`, `:1423`); [`BTreeSet`]/[`BTreeMap`] make that the storage
+/// order here, so insertion order is irrelevant and no explicit sort is needed.
+fn record_override_info(
+    agent: &mut AgentDefinition,
+    scope: OverrideScope,
+    settings_path: PathBuf,
+    fresh_base: Box<AgentDefinition>,
+    applied_keys: BTreeSet<String>,
+) {
+    let (base_snapshot, mut fields, mut field_scopes) = match agent.override_info.take() {
+        Some(previous) => (
+            previous.base_snapshot,
+            previous.fields,
+            previous.field_scopes,
+        ),
+        None => (fresh_base, BTreeSet::new(), BTreeMap::new()),
+    };
+    for key in applied_keys {
+        field_scopes.entry(key.clone()).or_default().insert(scope);
+        fields.insert(key);
+    }
+    agent.override_info = Some(AgentOverrideInfo {
+        scope,
+        settings_path,
+        base_snapshot,
+        fields,
+        field_scopes,
+    });
+}
+
+/// pi `applyBuiltinOverride` (`agents.ts:1410-1464` @v0.68.0): full-replace every field the delta
+/// states (`Value` sets, `ExplicitClear` resets to the field's absent value, `Unset` is left
+/// alone), and record [`AgentOverrideInfo`] provenance (`:1415-1424`) with `base` = the agent
+/// snapshot BEFORE this override, [`AgentOverrideInfo::fields`] = the keys this delta applied
+/// unioned with any already recorded, and [`AgentOverrideInfo::field_scopes`] = each of those keys
+/// mapped to every scope that has contributed it. See [`builtin_applied_keys`] for the key
+/// spellings and [`record_override_info`] for the three accumulation rules.
 /// pi's callers only ever pass a non-empty delta — a parsed override entry with no fields is dropped
 /// at read time (`parseBuiltinOverrideEntry` returns `undefined`), and the bulk-disable arms pass an
 /// explicit `{ disabled: true }`. Because this crate's settings deserialize CAN yield an all-`Unset`
@@ -572,17 +724,34 @@ fn apply_builtin_override(
         Some(v.clone())
     });
 
-    agent.override_info = Some(AgentOverrideInfo {
+    // pi `agents.ts:1415-1424`: the provenance record carries the keys this delta stated, unioned
+    // with whatever a previous pass recorded, and accumulates this pass's scope into each one.
+    // Going through [`record_override_info`] rather than constructing the struct here is what makes
+    // `base` sticky (`:1417`) — unobservable on THIS path, because [`apply_builtin_agent`]'s ladder
+    // (pi `:1492-1524`) is winner-take-all and calls this function at most once per agent, but it is
+    // the same rule upstream applies from the same function, and the custom path (which calls it
+    // twice) depends on it.
+    record_override_info(
+        agent,
         scope,
         settings_path,
         base_snapshot,
-    });
+        builtin_applied_keys(delta),
+    );
 }
 
-/// pi `clearBuiltinThinking` (`agents.ts:1033-1037`): a no-op when the agent has no `thinking`;
-/// otherwise drop `thinking` and record disable-thinking provenance ONLY if the agent has no
-/// override recorded yet (a per-agent override already applied in this pass keeps its own
-/// provenance/base). The snapshot is captured BEFORE the clear.
+/// pi `clearBuiltinThinking` (`agents.ts:1466-1470` @v0.68.0): a no-op when the agent has no
+/// `thinking`; otherwise drop `thinking` and record disable-thinking provenance ONLY if the agent
+/// has no override recorded yet (`agent.override ?? { ...meta, base }`, `:1469` — a per-agent
+/// override already applied in this pass keeps its own provenance/base). The snapshot is captured
+/// BEFORE the clear.
+///
+/// **This pass contributes NOTHING to [`AgentOverrideInfo::fields`] or
+/// [`AgentOverrideInfo::field_scopes`]** — not a `thinking` entry, not anything. The decision is
+/// upstream's, made twice over at `:1469`: the fabricated record omits both keys (they are
+/// optional, `agents.ts:118-119`), and when a record already exists it is passed through
+/// untouched. The consequence is recorded at the construction site below, with why it has to be
+/// that way for `savesThroughSettings`.
 fn clear_builtin_thinking(
     agent: &mut AgentDefinition,
     scope: OverrideScope,
@@ -597,6 +766,21 @@ fn clear_builtin_thinking(
             scope,
             settings_path,
             base_snapshot,
+            // EMPTY, and that is upstream's answer, not a gap. `clearBuiltinThinking`
+            // (`agents.ts:1466-1470`) fabricates its provenance as
+            // `{ ...meta, base: cloneOverrideBase(agent) }` (`:1469`) — three keys.
+            // `fields`/`fieldScopes` are OPTIONAL on `BuiltinAgentOverrideInfo`
+            // (`agents.ts:118-119`, both `?`), that literal omits them, and the whole record is
+            // skipped outright when `agent.override` already exists — so a bulk `disableThinking`
+            // NEVER contributes a `thinking` entry, at either scope, on either branch. It must not:
+            // `fields` is what `savesThroughSettings` (`subagents-admin.ts:129`) reads to conclude
+            // that SETTINGS own a key, and `subagents.disableThinking` is a global flag, not a
+            // `subagents.agentOverrides.<name>.thinking` entry — claiming otherwise would send
+            // `/subagents` to rewrite a per-agent override that does not exist. The
+            // base-comparison clause at `subagents-admin.ts:133-136` is the branch that covers this
+            // agent instead, and `base_snapshot` (captured just above, pre-clear) is what it reads.
+            fields: BTreeSet::new(),
+            field_scopes: BTreeMap::new(),
         });
     }
     agent.thinking = None;
@@ -673,16 +857,45 @@ fn apply_output_override(agent: &mut AgentDefinition, delta: &OverrideField<Stri
     }
 }
 
-/// pi `applyCustomAgentOverrides`' per-agent body (`agents.ts:1200-1212`): project override wins over
-/// user override; only ONE is ever applied, with the SETTINGS scope/path (never the agent's own
-/// source). The project branch is gated on the project scope actually existing.
+/// pi `applyCustomAgentOverrides`' per-agent body (`agents.ts:1546-1558` @v0.68.0): **user THEN
+/// project, CUMULATIVELY** — both entries are applied, in that order, and the project one lands on
+/// the result of the user one. Upstream states the reason in its own comment at `:1545`: *"Apply
+/// user then project so project fields win without dropping user-only fields."* The project branch
+/// is gated on the project scope actually existing (`projectSettingsPath` non-null, `:1553`).
+///
+/// **This replaced a winner-take-all shape** (`if project { … } else if user { … }`, one call at
+/// most) that was ported against a wrong citation — `agents.ts:1193-1213`, a range that is not this
+/// function at the pinned tag — and against the wrong rule. Two things change, both intended:
+///
+/// - A user-scope key the project entry does NOT restate now SURVIVES instead of being discarded.
+///   Upstream's comment describes that as the whole point of the ordering; the old shape dropped
+///   it, which is the bug this fixes.
+/// - [`AgentOverrideInfo::field_scopes`] can now genuinely hold TWO scopes for one field, because
+///   two passes really do record against the same key. That is the only thing that makes
+///   `persistSettingsField`'s `shadowsLowerScope` branch (`subagents-admin.ts:283`) reachable for a
+///   custom agent — it fires on `fieldScopes[field].includes("user")` while saving at project
+///   scope, i.e. on exactly the state this order produces.
+///
+/// **Not** the builtin rule. [`apply_builtin_agent`] stays winner-take-all because
+/// `applyBuiltinOverrides` (`agents.ts:1492-1524`) is a single `return`-per-branch ladder; upstream
+/// deliberately runs the two agent kinds on different rules, and so does this module.
+///
+/// How "project fields win" survives cyrup's retained fill-unset gate, which upstream no longer
+/// has: the gate tests the agent's own on-disk FRONTMATTER keys ([`AgentDefinition::present_fields`],
+/// fixed at parse time), not the running value, so a key the user pass filled is still unguarded on
+/// the project pass and the project value lands on top. Frontmatter beats both scopes, which is
+/// R-SA-010's custom-agent rule and unchanged here.
+///
+/// `disabled` was the one key that did NOT survive that reasoning, because its arm in
+/// [`apply_custom_override`] gated on the runtime value (`agent.disabled.is_none()`) rather than on
+/// frontmatter presence — so a user entry setting `disabled` would have frozen it against the
+/// project entry. Upstream hit exactly this and fixed it in the same change that introduced the
+/// layering; the guard is removed here for the same reason, and
+/// `agent-overrides.test.ts:646-684` is the upstream regression test (ported below as
+/// `custom_agent_project_scope_flips_disabled_set_by_user_scope`).
 fn apply_custom_agent(agent: &mut AgentDefinition, settings: &LayeredOverrideSettings) {
-    if let (Some(delta), Some(path)) = (
-        settings.project.overrides.get(&agent.name),
-        settings.project_settings_path.as_ref(),
-    ) {
-        apply_custom_override(agent, delta, OverrideScope::Project, path.clone());
-    } else if let Some(delta) = settings.user.overrides.get(&agent.name) {
+    // `:1547-1550` — the user entry first, unconditionally (the user settings path always exists).
+    if let Some(delta) = settings.user.overrides.get(&agent.name) {
         apply_custom_override(
             agent,
             delta,
@@ -690,14 +903,33 @@ fn apply_custom_agent(agent: &mut AgentDefinition, settings: &LayeredOverrideSet
             settings.user_settings_path.clone(),
         );
     }
+    // `:1552-1555` — then the project entry, on top of whatever the user entry produced.
+    if let (Some(delta), Some(path)) = (
+        settings.project.overrides.get(&agent.name),
+        settings.project_settings_path.as_ref(),
+    ) {
+        apply_custom_override(agent, delta, OverrideScope::Project, path.clone());
+    }
 }
 
-/// pi `applyCustomAgentOverride` (`agents.ts:1099-1191`): fill-unset-only — a field is applied only
-/// when its frontmatter key was absent from the agent's own on-disk frontmatter (an explicitly
-/// present field blocks the override for that field unconditionally, regardless of the delta's own
-/// value). `systemPrompt` is deliberately NOT a custom-agent override (pi omits it here — it only
-/// ever replaces a BUILTIN body). Provenance uses the passed settings `scope`/`settings_path`
-/// (never the agent's own source), recorded only when at least one field actually applied.
+/// pi `applyCustomAgentOverride` (`agents.ts:1527-1536` @v0.68.0, delegating to
+/// `applyBuiltinOverride` at `:1532`): fill-unset-only — a field is applied only when its
+/// frontmatter key was absent from the agent's own on-disk frontmatter (an explicitly present field
+/// blocks the override for that field unconditionally, regardless of the delta's own value).
+/// `systemPrompt` is deliberately NOT a custom-agent override (pi omits it here — it only ever
+/// replaces a BUILTIN body). Provenance uses the passed settings `scope`/`settings_path` (never the
+/// agent's own source), recorded only when at least one field actually applied.
+///
+/// **Called TWICE per agent** by [`apply_custom_agent`] — once for the user entry, once for the
+/// project entry (`agents.ts:1546-1558`). Every `applied.insert(..)` below therefore names the
+/// settings key that THIS pass applied, and [`record_override_info`] unions it into whatever the
+/// earlier pass recorded rather than overwriting. The set is also the "did anything apply?"
+/// predicate the old `applied_any` boolean served, so the two can never drift apart: a key is in
+/// [`AgentOverrideInfo::fields`] iff this function really wrote the corresponding definition field.
+///
+/// `base_snapshot` is captured on entry but is DISCARDED on the second pass —
+/// [`record_override_info`] keeps the first pass's, per pi `:1417`'s
+/// `agent.override?.base ?? cloneOverrideBase(agent)`.
 fn apply_custom_override(
     agent: &mut AgentDefinition,
     delta: &AgentOverrideConfig,
@@ -705,29 +937,31 @@ fn apply_custom_override(
     settings_path: PathBuf,
 ) {
     let base_snapshot = Box::new(agent.clone());
-    let mut applied_any = false;
+    let mut applied: BTreeSet<String> = BTreeSet::new();
 
     // pi `description` custom arm (agents.ts:1380-1383): UNCONDITIONAL — no frontmatter gate and
     // no clear form, unlike every fill below it.
     if let OverrideField::Value(v) = &delta.description {
         agent.description = v.clone();
-        applied_any = true;
+        applied.insert("description".to_string());
     }
     // pi `fill("output", ["output"], ...)` (agents.ts:1384-1386) — gated, but the concrete arm has
     // to preserve `mode`, so it cannot go through `apply_field_fill_unset` (which cannot read the
     // target). Mirrors the `disabled` arm below in hand-rolling the gate.
     if !agent.present_fields.contains("output") && delta.output.is_present() {
         apply_output_override(agent, &delta.output);
-        applied_any = true;
+        applied.insert("output".to_string());
     }
-    applied_any |= apply_field_fill_unset(
+    if apply_field_fill_unset(
         &mut agent.default_reads,
         &["defaultReads"],
         &agent.present_fields,
         &delta.default_reads,
         None,
         |v| Some(v.iter().map(PathBuf::from).collect()),
-    );
+    ) {
+        applied.insert("defaultReads".to_string());
+    }
     let model_applied = apply_field_fill_unset(
         &mut agent.model,
         &["model"],
@@ -743,90 +977,115 @@ fn apply_custom_override(
             OverrideField::Value(_) => Some(AgentModelSourceInfo::SettingsOverride),
             _ => None,
         };
+        applied.insert("model".to_string());
     }
-    applied_any |= model_applied;
-    applied_any |= apply_field_fill_unset(
+    if apply_field_fill_unset(
         &mut agent.fallback_models,
         &["fallbackModels"],
         &agent.present_fields,
         &delta.fallback_models,
         Vec::new(),
         |v| v.iter().cloned().map(cyrup_core::ModelId::from).collect(),
-    );
+    ) {
+        applied.insert("fallbackModels".to_string());
+    }
     // SUBA-088: `modelProvider` has NO frontmatter key (pi's agent-file parser never reads one),
     // so the fill-unset gate is vacuously open and this is the same set/clear pi's
     // `applyCustomAgentOverride` performs by delegating to `applyBuiltinOverride`
     // (`agents.ts:1481,1387-1390` @v0.64.0).
-    applied_any |= apply_field_fill_unset(
+    if apply_field_fill_unset(
         &mut agent.model_provider,
         &[],
         &agent.present_fields,
         &delta.default_provider,
         None,
         |v| Some(cyrup_core::ProviderId::from(v.as_str())),
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("defaultProvider".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.thinking,
         &["thinking"],
         &agent.present_fields,
         &delta.thinking,
         None,
         |v| Some(v.clone()),
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("thinking".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.system_prompt_mode,
         &["systemPromptMode"],
         &agent.present_fields,
         &delta.system_prompt_mode,
         crate::discovery::types::SystemPromptMode::Replace,
         |v| *v,
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("systemPromptMode".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.inherit_project_context,
         &["inheritProjectContext"],
         &agent.present_fields,
         &delta.inherit_project_context,
         false,
         |v| *v,
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("inheritProjectContext".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.inherit_skills,
         &["inheritSkills"],
         &agent.present_fields,
         &delta.inherit_skills,
         false,
         |v| *v,
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("inheritSkills".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.default_context,
         &["defaultContext"],
         &agent.present_fields,
         &delta.default_context,
         None,
         |v| Some(*v),
-    );
-    // pi `disabled` custom arm (agents.ts:893-896) gates on the runtime VALUE (`agent.disabled ===
-    // undefined`), not frontmatter-field presence, and has no `| false` clear form.
-    if agent.disabled.is_none()
-        && let OverrideField::Value(v) = &delta.disabled
-    {
+    ) {
+        applied.insert("defaultContext".to_string());
+    }
+    // pi `disabled` (`agents.ts:1451`): `if (override.disabled !== undefined) next.disabled =
+    // override.disabled` — UNCONDITIONAL. No frontmatter gate, no runtime-value gate, no `| false`
+    // clear form (an `OverrideField<bool>` never reaches `ExplicitClear`; see the field doc).
+    //
+    // The `agent.disabled.is_none()` guard that used to stand here is gone, and its removal is part
+    // of the same change that made [`apply_custom_agent`] cumulative — upstream removed the
+    // identical guard in the identical commit. `agent-overrides.test.ts:646-684` is the regression
+    // test, and its comment names the failure exactly: the guard was *"a stray `agent.disabled ===
+    // undefined` guard (a no-op before layering existed, since this function only ever ran once
+    // against the pristine base agent)"* that, once user-then-project layering arrived, *"silently
+    // blocked the project override from ever changing `disabled` once the user override had already
+    // set it — breaking this PR's own 'project wins' precedence for that one field."* Keeping it
+    // here would have made `disabled` the single key on which a user entry beat a project entry.
+    if let OverrideField::Value(v) = &delta.disabled {
         agent.disabled = Some(*v);
-        applied_any = true;
+        applied.insert("disabled".to_string());
     }
     // pi checks BOTH `skill` and `skills` frontmatter keys for the skills fill (agents.ts:898).
-    applied_any |= apply_field_fill_unset(
+    if apply_field_fill_unset(
         &mut agent.skills,
         &["skill", "skills"],
         &agent.present_fields,
         &delta.skills,
         Vec::new(),
         |v| v.clone(),
-    );
+    ) {
+        applied.insert("skills".to_string());
+    }
     // pi `tools` custom arm (agents.ts:1438-1441): the frontmatter gate is hand-rolled upstream
     // too, because the four-state apply is a shared function rather than a value assignment.
     if !agent.present_fields.contains("tools") && delta.tools.is_present() {
         apply_tools_override(&mut agent.tools, &delta.tools);
-        applied_any = true;
+        applied.insert("tools".to_string());
     }
     // SUBA-092 / pi `agents.ts:1547-1552` @v0.62.0: `fill("excludeTools", ["excludeTools"],
     // override.excludeTools === false ? undefined : [...])` and `fill("allowNestedSubagents",
@@ -834,61 +1093,76 @@ fn apply_custom_override(
     // (At v0.64.0 `31562d76` collapsed `applyCustomAgentOverride` into `applyBuiltinOverride` for
     // EVERY field, so the gate no longer exists upstream for any key; that is a cross-field
     // precedence change to R-SA-010 and is tracked separately, not folded into this item.)
-    applied_any |= apply_field_fill_unset(
+    if apply_field_fill_unset(
         &mut agent.exclude_tools,
         &["excludeTools"],
         &agent.present_fields,
         &delta.exclude_tools,
         None,
         |v| Some(v.clone()),
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("excludeTools".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.allow_nested_subagents,
         &["allowNestedSubagents"],
         &agent.present_fields,
         &delta.allow_nested_subagents,
         None,
         |v| Some(*v),
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("allowNestedSubagents".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.extensions,
         &["extensions"],
         &agent.present_fields,
         &delta.extensions,
         None,
         |v| Some(v.clone()),
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("extensions".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.subagent_only_extensions,
         &["subagentOnlyExtensions"],
         &agent.present_fields,
         &delta.subagent_only_extensions,
         Vec::new(),
         |v| v.clone(),
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("subagentOnlyExtensions".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.completion_guard,
         &["completionGuard"],
         &agent.present_fields,
         &delta.completion_guard,
         None,
         |v| Some(*v),
-    );
-    applied_any |= apply_field_fill_unset(
+    ) {
+        applied.insert("completionGuard".to_string());
+    }
+    if apply_field_fill_unset(
         &mut agent.tool_budget,
         &["toolBudget"],
         &agent.present_fields,
         &delta.tool_budget,
         None,
         |v| Some(v.clone()),
-    );
+    ) {
+        applied.insert("toolBudget".to_string());
+    }
 
-    if applied_any {
-        agent.override_info = Some(AgentOverrideInfo {
-            scope,
-            settings_path,
-            base_snapshot,
-        });
+    if !applied.is_empty() {
+        // pi `agents.ts:1415-1424`, reached through `applyCustomAgentOverride`'s delegation to
+        // `applyBuiltinOverride` (`agents.ts:1532`). On the SECOND (project) pass this EXTENDS the
+        // first pass's record instead of replacing it: `base` stays the user pass's (`:1417`),
+        // `fields` unions (`:1418`), and a key both scopes set ends up carrying `{User, Project}`
+        // in `field_scopes` (`:1421-1424`) — the two-element set `shadowsLowerScope`
+        // (`subagents-admin.ts:283`) exists to read, and which no winner-take-all merge can
+        // produce.
+        record_override_info(agent, scope, settings_path, base_snapshot, applied);
     }
 }
 
@@ -1597,8 +1871,18 @@ mod tests {
 
     #[test]
     fn project_override_beats_user_override_on_a_custom_agent() {
-        // pi agent-overrides.test.ts:387-401: a same-named user+project override on a project custom
-        // agent -> the PROJECT override wins, at scope "project".
+        // A same-named user+project override on a project custom agent, COLLIDING on one key
+        // (`model`) -> the PROJECT value wins, at scope "project".
+        //
+        // KEPT, not rewritten, when `apply_custom_agent` became cumulative (`agents.ts:1538-1559`).
+        // Everything it asserts is still upstream's behaviour: `:1554` applies the project entry
+        // LAST, so it overwrites the user entry on any key both state, and `:1416`'s `...meta`
+        // spread leaves the last pass's scope/path on the record. What this test never asserted —
+        // and what the old winner-take-all code additionally, wrongly did — is that the user
+        // entry's OTHER keys are discarded. That half is pinned by
+        // `custom_agent_layers_project_over_user_without_dropping_user_only_fields` below; the two
+        // together are the whole of `:1545`'s "project fields win without dropping user-only
+        // fields".
         let mut merged = HashMap::new();
         merged.insert(
             "implementer".to_string(),
@@ -1631,6 +1915,332 @@ mod tests {
             updated.override_info.as_ref().expect("recorded").scope,
             OverrideScope::Project
         );
+    }
+
+    /// Upstream `agent-overrides.test.ts:608-644` ("layers a project override on top of a user
+    /// override for a custom agent instead of discarding it"), pinning `agents.ts:1546-1558`.
+    ///
+    /// **Mutation caught:** restore the winner-take-all shape in [`apply_custom_agent`] — the
+    /// `if project { .. } else if user { .. }` it used to have — and `thinking`, which only the
+    /// USER entry states, reverts to `None`. That silent drop is the bug this test exists for; it
+    /// is also upstream's own stated reason for the ordering at `:1545`.
+    #[test]
+    fn custom_agent_layers_project_over_user_without_dropping_user_only_fields() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "persona-reviewer".to_string(),
+            agent("persona-reviewer", AgentSource::User, "/home/persona.md"),
+        );
+        let settings = two_scope(
+            settings_with_override(
+                "persona-reviewer",
+                AgentOverrideConfig {
+                    // Collides with the project entry below.
+                    model: OverrideField::Value("anthropic/claude-opus-4-8".to_string()),
+                    // USER-ONLY: the project entry says nothing about `thinking`.
+                    thinking: OverrideField::Value("high".to_string()),
+                    ..Default::default()
+                },
+            ),
+            settings_with_override(
+                "persona-reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("openai/gpt-5.4".to_string()),
+                    // PROJECT-ONLY.
+                    subagent_only_extensions: OverrideField::Value(vec![
+                        "./tools/child-only.ts".to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            ),
+        );
+
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("persona-reviewer").expect("present");
+        assert_eq!(
+            updated.model,
+            Some("openai/gpt-5.4".into()),
+            "project wins the key both scopes state"
+        );
+        assert_eq!(
+            updated.thinking,
+            Some("high".to_string()),
+            "a user-only key MUST survive the project pass (agents.ts:1545)"
+        );
+        assert_eq!(
+            updated.subagent_only_extensions,
+            vec!["./tools/child-only.ts".to_string()],
+            "the project-only key applies too"
+        );
+
+        let info = updated.override_info.as_ref().expect("recorded");
+        assert_eq!(
+            info.scope,
+            OverrideScope::Project,
+            "the LAST pass that applied anything owns scope/path (agents.ts:1416)"
+        );
+        assert_eq!(info.settings_path, PathBuf::from(PROJECT_SETTINGS));
+        // pi `:1417` — `agent.override?.base ?? cloneOverrideBase(agent)`: the base belongs to the
+        // state before the FIRST override, so the project pass must NOT re-snapshot the
+        // already-user-overridden agent. If it did, `base_snapshot.thinking` would read "high" and
+        // `subagents-admin.ts:136`'s effective-vs-base comparison would stop seeing the user
+        // override at all.
+        assert_eq!(
+            info.base_snapshot.model, None,
+            "base predates the user pass"
+        );
+        assert_eq!(
+            info.base_snapshot.thinking, None,
+            "base predates the user pass"
+        );
+    }
+
+    /// Pins `agents.ts:1421-1424` — `fieldScopes[field] = [...new Set([...scopes, meta.scope])]`,
+    /// an ACCUMULATION seeded from the previous record at `:1419`.
+    ///
+    /// **Mutation caught:** make [`record_override_info`] replace `field_scopes` instead of
+    /// extending it (or drop the `agent.override_info.take()` seed), and `model` comes back with a
+    /// one-element set. A single-scope set makes `persistSettingsField`'s `shadowsLowerScope`
+    /// branch (`subagents-admin.ts:283`, `fieldScopes?.[field]?.includes("user")` while saving at
+    /// project scope) permanently false for custom agents — i.e. `/subagents` silently stops
+    /// warning that the edit it is about to write is shadowed.
+    ///
+    /// The set is a [`BTreeSet`], so the assertion is order-free by construction: it holds
+    /// regardless of which pass inserted first, which is the point of pi's `.sort()` at `:1423`.
+    #[test]
+    fn field_scopes_accumulates_both_scopes_for_a_key_set_at_both() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "persona-reviewer".to_string(),
+            agent("persona-reviewer", AgentSource::User, "/home/persona.md"),
+        );
+        let settings = two_scope(
+            settings_with_override(
+                "persona-reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("anthropic/claude-opus-4-8".to_string()),
+                    thinking: OverrideField::Value("high".to_string()),
+                    ..Default::default()
+                },
+            ),
+            settings_with_override(
+                "persona-reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("openai/gpt-5.4".to_string()),
+                    completion_guard: OverrideField::Value(true),
+                    ..Default::default()
+                },
+            ),
+        );
+
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let info = merged
+            .get("persona-reviewer")
+            .expect("present")
+            .override_info
+            .as_ref()
+            .expect("recorded");
+
+        let both_scopes = BTreeSet::from([OverrideScope::User, OverrideScope::Project]);
+        assert_eq!(
+            info.field_scopes.get("model"),
+            Some(&both_scopes),
+            "a key set at BOTH scopes carries both — the shadowsLowerScope input"
+        );
+        assert_eq!(
+            info.field_scopes.get("thinking"),
+            Some(&BTreeSet::from([OverrideScope::User])),
+            "a user-only key carries user alone"
+        );
+        assert_eq!(
+            info.field_scopes.get("completionGuard"),
+            Some(&BTreeSet::from([OverrideScope::Project])),
+            "a project-only key carries project alone"
+        );
+    }
+
+    /// Pins `agents.ts:1418` — `fields: [...new Set([...(agent.override?.fields ?? []),
+    /// ...Object.keys(override)])]`, a UNION with whatever the previous pass recorded.
+    ///
+    /// **Mutation caught:** have [`record_override_info`] start `fields` empty on every pass (or
+    /// build it from `applied_keys` alone), and the set collapses to the PROJECT pass's two keys —
+    /// `thinking`, which only the user entry set, disappears. `savesThroughSettings`
+    /// (`subagents-admin.ts:129`) reads exactly this set to decide whether `/subagents` edits
+    /// `settings.json` or rewrites the agent's frontmatter file, so a lost key sends an edit to the
+    /// wrong file.
+    ///
+    /// Also pins the KEY SPELLINGS, which are on-disk camelCase JSON keys (pi's
+    /// `BuiltinAgentOverrideConfig`, `agents.ts:80-111`) and not Rust field names — `completionGuard`,
+    /// never `completion_guard`. `subagents-admin.ts:117`'s `EditableOverrideField` compares against
+    /// these strings literally.
+    #[test]
+    fn override_fields_are_the_union_across_scopes_not_the_last_pass() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "persona-reviewer".to_string(),
+            agent("persona-reviewer", AgentSource::User, "/home/persona.md"),
+        );
+        let settings = two_scope(
+            settings_with_override(
+                "persona-reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("anthropic/claude-opus-4-8".to_string()),
+                    thinking: OverrideField::Value("high".to_string()),
+                    ..Default::default()
+                },
+            ),
+            settings_with_override(
+                "persona-reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("openai/gpt-5.4".to_string()),
+                    completion_guard: OverrideField::Value(true),
+                    ..Default::default()
+                },
+            ),
+        );
+
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let info = merged
+            .get("persona-reviewer")
+            .expect("present")
+            .override_info
+            .as_ref()
+            .expect("recorded");
+
+        assert_eq!(
+            info.fields,
+            BTreeSet::from([
+                "completionGuard".to_string(),
+                "model".to_string(),
+                "thinking".to_string(),
+            ]),
+            "the union of both passes' applied keys, in pi's on-disk key spellings"
+        );
+        assert_eq!(
+            info.fields.iter().collect::<Vec<_>>(),
+            info.field_scopes.keys().collect::<Vec<_>>(),
+            "`fields` and `field_scopes` are populated from the same key set and cannot drift"
+        );
+    }
+
+    /// Upstream `agent-overrides.test.ts:646-684` ("lets a project override flip `disabled` on a
+    /// custom agent even after a user override already set it"), pinning `agents.ts:1451`'s
+    /// unconditional `next.disabled = override.disabled`.
+    ///
+    /// **Mutation caught:** put the `agent.disabled.is_none()` guard back on the `disabled` arm of
+    /// [`apply_custom_override`]. It is invisible without layering (one pass, pristine agent) and
+    /// becomes a precedence inversion with it: `disabled` would be the one key on which a USER
+    /// entry beat a PROJECT entry. Both directions are covered, because a guard that only blocks
+    /// `true -> false` would still pass a one-directional test.
+    #[test]
+    fn custom_agent_project_scope_flips_disabled_set_by_user_scope() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "disable-flip-a".to_string(),
+            agent("disable-flip-a", AgentSource::User, "/home/flip-a.md"),
+        );
+        merged.insert(
+            "disable-flip-b".to_string(),
+            agent("disable-flip-b", AgentSource::User, "/home/flip-b.md"),
+        );
+
+        let disabled_delta = |value: bool| AgentOverrideConfig {
+            disabled: OverrideField::Value(value),
+            ..Default::default()
+        };
+        let scope_settings = |flip_a: bool, flip_b: bool| {
+            let mut overrides = BTreeMap::new();
+            overrides.insert("disable-flip-a".to_string(), disabled_delta(flip_a));
+            overrides.insert("disable-flip-b".to_string(), disabled_delta(flip_b));
+            SubagentSettings {
+                overrides,
+                ..Default::default()
+            }
+        };
+
+        let settings = two_scope(scope_settings(true, false), scope_settings(false, true));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("disable-flip-a").expect("present").disabled,
+            Some(false),
+            "project `disabled: false` must re-enable what user `disabled: true` disabled"
+        );
+        assert_eq!(
+            merged.get("disable-flip-b").expect("present").disabled,
+            Some(true),
+            "project `disabled: true` must disable what user `disabled: false` enabled"
+        );
+        let both_scopes = BTreeSet::from([OverrideScope::User, OverrideScope::Project]);
+        for name in ["disable-flip-a", "disable-flip-b"] {
+            let info = merged
+                .get(name)
+                .expect("present")
+                .override_info
+                .as_ref()
+                .expect("recorded");
+            assert_eq!(
+                info.field_scopes.get("disabled"),
+                Some(&both_scopes),
+                "both passes really applied `disabled`, so both scopes are recorded"
+            );
+        }
+    }
+
+    /// Pins `applyBuiltinOverrides`' branch ladder (`agents.ts:1492-1524`), which this work does
+    /// NOT change: every branch is its own `return`, so a builtin agent gets AT MOST ONE
+    /// `applyBuiltinOverride` call and the project entry discards the user entry wholesale.
+    ///
+    /// **Mutation caught:** apply [`apply_custom_agent`]'s cumulative user-THEN-project rule to
+    /// builtins as well. `thinking`, which only the USER entry states, would then survive (it must
+    /// not), and `field_scopes["model"]` would grow a second scope (it cannot: for a builtin, one
+    /// pass ran). The two agent kinds run on different rules upstream, and this test is what keeps
+    /// them different here.
+    #[test]
+    fn builtin_override_stays_winner_take_all_across_scopes() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "reviewer".to_string(),
+            agent("reviewer", AgentSource::Builtin, "/builtin/reviewer.md"),
+        );
+        let settings = two_scope(
+            settings_with_override(
+                "reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("anthropic/claude-opus-4-8".to_string()),
+                    thinking: OverrideField::Value("high".to_string()),
+                    ..Default::default()
+                },
+            ),
+            settings_with_override(
+                "reviewer",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("openai/gpt-5.4".to_string()),
+                    ..Default::default()
+                },
+            ),
+        );
+
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(updated.model, Some("openai/gpt-5.4".into()));
+        assert_eq!(
+            updated.thinking, None,
+            "the user entry is DISCARDED, not layered: agents.ts:1494-1499 returns outright"
+        );
+
+        let info = updated.override_info.as_ref().expect("recorded");
+        assert_eq!(info.scope, OverrideScope::Project);
+        assert_eq!(
+            info.fields,
+            BTreeSet::from(["model".to_string()]),
+            "only the winning (project) entry's keys are recorded for a builtin"
+        );
+        assert_eq!(
+            info.field_scopes.get("model"),
+            Some(&BTreeSet::from([OverrideScope::Project])),
+            "a builtin can never accumulate two scopes on one key"
+        );
+        assert_eq!(info.field_scopes.get("thinking"), None);
     }
 
     #[test]

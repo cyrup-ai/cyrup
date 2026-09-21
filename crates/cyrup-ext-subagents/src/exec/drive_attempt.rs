@@ -353,6 +353,16 @@ async fn handle_child_line(
     // `ClarifyChannel` (fired exactly once) and marks this attempt detached. The intercom answer
     // routes back to the still-alive child over the BROKER (independent of this stdout pipe), so
     // the loop keeps driving — it neither kills nor synchronously blocks on the child.
+    //
+    // VL-S11b — this is cyrup's port of upstream's FIRST detach producer,
+    // `detachForeground("intercom coordination")` (`execution.ts:762`). The flag set here is what
+    // `run_foreground_impl`'s `stamp_intercom_detach_reason`
+    // (`extension/executor/foreground.rs`) reads to write `DetachReason::IntercomCoordination`
+    // onto `SingleResult::detached_reason` — up there rather than here because `crate::exec` sits
+    // below `crate::extension` and cannot name that module. The SECOND producer,
+    // `/subagents-detach`, does not pass through here at all: it mints its receipt in
+    // `foreground.rs`'s `detach_receipt` and returns while this loop keeps driving the same child
+    // in a continuation task, which is the difference `workflow_detach`'s module doc now states.
     if !state.detached_seen
         && let Some(prompt) = contact_supervisor_block_prompt(&event)
     {

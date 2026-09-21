@@ -30,21 +30,37 @@ Use this skill when the parent orchestrator needs to launch a specialized subage
 Agents can use the `subagent(...)` tool directly for execution, management, status, and control.
 Humans often use the slash-command layer instead:
 
-- `/run` — launch a single agent
-- `/chain` — launch a chain of steps
-- `/parallel` — launch top-level parallel tasks
-- `/run-chain` — launch a saved `.chain.md` or `.chain.json` workflow
-- `/subagents-doctor` — diagnose setup, discovery, async paths, and intercom bridge state
+- `/run <agent>[key=value,...] [task] [--bg] [--fork]` — run a subagent directly
+- `/prompt-workflow <name> [args]` — run a prompt template through native subagents
+- `/subagents [agent]` — administer subagents: inspect metadata and update models, thinking, or prompts
+- `/subagents-fleet` — open the live subagent fleet inspector
+- `/subagents-doctor` — show subagent diagnostics
+- `/subagent-cost` — show parent and subagent child usage cost for this session
+- `/subagents-models [builtin-agent-name]` — show runtime-loaded builtin subagent models
+- `/subagents-guide [topic]` — show a packaged subagents guide topic
+- `/subagents-refine <agent>` — generate a bounded project-local refinement overlay for one subagent
+- `/subagents-stop [run-id]` — stop a current-session async subagent run
+- `/subagents-steer <run-id> [--child <child-id>] <message>` — steer a live async subagent run with a message
+- `/subagents-detach [run-id]` — detach the active foreground single-subagent run without terminating it
+- `/subagents-profiles`, `/subagents-load-profile <name>`, `/subagents-generate-profiles <provider>`,
+  `/subagents-check-profile <name>`, `/subagents-refresh-provider-models <provider> [--force]` — the profile and
+  provider-catalog commands
+- `/subagents-inspect-rpc <request-json>` — host integration bridge; never a model turn
+
+**There is no `/chain`, `/parallel`, `/run-chain` or `/chain-prompts` command.** They were removed
+upstream and typing one is an unknown command. The chain and parallel SHAPES are unaffected: reach
+them through `subagent({ chain: [...] })` and `subagent({ tasks: [...] })`, or from the slash layer
+through a prompt recipe whose frontmatter carries `chain: recipe-a -> recipe-b`.
 
 Prefer the tool when you are writing agent logic. Prefer the slash commands when
 you are guiding a human through an interactive flow.
 
-Packaged prompt shortcuts are also available for repeatable workflows. Treat them as reusable orchestration recipes, not just human slash commands. When the user asks for one of these shapes, or when the workflow clearly fits, apply the same pattern directly with `subagent(...)` and other tools:
-- `/parallel-review` — fresh-context reviewers with distinct review angles, then synthesis
-- `/review-loop` — parent-orchestrated worker, fresh-reviewer, and fix-worker cycles until clean or capped
-- `/parallel-research` — combine `researcher` and `scout` for external evidence plus local code context
-- `/gather-context-and-clarify` — scout/research first, then ask the user clarifying questions with `interview`
-- `/parallel-cleanup` — two fresh-context reviewers (deslop + verbosity passes) for an adversarial cleanup review of the current diff
+Packaged prompt recipes are also available for repeatable workflows. Each is a `prompts/*.md` file invoked as `/prompt-workflow <name>`, not a command of its own. Treat them as reusable orchestration recipes, not just human slash commands. When the user asks for one of these shapes, or when the workflow clearly fits, apply the same pattern directly with `subagent(...)` and other tools:
+- `/prompt-workflow parallel-review` — fresh-context reviewers with distinct review angles, then synthesis
+- `/prompt-workflow review-loop` — parent-orchestrated worker, fresh-reviewer, and fix-worker cycles until clean or capped
+- `/prompt-workflow parallel-research` — combine `researcher` and `scout` for external evidence plus local code context
+- `/prompt-workflow gather-context-and-clarify` — scout/research first, then ask the user clarifying questions with `interview`
+- `/prompt-workflow parallel-cleanup` — two fresh-context reviewers (deslop + verbosity passes) for an adversarial cleanup review of the current diff
 
 ## Applying Prompt Techniques Without Slash Commands
 
@@ -577,12 +593,12 @@ copying a full builtin file.
 
 ## Prompt Template Integration
 
-The package includes prompt shortcuts for common workflows: `/parallel-review`,
-`/review-loop`, `/parallel-research`, `/gather-context-and-clarify`, and
-`/parallel-cleanup`. Use them when the user wants repeatable review,
-review/fix loops, research, context handoff, implementation handoff,
-clarification, or cleanup-review patterns. `/parallel-review autofix` and
-`/parallel-cleanup autofix` synthesize reviewer feedback and then apply only the
+The package includes prompt recipes for common workflows: `parallel-review`,
+`review-loop`, `parallel-research`, `gather-context-and-clarify`, and
+`parallel-cleanup`, each invoked as `/prompt-workflow <name> [args]`. Use them when the user wants
+repeatable review, review/fix loops, research, context handoff, implementation handoff,
+clarification, or cleanup-review patterns. `/prompt-workflow parallel-review autofix` and
+`/prompt-workflow parallel-cleanup autofix` synthesize reviewer feedback and then apply only the
 fixes worth doing now. Parent agents can also apply the same recipes directly
 with `subagent(...)` when the user describes the workflow in natural language
 instead of invoking a slash command.
@@ -593,8 +609,8 @@ particular agent or with forked context.
 
 If `subagent({ action: "list" })`, `/subagents-doctor`, or a startup message recommends
 `pi-intercom` or `pi-prompt-template-model`, offer to run the shown `pi install npm:<package>`
-command only after user approval. To hide future recommendations, use
-`/subagents-companions hide <package> workspace` or `... user`.
+command only after user approval. There is no `/subagents-companions` command — companion
+suggestions were removed upstream, so there is nothing to hide and no hide verb to call.
 
 ## Important Constraints
 
@@ -670,11 +686,11 @@ Keep builtin agent defaults unless the user explicitly asks for a different mode
 
 When the user approves launching a subagent to carry out a plan or workflow, treat that as approval to generate a proper role-specific meta prompt for that subagent. Include the approved plan path or summary, clarified requirements, non-goals, relevant context, role boundaries, files or areas to inspect, acceptance criteria, expected output, and validation expectations. Do not pass vague instructions like “implement the plan fully” or “review this” by themselves.
 
-- `/gather-context-and-clarify` maps to: launch `scout` and, when needed, `researcher`; synthesize findings; then use `interview` to ask every clarification question needed for shared understanding.
-- `/parallel-review` maps to: launch fresh-context `reviewer` agents with distinct review angles; synthesize the feedback before applying anything.
-- `/review-loop` maps to: keep the parent in charge of worker → fresh reviewers → synthesized fix worker cycles until no fixes worth doing now remain, an unapproved decision appears, or the review-round cap is reached.
-- `/parallel-research` maps to: combine local `scout` context with external `researcher` evidence when current docs, ecosystem behavior, or API details matter.
-- `/parallel-cleanup` maps to: use review-only cleanup passes after implementation, especially for simplicity, verbosity, and redundant tests.
+- `/prompt-workflow gather-context-and-clarify` maps to: launch `scout` and, when needed, `researcher`; synthesize findings; then use `interview` to ask every clarification question needed for shared understanding.
+- `/prompt-workflow parallel-review` maps to: launch fresh-context `reviewer` agents with distinct review angles; synthesize the feedback before applying anything.
+- `/prompt-workflow review-loop` maps to: keep the parent in charge of worker → fresh reviewers → synthesized fix worker cycles until no fixes worth doing now remain, an unapproved decision appears, or the review-round cap is reached.
+- `/prompt-workflow parallel-research` maps to: combine local `scout` context with external `researcher` evidence when current docs, ecosystem behavior, or API details matter.
+- `/prompt-workflow parallel-cleanup` maps to: use review-only cleanup passes after implementation, especially for simplicity, verbosity, and redundant tests.
 
 For feature work, use this sequence as scaffolding for parent-agent behavior:
 
@@ -766,11 +782,19 @@ subagent({
 
 ### Saved chain
 
-```text
-/run-chain review-chain -- review this branch
+There is no command that launches a saved chain by name. Read the saved definition, then hand its
+steps to the tool:
+
+```typescript
+subagent({ action: "get", chainName: "review-chain" })
+// then run the steps it reports:
+subagent({ chain: [
+  { agent: "scout", task: "map what this branch touched", output: "map.md" },
+  { agent: "reviewer", task: "review this branch", reads: ["map.md"] }
+] })
 ```
 
-Use saved `.chain.md` or `.chain.json` workflows when the user wants a repeatable multi-agent flow without rewriting the chain each time. Prefer `.chain.json` for dynamic fanout or inline `outputSchema` objects; `.chain.md` remains the simple sequential/static authoring format.
+Use saved `.chain.md` or `.chain.json` workflows when the user wants a repeatable multi-agent flow without rewriting the chain each time. Prefer `.chain.json` for dynamic fanout or inline `outputSchema` objects; `.chain.md` remains the simple sequential/static authoring format. For a repeatable flow the USER should be able to invoke, a `prompts/*.md` recipe with `chain:` frontmatter is the slash-reachable equivalent.
 
 ## Error Handling
 

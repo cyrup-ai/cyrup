@@ -1,21 +1,30 @@
 //! Prompt-template workflows — a 1:1 port of `pi-subagents/src/slash/prompt-workflows.ts` (330
 //! lines @v0.34.0), the subsystem that turns a `prompts/*.md` recipe into a runnable subagent
-//! delegation and exposes it to the user as `/prompt-workflow` and `/chain-prompts`.
+//! delegation and exposes it to the user as `/prompt-workflow`.
+//!
+//! VL-S12: the baseline registered a SECOND command here, `/chain-prompts`, which chained recipes
+//! by an inline ` -> ` declaration. Upstream deleted it at v0.41.0 — at the pinned v0.68.0 tag
+//! `registerPromptWorkflowCommands` registers `prompt-workflow` alone (`:254`) and
+//! `"chain-prompts"` survives only in `RESERVED_COMMAND_NAMES` (`:24`), so no recipe can claim
+//! that name. Its helper `splitChainDeclaration` went with it and is deleted here too. The recipe
+//! CHAIN shape itself is untouched: `/prompt-workflow` still expands a recipe carrying `chain:`
+//! frontmatter into a chain of other recipes and never runs its own body (`:271-278`), which is
+//! what keeps [`split_prompt_chain`], [`build_chain_steps`] and [`format_workflow_list`] reachable.
 //!
 //! # Why this module exists (the gap it closes)
 //!
-//! [`super::resources::bundled_prompt_files`] discovers the SEVEN `.md` recipes this crate ships
+//! [`super::resources::bundled_prompt_files`] discovers the FIVE `.md` recipes this crate ships
 //! under `resources/prompts/` — and until this module landed its ONLY caller was
 //! `resources.rs`'s own `#[cfg(test)]` block. The recipes were vendored, discovered and unit-tested,
 //! and no user could invoke one: nothing registered a command that reads them. Upstream reaches
-//! them through two slash commands registered from `registerSlashCommands`
+//! them through a slash command registered from `registerSlashCommands`
 //! (`slash/slash-commands.ts:795-800` @v0.43.0 calls `registerPromptWorkflowCommands`, which
-//! registers `prompt-workflow` at `prompt-workflows.ts:269` and `chain-prompts` at `:303`), and
+//! registers `prompt-workflow` at `prompt-workflows.ts:269`, `:254` @v0.68.0), and
 //! `registerSlashCommands(pi, state)` is itself called from the extension entry point
 //! (`extension/index.ts:605`). So the user action is literally typing `/prompt-workflow list` or
 //! `/prompt-workflow parallel-review <task>`.
 //!
-//! Classification: **port-bug**. Both commands and this whole file exist at the ported baseline
+//! Classification: **port-bug**. The command and this whole file exist at the ported baseline
 //! v0.34.0; `git -C pi-subagents show v0.34.0:src/slash/prompt-workflows.ts` is byte-identical in
 //! every function this module ports to the v0.38.0 copy.
 //!
@@ -34,7 +43,7 @@
 //! (`:125`).
 //!
 //! [CYRUP-DELTA] `readPromptFiles` (`:49-63`) does a FLAT `readdirSync` of each directory, while
-//! `bundled_prompt_files()` expands the manifest entry recursively. For the bundled root — seven
+//! `bundled_prompt_files()` expands the manifest entry recursively. For the bundled root — five
 //! flat `.md` files — the two agree exactly; the user/project tiers below use the flat walk
 //! upstream specifies. Routing tier 1 through the manifest is deliberate: it keeps ONE definition
 //! of "which files does this crate ship" instead of a second `resources/prompts` path literal.
@@ -47,8 +56,10 @@ use crate::fork_context::ContextMode;
 /// Command names a prompt file may not claim (`RESERVED_COMMAND_NAMES`, `prompt-workflows.ts:26-35`
 /// @v0.34.0). A `prompts/run.md` would otherwise shadow `/run`; upstream drops it at load
 /// (`:98`) rather than registering it. Ported as upstream's exact eight, not as cyrup's own
-/// thirteen-command table — this is the upstream-declared reservation list, and widening it would
-/// silently reject recipe names upstream accepts.
+/// eighteen-command table — this is the upstream-declared reservation list, and neither widening
+/// nor narrowing it is safe. In particular the four names upstream DELETED as commands at v0.41.0
+/// (`chain-prompts`, `chain`, `parallel`, `run-chain`) are STILL reserved here at v0.68.0
+/// (`:23-32`), so this list does not shrink with the command palette.
 const RESERVED_COMMAND_NAMES: &[&str] = &[
     "chain-prompts",
     "prompt-workflow",
@@ -448,24 +459,9 @@ pub fn parse_runtime_options(words: &[String]) -> RuntimeOptions {
     out
 }
 
-/// pi `splitChainDeclaration` (`:213-217`): everything before the first ` -- ` is the chain
-/// declaration, everything after is the argument text. No delimiter means "all declaration".
-#[must_use]
-pub fn split_chain_declaration(input: &str) -> (String, String) {
-    match input.find(" -- ") {
-        None => (input.trim().to_string(), String::new()),
-        Some(at) => (
-            input.get(..at).unwrap_or_default().trim().to_string(),
-            input
-                .get(at.saturating_add(4)..)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-        ),
-    }
-}
-
-/// pi `splitPromptChain` (`:219-221`): split on the literal ` -> `, trim, drop empties.
+/// pi `splitPromptChain` (`:219-221` @v0.34.0, `:193-196` @v0.68.0): split on the literal ` -> `,
+/// trim, drop empties. Its one caller is `/prompt-workflow`'s `chain:` frontmatter branch
+/// (`:271-278` @v0.68.0) now that `/chain-prompts` is gone.
 #[must_use]
 pub fn split_prompt_chain(input: &str) -> Vec<String> {
     input
@@ -558,29 +554,36 @@ pub fn workflow_chain_step(
     }
 }
 
-/// Expand a `chain:` declaration (or a `/chain-prompts` declaration) into its ordered steps,
-/// resolving every name against `workflows` (`:288-292` / `:319-323`). The `Err` string is
-/// upstream's exact thrown message, which its handler surfaces via `ctx.ui.notify(…, "error")`.
+/// Expand a recipe's `chain:` declaration into its ordered steps, resolving every name against
+/// `workflows` (`:288-292` @v0.34.0, `:272-276` @v0.68.0). The `Err` string is upstream's exact
+/// thrown message, which its handler surfaces via `ctx.ui.notify(…, "error")`.
 ///
-/// `chain_owner` names the recipe whose `chain:` field is being expanded, which upstream includes in
-/// the error (`Unknown prompt workflow in chain '<name>': <step>`, `:290`); `None` selects the
-/// `/chain-prompts` wording (`Unknown prompt workflow: <step>`, `:321`).
+/// `chain_owner` names the recipe whose `chain:` field is being expanded, which upstream includes
+/// in the error (`Unknown prompt workflow in chain '<name>': <step>`, `:274`).
+///
+/// VL-S12: this took an `Option<&str>` owner at the baseline, because `/chain-prompts` had no
+/// owning recipe and selected a second wording (`Unknown prompt workflow: <step>`, `:321`
+/// @v0.34.0). That command is deleted, and with it upstream's only producer of that second
+/// sentence — at v0.68.0 the sole throw site is the owner-named one, so the parameter is no
+/// longer optional and there is no second branch to keep alive.
+///
+/// # Errors
+///
+/// Returns upstream's `Unknown prompt workflow in chain '<owner>': <step>` for the FIRST name in
+/// `names` that no discovered recipe matches; the whole expansion fails with it.
 pub fn build_chain_steps(
     workflows: &[PromptWorkflow],
     names: &[String],
     args: &[String],
     runtime: &RuntimeOptions,
-    chain_owner: Option<&str>,
+    chain_owner: &str,
 ) -> Result<Vec<WorkflowRun>, String> {
     names
         .iter()
         .map(|step_name| {
             find_workflow(workflows, step_name)
-                .ok_or_else(|| match chain_owner {
-                    Some(owner) => {
-                        format!("Unknown prompt workflow in chain '{owner}': {step_name}")
-                    }
-                    None => format!("Unknown prompt workflow: {step_name}"),
+                .ok_or_else(|| {
+                    format!("Unknown prompt workflow in chain '{chain_owner}': {step_name}")
                 })
                 .map(|step| workflow_chain_step(step, args, runtime))
         })
@@ -746,16 +749,14 @@ mod tests {
         );
     }
 
+    /// pi `splitPromptChain` (`:193-196` @v0.68.0) — the splitter a recipe's `chain:` frontmatter
+    /// goes through. `/chain-prompts`' own ` -- `-declaration splitter was deleted with the
+    /// command at v0.41.0, so this is the whole of the surviving arrow grammar.
     #[test]
-    fn chain_declaration_and_arrow_splitting() {
-        let (decl, args) = split_chain_declaration("a -> b -- do the thing");
-        assert_eq!(decl, "a -> b");
-        assert_eq!(args, "do the thing");
-        let (decl, args) = split_chain_declaration("  a -> b  ");
-        assert_eq!(decl, "a -> b");
-        assert_eq!(args, "");
+    fn arrow_splitting_of_a_recipes_chain_frontmatter() {
         assert_eq!(split_prompt_chain("a -> b -> c"), vec!["a", "b", "c"]);
         assert_eq!(split_prompt_chain(" -> "), Vec::<String>::new());
+        assert_eq!(split_prompt_chain("  a -> b  "), vec!["a", "b"]);
     }
 
     fn workflow(name: &str) -> PromptWorkflow {
@@ -830,22 +831,14 @@ mod tests {
         assert_eq!(step.cwd.as_deref(), Some("sub"));
     }
 
+    /// pi `:274` @v0.68.0, verbatim — the one sentence a `chain:` frontmatter expansion can throw.
     #[test]
     fn an_unknown_chain_step_reports_pis_exact_message() {
         let workflows = vec![workflow("a")];
         let names = vec!["a".to_string(), "missing".to_string()];
-        let err = build_chain_steps(
-            &workflows,
-            &names,
-            &[],
-            &RuntimeOptions::default(),
-            Some("outer"),
-        )
-        .expect_err("an unknown step must fail the whole expansion");
+        let err = build_chain_steps(&workflows, &names, &[], &RuntimeOptions::default(), "outer")
+            .expect_err("an unknown step must fail the whole expansion");
         assert_eq!(err, "Unknown prompt workflow in chain 'outer': missing");
-        let err = build_chain_steps(&workflows, &names, &[], &RuntimeOptions::default(), None)
-            .expect_err("the /chain-prompts wording differs");
-        assert_eq!(err, "Unknown prompt workflow: missing");
     }
 
     #[test]

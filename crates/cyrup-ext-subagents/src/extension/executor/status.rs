@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::background::{RunId, RunPaths, RunState, run_status};
 use crate::extension::executor::SubagentExecutor;
+use crate::extension::executor::foreground_history::ForegroundHistoryRun;
 use crate::extension::executor::foreground_transcript;
 use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
 use crate::extension::executor::requests::StatusViewSelector;
@@ -581,6 +582,32 @@ impl SubagentExecutor {
         // (4) the ordinary id/dir resolution. pi precedence (`run-status.ts:131`): a bare `id` (no
         // `dir`) resolves by id; otherwise a present `dir` resolves the directory directly.
         if !transcript {
+            // VL-S11b — pi `run-status.ts:421-424`: `const run = deps.state?.foregroundRuns?.get(
+            // resolved.id); if (run) return formatRememberedForegroundStatus(run);`
+            //
+            // The SECOND foreground arm, and the one a DETACHED run needs. `foreground_controls`
+            // and `foreground_runs` are disjoint by construction (`executor/mod.rs`: the history
+            // entry is created at the exact point the live control is removed), and a detached run
+            // is in the history map by definition — `run_foreground_impl` remembers the receipt
+            // and then settles the control. So the SCOPE_10 branch below, which resolves through
+            // `foreground_controls` only, cannot see it, and without this arm the id falls
+            // straight through to `Async run not found. Provide id or dir.`
+            //
+            // Placed ahead of the async resolution for upstream's own reason: a foreground run has
+            // no `status.json` to reconcile, so asking the async resolver about it can only fail.
+            //
+            // pi `:425`'s ternary has a transcript half (`formatRememberedForegroundTranscript`)
+            // with no cyrup counterpart — `foreground_transcript.rs` renders the LIVE control
+            // only, off `active_children`, and a remembered run carries no event stream to render.
+            // `view: "transcript"` on a detached id therefore still falls through; the status view
+            // this arm serves is what `/subagents-detach`'s own success sentence names.
+            if let Some(id) = resolved_id.as_deref()
+                && dir.is_none()
+                && let Some(run) = self.remembered_foreground_run(id)
+            {
+                return Ok(format_remembered_foreground_status(&run));
+            }
+
             // S6 — the renderer is HANDED the two live registries it may not lock across an
             // `.await`; see `run_status::RunStatusRenderDeps`.
             let deps = self.run_status_render_deps();
@@ -860,6 +887,238 @@ impl SubagentExecutor {
         session_roots.dedup();
         session_roots
     }
+
+    /// VL-S11b — pi `deps.state?.foregroundRuns?.get(resolved.id)` (`run-status.ts:421`), with the
+    /// exact-then-UNIQUE-prefix rule every other selector in this crate honours
+    /// ([`SubagentExecutor::resolve_live_foreground_run`]'s own, restated over the OTHER map).
+    ///
+    /// Cloned out of the lock: the caller renders asynchronously and this is a `std::sync::Mutex`.
+    /// An ambiguous prefix declines, for the same reason the live resolver's does — the accurate
+    /// diagnosis for two matching runs is the async resolver's `AmbiguousRunId`, not a silently
+    /// chosen one.
+    fn remembered_foreground_run(&self, selector: &str) -> Option<ForegroundHistoryRun> {
+        let runs = self
+            .foreground_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, run)) = runs.iter().find(|(id, _)| id.as_str() == selector) {
+            return Some(run.clone());
+        }
+        let mut prefix = runs
+            .iter()
+            .filter(|(id, _)| id.as_str().starts_with(selector));
+        let (_, first) = prefix.next()?;
+        if prefix.next().is_some() {
+            return None;
+        }
+        Some(first.clone())
+    }
+}
+
+/// pi `deps.state.foregroundRuns` as `bg_wait` consumes it (`subagent-wait.ts:226`) — the
+/// executor's projection of its remembered-run map onto the shape `background/wait` is able to
+/// name.
+///
+/// A [`std::sync::Weak`] for the same reason `ExecutorSubscriptionSessions` and
+/// `ExecutorForegroundProbe` are (`extension/executor/wait_subscriptions.rs`): the hook is handed
+/// to a wait that may outlive the turn, and a detached child must not keep the executor alive. A
+/// dropped executor snapshots as "no remembered runs", which makes every wait on one report the
+/// run as having disappeared rather than blocking on a map nobody can write to any more.
+struct ExecutorDetachedForegroundRuns {
+    executor: std::sync::Weak<SubagentExecutor>,
+}
+
+impl crate::background::wait::DetachedForegroundRunsSource for ExecutorDetachedForegroundRuns {
+    fn snapshot(&self) -> Vec<crate::background::wait::DetachedForegroundRun> {
+        let Some(executor) = std::sync::Weak::upgrade(&self.executor) else {
+            return Vec::new();
+        };
+        let runs = executor
+            .foreground_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runs.values()
+            .map(|run| crate::background::wait::DetachedForegroundRun {
+                run_id: run.run_id.as_str().to_string(),
+                session_id: run.session_id.as_str().to_string(),
+                children: run
+                    .children
+                    .iter()
+                    .map(|child| crate::background::wait::DetachedForegroundChild {
+                        index: child.index,
+                        agent: child.agent.clone(),
+                        status: child.status.clone(),
+                        // `[CYRUP-DELTA]`, already recorded and not re-stated: a remembered child
+                        // carries no live activity state or current tool (`wait_subscriptions`'
+                        // module doc, and `ExecutorForegroundProbe`'s own `// Not persisted` note
+                        // on the identical projection). Upstream's supervisor-attention test
+                        // (`subagent-wait.ts:242`) therefore cannot fire for a cyrup detached run;
+                        // it is ported in full because the record format is shared with the
+                        // subscription manager, which restores records written by any producer.
+                        activity_state: None,
+                        current_tool: None,
+                        transcript_path: child.transcript_path.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+impl SubagentExecutor {
+    /// VL-S11b — the hook `extension/wait_tool.rs` attaches to every `bg_wait` call's
+    /// [`crate::background::wait::WaitDeps`], so a wait's candidate set is upstream's full one
+    /// (async runs PLUS remembered detached foreground runs, `subagent-wait.ts:581-584`).
+    ///
+    /// `self: &Arc<Self>` because the hook must hold a [`std::sync::Weak`]; every production
+    /// caller already holds the executor in an [`Arc`](std::sync::Arc).
+    #[must_use]
+    pub fn detached_foreground_hook(
+        self: &std::sync::Arc<Self>,
+    ) -> crate::background::wait::DetachedForegroundHook {
+        crate::background::wait::DetachedForegroundHook::new(std::sync::Arc::new(
+            ExecutorDetachedForegroundRuns {
+                executor: std::sync::Arc::downgrade(self),
+            },
+        ))
+    }
+}
+
+/// pi `rememberedForegroundChildOutput` (`run-status.ts:192-203`): prefer the artifact/saved
+/// output FILE when it is still on disk, and fall back to the remembered inline snapshot.
+///
+/// The file is authoritative because `compact_child` drops `final_output` from a persisted record
+/// that has an output path (`foreground_history/persist.rs`) — exactly upstream's own
+/// `...(!outputPath && child.finalOutput ? … : {})`. A read failure falls through silently, as
+/// upstream's `catch` does.
+fn remembered_foreground_child_output(
+    artifact_output_path: Option<&Path>,
+    saved_output_path: Option<&Path>,
+    final_output: Option<&str>,
+) -> String {
+    if let Some(path) = artifact_output_path.or(saved_output_path)
+        && let Ok(text) = std::fs::read_to_string(path)
+        && !text.trim().is_empty()
+    {
+        return text.trim().to_string();
+    }
+    final_output.unwrap_or_default().to_string()
+}
+
+/// pi `formatRememberedForegroundStatus` (`run-status.ts:205-243`) — what
+/// `subagent({ action: "status", id })` renders for a run that is no longer LIVE but is still
+/// remembered, which is the only shape a detached run ever has.
+///
+/// Narrowed to the fields
+/// [`ForegroundHistoryChild`](crate::extension::executor::foreground_history) carries. Three of
+/// upstream's per-child parts have no cyrup field and are therefore absent rather than faked:
+/// `sessionName` (pi `:216`; cyrup's history child records the agent only), `exit ${exitCode}`
+/// (`:218`) and `acceptance: ${status}` (`:220`) — the same field-set narrowing that record's own
+/// "scoped out, deliberately" note already states, and none of them changes which branch the
+/// trailing recovery line takes.
+fn format_remembered_foreground_status(run: &ForegroundHistoryRun) -> String {
+    let run_id = run.run_id.as_str();
+    let mut lines = vec![
+        format!("Run: {run_id}"),
+        "State: remembered foreground".to_string(),
+        format!("Mode: {}", crate::formatters::run_mode_label(run.mode)),
+        format!(
+            "Updated: {}",
+            crate::time::format_iso8601_millis(run.updated_at)
+        ),
+        format!("Cwd: {}", run.cwd.display()),
+    ];
+    for child in &run.children {
+        // pi `:215` — the FIRST non-blank line of the child's output, capped at 160 chars.
+        let output = remembered_foreground_child_output(
+            child.artifact_output_path.as_deref(),
+            child.saved_output_path.as_deref(),
+            child.final_output.as_deref(),
+        );
+        let preview = output
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.chars().take(160).collect::<String>());
+        let mut parts = vec![format!(
+            "{}. {} {}",
+            child.index + 1,
+            child.agent,
+            child.status
+        )];
+        if let Some(error) = child.error.as_ref() {
+            parts.push(format!("error: {error}"));
+        }
+        if let Some(preview) = preview.filter(|p| !p.is_empty()) {
+            parts.push(format!("output: {preview}"));
+        }
+        lines.push(parts.join(", "));
+        if let Some(path) = child.session_file.as_ref() {
+            lines.push(format!("  Session: {}", path.display()));
+        }
+        if let Some(path) = child.transcript_path.as_ref() {
+            lines.push(format!("  Transcript: {}", path.display()));
+        }
+        if let Some(path) = child.artifact_output_path.as_ref() {
+            lines.push(format!("  Output: {}", path.display()));
+        }
+        if let Some(path) = child
+            .saved_output_path
+            .as_ref()
+            .filter(|saved| Some(*saved) != child.artifact_output_path.as_ref())
+        {
+            lines.push(format!("  Saved output: {}", path.display()));
+        }
+        if let Some(warning) = child.output_save_error.as_ref() {
+            lines.push(format!("  Output warning: {warning}"));
+        }
+        if let Some(warning) = child.transcript_error.as_ref() {
+            lines.push(format!("  Transcript warning: {warning}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Status: subagent({{ action: \"status\", id: \"{run_id}\" }})"
+    ));
+    if run.children.len() == 1 {
+        lines.push(format!(
+            "Transcript: subagent({{ action: \"status\", id: \"{run_id}\", view: \"transcript\" }})"
+        ));
+    } else {
+        lines.push(format!(
+            "Transcript: subagent({{ action: \"status\", id: \"{run_id}\", index: 0, view: \
+             \"transcript\" }})"
+        ));
+    }
+    // pi `:236-242` — the detached arm WINS over the resume arm, because a still-detached child
+    // must not be replaced by a revival of its own session file.
+    let detached = run.children.iter().any(|child| child.status == "detached");
+    let resumable = run
+        .children
+        .iter()
+        .find(|child| child.session_file.as_ref().is_some_and(|p| p.exists()));
+    if detached {
+        lines.push(format!(
+            "Recovery: reply to the supervisor request first, then wait with {}({{ id: \
+             \"{run_id}\" }}); do not resume or launch a replacement while any child remains \
+             detached.",
+            crate::extension::wait_tool::WAIT_TOOL_NAME
+        ));
+    } else if let Some(child) = resumable {
+        lines.push(if run.children.len() == 1 {
+            format!(
+                "Revive: subagent({{ action: \"resume\", id: \"{run_id}\", message: \"...\" }})"
+            )
+        } else {
+            format!(
+                "Revive child: subagent({{ action: \"resume\", id: \"{run_id}\", index: {}, \
+                 message: \"...\" }})",
+                child.index
+            )
+        });
+    } else {
+        lines.push("Resume: unavailable; no child session file was persisted.".to_string());
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -989,6 +1248,7 @@ mod tests {
         children: &[usize],
     ) {
         let entry = ForegroundControlEntry {
+            detach: None,
             interrupt: cyrup_core::CancelToken::new(),
             current_agent: None,
             current_index: None,
@@ -1203,6 +1463,73 @@ mod tests {
             .await
             .expect("a named child renders");
         assert!(report.contains("Child: 2 (scout)"), "{report}");
+    }
+
+    /// VL-S11b — `subagent({ action: "status", id })` finds a run that is in `foreground_runs`
+    /// but NOT in `foreground_controls`, which is by construction the shape every DETACHED run
+    /// has (`run_foreground_impl` remembers the receipt and then drops the live control).
+    ///
+    /// **Gutting mutation this fails on:** delete the second foreground arm (the
+    /// `remembered_foreground_run` branch). The id then falls through to the async resolver, which
+    /// has no `status.json` for a foreground run, and the call returns
+    /// `Err("Async run not found. Provide id or dir.")` — so both the `expect` and every
+    /// `contains` below fire.
+    #[tokio::test]
+    async fn status_by_id_finds_a_remembered_foreground_run_that_is_no_longer_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(std::sync::Arc::new(
+            crate::extension::testsupport::FixedSessionIdHost {
+                id: Some("session-detach".to_string()),
+                file: None,
+            },
+        ));
+
+        // The receipt a detach publishes, remembered exactly as `run_foreground_impl` does.
+        let receipt = crate::extension::executor::foreground::detach_receipt(
+            "scout",
+            "hold the line",
+            crate::extension::executor::detach::DetachReason::UserRequest,
+            false,
+        );
+        let run_id = RunId::from_token("fgdetached0001".to_string());
+        executor.remember_foreground_run(
+            &run_id,
+            crate::background::RunMode::Single,
+            dir.path(),
+            &[&receipt.result],
+        );
+        // The live-control map is EMPTY: the two maps are disjoint, which is the whole premise.
+        assert_eq!(
+            executor.resolve_live_foreground_run("fgdetached0001"),
+            None,
+            "a detached run must not be in `foreground_controls`"
+        );
+
+        let text = executor
+            .control_status(dir.path(), Some("fgdetached0001"), None, false)
+            .await
+            .expect("a remembered foreground run resolves by id");
+        assert!(text.contains("Run: fgdetached0001"), "{text}");
+        assert!(text.contains("State: remembered foreground"), "{text}");
+        assert!(text.contains("Mode: single"), "{text}");
+        assert!(text.contains("1. scout detached"), "{text}");
+        // pi `:238` — the detached arm wins, and it names the REGISTERED wait tool.
+        assert!(
+            text.contains(&format!(
+                "Recovery: reply to the supervisor request first, then wait with {}({{ id: \
+                 \"fgdetached0001\" }})",
+                crate::extension::wait_tool::WAIT_TOOL_NAME
+            )),
+            "{text}"
+        );
+
+        // A UNIQUE PREFIX resolves it too, matching every other selector in this crate.
+        let by_prefix = executor
+            .control_status(dir.path(), Some("fgdetached"), None, false)
+            .await
+            .expect("a unique prefix resolves a remembered foreground run");
+        assert!(by_prefix.contains("Run: fgdetached0001"), "{by_prefix}");
     }
 
     /// S6's executor half: the deps handed to the renderer carry each control's session, its

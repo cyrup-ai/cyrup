@@ -22,7 +22,7 @@
 //! semantics* are bespoke (R-SA-021). That plumbing is consumed in `mod.rs`/`chains.rs`, not
 //! here.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use cyrup_core::{ModelId, ProviderId};
@@ -529,7 +529,22 @@ impl<'de> serde::Deserialize<'de> for ToolsOverrideField {
 /// Which settings scope produced an applied [`AgentOverrideInfo`] (R-SA-012's project-beats-user
 /// precedence operates over exactly these two scopes; a `subagents.overrides.<name>` entry can
 /// live at either).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// "Project beats user" is one rule with two shapes, and `discovery/merge.rs` keeps them apart
+/// because pi does: for a BUILTIN agent the project entry wins by DISCARDING the user entry
+/// (`applyBuiltinOverrides`' return-per-branch ladder, `agents.ts:1492-1524`), while for a CUSTOM
+/// agent both entries apply, user first, and the project one merely lands on top
+/// (`applyCustomAgentOverrides`, `agents.ts:1538-1559`). Only the second shape can put both
+/// variants into one [`AgentOverrideInfo::field_scopes`] entry.
+///
+/// `Ord`/`Hash` exist so this can be a [`BTreeSet`] element (pi stores `fieldScopes[field]` as a
+/// sorted string array, `agents.ts:1423`). The derived order is declaration order — `User` before
+/// `Project` — which is NOT pi's, since pi sorts the strings and gets `"project"` before `"user"`.
+/// Nothing depends on the difference: every reader tests membership
+/// (`subagents-admin.ts:283`'s `.includes("user")`), never position.
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum OverrideScope {
     User,
@@ -543,32 +558,97 @@ pub enum OverrideScope {
 /// second time.
 #[derive(Clone, Debug)]
 pub struct AgentOverrideInfo {
+    /// The scope of the LAST pass that applied something, not "the only scope involved" — see
+    /// [`Self::field_scopes`] for the per-key truth. pi builds the record with `{ ...meta, ... }`
+    /// (`agents.ts:1416`), so the current pass's `scope`/`path` overwrite the previous pass's while
+    /// `fields`/`fieldScopes` accumulate underneath. For a custom agent carrying entries at both
+    /// scopes this is therefore always `Project`, even for the keys only the user entry set.
     pub scope: OverrideScope,
+    /// The `settings.json` that [`Self::scope`] names — never the agent's own `.md` path. Last
+    /// writer wins, for the same reason as [`Self::scope`].
     pub settings_path: PathBuf,
-    /// The agent definition exactly as parsed from disk, before this override was applied.
+    /// The agent definition as parsed from disk, before the FIRST override touched it — pi
+    /// `agent.override?.base ?? cloneOverrideBase(agent)` (`agents.ts:1417`), which reuses an
+    /// existing record's base rather than re-snapshotting. It is deliberately not "before the
+    /// override named by [`Self::scope`]": on a custom agent whose project entry layers over a user
+    /// entry, re-snapshotting would fold the user override into the baseline and hide it from
+    /// `savesThroughSettings`' effective-vs-base comparison (`subagents-admin.ts:136`).
+    ///
     /// Boxed to avoid inflating the common (no-override) `AgentDefinition` size for the rare
     /// overridden case.
     pub base_snapshot: Box<AgentDefinition>,
+    /// pi `BuiltinAgentOverrideInfo.fields` (`agents.ts:118`, built at `:1418`) — the union of
+    /// every settings key that has been applied to this agent, ACROSS scopes.
+    ///
+    /// `savesThroughSettings`'s second clause (`subagents-admin.ts:129`) reads this and has no
+    /// other data source: it decides whether `/subagents` persists an edit into settings or
+    /// rewrites the agent's own frontmatter file.
+    ///
+    /// **Key spelling is load-bearing.** These are pi's own `BuiltinAgentOverrideConfig` JSON keys
+    /// (`agents.ts:85-112`) in on-disk camelCase — `model`, `thinking`, `systemPrompt`,
+    /// `completionGuard`, `subagentOnlyExtensions`, … — matching this crate's
+    /// [`AgentOverrideConfig`] `#[serde(rename_all = "camelCase")]` names, never the Rust field
+    /// names. `subagents-admin.ts:117`'s `EditableOverrideField` is a union of exactly these
+    /// strings and `:129` tests membership with them literally.
+    ///
+    /// Two things it does NOT contain, both matching upstream:
+    /// - a key stated in settings but not written by the apply pass — currently only a
+    ///   `description: false`, which both apply sites in `merge.rs` ignore (see
+    ///   [`AgentOverrideConfig::description`]);
+    /// - anything at all from the bulk `subagents.disableThinking` clear, whose provenance record
+    ///   (pi `clearBuiltinThinking`, `agents.ts:1469`) omits `fields`/`fieldScopes` entirely. An
+    ///   agent whose only "override" is that clear therefore has an `AgentOverrideInfo` with EMPTY
+    ///   `fields` — readers must not treat non-`None` provenance as implying a non-empty set.
+    pub fields: BTreeSet<String>,
+    /// pi `BuiltinAgentOverrideInfo.fieldScopes` (`agents.ts:119`, accumulated at `:1421-1424`) —
+    /// per field, EVERY scope that contributed it. Its key set is always exactly
+    /// [`Self::fields`]; the two are populated from one set of applied keys in `merge.rs`.
+    ///
+    /// `persistSettingsField`'s `shadowsLowerScope` branch (`subagents-admin.ts:283`) reads this
+    /// and has no other data source: it is how `/subagents` warns that the user-scope value the
+    /// human just edited is shadowed by a project-scope one.
+    ///
+    /// A two-element entry is reachable for CUSTOM agents only, and only because
+    /// `applyCustomAgentOverrides` applies **user THEN project** cumulatively (`agents.ts:1538-1559`,
+    /// whose own comment says *"Apply user then project so project fields win without dropping
+    /// user-only fields"*) — which `discovery/merge.rs`'s `apply_custom_agent` now does. For a
+    /// BUILTIN agent the ladder at `agents.ts:1492-1524` runs exactly one pass, so every entry here
+    /// is a singleton; that is upstream's shape, not a gap.
+    pub field_scopes: BTreeMap<String, BTreeSet<OverrideScope>>,
 }
 
 /// Per-field three-state override delta for one agent name, as read from
 /// `subagents.agentOverrides.<name>` in `cyrup-config`'s layered, untyped settings map (func-SA
 /// §4.1). Every field below is exactly one field of pi's `BuiltinAgentOverrideConfig`
-/// (`agents.ts:80-103`), under the same JSON key.
+/// (`agents/agents.ts:85-112` @v0.68.0 — note the PATH: the file moved to `src/agents/` and an
+/// unqualified `agents.ts:80-103` was both a v0.43.0 line range and a v0.43.0 location).
 ///
-/// **This is NOT the complete set.** pi declares 22 override keys at v0.43.0; the fields below model
-/// 19 of them, plus the two keys pi added in v0.62.0 (`excludeTools`/`allowNestedSubagents`,
-/// SUBA-092), and 3 are unmodeled. An earlier revision of this doc claimed field-for-field
-/// completeness — it was wrong, and the claim is retracted rather than softened, because "pi has no
-/// others" is exactly the sentence that stops a reader from checking. Keep the arithmetic here
-/// honest: a wrong census misleads in the same way the completeness claim did. (`defaultProvider`
-/// left this list with SUBA-088 — see [`Self::default_provider`].)
+/// **This is NOT the complete set, and the census below is re-counted at v0.68.0.** The previous
+/// revision of this paragraph said "22 keys at v0.43.0; 19 modeled; 3 unmodeled". Every one of
+/// those numbers is now stale. Counted off the interface itself (`:86-111` are the 26 field
+/// declarations inside the `:85-112` block):
 ///
-/// TWO of the three are unmodeled because this crate's [`AgentDefinition`] has no field for them to
-/// land in, and modeling them anyway would produce a settings key that parses and is then silently
+/// - **26 keys upstream.**
+/// - **20 modeled here**, and `merge.rs`'s private `builtin_applied_keys` is the mechanical
+///   statement of which — its list carries 21 entries, being those 20 plus `fallbackModels`,
+///   which is cyrup's OWN key and has no `BuiltinAgentOverrideConfig` counterpart at any tag.
+/// - **6 unmodeled**: `machine`, `outputMode`, `fast`, `inheritGlobalContext`, `acceptanceRole`,
+///   `mutationTools`.
+///
+/// The claim is retracted and re-derived rather than softened, because "pi has no others" is
+/// exactly the sentence that stops a reader from checking, and a wrong census misleads in the same
+/// way. (`defaultProvider` left this list with SUBA-088 — see [`Self::default_provider`].)
+///
+/// FIVE of the six are unmodeled because this crate's [`AgentDefinition`] has no field for them to
+/// land in (`acceptanceRole` is the partial case — the definition carries it, the override delta
+/// does not), and modeling them anyway would produce a settings key that parses and is then silently
 /// dropped — which, for an override delta, is indistinguishable from the setting not working at all:
 ///
 /// - `fast?: boolean` — pi `AgentConfig.fast`; no counterpart here.
+/// - `machine?: string | false` — pi's remote-execution target; cyrup has no machine dispatch.
+/// - `inheritGlobalContext?: boolean` — the global half of pi's context inheritance; cyrup models
+///   only [`Self::inherit_project_context`].
+/// - `mutationTools?: string[] | false` — pi's per-agent mutation-tool allowlist.
 /// - `acceptanceRole?: AcceptanceRole | false` — pi `AgentConfig.acceptanceRole`. The definition
 ///   DOES carry it now ([`AgentDefinition::acceptance_role`], SUBA-082's frontmatter half), but
 ///   the settings-override delta for it is still unmodeled here (SUBA-081's remainder): pi's
@@ -576,8 +656,8 @@ pub struct AgentOverrideInfo {
 ///   (`applyAgentOverride`, `agents.ts` @v0.64.0), and that three-state (`unset`/`role`/`false`)
 ///   needs its own field.
 ///
-/// The THIRD, `outputMode?: OutputMode`, is a different case: it IS representable — this crate
-/// merges pi's independent `output` (a path string) and `outputMode` fields into a single
+/// The SIXTH, `outputMode?: OutputMode` (`:89`), is a different case: it IS representable — this
+/// crate merges pi's independent `output` (a path string) and `outputMode` fields into a single
 /// [`OutputSpec`], so its target is [`OutputSpec::mode`] — and is unmodeled only because it fell
 /// outside the scope that added the other five. Note the consequence for [`Self::output`], which is
 /// handled in `merge.rs`: a concrete `output` override replaces the PATH and must PRESERVE any
@@ -828,7 +908,11 @@ pub struct SubagentSettings {
 /// precedence at APPLICATION time and record the real winning scope + settings-file path in
 /// [`AgentOverrideInfo`] — exactly as pi's `discoverAgents` holds `userSettings`/`projectSettings`
 /// plus `userSettingsPath`/`projectSettingsPath` and hands all four to
-/// `applyBuiltinOverrides`/`applyCustomAgentOverrides` (`agents.ts:1039-1213`, `1282-1298`).
+/// `applyBuiltinOverrides`/`applyCustomAgentOverrides` (`agents.ts:1472-1525` and `:1538-1559`
+/// @v0.68.0). Note that the two consume the pair differently: the builtin ladder picks ONE scope
+/// and returns (`:1492-1524`), while the custom pass applies user and then project (`:1546-1558`),
+/// so "the winning scope" recorded in [`AgentOverrideInfo::scope`] means *the last scope that
+/// applied something* — [`AgentOverrideInfo::field_scopes`] is the per-key record.
 ///
 /// Pre-flattening the two scopes into a single [`SubagentSettings`] (the pre-Tier-7 shape)
 /// irrecoverably loses *which* scope an applied override came from — which is why the provenance

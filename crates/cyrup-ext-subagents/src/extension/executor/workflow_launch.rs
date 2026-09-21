@@ -724,14 +724,37 @@ async fn settle_foreground_workflow(
 ///
 /// Upstream needs a callback because `detachForeground` returns the tool call EARLY and leaves
 /// the child running; the exit it is waiting for happens after the workflow is already parked.
-/// cyrup's drive loop does the opposite: a blocking `contact_supervisor` ask fires
-/// `spawn_clarify` and the loop KEEPS DRIVING (`exec/drive_attempt.rs:345-367`), the human's
-/// answer riding back to the still-alive child over the broker rather than this stdout pipe. So
-/// the detached child's exit is observed synchronously, inside
+/// cyrup's INTERCOM detach — the only one a workflow child can take — does the opposite: a
+/// blocking `contact_supervisor` ask fires `spawn_clarify` and the drive loop KEEPS DRIVING
+/// (`exec/drive_attempt.rs:345-367`), the human's answer riding back to the still-alive child over
+/// the broker rather than this stdout pipe. So the detached child's exit is observed
+/// synchronously, inside
 /// [`WorkflowScriptHost::launch`](crate::workflows::scripted::WorkflowScriptHost::launch), and
 /// the two upstream moments — "the workflow parks at paused" and "its detached child exits" —
 /// collapse into this one settlement. The `Paused` status the caller just wrote is the input;
 /// this is the write that supersedes it.
+///
+/// **Scoped to the intercom producer on purpose, and the scope is narrower than it looks.**
+/// VL-S11b added cyrup's second producer, `/subagents-detach`, which DOES return early and hands
+/// its child to a continuation task (`extension/executor/foreground.rs`'s producer split). A
+/// workflow child is reachable from it: `register_foreground_controls` stamps `mode: Single` on
+/// EVERY entry it publishes, including a workflow child's (it only adds
+/// `parent_workflow_run_id`/`workflow_key` on top), so the handler's `mode != Single` refusal (pi
+/// `slash-commands.ts:990`) does not fire and a human who names that child's run id detaches it.
+///
+/// What then reaches this hook is the RECEIPT, not a terminal result — `launch` cannot tell the
+/// two apart, since both are `SingleResult { detached: true }` returned from
+/// `run_foreground_streaming`. The reconciliation it drives is therefore provisional for a user
+/// detach: correct about "this child is detached and the workflow parks at paused", but written
+/// before the child exited. The real exit is observed by the producer's own continuation, whose
+/// reconciler is upstream's other one, `updateRememberedForegroundChild`
+/// (`subagent-executor.ts:850-899`, ported as `reconcile_detached_foreground_child`), and which
+/// updates `foreground_runs` — not this workflow status. Upstream closes that gap by routing the
+/// exit back through `resolveDetachedWorkflowChild` (`subagent-executor.ts:4078-4081`); cyrup's
+/// continuation has no workflow handle to route to, so a user-detached WORKFLOW child stays
+/// `paused` until something else settles it. A user-detached plain `/run` single — the case
+/// `/subagents-detach` exists for, and the only one its success sentence describes — is fully
+/// reconciled.
 ///
 /// Sequential, in launch order, never concurrent: each call re-reads `status.json` and writes
 /// it back, and only the LAST open child's settlement promotes the workflow out of `paused`

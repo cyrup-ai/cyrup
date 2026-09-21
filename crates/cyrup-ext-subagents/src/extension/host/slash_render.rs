@@ -241,37 +241,14 @@ async fn resolve_step_fork_context(
     Ok(())
 }
 
-/// `/run-chain`'s task-seeding rule (see this command's own doc note in `dispatch_slash`): splice
-/// `task` into the first element's first task only, leaving every later step's saved task text
-/// verbatim.
-pub(crate) fn seed_first_step_task(mut steps: Vec<RunnerStep>, task: &str) -> Vec<RunnerStep> {
-    if task.is_empty() {
-        return steps;
-    }
-    if let Some(first) = steps.first_mut() {
-        match first {
-            RunnerStep::SingleStep(spec) => spec.task = task.to_string(),
-            RunnerStep::ParallelGroup(group) => {
-                if let Some(first_task) = group.steps.first_mut() {
-                    first_task.task = task.to_string();
-                }
-            }
-            RunnerStep::DynamicGroup(_) => {
-                // A `DynamicGroup` has no single fixed task to overwrite (its per-item tasks come
-                // from `template` instantiated once per resolved array element) — left as saved.
-            }
-            RunnerStep::ImportAsyncRoot(_) => {
-                // A root-attachment step's "task" is fixed by the target run it imports; there is no
-                // free task text to seed (R-SA-097) — left as saved.
-            }
-        }
-    }
-    steps
-}
-
-/// Render [`StepResult`]s from a foreground `/chain`/`/parallel`/`/run-chain` run as human-readable
-/// text — one line per step, in chain order (R-SA-051's ordering guarantee, restated at this
-/// command's own text-rendering layer).
+/// Render [`StepResult`]s from a foreground multi-step run as human-readable text — one line per
+/// step, in chain order (R-SA-051's ordering guarantee, restated at this layer).
+///
+/// The three slash commands this once named (`/chain`, `/parallel`, `/run-chain`) were deleted
+/// with VL-S12; upstream removed them at v0.41.0. This function outlived them because the
+/// `subagent` tool's own chain/parallel routing still calls it
+/// (`extension/tool/routing.rs:2889`). Its former neighbour in this module, the `/run-chain`
+/// task-seeding helper, had no such second caller and was deleted with the command.
 pub(crate) fn render_chain_results(
     results: &[StepResult],
     is_group: &[bool],

@@ -772,6 +772,23 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             .map(ToString::to_string),
         acceptance: acceptance_ledger,
         detached,
+        // VL-S11b — pi `receipt.detachedReason = reason` (`execution.ts:620`). `run_sync` knows
+        // WHICH detach this is (its only observation is the drive loop's R-SA-037 blocking
+        // `contact_supervisor` arm, which IS upstream's
+        // `detachForeground("intercom coordination")`, `execution.ts:762`) but it may not NAME it
+        // from here, and that is a layering fact rather than an omission: `extension::executor` is
+        // a PRIVATE module of `extension` (`extension/mod.rs`'s `mod executor;`), so
+        // `extension::executor::detach::DetachReason` — the closed vocabulary both producers share
+        // — is not a path `crate::exec` can write. `exec` sits BELOW `extension`, exactly as
+        // `background` does.
+        //
+        // So the reason is stamped ONE LAYER UP, by the caller that owns the vocabulary:
+        // `run_foreground_impl`'s `stamp_intercom_detach_reason`
+        // (`extension/executor/foreground.rs`) fills this in on every settled result that
+        // detached, and the same file's `detach_receipt` mints `DetachReason::UserRequest`
+        // receipts for `/subagents-detach`. Writing a second literal here instead is precisely the
+        // drift the closed enum exists to prevent.
+        detached_reason: None,
         interrupted,
         timed_out,
         // pi `result.timeoutRecovery` (`execution.ts:1503`, published `subagent-runner.ts:1616`)
@@ -1064,6 +1081,7 @@ pub(crate) fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) 
         transcript_error: None,
         acceptance: None,
         detached: false,
+        detached_reason: None,
         interrupted: false,
         timed_out: false,
         // Nothing spawned ⇒ no deadline fired and no worktree evidence exists to summarize.
