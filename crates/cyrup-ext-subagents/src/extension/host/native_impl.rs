@@ -264,6 +264,23 @@ impl NativeExtension for SubagentsExtension {
                     );
                 }
 
+                // VL-S11 R3 — pi `if (options.foregroundDetachShortcut) pi.registerShortcut(…)`
+                // (`slash/slash-commands.ts:1007-1012`): the SAME `/subagents-detach` handler,
+                // reachable from a chord. Registered right after the command it shares a handler
+                // with, exactly where upstream registers it (`:1002` then `:1007`), and in the
+                // `Full` arm only — a `ChildSafe` fanout child registers no orchestrator UI, so it
+                // binds no key either. `None` here is upstream's falsy config value: no chord.
+                // The press lands at `Self::execute_shortcut` below.
+                if let Some(key) = self.foreground_detach_shortcut() {
+                    api.register_shortcut(
+                        key,
+                        Some(
+                            crate::extension::host::shortcuts::FOREGROUND_DETACH_SHORTCUT_DESCRIPTION
+                                .to_string(),
+                        ),
+                    );
+                }
+
                 // pi `registerMainWatchdog`'s own two registrations (`watchdog/register-main.ts:392-409`):
                 // the `/subagents-watchdog` command and the renderer for its warning message. Both
                 // in the Full arm only — a `ChildSafe` child registers no orchestrator UI at all,
@@ -360,6 +377,10 @@ impl NativeExtension for SubagentsExtension {
     /// run survives shutdown — a detached run MUST continue to completion even after the
     /// orchestrating process exits (R-SA-071/DI-SA-8), and nothing here sends it any signal.
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
+        // pi `ctx.mode`, latched — see `execute_command`'s note and `slash_inspect_rpc`'s module
+        // doc. Recorded here as well so the value is already correct on the FIRST command of a
+        // session, rather than only from the second.
+        crate::extension::host::slash_inspect_rpc::record_attached_mode(ctx.mode);
         match ev {
             HostEvent::SessionStart { .. } => {
                 // T6's once-per-load housekeeping (`ensureAccessibleDir`/`cleanupOldChainDirs`/
@@ -944,9 +965,14 @@ impl NativeExtension for SubagentsExtension {
         ctx: &HostCtx,
     ) -> Result<Option<String>, ExtError> {
         ctx.require_command_tier()?;
+        // pi `ctx.mode`, latched for the one handler that needs it and cannot be handed a ctx —
+        // `/subagents-inspect-rpc`'s `mode === "tui"` guard (`slash/slash-commands.ts:931`). See
+        // `slash_inspect_rpc`'s module doc for exactly how faithful that latch is. Written from
+        // THIS invocation's ctx, immediately before dispatching it.
+        crate::extension::host::slash_inspect_rpc::record_attached_mode(ctx.mode);
 
         // pi `register-main.ts:403-409` registers `/subagents-watchdog` as its OWN command, separate
-        // from this crate's twelve `SLASH_COMMANDS`, so it routes before the table lookup.
+        // from this crate's eighteen `SLASH_COMMANDS`, so it routes before the table lookup.
         if name == crate::watchdog::register_main::WATCHDOG_COMMAND_NAME {
             return Ok(self.execute_watchdog_command(args, ctx));
         }
@@ -963,6 +989,28 @@ impl NativeExtension for SubagentsExtension {
             .unwrap_or_else(|err| format!("subagent command failed: {err}"));
 
         Ok(Some(output))
+    }
+
+    /// VL-S11 R3 — run the chord declared at [`NativeExtension::init`] through
+    /// [`cyrup_ext::native::InitApi::register_shortcut`].
+    ///
+    /// pi `pi.registerShortcut(options.foregroundDetachShortcut as KeyId, { description, handler:
+    /// async (ctx) => detachForegroundRun("", ctx) })` (`slash/slash-commands.ts:1007-1012`): the
+    /// handler is the SAME closure `/subagents-detach` is registered with, called with an empty
+    /// argument. That is reproduced exactly —
+    /// [`SubagentsExtension::dispatch_shortcut`] reaches
+    /// [`SubagentsExtension::slash_subagents_detach`] with `""` — so the chord and the command can
+    /// never resolve different targets or print different sentences.
+    ///
+    /// `ctx` is COMMAND tier here as it is for `execute_command`, matching pi, where a shortcut
+    /// handler receives the same `ExtensionContext` a command handler does.
+    ///
+    /// A key this extension did not bind falls through to the trait default's own sentence rather
+    /// than silently succeeding; see [`SubagentsExtension::dispatch_shortcut`].
+    async fn execute_shortcut(&self, key: &str, ctx: &HostCtx) -> Result<(), ExtError> {
+        ctx.require_command_tier()?;
+        crate::extension::host::slash_inspect_rpc::record_attached_mode(ctx.mode);
+        self.dispatch_shortcut(key).await
     }
 
     /// Late-bind the live capability backend (P-1, reconciliation §2 item 1). The session builder

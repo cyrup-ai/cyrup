@@ -21,6 +21,19 @@ pub(crate) struct ForegroundControlEntry {
     /// Fires this run's soft interrupt (pi `control.interrupt?.()`); shared with the live
     /// [`crate::exec::RunOptions::interrupt`] token the running child's own attempt loop races against.
     pub(crate) interrupt: CancelToken,
+    /// Fires this run's DETACH (pi `control.detach?.()`, `slash-commands.ts:993`), lifted from the
+    /// live child by `syncCurrentChild` (`foreground-control.ts:59`) and cleared by
+    /// `clearCurrentChild` (`:83`).
+    ///
+    /// `None` while the run has no detach-ready attempt — upstream's own `if (input.detach)` guard
+    /// (`foreground-control.ts:119`), which exists because an attempt only publishes its callback
+    /// once its coordinator is live (`execution.ts:1372`'s `onDetachReady`).
+    ///
+    /// **Deliberately not a [`CancelToken`].** A cancel means *stop*; the whole point of a detach
+    /// is that the child keeps running. The handle answers accept-or-refuse instead, because
+    /// upstream's `detach()` returns a `bool` that `/subagents-detach` renders as a distinct
+    /// sentence. See [`crate::extension::executor::detach`] for the handshake and every string.
+    pub(crate) detach: Option<crate::extension::executor::detach::ForegroundDetachHandle>,
     /// The run's current step agent name (pi `control.currentAgent`); `None` means no live message
     /// route exists yet (pi's "has no active child message route" guard).
     pub(crate) current_agent: Option<String>,
@@ -96,6 +109,43 @@ pub(crate) struct ForegroundControlEntry {
         usize,
         crate::extension::executor::foreground_control::ForegroundChildEntry,
     >,
+}
+
+#[cfg(test)]
+impl ForegroundControlEntry {
+    /// Test-only: a minimal live control carrying only the fields the detach resolver and the
+    /// `/subagents-detach` handler read — `mode`, `updated_at` and `detach`.
+    ///
+    /// One constructor rather than a hand-written 19-field literal per test file, so a future
+    /// field addition does not have to be threaded through several copies of the same fixture.
+    pub(crate) fn for_test(
+        mode: crate::background::RunMode,
+        updated_at: i64,
+        detach: Option<crate::extension::executor::detach::ForegroundDetachHandle>,
+    ) -> Self {
+        Self {
+            interrupt: CancelToken::new(),
+            detach,
+            current_agent: None,
+            current_index: None,
+            current_activity_state: None,
+            mode,
+            description: None,
+            current_tool: None,
+            current_path: None,
+            turn_count: None,
+            tool_count: None,
+            tokens: None,
+            started_at: updated_at,
+            updated_at,
+            session_id: None,
+            parent_workflow_run_id: None,
+            workflow_key: None,
+            cwd: None,
+            session_name: None,
+            active_children: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 /// How long [`ForegroundControlNotifier::flush`] waits for the notice pump to acknowledge that it
@@ -1457,6 +1507,7 @@ mod tests {
             controls.insert(
                 "run-nested-1".to_string(),
                 ForegroundControlEntry {
+                    detach: None,
                     interrupt: token.clone(),
                     current_agent: Some("reviewer".to_string()),
                     current_index: Some(0),
@@ -1547,6 +1598,7 @@ mod tests {
             controls.insert(
                 "run-nested-2".to_string(),
                 ForegroundControlEntry {
+                    detach: None,
                     interrupt: CancelToken::new(),
                     current_agent: Some("reviewer".to_string()),
                     current_index: Some(0),
@@ -1979,6 +2031,7 @@ mod tests {
             controls.insert(
                 "fgstop0001".to_string(),
                 ForegroundControlEntry {
+                    detach: None,
                     interrupt: CancelToken::new(),
                     current_agent: Some("scout".to_string()),
                     current_index: Some(0),

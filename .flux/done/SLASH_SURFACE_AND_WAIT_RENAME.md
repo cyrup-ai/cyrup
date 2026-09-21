@@ -1,7 +1,7 @@
 ---
-stage: new
-status: pending
-updated: 2026-09-20
+stage: done
+status: completed
+updated: 2026-09-21
 ---
 
 # The slash surface and the wait-tool name — VL-S11, VL-S12, VL-S8
@@ -865,3 +865,165 @@ An augment may report that something is BIG. It may not decide that something is
 is large, it is sequenced — not dropped — and the only thing that may be recorded as a residual is
 a dependency that genuinely does not exist, with the grep that proves it. Three of the four above
 were filed on premises that a single grep refutes. **Grep before you file.**
+
+---
+
+## [EXEC — slash surface] 2026-09-21 — what landed, and the eight things this spec got wrong
+
+Seven writers, one verify pass. `VL-S8`, `VL-S11` and `VL-S12` all **CLOSED**; `SUBA-026` narrowed
+to its UI half. The Definition of Done stands as amended by the scope correction: the palette is
+**18 of 18**, `/subagents-steer` reaches the live `steer` action, `/subagents-inspect-rpc` reaches
+`background/inspect_rpc/`, the detach shortcut is bound through `register_shortcut`, and
+`apply_custom_agent` merges cumulatively with `field_scopes` holding two scopes.
+
+### What landed
+
+- **VL-S12** — `Chain`, `Parallel`, `RunChain`, `ChainPrompts` deleted from the enum, the table,
+  the parsers and the prose. Pinned NEGATIVELY by
+  `the_four_commands_upstream_deleted_at_v0_41_0_are_not_registered`, which is the only way a
+  removal can be pinned. Five pure slash-surface ITs retired; `tool_parallel_chain`'s inline-group
+  fan-out counting and both recipe-chain tests were RE-POINTED rather than deleted, because the
+  machinery under them is real and still reachable.
+- **VL-S8** — `WAIT_TOOL_NAME` is `bg_wait`, asserted off the REGISTERED tool object rather than
+  off the const. **The rename was not the point.** `watchdog/permission_arbiter.rs`'s
+  `INTERNAL_TOOLS` — the set a permission policy may NOT gate, because gating one of its members
+  strands a child that then cannot report back — held the literal `"subagent_wait"`, **a name this
+  crate has never registered at any point in its history.** A parent shipping `{"bg_wait": "deny"}`
+  was ACCEPTED. The set now holds `WAIT_TOOL_NAME` itself, so the two cannot diverge again.
+- **VL-S11a** — `/subagents`, the admin surface, over the five save/choose functions.
+- **VL-S11b** — `/subagents-detach`, and it is the only command here that was not a registration
+  over an existing capability. Upstream's detach is cheap because pi's child is an in-process
+  session object; cyrup's is a real OS process owned by the `drive_foreground_run_sync` future, so
+  the same move would KILL the thing the feature exists to preserve. `run_foreground_impl` is split:
+  the future is built from owned inputs and boxed `Pin<Box<dyn Future + Send>>` so the whole value
+  can move into `tokio::spawn` on an accepted detach. **Both reader halves were dead from
+  production** — `WaitTool::execute` never chained `.with_detached_foreground(…)` and
+  `DetachedForegroundRunsSource` had no implementation anywhere in the tree, so
+  `active_detached_foreground_runs` always returned empty. Found by the IT that asserts `bg_wait`
+  BLOCKS, which was committed knowingly red.
+- **`/subagents-steer` and `/subagents-inspect-rpc`**, plus the detach keybinding.
+- **Cumulative custom-agent overrides** — user pass then project pass, with `AgentOverrideInfo`'s
+  `fields`/`field_scopes` populated at all three construction sites. One extra change was
+  mandatory and upstream pins it: `apply_custom_override`'s `disabled` arm was gated on the runtime
+  value, and once layering lands that guard makes `disabled` the single key on which a USER entry
+  beats a PROJECT one. Upstream's own regression test (`agent-overrides.test.ts:646-684`) names
+  that stray guard as the bug its layering commit removed.
+
+### Gates
+
+`cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets --features
+test-fixtures -- -D warnings` clean. `cargo nextest run --workspace --features test-fixtures`
+**11 074 run, 11 074 passed, 9 skipped**. `cargo nextest run -p cyrup-it --features it` **594 run,
+594 passed, 0 skipped**.
+
+**The 594 is accounted for, not asserted.** This spec's brief quoted a `cyrup-it` baseline of 567
+and predicted `567 - 6 + 9 = 570`. Both halves were stale. The real pre-batch figure is **590** —
+`PARITY-GAPS.md`'s `VL-S6` closure records `cyrup-it 590 passed` on the herdr merge that is this
+branch's own ancestor — and the retirement was **five** `#[test]`s, not six: the sixth was
+RE-POINTED onto a surviving surface, so it still runs. `590 - 5 + 9 = 594`, and counting
+`#[test]`/`#[tokio::test]` attributes across the batch's diff of `crates/cyrup-it/` gives
+`before=22, after=26`, i.e. the same `+4`.
+
+**Both numbers above are from clean runs, but two flakes were seen on the way there and are
+recorded rather than quietly retried away.** Neither is this batch's, both are timing-dependent
+under parallel load, and both were re-run in isolation before being called flaky:
+
+* `extension::tool::routing::scheduled_runs_tests::the_armed_tick_fires_a_due_schedule_with_nobody_asking`
+  failed once (`left: 0, right: 1` — the armed tick had not fired) after **14.3s** in a full
+  workspace run. Alone it is **0.045s and green**. It is a wall-clock tick assertion about the
+  scheduler's own timer, starved when 11 074 tests share the box.
+* `cyrup-it::bin acp_session::session_new_is_built_off_the_dispatch_loop` failed once after
+  **45.9s** on *"timed out waiting for the response to id 2"* — while its own frame log, printed
+  in the panic, CONTAINS that response. Alone it is **0.38s and green**. Last touched at
+  `8de7460`, before this batch's base commit, and nothing here is on its path.
+
+They are written down because a suite that reaches green by retrying is not reporting anything, and
+the next reader deserves to know which two tests will bite them.
+
+### Eight spec errors, found by the writers and confirmed here
+
+1. **§I.4 says `SLASH_COMMANDS.len() == 16`. It is 18** — and it was 18 at this batch's own base
+   commit, before a single command was added or removed. The test asserts 18 and additionally
+   names every entry in table order.
+2. **§I.8's package-agent refusal is unreachable on the production path.** `savesThroughSettings`
+   returns `true` for every package agent on its second line — `subagents-admin.ts:127`,
+   `if (agent.source === "package") return true;` — so `readOnlyAgentMessage`'s package arm
+   (`:154-155`) is never consulted from there. The claim is a UNIT assertion in
+   `subagents_admin.rs` instead of an IT, with the reachability argument recorded in the file so
+   the next reader does not re-add it.
+3. **§D.2/§G.3 named five primitives as reusable from `registration::`. All five are in PRIVATE
+   modules** — `mod render;` (`:73`), `mod frontmatter_write;` (`:69`) and `mod tier_actions;`
+   (`:75`) are all declared without `pub` inside `discovery/management/mod.rs`, so
+   `format_agent_detail`, `serialize_agent`, `write_agent_file`, `preserved_frontmatter_fields` and
+   `tier_actions` are `pub(crate)` items behind a path that cannot be named from outside
+   `management`. `pub(crate)` on the item is not enough when the module is private.
+4. **`resolve_extra_agent_dirs` (`discovery/mod.rs:768`) is a private `fn`**, not a reusable one,
+   and **`AvailableModelEntry` (`extension/models/mod.rs:34`) has private fields** — `provider`,
+   `id`, `full_id` are all bare — so a `registration::` caller can construct neither.
+5. **§G.2 claimed the `subagent` tool's chain/parallel actions reach `resolve_chain`. They do
+   not** — they reach `discovery::chains::chain_step_to_runner_step` (`:1057`). `resolve_chain` is
+   defined at `extension/executor/chain.rs:525` and `git grep -n 'resolve_chain\b'` returns that
+   definition and nothing else: it is a public-API method with **no in-crate caller**, which is why
+   it survives dead-code analysis. The "still use them" clause was right about the chain-graph
+   types and wrong about the resolver.
+6. **The `/subagents-steer` "no-id opens a selector" hypothesis is REFUTED by upstream.**
+   `/subagents-stop` opens `ctx.ui.custom(…)` on its no-id branch (`slash-commands.ts:1044-1047`);
+   `/subagents-steer` does not — `:1065-1068` is `sendSlashText(pi, usage)` and nothing else.
+   `has_ui` is threaded into the handler and deliberately unused, with the reason in the module
+   doc: steering an unnamed run is a guess, and a guess speaks into a live child's prompt. §137's
+   own correction ("there is no in-tree precedent for a slash command opening an interactive
+   selector") was right, and this is the upstream half of it.
+7. **`DetachTarget::Ambiguous`'s frozen-contract doc said "no id was given".** Both producers only
+   reach it WITH an id; the no-id path takes upstream's newest-single fallback
+   (`slash-commands.ts:246-249`), where several live runs are not a refusal at all.
+8. **Three upstream citations in the spec had drifted**: `reconcileDetachedForegroundChild` does
+   not exist at v0.68.0 (it is `updateRememberedForegroundChild`, `subagent-executor.ts:850-899`),
+   `onDetachReady` is `:4074-4081`, and `subagent-wait.ts`'s arming site is `:704-714`.
+
+### Residuals, each with a TRUE premise and the grep that proves it
+
+Filed in `docs/gap-analysis/00-residual-ledger.md` as `R-VLS11b-01`, `R-VLS11b-02`, `R-VLS11b-03`
+and `R-SUBA087-01`: a user detach aimed at a WORKFLOW child is not refused and its reconciliation
+is provisional; the detach continuation cannot persist foreground history; the detach chord is
+env-tier only and defaults ON where upstream has a settings key and registers nothing unless
+configured; and `step.childId`, the unported 4th identity rung. None of the four is a request to
+re-scope this spec — they are the four things that genuinely did not exist, greped at HEAD.
+
+### The standing rule, honoured
+
+The rule this spec's last section exists to enforce held: nothing was dropped. Two things were
+found BROKEN rather than missing and were fixed rather than filed — `INTERNAL_TOOLS`' phantom
+gating and the two dead reader halves behind `/subagents-detach` — and one earlier "finding"
+(`includeNested` "is not ported") turned out to have a premise that `/subagents-steer` itself
+falsifies, so it was struck rather than carried forward.
+
+### Mutation proof
+
+Every claim this batch makes was gutted and the gutting was proved to turn a test red. Each
+mutation was restored byte-for-byte and `git diff` over `crates/` was confirmed EMPTY before the
+commit that followed it.
+
+| # | mutation | target tests | result |
+|---|---|---|---|
+| M4 | `INTERNAL_TOOLS` reverted to the literal `"subagent_wait"` | `a_rule_keyed_on_the_registered_wait_tool_is_refused_at_validation`, `a_deny_rule_on_the_registered_wait_tool_cannot_strand_a_child`, `bash_and_the_internal_tools_are_allowed_even_when_a_rule_says_otherwise` | 3 RED |
+| M5 | `apply_custom_agent` reverted to winner-take-all (project replaces user outright) | `custom_agent_layers_project_over_user_without_dropping_user_only_fields` | RED |
+| M2 | `control_status`' SECOND foreground arm (`remembered_foreground_run`) deleted | `status_by_id_finds_a_remembered_foreground_run_that_is_no_longer_live` | RED — falls through to `Async run not found. Provide id or dir.` |
+| M3 | `active_detached_foreground_runs` returns an empty candidate set | `a_wait_on_a_detached_foreground_run_blocks_until_its_child_is_reconciled`, `the_detached_foreground_candidate_set_honours_every_upstream_filter` | 2 RED |
+| M1 | `spawn_detached_foreground_continuation` DROPS the drive future instead of moving it into a task that owns it — i.e. the detach cancels the run | `a_live_detach_returns_the_receipt_and_leaves_its_child_running` (`cyrup-it`) | RED |
+
+M4, M5, M2 and M3 were applied **together, in one build**, and run in a single filtered `nextest`
+invocation: their target tests live in four disjoint modules, so batching costs nothing in
+attribution. M1 needed the `cyrup-it` link and was run alone.
+
+**M1 found a real weakness in the assertion the detach IT says it exists for, and it is worth
+recording.** On the first run, M1 did NOT fail assertion `(b)` — the `/proc`-backed PID-liveness
+probe taken immediately after the receipt returns. It failed 40 seconds later, at the `bg_wait`
+timeout. The reason: `SpawnedChild::drop` (`spawn/mod.rs:1086-1099`) terminates nothing
+synchronously — it SIGKILLs the child's process GROUP, and delivery plus the transition to `Z` is
+the kernel's business, not the dropping thread's. A probe with no sleep reads the state the child
+had microseconds ago, which is `R`/`S`. `(b)` proves *"not killed SYNCHRONOUSLY by the detach"*,
+which is worth proving and is **not** what the file's doc claimed for it.
+
+`(b)` is kept verbatim and a second probe was ADDED after it, 750ms later — a small fraction of the
+child's 10s scripted sleep. Under M1 the test now fails in **0.99s at the liveness assertion**
+instead of surviving to a 40s timeout. Nothing was weakened and nothing was deleted.

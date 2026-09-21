@@ -179,6 +179,7 @@ mod tests {
             transcript_error: None,
             acceptance: None,
             detached: false,
+            detached_reason: None,
             interrupted: false,
             timed_out: false,
             timeout_recovery: None,

@@ -56,7 +56,11 @@ impl SubscriptionSessions for ExecutorSubscriptionSessions {
     }
 }
 
-/// pi `state.foregroundRuns?.get(record.runId)` (`:212`, `:329`) over cyrup's TWO disjoint maps.
+/// pi `state.foregroundRuns?.get(record.runId)` (`runs/background/wait-subscriptions.ts:214` and
+/// `:334` @v0.68.0 — the FILE matters here: `subagent-wait.ts` has its own `state.foregroundRuns`
+/// reads at `:224-225`/`:431`/`:573`/`:619`, and a bare line number reads as either) over cyrup's
+/// TWO disjoint maps. These three numbers were `:212`/`:329`/`:220`, which are exact at `v0.64.0`
+/// and drift by +2/+5/+2 at `v0.68.0`.
 ///
 /// # The consultation order, and why it is not a preference
 ///
@@ -65,14 +69,14 @@ impl SubscriptionSessions for ExecutorSubscriptionSessions {
 /// of them can answer and the order is only about which is checked first.
 ///
 /// 1. **`foreground_controls` — the LIVE run.** Its `active_children` carry
-///    `current_activity_state`/`current_tool`, which is what makes `:220`'s `contact_supervisor`
+///    `current_activity_state`/`current_tool`, which is what makes `:222`'s `contact_supervisor`
 ///    test real rather than vacuous. A live child has not settled, so it maps to
 ///    [`ForegroundChildState::Detached`] — upstream's `detached.length > 0` state, the one that
 ///    keeps the subscription armed.
 /// 2. **`foreground_runs` — the SETTLED run**, cyrup's literal `state.foregroundRuns`. Its
 ///    `ForegroundHistoryChild::status` supplies `detached`/`failed`/`completed`/`stopped` (minted
 ///    by `foreground_history_child_status`), which is exactly what `:224-227` needs.
-///    `activity_state`/`current_tool` are absent from that record, so `:220` simply cannot fire —
+///    `activity_state`/`current_tool` are absent from that record, so `:222` simply cannot fire —
 ///    correct, because a settled run has no tool in flight.
 /// 3. **Neither** → `None` → `:215`'s `!run` arm → `"could not be reconciled"`.
 struct ExecutorForegroundProbe {

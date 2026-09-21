@@ -100,8 +100,15 @@ pub use wait_tool::WaitTool;
 // `crate::registration::guide` asserts against [`subagent_actions`] — and each of those two reads
 // happens only from a `#[cfg(test)]` context in its consumer, so the re-export carries the same
 // gate rather than standing as a permanently-unused import under `-D warnings`. `WAIT_TOOL_NAME`
-// needs no re-export at all: `wait_tool` is its only reader, so it stays `pub(crate)` where it is
-// defined, its visibility unchanged from before the split.
+// needs no re-export either, but NOT because `wait_tool` is its only reader — it no longer is.
+// `watchdog::permission_arbiter`'s `INTERNAL_TOOLS` (pi `permissions.ts:8` @v0.68.0) names it
+// through its full `crate::extension::wait_tool::WAIT_TOOL_NAME` path, and that cross-module read
+// is deliberate and load-bearing: the set exists so a parent's permission policy cannot gate the
+// child's own coordination surface, so it must name the tool that is actually REGISTERED. It
+// previously carried a second literal instead, and that literal drifted into `"subagent_wait"` —
+// a tool this crate has never registered — which left the real wait tool gateable. `pub(crate)`
+// already reaches that reader, so the const stays where it is defined, its visibility unchanged
+// from before the split.
 #[cfg(test)]
 pub(crate) use tool::schema::sj_acceptance_override;
 #[cfg(test)]

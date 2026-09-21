@@ -2060,7 +2060,7 @@ impl NativeExtension for SubagentPromptRuntime {
                     results_dir: artifact_roots.results_dir,
                 };
                 let waiter = crate::background::auto_drain::SubagentDrainWaiter {
-                    // `enabled: true` — the drain ignores the `wait` TOOL's config gate, exactly
+                    // `enabled: true` — the drain ignores the `bg_wait` TOOL's config gate, exactly
                     // as in the parent site (pi checks `deps.enabled === false` and the drain
                     // never sets it, `subagent-wait.ts:547`).
                     deps: crate::background::wait::WaitDeps::for_cwd(
@@ -2901,8 +2901,11 @@ mod permission_gate_tests {
         assert!(!preview.contains("ABCDEFGHIJ"), "{preview}");
     }
 
-    /// `permissionDecision` (`permissions.ts:46-49`): `bash` and the four internal coordination
-    /// tools are allowed no matter what the rules say, so a parent cannot strand a child.
+    /// `permissionDecision` (`permissions.ts:48-51` @v0.68.0): `bash` and the four internal
+    /// coordination tools are allowed no matter what the rules say, so a parent cannot strand a
+    /// child. The wait tool is named through the const the registration itself uses
+    /// ([`crate::extension::wait_tool::WAIT_TOOL_NAME`]), so this end-to-end hook assertion covers
+    /// whatever `INTERNAL_TOOLS` actually holds rather than a copy of it.
     #[tokio::test]
     async fn bash_and_the_internal_coordination_tools_are_never_gated() {
         // The rules a parent could still ship for them (validation refuses to record these, but a
@@ -2913,7 +2916,7 @@ mod permission_gate_tests {
             "bash",
             "contact_supervisor",
             "intercom",
-            "subagent_wait",
+            crate::extension::wait_tool::WAIT_TOOL_NAME,
             "structured_output",
         ] {
             assert!(

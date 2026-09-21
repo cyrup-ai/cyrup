@@ -11,9 +11,13 @@ use crate::exec::fallback::{provider_of, resolve_model_inheritance};
 use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::extension::EXTENSION_ID;
 use crate::extension::executor::SubagentExecutor;
+use crate::extension::executor::detach::{
+    DETACHED_EXIT_CODE, DetachGate, DetachReason, DetachRefusal,
+};
 use crate::extension::executor::foreground_control::{
     ForegroundChildEntry, begin_foreground_child,
 };
+use crate::extension::executor::foreground_history::ForegroundHistoryRun;
 use crate::extension::executor::notices::{ForegroundControlEntry, ForegroundControlNotifier};
 use crate::extension::executor::paths::{
     drive_foreground_run_sync, write_foreground_output_artifacts,
@@ -347,6 +351,11 @@ impl SubagentExecutor {
             workflow_steer: workflow_steer.as_ref(),
         });
 
+        // VL-S11b — the run's detach gate, minted BEFORE its control surface is published so the
+        // handle `/subagents-detach` fires and the gate this driver races are one object. The
+        // driver keeps the gate; the control entry gets a [`ForegroundDetachHandle`] clone.
+        let detach_gate = DetachGate::new();
+
         self.register_foreground_controls(
             &run_id,
             &run_options,
@@ -359,33 +368,187 @@ impl SubagentExecutor {
                 // The SAME handle the run options above were derived from — one value, both sides.
                 workflow_steer: workflow_steer.as_ref(),
             },
+            &detach_gate,
         )
         .await;
 
         let art_paths =
             write_foreground_input_artifact(&art_cfg, &art_dir, &run_id, &agent.name, task);
 
-        let result = drive_foreground_run_sync(
-            &agent_config,
-            task,
-            run_options,
-            &agent.name,
-            resolved_context,
-            on_update,
-        )
-        .await;
+        // Both read BEFORE `run_options` is moved into the driving future below.
+        //
+        // `output_path_configured` is pi's `if (options.outputPath)` (`execution.ts:627`), the
+        // gate on the receipt's `outputSaveError`; `run_cancel` is pi's `options.signal`, the
+        // FOURTH of upstream's four detach guards (`:613`).
+        let output_path_configured = run_options.output_path.is_some();
+        let run_cancel = run_options.cancel.clone();
 
+        // ── The producer split (VL-S11b §C.5) ────────────────────────────────────────────────
+        //
+        // Upstream's `detachForeground` is cheap because pi's child is an IN-PROCESS session
+        // object: the receipt is a snapshot, the tool call returns, and the session's callbacks
+        // keep firing (`execution.ts:612-649`). cyrup's child is a REAL OS PROCESS owned by this
+        // `drive_foreground_run_sync` future, so **dropping the future kills the very child the
+        // feature exists to keep alive.**
+        //
+        // The future is therefore built from OWNED inputs and BOXED. A `Pin<Box<dyn Future>>` is
+        // `Unpin` and `'static`, so `&mut drive` can be raced in a `select!` here and then the
+        // whole value MOVED into a spawned task on a detach — the child is handed over, never
+        // dropped. (A stack `tokio::pin!` would be racy-cheap but unmovable, which is exactly the
+        // property this needs to NOT have.)
+        let mut drive: std::pin::Pin<Box<dyn std::future::Future<Output = SingleResult> + Send>> = {
+            let agent_config = agent_config.clone();
+            let drive_task = task.to_string();
+            let agent_name = agent.name.clone();
+            Box::pin(async move {
+                drive_foreground_run_sync(
+                    &agent_config,
+                    &drive_task,
+                    run_options,
+                    &agent_name,
+                    resolved_context,
+                    on_update,
+                )
+                .await
+            })
+        };
+
+        // The drive loop races its own settle against a detach request — pi's `detachForeground`
+        // guard set, expressed as a race because the request arrives from another task.
+        //
+        // `biased` so the settle arm is polled FIRST on every wake: a run that has already
+        // finished must win over a detach request landing in the same tick, which is upstream's
+        // `sessionSettled` guard (`:613`) evaluated in upstream's own order.
+        let detach_reason = loop {
+            tokio::select! {
+                biased;
+                settled = &mut drive => {
+                    // Every settle path closes the gate — a requester parked on a gate nobody
+                    // closes would hang forever. `close` is a no-op after `accept`, so this
+                    // cannot retract an already-accepted detach (it never runs on that path
+                    // anyway: an accepted detach leaves this loop through `break`).
+                    detach_gate.close(DetachRefusal::SessionSettled);
+                    let mut settled = settled;
+                    stamp_intercom_detach_reason(&mut settled);
+                    self.settle_attached_foreground_run(
+                        &run_id,
+                        cwd,
+                        &control_notifier,
+                        &art_paths,
+                        &art_cfg,
+                        &settled,
+                    )
+                    .await;
+                    return Ok((settled, run_id));
+                }
+                reason = detach_gate.requested() => {
+                    // pi `options.signal?.aborted` (`:613`): a cancelled run is not detachable,
+                    // and refusing it must NOT stop driving — the child is being torn down and
+                    // the caller is still owed its terminal result.
+                    if run_cancel.is_cancelled() {
+                        detach_gate.close(DetachRefusal::Aborted);
+                        continue;
+                    }
+                    break reason;
+                }
+            }
+        };
+
+        // ── The detach branch ────────────────────────────────────────────────────────────────
+        //
+        // pi `detachForeground` (`execution.ts:615-649`): mint, PUBLISH, and only then mark the
+        // run detached. Upstream's ordering is load-bearing and is preserved — `detached = true`
+        // is set only after `onDetachReceipt` returned `true` (`:646-648`), so a publish failure
+        // leaves the run attached and abortable rather than orphaned.
+        let receipt = detach_receipt(&agent.name, task, detach_reason, output_path_configured);
+
+        // The publish: the run becomes an entry in `foreground_runs` whose only child is
+        // `"detached"` (minted by `foreground_history_child_status` off `receipt.detached`). That
+        // in-memory entry is the WHOLE of what `status` by id, `bg_wait` by id/`all` and
+        // `ExecutorForegroundProbe` need — upstream writes nothing to disk for a detached run
+        // either (`foreground-history.ts:67-69`), and cyrup's `persist.rs` refuses one outright.
+        self.remember_foreground_run(
+            &run_id,
+            crate::background::RunMode::Single,
+            cwd,
+            &[&receipt.result],
+        );
+        if !self.stamp_detached_receipt(&run_id, receipt.output_save_error.as_deref()) {
+            // pi `accepted = options.onDetachReceipt?.(receipt) === true` returning false
+            // (`:643-645`): the run stays ATTACHED. cyrup's one failure mode is an unattributed
+            // run — `remember_foreground_run` refuses a run with no `current_session_id` BY TYPE
+            // (`ForegroundHistoryRun::session_id` is a required `SessionId`), so there is no
+            // addressable identity to hand back and detaching would orphan the child.
+            detach_gate.close(DetachRefusal::LifecycleFinished);
+            tracing::warn!(
+                run_id = %run_id,
+                "detach refused: the run has no session identity, so it cannot be remembered or \
+                 recovered by id"
+            );
+            let mut settled = drive.await;
+            stamp_intercom_detach_reason(&mut settled);
+            self.settle_attached_foreground_run(
+                &run_id,
+                cwd,
+                &control_notifier,
+                &art_paths,
+                &art_cfg,
+                &settled,
+            )
+            .await;
+            return Ok((settled, run_id));
+        }
+        detach_gate.accept();
+
+        // pi drops the live control on a detach exactly as on a settle — which is why
+        // `fleet-view.ts:406-408` re-checks `!activeForegroundIds.has(runId)` before rendering a
+        // remembered run. cyrup's two maps are disjoint by construction and this is the edge that
+        // keeps them so.
+        self.settle_foreground_run(&run_id, &control_notifier).await;
+
+        // NO `persist_foreground_run_history_for` here, deliberately: `persist.rs`'s
+        // `is_persistable` refuses a run whose child is `"detached"` (it is not one of the four
+        // `RESTORABLE` statuses), so the call would be a no-op with a config read and a directory
+        // resolution attached. The continuation's reconcile is where the run first becomes
+        // persistable — see `spawn_detached_foreground_continuation` for what it does and does
+        // not do there.
+        spawn_detached_foreground_continuation(
+            std::sync::Arc::clone(&self.foreground_runs),
+            drive,
+            run_id.clone(),
+            art_paths,
+            art_cfg,
+        );
+
+        Ok((receipt.result, run_id))
+    }
+
+    /// The ATTACHED settle tail — everything `run_foreground_impl` does once a foreground run
+    /// reaches a terminal [`SingleResult`], in the one order that cannot be raced.
+    ///
+    /// Factored out because there are now TWO paths that reach it: the ordinary settle, and a
+    /// detach whose receipt could not be published (which leaves the run attached, pi
+    /// `execution.ts:643-645`). Two copies of this ordering would be two orderings.
+    async fn settle_attached_foreground_run(
+        &self,
+        run_id: &RunId,
+        cwd: &Path,
+        control_notifier: &ForegroundControlNotifier,
+        art_paths: &crate::artifacts::ArtifactPaths,
+        art_cfg: &crate::artifacts::ArtifactConfig,
+        result: &SingleResult,
+    ) {
         // WORKFLOW_7 — pi `rememberForegroundRun` (`subagent-executor.ts:4057`), on the settle
         // path with the results in hand. BEFORE `settle_foreground_run`, whose own doc calls out
         // an ordering that must not be disturbed: this call touches only `foreground_runs` (a
         // DIFFERENT map from the one `settle_foreground_run` drops an entry from), so it cannot
         // race that ordering either way, but placing it here keeps every foreground-history write
         // together, ahead of teardown, in one place.
-        self.remember_foreground_run(&run_id, crate::background::RunMode::Single, cwd, &[&result]);
+        self.remember_foreground_run(run_id, crate::background::RunMode::Single, cwd, &[result]);
 
-        self.settle_foreground_run(&run_id, &control_notifier).await;
+        self.settle_foreground_run(run_id, control_notifier).await;
 
-        write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
+        write_foreground_output_artifacts(art_paths, art_cfg, run_id.as_str(), result);
 
         // pi `persistForegroundRunHistory` (`foreground-history.ts:136`), after the in-memory
         // record exists. Bounded, 0600, atomic; a write failure never alters the `SingleResult`
@@ -408,8 +571,37 @@ impl SubagentExecutor {
         // revision erroneously `remove_dir_all`'d the whole scratch dir here, which silently
         // discarded that tee the moment a foreground `/run` completed — defeating the tee's own
         // stated purpose and diverging from every sibling path — so no such deletion is performed.
+    }
 
-        Ok((result, run_id))
+    /// Stamp the detach's `outputSaveError` onto the remembered child, and report whether the
+    /// receipt was PUBLISHED at all — pi's `onDetachReceipt` return value (`execution.ts:2133`),
+    /// whose `false` keeps the run attached.
+    ///
+    /// Returns `false` only when [`SubagentExecutor::remember_foreground_run`] declined to record
+    /// the run, which it does for exactly one reason: no `current_session_id`, which
+    /// [`ForegroundHistoryRun`](crate::extension::executor::foreground_history::ForegroundHistoryRun)'s
+    /// required `session_id` makes unrepresentable rather than merely unchecked.
+    ///
+    /// The stamp itself is here and not inside `remember_foreground_run` because cyrup's
+    /// [`SingleResult`] carries no `output_save_error` field to thread it through — see
+    /// [`DetachReceipt`] for why the receipt carries it separately. This is the
+    /// producer the history child's own field doc says it had been waiting for, and its consumer
+    /// is the fleet detail pane's `Output warning:` line (`tui/fleet.rs`, pi
+    /// `run-status.ts:230`).
+    fn stamp_detached_receipt(&self, run_id: &RunId, output_save_error: Option<&str>) -> bool {
+        let mut runs = self
+            .foreground_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(run) = runs.get_mut(run_id) else {
+            return false;
+        };
+        if let Some(message) = output_save_error
+            && let Some(child) = run.children.first_mut()
+        {
+            child.output_save_error = Some(message.to_string());
+        }
+        true
     }
 
     /// Resolve the persona this foreground run will spawn, together with everything about it
@@ -981,12 +1173,25 @@ impl SubagentExecutor {
         agent: &AgentDefinition,
         task: &str,
         identity: ForegroundControlIdentity<'_>,
+        detach_gate: &DetachGate,
     ) {
         {
             let now = crate::time::now_epoch_millis();
             let description = Some(task.to_string()).filter(|t| !t.trim().is_empty());
             let mut entry = ForegroundControlEntry {
                 interrupt: run_options.interrupt.clone(),
+                // VL-S11b — the live gate's handle, stamped at registration because the driver
+                // already owns the gate by the time it calls this. This is upstream's
+                // `onDetachReady` publication (`execution.ts:1372`), lifted onto the control by
+                // `syncCurrentChild` (`foreground-control.ts:59`); cyrup's driver has no
+                // separate "coordinator became live" moment, so the two collapse into one.
+                //
+                // Every OTHER construction site of this entry still carries `None` — upstream's
+                // own `if (input.detach)` guard (`foreground-control.ts:119`) — and
+                // `/subagents-detach` renders those as "not currently detachable" rather than
+                // panicking; see `slash_detach.rs`'s `None`-handle arm for which of upstream's
+                // four refusals that is and why.
+                detach: Some(detach_gate.handle()),
                 // Derived below by `begin_foreground_child`, from the child this call registers at
                 // flat index 0 — never hand-written here (WORKFLOW_6 §1.3).
                 current_agent: None,
@@ -1177,6 +1382,269 @@ fn fork_requires_thinking_off(agent: &AgentDefinition) -> bool {
                 | crate::runner::AgentRunnerConfig::ExternalJob(_)
         )
     )
+}
+
+/// pi `receipt.detachedReason = "intercom coordination"` (`execution.ts:620`, produced at `:762`),
+/// stamped HERE because this is the lowest layer that may name the closed vocabulary.
+///
+/// [`crate::exec::run_sync`] observes the detach — its ONLY detach observation is the drive loop's
+/// R-SA-037 blocking `contact_supervisor` arm (`exec/drive_attempt.rs`), which is upstream's
+/// intercom producer and nothing else — but `crate::exec` sits BELOW `crate::extension` and
+/// `extension::executor` is a private module of it, so `exec` cannot write
+/// [`DetachReason`]'s path. Rather than let a second string literal exist down there (the exact
+/// drift the closed enum prevents), `run_sync` leaves the field `None` and this fills it in.
+///
+/// Idempotent on `detached_reason`: a result that already carries one came from
+/// [`detach_receipt`], and a user detach must never be relabelled as an intercom one.
+fn stamp_intercom_detach_reason(result: &mut SingleResult) {
+    if result.detached && result.detached_reason.is_none() {
+        result.detached_reason = Some(DetachReason::IntercomCoordination.as_str().to_string());
+    }
+}
+
+/// A minted detach receipt — pi's `receipt` object (`execution.ts:615-638`), which upstream hands
+/// to `onDetachReceipt` and cyrup hands back to the caller of `run_foreground_impl`.
+///
+/// Two values rather than one because cyrup's [`SingleResult`] carries no `outputSaveError` field
+/// (`exec/run_result.rs` has no such member; `ForegroundHistoryChild::output_save_error`
+/// (`foreground_history/record.rs`) is the only slot in this crate that holds one, and its own doc
+/// records that it had no producer until now). The receipt therefore carries upstream's
+/// `receipt.outputSaveError`
+/// (`execution.ts:627-631`) alongside the result, and the foreground driver stamps it onto the
+/// remembered child — which is the sole consumer upstream has too (`run-status.ts:230`'s
+/// `Output warning:` line, cyrup `tui/fleet.rs:982`).
+pub(crate) struct DetachReceipt {
+    /// The receipt itself: what `/subagents-detach` returns to its caller while the child keeps
+    /// running.
+    pub(crate) result: SingleResult,
+    /// pi `receipt.outputSaveError` (`execution.ts:627-631`) — `Some` **only** when the run had an
+    /// output path configured, because that is the file the detach left unfinalized. A run with no
+    /// `output:` has nothing unfinalized to warn about, so upstream stamps nothing and neither
+    /// does this.
+    pub(crate) output_save_error: Option<String>,
+}
+
+/// Mint the receipt a detach hands back — pi `detachForeground`'s snapshot
+/// (`execution.ts:615-638`), for the `/subagents-detach` producer.
+///
+/// # Why this is a separate construction site from [`crate::exec::run_sync`]'s own result
+///
+/// Upstream can build its receipt by SNAPSHOTTING live progress (`snapshotResult(result,
+/// receiptProgress)`, `:617`) because its child is an in-process session object whose accumulated
+/// `result`/`progress` are already in hand on the same event loop as the detach call. cyrup's
+/// child is a real OS process whose accumulation lives inside the still-running
+/// `drive_foreground_run_sync` future, and taking a consistent snapshot out of it would mean
+/// synchronizing on the very future the detach exists to leave alone. So the receipt is minted
+/// fresh, from the two facts the driver genuinely owns at that instant — the agent and the task —
+/// plus the closed [`crate::extension::executor::detach::DetachReason`] vocabulary.
+///
+/// `[CYRUP-DELTA]` the consequence is that a detach receipt reports zero usage, zero turns and no
+/// tool calls, where upstream's reports the partial totals accumulated so far. Nothing downstream
+/// reads them as authoritative: the run's terminal totals arrive on the continuation's
+/// reconciliation of the same run id, which is the value `subagent({ action: "status" })` and
+/// `bg_wait` both render once the child exits.
+///
+/// `acceptance` is `None` and not upstream's interrupted-acceptance ledger
+/// (`execution.ts:2000-2006`): that branch is gated on `result.interrupted && detachedReason ===
+/// "user request"`, and a detach receipt is not interrupted — it is a hand-off. The ledger lands on
+/// the CONTINUATION's terminal result if the child is later interrupted, which is where upstream
+/// builds it too.
+pub(crate) fn detach_receipt(
+    agent: &str,
+    task: &str,
+    reason: DetachReason,
+    output_path_configured: bool,
+) -> DetachReceipt {
+    DetachReceipt {
+        output_save_error: output_path_configured.then(|| reason.output_save_error().to_string()),
+        result: SingleResult {
+            agent: agent.to_string(),
+            task: task.to_string(),
+            // pi `receipt.exitCode = -2` (`:618`).
+            exit_code: DETACHED_EXIT_CODE,
+            // pi `receipt.detached = true` (`:619`), set here rather than by the caller because a
+            // receipt that is not marked detached is indistinguishable from a failed run.
+            detached: true,
+            // pi `receipt.detachedReason = reason` (`:620`).
+            detached_reason: Some(reason.as_str().to_string()),
+            // pi `receipt.finalOutput` (`:621-625`), reason-keyed.
+            final_output: Some(reason.final_output().to_string()),
+            // The sentence above IS substantive text, so the state is `Present` by
+            // `derive_output_state`'s own first branch — asserted rather than re-derived, because
+            // the only input that could change the answer is a constant.
+            output_state: crate::exec::output_state::SubagentOutputState::Present,
+            // A detach is a hand-off, not a failure: `error` must stay `None` or
+            // `foreground_history_child_status` would mint `"failed"` instead of `"detached"`
+            // (`foreground_history/record.rs`), and `routing.rs`'s detached arm would never be
+            // reached.
+            error: None,
+            usage: cyrup_core::Usage::default(),
+            turns: 0,
+            usage_budget: None,
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
+            model: None,
+            attempted_models: Vec::new(),
+            child_run_id: None,
+            model_attempts: Vec::new(),
+            structured_output: None,
+            session_file: None,
+            structured_output_path: None,
+            artifact_paths: None,
+            transcript_path: None,
+            transcript_error: None,
+            acceptance: None,
+            interrupted: false,
+            timed_out: false,
+            timeout_recovery: None,
+            context_overflow: false,
+            stopped: false,
+            process_signal: None,
+            saved_output_path: None,
+            tool_calls: Vec::new(),
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
+            // pi never truncates a detached run's output (`assemble_delivered_output`'s R-SA-037
+            // skip); this text is upstream's own sentence and is under every cap regardless.
+            output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
+            runner: None,
+            external_process: None,
+        },
+    }
+}
+
+/// Hand the still-running child to a task that OWNS its driving future — the other half of the
+/// producer split, and upstream's own post-detach lifetime (`execution.ts:646-648`: the session's
+/// callbacks keep firing after the tool call returned).
+///
+/// # What this task holds, and what it deliberately does not
+///
+/// It holds the `Pin<Box<…>>` drive future (and with it the `SpawnedChild`), the run's artifact
+/// paths, and a clone of the executor's own `foreground_runs` `Arc` — **not** the executor.
+///
+/// `[CYRUP-DELTA]` the spec called for a `Weak<SubagentExecutor>` here, for the stated reason that
+/// a shutdown must not be pinned alive by a detached child. No such handle is obtainable:
+/// `run_foreground_impl` takes `&self`, [`SubagentExecutor`] carries no self-`Arc` slot, and
+/// switching the receiver to `self: &Arc<Self>` would change the public `&self` contract of
+/// `run_foreground`/`run_foreground_streaming` at call sites outside this seam (`resolve.rs`,
+/// `refinement.rs`, `workflow.rs`, `routing.rs`, `slash.rs` and three `cyrup-it` suites construct
+/// bare `SubagentExecutor` values). Capturing the ONE `Arc` field the reconcile writes is strictly
+/// stronger than a `Weak` for the stated purpose — it cannot keep the executor alive at all, only
+/// a map bounded at
+/// [`MAX_REMEMBERED_FOREGROUND_RUNS`](crate::extension::executor::foreground_history) entries.
+///
+/// `[CYRUP-DELTA]` the one thing it therefore cannot do is call
+/// `persist_foreground_run_history_for`, which upstream reaches through
+/// `persistRememberedForegroundRuns` at the end of `updateRememberedForegroundChild`
+/// (`subagent-executor.ts:900`): that writer is `&self` on [`SubagentExecutor`]
+/// (`foreground_history/persist.rs`) and its merge/eligibility helpers are private to that module.
+/// The reconciled run reaches disk at the session's next foreground settle, which calls the same
+/// writer over the same map. Nothing an in-session reader consults is affected —
+/// `subagent({ action: "status" })`, `bg_wait` and `ExecutorForegroundProbe` all read the
+/// in-memory map this task DOES update — only a cross-restart restore of a run that settled after
+/// its session's last foreground run is delayed.
+fn spawn_detached_foreground_continuation(
+    foreground_runs: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<RunId, ForegroundHistoryRun>>,
+    >,
+    drive: std::pin::Pin<Box<dyn std::future::Future<Output = SingleResult> + Send>>,
+    run_id: RunId,
+    art_paths: crate::artifacts::ArtifactPaths,
+    art_cfg: crate::artifacts::ArtifactConfig,
+) {
+    tokio::spawn(async move {
+        // The future is AWAITED here, in a task that owns it — the child keeps running exactly as
+        // it was, on the same `SpawnedChild`, with the same stdout reader and the same deadline.
+        let result = drive.await;
+        // pi `onDetachedExit`'s artifact leg (`subagent-executor.ts:4077-4090` →
+        // `finalizeSingleWorktreeHandoff`/the artifact writes): the output/metadata/JSONL legs of
+        // the quadruple are written now, against the paths minted before the run started, so a
+        // detached run's artifacts land in the same place an attached one's would.
+        write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
+        reconcile_detached_foreground_child(&foreground_runs, &run_id, &result);
+        tracing::debug!(
+            run_id = %run_id,
+            exit_code = result.exit_code,
+            "detached foreground child settled and was reconciled"
+        );
+    });
+}
+
+/// pi `updateRememberedForegroundChild` (`subagent-executor.ts:850-899`) — the SECOND of
+/// upstream's two moments, reduced to the fields
+/// [`ForegroundHistoryChild`](crate::extension::executor::foreground_history) carries.
+///
+/// This is the reconciler for a detached `/run` single, and `workflow_detach/` is deliberately not
+/// it: that module is a port of `workflow-detach-reconcile.ts` and is workflow-scoped (it needs a
+/// `WorkflowKey`, a workflow `status.json` and `find_workflow_settlement_step`). A plain `/run`
+/// single has no workflow status to settle, so upstream's own reconciler for it is this one.
+///
+/// # Why the status is recomputed rather than re-derived from `SingleResult::detached`
+///
+/// Upstream calls `resolveSubagentResultStatus({ …, detached: false })` (`:863`) — it FORCES the
+/// detached term off, because the child has now exited and the `"detached"` status is exactly what
+/// this write exists to clear. The three remaining arms mirror
+/// `foreground_history_child_status`'s own (`foreground_history/record.rs`) with its first arm
+/// removed; they are restated here rather than called because that function is private to the
+/// history facade and its `detached` arm is the one thing that must NOT apply.
+///
+/// `output_save_error` is CLEARED for upstream's reason (`:880` assigns
+/// `input.result.outputSaveError`, which `omitUndefinedProperties` then drops): the warning said
+/// the output file was left unfinalized by the detach, and this write is the moment it stopped
+/// being true.
+fn reconcile_detached_foreground_child(
+    foreground_runs: &std::sync::Mutex<std::collections::HashMap<RunId, ForegroundHistoryRun>>,
+    run_id: &RunId,
+    result: &SingleResult,
+) {
+    let now = crate::time::now_epoch_millis();
+    let mut runs = foreground_runs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // pi `:853-857` — a run the map no longer holds (evicted, or the process moved on) is simply
+    // not reconciled. Upstream's `run.children[index]` lookup degrades the same way.
+    let Some(run) = runs.get_mut(run_id) else {
+        return;
+    };
+    run.updated_at = now;
+    // A foreground SINGLE run has exactly one child, at flat index 0 — pi's `input.index`, which
+    // `subagent-executor.ts:4086` passes as `0` for this call.
+    let Some(child) = run.children.first_mut() else {
+        return;
+    };
+    child.status = if result.stopped {
+        "stopped"
+    } else if result.exit_code != 0 || result.error.is_some() {
+        "failed"
+    } else {
+        "completed"
+    }
+    .to_string();
+    child.agent = result.agent.clone();
+    child.updated_at = Some(now);
+    child.model = result.model.as_ref().map(|m| m.as_str().to_string());
+    child.session_file = result.session_file.clone();
+    child.transcript_path = result.transcript_path.clone();
+    child.saved_output_path = result.saved_output_path.as_ref().map(PathBuf::from);
+    child.artifact_output_path = result
+        .artifact_paths
+        .as_ref()
+        .map(|paths| paths.output_path.clone());
+    child.error = result.error.clone();
+    child.transcript_error = result.transcript_error.clone();
+    child.output_save_error = None;
+    // pi `:887` — `finalOutput` is spread only when the terminal result HAS one, so a child that
+    // exited silently keeps the detach receipt's sentence rather than blanking it.
+    if result.final_output.is_some() {
+        child.final_output = result.final_output.clone();
+    }
+    child.tokens = (result.usage.total_tokens > 0).then_some(result.usage.total_tokens);
+    child.tool_count = {
+        let calls = result.tool_calls.len() as u64;
+        (calls > 0).then_some(calls)
+    };
 }
 
 fn write_foreground_input_artifact(
@@ -1456,6 +1924,8 @@ mod tests {
                     workflow_key: Some(&key),
                     workflow_steer: Some(&steer),
                 },
+                // VL-S11b — the driver's gate; the entry publishes its handle.
+                &crate::extension::executor::detach::DetachGate::new(),
             )
             .await;
 
@@ -1523,6 +1993,7 @@ mod tests {
                     workflow_key: None,
                     workflow_steer: None,
                 },
+                &crate::extension::executor::detach::DetachGate::new(),
             )
             .await;
 
@@ -1541,5 +2012,245 @@ mod tests {
             .get(&0)
             .expect("child at flat index 0");
         assert!(child.steer.is_none());
+    }
+}
+
+#[cfg(test)]
+mod detach_producer_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+    use crate::background::RunMode;
+    use crate::extension::executor::detach::{DetachGate, DetachReason};
+    use crate::extension::executor::notices::ForegroundControlEntry;
+    use crate::extension::testsupport::FixedSessionIdHost;
+    use std::sync::Arc;
+
+    fn executor_with_session(session: &str) -> SubagentExecutor {
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedSessionIdHost {
+            id: Some(session.to_string()),
+            file: None,
+        }));
+        executor
+    }
+
+    /// Remember the receipt the way `run_foreground_impl`'s detach branch does, and hand back the
+    /// receipt itself.
+    fn publish_detach(
+        executor: &SubagentExecutor,
+        run_id: &RunId,
+        reason: DetachReason,
+        output_path_configured: bool,
+    ) -> DetachReceipt {
+        let receipt = detach_receipt("scout", "hold the line", reason, output_path_configured);
+        executor.remember_foreground_run(
+            run_id,
+            RunMode::Single,
+            Path::new("/tmp/project"),
+            &[&receipt.result],
+        );
+        assert!(executor.stamp_detached_receipt(run_id, receipt.output_save_error.as_deref()));
+        receipt
+    }
+
+    /// The receipt shape, field for field — pi `detachForeground` (`execution.ts:615-638`).
+    ///
+    /// **Gutting mutation this fails on:** return a plain `pre_spawn_failure`-shaped result (exit
+    /// 1, `detached: false`, no reason) and call it a receipt. Every assert below fires, and the
+    /// history status it mints becomes `"failed"` instead of `"detached"` — which is what makes a
+    /// detached run addressable at all.
+    #[test]
+    fn the_detach_receipt_carries_upstreams_exact_shape() {
+        let receipt = detach_receipt("scout", "hold the line", DetachReason::UserRequest, false);
+        assert_eq!(
+            receipt.result.exit_code,
+            crate::extension::executor::detach::DETACHED_EXIT_CODE
+        );
+        assert_eq!(receipt.result.exit_code, -2, "pi `receipt.exitCode = -2`");
+        assert!(receipt.result.detached);
+        assert_eq!(
+            receipt.result.detached_reason.as_deref(),
+            Some("user request")
+        );
+        assert_eq!(
+            receipt.result.final_output.as_deref(),
+            Some("Detached at user request before task completion.")
+        );
+        // A detach is a HAND-OFF: an `error` here would mint `"failed"` instead of `"detached"`.
+        assert!(receipt.result.error.is_none());
+        assert!(!receipt.result.interrupted && !receipt.result.timed_out);
+
+        // pi `:627` — `outputSaveError` is stamped ONLY when an output path was configured.
+        assert_eq!(
+            receipt.output_save_error, None,
+            "no output path ⇒ nothing was left unfinalized ⇒ no warning"
+        );
+        let with_output = detach_receipt("scout", "hold the line", DetachReason::UserRequest, true);
+        assert_eq!(
+            with_output.output_save_error.as_deref(),
+            Some("Output file was not finalized because the subagent detached at user request.")
+        );
+
+        // The intercom producer's own arm, from the same closed vocabulary.
+        let intercom = detach_receipt(
+            "scout",
+            "hold the line",
+            DetachReason::IntercomCoordination,
+            true,
+        );
+        assert_eq!(
+            intercom.result.detached_reason.as_deref(),
+            Some("intercom coordination")
+        );
+        assert_eq!(
+            intercom.result.final_output.as_deref(),
+            Some("Detached for intercom coordination before task completion.")
+        );
+    }
+
+    /// Publishing the receipt makes the run a `"detached"` entry in `foreground_runs` and stamps
+    /// the output warning onto its child — the producer the history child's own `output_save_error`
+    /// field doc says it had been waiting for.
+    ///
+    /// **Gutting mutation this fails on:** drop the `stamp_detached_receipt` call and the warning
+    /// is `None`, so the fleet detail pane's `Output warning:` line never renders for a detach.
+    #[test]
+    fn publishing_a_receipt_remembers_a_detached_run_and_stamps_its_output_warning() {
+        let executor = executor_with_session("session-a");
+        let run_id = RunId::from_token("fgdetach0001".to_string());
+        publish_detach(&executor, &run_id, DetachReason::UserRequest, true);
+
+        let runs = executor
+            .foreground_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let run = runs.get(&run_id).expect("the receipt was published");
+        assert_eq!(run.children.len(), 1);
+        assert_eq!(run.children[0].status, "detached");
+        assert_eq!(
+            run.children[0].output_save_error.as_deref(),
+            Some("Output file was not finalized because the subagent detached at user request.")
+        );
+    }
+
+    /// An unattributed run cannot be published, so the detach must be REFUSED rather than
+    /// accepted — pi `onDetachReceipt` returning `false` (`execution.ts:643-645`), which leaves
+    /// the run attached and abortable rather than orphaned.
+    ///
+    /// **Gutting mutation this fails on:** make `stamp_detached_receipt` return `true`
+    /// unconditionally. The driver then accepts a detach for a run nothing can address — no
+    /// `foreground_runs` entry means `status`, `bg_wait` and the probe all report it missing.
+    #[test]
+    fn a_run_with_no_session_identity_cannot_publish_a_receipt() {
+        // No host services ⇒ no `current_session_id` ⇒ `remember_foreground_run` declines.
+        let executor = SubagentExecutor::new();
+        let run_id = RunId::from_token("fgdetach0002".to_string());
+        let receipt = detach_receipt("scout", "hold the line", DetachReason::UserRequest, false);
+        executor.remember_foreground_run(
+            &run_id,
+            RunMode::Single,
+            Path::new("/tmp/project"),
+            &[&receipt.result],
+        );
+        assert!(
+            !executor.stamp_detached_receipt(&run_id, receipt.output_save_error.as_deref()),
+            "an unpublishable receipt must report the refusal, not a silent success"
+        );
+    }
+
+    /// The continuation's reconcile — pi `updateRememberedForegroundChild`
+    /// (`subagent-executor.ts:850-899`) — flips the child OFF `"detached"` and clears the now-stale
+    /// output warning.
+    ///
+    /// **Gutting mutation this fails on:** never spawn the continuation (or drop its reconcile
+    /// call). The child stays `"detached"` forever, so `bg_wait({ id })` never returns and the
+    /// fleet shows a finished child as still handed off.
+    #[test]
+    fn the_continuations_reconcile_takes_the_child_off_detached() {
+        let executor = executor_with_session("session-a");
+        let run_id = RunId::from_token("fgdetach0003".to_string());
+        publish_detach(&executor, &run_id, DetachReason::UserRequest, true);
+
+        // The child's real terminal result, built off the receipt shape so the test needs no
+        // `AgentConfig`: a clean exit with no error, which pi's `resolveSubagentResultStatus`
+        // with `detached: false` (`subagent-executor.ts:863`) resolves to `"completed"`.
+        let mut settled =
+            detach_receipt("scout", "hold the line", DetachReason::UserRequest, false).result;
+        settled.detached = false;
+        settled.detached_reason = None;
+        settled.exit_code = 0;
+        settled.error = None;
+        settled.final_output = Some("the real answer".to_string());
+
+        reconcile_detached_foreground_child(&executor.foreground_runs, &run_id, &settled);
+
+        let runs = executor
+            .foreground_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let run = runs.get(&run_id).expect("still remembered");
+        assert_eq!(run.children[0].status, "completed");
+        assert_eq!(
+            run.children[0].final_output.as_deref(),
+            Some("the real answer")
+        );
+        assert_eq!(
+            run.children[0].output_save_error, None,
+            "the file IS finalized now, so the detach's warning must not survive"
+        );
+    }
+
+    /// A settle closes the gate, so a `/subagents-detach` arriving afterwards REFUSES instead of
+    /// parking on a gate nobody will ever answer.
+    ///
+    /// The two statements exercised here are exactly the two `run_foreground_impl`'s settle arm
+    /// runs, in that order.
+    ///
+    /// **Gutting mutation this fails on:** delete the `close` from the settle arm. `request`
+    /// never resolves, the `timeout` below expires, and the assert fires — which is the
+    /// user-visible hang this closes.
+    #[tokio::test]
+    async fn a_settled_run_closes_its_gate_so_a_later_request_refuses_instead_of_hanging() {
+        let executor = executor_with_session("session-a");
+        let run_id = RunId::from_token("fgdetach0004".to_string());
+        let gate = DetachGate::new();
+        executor.insert_foreground_control_for_test(
+            run_id.as_str(),
+            ForegroundControlEntry::for_test(RunMode::Single, 1, Some(gate.handle())),
+        );
+        let handle = executor
+            .foreground_detach_control(run_id.as_str())
+            .expect("the control is live")
+            .1
+            .expect("its detach handle is published");
+
+        // The settle arm, verbatim.
+        gate.close(DetachRefusal::SessionSettled);
+        let notifier = executor.foreground_control_notifier(
+            run_id.clone(),
+            "scout".to_string(),
+            crate::exec::control::ResolvedControlConfig::default(),
+        );
+        executor.settle_foreground_run(&run_id, &notifier).await;
+
+        assert!(
+            executor
+                .foreground_detach_control(run_id.as_str())
+                .is_none(),
+            "the live control is dropped on settle"
+        );
+        let verdict = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle.request(DetachReason::UserRequest),
+        )
+        .await
+        .expect("a request after settlement must not hang");
+        assert_eq!(verdict, Err(DetachRefusal::SessionSettled));
     }
 }

@@ -403,6 +403,7 @@ mod tests {
         active_children: std::collections::BTreeMap<usize, ForegroundChildEntry>,
     ) -> ForegroundControlEntry {
         ForegroundControlEntry {
+            detach: None,
             interrupt: CancelToken::new(),
             current_agent: None,
             current_index: None,

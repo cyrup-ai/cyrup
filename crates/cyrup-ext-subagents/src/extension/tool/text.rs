@@ -1113,6 +1113,7 @@ mod tests {
             controls.insert(
                 "fgrun0001".to_string(),
                 ForegroundControlEntry {
+                    detach: None,
                     interrupt: CancelToken::new(),
                     current_agent: Some("scout".to_string()),
                     current_index: Some(0),

@@ -1,15 +1,19 @@
-//! SUBA-004 end-to-end proof: the `wait` tool is actually REGISTERED on a real, fully-wired
-//! session and actually dispatches.
+//! SUBA-004 end-to-end proof: the background-wait tool is actually REGISTERED on a real,
+//! fully-wired session, under the name the model is told to call, and actually dispatches.
+//!
+//! VL-S8: that name is **`bg_wait`** — pi `wait-tool.ts:38` @v0.68.0. Upstream registers exactly
+//! one tool (`:44`) and no alias, and so does this crate, which is why the three literals below
+//! are `bg_wait` and not `wait`.
 //!
 //! The defect this file guards is not "a function is missing" — it is that an orchestrator had no
 //! way at all to block on a background subagent run, because `extension.rs` registered exactly one
 //! tool (`subagent`) and nothing else. A unit test on the wait loop cannot catch that: the loop
 //! could be perfect and still unreachable by the model. So this test drives a REAL
 //! `SessionBuilder`-assembled `AgentSession` (via `cyrup-test-support`'s harness, scripted faux LLM
-//! responses only) whose scripted response is a `wait` tool call, and asserts the session's own
-//! event stream shows that call being dispatched and returning wait's own text.
+//! responses only) whose scripted response is a `bg_wait` tool call, and asserts the session's own
+//! event stream shows that call being dispatched and returning the wait loop's own text.
 //!
-//! Deliberately fixture-free (unlike `extension_end_to_end_smoke.rs`): `wait` spawns nothing, so
+//! Deliberately fixture-free (unlike `extension_end_to_end_smoke.rs`): `bg_wait` spawns nothing, so
 //! this file needs no `test-fixtures` gate and no `CYRUP_SUBAGENT_BINARY` override — which also
 //! means a regression here can never be masked by a missing fixture binary.
 
@@ -52,15 +56,21 @@ fn tool_ends(
         .collect()
 }
 
-/// The load-bearing SUBA-004 assertion: a model can call `wait`, and the call reaches this
-/// extension's real registered tool. Before the fix the session's tool registry had no `wait` at
-/// all, so this same scripted call surfaced as an unknown-tool error instead of wait's own summary.
+/// The load-bearing SUBA-004 assertion: a model can call `bg_wait`, and the call reaches this
+/// extension's real registered tool. Before the fix the session's tool registry had no wait tool
+/// at all, so this same scripted call surfaced as an unknown-tool error instead of the wait loop's
+/// own summary.
 ///
-/// With no background runs in the fixture cwd, `wait` returns its "nothing to wait for" summary
+/// VL-S8 added a second thing this proves: the tool is registered under pi's v0.68.0 name. A
+/// session that still registered the pre-rename `"wait"` emits NO `tool_execution_start` for the
+/// `bg_wait` call the faux model makes, so `tool_starts(&events)` comes back EMPTY and the first
+/// assertion fires with that exact diagnosis.
+///
+/// With no background runs in the fixture cwd, `bg_wait` returns its "nothing to wait for" summary
 /// immediately — which is exactly what makes this a fast, spawn-free registration proof rather than
 /// a duplicate of the blocking-behavior unit tests in `background::wait`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_wait_tool_is_registered_and_dispatches_on_a_real_session() {
+async fn the_bg_wait_tool_is_registered_under_its_v0_68_0_name_and_dispatches_on_a_real_session() {
     let home = tempfile::tempdir().expect("home tempdir");
     let work_dir = tempfile::tempdir().expect("work tempdir");
 
@@ -78,23 +88,25 @@ async fn the_wait_tool_is_registered_and_dispatches_on_a_real_session() {
     let harness = create_harness_with_extensions(HarnessOptions {
         native_extensions: vec![extension],
         responses: vec![
-            FauxResponse::tool_call("wait", serde_json::json!({})),
-            FauxResponse::text("observed the wait result"),
+            FauxResponse::tool_call("bg_wait", serde_json::json!({})),
+            FauxResponse::text("observed the bg_wait result"),
         ],
         ..HarnessOptions::default()
     })
     .await
     .expect("harness builds a real session with the subagents extension loaded");
 
-    let events = harness.run("wait for the background subagents").await;
+    let events = harness.run("bg_wait for the background subagents").await;
 
     let events = events.expect("the turn completes without a transport/session-level error");
 
     assert_eq!(
         tool_starts(&events),
-        vec!["wait"],
-        "the `wait` tool must be registered on the live session and actually dispatch; got: \
-         {events:#?}"
+        vec!["bg_wait"],
+        "the `bg_wait` tool must be registered on the live session under THAT name and actually \
+         dispatch. An EMPTY list here means the session registered some other name (the \
+         pre-VL-S8 `wait`, or `subagent_wait`) and the model's `bg_wait` call reached no tool at \
+         all; got: {events:#?}"
     );
 
     let ends = tool_ends(&events);
@@ -104,7 +116,7 @@ async fn the_wait_tool_is_registered_and_dispatches_on_a_real_session() {
         "expected exactly one tool_execution_end; got: {events:#?}"
     );
     let (tool_name, result, is_error) = ends[0];
-    assert_eq!(tool_name, "wait");
+    assert_eq!(tool_name, "bg_wait");
     assert!(
         !is_error,
         "an empty async root is not an error condition; result: {result:#?}"
@@ -112,21 +124,21 @@ async fn the_wait_tool_is_registered_and_dispatches_on_a_real_session() {
     let text = result.to_string();
     assert!(
         text.contains("No active async runs in this session. Nothing to wait for."),
-        "the result must be wait's OWN summary — proving this extension's tool serviced the call, \
-         not some same-named stand-in; got: {text}"
+        "the result must be the wait loop's OWN summary — proving this extension's tool serviced \
+         the call, not some same-named stand-in; got: {text}"
     );
 
     assert!(
         events.iter().any(|e| e.kind() == "agent_end"),
-        "the turn must reach agent_end after the wait result is consumed; got: {events:#?}"
+        "the turn must reach agent_end after the bg_wait result is consumed; got: {events:#?}"
     );
 }
 
-/// A fanout child must NOT get `wait`: it has no business blocking on its parent's whole async
+/// A fanout child must NOT get `bg_wait`: it has no business blocking on its parent's whole async
 /// root, the same reasoning that makes `control_status`'s no-id listing child-unsafe. The
 /// `ChildSafe` registration arm therefore registers only the restricted `subagent` tool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fanout_child_does_not_get_the_wait_tool() {
+async fn a_fanout_child_does_not_get_the_bg_wait_tool() {
     use cyrup_ext::native::{InitApi, NativeExtension};
     use cyrup_ext_subagents::extension::RegistrationMode;
 

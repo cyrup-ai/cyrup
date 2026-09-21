@@ -128,6 +128,11 @@ restart, no reload command.
 `disable`/`enable`/`reset` write per-agent overrides into the scope's `settings.json` rather than
 touching the agent file.
 
+`/subagents [agent]` is the interactive face of the same writers: it shows an agent's resolved
+metadata and persists a model, thinking-level or system-prompt override through `settings.json`,
+choosing user or project scope. An agent owned by a read-only package definition, or one loaded
+from `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS`, refuses the edit rather than writing a shadow copy.
+
 ## Bundled personas
 
 `delegate`, `oracle`, `researcher`, `reviewer`, `scout` and `worker` ship inside the binary. Eject

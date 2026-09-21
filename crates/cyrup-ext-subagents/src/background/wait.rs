@@ -1,4 +1,4 @@
-//! The `wait` tool (SUBA-004): block the current turn until outstanding background subagent runs
+//! The `bg_wait` tool (SUBA-004): block the current turn until outstanding background subagent runs
 //! finish — a port of pi-subagents' `src/runs/background/wait.ts` (present at the ported
 //! v0.33.x–v0.34.0 baseline; added upstream by `05019cd`, first shipped in v0.33.0).
 //!
@@ -24,7 +24,7 @@
 //!    tears everything down — this loop owns no task, no thread and no spawned work.
 //!
 //! A third, quieter guarantee: with [`WaitDeps::stop_on_attention`] set (the default, and the
-//! `wait` tool's own mode), a run that trips the `needs_attention` heuristic ALSO ends the wait, in
+//! `bg_wait` tool's own mode), a run that trips the `needs_attention` heuristic ALSO ends the wait, in
 //! either mode. A child that went idle or blocked on a decision would otherwise stall the loop
 //! until the timeout, and the caller is exactly who has to act on it. Auto-drain is the documented
 //! exception: with the flag off it waits THROUGH attention instead of resolving on it, bounded by
@@ -86,7 +86,7 @@
 //!
 //! # Scoping (SUBA-031)
 //!
-//! pi scopes `subagent_wait` to `state.currentSessionId` (`activeRunsForSession` passes
+//! pi scopes `bg_wait` to `state.currentSessionId` (`activeRunsForSession` passes
 //! `sessionId: deps.state.currentSessionId ?? undefined` into `listAsyncRuns`,
 //! `subagent-wait.ts:265`), and cyrup now does the same through [`WaitDeps::session_id`]. The cwd
 //! partition (`async_root`, derived per-cwd by [`super::run_artifact_roots`]) is still the outer
@@ -202,7 +202,7 @@ pub fn resolve_wait_tool_enabled(
         .unwrap_or(true))
 }
 
-/// The `wait` tool's parameter object (pi `WaitParams`, `runs/background/wait.ts:96-108` @v0.34.0).
+/// The `bg_wait` tool's parameter object (pi `WaitParams`, `runs/background/wait.ts:96-108` @v0.34.0).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WaitParams {
@@ -308,6 +308,13 @@ pub struct WaitDeps {
     /// kind, deliberately: a missing bus costs latency, a missing manager costs the whole
     /// guarantee the caller asked for.
     pub subscribe: Option<WaitSubscribeHook>,
+    /// VL-S11b — pi `deps.state.foregroundRuns` (`subagent-wait.ts:226`): the in-memory remembered
+    /// foreground runs this session holds, which is where a DETACHED run lives (upstream never
+    /// writes one to disk — `foreground-history.ts:67-69` — and cyrup's `persist.rs` refuses one).
+    ///
+    /// `None` is the no-executor degradation every other injected seam here has, and it means
+    /// exactly what it meant before this field existed: the candidate set is async runs only.
+    pub detached_foreground: Option<DetachedForegroundHook>,
 }
 
 /// [`WaitDeps::subscribe`]'s payload — pi's `deps.subscribe` closure.
@@ -348,7 +355,7 @@ impl std::fmt::Debug for WaitSubscribeHook {
     }
 }
 
-/// The one method the `wait` tool needs off the subscription manager — pi's
+/// The one method the `bg_wait` tool needs off the subscription manager — pi's
 /// `Pick<WaitSubscriptionManager, "arm">` (`wait-tool.ts:12`).
 ///
 /// A trait, not the concrete manager, because `background/wait.rs` must not depend on the
@@ -392,7 +399,7 @@ impl WaitDeps {
             // pi's defaults: `deps.stopOnAttention !== false` (`subagent-wait.ts:618`) and
             // `deps.failOnFailedRuns === true` / `deps.failOnAttention === true` (`:708`,`:725`)
             // — i.e. attention breaks the wait and neither outcome flips the result to an error
-            // unless a caller (auto-drain) opts in. Byte-identical behaviour for the `wait` tool.
+            // unless a caller (auto-drain) opts in. Byte-identical behaviour for the `bg_wait` tool.
             stop_on_attention: true,
             fail_on_failed_runs: false,
             fail_on_attention: false,
@@ -400,7 +407,25 @@ impl WaitDeps {
             // pi's own no-manager shape: `wait-tool.ts:33` omits `subscribe` entirely unless the
             // extension holds a manager AND `ctx.hasUI`.
             subscribe: None,
+            // No executor in hand here, so no remembered-run map to consult — see
+            // [`Self::with_detached_foreground`].
+            detached_foreground: None,
         }
+    }
+
+    /// VL-S11b — attach the executor's remembered-foreground-run projection, so this wait's
+    /// candidate set is upstream's FULL one (async runs plus detached foreground runs,
+    /// `subagent-wait.ts:671`) rather than its async half.
+    ///
+    /// Separate from [`Self::for_cwd`] for exactly the reason [`Self::with_completion_bus`] and
+    /// [`Self::with_subscribe`] are: the map is executor-owned and outlives any single wait, while
+    /// `for_cwd` is reachable from contexts that have no executor at all (the auto-drain's two
+    /// construction sites are two of them, and upstream's drain likewise waits on async runs
+    /// only).
+    #[must_use]
+    pub fn with_detached_foreground(mut self, source: Option<DetachedForegroundHook>) -> Self {
+        self.detached_foreground = source;
+        self
     }
 
     /// SUBA-034 — attach the orchestrator's live completion bus, so this wait wakes on the
@@ -496,6 +521,218 @@ pub fn format_duration(ms: u64) -> String {
         return format!("{seconds:.1}s");
     }
     format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1000)
+}
+
+// =================================================================================================
+// VL-S11b — remembered DETACHED FOREGROUND runs, the other half of upstream's candidate set
+// =================================================================================================
+
+/// One remembered foreground run, as `bg_wait` sees it — pi `ForegroundResumeRun`
+/// (`shared/types.ts:1470-1479`) narrowed to what `activeDetachedForegroundRuns` and its three
+/// renderers (`subagent-wait.ts:224-249`, `:541-562`) actually read.
+///
+/// A projection rather than the record itself for this module's standing reason: `background/`
+/// sits BELOW `extension/executor/`, where `ForegroundHistoryRun` lives, and every cross-layer
+/// dependency here is injected as a value (the same shape [`WaitDeps::completion_bus`] and
+/// [`WaitDeps::subscribe`] already use).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetachedForegroundRun {
+    /// pi `run.runId`.
+    pub run_id: String,
+    /// pi `run.sessionId` — REQUIRED here, because `:225`'s filter drops a run without one.
+    pub session_id: String,
+    /// pi `run.children`.
+    pub children: Vec<DetachedForegroundChild>,
+}
+
+/// One child of a remembered foreground run — pi `ForegroundResumeChild`, narrowed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetachedForegroundChild {
+    /// pi `child.index` — the flat child index the initially-detached set is keyed on.
+    pub index: usize,
+    /// pi `child.agent`.
+    pub agent: String,
+    /// pi `child.status`, compared against the literal `"detached"` exactly as upstream does.
+    pub status: String,
+    /// pi `child.activityState` — the first half of `:242`'s attention test.
+    pub activity_state: Option<ActivityState>,
+    /// pi `child.currentTool` — the second half of `:242`'s attention test
+    /// (`=== "contact_supervisor"`).
+    pub current_tool: Option<String>,
+    /// pi `child.transcriptPath`, read by the progress renderer (`:546`).
+    pub transcript_path: Option<PathBuf>,
+}
+
+/// pi `deps.state.foregroundRuns` (`subagent-wait.ts:224`) — the injected seam that hands this
+/// module a snapshot of the executor's in-memory remembered-run map.
+///
+/// A trait rather than the map itself because the map is `extension/executor`'s private field and
+/// its value type is `pub(crate)` inside that facade. The production implementation is the
+/// executor's own projection; `None` on [`WaitDeps::detached_foreground`] is the no-executor
+/// degradation every other injected seam here already has.
+pub trait DetachedForegroundRunsSource: Send + Sync {
+    /// Every remembered foreground run this process currently holds, session id included. The
+    /// filtering (session, `"detached"` children, id/`all`) is
+    /// [`active_detached_foreground_runs`]'s, so a source cannot get it subtly wrong.
+    fn snapshot(&self) -> Vec<DetachedForegroundRun>;
+}
+
+/// [`WaitDeps::detached_foreground`]'s payload.
+///
+/// A newtype for the same mechanical reason [`WaitSubscribeHook`] is one: [`WaitDeps`] derives
+/// [`Debug`] and a trait object cannot.
+#[derive(Clone)]
+pub struct DetachedForegroundHook(std::sync::Arc<dyn DetachedForegroundRunsSource>);
+
+impl DetachedForegroundHook {
+    /// Wrap a live source — in production the executor's own `foreground_runs` projection.
+    #[must_use]
+    pub fn new(source: std::sync::Arc<dyn DetachedForegroundRunsSource>) -> Self {
+        Self(source)
+    }
+
+    /// pi `[...deps.state.foregroundRuns.values()]` (`:224`).
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<DetachedForegroundRun> {
+        self.0.snapshot()
+    }
+}
+
+impl std::fmt::Debug for DetachedForegroundHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DetachedForegroundHook(..)")
+    }
+}
+
+/// pi `activeDetachedForegroundRuns` (`subagent-wait.ts:222-230`) — the candidate set `bg_wait`
+/// gains alongside its async runs, and the reason `WaitTargetKind::Foreground` is reachable from
+/// production at all.
+///
+/// Upstream's four filters, in order: a live session is REQUIRED (`:223`); a run must belong to it
+/// AND have at least one `"detached"` child (`:225-226`); an `id` narrows by exact-or-prefix
+/// (`:228`); and with no `id`, only `all: true` selects anything (`:229`) — a bare `bg_wait()` does
+/// NOT block on a detached foreground run, because the fleet-wide default is "return as soon as
+/// something finishes" and a detached child is the one thing that will not.
+pub fn active_detached_foreground_runs(
+    params: &WaitParams,
+    deps: &WaitDeps,
+) -> Vec<DetachedForegroundRun> {
+    let (Some(session_id), Some(hook)) = (
+        deps.session_id.as_deref(),
+        deps.detached_foreground.as_ref(),
+    ) else {
+        return Vec::new();
+    };
+    let runs = hook.snapshot().into_iter().filter(|run| {
+        run.session_id == session_id && run.children.iter().any(|child| child.status == "detached")
+    });
+    match params.id.as_deref() {
+        Some(id) => runs
+            .filter(|run| run.run_id == id || run.run_id.starts_with(id))
+            .collect(),
+        None if params.all == Some(true) => runs.collect(),
+        None => Vec::new(),
+    }
+}
+
+/// pi `foregroundChildrenNeedingAttention` (`subagent-wait.ts:241-243`): a still-`detached` child
+/// parked on a blocking `contact_supervisor` ask.
+fn foreground_children_needing_attention<'a>(
+    run: &'a DetachedForegroundRun,
+    indices: &std::collections::BTreeSet<usize>,
+) -> Vec<&'a DetachedForegroundChild> {
+    run.children
+        .iter()
+        .filter(|child| {
+            indices.contains(&child.index)
+                && child.status == "detached"
+                && child.activity_state == Some(ActivityState::NeedsAttention)
+                && child.current_tool.as_deref() == Some("contact_supervisor")
+        })
+        .collect()
+}
+
+/// pi `summarizeForegroundChildren` (`subagent-wait.ts:232-239`): `"2 completed, 1 failed"` over
+/// the initially-detached set, EXCLUDING any child still detached.
+fn summarize_foreground_children(
+    run: &DetachedForegroundRun,
+    indices: &std::collections::BTreeSet<usize>,
+) -> String {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for child in &run.children {
+        if !indices.contains(&child.index) || child.status == "detached" {
+            continue;
+        }
+        *counts.entry(child.status.as_str()).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(status, count)| format!("{count} {status}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// pi `formatForegroundAttention` (`subagent-wait.ts:245-249`).
+fn format_foreground_attention(
+    run: &DetachedForegroundRun,
+    children: &[&DetachedForegroundChild],
+    elapsed_ms: u64,
+) -> String {
+    let child_list = children
+        .iter()
+        .map(|child| format!("{}#{}", child.agent, child.index))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Waited {} for remembered detached foreground run \"{}\"; attention required. {} child \
+         run(s) need attention: {child_list}. Reply to any pending supervisor request, then call \
+         {}({{ id: \"{}\" }}) again or inspect status; do not resume or launch a replacement \
+         while it remains detached.",
+        format_duration(elapsed_ms),
+        run.run_id,
+        children.len(),
+        crate::extension::wait_tool::WAIT_TOOL_NAME,
+        run.run_id
+    )
+}
+
+/// pi `detachedForegroundWaitUpdate` (`subagent-wait.ts:541-556`) — the per-tick progress render.
+///
+/// `[CYRUP-DELTA]` two narrowings, both forced and both stated rather than faked. Upstream streams
+/// this through `deps.onUpdate` (`:587`); cyrup's [`WaitDeps`] carries no update seam on this
+/// path, so the render goes to the diagnostic log each tick — the same channel every other
+/// unstreamed observation in this crate uses. And upstream enriches each line from
+/// `readTranscriptActivity(child.transcriptPath)` (`:545`), a live NDJSON tail; the projection
+/// this module is handed carries the child's `current_tool` but not its recent output, so the
+/// per-child line names the tool in flight and says when no transcript is available, which is
+/// upstream's own `"live transcript unavailable"` arm.
+#[must_use]
+pub fn detached_foreground_wait_update(
+    run: &DetachedForegroundRun,
+    pending_indices: &std::collections::BTreeSet<usize>,
+    elapsed_ms: u64,
+) -> String {
+    let mut lines = vec![format!(
+        "Waiting for detached foreground run \"{}\" · {}",
+        run.run_id,
+        format_duration(elapsed_ms)
+    )];
+    for child in &run.children {
+        if !pending_indices.contains(&child.index) || child.status != "detached" {
+            continue;
+        }
+        lines.push(format!(
+            "{} · working after supervisor handoff",
+            child.agent
+        ));
+        if let Some(tool) = child.current_tool.as_deref() {
+            lines.push(format!("  current: {tool}"));
+        }
+        if child.transcript_path.is_none() {
+            lines.push("  live transcript unavailable; waiting for completion event".to_string());
+        }
+    }
+    lines.join("\n")
 }
 
 /// A run flagged as needing the orchestrator's attention (pi `needsAttention`, `runs/background/wait.ts:203-205` @v0.34.0).
@@ -665,6 +902,15 @@ pub enum WaitVerdict {
         /// The armed record's identity — [`super::wait_subscriptions::WaitSubscriptionRecord::token`].
         token: super::wait_subscriptions::SubscriptionToken,
     },
+    /// VL-S11b — a wait on a remembered DETACHED FOREGROUND run could not be reconciled: the
+    /// active session changed under it (pi `subagent-wait.ts:568-570`) or the run disappeared from
+    /// the remembered map before any terminal child result was recorded (`:573-575`). Error, as
+    /// both of upstream's are.
+    ///
+    /// Its own variant rather than [`Self::ListingFailed`] because nothing faulted — the listing
+    /// succeeded and told the wait that what it was waiting for is no longer addressable from
+    /// here, which is a different thing for a caller to decide about.
+    ForegroundUnreconciled,
     /// SCOPE_11 — the non-blocking form was REFUSED. Error.
     ///
     /// One variant for upstream's four refusal sites (`:561` no `id`, `:564` combined with `all`,
@@ -757,6 +1003,7 @@ impl WaitOutcome {
             | WaitVerdict::AmbiguousId
             | WaitVerdict::Aborted
             | WaitVerdict::SubscriptionRefused
+            | WaitVerdict::ForegroundUnreconciled
             | WaitVerdict::CompletionsFailed => true,
             WaitVerdict::Resolved {
                 reported_as_error, ..
@@ -812,6 +1059,260 @@ impl WaitOutcome {
     #[must_use]
     pub fn usage(&self) -> Option<cyrup_core::Usage> {
         super::wait_completions::completion_usage(&self.completions)
+    }
+}
+
+/// SCOPE_11 / pi `:704-714` — the one arming site, for BOTH target kinds.
+///
+/// Extracted rather than duplicated because upstream has one site too: `selected.kind` is
+/// interpolated into the success sentence (`:710` — `for exact ${selected.kind} run ${selected.id}`),
+/// so the async and foreground texts differ in exactly that one word and nothing else.
+async fn arm_wait_subscription(
+    kind: super::wait_subscriptions::WaitTargetKind,
+    exact: &str,
+    requested: &str,
+    timeout: Duration,
+    deps: &WaitDeps,
+) -> WaitOutcome {
+    let Some(subscribe) = deps.subscribe.as_ref() else {
+        // pi `:705-707` — the `ctx?.hasUI`/no-manager refusal (`wait-tool.ts:33`), with pi's
+        // `bg_wait` spelled through cyrup's own registered tool name.
+        return WaitOutcome::plain(
+            format!(
+                "Non-blocking wait subscriptions require a long-lived interactive subagent \
+                 runtime; this runtime can only use blocking {} calls.",
+                crate::extension::wait_tool::WAIT_TOOL_NAME
+            ),
+            WaitVerdict::SubscriptionRefused,
+        );
+    };
+    let input = super::wait_subscriptions::ArmWaitSubscriptionInput {
+        target_kind: kind,
+        run_id: super::RunId::from_token(exact.to_string()),
+        requested_id: requested.to_string(),
+        timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+    };
+    // pi `:711-713` — the arm's own throw is reported as an error RESULT, never propagated.
+    match subscribe.arm(input).await {
+        Ok(record) => WaitOutcome::plain(
+            format!(
+                "Armed wait subscription {} for exact {kind} run {exact}. Returning immediately; \
+                 this session will be woken on completion, failure, attention, reconciliation \
+                 failure, or timeout. Inspect armed subscriptions with \
+                 subagent({{ action: \"status\" }}).",
+                record.token
+            ),
+            WaitVerdict::SubscriptionArmed {
+                token: record.token,
+            },
+        ),
+        Err(error) => WaitOutcome::plain(error.to_string(), WaitVerdict::SubscriptionRefused),
+    }
+}
+
+/// pi `waitForSessionDetachedForegroundRuns` (`subagent-wait.ts:602-630`): wait each selected
+/// remembered foreground run to a terminal child result, in order, returning on the FIRST one that
+/// ends the wait.
+///
+/// Sequential and not concurrent because upstream is: an attention result or an abort from any one
+/// run is the answer for all of them, and a caller told "reply to the supervisor request" must not
+/// also be handed three other runs' progress.
+async fn wait_for_detached_foreground_runs(
+    runs: &[DetachedForegroundRun],
+    cancel: &CancelToken,
+    deps: &WaitDeps,
+    started_at: Instant,
+    poll_interval: Duration,
+    timeout: Duration,
+) -> WaitOutcome {
+    let mut last_done: Option<WaitOutcome> = None;
+    for run in runs {
+        let outcome =
+            wait_for_detached_foreground_run(run, cancel, deps, started_at, poll_interval, timeout)
+                .await;
+        // pi `:615-624` — an error, an attention yield or an elapsed window ends the whole wait;
+        // only a plain `done` (a `Resolved` with no attention) lets the loop move to the next run.
+        if !matches!(
+            outcome.verdict,
+            WaitVerdict::Resolved {
+                attention_runs: 0,
+                ..
+            }
+        ) {
+            return outcome;
+        }
+        last_done = Some(outcome);
+    }
+    // Every selected run reached a terminal child result; upstream's loop likewise ends on the
+    // LAST one's text (`:627`). The fallback is unreachable from `wait_for_subagents`, whose
+    // caller guard is `!detached_foreground.is_empty()`, and is a value rather than a panic
+    // because an empty slice is a legitimate thing to hand a helper.
+    last_done.unwrap_or_else(|| {
+        WaitOutcome::plain(
+            "No remembered detached foreground run remained to wait for.".to_string(),
+            WaitVerdict::NothingToWait,
+        )
+    })
+}
+
+/// pi `waitForDetachedForegroundRun` (`subagent-wait.ts:558-599`) — one run's poll loop, with
+/// upstream's guard order preserved exactly: session changed ▸ run gone ▸ attention ▸ done ▸
+/// progress ▸ abort ▸ window elapsed ▸ sleep.
+///
+/// `[CYRUP-DELTA]` upstream's `deps.hasPendingSupervisorRequest?.()` yield (`:577`) has no cyrup
+/// seam on this path — [`WaitDeps`] carries no supervisor-request probe, and the ask lock that
+/// would answer it lives on the executor above this layer. The ATTENTION guard immediately below
+/// it covers the case that matters here (a detached child parked on `contact_supervisor`), which
+/// is the only way a supervisor request can exist for a run this function is waiting on.
+async fn wait_for_detached_foreground_run(
+    run: &DetachedForegroundRun,
+    cancel: &CancelToken,
+    deps: &WaitDeps,
+    started_at: Instant,
+    poll_interval: Duration,
+    timeout: Duration,
+) -> WaitOutcome {
+    // pi `:559` — the set is fixed at entry: a child that becomes detached later is not something
+    // this wait promised to cover.
+    let initial_detached: std::collections::BTreeSet<usize> = run
+        .children
+        .iter()
+        .filter(|child| child.status == "detached")
+        .map(|child| child.index)
+        .collect();
+    let run_id = run.run_id.as_str();
+    loop {
+        // pi `:561-563` — the session changed under the wait.
+        if deps.session_id.as_deref() != Some(run.session_id.as_str()) {
+            return WaitOutcome::plain(
+                format!(
+                    "Wait stopped because the active session changed while remembered foreground \
+                     run \"{run_id}\" was still detached. Return to the originating session to \
+                     inspect or wait for it. Reply to any pending supervisor request before \
+                     resuming or launching a replacement."
+                ),
+                WaitVerdict::ForegroundUnreconciled,
+            );
+        }
+        // pi `:564-566` — re-read the LIVE map every lap; the continuation task that owns the
+        // child writes its terminal status there (`reconcile_detached_foreground_child`).
+        let current = deps
+            .detached_foreground
+            .as_ref()
+            .map(DetachedForegroundHook::snapshot)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|candidate| {
+                candidate.run_id == run.run_id && candidate.session_id == run.session_id
+            });
+        let Some(current) = current else {
+            return WaitOutcome::plain(
+                format!(
+                    "Remembered foreground run \"{run_id}\" disappeared before a terminal child \
+                     result was recorded. Completion cannot be confirmed; do not launch a \
+                     replacement without checking the originating child session."
+                ),
+                WaitVerdict::ForegroundUnreconciled,
+            );
+        };
+        let elapsed = started_at.elapsed();
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+
+        // pi `:579-580` — attention wins over done, because a child parked on a supervisor ask has
+        // not finished and the caller is exactly who has to unblock it.
+        let attention = foreground_children_needing_attention(&current, &initial_detached);
+        if !attention.is_empty() {
+            return WaitOutcome::plain(
+                format_foreground_attention(&current, &attention, elapsed_ms),
+                WaitVerdict::Resolved {
+                    failed_runs: 0,
+                    attention_runs: attention.len(),
+                    // pi `:768` — only the drain's `failOnAttention` turns this into an error.
+                    reported_as_error: deps.fail_on_attention,
+                },
+            );
+        }
+
+        // pi `:581-586` — every initially-detached child has landed.
+        let pending = current
+            .children
+            .iter()
+            .any(|child| initial_detached.contains(&child.index) && child.status == "detached");
+        if !pending {
+            let outcome = summarize_foreground_children(&current, &initial_detached);
+            let failed_runs = current
+                .children
+                .iter()
+                .filter(|child| initial_detached.contains(&child.index) && child.status == "failed")
+                .count();
+            let outcome_text = if outcome.is_empty() {
+                "no recovered child status".to_string()
+            } else {
+                outcome
+            };
+            return WaitOutcome::plain(
+                format!(
+                    "Waited {} for remembered detached foreground run \"{run_id}\"; done. \
+                     Outcome: {outcome_text}. Completion event observed; inspect with \
+                     subagent({{ action: \"status\", id: \"{run_id}\" }}) for recovered output.",
+                    format_duration(elapsed_ms)
+                ),
+                WaitVerdict::Resolved {
+                    failed_runs,
+                    attention_runs: 0,
+                    // pi `:751` — only the drain's `failOnFailedRuns` turns this into an error.
+                    reported_as_error: deps.fail_on_failed_runs && failed_runs > 0,
+                },
+            );
+        }
+
+        // pi `:587-588` — the per-tick progress render; see
+        // [`detached_foreground_wait_update`]'s own `[CYRUP-DELTA]` for where it goes here.
+        tracing::debug!(
+            run_id = %run_id,
+            progress = %detached_foreground_wait_update(&current, &initial_detached, elapsed_ms),
+            "waiting for a detached foreground run"
+        );
+
+        // pi `:589-591`.
+        if cancel.is_cancelled() {
+            return WaitOutcome::plain(
+                format!(
+                    "Wait aborted after {}. Remembered foreground run \"{run_id}\" remains \
+                     detached. Reply to any pending supervisor request before resuming or \
+                     launching a replacement.",
+                    format_duration(elapsed_ms)
+                ),
+                WaitVerdict::Aborted,
+            );
+        }
+
+        // pi `:592-597`.
+        if elapsed >= timeout {
+            let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+            return WaitOutcome::plain(
+                format!(
+                    "Wait window elapsed after {} with remembered foreground run \"{run_id}\" \
+                     still detached. Reply to any pending supervisor request, then call {}({{ id: \
+                     \"{run_id}\" }}) again or inspect status; do not resume or launch a \
+                     replacement while it remains detached.",
+                    format_duration(timeout_ms),
+                    crate::extension::wait_tool::WAIT_TOOL_NAME
+                ),
+                WaitVerdict::WindowElapsed {
+                    active_run_ids: vec![run.run_id.clone()],
+                },
+            );
+        }
+
+        // pi `await waitForWake(pollIntervalMs, signal, deps)` (`:598`). `biased` for the reason
+        // the async loop's own sleep states: a cancelled token must win over a ready timer.
+        let slice = poll_interval.min(timeout.saturating_sub(elapsed));
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            () = tokio::time::sleep(slice) => {}
+        }
     }
 }
 
@@ -896,6 +1397,53 @@ pub async fn wait_for_subagents(
         Err(text) => return WaitOutcome::plain(text, WaitVerdict::ListingFailed),
     };
 
+    // VL-S11b — pi `:671`: the candidate set is async runs PLUS remembered detached FOREGROUND
+    // runs (`activeDetachedForegroundRuns`). `bg_wait` had only the async half, which is why
+    // `WaitTargetKind::Foreground` had no production producer until now.
+    //
+    // `[CYRUP-DELTA]` upstream MERGES the two lists into one candidate array and resolves the id
+    // across both (`:681-690`), so an id matching one async run AND one foreground run is reported
+    // as AMBIGUOUS. cyrup consults the foreground half only when the async half selected nothing,
+    // so that collision resolves to the async run instead. It is not reachable in practice — a
+    // `RunId` is minted once per run and the two maps are keyed by the same id space, so one id
+    // cannot name both — but the resolution rule differs and is stated rather than implied.
+    let detached_foreground = if active.is_empty() {
+        active_detached_foreground_runs(params, deps)
+    } else {
+        // The async half selected something, so the foreground half is not consulted and its
+        // snapshot is not taken — a wait that already has work to do pays nothing for this.
+        Vec::new()
+    };
+    if !detached_foreground.is_empty() {
+        // SCOPE_11 — the arming site's OTHER target kind, reachable from production for the first
+        // time. pi `:704-714` arms whatever `selected.kind` resolved to; the record format, the
+        // manager's restore path and its whole foreground reconcile branch
+        // (`wait_subscriptions/manager.rs`) were already ported against a producer that did not
+        // exist yet.
+        if params.non_blocking == Some(true)
+            && let Some(requested) = params.id.as_deref()
+            && let Some(run) = detached_foreground.first()
+        {
+            return arm_wait_subscription(
+                super::wait_subscriptions::WaitTargetKind::Foreground,
+                &run.run_id,
+                requested,
+                timeout,
+                deps,
+            )
+            .await;
+        }
+        return wait_for_detached_foreground_runs(
+            &detached_foreground,
+            cancel,
+            deps,
+            started_at,
+            poll_interval,
+            timeout,
+        )
+        .await;
+    }
+
     if active.is_empty() {
         // Nothing is running. That is NOT the same as "there is nothing to report": the runs this
         // caller is asking about have very likely just finished, and their results are on disk
@@ -942,8 +1490,8 @@ pub async fn wait_for_subagents(
         effective_id = active.first().map(|run| run_id_of(run).to_string());
     }
 
-    // SCOPE_11 / pi `:590-600` — THE arming site, and its position is the whole point: after the
-    // ambiguity rejection at `:586` and after the id has been narrowed to ONE exact run, so the
+    // SCOPE_11 / pi `:704-714` — THE arming site, and its position is the whole point: after the
+    // ambiguity rejection at `:688-690` and after the id has been narrowed to ONE exact run, so the
     // record binds the resolved identity rather than the prefix the caller typed. Both are kept:
     // `run_id` is the exact id, `requested_id` is what the user asked for.
     //
@@ -951,50 +1499,22 @@ pub async fn wait_for_subagents(
     // equivalent guard is the `active.is_empty()` return above, which already answered
     // `No active run matched "…"`.
     //
-    // `[CYRUP-DELTA]` upstream's candidate list spans async runs AND remembered detached
-    // FOREGROUND runs (`:581-584`, `activeDetachedForegroundRuns`), so its `selected.kind` can be
-    // either. cyrup's `wait` lists async runs only (`active_runs` → `list_active_runs`), so this
-    // site can only ever arm [`super::wait_subscriptions::WaitTargetKind::Async`]. The foreground
-    // target kind and its whole reconcile branch are still ported, because the manager restores
-    // records written by ANY producer and a record's format cannot be half-implemented.
+    // Upstream's `selected.kind` can be `async` or `foreground` (`:671`, `:682-684`), and so can
+    // cyrup's:
+    // the FOREGROUND arm is the `detached_foreground` branch above, which reaches the same
+    // [`arm_wait_subscription`] with the other [`super::wait_subscriptions::WaitTargetKind`].
     if params.non_blocking == Some(true)
         && let Some(id) = params.id.as_deref()
         && let Some(exact) = effective_id.as_deref()
     {
-        let Some(subscribe) = deps.subscribe.as_ref() else {
-            // pi `:591-593` — the `ctx?.hasUI`/no-manager refusal (`wait-tool.ts:33`), with pi's
-            // `bg_wait` spelled as cyrup's own tool name.
-            return WaitOutcome::plain(
-                format!(
-                    "Non-blocking wait subscriptions require a long-lived interactive subagent \
-                     runtime; this runtime can only use blocking {} calls.",
-                    crate::extension::wait_tool::WAIT_TOOL_NAME
-                ),
-                WaitVerdict::SubscriptionRefused,
-            );
-        };
-        let input = super::wait_subscriptions::ArmWaitSubscriptionInput {
-            target_kind: super::wait_subscriptions::WaitTargetKind::Async,
-            run_id: super::RunId::from_token(exact.to_string()),
-            requested_id: id.to_string(),
-            timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
-        };
-        // pi `:595-600` — the arm's own throw is reported as an error RESULT, never propagated.
-        return match subscribe.arm(input).await {
-            Ok(record) => WaitOutcome::plain(
-                format!(
-                    "Armed wait subscription {} for exact async run {exact}. Returning \
-                     immediately; this session will be woken on completion, failure, attention, \
-                     reconciliation failure, or timeout. Inspect armed subscriptions with \
-                     subagent({{ action: \"status\" }}).",
-                    record.token
-                ),
-                WaitVerdict::SubscriptionArmed {
-                    token: record.token,
-                },
-            ),
-            Err(error) => WaitOutcome::plain(error.to_string(), WaitVerdict::SubscriptionRefused),
-        };
+        return arm_wait_subscription(
+            super::wait_subscriptions::WaitTargetKind::Async,
+            exact,
+            id,
+            timeout,
+            deps,
+        )
+        .await;
     }
 
     // The set of runs in flight when the wait began. In first-completion mode we return as soon as
@@ -1030,7 +1550,7 @@ pub async fn wait_for_subagents(
         .collect();
 
     let done = |pending: &[ActiveRun], attention: &[ActiveRun]| -> bool {
-        // With the flag set — the default, and the `wait` tool's mode — a run needing attention
+        // With the flag set — the default, and the `bg_wait` tool's mode — a run needing attention
         // breaks the wait in either mode: the caller has to act on it (nudge/resume/interrupt)
         // and blocking longer helps nothing. With it off (auto-drain), attention does NOT end the
         // wait — pi's `stopOnAttention || hasSupervisorTool(run)` gate (`subagent-wait.ts:618-622`;
@@ -1059,7 +1579,7 @@ pub async fn wait_for_subagents(
         // drain), the wait can time out while ONLY attention runs remain, and a message built from
         // `pending` alone would then claim "0 run(s) still active" about a live run. With the flag
         // on, `attention` is empty at both sites (the `done` short-circuit exits first), so this
-        // changes nothing for the `wait` tool.
+        // changes nothing for the `bg_wait` tool.
         if cancel.is_cancelled() {
             let in_flight: Vec<ActiveRun> =
                 pending.iter().chain(attention.iter()).cloned().collect();
@@ -1771,7 +2291,7 @@ mod tests {
                 // what every pre-existing test in this module exercises — so the polling path stays
                 // covered exactly as before and only the two new tests opt into a bus.
                 completion_bus: None,
-                // The `wait` tool's defaults (pi `subagent-wait.ts:618,708,725`); the auto-drain
+                // The `bg_wait` tool's defaults (pi `subagent-wait.ts:618,708,725`); the auto-drain
                 // tests override through the builders.
                 stop_on_attention: true,
                 fail_on_failed_runs: false,
@@ -1786,6 +2306,9 @@ mod tests {
                 // every pre-existing test in this module exercises. The `nonBlocking` tests below
                 // opt into a fake arming seam explicitly.
                 subscribe: None,
+                // VL-S11b — no executor, so no remembered foreground runs; the detach tests below
+                // attach a fake source explicitly.
+                detached_foreground: None,
             }
         }
 
@@ -3212,6 +3735,288 @@ mod tests {
         )
     }
 
+    // ---------------------------------------------------------------------------------------
+    // VL-S11b — remembered DETACHED FOREGROUND runs
+    // ---------------------------------------------------------------------------------------
+
+    /// A settable stand-in for the executor's `foreground_runs` map.
+    #[derive(Clone, Default)]
+    struct FakeForegroundRuns(std::sync::Arc<std::sync::Mutex<Vec<DetachedForegroundRun>>>);
+
+    impl FakeForegroundRuns {
+        fn set(&self, runs: Vec<DetachedForegroundRun>) {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = runs;
+        }
+
+        fn hook(&self) -> DetachedForegroundHook {
+            DetachedForegroundHook::new(std::sync::Arc::new(self.clone()))
+        }
+    }
+
+    impl DetachedForegroundRunsSource for FakeForegroundRuns {
+        fn snapshot(&self) -> Vec<DetachedForegroundRun> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    fn foreground_run(run_id: &str, session_id: &str, status: &str) -> DetachedForegroundRun {
+        DetachedForegroundRun {
+            run_id: run_id.to_string(),
+            session_id: session_id.to_string(),
+            children: vec![DetachedForegroundChild {
+                index: 0,
+                agent: "scout".to_string(),
+                status: status.to_string(),
+                activity_state: None,
+                current_tool: None,
+                transcript_path: None,
+            }],
+        }
+    }
+
+    /// pi `activeDetachedForegroundRuns` (`subagent-wait.ts:224-236`): all four filters.
+    ///
+    /// **Gutting mutation this fails on:** drop the `all` gate and a bare `bg_wait()` starts
+    /// blocking on every detached foreground run in the session — the `no_id_without_all` assert
+    /// fires. Drop the session filter and another session's run is waited on — the
+    /// `other_session` assert fires.
+    #[test]
+    fn the_detached_foreground_candidate_set_honours_every_upstream_filter() {
+        let fx = Fixture::new();
+        let source = FakeForegroundRuns::default();
+        source.set(vec![
+            foreground_run("fg-alpha", "sess-a", "detached"),
+            foreground_run("fg-beta", "sess-a", "completed"),
+            foreground_run("fg-other", "sess-b", "detached"),
+        ]);
+        let mut deps = fx.deps(true);
+        deps.session_id = Some("sess-a".to_string());
+        deps.detached_foreground = Some(source.hook());
+
+        // No id and no `all`: upstream selects nothing (`:231`).
+        let no_id_without_all = active_detached_foreground_runs(&WaitParams::default(), &deps);
+        assert!(
+            no_id_without_all.is_empty(),
+            "a bare wait must not block on a detached foreground run"
+        );
+
+        // `all: true`: only this session's runs, and only the ones with a detached child.
+        let all = active_detached_foreground_runs(
+            &WaitParams {
+                all: Some(true),
+                ..WaitParams::default()
+            },
+            &deps,
+        );
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(all[0].run_id, "fg-alpha");
+        let other_session = all.iter().any(|run| run.session_id == "sess-b");
+        assert!(
+            !other_session,
+            "another session's run must never be selected"
+        );
+
+        // An id narrows by exact-or-prefix (`:230`).
+        let by_prefix = active_detached_foreground_runs(
+            &WaitParams {
+                id: Some("fg-al".to_string()),
+                ..WaitParams::default()
+            },
+            &deps,
+        );
+        assert_eq!(by_prefix.len(), 1);
+        assert_eq!(by_prefix[0].run_id, "fg-alpha");
+
+        // A settled foreground run is not a candidate at all — its child is not `"detached"`.
+        let settled = active_detached_foreground_runs(
+            &WaitParams {
+                id: Some("fg-beta".to_string()),
+                ..WaitParams::default()
+            },
+            &deps,
+        );
+        assert!(settled.is_empty(), "{settled:?}");
+
+        // No source wired (every pre-`with_detached_foreground` construction) selects nothing.
+        deps.detached_foreground = None;
+        assert!(
+            active_detached_foreground_runs(
+                &WaitParams {
+                    all: Some(true),
+                    ..WaitParams::default()
+                },
+                &deps
+            )
+            .is_empty()
+        );
+    }
+
+    /// `bg_wait({ id })` on a DETACHED foreground run BLOCKS, and resolves when the continuation
+    /// task's reconcile flips the child off `"detached"`.
+    ///
+    /// This is the whole point of the candidate-set extension, and it is what the deleted
+    /// `[CYRUP-DELTA]` said could not happen: there is no async run on disk here at all.
+    ///
+    /// **Gutting mutation this fails on:** remove the `detached_foreground` branch from
+    /// `wait_for_subagents`. The async listing is empty, so the wait returns IMMEDIATELY with
+    /// `No active run matched "fg-live". Nothing to wait for.` — the elapsed-time assert and both
+    /// text asserts fire.
+    #[tokio::test]
+    async fn a_wait_on_a_detached_foreground_run_blocks_until_its_child_is_reconciled() {
+        let fx = Fixture::new();
+        let source = FakeForegroundRuns::default();
+        source.set(vec![foreground_run("fg-live", "sess-a", "detached")]);
+        let mut deps = fx.deps(true);
+        deps.session_id = Some("sess-a".to_string());
+        deps.poll_interval = Duration::from_millis(MIN_POLL_INTERVAL_MS);
+        deps.detached_foreground = Some(source.hook());
+
+        let settler = {
+            let source = source.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                source.set(vec![foreground_run("fg-live", "sess-a", "completed")]);
+            })
+        };
+
+        let params = WaitParams {
+            id: Some("fg-live".to_string()),
+            timeout_ms: Some(15_000),
+            ..WaitParams::default()
+        };
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(&params, &CancelToken::new(), &deps),
+        )
+        .await
+        .expect("the foreground wait resolves");
+        settler.await.expect("settler task");
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "the wait must have BLOCKED on the detached child, took {:?}",
+            started.elapsed()
+        );
+        assert!(!outcome.is_error(), "{}", outcome.text);
+        assert!(
+            outcome
+                .text
+                .contains("for remembered detached foreground run \"fg-live\"; done."),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("Outcome: 1 completed"),
+            "{}",
+            outcome.text
+        );
+    }
+
+    /// A session switch under a foreground wait stops it — pi `:568-570` — as an ERROR, and it
+    /// names the run rather than reporting a generic listing failure.
+    ///
+    /// **Gutting mutation this fails on:** drop the session re-check from the loop. The wait then
+    /// blocks until its window elapses and the verdict is `WindowElapsed`, not
+    /// `ForegroundUnreconciled`.
+    #[tokio::test]
+    async fn a_session_change_stops_a_detached_foreground_wait_with_its_own_refusal() {
+        let fx = Fixture::new();
+        let source = FakeForegroundRuns::default();
+        source.set(vec![foreground_run("fg-moved", "sess-a", "detached")]);
+        let mut deps = fx.deps(true);
+        // The wait's own session is NOT the run's: upstream's `:561` comparison fails on the very
+        // first lap, which is the same observable as a switch mid-wait.
+        deps.session_id = Some("sess-a".to_string());
+        deps.detached_foreground = Some(source.hook());
+        let selected = active_detached_foreground_runs(
+            &WaitParams {
+                id: Some("fg-moved".to_string()),
+                ..WaitParams::default()
+            },
+            &deps,
+        );
+        assert_eq!(selected.len(), 1);
+
+        deps.session_id = Some("sess-b".to_string());
+        let outcome = wait_for_detached_foreground_runs(
+            &selected,
+            &CancelToken::new(),
+            &deps,
+            Instant::now(),
+            Duration::from_millis(MIN_POLL_INTERVAL_MS),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert_eq!(outcome.verdict, WaitVerdict::ForegroundUnreconciled);
+        assert!(outcome.is_error());
+        assert!(
+            outcome.text.starts_with(
+                "Wait stopped because the active session changed while remembered foreground run \
+                 \"fg-moved\" was still detached."
+            ),
+            "{}",
+            outcome.text
+        );
+    }
+
+    /// SCOPE_11 — `{ id, nonBlocking: true }` over a detached foreground run arms
+    /// `WaitTargetKind::Foreground`, which had no production producer before VL-S11b.
+    ///
+    /// **Gutting mutation this fails on:** arm `WaitTargetKind::Async` for it (which is what the
+    /// single arming site did before the candidate set grew). The record's `targetKind` is then
+    /// `async`, the manager reconciles it through `run_status` against an async root that has no
+    /// such run, and both the sentence and the on-disk assert fire.
+    #[tokio::test]
+    async fn a_non_blocking_wait_on_a_detached_foreground_run_arms_the_foreground_kind() {
+        let fx = Fixture::new();
+        let subs = fx.async_root.parent().expect("temp root").join("subs");
+        let source = FakeForegroundRuns::default();
+        source.set(vec![foreground_run("fg-arm-1", "sess-a", "detached")]);
+
+        let manager = subscription_manager(&fx, &subs, Some("sess-a"));
+        let mut deps = fx.deps(true);
+        deps.session_id = Some("sess-a".to_string());
+        deps.poll_interval = Duration::from_secs(10);
+        deps.detached_foreground = Some(source.hook());
+        let arming: std::sync::Arc<dyn WaitSubscriptionArming> = manager;
+        deps.subscribe = Some(WaitSubscribeHook::new(arming));
+
+        let params = WaitParams {
+            id: Some("fg-arm".to_string()),
+            non_blocking: Some(true),
+            timeout_ms: Some(60 * 60 * 1000),
+            ..WaitParams::default()
+        };
+        let started = Instant::now();
+        let outcome = wait_for_subagents(&params, &CancelToken::new(), &deps).await;
+        assert!(
+            started.elapsed() < deps.poll_interval,
+            "a non-blocking wait must not pay a poll interval: {:?}",
+            started.elapsed()
+        );
+
+        let WaitVerdict::SubscriptionArmed { token } = &outcome.verdict else {
+            panic!("expected SubscriptionArmed, got {:?}", outcome.verdict);
+        };
+        assert!(!outcome.is_error(), "{}", outcome.text);
+        // pi `:710` interpolates `selected.kind`, so the word here is `foreground`, not `async`.
+        assert!(
+            outcome.text.contains(&format!(
+                "Armed wait subscription {token} for exact foreground run fg-arm-1."
+            )),
+            "{}",
+            outcome.text
+        );
+    }
+
     /// SUBTASK2 — the feature: the wait RETURNS instead of blocking, and it leaves a durable
     /// record behind.
     ///
@@ -3342,10 +4147,14 @@ mod tests {
         .await;
         assert_eq!(outcome.verdict, WaitVerdict::SubscriptionRefused);
         assert!(outcome.is_error());
+        // VL-S8: the sentence interpolates `WAIT_TOOL_NAME`, and this literal is the assert that
+        // makes the rename observable at THIS site. It is byte-identical to upstream's
+        // `subagent-wait.ts:706` @v0.68.0, which also says `bg_wait` — so a revert of the const
+        // fails here as well as at the registration.
         assert_eq!(
             outcome.text,
             "Non-blocking wait subscriptions require a long-lived interactive subagent runtime; \
-             this runtime can only use blocking wait calls."
+             this runtime can only use blocking bg_wait calls."
         );
     }
 

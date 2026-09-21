@@ -994,14 +994,34 @@ impl SubagentTool {
             return delivered;
         }
 
-        // A detached (intercom) run is a coordination hand-off, not a failure (pi 2738-2743). No
-        // live trigger sets `detached` in this crate today, but the branch is kept for fidelity.
+        // A detached run is a coordination hand-off, not a failure — pi
+        // `subagent-executor.ts:4206-4213`, whose message is REASON-KEYED because the two
+        // producers hand the model two different jobs: an intercom detach asks it to answer the
+        // supervisor first, a user detach tells it the child is now independent. Both name a
+        // recovery verb, which is the whole point of the branch: a model told its run detached and
+        // given no way to recover the result has been told nothing actionable.
+        //
+        // Both producers are live in this crate. `run_sync` stamps
+        // [`DetachReason::IntercomCoordination`] on the R-SA-037 blocking-`contact_supervisor` arm
+        // (`exec/mod.rs`), and `/subagents-detach` stamps [`DetachReason::UserRequest`] on the
+        // receipt it mints (`extension/executor/foreground.rs`). The message itself lives on the
+        // reason (`extension/executor/detach.rs`) so this site and the slash command cannot drift.
+        //
+        // A `detached` result with an unparseable or absent reason falls back to
+        // [`DetachReason::IntercomCoordination`] — the arm that existed before `/subagents-detach`
+        // did, and the only one a pre-VL-S11b `status.json`/result file can be carrying.
         if result.detached {
+            use crate::extension::executor::detach::DetachReason;
+            let reason =
+                if result.detached_reason.as_deref() == Some(DetachReason::UserRequest.as_str()) {
+                    DetachReason::UserRequest
+                } else {
+                    DetachReason::IntercomCoordination
+                };
             return Ok(ToolResult {
-                content: vec![cyrup_core::Content::text(format!(
-                    "Detached for intercom coordination: {agent}. Reply to the supervisor request \
-                     first. After the child exits, start a fresh follow-up if needed."
-                ))],
+                content: vec![cyrup_core::Content::text(
+                    reason.tool_result_message(agent, run_id.as_str()),
+                )],
                 details,
                 terminate: TerminateHint::Unspecified,
                 ..Default::default()

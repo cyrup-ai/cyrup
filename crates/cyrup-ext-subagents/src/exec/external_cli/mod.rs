@@ -352,6 +352,7 @@ pub async fn run_external_cli(
         structured_output: None,
         acceptance: None,
         detached: false,
+        detached_reason: None,
         interrupted: false,
         timed_out: outcome.timed_out,
         // Upstream's external-CLI branch never sets `timeoutRecovery` either (`subagent-runner.ts:1563`

@@ -5,18 +5,39 @@
 //! Upstream addresses one child of an async run by a string the caller can copy out of a status
 //! surface rather than by a bare index, so a stop aimed at "the second child" survives the caller
 //! and the runner disagreeing about which list the number indexes. The identity is derived, never
-//! stored: `asyncStatusChildIdentity(step, index)` is `step.workflowKey ?? step.runId ??
-//! \`step:${index}\`` (`:16-18`), and `resolveAsyncStatusChild` (`:24-47`) accepts ANY of those
-//! three spellings as a candidate (`:20-22`), so a caller may name a workflow child by its key, its
-//! child run id, or its position.
+//! stored: `asyncStatusChildIdentity(step, index)` is the FIRST non-empty entry of
+//! `asyncStatusChildIdentityCandidates` (`:16-18`), and that candidate list is FOUR rungs, not
+//! three (`child-identity.ts:20-22` @v0.68.0):
+//!
+//! ```text
+//! [step.childId, step.workflowKey, step.runId, `step:${index}`]
+//! ```
+//!
+//! `resolveAsyncStatusChild` (`:24-47`) accepts ANY of them, so a caller may name a workflow child
+//! by its explicit child id, its lane key, its child run id, or its position.
 //!
 //! # What the port can and cannot represent
 //!
-//! [`StepStatus::workflow_key`] and [`StepStatus::run_id`] (SCOPE_3d) are what populate the first
-//! two rungs on a real status: a workflow child resolves by its lane key, then by its own child
-//! run id, and only positionally as the fallback. What remains genuinely unrepresentable is the
-//! `DynamicGroup` splice residual described below — a dynamic group is still one entry whose
-//! members share an identity.
+//! [`StepStatus::workflow_key`] and [`StepStatus::run_id`] (SCOPE_3d) populate the SECOND and THIRD
+//! rungs on a real status: a workflow child resolves by its lane key, then by its own child run id,
+//! and only positionally as the fallback.
+//!
+//! **The FIRST rung, `step.childId`, is unported.** [`StepStatus`] has no `child_id` field at all,
+//! so `async_status_child_identity_candidates` below emits three candidates where upstream emits
+//! four, and a caller holding an explicit child id cannot use it:
+//!
+//! ```text
+//! $ git grep -n 'child_id' crates/cyrup-ext-subagents/src/background/records.rs
+//! $ (no output — the struct at records.rs:24 has no such field)
+//! ```
+//!
+//! This is small and real rather than theoretical: it does not change which child any EXISTING
+//! caller resolves (cyrup never mints a `childId`, so upstream's first rung would be `undefined`
+//! and skipped for every step cyrup produces), but it does mean the ladder is narrower than
+//! upstream's and cannot widen until `StepStatus` carries the field. Recorded as a residual in
+//! `docs/gap-analysis/00-residual-ledger.md`. The other thing that remains genuinely
+//! unrepresentable is the `DynamicGroup` splice residual described below — a dynamic group is
+//! still one entry whose members share an identity.
 //!
 //! `index` here is the index into [`RunStatus::steps`] — the SAME index space cyrup's other
 //! per-child surfaces use (`steer`'s `target_index`, the transcript view's `index`, the runner's
@@ -27,11 +48,20 @@
 //! (`subagent-runner.ts:4155` @v0.64.0); that half is a recorded SUBA-093 residual.
 //!
 //! `resolveAsyncStatusChild`'s `includeNested` option (`:27,34-42`, added between v0.57.0 and
-//! v0.64.0) walks each step's `children: NestedRunSummary[]` for a nested run id. Its only consumer
-//! is the slash path (`slash/slash-commands.ts:1110`), which cyrup's `/subagents-stop` does not
-//! expose (it takes a bare run id), and cyrup's per-step nested tracking is a list of bare
-//! [`crate::background::RunId`]s rather than summaries — so it is not ported; the tool path
-//! (`async-stop-action.ts:50`) never passes it.
+//! v0.64.0) walks each step's `children: NestedRunSummary[]` for a nested run id. An earlier
+//! revision of this paragraph said it "is not ported", on the true-at-the-time premise that its
+//! only consumer was a slash path cyrup did not expose. **That premise no longer holds.** VL-S11
+//! landed `/subagents-steer`, which is upstream's other `includeNested: true` caller
+//! (`slash/slash-commands.ts:1097-1103`), and it supplies the nested rung through this module's
+//! own seam: [`resolve_by_candidates`] takes the candidate function, and
+//! `extension/host/slash_steer.rs` passes a `candidates_including_nested` that appends each step's
+//! nested run ids. So the nested rung IS reachable in cyrup — through a caller-supplied candidate
+//! list rather than through a boolean option, which is why the signature here has no
+//! `include_nested` flag. What is still true: [`async_status_child_identity_candidates`], the
+//! DEFAULT candidate function, does not walk nested runs, so the tool path
+//! (`async-stop-action.ts:50`, which never passes the flag upstream either) is unchanged; and
+//! cyrup's per-step nested tracking is a list of bare [`crate::background::RunId`]s rather than
+//! `NestedRunSummary`s, so the recursive `findNested` descent (`:38`) flattens to one level.
 
 use crate::background::{RunStatus, StepState, StepStatus};
 

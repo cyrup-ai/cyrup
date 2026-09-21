@@ -9,7 +9,7 @@ The crate registers **two** extensions that never coexist in one process:
 
 | Id | Where | What it does |
 |---|---|---|
-| `subagents` | the orchestrator session | Registers the `subagent` and `wait` tools, the slash commands, the fleet widget and the watchdog |
+| `subagents` | the orchestrator session | Registers the `subagent` and `bg_wait` tools, the slash commands, the fleet widget and the watchdog |
 | `subagent-prompt-runtime` | inside a spawned child | Registers the child's structured-output tool, the steering inbox, the tool-budget enforcer and the child watchdog |
 
 A plain child gets only the second; a root orchestrator gets only the first.
@@ -22,7 +22,7 @@ The extension is a native extension and reaches the host through `cyrup_ext::hos
 |---|---|
 | `inject_message` | Delivering a steer or a completion notice into a live session |
 | `set_widget` | The under-editor fleet widget — three arguments; `lines: None` removes it |
-| `session_id` | Scoping runs and the `wait` tool to the current session |
+| `session_id` | Scoping runs and the `bg_wait` tool to the current session |
 | `confirm` | The authority-policy confirmation for gated actions |
 
 `NativeExtension::set_host_services` is how the backend is bound. It is late-bound: code that needs

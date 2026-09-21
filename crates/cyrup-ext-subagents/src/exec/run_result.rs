@@ -60,6 +60,27 @@ pub struct SingleResult {
     /// no intercom channel is wired (headless / `RunOptions::clarify = None`) the drive loop still marks
     /// the attempt detached but the `AskLock` degrades to its no-live-channel fallback.
     pub detached: bool,
+    /// Why this run was detached, when the detach came from an explicit hand-off rather than an
+    /// intercom blocking ask — pi `SingleResult.detachedReason` (`shared/types.ts`), set alongside
+    /// `detached = true` and `exitCode = -2` by upstream's `detachForeground`
+    /// (`execution.ts:612-620`).
+    ///
+    /// Upstream has exactly two producers and so does this port; both stamp it. The value is
+    /// always a `DetachReason::as_str` spelling (`extension/executor/detach.rs`; not an intra-doc
+    /// link because `extension::executor` is a private module and the path is not nameable from
+    /// here) —
+    /// `"intercom coordination"` for a child's blocking `contact_supervisor` hand-off
+    /// (`execution.ts:762`), `"user request"` for `/subagents-detach` and its keybinding
+    /// (`subagent-executor.ts:3978`). `None` only on a result that never detached at all.
+    ///
+    /// Four downstream branches key off it rather than off [`Self::detached`] alone: the receipt's
+    /// `final_output` and `output_save_error` (`execution.ts:621-631`), the interrupted-acceptance
+    /// ledger (`:2006`), and the model-facing tool result (`subagent-executor.ts:4209-4213`).
+    ///
+    /// `#[serde(default)]` + omit-when-absent so a `status.json`/result file written before this
+    /// field existed still round-trips, matching [`Self::timeout_recovery`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached_reason: Option<String>,
     /// A soft interrupt was observed (`RunOptions.interrupt` fired) — like a timeout, this
     /// terminates the fallback ladder outright without advancing, but is recorded under its own
     /// flag rather than folded into `timed_out` (R-SA-084 vs. R-SA-036 have distinct downstream

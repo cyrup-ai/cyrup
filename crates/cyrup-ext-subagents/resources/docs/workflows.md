@@ -2,6 +2,11 @@
 
 Four execution shapes reach the same machinery: single, parallel, chain, and prompt workflows.
 
+Only two of them have a slash command of their own: `/run` (single) and `/prompt-workflow`. The
+parallel and chain shapes are driven through the `subagent` tool — there is no `/chain`,
+`/parallel`, `/run-chain` or `/chain-prompts` command. All four shapes reach the same executor, so
+nothing the tool can express is out of reach.
+
 ## Single
 
 One agent, one task.
@@ -14,8 +19,13 @@ subagent({ agent: "reviewer", task: "review the changes on this branch" })
 /run reviewer review the changes on this branch
 ```
 
-Add `async: true` (or `--bg`) to detach the run and collect it later with the `wait` tool or
+Add `async: true` (or `--bg`) to detach the run and collect it later with the `bg_wait` tool or
 `action: "status"`.
+
+`/subagents-detach [run-id]` hands a run you started in the FOREGROUND to the background without
+terminating its child: the child keeps running and the run becomes addressable by
+`subagent({ action: "status", id })` and `bg_wait({ id })`. It does not daemonize the process or
+guarantee survival across a reload or restart.
 
 ## Parallel
 
@@ -28,9 +38,11 @@ subagent({ tasks: [
 ] })
 ```
 
-```sh
-/parallel reviewer "review src/" -> scout "map the call graph"
-```
+There is no `/parallel` command; `/run` launches one child, and a fan-out is a `tasks` array on the
+tool call above. To reach a fan-out from a slash command, write the fan-out into a prompt recipe and
+invoke it with `/prompt-workflow` — the bundled `parallel-review`, `parallel-research` and
+`parallel-cleanup` recipes do exactly that, handing a delegate the instruction to launch the
+fan-out.
 
 `parallel.maxTasks` caps how many tasks one fan-out may carry and `parallel.concurrency` caps how
 many of them run at once. `globalConcurrencyLimit` sits above both.
@@ -46,9 +58,9 @@ subagent({ chain: [
 ] })
 ```
 
-```sh
-/chain scout "find every caller" -> worker "update them"
-```
+There is no `/chain` command either. A recipe whose frontmatter carries
+`chain: recipe-a -> recipe-b` expands to a chain of other recipes when it is invoked with
+`/prompt-workflow`, which is the slash route to the same walker.
 
 A step may declare `reads` (files handed to the child as a `[Read from: …]` instruction) and
 `output` (a `[Write to: …]` instruction). Both resolve against the chain's run directory unless the
@@ -58,8 +70,10 @@ missing file.
 
 Chain runs are addressed by run id. `append-step` adds a step to a chain that is still running.
 
-Named chains live in `~/.cyrup/chains` and `<project>/.cyrup/chains` and run with
-`/run-chain <chainName> -- <task>`.
+Named chains live in `~/.cyrup/chains` and `<project>/.cyrup/chains`. They are discovered, listed
+and edited through the management actions (`subagent({ action: "get", chainName: "<name>" })`, and
+the matching `update`/`delete`), and a discovered chain's steps are what you copy into a `chain`
+array to run it. There is no command that launches a saved chain by name.
 
 ## Prompt workflows
 
@@ -67,11 +81,23 @@ A prompt workflow is a saved prompt (or a sequence of them) run through a subage
 
 ```sh
 /prompt-workflow <name> [args] [--fork|--fresh] [--worktree] [--bg] [--subagent <agent>]
-/chain-prompts prompt-a -> prompt-b -- args
+/prompt-workflow list
 ```
 
 The bundled prompts are `gather-context-and-clarify`, `parallel-cleanup`, `parallel-research`,
 `parallel-review` and `review-loop`.
+
+A recipe can chain OTHER recipes by naming them in its own frontmatter:
+
+```
+---
+description: research, then review
+chain: parallel-research -> parallel-review
+---
+```
+
+Invoking that recipe runs the named recipes in order and never runs its own body. This is the only
+recipe-chaining form; the inline `prompt-a -> prompt-b` declaration `/chain-prompts` took is gone.
 
 ## Fresh vs forked context
 
@@ -99,8 +125,8 @@ session, behind an explicit confirmation, and can never exceed the originally co
 
 ## Steering a live run
 
-`action: "steer"` queues non-terminal guidance for a still-live background child without
-interrupting it. `mode` selects delivery: `steer` interrupts at the next safe point (the default),
+`action: "steer"` — or `/subagents-steer <run-id> [--child <child-id>] <message>` — queues
+non-terminal guidance for a still-live background child without interrupting it. `mode` selects delivery: `steer` interrupts at the next safe point (the default),
 `follow_up` waits for the next turn boundary, and `auto` follows up mid-turn but delivers
 immediately between turns. The tool answers with the child's own acknowledgment where one arrives in
 time, so a dropped steer is distinguishable from a delivered one.

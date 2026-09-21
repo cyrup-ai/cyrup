@@ -563,10 +563,14 @@ corrections are applied and recorded at the item.
 >   Candidate `upstream-drift`, medium.
 > - **v0.63.0 `31562d76` (#1798, 2026-09-01) — custom-agent override precedence.**
 >   `git show v0.64.0:src/agents/agents.ts:1476` `applyCustomAgentOverride` now delegates to
->   `applyBuiltinOverride` for every key, dropping the frontmatter-presence gate; cyrup's
+>   `applyBuiltinOverride` for every key, dropping the frontmatter-presence gate. That citation is
+>   correct AT v0.64.0 and was re-verified; at `v0.68.0` the same function is
+>   `src/agents/agents.ts:1527-1536` with the delegation on `:1532`
+>   (`const next = applyBuiltinOverride(agent, override, meta);`). cyrup's
 >   `discovery/merge.rs::apply_custom_override` still implements v0.62.0's fill-unset contract
 >   (R-SA-010) for all 20 override fields, the two `SUBA-092` added included. Cross-field; candidate
->   `upstream-drift`, medium.
+>   `upstream-drift`, medium. **Partially closed 2026-09-21 (`b512703`): the `disabled` half has
+>   landed — see the residual row below.**
 > - **v0.64.0 runtime-agent EVENT bridge** — `git show v0.64.0:src/agents/runtime-agent-events.ts:4-5`
 >   (`pi-subagents:runtime-agent-register:v1`), `:29-48` `registerAgentViaEvents` (synchronous emit,
 >   handler mutates `request.result` in place), `:51-70` the listener; re-exported at
@@ -2812,7 +2816,16 @@ exercise. (5) **ledger tooling, for the final ledger agent:**
 > precedence at v0.64.0**: `31562d76` (#1798, first tag v0.63.0) made `applyCustomAgentOverride`
 > delegate to `applyBuiltinOverride` for EVERY key; cyrup's `apply_custom_override` still implements
 > v0.62.0's fill-unset (R-SA-010) for all 20 fields, these two included, for consistency — a
-> cross-field change, ownerless lead in the summary blockquote. (2) Management surface not ported:
+> cross-field change, ownerless lead in the summary blockquote.
+> **PARTIALLY CLOSED 2026-09-21, `b512703`.** The `disabled` half of this collapse has landed. That
+> arm in `apply_custom_override` was gated on the RUNTIME value (`agent.disabled.is_none()`), which
+> upstream's own regression test (`test/unit/agent-overrides.test.ts:646-684`) names as the stray
+> guard its layering commit removed; `agents.ts:1451` is unconditional. The guard is gone, and
+> `custom_agent_project_scope_flips_disabled_set_by_user_scope` covers both directions. The reason
+> it was mandatory rather than opportunistic: the same commit made custom overrides CUMULATIVE
+> (user pass then project pass, `agents.ts:1538-1559`), and with the guard in place `disabled`
+> would have become the single key on which a USER entry beat a PROJECT one. The remaining fields
+> still follow v0.62.0's fill-unset, so this row stays open. (2) Management surface not ported:
 > `agentUpdate`'s `config.excludeTools` (`agent-management.ts:487-497`), the `excludes:` suffix in
 > list (`:738`), `Excluded tools:` in show (`:885`); update/rename preserve an author's values. (3)
 > `AgentDefinition::is_nested_fanout_eligible` (test-only consumers) does not consult the new fields.
@@ -2833,7 +2846,10 @@ this file's own scope note anticipates, per the task brief's "conservative, evid
 `BuiltinAgentOverrideBase` (`:73`), `BuiltinAgentOverrideConfig` as `string[] | false` (`:103`), and
 `AgentConfig` itself (`:137`) — i.e. it is BOTH a frontmatter key on the agent's own definition and a
 settings-override field, parsed by `parseOverrideStringArrayOrFalse` (`:1093-1094`) and applied at
-`applyBuiltinOverride` (`:1381`) and `applyCustomAgentOverride` (`:1547-1549`).
+`applyBuiltinOverride` (`:1381`) and `applyCustomAgentOverride` (`:1547-1549`). Both re-verified
+at their pinned `v0.62.0`; at `v0.68.0` the `excludeTools` fill is gone from
+`applyCustomAgentOverride` altogether, because `:1527-1536` delegates every key to
+`applyBuiltinOverride` on `:1532` — the collapse the residual row above tracks.
 `git show v0.62.0:src/agents/agent-serializer.ts:12` adds `"excludeTools"` to `KNOWN_FIELDS` (next to
 the pre-existing `"allowNestedSubagents"`, `:13`, which this crate also has no field for). Consumed at
 `git show v0.62.0:src/runs/shared/pi-args.ts:502-508`:

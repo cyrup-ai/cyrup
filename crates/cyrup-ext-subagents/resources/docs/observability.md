@@ -18,16 +18,16 @@ individual runs rather than the one-line summary, including each child's live tr
   caps how many lines come back, defaulting to 80 and capped at 500.
 
 A run that has gone idle or is blocked on a decision is reported as needing attention, and that
-state also ends an outstanding `wait`.
+state also ends an outstanding `bg_wait`.
 
 ## Waiting
 
-The `wait` tool blocks until a background run finishes. It is scoped to the current session and to
+The `bg_wait` tool blocks until a background run finishes. It is scoped to the current session and to
 the current working directory's run root, so two cyrup sessions in one repository do not block on
 each other's runs. It wakes as soon as this process observes a completion, with a one-second poll
 underneath as reconciliation, and times out after 30 minutes by default.
 
-A background run that finishes while no `wait` is outstanding fires its completion notice once. The
+A background run that finishes while no `bg_wait` is outstanding fires its completion notice once. The
 run's own `status.json` and `result.json` survive, so `{action:"status", view:"transcript"}` and a
 direct read of the run directory both still answer — but the notice itself is not replayed into a
 later turn.

@@ -5,8 +5,15 @@
 pub(crate) mod native_impl;
 pub(crate) mod profiles;
 pub(crate) mod registration;
+/// VL-S11 R3 — the `pi.registerShortcut` half of `/subagents-detach`
+/// (`slash/slash-commands.ts:1007-1012`).
+pub(crate) mod shortcuts;
 pub(crate) mod slash;
+pub(crate) mod slash_admin;
+pub(crate) mod slash_detach;
+pub(crate) mod slash_inspect_rpc;
 pub(crate) mod slash_render;
+pub(crate) mod slash_steer;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +29,7 @@ use crate::registration::SubagentExtensionConfig;
 use crate::watchdog::register_main::{watchdog_config_dirs, watchdog_model_info};
 
 /// The SubAgents extension's `NativeExtension` facade (arch-SA §3.1). In [`RegistrationMode::Full`]
-/// registers the `subagent` tool + all 12 slash commands at [`cyrup_ext::NativeExtension::init`], resumes
+/// registers the `subagent` tool + all 18 slash commands at [`cyrup_ext::NativeExtension::init`], resumes
 /// background-run tracking on [`cyrup_ext::HostEvent::SessionStart`], and routes every slash command through the
 /// SAME [`SubagentExecutor`] the tool itself uses (R-SA-130). In [`RegistrationMode::ChildSafe`]
 /// registers only the restricted, mutation-blocked tool (the fanout-child surface).
@@ -878,11 +885,11 @@ mod tests {
     /// `reserveSubagentSpawns` (`:3434-3441`), so a blocked call is billed nothing. cyrup's
     /// R-SA-055 guard lives one level down — inside `run_foreground`/`spawn_background`/
     /// `run_or_background_graph` — i.e. strictly AFTER each of the three charge sites SUBA-002
-    /// added, so pre-fix every depth-blocked invocation of `/run`, `/chain`, `/parallel` and the
-    /// `subagent` TOOL consumed budget it could never use: a subagent pinned at max depth could
+    /// added, so pre-fix every depth-blocked invocation of `/run`, the chain-shaped slash tail and
+    /// the `subagent` TOOL consumed budget it could never use: a subagent pinned at max depth could
     /// drain its whole session's allowance by repeatedly asking for children.
     ///
-    /// Asserts BOTH halves, on all four surfaces: the call is refused with `DepthExceeded` (not
+    /// Asserts BOTH halves, on every surface: the call is refused with `DepthExceeded` (not
     /// `SpawnLimitExceeded`), and the budget is still intact afterwards — proven by a `1`-spawn cap
     /// that a subsequent `reserve_subagent_spawns(1, 1)` can still satisfy. Against the pre-fix
     /// ordering that reserve fails, because the blocked call already took the session's only spawn.
@@ -943,7 +950,10 @@ mod tests {
             );
         }
 
-        // (3) the chain-shaped slash wrapper `/chain` // `/parallel` // `/run-chain` share.
+        // (3) the chain-shaped slash wrapper. Its three original callers (`/chain`, `/parallel`,
+        // `/run-chain`) were deleted upstream at v0.41.0 and with them here (VL-S12); the surviving
+        // production caller is `/prompt-workflow` run against a recipe carrying `chain:`
+        // frontmatter, which reaches this exact tail through `run_prompt_workflow_chain`.
         for background in [false, true] {
             ext.executor().reset_spawn_budget();
             let err = ext
@@ -1183,39 +1193,9 @@ mod tests {
         );
     }
 
-    /// R-SA-055 (SAFETY-CRITICAL), end to end through the full slash-command dispatch path:
-    /// `/run-chain` must reject on a blocked depth ceiling BEFORE `resolve_chain`'s own real
-    /// discovery filesystem scan ever runs. Proven the same "same unresolvable name, which error
-    /// wins" way as the foreground/background tests above — no chain named `"ghost-chain"` is
-    /// ever written to `dir`, so if the depth guard did NOT run first, this call would surface
-    /// [`SubagentError::ChainNotFound`] (discovery's own genuine failure mode for an unresolvable
-    /// name) instead of [`SubagentError::DepthExceeded`].
-    #[tokio::test]
-    async fn dispatch_slash_run_chain_rejects_on_depth_before_chain_discovery_ever_runs() {
-        let cfg = SubagentExtensionConfig {
-            max_subagent_depth: 0,
-            ..SubagentExtensionConfig::default()
-        };
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ext = SubagentsExtension::with_config_and_cwd(cfg, dir.path().to_path_buf());
-
-        let err = ext
-            .dispatch_slash(
-                SlashCommandName::RunChain,
-                "ghost-chain -- do something",
-                dir.path(),
-                false,
-            )
-            .await
-            .expect_err("a blocked depth ceiling must reject before chain discovery runs");
-
-        assert!(
-            matches!(err, SubagentError::DepthExceeded { current: 0, max: 0 }),
-            "expected DepthExceeded ahead of resolve_chain's own ChainNotFound, got: {err:?}"
-        );
-    }
-
-    /// The `/chain` and `/parallel` shared tail ([`SubagentsExtension::run_or_background_chain`])
+    /// The chain-shaped slash tail ([`SubagentsExtension::run_or_background_chain`], which
+    /// `/prompt-workflow`'s `chain:` frontmatter branch reaches through
+    /// `run_prompt_workflow_chain`)
     /// must likewise reject on a blocked depth ceiling before its own fork-context resolution (and
     /// therefore before either `run_chain_foreground`'s or `spawn_background_steps`' own
     /// independent, necessarily-later re-check) — proven directly against that private tail
@@ -1269,6 +1249,81 @@ mod tests {
             assert!(
                 matches!(err, SubagentError::DepthExceeded { current: 0, max: 0 }),
                 "background={background}: expected DepthExceeded, got: {err:?}"
+            );
+        }
+    }
+
+    /// VL-S12 (spec §I.5) — `/prompt-workflow`'s `chain:` frontmatter branch still expands a
+    /// recipe into MORE THAN ONE step now that `/chain-prompts` is deleted.
+    ///
+    /// The two commands shared `build_chain_steps`/`split_prompt_chain`/`run_prompt_workflow_chain`
+    /// at the baseline, and only `/chain-prompts` was removed upstream (v0.41.0):
+    /// `prompt-workflows.ts:254` @v0.68.0 registers `prompt-workflow` alone, and its handler still
+    /// takes the `chain:` branch at `:271-278`. So the multi-step shape must survive the deletion.
+    ///
+    /// Observed through SUBA-002's spawn-budget refusal, the same way
+    /// [`chain_spawn_count_bills_dynamic_fanout_worst_case_and_parallel_width`] observes a chain's
+    /// width: `run_or_background_chain` bills `count_graph_requested_spawns(&graph)` BEFORE any
+    /// child is started, and the notice quotes that number back. A 1-spawn cap turns the step count
+    /// into an assertable string with no subprocess, no network and no agent resolution.
+    ///
+    /// *Fails if gutted:* delete the `chain:` branch in `slash_prompt_workflow` and the recipe runs
+    /// its own body as a SINGLE run, which never reaches this wrapper at all — the dispatch returns
+    /// a different error (or tries to spawn) and the `2 requested` assert fires. Delete
+    /// `build_chain_steps`/`split_prompt_chain` along with `/chain-prompts` and it does not compile.
+    /// Collapse the expansion to its first step and the count reads `1 requested`.
+    #[tokio::test]
+    async fn prompt_workflows_chain_frontmatter_still_expands_to_multiple_steps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompts = dir.path().join(".cyrup").join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        // Distinctive names: `prompt_files` also reads `<agentDir>/prompts`, and a same-named
+        // recipe there would shadow these by the last-tier-wins rule.
+        for leaf in ["vl-s12-alpha", "vl-s12-beta"] {
+            std::fs::write(
+                prompts.join(format!("{leaf}.md")),
+                format!("---\ndescription: {leaf}\n---\n\nDo the {leaf} work.\n"),
+            )
+            .expect("write recipe");
+        }
+        std::fs::write(
+            prompts.join("vl-s12-pair.md"),
+            "---\ndescription: two steps\nchain: vl-s12-alpha -> vl-s12-beta\n---\n\nnever run\n",
+        )
+        .expect("write pair recipe");
+        std::fs::write(
+            prompts.join("vl-s12-triple.md"),
+            "---\ndescription: three steps\nchain: vl-s12-alpha -> vl-s12-beta -> vl-s12-alpha\n---\n\nnever run\n",
+        )
+        .expect("write triple recipe");
+
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                // One spawn: every chain below is over budget, so the reservation refuses the whole
+                // graph and NO child is ever started (`preflight_spawn_budget`'s "the declared run
+                // cannot fit, so no children were started").
+                max_subagent_spawns_per_session: 1,
+                missions: Some(scoped_missions(dir.path())),
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+
+        for (recipe, requested) in [("vl-s12-pair", 2u32), ("vl-s12-triple", 3u32)] {
+            ext.executor().reset_spawn_budget();
+            let err = ext
+                .dispatch_slash(SlashCommandName::PromptWorkflow, recipe, dir.path(), false)
+                .await
+                .expect_err("a chain wider than the 1-spawn budget is refused before any spawn");
+            let SubagentError::SpawnLimitExceeded(message) = &err else {
+                panic!(
+                    "/prompt-workflow {recipe} must reach the chain wrapper's budget, got: {err:?}"
+                );
+            };
+            assert!(
+                message.contains(&format!("(0/1 used, {requested} requested)")),
+                "/prompt-workflow {recipe} must lower its `chain:` frontmatter to {requested} \
+                 steps, got: {message}"
             );
         }
     }

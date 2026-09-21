@@ -474,6 +474,13 @@ impl WaitSubscriptionManager {
             .await;
             return Ok(());
         }
+        // VL-S11b — BOTH arms now have a production producer. The foreground arm was ported
+        // against a record format no cyrup surface could write: `bg_wait`'s candidate set was
+        // async-only, which `background/wait.rs`'s own `[CYRUP-DELTA]` stated. `/subagents-detach`
+        // is that producer — a detached foreground run is remembered in
+        // `SubagentExecutor::foreground_runs`, `active_detached_foreground_runs` selects it, and
+        // `{ id, nonBlocking: true }` arms [`WaitTargetKind::Foreground`] against it — so this
+        // branch is reached from production rather than from this module's tests alone.
         match record.target_kind {
             WaitTargetKind::Foreground => {
                 self.reconcile_foreground(record).await;
