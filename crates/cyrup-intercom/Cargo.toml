@@ -25,6 +25,12 @@ test-fixtures = []
 
 [dependencies]
 cyrup-core = { workspace = true }
+# The workspace's ONE herdr client (`HERDR_NATIVE_CLIENT.md` §5). `project_pane.rs`'s
+# `HerdrLauncher` is a port of `pi-intercom`'s `project-agent.ts` and keeps that provenance, but the
+# herdr mechanics underneath it — spawning the binary, the `HERDR_BIN` ladder, the last-JSON-line
+# scan, the error envelope — live in `cyrup-herdr` so this workspace has one of them rather than
+# two. A leaf crate: it depends on no `cyrup-*` crate, so this edge cannot cycle.
+cyrup-herdr = { workspace = true }
 # For `cyrup_config::paths` — the workspace's one home ladder. `cyrup-config` depends only on
 # `cyrup-core` and `cyrup-provider`, so this edge cannot cycle.
 cyrup-config = { workspace = true }

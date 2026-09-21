@@ -52,6 +52,13 @@ With an `action`, the tool is in **management** or **control** mode.
 | `refine` | management | Propose and write a bounded, evidence-cited refinement overlay for one agent |
 | `refine.show` | management | Show one agent's refinement overlay, its revision history and base-prompt drift. Read-only |
 | `refine.rollback` | management | Undo the last overlay revision by appending a rollback revision. **Destructive and NOT confirmed** — it rewrites the overlay immediately, and that overlay is folded into every later spawn of the agent. |
+| `inspector.open` | management | Open an inspector pane for one async run (or one child of it) in a supported host — Herdr first, then Ghostty. With no host available it refuses with `No inspector plugin is available. Start a supported inspector host, or use inspector.command for a standalone command.` **Confirmed only if `authorityPolicy.inspectorOpen` says so; the default is `auto`.** |
+| `inspector.command` | management | Print the standalone command that would launch the inspector for a run, without opening anything. **Needs no inspector backend at all** — it answers on a bare Linux box with no Herdr and no Ghostty, and is the fallback `inspector.open`'s refusal points at. Read-only |
+| `inspector.status` | management | Report the inspector pane bound to a run. Answers from the binding file, with no call to any host — so `No inspector plugin owns this binding for async run <id>.` is a NORMAL answer and not an error. Read-only |
+| `inspector.close` | management | Close the inspector pane bound to a run and drop its binding. Like `inspector.status`, "no inspector is open" is a normal answer, not an error. |
+| `project.open` | management | Open (or focus, if one is already open) a Herdr project pane running an agent session for a project root. **Destructive-adjacent and confirmed by default** — `authorityPolicy.projectOpen` defaults to `confirm`, because this starts a new agent session in a pane of your workspace. Needs Herdr. |
+| `project.status` | management | Report the project pane bound to a project root — open, stale, or absent. **Answers with Herdr not installed**: it reads the binding file and makes no Herdr call when there is no binding, and `No Herdr project pane binding exists for <root>.` is a normal answer, not an error. Read-only |
+| `project.close` | management | Close a project's Herdr pane and remove its binding. Like `project.status`, it answers with no binding and no Herdr installed, and "no binding exists" is a normal answer rather than an error. |
 | `watchdog.status` | management | Report the effective watchdog config |
 | `watchdog.check` | management | Run one watchdog review now |
 | `watchdog.configure` | management | Change the watchdog config |
@@ -146,6 +153,92 @@ group's output (and on an async run's status, as `parallelHandoff.path`). That p
 not. It is **read-only and stays available to a child-safe fanout tool** — a delegated child can
 read its own lane graph. Every other verb in this feature — `lane.recordMerge`,
 `lane.recordSupersession`, `worktree.cleanup` and `worktree.discard` — is refused there.
+
+## Inspector and project panes
+
+Seven verbs put a run, or a project, in front of you in a real terminal pane.
+
+### Inspector panes — `inspector.*`
+
+```
+{ action: "inspector.open", id: "<run id or prefix>", index?: 0, focus?: true }
+```
+
+`inspector.open` opens a live dashboard for one async run — or for one child of it, when `index`
+names one — in whichever inspector host is available. The backends are consulted in a fixed order,
+**Herdr first, then Ghostty**, and the first one whose host is actually present wins. Herdr is
+present when this process is itself running inside a Herdr pane; Ghostty is present on macOS when
+`TERM_PROGRAM` is `ghostty`.
+
+With NO host available the verb does not guess and does not half-succeed. It answers:
+
+```
+No inspector plugin is available. Start a supported inspector host, or use inspector.command for a
+standalone command.
+```
+
+That sentence names the way out, and the way out always works:
+
+```
+{ action: "inspector.command", id: "<run id or prefix>" }
+```
+
+`inspector.command` **needs no backend whatsoever**. It returns the single, platform-quoted shell
+command that launches the inspector for that run, for you to paste into any terminal you like. It
+is the verb to reach for on a bare Linux box, over SSH, or inside CI.
+
+```
+{ action: "inspector.status", id: "<run id or prefix>" }
+{ action: "inspector.close",  id: "<run id or prefix>" }
+```
+
+Both read the binding file this run's inspector wrote, and neither needs a host to be running.
+**"No inspector is open" is a normal answer, not an error** — `No inspector plugin owns this
+binding for async run <id>.` comes back as an ordinary reply, so a model can ask the question
+freely without having to guard the call.
+
+The directory an inspector may be launched against is not taken on trust: it must either be a run
+this process is actively tracking, or live inside the configured async root, checked both
+literally and through its real path so a planted symlink cannot escape. The inspector's in-pane
+steer and stop controls are enabled only when the authority policy's `steerRun` / `stopRun` are
+`auto` — a `confirm` or `forbid` policy produces a pane whose controls are genuinely disabled
+rather than one that prompts where there is nothing to prompt through.
+
+### Project panes — `project.*`
+
+```
+{ action: "project.open",   cwd?: "<project root>", message?: "<first message>", focus?: true }
+{ action: "project.status", cwd?: "<project root>" }
+{ action: "project.close",  cwd?: "<project root>" }
+```
+
+A project pane is a Herdr pane running an agent session for a project root, bound to that root by
+a binding file so the same project reopens the same pane instead of accumulating panes.
+`project.open` focuses an existing live pane rather than duplicating it.
+
+`project.open` is **confirmed by default**: `authorityPolicy.projectOpen` defaults to `confirm`
+because opening one starts a new agent session inside your workspace. `inspectorOpen` defaults to
+`auto`, because an inspector is a read-only view of a run you already named.
+
+**What works with no Herdr installed.** `project.status` and `project.close` answer from the
+binding file and make no Herdr call at all when there is no binding, so both are usable anywhere:
+
+| verb | no binding on disk | binding on disk, no Herdr | binding on disk, Herdr live |
+|---|---|---|---|
+| `project.status` | `No Herdr project pane binding exists for <root>.` — a normal answer | `Herdr project pane error (HERDR_UNAVAILABLE): …` | the pane's state, agent status and summary |
+| `project.close` | `No Herdr project pane binding exists for <root>.` — a normal answer | `Herdr project pane error (HERDR_UNAVAILABLE): …` | the pane is closed and the binding removed |
+| `project.open` | needs Herdr: `Herdr project pane error (HERDR_UNAVAILABLE): Herdr is not installed or is not on PATH. Install Herdr 0.7.5+ or set HERDR_BIN.` | same | the pane is opened, or the live one focused |
+
+Neither read verb is an error when there is nothing there. That distinction is deliberate and is
+pinned by tests: a model asking "is a pane open for this project?" should get an answer, not a
+failure it has to interpret.
+
+### Child-safe fanout
+
+`inspector.open`, `inspector.close`, `project.open` and `project.close` are all refused from a
+child-safe fanout tool with `Action '<verb>' is not available from child-safe subagent fanout
+mode.` The three reads — `inspector.command`, `inspector.status` and `project.status` — stay
+available, so a fanout child can still discover and report, just not act.
 
 ## Refinement overlays
 

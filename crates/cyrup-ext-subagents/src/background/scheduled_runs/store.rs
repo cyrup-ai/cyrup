@@ -173,12 +173,6 @@ fn resolve_path(value: &Path) -> PathBuf {
     std::path::absolute(value).unwrap_or_else(|_| value.to_path_buf())
 }
 
-/// pi `pathWithin` (`:166-169`) over two already-resolved paths: `candidate` is `root` itself or a
-/// descendant of it.
-fn path_within(root: &Path, candidate: &Path) -> bool {
-    candidate == root || candidate.starts_with(root)
-}
-
 // =================================================================================================
 // Errors
 // =================================================================================================
@@ -308,7 +302,7 @@ impl ScheduleStore {
             existing = parent.to_path_buf();
         }
         let existing_path = tokio::fs::canonicalize(&existing).await?;
-        if !path_within(&project_path, &existing_path) {
+        if !crate::paths::path_within(&project_path, &existing_path) {
             return Err(refusal());
         }
         if !create {
@@ -316,7 +310,7 @@ impl ScheduleStore {
         }
         create_private_dir(&self.root).await?;
         let created = tokio::fs::canonicalize(&self.root).await?;
-        if path_within(&project_path, &created) {
+        if crate::paths::path_within(&project_path, &created) {
             Ok(())
         } else {
             Err(refusal())

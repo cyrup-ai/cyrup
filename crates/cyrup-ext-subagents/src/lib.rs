@@ -37,7 +37,10 @@ pub mod formatters;
 /// The parallel-handoff manifest: the coordination layer over a worktree fan-out. See
 /// [`handoff`].
 pub mod handoff;
+/// The herdr status bridge: cyrup's fleet state in herdr's sidebar. See [`herdr`].
+pub mod herdr;
 pub mod identity;
+pub mod inspectors;
 pub mod jsonl;
 pub mod missions;
 pub mod native_supervisor;

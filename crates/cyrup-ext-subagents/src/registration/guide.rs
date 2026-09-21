@@ -234,8 +234,15 @@ mod tests {
     #[test]
     fn every_authority_gated_verb_that_the_table_lists_says_so() {
         use crate::registration::authority::{AuthorityAction, AuthorityDecision};
+        use std::collections::BTreeMap;
 
+        // PER VERB, not per row. The served reference carries more than one table keyed on the
+        // verb — the Actions table describes it, and the "what each verb needs" table lists its
+        // refusal sentence — so a row-by-row predicate would demand that the refusal table
+        // repeat the gate. What must be true is that a gated verb is described as gated
+        // SOMEWHERE in the document the model reads.
         let served = read_subagent_guide(Some("tool-reference"));
+        let mut says_so: BTreeMap<&str, bool> = BTreeMap::new();
         for line in served.lines() {
             let Some(verb) = line
                 .strip_prefix("| `")
@@ -248,10 +255,17 @@ mod tests {
             {
                 continue;
             }
+            *says_so.entry(verb).or_insert(false) |= line.contains("confirmed by default");
+        }
+        assert!(
+            !says_so.is_empty(),
+            "the served reference lists no authority-gated verb at all; if that is deliberate \
+             delete this test, but do not let it pass vacuously"
+        );
+        for (verb, described) in &says_so {
             assert!(
-                line.contains("confirmed by default"),
-                "`{verb}` is authority-gated to Confirm but its tool-reference row does not say \
-                 so: {line}"
+                described,
+                "`{verb}` is authority-gated to Confirm but no tool-reference row says so"
             );
         }
     }

@@ -37,6 +37,7 @@ pub mod signals;
 pub mod startup;
 pub mod startup_ui;
 pub mod subagent_config;
+pub mod subagent_inspector_cmd;
 pub mod subagent_runner_cmd;
 pub mod subcommands;
 pub mod timings;

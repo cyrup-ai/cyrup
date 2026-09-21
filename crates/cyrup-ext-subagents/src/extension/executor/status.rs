@@ -224,6 +224,14 @@ impl SubagentExecutor {
                     // `fleet.ts:63-65`'s `belongsToCurrentSession` is a real test on this axis now,
                     // matching what the async half already does (this method's own doc, above).
                     session_id: entry.session_id.as_ref().map(|s| s.as_str().to_string()),
+                    // VL-S6 — `selectedInspectAction`'s parent rung (`fleet.ts:956-958`): a
+                    // workflow CHILD has no async directory of its own, so `Enter`/`H` inspects
+                    // the PARENT's run. The value has been on the entry since WORKFLOW_18
+                    // (`notices.rs:73`) with no reader; this is the reader.
+                    parent_workflow_run_id: entry
+                        .parent_workflow_run_id
+                        .as_ref()
+                        .map(|id| id.as_str().to_string()),
                     current_agent: entry.current_agent.clone(),
                     current_index: entry.current_index,
                     activity_state: entry.current_activity_state,
@@ -287,6 +295,11 @@ impl SubagentExecutor {
                 cfg.default_session_dir.as_deref(),
                 parent_session_file.as_deref(),
             ),
+            // VL-S6 / pi `state.herdrProjectPanes` (`fleet-status.ts:351-365`) — the map the
+            // SessionStart restore (`extension/index.ts:980-981`) last refreshed, flattened for
+            // `tui::fleet_status::project_pane_entries`. Empty until that restore has run, which
+            // renders no project-pane section at all rather than an empty heading.
+            herdr_project_panes: self.herdr_project_pane_snapshots(),
             parent_session_file,
             foreground_controls,
             // WORKFLOW_7 §3.3 — pi `state.foregroundRuns` (`fleet.ts:211`). Was `Vec::new()` with a

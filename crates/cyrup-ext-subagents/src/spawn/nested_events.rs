@@ -697,12 +697,6 @@ pub fn sanitize_summary(input: &Value) -> Option<NestedRunSummary> {
 // Route creation + validation (pi createNestedRoute / validateRouteShape / resolve*FromEnv)
 // =================================================================================================
 
-fn contained_path(base: &Path, candidate: &Path) -> bool {
-    let base = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
-    let candidate = std::path::absolute(candidate).unwrap_or_else(|_| candidate.to_path_buf());
-    candidate == base || candidate.starts_with(&base)
-}
-
 fn common_route_root(event_sink: &Path) -> PathBuf {
     std::path::absolute(event_sink)
         .unwrap_or_else(|_| event_sink.to_path_buf())
@@ -735,12 +729,12 @@ fn validate_route_shape(route: &NestedRoute) -> Result<(), SubagentError> {
 fn validate_route_shape_in(root: &Path, route: &NestedRoute) -> Result<(), SubagentError> {
     assert_safe_id("rootRunId", &route.root_run_id)?;
     assert_safe_id("capabilityToken", &route.capability_token)?;
-    if !contained_path(root, &route.event_sink) {
+    if !crate::paths::path_within(root, &route.event_sink) {
         return Err(SubagentError::UnsafePathToken(
             "Nested event sink is outside the subagent nested event root.".to_string(),
         ));
     }
-    if !contained_path(root, &route.control_inbox) {
+    if !crate::paths::path_within(root, &route.control_inbox) {
         return Err(SubagentError::UnsafePathToken(
             "Nested control inbox is outside the subagent nested event root.".to_string(),
         ));
@@ -1441,7 +1435,7 @@ pub fn project_nested_events_in(
             continue;
         }
         let event_path = route.event_sink.join(&entry);
-        if !contained_path(&route.event_sink, &event_path) {
+        if !crate::paths::path_within(&route.event_sink, &event_path) {
             continue;
         }
         let content = match std::fs::metadata(&event_path) {
@@ -1775,7 +1769,7 @@ pub fn read_nested_control_requests(
     let mut requests = Vec::new();
     for entry in entries {
         let file_path = route.control_inbox.join(&entry);
-        if !contained_path(&route.control_inbox, &file_path) {
+        if !crate::paths::path_within(&route.control_inbox, &file_path) {
             continue;
         }
         let Ok(meta) = std::fs::metadata(&file_path) else {
@@ -1859,7 +1853,7 @@ pub fn read_nested_control_results(
     let mut results = Vec::new();
     for entry in entries {
         let event_path = route.event_sink.join(&entry);
-        if !contained_path(&route.event_sink, &event_path) {
+        if !crate::paths::path_within(&route.event_sink, &event_path) {
             continue;
         }
         let Ok(meta) = std::fs::metadata(&event_path) else {
@@ -1939,7 +1933,8 @@ pub fn nested_async_root(root_run_id: &str) -> Result<PathBuf, SubagentError> {
 pub fn is_top_level_async_dir(async_dir_path: &Path) -> bool {
     let resolved =
         std::path::absolute(async_dir_path).unwrap_or_else(|_| async_dir_path.to_path_buf());
-    contained_path(&async_dir(), &resolved) && !contained_path(&nested_runs_dir(), &resolved)
+    crate::paths::path_within(&async_dir(), &resolved)
+        && !crate::paths::path_within(&nested_runs_dir(), &resolved)
 }
 
 /// pi `resolveNestedAsyncDir`: accept a run's `asyncDir` only when it stays inside its expected

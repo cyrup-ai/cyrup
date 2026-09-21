@@ -31,11 +31,12 @@
 //!
 //! # Honest deltas vs. pi
 //!
-//! Both are inherited from `fleet.rs` rather than introduced here, and neither is a behaviour this
-//! adapter could supply: the steer delivery mode reaches
-//! [`SubagentExecutor::control_steer`], which takes no mode field yet (`fleet.rs` delta 1), and
-//! there is no Herdr inspector to route `H` to (`fleet.rs` delta 2), so `has_inspect` is `false`
-//! and `H` takes pi's own "unavailable in this context" branch (`fleet.ts:692`).
+//! **None left in this adapter.** The two it used to inherit from `fleet.rs` are both deleted
+//! rather than reworded, because the tree falsified them: SUBA-049 gave
+//! [`SubagentExecutor::control_steer`] its `mode` parameter
+//! (`extension/executor/foreground_actions/steer.rs:82`), and `crate::inspectors` ports the whole
+//! `src/inspectors/` subtree, so [`FleetPendingAction::Inspect`] is a real `inspector.open` here
+//! (`fleet.ts:1417-1430`) rather than an unreachable arm.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -268,14 +269,29 @@ async fn run_fleet_action(
                 &fallback,
             )
         }
-        // pi makes `inspect` OPTIONAL on the handler bundle (`fleet.ts:51`) and the component
-        // refuses `H` outright when it is absent (`:692`), so this is unreachable from
-        // `handle_input` while `has_inspect` is false. Answered with pi's own message rather than a
-        // panic, because "unreachable" is a property of the caller, not of this function.
-        FleetPendingAction::Inspect { target } => FleetActionResult::error(format!(
-            "Failed to open Herdr inspector for async run {}.",
-            target.run_id
-        )),
+        // pi's `inspect` handler (`fleet.ts:1417-1430`): `handleInspectorAction("inspector.open",
+        // { id, dir, focus: true, index? })`, with `firstToolResultText`'s fallback
+        // `Failed to open inspector for async run ${runId}.` (`:1430`) — the sentence has no
+        // "Herdr" in it, because the dispatcher picks whichever backend is available (herdr first,
+        // then ghostty) and may well have opened neither.
+        //
+        // `focus: true` is upstream's own literal (`:1420`) and it is the point of the key: the
+        // user pressed Enter/H to LOOK at this child, so the pane that opens takes the focus.
+        FleetPendingAction::Inspect { target } => {
+            let fallback = format!("Failed to open inspector for async run {}.", target.run_id);
+            super::fleet::action_result_from_control(
+                executor
+                    .inspector_open(
+                        cwd,
+                        Some(target.run_id.as_str()),
+                        target.async_dir.to_str(),
+                        target.index,
+                        true,
+                    )
+                    .await,
+                &fallback,
+            )
+        }
     }
 }
 
@@ -615,26 +631,52 @@ mod tests {
         );
     }
 
+    /// T-FLEET-1's overlay half — the `Inspect` arm REACHES `inspector.open`, and its `Err` keeps
+    /// upstream's fallback sentence (`fleet.ts:1430`).
+    ///
+    /// The run id here does not resolve, so the verb answers with the dispatcher's own
+    /// target-resolution refusal — which is the proof that the arm CALLED it: the old
+    /// unreachable-arm implementation returned a fixed string and never touched the executor, so
+    /// it could not produce a resolver sentence. GUT the arm back to a literal and this goes red;
+    /// GUT `focus` to `false` and the pane opens behind the user's session, which
+    /// `fleet_inspector_integration` (IT) sees and this does not.
     #[tokio::test]
-    async fn an_inspect_action_answers_upstreams_herdr_failure_text() {
-        // `has_inspect` is false, so `handle_input` never emits this — but the handler must still
-        // answer rather than panic if it ever does.
+    async fn an_inspect_action_reaches_inspector_open_and_keeps_upstreams_fallback() {
+        let dir = tempfile::tempdir().unwrap();
         let target = crate::tui::fleet::FleetActionTarget {
             run_id: "abc123".into(),
-            async_dir: PathBuf::from("/tmp/none"),
+            async_dir: dir.path().join("missing-run"),
             index: None,
         };
         let executor = crate::extension::SubagentExecutor::new();
         let result = run_fleet_action(
             &executor,
-            std::path::Path::new("/tmp"),
+            dir.path(),
             FleetPendingAction::Inspect { target },
         )
         .await;
         assert!(result.is_error);
-        assert_eq!(
-            result.text,
-            "Failed to open Herdr inspector for async run abc123."
+        assert!(
+            !result.text.is_empty(),
+            "the fallback must never render as an empty notice"
+        );
+        assert!(
+            !result
+                .text
+                .contains("Herdr inspector controls are unavailable"),
+            "the component's refusal must not be the executor's answer: {}",
+            result.text
+        );
+        // The proof that the arm CALLED the verb rather than answering for it. `missing-run` does
+        // not exist, so `resolve_target` refuses with its OWN sentence
+        // (`inspectors::actions::resolve_target`, upstream `actions.ts:55`) — a string no fixed
+        // fallback in this file could produce. The three assertions above are all satisfied by
+        // the fallback itself, which is how an arm that never reached the executor used to pass.
+        assert!(
+            result.text.contains("is outside trusted run roots"),
+            "the dispatcher's own target-resolution refusal must come back, not this file's \
+             fallback: {}",
+            result.text
         );
     }
 }

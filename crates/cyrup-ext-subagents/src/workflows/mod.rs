@@ -45,7 +45,8 @@
 //! stable_json.rs    stable_json / stable_json_digest (launch-contract.ts:9-23)
 //! permit.rs         WorkflowResourcePermit + authority validation + provenance
 //! resources.rs      the session-scoped resource registry, builtins, and resolution
-//! display_text.rs   sanitize_display_text + §A.4's truncating family (SCOPE_3e SUBTASK0)
+//! display_text.rs   sanitize_display_text + §A.4's truncating family, preview included
+//!                   (SCOPE_3e SUBTASK0)
 //! host_step.rs      HostStepNode + its monitor/state/verdict vocabulary (SCOPE_3e SUBTASK0)
 //! preflight.rs      the preflight normalizer, advisory warnings, formatters (SCOPE_3e SUBTASK1)
 //! checklist.rs      the checklist projection + formatters (SCOPE_3e SUBTASK2)
@@ -98,7 +99,9 @@ pub use child_summary::{
     workflow_child_activity, workflow_child_progress, workflow_child_summary,
     workflow_step_statuses,
 };
-pub use display_text::{sanitize_display_text, truncate_display, truncate_to_bytes};
+pub use display_text::{
+    preview_display_text, sanitize_display_text, truncate_display, truncate_to_bytes,
+};
 pub use host_command::{
     HostCommandKind, WorkflowHostCommandParams, WorkflowHostCommandResult, WorkflowHostCommandRole,
     WorkflowHostCommandState, execute_workflow_host_command,

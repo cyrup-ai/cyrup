@@ -457,8 +457,18 @@ pub(super) fn is_absolute_url(value: &str) -> bool {
     url::Url::parse(value).is_ok()
 }
 
-/// pi `parseMissionRecord` (`store.ts:185-223`). Exported: `inspectors/herdr/inspector-runner.ts:24`
-/// calls it directly on an arbitrary file.
+/// pi `parseMissionRecord` (`store.ts:185-223`).
+///
+/// Exported because upstream's inspector runner calls it directly on an arbitrary file:
+/// `src/inspectors/inspector-runner.ts` imports it at `:5` and calls it inside `readMission` at
+/// `:27`, which swallows every failure and answers `undefined` — the mission panel simply does not
+/// render. cyrup's counterpart is the `__subagent-inspector` subcommand's own mission read
+/// (`crate::inspectors::runner`), which reaches this function the same way.
+///
+/// The citation this doc carried until this batch — `inspectors/herdr/inspector-runner.ts:24` —
+/// was false on both halves: the file is not under `herdr/`, and the line is not `:24`.
+/// `git -C tmp/pi-subagents show v0.68.0:src/inspectors/herdr/inspector-runner.ts` answers
+/// `fatal: path … does not exist in 'v0.68.0'`.
 ///
 /// # Errors
 ///

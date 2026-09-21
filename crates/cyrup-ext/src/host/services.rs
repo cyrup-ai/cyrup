@@ -222,6 +222,31 @@ impl HumanInteractionLock {
             _permit: Arc::clone(&self.slot).acquire_owned().await.ok(),
         }
     }
+
+    /// Whether a human prompt is open RIGHT NOW — i.e. some companion holds the single permit.
+    ///
+    /// A non-blocking read of the semaphore's permit count, so an observer never contends with the
+    /// prompt it is observing and can never itself take the slot. This is the ONE seam a process
+    /// can ask "is cyrup parked on the human?" and get an answer that covers every companion:
+    /// the permission dialog (`crates/cyrup-permission-system/src/extension/prompt.rs:176`), the
+    /// permission ask-forwarder (`crates/cyrup-permission-system/src/forwarding.rs:1231`), MCP's
+    /// dialog owner (`crates/cyrup-mcp/src/owner.rs:659`), intercom's clarify
+    /// (`crates/cyrup-intercom/src/seams.rs:369`) and flux's ask tool
+    /// (`crates/cyrup-flux/src/ask_tool.rs:185`) all acquire THIS instance — the one
+    /// [`HostServices::human_interaction_lock`] hands every native off the single backend Arc
+    /// `load_native_with_services` clones into each of them
+    /// (`crates/cyrup-session-svc/src/builder.rs:1221-1224`).
+    ///
+    /// Contrast [`crate::native::HumanWaitGate`], which is minted FRESH per native ctx
+    /// (`HostCtx::event`, `crates/cyrup-ext/src/native.rs:170-180`; one ctx per native at
+    /// `crates/cyrup-ext/src/facade.rs:541`) and is therefore only ever raised by the native that
+    /// owns it. That gate answers the dispatcher's budget question ("may I forgive THIS handler's
+    /// deadline?"); this lock answers the cross-extension question ("is a human being waited on at
+    /// all?"). They are not interchangeable.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.slot.available_permits() == 0
+    }
 }
 
 /// RAII guard for the single human-interaction slot (see [`HumanInteractionLock`]). While held, no

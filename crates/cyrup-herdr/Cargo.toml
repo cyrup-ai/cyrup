@@ -1,0 +1,49 @@
+[package]
+name = "cyrup-herdr"
+description = "The workspace's one client for herdr's newline-delimited JSON socket API (herdr v0.9.1, d59d060)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# A LEAF. No `cyrup-*` edge, and that is load-bearing rather than tidy — for ONE reason, the build
+# target. The dependency-graph argument that used to stand here was false and has been deleted:
+# `crates/cyrup-intercom/Cargo.toml:56` carries `cyrup-ext-subagents = { workspace = true }`, so
+# the two consumer layers are NOT independent and hosting this client inside `cyrup-ext-subagents`
+# would have forced no new edge. (Both layers now consume it: `cyrup-intercom`'s `HerdrLauncher`
+# and `cyrup-ext-subagents`'s `src/herdr/` status bridge. The note that used to stand here —
+# "`grep -rn 'cyrup_herdr\|cyrup-herdr' crates/cyrup-ext-subagents/` is empty at this commit" —
+# became false when that bridge landed and has been deleted rather than softened.)
+#
+#     `cyrup-ext-subagents` carries `nix` and `libc` UNGATED in `[dependencies]`
+#     (`.flux/todo/WINDOWS_BUILD_UNGATED_DEPS.md` records exactly that), so it cannot target
+#     Windows today. herdr's socket is explicitly Windows-capable — `tmp/herdr/src/ipc.rs:44-51`
+#     maps the file-style socket path onto a `GenericNamespaced` named pipe. Putting a
+#     Windows-capable protocol inside the one crate that cannot be built for Windows would bury the
+#     named-pipe arm as unbuildable text, which is the precise failure
+#     `crates/cyrup-intercom/src/broker/listener.rs:16-25` documents having already happened once
+#     in this workspace.
+[dependencies]
+# `net` = `UnixStream` + `windows::named_pipe::ClientOptions`; `io-util` = `AsyncReadExt`/
+# `AsyncWriteExt`; `time` = the round-trip deadline; `sync` = the fake server's recorder and the
+# subscription plumbing the read/stream halves add; `macros` = `#[tokio::test]` in `src/`;
+# `process` = the CLI fallback's `Command`, which races its own deadline rather than blocking a
+# worker (`src/cli.rs`).
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros", "process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Not a workspace-table dep; `cyrup-intercom` and `cyrup-ext-subagents` both pin it directly at
+# this version, matched here rather than introducing a new workspace-wide version surface.
+tracing = "0.1.44"
+
+[dev-dependencies]
+# `rt-multi-thread` so `#[tokio::test]` can run the fake server on a second worker; `test-util`
+# is NOT used — every deadline assertion here is a real elapsed-time bound on a socket.
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros", "process", "rt-multi-thread"] }
+tempfile = { workspace = true }

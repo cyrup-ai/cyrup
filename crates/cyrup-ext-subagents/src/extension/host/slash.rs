@@ -80,10 +80,16 @@ impl SubagentsExtension {
             state,
             FleetViewOptions::default(),
             None,
-            // The action bundle exists (steer/stop route to `control_steer`/`control_stop`); the
-            // Herdr inspector does not — see `tui/fleet.rs`'s delta 2.
+            // `has_actions`: steer/stop route to `control_steer`/`control_stop`.
             true,
-            false,
+            // `has_inspect`: the inspector backends exist now —
+            // `inspectors::plugins::builtin_inspector_plugins()` is herdr then ghostty — so
+            // `Enter`/`H` route to a real `inspector.open` through
+            // `SubagentExecutor::inspector_open` (pi `fleet.ts:1417-1430`). With NO host
+            // available the key still answers: the dispatcher's own
+            // `NO_INSPECTOR_PLUGIN_AVAILABLE` sentence names `inspector.command` as the way out,
+            // which is a better answer than the unavailable notice this used to force.
+            true,
         ) {
             FleetOpenOutcome::NoUiFallback => self
                 .executor

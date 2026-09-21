@@ -14,13 +14,23 @@
 //!
 //! # Severity note, carried from the item so it is not rediscovered
 //!
-//! This started `medium` only because of WHICH actions cyrup could dispatch. As of LANES_2 four
-//! of upstream's six `AUTHORITY_ACTIONS` are consulted from a real dispatch: `stopRun`/`steerRun`
-//! (`route_control_action`), `scheduleCreate` (`route_action`'s `schedule.*` arm) and now
+//! This started `medium` only because of WHICH actions cyrup could dispatch. As of VL-S6 SIX of
+//! upstream's eight `AUTHORITY_ACTIONS` are consulted from a real dispatch: `stopRun`/`steerRun`
+//! (`route_control_action`), `scheduleCreate` (`route_action`'s `schedule.*` arm),
 //! `discardWorktree` — `route_action`'s `worktree.discard` arm, mirroring
 //! `subagent-executor.ts:6249` @v0.68.0, plus a SECOND consult inside
 //! [`crate::spawn::worktree::cleanup_worktrees`] (pi `worktree.ts:1232-1234`) that refuses to
-//! `--force`-remove a worktree holding uncommitted work unless the user confirmed it.
+//! `--force`-remove a worktree holding uncommitted work unless the user confirmed it — and
+//! `inspectorOpen`/`projectOpen`, consulted by `route_action`'s two VL-S6 guard arms exactly where
+//! upstream consults them (`subagent-executor.ts:6294-6311`, once above both dispatch blocks).
+//!
+//! A FIFTH consumer landed with VL-S6 and it is not a gate:
+//! [`crate::inspectors::actions::launch_for`] reads the `steerRun` / `stopRun` verdicts and turns
+//! them into the inspector runner's `--allow-steer` / `--allow-stop` argv — `"true"` only on
+//! [`AuthorityDecision::Auto`]. That is pi `herdr/actions.ts:205-206`, the fourth v0.43.0 consumer
+//! this module's opening paragraph names and the last one to land. It consults the two EXISTING
+//! actions, not the two new ones: `inspectorOpen` gates opening the pane, not what the pane may do
+//! once open.
 //!
 //! **CORRECTION, with its evidence.** This note used to read *"whoever lands `worktree.discard`
 //! or `destructiveCleanup` must wire them through [`resolve_authority_decision`] in the same
@@ -32,18 +42,19 @@
 //! (`subagent-executor.ts:6217-6222`) and removes nothing, so gating it would prompt a user to
 //! authorize a deletion that cannot occur — which teaches operators to click through prompts.
 //! `destructiveCleanup` therefore stays parsed-and-inert **by parity, not by omission**.
-//! `spawnBudgetGrant` remains genuinely unwired. Anyone landing a cleanup APPLY phase must wire
-//! `destructiveCleanup` through here in that change.
+//! `spawnBudgetGrant` remains genuinely unwired — those two are the remaining two of eight.
+//! Anyone landing a cleanup APPLY phase must wire `destructiveCleanup` through here in that
+//! change.
 
 use serde::{Deserialize, Serialize};
 
 /// pi `AUTHORITY_ACTIONS` (`policy/authority.ts:1-10` @v0.68.0), in upstream's own order — which
 /// is the order [`validate_authority_policy`]'s error message enumerates.
 ///
-/// A SUBSET, not a copy: upstream declares EIGHT and this is the first six. `inspectorOpen` and
-/// `projectOpen` are omitted because the `inspector.*` / `project.*` verbs they gate are not
-/// ported, and an authority action naming a verb with no dispatch arm would be a policy key the
-/// operator can set and nothing can ever consult.
+/// All EIGHT of upstream's, in upstream's own order. VL-S6 added the last two: `inspectorOpen`
+/// gates `inspector.open` and `projectOpen` gates `project.open`, both of which this crate now
+/// dispatches from [`crate::extension::SubagentTool::route_action`], so neither is a policy key
+/// the operator can set and nothing can ever consult.
 pub const AUTHORITY_ACTIONS: &[&str] = &[
     "discardWorktree",
     "destructiveCleanup",
@@ -51,6 +62,8 @@ pub const AUTHORITY_ACTIONS: &[&str] = &[
     "scheduleCreate",
     "stopRun",
     "steerRun",
+    "inspectorOpen",
+    "projectOpen",
 ];
 
 /// pi `AuthorityAction` (`policy/authority.ts:12` @v0.68.0).
@@ -62,6 +75,8 @@ pub enum AuthorityAction {
     ScheduleCreate,
     StopRun,
     SteerRun,
+    InspectorOpen,
+    ProjectOpen,
 }
 
 impl AuthorityAction {
@@ -75,6 +90,8 @@ impl AuthorityAction {
             Self::ScheduleCreate => "scheduleCreate",
             Self::StopRun => "stopRun",
             Self::SteerRun => "steerRun",
+            Self::InspectorOpen => "inspectorOpen",
+            Self::ProjectOpen => "projectOpen",
         }
     }
 
@@ -101,22 +118,46 @@ impl AuthorityAction {
             // `worktree.cleanup` is deliberately absent and must stay absent: upstream gates it
             // on nothing, and it is plan-only. See the module doc's correction.
             "worktree.discard" => Some(Self::DiscardWorktree),
+            // VL-S6 — pi `subagent-executor.ts:6294-6311` @v0.68.0 consults the policy for
+            // EXACTLY these two verbs of the seven this crate now dispatches:
+            // `resolveAuthorityDecision({ action: "projectOpen", ... })` above the project-pane
+            // block (`:6312`) and `{ action: "inspectorOpen", ... }` above the inspector block
+            // (`:6319`).
+            //
+            // The other five — `inspector.command`, `inspector.status`, `inspector.close`,
+            // `project.status`, `project.close` — MUST keep returning `None`. Upstream gates none
+            // of them, and three of the five are reads that answer from a binding file with no
+            // herdr call at all (`inspectors/herdr/mod.rs`'s "What works with no herdr
+            // installed"). Gating a read behind a confirmation dialog would teach operators to
+            // click through prompts, which is the same reasoning this module's doc gives for
+            // leaving `worktree.cleanup` ungated. `inspector.close`/`project.close` are gated
+            // instead by `DESTRUCTIVE_MANAGEMENT_ACTIONS` (`extension/tool/text.rs:376-390`),
+            // which is the did-you-mean surface, not an authority surface.
+            "inspector.open" => Some(Self::InspectorOpen),
+            "project.open" => Some(Self::ProjectOpen),
             _ => None,
         }
     }
 
-    /// pi `DEFAULT_AUTHORITY_POLICY` (`policy/authority.ts:16-25` @v0.68.0), restricted to the six
-    /// actions [`AUTHORITY_ACTIONS`] ports: cyrup's three privileged/destructive ones default to
-    /// `confirm` and its three ordinary ones to `auto`. Upstream's map has eight entries because it
-    /// also carries `inspectorOpen: "auto"` and `projectOpen: "confirm"`, so the three/three split
-    /// is a statement about THIS list, not about upstream's.
+    /// pi `DEFAULT_AUTHORITY_POLICY` (`policy/authority.ts:16-25` @v0.68.0), ported entry for
+    /// entry over all eight actions: four default to `confirm` — `discardWorktree`,
+    /// `destructiveCleanup`, `spawnBudgetGrant`, `projectOpen` — and four to `auto` —
+    /// `scheduleCreate`, `stopRun`, `steerRun`, `inspectorOpen`.
+    ///
+    /// The four/four split is upstream's own and the asymmetry between the two VL-S6 entries is
+    /// deliberate on upstream's part (`policy/authority.ts:23-24`): `inspector.open` opens a
+    /// READ-ONLY dashboard onto a run the caller already addressed, while `project.open` starts a
+    /// whole new agent session in a pane of the user's workspace.
     #[must_use]
     pub fn default_decision(self) -> AuthorityDecision {
         match self {
-            Self::DiscardWorktree | Self::DestructiveCleanup | Self::SpawnBudgetGrant => {
-                AuthorityDecision::Confirm
+            Self::DiscardWorktree
+            | Self::DestructiveCleanup
+            | Self::SpawnBudgetGrant
+            | Self::ProjectOpen => AuthorityDecision::Confirm,
+            Self::ScheduleCreate | Self::StopRun | Self::SteerRun | Self::InspectorOpen => {
+                AuthorityDecision::Auto
             }
-            Self::ScheduleCreate | Self::StopRun | Self::SteerRun => AuthorityDecision::Auto,
         }
     }
 }
@@ -151,6 +192,14 @@ pub struct AuthorityPolicyConfig {
     pub stop_run: Option<AuthorityDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer_run: Option<AuthorityDecision>,
+    /// VL-S6 — `inspectorOpen` (`policy/authority.ts:8`), consulted by `route_action`'s
+    /// `inspector.*` arm for `inspector.open` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspector_open: Option<AuthorityDecision>,
+    /// VL-S6 — `projectOpen` (`policy/authority.ts:9`), consulted by `route_action`'s `project.*`
+    /// arm for `project.open` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_open: Option<AuthorityDecision>,
 }
 
 impl AuthorityPolicyConfig {
@@ -164,6 +213,8 @@ impl AuthorityPolicyConfig {
             AuthorityAction::ScheduleCreate => self.schedule_create,
             AuthorityAction::StopRun => self.stop_run,
             AuthorityAction::SteerRun => self.steer_run,
+            AuthorityAction::InspectorOpen => self.inspector_open,
+            AuthorityAction::ProjectOpen => self.project_open,
         }
     }
 }
@@ -261,11 +312,10 @@ mod tests {
     use super::*;
 
     /// pi `DEFAULT_AUTHORITY_POLICY` (`policy/authority.ts:16-25` @v0.68.0), pinned element by
-    /// element over the six actions cyrup ports: the three privileged ones default to `confirm` and
-    /// the three ordinary ones to `auto` (upstream's other two, `inspectorOpen`/`projectOpen`, gate
-    /// unported verbs and are not in [`AUTHORITY_ACTIONS`]). Getting
-    /// this backwards would either gate every stop behind a dialog or let a worktree discard run
-    /// unasked.
+    /// element over all eight actions: four default to `confirm` and four to `auto`. Getting this
+    /// backwards would either gate every stop behind a dialog, let a worktree discard run unasked,
+    /// or — for the two VL-S6 entries — start an agent session in the user's workspace without
+    /// asking.
     #[test]
     fn the_default_policy_is_pis_own() {
         assert_eq!(
@@ -292,20 +342,30 @@ mod tests {
             AuthorityAction::SteerRun.default_decision(),
             AuthorityDecision::Auto
         );
+        assert_eq!(
+            AuthorityAction::InspectorOpen.default_decision(),
+            AuthorityDecision::Auto
+        );
+        assert_eq!(
+            AuthorityAction::ProjectOpen.default_decision(),
+            AuthorityDecision::Confirm
+        );
     }
 
     /// The tool-verb → policy-key mapping: the three pi performs at
-    /// `subagent-executor.ts:4412` plus `worktree.discard`, which pi gates separately at
-    /// `subagent-executor.ts:6249`. Every OTHER verb the tool advertises is ungated, which is why
-    /// the `None` arm enumerates them — a mapping that accidentally matched, say, `status` would
-    /// put a read-only verb behind a confirmation dialog, and one that stopped matching
-    /// `worktree.discard` would take the only destructive verb out from behind one.
+    /// `subagent-executor.ts:4412`, plus `worktree.discard` (`subagent-executor.ts:6249`) and
+    /// VL-S6's `project.open` / `inspector.open` (`:6294-6311`, consulted once above BOTH
+    /// dispatch blocks). Every OTHER verb the tool advertises is ungated, which is why the `None`
+    /// arm enumerates them — a mapping that accidentally matched, say, `status` would put a
+    /// read-only verb behind a confirmation dialog, and one that stopped matching
+    /// `worktree.discard` would take a destructive verb out from behind one.
     ///
     /// The negative list names every other verb `route_action` dispatches, including all four
-    /// remaining [`crate::extension::tool::lane_actions::LaneAction`] wire names, so the test
-    /// pins the completeness its name claims instead of sampling around the new verb.
+    /// remaining [`crate::extension::tool::lane_actions::LaneAction`] wire names and the FIVE
+    /// VL-S6 verbs upstream leaves ungated, so the test pins the completeness its name claims
+    /// instead of sampling around the new verbs.
     #[test]
-    fn only_the_four_privileged_verbs_map_to_a_policy_action() {
+    fn only_the_six_privileged_verbs_map_to_a_policy_action() {
         assert_eq!(
             AuthorityAction::for_tool_action("stop"),
             Some(AuthorityAction::StopRun)
@@ -322,6 +382,14 @@ mod tests {
             AuthorityAction::for_tool_action("worktree.discard"),
             Some(AuthorityAction::DiscardWorktree)
         );
+        assert_eq!(
+            AuthorityAction::for_tool_action("inspector.open"),
+            Some(AuthorityAction::InspectorOpen)
+        );
+        assert_eq!(
+            AuthorityAction::for_tool_action("project.open"),
+            Some(AuthorityAction::ProjectOpen)
+        );
         for ungated in [
             "status",
             "interrupt",
@@ -337,6 +405,15 @@ mod tests {
             "lane.status",
             "lane.recordMerge",
             "lane.recordSupersession",
+            // VL-S6 — the five of the seven inspector/project verbs upstream does NOT gate.
+            // `inspector.command` returns a string and touches nothing; the four reads and
+            // closes answer from a binding file. `inspector.close`/`project.close` are covered by
+            // `DESTRUCTIVE_MANAGEMENT_ACTIONS` instead, which is the did-you-mean surface.
+            "inspector.command",
+            "inspector.status",
+            "inspector.close",
+            "project.status",
+            "project.close",
         ] {
             assert_eq!(AuthorityAction::for_tool_action(ungated), None, "{ungated}");
         }
@@ -413,7 +490,8 @@ mod tests {
             )
             .expect_err("unknown action key"),
             "config.authorityPolicy.stopRunn is unknown; expected one of discardWorktree, \
-             destructiveCleanup, spawnBudgetGrant, scheduleCreate, stopRun, steerRun"
+             destructiveCleanup, spawnBudgetGrant, scheduleCreate, stopRun, steerRun, \
+             inspectorOpen, projectOpen"
         );
         assert_eq!(
             validate_authority_policy(

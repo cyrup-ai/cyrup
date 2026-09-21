@@ -22,6 +22,7 @@ members = [
     "crates/cyrup-workflow-runtime",
     "crates/cyrup-permission-system",
     "crates/cyrup-intercom",
+    "crates/cyrup-herdr",
     "crates/cyrup-flux",
     "crates/cyrup-mcp",
     "crates/cyrup-acp",
@@ -81,6 +82,7 @@ default-members = [
     "crates/cyrup-ext-subagents",
     "crates/cyrup-permission-system",
     "crates/cyrup-intercom",
+    "crates/cyrup-herdr",
     "crates/cyrup-flux",
     "crates/cyrup-mcp",
     "crates/cyrup-acp",
@@ -137,6 +139,12 @@ cyrup-ext-subagents = { path = "crates/cyrup-ext-subagents", version = "0.0.0" }
 cyrup-workflow-runtime = { path = "crates/cyrup-workflow-runtime", version = "0.0.0" }
 cyrup-permission-system = { path = "crates/cyrup-permission-system", version = "0.0.0" }
 cyrup-intercom     = { path = "crates/cyrup-intercom",     version = "0.0.0" }
+# The workspace's ONE herdr client (HERDR_NATIVE_CLIENT.md §5). A leaf: it depends on no cyrup
+# crate, so it stays buildable for Windows, where `cyrup-ext-subagents` — which carries `nix` and
+# `libc` ungated — today is not. That target argument is the whole reason; the graph argument that
+# stood here ("either consumer can take it without taking the other") was false, because
+# `crates/cyrup-intercom/Cargo.toml` already depends on `cyrup-ext-subagents`.
+cyrup-herdr        = { path = "crates/cyrup-herdr",        version = "0.0.0" }
 cyrup-flux         = { path = "crates/cyrup-flux",         version = "0.0.0" }
 cyrup-mcp          = { path = "crates/cyrup-mcp",          version = "0.0.0" }
 cyrup-acp          = { path = "crates/cyrup-acp",          version = "0.0.0" }

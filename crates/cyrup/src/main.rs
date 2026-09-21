@@ -24,7 +24,7 @@
 //!
 //! [`set_process_name`] cannot move into the library: it needs `unsafe` (`prctl(PR_SET_NAME)` /
 //! `pthread_setname_np`) and `cyrup`'s lib root is `#![forbid(unsafe_code)]`. That is also why
-//! [`cyrup::predispatch`] *classifies* the three internal subcommands and this file dispatches them
+//! [`cyrup::predispatch`] *classifies* the four internal subcommands and this file dispatches them
 //! — each one re-labels the process first (SEAM-070).
 
 use std::io::{self, IsTerminal};
@@ -248,9 +248,10 @@ async fn run() -> anyhow::Result<i32> {
     // native shorts, so normalize them up front (`-nt` ⇒ `--no-tools`, …).
     let mut raw: Vec<String> = normalize_short_aliases(std::env::args());
 
-    // The three internal, never-advertised subcommands — `__subagent-runner --config <path>`
-    // (arch-SA §2.2/§6.5), `__intercom-broker` (cyrup-intercom-port.md §7.3) and
-    // `__mcp-keyring-helper` (13f-mcp-credentials MCP-260). All three MUST be recognized before ANY
+    // The four internal, never-advertised subcommands — `__subagent-runner --config <path>`
+    // (arch-SA §2.2/§6.5), `__subagent-inspector --async-dir <dir> --run-id <id>` (VL-S6),
+    // `__intercom-broker` (cyrup-intercom-port.md §7.3) and
+    // `__mcp-keyring-helper` (13f-mcp-credentials MCP-260). All four MUST be recognized before ANY
     // user-facing arg leniency/clap parsing and before the package/config pre-dispatch below, which
     // has no knowledge of them. `cyrup::predispatch` classifies; the naming + dispatch is here
     // because `set_process_name` is `unsafe` and cannot live in the library (SEAM-070: a distinct
@@ -268,6 +269,13 @@ async fn run() -> anyhow::Result<i32> {
             set_process_name("cyrup-subagent");
             return Ok(cyrup::subagent_runner_cmd::dispatch(&raw).await);
         }
+        Some(Internal::SubagentInspector) => {
+            // VL-S6 — the inspector pane. `PR_SET_NAME` caps a name at 16 bytes including the
+            // NUL; `cyrup-inspector` is 15, so unlike `cyrup-mcp-keyring` it survives intact and
+            // `ps -o comm=` shows it whole — which is what SEAM-070 asks of it.
+            set_process_name("cyrup-inspector");
+            return Ok(cyrup::subagent_inspector_cmd::dispatch(&raw).await);
+        }
         Some(Internal::IntercomBroker) => {
             set_process_name("cyrup-broker");
             return Ok(cyrup::intercom_broker_cmd::dispatch().await);
@@ -280,7 +288,7 @@ async fn run() -> anyhow::Result<i32> {
             set_process_name("cyrup-mcp-keyring");
             return Ok(cyrup::mcp_keyring_helper_cmd::dispatch());
         }
-        // ACP-001 — the `--terminal-login` gate. Unlike the three above it does NOT end the
+        // ACP-001 — the `--terminal-login` gate. Unlike the four above it does NOT end the
         // process: an ACP client's Authenticate button appends `AuthMethod.args` to the agent
         // command it already holds, so this argv is `cyrup --acp … --terminal-login`, and the job
         // is to become an ordinary interactive `cyrup` the user can type `/login` into.

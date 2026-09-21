@@ -36,6 +36,40 @@ use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec, S
 use crate::spawn::depth::resolve_effective_depth;
 use crate::watchdog::register_main::{watchdog_config_dirs, watchdog_model_info};
 
+/// VL-S6 — the [`HerdrClient`](crate::inspectors::plugins::HerdrClient) the `project.*` arm uses
+/// when this process is NOT inside a herdr pane.
+///
+/// `SocketHerdrClient::from_process_env()` answers `None` outside a pane
+/// (`inspectors/herdr/client.rs:364-372`), and there is nothing for it to connect to. pi is in the
+/// same position with no `herdr` on `PATH` and does NOT short-circuit the verb: its client throws
+/// `HERDR_UNAVAILABLE` carrying *"Herdr is not installed or is not on PATH. Install Herdr 0.7.5+
+/// or set HERDR_BIN."* (`herdr/client.ts:55`) from whichever call first needs the backend. This
+/// null object reproduces exactly that, and `client::message_for`
+/// (`inspectors/herdr/client.rs:139`) already maps the code back to that same sentence.
+///
+/// **Why this exists at all, rather than an early return.** `project.status` and `project.close`
+/// answer from the binding file with ZERO herdr calls, and both are answerable on a box with no
+/// herdr installed (`inspectors/herdr/mod.rs`'s "What works with no herdr installed",
+/// `project_panes.rs`'s `handle_herdr_project_pane_action` doc). A `let … else { return Err(…) }`
+/// at the arm would have refused both — a regression the model could not work around, on the two
+/// verbs most likely to be called first. The null object keeps the not-installed table intact and
+/// still produces upstream's install sentence for `project.open`, which is the only one of the
+/// three that genuinely needs a backend.
+///
+/// It opens no socket and spawns no process, so it does not violate
+/// `inspectors/plugins.rs:50-51`'s one-client rule; it is the ABSENCE of a client.
+struct UnavailableHerdrClient;
+
+#[async_trait::async_trait]
+impl crate::inspectors::plugins::HerdrClient for UnavailableHerdrClient {
+    async fn run(
+        &self,
+        _args: &[&str],
+    ) -> Result<serde_json::Value, crate::inspectors::types::HerdrErrorCode> {
+        Err(crate::inspectors::types::HerdrErrorCode::Unavailable)
+    }
+}
+
 /// The resolved SINGLE-mode call [`SubagentTool::route_single`]'s prologue hands to
 /// [`SubagentTool::route_single_background`].
 ///
@@ -1076,6 +1110,75 @@ impl SubagentTool {
         None
     }
 
+    /// VL-S6 — the child-safe gate and the authority consult the `project.*` and `inspector.*`
+    /// arms share, written ONCE because upstream writes it once (`subagent-executor.ts:6294-6311`
+    /// @v0.68.0, above BOTH dispatch blocks).
+    ///
+    /// The two gates are in upstream's order, and upstream's own comment says why — ported
+    /// verbatim:
+    ///
+    /// > Child-safe mode is a hard capability boundary; the policy is an operator preference.
+    /// > Refuse first, so the gate never prompts for an action that is going to be rejected
+    /// > anyway and never masks the more specific reason.
+    ///
+    /// Note the child-safe refusal sits INSIDE the `if (policyAction)` block upstream AND is
+    /// repeated inside each of the two verb blocks (`:6313`, `:6320`). The repetition is
+    /// upstream's belt and braces for the five verbs that have no `policyAction`; collapsing it
+    /// here into one call taken by BOTH arms, on `verb.is_mutating()`, covers the same four verbs
+    /// (`inspector.open`, `inspector.close`, `project.open`, `project.close` — exactly
+    /// upstream's `MUTATING_MANAGEMENT_ACTIONS ∩ {the seven}`) with no third copy to drift.
+    ///
+    /// `Ok(None)` means proceed. `Ok(Some(result))` is the user DECLINING a confirmation, which
+    /// upstream returns without `isError` (`:6309`) because a decline is a choice, not a failure.
+    ///
+    /// # Errors
+    ///
+    /// The child-safe refusal, `Authority policy forbids action '{action}'.`, or the no-UI
+    /// refusal — each upstream's own sentence, from [`crate::registration::authority`].
+    async fn consult_vl_s6_authority(
+        &self,
+        action: &str,
+        is_mutating: bool,
+    ) -> Result<Option<ToolResult>, ToolError> {
+        if !self.allow_mutating_management && is_mutating {
+            return Err(ToolError::new(format!(
+                "Action '{action}' is not available from child-safe subagent fanout mode."
+            )));
+        }
+        let Some(policy_action) =
+            crate::registration::authority::AuthorityAction::for_tool_action(action)
+        else {
+            // Five of the seven map to nothing, which is upstream's own mapping (`:6294` names
+            // only `inspector.open` and `project.open`) — see `authority.rs::for_tool_action`.
+            return Ok(None);
+        };
+        use crate::registration::authority as auth;
+        let policy = self.executor.config_snapshot().await.authority_policy;
+        match auth::resolve_authority_decision(policy_action, policy.as_ref()) {
+            auth::AuthorityDecision::Auto => Ok(None),
+            auth::AuthorityDecision::Forbid => Err(ToolError::new(auth::forbidden_message(action))),
+            auth::AuthorityDecision::Confirm => {
+                let Some(services) = self.executor.host_services() else {
+                    return Err(ToolError::new(auth::no_ui_message(action)));
+                };
+                if services.confirm(
+                    &auth::confirm_prompt(action),
+                    &auth::confirm_message(action),
+                    &cyrup_ext::host::DialogOptions::default(),
+                ) {
+                    Ok(None)
+                } else {
+                    Ok(Some(ToolResult {
+                        content: vec![cyrup_core::Content::text(auth::declined_message(action))],
+                        details: Some(serde_json::json!({ "mode": "management", "results": [] })),
+                        terminate: TerminateHint::Unspecified,
+                        ..Default::default()
+                    }))
+                }
+            }
+        }
+    }
+
     /// Management/control action dispatch (pi: a present `action` puts the tool in management mode).
     /// `doctor`/`models` (read-only) are wired to [`crate::extension::SubagentExecutor::run_doctor`]/`run_models_report`;
     /// the CRUD (`list`/`get`/`create`/`update`/`delete`, C3) routes to [`Self::route_management_action`]
@@ -1418,6 +1521,131 @@ impl SubagentTool {
                     }
                 }
             }
+            // VL-S6 — the three `project.*` verbs, then the four `inspector.*` ones.
+            //
+            // TWO guard arms, in UPSTREAM's order: project panes first (`subagent-executor.ts:6312`
+            // @v0.68.0), inspector second (`:6319`). The order is inert in a `match` on disjoint
+            // string patterns — this file's `refine*` arm records why — but it is kept because the
+            // authority consult above BOTH of them is written once, exactly as upstream writes it
+            // once at `:6294-6311`, and reading the three blocks in upstream's sequence is what
+            // makes that shared consult obviously shared.
+            //
+            // The consult is factored into [`Self::consult_vl_s6_authority`], which carries the
+            // child-safe refusal FIRST — upstream's own ordering and upstream's own reason,
+            // ported verbatim at that function.
+            project_pane_action
+                if crate::inspectors::types::ProjectPaneAction::from_wire(project_pane_action)
+                    .is_some() =>
+            {
+                let Some(verb) =
+                    crate::inspectors::types::ProjectPaneAction::from_wire(project_pane_action)
+                else {
+                    // Unreachable: the guard above already resolved it.
+                    return Err(ToolError::new(format!(
+                        "unknown subagent action '{action}'"
+                    )));
+                };
+                if let Some(declined) = self
+                    .consult_vl_s6_authority(action, verb.is_mutating())
+                    .await?
+                {
+                    return Ok(declined);
+                }
+                // `SocketHerdrClient::from_process_env()` is `None` only when this process is not
+                // inside a herdr pane (`inspectors/herdr/client.rs:364-372`). That is NOT a reason
+                // to refuse: `project.status` and `project.close` answer from the binding file
+                // with ZERO herdr calls and are answerable on a box with no herdr at all
+                // (`inspectors/herdr/mod.rs`'s "What works with no herdr installed"). An early
+                // return here would have turned both reads into refusals — see
+                // [`UnavailableHerdrClient`], which is the null object that keeps them honest and
+                // still produces upstream's own install sentence for `project.open`.
+                let socket = crate::inspectors::herdr::SocketHerdrClient::from_process_env();
+                let client: &dyn crate::inspectors::plugins::HerdrClient = match socket.as_ref() {
+                    Some(live) => live,
+                    None => &UnavailableHerdrClient,
+                };
+                // `params.cwd` was already folded into `cwd` at the tool boundary —
+                // `extension/tool/mod.rs:238`'s `resolve_requested_cwd(params.cwd)` is pi's
+                // `resolveRequestedCwd(ctx.cwd, params.cwd)` (`:2801`), and upstream's
+                // `paramsWithResolvedCwd` then carries that SAME value in both slots
+                // (`:6317`: `handleHerdrProjectPaneAction(action, paramsWithResolvedCwd, { cwd:
+                // requestCwd, … })`). Passing `None` here is therefore upstream's shape, not a
+                // dropped parameter: the manager falls back to `deps.cwd`, which is that value.
+                crate::inspectors::herdr::handle_herdr_project_pane_action(
+                    verb,
+                    &crate::inspectors::herdr::ProjectPaneParams {
+                        cwd: None,
+                        message: p.message.clone(),
+                        focus: p.focus,
+                    },
+                    crate::inspectors::herdr::ProjectPaneDeps {
+                        cwd: cwd.to_path_buf(),
+                        client,
+                        // pi `:6317` passes `state.herdrProjectPanes` into this handler and reads
+                        // the same map back live through its `getProjectPaneCount` closure
+                        // (`extension/index.ts:864`). This is that map: the executor's, the one
+                        // `SessionStart`'s `restore_herdr_project_panes` fills and the one BOTH
+                        // readers project from — the roster's project-pane section
+                        // (`tui::fleet_status::project_pane_entries` via
+                        // `FleetState::herdr_project_panes`) and the herdr pane label's
+                        // `" · N panes"` suffix (`open_herdr_project_pane_count`).
+                        //
+                        // Passing `None` here left the restore as the map's only writer, so an
+                        // `open` the agent had just performed was absent from the human's roster
+                        // and uncounted in the label, and a `close` left both still showing the
+                        // pane, until the session restarted.
+                        panes: Some(self.executor.herdr_project_pane_map()),
+                    },
+                )
+                .await
+            }
+            // VL-S6 — the four `inspector.*` verbs, through the ONE dispatcher
+            // `crate::inspectors::actions::handle_inspector_action`, which owns the whole family
+            // including `inspector.command`'s no-backend answer.
+            inspector_action
+                if crate::inspectors::types::InspectorAction::from_wire(inspector_action)
+                    .is_some() =>
+            {
+                let Some(verb) =
+                    crate::inspectors::types::InspectorAction::from_wire(inspector_action)
+                else {
+                    // Unreachable: the guard above already resolved it.
+                    return Err(ToolError::new(format!(
+                        "unknown subagent action '{action}'"
+                    )));
+                };
+                if let Some(declined) = self
+                    .consult_vl_s6_authority(action, verb.is_mutating())
+                    .await?
+                {
+                    return Ok(declined);
+                }
+                // pi `:6321-6329` — the deps are assembled ONCE, in
+                // `extension/executor/foreground_actions/inspector.rs`, and the fleet overlay's
+                // `Enter`/`H` key uses the same assembly. Two surfaces, one notion of which runs
+                // are trusted and which session roots a pane may read.
+                let deps = self.executor.inspector_dispatcher_deps(cwd).await;
+                let request = crate::inspectors::actions::InspectorRequest {
+                    id: p.id.clone(),
+                    run_id: p.run_id.clone(),
+                    dir: p.dir.as_ref().map(std::path::PathBuf::from),
+                    // The contract's `index` is `i64` so that upstream's range refusal can report
+                    // a NEGATIVE value the caller sent (`inspectors/actions.rs:70`'s own note).
+                    // This edge cannot deliver one: `SubagentToolParams::index` is `u64` because
+                    // the advertised schema declares `minimum: 0` (pi `extension/schemas.ts:304`),
+                    // so serde refuses `-1` before dispatch — which is upstream's behaviour too,
+                    // since its TypeBox carries the same `minimum`. A value above `i64::MAX` is
+                    // saturated rather than wrapped, so it lands on the out-of-range refusal
+                    // instead of silently addressing child 0.
+                    index: p.index.map(|raw| i64::try_from(raw).unwrap_or(i64::MAX)),
+                    focus: p.focus,
+                    // pi declares no `paneId` on the tool surface (`extension/schemas.ts` has no
+                    // such property); the field exists on the dispatcher's request so a host that
+                    // already holds a pane can reuse it, and the tool edge leaves it unset.
+                    pane_id: None,
+                };
+                crate::inspectors::actions::handle_inspector_action(verb, &request, &deps).await
+            }
             // VL-S13 — the three `refine*` verbs. ONE guard arm through
             // `RefinementAction::from_wire`, the same shape the `lane.*` and `schedule.*` arms use.
             //
@@ -1430,10 +1658,9 @@ impl SubagentTool {
             //
             // Authority is deliberately NOT consulted, and that is a finding rather than an
             // omission: upstream's whole dispatch block's only gate is the child-safe one at
-            // `:6359`. cyrup's `AUTHORITY_ACTIONS` (`registration/authority.rs:47-54`) is a closed
-            // SIX-entry list and upstream's (`policy/authority.ts:1-10` @v0.68.0) a closed EIGHT
-            // — cyrup omits `inspectorOpen`/`projectOpen`, whose verbs it has not ported — and
-            // NEITHER list has a member for any `refine*` verb.
+            // `:6359`. `AUTHORITY_ACTIONS` (`registration/authority.rs:47-55`) is a closed
+            // EIGHT-entry list, matching upstream's (`policy/authority.ts:1-10` @v0.68.0) entry
+            // for entry since VL-S6, and NEITHER list has a member for any `refine*` verb.
             // `AuthorityAction::for_tool_action` therefore keeps returning `None`
             // for all three, and the read/mutate split is carried entirely by
             // `RefinementAction::is_mutating` at the child-safe gate below — the same inline shape
@@ -1472,7 +1699,7 @@ impl SubagentTool {
             // `schedule.*` between `append-step` and `dismiss`, which is the neighbourhood
             // `route_control_action`'s own doc already names.
             //
-            // `schedule.delete` is in `DESTRUCTIVE_MANAGEMENT_ACTIONS` (`text.rs:299-312`), which
+            // `schedule.delete` is in `DESTRUCTIVE_MANAGEMENT_ACTIONS` (`text.rs:376-390`), which
             // has carried it since SUBA-065 — so the stricter did-you-mean rule applies to it
             // automatically from the first call.
             schedule_action
@@ -2793,6 +3020,13 @@ mod worktree_cleanup_tests;
 #[cfg(test)]
 #[path = "lane_actions_tests.rs"]
 mod lane_actions_tests;
+
+/// VL-S6's advertise-vs-dispatch seam — the seven inspector/project verbs, from the two
+/// model-facing lists through `from_wire` to this file's two guard arms. A `#[path]` sibling for
+/// the same reason as the suites above.
+#[cfg(test)]
+#[path = "inspector_actions_dispatch_tests.rs"]
+mod inspector_actions_dispatch_tests;
 
 // `children.list` — the reachability tests for the retained-children listing, a `#[path]`
 // sibling like the two above so `routing_tests.rs` does not grow past its already-largest size.

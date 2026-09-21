@@ -363,13 +363,6 @@ pub struct FleetTranscriptReadOptions {
 // Path validation + bounded tail read (pi `fleet-transcript.ts:145-221`)
 // =================================================================================================
 
-/// pi `pathWithin` (`fleet-transcript.ts:145-149`), on already-absolute inputs.
-fn path_within(base: &Path, candidate: &Path) -> bool {
-    let base = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
-    let candidate = std::path::absolute(candidate).unwrap_or_else(|_| candidate.to_path_buf());
-    candidate == base || candidate.starts_with(&base)
-}
-
 /// pi `validateTranscriptPath` (`fleet-transcript.ts:159-186`). Returns `(resolved_path, warning)`;
 /// pi's "file does not exist yet" case is `(None, None)` — no path, and deliberately no warning,
 /// so a child that has not written its transcript yet renders as an empty pane rather than an
@@ -391,7 +384,7 @@ pub fn validate_transcript_path(
     let resolved = std::path::absolute(file_path).unwrap_or_else(|_| file_path.to_path_buf());
     if !trusted_roots
         .iter()
-        .any(|root| path_within(root, &resolved))
+        .any(|root| crate::paths::path_within(root, &resolved))
     {
         return (
             None,
@@ -443,7 +436,10 @@ pub fn validate_transcript_path(
         .filter(|root| root.exists())
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .collect();
-    if !real_roots.iter().any(|root| path_within(root, &real_path)) {
+    if !real_roots
+        .iter()
+        .any(|root| crate::paths::path_within(root, &real_path))
+    {
         return (
             None,
             Some(format!(

@@ -18,7 +18,16 @@ use std::time::Duration;
 
 /// The per-handler invocation budget for the native path — the in-process analog of the wasm epoch
 /// deadline (R-ARCH-EXT-012). A cooperatively-yielding runaway handler is preempted and skipped.
-const DEFAULT_INVOKE_BUDGET: Duration = Duration::from_secs(5);
+///
+/// **Public because a handler has to budget against it.** The whole handler future is dropped when
+/// this elapses (`Dispatcher::invoke_contained`'s `tokio::time::timeout`), so a handler that
+/// spends the budget on its FIRST `await` silently loses every statement below it. A handler that
+/// awaits anything it does not control therefore bounds that wait against this constant rather
+/// than against a hand-copied `5` — `cyrup-ext-subagents`'
+/// `extension/host/native_impl.rs`'s `SessionShutdown` arm is the worked example, and it holds a
+/// `const` assertion against this value so a shrink here is a compile error there rather than a
+/// teardown that stops happening.
+pub const DEFAULT_INVOKE_BUDGET: Duration = Duration::from_secs(5);
 
 /// A contained extension fault, surfaced to registered error listeners (Pi `ExtensionError`,
 /// types.ts:1609; `extensionPath`/`event`/`error`). The host turns each contained fault into one of

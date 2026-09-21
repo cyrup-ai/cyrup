@@ -383,7 +383,41 @@ impl SubagentExecutor {
             if event.event_type == crate::registration::ControlEventType::ActiveLongRunning {
                 return;
             }
-            // (5) ordered hand-off. A closed channel (pump already gone) drops the notice, which is
+            // (5) the herdr status bridge's FOREGROUND attention edge (pi `herdr-status.ts:290`).
+            //
+            // Placed HERE — after the channel gate at (3) and after the `ActiveLongRunning` early
+            // return at (4) — because those two gates are what decide whether this transition is
+            // a NOTICE at all, and the sidebar must say the same thing the notice pump says.
+            //
+            // `raise_attention` de-duplicates a run already raised, so a repeated notice never
+            // relabels the pane. The message is the REASON TOKEN — an enum's wire spelling — and
+            // never `event.message`, which interpolates the CHILD'S OWN OUTPUT: `crate::herdr`'s
+            // label rules forbid putting a child's text on a pane record herdr shows to whoever
+            // can see the workspace.
+            //
+            // Without this, a foreground run reaches the bridge only through `sync_fleet`'s
+            // background projection at turn boundaries — so the pane would go amber some seconds
+            // after the human was already being waited on, which is precisely the latency this
+            // feature exists to remove.
+            if let Some(bridge) = crate::herdr::bridge() {
+                let run = crate::background::RunId::from_token(event.run_id.as_str());
+                match event.event_type {
+                    crate::registration::ControlEventType::NeedsAttention => bridge
+                        .raise_attention(
+                            &run,
+                            event
+                                .reason
+                                .map(crate::exec::control::control_event_reason_wire),
+                        ),
+                    crate::registration::ControlEventType::ActiveLongRunning => {
+                        // Unreachable: (4) returned above. Kept as an explicit arm rather than a
+                        // wildcard so a third `ControlEventType` is a compile error here, not a
+                        // silently un-cleared pane.
+                        bridge.clear_attention(&run);
+                    }
+                }
+            }
+            // (6) ordered hand-off. A closed channel (pump already gone) drops the notice, which is
             // the same outcome pi's own fire-and-forget `setTimeout` has once its state is torn down.
             let _ = sink_tx.send(ForegroundControlPumpMsg::Event(Box::new(event.clone())));
         });
