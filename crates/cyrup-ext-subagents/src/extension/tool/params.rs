@@ -98,6 +98,17 @@ pub(crate) struct SubagentToolParams {
     pub(crate) run_id: Option<String>,
     pub(crate) dir: Option<String>,
     pub(crate) index: Option<u64>,
+    /// VL-S6 / pi `params.focus` (`extension/schemas.ts:318` @v0.68.0, description VERBATIM:
+    /// *"Focus inspector.open/project.open pane."*) — whether the host should raise the pane it
+    /// opens.
+    ///
+    /// `Option<bool>`, not `bool`, and the absence is load-bearing on BOTH verbs it reaches:
+    /// `openHerdrInspector` treats `focus !== false` as focus (`herdr/actions.ts`), while the
+    /// project-pane manager treats `focus === true` as focus — so an unset value means different
+    /// things to the two and collapsing it to `false` here would silently change one of them.
+    /// Carried through to `crate::inspectors::actions::InspectorRequest::focus` and
+    /// `crate::inspectors::herdr::ProjectPaneParams::focus` unchanged.
+    pub(crate) focus: Option<bool>,
     /// SUBA-087 / pi `params.childId` (`extension/schemas.ts:306` @v0.64.0: `Type.Optional(
     /// Type.String({minLength: 1, maxLength: 256}))`, *"Stable child identity for child-scoped stop
     /// requests."*) — the child of an async run `action='stop'` is scoped to
@@ -682,6 +693,9 @@ impl SubagentToolParams {
         }
         if self.index.is_some() {
             keys.push("index");
+        }
+        if self.focus.is_some() {
+            keys.push("focus");
         }
         if self.view.is_some() {
             keys.push("view");

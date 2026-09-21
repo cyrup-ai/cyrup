@@ -32,8 +32,12 @@ Two rules keep this honest:
 - Upstream's STRUCTURE is the contract: on-disk formats, message strings, decision ORDER.
   Exceeding means doing MORE, never doing it differently for its own sake.
 - Read the DEPENDENCY's own source and docs, not just pi's consumption of it. pi's integration
-  with a tool is one consumer's subset. (Worked example: pi drives 4 herdr CLI verbs; herdr
-  v0.9.1 exposes 99 socket methods, a first-class agent protocol and an event stream.)
+  with a tool is one consumer's subset. (Worked example: pi drives 6 herdr CLI verbs — `pane
+  get`/`split`/`run`/`close` plus `tab focus` and `workspace focus`, `inspectors/herdr/focus.ts`
+  — while herdr v0.9.1 exposes 105 socket methods, a first-class agent protocol and an event
+  stream. **Both of those numbers were wrong the first time this file stated them (4 and 99),
+  and the error survived into code comments until a QA lens greped it.** Count with the grep,
+  cite the grep, and expect to be checked.)
 
 ## Residuals
 

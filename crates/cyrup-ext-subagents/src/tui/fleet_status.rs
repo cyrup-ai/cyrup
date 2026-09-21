@@ -156,7 +156,20 @@ pub fn is_active_state(value: &str) -> bool {
 // Entries + the collapsed tree (pi `fleet-status.ts:17-138`)
 // =================================================================================================
 
-/// pi `FleetStatusEntry` (`fleet-status.ts:17-26`).
+/// pi `FleetStatusEntry.surface` (`fleet-status.ts:55`, `"project-pane"` as its only value).
+///
+/// A one-variant enum rather than an `Option<String>` for the same reason
+/// [`crate::inspectors::types::HerdrInspectorKind`] is one: the value is a CLOSED vocabulary the
+/// renderer switches on, and a second spelling must be a compile error rather than a row that
+/// silently lands in the agent tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FleetStatusSurface {
+    /// A herdr **project pane** — a pane per project root, restored on session start, not an
+    /// agent this session is running.
+    ProjectPane,
+}
+
+/// pi `FleetStatusEntry` (`fleet-status.ts:39-56`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FleetStatusEntry {
     /// pi `key` — the roster identity, and the value handed to `openInspector`
@@ -174,6 +187,23 @@ pub struct FleetStatusEntry {
     pub tokens: u64,
     /// pi `state`.
     pub state: String,
+    /// pi `surface` (`fleet-status.ts:41`) — `None` is upstream's absent key, i.e. an ordinary
+    /// agent row. Every rendering decision that separates the two reads THIS, not the key prefix:
+    /// the agent tree is built from `surface.is_none()` rows (`:800-801`) and the project-pane
+    /// section from the rest (`:846-847`).
+    pub surface: Option<FleetStatusSurface>,
+    /// pi `projectPane` (`fleet-status.ts:53`) — the restored snapshot this row renders, present
+    /// exactly when [`Self::surface`] is [`FleetStatusSurface::ProjectPane`].
+    ///
+    /// This is the production reader that makes `restore_herdr_project_pane_snapshots` live: the
+    /// session-start hook writes the map, [`project_pane_entries`] folds it into the roster, and
+    /// [`SubagentFleetStatus::render`] paints it. Without it the restore would write state nothing
+    /// reads.
+    /// Boxed: [`FleetTreeRow::Owner`] carries a whole [`FleetStatusEntry`] by value, and an
+    /// inline snapshot makes that variant several hundred bytes larger than
+    /// [`FleetTreeRow::Nested`] — `clippy::large_enum_variant` on the tree row, for a field only
+    /// project-pane rows ever fill.
+    pub project_pane: Option<Box<crate::inspectors::types::HerdrProjectPaneSnapshot>>,
     /// pi `nestedChildren`.
     pub nested_children: Vec<NestedRunView>,
 }
@@ -359,6 +389,141 @@ pub fn collapse_whitespace(text: &str) -> String {
 // collectFleetStatusEntries (pi `fleet-status.ts:147-239`)
 // =================================================================================================
 
+/// pi `projectPaneNeedsAttention(pane)` (`fleet-status.ts:517-520`) — the `⚠` count in the
+/// collapsed line, and the whole reason a project pane is worth a roster row: it is how the
+/// sidebar tells a human WHICH pane is blocked on them.
+///
+/// `agentStatus.includes(status)` is a SUBSTRING test upstream, not equality — herdr's agent
+/// statuses are free-form strings like `"waiting-for-attention"`, so `"attention"` must match
+/// inside them.
+#[must_use]
+pub fn project_pane_needs_attention(
+    pane: &crate::inspectors::types::HerdrProjectPaneSnapshot,
+) -> bool {
+    const ATTENTION: [&str; 5] = ["attention", "blocked", "paused", "failed", "error"];
+    ATTENTION
+        .iter()
+        .any(|needle| pane.agent_status.contains(needle))
+        || pane.summary.as_ref().is_some_and(|s| s.contains('⚠'))
+}
+
+/// pi `projectName(projectRoot)` (`fleet-status.ts:522-524`) — the last non-empty path segment,
+/// falling back to the whole root. `split(/[\\/]/)` is BOTH separators upstream, which
+/// [`std::path::Path::file_name`] does not reproduce on Unix for a Windows-style root, so the
+/// split is written out.
+#[must_use]
+pub fn project_name(project_root: &std::path::Path) -> String {
+    let raw = project_root.to_string_lossy();
+    raw.split(['\\', '/'])
+        .rfind(|segment| !segment.is_empty())
+        .map_or_else(|| raw.to_string(), ToOwned::to_owned)
+}
+
+/// The inverse of [`crate::time::format_iso8601_millis`], for pi's `Date.parse(pane.openedAt)`
+/// (`fleet-status.ts:361`).
+///
+/// Strict on purpose: it accepts exactly the shape this crate's own writer emits
+/// (`YYYY-MM-DDTHH:MM:SS[.mmm]Z`) and answers `None` for anything else, which is what drives
+/// upstream's `|| pane.refreshedAt` fallback — `Date.parse` returns `NaN` there, and `NaN` is
+/// falsy. Integer-only (Howard Hinnant's `days_from_civil`), so it cannot panic.
+fn parse_iso8601_millis(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || !text.ends_with('Z')
+    {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| -> Option<i64> { text.get(range)?.parse().ok() };
+    let year = num(0..4)?;
+    let month = num(5..7)?;
+    let day = num(8..10)?;
+    let hour = num(11..13)?;
+    let minute = num(14..16)?;
+    let second = num(17..19)?;
+    let millis = match bytes.get(19) {
+        Some(b'.') => num(20..23)?,
+        Some(b'Z') => 0,
+        _ => return None,
+    };
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(((days * 86_400 + hour * 3600 + minute * 60 + second) * 1000) + millis)
+}
+
+/// Howard Hinnant's `days_from_civil` — the exact inverse of `crate::time`'s `civil_from_days`,
+/// written here because `crate::time` is not this batch's file to edit. Integer-only, total.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// pi `projectPaneEntries(state)` (`fleet-status.ts:351-365`).
+///
+/// The ONE production reader of the restored project-pane map inside this crate — the session
+/// start hook's `restore_herdr_project_pane_snapshots` writes it, and this fold is what turns it
+/// into rows a human sees. Upstream's second reader (`extension/index.ts:864`'s
+/// `getProjectPaneCount`, folded into the herdr status bridge's pane label) consumes a COUNT, not
+/// the snapshots, and belongs to the bridge batch.
+///
+/// Only `state == "open"` panes are listed (`:353`): a stale binding names a pane herdr no longer
+/// has, and a roster row for it would be a lie about what is running.
+#[must_use]
+pub fn project_pane_entries(state: &FleetState) -> Vec<FleetStatusEntry> {
+    let mut panes: Vec<&crate::inspectors::types::HerdrProjectPaneSnapshot> = state
+        .herdr_project_panes
+        .iter()
+        .filter(|pane| pane.state == crate::inspectors::types::ProjectPaneState::Open)
+        .collect();
+    // pi `:354` — `openedAt` ascending, ties broken by `projectRoot`. Both are `localeCompare`
+    // upstream; an ISO-8601 stamp sorts chronologically under plain byte order, which is why the
+    // writer emits that shape in the first place.
+    panes.sort_by(|left, right| {
+        left.opened_at
+            .cmp(&right.opened_at)
+            .then_with(|| left.project_root.cmp(&right.project_root))
+    });
+
+    panes
+        .into_iter()
+        .map(|pane| FleetStatusEntry {
+            key: format!("project-pane:{}", pane.project_root.display()),
+            agent: format!("{} · {}", project_name(&pane.project_root), pane.pane_id),
+            model_thinking: None,
+            description: pane.summary.clone(),
+            // pi `Date.parse(pane.openedAt) || pane.refreshedAt` (`:361`).
+            started_at: parse_iso8601_millis(&pane.opened_at).unwrap_or(pane.refreshed_at),
+            tokens: 0,
+            // pi `pane.agentStatus || "unknown"` (`:363`) — the JS `||`, so an EMPTY string falls
+            // through too, not only an absent one.
+            state: if pane.agent_status.is_empty() {
+                "unknown".to_string()
+            } else {
+                pane.agent_status.clone()
+            },
+            surface: Some(FleetStatusSurface::ProjectPane),
+            project_pane: Some(Box::new(pane.clone())),
+            nested_children: Vec::new(),
+        })
+        .collect()
+}
+
 /// pi `collectFleetStatusEntries(state)` (`fleet-status.ts:147-239`).
 ///
 /// `now` is the wall clock in epoch millis (pi's `Date.now()`, `:183`), taken as a parameter so
@@ -401,6 +566,8 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
                     started_at: child.started_at,
                     tokens: child.tokens.unwrap_or(0),
                     state: "running".to_string(),
+                    surface: None,
+                    project_pane: None,
                     nested_children,
                 });
             }
@@ -424,6 +591,8 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
             started_at: control.started_at,
             tokens: control.tokens.unwrap_or(0),
             state: "running".to_string(),
+            surface: None,
+            project_pane: None,
             nested_children: control.nested_children.clone(),
         });
     }
@@ -453,6 +622,8 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
                 started_at,
                 tokens: total_tokens,
                 state: job.state_label().to_string(),
+                surface: None,
+                project_pane: None,
                 nested_children: job.nested_children.clone(),
             });
             continue;
@@ -495,10 +666,16 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
                     .as_ref()
                     .map_or_else(|| if single_step { total_tokens } else { 0 }, |t| t.total),
                 state: label.to_string(),
+                surface: None,
+                project_pane: None,
                 nested_children,
             });
         }
     }
+
+    // pi `:526` — the project panes join the SAME roster and the SAME sort, so a pane opened
+    // before a run sorts above it. They are separated only at render time, by `surface`.
+    entries.extend(project_pane_entries(state));
 
     // pi `:238` — `startedAt` ascending, ties broken by key.
     entries.sort_by(|left, right| {
@@ -820,19 +997,54 @@ impl SubagentFleetStatus {
             return Vec::new();
         }
         if !self.active {
-            let tokens: u64 = self
+            // pi `:764-765` — the collapsed line counts AGENTS and PROJECT PANES separately.
+            // A project pane is not an agent this session is running: counting it as one would
+            // report "3 active agents" for one child and two restored panes.
+            let work: Vec<&FleetStatusEntry> = self
                 .entries
                 .iter()
+                .filter(|entry| entry.surface.is_none())
+                .collect();
+            let panes: Vec<&FleetStatusEntry> = self
+                .entries
+                .iter()
+                .filter(|entry| entry.surface == Some(FleetStatusSurface::ProjectPane))
+                .collect();
+            let tokens: u64 = work
+                .iter()
                 .fold(0u64, |total, entry| total.saturating_add(entry.tokens));
-            let label = format!(
-                "{} active {}",
-                self.entries.len(),
-                if self.entries.len() == 1 {
-                    "agent"
+
+            let mut label_parts: Vec<String> = Vec::new();
+            if !work.is_empty() {
+                label_parts.push(format!(
+                    "{} active {}",
+                    work.len(),
+                    if work.len() == 1 { "agent" } else { "agents" }
+                ));
+            }
+            if !panes.is_empty() {
+                // pi `:781` — `N pane(s)` plus `(M ⚠)` when any of them wants a human.
+                let attention = panes
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .project_pane
+                            .as_deref()
+                            .is_some_and(project_pane_needs_attention)
+                    })
+                    .count();
+                let suffix = if attention > 0 {
+                    format!(" ({attention} ⚠)")
                 } else {
-                    "agents"
-                }
-            );
+                    String::new()
+                };
+                label_parts.push(format!(
+                    "{} pane{}{suffix}",
+                    panes.len(),
+                    if panes.len() == 1 { "" } else { "s" }
+                ));
+            }
+            let label = label_parts.join(" · ");
             return vec![th::clip(
                 &Line::from(vec![
                     th::raw("  "),
@@ -871,7 +1083,16 @@ impl SubagentFleetStatus {
             width,
         ));
 
-        let tree = fleet_tree_rows(&self.entries);
+        // pi `:800-801` — the agent tree is built from the NON-surface entries only; project
+        // panes get their own section below (`:841`), so a pane never lands inside a run's
+        // collapsed child tree.
+        let work_entries: Vec<FleetStatusEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.surface.is_none())
+            .cloned()
+            .collect();
+        let tree = fleet_tree_rows(&work_entries);
         let selected_tree_index = tree
             .iter()
             .position(
@@ -918,7 +1139,48 @@ impl SubagentFleetStatus {
                 width,
             ));
         }
+        self.render_project_pane_section(&mut lines, selected_index, width, now);
         lines
+    }
+
+    /// pi `renderProjectPaneSection(...)` (`fleet-status.ts:845-853`) — a blank line, a dim
+    /// `project panes` heading, then one row per pane, appended AFTER the agent tree and outside
+    /// its `maxAgentRows` window (`:847` returns early when there are none, so a session with no
+    /// panes renders exactly what it rendered before this existed).
+    ///
+    /// The roster index each row is painted with is its position in the FULL entry list, so the
+    /// `>` bullet tracks `selected_key` across both sections and `Enter` opens the inspector at a
+    /// pane row exactly as it does at an agent row.
+    fn render_project_pane_section(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        selected_index: usize,
+        width: usize,
+        now: i64,
+    ) {
+        let panes: Vec<(usize, &FleetStatusEntry)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.surface == Some(FleetStatusSurface::ProjectPane))
+            .collect();
+        if panes.is_empty() {
+            return;
+        }
+        lines.push(Line::from(Vec::<Span<'static>>::new()));
+        lines.push(th::clip(
+            &Line::from(vec![th::raw("  "), th::fg(Role::Dim, "project panes")]),
+            width,
+        ));
+        for (index, entry) in panes {
+            lines.push(self.render_entry(
+                index.saturating_add(1),
+                selected_index,
+                entry,
+                width,
+                now,
+            ));
+        }
     }
 
     /// pi `renderEntry` (`fleet-status.ts:443-450`).
@@ -946,14 +1208,23 @@ impl SubagentFleetStatus {
             left.push(th::raw(format!("  {description}")));
         }
         let elapsed = now.saturating_sub(entry.started_at);
-        let right = Line::from(vec![th::fg(
-            Role::Dim,
-            format!(
+        // pi `:865-866` — a project pane's right-hand column is its SUMMARY and how long ago herdr
+        // last refreshed it, not an elapsed/token pair: the pane is not spending this session's
+        // tokens, and "what is it doing" is the fact the sidebar exists to carry. `—` is
+        // upstream's own placeholder for a pane herdr reported no summary for.
+        let right_text = match entry.project_pane.as_deref() {
+            Some(pane) => format!(
+                "{} · {} ago",
+                pane.summary.as_deref().unwrap_or("—"),
+                format_fleet_elapsed(now.saturating_sub(pane.refreshed_at))
+            ),
+            None => format!(
                 "{} · {}",
                 format_fleet_elapsed(elapsed),
                 format_fleet_tokens(entry.tokens)
             ),
-        )]);
+        };
+        let right = Line::from(vec![th::fg(Role::Dim, right_text)]);
         th::right_align_status(&Line::from(left), &right, width)
     }
 
@@ -1031,7 +1302,21 @@ impl SubagentFleetStatus {
                             .collect::<Vec<_>>()
                     ])
                 } else {
-                    serde_json::json!([entry.key, entry.state, entry.tokens])
+                    // A project pane's `⚠` is derived from its snapshot, not from `state` alone
+                    // (a `summary` gaining a `⚠` changes the collapsed line while `agentStatus`
+                    // holds still), so the pane's attention flag and summary join the collapsed
+                    // key. Without them the sidebar can sit on a stale "2 panes" while one of
+                    // them has started asking for a human.
+                    serde_json::json!([
+                        entry.key,
+                        entry.state,
+                        entry.tokens,
+                        entry.project_pane.as_deref().map(|pane| serde_json::json!([
+                            project_pane_needs_attention(pane),
+                            pane.summary,
+                            pane.refreshed_at
+                        ]))
+                    ])
                 }
             })
             .collect();
@@ -1734,6 +2019,256 @@ mod tests {
         // one — a distinction no text assertion can make.
         let state = th::painted_style(&lines, 100, "running");
         assert_eq!(state.fg, Some(ratatui::style::Color::Reset));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Project panes — the restored herdr map's ONE production reader in this crate
+    // ---------------------------------------------------------------------------------------
+
+    fn pane(
+        root: &str,
+        pane_id: &str,
+        agent_status: &str,
+        summary: Option<&str>,
+        state: crate::inspectors::types::ProjectPaneState,
+    ) -> crate::inspectors::types::HerdrProjectPaneSnapshot {
+        // Every field spelled out: `HerdrProjectPaneSnapshot` derives no `Default`, and it
+        // cannot — two of its fields are FROZEN-CONTRACT enums (`ProjectPaneState`,
+        // `PaneOwnership`) with no default member, because "which state is a pane in by default"
+        // has no honest answer. A struct-update shorthand here would have required inventing one.
+        crate::inspectors::types::HerdrProjectPaneSnapshot {
+            project_root: std::path::PathBuf::from(root),
+            binding_path: std::path::PathBuf::from(root).join(".cyrup-subagents/project-pane.json"),
+            pane_id: pane_id.to_string(),
+            opened_at: "2026-09-21T00:00:00.000Z".to_string(),
+            last_focused_at: None,
+            state,
+            agent_status: agent_status.to_string(),
+            ownership: crate::inspectors::types::PaneOwnership::Verified,
+            safe_to_close: agent_status == "idle",
+            refreshed_at: 9_000,
+            summary: summary.map(ToOwned::to_owned),
+            tab_id: None,
+            workspace_id: None,
+            terminal_title: None,
+            stale_reason: None,
+        }
+    }
+
+    /// T-RESTORE-1's unit half — a restored, OPEN pane becomes a roster row keyed
+    /// `project-pane:<root>` whose `agent` carries the pane id (`fleet-status.ts:356-364`), and a
+    /// STALE one does not (`:353`).
+    ///
+    /// GUT: drop the `state == Open` filter and the sidebar lists panes herdr no longer has, so a
+    /// human is told work is running in a terminal that closed hours ago. GUT the fold out of
+    /// `collect_fleet_status_entries` entirely and the session-start restore writes a map nothing
+    /// reads — the exact dead state the bar forbids.
+    #[test]
+    fn a_restored_project_pane_becomes_a_roster_row_and_a_stale_one_does_not() {
+        use crate::inspectors::types::ProjectPaneState;
+        let state = FleetState {
+            herdr_project_panes: vec![
+                pane(
+                    "/w/app",
+                    "w1:p2",
+                    "working",
+                    Some("refactoring auth"),
+                    ProjectPaneState::Open,
+                ),
+                pane("/w/gone", "w1:p9", "idle", None, ProjectPaneState::Stale),
+            ],
+            ..FleetState::default()
+        };
+        let entries = collect_fleet_status_entries(&state, 10_000);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.key, "project-pane:/w/app");
+        assert_eq!(entry.agent, "app · w1:p2");
+        assert_eq!(entry.state, "working");
+        assert_eq!(entry.description.as_deref(), Some("refactoring auth"));
+        assert_eq!(entry.surface, Some(FleetStatusSurface::ProjectPane));
+        assert_eq!(entry.tokens, 0);
+        assert!(entry.project_pane.is_some());
+        // `Date.parse(openedAt)` (`:361`), not `refreshedAt`.
+        assert_eq!(entry.started_at, 1_789_948_800_000);
+    }
+
+    /// pi `pane.agentStatus || "unknown"` (`:363`) and `Date.parse(...) || refreshedAt` (`:361`).
+    /// GUT either `||` into a plain read and an empty status renders a blank state column while an
+    /// unparseable stamp sorts the pane to 1970 — above every real row, permanently.
+    #[test]
+    fn an_empty_status_and_an_unparseable_stamp_take_upstreams_fallbacks() {
+        use crate::inspectors::types::ProjectPaneState;
+        let mut broken = pane("/w/app", "w1:p2", "", None, ProjectPaneState::Open);
+        broken.opened_at = "not-a-timestamp".to_string();
+        let state = FleetState {
+            herdr_project_panes: vec![broken],
+            ..FleetState::default()
+        };
+        let entries = collect_fleet_status_entries(&state, 10_000);
+        assert_eq!(entries[0].state, "unknown");
+        assert_eq!(entries[0].started_at, 9_000);
+    }
+
+    /// pi `:764-765,:781`. GUT the work/pane split and one child plus two panes reports
+    /// "3 active agents" — a number the user cannot reconcile with anything on screen.
+    #[test]
+    fn the_collapsed_line_counts_panes_separately_and_flags_attention() {
+        use crate::inspectors::types::ProjectPaneState;
+        let state = FleetState {
+            foreground_controls: vec![control("a", "coder", 0)],
+            herdr_project_panes: vec![
+                pane("/w/app", "w1:p2", "working", None, ProjectPaneState::Open),
+                pane(
+                    "/w/api",
+                    "w1:p3",
+                    "waiting-for-attention",
+                    None,
+                    ProjectPaneState::Open,
+                ),
+            ],
+            ..FleetState::default()
+        };
+        let widget = armed_widget(&state);
+        let text = th::lines_text(&widget.render(120, 10_000));
+        assert!(text.contains("1 active agent · 2 panes (1 ⚠)"), "{text}");
+    }
+
+    /// pi `:800-801` + `:845-853` — panes live in their OWN section, below the agent tree.
+    ///
+    /// GUT the `surface.is_none()` filter on `fleet_tree_rows` and a project pane is rendered as
+    /// an agent row inside the `max_agent_rows` window, pushing real children out of view.
+    #[test]
+    fn project_panes_render_in_their_own_section_and_not_in_the_agent_tree() {
+        use crate::inspectors::types::ProjectPaneState;
+        let state = FleetState {
+            foreground_controls: vec![control("a", "coder", 0)],
+            herdr_project_panes: vec![pane(
+                "/w/app",
+                "w1:p2",
+                "working",
+                Some("refactoring auth"),
+                ProjectPaneState::Open,
+            )],
+            ..FleetState::default()
+        };
+        let mut widget = armed_widget(&state);
+        widget.handle_key(&FleetStatusKey::press(FleetStatusKeyCode::Down), true, "");
+        let lines = widget.render(120, 10_000);
+        let text = th::lines_text(&lines);
+        let heading = text.find("project panes").expect("the section heading");
+        let row = text.find("app · w1:p2").expect("the pane row");
+        assert!(heading < row, "the row must follow its heading: {text}");
+        // pi `:865-866` — the summary and the refresh age, NOT an elapsed/token pair.
+        assert!(text.contains("refactoring auth · 1s ago"), "{text}");
+        assert!(!text.contains("app · w1:p2 · running"), "{text}");
+    }
+
+    /// pi `projectPaneNeedsAttention` (`:517-520`) is a SUBSTRING test over `agentStatus` plus a
+    /// `⚠` in the summary. GUT it to equality and `waiting-for-attention` — herdr's own spelling —
+    /// stops raising the flag, which is the single fact the collapsed line exists to carry.
+    #[test]
+    fn needing_attention_is_a_substring_test_over_status_and_summary() {
+        use crate::inspectors::types::ProjectPaneState;
+        for status in [
+            "attention",
+            "waiting-for-attention",
+            "blocked",
+            "paused",
+            "failed",
+            "error",
+        ] {
+            assert!(
+                project_pane_needs_attention(&pane(
+                    "/w/a",
+                    "p",
+                    status,
+                    None,
+                    ProjectPaneState::Open
+                )),
+                "{status}"
+            );
+        }
+        assert!(!project_pane_needs_attention(&pane(
+            "/w/a",
+            "p",
+            "working",
+            None,
+            ProjectPaneState::Open
+        )));
+        assert!(project_pane_needs_attention(&pane(
+            "/w/a",
+            "p",
+            "working",
+            Some("⚠ needs a decision"),
+            ProjectPaneState::Open
+        )));
+    }
+
+    /// pi `projectName` (`:522-524`) — the last non-empty segment of EITHER separator.
+    #[test]
+    fn a_project_name_is_the_last_segment_of_either_separator() {
+        assert_eq!(project_name(std::path::Path::new("/w/app")), "app");
+        assert_eq!(project_name(std::path::Path::new("/w/app/")), "app");
+        assert_eq!(project_name(std::path::Path::new(r"C:\work\api")), "api");
+        assert_eq!(project_name(std::path::Path::new("/")), "/");
+    }
+
+    /// The `Date.parse` port, against the exact strings this crate's own writer emits
+    /// (`crate::time::format_iso8601_millis`). GUT any field offset and every pane sorts by a
+    /// wrong timestamp — silently, because the row still renders.
+    #[test]
+    fn the_iso8601_parser_inverts_the_writers_format() {
+        for ms in [0_i64, 1_609_459_200_000, 1_609_459_200_000 + 45_296_789] {
+            assert_eq!(
+                parse_iso8601_millis(&crate::time::format_iso8601_millis(ms)),
+                Some(ms),
+                "{ms}"
+            );
+        }
+        assert_eq!(
+            parse_iso8601_millis("2026-09-21T00:00:00Z"),
+            Some(1_789_948_800_000)
+        );
+        for bad in [
+            "",
+            "2026-09-21",
+            "2026-09-21T00:00:00.000",
+            "2026-13-21T00:00:00.000Z",
+            "not-a-timestamp",
+            "2026-09-21T99:00:00.000Z",
+        ] {
+            assert_eq!(parse_iso8601_millis(bad), None, "{bad}");
+        }
+    }
+
+    /// A pane row must be selectable, because `Enter` on it is how a human opens the inspector at
+    /// that pane. GUT the roster index back to the tree's position and the `>` bullet lands on the
+    /// wrong row whenever any pane is listed.
+    #[test]
+    fn a_pane_row_joins_the_roster_so_enter_can_select_it() {
+        use crate::inspectors::types::ProjectPaneState;
+        let state = FleetState {
+            foreground_controls: vec![control("a", "coder", 0)],
+            herdr_project_panes: vec![pane(
+                "/w/app",
+                "w1:p2",
+                "working",
+                None,
+                ProjectPaneState::Open,
+            )],
+            ..FleetState::default()
+        };
+        let widget = armed_widget(&state);
+        let keys: Vec<String> = widget
+            .entries()
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect();
+        assert!(
+            keys.contains(&"project-pane:/w/app".to_string()),
+            "{keys:?}"
+        );
     }
 
     #[test]

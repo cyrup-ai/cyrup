@@ -4,6 +4,9 @@
 //! here verbatim out of `extension::executor::control`, which keeps only `interrupt`, `resume` and
 //! `append_step`.
 //!
+//! VL-S6 added a FOURTH file, [`inspector`], which is not one of pi's three: see the comment on
+//! its `mod` line for why it lives here anyway.
+//!
 //! # `foreground_actions` names pi's SOURCE directory, not a claim about the runs it acts on
 //!
 //! pi's own tree calls this directory `runs/foreground/` because it holds the FOREGROUND
@@ -39,6 +42,13 @@
 //! covering the same observable need (knowing whether a queued steer actually landed).
 
 pub(crate) mod dismiss;
+// VL-S6 — `inspector.open`'s executor entry point plus the ONE production assembly of
+// `InspectorDispatcherDeps`, shared by the tool arm and the fleet overlay's `Enter`/`H` key.
+// It is NOT one of pi's three `runs/foreground/*.ts` action files; it lives here because it is
+// the same shape — an inherent `impl SubagentExecutor` verb returning `Result<String, String>`
+// for a TUI caller — and splitting it into a fourth directory would separate it from the file
+// (`stop.rs`) whose signature `tui/fleet.rs::action_result_from_control` requires it to match.
+pub(crate) mod inspector;
 pub(crate) mod steer;
 pub(crate) mod stop;
 

@@ -385,6 +385,12 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("runId".to_string(), serde_json::json!({ "type": "string", "deprecated": true, "description": "Deprecated alias of id for action='interrupt', action='stop', action='resume', action='steer', or action='append-step'; still accepted. Prefer id." }));
     props.insert("dir".to_string(), serde_json::json!({ "type": "string", "description": "Async run directory for action='status', action='stop', action='resume', or action='steer'." }));
     props.insert("index".to_string(), serde_json::json!({ "type": "integer", "minimum": 0, "description": "Zero-based child index for actions that target a specific child or transcript." }));
+    // VL-S6 — pi `extension/schemas.ts:318` @v0.68.0, description VERBATIM. Advertised in the
+    // same change that gives `route_action` its `inspector.*` and `project.*` arms, both of which
+    // read it (`SubagentToolParams::focus` → `InspectorRequest::focus` /
+    // `ProjectPaneParams::focus`), so `every_advertised_schema_property_is_read_outside_provided_keys`
+    // has a real read to find.
+    props.insert("focus".to_string(), serde_json::json!({ "type": "boolean", "description": "Focus inspector.open/project.open pane." }));
     // SUBA-087 — pi `extension/schemas.ts:306` @v0.64.0, description VERBATIM. Advertised because
     // the `stop` dispatch arm threads it into `control_stop`'s resolver in this same change.
     props.insert("childId".to_string(), serde_json::json!({ "type": "string", "minLength": 1, "maxLength": 256, "description": "Stable child identity for child-scoped stop requests." }));
@@ -984,13 +990,27 @@ mod tests {
                 "lane.recordMerge",
                 "lane.recordSupersession",
                 // VL-S13 — pi's own indices for the three `refine*` verbs, immediately after
-                // `lane.recordSupersession` and before `inspector.open`. cyrup omits
-                // `inspector.*`/`project.*`, so the band from `worktree.discard` through
-                // `refine.rollback` is what is contiguous here now — re-derived from the v0.68.0
-                // list, not patched.
+                // `lane.recordSupersession` and before `inspector.open`.
                 "refine",
                 "refine.show",
                 "refine.rollback",
+                // VL-S6 — the seven inspector/project verbs at pi's own indices
+                // (`shared/types.ts:2801` @v0.68.0: `… "refine.rollback", "inspector.open",
+                // "inspector.command", "inspector.status", "inspector.close", "project.open",
+                // "project.status", "project.close", "status", …`), anchored on the NEIGHBOURS
+                // they have in THIS list rather than on upstream's absolute index — see
+                // `text.rs`'s `SUBAGENT_ACTIONS` doc for why the two orders are not the same.
+                //
+                // These seven are pinned present in BOTH this enum and `SUBAGENT_ACTIONS`, and
+                // proven to reach their own dispatch arms, by
+                // `inspector_actions_dispatch_tests.rs` (a `#[path]` sibling of `routing.rs`).
+                "inspector.open",
+                "inspector.command",
+                "inspector.status",
+                "inspector.close",
+                "project.open",
+                "project.status",
+                "project.close",
                 "watchdog.status",
                 "watchdog.check",
                 "watchdog.configure",

@@ -185,11 +185,63 @@ pub fn truncate_to_bytes(value: &str, max_bytes: usize) -> String {
     format!("{kept}...")
 }
 
+/// §A.4's truncating family, ellipsised — pi `previewDisplayText`
+/// (`shared/display-text.ts:81-87`), the one member that SANITIZES first.
+///
+/// [`sanitize_display_text`] the value, and if the result is longer than `max_utf16_units` cut it
+/// with [`truncate_display`] and append a literal `"..."` so the whole answer fits the budget. A
+/// budget of `<= 3` has no room for the ellipsis, so upstream truncates bare — ported exactly
+/// (`:85`), which is also why `max_utf16_units == 0` yields `""` rather than `"..."`.
+///
+/// The length compared against the budget is UTF-16 code units, upstream's `String#length`
+/// (`:83`), matching [`truncate_display`]'s own unit. Astral characters therefore count 2, and a
+/// cut that would split a surrogate pair keeps whole scalar values instead (the delta
+/// [`truncate_display`] already records).
+#[must_use]
+pub fn preview_display_text(value: &str, max_utf16_units: usize) -> String {
+    let normalized = sanitize_display_text(value);
+    let units: usize = normalized.chars().map(char::len_utf16).sum();
+    if units <= max_utf16_units {
+        return normalized;
+    }
+    if max_utf16_units <= 3 {
+        return truncate_display(&normalized, max_utf16_units);
+    }
+    let kept = truncate_display(&normalized, max_utf16_units - 3);
+    format!("{kept}...")
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    /// `preview_display_text` is the only member of this family that sanitizes first, and the
+    /// only one that appends an ellipsis — and the ellipsis is INSIDE the budget, so the whole
+    /// answer fits `max_utf16_units`.
+    #[test]
+    fn preview_sanitizes_then_ellipsises_within_the_budget() {
+        // Sanitizes first: the CSI run collapses to one space before any measuring happens.
+        assert_eq!(preview_display_text("a\u{1b}[2Jb", 80), "a b");
+        // Under budget: returned whole, no ellipsis.
+        assert_eq!(preview_display_text("short", 10), "short");
+        // Exactly at budget is NOT truncated (upstream's `<=`).
+        assert_eq!(preview_display_text("abcde", 5), "abcde");
+        // Over budget: cut to `max - 3` plus "...", total exactly `max`.
+        assert_eq!(preview_display_text("abcdefghij", 8), "abcde...");
+        // Upstream's `maxLength <= 3` arm has no room for an ellipsis, so it cuts bare.
+        assert_eq!(preview_display_text("abcdefghij", 3), "abc");
+        assert_eq!(preview_display_text("abcdefghij", 0), "");
+        // Astral characters count 2 UTF-16 units, like `truncate_display`.
+        // "\u{1f600}\u{1f600}xyz" is 7 units, over a budget of 6, so 3 units are kept. The first
+        // emoji fits; the second does not, and upstream BREAKS there rather than skipping ahead to
+        // a narrower character — so the answer is one emoji, not an emoji plus "x".
+        assert_eq!(
+            preview_display_text("\u{1f600}\u{1f600}xyz", 6),
+            "\u{1f600}..."
+        );
+    }
 
     /// The CSI arm: the whole `\x1b[2J` sequence is consumed and stands in for one separator.
     /// Contrast `tui/fleet_transcript.rs`'s `safe_display_text`, whose own test asserts

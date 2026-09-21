@@ -32,6 +32,7 @@ pub(crate) mod workflow_launch;
 pub(crate) mod workflow_steering;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::Mutex as AsyncMutex;
@@ -163,6 +164,16 @@ pub struct SubagentExecutor {
     /// pi `fanout-child.ts:53-128`) to service an interrupt/resume request a grandparent orchestrator
     /// addressed at a run nested inside THIS process.
     foreground_controls: Arc<std::sync::Mutex<HashMap<String, ForegroundControlEntry>>>,
+    /// VL-S6 — pi `state.herdrProjectPanes` (`extension/index.ts:864`, `:980-981`): the project
+    /// panes this session knows about, keyed by project root.
+    ///
+    /// Lives on the executor rather than on the extension because it has TWO readers on opposite
+    /// sides of the seam — `SessionStart` restores it
+    /// ([`crate::inspectors::herdr::restore_herdr_project_pane_snapshots`]) and
+    /// [`Self::fleet_state`] projects it onto the roster — and the executor is the one thing both
+    /// already hold. A `std::sync::Mutex`, matching `foreground_controls`: every access is a
+    /// short synchronous read or swap, never held across an `await`.
+    herdr_project_panes: Arc<std::sync::Mutex<crate::inspectors::types::ProjectPaneSnapshots>>,
     /// pi `state.workflowControllers` (`shared/types.ts:2269-2270`; created `subagent-executor.ts:4828`,
     /// populated `:5098`, drained `:5272`/`:5796`, aborted-and-cleared `extension/index.ts:1038-1041`):
     /// every workflow shell THIS process is currently driving, keyed by its workflow run id
@@ -314,6 +325,9 @@ impl SubagentExecutor {
             delivery: Arc::new(crate::tui::intercom::NoTransportChannel),
             clarify: Arc::new(crate::tui::intercom::AskLock::new_with_no_live_channel()),
             foreground_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            herdr_project_panes: Arc::new(std::sync::Mutex::new(
+                crate::inspectors::types::ProjectPaneSnapshots::new(),
+            )),
             workflow_controllers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workflow_child_stops: Arc::new(std::sync::Mutex::new(HashMap::new())),
             foreground_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -573,6 +587,80 @@ impl SubagentExecutor {
             return ForegroundRunOwnership::Unknown;
         }
         ForegroundRunOwnership::Terminal
+    }
+
+    /// VL-S6 — pi `extension/index.ts:980-981`'s session-start restore, applied to this
+    /// session's project-pane map.
+    ///
+    /// The root set is upstream's own union, verbatim: the keys already known, plus every root
+    /// the owner's on-disk index names, plus the owner root itself.
+    ///
+    /// ADDITIVE, exactly as upstream is (`new Map(state.herdrProjectPanes ?? [])`,
+    /// `project-panes.ts:303`, and this crate's
+    /// [`crate::inspectors::herdr::restore_herdr_project_pane_snapshots`] says so on itself): a
+    /// root whose binding has since been removed KEEPS whatever the session already knew rather
+    /// than being silently dropped. `project.close` is what removes an entry, and it removes the
+    /// binding with it.
+    ///
+    /// Reads binding files only — it never calls herdr — so a session starts at the same speed on
+    /// a box with no herdr installed.
+    pub(crate) fn restore_herdr_project_panes(&self, owner_root: &Path) {
+        let mut panes = self
+            .herdr_project_panes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut roots: Vec<PathBuf> = panes.keys().cloned().collect();
+        roots.extend(
+            crate::inspectors::herdr::list_herdr_project_pane_roots(owner_root).unwrap_or_default(),
+        );
+        roots.push(owner_root.to_path_buf());
+        crate::inspectors::herdr::restore_herdr_project_pane_snapshots(
+            &mut panes,
+            roots,
+            crate::time::now_epoch_millis(),
+        );
+    }
+
+    /// The LIVE project-pane map, for the `project.*` handler to write through.
+    ///
+    /// pi threads `state.herdrProjectPanes` into `handleHerdrProjectPaneAction`
+    /// (`extension/index.ts:864`) and reads the same map back through its `getProjectPaneCount`
+    /// closure; this is that thread. Without it the map's only writer is
+    /// [`Self::restore_herdr_project_panes`] at `SessionStart`, so both readers —
+    /// [`Self::herdr_project_pane_snapshots`] (the roster) and
+    /// [`Self::open_herdr_project_pane_count`] (the herdr pane label's `" · N panes"`) — would
+    /// stay frozen at whatever that restore found, denying a pane the agent had just opened and
+    /// still counting one it had just closed, until the next session start.
+    #[must_use]
+    pub(crate) fn herdr_project_pane_map(
+        &self,
+    ) -> &std::sync::Mutex<crate::inspectors::types::ProjectPaneSnapshots> {
+        &self.herdr_project_panes
+    }
+
+    /// The restored project panes, flattened for [`crate::tui::fleet_state::FleetState`].
+    #[must_use]
+    pub(crate) fn herdr_project_pane_snapshots(
+        &self,
+    ) -> Vec<crate::inspectors::types::HerdrProjectPaneSnapshot> {
+        self.herdr_project_panes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// VL-S6 — pi `getProjectPaneCount` (`extension/index.ts:864`), the closure the herdr status
+    /// bridge folds into the pane label as `" · N panes"` (`integrations/herdr-status.ts:162-163`).
+    #[must_use]
+    pub(crate) fn open_herdr_project_pane_count(&self) -> usize {
+        crate::inspectors::herdr::open_project_pane_count(
+            &self
+                .herdr_project_panes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// The shared background-job tracker (R-SA-093), so `on_event`'s `SessionStart` handler can

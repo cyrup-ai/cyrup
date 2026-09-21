@@ -1,10 +1,11 @@
-//! Seam tests drained from **`crates/cyrup-ext-subagents`** — 41 files today: the 35 the
+//! Seam tests drained from **`crates/cyrup-ext-subagents`** — 43 files today: the 35 the
 //! migration below drained, minus `verify_redaction_inherited_env` (removed when the workspace
 //! grew a safe env seam), plus `watchdog_model_turn_integration`,
 //! `watchdog_permission_arbiter_integration`, `child_transcript_live_integration`,
 //! `refinement_proposal_refusal_integration`, `debug_run_lifecycle_integration`,
-//! `process_terminal_lifecycle_integration` and `session_lease_revival_integration`, added since
-//! under the same rule.
+//! `process_terminal_lifecycle_integration`, `session_lease_revival_integration` and VL-S6's two
+//! — `inspector_runner_subcommand_integration` and `herdr_status_bridge_integration` — added
+//! since under the same rule.
 //!
 //! What makes a test belong here: it drives a real subagent CHILD PROCESS, or it mutates this
 //! process's environment so that the library's own in-process spawn resolver picks up a test
@@ -120,6 +121,10 @@ mod watchdog_permission_arbiter_integration;
 mod companions_hostservices_proof;
 mod companions_wiring_proof;
 mod control_notice_pipeline_integration;
+// VL-S6's sibling — the herdr status bridge drives a real `UnixListener` and a real socket
+// handshake, which no in-process test can stand in for. `#[cfg(unix)]` is an INNER attribute
+// already on that file, so a bare `mod` line is correct here.
+mod herdr_status_bridge_integration;
 mod native_supervisor_channel_integration;
 mod result_intercom_delivery_integration;
 
@@ -131,6 +136,9 @@ mod subagent_persona_and_depth_integration;
 // ---- operator surface: slash commands, prompt workflows, rendering, fleet inspection ----
 mod debug_run_lifecycle_integration;
 mod fleet_inspector_integration;
+// VL-S6 — the `__subagent-inspector` re-exec seam (T-RUN-1). It drives the real binary under the
+// reserved argv token, which is exactly this harness's admission rule.
+mod inspector_runner_subcommand_integration;
 mod prompt_workflow_commands_integration;
 mod refinement_proposal_refusal_integration;
 mod slash_command_dispatch_integration;

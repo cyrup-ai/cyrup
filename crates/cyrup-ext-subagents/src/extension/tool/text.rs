@@ -158,10 +158,18 @@ pub(crate) const CHILD_SESSION_NOT_RUNNING_YET: &str = "Child session is not run
 ///   [`crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS`] is still deliberately NOT
 ///   extended to match: it gates [`crate::extension::SubagentTool::route_management_action`], which
 ///   `grant-spawn-budget` does not route through, and upstream's set (26 entries at v0.43.0,
-///   `subagent-executor.ts:151`; 31 at the v0.68.0 pin this crate now reads, `:213`) names
-///   actions this crate has not ported — exactly four of them, `inspector.open`,
-///   `inspector.close`, `project.open` and `project.close` — and grafting one of those onto a
-///   7-entry port would make the runtime denylist message advertise a verb with no handler.
+///   `subagent-executor.ts:151`; 31 at the v0.68.0 pin this crate now reads, `:213`) is a
+///   DIFFERENT set serving a different gate.
+///
+///   VL-S6 closed the last gap in that reasoning and the note is re-derived rather than patched:
+///   upstream's four `inspector.open` / `inspector.close` / `project.open` / `project.close`
+///   members are all dispatched here now, and all four are refused in child-safe mode INLINE in
+///   their own `route_action` arm — which is what upstream itself does, twice, at
+///   `subagent-executor.ts:6313` (project panes) and `:6320` (inspector). Extending
+///   [`crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS`] to carry them would be the
+///   wrong site, not merely a redundant one: that slice gates `route_management_action`'s CRUD
+///   band, which none of the seven VL-S6 verbs routes through, so a name added there would gate
+///   nothing and would only widen the sentence `route_management_action` prints.
 ///   (`debug.run` is NOT a member: enumerate `:213` and it is absent. It is READ-ONLY upstream,
 ///   dispatched by `if (action === "status" || action === "debug.run")` at `:6515`, and cyrup
 ///   dispatches it the same way — through the control band into
@@ -184,6 +192,16 @@ pub(crate) const CHILD_SESSION_NOT_RUNNING_YET: &str = "Child session is not run
 ///     handles it in its own `if (action === "dismiss")` arm (`subagent-executor.ts:6687`
 ///     @v0.68.0) rather than in the shared management gate, and lists it in
 ///     `MUTATING_MANAGEMENT_ACTIONS` at `:213`.
+///   - VL-S6's `inspector.open`/`inspector.close` and `project.open`/`project.close` check
+///     `!allow_mutating_management && verb.is_mutating()` inline in `route_action`'s two new
+///     guard arms — the `project.*` arm and the `inspector.*` arm — and the check is the FIRST
+///     statement in each, above the authority consult, which is upstream's own ordering
+///     (`subagent-executor.ts:6296-6301`: refuse first, so the gate never prompts for an action
+///     that is going to be rejected anyway). `inspector.command`, `inspector.status` and
+///     `project.status` are reads and are NOT refused, because upstream's `:213` does not carry
+///     them either. `DESTRUCTIVE_MANAGEMENT_ACTIONS` below has carried `inspector.close` and
+///     `project.close` since SUBA-065, deliberately ahead of this dispatch, so the stricter
+///     did-you-mean rule applies to both from the first call.
 ///
 ///   That list is exhaustive against `:213`; anything appearing there and not here is a gap.
 /// * The **allowed** line names `steer` (which the dispatcher genuinely answers) and, since this
@@ -207,9 +225,17 @@ pub(crate) const CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate to subag
 /// verbs that DO dispatch, and the control-arm text omitted `stop`. A model recovering from a typo
 /// was therefore steered away from verbs that exist.
 ///
-/// Order is pi's own (`stop` between `steer` and `append-step`, `shared/types.ts:1885`). This is
-/// cyrup's CURRENT surface, not upstream's full 53 — the missing verbs have their own items
-/// (SUBA-016, SUBA-046, SUBA-055, SUBA-057, …) and each adds its name here when it lands.
+/// Order is pi's own (`stop` between `steer` and `append-step`, `shared/types.ts:1885`) for every
+/// band that has an upstream neighbour, which is how each item has slotted its verbs in rather
+/// than appending them. It is NOT upstream's order end to end — cyrup's `"status"` sits at index
+/// 13 where upstream's sits at 35 — so the anchor a new band uses is its pair of NEIGHBOURS in
+/// THIS list, never an absolute index into upstream's.
+///
+/// As of VL-S6 this list names all **57** verbs of upstream's `SUBAGENT_ACTIONS`
+/// (`shared/types.ts:2801` @v0.68.0) plus **2** cyrup dispatches that upstream does not advertise
+/// there — `append-step` and `inspect` — for **59**. The "each item adds its name here when it
+/// lands" discipline (SUBA-016, SUBA-046, SUBA-055, SUBA-057, VL-S13, VL-S6, …) is what closed
+/// it; the next verb to land is a cyrup addition, not a catch-up.
 /// SUBA-049 — how long `action: "steer"` waits for the child's acknowledgment before answering
 /// `pending`. pi `ackTimeoutMs ?? 3_000` (`runs/foreground/async-steering-action.ts`'s
 /// `waitForSteeringAction` call).
@@ -329,11 +355,7 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     "lane.recordSupersession",
     // VL-S13 — the three `refine*` verbs, at pi's own indices: upstream's list reads
     // `… "lane.recordSupersession", "refine", "refine.show", "refine.rollback",
-    // "inspector.open", …`, so they slot here and are NOT appended. cyrup still omits
-    // `inspector.*`/`project.*`, so the band from `worktree.discard` to `refine.rollback` is the
-    // contiguous stretch between `mission.close` and `watchdog.status` — the LANES_2 note above
-    // said "the five", and this is the re-derivation of that claim from the v0.68.0 list rather
-    // than a patch of it.
+    // "inspector.open", …`, so they slot here and are NOT appended.
     //
     // All three are dispatched by `route_action`'s ONE `RefinementAction::from_wire` guard arm
     // (`extension/tool/refinement.rs`), per the advertise-vs-dispatch invariant.
@@ -342,6 +364,30 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     "refine",
     "refine.show",
     "refine.rollback",
+    // VL-S6 — the seven inspector/project verbs at pi's OWN indices. Upstream's list reads
+    // `… "refine", "refine.show", "refine.rollback", "inspector.open", "inspector.command",
+    // "inspector.status", "inspector.close", "project.open", "project.status", "project.close",
+    // "status", "debug.run", …` (`shared/types.ts:2801` @v0.68.0).
+    //
+    // They land BETWEEN `refine.rollback` and `watchdog.status` because that is where upstream's
+    // own order puts them relative to the verbs on either side of them HERE — NOT before
+    // `"status"`. cyrup's list is not in upstream's order end to end (its `"status"` sits at
+    // index 13, where upstream's sits at 35), so "immediately before `status`" would have put
+    // them in the wrong band entirely. The anchor that survives both orderings is the pair of
+    // neighbours, and `refine.rollback` → `watchdog.status` is the pair this list has.
+    //
+    // All four `inspector.*` verbs are dispatched by `route_action`'s ONE
+    // `InspectorAction::from_wire` guard arm and all three `project.*` verbs by its
+    // `ProjectPaneAction::from_wire` arm, per the advertise-vs-dispatch invariant this slice's
+    // doc above records. `DESTRUCTIVE_MANAGEMENT_ACTIONS` below has carried `inspector.close`
+    // and `project.close` since SUBA-065.
+    "inspector.open",
+    "inspector.command",
+    "inspector.status",
+    "inspector.close",
+    "project.open",
+    "project.status",
+    "project.close",
     "watchdog.status",
     "watchdog.check",
     "watchdog.configure",

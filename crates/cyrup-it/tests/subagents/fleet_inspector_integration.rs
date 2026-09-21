@@ -269,7 +269,7 @@ async fn subagents_fleet_with_a_ui_renders_the_interactive_inspector_frame() {
     assert!(frame.contains("· live controls"), "got:\n{frame}");
     assert!(frame.contains("No tracked children"), "got:\n{frame}");
     assert!(
-        frame.contains("↑↓/jk agent · H Herdr · s steer · D stop"),
+        frame.contains("↑↓/jk agent · Enter/H Inspect · s steer · D stop"),
         "got:\n{frame}"
     );
     assert!(frame.contains('╭') && frame.contains('╰'), "got:\n{frame}");

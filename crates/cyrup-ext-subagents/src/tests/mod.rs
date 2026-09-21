@@ -27,6 +27,7 @@ mod child_prompt_runtime_integration;
 mod discovery_integration;
 mod dynamic_collect_record_fidelity;
 mod dynamic_group_acceptance_parity;
+mod herdr_shutdown_budget_integration;
 mod management_actions_integration;
 mod read_only_agent_name_alternation;
 mod rpc_bridge_integration;

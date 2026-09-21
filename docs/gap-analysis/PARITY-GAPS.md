@@ -1505,7 +1505,53 @@ the behaviour was available to be ported and was not.
 - **Re-greped this pass, and cyrup now says so in its own source:** `background/async_retention/scan.rs:56` defines `RECOVERY_DESCRIPTOR_FILE = "recovery-descriptor.json"` as a *reader* (it is one of the resumability signals the retention scan honours, pi `hasResumableContract`), and `:381` carries the explicit `[CYRUP-DELTA] no cyrup writer produces recovery-descriptor.json today`. **The read half now exists and the write half still does not** — which is strictly worse than before, because the retention scan's resumable-contract check can never fire. The `extension.rs:4269-4285` citation below is dead
 `runs/background/async-execution.ts:1358` builds a `SteeringRecoveryDescriptor` and `:1401` persists it as `recovery-descriptor.json`; `async-resume.ts:276` reads it back and `:501-524` re-applies model, fallbackModels, thinking, tools, extensions, mcpDirectTools, systemPrompt, skills, completionGuard, memory, output, toolBudget and maxSubagentDepth — vs cyrup, which writes no descriptor and rebuilds the revived step with `model: None, tools: None, extensions: None` at `extension.rs:4269-4285`. **Observable**: a run launched with per-call `model`/`tools`/`toolBudget` overrides revives without them. *(Revival ITSELF is ported and works — `ResumeOutcome::RespawnFromTranscript` at `background/control.rs:1214` → `revive_from_transcript` at `extension.rs:4232`.)*
 
-**VL-S6 · Herdr inspector subsystem** — *large* · id retained, class corrected (v0.41.0) · **STILL OPEN at `cc7818b`; re-measured 2026-09-16**
+**~~VL-S6 · Herdr inspector subsystem~~** — ~~*large*~~ **CLOSED 2026-09-21**
+- **CLOSED.** Both upstream paths this row names are ported, and the feature works for a human and
+  for an agent on the same merge.
+- **`crates/cyrup-herdr`** (35 files) is the workspace's ONE herdr client: NDJSON over a Unix
+  socket (named pipe on Windows), the typed method surface checked against herdr's own
+  checked-in JSON Schema (`tmp/herdr/docs/next/api/herdr-api.schema.json`), `events.subscribe`
+  with herdr's documented no-gap `bootstrap()`, reconnect, and a CLI fallback.
+  `cyrup-intercom`'s `HerdrLauncher` was MIGRATED onto it in the same PR — its public behaviour
+  unchanged, its existing tests unmodified — so the workspace has one herdr transport, not two.
+- **The seven verbs** — `inspector.{open,command,status,close}` and `project.{open,status,close}`
+  — are advertised in `SUBAGENT_ACTIONS` at pi's own index and dispatched through the typed
+  `InspectorAction::from_wire` / `ProjectPaneAction::from_wire` seams
+  (`extension/tool/routing.rs:1537`, `:1606`), with a test driving all seven through the real
+  `cyrup_core::Tool::execute` and asserting each lands on its own arm rather than the
+  `Unknown action:` fallback.
+- **The status bridge** (`src/herdr/`) is `src/integrations/herdr-status.ts`'s port and more:
+  cyrup reports SEMANTIC state through `pane.report_agent`, which pi never does (`git grep
+  'report_agent\|report-agent' v0.68.0 -- src` is empty — pi reports display metadata only and
+  rolls up as `unknown`). The `blocked` signal is the process-wide `HumanInteractionLock` the
+  permission dialog and MCP's dialog owner both acquire, so a pane goes `blocked` on a real
+  prompt. Raw prompts can never reach pane metadata, pinned on the PRODUCTION producer.
+- **The `H` key answers.** `tui/fleet.rs`'s `has_inspect` seam and its
+  "Herdr inspector controls are unavailable in this context." refusal were already in the tree;
+  only the implementation behind them was missing. It is there now, and the deltas saying it
+  could not be wired are DELETED.
+- **With no herdr and no ghostty installed** — this container, and any CI box — every surface
+  degrades with upstream's own sentence and no pretend success: `inspector.command` still returns
+  the full launch string (upstream returns before reading its plugin list), `inspector.open`
+  refuses byte-exactly and writes nothing.
+- **Verification:** three QA lenses; two BLOCKING defects found and closed — the bridge was
+  polling a `HumanWaitGate` no production code raises, so the pane never reported `blocked` at
+  all, and the privacy rule's only test drove a function with zero production callers. An
+  independent verifier re-proved both by tracing the tree. 23 gutting mutations, all RED.
+  Gates: fmt clean; clippy `--workspace --all-targets` clean; `nextest --workspace` **11 032
+  passed**; `cyrup-it` **590 passed**.
+- **[CYRUP-EXCEEDS-UPSTREAM]** `agent.view.set`/`agent.view.clear` are sent, which pi never does:
+  eleven types in `cyrup-herdr`'s `schema/agents.rs` mirroring `tmp/herdr/src/api/schema/agents.rs:52-162`,
+  both `Method` variants, and a production caller in the status bridge's drain that installs the
+  projection before its first report and clears it after release, gated by the same env the
+  bridge's own gate reads. It is a SORT WITH NO FILTER — attention desc, then `state_change_seq`
+  desc — deliberately: there is exactly ONE view server-wide
+  (`tmp/herdr/src/app/api/agent_view.rs:88-89`) and it governs the sidebar, the mobile list,
+  mouse targets, indexed focus and next/previous navigation (`socket-api.mdx:421-424`), so a
+  cyrup-scoped FILTER would hide other agents' panes from the human. Sorting reorders; filtering
+  would conceal.
+- The body that follows is the original filing, kept as history.
+
 - **Re-measured this pass against the verb set rather than a line citation:** of the 57 verbs in `pi-subagents` v0.68.0 `shared/types.ts:2801`, cyrup's 42-verb list (`extension/tool/text.rs:215`) is missing all seven this row owns — `inspector.{open,command,status,close}` and `project.{open,status,close}`. The `extension.rs:6557` / `extension.rs:9863` citations below are dead; `tui/fleet.rs`'s "Herdr inspector controls are unavailable in this context." refusal was not re-resolved to a current line this pass
 `src/inspectors/herdr/actions.ts:15` (`HERDR_INSPECTOR_ACTIONS`) and `:158`, plus `client.ts` (130), `inspector-runner.ts` (141), `project-panes.ts` (154), `src/integrations/herdr-status.ts` (330) — vs `tui/fleet.rs:1654` ("Herdr inspector controls are unavailable in this context."), the hard-coded `false` at `extension.rs:9863`, and no `inspector.*` verb in the enum at `extension.rs:6557`. **Observable**: the FleetView's advertised `H` key (footer at `tui/fleet.rs:2025`) always answers "unavailable".
 

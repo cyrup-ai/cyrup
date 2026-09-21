@@ -1055,6 +1055,16 @@ impl SubagentExecutor {
                 .insert(run_id.as_str().to_string(), entry);
         }
 
+        // The herdr status bridge's foreground refcount. ONE call per RUN, never per child: a
+        // parallel run with nine children is ONE run in flight, which is the whole point of the
+        // refcount (`crate::herdr::state`'s module doc). Paired with the
+        // `foreground_run_finished` in `settle_foreground_run` below, which is the ONE place a
+        // run's control surface is torn down — so the count cannot leak on a failed, interrupted
+        // or stopped run.
+        if let Some(bridge) = crate::herdr::bridge() {
+            bridge.foreground_run_started();
+        }
+
         // The notice machine's own live-state projection (R-SA-116 check 1: an unknown run is not
         // actionable). Registered alongside the `foregroundControls` entry above and dropped
         // alongside it by [`SubagentExecutor::settle_foreground_run`], so the two views of "is this
@@ -1110,6 +1120,15 @@ impl SubagentExecutor {
                 );
             }
         }
+
+        // The herdr status bridge's matching edges, at the ONE teardown point. `clear_attention`
+        // is unconditional and idempotent: a run that settles while raised must not leave the
+        // pane amber, and a run that was never raised is a no-op.
+        if let Some(bridge) = crate::herdr::bridge() {
+            bridge.clear_attention(run_id);
+            bridge.foreground_run_finished();
+        }
+
         // ...and the notice machine's projection of the same fact (pi's single
         // `state.foregroundControls` map serves both roles), together with the pending-timer abort
         // pi pairs it with (`clearPendingForegroundControlNotices(deps.state, runId)` immediately

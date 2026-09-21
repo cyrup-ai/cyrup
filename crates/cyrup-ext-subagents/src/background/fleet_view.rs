@@ -187,7 +187,7 @@ fn read_contained_text_tail(
     let resolved = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     if !trusted_roots
         .iter()
-        .any(|root| path_within(root, &resolved))
+        .any(|root| crate::paths::path_within(root, &resolved))
     {
         return TextTail::failed(
             path,
@@ -228,7 +228,10 @@ fn read_contained_text_tail(
         .iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .collect();
-    if !real_roots.iter().any(|root| path_within(root, &real_path)) {
+    if !real_roots
+        .iter()
+        .any(|root| crate::paths::path_within(root, &real_path))
+    {
         return TextTail::failed(
             path,
             format!(
@@ -238,13 +241,6 @@ fn read_contained_text_tail(
         );
     }
     read_text_tail(&real_path, max_lines)
-}
-
-/// pi `pathWithin` (`fleet-view.ts:75-79`), on already-absolute inputs.
-fn path_within(base: &Path, candidate: &Path) -> bool {
-    let base = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
-    let candidate = std::path::absolute(candidate).unwrap_or_else(|_| candidate.to_path_buf());
-    candidate == base || candidate.starts_with(&base)
 }
 
 // =================================================================================================

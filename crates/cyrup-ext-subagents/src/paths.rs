@@ -149,6 +149,44 @@ pub fn project_config_dir(project_root: &Path) -> PathBuf {
     project_root.join(".cyrup")
 }
 
+/// pi `pathWithin` — is `candidate` inside `base`, or `base` itself?
+///
+/// **The crate's ONE containment check**, and the claim is now checkable: `grep -rn 'fn
+/// path_within\|fn contained_path' crates/cyrup-ext-subagents/src` returns this definition and
+/// nothing else.
+///
+/// Upstream carries a private copy per module — SEVEN of them at v0.68.0
+/// (`git grep -l 'function pathWithin' v0.68.0 -- src`: `inspectors/actions.ts`,
+/// `runs/background/fleet-view.ts`, `runs/background/scheduled-runs.ts`,
+/// `runs/foreground/subagent-executor.ts`, `shared/session-file-trust.ts`,
+/// `tui/fleet-transcript.ts`, `tui/fleet.ts`) — and cyrup grew FIVE to match before this
+/// consolidation: the four the ledger named plus `spawn/nested_events.rs`'s byte-identical
+/// `contained_path`, which the same predicate under a different name hid from the first sweep.
+/// That was five places for a security-relevant predicate to drift, and drift here is not
+/// cosmetic: every caller uses it to
+/// REFUSE a path that escaped a trusted root — a transcript outside the session roots
+/// (`background::fleet_view`, `tui::fleet_transcript`), an inspector launched outside the async
+/// root (`inspectors::actions::trusted_dir`), a schedule store outside the project
+/// (`background::scheduled_runs::store`). A copy that quietly lost its `starts_with` leg, or
+/// gained a `..`-tolerant one, would widen exactly one of those and nothing would fail.
+///
+/// Both sides are put through [`std::path::absolute`] first, so a relative input cannot slip past
+/// by comparing unlike shapes. That is a no-op for a caller that already resolved its inputs —
+/// `scheduled_runs::store` canonicalizes both before calling — and is what the other three
+/// copies did inline.
+///
+/// It is **not** a symlink check. `absolute` resolves neither `..` nor symlinks (it is not
+/// `canonicalize`), so a caller that must survive a planted symlink canonicalizes first and
+/// applies this to the real paths — which is precisely what
+/// [`crate::inspectors::actions::trusted_dir`] does on both legs, and why its doc calls the
+/// realpath leg load-bearing.
+#[must_use]
+pub(crate) fn path_within(base: &Path, candidate: &Path) -> bool {
+    let base = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
+    let candidate = std::path::absolute(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    candidate == base || candidate.starts_with(&base)
+}
+
 // =================================================================================================
 // Roots — every filesystem root this crate derives from the environment, resolved ONCE
 // =================================================================================================
@@ -527,5 +565,51 @@ mod tests {
 
         // Roots the child can derive itself are NOT handed down.
         assert_eq!(Roots::from_env().child_home_override(), None);
+    }
+
+    /// **The crate's one containment predicate, both directions.**
+    ///
+    /// Four modules use it to REFUSE a path that escaped a trusted root, and it had four private
+    /// copies until this batch. A table here is what keeps the one that is left honest: the
+    /// `starts_with` leg (a descendant IS inside), the equality leg (the root itself is inside),
+    /// a sibling whose name merely SHARES A PREFIX with the root (`/a/roots` is not inside
+    /// `/a/root`, which a naive `to_string_lossy().starts_with` would get wrong), and a relative
+    /// input, which `std::path::absolute` resolves against the cwd rather than letting it compare
+    /// as an unlike shape.
+    ///
+    /// *Gutted by*: dropping the `starts_with` leg (row 2 goes red); dropping the `==` leg
+    /// (row 1); returning `true` (rows 4 and 5); comparing the rendered strings instead of the
+    /// components (row 5).
+    #[test]
+    fn path_within_is_component_wise_containment_over_absolute_paths() {
+        let root = Path::new("/a/root");
+        assert!(path_within(root, Path::new("/a/root")), "the root itself");
+        assert!(
+            path_within(root, Path::new("/a/root/child")),
+            "a descendant"
+        );
+        assert!(
+            path_within(root, Path::new("/a/root/deep/er/still")),
+            "a deep descendant"
+        );
+        assert!(!path_within(root, Path::new("/a")), "the parent is outside");
+        assert!(
+            !path_within(root, Path::new("/a/roots")),
+            "a sibling sharing the root's spelling is OUTSIDE — this is the string-prefix bug"
+        );
+        assert!(
+            !path_within(root, Path::new("/b/root/child")),
+            "another tree entirely"
+        );
+
+        // A relative candidate is absolutized against the cwd, so it is compared as a path rather
+        // than as unlike shapes. Against the cwd itself it must be inside; against an unrelated
+        // absolute root it must not.
+        let cwd = std::env::current_dir().expect("a cwd");
+        assert!(path_within(&cwd, Path::new("some/relative/leaf")));
+        assert!(!path_within(
+            Path::new("/definitely/not/the/cwd"),
+            Path::new("x")
+        ));
     }
 }

@@ -1624,6 +1624,7 @@ dependencies = [
  "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
+ "cyrup-herdr",
  "cyrup-mcp",
  "cyrup-provider",
  "cyrup-resources",
@@ -1674,6 +1675,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyrup-herdr"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cyrup-intercom"
 version = "0.0.0"
 dependencies = [
@@ -1683,6 +1696,7 @@ dependencies = [
  "cyrup-core",
  "cyrup-ext",
  "cyrup-ext-subagents",
+ "cyrup-herdr",
  "cyrup-resources",
  "nix 0.31.3",
  "serde",

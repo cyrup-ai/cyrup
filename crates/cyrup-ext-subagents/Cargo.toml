@@ -58,6 +58,11 @@ cyrup-ext = { workspace = true, features = ["wasm-host"] }
 # message); the extension seam wants the agent-loop one.
 cyrup-agent = { workspace = true }
 cyrup-session = { workspace = true }
+# The workspace's ONE herdr client (herdr v0.9.1, `tmp/herdr` @ `d59d060`). `src/herdr/` is the
+# cyrup half of the status bridge — the state machine and the label rules — and it reports through
+# this crate's typed method surface rather than growing a second NDJSON client beside it. A leaf
+# with no `cyrup-*` edge of its own, so this adds no cycle and no new transitive weight.
+cyrup-herdr = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-resources = { workspace = true }
 # `/subagents-models` and `/subagents-refresh-provider-models` (R-SA-129/130 gap closure): the
@@ -230,7 +235,12 @@ cyrup-mcp = { workspace = true }
 # assertion landed 15 ms inside the deadline and flaked under machine load. Dev-only: the feature
 # is additive to the runtime features the production dependency above already enables, and nothing
 # in `src/` outside `#[cfg(test)]` references it.
-tokio = { workspace = true, features = ["test-util"] }
+# `net` is the C5 shutdown-budget test's: it binds a `UnixListener` that accepts and then answers
+# nothing, which is the only way to make `crate::herdr::shutdown()` actually hang without a herdr.
+# Additive and already in this build's tokio anyway (`cyrup-herdr` enables it for the socket
+# transport this crate consumes); naming it here is so the test does not depend on that unification
+# holding.
+tokio = { workspace = true, features = ["test-util", "net"] }
 # `artifacts.rs`'s 7-day sweep / 24h-throttle unit tests must backdate an artifact's mtime to prove
 # a file older than the cleanup horizon is deleted while a fresh one survives; `std::fs` has no
 # portable mtime setter and this crate is `#![forbid(unsafe_code)]` (so a `libc::utimes` call is not

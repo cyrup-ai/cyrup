@@ -236,6 +236,11 @@ pub struct ForegroundControlView {
     pub run_id: String,
     /// pi `sessionId`.
     pub session_id: Option<String>,
+    /// pi `control.parentWorkflowRunId` — `selectedInspectAction`'s parent rung
+    /// (`fleet.ts:956-958`): the run id `Enter`/`H` inspects when the selected row is a workflow
+    /// CHILD, because a child has no async directory of its own and the inspector needs the
+    /// parent's. `None` for a top-level run, which is the common case and inspects itself.
+    pub parent_workflow_run_id: Option<String>,
     /// pi `mode` — the agent label when no `currentAgent` is known (`fleet.ts:166`).
     pub mode: RunMode,
     /// pi `startedAt` (`fleet-status.ts:174`).
@@ -281,6 +286,7 @@ impl Default for ForegroundControlView {
         Self {
             run_id: String::new(),
             session_id: None,
+            parent_workflow_run_id: None,
             mode: RunMode::Single,
             started_at: 0,
             updated_at: 0,
@@ -494,6 +500,18 @@ pub struct FleetState {
     /// pi `state.fleetInspectorOpen` (`fleet.ts:844-845`, `fleet-status.ts:306`) — while true the
     /// status widget unregisters itself so the two surfaces never render at once.
     pub fleet_inspector_open: bool,
+    /// VL-S6 — pi `state.herdrProjectPanes` (`extension/index.ts:864`, `fleet-status.ts:351-365`):
+    /// every project pane this session knows about, as the session-start restore last saw them.
+    ///
+    /// A `Map<projectRoot, snapshot>` upstream and a `Vec` here, per this struct's established
+    /// convention for [`Self::foreground_controls`] and [`Self::tracked_jobs`] — the owning map
+    /// is [`crate::inspectors::types::ProjectPaneSnapshots`], kept by the host's session state,
+    /// and [`crate::extension::SubagentExecutor::fleet_state`] flattens it here for the one
+    /// reader ([`crate::tui::fleet_status::project_pane_entries`]) that walks it in sort order
+    /// rather than by key. The bridge's own reader wants a COUNT off the map and takes it from
+    /// the map directly (`inspectors::herdr::open_project_pane_count`), so nothing needs the key
+    /// lookup this flattening gives up.
+    pub herdr_project_panes: Vec<crate::inspectors::types::HerdrProjectPaneSnapshot>,
     /// The failure pi's own `try`/`catch` around the background half of `collectFleetSnapshot`
     /// records (`fleet.ts:174-209`), carried on the state because the scan that can fail
     /// ([`super::fleet::collect_fleet_history`]) is `async` and therefore runs in the producer, not

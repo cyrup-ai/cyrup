@@ -6,12 +6,30 @@
 //! verbatim and every string it produces is byte-identical to `formatHerdrError`'s. The trait stays
 //! because it is what keeps the vendor noun out of the *types*: a second backend is one more `impl`
 //! and a different binding site, with no change to [`crate::tools::intercom`].
+//!
+//! **The transport underneath is `cyrup-herdr`, the workspace's one herdr client.** That crate owns
+//! everything that is true of *herdr* — spawning the binary, the `HERDR_BIN` ladder, the last-JSON
+//! -line scan, the error envelope outranking the exit code, the socket API the inspector verbs and
+//! the status bridge speak. This file keeps everything that is true of *this port*: pi's five-code
+//! `HerdrErrorCode` union, `normalizeCode`, the 0.7.5 raw-pane gate, the split/run/close
+//! choreography, and every sentence `formatHerdrError` renders. So the provenance below is still
+//! `pi-intercom`'s `project-agent.ts` — a different upstream from `cyrup-herdr`'s, which is herdr's
+//! own source — and there is exactly one implementation of the herdr mechanics in this workspace
+//! rather than a second one living here.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use cyrup_core::CancelToken;
+use cyrup_herdr::Unavailable;
+use cyrup_herdr::cli::{
+    CliError, CliOutput, HerdrCli, extract_pane_id, parse_herdr_version, shell_quote,
+};
+// `parseLastJson` runs inside `HerdrCli::run` now, so the port has no call of its own — but this
+// file's test for it predates the move and must keep passing unmodified against the one
+// implementation, which is what this import gives it through `use super::*`.
+#[cfg(test)]
+use cyrup_herdr::cli::parse_last_json;
 
 use crate::identity::{ENV_CYRUP_BIN, ENV_HERDR_BIN, ENV_INTERCOM_CYRUP_BIN};
 
@@ -237,116 +255,20 @@ pub fn resolve_project_root(base: &Path, cwd: &str) -> Result<PathBuf, String> {
 // §5-A — the Herdr backend.
 // ---------------------------------------------------------------------------------------------
 
-/// `parseLastJson(value)` (`project-agent.ts:52-59`): the whole trimmed string first, then each
-/// line from the LAST backwards. A backend that prints progress lines before its JSON envelope is
-/// therefore still readable.
-fn parse_last_json(value: &str) -> Option<serde_json::Value> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        return Some(v);
-    }
-    // `trimmed.split(/\r?\n/).reverse()` — `str::lines` splits on the same pair.
-    trimmed
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-}
-
-/// `String(value)` for the two error fields upstream stringifies (`:117`, `:134`). A JSON string
-/// yields itself; anything else yields its JSON form.
-///
-/// [CYRUP-DELTA] JS `String({})` is `"[object Object]"`, which carries no information; this yields
-/// the object's JSON instead. The divergence is only reachable when a backend puts a non-string in
-/// `error.message`, and the Rust form is strictly more diagnosable.
-fn js_string(value: &serde_json::Value) -> String {
-    value
-        .as_str()
-        .map_or_else(|| value.to_string(), str::to_string)
-}
-
-/// `extractPaneId(value)` (`project-agent.ts:164-172`): look inside `value.pane` when that is an
-/// object, else at `value` itself, then take the first of `pane_id` / `paneId` / `id` that is a
-/// string. Arrays are rejected — `serde_json`'s `as_object` already does that.
-fn extract_pane_id(value: &serde_json::Value) -> Option<String> {
-    let record = value.as_object()?;
-    let pane = record
-        .get("pane")
-        .and_then(serde_json::Value::as_object)
-        .unwrap_or(record);
-    ["pane_id", "paneId", "id"].into_iter().find_map(|key| {
-        pane.get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    })
-}
-
-/// `shellQuote(value)` (`project-agent.ts:174-177`). The pane runs the command through a shell, so
-/// a path with a space must survive; `cfg!(windows)` is upstream's `process.platform === "win32"`.
-fn shell_quote(value: &str) -> String {
-    if cfg!(windows) {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
-/// The leading run of ASCII digits, and how many bytes it spans. `None` when there is none, or when
-/// the run overflows `u64` — an overflowing "version" is not one.
-fn leading_digits(rest: &[u8]) -> Option<(u64, usize)> {
-    let mut value: u64 = 0;
-    let mut len = 0usize;
-    for byte in rest {
-        if !byte.is_ascii_digit() {
-            break;
-        }
-        value = value
-            .checked_mul(10)?
-            .checked_add(u64::from(*byte - b'0'))?;
-        len = len.checked_add(1)?;
-    }
-    (len > 0).then_some((value, len))
-}
-
-/// `parseHerdrVersion(value)` (`project-agent.ts:145-148`) — `/(\d+)\.(\d+)\.(\d+)/.exec(value)`.
-///
-/// Hand-rolled rather than pulling in a regex dependency for one pattern. The scan reproduces the
-/// engine's semantics exactly: leftmost match wins, and each `\d+` is greedy (no backtracking is
-/// needed here, because a greedy digit run can only ever be followed by a non-digit, which is the
-/// `.` the pattern wants next).
-fn parse_herdr_version(value: &str) -> Option<(u64, u64, u64)> {
-    let bytes = value.as_bytes();
-    for start in 0..bytes.len() {
-        let Some(rest) = bytes.get(start..) else {
-            continue;
-        };
-        let Some((major, major_len)) = leading_digits(rest) else {
-            continue;
-        };
-        let Some(rest) = rest.get(major_len..) else {
-            continue;
-        };
-        let Some(rest) = rest.strip_prefix(b".") else {
-            continue;
-        };
-        let Some((minor, minor_len)) = leading_digits(rest) else {
-            continue;
-        };
-        let Some(rest) = rest.get(minor_len..) else {
-            continue;
-        };
-        let Some(rest) = rest.strip_prefix(b".") else {
-            continue;
-        };
-        let Some((patch, _)) = leading_digits(rest) else {
-            continue;
-        };
-        return Some((major, minor, patch));
-    }
-    None
-}
+// `parseLastJson` (`project-agent.ts:52-59`), `String(value)` (`:117`), `extractPaneId`
+// (`:164-172`), `shellQuote` (`:174-177`) and `parseHerdrVersion` (`:145-148`) are NOT here any
+// more: they are the mechanics of talking to the `herdr` binary, and this workspace has one place
+// for that — `cyrup_herdr::cli` (`crates/cyrup-herdr/src/cli.rs`), which is the crate the inspector
+// verbs and the status bridge will take their herdr from too, rather than growing a second copy of
+// this file's. They are imported at the top of this file under their own names, so the port below
+// reads exactly as upstream does and the tests at the foot of this file exercise the one
+// implementation rather than a copy of it.
+//
+// `supportsRawPanes` stays, and stays HERE: it is a version gate pi applies to a decision pi makes
+// (`:150-152`), it backs a byte-identical upstream sentence (`:489-495`), and a socket client
+// gates on capability instead — `cyrup_herdr::HerdrError::is_unsupported_method`, per herdr's own
+// per-method stability rule (`socket-api.mdx:951-959`). Two gates with one spelling would be a
+// claim that cyrup checks a version on the socket path, and it does not.
 
 /// `supportsRawPanes(version)` (`project-agent.ts:150-152`) — Herdr 0.7.5+.
 const fn supports_raw_panes((major, minor, patch): (u64, u64, u64)) -> bool {
@@ -375,19 +297,29 @@ pub(crate) fn resolve_agent_command(env: impl Fn(&str) -> Option<String>) -> Str
         .unwrap_or_else(|| "cyrup".to_string())
 }
 
-/// What one `herdr` invocation produced. Upstream's `run<T>` is generic and switches on `textOk`;
-/// both shapes are carried here at once so the caller picks, which is the same information with no
-/// type parameter.
-struct HerdrOutput {
-    /// `envelope.result ?? parsed` (`:125`) when stdout parsed as JSON.
-    json: Option<serde_json::Value>,
-    /// `stdout.trim()` — upstream's `textOk` arm (`:127`).
-    text: String,
+/// [`cyrup_herdr::EnvSource`] over a plain `Fn(&str) -> Option<String>`.
+///
+/// Every `*_with_env` constructor in this crate takes a closure, and its tests are written against
+/// that shape; `cyrup-herdr` takes a trait, because its own resolution ladder reads several
+/// variables and a trait is what lets a test hand it a whole map. Neither shape is wrong and the
+/// adapter is four lines, so the seam is here rather than a change to either crate's API.
+struct FnEnv<F>(F);
+
+impl<F: Fn(&str) -> Option<String>> cyrup_herdr::EnvSource for FnEnv<F> {
+    fn var(&self, key: &str) -> Option<String> {
+        (self.0)(key)
+    }
 }
 
-/// `createHerdrClient` (`project-agent.ts:68-139`) plus `openProjectPane` (`:227-253`).
+/// `createHerdrClient` (`project-agent.ts:68-139`) plus `openProjectPane` (`:227-253`), over
+/// [`cyrup_herdr::cli::HerdrCli`].
 pub struct HerdrLauncher {
-    /// `options.bin ?? process.env.HERDR_BIN ?? "herdr"` (`:69`).
+    /// `options.bin ?? process.env.HERDR_BIN ?? "herdr"` (`:69`), resolved by
+    /// [`HerdrCli::with_env`] — the same ladder every other cyrup caller of herdr uses.
+    ///
+    /// Held as the name rather than as a built [`HerdrCli`] because a `HerdrCli` is exactly this
+    /// string: constructing one opens nothing, looks nothing up and spawns nothing, so
+    /// [`Self::cli`] can make one per verb and there is no second copy of this value to drift.
     bin: String,
     /// The agent binary a launched pane runs — see [`resolve_agent_command`].
     agent_command: String,
@@ -407,12 +339,19 @@ impl HerdrLauncher {
     }
 
     /// The pure core of [`Self::from_env`].
+    ///
+    /// `HERDR_BIN` is resolved by [`HerdrCli::with_env`] — upstream's `options.bin ??
+    /// process.env.HERDR_BIN ?? "herdr"` (`:69`) and cyrup's one implementation of it, shared with
+    /// every other caller of herdr in this workspace. [`ENV_HERDR_BIN`] is still named here because
+    /// this crate documents its own environment surface in `identity.rs`, and the two spellings are
+    /// the same variable by construction: the assertion below is `cyrup_herdr::cli::HERDR_BIN`.
     #[must_use]
     pub fn with_env(env: impl Fn(&str) -> Option<String>) -> Self {
-        let bin = env(ENV_HERDR_BIN)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "herdr".to_string());
+        const _: () = assert!(
+            matches!(ENV_HERDR_BIN.as_bytes(), b"HERDR_BIN")
+                && matches!(cyrup_herdr::cli::HERDR_BIN.as_bytes(), b"HERDR_BIN")
+        );
+        let bin = HerdrCli::with_env(&FnEnv(&env)).bin().to_string();
         Self {
             bin,
             agent_command: resolve_agent_command(env),
@@ -436,7 +375,16 @@ impl HerdrLauncher {
         }
     }
 
-    /// `client.run(args, { timeoutMs, signal })` (`project-agent.ts:71-137`).
+    /// The [`HerdrCli`] this launcher runs verbs through.
+    ///
+    /// Built per verb rather than stored: it is `self.bin` and nothing else — no handle, no
+    /// connection, no PATH lookup — so a field would be a second copy of one `String`.
+    fn cli(&self) -> HerdrCli {
+        HerdrCli::new(self.bin.clone())
+    }
+
+    /// `client.run(args, { timeoutMs, signal })` (`project-agent.ts:71-137`) — now
+    /// [`HerdrCli::run_cancellable`], with this port supplying the sentences.
     ///
     /// # Errors
     /// Every arm of upstream's `error(...)`: `HERDR_UNAVAILABLE` on a spawn failure, `TIMEOUT` on
@@ -447,136 +395,91 @@ impl HerdrLauncher {
         args: &[&str],
         timeout_ms: u64,
         cancel: &CancelToken,
-    ) -> Result<HerdrOutput, PaneLaunchError> {
-        let mut command = tokio::process::Command::new(&self.bin);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        {
-            // `windowsHide: true` (`:75`). Same constant and rationale as
-            // `transport::spawn::spawn_detached_broker`; DETACHED_PROCESS is deliberately NOT set,
-            // because this child's stdout is the result.
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
+    ) -> Result<CliOutput, PaneLaunchError> {
+        // `signal.addEventListener("abort", abort)` (`:96-98`): the token is the `AbortSignal`, and
+        // `run_cancellable` races it against the deadline and the child exactly as upstream races
+        // its two handlers. `kill_on_drop` there is the `child.kill()` both of them call.
+        self.cli()
+            .run_cancellable(args, Duration::from_millis(timeout_ms), cancel.cancelled())
+            .await
+            .map_err(|error| self.rendered(timeout_ms, error))
+    }
+
+    /// Upstream's `error(code, message)` calls, rebuilt from [`CliError`]'s structure.
+    ///
+    /// This is the whole of what the migration left behind in this file, and it is the half that
+    /// is genuinely pi's: `cyrup_herdr` reports *what herdr did* — a missing binary, an error
+    /// envelope, a non-zero exit — and this maps each onto `HerdrErrorCode` plus the sentence
+    /// `formatHerdrError` wraps. Every string below is upstream's, byte for byte.
+    fn rendered(&self, timeout_ms: u64, error: CliError) -> PaneLaunchError {
+        match error {
+            // `:79-81` and `:111-113` are one arm here: node distinguishes a synchronous `spawn`
+            // throw from a later `error` event, Rust surfaces both as `NotFound`, and the message
+            // that names the actionable fix is the same one.
+            CliError::Unavailable(Unavailable::BinaryMissing { .. }) => self.not_installed(),
+            // `Unavailable` is herdr's open account of "nothing to talk to" and has arms this
+            // launcher does not produce today — a resolved socket that refuses, for the socket
+            // route AUG §7 adds. They are the same `HERDR_UNAVAILABLE` condition and each carries
+            // its own reason, including the path, which upstream has no equivalent for.
+            CliError::Unavailable(reason) => {
+                self.fail(PaneErrorCode::Unavailable, reason.to_string())
+            }
+            CliError::SpawnFailed { source, .. } => self.fail(
+                PaneErrorCode::Unavailable,
+                format!("Failed to start Herdr: {source}"),
+            ),
+            CliError::WaitFailed { source, .. } => self.fail(
+                PaneErrorCode::Unavailable,
+                format!("Failed to run Herdr: {source}"),
+            ),
+            // `:100-103`. `timeout_ms` is the caller's own number rather than the elapsed
+            // `Duration` re-rendered, so the sentence cannot drift from the deadline that was set.
+            CliError::TimedOut { command, .. } => self.fail(
+                PaneErrorCode::Timeout,
+                format!("Herdr command '{command}' timed out after {timeout_ms}ms."),
+            ),
+            // `:95-98` — the abort path, which upstream reports under the same TIMEOUT code.
+            CliError::Cancelled { command } => self.fail(
+                PaneErrorCode::Timeout,
+                format!("Herdr command '{command}' was aborted."),
+            ),
+            // `:119-123`. `normalize_code` folds herdr's ~60-code space onto upstream's five, and
+            // `ApiErrorCode::as_str` hands it the wire spelling unchanged — including a code this
+            // workspace has never heard of, which `ApiErrorCode::Other` carries verbatim.
+            CliError::Api { code, message, .. } => self.fail(
+                normalize_code(code.as_str()),
+                message.unwrap_or_else(|| "Herdr command failed.".to_string()),
+            ),
+            // `:133-134`. A signal-killed child has a null exit code in node too, so the literal
+            // `null` is upstream's own rendering.
+            CliError::Exit {
+                status,
+                stderr_line,
+                ..
+            } => self.fail(
+                PaneErrorCode::ValidationError,
+                stderr_line.unwrap_or_else(|| {
+                    let rendered = status.map_or_else(|| "null".to_string(), |c| c.to_string());
+                    format!("Herdr exited with code {rendered}.")
+                }),
+            ),
         }
-
-        // Upstream distinguishes a synchronous `spawn` throw (`:77-84`) from a later `error` event
-        // (`:109-115`); in Rust both surface here, so the two messages collapse into the one that
-        // names the actionable fix.
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(self.not_installed()),
-            Err(e) => {
-                return Err(self.fail(
-                    PaneErrorCode::Unavailable,
-                    format!("Failed to start Herdr: {e}"),
-                ));
-            }
-        };
-
-        // `setTimeout(…, timeoutMs ?? 15_000)` (`:100-103`) and
-        // `signal.addEventListener("abort", abort)` (`:96-98`) race the child. `kill_on_drop`
-        // above is the `child.kill()` both handlers call: dropping the future drops the child.
-        //
-        // Upstream's `?? 15_000` covers an ABSENT `timeoutMs`; here the parameter is required, so
-        // there is nothing to default and `timeout_ms` is both waited and reported. A fallback
-        // would only let the deadline and the message below disagree.
-        let deadline = Duration::from_millis(timeout_ms);
-        let joined = args.join(" ");
-        let output = tokio::select! {
-            result = child.wait_with_output() => result,
-            () = tokio::time::sleep(deadline) => {
-                return Err(self.fail(
-                    PaneErrorCode::Timeout,
-                    format!("Herdr command '{joined}' timed out after {timeout_ms}ms."),
-                ));
-            }
-            () = cancel.cancelled() => {
-                return Err(self.fail(
-                    PaneErrorCode::Timeout,
-                    format!("Herdr command '{joined}' was aborted."),
-                ));
-            }
-        };
-        let output = match output {
-            Ok(output) => output,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(self.not_installed()),
-            Err(e) => {
-                return Err(self.fail(
-                    PaneErrorCode::Unavailable,
-                    format!("Failed to run Herdr: {e}"),
-                ));
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let exit_code = output.status.code();
-        let succeeded = exit_code == Some(0);
-
-        // `parseLastJson(stdout) ?? (exitCode === 0 ? undefined : parseLastJson(stderr))` (`:118`).
-        let parsed = parse_last_json(&stdout).or_else(|| {
-            if succeeded {
-                None
-            } else {
-                parse_last_json(&stderr)
-            }
-        });
-
-        // `if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "error" in parsed)`
-        // (`:119-123`) — the envelope wins over the exit code, in both directions.
-        if let Some(envelope) = parsed.as_ref().and_then(serde_json::Value::as_object)
-            && let Some(raw) = envelope.get("error")
-        {
-            let code = raw.get("code").map_or_else(String::new, js_string);
-            let message = raw
-                .get("message")
-                .filter(|m| !m.is_null())
-                .map_or_else(|| "Herdr command failed.".to_string(), js_string);
-            return Err(self.fail(normalize_code(&code), message));
-        }
-
-        if succeeded {
-            // `envelope.result ?? parsed` (`:125`).
-            let json = parsed.map(|p| {
-                p.as_object()
-                    .and_then(|o| o.get("result"))
-                    .filter(|r| !r.is_null())
-                    .cloned()
-                    .unwrap_or(p)
-            });
-            return Ok(HerdrOutput {
-                json,
-                text: stdout.trim().to_string(),
-            });
-        }
-
-        // `stderr.split(/\r?\n/).find(line => line.trim())?.trim() ?? …` (`:133`).
-        let message = stderr
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .map(|line| line.trim().to_string())
-            .unwrap_or_else(|| {
-                // `Herdr exited with code ${exitCode}.` — a signal-killed child has a null code in
-                // node too, so the literal `null` is upstream's own rendering.
-                let rendered = exit_code.map_or_else(|| "null".to_string(), |c| c.to_string());
-                format!("Herdr exited with code {rendered}.")
-            });
-        Err(self.fail(PaneErrorCode::ValidationError, message))
     }
 
     /// `detectHerdr(client, signal)` (`project-agent.ts:154-162`) — availability THEN version, each
     /// with its own code. Returns the version text `ProjectPaneLaunch` carries.
     async fn detect(&self, cancel: &CancelToken) -> Result<String, PaneLaunchError> {
-        let probe = self
-            .run(&["--version"], VERSION_PROBE_TIMEOUT_MS, cancel)
-            .await?;
-        // `typeof result.data === "string" ? result.data : JSON.stringify(result.data)` (`:157`).
-        let version_text = probe.json.map_or(probe.text, |v| js_string(&v));
+        // `client.run(["--version"], …)` plus `:157`'s `typeof result.data === "string" ?
+        // result.data : JSON.stringify(result.data)` — both inside `version_text` now, because
+        // "ask the binary what version it is" is herdr's business and not this port's.
+        let version_text = self
+            .cli()
+            .version_text(
+                Duration::from_millis(VERSION_PROBE_TIMEOUT_MS),
+                cancel.cancelled(),
+            )
+            .await
+            .map_err(|error| self.rendered(VERSION_PROBE_TIMEOUT_MS, error))?;
         let Some(version) = parse_herdr_version(&version_text) else {
             return Err(self.fail(
                 PaneErrorCode::ValidationError,
@@ -646,14 +549,15 @@ impl ProjectPaneLauncher for HerdrLauncher {
             .await
         {
             // `await client.run(["pane", "close", paneId], { timeoutMs: 5_000 })` (`:248`) — note
-            // upstream passes NO signal here, so a cancelled launch still cleans its pane up. A
-            // FRESH token reproduces that: reusing `request.cancel` would skip the cleanup in
-            // exactly the case that needs it most.
+            // upstream passes NO signal here, so a cancelled launch still cleans its pane up.
+            // [`HerdrCli::run`] has no cancel arm at all, which reproduces that structurally: there
+            // is no token to reuse by accident, and reusing `request.cancel` would have skipped the
+            // cleanup in exactly the case that needs it most.
             let _ = self
+                .cli()
                 .run(
                     &["pane", "close", &pane_id],
-                    PANE_CLOSE_TIMEOUT_MS,
-                    &CancelToken::new(),
+                    Duration::from_millis(PANE_CLOSE_TIMEOUT_MS),
                 )
                 .await;
             return Err(e);
@@ -812,6 +716,15 @@ mod tests {
         );
     }
 
+    /// The abort arm, end to end — **and its sentence**.
+    ///
+    /// `CliError::Cancelled` and `CliError::TimedOut` share `PaneErrorCode::Timeout` but render
+    /// two DIFFERENT byte-identical upstream sentences (`project-agent.ts:95-98` and `:100-103`).
+    /// Asserting only the code leaves the two arms interchangeable: swapping them in
+    /// `cyrup-herdr`'s cancel arm would show a user who cancelled a launch a deadline that never
+    /// expired, in a sentence pi's logs are matched against. `rendered` became a cross-crate
+    /// mapping in this migration, so each arm is pinned on its own — this one here, the deadline
+    /// one in `a_deadline_that_expires_renders_upstreams_timeout_sentence`.
     #[tokio::test]
     async fn an_already_cancelled_token_aborts_before_the_deadline() {
         let cancel = CancelToken::new();
@@ -826,6 +739,44 @@ mod tests {
             .expect_err("a cancelled launch cannot detect");
         assert_eq!(err.code, PaneErrorCode::Timeout);
         assert!(started.elapsed() < Duration::from_millis(2_500));
+        // `:95-98`. "was aborted", NOT "timed out after 3000ms" — the deadline had 3 s left.
+        assert_eq!(
+            err.to_string(),
+            "Herdr project pane error (TIMEOUT): Herdr command '--version' was aborted."
+        );
+    }
+
+    /// The deadline arm, end to end — the other half of the pair above.
+    ///
+    /// The fake never answers `--version`, so the only way out is
+    /// [`VERSION_PROBE_TIMEOUT_MS`]'s deadline, and the number in the sentence is the caller's own
+    /// constant rather than the elapsed time re-rendered (`:100-103`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deadline_that_expires_renders_upstreams_timeout_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        // Far longer than the probe deadline, so the deadline is the only thing that can end it.
+        let bin = fake_herdr_script(dir.path(), "sleep 600");
+        let launcher =
+            HerdrLauncher::with_env(|k| (k == ENV_HERDR_BIN).then(|| bin.display().to_string()));
+
+        let started = std::time::Instant::now();
+        let err = launcher
+            .detect(&CancelToken::new())
+            .await
+            .expect_err("a herdr that never answers cannot be detected");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.code, PaneErrorCode::Timeout);
+        assert_eq!(
+            err.to_string(),
+            "Herdr project pane error (TIMEOUT): Herdr command '--version' timed out after 3000ms."
+        );
+        assert!(
+            elapsed >= Duration::from_millis(2_500),
+            "the deadline was waited out, not short-circuited ({elapsed:?})"
+        );
+        assert_eq!(VERSION_PROBE_TIMEOUT_MS, 3_000);
     }
 
     #[test]
@@ -855,6 +806,142 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(fut)
+    }
+
+    /// A `herdr` on disk that answers `--version` with `version` and fails every other verb with
+    /// `envelope` on stderr — which is where herdr's own CLI writes an error envelope, with exit 1
+    /// (`tmp/herdr/src/cli.rs:745-752`).
+    ///
+    /// The binary is not installed in this container and these tests do not need it: what they
+    /// pin is that a herdr answer reaches this port's sentences unchanged now that the spawning,
+    /// scanning and envelope reading happen in `cyrup-herdr`.
+    #[cfg(unix)]
+    fn fake_herdr(dir: &Path, version: &str, envelope: &str) -> PathBuf {
+        fake_herdr_script(
+            dir,
+            &format!(
+                "case \"$1\" in\n  --version) echo '{version}' ;;\n  *) echo '{envelope}' >&2; \
+                 exit 1 ;;\nesac"
+            ),
+        )
+    }
+
+    /// A `herdr` on disk whose whole body is `body`.
+    #[cfg(unix)]
+    fn fake_herdr_script(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-herdr");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&path);
+        path
+    }
+
+    /// Block until `path` can actually be `exec`'d, i.e. until no process holds it open for
+    /// writing.
+    ///
+    /// `cargo test` runs a crate's tests as **threads in one process**. When this thread calls
+    /// `std::fs::write` on the fake binary, any sibling test that `fork`s during that window
+    /// inherits a copy of the write fd, and the kernel answers `ETXTBSY` (`Text file busy`,
+    /// `os error 26`) to an `exec` of a file any process still has open for writing. The failure
+    /// surfaces as a spawn error from a completely unrelated test, so it reads as if the code
+    /// under test were broken.
+    ///
+    /// One successful `exec` proves no such fd exists any more, and none can appear again —
+    /// nothing writes this path after this point, and `fork` only copies fds that already exist.
+    /// So a single successful spawn here makes every later spawn of this file safe for the rest
+    /// of the process. The child is killed immediately: what is being probed is the `exec`, not
+    /// whatever the script goes on to do.
+    #[cfg(unix)]
+    fn wait_until_executable(path: &Path) {
+        for _ in 0..500 {
+            match std::process::Command::new(path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                // `ETXTBSY` is 26 on every unix this runs on; `libc` is not a dependency of this
+                // crate and one constant does not justify making it one.
+                Err(err) if err.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Anything else is the spawning test's own business to report.
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// The whole port, end to end: `detect` then `pane split`, with herdr's own error envelope
+    /// coming back on the split. `normalizeCode` maps herdr's `no_such_pane` onto upstream's
+    /// `NOT_FOUND` and `formatHerdrError` renders it, byte for byte — across a crate boundary that
+    /// did not exist before the migration.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_herdr_error_envelope_reaches_the_caller_as_upstreams_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_herdr(
+            dir.path(),
+            "herdr 0.9.1",
+            r#"{"id":"cli:request","error":{"code":"no_such_pane","message":"pane w1:p9 not found"}}"#,
+        );
+        let launcher =
+            HerdrLauncher::with_env(|k| (k == ENV_HERDR_BIN).then(|| bin.display().to_string()));
+
+        let err = launcher
+            .open(ProjectPaneRequest {
+                project_root: dir.path().to_path_buf(),
+                focus: true,
+                cancel: &CancelToken::new(),
+            })
+            .await
+            .expect_err("a split that herdr refused cannot open a pane");
+
+        assert_eq!(err.code, PaneErrorCode::NotFound);
+        assert_eq!(
+            err.to_string(),
+            "Herdr project pane error (NOT_FOUND): pane w1:p9 not found"
+        );
+    }
+
+    /// `detectHerdr` refuses an old herdr BEFORE anything is split (`project-agent.ts:154-162`):
+    /// the fake above fails every non-`--version` verb, so reaching the split at all would produce
+    /// `NOT_FOUND` instead of this.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_herdr_older_than_zero_seven_five_is_refused_before_a_pane_is_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_herdr(
+            dir.path(),
+            "herdr 0.7.4",
+            r#"{"id":"cli:request","error":{"code":"no_such_pane","message":"unreachable"}}"#,
+        );
+        let launcher =
+            HerdrLauncher::with_env(|k| (k == ENV_HERDR_BIN).then(|| bin.display().to_string()));
+
+        let err = launcher
+            .open(ProjectPaneRequest {
+                project_root: dir.path().to_path_buf(),
+                focus: true,
+                cancel: &CancelToken::new(),
+            })
+            .await
+            .expect_err("0.7.4 cannot split a raw pane");
+
+        assert_eq!(err.code, PaneErrorCode::UnsupportedVersion);
+        // `Herdr ${version}` where `version` is the WHOLE `--version` line, so a herdr that names
+        // itself doubles the word. That is upstream's own rendering (`:160`), and the sentence is
+        // matched against pi's logs.
+        assert_eq!(
+            err.to_string(),
+            "Herdr project pane error (HERDR_UNSUPPORTED_VERSION): Herdr herdr 0.7.4 does not \
+             support raw panes. Upgrade to Herdr 0.7.5 or newer."
+        );
     }
 
     #[test]

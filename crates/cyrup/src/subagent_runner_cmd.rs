@@ -46,6 +46,11 @@
 //! from `--help` and from `crate::subcommands::SUBCOMMANDS`, and matched only as an exact `argv[1]`
 //! ([`is_selected`]), so it is undiscoverable rather than absent — a user-reachable command surface
 //! that upstream does not have. Recorded here so it is KNOWN rather than mistaken for parity.
+//!
+//! The same mechanism now carries a second reserved token, `__subagent-inspector`
+//! (`crates/cyrup/src/subagent_inspector_cmd.rs`), which stands in for upstream's
+//! `inspector-runner.mjs` (`src/inspectors/actions.ts:90-104` @v0.68.0) for exactly the same
+//! reason and is undiscoverable on exactly the same terms.
 
 use std::path::{Path, PathBuf};
 

@@ -5,8 +5,8 @@
 //! A two-pane frame: a roster of every child this session can see on the left, and on the right
 //! either that child's live transcript (rendered by [`super::fleet_transcript`]) or, when no
 //! transcript is reachable, a structured detail block. Live controls sit on top of it — `s` steers
-//! the selected background child, `D` stops it, `H` opens the Herdr inspector, `x`/`Ctrl+O`
-//! expands tool output, `r` refreshes.
+//! the selected background child, `D` stops it, `Enter`/`H` open an inspector pane for it
+//! (`inspect: ["return", "H"]`, `fleet.ts:45`), `x`/`Ctrl+O` expands tool output, `r` refreshes.
 //!
 //! # The four things this module owns
 //!
@@ -48,23 +48,24 @@
 //!
 //! # Honest deltas vs. pi
 //!
-//! 1. **No steer delivery-mode transport.** The `Tab` cycle over
-//!    [`SteerDeliveryMode`] (`steer`/`follow_up`/`auto`, pi `:628`) is ported and shown in the
-//!    prompt, but cyrup's own steer entry point
-//!    ([`crate::extension::SubagentExecutor::control_steer`]) takes no delivery mode, so all three
-//!    currently deliver identically. The mode reaches the owner verbatim, on
-//!    [`FleetPendingAction::Steer`], so wiring it is a one-line change the day the control channel
-//!    grows the field.
-//! 2. **No Herdr inspector.** `handleHerdrInspectorAction` lives in `src/inspectors/herdr/`, a
-//!    subtree this crate does not port. pi already makes `inspect` OPTIONAL on its handler bundle
-//!    (`fleet.ts:51`), so `H` takes pi's own "Herdr inspector controls are unavailable in this
-//!    context." branch (`:692`) rather than a cyrup-invented one.
-//! 3. **Per-step `label`/`phase`/`context` and nested descendants.** Same three gaps
+//! 1. **Per-step `label`/`phase`/`context` and nested descendants.** Same three gaps
 //!    `background/fleet_view.rs` documents as its deltas 1-2: cyrup's [`crate::background::StepStatus`] carries no
 //!    user-facing label, no phase tag and no per-step fork context, so `label (agent)` collapses to
 //!    the bare agent name and per-step context badges are absent.
-//! 4. **No markdown/highlighting in the transcript pane** — see
+//! 2. **No markdown/highlighting in the transcript pane** — see
 //!    [`super::fleet_transcript`]'s own deltas 1-2.
+//!
+//! Two deltas this module used to carry are **deleted, not reworded**, because their premises
+//! became false in the tree rather than in prose:
+//!
+//! * *"No steer delivery-mode transport"* — SUBA-049 gave
+//!   [`crate::extension::SubagentExecutor::control_steer`] a `mode` parameter
+//!   (`extension/executor/foreground_actions/steer.rs:82`) and
+//!   [`super::fleet_overlay`] passes the `Tab`-selected mode into it, so the three settings no
+//!   longer deliver identically.
+//! * *"No Herdr inspector"* — `crate::inspectors` ports the whole `src/inspectors/` subtree,
+//!   both built-in backends included, so `H`/`Enter` reach a real `inspector.open` and the
+//!   `inspect` handler is no longer absent.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -1464,7 +1465,9 @@ pub struct SubagentFleetComponent {
     terminal_rows: usize,
     /// Whether the owner supplied an action bundle at all — pi's `!this.options.actions` guard.
     has_actions: bool,
-    /// Whether that bundle can service `H` — pi's `!this.options.actions?.inspect` guard.
+    /// Whether that bundle can service the `inspect` binding (`Enter`/`H`, `fleet.ts:45`) — pi's
+    /// `!this.options.actions?.inspect` guard (`:963`). The owner passes `true` once it can route
+    /// to `inspector.open`; `extension/host/slash.rs` is the production site that decides.
     has_inspect: bool,
 }
 
@@ -1671,8 +1674,118 @@ impl SubagentFleetComponent {
         })
     }
 
-    /// pi's `if ("reason" in target || !this.options.actions)` guard, shared by `s`/`D`/`H` and by
-    /// both confirm paths (`fleet.ts:620,647,680,692,698`).
+    /// pi `selectedInspectAction()` (`fleet.ts:947-959`) — **NOT** [`Self::selected_async_action`].
+    ///
+    /// The inspector's target resolver is a separate function upstream and differs on two axes:
+    ///
+    /// 1. A `foreground-active` row whose control names a **parent workflow** resolves to that
+    ///    PARENT's async run (`:957-958` returns `parent.asyncId` / `parent.asyncDir`, with no
+    ///    `index`), because a foreground child has no async directory of its own to mirror. The
+    ///    async resolver refuses that row outright.
+    /// 2. It carries its own refusal sentence for a parent that has settled (`:957`).
+    ///
+    /// Upstream's `item.kind === "external"` rung (`:950`,
+    /// *"External jobs are display-only and have no inspector controls."*) has **no cyrup
+    /// counterpart**: this roster has no external surface at all — `rg -n external
+    /// crates/cyrup-ext-subagents/src/tui/fleet.rs` is zero-hit, and [`FleetItemKind`] has three
+    /// members, none of them `External`. It is not dropped, it is unreachable; the day an external
+    /// surface lands, this is the function that gains the arm.
+    ///
+    /// `[CYRUP-EXCEEDS-UPSTREAM: the parent lookup also consults on-disk history]` — pi looks in
+    /// `state.asyncJobs` then `state.fleetJobs` (`:956`), both in-memory maps. cyrup's
+    /// [`FleetState::history_jobs`] holds runs this process is not tracking in memory but which
+    /// are demonstrably on disk with a live state; refusing to inspect one would be a worse answer
+    /// than pi's for no reason. The actionable-state test is applied identically either way, so
+    /// the widening cannot admit a settled parent.
+    fn selected_inspect_action(&self) -> Result<FleetActionTarget, String> {
+        let Some(item) = self.snapshot.items.get(self.selected) else {
+            return Err("No child is selected.".to_string());
+        };
+
+        // pi `:952-953` — the async rung, with the SAME actionable test the async resolver uses.
+        if let FleetItemKind::Async { run, .. } = &item.kind {
+            if !is_actionable_async_state(run.state_label())
+                || !is_actionable_async_state(&item.state)
+            {
+                return Err(format!(
+                    "Selected child is {}; controls require a running or queued async child.",
+                    item.state
+                ));
+            }
+            return Ok(FleetActionTarget {
+                run_id: item.run_id.clone(),
+                async_dir: run.dir().to_path_buf(),
+                index: item.index,
+            });
+        }
+
+        // pi `:955` — anything that is not a foreground-active row WITH a parent workflow.
+        let FleetItemKind::ForegroundActive { control, .. } = &item.kind else {
+            return Err(
+                "Fleet controls are available for current-session top-level async runs only."
+                    .to_string(),
+            );
+        };
+        let Some(parent_id) = control.parent_workflow_run_id.as_deref() else {
+            return Err(
+                "Fleet controls are available for current-session top-level async runs only."
+                    .to_string(),
+            );
+        };
+
+        // pi `:956-958`.
+        let parent = self
+            .state
+            .tracked_jobs
+            .iter()
+            .chain(self.state.history_jobs.iter())
+            .find(|run| run.status.run_id.as_str() == parent_id)
+            .filter(|run| is_actionable_async_state(run.state_label()));
+        let Some(parent) = parent else {
+            return Err("The parent workflow is no longer available for inspection.".to_string());
+        };
+        Ok(FleetActionTarget {
+            run_id: parent.status.run_id.as_str().to_string(),
+            async_dir: parent.dir().to_path_buf(),
+            // `:958` spreads no `index`: the inspector mirrors the WHOLE parent workflow, not the
+            // foreground child that happened to be selected.
+            index: None,
+        })
+    }
+
+    /// pi `inspectSelected()` (`fleet.ts:961-965`).
+    ///
+    /// The unavailable sentence is upstream's own at v0.68.0 (`:963`) — *"Inspector controls are
+    /// unavailable in this context."*, with **no `"Herdr"`** in it (`git show v0.68.0:src/tui/
+    /// fleet.ts | grep -n Herdr` is zero-hit over 1 448 lines). The handler-presence half of the
+    /// guard is `!this.options.actions?.inspect`, which is [`Self::has_actions`] and
+    /// [`Self::has_inspect`] here.
+    fn inspect_selected(&mut self) -> FleetInputOutcome {
+        let resolved = self.selected_inspect_action().and_then(|target| {
+            if self.has_actions && self.has_inspect {
+                Ok(target)
+            } else {
+                Err("Inspector controls are unavailable in this context.".to_string())
+            }
+        });
+        match resolved {
+            Err(reason) => {
+                self.set_action_notice(FleetActionResult::error(reason));
+                FleetInputOutcome::Rerender
+            }
+            Ok(target) => {
+                if self.action_busy {
+                    return FleetInputOutcome::Ignored;
+                }
+                self.action_busy = true;
+                self.action_notice = None;
+                FleetInputOutcome::RunAction(Box::new(FleetPendingAction::Inspect { target }))
+            }
+        }
+    }
+
+    /// pi's `if ("reason" in target || !this.options.actions)` guard, shared by `s`/`D` and by
+    /// both confirm paths (`fleet.ts:620,647,680,698`).
     fn resolve_action_target(&self, unavailable: &str) -> Result<FleetActionTarget, String> {
         let target = self.selected_async_action()?;
         if !self.has_actions {
@@ -1817,31 +1930,12 @@ impl SubagentFleetComponent {
                 }
                 FleetInputOutcome::Rerender
             }
-            FleetKey::Char('H') => {
-                let resolved = self.selected_async_action().and_then(|target| {
-                    if self.has_actions && self.has_inspect {
-                        Ok(target)
-                    } else {
-                        Err("Herdr inspector controls are unavailable in this context.".to_string())
-                    }
-                });
-                match resolved {
-                    Err(reason) => {
-                        self.set_action_notice(FleetActionResult::error(reason));
-                        FleetInputOutcome::Rerender
-                    }
-                    Ok(target) => {
-                        if self.action_busy {
-                            return FleetInputOutcome::Ignored;
-                        }
-                        self.action_busy = true;
-                        self.action_notice = None;
-                        FleetInputOutcome::RunAction(Box::new(FleetPendingAction::Inspect {
-                            target,
-                        }))
-                    }
-                }
-            }
+            // pi `DEFAULT_FLEET_KEYBINDINGS.inspect = ["return", "H"]` (`fleet.ts:45`) — **Enter as
+            // well as H**, both dispatched through the one `inspectSelected()` (`:1021`'s
+            // `matchesBinding(data, this.keybindings.inspect)`). `Enter` reaches this arm only in
+            // normal mode: the steer draft (pi `:607-643`) and the stop confirmation (`:644-659`)
+            // both return above it, exactly as upstream's earlier branches do.
+            FleetKey::Enter | FleetKey::Char('H') => self.inspect_selected(),
             FleetKey::Char('D') => {
                 match self.resolve_action_target("Fleet controls are unavailable in this context.")
                 {
@@ -2204,9 +2298,13 @@ impl SubagentFleetComponent {
                 self.snapshot.items.len()
             )
         };
+        // pi `fleet.ts:1368`, whose inspect label is `bindingLabel(keybindings, "inspect")` —
+        // `["return", "H"]` rendered by `:67-71`, which maps `return` to `Enter` and joins with
+        // `/`. So upstream's own footer reads `Enter/H Inspect`, and the word is **Inspect**, not
+        // a backend name: `grep -n Herdr` over `fleet.ts` @v0.68.0 is zero-hit.
         let footer = format!(
-            " ↑↓/jk agent · H Herdr · s steer · D stop · x/Ctrl+O tools · r refresh · Esc close · \
-             {position}"
+            " ↑↓/jk agent · Enter/H Inspect · s steer · D stop · x/Ctrl+O tools · r refresh · Esc \
+             close · {position}"
         );
         let mut footer_row = vec![th::fg(Role::Border, "│")];
         footer_row.extend(th::fit(&Line::from(vec![th::fg(Role::Dim, footer)]), inner_width).spans);
@@ -3388,19 +3486,58 @@ mod tests {
         ));
     }
 
+    /// T-FLEET-3 — pi's v0.68.0 wording (`fleet.ts:963`).
+    ///
+    /// GUT: put `"Herdr"` back in the sentence. `git show v0.68.0:src/tui/fleet.ts | grep -n
+    /// Herdr` is zero-hit over 1 448 lines — the message names the FEATURE, not a backend, and
+    /// with the ghostty backend also wired a Herdr-specific refusal would be a lie about which
+    /// host is missing.
     #[test]
-    fn herdr_is_unavailable_without_an_inspect_handler() {
+    fn the_unavailable_message_is_upstreams_v0_68_0_wording() {
         let mut c = component();
         c.handle_input(FleetKey::Down);
         c.handle_input(FleetKey::Char('H'));
         assert_eq!(
             c.action_notice().map(|n| n.text.clone()),
-            Some("Herdr inspector controls are unavailable in this context.".into())
+            Some("Inspector controls are unavailable in this context.".into())
         );
     }
 
+    /// T-FLEET-1 — `inspect: ["return", "H"]` (`fleet.ts:45`): BOTH keys, one handler.
+    ///
+    /// GUT: drop the `FleetKey::Enter` half of the arm and Enter silently does nothing at top
+    /// level, which is the binding upstream lists FIRST. GUT `has_inspect` back to a hard-coded
+    /// refusal and both keys answer the notice instead of dispatching.
     #[test]
-    fn herdr_dispatches_when_an_inspect_handler_exists() {
+    fn h_and_enter_both_route_to_one_inspect_action() {
+        for key in [FleetKey::Char('H'), FleetKey::Enter] {
+            let mut c = SubagentFleetComponent::new(
+                busy_state(),
+                FleetViewOptions::default(),
+                None,
+                true,
+                true,
+            );
+            c.handle_input(FleetKey::Down);
+            let outcome = c.handle_input(key);
+            match outcome {
+                FleetInputOutcome::RunAction(action) => match *action {
+                    FleetPendingAction::Inspect { target } => {
+                        assert_eq!(target.run_id, "bg");
+                        assert_eq!(target.async_dir, run_paths("bg").run_dir);
+                    }
+                    other => panic!("expected Inspect, got {other:?}"),
+                },
+                other => panic!("expected RunAction, got {other:?}"),
+            }
+        }
+    }
+
+    /// Enter must still belong to the steer draft and the stop confirmation, which return ABOVE
+    /// the normal-mode match. GUT the ordering (put the inspect arm first) and Enter stops sending
+    /// a typed steer message.
+    #[test]
+    fn enter_still_sends_a_steer_draft_before_it_inspects() {
         let mut c = SubagentFleetComponent::new(
             busy_state(),
             FleetViewOptions::default(),
@@ -3409,11 +3546,137 @@ mod tests {
             true,
         );
         c.handle_input(FleetKey::Down);
-        let outcome = c.handle_input(FleetKey::Char('H'));
+        c.handle_input(FleetKey::Char('s'));
+        c.handle_input(FleetKey::Char('h'));
+        c.handle_input(FleetKey::Char('i'));
+        let outcome = c.handle_input(FleetKey::Enter);
         assert!(matches!(
             outcome,
-            FleetInputOutcome::RunAction(ref a) if matches!(**a, FleetPendingAction::Inspect { .. })
+            FleetInputOutcome::RunAction(ref a) if matches!(**a, FleetPendingAction::Steer { .. })
         ));
+    }
+
+    /// T-FLEET-2 — the inspect resolver is `selectedInspectAction` (`fleet.ts:947-959`), NOT
+    /// `selectedAsyncAction` (`:926-933`).
+    ///
+    /// GUT: route `inspect_selected` through [`SubagentFleetComponent::selected_async_action`] and
+    /// all three foreground rows below answer *"Fleet controls are available for current-session
+    /// top-level async runs only."* — i.e. a workflow's live child becomes uninspectable, which is
+    /// the single behaviour this separate resolver exists to provide.
+    #[test]
+    fn the_inspect_target_resolver_is_upstreams_not_the_async_one() {
+        // A foreground row with NO parent workflow — upstream `:955`.
+        let mut orphan = SubagentFleetComponent::new(
+            busy_state(),
+            FleetViewOptions::default(),
+            None,
+            true,
+            true,
+        );
+        orphan.handle_input(FleetKey::Char('H'));
+        assert_eq!(
+            orphan.action_notice().map(|n| n.text.clone()),
+            Some(
+                "Fleet controls are available for current-session top-level async runs only."
+                    .into()
+            )
+        );
+
+        // A foreground row whose parent workflow is LIVE — upstream `:958` returns the PARENT's
+        // async id and dir, and spreads no index.
+        let mut child = control("fgchild", "coder", 400);
+        child.parent_workflow_run_id = Some("wf-parent".to_string());
+        let live_parent = FleetState {
+            tracked_jobs: vec![async_run(
+                "wf-parent",
+                RunState::Running,
+                vec![step("a", StepState::Running)],
+                100,
+            )],
+            foreground_controls: vec![child.clone()],
+            ..FleetState::default()
+        };
+        let mut c =
+            SubagentFleetComponent::new(live_parent, FleetViewOptions::default(), None, true, true);
+        let outcome = c.handle_input(FleetKey::Char('H'));
+        match outcome {
+            FleetInputOutcome::RunAction(action) => match *action {
+                FleetPendingAction::Inspect { target } => {
+                    assert_eq!(target.run_id, "wf-parent");
+                    assert_eq!(target.async_dir, run_paths("wf-parent").run_dir);
+                    assert_eq!(target.index, None);
+                }
+                other => panic!("expected Inspect, got {other:?}"),
+            },
+            other => panic!("expected RunAction, got {other:?}"),
+        }
+
+        // The same row with a SETTLED parent — upstream `:957`.
+        let settled_parent = FleetState {
+            tracked_jobs: vec![async_run(
+                "wf-parent",
+                RunState::Complete,
+                vec![step("a", StepState::Complete)],
+                100,
+            )],
+            foreground_controls: vec![child],
+            ..FleetState::default()
+        };
+        let mut settled = SubagentFleetComponent::new(
+            settled_parent,
+            FleetViewOptions::default(),
+            None,
+            true,
+            true,
+        );
+        settled.handle_input(FleetKey::Char('H'));
+        assert_eq!(
+            settled.action_notice().map(|n| n.text.clone()),
+            Some("The parent workflow is no longer available for inspection.".into())
+        );
+    }
+
+    /// The async rung keeps `selectedAsyncAction`'s actionable test (`fleet.ts:952`). GUT it and
+    /// `H` opens an inspector on a run that has already finished — a pane that renders one settled
+    /// frame forever and accepts steering that can never land.
+    #[test]
+    fn a_settled_async_child_is_refused_by_the_inspect_resolver() {
+        let state = FleetState {
+            tracked_jobs: vec![async_run(
+                "done",
+                RunState::Complete,
+                vec![step("a", StepState::Complete)],
+                100,
+            )],
+            ..FleetState::default()
+        };
+        let mut c =
+            SubagentFleetComponent::new(state, FleetViewOptions::default(), None, true, true);
+        c.handle_input(FleetKey::Char('H'));
+        assert!(
+            c.action_notice()
+                .unwrap()
+                .text
+                .contains("controls require a running or queued async child")
+        );
+    }
+
+    /// An empty roster — upstream `:949`. GUT the `get(self.selected)` guard into an index and
+    /// this panics on a fleet with nothing in it.
+    #[test]
+    fn inspect_with_nothing_selected_says_so() {
+        let mut c = SubagentFleetComponent::new(
+            FleetState::default(),
+            FleetViewOptions::default(),
+            None,
+            true,
+            true,
+        );
+        c.handle_input(FleetKey::Enter);
+        assert_eq!(
+            c.action_notice().map(|n| n.text.clone()),
+            Some("No child is selected.".into())
+        );
     }
 
     #[test]
@@ -3502,7 +3765,7 @@ mod tests {
         assert!(text.contains("· live controls"), "{text}");
         assert!(text.contains("› ● coder"), "{text}");
         assert!(
-            text.contains("↑↓/jk agent · H Herdr · s steer · D stop"),
+            text.contains("↑↓/jk agent · Enter/H Inspect · s steer · D stop"),
             "{text}"
         );
         assert!(text.contains("1/2"), "{text}");
