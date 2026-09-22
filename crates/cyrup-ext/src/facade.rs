@@ -1469,6 +1469,20 @@ impl ExtensionHost {
     /// A faulting or panicking extension is CONTAINED and treated as `undefined`. That direction
     /// is load-bearing rather than merely tidy: the alternative (fail closed) would let one broken
     /// extension swallow the user's keyboard with no way to type the command that unloads it.
+    ///
+    /// # This is awaited on the TUI's input path
+    ///
+    /// UW-7 wired `cyrup_tui::app::App::offer_input_to_extensions` to this method, ahead of the
+    /// focused component, so every keystroke of an interactive session with a subscriber passes
+    /// through here. Two consequences, and only the first is handled:
+    ///
+    /// * **Native handlers must not block** (hazard H1). [`NativeExtension::on_terminal_input`]'s
+    ///   own doc states the prohibition and the deadlock it prevents.
+    /// * **A WASM guest's handler is genuinely `async`** (`LiveExtension::on_terminal_input`, `crate::host::live`)
+    ///   and is NOT budgeted here (hazard H2): a guest that stalls stalls the key path. No guest
+    ///   subscribes today — `git grep -rn subscribe_terminal_input -- crates/` finds no guest
+    ///   crate, only this crate and the SDK that declares the import — so nothing exercises it,
+    ///   and `crate::host::limits` is where a budget would go when one does.
     pub async fn terminal_input(&self, data: &str) -> TerminalInputDecision {
         let owners = self
             .registry
@@ -1748,6 +1762,23 @@ impl ExtensionHost {
     /// byte-identical to a build with no host at all.
     pub fn has_markdown_transformers(&self) -> bool {
         self.registry.has_markdown_transformers().unwrap_or(false)
+    }
+
+    /// Whether ANY extension subscribed to raw terminal input (EXT-021 / UW-7) — the sync
+    /// pre-check twin of [`Self::has_markdown_transformers`], for [`Self::terminal_input`].
+    ///
+    /// [`Self::terminal_input`] already early-returns the identity on an empty subscriber list, so
+    /// this answers nothing the fold could not. What it buys is the *shape* of the call, and here
+    /// the shape is the whole point: the consumer (`cyrup_tui::app::App::offer_input_to_extensions`)
+    /// runs on the KEYSTROKE path, ahead of the focused component, so reaching the fold means an
+    /// `.await`, a cloned owner list and a `String` allocation for every key the user types.
+    /// Gating on this keeps an extension-less session's key path exactly what it was before UW-7:
+    /// one rwlock read. Upstream guards the identical block the identical way —
+    /// `if (this.inputListeners.size > 0)` (`packages/tui/src/tui.ts:773` @v0.83.0).
+    pub fn has_terminal_input_subscribers(&self) -> bool {
+        self.registry
+            .has_terminal_input_subscribers()
+            .unwrap_or(false)
     }
 
     pub fn registry(&self) -> &ExtensionRegistry {

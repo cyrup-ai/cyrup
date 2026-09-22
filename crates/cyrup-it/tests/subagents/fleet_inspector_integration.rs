@@ -627,3 +627,247 @@ fn fleet_view_placement_is_resolved_from_config() {
         FleetViewPlacement::BelowEditor
     );
 }
+
+// =================================================================================================
+// (4) UW-7 — the roster receives real keystrokes, through the real host fold
+// =================================================================================================
+//
+// The unit tests on both sides of this seam drive their own halves: `cyrup-tui`'s fold is called
+// directly, and `SubagentsExtension::dispatch_terminal_input` is called directly. Neither can show
+// that a keystroke handed to `ExtensionHost::terminal_input` — the dispatcher the TUI's input arm
+// actually awaits — reaches the fleet widget and comes back as pi's `{ consume: true }`. That
+// needs the real registry, the real subscription declared by `init`, the real native dispatch, and
+// a fleet with something genuinely running in it. This is that test.
+//
+// The child is a REAL OS process (the scripted NDJSON fixture), because the fleet-status widget's
+// projection deliberately reads only LIVE work — `collect_fleet_status_entries` keeps active
+// entries and never scans on-disk history (`tui/fleet-status.ts:147-239` @v0.43.0). A
+// `status.json` fixture, which section (3) above uses for the INSPECTOR, would show nothing here.
+
+/// How long the scripted child blocks. Long enough that the whole key sequence below runs while
+/// the run is genuinely live, which is the precondition for the widget having any entry at all.
+const UW7_CHILD_SLEEP_MS: u64 = 20_000;
+
+/// One `message_end` NDJSON line — the fixture's terminal turn. Lifted from
+/// `subagents_detach_integration.rs`, whose own copy is lifted from
+/// `background_spawn_detached_integration.rs`: these files are siblings in one test binary but
+/// their fixtures are module-private, and making them shared would couple four unrelated suites to
+/// one another's script shapes.
+fn uw7_message_end_line(text: &str) -> String {
+    serde_json::json!({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "usage": {
+                "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": 2,
+                "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+            },
+            "stopReason": "stop"
+        }
+    })
+    .to_string()
+}
+
+/// A child that BLOCKS, so the fleet has a live entry for the whole test.
+fn uw7_blocking_script(dir: &std::path::Path) -> std::path::PathBuf {
+    let script = serde_json::json!({
+        "steps": [
+            { "kind": "sleep_ms", "ms": UW7_CHILD_SLEEP_MS },
+            { "kind": "emit", "line": uw7_message_end_line("UW7_CHILD_FINISHED") }
+        ],
+        "exit_code": 0
+    });
+    let path = dir.join("uw7-blocking.json");
+    std::fs::write(&path, script.to_string()).expect("write fixture script");
+    path
+}
+
+/// The persona the run below resolves, through the REAL project-scope pipeline.
+fn uw7_write_persona(cwd: &std::path::Path) {
+    let agents = cwd.join(".cyrup").join("agents");
+    std::fs::create_dir_all(&agents).expect("mkdir .cyrup/agents");
+    std::fs::write(
+        agents.join("worker.md"),
+        "---\nname: worker\ndescription: a blocking fixture persona for the UW-7 roster proof\n\
+         model: fixture/model\n---\n\nYou are a trivial test persona.\n",
+    )
+    .expect("write worker persona");
+}
+
+/// The capability backend the fold reads its two guards off, and the widget publishes through.
+/// `editor_has_focus` and `editor_text` are what `cyrup-tui`'s `EditorFocusMirror` /
+/// `EditorTextMirror` carry in a live session; here they are the canned "empty editor, editor
+/// focused" state in which pi lets `↓` activate the roster (`tui/fleet-status.ts:706-713`).
+#[derive(Default)]
+struct RosterKeyHost {
+    widgets: Mutex<Vec<WidgetEffect>>,
+}
+
+impl HostServices for RosterKeyHost {
+    fn set_widget(&self, key: &str, lines: Option<&[String]>, placement: WidgetPlacement) {
+        self.widgets
+            .lock()
+            .expect("widget lock")
+            .push(WidgetEffect {
+                key: key.to_string(),
+                lines: lines.map(<[String]>::to_vec),
+                placement,
+            });
+    }
+    fn session_id(&self) -> Option<String> {
+        Some(TEST_SESSION_ID.to_string())
+    }
+    fn editor_text(&self) -> String {
+        String::new()
+    }
+    fn editor_has_focus(&self) -> bool {
+        true
+    }
+}
+
+impl RosterKeyHost {
+    /// The most recent payload published under the fleet-status key, flattened to text.
+    fn latest_fleet_widget(&self) -> Option<String> {
+        self.widgets
+            .lock()
+            .expect("widget lock")
+            .iter()
+            .rev()
+            .find(|effect| effect.key == FLEET_STATUS_WIDGET_KEY)
+            .map(|effect| effect.lines.clone().unwrap_or_default().join("\n"))
+    }
+}
+
+/// **T13** — end to end: an extension loaded into a real [`cyrup_ext::ExtensionHost`] subscribes to
+/// raw terminal input at `init`, and `host.terminal_input("\x1b[B")` — the exact call
+/// `cyrup-tui`'s input arm awaits — expands the fleet roster and CONSUMES the keystroke.
+///
+/// The three assertions, in the order the user experiences them:
+/// 1. the collapsed status line is published while the run is live (the state UW-7 starts from);
+/// 2. `↓` answers [`cyrup_ext::TerminalInputDecision::Consume`] — pi's `{ consume: true }`
+///    (`tui/fleet-status.ts:713`) — so the arrow never reaches the editor;
+/// 3. the republished payload is the EXPANDED roster, naming the running agent.
+///
+/// MUTATION: drop `api.subscribe_terminal_input()` from `init` — the host folds nothing, the
+/// decision is `Deliver("\x1b[B")`, and assertion 2 fails. Observed RED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_down_arrow_through_the_host_expands_the_live_fleet_roster() {
+    use cyrup_ext_subagents::spawn::SpawnCommand;
+
+    let home = sandbox_home();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cwd = dir.path();
+    uw7_write_persona(cwd);
+    let script = uw7_blocking_script(cwd);
+
+    let ext = std::sync::Arc::new(SubagentsExtension::with_config_and_cwd(
+        SubagentExtensionConfig {
+            // A FOREGROUND run: `foreground_controls` is what the status widget's projection reads.
+            async_by_default: false,
+            spawn_command: Some(SpawnCommand {
+                binary: crate::support::bins::subagent_fixture(),
+                base_args: vec!["--fixture-script".to_string(), script.display().to_string()],
+            }),
+            roots: Roots::sandboxed(home.path()),
+            ..SubagentExtensionConfig::default()
+        },
+        cwd.to_path_buf(),
+    ));
+    let services = std::sync::Arc::new(RosterKeyHost::default());
+    ext.set_host_services(services.clone());
+
+    // The REAL host, and the real `init` — which is where `subscribe_terminal_input` is declared.
+    let host = cyrup_ext::ExtensionHost::new(cyrup_ext::HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: cwd.to_path_buf(),
+    });
+    host.load_native(std::sync::Arc::clone(&ext) as std::sync::Arc<dyn NativeExtension>)
+        .await
+        .expect("the subagents extension loads");
+    assert!(
+        host.has_terminal_input_subscribers(),
+        "`init` must declare the subscription, or the TUI's fold skips this extension entirely"
+    );
+
+    // A live foreground run, detached from this task so the test can act while it blocks.
+    let executor = std::sync::Arc::clone(ext.executor());
+    let run_cwd = cwd.to_path_buf();
+    let run = tokio::spawn(async move {
+        executor
+            .run_foreground(
+                &run_cwd,
+                "worker",
+                "block for the roster proof",
+                None,
+                None,
+                None,
+            )
+            .await
+    });
+
+    // Wait for the control to appear, then let the widget publish its collapsed line. The tick is
+    // an `AgentEnd` edge, which is what `refresh_fleet_status_widget` rides in production.
+    let ctx = HostCtx::event(ExtMode::Tui, true, cwd.to_path_buf());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let collapsed = loop {
+        ext.on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &ctx,
+        )
+        .await;
+        if let Some(text) = services.latest_fleet_widget()
+            && text.contains("↓/← to inspect")
+        {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fleet-status widget never published a collapsed line for a live foreground run \
+             — without that there is no roster for a keystroke to expand; saw {:?}",
+            services.latest_fleet_widget()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert!(
+        collapsed.contains("active agent"),
+        "the collapsed line counts the live agent, got:\n{collapsed}"
+    );
+
+    // THE KEY. `\x1b[B` is `encode_terminal_key(Down)`'s canonical form, i.e. exactly the bytes
+    // `cyrup-tui`'s fold puts on this wire.
+    assert_eq!(
+        host.terminal_input("\x1b[B").await,
+        cyrup_ext::TerminalInputDecision::Consume,
+        "`↓` on an empty, focused editor must be CONSUMED by the fleet widget — delivering it \
+         means the arrow moved the editor cursor instead of expanding the roster (UW-7)"
+    );
+
+    let expanded = services
+        .latest_fleet_widget()
+        .expect("the consumed key must republish the widget");
+    assert!(
+        !expanded.contains("↓/← to inspect"),
+        "the collapsed hint line means the roster never expanded, got:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("worker"),
+        "the expanded roster names the running agent, got:\n{expanded}"
+    );
+
+    // And a key the roster does NOT claim still falls through — pi's catch-all returns `undefined`
+    // (`tui/fleet-status.ts:752-753`), so the character reaches the editor unchanged.
+    assert_eq!(
+        host.terminal_input("z").await,
+        cyrup_ext::TerminalInputDecision::Deliver("z".to_string()),
+        "an unmatched key must still reach the editor, or a subscribed extension has eaten the \
+         keyboard"
+    );
+
+    run.abort();
+    let _ = run.await;
+}

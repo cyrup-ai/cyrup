@@ -35,7 +35,12 @@
 //!   and exposes it as three plain calls the owner drives: [`SubagentFleetStatus::refresh`],
 //!   [`SubagentFleetStatus::handle_key`] and [`SubagentFleetStatus::widget_payload`]. What pi's
 //!   interval does, the owner's poll does; what pi's `onTerminalInput` does, the owner's key
-//!   forwarding does.
+//!   forwarding does. **That owner is
+//!   [`crate::extension::host::terminal_input`]** (UW-7): it subscribes through
+//!   `InitApi::subscribe_terminal_input`, parses the raw chunk with
+//!   [`FleetStatusKey::from_terminal_data`], calls [`SubagentFleetStatus::handle_key`], and
+//!   republishes — the last of which is the owner's job here where it is inline upstream, see
+//!   below.
 //! * **Stale-context detection.** pi's `isStaleExtensionContextError` (`:140-145`) sniffs two
 //!   error message substrings because "Pi currently exposes stale contexts as plain Errors without
 //!   a stable code or subtype" (its own comment). cyrup has no throwing context — `has_ui` is a
@@ -1455,6 +1460,83 @@ impl FleetStatusKey {
             is_release: false,
         }
     }
+
+    /// Parse one RAW terminal chunk — what pi's `ctx.ui.onTerminalInput((data) =>
+    /// this.handleKey(data))` hands over (`fleet-status.ts:577-578` @v0.68.0) — into the key
+    /// [`SubagentFleetStatus::handle_key`] consumes.
+    ///
+    /// This is pi's `matchesKey(data, …)` / `isKeyRelease(data)` pair
+    /// (`pi/packages/tui/src/keys.ts:820`, `:527` @v0.83.0) collapsed onto the seven
+    /// [`FleetStatusKeyCode`] variants. The sequence table itself is NOT re-implemented here: it
+    /// lives once, in [`cyrup_ext::decode_terminal_key`], beside the seam's own contract types and
+    /// beside the ENCODER `cyrup-tui` uses to put these bytes on the wire in the first place. Two
+    /// independently written halves that must agree byte for byte is a defect waiting to happen;
+    /// one table with a round-trip test cannot drift.
+    ///
+    /// # Total by design
+    ///
+    /// There is no `None`. Every chunk is some key, and pi's handler ends in a catch-all —
+    /// `this.deactivate(); return undefined;` (`fleet-status.ts:752-753`) — that fires for any
+    /// data none of its `matchesKey` arms claimed. So a chunk the table does not recognise, and a
+    /// chunk that carries a MODIFIER (pi's arms all test `modifier === 0` for these keys), both
+    /// become [`FleetStatusKeyCode::Other`]: "some other key", which deactivates an open roster.
+    /// Answering `None` instead would mean "nothing happened", and `ctrl+p` would leave the roster
+    /// open where upstream closes it.
+    ///
+    /// `is_release` is pi's `isKeyRelease(data)`, which [`SubagentFleetStatus::handle_key`] checks
+    /// before anything else (`:699`).
+    ///
+    /// \[CYRUP-DELTA] `cyrup-ext-subagents` must not depend on `cyrup-tui` (arch-SA §1.1/§6.1,
+    /// restated in this module's doc), so this cannot reach `cyrup-tui`'s `Key::parse`. It does
+    /// not need to: the shared table is in `cyrup-ext`, which BOTH crates already depend on, so
+    /// the layering rule costs nothing here.
+    #[must_use]
+    pub fn from_terminal_data(data: &str) -> Self {
+        let Some(ev) = cyrup_ext::decode_terminal_key(data) else {
+            return Self {
+                code: FleetStatusKeyCode::Other,
+                // pi tests `isKeyRelease(data)` on the RAW chunk, independently of whether any
+                // `matchesKey` arm claimed it (`fleet-status.ts:699`), so an unrecognised release
+                // is still a release and is still ignored rather than deactivating the roster.
+                is_release: is_key_release(data),
+            };
+        };
+        let code = if ev.modifiers.is_empty() {
+            match ev.key {
+                cyrup_ext::TerminalKey::Up => FleetStatusKeyCode::Up,
+                cyrup_ext::TerminalKey::Down => FleetStatusKeyCode::Down,
+                cyrup_ext::TerminalKey::Left => FleetStatusKeyCode::Left,
+                cyrup_ext::TerminalKey::Escape => FleetStatusKeyCode::Escape,
+                cyrup_ext::TerminalKey::Enter => FleetStatusKeyCode::Enter,
+                cyrup_ext::TerminalKey::Char(c) => FleetStatusKeyCode::Char(c),
+                // pi has no `right` arm in `handleKey` at all, so `→` reaches the catch-all.
+                cyrup_ext::TerminalKey::Right => FleetStatusKeyCode::Other,
+            }
+        } else {
+            FleetStatusKeyCode::Other
+        };
+        Self {
+            code,
+            is_release: ev.release,
+        }
+    }
+}
+
+/// pi's `isKeyRelease(data)` (`pi/packages/tui/src/keys.ts:527-549` @v0.83.0), for the chunks
+/// [`cyrup_ext::decode_terminal_key`] does not claim.
+///
+/// Upstream's own implementation is exactly this substring scan — it does not parse. The two
+/// guards are both pi's: bracketed-paste content is never a release however much it looks like
+/// one (`:531-535`, whose comment cites a Bluetooth MAC address as the real-world false positive),
+/// and a kitty event-type-3 event is identified by `:3` immediately before the sequence's final
+/// byte (`:539-548`).
+fn is_key_release(data: &str) -> bool {
+    if data.contains("\x1b[200~") {
+        return false;
+    }
+    [":3u", ":3~", ":3A", ":3B", ":3C", ":3D", ":3H", ":3F"]
+        .iter()
+        .any(|marker| data.contains(marker))
 }
 
 #[cfg(test)]
@@ -1826,6 +1908,104 @@ mod tests {
         assert!(text.contains("2 active agents"), "{text}");
         assert!(text.contains("↓ 3.0k tokens"), "{text}");
         assert!(text.contains("↓/← to inspect"), "{text}");
+    }
+
+    /// **T6** — `FleetStatusKey::from_terminal_data` maps every arm `handle_key` matches on, off
+    /// the ONE shared table in `cyrup-ext`, and routes everything else to pi's catch-all.
+    ///
+    /// MUTATION: make the `Char` arm answer `Other` — `j`/`k` stop moving the roster (pi binds
+    /// both, `fleet-status.ts:715,721`) and instead deactivate it, and the third block fails.
+    /// Observed RED.
+    #[test]
+    fn from_terminal_data_maps_every_arm_handle_key_matches_on() {
+        // The canonical legacy forms `cyrup-tui`'s encoder emits.
+        for (data, code) in [
+            ("\x1b[A", FleetStatusKeyCode::Up),
+            ("\x1b[B", FleetStatusKeyCode::Down),
+            ("\x1b[D", FleetStatusKeyCode::Left),
+            ("\x1b", FleetStatusKeyCode::Escape),
+            ("\r", FleetStatusKeyCode::Enter),
+        ] {
+            assert_eq!(
+                FleetStatusKey::from_terminal_data(data),
+                FleetStatusKey::press(code),
+                "{data:?}"
+            );
+        }
+        // The alternates a real terminal sends: SS3 (application cursor keys), kitty CSI u, and
+        // xterm modifyOtherKeys. All accepted, all pi arms.
+        for (data, code) in [
+            ("\x1bOA", FleetStatusKeyCode::Up),
+            ("\x1bOB", FleetStatusKeyCode::Down),
+            ("\n", FleetStatusKeyCode::Enter),
+            ("\x1b[27u", FleetStatusKeyCode::Escape),
+            ("\x1b[27;1;13~", FleetStatusKeyCode::Enter),
+        ] {
+            assert_eq!(
+                FleetStatusKey::from_terminal_data(data),
+                FleetStatusKey::press(code),
+                "{data:?}"
+            );
+        }
+        // pi's printable arm: `j` and `k` are the roster's vi bindings, and every other printable
+        // reaches the catch-all through `handle_key`, not through the parser.
+        for c in ['j', 'k', 'q', '7'] {
+            assert_eq!(
+                FleetStatusKey::from_terminal_data(&c.to_string()),
+                FleetStatusKey::press(FleetStatusKeyCode::Char(c)),
+                "{c:?}"
+            );
+        }
+    }
+
+    /// Everything else is pi's catch-all — `Other`, which DEACTIVATES an open roster
+    /// (`fleet-status.ts:752-753`) — and never a "nothing happened".
+    ///
+    /// A MODIFIED key counts as other: every arm pi matches these keys in tests `modifier === 0`
+    /// (`pi/packages/tui/src/keys.ts:1063`, `:1091`, `:839`, `:919`), so `ctrl+↓` closes the
+    /// roster rather than scrolling it.
+    ///
+    /// MUTATION: return the unmodified code for a modified key — `ctrl+j` moves the roster
+    /// selection where upstream closes it, and the modified block fails. Observed RED.
+    #[test]
+    fn everything_else_is_pis_catch_all() {
+        for data in [
+            "\t",            // tab
+            "\x1b[C",        // right arrow: pi has no `right` arm in `handleKey`
+            "\x1b[5~",       // page up
+            "\x1b[<0;10;5M", // an SGR mouse report
+            "",              // an empty chunk
+        ] {
+            assert_eq!(
+                FleetStatusKey::from_terminal_data(data),
+                FleetStatusKey::press(FleetStatusKeyCode::Other),
+                "{data:?}"
+            );
+        }
+        // Modified: the kitty forms `cyrup-tui`'s encoder emits for `ctrl+↓` and `ctrl+j`.
+        for data in ["\x1b[1;5B", "\x1b[106;5u"] {
+            assert_eq!(
+                FleetStatusKey::from_terminal_data(data),
+                FleetStatusKey::press(FleetStatusKeyCode::Other),
+                "{data:?}"
+            );
+        }
+    }
+
+    /// pi's `isKeyRelease(data)` (`fleet-status.ts:699`), including for chunks the table does not
+    /// otherwise claim — upstream tests it on the RAW data, independently of `matchesKey`.
+    ///
+    /// MUTATION: delete the `is_key_release(data)` call from the unrecognised-chunk arm — a
+    /// released `Tab` reads as a press of `Other` and deactivates the roster, so the second
+    /// assertion fails. Observed RED.
+    #[test]
+    fn a_release_is_a_release_even_when_the_key_is_not_ours() {
+        assert!(FleetStatusKey::from_terminal_data("\x1b[1;1:3B").is_release);
+        // Kitty Tab, released: not in the vocabulary, still a release.
+        assert!(FleetStatusKey::from_terminal_data("\x1b[9;1:3u").is_release);
+        // Bracketed paste content is never a release, however much it looks like one — pi
+        // `keys.ts:531-535`, whose comment names a Bluetooth MAC address as the false positive.
+        assert!(!FleetStatusKey::from_terminal_data("\x1b[200~90:62:3F:A5\x1b[201~").is_release);
     }
 
     #[test]

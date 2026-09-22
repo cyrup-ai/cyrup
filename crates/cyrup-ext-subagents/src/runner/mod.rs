@@ -109,11 +109,20 @@ impl AgentRunnerConfig {
 /// instead of derived.
 #[must_use]
 pub fn runner_to_json_string(runner: &AgentRunnerConfig) -> String {
-    // Built as an ordered list of `"key":value` fragments rather than a `serde_json::Map`: this
-    // crate does not enable serde_json's `preserve_order` feature, so a `Map` is a `BTreeMap` and
-    // would emit keys ALPHABETICALLY (`command` before `type`), breaking the byte-stable
-    // round-trip an author's file depends on. Values still go through `serde_json` so escaping is
-    // correct; only the ORDER is hand-controlled, and it is upstream's own.
+    // Built as an ordered list of `"key":value` fragments rather than a `serde_json::Map`, so the
+    // emission order is upstream's own and is hand-controlled here rather than inherited from a
+    // map type. Values still go through `serde_json` so escaping is correct; only the ORDER is
+    // hand-written.
+    //
+    // CORRECTED 2026-09-22: this comment used to justify the `Vec` by claiming "this crate does
+    // not enable serde_json's `preserve_order` feature, so a `Map` is a `BTreeMap`". That reason
+    // is FALSE at HEAD and has been since 2026-09-05 — the workspace declares
+    // `serde_json = { features = ["preserve_order"] }` (`Cargo.toml:189`, pinned by
+    // `preserve_order_is_declared_workspace_wide` in `cyrup-core`; `Cargo.toml:348` records the
+    // change), so a `Map` would be an `IndexMap` and would preserve insertion order. The `Vec` is
+    // still the right shape — it keeps the order explicit at the call site instead of depending on
+    // a workspace feature flag a future dependency change could move — but do not re-derive the
+    // old reason from this code: only the comment was wrong, never the output.
     let mut fields: Vec<String> = Vec::new();
     let mut push = |key: &str, value: &Value| {
         fields.push(format!(

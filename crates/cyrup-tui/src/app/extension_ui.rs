@@ -194,6 +194,11 @@ impl<B: Backend> App<B> {
         switch: crate::theme_access::ThemeSwitchSink,
     ) {
         services.attach_editor_mirror(self.state.editor_mirror.clone());
+        // UW-7 — the focus half of the same editor readback family, attached here for the reason
+        // the text half is: `LiveHostServices` otherwise keeps the trait default (`false`) in
+        // every mode, including this one, and an extension that gates on editor focus would be
+        // permanently inert.
+        services.attach_editor_focus_mirror(self.state.editor_focus_mirror.clone());
         let access = Arc::new(crate::theme_access::TuiThemeAccess::new(
             resources,
             &self.state.theme.name,
@@ -207,7 +212,8 @@ impl<B: Backend> App<B> {
         self.publish_extension_readbacks();
     }
 
-    /// Republish the state behind the interactive read-back seams (SEAM-T01/T02).
+    /// Republish the state behind the interactive read-back seams (SEAM-T01/T02, and UW-7's
+    /// editor-focus half).
     ///
     /// Called from [`Self::draw`], which is the one choke point every run-loop arm that can have
     /// changed the editor or the theme passes through — the same reasoning that puts
@@ -222,6 +228,11 @@ impl<B: Backend> App<B> {
         self.state
             .editor_mirror
             .publish(self.state.editor.expanded_text());
+        // UW-7 — pi's `editorHasFocus()`. Published from the routing chain's own state rather
+        // than from the editor's `?1004` window-focus flag; see
+        // [`App::editor_has_keyboard_focus`].
+        let has_focus = self.editor_has_keyboard_focus();
+        self.state.editor_focus_mirror.publish(has_focus);
         if let Some(access) = self.state.theme_access.as_ref() {
             access.publish_active(&self.state.theme.name);
         }

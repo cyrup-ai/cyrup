@@ -271,6 +271,18 @@ impl NativeExtension for SubagentsExtension {
                 // `Full` arm only — a `ChildSafe` fanout child registers no orchestrator UI, so it
                 // binds no key either. `None` here is upstream's falsy config value: no chord.
                 // The press lands at `Self::execute_shortcut` below.
+                // UW-7 — pi `ctx.ui.onTerminalInput((data) => this.handleKey(data))`
+                // (`tui/fleet-status.ts:577-578` @v0.68.0), which upstream arms from
+                // `SubagentFleetStatus.setContext(ctx)`. Gated on `fleet_view_enabled` for the
+                // same reason `refresh_fleet_status_widget` is: with the fleet view off, upstream
+                // never constructs a `SubagentFleetStatus` at all (`extension/index.ts:497-511`),
+                // so there is nothing for a keystroke to reach and the seam must not cost the key
+                // path an `.await` per keypress. The handler is
+                // [`cyrup_ext::NativeExtension::on_terminal_input`] below.
+                if self.fleet_view_enabled {
+                    api.subscribe_terminal_input();
+                }
+
                 if let Some(key) = self.foreground_detach_shortcut() {
                     api.register_shortcut(
                         key,
@@ -1011,6 +1023,22 @@ impl NativeExtension for SubagentsExtension {
         ctx.require_command_tier()?;
         crate::extension::host::slash_inspect_rpc::record_attached_mode(ctx.mode);
         self.dispatch_shortcut(key).await
+    }
+
+    /// UW-7 — one raw terminal chunk, offered to the always-on fleet-status widget before the
+    /// editor sees it. pi `ctx.ui.onTerminalInput((data) => this.handleKey(data))`
+    /// (`tui/fleet-status.ts:577-578` @v0.68.0).
+    ///
+    /// SYNC, matching the trait (`cyrup-ext/src/native.rs`) — only the WASM tier is async — so the
+    /// whole body is lock, decide, maybe republish. The one thing that must not happen here is a
+    /// blocking capability call, and the one arm that would reach one (`Enter` → the fleet
+    /// overlay → `open_overlay`) spawns instead, exactly as upstream's detached microtask does;
+    /// see [`crate::extension::host::terminal_input`] for the deadlock that prevents.
+    ///
+    /// Only consulted at all when `init` declared the subscription, which it does under the
+    /// `fleet_view_enabled` gate above.
+    fn on_terminal_input(&self, data: &str) -> Option<cyrup_ext::TerminalInputResult> {
+        self.dispatch_terminal_input(data)
     }
 
     /// Late-bind the live capability backend (P-1, reconciliation §2 item 1). The session builder

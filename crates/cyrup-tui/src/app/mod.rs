@@ -67,6 +67,8 @@ mod share;
 mod shell;
 mod state;
 mod submit;
+/// UW-7 — the raw-terminal-input seam's host side: pi's `TUI.handleInput` listener fold.
+mod terminal_input;
 mod tree_nav;
 
 pub use action::{AppAction, AppCommand, CycleDirection};

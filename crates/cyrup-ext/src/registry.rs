@@ -614,6 +614,13 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.terminal_input_subscribers.clone())
     }
 
+    /// Whether the subscriber list is non-empty, WITHOUT cloning it — pi's own guard,
+    /// `if (this.inputListeners.size > 0)` (`packages/tui/src/tui.ts:773`). See
+    /// [`crate::ExtensionHost::has_terminal_input_subscribers`] for why the shape matters.
+    pub fn has_terminal_input_subscribers(&self) -> Result<bool, ExtError> {
+        Ok(!self.lock_read()?.terminal_input_subscribers.is_empty())
+    }
+
     pub fn message_renderer_owner(
         &self,
         custom_type: &str,

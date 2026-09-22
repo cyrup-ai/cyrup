@@ -185,6 +185,7 @@ pub use aggregate::{
 pub use bus::SharedBus;
 pub use contract::{
     EventPatch, HandledValue, HookOutcome, Reduced, TerminalInputDecision, TerminalInputResult,
+    TerminalKey, TerminalKeyEvent, TerminalKeyModifiers, decode_terminal_key, encode_terminal_key,
 };
 pub use dispatch::{Dispatcher, ErrorListener, ExtensionError};
 

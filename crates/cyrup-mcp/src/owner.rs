@@ -479,6 +479,7 @@ impl cyrup_ext::HostServices for OwnedServices {
         // for `models` (`json!([])`) and `context_usage` (`json!({})`) above. A caller that reads
         // `entries()` with `as_array()` therefore sees an empty transcript, not "unavailable".
         fn editor_text(&self) -> String => String::new();
+        fn editor_has_focus(&self) -> bool => false;
         fn set_editor_text(&self, text: &str, is_paste: bool) => ();
         fn theme_list(&self) -> serde_json::Value => serde_json::json!([]);
         fn theme_by_name(&self, name: &str) -> Option<serde_json::Value> => None;

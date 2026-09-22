@@ -14,6 +14,9 @@ pub(crate) mod slash_detach;
 pub(crate) mod slash_inspect_rpc;
 pub(crate) mod slash_render;
 pub(crate) mod slash_steer;
+/// UW-7 — the `ctx.ui.onTerminalInput` half of the fleet-status widget
+/// (`pi-subagents/src/tui/fleet-status.ts:577-578` @v0.68.0).
+pub(crate) mod terminal_input;
 
 use std::path::PathBuf;
 use std::sync::Arc;

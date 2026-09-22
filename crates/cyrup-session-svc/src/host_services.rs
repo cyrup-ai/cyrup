@@ -434,6 +434,50 @@ impl EditorTextMirror {
     }
 }
 
+/// The interactive editor's extension-visible FOCUS cell (UW-7) — the source behind
+/// [`HostServices::editor_has_focus`], i.e. pi's `editorHasFocus()`
+/// (`pi-subagents/src/tui/fleet-status.ts:965-976` @v0.68.0).
+///
+/// A sibling of [`EditorTextMirror`] rather than a second field on it, because the two answer
+/// different questions and are read by different guards. Both are published together by
+/// `App::publish_extension_readbacks`, so neither can go stale without the other.
+///
+/// **What it holds.** Whether the EDITOR is the component the key path would route to — not
+/// whether the terminal window has the OS focus. cyrup's editor carries a `focused` flag driven by
+/// DEC `?1004` `FocusGained`/`FocusLost` (`cyrup-tui/src/editor/config.rs`), and that flag is the
+/// WRONG answer here: upstream's `focusedComponent` is unaffected by window focus, and a widget
+/// that read window focus would stay active behind an open selector — precisely the state the
+/// guard exists to end. The publisher therefore computes "no overlay, no selector, no loader",
+/// which is the same three-way test `App::handle_input`'s own routing applies before it reaches
+/// the editor.
+///
+/// Unattached (`None` on [`LiveHostServices`]) in every non-interactive mode, where
+/// [`HostServices::editor_has_focus`] keeps the trait default `false` — pi's own answer there, its
+/// `noOpUIContext` having no editor to focus (`core/extensions/runner.ts:253`).
+#[derive(Clone, Debug, Default)]
+pub struct EditorFocusMirror(Arc<std::sync::atomic::AtomicBool>);
+
+impl EditorFocusMirror {
+    /// A fresh mirror. `false` until the first publish: an extension that asks before the first
+    /// frame gets "the editor does not hold focus", which is the safe direction — it declines a
+    /// keystroke rather than stealing one.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish whether the editor is the focused component. Called once per frame by the
+    /// interactive app, from the same choke point that publishes [`EditorTextMirror`].
+    pub fn publish(&self, has_focus: bool) {
+        self.0
+            .store(has_focus, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The current extension-visible focus state.
+    pub fn has_focus(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// pi's synthetic `SourceInfo` for a tool the extension registry does not own — the value
 /// `createSyntheticSourceInfo("<builtin:NAME>", { source: "builtin" })` produces
 /// (`core/agent-session.ts:2478`, defaults from `core/source-info.ts:24-40` @v0.83.0: scope
@@ -727,6 +771,10 @@ pub struct LiveHostServices {
     /// [`Self::attach_editor_mirror`]. `None` outside the interactive TUI, where
     /// [`HostServices::editor_text`] keeps pi's headless `""`. See [`EditorTextMirror`].
     editor_mirror: Mutex<Option<EditorTextMirror>>,
+    /// UW-7 — the interactive editor's focus cell, attached by [`Self::attach_editor_focus_mirror`].
+    /// `None` outside the interactive TUI, where [`HostServices::editor_has_focus`] keeps its
+    /// trait default `false`. See [`EditorFocusMirror`].
+    editor_focus_mirror: Mutex<Option<EditorFocusMirror>>,
     /// The host-owned inter-extension event bus (Pi's single `createEventBus()`, threaded onto
     /// every `ExtensionAPI` at `extensions/loader.ts:389` @v0.83.0), attached post-build via
     /// [`Self::attach_event_bus`] — the `ExtensionHost` that owns it is built AFTER this backend,
@@ -775,6 +823,7 @@ impl LiveHostServices {
             catalog: Mutex::new(None),
             theme_access: Mutex::new(None),
             editor_mirror: Mutex::new(None),
+            editor_focus_mirror: Mutex::new(None),
             event_bus: Mutex::new(None),
             provider_swap: Mutex::new(None),
         }
@@ -890,6 +939,13 @@ impl LiveHostServices {
     /// and re-run on every session swap, for the same reasons [`Self::attach_theme_access`] is.
     pub fn attach_editor_mirror(&self, mirror: EditorTextMirror) {
         *Self::lock(&self.editor_mirror) = Some(mirror);
+    }
+
+    /// Attach the interactive editor's extension-visible FOCUS cell (UW-7) — the source behind
+    /// [`HostServices::editor_has_focus`]. Interactive TUI only, and re-run on every session swap,
+    /// for the same reasons [`Self::attach_editor_mirror`] is.
+    pub fn attach_editor_focus_mirror(&self, mirror: EditorFocusMirror) {
+        *Self::lock(&self.editor_focus_mirror) = Some(mirror);
     }
 
     /// Attach the command-tier control sink (the runtime owns it once the session is live).
@@ -1405,6 +1461,16 @@ impl HostServices for LiveHostServices {
             .clone()
             .map(|m| m.text())
             .unwrap_or_default()
+    }
+
+    /// UW-7 — pi's `editorHasFocus()` (`pi-subagents/src/tui/fleet-status.ts:965-976` @v0.68.0),
+    /// the first guard of its raw-terminal-input handler. Symmetric with [`Self::editor_text`] in
+    /// every respect: a shared cell the interactive app republishes each frame, unattached (and so
+    /// `false`) in every other mode. See [`EditorFocusMirror`] for why this is not window focus.
+    fn editor_has_focus(&self) -> bool {
+        Self::lock(&self.editor_focus_mirror)
+            .clone()
+            .is_some_and(|m| m.has_focus())
     }
 
     // --- the theme family (SEAM-T01) ---

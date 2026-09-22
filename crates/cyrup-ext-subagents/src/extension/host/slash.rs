@@ -1,7 +1,6 @@
 //! The slash-command dispatcher and the fleet surfaces it opens.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use cyrup_core::{CancelToken, ModelId};
 
@@ -11,7 +10,6 @@ use crate::error::SubagentError;
 use crate::extension::executor::paths::format_slash_run_completion;
 use crate::extension::executor::requests::{
     BackgroundSingleRequest, ForegroundRunRequest, GraphRunOutcome, SingleRunOverrides,
-    StatusViewSelector,
 };
 use crate::extension::host::SubagentsExtension;
 use crate::extension::host::slash_render::render_chain_results;
@@ -69,114 +67,14 @@ impl SubagentsExtension {
     /// slot ([`crate::extension::SubagentExecutor::set_host_services`]), which the session builder binds once before
     /// `init` and which every surface in this file reads.
     async fn show_fleet(&self, cwd: &Path, has_ui: bool) -> Result<String, SubagentError> {
-        use std::sync::atomic::Ordering;
-
-        use crate::tui::fleet::{FleetOpenOutcome, FleetViewOptions, open_subagent_fleet};
-
-        // pi reads `fleetOpen` BEFORE it touches anything else that could change it.
-        let already_open = self.fleet_open.load(Ordering::Acquire);
-        let state = self
-            .executor
-            .fleet_state(cwd, true, self.fleet_inspector_open.load(Ordering::Acquire))
-            .await;
-
-        match open_subagent_fleet(
-            has_ui,
-            already_open,
-            state,
-            FleetViewOptions::default(),
-            None,
-            // `has_actions`: steer/stop route to `control_steer`/`control_stop`.
-            true,
-            // `has_inspect`: the inspector backends exist now —
-            // `inspectors::plugins::builtin_inspector_plugins()` is herdr then ghostty — so
-            // `Enter`/`H` route to a real `inspector.open` through
-            // `SubagentExecutor::inspector_open` (pi `fleet.ts:1417-1430`). With NO host
-            // available the key still answers: the dispatcher's own
-            // `NO_INSPECTOR_PLUGIN_AVAILABLE` sentence names `inspector.command` as the way out,
-            // which is a better answer than the unavailable notice this used to force.
-            true,
-        ) {
-            FleetOpenOutcome::NoUiFallback => self
-                .executor
-                .control_status_view(
-                    cwd,
-                    None,
-                    None,
-                    false,
-                    StatusViewSelector {
-                        view: Some("fleet"),
-                        ..StatusViewSelector::default()
-                    },
-                )
-                .await
-                .map_err(SubagentError::Management),
-            FleetOpenOutcome::AlreadyOpen => {
-                Ok("Subagent fleet inspector is already open.".to_string())
-            }
-            FleetOpenOutcome::Opened {
-                component,
-                clear_widget_key,
-            } => {
-                self.fleet_open.store(true, Ordering::Release);
-                self.fleet_inspector_open.store(true, Ordering::Release);
-                // pi `ctx.ui.setWidget(FLEET_STATUS_WIDGET_KEY, undefined)` (`tui/fleet.ts:846`):
-                // the status widget must be gone before the overlay paints.
-                let services = self.executor.host_services();
-                if let Some(services) = services.as_ref() {
-                    services.set_widget(
-                        clear_widget_key,
-                        None,
-                        cyrup_ext::host::WidgetPlacement::default(),
-                    );
-                }
-                if let Ok(mut widget) = self.fleet_status.lock() {
-                    widget.set_inspector_open(true);
-                }
-
-                let overlay = crate::tui::fleet_overlay::FleetOverlay::new(
-                    *component,
-                    Arc::clone(&self.executor),
-                    cwd.to_path_buf(),
-                    FleetViewOptions::default().refresh_ms,
-                    tokio::runtime::Handle::current(),
-                );
-                // BLOCKS until the human closes the modal — pi's `await ctx.ui.custom(...)`.
-                let driven = services
-                    .as_ref()
-                    .is_some_and(|services| services.open_overlay(Box::new(overlay)));
-
-                // pi's `finally` (`slash-commands.ts:646-647` + `tui/fleet.ts:876-878`): both
-                // latches are restored however the overlay ended.
-                if let Ok(mut widget) = self.fleet_status.lock() {
-                    widget.set_inspector_open(false);
-                }
-                self.fleet_inspector_open.store(false, Ordering::Release);
-                self.fleet_open.store(false, Ordering::Release);
-
-                if driven {
-                    // The overlay said everything it had to say on screen; pi's
-                    // `ctx.ui.custom<undefined>` likewise resolves with no value, and a non-empty
-                    // return here would surface as a redundant notification
-                    // (`cyrup-session-svc/src/session.rs`'s `try_execute_extension_command`).
-                    return Ok(String::new());
-                }
-                // No terminal to drive it on — pi's `!ctx.hasUI` outcome, one level later.
-                self.executor
-                    .control_status_view(
-                        cwd,
-                        None,
-                        None,
-                        false,
-                        StatusViewSelector {
-                            view: Some("fleet"),
-                            ..StatusViewSelector::default()
-                        },
-                    )
-                    .await
-                    .map_err(SubagentError::Management)
-            }
-        }
+        // UW-7 — the body moved to [`crate::extension::host::terminal_input::FleetInspectorHandle::open`]
+        // so that `Enter` on the fleet roster can reach the SAME code from a detached task. pi has
+        // one `openSubagentFleet` for both entry points too: `showFleet` calls it at
+        // `slash/slash-commands.ts:645`, and the `SubagentFleetStatus` constructor's
+        // `openInspector` callback calls it at `extension/index.ts:502` with an `initialKey`.
+        // `None` here is that callback's missing argument: `/subagents-fleet` opens on the
+        // component's own default row, not on a roster selection.
+        self.fleet_inspector_handle().open(cwd, has_ui, None).await
     }
 
     /// SCOPE_10 — publish (or clear) the ASYNC-JOBS widget slot's MACHINE document: pi
