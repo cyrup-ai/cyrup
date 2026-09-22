@@ -194,7 +194,7 @@ impl SubagentExecutor {
     ///   off the live control entry rather than left at their `Default`.
     /// * **`foreground_runs`** (WORKFLOW_7) — settled foreground runs this process remembers
     ///   (pi's `state.foregroundRuns`), projected from [`Self::foreground_runs_views`]. Populated
-    ///   from the SAME in-memory record `persist_foreground_run_history` writes to disk, so it
+    ///   from the SAME in-memory record `foreground_history::persist` writes to disk, so it
     ///   survives a restart within this session and is restored (STRICT, session-scoped) on the
     ///   next one. `tui/fleet.rs`'s own session filter over this field was written ahead of a real
     ///   producer and was dead until now.

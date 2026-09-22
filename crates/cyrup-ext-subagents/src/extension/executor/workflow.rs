@@ -928,6 +928,13 @@ impl WorkflowScriptHost for WorkflowRunHost {
         // reconciler takes a `SingleResult` and `WorkflowScriptChildResult` is the lossy guest-wire
         // projection of one — `exit_code`, `interrupted` and `session_file` are all absent from it.
         //
+        // R-VLS11b-01: `result` is a TERMINAL result on every path that reaches here, never a
+        // `/subagents-detach` receipt. `hand_off_detached_foreground_run` (`foreground.rs`) is
+        // upstream's `workflowAwaitDetached` fork (`subagent-executor.ts:4008-4012`, `:4123`): a
+        // user detach of a workflow child keeps driving the child in THIS task and returns its
+        // real exit, so the only producer that can set `detached` on what `run_foreground_streaming`
+        // hands back here is the intercom one — which is exactly what this hook is written for.
+        //
         // Same upsert-in-place rule as `settled` above, and for the same reason.
         if result.detached
             && let Ok(mut detached) = self.detached.lock()

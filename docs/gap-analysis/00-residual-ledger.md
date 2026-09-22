@@ -7,47 +7,179 @@ next work item**.
 
 # FILED 2026-09-21 — four residuals from the VL-S11/S12/S8 batch, each with a TRUE premise and the grep that proves it
 
+> **UPDATE 2026-09-21 — three of the four are now CLOSED.** `R-VLS11b-02`, `R-VLS11b-03` and
+> `R-SUBA087-01` were closed in a follow-up batch (see each one's own block, which keeps the
+> residual as filed in a `<details>` fold beneath the closure note). **`R-VLS11b-01` is now CLOSED
+> too** — `resolveDetachedWorkflowChild` is ported; see its block. All four are closed.
+>
 > **This block files, it does not rank.** `VL-S8`, `VL-S11` and `VL-S12` all CLOSED in this batch
 > (their ranked rows below are struck), and `SUBA-026` narrowed to its UI half. These four are what
 > the batch left behind. Every one was greped at HEAD before it was written: several "findings" this
 > batch turned out to have false premises, and a residual with a false premise is worse than no
 > residual, because it sends the next reader to fix something that is not broken.
 >
-> ## R-VLS11b-01 — a user detach aimed at a WORKFLOW child is not refused, and its reconciliation is provisional
+> ## ~~R-VLS11b-01 — a user detach aimed at a WORKFLOW child is not refused, and its reconciliation is provisional~~ — **CLOSED 2026-09-21**
 >
-> **medium** · `crates/cyrup-ext-subagents/src/extension/executor/foreground.rs`,
-> `extension/host/slash_detach.rs` · area 09 / §1b `VL-S11`
+> **CLOSED.** A user detach of a workflow child now settles back into the step that launched it.
 >
-> `/subagents-detach` refuses anything that is not a single-subagent run, and that refusal reads the
-> control's `mode`:
+> ### The premise as filed was half wrong, and the wrong half mattered
 >
-> ```text
-> $ grep -n 'mode != RunMode::Single' crates/cyrup-ext-subagents/src/extension/host/slash_detach.rs
-> 81:        if mode != RunMode::Single {
-> ```
->
-> **The guard cannot fire for a workflow child, because nothing ever stamps anything else.**
-> `register_foreground_controls` (`foreground.rs:1169`) is the ONE construction site on the
-> production path — it takes a `ForegroundControlIdentity` carrying `parent_workflow_run_id` and
-> `workflow_key`, so a workflow child goes through it too — and it stamps the mode unconditionally:
+> Filed as *"the parent workflow is not told"* — i.e. a stall. It was not a stall. The detach arm
+> returned the RECEIPT and `WorkflowRunHost::launch` returned with it immediately, so the step was
+> told its child had finished and told a FABRICATION:
 >
 > ```text
-> $ sed -n '1201p' crates/cyrup-ext-subagents/src/extension/executor/foreground.rs
->                 mode: crate::background::RunMode::Single,
+> $ grep -n 'ok: result.exit_code == 0' crates/cyrup-ext-subagents/src/extension/executor/workflow.rs
+> 432:            ok: result.exit_code == 0 && result.error.is_none() && !result.interrupted,
+> $ grep -n 'exit_code: DETACHED_EXIT_CODE' crates/cyrup-ext-subagents/src/extension/executor/foreground.rs
+> 1617:            exit_code: DETACHED_EXIT_CODE,        # = -2 (detach.rs)
 > ```
 >
-> So a human can detach a workflow child, and the continuation then reconciles it as an ordinary
-> remembered foreground run. Upstream closes exactly this with `resolveDetachedWorkflowChild`
-> (`subagent-executor.ts:4078-4081`), which routes the settle back to the workflow handle. cyrup's
-> continuation has no workflow handle to route to, so its reconciliation is provisional rather than
-> wrong: the run settles and becomes addressable, but the parent workflow is not told.
+> `ok: false` on a fabricated `-2`, the detach sentence *"Detached at user request before task
+> completion."* as the child's output, and `detached: true` — which `launch`'s detach hook then
+> recorded as a `DetachedWorkflowChild`, and which `reconcile_detached_workflow_children` settled the
+> workflow's `status.json` from, against a child that had not exited. A silent wrong answer, not a
+> hang. The child's REAL exit went to the continuation task and reached `foreground_runs` and
+> nothing else.
 >
-> **Two ways to close it, and they are not equivalent.** Either stamp the real mode at registration
-> (which makes the existing refusal correct and is the smaller change), or port
-> `resolveDetachedWorkflowChild` (which makes the detach WORK for a workflow child and is the
-> bigger one). Do not do the first and call the second closed.
+> ### What closed it
 >
-> ## R-VLS11b-02 — the detach continuation cannot persist foreground history
+> Upstream's `workflowAwaitDetached` fork, ported whole: `subagent-executor.ts:4008-4012` mints the
+> promise **only** when the run is a workflow child, `:4077-4081` resolves it from `onDetachedExit`
+> and returns before anything else in that closure runs, and `:4123` swaps it in for the receipt —
+> `r = launched.detached && detachedWorkflowChild ? await detachedWorkflowChild : launched`.
+> Upstream stamps `awaitDetachedChild: true` on every workflow child launch, unconditionally
+> (`:5790`).
+>
+> cyrup's port is `SubagentExecutor::hand_off_detached_foreground_run` (`foreground.rs`), entered
+> immediately after `detach_gate.accept()` and forking on `ForegroundRunRequest::parent_workflow_run_id`,
+> whose one production writer is `WorkflowRunHost::launch` (`workflow.rs:892`) — exactly the
+> launches upstream stamps the flag on, so no new request field was added for a boolean that is a
+> function of one already carried.
+>
+> * **workflow child** — the drive future is awaited in the launching step's own task, so the step
+>   receives the child's real terminal `SingleResult`. The ordinary `settle_attached_foreground_run`
+>   tail then runs: its `remember_foreground_run` takes the remembered child off `"detached"` by
+>   replacement (rather than by the continuation's mutation) and, unlike the continuation task, this
+>   path holds `&self` and persists the now-restorable run. `[CYRUP-DELTA]`: the live control is
+>   deliberately KEPT until the real settle, because `runs.status(key)`'s live arm and
+>   `runs.steer(key)` both resolve through `foreground_controls` and a workflow child that is still
+>   running must stay answerable to the script that launched it. That is upstream's ordering too
+>   (`finishForegroundChild` runs in the tail after the await, not in the skipped `onDetachedExit`
+>   body), and the live/remembered overlap it creates is one `tui/fleet.rs` already resolves in the
+>   live map's favour.
+> * **plain `/run` single** — unchanged: the caller is answered with the receipt immediately and
+>   `spawn_detached_foreground_continuation` keeps driving the child.
+>
+> The human's half of the detach is untouched either way: the receipt is minted, published, stamped
+> and accepted BEFORE the fork, so `/subagents-detach` renders its success sentence and the run is
+> addressable by `status`/`bg_wait` in both arms.
+>
+> **`workflow_detach/` was deliberately NOT the route.** Its module doc says it is the INTERCOM
+> detach's reconciler: it needs `find_workflow_settlement_step`, a `WorkflowKey` and a workflow
+> `status.json`, and it exists because an intercom detach's terminal result is observed inside
+> `launch` with the workflow already parked at `paused`. A user detach now produces no paused
+> workflow and no `DetachedWorkflowChild` at all — the step simply settles — so there is nothing for
+> that reconciler to reconcile. Its scoping doc in `workflow_launch.rs` was corrected from *"a
+> user-detached WORKFLOW child stays `paused` until something else settles it"* to the invariant
+> that now holds, and `workflow.rs`'s detach hook carries the matching note.
+>
+> ### The refusal shortcut stays struck
+>
+> *"Stamp the real mode at registration so the `mode != Single` refusal fires"* remains a
+> divergence, for the reason struck in `8128824`: upstream's mode describes the run's SHAPE
+> (`subagent-executor.ts:6938`) and carries `parentWorkflowRunId` as a SEPARATE field (`:7201`), so
+> upstream stamps `"single"` for a workflow child and deliberately ALLOWS the detach — which is why
+> `resolveDetachedWorkflowChild` exists at all. `register_foreground_controls` has exactly one
+> production caller (`run_foreground_impl`; chains go through `run_chain_foreground` and register
+> no control), so `mode: Single` is already correct on every entry that can exist.
+>
+> ### Proof
+>
+> Three tests in `foreground.rs`'s `detach_producer_tests`, each naming its gutting mutation, each
+> mutation RUN:
+>
+> | test | gutting mutation | result |
+> | --- | --- | --- |
+> | `a_detached_workflow_childs_settle_reaches_the_step_that_launched_it` | drop the routing (force the fork's `parent_workflow_run_id` to `None`) | FAILS — the step gets the `-2` receipt |
+> | `a_detached_workflow_child_keeps_its_live_control_until_it_really_settles` | share the plain arm's teardown | FAILS — `runs.status` cannot answer an in-flight child |
+> | `a_detached_plain_single_is_still_answered_with_its_receipt_immediately` | route everything through the workflow path | FAILS on timeout — `/subagents-detach` on a plain `/run` would block until the child exits |
+>
+> Those three call `hand_off_detached_foreground_run` directly with a synthetic drive future, so
+> they prove the FORK but not the plumbing INTO it: a mutation that passes `None` at the one call
+> site inside `run_foreground_impl` leaves all three green. The cyrup-it proof
+> `a_detached_workflow_child_settles_back_into_the_step_that_launched_it` closes that — a real OS
+> child, the real `/subagents-detach` dispatch and the real `DetachGate` race — asserting the
+> detach is ACCEPTED for a workflow child, the child is still alive, the step has NOT returned,
+> and the step gets a terminal result when it exits. Run under that mutation it FAILS on
+> `!settled.detached`.
+>
+> Its exit-code assertion is `!= -2` (the receipt's `DETACHED_EXIT_CODE`) rather than `== 0`
+> deliberately: `== 0` would additionally assert the FIXTURE child succeeded, and under the full
+> nine-binary suite that child was twice observed to exit zero having written nothing (the step
+> then gets `exit_code: 1` / *"Subagent produced no output …"*) — a starved child on a saturated
+> box, which the routing under test cannot cause. **That starvation is not understood and is not
+> claimed to be**; it reproduces only under the whole `-p cyrup-it` suite, never in isolation nor
+> across the 253-test `binary(subagents)` set, and there is no idle/read deadline in the drive
+> loop that would explain it (`grep -rn 'idle_timeout\|read_timeout' crates/cyrup-ext-subagents/src/exec/`
+> is empty). If a detach-adjacent teardown bug is ever found, this is a place to look first.
+>
+> Gates at the closing commit: `cargo fmt --all` clean; `cargo clippy --workspace --all-targets
+> --features test-fixtures -- -D warnings` clean; `cargo nextest run --workspace --features
+> test-fixtures` 11082 passed / 9 skipped; `cargo nextest run -p cyrup-it --features it` 595
+> passed / 0 skipped.
+>
+> ## ~~R-VLS11b-02 — the detach continuation cannot persist foreground history~~ — **CLOSED 2026-09-21**
+>
+> **CLOSED.** Every persist writer in `foreground_history/persist.rs` is now `&self`-free and takes
+> the foreground-runs MAP, so there is ONE implementation of the merge/bound/write rule and one of
+> the results-dir resolution:
+>
+> ```text
+> persist_foreground_run_history_from(&Mutex<HashMap<RunId, ForegroundHistoryRun>>, &Path, usize)
+> persist_foreground_run_history_in  (&Mutex<HashMap<RunId, ForegroundHistoryRun>>, &Roots, &Path)
+>     -> ..._from(map, &default_results_dir_in(roots, cwd), MAX_REMEMBERED_FOREGROUND_RUNS)
+> SubagentExecutor::persist_foreground_run_history_for(&self, cwd)   // the ONE &self wrapper left
+>     -> ..._in(&self.foreground_runs, &self.config_snapshot().await.roots, cwd)
+> ```
+>
+> `SubagentExecutor::persist_foreground_run_history(&self, results_dir, limit)` and
+> `SubagentExecutor::foreground_runs_snapshot(&self)` are GONE: both existed only to feed the
+> writer, and with the writer taking the map they had no production caller left. Their bodies live
+> on as `persist_foreground_run_history_from` and `record::foreground_runs_snapshot_of`, which every
+> former caller (tests included) now goes through — one rule, not two.
+>
+> `foreground_history/mod.rs`'s `persist` module is `pub(crate)`, alone among the three: the
+> continuation is a SIBLING of the facade, so a private `mod persist;` is invisible to it, and a
+> `pub(crate) use` re-export would be an unused import until the call site lands. Proven by
+> `the_free_entry_point_writes_the_same_bytes_the_executor_path_does` (the `&self` wrapper and the
+> free entry point write byte-identical files over the same map, the same seeded on-disk foreign
+> run and the same bound, under two sandboxed roots),
+> `the_free_entry_point_never_writes_a_detached_run` (the `is_persistable` rule holds on the new
+> path, and a run the continuation has RECONCILED does persist) and
+> `the_cwd_entry_point_resolves_the_results_dir_from_the_supplied_roots`.
+>
+> **The CALL SITE is `foreground.rs`'s `spawn_detached_foreground_continuation`, and it LANDED with
+> R-VLS11b-01** (the continuation now takes a `(Roots, PathBuf)` captured at spawn time, and its
+> `[CYRUP-DELTA]` paragraph — which used to say the task *cannot* persist — was rewritten to say it
+> does). It is, after
+> `reconcile_detached_foreground_child(&foreground_runs, &run_id, &result);`:
+>
+> ```rust
+> crate::extension::executor::foreground_history::persist::persist_foreground_run_history_in(
+>     &foreground_runs, &roots, &cwd,
+> );
+> ```
+>
+> with `roots: crate::paths::Roots` and `cwd: PathBuf` captured into the task at spawn time
+> (`run_foreground_impl` has both: it takes `cwd`, and its config snapshot carries `roots`). That
+> capture is what keeps the task free of any executor handle, which was the constraint that made
+> this a residual in the first place. Ordering matters: the persist runs AFTER the reconcile,
+> because `is_persistable` refuses a run whose child is still `"detached"`.
+>
+> ---
+>
+> <details><summary>The residual as filed</summary>
 >
 > **low** · `extension/executor/foreground_history/persist.rs` · area 09
 >
@@ -75,7 +207,38 @@ next work item**.
 >
 > **Estimated at ~5 lines**: a `&self`-free persist entry point taking the map and the results dir.
 >
-> ## R-VLS11b-03 — the detach chord is env-tier only and defaults ON, where upstream registers nothing unless configured
+> </details>
+>
+> ## ~~R-VLS11b-03 — the detach chord is env-tier only and defaults ON~~ — **CLOSED 2026-09-21**
+>
+> **CLOSED, and the default was DECIDED rather than inherited: cyrup now MATCHES UPSTREAM and
+> registers no chord unless one is configured.**
+>
+> `SubagentExtensionConfig::foreground_detach_shortcut` (`registration/mod.rs`) is the settings tier
+> — upstream's own `config.json` key (`shared/types.ts:2603`), deserialized straight through the
+> binary's existing `serde_json::from_slice::<SubagentExtensionConfig>` load, so no call site
+> changed. `CYRUP_SUBAGENT_FOREGROUND_DETACH_SHORTCUT` remains as the LOWER tier. A settings key
+> that is PRESENT ends the walk even when its value is falsy, so a project can turn the chord off
+> for everyone regardless of what any shell exports.
+>
+> **Why off by default.** Upstream ships opt-in (`if (options.foregroundDetachShortcut)`,
+> `slash-commands.ts:1007`, is a truthiness test around the whole `registerShortcut` call). Rule 3
+> of `ExtensionRegistry::resolve_shortcuts` (pi `runner.ts:522-528`) is that an extension shortcut
+> colliding with a NON-reserved built-in *warns but WINS*, and the extension tier fires before the
+> editor — so a default-on chord can take a key its user already bound. The collision check that
+> justified `ctrl+alt+d` proves it is free in cyrup's and pi's **default** keymaps; it cannot prove
+> anything about a user's own `keybindings.json`, which is exactly where a rebind lives. Nothing is
+> lost: `/subagents-detach` is registered unconditionally through the same handler, and `ctrl+alt+d`
+> is kept as the documented RECOMMENDED value with its collision analysis intact in
+> `shortcuts.rs`'s `[CYRUP-DELTA]`.
+>
+> Proven by `nothing_is_bound_when_neither_tier_is_configured` and
+> `the_settings_tier_wins_over_the_env_tier`; `the_shortcut_resolves_to_the_detach_handler_and_nothing_else`
+> now also asserts that an extension which bound nothing refuses the recommended chord.
+>
+> ---
+>
+> <details><summary>The residual as filed</summary>
 >
 > **low** · `extension/host/shortcuts.rs`, `registration/mod.rs` · area 09
 >
@@ -99,7 +262,35 @@ next work item**.
 > `DEFAULT_FOREGROUND_DETACH_SHORTCUT`'s own doc); what is missing is the settings tier and the
 > off-by-default. W6 was blocked from adding the field by file ownership in this batch.
 >
-> ## R-SUBA087-01 — `step.childId`, the unported 4th identity rung
+> </details>
+>
+> ## ~~R-SUBA087-01 — `step.childId`, the unported 4th identity rung~~ — **CLOSED 2026-09-21**
+>
+> **CLOSED.** `StepStatus::child_id: Option<String>` (`background/records.rs`) carries pi's
+> `step.childId?: string` (`shared/types.ts:1901`) under the same
+> `#[serde(default, skip_serializing_if = "Option::is_none")]` discipline its optional neighbours
+> use, so a `status.json` written before the field existed still round-trips and an absent id never
+> reaches the wire. `identity_from_parts`/`candidates_from_parts` (`background/child_identity.rs`)
+> take it as their FIRST rung, and `async_status_child_identity`/`..._candidates` feed it from the
+> step — the ladder is now upstream's four, `[childId, workflowKey, runId, step:<index>]`
+> (`child-identity.ts:20-22`), with upstream's `value.length > 0` filter and `new Set` de-dupe
+> unchanged. `StepStatus::pending` seeds `None`; every other construction site goes through it or
+> uses `..`, so nothing else needed fixing.
+>
+> Proven by `identity_falls_back_child_id_then_workflow_key_then_run_id_then_position`,
+> `candidates_keep_rung_order_and_dedupe`,
+> `a_stamped_child_id_outranks_the_derived_rungs_and_absence_falls_through` (a step carrying a
+> `child_id` resolves by it AND reports it as its canonical spelling while the lower rungs still
+> address the same child; a step without one falls through identically to the three-rung behaviour)
+> and `child_id_is_omitted_while_absent_and_round_trips_when_set`.
+>
+> The module doc's `includeNested` paragraph is rewritten to the truth: it IS ported, as a seam
+> (`resolve_by_candidates` + `/subagents-steer`'s `candidates_including_nested`,
+> `extension/host/slash_steer.rs:129`) rather than as a boolean option.
+>
+> ---
+>
+> <details><summary>The residual as filed</summary>
 >
 > **low** · `background/child_identity.rs`, `background/records.rs` · area 09 `SUBA-087`
 >
@@ -131,6 +322,8 @@ next work item**.
 > `resolve_by_candidates`' caller-supplied candidate function
 > (`extension/host/slash_steer.rs:129` `candidates_including_nested`). The doc is corrected in
 > place.
+>
+> </details>
 
 ---
 

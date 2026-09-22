@@ -71,8 +71,10 @@ mod tests {
 
     use super::*;
     use crate::background::{RunId, RunMode};
+    use crate::extension::executor::foreground_history::persist::persist_foreground_run_history_from;
     use crate::extension::executor::foreground_history::record::ForegroundHistoryChild;
     use crate::extension::executor::foreground_history::record::ForegroundHistoryRun;
+    use crate::extension::executor::foreground_history::record::foreground_runs_snapshot_of;
     use crate::extension::testsupport::FixedSessionIdHost;
     use std::sync::Arc;
 
@@ -138,7 +140,7 @@ mod tests {
 
         let restored = executor.restore_foreground_run_history(dir.path(), 50);
         assert_eq!(restored, 0);
-        assert!(executor.foreground_runs_snapshot().is_empty());
+        assert!(foreground_runs_snapshot_of(&executor.foreground_runs).is_empty());
     }
 
     /// Only runs whose recorded `session_id` equals the live one are restored; a foreign-session
@@ -158,7 +160,7 @@ mod tests {
 
         let restored = executor.restore_foreground_run_history(dir.path(), 50);
         assert_eq!(restored, 1);
-        let runs = executor.foreground_runs_snapshot();
+        let runs = foreground_runs_snapshot_of(&executor.foreground_runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id.as_str(), "mine");
     }
@@ -184,14 +186,14 @@ mod tests {
                 ),
             ],
         );
-        let live_updated_at = executor.foreground_runs_snapshot()[0].updated_at;
+        let live_updated_at = foreground_runs_snapshot_of(&executor.foreground_runs)[0].updated_at;
 
         let restored = executor.restore_foreground_run_history(dir.path(), 50);
         assert_eq!(
             restored, 0,
             "the id was already live — nothing NEW was inserted"
         );
-        let runs = executor.foreground_runs_snapshot();
+        let runs = foreground_runs_snapshot_of(&executor.foreground_runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(
             runs[0].updated_at, live_updated_at,
@@ -217,13 +219,13 @@ mod tests {
                 ),
             ],
         );
-        writer.persist_foreground_run_history(dir.path(), 50);
+        persist_foreground_run_history_from(&writer.foreground_runs, dir.path(), 50);
 
         let reader = SubagentExecutor::new();
         with_session(&reader, "session-a");
         let restored = reader.restore_foreground_run_history(dir.path(), 50);
         assert_eq!(restored, 1);
-        let runs = reader.foreground_runs_snapshot();
+        let runs = foreground_runs_snapshot_of(&reader.foreground_runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, run_id);
         assert_eq!(runs[0].children[0].status, "completed");

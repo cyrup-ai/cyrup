@@ -222,7 +222,7 @@ pub struct SubagentExecutor {
     /// construction, which is what `tui/fleet.rs`'s `!active_foreground_ids.contains(...)` assumes
     /// and what pi's own `fleet-view.ts:406-408` filter re-checks.
     ///
-    /// A SUPERSET of what `persist_foreground_run_history` writes to disk: every settled status is
+    /// A SUPERSET of what `foreground_history::persist` writes to disk: every settled status is
     /// remembered here; only the four RESTORABLE ones (`foreground_history::record::RESTORABLE`)
     /// are ever persisted.
     foreground_runs: Arc<
