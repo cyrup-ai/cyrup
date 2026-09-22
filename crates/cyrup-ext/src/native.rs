@@ -754,6 +754,24 @@ pub trait NativeExtension: Send + Sync {
     /// `None` is upstream's `undefined` — "I looked at it and did nothing". Sync for the same
     /// reason as [`Self::render_call`]: it runs on the UI's input path. A PANIC is contained by
     /// the host and treated as `None`, so a broken extension can never swallow the keyboard.
+    ///
+    /// # This handler MUST NOT reach a blocking capability
+    ///
+    /// UW-7 hazard H1, and the reason it is stated on the trait rather than on one implementor.
+    /// The consume-or-deliver answer is needed BEFORE the editor sees the key, so the TUI awaits
+    /// [`crate::ExtensionHost::terminal_input`] on the very task that services `ui_rx`
+    /// (`cyrup-tui/src/app/run_action.rs`, `App::on_input_event`). Any handler that calls
+    /// [`crate::host::HostServices::open_overlay`] — whose contract is *"BLOCK until the user
+    /// closes it"* (`crate::host::HostServices::open_overlay`) — or `confirm`/`select`/`input`,
+    /// which block on `ui_roundtrip`'s one-shot reply, blocks THAT task; and that task is the only
+    /// one that can ever unblock it. The whole TUI wedges, keyboard included.
+    ///
+    /// The shortcut path escapes this by spawning (`run_action.rs`, the
+    /// `AppAction::ExtensionShortcut` arm); the input path cannot, because it needs the answer
+    /// synchronously. A handler that wants to open a modal must therefore `tokio::spawn` it and
+    /// return `consume` immediately — which is exactly what upstream does, on a detached
+    /// microtask: `void Promise.resolve().then(() => this.openInspector(selectedKey))`
+    /// (`pi-subagents/src/tui/fleet-status.ts:741-750` @v0.68.0).
     fn on_terminal_input(&self, _data: &str) -> Option<crate::TerminalInputResult> {
         None
     }

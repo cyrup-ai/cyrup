@@ -336,6 +336,28 @@ pub trait HostServices: Send + Sync {
     fn editor_text(&self) -> String {
         String::new()
     }
+    /// Whether the EDITOR is the component currently holding keyboard focus — pi's
+    /// `editorHasFocus()` (`pi-subagents/src/tui/fleet-status.ts:965-976` @v0.68.0), the first
+    /// guard of its raw-terminal-input handler (`:701-704`).
+    ///
+    /// Upstream cannot answer this directly: `editorHasFocus` STRUCTURALLY DUCK-TYPES
+    /// `tui.focusedComponent` for five `EditorComponent` methods, with the in-source excuses
+    /// *"pi-tui exposes focus mutation but no focus getter"* and *"instanceof is unreliable across
+    /// jiti module boundaries"*. cyrup has neither problem, so this is a plain read of which
+    /// component the key path would route to.
+    ///
+    /// \[CYRUP-DELTA] It is NOT terminal-window focus. `FocusGained`/`FocusLost`
+    /// (`cyrup-tui/src/app/input.rs`, DEC `?1004`) says whether the TERMINAL has the OS focus,
+    /// which upstream's `focusedComponent` is entirely independent of; answering with that would
+    /// leave the fleet roster active behind an open selector — the exact state the guard exists
+    /// to end.
+    ///
+    /// `false` by default, which is also the honest answer in every non-interactive mode: there
+    /// is no editor to focus. That matches pi's `noOpUIContext`, whose whole UI surface is inert
+    /// (`core/extensions/runner.ts:253`).
+    fn editor_has_focus(&self) -> bool {
+        false
+    }
     /// Active theme name (Pi `getTheme`).
     fn theme(&self) -> Option<String> {
         None

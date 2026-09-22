@@ -269,6 +269,16 @@ pub struct AppState {
     /// WRITE half (`set_editor_text`) worked, so a guest's read-modify-write silently discarded its
     /// own edit. Always present here (an unattached mirror is simply never read).
     pub(super) editor_mirror: cyrup_session_svc::EditorTextMirror,
+    /// UW-7 — the extension-visible mirror of which component holds keyboard focus, backing
+    /// `HostServices::editor_has_focus` (pi's `editorHasFocus()`,
+    /// `pi-subagents/src/tui/fleet-status.ts:965-976` @v0.68.0). Republished beside
+    /// [`Self::editor_mirror`] by [`App::publish_extension_readbacks`] and handed to the session's
+    /// `LiveHostServices` by [`App::install_extension_readbacks`]; without it `editor_has_focus`
+    /// keeps the trait default `false` and the fleet roster can never activate. Always present
+    /// here (an unattached mirror is simply never read). See
+    /// [`App::editor_has_keyboard_focus`](crate::App::editor_has_keyboard_focus) for what is
+    /// published and why it is NOT terminal-window focus.
+    pub(super) editor_focus_mirror: cyrup_session_svc::EditorFocusMirror,
     /// The live theme seam handed to the session's `LiveHostServices` (SEAM-T01) — pi's four
     /// `createExtensionUIContext` theme bindings (`interactive-mode.ts:2401-2417` @v0.84.2). `None`
     /// until a session binds ([`App::install_extension_readbacks`]), and rebuilt on every session
@@ -509,6 +519,7 @@ impl AppState {
             },
             pending_ui_reply: None,
             editor_mirror: cyrup_session_svc::EditorTextMirror::new(),
+            editor_focus_mirror: cyrup_session_svc::EditorFocusMirror::new(),
             theme_access: None,
             theme_controller: None,
             pending_tree_nav: None,

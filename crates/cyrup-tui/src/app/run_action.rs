@@ -274,7 +274,35 @@ impl App<InlineBackend<Stdout>> {
             pending.push_back(ev);
         }
         let mut serviced = 0u64;
+        // UW-7 — the extension host this batch's keys are folded through. Cloned once per batch
+        // rather than per key, and out of the loop because `offer_input_to_extensions` takes
+        // `&mut self`.
+        let ext_host = ctx.session.services().ext_host.clone();
         while let Some(ev) = pending.pop_front() {
+            // UW-7 — pi's `TUI.handleInput` listener fold (`packages/tui/src/tui.ts:773-788`
+            // @v0.83.0) runs BEFORE the focused component is offered the key, which is why this
+            // sits here and not inside `handle_input`: `handle_input`'s own overlay / selector /
+            // loader guards return early, so a fold below them could never tell a subscribed
+            // extension that focus had moved off the editor.
+            //
+            // It is awaited HERE, on the task that services `ui_rx`, because the
+            // consume-or-deliver answer is needed before the editor sees the key —
+            // `AppAction::ExtensionShortcut`'s spawn-and-forget below works only because a
+            // shortcut's effect is fire-and-forget, and this one is not. The prohibition that
+            // buys (no blocking capability from inside a handler) is stated on
+            // `NativeExtension::on_terminal_input`.
+            //
+            // With no subscriber this is one rwlock read and the event passes straight through,
+            // which is upstream's own guard (`tui.ts:773`).
+            let ev = match self.offer_input_to_extensions(&ext_host, ev).await {
+                crate::app::terminal_input::TerminalInputOutcome::Deliver(ev) => ev,
+                // Consumed: the keystroke is DROPPED — the editor never sees it — but it was
+                // still serviced, so the liveness beacon must still be bumped for it (TUI-092).
+                crate::app::terminal_input::TerminalInputOutcome::Consume => {
+                    serviced += 1;
+                    continue;
+                }
+            };
             let action = self.handle_input(&ev);
             match self.dispatch_run_action(ctx, action).await? {
                 RunFlow::Continue => {}
