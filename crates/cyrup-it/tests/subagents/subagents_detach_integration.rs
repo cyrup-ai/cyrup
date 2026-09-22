@@ -47,9 +47,12 @@ use std::time::{Duration, Instant};
 
 use cyrup_core::{CancelToken, Tool, ToolCallId};
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
-use cyrup_ext_subagents::background::run_artifact_roots_in;
+use cyrup_ext_subagents::background::{RunId, run_artifact_roots_in};
+use cyrup_ext_subagents::discovery::types::AgentReadScope;
 use cyrup_ext_subagents::exec::SingleResult;
-use cyrup_ext_subagents::extension::{SubagentsExtension, WaitTool};
+use cyrup_ext_subagents::extension::{
+    ForegroundRunRequest, SingleRunOverrides, SubagentsExtension, WaitTool,
+};
 use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
@@ -702,32 +705,26 @@ async fn a_live_detach_returns_the_receipt_and_leaves_its_child_running() {
 
     // ---- §I.13, second half: it DOES reach disk once it settles ----
     //
-    // The persist is triggered by a SECOND, ordinary foreground run, and that is not a workaround
-    // — it is the documented shape. `spawn_detached_foreground_continuation`
-    // (`extension/executor/foreground.rs:1407-1416`) carries a `[CYRUP-DELTA]` saying it cannot
-    // call `persist_foreground_run_history_for` itself (it holds only the `Arc` to the map, not
-    // the executor), so *"the reconciled run reaches disk at the session's next foreground
-    // settle, which calls the same writer over the same map"*. This asserts exactly that, and it
-    // is still the assertion the spec wants: `persist.rs`'s `is_persistable` refuses a run any of
-    // whose children is `"detached"` (`RESTORABLE` is the four terminal statuses), so if the
-    // continuation never re-remembered, the next settle would write the SECOND run and skip this
-    // one — and this poll would time out.
-    assert!(
-        !history_names(&history, &run_id),
-        "still nothing on disk before the next foreground settle"
-    );
-    let second = launch_blocking_run(&ext, cwd.path(), "the next foreground run")
-        .await
-        .expect("the second foreground run task did not panic");
-    assert!(
-        !second.detached,
-        "sanity: the second run must be an ORDINARY attached settle, because that is the \
-         path that calls persist_foreground_run_history_for; got: {second:#?}"
-    );
-
+    // **This assertion was inverted by R-VLS11b-02.** It used to require that the run was still
+    // ABSENT here, and to trigger the write with a SECOND ordinary foreground run — because
+    // `spawn_detached_foreground_continuation` carried a `[CYRUP-DELTA]` saying it could not
+    // persist (it holds only the `Arc` to the map, not the executor), so the reconciled run
+    // reached disk only *"at the session's next foreground settle"*. R-VLS11b-02 added the
+    // `&self`-free `persist_foreground_run_history_in`, and R-VLS11b-01 wired the continuation to
+    // it, so the continuation now writes the run itself, with nothing else happening in the
+    // session. The old shape is not merely stale — it would PASS against an implementation that
+    // still could not persist, which is exactly the gap that was closed.
+    //
+    // It is still the same rule being proved. `persist.rs`'s `is_persistable` refuses a run any
+    // of whose children is `"detached"` (`RESTORABLE` is the four terminal statuses), so this
+    // file can only name the run if the continuation RECONCILED it first and then wrote it: an
+    // implementation that persisted before reconciling writes nothing, and one that reconciles
+    // but never persists never writes at all. Both time this poll out.
     eventually(
         SETTLE_BUDGET,
-        "the settled detached run never reached the foreground history on disk",
+        "the settled detached run never reached the foreground history on disk — the \
+         continuation reconciled it (the status poll above passed) but did not persist it, which \
+         is the R-VLS11b-02 gap this call site closed",
         || {
             let history = history.clone();
             let run_id = run_id.clone();
@@ -797,5 +794,181 @@ async fn bg_wait(ext: &SubagentsExtension, cwd: &Path, run_id: &str) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         Err(err) => err.message,
+    }
+}
+
+// =================================================================================================
+// R-VLS11b-01 — the WORKFLOW-CHILD arm of the detach, against a real OS child
+// =================================================================================================
+
+/// Launch one foreground run shaped exactly as `WorkflowRunHost::launch` shapes its children —
+/// `parent_workflow_run_id: Some(..)` — detached from this task so the test can act while it is
+/// in flight. The join handle yields what the WORKFLOW STEP would receive.
+///
+/// `workflow_steer` stays `None`. Production sets it whenever `parent_workflow_run_id` is `Some`
+/// (`requests.rs`'s "`Some` exactly when" rule), but it only decides where steer requests are
+/// written and read; the detach fork reads `parent_workflow_run_id` alone, and building a real
+/// steer handle would require a workflow run directory this test has no other use for.
+fn launch_workflow_child(
+    ext: &Arc<SubagentsExtension>,
+    cwd: &Path,
+    parent_workflow_run_id: RunId,
+) -> tokio::task::JoinHandle<SingleResult> {
+    let executor = Arc::clone(ext.executor());
+    let cwd = cwd.to_path_buf();
+    tokio::spawn(async move {
+        executor
+            .run_foreground_streaming(
+                ForegroundRunRequest {
+                    overrides: SingleRunOverrides::default(),
+                    cwd: &cwd,
+                    agent_name: "worker",
+                    task: "block for a long while, as a workflow child",
+                    agent_scope: AgentReadScope::Both,
+                    context: None,
+                    model_override: None,
+                    timeout_ms: None,
+                    cancel: CancelToken::new(),
+                    // THE ONE FIELD UNDER TEST.
+                    parent_workflow_run_id: Some(parent_workflow_run_id),
+                    workflow_key: None,
+                    workflow_steer: None,
+                },
+                // `run_foreground_streaming` takes the sink by value, not as an `Option`; this
+                // test reads the RESULT, not the progress stream, so it discards every update.
+                Box::new(|_: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect("the workflow child resolves its persona and spawns its child")
+            .0
+    })
+}
+
+/// R-VLS11b-01, end to end against a real OS child: `/subagents-detach` aimed at a WORKFLOW child
+/// is ACCEPTED (upstream allows it — `subagent-executor.ts:6938` stamps `"single"` for a workflow
+/// child and carries `parentWorkflowRunId` separately at `:7201`), the child keeps running, and
+/// the launching call is **not** answered with the receipt: it keeps awaiting and returns the
+/// child's real terminal result, which is upstream's `workflowAwaitDetached` promise (`:4009`,
+/// resolved at `:4078`, awaited at `:4123`).
+///
+/// # Why this cannot be a unit test
+///
+/// `foreground.rs`'s `detach_producer_tests` call `hand_off_detached_foreground_run` directly with
+/// a synthetic drive future, so they prove the FORK but not the plumbing into it. A mutation that
+/// passes `parent_workflow_run_id: None` at the one call site inside `run_foreground_impl` — or
+/// that reads `workflow_key` instead — leaves every one of those tests green while every workflow
+/// child silently goes back to being answered with a `-2` receipt. Only a run that goes through
+/// the real `run_foreground_impl`, the real `DetachGate` race and a real child process can catch
+/// that, and this is it.
+///
+/// Gutted, assertion by assertion:
+///
+/// * detach refused for a workflow child (the struck "stamp the real mode" shortcut) → the
+///   success-sentence assertion fires with *"is not a single-subagent run"*;
+/// * the fork not wired to `parent_workflow_run_id` → the step's result is the receipt
+///   (`detached: true`, `exit_code == -2`, the detach sentence) and (c)'s three asserts fire;
+/// * the fork wired but the child dropped instead of awaited → the liveness probe fires, and the
+///   step never stops awaiting inside [`SETTLE_BUDGET`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detached_workflow_child_settles_back_into_the_step_that_launched_it() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    write_worker_persona(cwd.path());
+    // [`CHILD_SLEEP_MS`], for its own stated reason: every probe below — the detach, the liveness
+    // check and the "the step has NOT returned yet" check — is only meaningful while the child is
+    // genuinely still running, and a shorter sleep makes that a race against the scheduler rather
+    // than a fact. A 4s sleep was tried and lost that race under a loaded box, where the child was
+    // torn down mid-run and the step got `exit_code: 1` / *"Subagent produced no output"*; this
+    // suite's existing constant is sized so it cannot.
+    let script = blocking_child_script(cwd.path(), "wf-blocking.json", CHILD_SLEEP_MS);
+    let ext = extension(home.path(), cwd.path(), &script);
+    let ctx = command_ctx(cwd.path());
+
+    let parent = RunId::new();
+    let step = launch_workflow_child(&ext, cwd.path(), parent.clone());
+
+    let run_id = eventually(
+        SETTLE_BUDGET,
+        "the workflow child never registered a live control",
+        || {
+            let ext = Arc::clone(&ext);
+            let cwd = cwd.path().to_path_buf();
+            async move { live_foreground_ids(&ext, &cwd).await.into_iter().next() }
+        },
+    )
+    .await;
+    let child_pid = eventually(
+        SETTLE_BUDGET,
+        "the scripted child never appeared in /proc",
+        || {
+            let script = script.clone();
+            async move { fixture_pids(&script).into_iter().next() }
+        },
+    )
+    .await;
+
+    // ---- (a) the detach is ACCEPTED for a workflow child ----
+    let receipt = tokio::time::timeout(RECEIPT_BUDGET, detach(&ext, &run_id, &ctx))
+        .await
+        .expect("the detach command answers the human promptly even for a workflow child");
+    assert!(
+        receipt.contains(&format!(
+            "Detached foreground run {run_id} without terminating its child."
+        )),
+        "a workflow child IS detachable — upstream stamps `\"single\"` for it and allows the \
+         detach, which is why `resolveDetachedWorkflowChild` exists. A refusal here is the struck \
+         shortcut, not a fix; got: {receipt}"
+    );
+
+    // ---- (b) the child is still running, and the STEP has not been answered ----
+    assert!(
+        pid_is_alive(child_pid),
+        "the detach must not terminate a workflow child's process either; pid {child_pid} is \
+         gone right after the command returned"
+    );
+    assert!(
+        !step.is_finished(),
+        "THE ASSERTION THIS TEST EXISTS FOR: the launching step must still be AWAITING. A step \
+         that has already returned was answered with the detach receipt — a fabricated \
+         `exit_code == -2` failure carrying the detach sentence as the child's output — which is \
+         exactly the divergence R-VLS11b-01 closed."
+    );
+
+    // ---- (c) ...and when the child really exits, the STEP gets its real result ----
+    let settled = tokio::time::timeout(SETTLE_BUDGET, step)
+        .await
+        .expect("the step must be answered once its detached child exits")
+        .expect("the launching task completes");
+    assert!(
+        !settled.detached,
+        "the step receives a TERMINAL result, not a receipt. A `detached: true` here is what \
+         `workflow.rs`'s detach hook records as a `DetachedWorkflowChild`, parking the workflow \
+         at `paused` against a child that has in fact finished: {settled:?}"
+    );
+    // `!= -2`, deliberately, and NOT `== 0`. The claim under test is "the step was handed a
+    // TERMINAL result rather than the detach receipt", and the receipt's exit code is the closed
+    // constant `DETACHED_EXIT_CODE` (`detach.rs`, pi `execution.ts:618`) — so this assertion is
+    // exactly the claim, with nothing added.
+    //
+    // `== 0` would additionally assert that the FIXTURE CHILD succeeded, which is a different
+    // claim and a load-sensitive one: under the full `-p cyrup-it` suite (nine binaries, several
+    // of them v8/wasm-heavy) this child was twice observed to exit zero having written nothing,
+    // giving the step `exit_code: 1` with `"Subagent produced no output …"` — a starved child on a
+    // saturated box, not a receipt, and not something the routing under test can cause. Asserting
+    // it here would make this test red for a reason it is not about.
+    assert_ne!(
+        settled.exit_code, -2,
+        "the receipt's exit code must never reach the step: {settled:?}"
+    );
+    assert!(
+        settled
+            .final_output
+            .as_deref()
+            .is_none_or(|out| !out.contains("Detached at user request")),
+        "the detach sentence is the RECEIPT's output, never the child's: {settled:?}"
+    );
+
+    for pid in fixture_pids(&script) {
+        kill_pid_for_cleanup(pid);
     }
 }

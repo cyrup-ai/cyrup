@@ -451,6 +451,34 @@ pub struct SubagentExtensionConfig {
     /// [`tool_description::build_subagent_tool_description`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_description_mode: Option<serde_json::Value>,
+    /// VL-S11 R3 — pi `ExtensionConfig.foregroundDetachShortcut?: string`
+    /// (`shared/types.ts:2603` @v0.68.0, its own comment: *"Optional shortcut that detaches the
+    /// active foreground single-subagent run."*), threaded to `registerSlashCommands` at
+    /// `extension/index.ts:856` and consumed by `if (options.foregroundDetachShortcut)
+    /// pi.registerShortcut(…)` (`slash/slash-commands.ts:1007-1012`).
+    ///
+    /// **Opt-in, exactly as upstream.** `None` (the key omitted) registers NO chord at all — that
+    /// truthiness test around the whole `registerShortcut` call is upstream's entire default, and
+    /// `/subagents-detach` remains reachable as a command either way. The empty string is the same
+    /// falsy value and means the same thing; it is also how a user turns the chord back OFF at this
+    /// tier after setting it, without falling through to
+    /// [`crate::extension::host::shortcuts::FOREGROUND_DETACH_SHORTCUT_ENV`].
+    ///
+    /// **This tier OUTRANKS that env var**, which is the `[CYRUP-DELTA]` lower rung and the crate's
+    /// only pre-existing home for the key. The order is upstream's own: the chord IS a settings
+    /// key there (validated at `extension/config.ts:152-155` as *"config.foregroundDetachShortcut
+    /// must be a valid keybinding string such as \"ctrl+b\""*), and the env var is cyrup's
+    /// addition for a caller that cannot edit `config.json`. A configured setting must therefore be
+    /// what a machine-wide exported variable cannot silently override. Resolved by
+    /// [`crate::extension::host::SubagentsExtension::foreground_detach_shortcut`], which is where
+    /// both rungs and the trimming live.
+    ///
+    /// Carried as a plain `Option<String>` rather than validated here: the resolver trims and
+    /// treats blank as falsy, and an unparseable chord is refused by the host's own shortcut
+    /// resolution (`cyrup_ext::ExtensionRegistry::resolve_shortcuts`) with a diagnostic, rather
+    /// than taking the whole `config.json` down at load the way upstream's `throw` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_detach_shortcut: Option<String>,
     /// SUBA-073 — pi `ExtensionConfig.permissions?: PermissionConfig` (`shared/types.ts:2268`
     /// @v0.57.0, *"Opt-in native tool permissions. Bash remains outside this policy."*). Carried
     /// RAW, exactly like [`Self::turn_budget`] and for the same reason: validated at the point of
@@ -537,6 +565,10 @@ impl Default for SubagentExtensionConfig {
             // SUBA-025 — pi's `mode === undefined => "full"` (`tool-description.ts:106`).
             tool_description_mode: None,
             permissions: None,
+            // VL-S11 R3 — upstream's own default: `if (options.foregroundDetachShortcut)`
+            // (`slash-commands.ts:1007`) registers NOTHING with the key absent. Opt-in, and
+            // deliberately so; see the field's doc for why a default-on chord was rejected.
+            foreground_detach_shortcut: None,
         }
     }
 }

@@ -1238,6 +1238,7 @@ mod tests {
             stop_requested: false,
             stop_requested_at: None,
             stopped: false,
+            child_id: None,
             workflow_key: None,
             run_id: None,
             runner: None,

@@ -187,6 +187,28 @@ fn is_fully_settled(run: &ForegroundHistoryRun) -> bool {
     !run.children.iter().any(|c| c.status == "detached")
 }
 
+/// A clone of every settled run the given map currently remembers — the persist writers'
+/// (`super::persist`) one input.
+///
+/// Takes the MAP rather than `&SubagentExecutor` because the writers do: `foreground.rs`'s
+/// detached continuation holds the `Arc` to this map and deliberately not the executor (its task
+/// must not be able to pin a shutdown alive), and there is exactly one snapshot rule for both
+/// paths.
+///
+/// Cloned out of the lock rather than holding it across the merge/serialize/write that follows.
+pub(crate) fn foreground_runs_snapshot_of(
+    foreground_runs: &std::sync::Mutex<
+        std::collections::HashMap<crate::background::RunId, ForegroundHistoryRun>,
+    >,
+) -> Vec<ForegroundHistoryRun> {
+    foreground_runs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect()
+}
+
 impl SubagentExecutor {
     /// pi `rememberForegroundRun` (`subagent-executor.ts:749-793`), narrowed to the fields cyrup's
     /// [`ForegroundHistoryChild`] carries and to the call shape this crate's ONE settle path
@@ -275,19 +297,6 @@ impl SubagentExecutor {
                 None => break,
             }
         }
-    }
-
-    /// A clone of every settled run this process currently remembers —
-    /// [`SubagentExecutor::persist_foreground_run_history`](crate::extension::executor::SubagentExecutor::persist_foreground_run_history)'s
-    /// input. Cloned out of the lock rather than holding it across the merge/serialize/write that
-    /// follows.
-    pub(crate) fn foreground_runs_snapshot(&self) -> Vec<ForegroundHistoryRun> {
-        self.foreground_runs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect()
     }
 
     /// WORKFLOW_7 §3.3 — project the in-memory record onto the FleetView's
@@ -438,7 +447,7 @@ mod tests {
             Path::new("/tmp/project"),
             &[&test_single_result("scout", 0)],
         );
-        assert!(executor.foreground_runs_snapshot().is_empty());
+        assert!(foreground_runs_snapshot_of(&executor.foreground_runs).is_empty());
     }
 
     /// A clean exit records `completed`; a nonzero exit records `failed`; both are remembered
@@ -461,7 +470,7 @@ mod tests {
             &[&ok],
         );
 
-        let runs = executor.foreground_runs_snapshot();
+        let runs = foreground_runs_snapshot_of(&executor.foreground_runs);
         assert_eq!(runs.len(), 1);
         let run = &runs[0];
         assert_eq!(run.run_id, run_id);
@@ -480,7 +489,7 @@ mod tests {
             Path::new("/tmp/project"),
             &[&failed],
         );
-        let runs = executor.foreground_runs_snapshot();
+        let runs = foreground_runs_snapshot_of(&executor.foreground_runs);
         let failed_run = runs
             .iter()
             .find(|r| r.run_id == run_id_2)
@@ -508,7 +517,7 @@ mod tests {
             // clock.
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let runs = executor.foreground_runs_snapshot();
+        let runs = foreground_runs_snapshot_of(&executor.foreground_runs);
         assert_eq!(runs.len(), MAX_REMEMBERED_FOREGROUND_RUNS);
         let first = ids.first().expect("at least one id minted");
         assert!(

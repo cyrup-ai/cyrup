@@ -105,14 +105,36 @@ pub struct StepStatus {
     /// on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+    /// SUBA-087 — pi `step.childId?: string` (`shared/types.ts:1901` @v0.68.0, its own comment:
+    /// *"Stable caller-facing child identity for inspect/status/stop."*), the **FIRST** rung of
+    /// [`crate::background::child_identity::identity_from_parts`]'s four-rung ladder
+    /// (`child-identity.ts:20-22`).
+    ///
+    /// An identity a producer STAMPED on the step, as opposed to the three derived rungs below
+    /// it: upstream writes it from `asyncStatusChildIdentity(step, index)` when it projects a
+    /// status (`async-status.ts:334`) and from the child event's own id in the job tracker
+    /// (`async-job-tracker.ts:270`). Because it outranks [`Self::workflow_key`], a stamped value
+    /// is also what [`crate::background::child_identity::async_status_child_identity`] reports
+    /// back as the child's canonical spelling — which is the whole point of the rung: an id a
+    /// caller copied out of one surface keeps naming the same child on every later one, even if
+    /// the lane key or the child run id changes underneath it.
+    ///
+    /// `None` on every step cyrup itself declares today — nothing in this crate mints a child id,
+    /// exactly as upstream leaves the key absent for a step no producer stamped. Omitted from the
+    /// wire while absent, so a `status.json` written before this field existed still round-trips
+    /// (the same `default` + `skip_serializing_if` discipline every optional neighbour here
+    /// carries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_id: Option<String>,
     /// The stable workflow lane key this step belongs to — pi `AsyncStatus.steps[].workflowKey`
     /// (`shared/types.ts:1878`), read by `workflowChildSummary`'s step pass
     /// (`workflow-child-summary.ts:83-84`).
     ///
-    /// `None` for every non-workflow run. This is the FIRST rung of
-    /// [`crate::background::child_identity::identity_from_parts`], which had been unreachable
-    /// since that module was written; landing it means a caller can name a workflow child by its
-    /// key rather than by a positional `step:<index>` that shifts when the graph does.
+    /// `None` for every non-workflow run. This is the SECOND rung of
+    /// [`crate::background::child_identity::identity_from_parts`] (the first being
+    /// [`Self::child_id`]), and it had been unreachable since that module was written; landing it
+    /// meant a caller can name a workflow child by its key rather than by a positional
+    /// `step:<index>` that shifts when the graph does.
     ///
     /// No `deserialize_with`: [`crate::workflows::WorkflowKey`] deserializes THROUGH its own
     /// parser (SCOPE_3d §0.9), matching [`crate::identity::SessionId`] and every other validated
@@ -120,7 +142,7 @@ pub struct StepStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_key: Option<crate::workflows::WorkflowKey>,
     /// This step's own child run id, when the step launched a real run — pi
-    /// `AsyncStatus.steps[].runId` (`shared/types.ts:1888`), the SECOND rung of the same identity
+    /// `AsyncStatus.steps[].runId` (`shared/types.ts:1888`), the THIRD rung of the same identity
     /// ladder, one of the four `launchResolved` witnesses (`workflow-child-summary.ts:91`), and
     /// the value `WaitCompletionChild.runId` carries (via
     /// [`crate::exec::SingleResult::child_run_id`]).
@@ -208,6 +230,7 @@ impl StepStatus {
             stop_requested: false,
             stop_requested_at: None,
             stopped: false,
+            child_id: None,
             workflow_key: None,
             run_id: None,
             runner: None,

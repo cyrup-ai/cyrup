@@ -18,26 +18,22 @@
 //!
 //! # What the port can and cannot represent
 //!
-//! [`StepStatus::workflow_key`] and [`StepStatus::run_id`] (SCOPE_3d) populate the SECOND and THIRD
-//! rungs on a real status: a workflow child resolves by its lane key, then by its own child run id,
-//! and only positionally as the fallback.
+//! All FOUR rungs are ported. [`StepStatus::child_id`] (SUBA-087) is the first: an identity a
+//! producer STAMPED on the step, which outranks the derived ones so that an id a caller copied
+//! out of one surface keeps naming the same child on every later one. [`StepStatus::workflow_key`]
+//! and [`StepStatus::run_id`] (SCOPE_3d) are the second and third, and the positional
+//! `step:<index>` is the fallback.
 //!
-//! **The FIRST rung, `step.childId`, is unported.** [`StepStatus`] has no `child_id` field at all,
-//! so `async_status_child_identity_candidates` below emits three candidates where upstream emits
-//! four, and a caller holding an explicit child id cannot use it:
+//! The first rung changes which child no EXISTING caller resolves, and that is by construction,
+//! not by accident: nothing in this crate mints a child id today, so every step cyrup declares
+//! carries `child_id: None` and the ladder starts, as it did, at the lane key. Upstream is in the
+//! same position for a step no producer stamped — its `childId` is `undefined` and the
+//! `value.length > 0` filter (`:21`) drops it. What the rung buys is that the ladder CAN now
+//! widen: a producer that stamps one (upstream's own do, at `async-status.ts:334` and
+//! `async-job-tracker.ts:270`) is resolvable by it, and `status.json` round-trips it.
 //!
-//! ```text
-//! $ git grep -n 'child_id' crates/cyrup-ext-subagents/src/background/records.rs
-//! $ (no output — the struct at records.rs:24 has no such field)
-//! ```
-//!
-//! This is small and real rather than theoretical: it does not change which child any EXISTING
-//! caller resolves (cyrup never mints a `childId`, so upstream's first rung would be `undefined`
-//! and skipped for every step cyrup produces), but it does mean the ladder is narrower than
-//! upstream's and cannot widen until `StepStatus` carries the field. Recorded as a residual in
-//! `docs/gap-analysis/00-residual-ledger.md`. The other thing that remains genuinely
-//! unrepresentable is the `DynamicGroup` splice residual described below — a dynamic group is
-//! still one entry whose members share an identity.
+//! What remains genuinely unrepresentable is the `DynamicGroup` splice residual described below —
+//! a dynamic group is still one entry whose members share an identity.
 //!
 //! `index` here is the index into [`RunStatus::steps`] — the SAME index space cyrup's other
 //! per-child surfaces use (`steer`'s `target_index`, the transcript view's `index`, the runner's
@@ -47,21 +43,23 @@
 //! identity — cyrup does not splice materialized items into `RunStatus::steps` as upstream does
 //! (`subagent-runner.ts:4155` @v0.64.0); that half is a recorded SUBA-093 residual.
 //!
+//! # `includeNested` IS ported — as a seam, not as a flag
+//!
 //! `resolveAsyncStatusChild`'s `includeNested` option (`:27,34-42`, added between v0.57.0 and
-//! v0.64.0) walks each step's `children: NestedRunSummary[]` for a nested run id. An earlier
-//! revision of this paragraph said it "is not ported", on the true-at-the-time premise that its
-//! only consumer was a slash path cyrup did not expose. **That premise no longer holds.** VL-S11
-//! landed `/subagents-steer`, which is upstream's other `includeNested: true` caller
-//! (`slash/slash-commands.ts:1097-1103`), and it supplies the nested rung through this module's
-//! own seam: [`resolve_by_candidates`] takes the candidate function, and
-//! `extension/host/slash_steer.rs` passes a `candidates_including_nested` that appends each step's
-//! nested run ids. So the nested rung IS reachable in cyrup — through a caller-supplied candidate
-//! list rather than through a boolean option, which is why the signature here has no
-//! `include_nested` flag. What is still true: [`async_status_child_identity_candidates`], the
-//! DEFAULT candidate function, does not walk nested runs, so the tool path
-//! (`async-stop-action.ts:50`, which never passes the flag upstream either) is unchanged; and
-//! cyrup's per-step nested tracking is a list of bare [`crate::background::RunId`]s rather than
-//! `NestedRunSummary`s, so the recursive `findNested` descent (`:38`) flattens to one level.
+//! v0.64.0) walks each step's `children: NestedRunSummary[]` for a nested run id. cyrup reaches
+//! it through [`resolve_by_candidates`], which takes the candidate function rather than a boolean:
+//! `/subagents-steer` — upstream's other `includeNested: true` caller
+//! (`slash/slash-commands.ts:1097-1103`) — passes `candidates_including_nested`
+//! (`extension/host/slash_steer.rs:129`), which appends each step's nested run ids to this
+//! module's default rungs. That is why the signature here has no `include_nested` flag: the option
+//! and the seam select the same behaviour, and the seam cannot be passed by a caller that has not
+//! decided it wants nested matches.
+//!
+//! Two narrowings remain, both deliberate. [`async_status_child_identity_candidates`], the DEFAULT
+//! candidate function, does not walk nested runs — so the tool path (`async-stop-action.ts:50`,
+//! which never passes the flag upstream either) is unchanged. And cyrup's per-step nested tracking
+//! is a list of bare [`crate::background::RunId`]s rather than `NestedRunSummary`s, so the
+//! recursive `findNested` descent (`:38`) flattens to one level.
 
 use crate::background::{RunStatus, StepState, StepStatus};
 
@@ -118,33 +116,45 @@ pub fn positional_child_identity(index: usize) -> String {
     format!("step:{index}")
 }
 
-/// pi `asyncStatusChildIdentity`'s three-rung fallback (`child-identity.ts:16-18`), over its raw
-/// inputs: `workflowKey ?? runId ?? step:<index>`. Empty strings count as absent, matching the
-/// candidate filter at `:21` (`value.length > 0`).
+/// pi `asyncStatusChildIdentity`'s FOUR-rung fallback (`child-identity.ts:16-22`), over its raw
+/// inputs: `childId ?? workflowKey ?? runId ?? step:<index>`. Empty strings count as absent,
+/// matching the candidate filter at `:21` (`value.length > 0`).
+///
+/// Upstream derives the identity from the candidate list itself (`candidates[0]!`, `:17`), so the
+/// two must agree rung for rung: [`candidates_from_parts`] below is the same four values in the
+/// same order.
 #[must_use]
 pub fn identity_from_parts(
+    child_id: Option<&str>,
     workflow_key: Option<&str>,
     run_id: Option<&str>,
     index: usize,
 ) -> String {
-    workflow_key
-        .filter(|key| !key.is_empty())
+    child_id
+        .filter(|id| !id.is_empty())
+        .or(workflow_key.filter(|key| !key.is_empty()))
         .or(run_id.filter(|id| !id.is_empty()))
         .map(str::to_string)
         .unwrap_or_else(|| positional_child_identity(index))
 }
 
+/// The number of rungs upstream's candidate array carries (`child-identity.ts:21`:
+/// `[step.childId, step.workflowKey, step.runId, `step:${index}`]`) — the `Vec` pre-allocation
+/// and the one place the count is written down.
+const RUNG_COUNT: usize = 4;
+
 /// pi `asyncStatusChildIdentityCandidates` (`child-identity.ts:20-22`): every spelling that names
 /// this child, de-duplicated in rung order, empties dropped.
 #[must_use]
 pub fn candidates_from_parts(
+    child_id: Option<&str>,
     workflow_key: Option<&str>,
     run_id: Option<&str>,
     index: usize,
 ) -> Vec<String> {
     let positional = positional_child_identity(index);
-    let mut out: Vec<String> = Vec::with_capacity(3);
-    for candidate in [workflow_key, run_id, Some(positional.as_str())]
+    let mut out: Vec<String> = Vec::with_capacity(RUNG_COUNT);
+    for candidate in [child_id, workflow_key, run_id, Some(positional.as_str())]
         .into_iter()
         .flatten()
         .filter(|value| !value.is_empty())
@@ -156,11 +166,12 @@ pub fn candidates_from_parts(
     out
 }
 
-/// pi `asyncStatusChildIdentity(step, index)` over a real [`StepStatus`]: `workflowKey ?? runId
-/// ?? step:<index>`, off the step's own fields (SCOPE_3d).
+/// pi `asyncStatusChildIdentity(step, index)` over a real [`StepStatus`]: `childId ?? workflowKey
+/// ?? runId ?? step:<index>`, off the step's own fields (SUBA-087 + SCOPE_3d).
 #[must_use]
 pub fn async_status_child_identity(step: &StepStatus, index: usize) -> String {
     identity_from_parts(
+        step.child_id.as_deref(),
         step.workflow_key.as_ref().map(|key| key.as_str()),
         step.run_id.as_ref().map(|run_id| run_id.as_str()),
         index,
@@ -171,6 +182,7 @@ pub fn async_status_child_identity(step: &StepStatus, index: usize) -> String {
 #[must_use]
 pub fn async_status_child_identity_candidates(step: &StepStatus, index: usize) -> Vec<String> {
     candidates_from_parts(
+        step.child_id.as_deref(),
         step.workflow_key.as_ref().map(|key| key.as_str()),
         step.run_id.as_ref().map(|run_id| run_id.as_str()),
         index,
@@ -244,7 +256,12 @@ pub fn is_stoppable_async_status_step(step: &StepStatus) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::background::{RunId, RunMode, RunStatus, StepState, StepStatus};
@@ -267,36 +284,154 @@ mod tests {
         status
     }
 
-    /// `child-identity.ts:16-18` — `workflowKey ?? runId ?? step:<index>`, in that order, with an
-    /// empty string treated as absent (`:21`).
+    /// `child-identity.ts:16-22` — `childId ?? workflowKey ?? runId ?? step:<index>`, in that
+    /// order, with an empty string treated as absent (`:21`).
+    ///
+    /// MUTATION: drop the `childId` rung (or demote it below `workflowKey`) and the first
+    /// assertion resolves to `wf-key` instead of `explicit-child`.
     #[test]
-    fn identity_falls_back_workflow_key_then_run_id_then_position() {
+    fn identity_falls_back_child_id_then_workflow_key_then_run_id_then_position() {
         assert_eq!(
-            identity_from_parts(Some("wf-key"), Some("run-9"), 3),
+            identity_from_parts(Some("explicit-child"), Some("wf-key"), Some("run-9"), 3),
+            "explicit-child"
+        );
+        assert_eq!(
+            identity_from_parts(None, Some("wf-key"), Some("run-9"), 3),
             "wf-key"
         );
-        assert_eq!(identity_from_parts(None, Some("run-9"), 3), "run-9");
-        assert_eq!(identity_from_parts(Some(""), Some("run-9"), 3), "run-9");
-        assert_eq!(identity_from_parts(None, None, 3), "step:3");
-        assert_eq!(identity_from_parts(Some(""), Some(""), 0), "step:0");
+        assert_eq!(
+            identity_from_parts(Some(""), Some("wf-key"), Some("run-9"), 3),
+            "wf-key",
+            "an empty childId is upstream's `value.length > 0` filter, not a match"
+        );
+        assert_eq!(identity_from_parts(None, None, Some("run-9"), 3), "run-9");
+        assert_eq!(
+            identity_from_parts(None, Some(""), Some("run-9"), 3),
+            "run-9"
+        );
+        assert_eq!(identity_from_parts(None, None, None, 3), "step:3");
+        assert_eq!(
+            identity_from_parts(Some(""), Some(""), Some(""), 0),
+            "step:0"
+        );
     }
 
     /// `child-identity.ts:20-22` — every non-empty rung is a candidate, de-duplicated, position
-    /// always last.
+    /// always last, `childId` always FIRST.
+    ///
+    /// MUTATION: drop the `childId` rung and the four-rung case loses its head entry.
     #[test]
     fn candidates_keep_rung_order_and_dedupe() {
         assert_eq!(
-            candidates_from_parts(Some("wf"), Some("wf"), 2),
+            candidates_from_parts(Some("cid"), Some("wf"), Some("run-1"), 2),
+            vec![
+                "cid".to_string(),
+                "wf".to_string(),
+                "run-1".to_string(),
+                "step:2".to_string()
+            ],
+            "all four rungs, in upstream's order"
+        );
+        assert_eq!(
+            candidates_from_parts(Some("same"), Some("same"), None, 1),
+            vec!["same".to_string(), "step:1".to_string()],
+            "the `new Set` de-dupe (`:21`) keeps the first spelling only"
+        );
+        assert_eq!(
+            candidates_from_parts(None, Some("wf"), Some("wf"), 2),
             vec!["wf".to_string(), "step:2".to_string()]
         );
         assert_eq!(
-            candidates_from_parts(None, Some("run-1"), 0),
+            candidates_from_parts(None, None, Some("run-1"), 0),
             vec!["run-1".to_string(), "step:0".to_string()]
         );
         assert_eq!(
-            candidates_from_parts(None, None, 7),
+            candidates_from_parts(None, None, None, 7),
             vec!["step:7".to_string()]
         );
+    }
+
+    /// SUBA-087 — the ladder over a REAL [`StepStatus`]: a step carrying a `child_id` resolves by
+    /// it and reports it as its canonical spelling, ahead of the `workflow_key` and `run_id` the
+    /// same step also carries; a step with no `child_id` falls through IDENTICALLY to the
+    /// three-rung behaviour that preceded the field.
+    ///
+    /// MUTATION: drop the rung from `async_status_child_identity_candidates` and `"explicit-child"`
+    /// stops resolving while step 0's canonical id regresses to `lane.a`.
+    #[test]
+    fn a_stamped_child_id_outranks_the_derived_rungs_and_absence_falls_through() {
+        let mut status = status_with(&[StepState::Running, StepState::Running]);
+        if let Some(step) = status.steps.get_mut(0) {
+            step.child_id = Some("explicit-child".to_string());
+            step.workflow_key = crate::workflows::WorkflowKey::parse("lane.a").ok();
+            step.run_id = Some(RunId::from_token("childrun00001"));
+        }
+        if let Some(step) = status.steps.get_mut(1) {
+            step.workflow_key = crate::workflows::WorkflowKey::parse("lane.b").ok();
+            step.run_id = Some(RunId::from_token("childrun00002"));
+        }
+
+        assert_eq!(
+            async_status_child_identity_candidates(&status.steps[0], 0),
+            vec![
+                "explicit-child".to_string(),
+                "lane.a".to_string(),
+                "childrun00001".to_string(),
+                "step:0".to_string()
+            ]
+        );
+        match resolve_async_status_child(&status, "explicit-child") {
+            AsyncStatusChildResolution::Resolved(child) => {
+                assert_eq!((child.index, child.id.as_str()), (0, "explicit-child"));
+            }
+            other => panic!("expected the stamped rung to resolve, got {other:?}"),
+        }
+        // The lower rungs still ADDRESS the same child; only the canonical spelling changed.
+        for alias in ["lane.a", "childrun00001", "step:0"] {
+            match resolve_async_status_child(&status, alias) {
+                AsyncStatusChildResolution::Resolved(child) => assert_eq!(
+                    (child.index, child.id.as_str()),
+                    (0, "explicit-child"),
+                    "{alias} must still name step 0, canonically spelled by the first rung"
+                ),
+                other => panic!("expected {alias} to resolve, got {other:?}"),
+            }
+        }
+        // …and the step with no `child_id` behaves exactly as it did before the field existed.
+        assert_eq!(
+            async_status_child_identity_candidates(&status.steps[1], 1),
+            vec![
+                "lane.b".to_string(),
+                "childrun00002".to_string(),
+                "step:1".to_string()
+            ]
+        );
+        assert_eq!(async_status_child_identity(&status.steps[1], 1), "lane.b");
+    }
+
+    /// `StepStatus::child_id`'s serde discipline: absent from the wire while `None` (so a
+    /// `status.json` written before the field existed still round-trips), and round-tripped when
+    /// set.
+    ///
+    /// MUTATION: drop `skip_serializing_if` and every status this crate writes gains a
+    /// `"childId": null`; drop `default` and every status written before the field fails to read.
+    #[test]
+    fn child_id_is_omitted_while_absent_and_round_trips_when_set() {
+        let step = StepStatus::pending("scout");
+        let json = serde_json::to_string(&step).expect("serialize");
+        assert!(
+            !json.contains("childId"),
+            "an absent child id must not reach the wire: {json}"
+        );
+        let back: StepStatus = serde_json::from_str(&json).expect("a status with no childId reads");
+        assert_eq!(back.child_id, None);
+
+        let mut stamped = StepStatus::pending("scout");
+        stamped.child_id = Some("child-7".to_string());
+        let json = serde_json::to_string(&stamped).expect("serialize");
+        assert!(json.contains(r#""childId":"child-7""#), "{json}");
+        let back: StepStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.child_id.as_deref(), Some("child-7"));
     }
 
     /// On a real cyrup status every child is positional, and the resolved `id` is the canonical

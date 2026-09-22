@@ -65,11 +65,6 @@ pub enum SubagentError {
         error: String,
     },
 
-    /// No saved chain definition matched the requested name (`/run-chain`, R-SA-129), applying
-    /// the identical exact-string-equality convention R-SA-008 mandates for agent names.
-    #[error("chain not found: {0}")]
-    ChainNotFound(String),
-
     /// A management (create/update/delete/rename) operation targeted a Builtin- or
     /// Package-sourced agent, which is read-only (R-SA-014).
     #[error("agent source is read-only: {0}")]

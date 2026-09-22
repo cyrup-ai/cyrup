@@ -91,6 +91,18 @@ pub struct SubagentsExtension {
     /// when false, upstream leaves `fleetStatus` `undefined` entirely (`:378-383`) and no widget
     /// ever registers. Captured at construction, exactly as upstream captures it.
     fleet_view_enabled: bool,
+    /// `SubagentExtensionConfig::foreground_detach_shortcut`, captured at construction — pi's own
+    /// `foregroundDetachShortcut: config.foregroundDetachShortcut` capture at
+    /// `extension/index.ts:856`, which is likewise read once as the config lands rather than
+    /// re-read per press.
+    ///
+    /// Captured for [`Self::fleet_view_enabled`]'s reason plus [`Self::roots`]': the shortcut is
+    /// resolved on SYNCHRONOUS `&self` methods (`NativeExtension::init` is not async), which
+    /// cannot reach the executor's async config cell. Named `_setting` because it is the
+    /// SETTINGS TIER and not the resolved answer — it is the higher of the two rungs
+    /// [`Self::foreground_detach_shortcut`] walks; the lower is the env var, read through
+    /// [`Self::env_lookup`].
+    foreground_detach_shortcut_setting: Option<String>,
     /// pi's single `SubagentFleetStatus` instance, constructed with the resolved
     /// `fleetViewPlacement` (`extension/index.ts:334,382`). Published through
     /// [`cyrup_ext::HostServices::set_widget`] by [`Self::refresh_fleet_status_widget`].
@@ -214,6 +226,8 @@ impl SubagentsExtension {
         let roots = config.roots.clone();
         let env_overrides = config.env_overrides.clone();
         let fleet_view_enabled = config.fleet_view;
+        // pi `foregroundDetachShortcut: config.foregroundDetachShortcut` (`extension/index.ts:856`).
+        let foreground_detach_shortcut_setting = config.foreground_detach_shortcut.clone();
         let fleet_status = crate::tui::fleet_status::SubagentFleetStatus::new(
             crate::tui::fleet_status::FleetStatusOptions {
                 placement: crate::tui::fleet_status::resolve_fleet_view_placement(
@@ -280,6 +294,7 @@ impl SubagentsExtension {
             fleet_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fleet_inspector_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fleet_view_enabled,
+            foreground_detach_shortcut_setting,
             fleet_status: Arc::new(std::sync::Mutex::new(fleet_status)),
             rpc_tool: std::sync::OnceLock::new(),
             rpc_bridge: crate::extension::rpc::SubagentRpcBridge::new(),

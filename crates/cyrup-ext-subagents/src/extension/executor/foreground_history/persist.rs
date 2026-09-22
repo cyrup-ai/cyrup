@@ -86,44 +86,81 @@ fn is_persistable(run: &ForegroundHistoryRun) -> bool {
             .all(|c| RESTORABLE.contains(&c.status.as_str()))
 }
 
-impl SubagentExecutor {
-    /// pi `persistForegroundRunHistory` (`:136-147`). Merge-by-`run_id` is the contract: a run
-    /// this process remembers REPLACES the same id on disk; an id only the file knows (written by
-    /// a sibling process sharing this results dir) survives untouched.
-    pub(crate) fn persist_foreground_run_history(&self, results_dir: &Path, limit: usize) {
-        let mut merged: HashMap<RunId, ForegroundHistoryRun> = read_index(results_dir)
-            .into_iter()
-            .map(|run| (run.run_id.clone(), run))
-            .collect();
-        for run in self.foreground_runs_snapshot() {
-            if !is_persistable(&run) {
-                continue;
-            }
-            merged.insert(run.run_id.clone(), compact_run(run));
+/// The `&self`-free persist entry point — pi `persistForegroundRunHistory` (`:136-147`), and the
+/// ONE implementation of the merge/bound/write rule in this crate.
+///
+/// Merge-by-`run_id` is the contract: a run this process remembers REPLACES the same id on disk;
+/// an id only the file knows (written by a sibling process sharing this results dir) survives
+/// untouched. [`is_persistable`] is applied to every remembered run FIRST, so the never-persist
+/// rule for a `"detached"` child holds on this path exactly as it does on the `&self` one — there
+/// is no second writer that could forget it.
+///
+/// # Why it takes the map and not the executor
+///
+/// `foreground.rs`'s detached continuation (`spawn_detached_foreground_continuation`) owns the
+/// drive future of a child that outlived its tool call, and it deliberately captures the ONE
+/// `Arc` field the reconcile writes rather than the executor: `run_foreground_impl` takes `&self`,
+/// [`SubagentExecutor`] carries no self-`Arc` slot, and a handle to the executor would let a
+/// detached child pin a shutdown alive. That task can therefore reconcile the settled child into
+/// the in-memory map but had nothing to call to get it onto DISK, so a run that settled after its
+/// session's last ordinary foreground settle was not restorable across a restart. This is what it
+/// calls.
+///
+/// [`SubagentExecutor::persist_foreground_run_history`] delegates here, so the two entry points
+/// cannot drift in what they merge, what they bound, or what they refuse to write.
+pub(crate) fn persist_foreground_run_history_from(
+    foreground_runs: &std::sync::Mutex<HashMap<RunId, ForegroundHistoryRun>>,
+    results_dir: &Path,
+    limit: usize,
+) {
+    let mut merged: HashMap<RunId, ForegroundHistoryRun> = read_index(results_dir)
+        .into_iter()
+        .map(|run| (run.run_id.clone(), run))
+        .collect();
+    for run in super::record::foreground_runs_snapshot_of(foreground_runs) {
+        if !is_persistable(&run) {
+            continue;
         }
-        let runs = sort_and_bound(merged.into_values().collect(), limit);
-        // pi `writePrivateAtomicJson` (`:146`) — 0600, creates the parent dir, atomic rename.
-        // Best-effort: a write failure here must never surface as a tool/run failure — exactly
-        // `record_run_history`'s own best-effort contract.
-        let _ = crate::background::atomic::write_private_atomic_json_blocking(
-            &history_path(results_dir),
-            &ForegroundHistoryIndex {
-                version: HistoryVersion,
-                runs,
-            },
-        );
+        merged.insert(run.run_id.clone(), compact_run(run));
     }
+    let runs = sort_and_bound(merged.into_values().collect(), limit);
+    // pi `writePrivateAtomicJson` (`:146`) — 0600, creates the parent dir, atomic rename.
+    // Best-effort: a write failure here must never surface as a tool/run failure — exactly
+    // `record_run_history`'s own best-effort contract.
+    let _ = crate::background::atomic::write_private_atomic_json_blocking(
+        &history_path(results_dir),
+        &ForegroundHistoryIndex {
+            version: HistoryVersion,
+            runs,
+        },
+    );
+}
 
+/// [`SubagentExecutor::persist_foreground_run_history_for`]'s body without the executor: resolve
+/// `results_dir` from the roots the caller already holds, then persist at the standard bound.
+///
+/// The resolution rule lives HERE, once, for the same reason the merge rule does — a redirected
+/// root must be honoured identically on both paths (the `background/run_history.rs:56-63` lesson).
+/// A caller that has no `Roots` in hand has no business guessing one.
+pub(crate) fn persist_foreground_run_history_in(
+    foreground_runs: &std::sync::Mutex<HashMap<RunId, ForegroundHistoryRun>>,
+    roots: &crate::paths::Roots,
+    cwd: &Path,
+) {
+    persist_foreground_run_history_from(
+        foreground_runs,
+        &default_results_dir_in(roots, cwd),
+        super::record::MAX_REMEMBERED_FOREGROUND_RUNS,
+    );
+}
+
+impl SubagentExecutor {
     /// The results-dir-resolving wrapper `foreground.rs`'s settle path calls (WORKFLOW_7 §3.2):
     /// resolves `results_dir` exactly as [`Self::resume_tracking`] does (`status.rs:27-29`), so a
     /// redirected root is honoured here too (the `background/run_history.rs:56-63` lesson).
     pub(crate) async fn persist_foreground_run_history_for(&self, cwd: &Path) {
         let roots = self.config_snapshot().await.roots;
-        let results_dir = default_results_dir_in(&roots, cwd);
-        self.persist_foreground_run_history(
-            &results_dir,
-            super::record::MAX_REMEMBERED_FOREGROUND_RUNS,
-        );
+        persist_foreground_run_history_in(&self.foreground_runs, &roots, cwd);
     }
 }
 
@@ -138,6 +175,7 @@ mod tests {
 
     use super::*;
     use crate::background::RunMode;
+    use crate::extension::executor::foreground_history::record::foreground_runs_snapshot_of;
     use crate::extension::executor::foreground_history::record::test_single_result;
     use crate::extension::testsupport::FixedSessionIdHost;
     use crate::identity::SessionId;
@@ -232,7 +270,7 @@ mod tests {
             &[&test_single_result("scout", 0)],
         );
 
-        executor.persist_foreground_run_history(dir.path(), 50);
+        persist_foreground_run_history_from(&executor.foreground_runs, dir.path(), 50);
 
         let persisted = read_index(dir.path());
         assert_eq!(persisted.len(), 1);
@@ -265,12 +303,12 @@ mod tests {
             &[&detached],
         );
         assert_eq!(
-            executor.foreground_runs_snapshot()[0].children[0].status,
+            foreground_runs_snapshot_of(&executor.foreground_runs)[0].children[0].status,
             "detached",
             "remembered in memory with its real status"
         );
 
-        executor.persist_foreground_run_history(dir.path(), 50);
+        persist_foreground_run_history_from(&executor.foreground_runs, dir.path(), 50);
         assert!(
             read_index(dir.path()).is_empty(),
             "a detached run must never reach disk"
@@ -297,16 +335,196 @@ mod tests {
         );
         // In memory, `final_output` is still carried raw (pi's own remember-time shape).
         assert!(
-            executor.foreground_runs_snapshot()[0].children[0]
+            foreground_runs_snapshot_of(&executor.foreground_runs)[0].children[0]
                 .final_output
                 .is_some()
         );
 
-        executor.persist_foreground_run_history(dir.path(), 50);
+        persist_foreground_run_history_from(&executor.foreground_runs, dir.path(), 50);
         let persisted = read_index(dir.path());
         assert_eq!(
             persisted[0].children[0].final_output, None,
             "an output path exists, so the persisted record must carry no inline final_output"
+        );
+    }
+
+    /// R-VLS11b-02 — the `&self`-free entry point and the `&self` one are ONE implementation:
+    /// over the same map and the same results dir they must produce the SAME BYTES, down to the
+    /// merge with what was already on disk and the `sort_and_bound` order.
+    ///
+    /// The map is seeded directly rather than through `remember_foreground_run` so each run has a
+    /// distinct `updated_at` — `sort_and_bound` orders by it, and two runs remembered in the same
+    /// millisecond would make the comparison depend on `HashMap` iteration order rather than on
+    /// the rule under test.
+    ///
+    /// MUTATION: let the free entry point skip `is_persistable` and the detached run below reaches
+    /// disk on one path and not the other, so the two files differ; re-implement the merge there
+    /// and the pre-existing foreign run is dropped from one of them.
+    #[tokio::test]
+    async fn the_free_entry_point_writes_the_same_bytes_the_executor_path_does() {
+        let executor = SubagentExecutor::new();
+        with_session(&executor, "session-a");
+        // Two sandboxed roots over ONE project cwd, so each path resolves its own file through the
+        // same `default_results_dir_in` arithmetic and the two can be compared.
+        let self_home = tempfile::tempdir().expect("tempdir");
+        let map_home = tempfile::tempdir().expect("tempdir");
+        let project = tempfile::tempdir().expect("tempdir");
+        let self_roots = crate::paths::Roots::sandboxed(self_home.path());
+        let map_roots = crate::paths::Roots::sandboxed(map_home.path());
+        let via_self = default_results_dir_in(&self_roots, project.path());
+        let via_map = default_results_dir_in(&map_roots, project.path());
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = self_roots.clone();
+        }
+
+        // A run only the FILE knows, seeded identically into both dirs, so the merge leg is
+        // exercised on both paths.
+        let foreign = run(
+            RunId::from_token("foreign-run"),
+            "session-b",
+            50,
+            "completed",
+        );
+        for dir in [via_self.as_path(), via_map.as_path()] {
+            crate::background::atomic::write_private_atomic_json_blocking(
+                &history_path(dir),
+                &ForegroundHistoryIndex {
+                    version: HistoryVersion,
+                    runs: vec![foreign.clone()],
+                },
+            )
+            .expect("seed an existing history file");
+        }
+
+        {
+            let mut map = executor
+                .foreground_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (token, updated_at, status) in [
+                ("run-old", 100_i64, "completed"),
+                ("run-new", 300, "failed"),
+                ("run-mid", 200, "stopped"),
+                // Never persistable on EITHER path — the rule under test.
+                ("run-detached", 400, "detached"),
+            ] {
+                let id = RunId::from_token(token);
+                map.insert(id.clone(), run(id, "session-a", updated_at, status));
+            }
+        }
+
+        // The `&self` path (what every ordinary foreground settle calls) …
+        executor
+            .persist_foreground_run_history_for(project.path())
+            .await;
+        // … and the `&self`-free one the detached continuation calls.
+        persist_foreground_run_history_in(&executor.foreground_runs, &map_roots, project.path());
+
+        let from_self = std::fs::read(history_path(&via_self)).expect("the &self path wrote");
+        let from_map = std::fs::read(history_path(&via_map)).expect("the free path wrote");
+        assert_eq!(
+            from_map, from_self,
+            "the two entry points must be one implementation, byte for byte"
+        );
+
+        let persisted = read_index(&via_map);
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|r| r.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-new", "run-mid", "run-old", "foreign-run"],
+            "newest first by updated_at, with the detached run refused and the foreign run merged"
+        );
+    }
+
+    /// §0.6/§2.1 on the `&self`-free path: a `detached` run reaches the in-memory map (the
+    /// detached continuation's whole job) and NEVER reaches disk — the never-persist rule is not
+    /// something a second writer may forget.
+    ///
+    /// MUTATION: drop the `is_persistable` guard from `persist_foreground_run_history_from` and a
+    /// detached run is written.
+    #[test]
+    fn the_free_entry_point_never_writes_a_detached_run() {
+        let executor = SubagentExecutor::new();
+        with_session(&executor, "session-a");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut detached = test_single_result("scout", 0);
+        detached.detached = true;
+        let run_id = RunId::new();
+        executor.remember_foreground_run(
+            &run_id,
+            RunMode::Single,
+            Path::new("/tmp/project"),
+            &[&detached],
+        );
+
+        persist_foreground_run_history_from(&executor.foreground_runs, dir.path(), 50);
+        assert!(
+            read_index(dir.path()).is_empty(),
+            "a detached run must never reach disk, on either entry point"
+        );
+
+        // …and once the continuation has RECONCILED it to a settled status, the same call does
+        // persist it — which is the whole point of giving that task an entry point.
+        {
+            let mut map = executor
+                .foreground_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = map.get_mut(&run_id)
+                && let Some(child) = entry.children.first_mut()
+            {
+                child.status = "completed".to_string();
+            }
+        }
+        persist_foreground_run_history_from(&executor.foreground_runs, dir.path(), 50);
+        let persisted = read_index(dir.path());
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].run_id, run_id);
+        assert_eq!(persisted[0].children[0].status, "completed");
+    }
+
+    /// `persist_foreground_run_history_in` resolves the results dir from the ROOTS it is handed —
+    /// the same rule `persist_foreground_run_history_for` applies through the executor's config —
+    /// so a redirected root is honoured on the `&self`-free path too.
+    ///
+    /// MUTATION: resolve against the process environment instead of the supplied roots and the
+    /// file lands outside the redirected root, where the restore pass will never look for it.
+    #[tokio::test]
+    async fn the_cwd_entry_point_resolves_the_results_dir_from_the_supplied_roots() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let project = tempfile::tempdir().expect("tempdir");
+        let roots = crate::paths::Roots::sandboxed(home.path());
+
+        let executor = SubagentExecutor::new();
+        with_session(&executor, "session-a");
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = roots.clone();
+        }
+        executor.remember_foreground_run(
+            &RunId::new(),
+            RunMode::Single,
+            project.path(),
+            &[&test_single_result("scout", 0)],
+        );
+
+        persist_foreground_run_history_in(&executor.foreground_runs, &roots, project.path());
+
+        let expected = default_results_dir_in(&roots, project.path());
+        assert_eq!(read_index(&expected).len(), 1, "wrote under {expected:?}");
+        // And the `&self` wrapper, which resolves the same roots out of the config, agrees.
+        let bytes = std::fs::read(history_path(&expected)).expect("read");
+        executor
+            .persist_foreground_run_history_for(project.path())
+            .await;
+        assert_eq!(
+            std::fs::read(history_path(&expected)).expect("read"),
+            bytes,
+            "both wrappers resolve to the same file and write the same bytes"
         );
     }
 
@@ -340,7 +558,7 @@ mod tests {
             Path::new("/tmp/project"),
             &[&test_single_result("scout", 0)],
         );
-        executor.persist_foreground_run_history(dir.path(), 50);
+        persist_foreground_run_history_from(&executor.foreground_runs, dir.path(), 50);
 
         let persisted = read_index(dir.path());
         assert_eq!(persisted.len(), 2, "the foreign run must survive the merge");

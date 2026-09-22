@@ -172,6 +172,30 @@ struct ForegroundControlIdentity<'a> {
         Option<&'a crate::extension::executor::foreground_control::ForegroundChildSteerHandle>,
 }
 
+/// Everything [`SubagentExecutor::hand_off_detached_foreground_run`] needs about a run whose
+/// detach receipt has already been published — a struct, not six more positional args, for the
+/// reason [`ForegroundControlIdentity`] above is one.
+///
+/// The artifact pair is OWNED because the plain arm moves it into the continuation task; the rest
+/// borrows for the one call, exactly as `run_foreground_impl` holds it.
+struct DetachedRunHandoff<'a> {
+    run_id: &'a RunId,
+    /// The run's effective working directory — `settle_attached_foreground_run`'s history/persist
+    /// legs are both keyed by it.
+    cwd: &'a Path,
+    control_notifier: &'a ForegroundControlNotifier,
+    art_paths: crate::artifacts::ArtifactPaths,
+    art_cfg: crate::artifacts::ArtifactConfig,
+    /// cyrup's `params.workflowAwaitDetached` (pi `subagent-executor.ts:4009`), which upstream
+    /// stamps on every workflow child launch and nothing else (`:5790`): `Some` iff this run is a
+    /// workflow child, whose sole production writer is `WorkflowRunHost::launch`.
+    parent_workflow_run_id: Option<&'a RunId>,
+    /// The config snapshot's roots, cloned for the plain arm's continuation task to persist
+    /// through (R-VLS11b-02). Owned because that task outlives this call; unused on the workflow
+    /// arm, which persists through `&self` in `settle_attached_foreground_run`.
+    persist_roots: crate::paths::Roots,
+}
+
 impl SubagentExecutor {
     // ---------------------------------------------------------------------------------------
     // Foreground single-run dispatch (the tool's synchronous shape; exec::run_sync end to end)
@@ -500,27 +524,156 @@ impl SubagentExecutor {
         }
         detach_gate.accept();
 
+        let settled = self
+            .hand_off_detached_foreground_run(
+                DetachedRunHandoff {
+                    run_id: &run_id,
+                    cwd,
+                    control_notifier: &control_notifier,
+                    art_paths,
+                    art_cfg,
+                    parent_workflow_run_id: parent_workflow_run_id.as_ref(),
+                    persist_roots: cfg.roots.clone(),
+                },
+                drive,
+                receipt.result,
+            )
+            .await;
+
+        Ok((settled, run_id))
+    }
+
+    /// Hand a run whose detach receipt has just been PUBLISHED to whichever of its two owners is
+    /// still waiting for a terminal result — pi's `resolveDetachedWorkflowChild` fork
+    /// (`subagent-executor.ts:4008-4012` mints the promise, `:4077-4081` fires it, `:4123`
+    /// awaits it).
+    ///
+    /// Returns what `run_foreground_impl` hands back to ITS caller: the receipt for a plain
+    /// `/run` single, the child's real terminal [`SingleResult`] for a workflow child.
+    ///
+    /// # The two owners, and why the fork is on `parent_workflow_run_id`
+    ///
+    /// A detach's whole premise is that the CALLER is answered early while the child keeps
+    /// running. That premise holds for a plain `/run` single, whose caller is a human tool call
+    /// that has nothing left to do with the child. It is FALSE for a workflow child, whose caller
+    /// is [`WorkflowRunHost::launch`](crate::extension::executor::workflow::WorkflowRunHost) —
+    /// a step of a running workflow that must report the child's verdict to the guest script.
+    /// Answering that caller with a receipt is answering it with `exit_code == -2`, which
+    /// `map_child_result`'s `ok` predicate (`workflow.rs`) reads as a FAILED child: the step
+    /// advances on a fabricated failure, and the real exit — observed later by the continuation
+    /// task — reaches `foreground_runs` and nothing else.
+    ///
+    /// Upstream refuses that trade in exactly the same place and for exactly the same reason:
+    /// every workflow child launch carries `awaitDetachedChild: true`
+    /// (`subagent-executor.ts:5790`, unconditional), which becomes `params.workflowAwaitDetached`
+    /// (`:4778`), which is the ONLY condition under which the `detachedWorkflowChild` promise
+    /// exists (`:4009`). When it exists, `onDetachedExit` resolves it and **returns before
+    /// anything else in that closure runs** (`:4077-4081`) — no `updateRememberedForegroundChild`,
+    /// no `reconcileDetachedWorkflowChildCompletion` — because the ordinary post-await tail is
+    /// about to do all of it against the real result.
+    ///
+    /// cyrup's equivalent of `workflowAwaitDetached` is
+    /// [`ForegroundRunRequest::parent_workflow_run_id`](crate::extension::executor::ForegroundRunRequest::parent_workflow_run_id)
+    /// being `Some`, whose ONE production writer is `WorkflowRunHost::launch` (`workflow.rs`) —
+    /// i.e. precisely the launches upstream stamps the flag on. No new request field is
+    /// introduced for a boolean that would be a function of one already carried.
+    ///
+    /// # What the human still gets, either way
+    ///
+    /// Everything the detach promised. The receipt was minted, `remember_foreground_run` made the
+    /// run addressable by id with a `"detached"` child, `stamp_detached_receipt` wrote its output
+    /// warning, and `detach_gate.accept()` told `/subagents-detach` to render its success
+    /// sentence — all of that happened BEFORE this call. The fork below decides only who receives
+    /// the child's eventual terminal result, never whether the detach happened.
+    ///
+    /// # `[CYRUP-DELTA]` the live control outlives the workflow-child detach
+    ///
+    /// The plain arm drops the live control immediately (pi does too — which is why
+    /// `fleet-view.ts:406-408` re-checks `!activeForegroundIds.has(runId)` before rendering a
+    /// remembered run). The workflow arm does NOT: it keeps the control until the child really
+    /// settles, because `runs.status(key)`'s live arm and `runs.steer(key)` both resolve through
+    /// `foreground_controls` (`workflow.rs::live_child_status`), and a workflow child that is
+    /// still running must stay answerable to the script that launched it. Dropping it here would
+    /// leave the key in NEITHER the settled list (the launch has not returned) nor the live
+    /// registry, and `runs.status` would answer a genuinely in-flight child with its
+    /// *"names no launched child in this workflow"* error.
+    ///
+    /// This is upstream's own ordering (`finishForegroundChild` runs in the tail after
+    /// `await detachedWorkflowChild`, not in the skipped `onDetachedExit` body), and the
+    /// overlap it creates between the live and remembered maps is one the fleet view already
+    /// resolves in the live map's favour (`tui/fleet.rs`'s
+    /// `an_active_foreground_run_hides_its_own_settled_twin`).
+    async fn hand_off_detached_foreground_run(
+        &self,
+        handoff: DetachedRunHandoff<'_>,
+        drive: std::pin::Pin<Box<dyn std::future::Future<Output = SingleResult> + Send>>,
+        receipt: SingleResult,
+    ) -> SingleResult {
+        let DetachedRunHandoff {
+            run_id,
+            cwd,
+            control_notifier,
+            art_paths,
+            art_cfg,
+            parent_workflow_run_id,
+            persist_roots,
+        } = handoff;
+
+        if let Some(parent_workflow_run_id) = parent_workflow_run_id {
+            // pi `:4123` — `r = launched.detached && detachedWorkflowChild ? await
+            // detachedWorkflowChild : launched`. The drive future is awaited HERE, in the workflow
+            // step's own task, so the child is never dropped and its terminal result lands in the
+            // value `launch` maps onto `WorkflowScriptChildResult`.
+            let mut settled = drive.await;
+            // A result that came back `detached` from the drive loop did so through the INTERCOM
+            // producer, which is the only detach `exec` can observe; the user detach above is
+            // invisible to it. Stamping here is the same idempotent call every other settle path
+            // makes, and its guard is what keeps a user detach from being relabelled.
+            stamp_intercom_detach_reason(&mut settled);
+            // The ORDINARY settle tail, unchanged — pi's post-await path for the same case. Its
+            // `remember_foreground_run` overwrites the receipt entry with the terminal result,
+            // which is `reconcile_detached_foreground_child`'s effect reached by replacement
+            // rather than by mutation; and unlike the continuation task, this path holds `&self`
+            // and so CAN persist the now-restorable run.
+            self.settle_attached_foreground_run(
+                run_id,
+                cwd,
+                control_notifier,
+                &art_paths,
+                &art_cfg,
+                &settled,
+            )
+            .await;
+            tracing::debug!(
+                run_id = %run_id,
+                parent_workflow_run_id = %parent_workflow_run_id,
+                exit_code = settled.exit_code,
+                "detached workflow child settled back into the step that launched it"
+            );
+            return settled;
+        }
+
         // pi drops the live control on a detach exactly as on a settle — which is why
         // `fleet-view.ts:406-408` re-checks `!activeForegroundIds.has(runId)` before rendering a
-        // remembered run. cyrup's two maps are disjoint by construction and this is the edge that
-        // keeps them so.
-        self.settle_foreground_run(&run_id, &control_notifier).await;
+        // remembered run. cyrup's two maps are disjoint by construction on this arm and this is
+        // the edge that keeps them so.
+        self.settle_foreground_run(run_id, control_notifier).await;
 
-        // NO `persist_foreground_run_history_for` here, deliberately: `persist.rs`'s
-        // `is_persistable` refuses a run whose child is `"detached"` (it is not one of the four
-        // `RESTORABLE` statuses), so the call would be a no-op with a config read and a directory
-        // resolution attached. The continuation's reconcile is where the run first becomes
-        // persistable — see `spawn_detached_foreground_continuation` for what it does and does
-        // not do there.
+        // NO persist here, deliberately: `persist.rs`'s `is_persistable` refuses a run whose child
+        // is `"detached"` (it is not one of the four `RESTORABLE` statuses), so the call would be a
+        // no-op with a config read and a directory resolution attached. The continuation's
+        // reconcile is where the run first becomes persistable, and the continuation now does the
+        // write itself — see `spawn_detached_foreground_continuation`.
         spawn_detached_foreground_continuation(
             std::sync::Arc::clone(&self.foreground_runs),
             drive,
             run_id.clone(),
             art_paths,
             art_cfg,
+            (persist_roots, cwd.to_path_buf()),
         );
 
-        Ok((receipt.result, run_id))
+        receipt
     }
 
     /// The ATTACHED settle tail — everything `run_foreground_impl` does once a foreground run
@@ -1535,16 +1688,14 @@ pub(crate) fn detach_receipt(
 /// a map bounded at
 /// [`MAX_REMEMBERED_FOREGROUND_RUNS`](crate::extension::executor::foreground_history) entries.
 ///
-/// `[CYRUP-DELTA]` the one thing it therefore cannot do is call
-/// `persist_foreground_run_history_for`, which upstream reaches through
+/// It also holds the `(Roots, PathBuf)` pair its persist leg needs — upstream's
 /// `persistRememberedForegroundRuns` at the end of `updateRememberedForegroundChild`
-/// (`subagent-executor.ts:900`): that writer is `&self` on [`SubagentExecutor`]
-/// (`foreground_history/persist.rs`) and its merge/eligibility helpers are private to that module.
-/// The reconciled run reaches disk at the session's next foreground settle, which calls the same
-/// writer over the same map. Nothing an in-session reader consults is affected —
-/// `subagent({ action: "status" })`, `bg_wait` and `ExecutorForegroundProbe` all read the
-/// in-memory map this task DOES update — only a cross-restart restore of a run that settled after
-/// its session's last foreground run is delayed.
+/// (`subagent-executor.ts:900`). R-VLS11b-02 added the `&self`-free
+/// `persist_foreground_run_history_in`, which the executor's own two methods now delegate to, so
+/// this task writes the same bytes by the same merge/bound rule while still holding no executor
+/// handle. Both values are captured at spawn time from what `run_foreground_impl` already has (its
+/// `cwd` argument and its config snapshot's `roots`), so the capture stays as cheap as the `Arc`
+/// beside it.
 fn spawn_detached_foreground_continuation(
     foreground_runs: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<RunId, ForegroundHistoryRun>>,
@@ -1553,6 +1704,7 @@ fn spawn_detached_foreground_continuation(
     run_id: RunId,
     art_paths: crate::artifacts::ArtifactPaths,
     art_cfg: crate::artifacts::ArtifactConfig,
+    persist_to: (crate::paths::Roots, PathBuf),
 ) {
     tokio::spawn(async move {
         // The future is AWAITED here, in a task that owns it — the child keeps running exactly as
@@ -1564,6 +1716,18 @@ fn spawn_detached_foreground_continuation(
         // detached run's artifacts land in the same place an attached one's would.
         write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
         reconcile_detached_foreground_child(&foreground_runs, &run_id, &result);
+        // R-VLS11b-02's assigned call site. `persist_foreground_run_history_in` is the
+        // `&self`-free entry point the executor's own two methods now delegate to, so the
+        // continuation writes the SAME bytes by the SAME merge/bound rule without holding an
+        // executor handle — the constraint that made this a residual. It runs AFTER the reconcile
+        // on purpose: `is_persistable` refuses a run whose child is still `"detached"`, and the
+        // reconcile above is the write that makes this one eligible.
+        let (roots, cwd) = persist_to;
+        crate::extension::executor::foreground_history::persist::persist_foreground_run_history_in(
+            &foreground_runs,
+            &roots,
+            &cwd,
+        );
         tracing::debug!(
             run_id = %run_id,
             exit_code = result.exit_code,
@@ -2252,5 +2416,268 @@ mod detach_producer_tests {
         .await
         .expect("a request after settlement must not hang");
         assert_eq!(verdict, Err(DetachRefusal::SessionSettled));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // R-VLS11b-01 — the workflow-child fork (pi `workflowAwaitDetached`,
+    // `subagent-executor.ts:4008-4012`/`:4077-4081`/`:4123`). Both arms are exercised against the
+    // REAL `hand_off_detached_foreground_run`, with a synthetic drive future standing in for the
+    // OS child: the fork's whole job is deciding WHO awaits that future, so a future whose
+    // completion the test controls is the sharpest possible probe of it.
+    // ---------------------------------------------------------------------------------------
+
+    /// A sandboxed executor whose history persistence cannot escape `home`.
+    ///
+    /// The workflow arm reaches `persist_foreground_run_history_for`, which resolves its results
+    /// directory from the config's `roots`. A bare [`SubagentExecutor::new`] would resolve the
+    /// REAL home, so every test on that arm confines it.
+    fn sandboxed_executor(home: &Path, session: &str) -> SubagentExecutor {
+        let executor =
+            SubagentExecutor::with_config(crate::registration::SubagentExtensionConfig {
+                roots: crate::paths::Roots::sandboxed(home),
+                ..crate::registration::SubagentExtensionConfig::default()
+            });
+        executor.set_host_services(Arc::new(FixedSessionIdHost {
+            id: Some(session.to_string()),
+            file: None,
+        }));
+        executor
+    }
+
+    /// The handoff bundle for a run in `cwd`, with artifacts OFF so no test writes the quadruple.
+    fn handoff<'a>(
+        run_id: &'a RunId,
+        cwd: &'a Path,
+        notifier: &'a ForegroundControlNotifier,
+        parent_workflow_run_id: Option<&'a RunId>,
+    ) -> DetachedRunHandoff<'a> {
+        DetachedRunHandoff {
+            run_id,
+            cwd,
+            control_notifier: notifier,
+            art_paths: crate::artifacts::artifact_paths(cwd, run_id.as_str(), "scout", None),
+            art_cfg: crate::artifacts::ArtifactConfig {
+                enabled: false,
+                ..crate::artifacts::ArtifactConfig::default()
+            },
+            parent_workflow_run_id,
+            persist_roots: crate::paths::Roots::sandboxed(cwd),
+        }
+    }
+
+    fn notifier_for(executor: &SubagentExecutor, run_id: &RunId) -> ForegroundControlNotifier {
+        executor.foreground_control_notifier(
+            run_id.clone(),
+            "scout".to_string(),
+            crate::exec::control::ResolvedControlConfig::default(),
+        )
+    }
+
+    /// The child's real terminal result, built off the receipt shape so no `AgentConfig` is
+    /// needed: a clean exit carrying the answer the workflow step is actually owed.
+    fn terminal_result(output: &str) -> SingleResult {
+        let mut settled =
+            detach_receipt("scout", "hold the line", DetachReason::UserRequest, false).result;
+        settled.detached = false;
+        settled.detached_reason = None;
+        settled.exit_code = 0;
+        settled.error = None;
+        settled.final_output = Some(output.to_string());
+        settled
+    }
+
+    /// A user detach of a WORKFLOW child does not answer the launching step with the receipt: the
+    /// step keeps awaiting and receives the child's real terminal result — pi `:4123`'s
+    /// `r = launched.detached && detachedWorkflowChild ? await detachedWorkflowChild : launched`.
+    ///
+    /// **Gutting mutation this fails on:** drop the routing — delete the
+    /// `parent_workflow_run_id` arm so every detach takes the plain `/run` path. The call then
+    /// returns the RECEIPT (`exit_code == -2`, `detached: true`, the detach sentence), which
+    /// `workflow.rs::map_child_result` reads as `ok: false` with the receipt's sentence as the
+    /// child's output: the parent workflow advances on a fabricated failure and never learns the
+    /// real verdict. All four asserts below fire.
+    #[tokio::test]
+    async fn a_detached_workflow_childs_settle_reaches_the_step_that_launched_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let executor = sandboxed_executor(home.path(), "session-w");
+        let run_id = RunId::from_token("fgdetach0005".to_string());
+        let parent = RunId::from_token("wfparent00001".to_string());
+        let receipt = publish_detach(&executor, &run_id, DetachReason::UserRequest, true);
+        let notifier = notifier_for(&executor, &run_id);
+
+        // The drive future the detach handed over: still running when the fork is entered, so a
+        // fork that returned the receipt would return BEFORE this sleep elapses.
+        let drive: std::pin::Pin<Box<dyn std::future::Future<Output = SingleResult> + Send>> =
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                terminal_result("the real answer")
+            });
+
+        let settled = executor
+            .hand_off_detached_foreground_run(
+                handoff(&run_id, home.path(), &notifier, Some(&parent)),
+                drive,
+                receipt.result,
+            )
+            .await;
+
+        assert_eq!(
+            settled.final_output.as_deref(),
+            Some("the real answer"),
+            "the step must receive the child's own output, never the detach sentence"
+        );
+        assert_eq!(
+            settled.exit_code, 0,
+            "the receipt's -2 must not reach the step"
+        );
+        assert!(
+            !settled.detached,
+            "a terminal result is not a receipt; `map_child_result` would otherwise record this \
+             as a DetachedWorkflowChild and park the workflow at paused"
+        );
+
+        // ...and the remembered run is off `"detached"`, by replacement rather than by the
+        // continuation's mutation — the step's own settle tail did it.
+        let runs = executor
+            .foreground_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            runs.get(&run_id).expect("still remembered").children[0].status,
+            "completed"
+        );
+    }
+
+    /// A user detach of a workflow child keeps the child's LIVE control until it really settles,
+    /// so `runs.status(key)`'s live arm and `runs.steer(key)` — which both resolve through
+    /// `foreground_controls` — can still answer for a child that is still running.
+    ///
+    /// **Gutting mutation this fails on:** call `settle_foreground_run` on the workflow arm too
+    /// (i.e. share the plain arm's teardown). The control is gone the instant the detach is
+    /// accepted, while `launch` has not returned and so has published nothing to the settled
+    /// list — `runs.status` answers a genuinely in-flight child with its *"names no launched
+    /// child in this workflow"* error. The first assert fires.
+    #[tokio::test]
+    async fn a_detached_workflow_child_keeps_its_live_control_until_it_really_settles() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let executor = sandboxed_executor(home.path(), "session-w");
+        let run_id = RunId::from_token("fgdetach0006".to_string());
+        let parent = RunId::from_token("wfparent00002".to_string());
+        let receipt = publish_detach(&executor, &run_id, DetachReason::UserRequest, false);
+        let notifier = notifier_for(&executor, &run_id);
+        executor.insert_foreground_control_for_test(
+            run_id.as_str(),
+            ForegroundControlEntry::for_test(RunMode::Single, 1, None),
+        );
+
+        let released = Arc::new(tokio::sync::Notify::new());
+        let wait = Arc::clone(&released);
+        let drive: std::pin::Pin<Box<dyn std::future::Future<Output = SingleResult> + Send>> =
+            Box::pin(async move {
+                wait.notified().await;
+                terminal_result("the real answer")
+            });
+
+        let executor = Arc::new(executor);
+        let driver = Arc::clone(&executor);
+        let run = run_id.clone();
+        let notifier_owned = notifier;
+        let art_paths =
+            crate::artifacts::artifact_paths(home.path(), run_id.as_str(), "scout", None);
+        let art_cfg = crate::artifacts::ArtifactConfig {
+            enabled: false,
+            ..crate::artifacts::ArtifactConfig::default()
+        };
+        let parent_owned = parent.clone();
+        let home_owned = home.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            driver
+                .hand_off_detached_foreground_run(
+                    DetachedRunHandoff {
+                        run_id: &run,
+                        cwd: &home_owned,
+                        control_notifier: &notifier_owned,
+                        art_paths,
+                        art_cfg,
+                        parent_workflow_run_id: Some(&parent_owned),
+                        persist_roots: crate::paths::Roots::sandboxed(&home_owned),
+                    },
+                    drive,
+                    receipt.result,
+                )
+                .await
+        });
+
+        // The child has NOT exited: the control must still be there for the script to poll.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(
+            executor
+                .foreground_detach_control(run_id.as_str())
+                .is_some(),
+            "a detached workflow child that is still running must stay live-addressable"
+        );
+
+        released.notify_one();
+        join.await.expect("the handoff task completes");
+        assert!(
+            executor
+                .foreground_detach_control(run_id.as_str())
+                .is_none(),
+            "...and the control IS dropped once the child really settles"
+        );
+    }
+
+    /// A user detach of a PLAIN single is unchanged: the caller is answered with the receipt
+    /// IMMEDIATELY, while the child keeps running in the spawned continuation.
+    ///
+    /// **Gutting mutation this fails on:** route everything through the workflow path (make the
+    /// fork unconditional, or key it on something that is always true). The call then blocks on
+    /// the drive future, so the `timeout` below expires and the assert fires — which is exactly
+    /// the user-visible regression it would be: `/subagents-detach` on a plain `/run` would hang
+    /// the tool call until the child it just detached exits.
+    #[tokio::test]
+    async fn a_detached_plain_single_is_still_answered_with_its_receipt_immediately() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let executor = sandboxed_executor(home.path(), "session-p");
+        let run_id = RunId::from_token("fgdetach0007".to_string());
+        let receipt = publish_detach(&executor, &run_id, DetachReason::UserRequest, true);
+        let notifier = notifier_for(&executor, &run_id);
+
+        // A future that NEVER completes: the plain arm must not await it at all.
+        let drive: std::pin::Pin<Box<dyn std::future::Future<Output = SingleResult> + Send>> =
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                unreachable!("the plain arm hands this to the continuation, it never awaits it")
+            });
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            executor.hand_off_detached_foreground_run(
+                handoff(&run_id, home.path(), &notifier, None),
+                drive,
+                receipt.result,
+            ),
+        )
+        .await
+        .expect("a plain detach answers its caller without waiting for the child");
+
+        assert!(answered.detached, "the caller gets the RECEIPT");
+        assert_eq!(
+            answered.exit_code,
+            crate::extension::executor::detach::DETACHED_EXIT_CODE
+        );
+        assert_eq!(
+            answered.final_output.as_deref(),
+            Some("Detached at user request before task completion.")
+        );
+        // The remembered child is still `"detached"` — the continuation, not this call, clears it.
+        let runs = executor
+            .foreground_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            runs.get(&run_id).expect("still remembered").children[0].status,
+            "detached"
+        );
     }
 }

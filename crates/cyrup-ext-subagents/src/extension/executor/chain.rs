@@ -8,7 +8,6 @@ use cyrup_core::CancelToken;
 
 use crate::background::runner_main::ExecSingleStepExecutor;
 use crate::background::{RunId, RunMode};
-use crate::discovery::discover_agents;
 use crate::discovery::types::AgentReadScope;
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
@@ -508,34 +507,6 @@ impl SubagentExecutor {
                 groups,
             })
         }
-    }
-
-    // ---------------------------------------------------------------------------------------
-    // Saved-chain resolution (`/run-chain`, R-SA-129)
-    // ---------------------------------------------------------------------------------------
-
-    /// Resolve a saved chain by its fully-qualified name (R-SA-008-style exact string equality
-    /// only — mirrors [`crate::extension::SubagentExecutor::resolve_agent`]'s identical convention applied to chain names instead of
-    /// agent names), via the real, on-demand, re-scanned-per-call discovery pipeline (R-SA-019).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SubagentError::ChainNotFound`] if no discovered chain matches `name` exactly, or
-    /// propagates a discovery-time [`SubagentError`] (R-SA-009's malformed-settings abort).
-    pub fn resolve_chain(
-        &self,
-        cwd: &Path,
-        name: &str,
-        roots: &crate::paths::Roots,
-    ) -> Result<crate::discovery::types::ChainDefinition, SubagentError> {
-        let cfg = self.discovery_config(cwd, roots)?;
-        let result = discover_agents(&cfg, None)?;
-        // Cross-scope run precedence Project > User > Package > Builtin (pi `discoverSavedChains`
-        // last-wins map, slash-commands.ts:172-177 @v0.34.0) — NOT a naive first-match, which incorrectly let a
-        // User chain shadow a same-named Project chain. See `discovery::resolve_chain_by_name`.
-        crate::discovery::resolve_chain_by_name(&result.chains, name)
-            .cloned()
-            .ok_or_else(|| SubagentError::ChainNotFound(name.to_string()))
     }
 }
 
