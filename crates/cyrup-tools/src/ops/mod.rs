@@ -466,12 +466,16 @@ pub struct ArgvOutput {
 
 /// Process outcome. `Killed` (cancel) and `TimedOut` are returned as `Ok` so `bash` can craft the
 /// right error while preserving the accumulated output (R-03-023/024). `Signaled` is a process that
-/// died to an external signal (no exit code) without our cancel — Pi returns `exitCode: null` and
-/// `bash` treats it as **success** with the output preserved (bash.ts:405), distinct from a cancel.
+/// died to a signal we did not send (no exit code), carrying the signal number when the OS reports
+/// one. Each consumer maps it as its pi counterpart does (TOOL-047): the shell tools and the user's
+/// `!` command report `128 + signo` as a FAILED exit, as pi's local shell operations have since
+/// v0.86.0 (`tools/bash.ts:139-142` @v0.87.1), and a guest backend's `exitCode: null` is
+/// `Signaled(None)`, which `bash` fails with `Command terminated without an exit code` (`:368-370`).
+/// `pi.exec` alone still reads a missing code as `0` (`exec.ts:97`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitStatus {
     Exited(i32),
-    Signaled,
+    Signaled(Option<i32>),
     Killed,
     TimedOut,
 }

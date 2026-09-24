@@ -138,6 +138,16 @@ fn is_live_state(state: &str) -> bool {
     matches!(state, "running" | "queued")
 }
 
+/// SUBA-115 — whether `run` is inside the subtree of the run issuing the cascade. pi's
+/// `isNestedControlDescendant` (`subagent-runner.ts:2384-2385` @v0.71.0, `bd03854a`/#2243, v0.68.0):
+/// `!config.nestedSelf || run.path.some((entry) => entry.runId === id)`. A root run (`issuer` is
+/// `None`) keeps root-wide control; a NESTED run reaches only descendants whose ancestor path passes
+/// through itself, so stopping, interrupting or timing out one nested child no longer stops or
+/// parks the sibling subtrees it never launched.
+fn is_control_descendant(run: &NestedRunSummary, issuer: Option<&str>) -> bool {
+    issuer.is_none_or(|id| run.path.iter().any(|entry| entry.run_id == id))
+}
+
 /// The descendant's own run directory, subject to the same containment check every other control
 /// op in this crate applies.
 ///
@@ -158,7 +168,8 @@ fn target_dir(
     resolve_nested_async_dir_in(nested_runs_root, root_run_id, run)
 }
 
-/// Deliver `verb` to every live nested async descendant reachable through `route`.
+/// Deliver `verb` to every live nested async descendant reachable through `route` — for a nested
+/// issuer (`issuer` is its run id), only those inside its own subtree ([`is_control_descendant`]).
 ///
 /// Never returns an error: every failure — a registry that will not project, a descendant whose
 /// directory cannot be resolved, an unwritable inbox — becomes a [`CascadeFailure`] in the report
@@ -167,6 +178,7 @@ fn target_dir(
 pub async fn cascade_to_nested_async_descendants(
     roots: &crate::paths::Roots,
     route: &NestedRoute,
+    issuer: Option<&str>,
     verb: CascadeVerb,
 ) -> CascadeReport {
     let mut report = CascadeReport::default();
@@ -186,7 +198,7 @@ pub async fn cascade_to_nested_async_descendants(
     flatten_nested_runs(&registry.children, &mut runs);
 
     for run in runs {
-        if !is_live_state(&run.state) {
+        if !is_control_descendant(&run, issuer) || !is_live_state(&run.state) {
             continue;
         }
         let Some(dir) = target_dir(&roots.nested_runs(), &route.root_run_id, &run) else {
@@ -308,6 +320,42 @@ mod tests {
         flatten_nested_runs(&[child], &mut out);
         let ids: Vec<&str> = out.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["child", "gc-children", "ggc", "gc-step"]);
+    }
+
+    /// SUBA-115's Verify: `root → {A → A1, B → B1}`. Issued by nested `A`, the cascade reaches `A1`
+    /// only; issued by the root (no `nested_self`), all four.
+    #[test]
+    fn a_nested_issuer_reaches_only_its_own_subtree() {
+        let hop = |id: &str| crate::spawn::nested_path::NestedPathEntry {
+            run_id: id.to_string(),
+            step_index: None,
+            agent: None,
+        };
+        let with_path = |id: &str, path: &[&str]| {
+            let mut run = summary(id, "running");
+            run.path = path.iter().map(|p| hop(p)).collect();
+            run
+        };
+        let mut a = with_path("A", &["root"]);
+        a.children = Some(vec![with_path("A1", &["root", "A"])]);
+        let mut b = with_path("B", &["root"]);
+        b.children = Some(vec![with_path("B1", &["root", "B"])]);
+        let mut runs = Vec::new();
+        flatten_nested_runs(&[a, b], &mut runs);
+
+        let reached = |issuer: Option<&str>| -> Vec<String> {
+            runs.iter()
+                .filter(|r| is_control_descendant(r, issuer))
+                .map(|r| r.id.clone())
+                .collect()
+        };
+        assert_eq!(reached(Some("A")), ["A1"], "sibling tree B/B1 is untouched");
+        assert_eq!(reached(Some("B")), ["B1"]);
+        assert_eq!(
+            reached(None),
+            ["A", "A1", "B", "B1"],
+            "a root run keeps root-wide control"
+        );
     }
 
     #[test]

@@ -121,6 +121,16 @@ impl AgentSession {
         };
         use cyrup_session::entry::{Entry, KnownEntry};
 
+        // SEAM-124 — pi's two refusals come FIRST, before even the already-at-target no-op
+        // (`agent-session.ts:3585-3592` @v0.87.1). Every caller gets them: the TUI, the extension
+        // control op `control_navigate_tree` and the command API's `NavigateTree` arm.
+        if self.is_run_active() {
+            return Err(SessionServiceError::NavigateTreeWhileStreaming);
+        }
+        if self.is_compacting() {
+            return Err(SessionServiceError::NavigateTreeWhileCompacting);
+        }
+
         // Phase 1 (guard held): read the session to compute the navigation target + the branch
         // collection, then build the real `TreePreparation` for the extension hook. The guard is
         // RELEASED before the hook so a guest may read the session during `session_before_tree`

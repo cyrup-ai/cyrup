@@ -633,3 +633,113 @@ fn tree_selector_can_be_reselected_at_a_given_entry() {
         "an unknown id is a no-op, not a panic"
     );
 }
+
+// ------------------------------------------------------------ TUI-104: refused while compacting --
+
+/// TUI-104 — confirming a `/tree` target while a compaction runs shows pi's error and leaves the
+/// compaction alone (`interactive-mode.ts:5466-5472` @v0.87.1: re-check `isCompacting` "before
+/// replacing another operation's UI"). Before the fix the branch-summary indicator overwrote the
+/// compaction's and both operations ran, so the compaction could land on the navigated-to branch.
+#[tokio::test]
+async fn tree_navigation_is_refused_while_a_compaction_runs() {
+    use cyrup_provider::faux::FauxConfig;
+
+    let fx = fixture();
+    // 1 token/s keeps the compaction's summarization in flight while the tree is confirmed.
+    let faux = Arc::new(FauxProvider::with_config(FauxConfig {
+        tokens_per_second: Some(1.0),
+        ..FauxConfig::default()
+    }));
+    faux.set_response_steps(vec![
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a")],
+            StopReason::Stop,
+        )),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("b")],
+            StopReason::Stop,
+        )),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text(
+                "a deliberately long compaction summary that is still streaming when the user \
+                 confirms a tree row",
+            )],
+            StopReason::Stop,
+        )),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.trust_override = Some(true);
+    let cli = Settings::parse(
+        r#"{"compaction":{"enabled":true,"keepRecentTokens":0,"reserveTokens":0},
+            "branchSummary":{"skipPrompt":true}}"#,
+    )
+    .unwrap();
+    let session = Arc::new(
+        SessionBuilder::new(provider, cfg)
+            .cli_settings(cli)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let _ = session.prompt("first").await.unwrap();
+    session.wait_for_idle().await;
+    let _ = session.prompt("second").await.unwrap();
+    session.wait_for_idle().await;
+    let first = session.user_messages_for_forking().await[0]
+        .entry_id
+        .clone();
+    let compacting = session.clone();
+    let compaction = tokio::spawn(async move { compacting.compact(None).await });
+    for _ in 0..200 {
+        if session.is_compacting() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        session.is_compacting(),
+        "precondition: the compaction is running"
+    );
+
+    let mut app = app();
+    let _rx = app.install_tree_nav_channel();
+    app.state_mut()
+        .indicator
+        .set(IndicatorKind::Compaction, Some("Compacting...".to_string()));
+
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
+
+    let errors: Vec<String> = app
+        .state()
+        .transcript
+        .pending()
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Error(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "Wait for the current compaction or tree navigation to finish before navigating the \
+          session tree."
+        ],
+        "pi's error is shown"
+    );
+    assert_eq!(
+        app.state().indicator.kind(),
+        IndicatorKind::Compaction,
+        "the compaction's indicator is not replaced"
+    );
+    assert!(!app.state().branch_summary_in_flight());
+
+    compaction.abort();
+    let _ = compaction.await;
+    assert!(
+        !statuses(&app).iter().any(|s| s == "navigated session tree"),
+        "nothing navigated"
+    );
+}

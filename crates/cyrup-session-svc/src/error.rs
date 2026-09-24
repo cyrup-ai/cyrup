@@ -114,6 +114,21 @@ pub enum SessionServiceError {
     #[error("Compaction cancelled")]
     CompactionCancelled,
 
+    /// SEAM-124 — pi `navigateTree`'s streaming guard (`agent-session.ts:3585-3587` @v0.87.1,
+    /// present since the ported v0.83.0): moving the leaf under a live run would land the run's
+    /// remaining appends on whichever branch the leaf now names.
+    #[error("Wait for the current response to finish before navigating the session tree.")]
+    NavigateTreeWhileStreaming,
+
+    /// SEAM-124 / TUI-104 — pi `navigateTree`'s compaction guard (`:3588-3592` @v0.87.1, v0.86.0,
+    /// #9179): a compaction appends its entry on the CURRENT leaf, so navigating first would put a
+    /// `first_kept_entry_id` from the abandoned branch on the new one and drop that branch's own
+    /// earlier turns from context.
+    #[error(
+        "Wait for the current compaction or tree navigation to finish before navigating the session tree."
+    )]
+    NavigateTreeWhileCompacting,
+
     #[error("invalid entry id for forking: {0}")]
     InvalidForkEntry(String),
 

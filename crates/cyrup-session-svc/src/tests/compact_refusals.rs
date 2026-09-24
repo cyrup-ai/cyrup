@@ -662,3 +662,130 @@ async fn compaction_rebuilds_the_agents_in_memory_transcript() {
         "the agent transcript must BE the compacted session context"
     );
 }
+
+/// SEAM-124 / TUI-104 — `navigate_tree` refuses while a compaction is running, with pi's message
+/// (`agent-session.ts:3588-3592` @v0.87.1), and leaves the leaf where it was. Without the guard the
+/// leaf moved first and the compaction's entry then landed on the new branch carrying a
+/// `first_kept_entry_id` from the abandoned one.
+#[tokio::test]
+async fn navigate_tree_refuses_during_a_compaction() {
+    let fx = fixture();
+    // 1 token/s keeps the summarization in flight long enough to observe.
+    let faux = Arc::new(FauxProvider::with_config(FauxConfig {
+        tokens_per_second: Some(1.0),
+        ..FauxConfig::default()
+    }));
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("a")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("b")], StopReason::Stop),
+        faux_assistant_message(
+            vec![faux_text(
+                "a deliberately long summary so the compaction is still streaming while the \
+                 navigation is attempted",
+            )],
+            StopReason::Stop,
+        ),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(aggressive_compaction_settings())
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+    let _ = session.prompt("tell me two").await.expect("prompt 2");
+    session.wait_for_idle().await;
+    let first_user = session.user_messages_for_forking().await[0]
+        .entry_id
+        .clone();
+    // Read before the compaction starts: the parked `compact()` future below can hold the manager
+    // lock at its await point, so a `leaf_id()` while it is pinned-but-unpolled would wait forever.
+    let leaf = session.leaf_id().await;
+
+    {
+        let mut compacting = std::pin::pin!(session.compact(None));
+        tokio::select! {
+            _ = &mut compacting => panic!("the summarization cannot settle inside 800 ms at 1 token/s"),
+            () = tokio::time::sleep(Duration::from_millis(800)) => {}
+        }
+        assert!(
+            session.is_compacting(),
+            "precondition: compaction in flight"
+        );
+        match session
+            .navigate_tree(first_user, crate::NavigateTreeOptions::default())
+            .await
+        {
+            Err(e @ crate::SessionServiceError::NavigateTreeWhileCompacting) => assert_eq!(
+                e.to_string(),
+                "Wait for the current compaction or tree navigation to finish before navigating the \
+             session tree."
+            ),
+            other => panic!("expected the compaction refusal, got {other:?}"),
+        }
+    } // the in-flight compaction is dropped (and its cancel guard released) here
+    assert_eq!(
+        session.leaf_id().await,
+        leaf,
+        "the refused navigation did not move the leaf"
+    );
+}
+
+/// SEAM-124 — the same call during a live run is refused with pi's streaming message
+/// (`agent-session.ts:3585-3587`), which the extension control op and the command API reached
+/// unguarded.
+#[tokio::test]
+async fn navigate_tree_refuses_during_a_run() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::with_config(FauxConfig {
+        tokens_per_second: Some(1.0),
+        ..FauxConfig::default()
+    }));
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("a")], StopReason::Stop),
+        faux_assistant_message(
+            vec![faux_text(
+                "a deliberately long reply so the run is still live",
+            )],
+            StopReason::Stop,
+        ),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+    let first_user = session.user_messages_for_forking().await[0]
+        .entry_id
+        .clone();
+
+    let running = session.clone();
+    let run = tokio::spawn(async move { running.prompt("tell me two").await });
+    for _ in 0..100 {
+        if session.is_run_active() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(session.is_run_active(), "precondition: the run is live");
+    let leaf = session.leaf_id().await;
+    match session
+        .navigate_tree(first_user, crate::NavigateTreeOptions::default())
+        .await
+    {
+        Err(e @ crate::SessionServiceError::NavigateTreeWhileStreaming) => assert_eq!(
+            e.to_string(),
+            "Wait for the current response to finish before navigating the session tree."
+        ),
+        other => panic!("expected the streaming refusal, got {other:?}"),
+    }
+    assert_eq!(session.leaf_id().await, leaf, "the leaf did not move");
+    session.abort_and_settle().await;
+    run.abort();
+}

@@ -589,11 +589,17 @@ impl Tool for ShellTool {
             terminate: TerminateHint::Unspecified,
         });
 
+        // TOOL-047 — a signal-killed shell is a FAILURE with the shell's `128 + signo` code, as pi's
+        // local shell operations report it since v0.86.0 (`bash.ts:139-142` @v0.87.1); it used to be
+        // `exitCode: null` ⇒ success, which is what this arm once mirrored.
+        let status = match status {
+            ExitStatus::Signaled(Some(signo)) => ExitStatus::Exited(128 + signo),
+            other => other,
+        };
         match status {
-            // Pi treats a signal-killed process (exitCode null) as success with output preserved.
-            // Both this arm and the non-zero-exit arm go through `formatOutput`, whose `emptyText`
+            // Both this arm and the failure arms go through `formatOutput`, whose `emptyText`
             // defaults to `"(no output)"` (bash.ts:357,375).
-            ExitStatus::Exited(0) | ExitStatus::Signaled => {
+            ExitStatus::Exited(0) => {
                 let body = if text.is_empty() {
                     "(no output)".to_string()
                 } else {
@@ -627,6 +633,30 @@ impl Tool for ShellTool {
                     full_output_path,
                     exit_code: Some(code),
                 }) {
+                    failure = failure.with_details(payload);
+                }
+                Err(failure)
+            }
+            // No exit code and no signal number (`Signaled(Some)` became `Exited` above): a guest
+            // backend's `exitCode: null`. Pi throws `Command terminated without an exit code`
+            // (`bash.ts:368-370` @v0.87.1).
+            ExitStatus::Signaled(_) => {
+                let body = if text.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    text
+                };
+                let mut failure = error::invalid(append_status(
+                    &body,
+                    "Command terminated without an exit code",
+                ));
+                if truncated
+                    && let Ok(payload) = serde_json::to_value(BashDetails {
+                        truncation: Some(info),
+                        full_output_path,
+                        exit_code: None,
+                    })
+                {
                     failure = failure.with_details(payload);
                 }
                 Err(failure)

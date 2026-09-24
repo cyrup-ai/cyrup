@@ -32,7 +32,7 @@ async fn exec_argv_timeout_kills_a_normal_child_well_within_grace() {
         .expect("exec_argv runs");
     assert_eq!(
         out.status,
-        ExitStatus::Signaled,
+        ExitStatus::Signaled(Some(15)),
         "the REAL observed status (died to the raw signal) is reported, not the bare TimedOut tag"
     );
     assert!(
@@ -143,7 +143,7 @@ async fn exec_argv_timeout_escalates_to_sigkill_when_the_child_ignores_sigterm()
     sleeper.reap();
     assert_eq!(
         out.status,
-        ExitStatus::Signaled,
+        ExitStatus::Signaled(Some(9)),
         "a forced SIGKILL reports the real (signal, no code) status, not the bare TimedOut tag"
     );
     assert!(out.killed, "a timeout-initiated kill is still `killed`");
@@ -178,7 +178,7 @@ async fn exec_argv_cancel_escalates_to_sigkill_when_the_child_ignores_sigterm() 
     sleeper.reap();
     assert_eq!(
         out.status,
-        ExitStatus::Signaled,
+        ExitStatus::Signaled(Some(9)),
         "a forced SIGKILL reports the real (signal, no code) status, not the bare Killed tag"
     );
     assert!(out.killed, "a cancel-initiated kill is still `killed`");

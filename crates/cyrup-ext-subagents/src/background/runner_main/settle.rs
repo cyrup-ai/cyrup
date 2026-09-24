@@ -487,7 +487,10 @@ pub(super) async fn cascade_to_descendants(
     let Some(route) = config.nested_route.as_ref() else {
         return;
     };
-    let report = cascade::cascade_to_nested_async_descendants(roots, route, verb).await;
+    // SUBA-115: a nested runner reaches only its own subtree; a root runner (no `nested_self`) the
+    // whole route, as pi's `isNestedControlDescendant` decides.
+    let issuer = config.nested_self.as_ref().map(|_| config.run_id.as_str());
+    let report = cascade::cascade_to_nested_async_descendants(roots, route, issuer, verb).await;
     for failure in report.failures {
         let mut payload = serde_json::json!({
             "runId": config.run_id.as_str(),

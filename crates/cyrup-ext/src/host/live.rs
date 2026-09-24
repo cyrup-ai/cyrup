@@ -1777,7 +1777,7 @@ impl LiveExtension {
             Ok(Ok(None)) => Ok(if cancel.is_cancelled() {
                 ExitStatus::Killed
             } else {
-                ExitStatus::Signaled
+                ExitStatus::Signaled(None)
             }),
             // pi's `throw`: `executeBashWithOperations` re-raises everything that is not an abort
             // (`core/bash-executor.ts:154`), so a backend failure is never a successful command.
