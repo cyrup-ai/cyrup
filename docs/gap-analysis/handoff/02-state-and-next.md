@@ -24,7 +24,7 @@ The script now reads areas 16 (herdr client; its `client-bug`/`protocol-drift` k
 bug / Version lag) and 17 (all trackers), and no longer counts `DRIFT-056`, a duplicate of `EXT-077`.
 Areas 13 and 15 stay outside the count by the standing rule.
 
-**The set above medium is now ten rows: 2 critical, 8 high.** The first pass found three; the second
+**The set above medium was ten rows: 2 critical, 8 high. Both criticals are now closed (`SESS-056` in `c625fbc`, `SEAM-122` in `7522d80`), leaving eight highs.** The first pass found three; the second
 pass added seven, one of them a reopened closure. The ranked table with reasons is at the top of
 `../00-residual-ledger.md` and of `../PARITY-GAPS.md`.
 
@@ -52,12 +52,12 @@ pass added seven, one of them a reopened closure. The ranked table with reasons 
 Every item below is a static read of both sides. None was reproduced. Reproduce each one before
 fixing it (see `../REPRO-LOG.md`), and record the run.
 
-**1. Session data loss — the two criticals. Both are S effort.**
+**1. Session data loss — the two criticals. Both are S effort. DONE 2026-09-24: both closed, see below.**
 
 - ~~`SESS-056`~~ **CLOSED 2026-09-24 (`c625fbc`).** (area 03): repair a session file's unterminated last line before appending, as pi
   v0.84.4 does. Today the next entry is glued onto the partial line and lost, and every later entry
   loses its parent chain.
-- `SEAM-122` (area 08): session import must not overwrite an existing file. Give the copy a unique
+- ~~`SEAM-122`~~ **CLOSED 2026-09-24 (`7522d80`).** (area 08): session import must not overwrite an existing file. Give the copy a unique
   name and copy with create-new semantics (pi v0.85.0).
 
 **2. Intercom delivery — three highs, one change in area 08's `cyrup-session-svc`.** Take `ICOM-035`
