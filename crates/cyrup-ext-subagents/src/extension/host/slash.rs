@@ -101,11 +101,20 @@ impl SubagentsExtension {
     /// `:31` session gate applies here exactly as it applies to the RPC `status` reply: a state
     /// that does not belong to the live session publishes NOTHING, rather than one instance's runs
     /// into another's widget slot.
+    ///
+    /// SUBA-061 — pi `renderWidget(ctx, widgetEnabled === false ? [] : jobs)`
+    /// (`async-job-tracker.ts:114` @v0.68.0): with `asyncWidget: false` the job list is EMPTY, so
+    /// the slot is cleared (in both modes) rather than left holding a stale document. In
+    /// `ExtMode::Rpc` the slot carries the machine document; in every other mode it carries the
+    /// human widget, [`crate::tui::events::render_async_jobs_widget`] (pi's mounted
+    /// `buildWidgetComponent`, `render.ts:3003-3007`), flattened to plain text because
+    /// [`cyrup_ext::host::HostServices::set_widget`] carries lines, not a live component.
     fn publish_async_status_snapshot_widget(
         &self,
         services: &dyn cyrup_ext::host::HostServices,
         state: &crate::tui::fleet_state::FleetState,
         has_ui: bool,
+        mode: cyrup_ext::ExtMode,
     ) {
         use crate::background::async_status_snapshot::{
             ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, AsyncStatusSnapshotOptions,
@@ -126,7 +135,27 @@ impl SubagentsExtension {
             }
         };
         let session = crate::identity::SessionId::parse_opt(state.current_session_id.as_deref());
-        let jobs = async_status_snapshot_jobs_for_state(Some(state), session.as_ref());
+        let tracked = async_status_snapshot_jobs_for_state(Some(state), session.as_ref());
+        // pi's tracker renders this slot only while it tracks async jobs (`if
+        // (state.asyncJobs.size > 0) refreshWidget(ctx)`, `extension/index.ts:916-918` @v0.68.0),
+        // and its own rerender clears it once when the last job leaves (`renderWidget(ctx, [])`,
+        // `async-job-tracker.ts:112-114,797`). So a refresh edge with nothing tracked writes
+        // NOTHING — not even a clear — unless the slot still holds what an earlier edge published.
+        if tracked.is_empty() {
+            if self
+                .async_slot_occupied
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+                && has_ui
+            {
+                services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, None, placement);
+            }
+            return;
+        }
+        let jobs = if self.async_widget_enabled {
+            tracked
+        } else {
+            Vec::new()
+        };
         // `:2992-2997` — an empty roster REMOVES the widget rather than publishing an empty
         // document, so a machine reader is not handed a snapshot that says nothing. `:2993-2994`'s
         // `resetWidgetLayoutSession()` / `asyncWidgetUpdates.delete(ctx.ui)` have no analogue:
@@ -137,20 +166,53 @@ impl SubagentsExtension {
             if has_ui {
                 services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, None, placement);
             }
+            self.async_slot_occupied
+                .store(false, std::sync::atomic::Ordering::Release);
             return;
         }
         // `:2998` — with no UI there is no widget slot to write to at all.
         if !has_ui {
             return;
         }
-        let lines = encode_async_status_snapshot_widget(
-            jobs,
-            &AsyncStatusSnapshotOptions {
-                generated_at: Some(crate::time::now_epoch_millis()),
-                ..AsyncStatusSnapshotOptions::default()
-            },
+        // `:2999-3002` — the RPC branch: the reader is a machine.
+        if mode == cyrup_ext::ExtMode::Rpc {
+            let lines = encode_async_status_snapshot_widget(
+                jobs,
+                &AsyncStatusSnapshotOptions {
+                    generated_at: Some(crate::time::now_epoch_millis()),
+                    ..AsyncStatusSnapshotOptions::default()
+                },
+            );
+            services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, Some(&lines), placement);
+            self.async_slot_occupied
+                .store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        // `:3003-3007` — the human widget.
+        let rows: Vec<crate::tui::events::AsyncJobSnapshot> = jobs
+            .iter()
+            .map(|job| {
+                let agent = job
+                    .status
+                    .current_step
+                    .and_then(|index| job.status.steps.get(index))
+                    .or_else(|| job.status.steps.first())
+                    .map(|step| step.agent.clone());
+                crate::tui::events::AsyncJobSnapshot::from_run_status(
+                    &job.status,
+                    agent,
+                    job.context.unwrap_or_default(),
+                )
+            })
+            .collect();
+        // The spinner frame, from the wall clock (upstream's own widget animates on a timer).
+        let tick = usize::try_from(crate::time::now_epoch_millis() / 120).unwrap_or(0);
+        let lines = crate::tui::render::lines_to_plain_text(
+            &crate::tui::events::render_async_jobs_widget(&rows, tick),
         );
         services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, Some(&lines), placement);
+        self.async_slot_occupied
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// PB-8 — pi `rpcBridge.emitReady(ctx)` (`extension/rpc.ts:841-843`, called from
@@ -201,14 +263,22 @@ impl SubagentsExtension {
     ) {
         use std::sync::atomic::Ordering;
 
-        // pi's `fleetViewEnabled` gate (`extension/index.ts:378`): with the fleet view off there is
-        // no `SubagentFleetStatus` at all upstream, so nothing is ever published.
-        if !self.fleet_view_enabled {
-            return;
-        }
         let Some(services) = self.executor.host_services() else {
             return;
         };
+        // SUBA-061 — nothing to collect when neither widget can publish: the async slot is off
+        // (`asyncWidget: false`) AND the fleet view is off. A slot an earlier edge left occupied
+        // still has to be CLEARED, which the branch below does without reading the fleet.
+        if !self.fleet_view_enabled && !self.async_widget_enabled {
+            if self.async_slot_occupied.swap(false, Ordering::AcqRel) && has_ui {
+                services.set_widget(
+                    crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY,
+                    None,
+                    cyrup_ext::host::WidgetPlacement::default(),
+                );
+            }
+            return;
+        }
         let state = self
             .executor
             .fleet_state(
@@ -236,8 +306,18 @@ impl SubagentsExtension {
         // `WIDGET_KEY`. The always-on fleet-status widget (`tui/fleet-status.ts:14`'s own key) is
         // driven by its own 500 ms tick and is untouched by that branch, so the human widget below
         // must keep running in `--acp`/`--rpc` too.
-        if mode == cyrup_ext::ExtMode::Rpc {
-            self.publish_async_status_snapshot_widget(services.as_ref(), &state, has_ui);
+        //
+        // SUBA-061: the async-jobs slot is published in EVERY mode now, not only RPC — the
+        // interactive human widget ([`crate::tui::events::render_async_jobs_widget`], C21) had
+        // no production caller, behind a module doc claiming the host call it needs did not
+        // exist. And it is published BEFORE the `fleetView` gate below: upstream's
+        // `asyncWidgetEnabled` is independent of `fleetViewEnabled` (`shared/types.ts:2610`), so
+        // `fleetView: false` no longer silences the async slot too.
+        self.publish_async_status_snapshot_widget(services.as_ref(), &state, has_ui, mode);
+        // pi's `fleetViewEnabled` gate (`extension/index.ts:378`): with the fleet view off there is
+        // no `SubagentFleetStatus` at all upstream, so the fleet-status widget never publishes.
+        if !self.fleet_view_enabled {
+            return;
         }
         let now = crate::time::now_epoch_millis();
         let payload = {
@@ -404,8 +484,11 @@ impl SubagentsExtension {
             let run_id = self
                 .executor
                 .spawn_background(BackgroundSingleRequest {
+                    machine_cwd: None,
+                    machine: None,
                     // SUBA-021: the slash surfaces advertise no `usageBudget` param upstream either.
                     usage_budget: None,
+                    fast: None,
                     // SUBA-008: `/run` parses no `turnBudget=` token (upstream's
                     // `slash-commands.ts:678-681` forwards only output/outputMode/skill/
                     // model), so there is no CALLER rung here — but the agent's own
@@ -763,8 +846,11 @@ impl SubagentsExtension {
             let run_id = self
                 .executor
                 .spawn_background(BackgroundSingleRequest {
+                    machine_cwd: None,
+                    machine: None,
                     // SUBA-021: the slash surfaces advertise no `usageBudget` param upstream either.
                     usage_budget: None,
+                    fast: None,
                     // SUBA-008: same as the `/run` surface — no caller rung on this path; the
                     // frontmatter and config rungs are applied inside `spawn_background`.
                     turn_budget: None,
@@ -851,6 +937,7 @@ impl SubagentsExtension {
             .iter()
             .map(|step| {
                 RunnerStep::SingleStep(SingleStepSpec {
+                    machine: None,
                     agent: step.agent.clone(),
                     task: step.task.clone(),
                     cwd: step.cwd.as_deref().map(PathBuf::from),
@@ -868,6 +955,7 @@ impl SubagentsExtension {
                     output: None,
                     output_path: None,
                     output_mode: None,
+                    fast: None,
                     reads: None,
                     acceptance: None,
                     context: None,

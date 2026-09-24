@@ -22,7 +22,7 @@ use serde_json::json;
 
 use super::*;
 use crate::background::{RunDir, RunId, RunMode, RunState, RunStatus, StepStatus};
-use crate::jsonl::BoundedJsonlWriter;
+use crate::jsonl::RunEventLog;
 
 /// A run directory plus the two roots the ladder reads, all under one tempdir.
 struct Fixture {
@@ -74,9 +74,9 @@ impl Fixture {
             .expect("write status");
     }
 
-    async fn events(&self) -> Option<BoundedJsonlWriter> {
+    async fn events(&self) -> Option<RunEventLog> {
         Some(
-            BoundedJsonlWriter::create(&self.run_dir.events())
+            RunEventLog::create(&self.run_dir.events())
                 .await
                 .expect("open events"),
         )
@@ -886,7 +886,7 @@ async fn a_non_durable_proof_write_emits_no_event_and_returns_unknown() {
     // The events file lives somewhere that exists; the RUN directory does not, so the sidecar's
     // atomic write cannot land. (A swept run directory is exactly this shape.)
     let mut events = Some(
-        BoundedJsonlWriter::create(&tmp.path().join("events.jsonl"))
+        RunEventLog::create(&tmp.path().join("events.jsonl"))
             .await
             .expect("open events"),
     );

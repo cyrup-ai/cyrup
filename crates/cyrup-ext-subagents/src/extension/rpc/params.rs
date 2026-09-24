@@ -195,9 +195,13 @@ pub(crate) fn manage_params(
 /// are layered on top, exactly where upstream puts them.
 pub(crate) fn spawn_params(params: Option<&Value>) -> Result<Map<String, Value>, SubagentRpcError> {
     let input = assert_record_params(params, "spawn")?;
-    // `:516-517` — the public-execution boundary FIRST, so a blank `action` gets its own refusal.
+    // `:516-517` — the public-execution boundary FIRST, so a blank `action` gets its own refusal
+    // and ANY `clarify` gets upstream's (PB-9). Before `clarify` was checked here, `{…, clarify:
+    // true}` passed, this function forced `async: true`, and `is_background`'s clarify term then
+    // ran the "detached-only" spawn in the FOREGROUND, holding the single-dispatch slot.
     crate::extension::tool::params::normalize_public_subagent_execution(
         input.get("action").and_then(Value::as_str),
+        input.contains_key("clarify"),
     )
     .map_err(|e| SubagentRpcError::invalid_params(e.message))?;
     // `:518-520` — upstream tests `normalized.params.action !== undefined`, so the key being
@@ -669,6 +673,27 @@ mod tests {
     /// `normalized.params.action !== undefined`): a string-typed check would let `action: 7` past
     /// and into the dispatched object, where the tool would answer with a serde rejection instead
     /// of the RPC's own sentence.
+    /// PB-9 — RPC `spawn` refuses ANY `clarify` value with upstream's text (`rpc.ts:516` via
+    /// `normalizePublicSubagentExecution`, `public-execution.ts:143-145` @v0.68.0). Before this,
+    /// `{…, clarify: true}` passed, was forced `async: true`, and then ran in the FOREGROUND —
+    /// `is_background`'s clarify term overrode the forced async — holding the single-dispatch
+    /// slot on a surface documented as detached-only.
+    ///
+    /// Mutation killed: passing `false` for `clarify_present` in `spawn_params` (the call then
+    /// returns `Ok` with `async: true` — the foreground bug's entry).
+    #[test]
+    fn spawn_refuses_clarify() {
+        for clarify in [json!(true), json!(false), json!(null), json!("yes")] {
+            assert_eq!(
+                refusal(spawn_params(Some(
+                    &json!({ "agent": "x", "task": "t", "clarify": clarify })
+                ))),
+                "Public workflowScript execution does not support clarify UI.",
+                "clarify={clarify}"
+            );
+        }
+    }
+
     #[test]
     fn spawn_is_detached_only_and_refuses_any_action_key() {
         for action in [json!("steer"), json!("status"), json!(7), json!(null)] {

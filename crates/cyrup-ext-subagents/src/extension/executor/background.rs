@@ -13,8 +13,9 @@ use crate::extension::executor::paths::resolve_background_storage_roots;
 use crate::extension::executor::requests::{BackgroundSingleRequest, BackgroundStepsSpec};
 use crate::extension::host::slash_render::plan_step_agent_names;
 use crate::extension::tool::task_items::{
-    normalize_single_output_override, parse_tool_output_mode, resolve_single_output_path,
-    resolve_single_run_output_base_dir, resolve_single_run_session_root,
+    normalize_single_output_override, parse_tool_output_mode, resolve_effective_output_mode,
+    resolve_single_output_path, resolve_single_run_output_base_dir,
+    resolve_single_run_session_root,
 };
 use crate::fork_context::resolve_effective_context;
 use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
@@ -57,8 +58,11 @@ impl SubagentExecutor {
             acceptance,
             control,
             include_progress,
+            machine,
+            machine_cwd,
             output,
             output_mode,
+            fast,
             skills,
             share,
             session_dir,
@@ -87,6 +91,21 @@ impl SubagentExecutor {
         // T0.1/C13: the SAME resolved definition is projected into the plan-time persona map handed
         // to the runner, so hop 2 dispatches this agent's REAL persona rather than a placeholder.
         let agent = self.resolve_agent(cwd, agent_name, agent_scope, &cfg.roots)?;
+        // SUBA-100 — pi `executeAsyncSingle` → `buildSeqStep`'s placement block
+        // (`async-execution.ts:990-1001` @v0.68.0): `params.machine ?? a.machine`, the runner
+        // refusal, then the resolution — all BEFORE the run id or the detached runner exists.
+        let placement = crate::placement::resolve::resolve_single_placement(
+            crate::placement::resolve::PlacementAgent {
+                name: &agent.name,
+                machine: agent.machine.as_deref(),
+                runner: agent.runner.as_ref(),
+            },
+            machine.as_deref(),
+            machine_cwd.as_deref(),
+            &mut crate::placement::resolve::launch_resolver(cwd, &cfg)?,
+        )
+        .await
+        .map_err(SubagentError::Management)?;
         let mut resolved_persona = crate::exec::resolve_step_agent_config(&agent);
         // SUBA-047 (async half) / pi `params.toolBudget ?? agentConfig.toolBudget`
         // (`runs/background/async-execution.ts:1298`). The persona map IS what hop 2 dispatches
@@ -193,10 +212,16 @@ impl SubagentExecutor {
             .as_deref(),
             &output_base_dir,
         );
-        // pi `async-execution.ts:908`: `const outputMode = params.outputMode ?? "inline"` — from the
-        // PARAM alone; pi never consults the persona's own mode here.
-        let effective_output_mode = parse_tool_output_mode(output_mode.as_deref())
-            .unwrap_or(crate::discovery::types::OutputMode::Inline);
+        // pi `async-execution.ts:1836` @v0.68.0: `params.outputMode ?? agentConfig.outputMode ??
+        // "inline"`. The comment that stood here said pi "never consults the persona's own mode" —
+        // true at v0.43.0 (`:908`), false from v0.57.0 on, and the reason the agent-level mode was
+        // dropped on this path (SUBA-096). The `file-only` refusal just below therefore sees the
+        // AGENT's mode too, which is the point: an agent declaring `outputMode: file-only` with no
+        // resolvable path is refused before spawn, as upstream refuses it.
+        let effective_output_mode = resolve_effective_output_mode(
+            parse_tool_output_mode(output_mode.as_deref()),
+            agent.output.as_ref(),
+        );
         // pi `validateFileOnlyOutputMode(outputMode, outputPath, \`Async single run (${agent})\`)`
         // (`async-execution.ts:909-910`, via `single-output.ts:140-145`): `file-only` with no
         // resolvable output path is refused BEFORE any spawn, and on the async path it is refused
@@ -219,6 +244,8 @@ impl SubagentExecutor {
                 .map(|root| root.join("run-0"));
 
         let step = SingleStepSpec {
+            // SUBA-100 — the resolved placement, carried to hop 2 on the step itself.
+            machine: placement,
             agent: agent_name.to_string(),
             task: task.to_string(),
             cwd: None,
@@ -243,6 +270,9 @@ impl SubagentExecutor {
             // drop them.
             output_path: output_path.map(|p| p.display().to_string()),
             output_mode: Some(effective_output_mode),
+            // SUBA-096 — pi `params.fast ?? agentConfig.fast` (`async-execution.ts:1741`
+            // @v0.68.0), resolved here where the persona is, and carried on the step to hop 2.
+            fast: fast.or(agent.fast),
             // SUBA-N03: the per-call `skill` override (pi's runner step `skills`,
             // `async-execution.ts:990`), already normalized by `normalize_skill_input` at the tool
             // boundary. `None` still defers to the persona's own `skills:` inside `run_sync`.
@@ -471,6 +501,13 @@ impl SubagentExecutor {
                 max: depth.max_depth,
             });
         }
+        // Launch-time refusal of `fast` for a foreign runner — pi `async-execution.ts:1012` (every
+        // step of `buildAsyncRunnerSteps`) and `:1756` (`executeAsyncSingle`) @v0.68.0, both BEFORE
+        // the async dir, the status file or the runner exist. Checked here, ahead of every
+        // directory this function creates, so the tool call itself errors and no run is left
+        // behind; the spawn-time refusal in `exec::external_cli` stays as the backstop for the
+        // foreground path.
+        refuse_external_runner_fast(&steps, &resolved_agents)?;
 
         // SUBA-N03: the run id is the CALLER'S (`BackgroundStepsSpec::run_id`), never minted here.
         // pi hoists it the same way and for the same reason — `const id = randomUUID()` at
@@ -547,9 +584,17 @@ impl SubagentExecutor {
             own_thinking_ceiling.as_deref(),
         ])
         .map_err(SubagentError::ThinkingCeilingViolation)?;
+        // The inherited half is read through the extension's env seam — `env_overrides` over this
+        // process — the same layering `SubagentsExtension::env_lookup` gives every other injectable
+        // read, so a pinned (or scrubbed) `CYRUP_SUBAGENT_CAPABILITY_CEILING_V1` binds this launch
+        // exactly as an inherited one would.
         let own_capability_ceiling =
-            crate::exec::capability_ceiling::resolve_current_capability_ceiling(
+            crate::exec::capability_ceiling::resolve_current_capability_ceiling_from(
                 self.current_session_id().as_deref(),
+                &|key| match cfg.env_overrides.get(key) {
+                    Some(pinned) => pinned.clone(),
+                    None => std::env::var(key).ok(),
+                },
             )
             .map_err(SubagentError::CapabilityCeilingViolation)?;
         let capability_ceiling = crate::exec::capability_ceiling::intersect_capability_ceilings(&[
@@ -841,6 +886,14 @@ impl SubagentExecutor {
         // computed above the capacity claim — never wider than what THIS process is bound by.
         let mut env_overlay =
             crate::background::parent_anchor::detached_runner_env_overlay_in(&cfg.roots);
+        // SUBA-100 — the detached runner reaches a placed step's machine through ITS environment,
+        // so the placement keys this extension pins in `env_overrides` (the ssh binary and agent
+        // socket, the herdr binary) are forwarded to it; unpinned keys are inherited as ever.
+        for key in crate::placement::resolve::PLACEMENT_ENV_KEYS {
+            if let Some(Some(value)) = cfg.env_overrides.get(*key) {
+                env_overlay.insert((*key).to_string(), value.clone());
+            }
+        }
         if revive_carries_thinking_ceiling && let Some(level) = &thinking_ceiling {
             env_overlay.insert(
                 crate::exec::thinking_ceiling::THINKING_CEILING_ENV.to_string(),
@@ -1011,6 +1064,56 @@ impl SubagentExecutor {
     }
 }
 
+/// The `runner.type` of a foreign runner (`external-cli` / `external-job`), or `None` for the
+/// native child — pi `const externalRunner = runner?.type === "external-cli" || runner?.type ===
+/// "external-job"` (`async-execution.ts:1754` @v0.68.0).
+pub(crate) fn external_runner_type(
+    runner: Option<&crate::runner::AgentRunnerConfig>,
+) -> Option<&'static str> {
+    runner
+        .filter(|runner| !matches!(runner, crate::runner::AgentRunnerConfig::Pi))
+        .map(crate::runner::AgentRunnerConfig::type_str)
+}
+
+/// pi's async launch-time `fast mode` refusal for a foreign runner
+/// (`async-execution.ts:1012,1756` @v0.68.0): every agent-running step whose EFFECTIVE `fast`
+/// (`s.fast ?? params.fast ?? a.fast`, already folded onto the step by every dispatch site) is
+/// `true` and whose persona declares an `external-cli`/`external-job` runner is refused with
+/// upstream's own sentence, before anything is created.
+///
+/// `[CYRUP-DELTA]` (text only): upstream lists every unsupported feature of the step in one
+/// sentence (`does not support: model override, fast mode.`); this check owns only `fast`, so its
+/// list is `fast mode` alone.
+fn refuse_external_runner_fast(
+    steps: &[RunnerStep],
+    resolved_agents: &BTreeMap<String, ResolvedAgentPersona>,
+) -> Result<(), SubagentError> {
+    let mut specs: Vec<&SingleStepSpec> = Vec::new();
+    for step in steps {
+        match step {
+            RunnerStep::SingleStep(spec) => specs.push(spec),
+            RunnerStep::ParallelGroup(group) => specs.extend(group.steps.iter()),
+            RunnerStep::DynamicGroup(dynamic) => specs.push(&dynamic.template),
+            RunnerStep::ImportAsyncRoot(_) => {}
+        }
+    }
+    for spec in specs {
+        if spec.fast != Some(true) {
+            continue;
+        }
+        let Some(persona) = resolved_agents.get(&spec.agent) else {
+            continue;
+        };
+        if let Some(runner_type) = external_runner_type(persona.runner.as_ref()) {
+            return Err(SubagentError::Management(format!(
+                "Agent '{}' uses runner.type='{runner_type}' and does not support: fast mode.",
+                spec.agent
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1027,6 +1130,251 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    /// Launch-time `fast` refusal for a foreign runner (pi `async-execution.ts:1012,1756`
+    /// @v0.68.0), driven through the REAL tool entry (`subagent` with `async: true`).
+    mod external_fast_refusal {
+        use super::*;
+        use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
+        use crate::paths::Roots;
+        use crate::spawn::SpawnCommand;
+
+        const REFUSAL: &str =
+            "Agent 'foreign' uses runner.type='external-cli' and does not support: fast mode.";
+
+        fn entries(dir: &Path) -> Vec<PathBuf> {
+            match std::fs::read_dir(dir) {
+                Ok(read) => read.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+
+        async fn tool_for(dir: &Path, persona: &str) -> crate::extension::tool::SubagentTool {
+            let agents = dir.join(".cyrup").join("agents");
+            std::fs::create_dir_all(&agents).expect("mkdir agents");
+            std::fs::write(agents.join("foreign.md"), persona).expect("write persona");
+            let executor = Arc::new(SubagentExecutor::new());
+            crate::extension::testsupport::arm_scoped_missions(&executor, dir).await;
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = Roots::sandboxed(dir);
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+            }
+            crate::extension::tool::SubagentTool::new(executor, dir.to_path_buf())
+        }
+
+        async fn launch_text(
+            tool: &crate::extension::tool::SubagentTool,
+            params: serde_json::Value,
+        ) -> String {
+            match crate::extension::testsupport::dispatch_tool(tool, params).await {
+                Ok(result) => crate::extension::testsupport::tool_text(&result),
+                Err(error) => error.to_string(),
+            }
+        }
+
+        /// The call's `fast: true` and the agent's own `fast: true` are each refused at the tool
+        /// call, with pi's sentence, and neither leaves a run directory, a status file or a result
+        /// behind. The same agent WITHOUT fast gets past the check and creates its run — so the
+        /// refusal keys on `fast`, not on the runner. Mutation killed: removing the
+        /// `refuse_external_runner_fast` call (the launch then creates the run and the refusal
+        /// surfaces only at hop-2 spawn), or moving it after the run-dir creation.
+        #[tokio::test]
+        async fn an_external_cli_agent_with_fast_is_refused_before_any_run_exists() {
+            const FOREIGN: &str = "---\nname: foreign\ndescription: F\n\
+runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
+            const FOREIGN_FAST: &str = "---\nname: foreign\ndescription: F\nfast: true\n\
+runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
+            for (persona, params) in [
+                (
+                    FOREIGN,
+                    serde_json::json!({"agent": "foreign", "task": "t", "async": true, "fast": true}),
+                ),
+                (
+                    FOREIGN_FAST,
+                    serde_json::json!({"agent": "foreign", "task": "t", "async": true}),
+                ),
+                (
+                    FOREIGN,
+                    serde_json::json!({"chain": [{"agent": "foreign", "task": "t", "fast": true}], "async": true}),
+                ),
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let tool = tool_for(dir.path(), persona).await;
+                let text = launch_text(&tool, params.clone()).await;
+                assert!(text.contains(REFUSAL), "{params}: {text}");
+                let roots = Roots::sandboxed(dir.path());
+                let async_root = default_async_root_in(&roots, dir.path());
+                let results = default_results_dir_in(&roots, dir.path());
+                assert!(
+                    entries(&async_root).is_empty(),
+                    "{params}: no run directory: {:?}",
+                    entries(&async_root)
+                );
+                assert!(
+                    entries(&results).is_empty(),
+                    "{params}: no result: {:?}",
+                    entries(&results)
+                );
+            }
+
+            // Control: no fast, same foreign agent — the launch proceeds and creates its run.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let tool = tool_for(dir.path(), FOREIGN).await;
+            let text = launch_text(
+                &tool,
+                serde_json::json!({"agent": "foreign", "task": "t", "async": true}),
+            )
+            .await;
+            assert!(!text.contains(REFUSAL), "{text}");
+            let roots = Roots::sandboxed(dir.path());
+            assert!(
+                !entries(&default_async_root_in(&roots, dir.path())).is_empty(),
+                "the unrefused launch creates its run directory: {text}"
+            );
+        }
+    }
+
+    /// The inherited capability ceiling (`CYRUP_SUBAGENT_CAPABILITY_CEILING_V1`, pi
+    /// `resolveCurrentSubagentCapabilityCeiling`, `capability-ceiling.ts:168-170` @v0.68.0) is
+    /// read through the extension's env seam on the async launch path, so a MALFORMED inherited
+    /// value is provably refused — fail closed, never "unbounded" — through the REAL tool entry,
+    /// with no process-environment mutation.
+    mod inherited_capability_ceiling_refusal {
+        use super::*;
+        use crate::paths::Roots;
+        use crate::spawn::SpawnCommand;
+
+        async fn tool_with_pin(
+            dir: &Path,
+            pin: Option<&str>,
+        ) -> crate::extension::tool::SubagentTool {
+            let agents = dir.join(".cyrup").join("agents");
+            std::fs::create_dir_all(&agents).expect("mkdir agents");
+            std::fs::write(
+                agents.join("worker.md"),
+                "---\nname: worker\ndescription: W\n---\n\nbody\n",
+            )
+            .expect("write persona");
+            let executor = Arc::new(SubagentExecutor::new());
+            crate::extension::testsupport::arm_scoped_missions(&executor, dir).await;
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = Roots::sandboxed(dir);
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+                cfg.env_overrides.insert(
+                    crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV.to_string(),
+                    pin.map(str::to_string),
+                );
+            }
+            crate::extension::tool::SubagentTool::new(executor, dir.to_path_buf())
+        }
+
+        async fn launch_text(tool: &crate::extension::tool::SubagentTool) -> String {
+            match crate::extension::testsupport::dispatch_tool(
+                tool,
+                serde_json::json!({"agent": "worker", "task": "t", "async": true}),
+            )
+            .await
+            {
+                Ok(result) => crate::extension::testsupport::tool_text(&result),
+                Err(error) => error.to_string(),
+            }
+        }
+
+        /// A malformed inherited ceiling refuses the launch with the decoder's own text; the same
+        /// launch with the variable scrubbed goes ahead. Both a non-base64 value and a well-formed
+        /// value of the wrong version fail closed.
+        #[tokio::test]
+        async fn a_malformed_inherited_capability_ceiling_refuses_an_async_launch() {
+            use base64::Engine as _;
+            let wrong_version = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"version":99,"sources":["parent"]}"#);
+            for (pin, expected) in [
+                (
+                    "%%% not base64 %%%",
+                    "Invalid inherited capability ceiling: ",
+                ),
+                (
+                    wrong_version.as_str(),
+                    "Invalid inherited capability ceiling version.",
+                ),
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let text = launch_text(&tool_with_pin(dir.path(), Some(pin)).await).await;
+                assert!(text.contains(expected), "{pin}: {text}");
+            }
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let text = launch_text(&tool_with_pin(dir.path(), None).await).await;
+            assert!(
+                !text.contains("Invalid inherited capability ceiling"),
+                "a scrubbed ceiling is unbounded, not refused: {text}"
+            );
+        }
+
+        /// The FOREGROUND launch reads the same inherited ceiling through the same seam:
+        /// `run_foreground_impl` hands `env_overrides` to `RunOptions::parent_env_overrides`, and
+        /// `exec::spawn_plan::preflight_capability_ceiling` resolves the ceiling through it before
+        /// any child exists. A malformed value refuses (fail closed); a well-formed one that
+        /// excludes the agent refuses with upstream's restriction text
+        /// (`capabilityCeilingAgentRestrictionMessage`, `capability-ceiling.ts:176-181`); a
+        /// scrubbed one is unbounded.
+        #[tokio::test]
+        async fn an_inherited_capability_ceiling_binds_a_foreground_launch() {
+            async fn foreground_text(pin: Option<&str>) -> String {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let tool = tool_with_pin(dir.path(), pin).await;
+                match crate::extension::testsupport::dispatch_tool(
+                    &tool,
+                    serde_json::json!({"agent": "worker", "task": "t", "async": false, "model": "anthropic/claude-sonnet-4-5"}),
+                )
+                .await
+                {
+                    Ok(result) => crate::extension::testsupport::tool_text(&result),
+                    Err(error) => error.to_string(),
+                }
+            }
+
+            let text = foreground_text(Some("%%% not base64 %%%")).await;
+            assert!(
+                text.contains("Invalid inherited capability ceiling: "),
+                "{text}"
+            );
+
+            let excluding = crate::exec::capability_ceiling::encode_capability_ceiling(Some(
+                &crate::exec::capability_ceiling::ResolvedCapabilityCeiling {
+                    version: crate::exec::capability_ceiling::CAPABILITY_CEILING_VERSION,
+                    allowed_tools: None,
+                    allowed_agents: Some(vec!["reviewer".to_string()]),
+                    deny_extensions: false,
+                    sources: vec!["parent-ceiling".to_string()],
+                },
+            ))
+            .expect("encode");
+            let text = foreground_text(Some(&excluding)).await;
+            assert!(
+                text.contains(
+                    "Capability ceiling from parent-ceiling does not allow agent 'worker'. \
+                     Allowed agents: reviewer."
+                ),
+                "{text}"
+            );
+
+            let text = foreground_text(None).await;
+            assert!(
+                !text.contains("Invalid inherited capability ceiling")
+                    && !text.contains("does not allow agent"),
+                "a scrubbed ceiling is unbounded, not refused: {text}"
+            );
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // SCOPE_9/SUBTASK4 — the per-session active-async capacity gate at the spawn path.
     // ---------------------------------------------------------------------------------------
@@ -1035,6 +1383,8 @@ mod tests {
     /// assertions below are about the SLOT and not about step configuration.
     fn bare_background_request<'a>(cwd: &'a Path) -> BackgroundSingleRequest<'a> {
         BackgroundSingleRequest {
+            machine_cwd: None,
+            machine: None,
             thinking: None,
             usage_budget: None,
             turn_budget: None,
@@ -1051,6 +1401,7 @@ mod tests {
             include_progress: None,
             output: None,
             output_mode: None,
+            fast: None,
             skills: None,
             share: None,
             session_dir: None,
@@ -1373,6 +1724,8 @@ mod tests {
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -1390,6 +1743,7 @@ mod tests {
                 include_progress: Some(true),
                 output: Some(serde_json::json!("report.md")),
                 output_mode: Some("file-only".to_string()),
+                fast: None,
                 // `normalize_skill_input`'s output shape, exactly as `route_single` hands it over.
                 skills: Some(vec!["rust".to_string()]),
                 share: Some(true),
@@ -1506,6 +1860,8 @@ mod tests {
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -1523,6 +1879,7 @@ mod tests {
                 include_progress: None,
                 output: None,
                 output_mode: None,
+                fast: None,
                 skills: None,
                 share: None,
                 artifacts: None,
@@ -1583,6 +1940,8 @@ mod tests {
         for artifacts in [None, Some(true), Some(false)] {
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    machine_cwd: None,
+                    machine: None,
                     thinking: None,
                     // SUBA-021: unbudgeted on this path (see the field doc).
                     usage_budget: None,
@@ -1600,6 +1959,7 @@ mod tests {
                     include_progress: None,
                     output: Some(serde_json::json!("report.md")),
                     output_mode: None,
+                    fast: None,
                     skills: None,
                     share: None,
                     session_dir: None,
@@ -1673,6 +2033,8 @@ mod tests {
         let before = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -1690,6 +2052,7 @@ mod tests {
                 include_progress: None,
                 output: None,
                 output_mode: None,
+                fast: None,
                 skills: None,
                 share: None,
                 session_dir: None,
@@ -1734,6 +2097,8 @@ mod tests {
         // and CPU until a human noticed and issued `interrupt`.
         let untimed = executor
             .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -1751,6 +2116,7 @@ mod tests {
                 include_progress: None,
                 output: None,
                 output_mode: None,
+                fast: None,
                 skills: None,
                 share: None,
                 session_dir: None,
@@ -1794,6 +2160,8 @@ mod tests {
 
         let request = |exec: Arc<SubagentExecutor>, root: std::path::PathBuf| async move {
             exec.spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -1811,6 +2179,7 @@ mod tests {
                 include_progress: None,
                 output: Some(serde_json::json!("report.md")),
                 output_mode: None,
+                fast: None,
                 skills: None,
                 share: None,
                 session_dir: None,
@@ -1915,6 +2284,8 @@ mod tests {
 
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    machine_cwd: None,
+                    machine: None,
                     thinking: None,
                     // SUBA-021: unbudgeted on this path (see the field doc).
                     usage_budget: None,
@@ -1932,6 +2303,7 @@ mod tests {
                     include_progress: None,
                     output: None,
                     output_mode: None,
+                    fast: None,
                     skills: None,
                     share: None,
                     session_dir: None,
@@ -2009,6 +2381,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -2026,6 +2400,7 @@ mod tests {
                 include_progress: None,
                 output: None,
                 output_mode: None,
+                fast: None,
                 skills: None,
                 share: None,
                 session_dir: None,
@@ -2079,6 +2454,8 @@ mod tests {
         });
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -2096,6 +2473,7 @@ mod tests {
                 include_progress: None,
                 output: None,
                 output_mode: None,
+                fast: None,
                 skills: None,
                 share: None,
                 session_dir: None,
@@ -2158,6 +2536,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -2181,6 +2561,7 @@ mod tests {
                 include_progress: None,
                 output: None,
                 output_mode: None,
+                fast: None,
                 skills: None,
                 share: None,
                 session_dir: None,
@@ -2546,6 +2927,8 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
             });
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    machine_cwd: None,
+                    machine: None,
                     structured_output_schema: Some(schema.clone()),
                     tool_budget: Some(launch_tool_budget()),
                     turn_budget: Some(launch_turn_budget()),
@@ -2565,6 +2948,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                     include_progress: Some(true),
                     output: Some(serde_json::json!("out.md")),
                     output_mode: Some("file-only".to_string()),
+                    fast: None,
                     skills: Some(vec!["beta".to_string()]),
                     share: Some(true),
                     session_dir: Some(dir.path().join("sessions").display().to_string()),
@@ -2701,6 +3085,11 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
             );
             let artifacts_dir = crate::artifacts::project_artifacts_dir(launch.cwd());
             let expected = RecoveryDescriptor {
+                fast: None,
+                // SUBA-101: always recorded (pi `async-execution.ts:2024`); NARROW_MD declares
+                // none, so the parser default `false`.
+                inherit_global_context: Some(false),
+                mutation_tools: None,
                 version: DescriptorVersion,
                 launch_contract_digest: written.launch_contract_digest.clone(),
                 source_run_id: launch.run_id.clone(),
@@ -2937,6 +3326,187 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
             );
         }
 
+        /// SUBA-103 / SUBA-101 / SUBA-102, through production: the launch's EFFECTIVE `fast`
+        /// (here the agent's own `fast: true`, folded onto the step by `spawn_background`), its
+        /// `inheritGlobalContext` and its `mutationTools` are written to the descriptor, the file
+        /// is then rewritten WITHOUT any of them, and `action: "resume"` still relaunches the
+        /// revived step fast with the launch's global-context flag and mutation tools — and
+        /// records all three again on the revived run's own descriptor. Mutation killed:
+        /// `fast: None` at `control.rs`'s revive (the revived step is standard tier), `fast: None`
+        /// in `for_single_launch` (nothing to replay), or dropping the two `apply_to_persona`
+        /// lines (the widened file's `false`/`None` win).
+        #[tokio::test]
+        async fn a_revived_run_replays_fast_global_context_and_mutation_tools() {
+            let persona = NARROW_MD.replace(
+                "completionGuard: false\n",
+                "completionGuard: false\nfast: true\ninheritGlobalContext: true\n\
+mutationTools: apply_patch, notebook_edit\n",
+            );
+            assert!(persona.contains("\nfast: true\n"), "fixture: {persona}");
+            let launch = launch_with(LaunchSpec {
+                persona,
+                ..LaunchSpec::standard("descriptor-fast-replay", "worker")
+            })
+            .await;
+            let raw: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(launch.descriptor_path()).expect("descriptor written"),
+            )
+            .expect("JSON");
+            assert_eq!(raw["fast"], true);
+            assert_eq!(raw["inheritGlobalContext"], true);
+            assert_eq!(
+                raw["mutationTools"],
+                serde_json::json!(["apply_patch", "notebook_edit"])
+            );
+
+            launch.settle(Some(launch.cwd().to_path_buf())).await;
+            write_persona(launch.cwd(), "worker", WIDE_MD);
+            let confirmation = launch.resume().await.expect("revives");
+            let revived = revived_id(&confirmation);
+            let revived_paths = launch.run_paths_under(launch.cwd(), &revived);
+            let cfg = read_runner_config(&revived_paths.run_dir);
+            let step = single_step(&cfg);
+            let revived_persona = cfg
+                .resolved_agents
+                .get("worker")
+                .expect("the revived persona map carries the agent");
+            assert_eq!(step.fast, Some(true), "the revived step replays fast");
+            assert!(revived_persona.inherit_global_context);
+            assert_eq!(
+                revived_persona.mutation_tools,
+                Some(vec!["apply_patch".to_string(), "notebook_edit".to_string()])
+            );
+            let revived_descriptor = RecoveryDescriptor::read(
+                &RunDir::for_existing(&revived_paths.run_dir).recovery_descriptor(),
+            )
+            .await
+            .expect("readable")
+            .expect("written per revive");
+            assert_eq!(revived_descriptor.fast, Some(true));
+            assert_eq!(revived_descriptor.inherit_global_context, Some(true));
+            assert_eq!(
+                revived_descriptor.mutation_tools,
+                Some(vec!["apply_patch".to_string(), "notebook_edit".to_string()])
+            );
+        }
+
+        /// SUBA-100 — pi's revive relaunches `params.machine ?? agentConfig.machine`
+        /// (`async-execution.ts:1774` @v0.68.0) over the DISCOVERED agent, resolving the placement
+        /// before the run exists. So once the agent file names a saved machine, the revived step is
+        /// PLACED — resolved against the catalog and `subagents.machines` — and never runs locally
+        /// (its runner then meets `serializeHerdrPiLaunch`'s resume refusal, as upstream's does).
+        ///
+        /// *Gutted by*: `machine: None` at `control.rs`'s revive step, or dropping its fold.
+        #[tokio::test]
+        async fn a_revived_agent_that_names_a_machine_is_placed_there() {
+            let launch = launch("descriptor-revive-machine", "worker").await;
+            launch.settle(Some(launch.cwd().to_path_buf())).await;
+            let placed = NARROW_MD.replace(
+                "completionGuard: false\n",
+                "completionGuard: false\nmachine: fake-box\n",
+            );
+            assert!(
+                placed.contains("\nmachine: fake-box\n"),
+                "fixture: {placed}"
+            );
+            write_persona(launch.cwd(), "worker", &placed);
+            std::fs::write(
+                launch.cwd().join(".cyrup/agents/settings.json"),
+                serde_json::json!({"subagents":{"machines":{"fake-box":{"cwd":"/srv/repo"}}}})
+                    .to_string(),
+            )
+            .expect("settings");
+            let herdr = launch.cwd().join("fake-herdr");
+            std::fs::write(
+                &herdr,
+                "#!/bin/sh\nprintf '%s\\n' '{\"machines\":[{\"id\":\"m-fake\",\"label\":\"fake-box\",\"target\":\"me@fake-box\",\"enabled\":true}]}'\n",
+            )
+            .expect("herdr");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&herdr, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+            launch
+                .executor
+                .config_cell()
+                .lock()
+                .await
+                .env_overrides
+                .insert(
+                    cyrup_herdr::cli::HERDR_BIN.to_string(),
+                    Some(herdr.display().to_string()),
+                );
+            let confirmation = launch.resume().await.expect("revives");
+            let revived_paths = launch.run_paths_under(launch.cwd(), &revived_id(&confirmation));
+            let step = single_step(&read_runner_config(&revived_paths.run_dir)).clone();
+            let placement = step.machine.expect("the revived step is placed");
+            assert_eq!(placement.requested, "fake-box");
+            let resolved = placement.resolved.expect("resolved before the run exists");
+            assert_eq!(resolved.id, "m-fake");
+            assert_eq!(resolved.cwd, "/srv/repo");
+            assert_eq!(step.cwd, None, "the machine cwd never becomes a local one");
+        }
+
+        /// SUBA-103, the revive's FALLBACK rung, through production. A launch no rung set `fast`
+        /// on records none (pi writes `fast` only when set, `async-execution.ts:2008` @v0.68.0),
+        /// and pi's revive relaunches with `params.fast ?? agentConfig.fast` (`:1967`) over the
+        /// CURRENTLY discovered agent — so once the file says `fast: true`, the revived step runs
+        /// fast and records it. The `[CYRUP-DELTA]` half: a descriptor that recorded an explicit
+        /// `false` keeps its revive standard although the file now says `true`.
+        ///
+        /// *Gutted by*: `fast: descriptor.fast` at `control.rs`'s revive (the fallback is lost and
+        /// the first revive is standard), or `current_agent_fast` projected as `None` (same).
+        #[tokio::test]
+        async fn a_revive_with_no_recorded_fast_takes_the_agents_current_fast() {
+            let fast_now = NARROW_MD.replace(
+                "completionGuard: false\n",
+                "completionGuard: false\nfast: true\n",
+            );
+            assert!(fast_now.contains("\nfast: true\n"), "fixture: {fast_now}");
+
+            let unset = launch("descriptor-fast-fallback", "worker").await;
+            let raw: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(unset.descriptor_path()).expect("descriptor written"),
+            )
+            .expect("JSON");
+            assert!(raw.get("fast").is_none(), "no rung set fast: {raw}");
+            unset.settle(Some(unset.cwd().to_path_buf())).await;
+            write_persona(unset.cwd(), "worker", &fast_now);
+            let confirmation = unset.resume().await.expect("revives");
+            let revived_paths = unset.run_paths_under(unset.cwd(), &revived_id(&confirmation));
+            assert_eq!(
+                single_step(&read_runner_config(&revived_paths.run_dir)).fast,
+                Some(true),
+                "an unrecorded fast falls back to the agent's current `fast: true`"
+            );
+            let revived_descriptor = RecoveryDescriptor::read(
+                &RunDir::for_existing(&revived_paths.run_dir).recovery_descriptor(),
+            )
+            .await
+            .expect("readable")
+            .expect("written per revive");
+            assert_eq!(revived_descriptor.fast, Some(true), "and records it");
+
+            let pinned = launch("descriptor-fast-false", "worker").await;
+            let path = pinned.descriptor_path();
+            let mut descriptor = RecoveryDescriptor::read(&path)
+                .await
+                .expect("readable")
+                .expect("present");
+            descriptor.fast = Some(false);
+            descriptor.write(&path).await.expect("rewrite");
+            pinned.settle(Some(pinned.cwd().to_path_buf())).await;
+            write_persona(pinned.cwd(), "worker", &fast_now);
+            let confirmation = pinned.resume().await.expect("revives");
+            let revived_paths = pinned.run_paths_under(pinned.cwd(), &revived_id(&confirmation));
+            assert_eq!(
+                single_step(&read_runner_config(&revived_paths.run_dir)).fast,
+                Some(false),
+                "a recorded `false` is the launch's own decision and outranks the file"
+            );
+        }
+
         /// Row 4 through production: with no recorded `status.cwd` the revive runs in the cwd the
         /// WRITER recorded, and records it again on its own descriptor. cyrup's async root is
         /// keyed by the exact cwd (`background::artifact_roots::cwd_key`), so a resume can only
@@ -3097,6 +3667,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                 .expect("the persona resolves");
             let persona = crate::exec::resolve_step_agent_config(&agent);
             let step = SingleStepSpec {
+                machine: None,
                 agent: "worker".to_string(),
                 task: "do the thing".to_string(),
                 cwd: None,
@@ -3109,6 +3680,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                 output: None,
                 output_path: None,
                 output_mode: None,
+                fast: None,
                 reads: None,
                 acceptance: None,
                 skills: None,
@@ -3186,6 +3758,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                 capability_ceiling: None,
                 model_origin: None,
                 steps: vec![RunnerStep::SingleStep(SingleStepSpec {
+                    machine: None,
                     agent: "worker".to_string(),
                     task: "do the thing".to_string(),
                     cwd: None,
@@ -3198,6 +3771,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                     output: None,
                     output_path: None,
                     output_mode: None,
+                    fast: None,
                     reads: None,
                     acceptance: None,
                     skills: None,

@@ -264,6 +264,10 @@ pub fn workflow_child_summary(
             StepState::Failed => WorkflowChildState::Failed,
             StepState::Paused => WorkflowChildState::Paused,
             StepState::Stopped => WorkflowChildState::Stopped,
+            // SUBA-100 — upstream's ladder (`workflow-child-summary.ts:85-90` @v0.68.0) has no
+            // `"partial"` arm and falls through to `"running"`, which would show a FINISHED child
+            // as live forever. A partial step is terminal and not a success: it is a failure here.
+            StepState::Partial => WorkflowChildState::Failed,
             StepState::Pending => WorkflowChildState::Pending,
             StepState::Running => WorkflowChildState::Running,
         };

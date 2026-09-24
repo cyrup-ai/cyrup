@@ -163,10 +163,11 @@ pub struct RunPaths {
     pub run_dir: PathBuf,
     /// `<run_dir>/status.json` — [`RunStatus`](crate::background::RunStatus), atomic writes only.
     pub status: PathBuf,
-    /// `<run_dir>/events.jsonl` — append-only, size-capped event log (R-SA-136/146). Any writer
-    /// appending to this path MUST go through [`crate::jsonl::BoundedJsonlWriter`] (the same
-    /// shared primitive [`crate::spawn::SpawnedChild`]'s own per-attempt `.jsonl` tee uses) so the
-    /// 50MB-default byte-budget cap is enforced identically here, not re-implemented per writer.
+    /// `<run_dir>/events.jsonl` — append-only event log (R-SA-136/146). Any writer appending to
+    /// this path MUST go through [`crate::jsonl::RunEventLog`], so the split upstream draws is
+    /// enforced identically by every writer: lifecycle lines are never capped, child diagnostic
+    /// lines are capped (`CYRUP_SUBAGENT_ASYNC_EVENTS_MAX_BYTES`, 50 MiB default) with a one-shot
+    /// `subagent.events.truncated` marker (pi `subagent-runner.ts:300-330` @v0.43.0).
     pub events: PathBuf,
     /// `<run_dir>/control/interrupt.json` — present only while an [`crate::error::SubagentError`]-
     /// free pending interrupt request exists (R-SA-081); a later phase's `InterruptRequest` type

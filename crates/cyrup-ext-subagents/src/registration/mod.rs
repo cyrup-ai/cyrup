@@ -479,6 +479,37 @@ pub struct SubagentExtensionConfig {
     /// than taking the whole `config.json` down at load the way upstream's `throw` does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_detach_shortcut: Option<String>,
+    /// pi `completionBatch` (`shared/types.ts:2663`, interface `:351-365` @v0.68.0) — the lead-in
+    /// debounce that coalesces a burst of background completions into one grouped notice.
+    /// SUBA-017; resolved by `resolve_completion_batch_config`.
+    ///
+    /// Held as the RAW JSON value rather than a typed field, deliberately: `SubagentExtensionConfig`
+    /// is deserialized in one shot, so a strict type would let one malformed value in a user's
+    /// config fail the ENTIRE parse. Keeping it raw lets the owning feature resolve it with
+    /// upstream's own per-key diagnostic while every other key still loads.
+    pub completion_batch: Option<serde_json::Value>,
+    /// pi `asyncWidget` — whether the async-jobs widget is shown. SUBA-061.
+    ///
+    /// Held as the RAW JSON value rather than a typed field, deliberately: `SubagentExtensionConfig`
+    /// is deserialized in one shot, so a strict type would let one malformed value in a user's
+    /// config fail the ENTIRE parse. Keeping it raw lets the owning feature resolve it with
+    /// upstream's own per-key diagnostic while every other key still loads.
+    pub async_widget: Option<serde_json::Value>,
+    /// pi `inlineToolDisplay` — how a finished subagent result renders inline. SUBA-061.
+    ///
+    /// Held as the RAW JSON value rather than a typed field, deliberately: `SubagentExtensionConfig`
+    /// is deserialized in one shot, so a strict type would let one malformed value in a user's
+    /// config fail the ENTIRE parse. Keeping it raw lets the owning feature resolve it with
+    /// upstream's own per-key diagnostic while every other key still loads.
+    pub inline_tool_display: Option<serde_json::Value>,
+    /// pi `fleetKeybindings` — per-action replacement bindings for the full fleet inspector
+    /// (`resolveFleetKeybindings`). SUBA-061.
+    ///
+    /// Held as the RAW JSON value rather than a typed field, deliberately: `SubagentExtensionConfig`
+    /// is deserialized in one shot, so a strict type would let one malformed value in a user's
+    /// config fail the ENTIRE parse. Keeping it raw lets the owning feature resolve it with
+    /// upstream's own per-key diagnostic while every other key still loads.
+    pub fleet_keybindings: Option<serde_json::Value>,
     /// SUBA-073 — pi `ExtensionConfig.permissions?: PermissionConfig` (`shared/types.ts:2268`
     /// @v0.57.0, *"Opt-in native tool permissions. Bash remains outside this policy."*). Carried
     /// RAW, exactly like [`Self::turn_budget`] and for the same reason: validated at the point of
@@ -491,6 +522,36 @@ pub struct SubagentExtensionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<serde_json::Value>,
 }
+
+/// The `config.json` keys pi declares on `ExtensionConfig` at v0.68.0 (`shared/types.ts:2596-2690`)
+/// that this port has no reader for, each with what it would drive. Reported by
+/// [`SubagentExtensionConfig::config_warnings`] when set, rather than dropped by serde.
+///
+/// Each is a real feature gap, not a decision that it is out of scope; the ledger carries them.
+pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 13] = [
+    ("forkContext", "pruned fork-context preparation"),
+    (
+        "modelResponseAliases",
+        "operator-declared model response-id aliases",
+    ),
+    ("mainWindowRenderer", "main-chat renderer density controls"),
+    ("orcaProgressTabs", "Orca observer tabs"),
+    ("toolTimeoutMs", "a config-level per-tool-call timeout"),
+    (
+        "checkpointBeforeDeadlineMs",
+        "pre-deadline checkpoint requests",
+    ),
+    ("toolBudget", "a config-level tool-budget default"),
+    ("usageBudget", "a config-level usage-budget default"),
+    ("worktree", "a config-level managed-worktree default"),
+    ("worktreeProvider", "worktree allocator selection"),
+    (
+        "worktreeBranchPrefix",
+        "managed worktree branch namespacing",
+    ),
+    ("intercomBridge", "intercom bridge configuration"),
+    ("resultScanLogging", "result-index scan logging"),
+];
 
 /// SUBA-059 — pi's `Pick<ArtifactConfig, "cleanupDays">` (`shared/types.ts:1859` @v0.47.1): the
 /// only artifact field `config.json` may set. A separate type from
@@ -569,20 +630,15 @@ impl Default for SubagentExtensionConfig {
             // (`slash-commands.ts:1007`) registers NOTHING with the key absent. Opt-in, and
             // deliberately so; see the field's doc for why a default-on chord was rejected.
             foreground_detach_shortcut: None,
+            completion_batch: None,
+            async_widget: None,
+            inline_tool_display: None,
+            fleet_keybindings: None,
         }
     }
 }
 
 impl SubagentExtensionConfig {
-    /// pi `validateMissionStoreConfig(config.missions)` (`extension/config.ts:25`) — the
-    /// unknown-key/wrong-type check upstream runs on every config read, applied to the RAW config
-    /// JSON so an unknown key inside the `missions` block is refused rather than silently dropped
-    /// by serde's field matching.
-    ///
-    /// # Errors
-    ///
-    /// The upstream refusal text (`config.missions.<key> is unknown`, `… must be boolean`, `…
-    /// must be a positive integer`).
     /// SUBA-064 — pi `validateAuthorityPolicy(config.authorityPolicy)`
     /// (`policy/authority.ts:30-45`), applied to the RAW config JSON beside
     /// [`Self::validate_missions`] for the same reason: serde drops an unknown action key and a bad
@@ -710,10 +766,149 @@ impl SubagentExtensionConfig {
         Ok(())
     }
 
+    /// pi `validateMissionStoreConfig(config.missions)` (`extension/config.ts:25`) — the
+    /// unknown-key/wrong-type check upstream runs on every config read, applied to the RAW config
+    /// JSON so an unknown key inside the `missions` block is refused rather than silently dropped
+    /// by serde's field matching.
+    ///
+    /// # Errors
+    ///
+    /// The upstream refusal text (`config.missions.<key> is unknown`, `… must be boolean`, `…
+    /// must be a positive integer`).
     pub fn validate_missions(raw: &serde_json::Value) -> Result<(), String> {
         crate::missions::validate_mission_store_config(raw.get("missions"), "config.missions")
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    /// Every raw-config validator whose failure upstream treats as fatal — pi `validateConfig`
+    /// (`extension/config.ts:131-181` @v0.68.0), run by `readConfigForUpdate` on every read, whose
+    /// throw `loadConfig` (`:218-236`) turns into "log and use the defaults". The loader
+    /// (`crates/cyrup/src/subagent_config.rs`) calls this and does exactly that.
+    ///
+    /// Before this existed the loader called ONLY [`Self::validate_missions`]; the other three were
+    /// written, documented as "must be refused at config load", and never called — so a typo'd
+    /// `authorityPolicy` action (`stopRuns` for `stopRun`), an unknown `artifactDir`, or a negative
+    /// `artifactConfig.cleanupDays` was dropped by serde without a word.
+    ///
+    /// Order is upstream's: `artifactDir` (`:152`), then `missions` (`:162`), `authorityPolicy`
+    /// (`:163`), `artifactConfig` (`:167`), so a file with two problems reports the one pi would.
+    ///
+    /// # Errors
+    ///
+    /// The first failing validator's own field-naming message.
+    pub fn validate_raw_config(raw: &serde_json::Value) -> Result<(), String> {
+        Self::validate_artifact_dir(raw)?;
+        Self::validate_missions(raw)?;
+        Self::validate_authority_policy(raw)?;
+        Self::validate_artifact_config(raw)?;
+        Ok(())
+    }
+
+    /// Non-fatal diagnostics for a raw `config.json` object: every key this port does not read.
+    ///
+    /// `[CYRUP-DELTA]`: upstream ignores an unknown top-level key silently — but upstream READS
+    /// every key it declares. This port does not, so the same silence would hide a key the user
+    /// set from the pi docs and that does nothing here. Two messages:
+    ///
+    /// - a key upstream declares at v0.68.0 (`shared/types.ts:2596-2690`) that this port has not
+    ///   ported: `'<key>' is not supported by this port (<what it would drive>); it has no
+    ///   effect`;
+    /// - any other key: `unknown key '<key>' (ignored)` — a typo, or a key from another tool.
+    ///
+    /// The known set is read off the struct's own serde field list
+    /// ([`crate::discovery::key_census::struct_fields`]), so it cannot drift from what the typed
+    /// parse actually consumes.
+    #[must_use]
+    pub fn config_warnings(raw: &serde_json::Value) -> Vec<String> {
+        let Some(object) = raw.as_object() else {
+            return Vec::new();
+        };
+        let known = crate::discovery::key_census::struct_fields::<Self>();
+        let key_census = crate::discovery::key_census::census(object, known, &UNPORTED_CONFIG_KEYS);
+        let mut warnings: Vec<String> = key_census
+            .unported
+            .iter()
+            .map(|(key, landing)| {
+                format!("'{key}' is not supported by this port ({landing}); it has no effect")
+            })
+            .collect();
+        warnings.extend(
+            key_census
+                .unknown
+                .iter()
+                .map(|key| format!("unknown key '{key}' (ignored)")),
+        );
+        // SUBA-061 — the three keys held raw so one bad value cannot fail the whole parse. Each
+        // is resolved per key, and a value that resolves to the default says so here.
+        if let Some(value) = raw.get("asyncWidget")
+            && !value.is_boolean()
+        {
+            // [CYRUP-DELTA] upstream's `config.asyncWidget !== false` silently treats any
+            // non-`false` value as "on".
+            warnings.push(format!(
+                "config.asyncWidget must be a boolean; {value} leaves the async-jobs widget on"
+            ));
+        }
+        if let Some(value) = raw.get("inlineToolDisplay")
+            && !matches!(value.as_str(), Some("rich" | "summary"))
+        {
+            // [CYRUP-DELTA] upstream has no validator: anything but "summary" is rich, silently.
+            warnings.push(format!(
+                r#"config.inlineToolDisplay must be "rich" or "summary"; {value} renders "rich""#
+            ));
+        }
+        match crate::tui::fleet::validate_fleet_keybindings(raw.get("fleetKeybindings")) {
+            // Upstream THROWS here and `loadConfig` then discards the whole file; the key is held
+            // raw precisely so this port can refuse only it. [CYRUP-DELTA] in blast radius only —
+            // the message is upstream's, verbatim.
+            Err(message) => {
+                warnings.push(format!("{message}; the default Fleet keybindings apply"))
+            }
+            Ok(config) => {
+                for (action, spec) in
+                    crate::tui::fleet::FleetKeybindings::unmatchable_specs(&config)
+                {
+                    // [CYRUP-DELTA] pi's `matchesKey` simply never matches such a binding.
+                    warnings.push(format!(
+                        "config.fleetKeybindings.{}: '{spec}' is not a key this port can match (ignored)",
+                        action.as_str()
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
+    /// SUBA-061 — pi `const asyncWidgetEnabled = config.asyncWidget !== false`
+    /// (`extension/index.ts:438` @v0.68.0): only the literal `false` turns the async-jobs widget
+    /// off. Independent of [`Self::fleet_view`] (`shared/types.ts:2610`: *"Defaults to true,
+    /// including when FleetView is enabled"*).
+    #[must_use]
+    pub fn async_widget_enabled(&self) -> bool {
+        self.async_widget != Some(serde_json::Value::Bool(false))
+    }
+
+    /// SUBA-061 — pi `summaryInlineToolDisplay = config.inlineToolDisplay === "summary"`
+    /// (`extension/index.ts:439` @v0.68.0). Anything else — absent, `"rich"`, or an unknown value
+    /// ([`Self::config_warnings`] reports that one) — is the rich renderer.
+    #[must_use]
+    pub fn inline_tool_display_summary(&self) -> bool {
+        self.inline_tool_display
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            == Some("summary")
+    }
+
+    /// SUBA-061 — pi `resolveFleetKeybindings(config.fleetKeybindings)` (`tui/fleet.ts:50-56`
+    /// @v0.68.0): per-action REPLACEMENT of the defaults. A block upstream's validator refuses
+    /// resolves to the defaults entirely ([`Self::config_warnings`] names the problem).
+    #[must_use]
+    pub fn fleet_keybindings(&self) -> crate::tui::fleet::FleetKeybindings {
+        match crate::tui::fleet::validate_fleet_keybindings(self.fleet_keybindings.as_ref()) {
+            Ok(config) => crate::tui::fleet::FleetKeybindings::resolve(&config),
+            Err(_) => crate::tui::fleet::FleetKeybindings::default(),
+        }
     }
 
     /// The effective `parallel.maxTasks` (pi `ExtensionConfig.parallel?.maxTasks`), falling back to
@@ -1389,6 +1584,61 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
+
+    /// SUBA-061 — each raw-held key resolves on its own, with its own diagnostic, and a bad value
+    /// never takes the rest of the config with it. Mutations killed: `async_widget_enabled` as
+    /// `== Some(true)` (an absent key would then disable the widget), `inline_tool_display_summary`
+    /// as `!= "rich"` (an unknown value would then be summary), and dropping any warning arm.
+    #[test]
+    fn the_three_raw_widget_keys_resolve_with_upstreams_defaults_and_warn_when_invalid() {
+        let config = |raw: serde_json::Value| -> SubagentExtensionConfig {
+            serde_json::from_value(raw).expect("the typed parse never fails on these keys")
+        };
+        assert!(SubagentExtensionConfig::default().async_widget_enabled());
+        assert!(config(serde_json::json!({"asyncWidget": "no"})).async_widget_enabled());
+        assert!(!config(serde_json::json!({"asyncWidget": false})).async_widget_enabled());
+        assert!(!SubagentExtensionConfig::default().inline_tool_display_summary());
+        assert!(
+            !config(serde_json::json!({"inlineToolDisplay": "fancy"}))
+                .inline_tool_display_summary()
+        );
+        assert!(
+            config(serde_json::json!({"inlineToolDisplay": "summary"}))
+                .inline_tool_display_summary()
+        );
+        assert_eq!(
+            config(serde_json::json!({"fleetKeybindings": {"nope": ["x"]}})).fleet_keybindings(),
+            crate::tui::fleet::FleetKeybindings::default(),
+            "an invalid block resolves to the defaults"
+        );
+
+        let warnings = SubagentExtensionConfig::config_warnings(&serde_json::json!({
+            "asyncWidget": "no",
+            "inlineToolDisplay": "fancy",
+            "fleetKeybindings": {"nope": ["x"]},
+        }));
+        assert_eq!(
+            warnings,
+            vec![
+                r#"config.asyncWidget must be a boolean; "no" leaves the async-jobs widget on"#
+                    .to_string(),
+                r#"config.inlineToolDisplay must be "rich" or "summary"; "fancy" renders "rich""#
+                    .to_string(),
+                "config.fleetKeybindings.nope is not a supported Fleet action; the default Fleet \
+                 keybindings apply"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            SubagentExtensionConfig::config_warnings(
+                &serde_json::json!({"fleetKeybindings": {"close": ["super+q"]}})
+            ),
+            vec![
+                "config.fleetKeybindings.close: 'super+q' is not a key this port can match (ignored)"
+                    .to_string()
+            ]
+        );
+    }
     use crate::discovery::types::{AgentOverrideConfig, OverrideField, SubagentSettings};
 
     // -----------------------------------------------------------------------------------------
@@ -1670,6 +1920,7 @@ mod tests {
             disable_builtins: Some(true),
             disable_thinking: Some(true),
             max_thinking: None,
+            warnings: Vec::new(),
         };
         let view = SubagentsSettingsView::from_subagent_settings(&settings);
         assert!(view.disable_builtins);

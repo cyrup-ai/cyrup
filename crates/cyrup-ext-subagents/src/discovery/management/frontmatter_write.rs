@@ -129,6 +129,18 @@ pub(crate) fn serialize_agent(
             .unwrap_or_default();
         lines.push(format!("model: {model_str}"));
     }
+    // SUBA-096 — pi `if (config.fast === true || preserve("fast")) lines.push(`fast: …`)`
+    // (`agent-serializer.ts:84` @v0.68.0): emitted only when enabled, or to preserve a line the
+    // file already had. `fast` is now a typed field (`KNOWN_FIELDS`), so without this arm the
+    // first management rewrite would delete it.
+    if def.fast == Some(true) || preserve(&["fast"]) {
+        let value = match def.fast {
+            None => "",
+            Some(true) => "true",
+            Some(false) => "false",
+        };
+        lines.push(format!("fast: {value}"));
+    }
 
     let fallback_value = if def.fallback_models.is_empty() {
         None
@@ -177,6 +189,15 @@ pub(crate) fn serialize_agent(
             def.inherit_project_context
         ));
     }
+    // SUBA-101 — pi `if (config.inheritGlobalContext || preserve("inheritGlobalContext"))`
+    // (`agent-serializer.ts:90` @v0.68.0): written only when TRUE or preserved, unlike
+    // `inheritProjectContext` above, because `false` is the parser's default.
+    if def.inherit_global_context || preserve(&["inheritGlobalContext"]) {
+        lines.push(format!(
+            "inheritGlobalContext: {}",
+            def.inherit_global_context
+        ));
+    }
     if !preserving_existing || preserve(&["inheritSkills"]) {
         lines.push(format!("inheritSkills: {}", def.inherit_skills));
     }
@@ -210,11 +231,43 @@ pub(crate) fn serialize_agent(
             def.subagent_only_extensions.join(", ")
         ));
     }
+    // SUBA-102 — pi `const mutationToolsValue = joinComma(config.mutationTools); if
+    // (mutationToolsValue || preserve("mutationTools")) …` (`agent-serializer.ts:126-127` @v0.68.0):
+    // an empty or absent list writes nothing unless the key is being preserved.
+    let mutation_tools_value = def
+        .mutation_tools
+        .as_ref()
+        .filter(|names| !names.is_empty())
+        .map(|names| names.join(", "));
+    if mutation_tools_value.is_some() || preserve(&["mutationTools"]) {
+        lines.push(format!(
+            "mutationTools: {}",
+            mutation_tools_value.as_deref().unwrap_or("")
+        ));
+    }
+    // SUBA-100 — pi `if (config.machine || preserve("machine")) lines.push(`machine: ${config.machine
+    // ?? ""}`)` (`agent-serializer.ts:129` @v0.68.0), in upstream's order: after `mutationTools`,
+    // before `output`.
+    if def.machine.is_some() || preserve(&["machine"]) {
+        lines.push(format!("machine: {}", def.machine.as_deref().unwrap_or("")));
+    }
 
     if let Some(output) = &def.output
         && let Some(path) = &output.path
     {
         lines.push(format!("output: {}", path.display()));
+    }
+    // SUBA-096 — pi `if (config.outputMode || preserve("outputMode")) lines.push(`outputMode: …`)`
+    // (`agent-serializer.ts:131` @v0.68.0), for the same reason as `fast` above. Only pi's two
+    // spellings are ever parsed into `output.mode`, so `FileAndInline` is unreachable here and
+    // writes nothing rather than a value the parser would refuse.
+    let output_mode = match def.output.as_ref().and_then(|spec| spec.mode) {
+        Some(crate::discovery::types::OutputMode::Inline) => Some("inline"),
+        Some(crate::discovery::types::OutputMode::FileOnly) => Some("file-only"),
+        Some(crate::discovery::types::OutputMode::FileAndInline) | None => None,
+    };
+    if output_mode.is_some() || preserve(&["outputMode"]) {
+        lines.push(format!("outputMode: {}", output_mode.unwrap_or_default()));
     }
     if let Some(reads) = &def.default_reads
         && !reads.is_empty()
@@ -439,6 +492,21 @@ pub(crate) fn preserved_frontmatter_fields(
     }
     if fields.subagent_only_extensions.is_some() {
         set.remove("subagentOnlyExtensions");
+    }
+    // SUBA-102 — pi `if (hasKey(cfg, "mutationTools")) changed("mutationTools")`
+    // (`agent-management.ts:353` @v0.68.0).
+    if fields.mutation_tools.is_some() {
+        set.remove("mutationTools");
+    }
+    // SUBA-100 — a stated `config.machine` is a change like any other scalar: the preserved
+    // original line must not survive a clear.
+    if fields.machine.is_some() {
+        set.remove("machine");
+    }
+    // SUBA-101 — pi `:366-369`: `changed` then `fields.add`, exactly as `inheritProjectContext`.
+    if fields.inherit_global_context.is_some() {
+        set.remove("inheritGlobalContext");
+        set.insert("inheritGlobalContext".to_string());
     }
     if fields.thinking.is_some() {
         set.remove("thinking");

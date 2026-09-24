@@ -560,36 +560,63 @@ fn discovery_observes_filesystem_changes_between_calls_over_the_full_fixture() {
 }
 
 // -------------------------------------------------------------------------------------------
-// R-SA-003: extra agent directories via environment, exercised against the real config type
-// (the pure closure-injected core is unit-tested in discovery/mod.rs itself; this integration
-// test additionally proves `with_env_extras` composes correctly with a full discovery pass).
+// R-SA-003: extra agent directories, exercised against the real config type and a full discovery
+// pass. The variable itself is parsed once, into `paths::Roots::extra_agent_dirs` (unit-tested in
+// `paths.rs`); this proves the resolved dirs compose with the four-scope fixture as the
+// LOWEST-precedence User-tier stream.
 // -------------------------------------------------------------------------------------------
 
 #[test]
-fn with_env_extras_is_a_no_op_when_the_env_var_is_unset_in_the_real_process_environment() {
-    // This test intentionally does NOT set the env var (this crate forbids unsafe code and never
-    // calls std::env::set_var) — it only proves that calling `with_env_extras()` against whatever
-    // the real test-process environment happens to be does not corrupt an otherwise-valid
-    // discovery config, by re-running discovery afterward and getting the same agent set back.
+fn roots_extra_agent_dirs_are_the_lowest_precedence_user_stream_in_a_full_discovery() {
     let fixture = build_four_scope_fixture();
+    let extra_root = tempfile::tempdir().expect("extra dir");
+    let extra = extra_root.path().join("agents");
+    write_agent(
+        &extra,
+        "extra-only.md",
+        "",
+        "extra-only",
+        "only in the extra dir",
+    );
+    write_agent(
+        &extra,
+        "scoped-user-only.md",
+        "",
+        "scoped-user-only",
+        "the extra dir's shadowed copy",
+    );
+    let roots = crate::paths::Roots::sandboxed(extra_root.path())
+        .with_extra_agent_dirs(vec![extra.clone()]);
     let user_dirs_before = fixture.cfg.user_agent_dirs.clone();
 
-    let cfg_with_extras = AgentDiscoveryConfig {
-        user_agent_dirs: user_dirs_before.clone(),
-        ..fixture.cfg.clone()
-    }
-    .with_env_extras();
+    let cfg = fixture
+        .cfg
+        .clone()
+        .with_prepended_user_extras(roots.extra_agent_dirs().to_vec());
 
-    // Whatever CYRUP_SUBAGENT_EXTRA_AGENT_DIRS is (or is not) set to in this test process, the
-    // ordinary configured dirs must still be present and in their original relative order as a
-    // prefix — with_env_extras only ever appends.
     assert_eq!(
-        &cfg_with_extras.user_agent_dirs[..user_dirs_before.len()],
-        user_dirs_before.as_slice()
+        cfg.user_agent_dirs.first(),
+        Some(&extra),
+        "extras come first"
     );
-
-    let result = discover_agents_all(&cfg_with_extras).expect("discovery still succeeds");
-    assert!(result.agents.iter().any(|a| a.name == "scoped-user-only"));
+    assert_eq!(&cfg.user_agent_dirs[1..], user_dirs_before.as_slice());
+    let result = discover_agents_all(&cfg).expect("discovery succeeds");
+    let extra_only = result
+        .agents
+        .iter()
+        .find(|a| a.name == "extra-only")
+        .expect("an extra-dir agent is discovered");
+    assert_eq!(extra_only.source, AgentSource::User);
+    let user_own = result
+        .agents
+        .iter()
+        .find(|a| a.name == "scoped-user-only")
+        .expect("the user's own agent");
+    assert!(
+        !user_own.file_path.starts_with(&extra),
+        "the user's own agent wins over the extra dir's copy: {}",
+        user_own.file_path.display()
+    );
 }
 
 // -------------------------------------------------------------------------------------------

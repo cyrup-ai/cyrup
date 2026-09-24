@@ -140,11 +140,16 @@ pub use crate::exec::task_intent::expects_implementation_mutation;
 /// message-part walk exhibits (a `toolCall` part is present in the assistant message regardless of
 /// whether a corresponding `toolResult` was ever appended).
 ///
-/// Returns true on the first `edit`/`write` tool call observed, or the first `bash` call whose
-/// `command` argument [`is_mutating_bash_command`] classifies as mutating (the source's
-/// `part.arguments.command` read, applied here to the start event's `args.command`).
+/// Returns true on the first call [`crate::exec::control::is_mutating_tool`] classifies as
+/// mutating — the SAME predicate upstream's scan calls (`isMutatingTool(part.name, args,
+/// mutationTools)`, `completion-guard.ts:145` @v0.68.0): a name in the agent's own
+/// `mutation_tools` (SUBA-102), `edit`/`write`, a `cursor` edit/write activity, or a `bash` call
+/// whose `command` argument [`is_mutating_bash_command`] classifies as mutating.
+///
+/// This used to be a private copy of the classifier covering only `edit`/`write`/`bash`, so it
+/// could not see the agent's `mutationTools` at all and also missed upstream's `cursor` arm.
 #[must_use]
-pub fn has_mutation_tool_call(events: &[SubagentEvent]) -> bool {
+pub fn has_mutation_tool_call(events: &[SubagentEvent], mutation_tools: Option<&[String]>) -> bool {
     events.iter().any(|event| {
         let SubagentEvent::ToolExecutionStart {
             tool_name, args, ..
@@ -152,14 +157,7 @@ pub fn has_mutation_tool_call(events: &[SubagentEvent]) -> bool {
         else {
             return false;
         };
-        match tool_name.as_str() {
-            "edit" | "write" => true,
-            "bash" => args
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(is_mutating_bash_command),
-            _ => false,
-        }
+        crate::exec::control::is_mutating_tool(tool_name, args, mutation_tools)
     })
 }
 
@@ -797,7 +795,8 @@ pub fn evaluate_completion_mutation_guard(
     } else {
         expects_implementation_mutation(&agent.local_name, task)
     };
-    let attempted_mutation = has_mutation_tool_call(events);
+    // SUBA-102 — pi `hasMutationToolCall(input.messages, input.mutationTools)` (`:246`).
+    let attempted_mutation = has_mutation_tool_call(events, agent.mutation_tools.as_deref());
     CompletionMutationGuardResult {
         expected_mutation,
         attempted_mutation,
@@ -821,9 +820,13 @@ mod tests {
         completion_guard: Option<bool>,
     ) -> AgentDefinition {
         AgentDefinition {
+            inherit_global_context: false,
+            machine: None,
+            mutation_tools: None,
             default_turn_budget: None,
             default_acceptance: None,
             acceptance_role: None,
+            fast: None,
             permission_rules: None,
             runner: None,
             name: local_name.to_string(),
@@ -1029,14 +1032,14 @@ mod tests {
 
     #[test]
     fn edit_and_write_tool_calls_count_as_mutation_attempts() {
-        assert!(has_mutation_tool_call(&[tool_start(
-            "edit",
-            serde_json::json!({"path": "a.ts"})
-        )]));
-        assert!(has_mutation_tool_call(&[tool_start(
-            "write",
-            serde_json::json!({"path": "a.ts"})
-        )]));
+        assert!(has_mutation_tool_call(
+            &[tool_start("edit", serde_json::json!({"path": "a.ts"}))],
+            None
+        ));
+        assert!(has_mutation_tool_call(
+            &[tool_start("write", serde_json::json!({"path": "a.ts"}))],
+            None
+        ));
     }
 
     #[test]
@@ -1046,13 +1049,13 @@ mod tests {
         // mid-tool-call, or the tool never finished) must STILL count. Only the start event is
         // present here; no matching end.
         let start_only = vec![tool_start("edit", serde_json::json!({"path": "a.ts"}))];
-        assert!(has_mutation_tool_call(&start_only));
+        assert!(has_mutation_tool_call(&start_only, None));
 
         let bash_start_only = vec![tool_start(
             "bash",
             serde_json::json!({"command": "rm -rf build"}),
         )];
-        assert!(has_mutation_tool_call(&bash_start_only));
+        assert!(has_mutation_tool_call(&bash_start_only, None));
     }
 
     #[test]
@@ -1064,7 +1067,7 @@ mod tests {
             "bash",
             serde_json::json!({"command": "rm -rf build", "stdout": ""}),
         )];
-        assert!(!has_mutation_tool_call(&end_only));
+        assert!(!has_mutation_tool_call(&end_only, None));
     }
 
     #[test]
@@ -1149,7 +1152,7 @@ mod tests {
             "bash",
             serde_json::json!({"command": "git commit -am 'fix the failing test'"}),
         )];
-        assert!(has_mutation_tool_call(&events));
+        assert!(has_mutation_tool_call(&events, None));
 
         let result = evaluate_completion_mutation_guard(
             &committer,
@@ -1188,10 +1191,10 @@ mod tests {
             "bash",
             serde_json::json!({"command": "rm -rf build"}),
         )];
-        assert!(has_mutation_tool_call(&events));
+        assert!(has_mutation_tool_call(&events, None));
 
         let non_mutating = vec![tool_start("bash", serde_json::json!({"command": "ls -la"}))];
-        assert!(!has_mutation_tool_call(&non_mutating));
+        assert!(!has_mutation_tool_call(&non_mutating, None));
     }
 
     // ---- evaluate_completion_mutation_guard: the three required scenarios ----
@@ -1416,5 +1419,126 @@ mod tests {
             ]),
             None
         )));
+    }
+
+    /// SUBA-102 — `mutationTools` on `is_mutating_tool`, checked first (pi `long-running-guard.ts:146`
+    /// @v0.68.0): a listed name counts whatever it is, an unlisted custom name does not, and an
+    /// empty name never does. Mutation killed: dropping the list check.
+    #[test]
+    fn listed_mutation_tools_count_as_mutating() {
+        let listed = vec!["apply_patch".to_string()];
+        let events = vec![tool_start("apply_patch", serde_json::json!({}))];
+        assert!(!has_mutation_tool_call(&events, None));
+        assert!(has_mutation_tool_call(&events, Some(&listed)));
+        assert!(crate::exec::control::is_mutating_tool(
+            "apply_patch",
+            &serde_json::json!({}),
+            Some(&listed)
+        ));
+        assert!(!crate::exec::control::is_mutating_tool(
+            "",
+            &serde_json::json!({}),
+            Some(&[String::new()])
+        ));
+        let mut a = agent("worker", None, None);
+        a.mutation_tools = Some(listed);
+        let result = evaluate_completion_mutation_guard(&a, "Implement the approved fix", &events);
+        assert!(result.expected_mutation && result.attempted_mutation && !result.triggered);
+    }
+
+    /// SUBA-102 end to end through `run_sync` and a scripted child: the child calls only the
+    /// agent's own `apply_patch` (twice, failing both times). With `mutationTools:
+    /// [apply_patch]` the completion guard sees the mutation (the run succeeds) AND the control
+    /// loop counts the failures toward `needs_attention`; without it the guard fails the run and
+    /// no failure streak exists. Mutation killed: the projection's `mutation_tools` placeholder
+    /// (`exec/mod.rs`), `evaluate_completion_mutation_guard` ignoring `agent.mutation_tools`, or
+    /// the `with_mutation_tools` wiring in `attempt_runner.rs`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_agent_s_mutation_tools_reach_the_guard_and_the_control_loop() {
+        use crate::exec::control::{ControlEventReason, ResolvedControlConfig};
+        use crate::exec::testsupport::{base_opts, sample_agent_config};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("patching-child.sh");
+        let line = |json: &str| format!("printf '%s\\n' '{json}'\n");
+        let mut body = String::from("#!/bin/sh\n");
+        body.push_str(&line(r#"{"type":"agent_start"}"#));
+        for id in ["c1", "c2"] {
+            body.push_str(&line(&format!(
+                r#"{{"type":"tool_execution_start","toolCallId":"{id}","toolName":"apply_patch","args":{{"path":"a.rs"}}}}"#
+            )));
+            body.push_str(&line(&format!(
+                r#"{{"type":"tool_execution_end","toolCallId":"{id}","toolName":"apply_patch","result":"Error: no exact match for the hunk","isError":false}}"#
+            )));
+        }
+        body.push_str(&line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+        ));
+        body.push_str(&line(r#"{"type":"agent_settled"}"#));
+        body.push_str("exit 0\n");
+        std::fs::write(&script, body).expect("write child");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let run = |mutation_tools: Option<Vec<String>>| {
+            let script = script.clone();
+            let cwd = dir.path().to_path_buf();
+            async move {
+                let mut agent = sample_agent_config("m1", &[]);
+                agent.completion_guard = None;
+                agent.mutation_tools = mutation_tools;
+                let mut opts = base_opts(&cwd, &["m1"]);
+                opts.spawn_command = Some(crate::spawn::SpawnCommand {
+                    binary: script,
+                    base_args: Vec::new(),
+                });
+                opts.control_config = Some(ResolvedControlConfig {
+                    failed_tool_attempts_before_attention: 2,
+                    needs_attention_after_ms: 10_000_000,
+                    active_notice_after_ms: 10_000_000,
+                    ..ResolvedControlConfig::default()
+                });
+                crate::exec::run_sync(&agent, "Implement the approved fix", &opts).await
+            }
+        };
+
+        let listed = run(Some(vec!["apply_patch".to_string()])).await;
+        assert_eq!(listed.exit_code, 0, "{listed:?}");
+        assert!(
+            !listed
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains(COMPLETION_GUARD_ERROR_MESSAGE),
+            "{listed:?}"
+        );
+        assert!(
+            listed
+                .control_events
+                .iter()
+                .any(|e| e.reason == Some(ControlEventReason::ToolFailures)),
+            "the listed tool's failures escalate: {:?}",
+            listed.control_events
+        );
+
+        let unlisted = run(None).await;
+        assert_ne!(unlisted.exit_code, 0, "{unlisted:?}");
+        assert!(
+            unlisted
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains(COMPLETION_GUARD_ERROR_MESSAGE),
+            "{unlisted:?}"
+        );
+        assert!(
+            !unlisted
+                .control_events
+                .iter()
+                .any(|e| e.reason == Some(ControlEventReason::ToolFailures)),
+            "{:?}",
+            unlisted.control_events
+        );
     }
 }

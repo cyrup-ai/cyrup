@@ -100,6 +100,7 @@ impl HostServices for RecordingHost {
 
 fn worker_step() -> RunnerStep {
     RunnerStep::SingleStep(SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: "worker".to_string(),
@@ -114,6 +115,7 @@ fn worker_step() -> RunnerStep {
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,
@@ -172,10 +174,10 @@ fn json_files_under(dir: &Path) -> Vec<String> {
         let path = entry.path();
         if path.is_dir() {
             out.extend(json_files_under(&path));
-        } else if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                out.push(text);
-            }
+        } else if path.extension().is_some_and(|e| e == "json")
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            out.push(text);
         }
     }
     out

@@ -104,6 +104,28 @@ pub(crate) struct AttemptRecord {
     /// Default (unpinned/empty) on every path that never built a plan — a setup failure has no
     /// surface to report, and inventing one would be a claim about a child that never existed.
     pub(crate) tool_surface: crate::exec::tool_surface::ResolvedToolSurface,
+    /// UW-3 — the parent's folded view of this attempt's ARMED child watchdog (pi
+    /// `result.watchdog`, `execution.ts:563-567` @v0.43.0), carried out of [`drive_attempt`] so
+    /// `run_sync` can publish the WINNING attempt's value on
+    /// [`crate::exec::run_result::SingleResult::watchdog`]. `None` for an unarmed child and on
+    /// every path that never reached the drive loop.
+    pub(crate) watchdog: Option<crate::watchdog::child_status::ChildWatchdogStateSnapshot>,
+    /// SUBA-063 — the extension ids THIS attempt's child runtime acknowledged, read back from the
+    /// file the plan named when the child closed (pi `result.runtimeAcknowledgedExtensions =
+    /// readRuntimeAcknowledgedExtensions(runtimeAcknowledgedExtensionsPath)` in the `close` handler,
+    /// `foreground/execution.ts:1386` @v0.64.0 — every close, interrupted and timed-out included).
+    /// `run_sync` publishes the WINNING attempt's value. `None` on every path that never spawned a
+    /// child, and for a child that acknowledged nothing valid.
+    pub(crate) runtime_acknowledged_extensions:
+        Option<crate::exec::run_result::RuntimeAcknowledgedChildExtensions>,
+    /// SUBA-100 — pi `result.nativeMachine` (`foreground/execution.ts:1293` @v0.68.0): the
+    /// placed attempt's remote Git before/after evidence, `None` for a local child and on every
+    /// path that never reached a placed pane.
+    pub(crate) native_machine: Option<crate::placement::native::NativeMachineEvidence>,
+    /// SUBA-100 — the placed child's own stderr tail, read back from its runtime dir when it
+    /// settled, for the remote-failure hint (`decorateHerdrMachineResult`'s `stderrTail`). `None`
+    /// for a local child.
+    pub(crate) placed_stderr_tail: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -121,6 +143,9 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             mut control,
             tool_diagnostic_path,
             tool_surface,
+            child_watchdog,
+            runtime_acknowledged_extensions_path,
+            placed,
         } = match self.prepare_attempt(model, attempt_notes).await {
             Ok(prepared) => prepared,
             Err(failure) => return *failure,
@@ -154,18 +179,64 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             deadline_sleep,
             &mut control,
             self.transcript.as_mut(),
+            child_watchdog,
         )
         .await;
 
         // The child is gone (or was force-terminated). Report its close — including the
         // process-group teardown verdict — on EVERY path out of this function, which is why it sits
         // above the two early returns below rather than beside the ordinary one.
-        report_writer_process_close(self.opts, child_pid, attempt_ordinal, &outcome).await;
+        // SUBA-100 — a placed child launched no local writer process (see `prepare_attempt`), so
+        // there is no local close to report.
+        if placed.is_none() {
+            report_writer_process_close(self.opts, child_pid, attempt_ordinal, &outcome).await;
+        }
+
+        // SUBA-100 — settle the placed run BEFORE any file the plan named is read: a settled
+        // child's capture / diagnostic / acknowledgement files are fetched back to exactly the
+        // local paths read below, the pane is closed and the remote runtime dir removed. A relay
+        // that lost the machine past its reconnect budget exits 255, and that state is unknown:
+        // the pane and runtime dir are retained for inspection.
+        let (native_machine, placed_stderr_tail) = match placed {
+            Some(run) => {
+                let relay_exit = outcome
+                    .exit_status
+                    .as_ref()
+                    .ok()
+                    .and_then(|status| status.and_then(|status| status.code()));
+                let disposition = if outcome.timed_out
+                    || outcome.interrupted
+                    || self.opts.cancel.is_cancelled()
+                {
+                    crate::placement::native::PlacedDisposition::Aborted
+                } else if relay_exit == Some(crate::placement::native::RELAY_UNKNOWN_EXIT) {
+                    crate::placement::native::PlacedDisposition::Unknown
+                } else {
+                    crate::placement::native::PlacedDisposition::Settled
+                };
+                let finish = run.finish(disposition).await;
+                (Some(finish.evidence), finish.stderr_tail)
+            }
+            None => (None, None),
+        };
+
+        // SUBA-063 — pi reads the child's acknowledgement file in the `close` handler, BEFORE any
+        // exit classification (`execution.ts:1386` @v0.64.0), so every way out of this function —
+        // interrupted and timed-out included — carries what the child acknowledged before it died.
+        let runtime_acknowledged_extensions =
+            crate::exec::runtime_acknowledged_extensions::read_runtime_acknowledged_extensions(
+                Some(&runtime_acknowledged_extensions_path),
+            );
 
         // pi returns from `runSingleAttempt` on an interrupt BEFORE any exit-code re-diagnosis, so
         // this branch stays ahead of every diagnosis below.
         if outcome.interrupted {
-            return interrupted_attempt(progress, control, tool_surface, &outcome);
+            let (signal, mut record) =
+                interrupted_attempt(progress, control, tool_surface, &outcome);
+            record.runtime_acknowledged_extensions = runtime_acknowledged_extensions;
+            record.native_machine = native_machine;
+            record.placed_stderr_tail = placed_stderr_tail;
+            return (signal, record);
         }
 
         let (raw_exit_code, spawn_error, process_signal) = match &outcome.exit_status {
@@ -179,7 +250,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         // Kept as a distinct early exit so the exit-0 re-diagnosis chain below never runs against a
         // timed-out attempt.
         if outcome.timed_out {
-            return timed_out_attempt(
+            let (signal, mut record) = timed_out_attempt(
                 progress,
                 control,
                 tool_surface,
@@ -188,6 +259,10 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 spawn_error,
                 final_output,
             );
+            record.runtime_acknowledged_extensions = runtime_acknowledged_extensions;
+            record.native_machine = native_machine;
+            record.placed_stderr_tail = placed_stderr_tail;
+            return (signal, record);
         }
 
         let error = diagnose_attempt_error(
@@ -237,6 +312,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                     final_output.as_deref(),
                     process_signal,
                     error_is_placeholder,
+                    self.agent.mutation_tools.as_deref(),
                 ),
             },
             AttemptRecord {
@@ -246,6 +322,10 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 interrupted: false,
                 control,
                 tool_surface,
+                watchdog: outcome.watchdog.clone(),
+                runtime_acknowledged_extensions,
+                native_machine,
+                placed_stderr_tail,
             },
         )
     }
@@ -313,6 +393,16 @@ struct PreparedAttempt {
     /// [`Self::tool_diagnostic_path`]: `plan.spec` moves into the spawn immediately below, so any
     /// value the settle path needs has to leave the plan first.
     tool_surface: crate::exec::tool_surface::ResolvedToolSurface,
+    /// UW-3 — the child-watchdog config this attempt ENCODED into the child's env, taken off the
+    /// plan on the same line as [`Self::tool_surface`] and handed to [`drive_attempt`], which filters
+    /// the child's status events by the identity in it. `None` for an unarmed child.
+    child_watchdog: Option<crate::watchdog::child_status::ChildWatchdogConfig>,
+    /// SUBA-063 — the acknowledgement file the plan told the child to write, taken off the plan on
+    /// the same line as [`Self::tool_surface`] and read back once the child has closed.
+    runtime_acknowledged_extensions_path: PathBuf,
+    /// SUBA-100 — the placed run this attempt's relay drives, finished right after the drive
+    /// loop so its fetched files are local before anything reads them. `None` for a local child.
+    placed: Option<crate::placement::native::PlacedNativeRun>,
 }
 
 /// What [`SpawnedChildAttemptRunner::resolve_attempt_exit`] concluded about a settled attempt.
@@ -390,7 +480,11 @@ impl SpawnedChildAttemptRunner<'_> {
                 .and_then(|index| u32::try_from(index).ok()),
             self.opts.on_control_event.clone(),
             crate::time::now_epoch_millis(),
-        );
+        )
+        // SUBA-102 — pi `isMutatingTool(evt.toolName, toolArgs, agent.mutationTools)`
+        // (`execution.ts:1059` @v0.68.0): the failure-streak escalation counts the agent's own
+        // mutating tools.
+        .with_mutation_tools(self.agent.mutation_tools.clone());
 
         let task_text = build_task_text(
             self.agent,
@@ -453,13 +547,81 @@ impl SpawnedChildAttemptRunner<'_> {
         // tools to attempt N+1's startup crash.
         let tool_diagnostic_path = plan.tool_diagnostic_path;
         let tool_surface = plan.tool_surface;
+        let child_watchdog = plan.child_watchdog;
         if let Some(path) = tool_diagnostic_path.as_deref() {
             let _ = std::fs::remove_file(path);
         }
+        // SUBA-063 — the same shared-scratch-dir delta as the diagnostic above: pi's per-attempt
+        // `mkdtemp` makes the acknowledgement file fresh by construction; here it is cleared before
+        // the spawn so a child that dies before its `agent_end` cannot inherit the previous model
+        // attempt's acknowledgements.
+        let runtime_acknowledged_extensions_path = plan.runtime_acknowledged_extensions_path;
+        let _ = std::fs::remove_file(&runtime_acknowledged_extensions_path);
 
-        let child = match SpawnedChild::spawn(plan.spec, &jsonl_path).await {
+        // SUBA-100 — a resolved machine runs this SAME child contract in a fresh Herdr-owned pane
+        // on that machine: the spec is serialized for the remote side (upstream's refusals first,
+        // nothing touched), its files uploaded, the pane opened and the child started there — and
+        // the drive loop below reads it through the in-process placed-run relay exactly as it
+        // reads a local child's stdout.
+        let (spawned, placed) = match self.opts.machine.as_ref() {
+            Some(machine) => {
+                let placed_run_id = self.opts.run_id.as_ref().map(|run_id| {
+                    format!(
+                        "{}-{}-a{}",
+                        run_id.as_str(),
+                        self.opts.child_index.unwrap_or(0),
+                        self.attempt_index
+                    )
+                });
+                let agent_dir = machine.agent_dir();
+                // pi `remoteResources` (`child-launch.ts:309` @v0.68.0): the agent's NAME and
+                // the launch's skill names (`options.skills ?? agent.skills`, `execution.ts:383`)
+                // — the machine resolves both against its own checkout. No launch surface here
+                // carries an explicit `reads` override, so the remote agent's own `defaultReads`
+                // apply (`remoteReads` undefined).
+                let resources = crate::placement::remote_resources::RemoteResources {
+                    agent: self.agent.name.clone(),
+                    skills: self.opts.skills.clone().or_else(|| {
+                        (!self.agent.skills.is_empty()).then(|| self.agent.skills.clone())
+                    }),
+                    tool_ceiling: None,
+                    reads: None,
+                };
+                match crate::placement::native::prepare_placed_native_attempt(
+                    plan.spec,
+                    crate::placement::native::PlacedAttemptInput {
+                        machine,
+                        run_id: placed_run_id.as_deref(),
+                        agent_name: &self.agent.name,
+                        child_depth: child_depth.current_depth,
+                        resources,
+                        agent_dir: &agent_dir,
+                        transport: machine.ssh_transport(),
+                    },
+                )
+                .await
+                {
+                    Ok(run) => (
+                        SpawnedChild::relayed(run.start_relay(), &jsonl_path).await,
+                        Some(run),
+                    ),
+                    Err(error) => {
+                        return Err(Box::new(attempt_setup_failure(error, progress, control)));
+                    }
+                }
+            }
+            None => (SpawnedChild::spawn(plan.spec, &jsonl_path).await, None),
+        };
+        let child = match spawned {
             Ok(child) => child,
             Err(err) => {
+                // SUBA-100 — the relay never started, so the remote child is never read: close
+                // its pane and remove its runtime dir rather than leave it running unobserved.
+                if let Some(run) = placed {
+                    let _ = run
+                        .finish(crate::placement::native::PlacedDisposition::Aborted)
+                        .await;
+                }
                 // A spawn that FAILED launched no writer process, so nothing is reported: the
                 // candidate's expected count must stay equal to the number of children that really
                 // exist, or every run with one failed spawn would report `writer-close-unverified`.
@@ -474,7 +636,12 @@ impl SpawnedChildAttemptRunner<'_> {
         // equivalent — see `WriterProcessObservation`), so a child whose close is never observed
         // still raises `expectedWriters` and leaves the runner's proof `writer-close-unverified`
         // rather than silently `observed`.
-        if let Some(sink) = self.opts.live_events.as_ref() {
+        //
+        // SUBA-100 — a placed child is no LOCAL writer process: its writer lives in a pane on the
+        // machine, and the only local thing is the in-process relay, which nothing can signal.
+        if placed.is_none()
+            && let Some(sink) = self.opts.live_events.as_ref()
+        {
             sink.emit_writer_process(crate::exec::WriterProcessObservation::Launched {
                 pid: child.id(),
             });
@@ -486,6 +653,9 @@ impl SpawnedChildAttemptRunner<'_> {
             control,
             tool_diagnostic_path,
             tool_surface,
+            child_watchdog,
+            runtime_acknowledged_extensions_path,
+            placed,
         })
     }
 
@@ -740,6 +910,12 @@ fn attempt_setup_failure(
             control,
             // Nothing was planned or spawned, so there is no surface to report.
             tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
+            // Nor a child whose watchdog could have reported.
+            watchdog: None,
+            // Nor a child runtime to acknowledge anything.
+            runtime_acknowledged_extensions: None,
+            native_machine: None,
+            placed_stderr_tail: None,
         },
     )
 }
@@ -777,6 +953,11 @@ fn interrupted_attempt(
             // A child DID launch on this path, so the surface it launched with is real and is
             // published exactly as the success path publishes it.
             tool_surface,
+            watchdog: outcome.watchdog.clone(),
+            // Stamped by the caller from the file read at the child's close.
+            runtime_acknowledged_extensions: None,
+            native_machine: None,
+            placed_stderr_tail: None,
         },
     )
 }
@@ -815,6 +996,11 @@ fn timed_out_attempt(
             control,
             // As on the interrupt path: a child launched, so its surface is real.
             tool_surface,
+            watchdog: outcome.watchdog.clone(),
+            // Stamped by the caller from the file read at the child's close.
+            runtime_acknowledged_extensions: None,
+            native_machine: None,
+            placed_stderr_tail: None,
         },
     )
 }
@@ -882,6 +1068,7 @@ fn build_startup_evidence(
     final_output: Option<&str>,
     process_signal: Option<String>,
     error_is_placeholder: bool,
+    mutation_tools: Option<&[String]>,
 ) -> StartupEvidence {
     StartupEvidence {
         final_output_present: final_output.is_some_and(|text| !text.trim().is_empty()),
@@ -890,8 +1077,11 @@ fn build_startup_evidence(
         duration_ms: Some(progress.duration_ms()),
         protocol_error: outcome.protocol_error.is_some(),
         process_signal,
+        // SUBA-102 — pi `isMutatingTool(event.toolName, toolArgs, input.mutationTools)`
+        // (`run-child-session.ts:471` @v0.68.0): the agent's own mutating tools count too.
         observed_mutation_attempt: crate::exec::completion_guard::has_mutation_tool_call(
             &progress.all_events,
+            mutation_tools,
         ),
         // cyrup's foreground executor has no `stopped` analog (pi carries it on the
         // BACKGROUND runner's result). It cannot be true of a child with zero

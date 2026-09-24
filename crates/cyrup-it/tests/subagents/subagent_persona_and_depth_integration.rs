@@ -81,6 +81,7 @@ fn read_attempt_tee(cwd: &Path) -> String {
 
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: agent.to_string(),
@@ -95,6 +96,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,
@@ -133,6 +135,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     // orchestrator produces via `exec::resolve_step_agent_config` for a discovered `reviewer`
     // agent.
     let reviewer = ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -153,6 +156,8 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -362,6 +367,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     // A Replace-mode persona with an empty system prompt so the child's task text is the raw
     // (substituted) step task — no appended prompt to obscure the marker.
     let worker = ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -379,6 +385,8 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -502,9 +510,12 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        parent_env_overrides: std::collections::BTreeMap::new(),
+        machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
         // nothing is recorded, which is this field's documented `None` behaviour.
         model_exclusions: None,
+        fast: false,
         host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
@@ -569,6 +580,7 @@ fn depth_echo_agent(
     max_subagent_depth: Option<u32>,
 ) -> AgentConfig {
     AgentConfig {
+        machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: "worker".to_string(),
@@ -585,6 +597,8 @@ fn depth_echo_agent(
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -731,6 +745,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     resolved_agents.insert(
         "reviewer".to_string(),
         ResolvedAgentPersona {
+            machine: None,
             file_path: None,
             acceptance_role: None, // SUBA-082: no declared role, the name decides
             default_acceptance: None,
@@ -748,6 +763,8 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
             allow_nested_subagents: None,
             output: None,
             inherit_project_context: false,
+            inherit_global_context: false, // SUBA-101: parser default
+            mutation_tools: None,          // SUBA-102: built-in set only
             inherit_skills: true,
             skills: Vec::new(),
             completion_guard: Some(false),
@@ -911,6 +928,7 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
     // heuristic is NotRequired and the completion guard — also disabled here — never fires): the run
     // stays exit 0, which is what gates the saved-output reference.
     let reporter = ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -928,6 +946,8 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -942,6 +962,7 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
 
     // The step carries an `output` FILE path (relative — resolved against the run cwd).
     let step = SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: "reporter".to_string(),
@@ -956,6 +977,7 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         output: None,
         output_path: Some("report.md".to_string()),
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,
@@ -1051,6 +1073,7 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
     let script_path = write_script(dir.path(), "script-chain-timeout.json", &script);
 
     let reporter = ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -1068,6 +1091,8 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -1081,6 +1106,7 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
     resolved_agents.insert("reporter".to_string(), reporter);
 
     let step = SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: "reporter".to_string(),
@@ -1095,6 +1121,7 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,
@@ -1184,6 +1211,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
     let executor = ext.executor();
 
     let step = SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: "worker".to_string(),
@@ -1198,6 +1226,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,
@@ -1290,6 +1319,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
 /// these two tests is the `verify[]` command's own real exit code.
 fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -1307,6 +1337,8 @@ fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),

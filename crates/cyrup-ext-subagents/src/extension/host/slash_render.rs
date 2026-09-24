@@ -35,6 +35,63 @@ pub(crate) fn plan_step_agent_names(graph: &[RunnerStep]) -> Vec<String> {
     names
 }
 
+/// Visit every agent-running step spec in a plan: a single step, each task of a parallel group,
+/// and a dynamic group's per-item template.
+fn for_each_step_spec(
+    graph: &mut [RunnerStep],
+    mut visit: impl FnMut(&mut crate::spawn::chain_graph::SingleStepSpec),
+) {
+    for step in graph {
+        match step {
+            RunnerStep::SingleStep(spec) => visit(spec),
+            RunnerStep::ParallelGroup(group) => group.steps.iter_mut().for_each(&mut visit),
+            RunnerStep::DynamicGroup(dynamic) => visit(&mut dynamic.template),
+            RunnerStep::ImportAsyncRoot(_) => {}
+        }
+    }
+}
+
+/// SUBA-096 — the CALL rung of pi's `s.fast ?? params.fast ?? a.fast`: a step that states no
+/// `fast` of its own takes the call's.
+pub(crate) fn apply_call_fast(graph: &mut [RunnerStep], call_fast: Option<bool>) {
+    if call_fast.is_none() {
+        return;
+    }
+    for_each_step_spec(graph, |spec| spec.fast = spec.fast.or(call_fast));
+}
+
+/// SUBA-096 — fold each step's AGENT-level launch defaults into the step, at plan time, while the
+/// resolved agents are in hand:
+///
+/// - **output mode** — pi `outputMode: s.outputMode ?? a.outputMode` for a chain step
+///   (`child-launch-plan.ts:105`, `settings.ts:390` @v0.68.0) and `task.outputMode ??
+///   agent.outputMode` for a parallel task (`subagent-executor.ts:3346`);
+/// - **fast** — the agent rung of `s.fast ?? params.fast ?? a.fast`
+///   (`async-execution.ts:983,1118` @v0.68.0), under whatever the step and call already set
+///   ([`apply_call_fast`] runs first, at the tool boundary).
+///
+/// The per-step executor (`background::runner_main`) and the recovery descriptor both resolve a
+/// step's mode as `step.output_mode.unwrap_or(Inline)` and its fast flag as `step.fast` — correct
+/// for the step's own values, but they hold only the step, so without this pass an agent that
+/// declares `outputMode: file-only` ran every chain/parallel step inline and an agent declaring
+/// `fast: true` never ran fast. Resolving here covers every consumer at once: the foreground and
+/// background graph executors, the async status record, and the descriptor a revive replays. An
+/// explicit step value is never replaced.
+pub(crate) fn apply_agent_launch_defaults(
+    graph: &mut [RunnerStep],
+    agents: &std::collections::BTreeMap<String, crate::discovery::types::AgentDefinition>,
+) {
+    for_each_step_spec(graph, |spec| {
+        let Some(agent) = agents.get(&spec.agent) else {
+            return;
+        };
+        if spec.output_mode.is_none() {
+            spec.output_mode = agent.output.as_ref().and_then(|output| output.mode);
+        }
+        spec.fast = spec.fast.or(agent.fast);
+    });
+}
+
 /// The graph's first step's first task text — the fallback `{task}` value when the call site
 /// supplied no explicit top-level task (pi `originalTask = params.task ?? firstStepFirstTask`,
 /// `chain-execution.ts:493-497`). A single step's own task, a parallel group's first child's task, or
@@ -425,6 +482,7 @@ mod tests {
 
     fn fork_test_step(agent: &str) -> SingleStepSpec {
         SingleStepSpec {
+            machine: None,
             skills: None,
             session_dir: None,
             agent: agent.to_string(),
@@ -439,6 +497,7 @@ mod tests {
             output: None,
             output_path: None,
             output_mode: None,
+            fast: None,
             reads: None,
             acceptance: None,
             context: None,
@@ -446,11 +505,112 @@ mod tests {
         }
     }
 
+    fn defaults_agent(
+        output_mode: Option<crate::discovery::types::OutputMode>,
+        fast: Option<bool>,
+    ) -> crate::discovery::types::AgentDefinition {
+        let mut agent = crate::discovery::management::test_support::sample_agent(
+            crate::discovery::types::AgentSource::User,
+            std::path::PathBuf::from("/a/worker.md"),
+        );
+        agent.output = output_mode.map(|mode| crate::discovery::types::OutputSpec {
+            path: None,
+            mode: Some(mode),
+        });
+        agent.fast = fast;
+        agent
+    }
+
+    /// SUBA-096 — a chain step with no mode of its own takes its AGENT's mode (pi `s.outputMode
+    /// ?? a.outputMode`), an explicit step mode is kept, and every step shape is visited.
+    /// Mutation killed: dropping the pass from `run_graph` (verified via this helper's contract),
+    /// or overwriting an explicit step mode.
+    #[test]
+    fn agent_output_mode_reaches_every_step_shape_unless_the_step_set_one() {
+        use crate::discovery::types::OutputMode;
+        let agents = std::collections::BTreeMap::from([
+            (
+                "writer".to_string(),
+                defaults_agent(Some(OutputMode::FileOnly), None),
+            ),
+            ("plain".to_string(), defaults_agent(None, None)),
+        ]);
+        let mut explicit = fork_test_step("writer");
+        explicit.output_mode = Some(OutputMode::Inline);
+        let mut graph = vec![
+            RunnerStep::SingleStep(fork_test_step("writer")),
+            RunnerStep::SingleStep(explicit),
+            RunnerStep::SingleStep(fork_test_step("plain")),
+            RunnerStep::ParallelGroup(ParallelGroupSpec {
+                steps: vec![fork_test_step("writer")],
+                concurrency: 1,
+                fail_fast: false,
+                worktree: false,
+                lane: None,
+            }),
+        ];
+        apply_agent_launch_defaults(&mut graph, &agents);
+        let modes: Vec<Option<OutputMode>> = graph
+            .iter()
+            .map(|step| match step {
+                RunnerStep::SingleStep(spec) => spec.output_mode,
+                RunnerStep::ParallelGroup(group) => group.steps[0].output_mode,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                Some(OutputMode::FileOnly),
+                Some(OutputMode::Inline),
+                None,
+                Some(OutputMode::FileOnly),
+            ]
+        );
+    }
+
+    /// SUBA-096 — `s.fast ?? params.fast ?? a.fast`: a step's own `false` beats a call `true`
+    /// and an agent `true`; a call value beats the agent's; the agent's applies last. Mutation
+    /// killed: inverting either fold (`agent.or(step)`), or skipping `apply_call_fast`.
+    #[test]
+    fn fast_precedence_is_step_then_call_then_agent() {
+        let agents = std::collections::BTreeMap::from([(
+            "worker".to_string(),
+            defaults_agent(None, Some(true)),
+        )]);
+        let mut step_false = fork_test_step("worker");
+        step_false.fast = Some(false);
+        let mut graph = vec![
+            RunnerStep::SingleStep(step_false),
+            RunnerStep::SingleStep(fork_test_step("worker")),
+        ];
+        apply_call_fast(&mut graph, None);
+        apply_agent_launch_defaults(&mut graph, &agents);
+        let fast = |graph: &[RunnerStep]| -> Vec<Option<bool>> {
+            graph
+                .iter()
+                .map(|step| match step {
+                    RunnerStep::SingleStep(spec) => spec.fast,
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        assert_eq!(fast(&graph), vec![Some(false), Some(true)]);
+
+        let mut graph = vec![RunnerStep::SingleStep(fork_test_step("worker"))];
+        apply_call_fast(&mut graph, Some(false));
+        apply_agent_launch_defaults(&mut graph, &agents);
+        assert_eq!(fast(&graph), vec![Some(false)], "the call beats the agent");
+    }
+
     fn persona_with_default_context(
         name: &str,
         default_context: Option<ContextMode>,
     ) -> ResolvedAgentPersona {
         ResolvedAgentPersona {
+            inherit_global_context: false,
+            machine: None,
+            mutation_tools: None,
             name: name.to_string(),
             model: None,
             model_provider: None,

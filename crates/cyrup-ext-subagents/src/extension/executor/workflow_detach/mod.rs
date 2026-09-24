@@ -95,7 +95,7 @@ use crate::background::{ResultFile, RunMode, RunPaths, RunState, RunStatus, Step
 use crate::error::SubagentError;
 use crate::exec::SingleResult;
 use crate::identity::SessionId;
-use crate::jsonl::BoundedJsonlWriter;
+use crate::jsonl::RunEventLog;
 use crate::workflows::{
     DetachedChildSettlement, PlanWorkflowSettlement, SettledWorkflowStatus, WorkflowKey,
     WorkflowReceipt, WorkflowScriptTraceEntry, WorkflowSettlementPlan, WorkflowTerminalResolution,
@@ -512,10 +512,22 @@ async fn publish_reconciled_settlement(
     // 4/5 — `:265-280`. One writer, reused for both lines. A journal failure is logged and
     // swallowed, matching upstream's `appendDetachedWorkflowEvent` try/catch (`:161-168`): the
     // settlement is already durable on disk, and losing an advisory event line must not undo it.
-    // `write_line` is additionally a silent no-op once the file's byte budget is reached
-    // (R-SA-136), so a dropped event is not an error either.
+    //
+    // The journal is the run's `events.jsonl`, the same file the detached runner writes, so it is
+    // opened as the runner opens it: a [`RunEventLog`] carrying the operator's
+    // `CYRUP_SUBAGENT_ASYNC_EVENTS_MAX_BYTES` cap (pi `maxAsyncEventsBytes()`,
+    // `subagent-runner.ts:330-336` @v0.68.0). Both lines below are LIFECYCLE lines — upstream's
+    // `appendDetachedWorkflowEvent` is a bare `fs.appendFileSync` (`workflow-detach-reconcile.ts:
+    // 161-168` @v0.68.0), the uncapped `appendJsonl` of `subagent-runner.ts:354-362` — so they go
+    // through `write_line` and survive any cap, `0` included. This used to be a silent 50 MiB
+    // `BoundedJsonlWriter` that neither read the operator's cap nor wrote a marker, and that
+    // dropped a workflow's terminal `subagent.workflow.completed` line without a trace once the
+    // runner's own trail had filled the file.
     if receipt_error.is_some() || plan.completion_event.is_some() {
-        match BoundedJsonlWriter::create(&input.run_paths.events).await {
+        let cap = crate::background::runner_main::resolve_async_events_cap_bytes(&|name| {
+            std::env::var(name).ok()
+        });
+        match RunEventLog::create_with_cap(&input.run_paths.events, cap).await {
             Ok(mut writer) => {
                 if let Some(error) = receipt_error {
                     let mut event = event_envelope(settled);
@@ -579,7 +591,7 @@ fn event_envelope(settled: &RunStatus) -> serde_json::Map<String, serde_json::Va
 }
 
 async fn append_event(
-    writer: &mut BoundedJsonlWriter,
+    writer: &mut RunEventLog,
     path: &std::path::Path,
     event: serde_json::Map<String, serde_json::Value>,
 ) {

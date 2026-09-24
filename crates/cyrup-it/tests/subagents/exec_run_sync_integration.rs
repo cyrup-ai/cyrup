@@ -52,6 +52,7 @@ fn write_script(dir: &std::path::Path, name: &str, script_json: &serde_json::Val
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: "worker".to_string(),
@@ -68,6 +69,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false), // isolate this test from R-SA-034's own separate gate
@@ -85,9 +88,12 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
     RunOptions {
+        parent_env_overrides: std::collections::BTreeMap::new(),
+        machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
         // nothing is recorded, which is this field's documented `None` behaviour.
         model_exclusions: None,
+        fast: false,
         host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
@@ -1691,4 +1697,129 @@ async fn a_child_that_finishes_inside_its_turn_budget_is_untouched() {
         cyrup_ext_subagents::exec::turn_budget::TurnBudgetOutcome::WithinBudget
     );
     assert_eq!(state.turn_count, 1);
+}
+
+// -------------------------------------------------------------------------------------------
+// SUBA-063 — the runtime-acknowledged-extensions hand-back, across the process boundary
+// -------------------------------------------------------------------------------------------
+
+/// The RAW capture a child writes: two valid ids (one duplicated), three a sanitizer must drop,
+/// then 32 more valid ones (34 valid unique in all) and a self-declared `omitted: 3`.
+pub(crate) fn raw_runtime_acknowledgement() -> serde_json::Value {
+    let mut ids = vec![
+        serde_json::json!("ext.alpha"),
+        serde_json::json!("ext.alpha"),
+        serde_json::json!("../escape"),
+        serde_json::json!("bad/id"),
+        serde_json::json!(7),
+        serde_json::json!("ext.beta"),
+    ];
+    ids.extend((0..32).map(|i| serde_json::json!(format!("pkg:e{i:02}"))));
+    serde_json::json!({ "version": 1, "source": "child-runtime", "ids": ids, "omitted": 3 })
+}
+
+/// What the parent must publish for [`raw_runtime_acknowledgement`]: the first 32 valid unique
+/// ids in first-seen order, and `omitted` = (34 − 32) + the child's declared 3.
+pub(crate) fn assert_sanitized_runtime_acknowledgement(
+    acknowledged: Option<
+        &cyrup_ext_subagents::exec::run_result::RuntimeAcknowledgedChildExtensions,
+    >,
+    context: &str,
+) {
+    let acknowledged = acknowledged.unwrap_or_else(|| {
+        panic!("{context}: the child's acknowledgement never reached the parent's record")
+    });
+    assert_eq!(acknowledged.version, 1, "{context}");
+    assert_eq!(acknowledged.source, "child-runtime", "{context}");
+    assert_eq!(acknowledged.ids.len(), 32, "{context}: {acknowledged:?}");
+    assert_eq!(
+        acknowledged.ids[..3],
+        ["ext.alpha", "ext.beta", "pkg:e00"],
+        "{context}: de-duplicated, invalid ids dropped, first-seen order kept"
+    );
+    assert_eq!(acknowledged.ids[31], "pkg:e29", "{context}");
+    assert_eq!(
+        acknowledged.omitted, 5,
+        "{context}: 2 over the cap + 3 declared"
+    );
+}
+
+/// SUBA-063, foreground: `run_sync` names an acknowledgement file in the child's environment
+/// (`CYRUP_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS`, pi `pi-args.ts:842-846` @v0.64.0), the child
+/// writes its capture there, and the parent reads it back when the child closes — through the
+/// SANITIZER, because the file is child-written — onto `SingleResult::runtime_acknowledged_extensions`
+/// (pi `execution.ts:1386`).
+///
+/// Gutted by, each alone: dropping the env insert in `build_attempt_spawn_plan` (the child has no
+/// path, writes nothing, the field stays `None`); dropping the read in `run_attempt`; publishing
+/// `None` instead of the winning attempt's value in `run_sync`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sync_reads_the_childs_runtime_acknowledgements_back_through_the_sanitizer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": r#"{"type":"agent_start"}"#},
+            {"kind": "write_runtime_acknowledged_extensions", "value": raw_runtime_acknowledgement()},
+            {"kind": "emit", "line": message_end_line("done", 3, 2)},
+            {"kind": "emit", "line": r#"{"type":"agent_end"}"#}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-runtime-ack.json", &script);
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        cyrup_ext_subagents::exec::run_sync(&agent, "acknowledge", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against a fast fixture child");
+
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    assert_sanitized_runtime_acknowledgement(
+        result.runtime_acknowledged_extensions.as_ref(),
+        "SingleResult",
+    );
+}
+
+/// A child that acknowledges NOTHING publishes nothing — and a stale capture a previous attempt
+/// left in the shared scratch directory does not leak onto this one (pi's per-attempt `mkdtemp`
+/// guarantee, restored by clearing the file before the spawn).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_that_acknowledges_nothing_publishes_no_runtime_acknowledgement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": message_end_line("done", 3, 2)},
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script-no-ack.json", &script);
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    opts.spawn_command = Some(SpawnCommand {
+        binary: fixture_binary_path(),
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        cyrup_ext_subagents::exec::run_sync(&agent, "acknowledge nothing", &opts),
+    )
+    .await
+    .expect("run_sync must not hang against a fast fixture child");
+
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    assert_eq!(result.runtime_acknowledged_extensions, None);
 }

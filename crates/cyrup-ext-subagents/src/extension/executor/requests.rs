@@ -54,6 +54,16 @@ pub struct SingleRunOverrides {
     pub output: Option<serde_json::Value>,
     /// pi `params.outputMode` (`schemas.ts:50-53`): `"inline"` (pi's own default) or `"file-only"`.
     pub output_mode: Option<String>,
+    /// SUBA-096 — pi `params.fast` (`extension/schemas.ts:388` @v0.68.0), the call rung of
+    /// `params.fast ?? a.fast`. `run_foreground_impl` folds the persona's own `fast` beneath it.
+    pub fast: Option<bool>,
+    /// SUBA-100 — pi `params.machine` (`subagent-executor.ts:3824` @v0.68.0), the call rung of
+    /// `params.machine ?? agentConfig.machine`. `run_foreground_impl` folds the persona's own
+    /// `machine` beneath it and resolves the placement before minting the run.
+    pub machine: Option<String>,
+    /// SUBA-100 — pi `params.machineCwd` (`subagent-executor.ts:391-393`): the call's `cwd` as
+    /// typed, kept as a path ON THE MACHINE.
+    pub machine_cwd: Option<String>,
     /// pi `params.skill` (`SkillOverride`, `schemas.ts:33-40`), already normalized through
     /// [`crate::extension::tool::task_items::normalize_skill_input`]: `Some(names)` replaces the persona's own `skills:`, `Some(vec![])`
     /// is the explicit `skill: false` "no skills" form, `None` inherits the persona's list.
@@ -302,6 +312,17 @@ pub struct BackgroundSingleRequest<'a> {
     /// `outputMode: effectiveOutputMode` (`subagent-executor.ts:3637`), consumed at
     /// `async-execution.ts:908-910` where it also drives `validateFileOnlyOutputMode`.
     pub output_mode: Option<String>,
+    /// SUBA-096 — pi `params.fast` (`async-execution.ts:1741` @v0.68.0, `params.fast ??
+    /// agentConfig.fast`). `spawn_background` folds the persona's own `fast` beneath it and lands
+    /// the effective value on the step.
+    pub fast: Option<bool>,
+    /// SUBA-100 — pi `params.machine` (`async-execution.ts:1774` @v0.68.0, `params.machine ??
+    /// agentConfig.machine`): the call rung. `spawn_background` folds the persona's own `machine`
+    /// beneath it, refuses an unsupported runner, and RESOLVES the placement before the run exists
+    /// (upstream's `formatAsyncStartError`), landing the reference on the step.
+    pub machine: Option<String>,
+    /// SUBA-100 — pi `params.machineCwd`: the call's `cwd` as typed, a path ON THE MACHINE.
+    pub machine_cwd: Option<String>,
     /// SUBA-N03: pi `params.skill` (`SkillOverride`, `extension/schemas.ts:33-40`), already
     /// normalized through [`crate::extension::tool::task_items::normalize_skill_input`] into the same tri-state
     /// [`SingleRunOverrides::skills`] carries. Lands on

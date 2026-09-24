@@ -58,6 +58,12 @@ use std::path::PathBuf;
 /// non-disabled) and scopes the `list` call to what it can actually reveal. Every other line is
 /// upstream's, and the appender contract below is unchanged.
 ///
+/// SUBA-104 — that `list` pointer asks for `capabilities: true` and names the external-cli
+/// `runner.available` requirement: the substance of upstream's v0.68.0 `AGENT_SELECTION_GUIDANCE`
+/// (`tool-description.ts:8`: *"First call {action:\"list\",capabilities:true}: executable,
+/// non-disabled agents only; external-cli requires runner.available === true."*), the consumer
+/// the capability listing is built for.
+///
 /// This is the block [`with_mandatory_safety_guidance`] guarantees survives a custom description:
 /// a deployment may replace every other word the orchestrator reads about delegation, but not
 /// these six bullets.
@@ -73,7 +79,7 @@ use std::path::PathBuf;
 /// from (`FULL_SUBAGENT_TOOL_DESCRIPTION`, `tool-description.ts:17-66` @v0.34.0), so the two
 /// constants come from ONE upstream revision rather than two.
 pub const SUBAGENT_SAFETY_GUIDANCE: &str = r#"SAFETY-CRITICAL SUBAGENT GUIDANCE:
-• Run only executable/non-disabled agents or chains; builtins (delegate, oracle, researcher, reviewer, scout, worker) are always executable — use { action: "list" } to check anything else.
+• Run only executable/non-disabled agents or chains; builtins (delegate, oracle, researcher, reviewer, scout, worker) are always executable — use { action: "list", capabilities: true } to check anything else; an external-cli agent also needs runner.available === true.
 • Keep execution and management separate: omit action for SINGLE/PARALLEL/CHAIN execution; use action only for list/get/models/create/update/delete/status/interrupt/resume/append-step/doctor.
 • Async/background runs: launch with async:true only when work can proceed independently. Do not sleep or poll status just to wait; if this turn must block, use the bg_wait tool. Otherwise continue useful work or respond and let completion notifications arrive.
 • Child-safety boundary: ordinary child subagents are not orchestrators and must not run subagents. Only explicitly configured fanout children may use the child-safe subagent tool, still bounded by depth/session limits.
@@ -849,6 +855,11 @@ mod tests {
     /// and upstream spells the same tool the same way (`wait-tool.ts:38` @v0.68.0). The pin's job
     /// is unchanged: any FURTHER edit must be a deliberate, recorded act, and the builtins
     /// assertion below keeps the reworded bullet honest.
+    ///
+    /// SUBA-104 moved it once more (1430 → **1510**): the first bullet's `list` pointer now
+    /// asks for `capabilities: true` and states the external-cli `runner.available` requirement —
+    /// upstream's `AGENT_SELECTION_GUIDANCE` (`tool-description.ts:8` @v0.68.0), which is the
+    /// consumer the capability listing exists for.
     #[test]
     fn the_safety_guidance_is_pinned_to_pis_v0_34_0_text() {
         assert!(SUBAGENT_SAFETY_GUIDANCE.starts_with("SAFETY-CRITICAL SUBAGENT GUIDANCE:\n"));
@@ -859,9 +870,14 @@ mod tests {
         );
         assert_eq!(
             SUBAGENT_SAFETY_GUIDANCE.len(),
-            1430,
+            1510,
             "byte length is pinned"
         );
+        // SUBA-104 — the first bullet points at the capability listing, pi's own
+        // `AGENT_SELECTION_GUIDANCE` (`tool-description.ts:8` @v0.68.0).
+        assert!(SUBAGENT_SAFETY_GUIDANCE.contains(
+            "use { action: \"list\", capabilities: true } to check anything else; an external-cli agent also needs runner.available === true."
+        ));
         assert!(
             SUBAGENT_SAFETY_GUIDANCE
                 .contains("builtins (delegate, oracle, researcher, reviewer, scout, worker)"),

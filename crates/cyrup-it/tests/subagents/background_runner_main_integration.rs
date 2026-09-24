@@ -62,6 +62,7 @@ use cyrup_ext_subagents::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, Sin
 /// an unresolved agent as `Unknown agent` rather than synthesizing a placeholder.
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -79,6 +80,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -152,6 +155,7 @@ fn message_end_line(text: &str) -> String {
 
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: agent.to_string(),
@@ -166,6 +170,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,
@@ -521,9 +526,12 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
 /// real fixture subprocess (no mocking, matching this file's own standing convention): after one
 /// successful run, `events.jsonl` must exist, contain multiple well-formed JSON lines (at least a
 /// `run.started`, one `step.started`/`step.completed` pair, and a `run.completed`), and every line
-/// must independently parse as valid JSON — proving this crate's shared
-/// [`cyrup_ext_subagents::jsonl::BoundedJsonlWriter`] primitive is genuinely exercised on this path,
-/// not just on the foreground per-attempt child-output tee.
+/// must independently parse as valid JSON — proving [`cyrup_ext_subagents::jsonl::RunEventLog`] is
+/// genuinely exercised on this path.
+///
+/// It also pins the child-event JOURNAL (pi `appendChildEvent`, `subagent-runner.ts:590-622`
+/// @v0.43.0): the child's `message_end` lands in `events.jsonl` as a diagnostic line carrying pi's
+/// provenance fields. Killing mutation: drop the `journal_child_line` call from the telemetry pump.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
     let dir = tempfile::tempdir().expect("real tempdir");
@@ -631,10 +639,17 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
 
     // events.jsonl field parity with pi (`subagent-runner.ts`): the field name is `type` (NOT
     // `kind`) and the event-type strings are `subagent.*`, with step events carrying `agent`.
+    // Lifecycle lines only: the child journal's lines are the child's own events (no `ts` of
+    // their own, as upstream) and are asserted separately below.
     let mut types = Vec::new();
+    let mut child_lines = Vec::new();
     for line in &lines {
         let parsed: serde_json::Value = serde_json::from_str(line)
             .unwrap_or_else(|e| panic!("every line must be valid JSON: {e}: {line}"));
+        if parsed["subagentSource"] == "child" {
+            child_lines.push(parsed);
+            continue;
+        }
         types.push(
             parsed["type"]
                 .as_str()
@@ -643,9 +658,17 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         );
         assert!(
             parsed["ts"].is_number(),
-            "every line must carry a numeric 'ts' field: {line}"
+            "every lifecycle line must carry a numeric 'ts' field: {line}"
         );
     }
+    let journaled_end = child_lines
+        .iter()
+        .find(|v| v["type"] == "message_end")
+        .unwrap_or_else(|| panic!("the child's message_end is journaled: {contents}"));
+    assert_eq!(journaled_end["subagentRunId"], "eventsrun1");
+    assert_eq!(journaled_end["subagentStepIndex"], 0);
+    assert_eq!(journaled_end["subagentAgent"], "worker");
+    assert!(journaled_end["observedAt"].is_number());
 
     assert_eq!(
         types.first().map(String::as_str),
@@ -3139,5 +3162,82 @@ async fn a_worktree_fan_out_publishes_a_real_parallel_handoff_manifest() {
     assert!(
         facts.unresolved_handoff,
         "a partial cleanup pins the run against retention"
+    );
+}
+
+/// SUBA-063, background: the same child-written capture, through the detached runner. pi publishes
+/// it on the status step (`setOptionalProperty(requiredStatusStep(…), "runtimeAcknowledgedExtensions",
+/// singleResult.runtimeAcknowledgedExtensions)`, `subagent-runner.ts:3834` @v0.68.0), on the
+/// terminal result payload's per-result copy (`:5068`), and — for a ONE-result run — on the run-level
+/// status (`:4887`, `:5002`).
+///
+/// Gutted by, each alone: the executor's `step_result.runtime_acknowledged_extensions = …` hop
+/// (every one of the three reads `None`); the status fold's per-slot write (the step reads `None`);
+/// `finish_run`'s single-result lift (the run-level status reads `None`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_background_runs_status_and_result_carry_the_childs_runtime_acknowledgements() {
+    let dir = tempfile::tempdir().expect("real tempdir");
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "write_runtime_acknowledged_extensions",
+             "value": crate::exec_run_sync_integration::raw_runtime_acknowledgement()},
+            {"kind": "emit", "line": message_end_line("acknowledged")},
+        ],
+        "exit_code": 0
+    });
+    let config = RunnerConfig {
+        runner_process_instance_id: None,
+        revival_lease: None,
+        host_available_builtins: None,
+        completion_owner_id: None,
+        turn_budget: None,
+        permission_rules: None,
+        usage_budget: None,
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
+        run_id: RunId::from_token("ackrun1"),
+        mode: RunMode::Single,
+        steps: vec![RunnerStep::SingleStep(single_step("worker", "acknowledge"))],
+        cwd: dir.path().to_path_buf(),
+        session_file: None,
+        session_id: Some("it-session".to_string()),
+        global_concurrency_limit: 20,
+        worktree_base_dir: None,
+        max_subagent_depth: 2,
+        async_root: dir.path().join("async"),
+        results_dir: dir.path().join("results"),
+        resolved_agents: all_personas(),
+        original_task: String::new(),
+        chain_dir: None,
+        orchestrator_intercom_target: None,
+        inherited_session_model: None,
+        inherited_session_thinking: None,
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
+
+    let (status, result_file) = run_against_fixture(dir.path(), &script, config).await;
+
+    assert_eq!(status.state, RunState::Complete);
+    crate::exec_run_sync_integration::assert_sanitized_runtime_acknowledgement(
+        status.steps[0].runtime_acknowledged_extensions.as_ref(),
+        "status.json steps[0]",
+    );
+    crate::exec_run_sync_integration::assert_sanitized_runtime_acknowledgement(
+        status.runtime_acknowledged_extensions.as_ref(),
+        "status.json run level (single result)",
+    );
+    crate::exec_run_sync_integration::assert_sanitized_runtime_acknowledgement(
+        result_file.results[0]
+            .runtime_acknowledged_extensions
+            .as_ref(),
+        "ResultFile results[0]",
     );
 }

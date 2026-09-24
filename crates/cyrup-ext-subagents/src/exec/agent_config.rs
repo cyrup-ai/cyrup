@@ -71,6 +71,12 @@ pub struct AgentConfig {
     /// project-context files (`AGENTS.md`/`CLAUDE.md`) — threaded to the child as
     /// `CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT=1|0` (pi `runs/shared/pi-args.ts:215` @v0.34.0).
     pub inherit_project_context: bool,
+    /// SUBA-101 — the child inherits the parent's global context files (pi `inheritGlobalContext`).
+    pub inherit_global_context: bool,
+    /// SUBA-102 — extra tool names this child counts as mutating (pi `mutationTools`).
+    pub mutation_tools: Option<Vec<String>>,
+    /// SUBA-100 — the Herdr saved machine this child is placed on (pi `machine`).
+    pub machine: Option<String>,
     /// Whether the child inherits skills discovery: when `false`, the child is spawned with
     /// `--no-skills` and `CYRUP_SUBAGENT_INHERIT_SKILLS=0` (pi `runs/shared/pi-args.ts:156,216` @v0.34.0).
     pub inherit_skills: bool,
@@ -136,6 +142,10 @@ impl AgentConfig {
     #[must_use]
     pub fn from_agent_definition(agent: &AgentDefinition, depth: DepthEnvelope) -> Self {
         Self {
+            inherit_global_context: agent.inherit_global_context,
+            // SUBA-100 — the agent rung of `s.machine ?? params.machine ?? a.machine`.
+            machine: agent.machine.clone(),
+            mutation_tools: agent.mutation_tools.clone(),
             name: agent.local_name.clone(),
             model: agent.model.clone(),
             model_provider: agent.model_provider.clone(),
@@ -188,8 +198,13 @@ impl AgentConfig {
 /// meaningfully bake in). The execution-ready [`AgentConfig`] is reconstituted at dispatch time by
 /// [`ResolvedAgentPersona::to_agent_config`], which stamps the runner's own live depth envelope
 /// onto the persona.
+///
+/// **Its serde impls are hand-written over the derived ones** (`remote = "Self"` makes the derives
+/// inherent functions): serialization is exactly the derive's, and deserialization applies ONE
+/// legacy rule before it (SUBA-101: an absent `inheritGlobalContext` reads as
+/// `inheritProjectContext`; the reasons are on the `Deserialize` impl).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", remote = "Self")]
 pub struct ResolvedAgentPersona {
     /// The agent's local (unqualified) name — exactly [`AgentConfig::name`].
     pub name: String,
@@ -236,6 +251,17 @@ pub struct ResolvedAgentPersona {
     /// `#[serde(default)]` keeps the runner-config hand-off backward compatible.
     #[serde(default)]
     pub inherit_project_context: bool,
+    /// SUBA-101 — carried so every step threads global-context inheritance identically. A config
+    /// written before this field existed reads it as `inheritProjectContext`, not `false` (see
+    /// the `Deserialize` impl).
+    #[serde(default)]
+    pub inherit_global_context: bool,
+    /// SUBA-102 — carried so every step's child counts the same extra tools as mutating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_tools: Option<Vec<String>>,
+    /// SUBA-100 — carried so every step is placed on the same Herdr machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     /// The agent's own skills inheritance flag, carried so a chain/parallel/background step threads
     /// `--no-skills`/`CYRUP_SUBAGENT_INHERIT_SKILLS` identically to the single-run path.
     /// `#[serde(default)]` keeps the runner-config hand-off backward compatible.
@@ -304,6 +330,45 @@ pub struct ResolvedAgentPersona {
     pub file_path: Option<PathBuf>,
 }
 
+impl serde::Serialize for ResolvedAgentPersona {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The derived (inherent, `remote = "Self"`) serializer, unchanged.
+        Self::serialize(self, serializer)
+    }
+}
+
+/// The derived deserializer, after SUBA-101's legacy rule: a persona serialized before
+/// `inheritGlobalContext` existed (no such key) reads it as its own `inheritProjectContext`, never
+/// `false`.
+///
+/// It is upstream's rule for the same situation on the recovery descriptor
+/// (`async-resume.ts:368` @v0.68.0: `if (parsed.inheritGlobalContext === undefined)
+/// parsed.inheritGlobalContext = parsed.inheritProjectContext;`, ported as
+/// `RecoveryDescriptor::effective_inherit_global_context`), and it is also exactly what the
+/// pre-field cyrup child did: with the project flag on it kept the whole `<project_context>`
+/// section — the global `AGENTS.md` included — and with it off it stripped the whole section. A
+/// plain `#[serde(default)]` (`false`) would instead strip the global context from every legacy
+/// persona whose project flag was ON, which that child never did.
+impl<'de> serde::Deserialize<'de> for ResolvedAgentPersona {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(object) = value.as_object_mut()
+            && !object.contains_key("inheritGlobalContext")
+        {
+            let project = object
+                .get("inheritProjectContext")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            object.insert(
+                "inheritGlobalContext".to_string(),
+                serde_json::Value::Bool(project),
+            );
+        }
+        // The derived (inherent) deserializer over the amended object.
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl ResolvedAgentPersona {
     /// Project a fully-resolved [`AgentDefinition`] into its serializable persona — a thin copy,
     /// never a re-derivation, of exactly the fields [`AgentConfig::from_agent_definition`] itself
@@ -312,6 +377,9 @@ impl ResolvedAgentPersona {
     #[must_use]
     pub fn from_agent_definition(agent: &AgentDefinition) -> Self {
         Self {
+            inherit_global_context: agent.inherit_global_context,
+            machine: agent.machine.clone(),
+            mutation_tools: agent.mutation_tools.clone(),
             name: agent.local_name.clone(),
             model: agent.model.clone(),
             model_provider: agent.model_provider.clone(),
@@ -347,6 +415,9 @@ impl ResolvedAgentPersona {
     #[must_use]
     pub fn to_agent_config(&self, depth: DepthEnvelope) -> AgentConfig {
         AgentConfig {
+            inherit_global_context: self.inherit_global_context,
+            machine: self.machine.clone(),
+            mutation_tools: self.mutation_tools.clone(),
             name: self.name.clone(),
             model: self.model.clone(),
             model_provider: self.model_provider.clone(),
@@ -701,6 +772,21 @@ pub struct RunOptions {
     /// text. `None` means unbudgeted, which is every run that does not ask for one: upstream has no
     /// default usage budget any more than it has a default turn budget.
     pub usage_budget: Option<crate::exec::usage_budget::UsageBudgetConfig>,
+    /// SUBA-096 — the EFFECTIVE fast-mode flag for this run: pi `s.fast ?? params.fast ?? a.fast`
+    /// (step > call > agent), already folded by the dispatch site. `true` makes
+    /// [`crate::exec::build_attempt_spawn_plan`] check each attempt's model against
+    /// [`crate::exec::FAST_MODE_ALLOWED_MODELS`] and hand the child
+    /// [`crate::prompt_runtime::FAST_MODE_ENV`], which puts its provider requests on the priority
+    /// service tier. `false` is every run that did not ask for it.
+    pub fast: bool,
+    /// SUBA-100 — the Herdr saved machine this run's child is placed on, RESOLVED at launch (pi
+    /// `options.machine: HerdrMachineReference`, `execution.ts:382` @v0.68.0): the effective
+    /// `step ?? call ?? agent` selector, validated against the catalog and settings before any run
+    /// existed. `Some` makes [`crate::exec::run_sync`] launch the child in a herdr-owned pane on
+    /// that machine ([`crate::placement::native`] / [`crate::placement::external`]); its `cwd` is
+    /// the directory ON THE MACHINE, while [`Self::cwd`] stays the local runner cwd. `None` is a
+    /// local run.
+    pub machine: Option<crate::placement::HerdrMachineReference>,
     /// SCOPE_3j — the cached model-exclusion registry this run filters its ladder against and
     /// records retryable model failures into (pi `runs/shared/model-exclusions.ts`).
     ///
@@ -752,6 +838,16 @@ pub struct RunOptions {
     ///
     /// It costs production no parameter and defaults to empty.
     pub child_env: std::collections::HashMap<String, String>,
+    /// The PARENT's env seam for this run — the launching extension's
+    /// `SubagentExtensionConfig::env_overrides`: a key present here is read from it (`None` =
+    /// scrubbed), any other key from this process ([`Self::parent_env_var`]). The inherited
+    /// capability ceiling (`CYRUP_SUBAGENT_CAPABILITY_CEILING_V1`) that
+    /// [`crate::exec::spawn_plan`]'s preflight binds this run by is read through it, so a
+    /// foreground launch is bound by exactly the ceiling the same extension's async launches
+    /// (`SubagentExecutor::spawn_background_steps`) and its `list` read. Empty = the process
+    /// environment only, which is what every non-extension caller (the detached runner, whose
+    /// own environment IS its parent's hand-off) wants.
+    pub parent_env_overrides: std::collections::BTreeMap<String, Option<String>>,
     /// pi `hostAvailableBuiltins` (`child-tool-plan.ts:198`, carried on the runner ctx/config at
     /// `subagent-runner.ts:236,702`) — the builtin tool names the LAUNCHING process's host registry
     /// reported, observed ONCE by [`crate::exec::tool_surface::host_builtin_tool_names`] and threaded
@@ -762,6 +858,17 @@ pub struct RunOptions {
     /// the intersection entirely, so absence of evidence is never reported as evidence of absence.
     /// `Some(vec![])` is the opposite — a real observation of nothing.
     pub host_available_builtins: Option<Vec<String>>,
+}
+
+impl RunOptions {
+    /// `key` through [`Self::parent_env_overrides`], then this process.
+    #[must_use]
+    pub fn parent_env_var(&self, key: &str) -> Option<String> {
+        match self.parent_env_overrides.get(key) {
+            Some(pinned) => pinned.clone(),
+            None => std::env::var(key).ok(),
+        }
+    }
 }
 
 /// A live per-line sink installed via [`RunOptions::live_events`]: [`crate::exec::run_sync`]'s per-attempt driver
@@ -933,6 +1040,9 @@ mod tests {
     #[test]
     fn resolved_agent_persona_round_trips_through_json_preserving_every_field() {
         let persona = ResolvedAgentPersona {
+            inherit_global_context: true,
+            machine: None,
+            mutation_tools: Some(vec!["apply_patch".to_string()]),
             name: "reviewer".to_string(),
             model: Some(ModelId::from("reviewer-model")),
             model_provider: None,
@@ -975,9 +1085,58 @@ mod tests {
         );
     }
 
+    /// SUBA-101 — a persona serialized before `inheritGlobalContext` existed reads it as its own
+    /// `inheritProjectContext` (upstream's legacy rule, `async-resume.ts:368` @v0.68.0, and what
+    /// the pre-field child actually did), and a recorded value always wins. Driven through a JSON
+    /// string, the form the runner reads its `runner-config.json` in.
+    ///
+    /// *Gutted by*: dropping the `object.insert("inheritGlobalContext", …)` in the `Deserialize`
+    /// impl (the legacy `project = true` persona reads `false` and loses its global context).
+    #[test]
+    fn a_pre_field_persona_reads_global_context_as_its_project_flag() {
+        let def = crate::discovery::frontmatter::parse_agent_file(
+            "---\nname: legacy\ndescription: d\n---\n\nBody\n",
+            crate::discovery::types::AgentSource::User,
+            std::path::Path::new("/legacy.md"),
+        )
+        .expect("parses");
+        for project in [true, false] {
+            let mut persona = ResolvedAgentPersona::from_agent_definition(&def);
+            persona.inherit_project_context = project;
+            persona.inherit_global_context = !project;
+            let mut value = serde_json::to_value(&persona).expect("serialize");
+            assert_eq!(value["inheritGlobalContext"], serde_json::json!(!project));
+            let current: ResolvedAgentPersona =
+                serde_json::from_str(&value.to_string()).expect("deserialize");
+            assert_eq!(
+                current, persona,
+                "a recorded value wins over the project flag"
+            );
+
+            value
+                .as_object_mut()
+                .expect("an object")
+                .remove("inheritGlobalContext");
+            let legacy: ResolvedAgentPersona =
+                serde_json::from_str(&value.to_string()).expect("a pre-field persona reads");
+            assert_eq!(
+                legacy.inherit_global_context, project,
+                "absent => inheritProjectContext ({project})"
+            );
+        }
+        let malformed = serde_json::json!({"name": 3}).to_string();
+        assert!(
+            serde_json::from_str::<ResolvedAgentPersona>(&malformed).is_err(),
+            "the derived shape checks still run"
+        );
+    }
+
     #[test]
     fn to_agent_config_stamps_the_live_depth_and_reproduces_the_persona() {
         let persona = ResolvedAgentPersona {
+            inherit_global_context: true,
+            machine: None,
+            mutation_tools: Some(vec!["apply_patch".to_string()]),
             name: "reviewer".to_string(),
             model: Some(ModelId::from("reviewer-model")),
             model_provider: None,
@@ -1030,6 +1189,9 @@ mod tests {
         );
         assert_eq!(cfg.fallback_models, vec![ModelId::from("backup-model")]);
         assert_eq!(cfg.completion_guard, Some(true));
+        // SUBA-101/102 — the hop-2 dispatch reconstitutes both from the persona.
+        assert!(cfg.inherit_global_context);
+        assert_eq!(cfg.mutation_tools, Some(vec!["apply_patch".to_string()]));
         assert_eq!(cfg.tools, Some(vec![ToolRef::Builtin("read".to_string())]));
         assert_eq!(cfg.max_subagent_depth, Some(1));
         assert_eq!(cfg.thinking, Some("high".to_string()));
@@ -1046,5 +1208,38 @@ mod tests {
         assert_eq!(cfg.skills, vec!["accessibility".to_string()]);
         // The depth is the caller-stamped live envelope, not a plan-time value.
         assert_eq!(cfg.depth, live_depth);
+    }
+
+    /// SUBA-101/102 — every production conversion carries both keys: definition -> `AgentConfig`
+    /// (the foreground single path), definition -> persona (the plan-time map every
+    /// chain/parallel/fanout/background step dispatches from) -> `AgentConfig`. Mutation killed:
+    /// restoring any one of the six `false`/`None` placeholders.
+    #[test]
+    fn inherit_global_context_and_mutation_tools_survive_every_projection() {
+        let agent = crate::discovery::frontmatter::parse_agent_file(
+            "---\nname: keeper\ndescription: d\ninheritGlobalContext: true\nmutationTools: apply_patch\n---\n\nBody\n",
+            crate::discovery::types::AgentSource::Project,
+            std::path::Path::new("/keeper.md"),
+        )
+        .expect("parses");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 2,
+        };
+        let direct = AgentConfig::from_agent_definition(&agent, depth);
+        assert!(direct.inherit_global_context);
+        assert_eq!(direct.mutation_tools, Some(vec!["apply_patch".to_string()]));
+        let persona = resolve_step_agent_config(&agent);
+        assert!(persona.inherit_global_context);
+        assert_eq!(
+            persona.mutation_tools,
+            Some(vec!["apply_patch".to_string()])
+        );
+        let via_persona = persona.to_agent_config(depth);
+        assert!(via_persona.inherit_global_context);
+        assert_eq!(
+            via_persona.mutation_tools,
+            Some(vec!["apply_patch".to_string()])
+        );
     }
 }

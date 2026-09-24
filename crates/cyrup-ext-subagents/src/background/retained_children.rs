@@ -99,7 +99,9 @@ pub const MAX_TASK_SUMMARY_LENGTH: usize = 120;
 /// (`:87`) and `isTerminalStepStatus(step.status)` (`:89`) both gate the child's own state. A
 /// cyrup child IS its step row, so both gates are this one conversion over [`StepState`]:
 /// `Pending`/`Running` are refused, the four terminal-or-paused states convert.
-/// `isRetainedChildState` also admits `"partial"`; [`StepState`] has no such member.
+/// `isRetainedChildState` also admits `"partial"`, but `isTerminalStepStatus` does not, and a
+/// cyrup child is its step row — so [`StepState::Partial`] is refused, as upstream's step gate
+/// refuses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetainedChildState {
     /// `complete`.
@@ -135,7 +137,9 @@ impl TryFrom<StepState> for RetainedChildState {
             StepState::Failed => Ok(Self::Failed),
             StepState::Paused => Ok(Self::Paused),
             StepState::Stopped => Ok(Self::Stopped),
-            StepState::Pending | StepState::Running => Err(state),
+            // SUBA-100 — upstream's STEP gate, `isTerminalStepStatus` (`:33-35` @v0.68.0), does
+            // not list `"partial"`, so a partial step is not retained, whatever its run's state.
+            StepState::Pending | StepState::Running | StepState::Partial => Err(state),
         }
     }
 }

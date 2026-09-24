@@ -231,6 +231,45 @@ pub struct Roots {
     /// `Some(root)` for [`Self::sandboxed`], which is the only constructor producing roots no
     /// child can re-derive.
     child_home_override: Option<PathBuf>,
+    /// R-SA-003 — the resolved `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` entries (pi
+    /// `PI_SUBAGENT_EXTRA_AGENT_DIRS`, `agents.ts:2308-2322` @v0.68.0): read-only directories
+    /// discovery scans as the LOWEST-precedence User-tier stream.
+    ///
+    /// A root like the other four, and for the same reason. Two readers need this answer —
+    /// discovery (`SubagentExecutor::discovery_dirs_config`, which prepends these to the user
+    /// agent dirs) and `/subagents`' read-only check (pi `isReadOnlyExtraAgent`,
+    /// `subagents-admin.ts:139-148`) — and they must agree about which agents are extra-dir
+    /// agents. They used to read it separately: discovery straight off `std::env`, the admin
+    /// through the extension's `env_overrides`, with two parsers that differed on blank entries.
+    /// So a pin reached one and not the other, and an agent could be discovered from an extra dir
+    /// while the admin let an edit of it through as if it were the user's own. Both now read THIS
+    /// field of the one `Roots` the session resolved.
+    extra_agent_dirs: Vec<PathBuf>,
+}
+
+/// pi `extraUserAgentDirs` (`agents.ts:2315-2322` @v0.68.0) and the identical split in
+/// `isReadOnlyExtraAgent` (`subagents-admin.ts:143`): `raw.split(path.delimiter).map(trim)
+/// .filter(nonEmpty)`, over [`crate::discovery::EXTRA_AGENT_DIRS_ENV_VAR`]. **The crate's one
+/// parser of that variable** — [`Roots::from_lookup`] is its only caller.
+///
+/// [`std::env::split_paths`] is `path.delimiter` (`:` on Unix, `;` on Windows). Each entry is
+/// trimmed as upstream trims it (a non-UTF-8 entry cannot carry the Unicode whitespace `trim`
+/// removes in a way this could see, so it is kept verbatim), and an entry that is empty after the
+/// trim is dropped — so an unset, empty or all-blank variable is no extra dirs at all, never the
+/// relative empty path (which would scan the process cwd).
+fn extra_agent_dirs_from(env: EnvLookup<'_>) -> Vec<PathBuf> {
+    let Some(raw) = env(crate::discovery::EXTRA_AGENT_DIRS_ENV_VAR) else {
+        return Vec::new();
+    };
+    std::env::split_paths(&raw)
+        .filter_map(|entry| match entry.to_str() {
+            Some(text) => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+            }
+            None => (!entry.as_os_str().is_empty()).then_some(entry),
+        })
+        .collect()
 }
 
 impl Roots {
@@ -277,6 +316,7 @@ impl Roots {
             ),
             home,
             child_home_override: None,
+            extra_agent_dirs: extra_agent_dirs_from(env),
         }
     }
 
@@ -316,7 +356,22 @@ impl Roots {
             run_scratch: root.join(".cyrup").join("subagents"),
             nested_scratch: root.join(".cyrup").join("nested"),
             child_home_override: Some(root.to_path_buf()),
+            // A sandbox has no extra agent dirs: an ambient `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` on
+            // the developer's or CI's machine must not add agents to an isolated test's User
+            // tier. A caller that wants some names them with [`Self::with_extra_agent_dirs`].
+            extra_agent_dirs: Vec::new(),
         }
+    }
+
+    /// These roots with `dirs` as the extra agent dirs, replacing whatever the constructor
+    /// resolved — the in-process pin for R-SA-003, so a caller (a test, an embedder) names the
+    /// directories explicitly instead of moving the process environment. Discovery and the
+    /// `/subagents` read-only check both see exactly `dirs`, because both read
+    /// [`Self::extra_agent_dirs`].
+    #[must_use]
+    pub fn with_extra_agent_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.extra_agent_dirs = dirs;
+        self
     }
 
     /// The home a detached CHILD must be told about, or `None` when it can derive these roots on
@@ -336,6 +391,14 @@ impl Roots {
     #[must_use]
     pub fn agent_dir(&self) -> &Path {
         &self.agent_dir
+    }
+
+    /// R-SA-003 — the extra agent dirs, lowest-precedence User tier first-to-last, in the order
+    /// the variable lists them. Read by discovery AND by `/subagents`' read-only check; see the
+    /// field for why they share this one answer.
+    #[must_use]
+    pub fn extra_agent_dirs(&self) -> &[PathBuf] {
+        &self.extra_agent_dirs
     }
 
     /// The background run-artifact scratch root (async/results trees hang off this).
@@ -565,6 +628,49 @@ mod tests {
 
         // Roots the child can derive itself are NOT handed down.
         assert_eq!(Roots::from_env().child_home_override(), None);
+    }
+
+    /// R-SA-003 — the ONE parser of `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS`, as upstream splits it in
+    /// both of its readers (`agents.ts:2315-2322`, `subagents-admin.ts:143` @v0.68.0): on the
+    /// platform delimiter, each entry trimmed, blanks dropped. `from_lookup` resolves it from the
+    /// SAME lookup as every other root, a sandbox has none, and the builder replaces it.
+    ///
+    /// *Gutted by*: `extra_agent_dirs: Vec::new()` in `from_lookup` (row 1 empty); dropping the
+    /// `trim` (row 1 keeps `" /b "`); dropping the empty filter (the blank variable yields `""`).
+    #[test]
+    fn extra_agent_dirs_are_one_resolved_root() {
+        let joined = if cfg!(windows) {
+            "/a; /b ;;  "
+        } else {
+            "/a: /b ::  "
+        };
+        let roots = Roots::from_lookup(&env(&[
+            ("CYRUP_HOME", "/sandbox"),
+            (crate::discovery::EXTRA_AGENT_DIRS_ENV_VAR, joined),
+        ]));
+        assert_eq!(
+            roots.extra_agent_dirs(),
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+        for blank in ["", "   "] {
+            let roots =
+                Roots::from_lookup(&env(&[(crate::discovery::EXTRA_AGENT_DIRS_ENV_VAR, blank)]));
+            assert!(roots.extra_agent_dirs().is_empty(), "{blank:?}");
+        }
+        assert!(
+            Roots::from_lookup(&env(&[("CYRUP_HOME", "/sandbox")]))
+                .extra_agent_dirs()
+                .is_empty()
+        );
+        let sandbox = Roots::sandboxed(Path::new("/sandbox"));
+        assert!(sandbox.extra_agent_dirs().is_empty());
+        let pinned = sandbox.with_extra_agent_dirs(vec![PathBuf::from("/pinned")]);
+        assert_eq!(pinned.extra_agent_dirs(), [PathBuf::from("/pinned")]);
+        assert_eq!(
+            pinned.home(),
+            Path::new("/sandbox"),
+            "the other roots are kept"
+        );
     }
 
     /// **The crate's one containment predicate, both directions.**

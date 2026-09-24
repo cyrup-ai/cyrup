@@ -10,7 +10,7 @@ use cyrup_core::ModelId;
 
 use crate::discovery::types::SystemPromptMode;
 use crate::error::SubagentError;
-use crate::exec::acceptance::{AcceptanceContract, inject_acceptance_contract};
+use crate::exec::acceptance::AcceptanceContract;
 use crate::exec::agent_config::{AgentConfig, RunOptions};
 use crate::exec::completion_guard_projection;
 use crate::exec::mcp_direct_tools;
@@ -52,6 +52,20 @@ pub struct AttemptSpawnPlan {
     /// Consumed by [`crate::exec::attempt_runner::AttemptRecord`], which carries it up to
     /// [`crate::exec::run_result::SingleResult::tool_surface`] off the WINNING attempt.
     pub tool_surface: crate::exec::tool_surface::ResolvedToolSurface,
+    /// UW-3 — the child-watchdog config this attempt ENCODED into
+    /// [`crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV`] (pi's `childWatchdog`,
+    /// `execution.ts:298-302` @v0.43.0), or `None` when the child runs unarmed (the default).
+    /// Returned alongside the spec rather than re-derived, for the rule [`Self::tool_diagnostic_path`]
+    /// states: the parent's status-event fold filters by the identity in THIS value, so it cannot
+    /// drift from what the child was told. In particular it carries no `childIndex` for an
+    /// unindexed run, where upstream's literal `options.index ?? 0` would reject every event.
+    pub child_watchdog: Option<crate::watchdog::child_status::ChildWatchdogConfig>,
+    /// SUBA-063 — where this attempt told the child to write its runtime-acknowledged extensions
+    /// ([`crate::exec::runtime_acknowledged_extensions::RUNTIME_EXTENSION_ACK_PATH_ENV`], pi
+    /// `runtimeAcknowledgedExtensionsPath`, `pi-args.ts:842-846` @v0.64.0), so the parent reads it
+    /// back when the child closes. Written for EVERY child, as upstream does, and returned alongside
+    /// the spec rather than re-derived for the rule [`Self::tool_diagnostic_path`] states.
+    pub runtime_acknowledged_extensions_path: PathBuf,
 }
 
 /// The reasoning-level suffixes [`apply_thinking_suffix`] recognizes on a model id (pi-subagents
@@ -73,6 +87,12 @@ pub(crate) const THINKING_LEVELS: [&str; 7] =
 /// `before_agent_start`) rather than re-spelled here: the two spellings drifting apart would
 /// silently restore the write-only-flag bug this alias exists to prevent.
 const INHERIT_PROJECT_CONTEXT_ENV: &str = crate::prompt_runtime::INHERIT_PROJECT_CONTEXT_ENV;
+
+/// SUBA-101 — child env flag: whether the subagent inherits the parent's GLOBAL context files
+/// (the agent-dir `AGENTS.md`/`CLAUDE.md`) — pi `PI_SUBAGENT_INHERIT_GLOBAL_CONTEXT`, carried in
+/// `childRuntimeConfig.inheritGlobalContext` (`child-launch.ts:261`, `child-runtime-config.ts:83`
+/// @v0.68.0). Same aliasing rule as above.
+const INHERIT_GLOBAL_CONTEXT_ENV: &str = crate::prompt_runtime::INHERIT_GLOBAL_CONTEXT_ENV;
 
 /// Child env flag: whether the subagent inherits skills discovery — pi
 /// `PI_SUBAGENT_INHERIT_SKILLS` (`runs/shared/pi-args.ts:200`). Same aliasing rule as above.
@@ -182,6 +202,67 @@ pub fn split_known_thinking_suffix(model: &str) -> (&str, &str) {
         model.get(..idx).unwrap_or(model),
         model.get(idx..).unwrap_or(""),
     )
+}
+
+/// SUBA-096 — pi `FAST_MODE_ALLOWED_MODELS` (`runs/shared/child-tool-plan.ts:60-63` @v0.68.0): the
+/// only two models fast mode may run on. Both are in cyrup's own provider catalog
+/// (`cyrup-provider/src/providers/catalog/openai-codex.json`), and the codex driver honours
+/// `service_tier` in the request body.
+pub const FAST_MODE_ALLOWED_MODELS: [&str; 2] =
+    ["openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-sol"];
+
+/// SUBA-096 — the parent half of fast mode: decide, for ONE attempt, whether the child gets the
+/// fast-mode marker ([`crate::prompt_runtime::FAST_MODE_ENV`]), and refuse where pi refuses.
+///
+/// - `fast == false`: nothing (`resolveFastModeExtension`'s `if (!input.fast) return []`).
+/// - the launch denies extensions: pi's `:494` text — fast mode IS a child runtime extension
+///   upstream, and a launch whose capability ceiling forbids extensions must not quietly gain one.
+///   cyrup's child runtime is compiled in rather than loaded, so the refusal is kept for what the
+///   ceiling MEANS, not for how the hook is installed.
+/// - no model: pi's `fast mode requires an explicit supported native OpenAI-Codex model…`.
+/// - a model (thinking suffix stripped, pi `stripThinkingSuffix`) outside
+///   [`FAST_MODE_ALLOWED_MODELS`]: pi's `fast mode supports only …; unsupported model: …`.
+///
+/// **`[CYRUP-DELTA]` granularity.** Upstream checks its ONE launch model (v0.68.0 has no fallback
+/// ladder). cyrup's ladder can reach a model outside the allowlist, so the check is made per
+/// ATTEMPT, against that attempt's model: an attempt on a disallowed model fails with pi's text
+/// and the ladder moves on, rather than one fallback silently running at the default tier or the
+/// whole run being refused for a model it might never use.
+///
+/// # Errors
+/// [`SubagentError::CapabilityCeilingViolation`] for the ceiling refusal,
+/// [`SubagentError::Management`] for the two model refusals — each carrying pi's text verbatim.
+pub fn fast_mode_env(
+    fast: bool,
+    model: &ModelId,
+    agent_name: &str,
+    deny_extensions: bool,
+) -> Result<Option<(String, String)>, SubagentError> {
+    if !fast {
+        return Ok(None);
+    }
+    if deny_extensions {
+        return Err(SubagentError::CapabilityCeilingViolation(
+            "fast mode requires a child runtime extension, but this launch denies extensions."
+                .to_string(),
+        ));
+    }
+    let (base, _) = split_known_thinking_suffix(model.as_str());
+    if base.trim().is_empty() {
+        return Err(SubagentError::Management(format!(
+            "fast mode requires an explicit supported native OpenAI-Codex model for agent '{agent_name}'."
+        )));
+    }
+    if !FAST_MODE_ALLOWED_MODELS.contains(&base) {
+        return Err(SubagentError::Management(format!(
+            "fast mode supports only {}; unsupported model: {base}.",
+            FAST_MODE_ALLOWED_MODELS.join(", ")
+        )));
+    }
+    Ok(Some((
+        crate::prompt_runtime::FAST_MODE_ENV.to_string(),
+        "1".to_string(),
+    )))
 }
 
 /// Append `item` to `vec` only if not already present — the order-preserving de-duplication pi
@@ -478,7 +559,7 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
             .and_then(|ceiling| ceiling.allowed_tools.as_ref()),
         ceiling_deny_extensions,
     );
-    env_orchestration(
+    let child_watchdog = env_orchestration(
         agent,
         opts,
         structured_runtime,
@@ -486,12 +567,32 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         temp_dir,
         &mut env_overlay,
     )?;
+
+    // SUBA-096 — fast mode (pi `resolveFastModeExtension`, `child-tool-plan.ts:151-163`, and the
+    // capability-ceiling refusal at `:494` @v0.68.0). `opts.fast` is the EFFECTIVE value, already
+    // folded `step > call > agent` by the dispatch site. See [`fast_mode_env`].
+    if let Some((key, value)) =
+        fast_mode_env(opts.fast, model, &agent.name, ceiling_deny_extensions)?
+    {
+        env_overlay.insert(key, value);
+    }
     let tool_diagnostic_path = env_control_channels(
         opts,
         temp_dir,
         required_child_tools,
         &surface.effective_mcp_tools,
         &mut env_overlay,
+    );
+    // SUBA-063 — pi `pi-args.ts:842-846` @v0.64.0: EVERY child is told where to write the
+    // extension ids its runtime acknowledged. Inserted unconditionally, which also OVERWRITES an
+    // inherited value, so a nested child can never write into its own parent's capture.
+    let runtime_acknowledged_extensions_path =
+        crate::exec::runtime_acknowledged_extensions::runtime_acknowledged_extensions_path_in(
+            temp_dir,
+        );
+    env_overlay.insert(
+        crate::exec::runtime_acknowledged_extensions::RUNTIME_EXTENSION_ACK_PATH_ENV.to_string(),
+        runtime_acknowledged_extensions_path.display().to_string(),
     );
 
     // An injected binary must reach the child's ENVIRONMENT as well as its argv. A child that
@@ -545,6 +646,8 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         // Carried out of the resolver rather than re-resolved here: this IS the value the
         // `--tools` CSV in `args` above was built from.
         tool_surface: surface,
+        child_watchdog,
+        runtime_acknowledged_extensions_path,
     })
 }
 
@@ -553,8 +656,9 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
 ///
 /// Resolved FIRST, before any argv or env is built, because a ceiling is an upper bound on what
 /// this subtree may do and the only useful place to enforce it is before a child exists. The
-/// resolution intersects the INHERITED ceiling (this process's own
-/// `CYRUP_SUBAGENT_CAPABILITY_CEILING_V1`, which a parent wrote when it spawned us) with every
+/// resolution intersects the INHERITED ceiling (`CYRUP_SUBAGENT_CAPABILITY_CEILING_V1`, which a
+/// parent wrote when it spawned us, read through [`RunOptions::parent_env_var`] — the launching
+/// extension's `env_overrides`, then this process) with every
 /// ceiling registered for this session, so it can only ever tighten as the tree deepens.
 ///
 /// Both arms are fail-CLOSED: a malformed inherited ceiling is an error, not "unbounded".
@@ -570,10 +674,12 @@ fn preflight_capability_ceiling(
     agent: &AgentConfig,
     opts: &RunOptions,
 ) -> Result<Option<crate::exec::capability_ceiling::ResolvedCapabilityCeiling>, SubagentError> {
-    let capability_ceiling = crate::exec::capability_ceiling::resolve_current_capability_ceiling(
-        opts.parent_session_id.as_deref(),
-    )
-    .map_err(SubagentError::CapabilityCeilingViolation)?;
+    let capability_ceiling =
+        crate::exec::capability_ceiling::resolve_current_capability_ceiling_from(
+            opts.parent_session_id.as_deref(),
+            &|key| opts.parent_env_var(key),
+        )
+        .map_err(SubagentError::CapabilityCeilingViolation)?;
     crate::exec::capability_ceiling::assert_agent_allowed(
         agent.name.as_str(),
         capability_ceiling.as_ref(),
@@ -938,6 +1044,19 @@ fn env_identity_and_depth(
         }
         .to_string(),
     );
+    // SUBA-101 — pi `inheritGlobalContext: input.inheritGlobalContext` into the child runtime
+    // config (`child-launch.ts:261` @v0.68.0), read child-side by the prompt rewrite
+    // (`subagent-prompt-runtime.ts:530-536`). Written for EVERY child, `1`/`0`, beside the project
+    // flag: independent of it, and an absent var would read as "inherit" (`?? true`).
+    env_overlay.insert(
+        INHERIT_GLOBAL_CONTEXT_ENV.to_string(),
+        if agent.inherit_global_context {
+            "1"
+        } else {
+            "0"
+        }
+        .to_string(),
+    );
     env_overlay.insert(
         INHERIT_SKILLS_ENV.to_string(),
         if agent.inherit_skills { "1" } else { "0" }.to_string(),
@@ -1000,6 +1119,9 @@ fn env_identity_and_depth(
 /// the child watchdog config, the intercom child bridge plus its native supervisor channel,
 /// the structured-output runtime, and the two encoded blobs (tool budget, capability ceiling).
 /// Every key here is a function of the RUN, not of the agent alone.
+///
+/// Returns the child-watchdog config it encoded (UW-3), so the caller carries the SAME value out on
+/// [`AttemptSpawnPlan::child_watchdog`].
 fn env_orchestration(
     agent: &AgentConfig,
     opts: &RunOptions,
@@ -1008,7 +1130,7 @@ fn env_orchestration(
     // SUBA-073 — this attempt's scratch dir, the default home of the permission audit log.
     temp_dir: &std::path::Path,
     env_overlay: &mut std::collections::HashMap<String, String>,
-) -> Result<(), SubagentError> {
+) -> Result<Option<crate::watchdog::child_status::ChildWatchdogConfig>, SubagentError> {
     // R-SA-P1 (port doc §4 P-4): the canonical parent-session anchor. Precedence: EXPLICIT (the
     // launching session's own id, resolved at the root's SessionStart via P-2 and threaded through
     // `opts.parent_session_id`) → INHERITED (this process's own `CYRUP_SUBAGENT_PARENT_SESSION`, so a
@@ -1038,6 +1160,7 @@ fn env_orchestration(
     // Resolved from the CHILD's cwd (`step.cwd ?? ctx.cwd`, `subagent-runner.ts:1309`) so a run in a
     // different project reads that project's settings, and a settings-parse failure simply yields no
     // child watchdog rather than failing the spawn (upstream's `watchdogConfig.ok` guard).
+    let mut child_watchdog = None;
     {
         let watchdog_cwd = opts.cwd.as_path();
         let resolved = crate::watchdog::settings::resolve_watchdog_config(watchdog_cwd, None);
@@ -1055,6 +1178,7 @@ fn env_orchestration(
                 crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV.to_string(),
                 encoded,
             );
+            child_watchdog = Some(child_config);
         }
     }
 
@@ -1158,6 +1282,23 @@ fn env_orchestration(
             crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV.to_string(),
             runtime.output_path.display().to_string(),
         );
+        // SUBA-105 — pi `structuredOutput.acceptanceReport: acceptanceReportRequired ? "required"
+        // : "optional"`, present only with an `acceptanceReportPath` (`child-launch.ts:276-278`
+        // @v0.68.0). The pair arms the child tool's `acceptanceReport` parameter; absent (the
+        // step's `acceptance.report` is `off`), the tool has none.
+        if let (Some(path), Some(mode)) = (
+            runtime.acceptance_report_path.as_ref(),
+            runtime.acceptance_report_mode(),
+        ) {
+            env_overlay.insert(
+                crate::exec::structured::STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_ENV.to_string(),
+                path.display().to_string(),
+            );
+            env_overlay.insert(
+                crate::exec::structured::STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_MODE_ENV.to_string(),
+                mode.as_str().to_string(),
+            );
+        }
     }
 
     // pi `pi-args.ts` ships the resolved tool budget to the child in `PI_SUBAGENT_TOOL_BUDGET`
@@ -1241,7 +1382,7 @@ fn env_orchestration(
             ceiling,
         );
     }
-    Ok(())
+    Ok(child_watchdog)
 }
 
 /// The CONTROL-CHANNEL half of the child env overlay, applied last: the SUBA-045
@@ -1404,7 +1545,17 @@ pub(crate) fn build_task_text(
     contract: &AcceptanceContract,
     skill_injection: &str,
 ) -> String {
-    let with_acceptance = inject_acceptance_contract(task, contract);
+    // SUBA-105 — pi `formatAcceptancePrompt(effectiveAcceptance, { …, structuredOutput:
+    // Boolean(options.structuredOutput?.acceptanceReportPath) })` (`execution.ts:1769` @v0.68.0):
+    // a step with an `outputSchema` whose `acceptance.report` is not `off` is told to put its
+    // report in the `structured_output` call instead of a fenced block.
+    let structured_acceptance_report = opts.structured_output_schema.is_some()
+        && contract.report_mode != crate::exec::acceptance::model::AcceptanceReportMode::Off;
+    let with_acceptance = crate::exec::acceptance::inject_acceptance_contract_for(
+        task,
+        contract,
+        structured_acceptance_report,
+    );
     let capabilities = completion_guard_projection(agent);
     let with_output_path = inject_single_output_instruction(
         &with_acceptance,
@@ -1415,10 +1566,21 @@ pub(crate) fn build_task_text(
     // BEFORE `injectSingleOutputInstruction` (`:3874`) — so the read line is the FIRST thing in the
     // task text, ahead of every other injected block. Prepending here rather than threading it
     // through the injectors keeps that ordering true whatever else is appended later.
-    let reads_instruction = opts.reads.as_deref().map_or_else(String::new, |reads| {
-        crate::spawn::chain_graph::build_single_reads_instruction(reads, &opts.cwd)
-    });
-    let body = if skill_injection.is_empty() {
+    //
+    // SUBA-100 — pi `readPaths = !foregroundMachine && …` (`subagent-executor.ts:3941` @v0.68.0):
+    // a placed child's reads name files ON THE MACHINE, which the local existence filter cannot
+    // see, so a placed run carries no read line at all.
+    let reads_instruction = opts
+        .reads
+        .as_deref()
+        .filter(|_| opts.machine.is_none())
+        .map_or_else(String::new, |reads| {
+            crate::spawn::chain_graph::build_single_reads_instruction(reads, &opts.cwd)
+        });
+    // SUBA-100 — a placed child's skills are resolved ON THE MACHINE into its system prompt
+    // (`resolveRemoteHerdrResources`, `herdr-pi-bridge.ts:38-40` @v0.68.0); the launching side's
+    // pointer block names files that exist only here.
+    let body = if skill_injection.is_empty() || opts.machine.is_some() {
         with_output_path
     } else {
         format!("{with_output_path}\n\n{skill_injection}")
@@ -4937,6 +5099,93 @@ mod tests {
         );
     }
 
+    fn fast_plan(model: &str, fast: bool) -> Result<AttemptSpawnPlan, SubagentError> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config(model, &[]);
+        let mut opts = base_opts(dir.path(), &[model]);
+        opts.fast = fast;
+        build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from(model),
+            "task",
+            &opts,
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            dir.path(),
+            None,
+        )
+    }
+
+    /// SUBA-096 — pi `resolveFastModeExtension` (`child-tool-plan.ts:151-163` @v0.68.0): outside
+    /// the two allowlisted OpenAI-Codex models, a fast launch is REFUSED with pi's text, never run
+    /// at the default tier. Mutation killed: dropping the allowlist check (the plan builds).
+    #[test]
+    fn fast_rejects_a_model_outside_the_allowlist() {
+        let Err(error) = fast_plan("anthropic/claude-sonnet-4:high", true) else {
+            panic!("a non-codex model must be refused in fast mode");
+        };
+        assert_eq!(
+            error.to_string(),
+            SubagentError::Management(
+                "fast mode supports only openai-codex/gpt-5.6-luna, openai-codex/gpt-5.6-sol; \
+                 unsupported model: anthropic/claude-sonnet-4."
+                    .to_string()
+            )
+            .to_string()
+        );
+    }
+
+    /// SUBA-096 — the marker is written iff the effective flag is `true` and the model (thinking
+    /// suffix stripped) is allowlisted. Mutation killed: writing the marker unconditionally, or
+    /// failing to strip the `:high` suffix before the allowlist check.
+    #[test]
+    fn fast_writes_the_env_marker_only_when_true() {
+        let plan = fast_plan("openai-codex/gpt-5.6-luna:high", true).expect("allowlisted");
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(crate::prompt_runtime::FAST_MODE_ENV)
+                .map(String::as_str),
+            Some("1")
+        );
+        let plan = fast_plan("openai-codex/gpt-5.6-luna", false).expect("not fast");
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(crate::prompt_runtime::FAST_MODE_ENV)
+        );
+        // A disallowed model is irrelevant when fast is off.
+        assert!(fast_plan("anthropic/claude-sonnet-4", false).is_ok());
+    }
+
+    /// SUBA-096 — pi `child-tool-plan.ts:494`: a launch whose ceiling denies extensions cannot
+    /// gain the fast-mode extension. Mutation killed: dropping the `deny_extensions` arm.
+    #[test]
+    fn fast_is_refused_when_the_launch_denies_extensions() {
+        let Err(error) = fast_mode_env(
+            true,
+            &ModelId::from("openai-codex/gpt-5.6-sol"),
+            "worker",
+            true,
+        ) else {
+            panic!("denyExtensions must refuse fast mode");
+        };
+        assert!(error.to_string().contains(
+            "fast mode requires a child runtime extension, but this launch denies extensions."
+        ));
+        assert!(
+            fast_mode_env(true, &ModelId::from(""), "worker", false)
+                .expect_err("no model")
+                .to_string()
+                .contains(
+                    "fast mode requires an explicit supported native OpenAI-Codex model for agent 'worker'."
+                )
+        );
+    }
+
     /// The override reaches argv. A persona asking for `thinking: high` whose fork came back
     /// sanitized launches with `:off` — the whole point of resolving the override at all.
     #[test]
@@ -5196,6 +5445,42 @@ mod tests {
             plan.spec.env_overlay.get(AGENT_NAME_ENV_VAR),
             Some(&"worker".to_string())
         );
+    }
+
+    /// SUBA-101 — the child is told its global-context inheritance as `1`/`0`, independently of
+    /// the project flag. Mutation killed: dropping the insert (the var is absent and the child
+    /// reads "inherit"), or keying it off `inherit_project_context`.
+    #[test]
+    fn build_attempt_spawn_plan_threads_inherit_global_context_independently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        for (project, global) in [(true, false), (false, true), (true, true), (false, false)] {
+            let mut agent = sample_agent_config("m1", &[]);
+            agent.inherit_project_context = project;
+            agent.inherit_global_context = global;
+            let plan = build_attempt_spawn_plan(
+                &agent,
+                &ModelId::from("m1"),
+                "t",
+                &opts,
+                depth,
+                dir.path(),
+                None,
+            )
+            .expect("plan builds");
+            assert_eq!(
+                plan.spec
+                    .env_overlay
+                    .get("CYRUP_SUBAGENT_INHERIT_GLOBAL_CONTEXT")
+                    .map(String::as_str),
+                Some(if global { "1" } else { "0" }),
+                "project={project} global={global}"
+            );
+        }
     }
 
     #[test]

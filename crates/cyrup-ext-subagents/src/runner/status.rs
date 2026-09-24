@@ -200,6 +200,10 @@ pub struct ExternalCliRunnerStatus {
     /// The per-adapter sandbox block; absent for the generic adapter (upstream spreads nothing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safety: Option<Value>,
+    /// SUBA-100 — the saved Herdr machine a placed run ran on (`...(input.machine ? { machine } :
+    /// {})`, `external-cli-contract.ts:107` @v0.68.0); absent for a local run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<crate::placement::HerdrMachineReference>,
     /// The fixed capability envelope.
     pub capabilities: ExternalCliCapabilities,
     /// One reason per narrowable capability.
@@ -299,6 +303,7 @@ pub fn resolve_external_cli_runner_status(
         prompt_delivery: delivery.wire().to_string(),
         adapter: ExternalCliAdapterDescriptor::new(id),
         safety: safety_receipt(id),
+        machine: None,
         capabilities: ExternalCliCapabilities::default(),
         non_resumable_reason: unsupported_reasons.resume.clone(),
         unsupported_reasons,
@@ -330,6 +335,15 @@ pub fn normalize_external_cli_runner_status(value: &Value) -> Option<ExternalCli
             .collect(),
         _ => Vec::new(),
     };
+    // SUBA-100 — `input.machine` read back as the placed run's machine (`:131-133` @v0.68.0).
+    // Upstream trusts any object there; the typed read refuses one that is not a Herdr reference
+    // rather than carrying an arbitrary blob into the rebuilt status.
+    let machine = object
+        .get("machine")
+        .filter(|value| value.is_object())
+        .and_then(|value| {
+            serde_json::from_value::<crate::placement::HerdrMachineReference>(value.clone()).ok()
+        });
     let adapter_id = object
         .get("adapter")
         .and_then(Value::as_object)
@@ -345,13 +359,17 @@ pub fn normalize_external_cli_runner_status(value: &Value) -> Option<ExternalCli
             prompt_delivery: PromptDeliveryKind::PromptFile.wire().to_string(),
             adapter: ExternalCliAdapterDescriptor::new(ReceiptAdapterId::LegacyGrokBuild),
             safety: None,
+            machine,
             capabilities: ExternalCliCapabilities::default(),
             non_resumable_reason: unsupported_reasons.resume.clone(),
             unsupported_reasons,
         });
     }
     let adapter = adapter_id.and_then(|id| AdapterId::try_from(id).ok());
-    Some(resolve_external_cli_runner_status(adapter, command, &args))
+    Some(ExternalCliRunnerStatus {
+        machine,
+        ..resolve_external_cli_runner_status(adapter, command, &args)
+    })
 }
 
 /// `ExternalProcessStatus` (`shared/types.ts:1772-1786`) — what the foreign process actually did.

@@ -94,10 +94,18 @@ pub(super) async fn write_shared_status(
 /// telemetry sender is dropped (the step loop finished and released the executor), which the caller
 /// awaits BEFORE writing the terminal record so no late telemetry write races the terminal
 /// `status.json`.
+///
+/// It is also the run's child-event JOURNAL (pi `appendChildEvent`, `subagent-runner.ts:590-622`
+/// @v0.43.0): every raw line is first appended to `events.jsonl` as a capped DIAGNOSTIC line
+/// through `events` ([`super::events::journal_child_line`]), before it is folded. Upstream does the
+/// same, in the same order (`appendChildEvent(event)` precedes the fold at `:621`). `events` is
+/// this task's own handle on the file; `None` when it could not be opened, which skips the journal
+/// and nothing else.
 pub(super) fn spawn_telemetry_task(
     run_paths: RunPaths,
     shared: SharedStatus,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<TelemetryMsg>,
+    mut events: Option<crate::jsonl::RunEventLog>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -108,6 +116,49 @@ pub(super) fn spawn_telemetry_task(
                     let Some(TelemetryMsg { flat_index, raw }) = message else {
                         break; // every sender dropped — the run's step loop has finished
                     };
+                    let provenance = {
+                        let status = lock_status(&shared);
+                        status.steps.get(flat_index).map(|step| {
+                            (status.run_id.as_str().to_string(), step.agent.clone())
+                        })
+                    };
+                    if let Some((run_id, agent)) = provenance {
+                        super::events::journal_child_line(
+                            &mut events,
+                            &raw,
+                            &super::events::ChildEventContext {
+                                run_id: &run_id,
+                                step_index: flat_index,
+                                agent: &agent,
+                            },
+                        )
+                        .await;
+                    }
+                    // UW-3 — pi `updateStepFromChildEvent`'s watchdog branch
+                    // (`subagent-runner.ts:2711-2722` @v0.43.0): `step.watchdog` in status.json.
+                    let watchdog = {
+                        let mut status = lock_status(&shared);
+                        let run_id = status.run_id.as_str().to_string();
+                        let now = crate::time::now_epoch_millis();
+                        let folded = status.steps.get_mut(flat_index).and_then(|step| {
+                            crate::background::apply_child_watchdog_line_to_step(
+                                step, &raw, &run_id, flat_index, now,
+                            )
+                        });
+                        if folded == Some(true) {
+                            status.telemetry.last_activity_at = Some(now);
+                            status.sync_top_level_telemetry(flat_index);
+                        }
+                        folded
+                    };
+                    match watchdog {
+                        Some(true) => {
+                            let _ = write_shared_status(&run_paths, &shared).await;
+                            continue;
+                        }
+                        Some(false) => continue,
+                        None => {}
+                    }
                     let Some(event) = crate::exec::ndjson::parse_line(&raw) else {
                         continue; // R-SA-026: a non-event line is tolerated, never fatal
                     };
@@ -316,6 +367,23 @@ pub(super) fn mark_step_running(status: &mut RunStatus, index: usize) {
     }
 }
 
+/// SUBA-100 — a settled step's state is pi's ladder (`subagent-runner.ts:3804,4224,4717`
+/// @v0.68.0): `… timedOut ? "failed" : … execution?.status === "partial" ? "partial" : exitCode
+/// === 0 ? "complete" : "failed"` (the stop and interrupt rungs are settled elsewhere here).
+pub(super) fn settled_step_state(result: &StepResult) -> StepState {
+    if result.success {
+        StepState::Complete
+    } else if !result.timed_out
+        && result.execution.is_some_and(|execution| {
+            execution.status == crate::exec::run_result::ExecutionStatus::Partial
+        })
+    {
+        StepState::Partial
+    } else {
+        StepState::Failed
+    }
+}
+
 /// Fold one completed step's [`StepResult`] (and, for a group step, its
 /// [`crate::spawn::chain_graph::GroupStepResult`]'s own per-child detail) back into the flat
 /// `status.steps` slots `slots` names, plus `status.parallel_groups`.
@@ -359,11 +427,7 @@ pub(super) fn record_step_outcome(
                 entry.ended_at = Some(now);
                 match child {
                     Some(outcome) => {
-                        entry.status = if outcome.success {
-                            StepState::Complete
-                        } else {
-                            StepState::Failed
-                        };
+                        entry.status = settled_step_state(outcome);
                         entry.error = outcome.error.clone();
                         // The member's real telemetry (SCOPE_3a): pi's per-member settle writes
                         // the child's own usage/model/session onto its step entry
@@ -388,6 +452,24 @@ pub(super) fn record_step_outcome(
                             entry.transcript_path = Some(path);
                         }
                         entry.transcript_error = outcome.transcript_error.clone();
+                        // UW-3 — pi `setOptionalProperty(…, "watchdog", singleResult.watchdog)`
+                        // (`subagent-runner.ts:3895`): kept when the result has none, as
+                        // `setOptionalProperty` leaves an undefined value unwritten.
+                        if let Some(watchdog) = outcome.watchdog.clone() {
+                            entry.watchdog = Some(watchdog);
+                        }
+                        // SUBA-063 — pi `setOptionalProperty(…, "runtimeAcknowledgedExtensions",
+                        // singleResult.runtimeAcknowledgedExtensions)` (`subagent-runner.ts:4253`
+                        // @v0.68.0), with `setOptionalProperty`'s leave-unwritten-when-undefined.
+                        if let Some(acknowledged) = outcome.runtime_acknowledged_extensions.clone()
+                        {
+                            entry.runtime_acknowledged_extensions = Some(acknowledged);
+                        }
+                        // SUBA-100 — the member's placed-run Git evidence (pi
+                        // `nativeMachine: finalResult?.nativeMachine`, `subagent-runner.ts:1579`).
+                        if let Some(evidence) = outcome.native_machine.clone() {
+                            entry.native_machine = Some(evidence);
+                        }
                     }
                     None => {
                         entry.status = StepState::Failed;
@@ -402,11 +484,7 @@ pub(super) fn record_step_outcome(
         // doc says a zero-width group contributes nothing), so this is a guard, not a live branch.
         None if !slots.is_empty() => {
             if let Some(entry) = status.steps.get_mut(index) {
-                entry.status = if result.success {
-                    StepState::Complete
-                } else {
-                    StepState::Failed
-                };
+                entry.status = settled_step_state(result);
                 entry.ended_at = Some(now);
                 entry.error = result.error.clone();
                 // Same six lines as the per-member arm above — the aggregate/single-slot shape
@@ -429,6 +507,19 @@ pub(super) fn record_step_outcome(
                     entry.transcript_path = Some(path);
                 }
                 entry.transcript_error = result.transcript_error.clone();
+                // UW-3 — pi `subagent-runner.ts:3508`/`:4248` on the single-slot shape.
+                if let Some(watchdog) = result.watchdog.clone() {
+                    entry.watchdog = Some(watchdog);
+                }
+                // SUBA-063 — pi `subagent-runner.ts:3834`/`:4738` @v0.68.0 on the single-slot
+                // shape (see the per-member arm above).
+                if let Some(acknowledged) = result.runtime_acknowledged_extensions.clone() {
+                    entry.runtime_acknowledged_extensions = Some(acknowledged);
+                }
+                // SUBA-100 — on the single-slot shape too.
+                if let Some(evidence) = result.native_machine.clone() {
+                    entry.native_machine = Some(evidence);
+                }
             }
         }
         None => {}
@@ -446,11 +537,7 @@ pub(super) fn record_step_outcome(
                 s.ended_at = Some(now);
                 match child {
                     Some(outcome) => {
-                        s.status = if outcome.success {
-                            StepState::Complete
-                        } else {
-                            StepState::Failed
-                        };
+                        s.status = settled_step_state(outcome);
                         s.error = outcome.error.clone();
                         // The same six fields the per-member arm writes onto `status.steps` —
                         // without them a `parallel_groups` reader sees zeros while `steps` sees
@@ -498,6 +585,212 @@ mod tests {
         flat_base, flat_range, flat_total, pending_step_statuses_for,
     };
     use crate::background::{RunId, RunMode, RunState};
+
+    fn watchdog_line(run: &str, agent: &str, index: u64, seq: u64, phase: &str) -> String {
+        serde_json::json!({
+            "type": "subagent.watchdog.status",
+            "runId": run,
+            "agent": agent,
+            "childIndex": index,
+            "stepIndex": index,
+            "seq": seq,
+            "phase": phase,
+            "ts": 5_i64,
+            "followUpPending": false,
+        })
+        .to_string()
+    }
+
+    /// SUBA-100 — pi's step ladder (`subagent-runner.ts:3804` @v0.68.0): a step whose result
+    /// settled `execution.status: "partial"` is `partial`, not `failed` — unless it timed out —
+    /// and its placed-run Git evidence lands on the step.
+    ///
+    /// *Gutted by*: the `StepState::Partial` arm of `settled_step_state`, or the `native_machine`
+    /// copy in `record_step_outcome`.
+    #[test]
+    fn a_partial_execution_settles_its_step_partial_with_its_machine_evidence() {
+        let mut result = StepResult::failure("unverified");
+        result.execution = Some(crate::exec::run_result::ExecutionOutcome::partial());
+        result.native_machine = Some(crate::placement::native::NativeMachineEvidence::new("m-1"));
+        let mut status =
+            RunStatus::queued(RunId::from_token("run-partialstep"), RunMode::Single, None);
+        status.steps = vec![crate::background::StepStatus::pending("worker")];
+        let step = RunnerStep::SingleStep(single_step("worker", "t"));
+        record_step_outcome(&mut status, &(0..1), &step, &result, None);
+        assert_eq!(status.steps[0].status, StepState::Partial);
+        assert_eq!(
+            status.steps[0]
+                .native_machine
+                .as_ref()
+                .map(|e| e.machine_id.as_str()),
+            Some("m-1")
+        );
+        let mut timed_out = result.clone();
+        timed_out.timed_out = true;
+        assert_eq!(settled_step_state(&timed_out), StepState::Failed);
+    }
+
+    /// SUBA-100 — the PER-MEMBER arm of `record_step_outcome` (a parallel group owning one flat
+    /// slot per member): each member's placed-run Git evidence (pi `nativeMachine:
+    /// finalResult?.nativeMachine`, `subagent-runner.ts:1579` @v0.68.0) lands on that member's
+    /// own status entry, and a partial member settles `Partial` — never on a sibling, and a
+    /// member with no evidence keeps none.
+    ///
+    /// *Gutted by*: the `native_machine` copy in the per-member arm.
+    #[test]
+    fn a_parallel_members_machine_evidence_lands_on_its_own_flat_entry() {
+        let mut status = RunStatus::queued(
+            RunId::from_token("flatgroupmach".to_string()),
+            RunMode::Parallel,
+            Some(1),
+        );
+        status.state = RunState::Running;
+        let group_step = RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
+            steps: vec![single_step("alpha", "a"), single_step("beta", "b")],
+            concurrency: 2,
+            fail_fast: false,
+            worktree: false,
+            lane: None,
+        });
+        status.steps = crate::background::flat_index::pending_step_statuses_for(&group_step);
+
+        let mut placed = StepResult::failure("unverified");
+        placed.execution = Some(crate::exec::run_result::ExecutionOutcome::partial());
+        placed.native_machine = Some(crate::placement::native::NativeMachineEvidence::new("m-a"));
+        let group_result = crate::spawn::chain_graph::GroupStepResult {
+            handoff: None,
+            aggregate: StepResult::failure("1 of 2 group step(s) failed or were skipped"),
+            children: vec![
+                Some(placed),
+                Some(StepResult::success(Some("out-b".to_string()), None)),
+            ],
+            fail_fast_skipped: vec![false, false],
+        };
+        let aggregate = group_result.aggregate.clone();
+        record_step_outcome(
+            &mut status,
+            &(0..2),
+            &group_step,
+            &aggregate,
+            Some(&group_result),
+        );
+
+        assert_eq!(status.steps[0].status, StepState::Partial);
+        assert_eq!(
+            status.steps[0]
+                .native_machine
+                .as_ref()
+                .map(|e| e.machine_id.as_str()),
+            Some("m-a"),
+            "{:?}",
+            status.steps
+        );
+        assert_eq!(status.steps[1].status, StepState::Complete);
+        assert!(
+            status.steps[1].native_machine.is_none(),
+            "a sibling never picks up another member's evidence"
+        );
+    }
+
+    /// UW-3 — pi `updateStepFromChildEvent`'s watchdog branch (`subagent-runner.ts:2711-2722`
+    /// @v0.43.0): an accepted status line lands on `step.watchdog` in `status.json` and bumps the
+    /// step's activity; a line for another step's index, or a replayed older one, is rejected and
+    /// changes nothing; any other line is not this branch's. Killing mutations: dropping the
+    /// status.json fold (`step.watchdog` stays `None`); dropping the identity filter (the index-3
+    /// line is accepted).
+    #[test]
+    fn a_child_watchdog_status_line_lands_on_the_status_step() {
+        let mut step = crate::background::StepStatus::pending("scout");
+        let run = "wdrun0000001";
+        assert_eq!(
+            crate::background::apply_child_watchdog_line_to_step(
+                &mut step,
+                &watchdog_line(run, "scout", 3, 1, "reviewing"),
+                run,
+                2,
+                10,
+            ),
+            Some(false),
+            "another step's index is not this step's watchdog"
+        );
+        assert!(step.watchdog.is_none());
+        assert_eq!(
+            crate::background::apply_child_watchdog_line_to_step(
+                &mut step,
+                &watchdog_line(run, "scout", 2, 2, "reviewing"),
+                run,
+                2,
+                11,
+            ),
+            Some(true)
+        );
+        let folded = step.watchdog.clone().expect("folded");
+        assert_eq!(
+            folded.phase,
+            crate::watchdog::child_status::ChildWatchdogPhase::Reviewing
+        );
+        assert_eq!(step.telemetry.last_activity_at, Some(11));
+        assert_eq!(
+            crate::background::apply_child_watchdog_line_to_step(
+                &mut step,
+                &watchdog_line(run, "scout", 2, 1, "idle"),
+                run,
+                2,
+                12,
+            ),
+            Some(false),
+            "a replayed older seq cannot walk the phase back"
+        );
+        assert_eq!(step.watchdog, Some(folded));
+        assert_eq!(
+            crate::background::apply_child_watchdog_line_to_step(
+                &mut step,
+                "{\"type\":\"turn_start\"}",
+                run,
+                2,
+                13,
+            ),
+            None
+        );
+    }
+
+    /// UW-3 — the settled attempt's watchdog view (which carries the PARENT's own `stale` /
+    /// `timedOut` mark when its tail fired, a fact no child line carries) overwrites the live
+    /// fold at settle, as pi's `setOptionalProperty(step, "watchdog", singleResult.watchdog)`
+    /// (`subagent-runner.ts:3508` @v0.43.0), and survives onto the step's terminal
+    /// `SingleResult`. Killing mutations: not copying `result.watchdog` in `record_step_outcome`;
+    /// `step_result_to_single_result_with` publishing `None`.
+    #[test]
+    fn the_settled_watchdog_view_reaches_the_status_step_and_the_result() {
+        let mut status = RunStatus::queued(
+            RunId::from_token("wdsettle0001".to_string()),
+            RunMode::Single,
+            Some(1),
+        );
+        status.state = RunState::Running;
+        let step = RunnerStep::SingleStep(single_step("scout", "look"));
+        status.steps = crate::background::flat_index::pending_step_statuses_for(&step);
+        let stale = crate::watchdog::child_status::ChildWatchdogStateSnapshot {
+            phase: crate::watchdog::child_status::ChildWatchdogPhase::Stale,
+            seq: 2,
+            last_update: 7,
+            follow_up_pending: false,
+            reason: Some("child watchdog tail timeout".to_string()),
+            timed_out: Some(true),
+        };
+        let mut result = crate::spawn::chain_graph::StepResult::success(Some("done".into()), None);
+        result.watchdog = Some(stale.clone());
+        record_step_outcome(&mut status, &(0..1), &step, &result, None);
+        assert_eq!(status.steps[0].watchdog, Some(stale.clone()));
+        let single = super::super::settle::step_result_to_single_result_with(
+            super::super::settle::ResultIdentity {
+                agent: "scout".to_string(),
+                task: "look".to_string(),
+            },
+            &result,
+        );
+        assert_eq!(single.watchdog, Some(stale));
+    }
 
     /// SUBA-093 — a `ParallelGroup`'s per-member outcomes land on the members' OWN flat status
     /// entries, not collapsed onto one entry for the whole group (pi's per-member settle,
@@ -857,6 +1150,11 @@ mod tests {
     #[test]
     fn promoting_stopped_children_leaves_already_settled_ones_alone() {
         let settled = |agent: &str, interrupted: bool, output: Option<&str>| SingleResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            skills_warning: None,
+            watchdog: None,
             // SUBA-021: no usage budget on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

@@ -30,7 +30,8 @@ impl SubagentExecutor {
     /// `<root>/.cyrup/agents` dir; the primary `~/.cyrup/agents` plus the "second" `~/.agents` user
     /// dir; **separate** `.cyrup/chains` chain dirs at each scope (never the shared agents dir); the
     /// bundled builtin-persona resource root ([`builtin_agents_dir`], R-SA-020/132/134); and
-    /// R-SA-003's `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` extras (prepended, lowest User-tier precedence).
+    /// R-SA-003's `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` extras as `roots` resolved them
+    /// ([`crate::paths::Roots::extra_agent_dirs`]; prepended, lowest User-tier precedence).
     ///
     /// # Package tier (Tier-2 wire-up)
     ///
@@ -69,8 +70,12 @@ impl SubagentExecutor {
         //
         // A malformed `projectRootResolution` at either consulted root ABORTS (R-SA-009) rather than
         // silently degrading to "nearest" — which is why this function now returns a `Result`.
-        let project_root = crate::discovery::find_configured_project_root(cwd)?
-            .unwrap_or_else(|| cwd.to_path_buf());
+        // #84 — the session's resolved user root is excluded from the walk exactly as upstream
+        // excludes `os.homedir()` (`agents.ts:833-854` @v0.68.0): it holds user configuration, never
+        // an implicit project.
+        let project_root =
+            crate::discovery::find_configured_project_root_excluding(cwd, &[roots.home()])?
+                .unwrap_or_else(|| cwd.to_path_buf());
         let installed_packages = enumerate_installed_packages(&global_dir, Some(&project_root));
         // Per-scope read dirs from the shared topology helpers (pi resolveNearestProject*Dirs /
         // discoverAgents userDir old+new / getUserChainDir): legacy `.agents` + preferred
@@ -89,8 +94,12 @@ impl SubagentExecutor {
             ..AgentDiscoveryConfig::default()
         }
         // R-SA-003: fold in `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` — PREPENDED ahead of the user dirs
-        // (extras are the lowest-precedence User-tier stream), so the user's own agents win.
-        .with_env_extras())
+        // (extras are the lowest-precedence User-tier stream), so the user's own agents win. Taken
+        // from `roots`, the session's ONE resolution of the variable, never re-read from the
+        // environment here: `/subagents`' read-only check reads the same field of the same roots
+        // (`extension/host/slash_admin.rs`), so the two cannot disagree about which agents came
+        // from an extra dir.
+        .with_prepended_user_extras(roots.extra_agent_dirs().to_vec()))
     }
 
     /// Build a real, fully-populated [`AgentDiscoveryConfig`] scoped to `cwd`: the directory/package
@@ -147,14 +156,25 @@ impl SubagentExecutor {
         // settings file that does not exist while its agents came from the real project root, and it
         // made `subagents.projectRootResolution` unobservable: the very setting that MOVES the root
         // lives in the file the root selects.
+        //
+        // #84 — and it is `null` when that search finds NO project root
+        // (`getProjectAgentSettingsPath`, `agents.ts:914-917` @v0.68.0: `projectRoot ?
+        // path.join(…) : null`). `cfg.project_root` cannot answer that question: it falls back to
+        // `cwd` when the search comes up empty (so package roots still resolve), which made this
+        // path `Some` for EVERY cwd — so `/subagents` offered a project scope outside any project,
+        // `disable`/`enable`/`reset` accepted `agentScope: "project"` there instead of pi's refusal,
+        // and a `<cwd>/.cyrup/agents/settings.json` nobody created was read as project settings.
+        // The search is re-run here rather than threaded through `AgentDiscoveryConfig`, whose
+        // `project_root` keeps its fallback for the package/dir consumers that want it.
         let project_settings =
-            crate::discovery::project_settings_path(cfg.project_root.as_deref().unwrap_or(cwd));
+            crate::discovery::find_configured_project_root_excluding(cwd, &[roots.home()])?
+                .map(|root| crate::discovery::project_settings_path(&root));
         // Tier 7: carry BOTH scopes UNFLATTENED (each with its own path) so `merge.rs` can resolve
         // project-beats-user at application time and record the true winning scope + path in
         // provenance (rather than a pre-flattened single scope that always looked like `Project`).
         cfg.override_settings = crate::discovery::load_layered_override_settings(
             &user_settings,
-            Some(&project_settings),
+            project_settings.as_deref(),
         )?;
         Ok(cfg)
     }
@@ -296,15 +316,38 @@ impl SubagentExecutor {
         scope: AgentReadScope,
         roots: &crate::paths::Roots,
     ) -> Result<BTreeMap<String, ResolvedAgentPersona>, SubagentError> {
-        let mut personas: BTreeMap<String, ResolvedAgentPersona> = BTreeMap::new();
+        Ok(self
+            .resolve_plan_agents(cwd, agent_names, scope, roots)?
+            .iter()
+            .map(|(name, agent)| (name.clone(), crate::exec::resolve_step_agent_config(agent)))
+            .collect())
+    }
+
+    /// The discovery half of [`Self::resolve_plan_personas`]: every DISTINCT named agent,
+    /// resolved to its full [`AgentDefinition`], keyed by the step's `agent` name. A plan that also
+    /// needs agent-level launch defaults the persona does not carry (SUBA-096's `fast`, folded by
+    /// `slash_render::apply_agent_launch_defaults`) resolves through this once and projects the
+    /// personas from the same definitions, rather than discovering twice.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_plan_personas`].
+    pub fn resolve_plan_agents(
+        &self,
+        cwd: &Path,
+        agent_names: impl IntoIterator<Item = String>,
+        scope: AgentReadScope,
+        roots: &crate::paths::Roots,
+    ) -> Result<BTreeMap<String, AgentDefinition>, SubagentError> {
+        let mut agents: BTreeMap<String, AgentDefinition> = BTreeMap::new();
         for name in agent_names {
-            if personas.contains_key(&name) {
+            if agents.contains_key(&name) {
                 continue;
             }
             let agent = self.resolve_agent(cwd, &name, scope, roots)?;
-            personas.insert(name, crate::exec::resolve_step_agent_config(&agent));
+            agents.insert(name, agent);
         }
-        Ok(personas)
+        Ok(agents)
     }
 
     // ---------------------------------------------------------------------------------------
@@ -432,10 +475,55 @@ mod tests {
         clippy::indexing_slicing
     )]
 
+    use std::path::PathBuf;
+
     use super::*;
     use crate::extension::testsupport::seed_scope_fixture;
     use crate::fork_context::ContextRequest;
     use cyrup_core::ModelId;
+
+    /// R-SA-003 — the discovery config takes its extra agent dirs from the `Roots` it is handed
+    /// (the session's one resolution of `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS`, the same field
+    /// `/subagents`' read-only check reads), prepended ahead of the user's own dirs, and the agent
+    /// in one is discovered at USER source. A sandbox names none, so an ambient value never
+    /// leaks into it.
+    ///
+    /// *Gutted by*: `.with_prepended_user_extras(Vec::new())` in `discovery_dirs_config` (the
+    /// extra dir is absent and its agent is not found).
+    #[tokio::test]
+    async fn discovery_takes_its_extra_agent_dirs_from_the_roots() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let extra = tempfile::tempdir().expect("extra");
+        std::fs::write(
+            extra.path().join("extra-probe.md"),
+            "---\nname: extra-probe\ndescription: from the extra dir\n---\n\nBody\n",
+        )
+        .expect("write extra agent");
+        let bare = crate::paths::Roots::sandboxed(home.path());
+        let cfg = SubagentExecutor::discovery_dirs_config(cwd.path(), &bare).expect("config");
+        assert!(
+            !cfg.user_agent_dirs.iter().any(|d| d == extra.path()),
+            "a sandbox has no extras"
+        );
+
+        let roots = bare.with_extra_agent_dirs(vec![extra.path().to_path_buf()]);
+        let cfg = SubagentExecutor::discovery_dirs_config(cwd.path(), &roots).expect("config");
+        assert_eq!(
+            cfg.user_agent_dirs.first().map(PathBuf::as_path),
+            Some(extra.path()),
+            "extras are the lowest-precedence user stream: {:?}",
+            cfg.user_agent_dirs
+        );
+        let agent = SubagentExecutor::new()
+            .resolve_agent(cwd.path(), "extra-probe", AgentReadScope::Both, &roots)
+            .expect("the extra-dir agent resolves through the real executor");
+        assert_eq!(
+            agent.source,
+            crate::discovery::types::AgentSource::User,
+            "pi loads extras as `user` source"
+        );
+    }
 
     /// SUBA-079: the executor-level wiring of pi `canPreferFork`. A cwd with no session at all
     /// cannot host a branch, so an INHERITED `defaultContext: fork` must resolve to `Fresh` and the

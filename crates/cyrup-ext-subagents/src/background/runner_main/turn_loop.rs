@@ -26,7 +26,7 @@ use crate::background::flat_index::{flat_base, flat_range, flat_total, pending_s
 use crate::background::{RunId, RunMode, RunPaths, RunStatus};
 use crate::error::SubagentError;
 use crate::exec::SingleResult;
-use crate::jsonl::BoundedJsonlWriter;
+use crate::jsonl::RunEventLog;
 use crate::spawn::chain_graph::{
     ChainRunContext, OutputRegistry, RunnerStep, SingleStepExecutor, StepResult, walk_chain,
 };
@@ -123,7 +123,7 @@ pub(super) async fn run_inner(
     telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
     writer_ledgers: super::executor::WriterProcessLedgers,
     lease_writer: Option<super::executor::LeaseWriterSender>,
-    events: &mut Option<BoundedJsonlWriter>,
+    events: &mut Option<RunEventLog>,
 ) -> Result<LoopOutcome, SubagentError> {
     let mut steps = config.steps.clone();
     let mut cursor = 0usize;
@@ -307,7 +307,7 @@ pub(super) struct TurnLoopIo<'a> {
     pub(super) config: &'a RunnerConfig,
     pub(super) run_paths: &'a RunPaths,
     pub(super) status: &'a SharedStatus,
-    pub(super) events: &'a mut Option<BoundedJsonlWriter>,
+    pub(super) events: &'a mut Option<RunEventLog>,
     pub(super) flags: &'a ControlFlags,
 }
 
@@ -776,6 +776,9 @@ pub(super) async fn run_import_async_root(
     .await?;
 
     let step_result = StepResult {
+        execution: None,
+        native_machine: None,
+        runtime_acknowledged_extensions: None,
         success: imported.success,
         structured_output: imported.structured_output.clone(),
         final_output: Some(imported.output.clone()),
@@ -825,6 +828,8 @@ pub(super) async fn run_import_async_root(
         // published on ITS own status/result; nothing to re-attribute here.
         transcript_path: None,
         transcript_error: None,
+        // An imported root reports no watchdog of this run's own.
+        watchdog: None,
     };
     // Register the imported output under its named key (pi's `outputName`/`as`) so a later
     // `{outputs.name}` reference in this chain resolves to it — a validated structured

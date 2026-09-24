@@ -63,6 +63,10 @@ fn compact_child(mut child: ForegroundHistoryChild) -> ForegroundHistoryChild {
     } else {
         child.final_output.map(|text| bounded_tail(&text))
     };
+    // SUBA-063 — pi's `compactChild` enumerates the keys it persists and
+    // `runtimeAcknowledgedExtensions` is not one of them (`foreground-history.ts:28-63` @v0.68.0):
+    // the acknowledgement rides the in-memory remembered child only, never the history file.
+    child.runtime_acknowledged_extensions = None;
     child
 }
 
@@ -213,6 +217,7 @@ mod tests {
                 final_output: Some("hello".to_string()),
                 tokens: None,
                 tool_count: None,
+                runtime_acknowledged_extensions: None,
             }],
         }
     }

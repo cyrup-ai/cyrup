@@ -99,6 +99,11 @@ const KNOWN_FIELDS: &[&str] = &[
     "thinking",
     "systemPromptMode",
     "inheritProjectContext",
+    // SUBA-101 / SUBA-102 — both in upstream's `KNOWN_FIELDS` (`agent-serializer.ts:20,33`
+    // @v0.68.0). Until they were typed here each round-tripped into `extra_fields`, where nothing
+    // read it. Emitted by `management::serialize_agent`, same rule as every key above.
+    "inheritGlobalContext",
+    "mutationTools",
     "inheritSkills",
     "defaultContext",
     "skill",
@@ -129,6 +134,13 @@ const KNOWN_FIELDS: &[&str] = &[
     // deletes it.
     "acceptance",
     "acceptanceRole",
+    // SUBA-096 — both in upstream's `KNOWN_FIELDS` (`agent-serializer.ts:16,36` @v0.68.0). Until
+    // they were typed here, `outputMode:` and `fast:` were VALIDATED and then left in
+    // `extra_fields`, where nothing read them: the agent-level default mode never reached a run,
+    // and `fast` never reached a child. Emitted by `management::serialize_agent`, same rule as
+    // every key above.
+    "outputMode",
+    "fast",
     // SUBA-008 — `turnBudget` (`agent-serializer.ts:22` @v0.43.0). Parsed into
     // `default_turn_budget` and applied by `route_single`'s `applySingleAgentLaunchDefaults` port
     // only when the call site omitted `turnBudget`. Same rule as `toolBudget` above: a key that is
@@ -146,6 +158,10 @@ const KNOWN_FIELDS: &[&str] = &[
     // `KNOWN_FIELDS` so a declared `runner:` is VALIDATED rather than demoted to `extra_fields` and
     // ignored, which is the silent capability widening this item exists to close.
     "runner",
+    // SUBA-100 — the Herdr saved machine the agent is placed on (`agent-serializer.ts:34`,
+    // parsed `agents.ts:2168` @v0.68.0). Until it was typed here, a `machine:` line round-tripped
+    // into `extra_fields` and the agent ran locally. Emitted by `management::serialize_agent`.
+    "machine",
 ];
 
 /// True iff `key` is one of the crate's first-class typed frontmatter fields (pi's `KNOWN_FIELDS`,
@@ -769,9 +785,9 @@ fn parse_max_subagent_depth(raw: &str) -> Option<u32> {
 
 /// `output: <path>` -> `Option<OutputSpec>`. Frontmatter's `output` field is a single path string
 /// in source (`AgentConfig.output: string`, e.g. `output: context.md`) — this parser lifts it into
-/// an [`OutputSpec`] with `path` populated and `mode: None` (no agent-level default output *mode*
-/// is expressible in frontmatter; only a call-site `RunOptions::output_mode` or a later config
-/// layer can supply one, per `OutputSpec`'s own doc).
+/// an [`OutputSpec`] with `path` populated and `mode: None`. The agent-level default MODE is the
+/// separate `outputMode:` key, folded into the same spec by [`parse_agent_file_checked`]
+/// (SUBA-096).
 fn parse_output_spec(raw: &str) -> Option<OutputSpec> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1225,28 +1241,43 @@ pub fn parse_agent_file_checked(
     }
 
     // SUBA-086 `outputMode:` — pi `agents.ts:2041-2044` @v0.64.0: anything but the two literal
-    // spellings `inline`/`file-only` THROWS. Validated only, for the same reason as
-    // `toolTimeoutMs` above ([`AgentDefinition::output`]'s doc: no agent-level default output
-    // MODE is carried yet).
-    if let Some(raw) = parsed.get("outputMode")
-        && raw != "inline"
-        && raw != "file-only"
-    {
-        return Err(fail(format!(
-            "Agent '{local_name}' has invalid outputMode frontmatter; expected 'inline' or 'file-only'."
-        )));
-    }
+    // spellings `inline`/`file-only` THROWS. SUBA-096: the valid value is now CARRIED into
+    // `output.mode` (below), the agent-level default every output-mode decision site consults
+    // after the call's own `outputMode` (pi `params.outputMode ?? agent.outputMode ?? "inline"`).
+    let output_mode = match parsed.get("outputMode") {
+        None => None,
+        Some("inline") => Some(OutputMode::Inline),
+        Some("file-only") => Some(OutputMode::FileOnly),
+        Some(_) => {
+            return Err(fail(format!(
+                "Agent '{local_name}' has invalid outputMode frontmatter; expected 'inline' or 'file-only'."
+            )));
+        }
+    };
+    let output = match (output, output_mode) {
+        (spec, None) => spec,
+        (Some(spec), Some(mode)) => Some(OutputSpec {
+            mode: Some(mode),
+            ..spec
+        }),
+        (None, Some(mode)) => Some(OutputSpec {
+            path: None,
+            mode: Some(mode),
+        }),
+    };
 
     // SUBA-086 `fast:` — pi `agents.ts:2057-2062` @v0.64.0: strictly `"true"`/`"false"`, else
-    // THROWS. Validated only, as `toolTimeoutMs`/`outputMode` above.
-    if let Some(raw) = parsed.get("fast")
-        && raw != "true"
-        && raw != "false"
-    {
-        return Err(fail(format!(
-            "Agent '{local_name}' has invalid fast frontmatter; expected true or false."
-        )));
-    }
+    // THROWS. SUBA-096: carried into `fast`, the agent rung of `s.fast ?? params.fast ?? a.fast`.
+    let fast = match parsed.get("fast") {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(_) => {
+            return Err(fail(format!(
+                "Agent '{local_name}' has invalid fast frontmatter; expected true or false."
+            )));
+        }
+    };
 
     // SUBA-082 `acceptance:` — pi `const defaultAcceptance = parseAgentAcceptanceFrontmatter(
     // frontmatter.acceptance, localName)` (`agents.ts:2005` @v0.57.0, `:2040` @v0.64.0). Same
@@ -1297,6 +1328,29 @@ pub fn parse_agent_file_checked(
     // handcrafted file disable itself, which pi does not permit; leave it `None` at parse time.
     let disabled: Option<bool> = None;
 
+    // SUBA-101 — pi `const inheritGlobalContext = frontmatter.inheritGlobalContext === "true"`
+    // (`agents.ts:2070` @v0.68.0): STRICTLY the literal `true`; anything else, absence included,
+    // is `false`. No name-sensitive default (contrast `inheritProjectContext`) and no throw.
+    let inherit_global_context = parsed.get("inheritGlobalContext") == Some("true");
+    // SUBA-102 — pi `parseFrontmatterList(frontmatter.mutationTools)` (`agents.ts:2117`), kept
+    // only when non-empty (`...(mutationTools?.length ? { mutationTools } : {})`, `:2205`).
+    let mutation_tools =
+        parse_frontmatter_list(parsed.get("mutationTools")).filter(|names| !names.is_empty());
+    // SUBA-100 — pi `validateOptionalMachine(frontmatter.machine, \`Agent '${runtimeName}'
+    // frontmatter 'machine'\`)` (`agents.ts:2168` @v0.68.0): trimmed, non-empty, at most 128
+    // characters, no control characters, else THROW — here the same per-file skip + warn as every
+    // other malformed frontmatter value above.
+    let machine = match crate::placement::validate_optional_machine(
+        parsed
+            .get("machine")
+            .map(|raw| serde_json::Value::String(raw.to_string()))
+            .as_ref(),
+        &format!("Agent '{runtime_name}' frontmatter 'machine'"),
+    ) {
+        Ok(machine) => machine,
+        Err(message) => return Err(fail(message)),
+    };
+
     let present_fields: HashSet<String> = parsed.keys().map(str::to_string).collect();
     let extra_fields: BTreeMap<String, String> = parsed
         .fields
@@ -1306,6 +1360,9 @@ pub fn parse_agent_file_checked(
         .collect();
 
     Ok(Some(AgentDefinition {
+        inherit_global_context,
+        machine,
+        mutation_tools,
         name: runtime_name,
         local_name,
         package_name,
@@ -1338,6 +1395,7 @@ pub fn parse_agent_file_checked(
         default_turn_budget,
         default_acceptance,
         acceptance_role,
+        fast,
         permission_rules,
         runner,
         disabled,
@@ -1852,6 +1910,42 @@ mod tests {
         let def =
             parse_agent_file(content, AgentSource::Project, Path::new("/d.md")).expect("parses");
         assert!(!def.inherit_project_context);
+    }
+
+    /// SUBA-101/102 — both keys are typed (never `extra_fields`), `inheritGlobalContext` is
+    /// strictly the literal `true` (`agents.ts:2070` @v0.68.0; default `false` even for
+    /// `delegate`), and `mutationTools` is a trimmed list kept only when non-empty (`:2117,2205`).
+    /// Mutation killed: dropping either `KNOWN_FIELDS` entry (the key lands in `extra_fields`), or
+    /// parsing `inheritGlobalContext` leniently (`yes`/`True` would become `true`).
+    #[test]
+    fn inherit_global_context_and_mutation_tools_are_typed_frontmatter() {
+        let content = "---\nname: delegate\ndescription: D\ninheritGlobalContext: true\nmutationTools: apply_patch, , notebook_edit\n---\n\nBody\n";
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/d.md")).expect("parses");
+        assert!(def.inherit_global_context);
+        assert_eq!(
+            def.mutation_tools,
+            Some(vec!["apply_patch".to_string(), "notebook_edit".to_string()])
+        );
+        assert!(!def.extra_fields.contains_key("inheritGlobalContext"));
+        assert!(!def.extra_fields.contains_key("mutationTools"));
+
+        for loose in ["yes", "True", "1", "false"] {
+            let content = format!(
+                "---\nname: delegate\ndescription: D\ninheritGlobalContext: {loose}\n---\n\nBody\n"
+            );
+            let def = parse_agent_file(&content, AgentSource::Project, Path::new("/d.md"))
+                .expect("parses");
+            assert!(!def.inherit_global_context, "{loose}");
+        }
+        let bare = parse_agent_file(
+            "---\nname: delegate\ndescription: D\nmutationTools: \n---\n\nBody\n",
+            AgentSource::Project,
+            Path::new("/d.md"),
+        )
+        .expect("parses");
+        assert!(!bare.inherit_global_context, "absent defaults to false");
+        assert_eq!(bare.mutation_tools, None, "an empty list is no list");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2771,9 +2865,9 @@ mod tests {
     /// `toolTimeoutMs`/`outputMode`/`fast` are validated only: a VALID value is not (yet) carried
     /// on the definition, so it must keep round-tripping through `extra_fields` as it did before.
     #[test]
-    fn valid_tool_timeout_output_mode_and_fast_still_round_trip_as_extra_fields() {
+    fn valid_tool_timeout_round_trips_and_output_mode_and_fast_are_typed() {
         let def = parse_agent_file_checked(
-            "---\nname: worker\ndescription: d\ntoolTimeoutMs: 5000\noutputMode: file-only\nfast: false\n---\n\nBody\n",
+            "---\nname: worker\ndescription: d\ntoolTimeoutMs: 5000\noutput: out.md\noutputMode: file-only\nfast: false\n---\n\nBody\n",
             AgentSource::Project,
             Path::new("/w.md"),
         )
@@ -2783,14 +2877,36 @@ mod tests {
             def.extra_fields.get("toolTimeoutMs").map(String::as_str),
             Some("5000")
         );
+        // SUBA-096: typed, and no longer parked in `extra_fields` where nothing read them.
+        // Mutation killed: dropping the fold of `outputMode` into `output.mode` (mode stays None),
+        // or leaving either key out of `KNOWN_FIELDS` (it lands in `extra_fields` too).
         assert_eq!(
-            def.extra_fields.get("outputMode").map(String::as_str),
-            Some("file-only")
+            def.output,
+            Some(OutputSpec {
+                path: Some(PathBuf::from("out.md")),
+                mode: Some(OutputMode::FileOnly),
+            })
         );
+        assert_eq!(def.fast, Some(false));
+        assert!(!def.extra_fields.contains_key("outputMode"));
+        assert!(!def.extra_fields.contains_key("fast"));
+
+        // A mode with no path still lands: the spec is created around it.
+        let mode_only = parse_agent_file_checked(
+            "---\nname: worker\ndescription: d\noutputMode: inline\nfast: true\n---\n\nBody\n",
+            AgentSource::Project,
+            Path::new("/w.md"),
+        )
+        .expect("valid")
+        .expect("parses");
         assert_eq!(
-            def.extra_fields.get("fast").map(String::as_str),
-            Some("false")
+            mode_only.output,
+            Some(OutputSpec {
+                path: None,
+                mode: Some(OutputMode::Inline),
+            })
         );
+        assert_eq!(mode_only.fast, Some(true));
     }
 
     #[test]

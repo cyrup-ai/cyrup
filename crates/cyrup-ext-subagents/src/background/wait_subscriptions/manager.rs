@@ -59,6 +59,8 @@ pub enum SubscriptionOutcome {
     /// its subscription. Ported as written: an interrupted run is exactly the state a caller who
     /// asked to be woken wants to hear about.
     Paused,
+    /// SUBA-100 — [`RunState::Partial`] rendered verbatim at `:257`.
+    Partial,
     /// pi `"reconciliation failed"` (`:272`).
     ReconciliationFailed,
 }
@@ -75,6 +77,7 @@ impl SubscriptionOutcome {
             SubscriptionOutcome::Failed => "failed",
             SubscriptionOutcome::Stopped => "stopped",
             SubscriptionOutcome::Paused => "paused",
+            SubscriptionOutcome::Partial => "partial",
             SubscriptionOutcome::ReconciliationFailed => "reconciliation failed",
         }
     }
@@ -92,6 +95,7 @@ impl SubscriptionOutcome {
             RunState::Failed => Some(SubscriptionOutcome::Failed),
             RunState::Stopped => Some(SubscriptionOutcome::Stopped),
             RunState::Paused => Some(SubscriptionOutcome::Paused),
+            RunState::Partial => Some(SubscriptionOutcome::Partial),
         }
     }
 }

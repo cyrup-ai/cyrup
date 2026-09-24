@@ -747,6 +747,7 @@ fn state_word(state: crate::background::RunState) -> &'static str {
         RunState::Complete => "complete",
         RunState::Failed => "failed",
         RunState::Stopped => "stopped",
+        RunState::Partial => "partial",
     }
 }
 

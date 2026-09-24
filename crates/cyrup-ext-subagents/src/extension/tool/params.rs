@@ -5,7 +5,7 @@ use cyrup_core::ToolError;
 
 use crate::discovery::types::AgentReadScope;
 use crate::exec::SingleResult;
-use crate::extension::tool::text::BLANK_ACTION_REFUSAL;
+use crate::extension::tool::text::{BLANK_ACTION_REFUSAL, CLARIFY_REFUSAL};
 use crate::fork_context::ContextRequest;
 use crate::registration::SubagentExtensionConfig;
 
@@ -38,35 +38,50 @@ use crate::registration::SubagentExtensionConfig;
 /// parameter this tool does not accept would be worse than the divergence it removes. Restore the
 /// upstream sentence when `workflowScript` lands.
 ///
-/// **Not ported (blocked on `workflowScript`).** Every remaining check in
+/// **`clarify` — ported (PB-9).** pi refuses ANY `clarify` value (`:143-145` @v0.68.0:
+/// `params.clarify !== undefined`), after the blank-action check and before action dispatch, so
+/// `{action: "status", clarify: false}` is refused too. `clarify_present` is key PRESENCE on the
+/// raw request — JSON has no `undefined`, so presence is exactly upstream's test, including `null`
+/// and non-boolean values — read before the typed parse, because `SubagentToolParams` no longer
+/// has the field and serde ignores the key.
+///
+/// **Not ported (legacy shapes cyrup deliberately keeps).** Every other check in
 /// `normalizePublicSubagentExecution` rejects a shape cyrup still supports and upstream deleted:
-/// `clarify` (`:32-34`), top-level `resume` (`:35-37`), `tasks`/`chain`/`parallel`/`concurrency`/
-/// `chainDir` (`:38-41`), the legacy `single`/`parallel`/`tasks`/`chain` action aliases (`:42-49`),
+/// top-level `resume` (`:35-37` @v0.43.0), `tasks`/`chain`/`parallel`/`concurrency`/`chainDir`
+/// (`:38-41`), the legacy `single`/`parallel`/`tasks`/`chain` action aliases (`:42-49`),
 /// `schedule.create`'s workflowScript requirement (`:50-58`), the "workflowScript execution must
 /// omit action" rule (`:59-61`), and the terminal "Direct execution was removed. Use workflowScript"
-/// pair (`:64-69`). All of them presuppose the `workflowScript` runtime, of which this crate has
-/// nothing — the identifier appears nowhere in it — so porting them in isolation would not move the
-/// port toward upstream, it would delete SINGLE, PARALLEL and CHAIN execution outright and leave no
-/// surface to replace them. They belong to the `workflowScript` port, and this function is the one
-/// place they go when it happens: upstream calls its boundary from exactly the two model-facing
-/// registrations that `Tool::execute` already serves.
+/// pair (`:64-69`). cyrup HAS a `workflowScript` runtime (`crate::workflows::scripted`,
+/// [`SubagentToolParams::workflow_script`]), but porting these refusals would delete SINGLE,
+/// PARALLEL and CHAIN execution outright — a product decision, not a parity fix, and not this
+/// function's to make. (An earlier revision of this doc said `workflowScript` "appears nowhere in"
+/// the crate; that was false.) Upstream calls its boundary from exactly the model-facing
+/// registrations `Tool::execute` serves, plus RPC `spawn` (`rpc.ts:516`), which calls this too.
 ///
 /// # Errors
 ///
-/// [`BLANK_ACTION_REFUSAL`] when `action` is present and trims to empty.
+/// [`BLANK_ACTION_REFUSAL`] when `action` is present and trims to empty; otherwise
+/// [`CLARIFY_REFUSAL`] when `clarify_present`.
 pub(crate) fn normalize_public_subagent_execution(
     action: Option<&str>,
+    clarify_present: bool,
 ) -> Result<Option<&str>, ToolError> {
-    match action {
-        None => Ok(None),
+    // pi `:133-135` — the blank-action refusal FIRST.
+    let action = match action {
+        None => None,
         Some(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 return Err(ToolError::new(BLANK_ACTION_REFUSAL));
             }
-            Ok(Some(trimmed))
+            Some(trimmed)
         }
+    };
+    // pi `:143-145` — then `clarify`, whatever its value, and whatever the action.
+    if clarify_present {
+        return Err(ToolError::new(CLARIFY_REFUSAL));
     }
+    Ok(action)
 }
 
 /// The `subagent` tool's full discriminated-union parameter surface (R-SA-128, C8) — the Rust parse
@@ -94,6 +109,11 @@ pub(crate) struct SubagentToolParams {
     /// `Tool::execute` dispatches `action` and returns at `mod.rs:222-224`, above the gate.
     pub(crate) workflow_script: Option<String>,
     pub(crate) action: Option<String>,
+    /// SUBA-104 — pi `params.capabilities` (`extension/schemas.ts:287` @v0.68.0,
+    /// `Type.Optional(Type.Boolean(…))`): `list` answers in compact capability rows and attaches
+    /// `details.agentCapabilities` when it is `true` (`agent-management.ts:989`). Typed `bool`, so
+    /// a non-boolean is refused at the parse the way upstream's schema check refuses it.
+    pub(crate) capabilities: Option<bool>,
     pub(crate) id: Option<String>,
     pub(crate) run_id: Option<String>,
     pub(crate) dir: Option<String>,
@@ -221,16 +241,30 @@ pub(crate) struct SubagentToolParams {
     #[serde(default, deserialize_with = "deserialize_watchdog_thinking")]
     pub(crate) thinking: Option<String>,
     pub(crate) cwd: Option<String>,
+    /// SUBA-100 — pi `params.machine` (`extension/schemas.ts:369` @v0.68.0): the Herdr saved
+    /// machine (id or label) this call's children run on — the CALL rung of `s.machine ??
+    /// params.machine ?? a.machine`. With it (or an agent placed by its own `machine:`), `cwd`
+    /// names a directory ON THAT MACHINE and is moved into [`Self::machine_cwd`] at the tool
+    /// boundary rather than resolved locally.
+    pub(crate) machine: Option<String>,
+    /// SUBA-100 — pi's internal `machineCwd` (`subagent-executor.ts:391-393` @v0.68.0): the
+    /// call's `cwd` as typed, kept as a REMOTE path because a machine is in play. Never read from
+    /// the wire (`#[serde(skip)]`); only the tool boundary sets it.
+    #[serde(skip)]
+    pub(crate) machine_cwd: Option<String>,
     pub(crate) artifacts: Option<bool>,
     pub(crate) include_progress: Option<bool>,
     pub(crate) share: Option<bool>,
     pub(crate) session_dir: Option<String>,
-    pub(crate) clarify: Option<bool>,
     pub(crate) control: Option<serde_json::Value>,
     pub(crate) output: Option<serde_json::Value>,
     pub(crate) output_mode: Option<String>,
     pub(crate) skill: Option<serde_json::Value>,
     pub(crate) model: Option<String>,
+    /// SUBA-096 — pi `params.fast` (`extension/schemas.ts:388` @v0.68.0): the CALL rung of
+    /// `s.fast ?? params.fast ?? a.fast`. `true` puts the child's provider requests on the priority
+    /// service tier, and only on one of the two allowlisted OpenAI-Codex models.
+    pub(crate) fast: Option<bool>,
     /// SUBA-043 / pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0), read by
     /// `runSinglePath` at `runs/foreground/subagent-executor.ts:3651,3671` and written into the
     /// child's structured-output env pair by `runs/shared/pi-args.ts:759-762`. Carried raw here for
@@ -613,28 +647,25 @@ impl SubagentToolParams {
     /// `subagent-executor.ts:3318-3322,3382` @v0.34.0).
     ///
     /// pi resolves this in two steps: first `applyForceTopLevelAsyncOverride`
-    /// (`runs/background/top-level-async.ts:5-12`) forces `async: true, clarify: false` onto the
-    /// effective params when this is a top-level call (`depth === 0`) AND
-    /// `config.forceTopLevelAsync === true` — overriding whatever the call itself requested. Then
-    /// `requestedAsync = effectiveParams.async ?? deps.asyncByDefault` (an omitted `async` falls
-    /// back to the config's `asyncByDefault`, not a hardcoded `false`), and finally
-    /// `effectiveAsync = requestedAsync && effectiveParams.clarify !== true` (an explicit
-    /// `clarify: true` always keeps the run foreground so its supervisor prompt can be seen,
-    /// regardless of the async request).
+    /// (`runs/background/top-level-async.ts:5-12`) forces `async: true` onto the effective params
+    /// when this is a top-level call (`depth === 0`) AND `config.forceTopLevelAsync === true` —
+    /// overriding whatever the call itself requested. Then `requestedAsync = effectiveParams.async
+    /// ?? deps.asyncByDefault` (an omitted `async` falls back to the config's `asyncByDefault`,
+    /// not a hardcoded `false`).
+    ///
+    /// PB-9: upstream still computes `effectiveAsync = requestedAsync && clarify !== true`
+    /// (`subagent-executor.ts:6975-6978` @v0.68.0), but only because its internal params type kept
+    /// the field — no public entry can reach that term, since the boundary refuses `clarify`
+    /// outright. cyrup has one params type and the field is gone, so the dead term is too. (The
+    /// term was live here, and it is how RPC `spawn`'s forced `async: true` used to run in the
+    /// FOREGROUND for `clarify: true`.)
     pub(crate) fn is_background(&self, cfg: &SubagentExtensionConfig, depth: u32) -> bool {
-        let force_override = depth == 0 && cfg.force_top_level_async;
-        let async_param = if force_override {
+        let async_param = if depth == 0 && cfg.force_top_level_async {
             Some(true)
         } else {
             self.r#async
         };
-        let clarify = if force_override {
-            Some(false)
-        } else {
-            self.clarify
-        };
-        let requested_async = async_param.unwrap_or(cfg.async_by_default);
-        requested_async && clarify != Some(true)
+        async_param.unwrap_or(cfg.async_by_default)
     }
 
     /// The requested fork/fresh context OVERRIDE (pi `context`), as an `Option` that preserves the
@@ -681,6 +712,9 @@ impl SubagentToolParams {
         }
         if self.action.is_some() {
             keys.push("action");
+        }
+        if self.capabilities.is_some() {
+            keys.push("capabilities");
         }
         if self.id.is_some() {
             keys.push("id");
@@ -778,9 +812,6 @@ impl SubagentToolParams {
         if self.session_dir.is_some() {
             keys.push("sessionDir");
         }
-        if self.clarify.is_some() {
-            keys.push("clarify");
-        }
         if self.control.is_some() {
             keys.push("control");
         }
@@ -795,6 +826,12 @@ impl SubagentToolParams {
         }
         if self.model.is_some() {
             keys.push("model");
+        }
+        if self.fast.is_some() {
+            keys.push("fast");
+        }
+        if self.machine.is_some() {
+            keys.push("machine");
         }
         if self.output_schema.is_some() {
             keys.push("outputSchema");
@@ -933,6 +970,21 @@ pub(crate) fn validate_execution_acceptance(params: &SubagentToolParams) -> Vec<
             _ => {}
         }
     }
+    // pi `validateExecutionAcceptance`'s second half (`runs/shared/acceptance.ts:404-421`
+    // @v0.68.0): after every site's policy is validated, every site that DECLARES
+    // `acceptance.report` is refused unless the same site carries an `outputSchema` (absent or
+    // `false` is none), with the same per-site labels. Upstream first projects each `tasks[i]` /
+    // `chain[i]` item's schema onto its agent's frontmatter `outputSchema`
+    // (`projectEffectiveAcceptanceSchemas`, `subagent-executor.ts:2507-2517`); cyrup agents carry
+    // no frontmatter `outputSchema`, so the item's own is the effective one.
+    errors.extend(
+        crate::exec::acceptance::model::validate_execution_acceptance_report_modes(
+            params.acceptance.as_ref(),
+            params.output_schema.as_ref(),
+            params.tasks.as_deref().unwrap_or_default(),
+            params.chain.as_deref().unwrap_or_default(),
+        ),
+    );
     errors
 }
 
@@ -1330,13 +1382,24 @@ mod tests {
             !explicit_false.is_background(&force_cfg, 1),
             "forceTopLevelAsync must NOT apply at a nested depth"
         );
+    }
 
-        // `clarify: true` always keeps the run foreground, even when async was requested.
-        let clarify_true: SubagentToolParams = serde_json::from_value(serde_json::json!({
+    /// PB-9 — `clarify` no longer keeps a run foreground: the field is gone, serde ignores the key
+    /// (the public boundary refuses it before this is ever reached), and `async: true` means
+    /// background. This used to assert the opposite, which is exactly what let RPC `spawn`'s
+    /// forced `async: true` run in the foreground. Mutation killed: restoring the
+    /// `requested_async && clarify != Some(true)` term (with the field).
+    #[test]
+    fn is_background_ignores_a_clarify_key() {
+        let with_clarify: SubagentToolParams = serde_json::from_value(serde_json::json!({
             "agent": "worker", "task": "do it", "async": true, "clarify": true
         }))
-        .expect("single shape parses");
-        assert!(!clarify_true.is_background(&SubagentExtensionConfig::default(), 0));
+        .expect("the key is ignored by the parse");
+        let cfg = SubagentExtensionConfig {
+            async_by_default: false,
+            ..SubagentExtensionConfig::default()
+        };
+        assert!(with_clarify.is_background(&cfg, 0));
     }
 
     /// SUBA-008's refusal half — pi `resolveTurnBudgetConfig(...)` at

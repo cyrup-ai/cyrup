@@ -944,6 +944,40 @@ impl MainWatchdogRuntime {
         });
     }
 
+    /// UW-3 — how long the agent-end boundary review may legitimately hold its `AgentEnd` handler:
+    /// the LSP diagnostics bound (when LSP is on), plus the review's own `agentEndTimeoutMs`, plus
+    /// one dispatch budget of slack for the bookkeeping after it. This is the ceiling
+    /// [`Self::handle_agent_end_in_handler`] declares; a review that overruns it is cut by the
+    /// dispatcher exactly as an undeclared handler is.
+    #[must_use]
+    pub fn agent_end_wait_ceiling(&self) -> Duration {
+        let inner = self.lock();
+        let config = &inner.config_result.config;
+        let lsp_ms = if config.lsp.enabled {
+            config.lsp.timeout_ms
+        } else {
+            0
+        };
+        Duration::from_millis(lsp_ms.saturating_add(config.agent_end_timeout_ms))
+            + cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET
+    }
+
+    /// [`Self::handle_agent_end`] as called from an `AgentEnd` extension HANDLER: the review is
+    /// awaited under a declared [`cyrup_ext::native::SanctionedWaitKind::ModelReview`] wait, so the
+    /// dispatcher's 5 s per-handler budget (`cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET`) does not
+    /// drop it mid-review. Upstream awaits the same review in its handler with no budget at all
+    /// (`register-main.ts:427-430`, `runner.ts:805-811`). See `cyrup_ext::native::SanctionedWaitGate`
+    /// for why this is a declared wait and not an `AgentEnd` exemption.
+    pub async fn handle_agent_end_in_handler(&self, ctx: &cyrup_ext::native::HostCtx) {
+        // Refreshed first so the ceiling is computed from the config this review will run under.
+        self.refresh_config(&ctx.cwd);
+        let _review = ctx.begin_sanctioned_wait(
+            cyrup_ext::native::SanctionedWaitKind::ModelReview,
+            self.agent_end_wait_ceiling(),
+        );
+        self.handle_agent_end(&ctx.cwd).await;
+    }
+
     /// `handleAgentEnd(event, ctx)` (`runtime.ts:362-435`) — the boundary review. See the inline
     /// comments for the early-return ladder; the `finally` (`:431-434`) is reproduced by running
     /// the cleanup after the body regardless of which arm returned.

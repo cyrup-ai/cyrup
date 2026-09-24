@@ -344,17 +344,19 @@ async fn a_builtin_model_override_is_written_to_user_settings_and_seen_by_a_re_d
 /// so the assertion is anchored on `… is read-only.` and on the agent name, not on prose that
 /// differs by a product noun.
 ///
-/// This is the one test in this file that moves the process environment.
-/// `AgentDiscoveryConfig::with_env_extras` (`discovery/mod.rs:741-744`) reads
-/// `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` from `std::env` directly and takes no injected lookup, and
-/// `isReadOnlyExtraAgent`'s path-containment check reads the SAME variable — so there is no seam
-/// in this crate through which the behaviour can be reached otherwise. Sound here because
-/// `cargo nextest` runs every test in its own process (this target's supported invocation; see
-/// `main.rs`), and nothing else in this file reads that variable.
+/// The extra dir is named through `SubagentExtensionConfig::roots`
+/// (`Roots::with_extra_agent_dirs`), not the process environment. `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS`
+/// is resolved ONCE, into `paths::Roots::extra_agent_dirs`, and BOTH readers take it from there:
+/// discovery (`SubagentExecutor::discovery_dirs_config` prepends the dirs to the User tier) and
+/// the admin's `isReadOnlyExtraAgent` check (`extension/host/slash_admin.rs` hands the same roots'
+/// dirs to `AdminContext::extra_agent_dirs`). So this one pin reaches both — the precondition
+/// below proves discovery saw it, the refusal proves the admin did — and no `set_var` is needed.
 ///
-/// Gutted: drop the path-containment check and the edit goes through, so the assertion sees a
-/// save receipt naming the model instead of the refusal — which is exactly what the second
-/// assertion reports.
+/// Gutted by, each alone: dropping the path-containment check (the edit goes through, so the
+/// assertion sees a save receipt naming the model instead of the refusal); `extra_agent_dirs:
+/// Vec::new()` in `slash_admin.rs` (the admin no longer sees the dir discovery loaded the agent
+/// from, and saves); `.with_prepended_user_extras(Vec::new())` in `discovery_dirs_config` (the
+/// precondition fails: the agent is not discovered at all).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_extra_agent_dirs_agent_refuses_a_model_edit_as_read_only() {
     let home = tempfile::tempdir().expect("home tempdir");
@@ -371,24 +373,22 @@ async fn an_extra_agent_dirs_agent_refuses_a_model_edit_as_read_only() {
     )
     .expect("write the extra-dir persona");
 
-    // SAFETY: `cargo nextest run -p cyrup-it --features it` gives every test its own process, so
-    // this variable is not shared with a concurrently-running test. See the doc comment above.
-    unsafe {
-        std::env::set_var(
-            cyrup_ext_subagents::discovery::EXTRA_AGENT_DIRS_ENV_VAR,
-            extra.path(),
-        );
-    }
-
-    let ext = extension(home.path(), cwd.path());
+    let ext = SubagentsExtension::with_config_and_cwd(
+        SubagentExtensionConfig {
+            roots: Roots::sandboxed(home.path())
+                .with_extra_agent_dirs(vec![extra.path().to_path_buf()]),
+            ..SubagentExtensionConfig::default()
+        },
+        cwd.path().to_path_buf(),
+    );
     let model = a_real_model_id();
     let host = ScriptedSelect::new(&[model.as_str(), "user"]);
     ext.executor()
         .set_host_services(Arc::clone(&host) as Arc<dyn HostServices>);
 
-    // Sanity: the extra dir really is folded into the USER tier (`with_prepended_user_extras`,
-    // `discovery/mod.rs:752`), which is `isReadOnlyExtraAgent`'s own `agent.source !== "user"`
-    // precondition (`:141`).
+    // Sanity: the extra dir really is folded into the USER tier (`with_prepended_user_extras`, fed
+    // `roots.extra_agent_dirs()` by `discovery_dirs_config`), which is `isReadOnlyExtraAgent`'s own
+    // `agent.source !== "user"` precondition (`:141`).
     let detail = subagents(&ext, AGENT, &headless_ctx(cwd.path())).await;
     assert!(
         detail.starts_with(&format!("Agent: {AGENT} (user)")),
@@ -488,5 +488,140 @@ async fn a_runtime_registered_agent_refuses_a_model_edit_with_upstreams_exact_se
     assert!(
         override_model(&user_settings_path(home.path()), AGENT).is_none(),
         "and the refusal must write nothing to the settings file"
+    );
+}
+
+// =================================================================================================
+// #84 — a project scope is offered only inside a project
+// =================================================================================================
+
+/// pi `chooseOverrideScope` (`subagents-admin.ts:265-273` @v0.68.0): `if (!d.projectSettingsPath ||
+/// !ctx.hasUI) return "user";` — and `projectSettingsPath` is `null` whenever
+/// `findConfiguredProjectRoot(cwd)` finds no `.cyrup`/`.agents` ancestor (`agents.ts:914-917`).
+/// So outside any project the save goes straight to user scope with NO scope prompt.
+///
+/// The script answers ONLY the model pick. Before #84 the producer
+/// (`extension/executor/resolve.rs`, `discovery_config_on_disk`) set the project settings path for
+/// every cwd, so the scope picker opened, found the script exhausted, read that as a dismissal and
+/// cancelled the save — the prompt-count and the bytes-on-disk assertions both fire.
+///
+/// Gutted by: restoring `Some(project_settings_path(project_root.unwrap_or(cwd)))` in the producer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outside_any_project_the_scope_picker_is_skipped_and_the_save_lands_in_user_scope() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    assert!(
+        cyrup_ext_subagents::discovery::find_nearest_project_root(cwd.path()).is_none(),
+        "precondition: no `.cyrup`/`.agents` ancestor above {}",
+        cwd.path().display()
+    );
+    let ext = extension(home.path(), cwd.path());
+    let model = a_real_model_id();
+    let host = ScriptedSelect::new(&[model.as_str()]);
+    ext.executor()
+        .set_host_services(Arc::clone(&host) as Arc<dyn HostServices>);
+
+    let output = subagents(&ext, &format!("{BUILTIN} model"), &ui_ctx(cwd.path())).await;
+
+    let prompts = host
+        .prompts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert!(
+        !prompts
+            .iter()
+            .any(|p| p.starts_with("Save subagent override for")),
+        "no project exists here, so no scope may be offered; got prompts {prompts:#?}\n\
+         output: {output}"
+    );
+    assert_eq!(
+        override_model(&user_settings_path(home.path()), BUILTIN).as_deref(),
+        Some(model.as_str()),
+        "the save must land in user scope without asking\n{}",
+        host.transcript()
+    );
+    assert!(
+        !cwd.path().join(".cyrup").exists(),
+        "nothing may be written under a cwd that is not a project"
+    );
+}
+
+/// The positive control: INSIDE a project (a `.cyrup` directory at the cwd) the picker IS offered,
+/// and a `project` pick writes the project's own settings file — so the fix narrowed the scope to
+/// where pi offers it rather than removing it.
+///
+/// Gutted by: `project_settings_path` returning `None` unconditionally (the picker is skipped and
+/// the save lands in user scope).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inside_a_project_the_scope_picker_is_offered_and_a_project_pick_writes_there() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    std::fs::create_dir_all(cwd.path().join(".cyrup")).expect("project config dir");
+    let ext = extension(home.path(), cwd.path());
+    let model = a_real_model_id();
+    let host = ScriptedSelect::new(&[model.as_str(), "project"]);
+    ext.executor()
+        .set_host_services(Arc::clone(&host) as Arc<dyn HostServices>);
+
+    let output = subagents(&ext, &format!("{BUILTIN} model"), &ui_ctx(cwd.path())).await;
+
+    let project_settings = cwd
+        .path()
+        .join(".cyrup")
+        .join("agents")
+        .join("settings.json");
+    assert_eq!(
+        override_model(&project_settings, BUILTIN).as_deref(),
+        Some(model.as_str()),
+        "a `project` pick must write {}; output: {output}\n{}",
+        project_settings.display(),
+        host.transcript()
+    );
+    assert!(
+        override_model(&user_settings_path(home.path()), BUILTIN).is_none(),
+        "and must not touch user scope"
+    );
+}
+
+/// #84, the case that bites in practice: a cwd under the user's home, where `~/.cyrup` exists (it
+/// holds the user's own settings) and no closer project does. pi stops its project-root walk at the
+/// home dir (`agents.ts:833-854` @v0.68.0), so there is no project and no scope prompt. Before the
+/// port the walk took the home dir itself as the project root, so the "project" scope it offered
+/// was the USER settings file under another name.
+///
+/// Gutted by: dropping the home stop in `find_project_root_candidates_excluding` (the picker opens,
+/// the exhausted script dismisses it, and the save is cancelled).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_the_home_dir_the_home_config_is_not_a_project_and_no_scope_is_offered() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    std::fs::create_dir_all(home.path().join(".cyrup").join("agents")).expect("user config dir");
+    let cwd = home.path().join("code").join("thing");
+    std::fs::create_dir_all(&cwd).expect("cwd under home");
+    let ext = extension(home.path(), &cwd);
+    let model = a_real_model_id();
+    let host = ScriptedSelect::new(&[model.as_str()]);
+    ext.executor()
+        .set_host_services(Arc::clone(&host) as Arc<dyn HostServices>);
+
+    let output = subagents(&ext, &format!("{BUILTIN} model"), &ui_ctx(&cwd)).await;
+
+    let prompts = host
+        .prompts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert!(
+        !prompts
+            .iter()
+            .any(|p| p.starts_with("Save subagent override for")),
+        "the home dir's `.cyrup` is user configuration, not a project; got prompts {prompts:#?}\n\
+         output: {output}"
+    );
+    assert_eq!(
+        override_model(&user_settings_path(home.path()), BUILTIN).as_deref(),
+        Some(model.as_str()),
+        "the save lands in user scope\n{}",
+        host.transcript()
     );
 }

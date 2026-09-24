@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 
 pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig {
     AgentConfig {
+        inherit_global_context: false,
+        machine: None,
+        mutation_tools: None,
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
         model_provider: None,
@@ -55,9 +58,12 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
 
 pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions {
     RunOptions {
+        parent_env_overrides: std::collections::BTreeMap::new(),
+        machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
         // nothing is recorded, which is this field's documented `None` behaviour.
         model_exclusions: None,
+        fast: false,
         structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),

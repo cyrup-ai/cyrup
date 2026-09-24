@@ -53,6 +53,7 @@ use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         acceptance_role: None,
         default_acceptance: None,
@@ -70,6 +71,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -110,6 +113,7 @@ fn message_end_line(text: &str) -> String {
 
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: agent.to_string(),
@@ -124,6 +128,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,

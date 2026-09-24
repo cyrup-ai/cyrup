@@ -26,6 +26,8 @@ mod cli;
 #[cfg(unix)]
 mod client_contract;
 mod discovery;
+#[cfg(unix)]
+mod machine_remote;
 mod method_names;
 #[cfg(unix)]
 mod probe_round_trip;
@@ -33,6 +35,8 @@ mod probe_round_trip;
 mod read_half;
 #[cfg(unix)]
 mod reconnect;
+#[cfg(unix)]
+mod relay;
 mod socket_path;
 #[cfg(unix)]
 mod stream;

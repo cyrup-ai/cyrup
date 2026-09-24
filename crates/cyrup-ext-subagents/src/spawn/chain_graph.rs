@@ -119,6 +119,24 @@ pub struct SingleStepSpec {
     pub output_path: Option<String>,
     /// Where/how this step's final output is written (func-SA §4.2 `outputMode`).
     pub output_mode: Option<OutputMode>,
+    /// SUBA-096 — pi's per-step `fast` (`ChainItem.fast`, `ParallelTask.fast`,
+    /// `DynamicParallelTemplate.fast`, `extension/schemas.ts:167,199,229` @v0.68.0). Carries the
+    /// step's own value from the tool call; the dispatch site folds the call-level and agent-level
+    /// rungs in (`s.fast ?? params.fast ?? a.fast`) before the runner reads it, so by execution
+    /// time `Some(true)` means "this step runs fast". `#[serde(default)]` keeps an older on-disk
+    /// runner config deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
+    /// SUBA-100 — pi's per-step `machine` (`ChainItem.machine`, `ParallelTask.machine`,
+    /// `DynamicParallelTemplate.machine`, `extension/schemas.ts:159,192,222` @v0.68.0): the Herdr
+    /// saved machine this step runs on. The step rung is set from the tool call or chain file; the
+    /// launch folds in the call and agent rungs (`s.machine ?? params.machine ?? a.machine`) and
+    /// resolves it before any run exists ([`crate::placement::resolve_graph_placements`]), and
+    /// the step's `cwd` then means the directory ON THAT MACHINE and is carried inside the
+    /// resolved reference, never resolved locally. `#[serde(default)]` keeps an older on-disk
+    /// runner config deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<crate::placement::StepPlacement>,
     /// Pre-declared read-context paths for this step (func-SA §4.2 `reads`).
     pub reads: Option<Vec<PathBuf>>,
     /// Explicit acceptance-contract override for this step (func-SA §4.2 `acceptance`); `None`
@@ -1269,6 +1287,24 @@ pub struct StepResult {
     /// ([`crate::exec::SingleResult::transcript_error`], pi `transcriptError`, `:1591`), carried
     /// for the same reason.
     pub transcript_error: Option<String>,
+    /// UW-3 — the step child's folded watchdog view as its run settled
+    /// ([`crate::exec::SingleResult::watchdog`], pi `singleResult.watchdog`), carried across this
+    /// waist for the same reason as [`Self::timeout_recovery`]: pi writes it onto the status step at
+    /// settle (`setOptionalProperty(step, "watchdog", singleResult.watchdog)`,
+    /// `subagent-runner.ts:3508` @v0.43.0) and onto the step's result (`:3565`). It includes the
+    /// PARENT's own `stale`/`timedOut` mark when the tail timer fired, which no child line carries,
+    /// so the live telemetry fold alone cannot produce it.
+    pub watchdog: Option<crate::watchdog::child_status::ChildWatchdogStateSnapshot>,
+    /// SUBA-063 — the child runtime's extension acknowledgement, carried from its
+    /// [`crate::exec::SingleResult::runtime_acknowledged_extensions`].
+    pub runtime_acknowledged_extensions:
+        Option<crate::exec::run_result::RuntimeAcknowledgedChildExtensions>,
+    /// SUBA-100 — pi `StepResult.nativeMachine` (`subagent-runner.ts:1579` @v0.68.0), carried from
+    /// [`crate::exec::SingleResult::native_machine`].
+    pub native_machine: Option<crate::placement::native::NativeMachineEvidence>,
+    /// SUBA-100 — pi `StepResult.execution`, carried from
+    /// [`crate::exec::SingleResult::execution`]; a `partial` one settles the step `partial`.
+    pub execution: Option<crate::exec::run_result::ExecutionOutcome>,
 }
 
 impl StepResult {
@@ -1280,6 +1316,9 @@ impl StepResult {
     #[must_use]
     pub fn success(final_output: Option<String>, structured_output: Option<Value>) -> Self {
         Self {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
             success: true,
             structured_output,
             final_output,
@@ -1301,6 +1340,7 @@ impl StepResult {
             timeout_recovery: None,
             transcript_path: None,
             transcript_error: None,
+            watchdog: None,
         }
     }
 
@@ -1310,6 +1350,9 @@ impl StepResult {
     #[must_use]
     pub fn failure(error: impl Into<String>) -> Self {
         Self {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
             success: false,
             structured_output: None,
             final_output: None,
@@ -1331,6 +1374,7 @@ impl StepResult {
             timeout_recovery: None,
             transcript_path: None,
             transcript_error: None,
+            watchdog: None,
         }
     }
 }
@@ -2541,6 +2585,9 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
 
     GroupStepResult {
         aggregate: StepResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
             success,
             structured_output: Some(structured_output),
             final_output: aggregate_final_output,
@@ -2567,6 +2614,7 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
             timeout_recovery: None,
             transcript_path: None,
             transcript_error: None,
+            watchdog: None,
         },
         children,
         fail_fast_skipped,
@@ -2592,6 +2640,7 @@ mod tests {
 
     fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
+            machine: None,
             skills: None,
             session_dir: None,
             agent: agent.to_string(),
@@ -2606,6 +2655,7 @@ mod tests {
             output: None,
             output_path: None,
             output_mode: None,
+            fast: None,
             reads: None,
             acceptance: None,
             context: None,

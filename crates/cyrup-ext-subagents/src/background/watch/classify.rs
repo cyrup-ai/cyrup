@@ -47,7 +47,9 @@ pub fn classify_outcome(result: &ResultFile) -> ClassifiedOutcome {
         RunState::Paused => ClassifiedOutcome::Paused,
         RunState::Complete if result.success => ClassifiedOutcome::Completed,
         RunState::Complete => ClassifiedOutcome::Failed, // state says done, success says no
-        RunState::Failed => ClassifiedOutcome::Failed,
+        // SUBA-100 — `notify.ts:210` has no fourth word for it: a partial run is not a success, so
+        // it reports `"failed"`.
+        RunState::Failed | RunState::Partial => ClassifiedOutcome::Failed,
         RunState::Queued | RunState::Running => {
             // Should not occur for a genuinely terminal ResultFile (finish_run only ever writes
             // Complete/Failed/Paused) — classified as Failed defensively rather than panicking or
@@ -138,6 +140,11 @@ mod tests {
     /// A `SingleResult` that was terminated by an explicit stop.
     fn stopped_child() -> crate::exec::SingleResult {
         crate::exec::SingleResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            skills_warning: None,
+            watchdog: None,
             // SUBA-021: no usage budget on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

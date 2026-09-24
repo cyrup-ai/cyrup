@@ -65,7 +65,24 @@ pub fn lower_acceptance_input(
     if !errors.is_empty() {
         return Err(errors.join(" "));
     }
+    // SUBA-105 — `acceptance.report` (`resolveAcceptanceReportMode`, `acceptance.ts:192-197`
+    // @v0.68.0) is resolved off the RAW policy — `false` is `off` — and rides on whatever contract
+    // the level arms below produce.
+    let report_mode = crate::exec::acceptance::model::resolve_acceptance_report_mode(raw);
+    let report_declared = crate::exec::acceptance::model::acceptance_declares_report(raw);
+    Ok(lower_acceptance_level(raw, report_declared)?
+        .map(|contract| contract.with_report(report_mode, report_declared)))
+}
 
+/// [`lower_acceptance_input`]'s level arms, after validation. `report_declared` keeps a policy
+/// whose ONLY declaration is `report` (e.g. `{ report: "on" }`) from collapsing to "no policy":
+/// upstream counts any non-`level` key as a requested policy (`explicitAcceptanceRequestsPolicy`,
+/// `acceptance.ts:238-240` @v0.68.0), so its level is still inferred and its report mode must
+/// survive to the structured-output runtime.
+fn lower_acceptance_level(
+    raw: &serde_json::Value,
+    report_declared: bool,
+) -> Result<Option<AcceptanceContract>, String> {
     fn level_to_status(level: &str) -> Option<AcceptanceStatus> {
         match level {
             "none" => Some(AcceptanceStatus::NotRequired),
@@ -141,7 +158,7 @@ pub fn lower_acceptance_input(
                 // floor is discarded by [`AcceptanceContract::resolve_effective`]'s max in favour of
                 // the inferred level, and the policy rides along. Returning `None` here (as this arm
                 // did before SUBA-C13) threw the whole policy away.
-                None if policy.is_declared() => Ok(Some(policy.apply(
+                None if policy.is_declared() || report_declared => Ok(Some(policy.apply(
                     AcceptanceContract::explicit_floor(AcceptanceStatus::NotRequired, Vec::new()),
                 ))),
                 None => Ok(None),

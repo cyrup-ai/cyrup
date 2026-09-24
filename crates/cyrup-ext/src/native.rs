@@ -13,7 +13,7 @@ use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A live component a NATIVE renderer handed back — Pi's `Component`
 /// (`packages/tui/src/index.ts`), whose `render(width)` the host calls on EVERY frame.
@@ -70,55 +70,149 @@ pub enum ExtMode {
     Print,
 }
 
-/// Coordinates a sanctioned human-latency wait between a native `on_event` handler and the dispatch
-/// invocation budget (P-3, `spec/extensions/cyrup-permission-system-port.md §4`). The native
-/// dispatcher wraps every handler in a `DEFAULT_INVOKE_BUDGET` `tokio::time::timeout` and, on expiry,
-/// SKIPS the handler and PROCEEDS the action (`dispatch.rs`) — which for a permission gate's
-/// `before_tool_call` `ask` is **fail-OPEN**: a human who takes longer than the budget to answer would
-/// let the tool run ungated. A handler that must block on a human calls [`HostCtx::begin_human_wait`]
-/// to hold a [`HumanWaitGuard`] across the blocking call; while any guard is alive the dispatcher's
-/// budget watchdog ([`crate::dispatch::Dispatcher`]) is SUSPENDED — the native analog of the wasm epoch
-/// forgiveness the guest UI round-trip already has (arch-08 §6.5a). The wait stays bounded by the
-/// handler's OWN timeout (which fail-CLOSES to `Block`), so forgiveness is never an unbounded hang.
-/// Reentrant: a counter admits nested/back-to-back guards; the budget resumes only once it returns to
-/// 0. This is **permission-only** by construction — no other handler obtains a guard, so every other
-/// handler keeps the exact fail-fast budget behavior (a cooperative runaway that never begins a human
-/// wait is still timed out).
-#[derive(Debug, Default)]
-pub struct HumanWaitGate {
-    /// Number of live [`HumanWaitGuard`]s (a human wait is in progress while `> 0`). The dispatcher's
-    /// budget watchdog polls [`Self::is_waiting`] whenever the budget deadline elapses: while it holds,
-    /// the watchdog re-arms the deadline instead of firing (the budget clock only advances when NOT
-    /// waiting) — critically WITHOUT ever suspending the handler future itself, so the very call that
-    /// will drop the guard keeps running.
-    waiting: AtomicUsize,
+/// What a handler is doing while it holds a [`SanctionedWaitGuard`] — the reason it is allowed to
+/// outlive the dispatch budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SanctionedWaitKind {
+    /// A human answering a dialog (P-3 — the permission gate's `ask`, the MCP approval prompt).
+    /// Unbounded by the gate: the handler's own timeout (which fails CLOSED) is the bound.
+    Human,
+    /// A model call the handler must await before it may return — the watchdog's agent-end review,
+    /// which upstream awaits inside its `agent_end` handler (`register-main.ts:427-430`,
+    /// `register-child.ts:102-110` @v0.43.0) with no per-handler budget at all
+    /// (`coding-agent/src/core/extensions/runner.ts:805-811`). Always declared with a ceiling.
+    ModelReview,
+    /// A headless session finishing its outstanding background work before the process exits — the
+    /// subagents extension's auto-drain, which upstream AWAITS inside its `agent_end` handler
+    /// (`pi-subagents` `extension/index.ts:834`, child `runs/shared/subagent-prompt-runtime.ts:500`
+    /// @v0.68.0) bounded only by the drain's own `timeoutMs` (`runs/background/auto-drain.ts:7,48`).
+    /// Cutting it at the dispatch budget loses exactly the completions the drain exists to deliver.
+    /// Always declared with a ceiling derived from that `timeoutMs`.
+    AutoDrain,
 }
 
-impl HumanWaitGate {
-    /// True while at least one [`HumanWaitGuard`] is alive (a human wait is in progress right now).
-    pub fn is_waiting(&self) -> bool {
-        self.waiting.load(Ordering::Acquire) > 0
+/// One live sanctioned wait.
+#[derive(Debug)]
+struct LiveWait {
+    id: u64,
+    kind: SanctionedWaitKind,
+    /// `None` for an unbounded (human) wait; otherwise the instant past which the dispatcher stops
+    /// forgiving this wait.
+    until: Option<tokio::time::Instant>,
+}
+
+/// Coordinates a SANCTIONED LONG WAIT between a native `on_event` handler and the dispatch
+/// invocation budget.
+///
+/// # The problem
+///
+/// The native dispatcher wraps every handler in a [`crate::dispatch::DEFAULT_INVOKE_BUDGET`] (5 s)
+/// deadline and, on expiry, DROPS the handler future (`dispatch.rs`, `invoke_contained`). That is
+/// cyrup's hang protection and upstream has none (pi's runner simply `await`s each handler,
+/// `runner.ts:805-811`). Three kinds of handler legitimately take longer:
+///
+/// - **a human** (P-3, `spec/extensions/cyrup-permission-system-port.md §4`): a permission gate's
+///   `before_tool_call` `ask`. Dropping it at the budget is **fail-OPEN** — the tool runs ungated.
+/// - **a model review** (UW-3): the watchdog's agent-end review is AWAITED inside the `AgentEnd`
+///   handler, bounded by its own `agentEndTimeoutMs` (30 s default). Dropping it at 5 s loses the
+///   review, every warning it would have raised, and — in an armed subagent child — the terminal
+///   `idle`/`failed`/`stale` status the parent is waiting for, leaving the parent's view stuck at
+///   `reviewing`.
+/// - **a headless auto-drain** ([`SanctionedWaitKind::AutoDrain`]): the subagents extension's
+///   `AgentEnd` handler waits for the session's background runs to land before a `-p` process
+///   exits, bounded by the drain's own timeout. Dropping it at 5 s abandons every completion that
+///   lands after that — the whole reason the drain exists.
+///
+/// # The shape
+///
+/// A handler DECLARES the wait by holding a [`SanctionedWaitGuard`] across it
+/// ([`HostCtx::begin_human_wait`], [`HostCtx::begin_sanctioned_wait`]). While any guard it holds is
+/// live the dispatcher's budget watchdog re-arms instead of firing — it never suspends the handler
+/// future itself, so the very call that will drop the guard keeps running. Every handler that
+/// declares nothing keeps the exact fail-fast budget: a cooperative runaway is still cut at 5 s.
+///
+/// A guard may carry a CEILING ([`HostCtx::begin_sanctioned_wait`]): the dispatcher forgives it
+/// only until the ceiling, so a declared-bounded wait whose own timeout is broken is still cut
+/// (at the first budget boundary past the ceiling). A human wait has no ceiling — a human's latency
+/// is not the handler's to bound, and the permission gate's own timeout fails closed.
+///
+/// [CYRUP-DELTA] Upstream has no per-handler budget to extend. This keeps the protection cyrup
+/// added and fixes the one thing it breaks — work the handler is REQUIRED to await — rather than
+/// exempting a whole event kind (which would drop the protection for every extension) or moving
+/// the review off the handler (which would reorder settle after review, `register-child.ts:102-110`).
+///
+/// Reentrant: nested or overlapping guards are tracked individually; the budget resumes once none
+/// of them forgives.
+#[derive(Debug, Default)]
+pub struct SanctionedWaitGate {
+    next_id: AtomicU64,
+    waits: std::sync::Mutex<Vec<LiveWait>>,
+}
+
+/// The gate's original name, from when a human was the only sanctioned wait (P-3). Kept as an alias
+/// because the permission gate and the MCP approval path name it.
+pub type HumanWaitGate = SanctionedWaitGate;
+
+impl SanctionedWaitGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<LiveWait>> {
+        self.waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn begin(self: &Arc<Self>) -> HumanWaitGuard {
-        self.waiting.fetch_add(1, Ordering::AcqRel);
-        HumanWaitGuard {
+    /// True while at least one live guard still forgives the budget right now: an unbounded
+    /// (human) wait, or a bounded one whose ceiling has not passed.
+    pub fn is_waiting(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        self.lock()
+            .iter()
+            .any(|wait| wait.until.is_none_or(|until| now < until))
+    }
+
+    /// The kinds of every live guard (including any past its ceiling), in the order they began.
+    pub fn live_kinds(&self) -> Vec<SanctionedWaitKind> {
+        self.lock().iter().map(|wait| wait.kind).collect()
+    }
+
+    fn begin(
+        self: &Arc<Self>,
+        kind: SanctionedWaitKind,
+        ceiling: Option<std::time::Duration>,
+    ) -> SanctionedWaitGuard {
+        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+        let until = ceiling.map(|ceiling| tokio::time::Instant::now() + ceiling);
+        self.lock().push(LiveWait { id, kind, until });
+        SanctionedWaitGuard {
             gate: Arc::clone(self),
+            id,
         }
     }
 }
 
-/// RAII guard for a sanctioned human wait (see [`HumanWaitGate`]). While held, the dispatch budget is
-/// suspended; on drop (including during a panic unwind) it decrements the wait count so the budget
-/// resumes for the handler's (instant) post-decision wrap-up.
-#[must_use = "the dispatch budget is only suspended while the guard is held"]
-pub struct HumanWaitGuard {
-    gate: Arc<HumanWaitGate>,
+/// RAII guard for a sanctioned long wait (see [`SanctionedWaitGate`]). While held, the dispatch
+/// budget is extended (up to the guard's ceiling, if it has one); on drop (including during a panic
+/// unwind) it is removed, so the handler's post-wait wrap-up is budgeted again.
+#[must_use = "the dispatch budget is only extended while the guard is held"]
+pub struct SanctionedWaitGuard {
+    gate: Arc<SanctionedWaitGate>,
+    id: u64,
 }
 
-impl Drop for HumanWaitGuard {
+/// The guard's original name (P-3). See [`HumanWaitGate`].
+pub type HumanWaitGuard = SanctionedWaitGuard;
+
+impl std::fmt::Debug for SanctionedWaitGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SanctionedWaitGuard")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SanctionedWaitGuard {
     fn drop(&mut self) {
-        self.gate.waiting.fetch_sub(1, Ordering::AcqRel);
+        let id = self.id;
+        self.gate.lock().retain(|wait| wait.id != id);
     }
 }
 
@@ -135,9 +229,10 @@ pub struct HostCtx {
     /// served by the `session`/`models`/`ui` capability imports; the native built-in path carries
     /// them inline so a built-in reaches the same surface without crossing a boundary (gap-08 #6).
     rich: HostCtxRich,
-    /// The sanctioned-human-wait coordinator (P-3). Shared (via `Arc`) with the dispatcher's budget
-    /// watchdog through [`Extension::human_wait_gate`], so a handler's [`Self::begin_human_wait`] and
-    /// the watchdog consult the SAME gate. One per handler ctx.
+    /// The sanctioned-long-wait coordinator (P-3, UW-3). Shared (via `Arc`) with the dispatcher's
+    /// budget watchdog through [`Extension::human_wait_gate`], so a handler's
+    /// [`Self::begin_human_wait`] / [`Self::begin_sanctioned_wait`] and the watchdog consult the SAME
+    /// gate. One per handler ctx.
     human_wait: Arc<HumanWaitGate>,
 }
 
@@ -254,7 +349,23 @@ impl HostCtx {
     /// guard (or let it fall out of scope) the instant the human interaction returns.
     #[must_use = "hold the guard across the human interaction; dropping it immediately does nothing"]
     pub fn begin_human_wait(&self) -> HumanWaitGuard {
-        self.human_wait.begin()
+        self.human_wait.begin(SanctionedWaitKind::Human, None)
+    }
+
+    /// Declare a sanctioned long wait of `kind` that must not outlive `ceiling` (UW-3): hold the
+    /// returned guard across work the handler is REQUIRED to await — the watchdog's agent-end model
+    /// review — and the dispatcher extends this handler's budget until the guard drops or the
+    /// ceiling passes, whichever is first. Every other handler keeps the fail-fast budget.
+    ///
+    /// `ceiling` should be the wait's own bound plus the handler's remaining work: a guard whose
+    /// ceiling is shorter than the work it covers is cut exactly as an undeclared handler is.
+    #[must_use = "hold the guard across the long wait; dropping it immediately does nothing"]
+    pub fn begin_sanctioned_wait(
+        &self,
+        kind: SanctionedWaitKind,
+        ceiling: std::time::Duration,
+    ) -> SanctionedWaitGuard {
+        self.human_wait.begin(kind, Some(ceiling))
     }
 
     /// The shared [`HumanWaitGate`] backing [`Self::begin_human_wait`] (P-3). The dispatcher reads this
@@ -1048,10 +1159,10 @@ impl Extension for NativeHandle {
         self.subs
     }
 
-    /// The P-3 human-wait gate for this native handler: its ctx's shared [`HumanWaitGate`]. The
-    /// dispatcher's budget watchdog reads it to forgive a sanctioned human wait (see
-    /// [`HostCtx::begin_human_wait`]). Only natives that actually block on a human (the permission
-    /// gate) ever set it waiting; for every other native it stays idle, preserving the fail-fast budget.
+    /// The sanctioned-wait gate for this native handler: its ctx's shared [`SanctionedWaitGate`].
+    /// The dispatcher's budget watchdog reads it to forgive a DECLARED long wait (a human, P-3; a
+    /// watchdog model review, UW-3 — see [`HostCtx::begin_sanctioned_wait`]). A native that declares
+    /// nothing leaves it idle and keeps the fail-fast budget.
     fn human_wait_gate(&self) -> Option<Arc<HumanWaitGate>> {
         Some(self.ctx.human_wait_gate())
     }

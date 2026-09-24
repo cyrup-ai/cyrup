@@ -115,6 +115,9 @@ mod tests {
     /// persona-map lookup and reach the spawn.
     pub(super) fn resolved_persona(name: &str) -> crate::exec::ResolvedAgentPersona {
         crate::exec::ResolvedAgentPersona {
+            inherit_global_context: false,
+            machine: None,
+            mutation_tools: None,
             file_path: None,
             acceptance_role: None,
             default_acceptance: None,
@@ -145,6 +148,7 @@ mod tests {
 
     pub(super) fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
+            machine: None,
             skills: None,
             session_dir: None,
             agent: agent.to_string(),
@@ -159,6 +163,7 @@ mod tests {
             output: None,
             output_path: None,
             output_mode: None,
+            fast: None,
             reads: None,
             acceptance: None,
             context: None,
@@ -245,6 +250,11 @@ mod tests {
             session_id: crate::identity::SessionId::parse("test-session"),
             completion_owner_id: None,
             results: vec![SingleResult {
+                execution: None,
+                native_machine: None,
+                runtime_acknowledged_extensions: None,
+                skills_warning: None,
+                watchdog: None,
                 // SUBA-021: no usage budget on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,

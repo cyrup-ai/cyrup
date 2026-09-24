@@ -57,7 +57,10 @@ use tokio::io::BufReader;
 use crate::env::HerdrPane;
 use crate::error::{ApiError, ApiErrorCode, HerdrError, Result};
 use crate::probe::{Pong, ping_for};
-use crate::schema::agents::{AgentInfo, AgentView, AgentViewClearParams, AgentViewSetParams};
+use crate::schema::agents::{
+    AgentInfo, AgentPromptParams, AgentStartParams, AgentView, AgentViewClearParams,
+    AgentViewSetParams,
+};
 use crate::schema::common::{AgentTarget, EmptyParams, PaneTarget, TabTarget};
 use crate::schema::events::PaneWaitForOutputParams;
 use crate::schema::events::{EventsSubscribeParams, Subscription};
@@ -69,7 +72,8 @@ use crate::schema::panes::{
 };
 use crate::schema::response::{OutputMatched, WireResponse};
 use crate::schema::session::SessionSnapshot;
-use crate::schema::tabs::{TabInfo, TabRenameParams};
+use crate::schema::tabs::{TabCreateParams, TabInfo, TabRenameParams};
+use crate::schema::workspaces::{WorkspaceCreateParams, WorkspaceInfo};
 use crate::schema::{Method, PingParams, Request, ResponseResult};
 use crate::stream::{self, HerdrEvents};
 use crate::transport::{self, DEFAULT_TIMEOUT, LocalStream};
@@ -390,6 +394,67 @@ impl HerdrClient {
         self.call(Method::PaneSplit(params))
             .await?
             .pane("pane.split")
+    }
+
+    /// `workspace.create` — open a workspace, and get it, its first tab and that tab's root pane.
+    ///
+    /// # Errors
+    /// herdr's refusals for the params (an unusable `cwd`, say), plus the transport arms.
+    pub async fn workspace_create(
+        &self,
+        params: WorkspaceCreateParams,
+    ) -> Result<(WorkspaceInfo, TabInfo, PaneInfo)> {
+        self.call(Method::WorkspaceCreate(params))
+            .await?
+            .workspace_created("workspace.create")
+    }
+
+    /// `tab.create` — open a tab, and get it and its root pane.
+    ///
+    /// # Errors
+    /// [`crate::ApiErrorCode::WorkspaceNotFound`]-class refusals for an unknown workspace, plus
+    /// the transport arms.
+    pub async fn tab_create(&self, params: TabCreateParams) -> Result<(TabInfo, PaneInfo)> {
+        self.call(Method::TabCreate(params))
+            .await?
+            .tab_created("tab.create")
+    }
+
+    /// `agent.start` — launch a managed agent into an empty shell pane, under `timeout`.
+    ///
+    /// herdr waits up to the request's own `timeout_ms` for the agent to come up before answering,
+    /// so the caller's deadline must exceed it; pi-subagents asks for 45 s and waits 60 s
+    /// (`src/runs/shared/herdr-placed-run.ts:173` @v0.68.0).
+    ///
+    /// # Errors
+    /// `agent_pane_busy` ("… is not an available shell") while the pane's shell is still coming up
+    /// — upstream retries that one — plus herdr's other `agent.start` refusals and the transport
+    /// arms.
+    pub async fn agent_start(
+        &self,
+        params: AgentStartParams,
+        timeout: Duration,
+    ) -> Result<(AgentInfo, Vec<String>)> {
+        self.call_for(Method::AgentStart(params), timeout)
+            .await?
+            .agent_started("agent.start")
+    }
+
+    /// `agent.prompt` — submit text to a managed agent, under `timeout`.
+    ///
+    /// With [`AgentPromptParams::wait`] set this is an in-band wait, so `timeout` must cover the
+    /// wait herdr was asked for; pi-subagents adds 5 s (`herdr-external-adapters.ts:113`).
+    ///
+    /// # Errors
+    /// herdr's `agent.prompt` refusals, plus the transport arms.
+    pub async fn agent_prompt(
+        &self,
+        params: AgentPromptParams,
+        timeout: Duration,
+    ) -> Result<AgentInfo> {
+        self.call_for(Method::AgentPrompt(params), timeout)
+            .await?
+            .agent_prompted("agent.prompt")
     }
 
     /// `pane.close` — close a pane.

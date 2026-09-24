@@ -133,6 +133,14 @@ pub const STRUCTURED_OUTPUT_TOOL_NAME: &str = "structured_output";
 /// existed at all, so nothing in the crate ever read them in production.
 pub const STEER_INBOX_ENV: &str = "CYRUP_SUBAGENT_STEER_INBOX";
 
+/// SUBA-096 — the parent's fast-mode hand-off: `"1"` when this child's effective `fast` is `true`
+/// (step > call > agent) and its model passed the allowlist
+/// (`crate::exec::spawn_plan`'s fast-mode gate). pi loads a separate child extension for the same
+/// decision (`runs/shared/fast-mode-extension.ts`, added to the launch by
+/// `resolveFastModeExtension`, `child-tool-plan.ts:151-163` @v0.68.0); cyrup's children already run
+/// this one native runtime, so the decision travels as an env var and arms one more handler here.
+pub const FAST_MODE_ENV: &str = "CYRUP_SUBAGENT_FAST";
+
 /// SUBA-049 — where this child publishes its steering capability once, at start. pi
 /// `SUBAGENT_STEER_CAPABILITY_ENV` (`runs/shared/pi-args.ts:101`, value
 /// `PI_SUBAGENT_STEER_CAPABILITY`), read at `subagent-prompt-runtime.ts:334`.
@@ -727,6 +735,14 @@ const STRUCTURED_OUTPUT_TOOL_DESCRIPTION: &str =
 /// write-only constant with no reader was exactly this item's defect.
 pub const INHERIT_PROJECT_CONTEXT_ENV: &str = "CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT";
 
+/// SUBA-101 — child env flag: whether this subagent inherits the parent's GLOBAL context files
+/// (the agent-dir `AGENTS.md`/`AGENTS.override.md`/`CLAUDE.md`) — pi's `inheritGlobalContext`
+/// child-runtime-config key (`child-runtime-config.ts:83`, read at
+/// `subagent-prompt-runtime.ts:530-536` @v0.68.0), written parent-side by `exec/spawn_plan.rs`.
+/// Independent of [`INHERIT_PROJECT_CONTEXT_ENV`]: `0` strips only the global files and keeps the
+/// project ones.
+pub const INHERIT_GLOBAL_CONTEXT_ENV: &str = "CYRUP_SUBAGENT_INHERIT_GLOBAL_CONTEXT";
+
 /// Child env flag: whether this subagent inherits the parent's skills — pi
 /// `SUBAGENT_INHERIT_SKILLS_ENV` (`subagent-prompt-runtime.ts:30`).
 ///
@@ -793,10 +809,19 @@ const SKILLS_CLOSE: &str = "</available_skills>";
 
 /// What [`rewrite_subagent_prompt`] was told about this child (pi's three `readBooleanEnv` results
 /// plus the structured-output presence check, `subagent-prompt-runtime.ts:111,330-338` @v0.34.0).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptRewriteOptions {
     /// `false` strips the inherited project-context section (pi `inheritProjectContext ?? true`).
     pub inherit_project_context: bool,
+    /// SUBA-101 — `false` strips only the GLOBAL context files (the agent dir's
+    /// `AGENTS.md`/`AGENTS.override.md`/`CLAUDE.md`) out of the project-context section, keeping
+    /// every project file (pi `inheritGlobalContext ?? true`, `subagent-prompt-runtime.ts:536`
+    /// @v0.68.0; applied by [`strip_global_context`]).
+    pub inherit_global_context: bool,
+    /// SUBA-101 — the GLOBAL agent dir the global strip compares against (pi `getAgentDir()`):
+    /// the dir this child's env resolves (`prompt_runtime_from_env` sets it from the same lookup
+    /// the rest of the runtime uses). `None` falls back to [`crate::paths::agent_dir`].
+    pub global_agent_dir: Option<PathBuf>,
     /// `false` strips the inherited skills section (pi `inheritSkills ?? true`).
     pub inherit_skills: bool,
     /// `true` selects [`CHILD_FANOUT_BOUNDARY_INSTRUCTIONS`] over
@@ -812,6 +837,8 @@ impl Default for PromptRewriteOptions {
     fn default() -> Self {
         Self {
             inherit_project_context: true,
+            inherit_global_context: true,
+            global_agent_dir: None,
             inherit_skills: true,
             fanout_child: false,
             structured_output: false,
@@ -864,6 +891,188 @@ pub fn strip_project_context(prompt: &str) -> String {
 #[must_use]
 pub fn strip_inherited_skills(prompt: &str) -> String {
     strip_delimited_section(prompt, SKILLS_OPEN, SKILLS_CLOSE)
+}
+
+/// Opening tag of one context file inside cyrup's project-context section
+/// (`cyrup-session/src/prompt/builder.rs`'s `emit_context_files`).
+const PROJECT_INSTRUCTIONS_OPEN: &str = "<project_instructions";
+/// Closing tag of one context file (`emit_context_files`).
+const PROJECT_INSTRUCTIONS_CLOSE: &str = "</project_instructions>";
+
+/// pi `GLOBAL_CONTEXT_FILE_NAMES` (`subagent-prompt-runtime.ts:121` @v0.68.0), compared
+/// lower-cased — so it also covers cyrup's `AGENTS.MD`/`CLAUDE.MD` loader candidates.
+const GLOBAL_CONTEXT_FILE_NAMES: [&str; 3] = ["agents.md", "agents.override.md", "claude.md"];
+
+/// pi `expandContextPath` (`:131-138`): a leading `~` or `~/` resolves against `HOME`
+/// (`USERPROFILE` on a host without one); anything else is taken verbatim.
+fn expand_context_path(file_path: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if file_path == "~" {
+        return home.map_or_else(|| PathBuf::from(file_path), PathBuf::from);
+    }
+    for prefix in ["~/", "~\\"] {
+        if let Some(rest) = file_path.strip_prefix(prefix) {
+            return home
+                .map_or_else(|| PathBuf::from("~"), PathBuf::from)
+                .join(rest);
+        }
+    }
+    PathBuf::from(file_path)
+}
+
+/// pi `canonicalDirectory` (`:123-129`): `realpath`, else `path.resolve`.
+fn canonical_directory(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir)
+        .unwrap_or_else(|_| std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf()))
+}
+
+/// pi `isContextFilePath` (`:140-142`): the file's basename, lower-cased, is a context-file name.
+fn is_context_file_path(file_path: &str) -> bool {
+    expand_context_path(file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| GLOBAL_CONTEXT_FILE_NAMES.contains(&name.to_lowercase().as_str()))
+}
+
+/// pi `isGlobalContextFile` (`:144-148`): a context-file name whose directory IS the agent dir
+/// (both canonicalized) — the file the child's own loader read as `ContextScope::Global`
+/// (`cyrup-session/src/prompt/context_files.rs`).
+fn is_global_context_file(file_path: &str, global_agent_dir: &Path) -> bool {
+    if !is_context_file_path(file_path) {
+        return false;
+    }
+    let expanded = expand_context_path(file_path);
+    let Some(parent) = expanded.parent() else {
+        return false;
+    };
+    canonical_directory(parent) == canonical_directory(global_agent_dir)
+}
+
+/// The `\s+path=(["'])(.*?)\1\s*>` tail of pi's `<project_instructions …>` pattern (`:151`),
+/// matched against the text right after the tag name. Returns the path and how many bytes of
+/// `after_tag` the header consumed (through its `>`). `.` does not cross a newline, and the
+/// match is non-greedy: the FIRST closing quote followed by optional whitespace and `>` ends it.
+fn parse_project_instructions_header(after_tag: &str) -> Option<(&str, usize)> {
+    let lead = after_tag.len() - after_tag.trim_start().len();
+    if lead == 0 {
+        return None;
+    }
+    let after_path = after_tag.get(lead..)?.strip_prefix("path=")?;
+    let quote = after_path.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let body = after_path.get(quote.len_utf8()..)?;
+    let mut search = 0usize;
+    loop {
+        let quote_at = search.saturating_add(body.get(search..)?.find(quote)?);
+        let candidate = body.get(..quote_at)?;
+        if candidate.contains('\n') {
+            return None;
+        }
+        let after_quote = body.get(quote_at.saturating_add(quote.len_utf8())..)?;
+        let trimmed = after_quote.trim_start();
+        if trimmed.starts_with('>') {
+            let consumed = lead
+                .saturating_add("path=".len())
+                .saturating_add(quote.len_utf8())
+                .saturating_add(quote_at)
+                .saturating_add(quote.len_utf8())
+                .saturating_add(after_quote.len() - trimmed.len())
+                .saturating_add(1);
+            return Some((candidate, consumed));
+        }
+        search = quote_at.saturating_add(quote.len_utf8());
+    }
+}
+
+/// pi `stripGlobalInstructionsFromXmlContext` (`:150-153`): drop every
+/// `<project_instructions path="…">…</project_instructions>` block (and the whitespace after it)
+/// whose path is a global context file; every other block is kept byte-for-byte.
+fn strip_global_instructions(section: &str, global_agent_dir: &Path) -> String {
+    let mut out = String::with_capacity(section.len());
+    let mut rest = section;
+    while let Some(open_at) = rest.find(PROJECT_INSTRUCTIONS_OPEN) {
+        let (Some(head), Some(from_open)) = (rest.get(..open_at), rest.get(open_at..)) else {
+            break;
+        };
+        let after_tag = from_open
+            .get(PROJECT_INSTRUCTIONS_OPEN.len()..)
+            .unwrap_or("");
+        let Some((path, header_len)) = parse_project_instructions_header(after_tag) else {
+            // Not a block header (`<project_instructionsX`, no `path=`): keep the text, move on.
+            out.push_str(head);
+            out.push_str(PROJECT_INSTRUCTIONS_OPEN);
+            rest = after_tag;
+            continue;
+        };
+        let body_start = PROJECT_INSTRUCTIONS_OPEN.len().saturating_add(header_len);
+        let Some(close_rel) = from_open
+            .get(body_start..)
+            .and_then(|body| body.find(PROJECT_INSTRUCTIONS_CLOSE))
+        else {
+            break;
+        };
+        let block_end = body_start
+            .saturating_add(close_rel)
+            .saturating_add(PROJECT_INSTRUCTIONS_CLOSE.len());
+        // pi's pattern ends in `\s*`: the whitespace after the block belongs to it.
+        let trailing = from_open.get(block_end..).unwrap_or("");
+        let end = block_end.saturating_add(trailing.len() - trailing.trim_start().len());
+        out.push_str(head);
+        if !is_global_context_file(path, global_agent_dir) {
+            out.push_str(from_open.get(..end).unwrap_or(""));
+        }
+        rest = from_open.get(end..).unwrap_or("");
+    }
+    out.push_str(rest);
+    out
+}
+
+/// SUBA-101 — pi `stripGlobalContext` (`subagent-prompt-runtime.ts:171-181` @v0.68.0), on cyrup's
+/// delimiters: inside every `<project_context>…</project_context>` section, remove the context
+/// files the child's loader read from the GLOBAL agent dir (`global_agent_dir`, pi
+/// `getAgentDir()`), keeping every ancestor/cwd file; a section left with no file at all is
+/// removed whole, exactly as [`strip_project_context`] removes it.
+///
+/// `[CYRUP-DELTA]` — upstream also rewrites pi's legacy `# Project Context` markdown header form
+/// (`stripGlobalInstructionsFromLegacyContext`); cyrup's prompt builder has only ever emitted the
+/// XML form, so there is no legacy section to rewrite (the same reason [`strip_project_context`]
+/// handles only the XML delimiters). Tag matching is case-sensitive for the same reason: cyrup's
+/// emitter writes one fixed spelling.
+#[must_use]
+pub fn strip_global_context(prompt: &str, global_agent_dir: &Path) -> String {
+    let mut out = String::with_capacity(prompt.len());
+    let mut cursor = 0usize;
+    while let Some(open_rel) = prompt
+        .get(cursor..)
+        .and_then(|r| r.find(PROJECT_CONTEXT_OPEN))
+    {
+        let start = cursor.saturating_add(open_rel);
+        let Some(close_rel) = prompt
+            .get(start..)
+            .and_then(|r| r.find(PROJECT_CONTEXT_CLOSE))
+        else {
+            break;
+        };
+        let end = start
+            .saturating_add(close_rel)
+            .saturating_add(PROJECT_CONTEXT_CLOSE.len());
+        let head = prompt.get(cursor..start).unwrap_or("");
+        let section = prompt.get(start..end).unwrap_or("");
+        let rewritten = strip_global_instructions(section, global_agent_dir);
+        if rewritten.contains(PROJECT_INSTRUCTIONS_OPEN) {
+            out.push_str(head);
+            out.push_str(&rewritten);
+        } else {
+            // Nothing inherited is left: drop the whole section and the blank line the assembler
+            // put before it, as `strip_delimited_section` does for `strip_project_context`.
+            out.push_str(head.trim_end_matches(['\n', '\r', ' ', '\t']));
+        }
+        cursor = end;
+    }
+    out.push_str(prompt.get(cursor..).unwrap_or(""));
+    out
 }
 
 /// The orchestration skill's name, as it appears inside a `<name>` element of cyrup's
@@ -1000,6 +1209,15 @@ pub fn rewrite_subagent_prompt(prompt: &str, opts: &PromptRewriteOptions) -> Str
     let mut rewritten = prompt.to_string();
     if !opts.inherit_project_context {
         rewritten = strip_project_context(&rewritten);
+    }
+    // SUBA-101 — pi `:212-214` @v0.68.0: independent of the project flag above (after a full
+    // project strip there is no section left, so this is then a no-op).
+    if !opts.inherit_global_context {
+        let global_agent_dir = opts
+            .global_agent_dir
+            .clone()
+            .unwrap_or_else(crate::paths::agent_dir);
+        rewritten = strip_global_context(&rewritten, &global_agent_dir);
     }
     if !opts.inherit_skills {
         rewritten = strip_inherited_skills(&rewritten);
@@ -1246,12 +1464,38 @@ fn rewrite_local_json_pointer_refs(
 /// nested under `value`, with every wrapper-relative JSON Pointer inside it rewritten.
 #[must_use]
 pub fn create_structured_output_tool_parameters(schema: &serde_json::Value) -> serde_json::Value {
+    create_structured_output_tool_parameters_with(schema, None)
+}
+
+/// SUBA-105 — pi `createStructuredOutputToolParameters(schema, { acceptanceReport })`
+/// (`structured-output.ts:64-74` @v0.68.0): with a report channel the parameters also carry
+/// `acceptanceReport: { type: "object" }`, listed in `required` only for `report: "on"`.
+#[must_use]
+pub fn create_structured_output_tool_parameters_with(
+    schema: &serde_json::Value,
+    acceptance_report: Option<crate::exec::acceptance::model::AcceptanceReportMode>,
+) -> serde_json::Value {
+    use crate::exec::acceptance::model::AcceptanceReportMode;
+    let acceptance_report = acceptance_report.filter(|mode| *mode != AcceptanceReportMode::Off);
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "value".to_string(),
+        rewrite_local_json_pointer_refs(schema, STRUCTURED_OUTPUT_VALUE_POINTER, true),
+    );
+    if acceptance_report.is_some() {
+        properties.insert(
+            "acceptanceReport".to_string(),
+            serde_json::json!({ "type": "object" }),
+        );
+    }
+    let mut required = vec![serde_json::json!("value")];
+    if acceptance_report == Some(AcceptanceReportMode::Required) {
+        required.push(serde_json::json!("acceptanceReport"));
+    }
     serde_json::json!({
         "type": "object",
-        "properties": {
-            "value": rewrite_local_json_pointer_refs(schema, STRUCTURED_OUTPUT_VALUE_POINTER, true),
-        },
-        "required": ["value"],
+        "properties": properties,
+        "required": required,
         "additionalProperties": false,
     })
 }
@@ -1270,6 +1514,14 @@ pub struct StructuredOutputTool {
     parameters: serde_json::Value,
     /// Where the validated value is written for the parent to read back.
     output_path: PathBuf,
+    /// SUBA-105 — the acceptance report channel (pi `structuredOutput.acceptanceReport` plus the
+    /// file capture's `acceptanceReportPath`, `child-runtime-config.ts:41-43`,
+    /// `structured-output.ts:203-214` @v0.68.0): where the call's `acceptanceReport` is written,
+    /// and whether it is required. `None` is `report: "off"` — no `acceptanceReport` parameter.
+    acceptance_report: Option<(
+        PathBuf,
+        crate::exec::acceptance::model::AcceptanceReportMode,
+    )>,
 }
 
 impl StructuredOutputTool {
@@ -1281,7 +1533,25 @@ impl StructuredOutputTool {
             schema,
             parameters,
             output_path,
+            acceptance_report: None,
         }
+    }
+
+    /// SUBA-105 — arm the `acceptanceReport` argument (builder-style): written to `path`, and
+    /// required when `mode` is [`crate::exec::acceptance::model::AcceptanceReportMode::Required`].
+    /// An `Off` mode leaves the tool without the parameter, exactly as no channel does.
+    #[must_use]
+    pub fn with_acceptance_report(
+        mut self,
+        path: PathBuf,
+        mode: crate::exec::acceptance::model::AcceptanceReportMode,
+    ) -> Self {
+        if mode == crate::exec::acceptance::model::AcceptanceReportMode::Off {
+            return self;
+        }
+        self.parameters = create_structured_output_tool_parameters_with(&self.schema, Some(mode));
+        self.acceptance_report = Some((path, mode));
+        self
     }
 }
 
@@ -1347,6 +1617,55 @@ impl Tool for StructuredOutputTool {
             ToolError::new(format!("Structured output validation failed: {message}"))
         })?;
 
+        // SUBA-105 — pi `registerStructuredOutputTool` (`subagent-prompt-runtime.ts:425-433`
+        // @v0.68.0): with `report: "on"` a call that carries no `acceptanceReport` is refused, and
+        // one whose report fails `validateAcceptanceReport` is refused with its errors — both as
+        // retryable tool errors, with NOTHING captured, so the parent never reads a value whose
+        // report was not accepted. An OPTIONAL report is captured unvalidated; the parent's
+        // acceptance gate validates it (`evaluateAcceptance`, `acceptance.ts:1430-1436`).
+        let report = params
+            .get("acceptanceReport")
+            .filter(|report| !report.is_null());
+        if let Some((_, mode)) = &self.acceptance_report
+            && *mode == crate::exec::acceptance::model::AcceptanceReportMode::Required
+        {
+            let Some(report) = report else {
+                return Err(ToolError::new(
+                    crate::exec::structured::MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR,
+                ));
+            };
+            let (validated, errors) =
+                crate::exec::acceptance::model::report::validate::validate_acceptance_report(
+                    report,
+                    "acceptanceReport",
+                );
+            if validated.is_none() {
+                return Err(ToolError::new(format!(
+                    "Invalid structured output acceptance report: {}",
+                    errors.join("; ")
+                )));
+            }
+        }
+
+        // pi `createStructuredOutputFileCapture` (`structured-output.ts:203-214` @v0.68.0): the
+        // report is written BEFORE the value (whose presence is the parent's "the tool was called"
+        // test), and a stale report from an earlier call is removed when this call carries none.
+        if let Some((report_path, _)) = &self.acceptance_report {
+            match report {
+                Some(report) => {
+                    write_private_json(report_path, report).map_err(|err| {
+                        ToolError::new(format!("Failed to write structured output: {err}"))
+                    })?;
+                }
+                None if report_path.exists() => {
+                    std::fs::remove_file(report_path).map_err(|err| {
+                        ToolError::new(format!("Failed to write structured output: {err}"))
+                    })?;
+                }
+                None => {}
+            }
+        }
+
         if let Some(dir) = self.output_path.parent() {
             std::fs::create_dir_all(dir).map_err(|err| {
                 ToolError::new(format!("Failed to write structured output: {err}"))
@@ -1374,6 +1693,22 @@ impl Tool for StructuredOutputTool {
             terminate: TerminateHint::Terminate,
         })
     }
+}
+
+/// SUBA-105 — write `value` as JSON to `path` with pi's `{ mode: 0o600 }`, creating the parent.
+fn write_private_json(path: &std::path::Path, value: &serde_json::Value) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let encoded = serde_json::to_vec(value)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    std::fs::write(path, encoded)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// The child-side runtime extension: the optional `structured_output` tool, the
@@ -1439,6 +1774,42 @@ pub struct SubagentPromptRuntime {
     /// `Some` only when the parent wrote BOTH the diagnostic path and the required-tools list, which
     /// is the same gate upstream applies (`if (!filePath || !required) return undefined;`).
     tool_diagnostic: Option<ChildToolDiagnosticPlan>,
+    /// SUBA-096 — pi `registerSubagentFastModeExtension` (`fast-mode-extension.ts:8-10` @v0.68.0):
+    /// `true` only when the parent wrote [`FAST_MODE_ENV`]` = "1"`. Arms a `before_provider_request`
+    /// handler that sets `service_tier: "priority"` on every outbound request body
+    /// ([`rewrite_fast_mode_provider_request`]); `false` subscribes nothing, so a normal child pays
+    /// nothing for it.
+    fast_mode: bool,
+    /// SUBA-063 — pi `registerRuntimeExtensionAcknowledgements` (`subagent-prompt-runtime.ts:116-140`
+    /// @v0.64.0, `:68-93` @v0.68.0). `Some` only when the parent named an output file in
+    /// [`crate::exec::runtime_acknowledged_extensions::RUNTIME_EXTENSION_ACK_PATH_ENV`] — which the
+    /// parent does for every child it spawns — so a top-level process registers nothing.
+    runtime_acknowledgements:
+        Option<Arc<crate::exec::runtime_acknowledged_extensions::RuntimeExtensionAcknowledgements>>,
+    /// SUBA-100 — a placed child's agent, skills, reads and memory as THIS machine resolved them
+    /// (pi's bridge `configure`, `herdr-pi-bridge.ts:34-45,109-121` @v0.68.0). `Some` only in a
+    /// child a Herdr placement launched ([`crate::placement::remote_resources::RESOURCES_ENV`]);
+    /// its `before_agent_start` override replaces the launching side's prompt rewrite.
+    placed_resources: Option<Arc<crate::placement::remote_resources::ResolvedRemoteResources>>,
+}
+
+/// SUBA-096 — pi `rewriteFastModeProviderRequest` (`fast-mode-extension.ts:3-6` @v0.68.0): a JSON
+/// object payload gains `service_tier: "priority"` with every other key untouched; anything else
+/// (an array, a string, `null`) passes through unchanged, exactly as upstream returns
+/// `event.payload` for a non-object.
+#[must_use]
+pub fn rewrite_fast_mode_provider_request(payload: &serde_json::Value) -> serde_json::Value {
+    match payload {
+        serde_json::Value::Object(map) => {
+            let mut next = map.clone();
+            next.insert(
+                "service_tier".to_string(),
+                serde_json::Value::String("priority".to_string()),
+            );
+            serde_json::Value::Object(next)
+        }
+        other => other.clone(),
+    }
 }
 
 /// SUBA-045 — the child-side half of pi's `refreshChildToolDiagnostic`
@@ -1587,6 +1958,9 @@ impl SubagentPromptRuntime {
             services: Arc::new(std::sync::Mutex::new(None)),
             permission_gate: None,
             tool_diagnostic: None,
+            fast_mode: false,
+            runtime_acknowledgements: None,
+            placed_resources: None,
         }
     }
 
@@ -1611,7 +1985,41 @@ impl SubagentPromptRuntime {
             services: Arc::new(std::sync::Mutex::new(None)),
             permission_gate: None,
             tool_diagnostic: None,
+            fast_mode: false,
+            runtime_acknowledgements: None,
+            placed_resources: None,
         }
+    }
+
+    /// SUBA-100 — arm the placed child's remote-resource override (see the `placed_resources`
+    /// field doc).
+    #[must_use]
+    pub fn with_placed_resources(
+        mut self,
+        resolved: Option<crate::placement::remote_resources::ResolvedRemoteResources>,
+    ) -> Self {
+        self.placed_resources = resolved.map(Arc::new);
+        self
+    }
+
+    /// SUBA-096 — arm the fast-mode request rewrite (see the `fast_mode` field doc).
+    #[must_use]
+    pub fn with_fast_mode(mut self, fast_mode: bool) -> Self {
+        self.fast_mode = fast_mode;
+        self
+    }
+
+    /// SUBA-063 — arm the runtime-extension acknowledgement collector from the child's env (pi
+    /// `const outputPath = process.env[RUNTIME_EXTENSION_ACK_PATH_ENV]?.trim(); if (!outputPath)
+    /// return;`, `subagent-prompt-runtime.ts:117-118` @v0.64.0).
+    #[must_use]
+    pub fn with_runtime_acknowledgements(mut self, get: &dyn Fn(&str) -> Option<String>) -> Self {
+        self.runtime_acknowledgements =
+            crate::exec::runtime_acknowledged_extensions::RuntimeExtensionAcknowledgements::from_env(
+                get,
+            )
+            .map(Arc::new);
+        self
     }
 
     /// Attach the child-side steering inbox (pi `registerSteeringInbox`,
@@ -1824,6 +2232,12 @@ impl SubagentPromptRuntime {
             // into every child unconditionally); cyrup's `is_inert` gate is the cyrup-side stand-in
             // for that, so every half that does work has to be named here.
             && self.tool_diagnostic.is_none()
+            // SUBA-096: a child whose only job is the fast-mode rewrite still has a real job.
+            && !self.fast_mode
+            // SUBA-063: a child asked to report its acknowledged extensions has a real job too.
+            && self.runtime_acknowledgements.is_none()
+            // SUBA-100: a placed child's remote agent prompt and tools are its whole persona.
+            && self.placed_resources.is_none()
     }
 
     /// Attach the parent-supplied tool budget (pi `registerToolBudget`,
@@ -1882,7 +2296,7 @@ impl NativeExtension for SubagentPromptRuntime {
         // unconditionally: this extension exists ONLY inside a subagent child, and every subagent
         // child must have the parent's orchestration bookkeeping filtered out of its context.
         let mut kinds = vec![EventKind::Context];
-        if self.rewrite.is_some() {
+        if self.rewrite.is_some() || self.placed_resources.is_some() {
             kinds.push(EventKind::BeforeAgentStart);
         }
         // pi `registerToolBudget` subscribes `onRuntimeEvent("tool_call", …)` only when a budget
@@ -1942,6 +2356,28 @@ impl NativeExtension for SubagentPromptRuntime {
         if self.tool_diagnostic.is_some() {
             kinds.push(EventKind::AgentStart);
         }
+        // SUBA-096 / pi `pi.on("before_provider_request", rewriteFastModeProviderRequest)`
+        // (`fast-mode-extension.ts:9`), registered only when the parent loaded that extension —
+        // i.e. only for a fast child.
+        if self.fast_mode {
+            kinds.push(EventKind::BeforeProviderRequest);
+        }
+        // The child-side auto-drain (`on_event`'s `AgentEnd` arm): upstream registers its
+        // `onRuntimeEvent("agent_end", … drainOutstandingWork …)` in EVERY child, unconditionally
+        // (`subagent-prompt-runtime.ts:488-491` @v0.43.0, `:490-500` @v0.68.0). This used to be
+        // declared only inside the watchdog block above, so an UNARMED child — the common case —
+        // never received `agent_end`, never drained, and abandoned its own background children
+        // the moment its single turn ended. `EventKind` de-duplicates through the bitset.
+        kinds.push(EventKind::AgentEnd);
+        // SUBA-063 — pi `events.on(RUNTIME_EXTENSION_ACK_EVENT, acknowledge)` plus the two finalize
+        // registrations, `onRuntimeEvent("agent_end", finalize)` / `("session_shutdown", finalize)`
+        // (`subagent-prompt-runtime.ts:134-137` @v0.64.0). Declared only when armed.
+        if self.runtime_acknowledgements.is_some() {
+            api.subscribe_bus(
+                crate::exec::runtime_acknowledged_extensions::RUNTIME_EXTENSION_ACK_EVENT,
+            );
+            kinds.push(EventKind::SessionShutdown);
+        }
         api.subscribe(&kinds);
         Ok(())
     }
@@ -1962,7 +2398,45 @@ impl NativeExtension for SubagentPromptRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(services);
     }
 
+    /// SUBA-063 — pi's `acknowledge` listener on `pi.events` (`subagent-prompt-runtime.ts:121-126`
+    /// @v0.64.0). Every other topic is ignored.
+    async fn on_bus_event(
+        &self,
+        topic: &str,
+        payload: &serde_json::Value,
+        _ctx: &HostCtx,
+    ) -> Result<(), cyrup_ext::ExtError> {
+        if topic == crate::exec::runtime_acknowledged_extensions::RUNTIME_EXTENSION_ACK_EVENT
+            && let Some(acknowledgements) = &self.runtime_acknowledgements
+        {
+            acknowledgements.acknowledge(payload);
+        }
+        Ok(())
+    }
+
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        // SUBA-063 — pi's `finalize` on `agent_end` / `session_shutdown`
+        // (`subagent-prompt-runtime.ts:127-137` @v0.64.0), registered FIRST in
+        // `registerSubagentPromptRuntime` (`:451` @v0.68.0), so it runs ahead of this runtime's
+        // other `agent_end` work — the drain included, which can block for a long time. Idempotent:
+        // only the first of the two events writes.
+        if matches!(
+            ev,
+            HostEvent::AgentEnd { .. } | HostEvent::SessionShutdown { .. }
+        ) && let Some(acknowledgements) = &self.runtime_acknowledgements
+        {
+            acknowledgements.finalize();
+        }
+        // SUBA-096 — the fast-mode rewrite. `before_provider_request` has no other meaning for this
+        // runtime, so it returns here rather than falling through.
+        if let HostEvent::BeforeProviderRequest { payload } = ev {
+            if !self.fast_mode {
+                return HookOutcome::Noop;
+            }
+            return HookOutcome::Mutate(EventPatch::ProviderRequest(
+                rewrite_fast_mode_provider_request(payload),
+            ));
+        }
         // G90 / pi `registerSteeringInbox`'s handlers (`subagent-prompt-runtime.ts:441-469`). Run
         // FIRST and always fall through: every one of these events also has (or may later grow) a
         // meaning for the other halves of this runtime, and steering is a pure side effect that
@@ -2014,7 +2488,10 @@ impl NativeExtension for SubagentPromptRuntime {
                     &crate::watchdog::turn_delta::watchdog_turn_end_event(message, tool_results),
                     &_ctx.cwd,
                 ),
-                HostEvent::AgentEnd { .. } => watchdog.handle_agent_end(&_ctx.cwd).await,
+                // UW-3 — under a declared model-review wait: the dispatcher's 5 s handler budget
+                // would otherwise drop the review, and with it the terminal status the parent's
+                // drain is holding for.
+                HostEvent::AgentEnd { .. } => watchdog.handle_agent_end_in_handler(_ctx).await,
                 HostEvent::SessionShutdown { .. } => watchdog.handle_session_shutdown(),
                 _ => {}
             }
@@ -2074,14 +2551,18 @@ impl NativeExtension for SubagentPromptRuntime {
                     .with_fail_on_failed_runs(true)
                     .with_fail_on_attention(true),
                 };
-                if let Err(message) = crate::background::auto_drain::drain_outstanding_work(
-                    &session_id,
-                    crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
-                    &crate::time::now_epoch_millis,
-                    &probe,
-                    &waiter,
-                )
-                .await
+                // Under a declared auto-drain wait, exactly as the parent site: without it the
+                // dispatcher's 5 s handler budget drops the drain and abandons the grandchildren.
+                if let Err(message) =
+                    crate::background::auto_drain::drain_outstanding_work_in_handler(
+                        _ctx,
+                        &session_id,
+                        crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
+                        &crate::time::now_epoch_millis,
+                        &probe,
+                        &waiter,
+                    )
+                    .await
                 {
                     // [CYRUP-DELTA in mechanism, not in behaviour] as at the parent site: upstream
                     // throws, pi's runner catches it (`runner.ts:869-878`) and the headless
@@ -2111,6 +2592,35 @@ impl NativeExtension for SubagentPromptRuntime {
         }
         match ev {
             // pi `:323-341`.
+            // SUBA-100 — a placed child: the bridge's `before_agent_start` (`herdr-pi-bridge.ts:
+            // 119` @v0.68.0) — the REMOTE agent's prompt under its own context policy — plus
+            // `setActiveTools(resolved.tools)` (`:120`).
+            HostEvent::BeforeAgentStart { system_prompt, .. }
+                if self.placed_resources.is_some() =>
+            {
+                let Some(placed) = &self.placed_resources else {
+                    return HookOutcome::Noop;
+                };
+                if let Some(tools) = &placed.tools
+                    && let Some(services) = self
+                        .services
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                {
+                    services.set_active_tools(tools);
+                }
+                let rewrite = self.rewrite.as_ref();
+                HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
+                    system: Some(placed.system_prompt(
+                        system_prompt,
+                        rewrite.and_then(|opts| opts.global_agent_dir.clone()),
+                        rewrite.is_some_and(|opts| opts.fanout_child),
+                        rewrite.is_some_and(|opts| opts.structured_output),
+                    )),
+                    inject: None,
+                })
+            }
             HostEvent::BeforeAgentStart { system_prompt, .. } => {
                 let Some(opts) = &self.rewrite else {
                     return HookOutcome::Noop;
@@ -2275,23 +2785,50 @@ pub fn prompt_runtime_from_env(
         (Some(capture), Some(schema_path)) => std::fs::read(&schema_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .map(|schema| Arc::new(StructuredOutputTool::new(schema, PathBuf::from(capture)))),
+            .map(|schema| {
+                let tool = StructuredOutputTool::new(schema, PathBuf::from(capture));
+                // SUBA-105 — the acceptance report channel the parent armed (pi
+                // `structuredOutput.acceptanceReport`, `child-launch.ts:276-278` @v0.68.0): both
+                // the path and a recognised mode, or no `acceptanceReport` parameter at all.
+                let tool = match (
+                    non_empty(crate::exec::structured::STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_ENV),
+                    non_empty(
+                        crate::exec::structured::STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_MODE_ENV,
+                    )
+                    .as_deref()
+                    .and_then(crate::exec::acceptance::model::AcceptanceReportMode::from_wire),
+                ) {
+                    (Some(path), Some(mode)) => {
+                        tool.with_acceptance_report(PathBuf::from(path), mode)
+                    }
+                    _ => tool,
+                };
+                Arc::new(tool)
+            }),
         _ => None,
     };
 
     let inherit_project_context = read_boolean_env(get, INHERIT_PROJECT_CONTEXT_ENV);
+    // SUBA-101 — pi `const { inheritProjectContext, inheritGlobalContext, inheritSkills } = config`
+    // (`subagent-prompt-runtime.ts:530` @v0.68.0).
+    let inherit_global_context = read_boolean_env(get, INHERIT_GLOBAL_CONTEXT_ENV);
     let inherit_skills = read_boolean_env(get, INHERIT_SKILLS_ENV);
     let fanout_child = read_boolean_env(get, FANOUT_CHILD_ENV);
-    // pi `:333`: all three undefined => no rewrite at all.
-    let rewrite =
-        (inherit_project_context.is_some() || inherit_skills.is_some() || fanout_child.is_some())
-            .then(|| PromptRewriteOptions {
-                inherit_project_context: inherit_project_context.unwrap_or(true),
-                inherit_skills: inherit_skills.unwrap_or(true),
-                fanout_child: fanout_child == Some(true),
-                // pi `:111` gates the appended instruction on the CAPTURE var alone.
-                structured_output: capture.is_some(),
-            });
+    // pi `:533`: all four undefined => no rewrite at all.
+    let rewrite = (inherit_project_context.is_some()
+        || inherit_global_context.is_some()
+        || inherit_skills.is_some()
+        || fanout_child.is_some())
+    .then(|| PromptRewriteOptions {
+        inherit_project_context: inherit_project_context.unwrap_or(true),
+        inherit_global_context: inherit_global_context.unwrap_or(true),
+        // Filled below, once this child's agent dir is resolved from the same `get`.
+        global_agent_dir: None,
+        inherit_skills: inherit_skills.unwrap_or(true),
+        fanout_child: fanout_child == Some(true),
+        // pi `:111` gates the appended instruction on the CAPTURE var alone.
+        structured_output: capture.is_some(),
+    });
 
     // pi `registerNativeSupervisorClient` (`subagent-prompt-runtime.ts:240` →
     // `native-supervisor-channel.ts:294-311`): a child with a resolvable supervisor channel gets a
@@ -2300,8 +2837,25 @@ pub fn prompt_runtime_from_env(
     // stands in for upstream's `!hasTool(pi, "contact_supervisor")`.
     let agent_dir =
         crate::native_supervisor::intercom_agent_dir_from(get, std::env::current_dir().ok());
+    // SUBA-101 — pi `getAgentDir()` inside `isGlobalContextFile`: the global strip compares against
+    // the agent dir THIS child's env resolves, the one its own context loader read `AGENTS.md` from.
+    let rewrite = rewrite.map(|options| PromptRewriteOptions {
+        global_agent_dir: Some(agent_dir.clone()),
+        ..options
+    });
+    // SUBA-100 — a placed child resolves its agent, skills, reads and memory against THIS
+    // machine's checkout while its extensions are built, so an unresolvable one refuses the launch
+    // before the first turn (pi's bridge `configure` throw).
+    let placed_resources = crate::placement::remote_resources::resources_from_env(
+        get,
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    )?;
+    // SUBA-100 — pi's bridge registers its own `contact_supervisor` in a placed child
+    // (`herdr-pi-bridge.ts:62-78`): the parent is reached through the placed run's relay, never
+    // through a broker on the machine, so the native file channel registers regardless.
     let child_metadata = crate::native_supervisor::read_child_metadata_from(get).filter(|_| {
-        crate::native_supervisor::native_child_client_should_register_from(get, &agent_dir)
+        placed_resources.is_some()
+            || crate::native_supervisor::native_child_client_should_register_from(get, &agent_dir)
     });
     let supervisor_tool = child_metadata.clone().map(|metadata| {
         Arc::new(crate::native_supervisor::NativeContactSupervisorTool::new(
@@ -2458,7 +3012,14 @@ pub fn prompt_runtime_from_env(
         .with_watchdog(watchdog, services)
         // SUBA-045 / pi `refreshChildToolDiagnostic` (`subagent-prompt-runtime.ts:98-103`), armed
         // from the pair of env vars the parent writes at `pi-args.ts:610-616`.
-        .with_tool_diagnostic(get);
+        .with_tool_diagnostic(get)
+        // SUBA-096 — pi loads `fast-mode-extension.ts` into the child only when the launch plan
+        // resolved fast mode; the parent's equivalent decision arrives as `FAST_MODE_ENV = "1"`.
+        .with_fast_mode(get(FAST_MODE_ENV).as_deref() == Some("1"))
+        // SUBA-063 — pi `registerRuntimeExtensionAcknowledgements(pi)` (`:451` @v0.68.0, env-read at
+        // `:117` @v0.64.0).
+        .with_runtime_acknowledgements(get)
+        .with_placed_resources(placed_resources);
 
     if runtime.is_inert() {
         return Ok(None);
@@ -3599,6 +4160,9 @@ mod tests {
     ) -> PromptRewriteOptions {
         PromptRewriteOptions {
             inherit_project_context,
+            // SUBA-101: these fixtures predate the global flag; inheriting keeps them unchanged.
+            inherit_global_context: true,
+            global_agent_dir: None,
             inherit_skills,
             fanout_child,
             structured_output: false,
@@ -3941,5 +4505,498 @@ mod tests {
     fn a_clean_context_reports_no_change() {
         let messages = vec![AgentMessage::user_text("task"), tool_result("bash")];
         assert!(strip_parent_only_subagent_messages(&arcs(messages), false).is_none());
+    }
+}
+
+/// SUBA-096 — the child half of fast mode: pi `fast-mode-extension.ts` @v0.68.0, driven through the
+/// real env resolver and the real `init` / `on_event` surface.
+#[cfg(test)]
+mod fast_mode_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use cyrup_ext::native::ExtMode;
+
+    fn ctx() -> HostCtx {
+        HostCtx::event(ExtMode::Json, false, PathBuf::from("/tmp"))
+    }
+
+    /// The parent's `FAST_MODE_ENV = "1"` alone arms the runtime, subscribes
+    /// `before_provider_request`, and the handler adds `service_tier: "priority"` while leaving
+    /// every other key — `model` included — as it was.
+    ///
+    /// Mutation killed: skipping the subscribe push (the host never delivers the event), or
+    /// replacing the payload wholesale (`model` is lost).
+    #[tokio::test]
+    async fn fast_child_rewrites_the_provider_request() {
+        let ext =
+            prompt_runtime_extension_from(&|key| (key == FAST_MODE_ENV).then(|| "1".to_string()))
+                .expect("builds")
+                .expect("fast mode alone arms the runtime");
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.expect("init");
+        assert!(
+            api.subscriptions()
+                .contains(EventKind::BeforeProviderRequest)
+        );
+        let outcome = ext
+            .on_event(
+                &HostEvent::BeforeProviderRequest {
+                    payload: serde_json::json!({"model": "gpt-5.6-luna", "input": []}),
+                },
+                &ctx(),
+            )
+            .await;
+        let HookOutcome::Mutate(EventPatch::ProviderRequest(body)) = outcome else {
+            panic!("a fast child must rewrite the request: {outcome:?}");
+        };
+        assert_eq!(
+            body,
+            serde_json::json!({"model": "gpt-5.6-luna", "input": [], "service_tier": "priority"})
+        );
+    }
+
+    /// No marker (or any value but `"1"`) => no subscription and no rewrite. Mutation killed:
+    /// arming on presence rather than on `"1"`, or pushing the subscription unconditionally.
+    #[tokio::test]
+    async fn a_child_without_the_marker_does_not_subscribe() {
+        assert!(
+            prompt_runtime_extension_from(&|_| None)
+                .expect("builds")
+                .is_none()
+        );
+        let ext =
+            prompt_runtime_extension_from(&|key| (key == FAST_MODE_ENV).then(|| "0".to_string()))
+                .expect("builds");
+        assert!(ext.is_none(), "\"0\" is not fast");
+
+        let plain = SubagentPromptRuntime::from_parts(None, None, false);
+        let mut api = InitApi::new();
+        plain.init(&mut api).await.expect("init");
+        assert!(
+            !api.subscriptions()
+                .contains(EventKind::BeforeProviderRequest)
+        );
+    }
+
+    /// pi's non-object passthrough: an array or string payload is returned unchanged.
+    #[test]
+    fn a_non_object_payload_passes_through() {
+        for payload in [
+            serde_json::json!([1, 2]),
+            serde_json::json!("raw"),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(rewrite_fast_mode_provider_request(&payload), payload);
+        }
+    }
+}
+
+/// SUBA-101 — the child half of `inheritGlobalContext`: pi `stripGlobalContext` /
+/// `rewriteSubagentPrompt` (`subagent-prompt-runtime.ts:171-214,530-536` @v0.68.0), driven
+/// through the pure strip and through the real env resolver + `before_agent_start` surface.
+#[cfg(test)]
+mod global_context_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use cyrup_ext::native::ExtMode;
+
+    fn ctx() -> HostCtx {
+        HostCtx::event(ExtMode::Json, false, PathBuf::from("/tmp"))
+    }
+
+    /// The assembler's exact shape (`cyrup-session/src/prompt/builder.rs` `emit_context_files`):
+    /// global file first, then the project file.
+    fn prompt_with(global: &Path, project: &Path) -> String {
+        format!(
+            "BODY\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n\
+             <project_instructions path=\"{}\">\nGLOBAL RULE\n</project_instructions>\n\n\
+             <project_instructions path=\"{}\">\nPROJECT RULE\n</project_instructions>\n\n\
+             </project_context>\n\nCurrent working directory: /repo",
+            global.display(),
+            project.display()
+        )
+    }
+
+    /// Only the file whose directory IS the agent dir goes; the project file and everything
+    /// around the section stay byte-for-byte. A section left empty goes whole. Mutation killed:
+    /// dropping the directory comparison (the project `AGENTS.md` is stripped too), or dropping
+    /// the empty-section removal (an empty `<project_context>` shell survives).
+    #[test]
+    fn strip_global_context_removes_only_agent_dir_context_files() {
+        let agent_dir = tempfile::tempdir().expect("tempdir");
+        let global = agent_dir.path().join("AGENTS.md");
+        let project = PathBuf::from("/repo/AGENTS.md");
+        let out = strip_global_context(&prompt_with(&global, &project), agent_dir.path());
+        assert!(!out.contains("GLOBAL RULE"), "{out}");
+        assert!(out.contains("PROJECT RULE"), "{out}");
+        assert!(out.contains("<project_context>"), "{out}");
+        assert!(out.starts_with("BODY\n\n<project_context>"), "{out}");
+        assert!(out.ends_with("Current working directory: /repo"), "{out}");
+
+        // A non-context filename in the agent dir is not a global context file.
+        let notes = agent_dir.path().join("NOTES.md");
+        let kept = strip_global_context(&prompt_with(&notes, &project), agent_dir.path());
+        assert!(kept.contains("GLOBAL RULE"), "{kept}");
+
+        // Only the global file inherited: the whole section is dropped with its blank line.
+        let only_global = format!(
+            "BODY\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n\
+             <project_instructions path=\"{}\">\nGLOBAL RULE\n</project_instructions>\n\n\
+             </project_context>\n\nCurrent working directory: /repo",
+            agent_dir.path().join("CLAUDE.MD").display()
+        );
+        let out = strip_global_context(&only_global, agent_dir.path());
+        assert_eq!(out, "BODY\n\nCurrent working directory: /repo");
+    }
+
+    /// The canonical comparison (pi `canonicalDirectory`, `realpath`): a global file recorded
+    /// through a symlinked path to the agent dir is still global.
+    #[cfg(unix)]
+    #[test]
+    fn strip_global_context_compares_canonical_directories() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join("agent");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let link = root.path().join("agent-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let out = strip_global_context(
+            &prompt_with(
+                &link.join("AGENTS.override.md"),
+                Path::new("/repo/CLAUDE.md"),
+            ),
+            &real,
+        );
+        assert!(!out.contains("GLOBAL RULE"), "{out}");
+        assert!(out.contains("PROJECT RULE"), "{out}");
+    }
+
+    /// Independent of the project flag in both directions (pi `:208-214`): project inherited +
+    /// global not => only the global file goes; project not inherited => the whole section goes
+    /// whatever the global flag says. Mutation killed: gating the global strip on the project
+    /// flag, or dropping it.
+    #[test]
+    fn rewrite_applies_the_global_flag_independently_of_the_project_flag() {
+        let agent_dir = tempfile::tempdir().expect("tempdir");
+        let prompt = prompt_with(
+            &agent_dir.path().join("AGENTS.md"),
+            Path::new("/repo/AGENTS.md"),
+        );
+        let flags = |project: bool, global: bool| PromptRewriteOptions {
+            inherit_project_context: project,
+            inherit_global_context: global,
+            global_agent_dir: Some(agent_dir.path().to_path_buf()),
+            ..PromptRewriteOptions::default()
+        };
+        let out = rewrite_subagent_prompt(&prompt, &flags(true, false));
+        assert!(
+            !out.contains("GLOBAL RULE") && out.contains("PROJECT RULE"),
+            "{out}"
+        );
+        let out = rewrite_subagent_prompt(&prompt, &flags(true, true));
+        assert!(
+            out.contains("GLOBAL RULE") && out.contains("PROJECT RULE"),
+            "{out}"
+        );
+        let out = rewrite_subagent_prompt(&prompt, &flags(false, true));
+        assert!(
+            !out.contains("GLOBAL RULE") && !out.contains("PROJECT RULE"),
+            "{out}"
+        );
+    }
+
+    async fn rewritten_by_runtime(env: &[(&str, &str)], system_prompt: &str) -> String {
+        let owned: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let ext = prompt_runtime_extension_from(&move |key| {
+            owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        })
+        .expect("builds")
+        .expect("an inherit flag arms the runtime");
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.expect("init");
+        assert!(api.subscriptions().contains(EventKind::BeforeAgentStart));
+        match ext
+            .on_event(
+                &HostEvent::BeforeAgentStart {
+                    prompt: "task".to_string(),
+                    images: serde_json::Value::Null,
+                    system_prompt: system_prompt.to_string(),
+                    options: serde_json::Value::Null,
+                    injected: Vec::new(),
+                },
+                &ctx(),
+            )
+            .await
+        {
+            HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
+                system: Some(system),
+                ..
+            }) => system,
+            other => panic!("the child rewrites its prompt: {other:?}"),
+        }
+    }
+
+    /// The production path: the parent's `CYRUP_SUBAGENT_INHERIT_GLOBAL_CONTEXT=0` reaches the
+    /// child's `before_agent_start` rewrite, which strips the file its loader read from the agent
+    /// dir THIS child's env resolves (`CYRUP_CODING_AGENT_DIR` here, pi `getAgentDir()`), and `1` /
+    /// an absent var (pi `inheritGlobalContext ?? true`) keeps it. The global var ALONE also arms
+    /// the rewrite (pi `:533`). Mutation killed: not reading the var, reading it with the wrong
+    /// default, leaving it out of the arming condition, or not handing the env-resolved agent dir
+    /// to the options (the strip then compares against a different dir and keeps the file).
+    #[tokio::test]
+    async fn the_child_runtime_strips_global_context_when_the_parent_says_so() {
+        let agent_dir = tempfile::tempdir().expect("tempdir");
+        let dir = agent_dir.path().display().to_string();
+        let dir = dir.as_str();
+        let agent_key = cyrup_config::paths::ENV_CODING_AGENT_DIR;
+        let prompt = prompt_with(
+            &agent_dir.path().join("AGENTS.md"),
+            Path::new("/repo/AGENTS.md"),
+        );
+        let stripped = rewritten_by_runtime(
+            &[
+                (agent_key, dir),
+                (INHERIT_PROJECT_CONTEXT_ENV, "1"),
+                (INHERIT_GLOBAL_CONTEXT_ENV, "0"),
+            ],
+            &prompt,
+        )
+        .await;
+        assert!(!stripped.contains("GLOBAL RULE"), "{stripped}");
+        assert!(stripped.contains("PROJECT RULE"), "{stripped}");
+
+        let kept = rewritten_by_runtime(
+            &[
+                (agent_key, dir),
+                (INHERIT_PROJECT_CONTEXT_ENV, "1"),
+                (INHERIT_GLOBAL_CONTEXT_ENV, "1"),
+            ],
+            &prompt,
+        )
+        .await;
+        assert!(kept.contains("GLOBAL RULE"), "{kept}");
+
+        let legacy = rewritten_by_runtime(
+            &[(agent_key, dir), (INHERIT_PROJECT_CONTEXT_ENV, "1")],
+            &prompt,
+        )
+        .await;
+        assert!(
+            legacy.contains("GLOBAL RULE"),
+            "absent var inherits: {legacy}"
+        );
+
+        let alone = rewritten_by_runtime(
+            &[(agent_key, dir), (INHERIT_GLOBAL_CONTEXT_ENV, "0")],
+            &prompt,
+        )
+        .await;
+        assert!(!alone.contains("GLOBAL RULE"), "{alone}");
+        assert!(alone.contains("PROJECT RULE"), "{alone}");
+    }
+}
+
+/// SUBA-105 — the child half of `acceptance.report`: the `structured_output` tool as
+/// [`prompt_runtime_from_env`] arms it from the parent's env hand-off (pi
+/// `registerStructuredOutputTool`, `subagent-prompt-runtime.ts:405-440` @v0.68.0, over the file
+/// capture `createStructuredOutputFileCapture`, `structured-output.ts:203-214`).
+#[cfg(test)]
+mod structured_acceptance_report_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+    use crate::exec::structured::{
+        MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_ENV,
+        STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_MODE_ENV,
+    };
+
+    struct Child {
+        _dir: tempfile::TempDir,
+        output: PathBuf,
+        report: PathBuf,
+        tool: Arc<StructuredOutputTool>,
+    }
+
+    /// Build the child runtime exactly as a spawned child does — from its environment — with the
+    /// report channel set to `mode` (`None` = the parent sent no report channel: `report: "off"`).
+    fn child(mode: Option<&str>) -> Child {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = dir.path().join("schema.json");
+        std::fs::write(
+            &schema_path,
+            serde_json::to_vec(&serde_json::json!({
+                "type": "object",
+                "properties": { "ok": { "type": "boolean" } },
+                "required": ["ok"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = dir.path().join("output.json");
+        let report = dir.path().join("acceptance-report.json");
+        let env: std::collections::HashMap<&str, String> = [
+            (
+                STRUCTURED_OUTPUT_SCHEMA_ENV,
+                schema_path.display().to_string(),
+            ),
+            (STRUCTURED_OUTPUT_CAPTURE_ENV, output.display().to_string()),
+        ]
+        .into_iter()
+        .chain(mode.into_iter().flat_map(|mode| {
+            [
+                (
+                    STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_ENV,
+                    report.display().to_string(),
+                ),
+                (
+                    STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_MODE_ENV,
+                    mode.to_string(),
+                ),
+            ]
+        }))
+        .collect();
+        let runtime = prompt_runtime_from_env(&|key| env.get(key).cloned())
+            .expect("builds")
+            .expect("a structured child gets the runtime");
+        let tool = runtime
+            .tool
+            .clone()
+            .expect("the structured_output tool is armed");
+        Child {
+            _dir: dir,
+            output,
+            report,
+            tool,
+        }
+    }
+
+    async fn call(
+        tool: &StructuredOutputTool,
+        params: serde_json::Value,
+    ) -> Result<ToolResult, ToolError> {
+        tool.execute(
+            ToolCallId::from("so"),
+            params,
+            CancelToken::new(),
+            Box::new(|_| {}),
+        )
+        .await
+    }
+
+    fn valid_report() -> serde_json::Value {
+        serde_json::json!({
+            "criteriaSatisfied": [{ "id": "proof", "status": "satisfied", "evidence": "ok is true" }],
+            "residualRisks": ["none"],
+        })
+    }
+
+    /// `report: "on"` (`subagent-prompt-runtime.ts:406-433`): `acceptanceReport` is advertised
+    /// and REQUIRED, a call without one is refused with pi's exact text, a malformed one is
+    /// refused with `validateAcceptanceReport`'s errors, and neither refusal captures anything —
+    /// the parent must not read a value whose report was not accepted.
+    #[tokio::test]
+    async fn a_required_report_is_enforced_before_anything_is_captured() {
+        let child = child(Some("required"));
+        let params = child.tool.parameters();
+        assert_eq!(
+            params["properties"]["acceptanceReport"],
+            serde_json::json!({ "type": "object" })
+        );
+        assert_eq!(
+            params["required"],
+            serde_json::json!(["value", "acceptanceReport"])
+        );
+
+        let missing = call(&child.tool, serde_json::json!({ "value": { "ok": true } }))
+            .await
+            .expect_err("a required report must be supplied");
+        assert_eq!(
+            missing.to_string(),
+            MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR
+        );
+
+        let malformed = call(
+            &child.tool,
+            serde_json::json!({ "value": { "ok": true }, "acceptanceReport": { "criteriaSatisfied": "all" } }),
+        )
+        .await
+        .expect_err("a malformed report is refused");
+        assert!(
+            malformed.to_string().starts_with(
+                "Invalid structured output acceptance report: acceptanceReport.criteriaSatisfied"
+            ),
+            "{malformed}"
+        );
+        assert!(!child.output.exists() && !child.report.exists());
+
+        call(
+            &child.tool,
+            serde_json::json!({ "value": { "ok": true }, "acceptanceReport": valid_report() }),
+        )
+        .await
+        .expect("a valid value with a valid report is captured");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&child.report).unwrap()).unwrap();
+        assert_eq!(written, valid_report());
+        assert!(child.output.exists());
+    }
+
+    /// The default (`optional`): the parameter is advertised but not required, a report is
+    /// captured when sent, and a later call without one REMOVES the stale file
+    /// (`createStructuredOutputFileCapture`'s `unlinkSync`, `structured-output.ts:209-210`), so
+    /// the parent can never read an earlier call's report beside a later call's value.
+    #[tokio::test]
+    async fn an_optional_report_is_captured_when_sent_and_cleared_when_not() {
+        let child = child(Some("optional"));
+        assert_eq!(
+            child.tool.parameters()["required"],
+            serde_json::json!(["value"])
+        );
+        assert!(
+            child.tool.parameters()["properties"]
+                .get("acceptanceReport")
+                .is_some()
+        );
+
+        call(
+            &child.tool,
+            serde_json::json!({ "value": { "ok": true }, "acceptanceReport": valid_report() }),
+        )
+        .await
+        .expect("captured");
+        assert!(child.report.exists());
+
+        call(&child.tool, serde_json::json!({ "value": { "ok": false } }))
+            .await
+            .expect("an optional report may be omitted");
+        assert!(!child.report.exists(), "the stale report must be removed");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&child.output).unwrap()).unwrap();
+        assert_eq!(written, serde_json::json!({ "ok": false }));
+    }
+
+    /// `report: "off"` sends no channel: the tool has no `acceptanceReport` parameter at all
+    /// (`createStructuredOutputToolParameters` without `acceptanceReport`, `structured-output.ts:64-74`).
+    #[test]
+    fn no_report_channel_advertises_no_acceptance_report_parameter() {
+        let child = child(None);
+        assert!(
+            child.tool.parameters()["properties"]
+                .get("acceptanceReport")
+                .is_none()
+        );
+        assert_eq!(
+            child.tool.parameters()["required"],
+            serde_json::json!(["value"])
+        );
     }
 }

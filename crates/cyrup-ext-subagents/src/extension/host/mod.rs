@@ -94,6 +94,22 @@ pub struct SubagentsExtension {
     /// when false, upstream leaves `fleetStatus` `undefined` entirely (`:378-383`) and no widget
     /// ever registers. Captured at construction, exactly as upstream captures it.
     fleet_view_enabled: bool,
+    /// SUBA-061 — pi `asyncWidgetEnabled` (`extension/index.ts:438` @v0.68.0), captured at
+    /// construction for [`Self::fleet_view_enabled`]'s reason. Gates the async-jobs widget slot in
+    /// BOTH modes, and is independent of the fleet view.
+    async_widget_enabled: bool,
+    /// Whether this extension's last write to the async-jobs widget slot left content in it —
+    /// pi's tracker only renders that slot while it tracks async jobs (`if
+    /// (state.asyncJobs.size > 0) refreshWidget(ctx)`, `extension/index.ts:916-918` @v0.68.0) and
+    /// clears it once when the last one leaves; this is what lets an idle refresh edge write
+    /// nothing at all, as upstream's does. See `publish_async_status_snapshot_widget`.
+    async_slot_occupied: Arc<std::sync::atomic::AtomicBool>,
+    /// SUBA-061 — pi `summaryInlineToolDisplay` (`extension/index.ts:439`), captured at
+    /// construction because `render_result` is synchronous and cannot lock the async config cell.
+    inline_tool_display_summary: bool,
+    /// SUBA-061 — `resolveFleetKeybindings(config.fleetKeybindings)`, resolved once and handed to
+    /// every inspector open (`extension/index.ts:502`, `slash-commands.ts:863` @v0.68.0).
+    fleet_keybindings: crate::tui::fleet::FleetKeybindings,
     /// `SubagentExtensionConfig::foreground_detach_shortcut`, captured at construction — pi's own
     /// `foregroundDetachShortcut: config.foregroundDetachShortcut` capture at
     /// `extension/index.ts:856`, which is likewise read once as the config lands rather than
@@ -229,6 +245,9 @@ impl SubagentsExtension {
         let roots = config.roots.clone();
         let env_overrides = config.env_overrides.clone();
         let fleet_view_enabled = config.fleet_view;
+        let async_widget_enabled = config.async_widget_enabled();
+        let inline_tool_display_summary = config.inline_tool_display_summary();
+        let fleet_keybindings = config.fleet_keybindings();
         // pi `foregroundDetachShortcut: config.foregroundDetachShortcut` (`extension/index.ts:856`).
         let foreground_detach_shortcut_setting = config.foreground_detach_shortcut.clone();
         let fleet_status = crate::tui::fleet_status::SubagentFleetStatus::new(
@@ -297,6 +316,10 @@ impl SubagentsExtension {
             fleet_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fleet_inspector_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fleet_view_enabled,
+            async_widget_enabled,
+            async_slot_occupied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inline_tool_display_summary,
+            fleet_keybindings,
             foreground_detach_shortcut_setting,
             fleet_status: Arc::new(std::sync::Mutex::new(fleet_status)),
             rpc_tool: std::sync::OnceLock::new(),
@@ -1231,6 +1254,7 @@ mod tests {
 
         let graph = vec![RunnerStep::SingleStep(
             crate::spawn::chain_graph::SingleStepSpec {
+                machine: None,
                 skills: None,
                 session_dir: None,
                 agent: "worker".to_string(),
@@ -1245,6 +1269,7 @@ mod tests {
                 output: None,
                 output_path: None,
                 output_mode: None,
+                fast: None,
                 reads: None,
                 acceptance: None,
                 context: None,

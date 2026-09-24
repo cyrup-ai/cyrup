@@ -56,14 +56,16 @@ pub type SettledWorkflowStatus = RunStatus;
 ///
 /// Exhaustive by design: `Queued`/`Running`/`Failed` all collapse to `Failed`, which is upstream's
 /// catch-all — but written out, so a seventh [`RunState`] breaks the build instead of silently
-/// reporting a failure. (`RunState` has no `Partial`/`Rejected`; `background/wait.rs:729` is the
-/// precedent for that collapse — cited, not re-derived.)
+/// reporting a failure. (`Partial` collapses to `Failed` too — upstream's ternary names only
+/// `complete`/`paused`/`stopped`; `RunState` has no `Rejected`.)
 fn workflow_state(state: RunState) -> WorkflowState {
     match state {
         RunState::Complete => WorkflowState::Completed,
         RunState::Paused => WorkflowState::Paused,
         RunState::Stopped => WorkflowState::Stopped,
-        RunState::Queued | RunState::Running | RunState::Failed => WorkflowState::Failed,
+        RunState::Queued | RunState::Running | RunState::Failed | RunState::Partial => {
+            WorkflowState::Failed
+        }
     }
 }
 
@@ -76,7 +78,9 @@ fn workflow_receipt_state(state: RunState) -> WorkflowReceiptState {
         RunState::Complete => WorkflowReceiptState::Complete,
         RunState::Paused => WorkflowReceiptState::Paused,
         RunState::Stopped => WorkflowReceiptState::Stopped,
-        RunState::Queued | RunState::Running | RunState::Failed => WorkflowReceiptState::Failed,
+        RunState::Queued | RunState::Running | RunState::Failed | RunState::Partial => {
+            WorkflowReceiptState::Failed
+        }
     }
 }
 

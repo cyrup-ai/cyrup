@@ -63,6 +63,7 @@ impl SingleStepExecutor for Scripted {
 
 fn template(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        machine: None,
         agent: agent.to_string(),
         task: task.to_string(),
         skills: None,
@@ -77,6 +78,7 @@ fn template(agent: &str, task: &str) -> SingleStepSpec {
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,

@@ -651,6 +651,7 @@ mod tests {
         // prompt, and it is in here precisely so that a builder or a label that started reading it
         // would be caught.
         let steps = vec![RunnerStep::SingleStep(SingleStepSpec {
+            machine: None,
             skills: None,
             session_dir: None,
             agent: AGENT_NAME.to_string(),
@@ -665,6 +666,7 @@ mod tests {
             output: None,
             output_path: None,
             output_mode: None,
+            fast: None,
             reads: None,
             acceptance: None,
             context: None,

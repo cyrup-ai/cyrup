@@ -101,6 +101,14 @@ pub enum RunState {
     /// into `Failed` would silently make a stopped run look resumable-or-not identically to a
     /// crashed one and would erase the distinct user-visible string at every one of those sites.
     Stopped,
+    /// SUBA-100 — pi `statusPayload.state = "partial"` (`subagent-runner.ts:4959` @v0.68.0): the
+    /// run ended with useful but unverified work and NO concrete failure — every non-successful
+    /// result is partial evidence (`partialWithEvidence`, `:4953`), e.g. a pane-native external
+    /// run on a Herdr saved machine, which only ever settles from terminal evidence
+    /// (`partialExecutionWithUsefulMutation`, `:1831-1838`). Terminal and not a success; upstream
+    /// counts it with `failed` wherever a caller asks "did this fail?"
+    /// (`subagent-wait.ts:698,817`, `resume-guidance.ts:42`) and renders it as its own word.
+    Partial,
 }
 
 impl RunState {
@@ -122,6 +130,7 @@ impl RunState {
             Self::Complete => "complete",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+            Self::Partial => "partial",
         }
     }
 
@@ -139,6 +148,7 @@ impl RunState {
             RunState::Complete => 3,
             RunState::Failed => 3,
             RunState::Stopped => 3,
+            RunState::Partial => 3,
         }
     }
 
@@ -155,7 +165,7 @@ impl RunState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            RunState::Complete | RunState::Failed | RunState::Stopped
+            RunState::Complete | RunState::Failed | RunState::Stopped | RunState::Partial
         )
     }
 
@@ -190,6 +200,9 @@ impl RunState {
                 | (RunState::Running, RunState::Complete)
                 | (RunState::Running, RunState::Failed)
                 | (RunState::Running, RunState::Stopped)
+                // SUBA-100 — `partial` is decided where `complete`/`failed` are, at the end of a
+                // running run (`subagent-runner.ts:4959` @v0.68.0).
+                | (RunState::Running, RunState::Partial)
                 | (RunState::Paused, RunState::Running)
                 | (RunState::Paused, RunState::Failed)
         )
@@ -259,6 +272,10 @@ pub enum StepState {
     /// `stopped` (with `exitCode: 1` and the stop message as its `error`) rather than `failed` or
     /// `paused`. Terminal and non-resumable, exactly like [`RunState::Stopped`].
     Stopped,
+    /// SUBA-100 — pi step `status = "partial"` (`subagent-runner.ts:3804,4224,4717` @v0.68.0):
+    /// the step's result carried `execution.status === "partial"` — useful but unverified work,
+    /// e.g. a pane-native external run on a Herdr saved machine. Terminal, not a success.
+    Partial,
 }
 
 impl StepState {
@@ -274,6 +291,7 @@ impl StepState {
             Self::Complete => "complete",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+            Self::Partial => "partial",
         }
     }
 
@@ -286,7 +304,7 @@ impl StepState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            StepState::Complete | StepState::Failed | StepState::Stopped
+            StepState::Complete | StepState::Failed | StepState::Stopped | StepState::Partial
         )
     }
 }

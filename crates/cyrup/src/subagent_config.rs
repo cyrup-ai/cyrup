@@ -54,14 +54,26 @@ pub fn load_subagent_extension_config(dirs: &ConfigDirs) -> SubagentExtensionCon
     // unknown key inside the `missions` block rather than refuse it. Upstream throws; this
     // loader's own established convention for a bad-but-present config file is warn-and-default
     // (see the module docs), so that is what a refused `missions` block gets too.
+    //
+    // The same holds for every other raw validator pi's `validateConfig` runs
+    // (`extension/config.ts:131-181` @v0.68.0): `artifactDir`, `authorityPolicy` and
+    // `artifactConfig` were written and documented as refused at load, and never called here, so
+    // a typo'd `authorityPolicy` action was ignored without a word. `validate_raw_config` runs
+    // them all, in upstream's order.
+    //
+    // Keys this port does not read at all get a non-fatal warning each (`config_warnings`): the
+    // rest of the file still loads, but nothing the user set disappears silently.
     match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(raw) => {
-            if let Err(message) = SubagentExtensionConfig::validate_missions(&raw) {
+            if let Err(message) = SubagentExtensionConfig::validate_raw_config(&raw) {
                 eprintln!(
-                    "cyrup: warning: {} has an invalid missions block ({message}); using defaults",
+                    "cyrup: warning: {} is invalid ({message}); using defaults",
                     path.display()
                 );
                 return rooted();
+            }
+            for warning in SubagentExtensionConfig::config_warnings(&raw) {
+                eprintln!("cyrup: warning: {}: {warning}", path.display());
             }
         }
         Err(_) => {
@@ -153,6 +165,92 @@ mod tests {
         // convention then discards the file rather than honoring a half-understood config.
         let dirs = dirs_at(dir.path());
         assert_eq!(load_subagent_extension_config(&dirs), defaults_for(&dirs));
+    }
+
+    /// Before this, the loader called only `validate_missions`, so an unknown `authorityPolicy`
+    /// action was dropped by serde and the file loaded as if it were fine.
+    ///
+    /// Mutation killed: calling `validate_missions` instead of `validate_raw_config` — the
+    /// file then loads with `maxSubagentDepth: 5`, not the defaults.
+    #[test]
+    fn an_unknown_authority_action_is_refused_by_name() {
+        let raw = serde_json::json!({"authorityPolicy": {"stopRuns": "allow"}});
+        let message = SubagentExtensionConfig::validate_raw_config(&raw)
+            .expect_err("an unknown authority action must be refused");
+        assert!(message.contains("stopRuns"), "names the key: {message}");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subagents_dir = dir.path().join("subagents");
+        std::fs::create_dir_all(&subagents_dir).expect("mkdir");
+        std::fs::write(
+            subagents_dir.join("config.json"),
+            r#"{"maxSubagentDepth": 5, "authorityPolicy": {"stopRuns": "allow"}}"#,
+        )
+        .expect("write");
+        let dirs = dirs_at(dir.path());
+        assert_eq!(load_subagent_extension_config(&dirs), defaults_for(&dirs));
+    }
+
+    /// The two other formerly-uncalled validators are reached through the same entry point, and
+    /// the refusal carries upstream's own field-naming sentence (`extension/config.ts:152,79`
+    /// @v0.68.0) rather than serde's generic "unknown variant"/"invalid value" text — which is all
+    /// the typed parse alone would have said, naming no key.
+    ///
+    /// Mutation killed: dropping either call from `validate_raw_config`.
+    #[test]
+    fn artifact_dir_and_artifact_config_are_validated_at_load() {
+        assert_eq!(
+            SubagentExtensionConfig::validate_raw_config(
+                &serde_json::json!({"artifactDir": "nowhere"})
+            ),
+            Err(r#"config.artifactDir must be "project", "session", or "temp""#.to_string())
+        );
+        assert_eq!(
+            SubagentExtensionConfig::validate_raw_config(
+                &serde_json::json!({"artifactConfig": {"cleanupDays": -1}})
+            ),
+            Err("config.artifactConfig.cleanupDays must be a non-negative integer".to_string())
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subagents_dir = dir.path().join("subagents");
+        std::fs::create_dir_all(&subagents_dir).expect("mkdir");
+        std::fs::write(
+            subagents_dir.join("config.json"),
+            r#"{"maxSubagentDepth": 5, "artifactDir": "nowhere"}"#,
+        )
+        .expect("write");
+        let dirs = dirs_at(dir.path());
+        assert_eq!(load_subagent_extension_config(&dirs), defaults_for(&dirs));
+    }
+
+    /// An upstream key this port never implemented, and a plain typo, are each reported — and
+    /// neither takes the rest of the file down.
+    ///
+    /// Mutation killed: an empty `UNPORTED_CONFIG_KEYS` (the unported key is then reported as
+    /// merely unknown), or dropping the unknown-key arm.
+    #[test]
+    fn an_unported_upstream_key_warns() {
+        let raw = serde_json::json!({"maxSubagentDepth": 5, "worktreeProvider": "native", "fleetVeiw": false});
+        let warnings = SubagentExtensionConfig::config_warnings(&raw);
+        assert_eq!(
+            warnings,
+            vec![
+                "'worktreeProvider' is not supported by this port (worktree allocator selection); it has no effect".to_string(),
+                "unknown key 'fleetVeiw' (ignored)".to_string(),
+            ]
+        );
+        // Every key the struct reads is known — including the raw-held ones.
+        let quiet = serde_json::json!({"asyncWidget": false, "inlineToolDisplay": "summary", "fleetKeybindings": {}, "completionBatch": {}, "missions": {}});
+        assert!(SubagentExtensionConfig::config_warnings(&quiet).is_empty());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subagents_dir = dir.path().join("subagents");
+        std::fs::create_dir_all(&subagents_dir).expect("mkdir");
+        std::fs::write(subagents_dir.join("config.json"), raw.to_string()).expect("write");
+        assert_eq!(
+            load_subagent_extension_config(&dirs_at(dir.path())).max_subagent_depth,
+            5
+        );
     }
 
     #[test]

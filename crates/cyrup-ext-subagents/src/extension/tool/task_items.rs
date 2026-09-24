@@ -72,6 +72,14 @@ pub(crate) struct ToolTaskItem {
     progress: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    /// SUBA-096 — pi `ParallelTask.fast` / `ChainItem.fast` (`extension/schemas.ts:167,229`
+    /// @v0.68.0): the step rung of `s.fast ?? params.fast ?? a.fast`.
+    #[serde(default)]
+    fast: Option<bool>,
+    /// SUBA-100 — pi `ParallelTask.machine` / `ChainItem.machine` (`extension/schemas.ts:159,222`
+    /// @v0.68.0): the step rung of `s.machine ?? params.machine ?? a.machine`.
+    #[serde(default)]
+    machine: Option<String>,
     #[serde(default)]
     skill: Option<serde_json::Value>,
     #[serde(default)]
@@ -118,6 +126,12 @@ impl ToolTaskItem {
         if self.model.is_some() {
             keys.push("model");
         }
+        if self.fast.is_some() {
+            keys.push("fast");
+        }
+        if self.machine.is_some() {
+            keys.push("machine");
+        }
         if self.skill.is_some() {
             keys.push("skill");
         }
@@ -155,6 +169,7 @@ pub(crate) fn parse_tool_task_items(
         // Touch the not-yet-plumbed fields so `dead_code` stays satisfied and a caller can see the
         // exact shape parsed (the fields themselves are Tier 4/5 wire-ups).
         let _ = item.provided_keys();
+        validate_step_machine(item.machine.as_deref())?;
         if task_required && item.task.as_deref().unwrap_or("").is_empty() {
             return Err(ToolError::new(format!(
                 "tasks[{i}] requires a non-empty 'task' (top-level PARALLEL mode)"
@@ -245,11 +260,32 @@ fn tool_output_path_string(output: Option<&serde_json::Value>) -> Option<String>
     }
 }
 
+/// SUBA-100 — a step / task / group `machine` (`extension/schemas.ts:159,192,222` @v0.68.0,
+/// `minLength: 1, maxLength: 128`) through `validateMachineName` (`herdr-machine.ts:66-72`): a
+/// blank one is refused rather than read as "no machine", which would silently run the step
+/// wherever the call or the agent placed it instead.
+fn validate_step_machine(machine: Option<&str>) -> Result<(), ToolError> {
+    match machine {
+        Some(machine) => crate::placement::resolve::validate_machine_name(machine)
+            .map(|_| ())
+            .map_err(ToolError::new),
+        None => Ok(()),
+    }
+}
+
 /// Lower one [`ToolTaskItem`] to a [`SingleStepSpec`] — the fields with a spec home only. The
 /// per-task `model` override reaches the child via `SingleStepSpec::model` (honored by
 /// `ExecSingleStepExecutor::run_single`'s `model_override`), exactly as the slash `[model=…]` path.
 pub(crate) fn tool_task_to_spec(item: &ToolTaskItem) -> SingleStepSpec {
     SingleStepSpec {
+        // SUBA-100 — the step rung; the call and agent rungs are folded in at launch
+        // (`crate::placement::resolve_graph_placements`), where the resolution happens.
+        machine: item
+            .machine
+            .as_deref()
+            .map(str::trim)
+            .filter(|machine| !machine.is_empty())
+            .map(crate::placement::StepPlacement::requested),
         // SUBA-N03 shape, third path: pi's `ParallelTaskSchema` advertises `skill`
         // (`extension/schemas.ts:146` @v0.43.0, the same `SkillOverride` the top-level `skill`
         // param uses) and HONOURS it — `const skillOverrides = params.tasks.map((task) =>
@@ -291,6 +327,7 @@ pub(crate) fn tool_task_to_spec(item: &ToolTaskItem) -> SingleStepSpec {
         // real output path reaches the child and drives the file-output handoff.
         output_path: tool_output_path_string(item.output.as_ref()),
         output_mode: parse_tool_output_mode(item.output_mode.as_deref()),
+        fast: item.fast,
         reads: parse_tool_reads(item.reads.as_ref()),
         acceptance: parse_tool_acceptance(item.acceptance.as_ref()),
         context: None,
@@ -374,6 +411,24 @@ pub(crate) fn parse_tool_output_mode(
         Some("file-only") => Some(crate::discovery::types::OutputMode::FileOnly),
         _ => None,
     }
+}
+
+/// SUBA-096 — the one output-mode rule every decision site applies: pi `params.outputMode ??
+/// agent.outputMode ?? "inline"`, at five sites upstream (`subagent-executor.ts:3346` parallel,
+/// `:3861` single; `async-execution.ts:1836` async single; `child-launch-plan.ts:105` chain step;
+/// `settings.ts:390` chain task — all @v0.68.0, the agent rung present since v0.57.0).
+///
+/// Before this, every cyrup site fell from the call's mode straight to `Inline`, so an agent's own
+/// mode — from `outputMode:` frontmatter, an `agentOverrides.<name>.outputMode` entry, or a
+/// runtime registration — was validated and then never read.
+#[must_use]
+pub(crate) fn resolve_effective_output_mode(
+    explicit: Option<crate::discovery::types::OutputMode>,
+    agent_output: Option<&crate::discovery::types::OutputSpec>,
+) -> crate::discovery::types::OutputMode {
+    explicit
+        .or_else(|| agent_output.and_then(|spec| spec.mode))
+        .unwrap_or(crate::discovery::types::OutputMode::Inline)
 }
 
 fn parse_tool_reads(raw: Option<&serde_json::Value>) -> Option<Vec<PathBuf>> {
@@ -547,7 +602,25 @@ pub(crate) fn parse_tool_chain_items(
             Some(serde_json::Value::Array(tasks)) => {
                 let items = parse_tool_task_items(tasks, false)?;
                 let expanded = expand_chain_parallel_counts(items, i)?;
-                let steps: Vec<SingleStepSpec> = expanded.iter().map(tool_task_to_spec).collect();
+                // SUBA-100 — pi `buildSeqStep({ ...t, machine: t.machine ?? s.machine, … })`
+                // (`async-execution.ts:1269` @v0.68.0): the group's own `machine` places every
+                // task that does not name one.
+                let group_machine = obj
+                    .and_then(|o| o.get("machine"))
+                    .and_then(serde_json::Value::as_str);
+                validate_step_machine(group_machine)?;
+                let group_machine = group_machine.map(str::trim);
+                let steps: Vec<SingleStepSpec> = expanded
+                    .iter()
+                    .map(tool_task_to_spec)
+                    .map(|mut spec| {
+                        if spec.machine.is_none() {
+                            spec.machine =
+                                group_machine.map(crate::placement::StepPlacement::requested);
+                        }
+                        spec
+                    })
+                    .collect();
                 let concurrency = obj
                     .and_then(|o| o.get("concurrency"))
                     .and_then(serde_json::Value::as_u64)
@@ -582,6 +655,7 @@ pub(crate) fn parse_tool_chain_items(
                 let item: ToolTaskItem = serde_json::from_value(value.clone())
                     .map_err(|e| ToolError::new(format!("invalid chain step at index {i}: {e}")))?;
                 let _ = item.provided_keys();
+                validate_step_machine(item.machine.as_deref())?;
                 graph.push(RunnerStep::SingleStep(tool_task_to_spec(&item)));
             }
         }

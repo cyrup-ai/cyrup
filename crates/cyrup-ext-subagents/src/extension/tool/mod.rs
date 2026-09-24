@@ -24,7 +24,8 @@ use crate::extension::tool::mission::{
     prepare_mission_binding_for_dispatch,
 };
 use crate::extension::tool::params::{
-    SubagentToolParams, normalize_public_subagent_execution, validate_execution_acceptance,
+    SubagentToolParams, normalize_public_subagent_execution, resolve_execution_agent_scope,
+    validate_execution_acceptance,
 };
 use crate::extension::tool::schema::subagent_tool_parameters;
 use crate::extension::tool::task_items::count_requested_subagent_spawns;
@@ -210,6 +211,12 @@ impl Tool for SubagentTool {
         {
             return Err(ToolError::new(refusal));
         }
+        // PB-9 — captured BEFORE the typed parse, which consumes `request` and (the field being
+        // gone) ignores the key: pi refuses ANY present `clarify` value, `null` and non-booleans
+        // included, so presence on the raw map is the test.
+        let clarify_present = request
+            .as_object()
+            .is_some_and(|map| map.contains_key("clarify"));
         let parsed: SubagentToolParams = serde_json::from_value(request)
             .map_err(|e| ToolError::new(format!("invalid subagent tool call: {e}")))?;
 
@@ -218,7 +225,7 @@ impl Tool for SubagentTool {
         // pattern the per-item `ToolTaskItem::provided_keys` calls above use.
         //
         // The list this comment used to carry ("fields no dispatch arm consumes yet: output/
-        // outputMode/skill/acceptance/artifacts/includeProgress/share/sessionDir/clarify/control/
+        // outputMode/skill/acceptance/artifacts/includeProgress/share/sessionDir/control/
         // timeoutMs/maxRuntimeMs/chainDir, wire-ups are Tiers 3/5") is GONE because it went stale
         // — every one of those is wired now — and a stale inventory here is actively harmful: it
         // reads as license for the next unwired param to sit unnoticed.
@@ -231,11 +238,53 @@ impl Tool for SubagentTool {
         // warning, that test is what will stop you.
         let _ = parsed.provided_keys();
 
+        // SUBA-100 — pi's schema declares the call `machine` `minLength: 1, maxLength: 128`
+        // (`extension/schemas.ts:369` @v0.68.0) and `resolveHerdrMachinePlacement` trims and
+        // validates it (`validateMachineName`, `herdr-machine.ts:66-72`). cyrup's argument
+        // coercion does not enforce string lengths, so an empty machine would otherwise count as
+        // "placed" below — moving `cwd` into `machineCwd` — while placing nothing, silently running
+        // the call in this tool's cwd instead of the one it named. Refused here with upstream's
+        // sentence before anything else reads it.
+        if parsed.action.is_none()
+            && let Some(machine) = parsed.machine.as_deref()
+        {
+            crate::placement::resolve::validate_machine_name(machine).map_err(ToolError::new)?;
+        }
+
         // pi `resolveRequestedCwd(ctx.cwd, params.cwd)` (`subagent-executor.ts:2801`): resolved ONCE
         // up front and threaded into every dispatch arm below — management/control CRUD, the
         // background-control actions, AND execution (PARALLEL/CHAIN/SINGLE) all see the SAME
         // `effectiveCwd`/`requestCwd`, not this tool's construction-time `self.cwd` unconditionally.
-        let effective_cwd = self.resolve_requested_cwd(parsed.cwd.as_deref());
+        //
+        // SUBA-100 — pi `remotePlacement` (`subagent-executor.ts:6176-6195` @v0.68.0): with a
+        // machine — the call's own, or a single agent's `machine:` — `cwd` names a directory ON
+        // THAT MACHINE, so it is kept out of every local path resolution: the request runs from
+        // this tool's cwd and the typed value travels as `machineCwd`. Management/control calls
+        // (`action`) keep their cwd.
+        let roots = self.executor.config_snapshot().await.roots.clone();
+        let placed_by_agent = parsed.machine.is_none()
+            && parsed.cwd.is_some()
+            && parsed.action.is_none()
+            && parsed.agent.as_deref().is_some_and(|agent| {
+                self.executor
+                    .resolve_agent(
+                        &self.cwd,
+                        agent,
+                        resolve_execution_agent_scope(parsed.agent_scope.as_deref()),
+                        &roots,
+                    )
+                    // Discovery errors surface from the launch path itself.
+                    .is_ok_and(|definition| definition.machine.is_some())
+            });
+        let remote_placement =
+            parsed.action.is_none() && (parsed.machine.is_some() || placed_by_agent);
+        let mut parsed = parsed;
+        let effective_cwd = if remote_placement {
+            parsed.machine_cwd = parsed.cwd.take();
+            self.cwd.clone()
+        } else {
+            self.resolve_requested_cwd(parsed.cwd.as_deref())
+        };
 
         // R-SA-128 / C8 dispatch: the `subagent` tool is a discriminated union over pi's full
         // parameter surface. Mode is selected exactly as pi's `subagent-executor` selects it — a
@@ -252,7 +301,8 @@ impl Tool for SubagentTool {
         // it to exactly the two surfaces upstream applies it to, and to nothing else. See
         // [`normalize_public_subagent_execution`] for what is and is not ported out of upstream's
         // `extension/public-execution.ts`.
-        let action = normalize_public_subagent_execution(parsed.action.as_deref())?;
+        let action =
+            normalize_public_subagent_execution(parsed.action.as_deref(), clarify_present)?;
         if let Some(action) = action {
             return self
                 .route_action(action, &parsed, &effective_cwd, &cancel)

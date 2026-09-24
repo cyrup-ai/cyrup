@@ -154,7 +154,10 @@ pub async fn run_with(
 
     let (control_flags, interrupt_cancel) = init_control_flags(run_paths).await;
 
-    let mut events = open_run_events(&config, run_paths).await;
+    // pi `maxAsyncEventsBytes()` — read once, handed to both handles that need it.
+    let events_cap =
+        super::events::resolve_async_events_cap_bytes(&|name| std::env::var(name).ok());
+    let mut events = open_run_events(&config, run_paths, events_cap).await;
 
     // The run's overall start (for `durationMs` on the terminal run event, pi's
     // `runEndedAt - overallStartTime`), captured before `status` is moved into the shared handle.
@@ -190,8 +193,17 @@ pub async fn run_with(
     let writer_ledgers: super::executor::WriterProcessLedgers =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let (telemetry_tx, telemetry_rx) = tokio::sync::mpsc::unbounded_channel::<TelemetryMsg>();
-    let telemetry_task =
-        spawn_telemetry_task(run_paths.clone(), Arc::clone(&shared_status), telemetry_rx);
+    // The telemetry pump's own `events.jsonl` handle, opened with the same operator cap: it is the
+    // ONE writer of child diagnostic lines, so the one-shot truncation marker is written once.
+    let child_journal = crate::jsonl::RunEventLog::create_with_cap(&run_paths.events, events_cap)
+        .await
+        .ok();
+    let telemetry_task = spawn_telemetry_task(
+        run_paths.clone(),
+        Arc::clone(&shared_status),
+        telemetry_rx,
+        child_journal,
+    );
     // The lease's writer channel, beside the telemetry one and for the same structural reason: an
     // observation made inside a synchronous sink callback has to reach an `async` writer. The
     // HANDLE moves into this task, which is what keeps one owner for the whole claim; it comes
@@ -580,7 +592,7 @@ async fn finalize_own_process_terminal(
     config: &RunnerConfig,
     run_paths: &RunPaths,
     roots: &crate::paths::Roots,
-    events: &mut Option<crate::jsonl::BoundedJsonlWriter>,
+    events: &mut Option<crate::jsonl::RunEventLog>,
 ) {
     let Some(instance) = config.runner_process_instance_id.clone() else {
         return;

@@ -500,16 +500,29 @@ pub(crate) async fn handle_reset(
             custom.file_path.display()
         ));
     }
-    if crate::discovery::settings_write::remove_builtin_agent_override(
-        &settings_path,
-        &runtime_name,
-    )
-    .await?
-    {
+    // SUBA-100 — pi `removeBuiltinAgentOverride(…, { preserveMachine: true })` and its report
+    // (`agent-management.ts:1387-1388` @v0.68.0): a reset keeps the agent's machine placement.
+    let (removed, machine_preserved) =
+        crate::discovery::settings_write::reset_builtin_agent_override_preserving_machine(
+            &settings_path,
+            &runtime_name,
+        )
+        .await?;
+    if removed {
         lines.push(format!(
-            "Removed {} settings override at {}.",
+            "{} {} settings override at {}.{}",
+            if machine_preserved {
+                "Cleared customization in"
+            } else {
+                "Removed"
+            },
             source_str(scope),
-            settings_path.display()
+            settings_path.display(),
+            if machine_preserved {
+                " Retained machine placement."
+            } else {
+                ""
+            }
         ));
     }
 

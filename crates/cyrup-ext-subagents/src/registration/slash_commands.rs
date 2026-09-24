@@ -1254,6 +1254,7 @@ pub fn step_token_to_spec(
     // which likewise only ever attaches `count` to a task INSIDE a parallel group.
 
     Ok(SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: step.name.clone(),
@@ -1279,6 +1280,7 @@ pub fn step_token_to_spec(
             _ => None,
         },
         output_mode,
+        fast: None,
         reads,
         // The slash surface's inline `acceptance=<level>` is a bare level string (already narrowed
         // to `auto|attested|checked` by `validate_inline_acceptance` above); it becomes the raw

@@ -295,17 +295,26 @@ async fn run_fleet_action(
     }
 }
 
-/// A host [`OverlayKey`] as the [`FleetKey`] pi's `handleInput` matches on (`fleet.ts:606-713`), or
-/// `None` when the key is not one the inspector binds.
+/// A host [`OverlayKey`] as the [`FleetKey`] pi's `handleInput` matches on (`fleet.ts:1015-1215`
+/// @v0.68.0), or `None` when the host key has no `FleetKey` at all.
 ///
 /// `Shift+K`/`Shift+J` arrive as `Char('K')`/`Char('J')` — the seam ships the terminal's own
 /// shift-resolved character, which is exactly what `matchesKey(data, Key.shift("k"))` distinguishes
 /// off.
+///
+/// SUBA-061: this used to DROP every Ctrl-chord except `c`/`o` and every Alt-chord, deciding here
+/// which keys the inspector binds. With `config.fleetKeybindings` the bindings decide that, so a
+/// user binding `ctrl+x` must be able to reach them: every chord now passes through as its own
+/// variant ([`FleetKey::Ctrl`] / [`FleetKey::Alt`]), and an unbound chord is ignored by the
+/// component's binding lookup instead. A chord is never a [`FleetKey::Char`], so `Ctrl+S` still
+/// cannot type an `s` into a steer draft.
 #[must_use]
 pub fn to_fleet_key(key: OverlayKey) -> Option<FleetKey> {
     Some(match key.code {
         OverlayKeyCode::Up => FleetKey::Up,
         OverlayKeyCode::Down => FleetKey::Down,
+        OverlayKeyCode::Left => FleetKey::Left,
+        OverlayKeyCode::Right => FleetKey::Right,
         OverlayKeyCode::Home => FleetKey::Home,
         OverlayKeyCode::End => FleetKey::End,
         OverlayKeyCode::PageUp => FleetKey::PageUp,
@@ -313,24 +322,18 @@ pub fn to_fleet_key(key: OverlayKey) -> Option<FleetKey> {
         OverlayKeyCode::Enter => FleetKey::Enter,
         OverlayKeyCode::Escape => FleetKey::Escape,
         OverlayKeyCode::Tab => FleetKey::Tab,
+        OverlayKeyCode::BackTab => FleetKey::BackTab,
         OverlayKeyCode::Backspace => FleetKey::Backspace,
-        // pi matches the CONTROL forms by name (`matchesKey(data, "ctrl+c")`, `"ctrl+o"`); every
-        // other Ctrl-chord is unbound and must not fall through as a printable character, or
-        // `Ctrl+S` would start typing an `s` into a steer draft.
+        OverlayKeyCode::Delete => FleetKey::Delete,
+        OverlayKeyCode::Insert => FleetKey::Insert,
         OverlayKeyCode::Char(c) if key.ctrl => match c.to_ascii_lowercase() {
             'c' => FleetKey::CtrlC,
             'o' => FleetKey::CtrlO,
-            _ => return None,
+            other => FleetKey::Ctrl(other),
         },
-        // An Alt-chord is likewise unbound upstream.
-        OverlayKeyCode::Char(_) if key.alt => return None,
+        OverlayKeyCode::Char(c) if key.alt => FleetKey::Alt(c.to_ascii_lowercase()),
         OverlayKeyCode::Char(c) => FleetKey::Char(c),
-        OverlayKeyCode::Delete
-        | OverlayKeyCode::BackTab
-        | OverlayKeyCode::Left
-        | OverlayKeyCode::Right
-        | OverlayKeyCode::Insert
-        | OverlayKeyCode::F(_) => return None,
+        OverlayKeyCode::F(_) => return None,
     })
 }
 
@@ -403,15 +406,15 @@ mod tests {
         );
     }
 
+    /// SUBA-061 — every Ctrl/Alt chord reaches the component as its OWN variant, so a
+    /// `config.fleetKeybindings` entry like `ctrl+x` can match it; the bindings, not this
+    /// function, decide what is bound. Mutation killed: restoring the old filter (`ctrl+s` →
+    /// `None`), which made a user's `ctrl+x` binding unreachable.
     #[test]
-    fn the_two_control_chords_upstream_binds_map_and_the_rest_are_dropped() {
+    fn a_ctrl_chord_binding_reaches_the_component() {
         assert_eq!(
             to_fleet_key(OverlayKey::ctrl(OverlayKeyCode::Char('c'))),
             Some(FleetKey::CtrlC)
-        );
-        assert_eq!(
-            to_fleet_key(OverlayKey::ctrl(OverlayKeyCode::Char('o'))),
-            Some(FleetKey::CtrlO)
         );
         assert_eq!(
             to_fleet_key(OverlayKey::ctrl(OverlayKeyCode::Char('O'))),
@@ -419,35 +422,59 @@ mod tests {
             "the terminal may report Ctrl+Shift+O; upstream matches the chord by name"
         );
         assert_eq!(
-            to_fleet_key(OverlayKey::ctrl(OverlayKeyCode::Char('s'))),
-            None,
-            "an unbound Ctrl-chord must never reach the steer draft as a printable character"
+            to_fleet_key(OverlayKey::ctrl(OverlayKeyCode::Char('x'))),
+            Some(FleetKey::Ctrl('x'))
         );
-    }
-
-    #[test]
-    fn keys_upstream_does_not_bind_never_reach_the_component() {
-        for code in [
-            OverlayKeyCode::Delete,
-            OverlayKeyCode::BackTab,
-            OverlayKeyCode::Left,
-            OverlayKeyCode::Right,
-            OverlayKeyCode::Insert,
-            OverlayKeyCode::F(5),
-        ] {
-            assert_eq!(
-                to_fleet_key(plain(code)),
-                None,
-                "{code:?} is unbound upstream"
-            );
-        }
         let alt = OverlayKey {
             code: OverlayKeyCode::Char('x'),
             ctrl: false,
             alt: true,
             shift: false,
         };
-        assert_eq!(to_fleet_key(alt), None);
+        assert_eq!(to_fleet_key(alt), Some(FleetKey::Alt('x')));
+        // The end-to-end point: a user binding `ctrl+x` to stop, dispatched through the
+        // component, enters stop-confirm; an unbound chord is ignored and types nothing.
+        let mut component = SubagentFleetComponent::new(
+            background_state("chordrun", "worker"),
+            crate::tui::fleet::FleetViewOptions {
+                keybindings: crate::tui::fleet::FleetKeybindings::resolve(
+                    &std::collections::BTreeMap::from([(
+                        crate::tui::fleet::FleetAction::Stop,
+                        vec!["ctrl+x".to_string()],
+                    )]),
+                ),
+                ..crate::tui::fleet::FleetViewOptions::default()
+            },
+            None,
+            true,
+            false,
+        );
+        let key = to_fleet_key(OverlayKey::ctrl(OverlayKeyCode::Char('x'))).expect("a chord");
+        assert_eq!(component.handle_input(key), FleetInputOutcome::Rerender);
+        assert!(
+            component.stop_confirming(),
+            "ctrl+x is the configured stop key"
+        );
+        let unbound = to_fleet_key(OverlayKey::ctrl(OverlayKeyCode::Char('s'))).expect("a chord");
+        assert_ne!(
+            unbound,
+            FleetKey::Char('s'),
+            "a chord never types into a steer draft"
+        );
+    }
+
+    #[test]
+    fn named_keys_map_to_their_own_variants() {
+        for (code, key) in [
+            (OverlayKeyCode::Delete, FleetKey::Delete),
+            (OverlayKeyCode::BackTab, FleetKey::BackTab),
+            (OverlayKeyCode::Left, FleetKey::Left),
+            (OverlayKeyCode::Right, FleetKey::Right),
+            (OverlayKeyCode::Insert, FleetKey::Insert),
+        ] {
+            assert_eq!(to_fleet_key(plain(code)), Some(key));
+        }
+        assert_eq!(to_fleet_key(plain(OverlayKeyCode::F(5))), None);
     }
 
     #[test]

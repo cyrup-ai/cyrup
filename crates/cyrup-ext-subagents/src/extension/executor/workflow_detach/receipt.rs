@@ -52,7 +52,9 @@ fn receipt_state_for(state: RunState) -> WorkflowReceiptState {
         RunState::Complete => WorkflowReceiptState::Complete,
         RunState::Paused => WorkflowReceiptState::Paused,
         RunState::Stopped => WorkflowReceiptState::Stopped,
-        RunState::Queued | RunState::Running | RunState::Failed => WorkflowReceiptState::Failed,
+        RunState::Queued | RunState::Running | RunState::Failed | RunState::Partial => {
+            WorkflowReceiptState::Failed
+        }
     }
 }
 

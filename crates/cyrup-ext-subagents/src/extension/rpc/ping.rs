@@ -52,7 +52,7 @@ fn session_data(executor: &SubagentExecutor, cwd: &Path) -> Value {
 
 /// pi `pingData(ctx)` (`rpc.ts:440-470`).
 ///
-/// # `[CYRUP-DELTA]` — three capability keys and one event key are DROPPED
+/// # `[CYRUP-DELTA]` — two capability keys and one event key are DROPPED
 ///
 /// * **`nonRecoveringSteer`** (`:452`) advertises that the RPC forces `steeringRecovery: false`.
 ///   cyrup's steer has no recovery mode to turn off: [`crate::background::control::SteerDeliveryMode`]
@@ -61,9 +61,13 @@ fn session_data(executor: &SubagentExecutor, cwd: &Path) -> Value {
 ///   [`super::params::steer_params`]. (A grep for `steering_recovery` is NOT the evidence: its only
 ///   hits in this crate are this bullet and that function's delta block, so the grep quotes itself.
 ///   The three-arm enum is the evidence.)
-/// * **`launchResolvedExtensions`** / **`runtimeAcknowledgedExtensions`** (`:456-457`) advertise
-///   the child extension-resolution reporting surface and the
-///   `subagent:acknowledge-extension` child-runtime event. Neither exists here.
+/// * **`launchResolvedExtensions`** (`:456`) advertises the launch-time child extension-resolution
+///   reporting surface, which does not exist here.
+///
+/// **`runtimeAcknowledgedExtensions`** (`:457`) is KEPT (SUBA-063): the child runtime collects
+/// `subagent:acknowledge-extension` bus events and hands them back through the file
+/// [`crate::exec::runtime_acknowledged_extensions`] names, and the parent publishes them on the
+/// child's result, the background step/run status and the terminal result file.
 /// * **`events.childStatus`** (`:465`) is `subagent:child-status`, emitted only by upstream's
 ///   inline `stopAsyncRun`. cyrup routes `stop` through the tool arm instead (see
 ///   [`super`]'s module doc), so nothing emits it.
@@ -97,6 +101,12 @@ pub(crate) fn ping_data(executor: &SubagentExecutor, cwd: &Path) -> Value {
             "interrupt": true,
             "stop": true,
             "resume": true,
+            // `rpc.ts:457` — SUBA-063, a real promise: see the doc above.
+            "runtimeAcknowledgedExtensions": {
+                "version": 1,
+                "source": "child-runtime",
+                "event": crate::exec::runtime_acknowledged_extensions::RUNTIME_EXTENSION_ACK_EVENT,
+            },
             // `rpc.ts:458` — the process-terminal lifecycle artifact, stamped with the schema
             // generation its event lines carry (`shared/types.ts:629`). Advertising it is a real
             // promise: [`crate::background::process_terminal`] writes the candidate and the proof

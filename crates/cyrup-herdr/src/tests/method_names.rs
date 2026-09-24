@@ -15,7 +15,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::schema::agents::{AgentInfo, AgentViewClearParams, AgentViewSetParams};
+use crate::schema::agents::{
+    AgentInfo, AgentPromptParams, AgentPromptWaitOptions, AgentStartParams, AgentViewClearParams,
+    AgentViewSetParams,
+};
 use crate::schema::common::{
     AgentStatus, AgentTarget, EmptyParams, PaneAgentState, PaneTarget, ReadFormat, ReadSource,
     SplitDirection, TabTarget,
@@ -28,7 +31,8 @@ use crate::schema::panes::{
     PaneReadParams, PaneReleaseAgentParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneSendInputParams, PaneSplitParams,
 };
-use crate::schema::tabs::TabRenameParams;
+use crate::schema::tabs::{TabCreateParams, TabRenameParams};
+use crate::schema::workspaces::WorkspaceCreateParams;
 use crate::schema::{Method, PingParams, Request, TabInfo};
 
 /// Every variant this crate ships, paired with the spelling herdr declares and the
@@ -39,6 +43,13 @@ fn every_method() -> Vec<(Method, &'static str)> {
         (Method::Ping(PingParams {}), "ping"),
         // schema.rs:74
         (Method::SessionSnapshot(EmptyParams {}), "session.snapshot"),
+        // schema.rs:76
+        (
+            Method::WorkspaceCreate(WorkspaceCreateParams::default()),
+            "workspace.create",
+        ),
+        // schema.rs:102
+        (Method::TabCreate(TabCreateParams::default()), "tab.create"),
         // schema.rs:106
         (Method::TabGet(TabTarget::new("w1:t1")), "tab.get"),
         // schema.rs:110
@@ -59,6 +70,29 @@ fn every_method() -> Vec<(Method, &'static str)> {
         (
             Method::AgentViewClear(AgentViewClearParams::owned_by("cyrup:subagents")),
             "agent.view.clear",
+        ),
+        // schema.rs:134
+        (
+            Method::AgentStart(AgentStartParams {
+                name: "codex-1".to_owned(),
+                kind: "codex".to_owned(),
+                pane_id: "w1:p1".to_owned(),
+                args: Vec::new(),
+                timeout_ms: None,
+            }),
+            "agent.start",
+        ),
+        // schema.rs:136
+        (
+            Method::AgentPrompt(AgentPromptParams {
+                target: "codex-1".to_owned(),
+                text: "hi".to_owned(),
+                wait: Some(AgentPromptWaitOptions {
+                    until: vec![AgentStatus::Idle],
+                    timeout_ms: Some(1_000),
+                }),
+            }),
+            "agent.prompt",
         ),
         // schema.rs:140
         (

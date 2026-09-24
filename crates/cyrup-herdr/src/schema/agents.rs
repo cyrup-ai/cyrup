@@ -120,6 +120,57 @@ pub enum AgentSessionRefKind {
 // `agent.view.set` / `agent.view.clear` — the sidebar projection
 // =================================================================================================
 
+/// `AgentStartParams` (`tmp/herdr/src/api/schema/agents.rs:166-176`) — launch a herdr-managed
+/// interactive agent of a known `kind` into an empty shell pane.
+///
+/// herdr types `<kind executable> <args…>` into the pane's shell
+/// (`tmp/herdr/src/app/agents.rs:144-232`), so `kind` must be one herdr detects (`claude`,
+/// `codex`, `cursor`, `pi`, …; `crate::detect::parse_agent_label` upstream) — `cyrup` is not one,
+/// which is why saved-machine placement starts a native cyrup child with
+/// [`super::panes::PaneSendInputParams::run`] instead and reserves this verb for the three
+/// external CLI kinds (`src/runs/shared/herdr-external-adapters.ts:169` @v0.68.0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentStartParams {
+    /// The agent's name, unique across the session.
+    pub name: String,
+    /// The herdr agent kind.
+    pub kind: String,
+    /// The shell pane to start it in.
+    pub pane_id: String,
+    /// Arguments after the kind's executable. herdr refuses any containing a control character.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Startup timeout: greater than 3000 and at most 300000 ms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// `AgentPromptWaitOptions` (`tmp/herdr/src/api/schema/agents.rs:34-43`) — hold the
+/// `agent.prompt` answer until the agent reaches one of `until`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentPromptWaitOptions {
+    /// The statuses that end the wait.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub until: Vec<AgentStatus>,
+    /// herdr's own bound on the wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// `AgentPromptParams` (`tmp/herdr/src/api/schema/agents.rs:178-184`) — submit `text` to a
+/// managed agent. With [`Self::wait`] this is one of herdr's in-band waits: it answers once, after
+/// the agent settles (`tmp/herdr/src/api/server.rs:251-288`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentPromptParams {
+    /// A terminal id, pane id or agent name.
+    pub target: String,
+    /// The prompt text.
+    pub text: String,
+    /// Wait for settlement before answering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<AgentPromptWaitOptions>,
+}
+
 /// `AgentViewSetParams` (`tmp/herdr/src/api/schema/agents.rs:52-61`).
 ///
 /// One TRANSIENT declarative projection over herdr's built-in Agents view. herdr re-evaluates it

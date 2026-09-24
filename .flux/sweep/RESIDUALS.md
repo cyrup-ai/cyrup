@@ -20,9 +20,9 @@ explicitly keeps as ownerless open leads.
 | `R-VLS11b-03` | **CLOSED** (confirmed) | settings tier + both named tests exist |
 | `R-SUBA087-01` | **CLOSED** (confirmed) | `StepStatus::child_id` is rung 1 of four |
 | RANKED #3 `UW-10` | **STILL OPEN, citations drifted** | premise intact; `native.rs:270` → `:370`; "three other crates" → four |
-| RANKED #7 `SUBA-096` | **STILL OPEN, premise holds** | — |
-| RANKED #8 `PB-14` | **STILL OPEN, premise holds** | — |
-| RANKED #13 `PB-9` | **STILL OPEN, premise holds** | zero-hit grep still zero |
+| RANKED #7 `SUBA-096` | ~~STILL OPEN, premise holds~~ **CLOSED 2026-09-23 (`c7a56ed`)** | residuals filed as `SUBA-100`…`SUBA-103` in `09a` |
+| RANKED #8 `PB-14` | ~~STILL OPEN, premise holds~~ **CLOSED 2026-09-23 (`f978396`)** | both surfaces |
+| RANKED #13 `PB-9` | ~~STILL OPEN, premise holds~~ **CLOSED 2026-09-23 (`076a5f9`), Plan A** | the premise ("build the preview UI") was v0.42.1's; upstream refuses `clarify` at v0.68.0 and cyrup now does too |
 | BLOCKED `SUBA-054` | **STILL OPEN, premise holds** | async half still `reads: None` |
 | BLOCKED `UW-21` | **PREMISE FALSE** | closed 2026-09-18 by `PB-8`; the same block's row 1 says so |
 | BLOCKED `UW-7` | **PREMISE FALSE** | the `on_terminal_input` seam exists, and did when the block was written |

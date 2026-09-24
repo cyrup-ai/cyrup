@@ -124,6 +124,24 @@ pub fn read_subagent_guide(topic: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    /// PB-9 — the bundled text shown to the model must not advertise the launch preview that
+    /// upstream deleted (v0.51.0) and cyrup never had, nor tell the model to set `clarify`, which
+    /// every public entry now refuses. Upstream v0.68.0's `SKILL.md` has none of these.
+    ///
+    /// Mutation killed: restoring the `tool-reference.md` row or the SKILL's `## Clarify TUI`
+    /// section / `clarify: true` example.
+    #[test]
+    fn bundled_docs_do_not_advertise_clarify() {
+        const SKILL: &str = include_str!("../../resources/skills/pi-subagents/SKILL.md");
+        const REVIEW_LOOP: &str = include_str!("../../resources/prompts/review-loop.md");
+        assert!(!TOOL_REFERENCE.contains("`clarify`"), "tool-reference.md");
+        assert!(!SKILL.contains("## Clarify TUI"));
+        for text in [SKILL, REVIEW_LOOP, TOOL_REFERENCE] {
+            assert!(!text.contains("clarify: true"));
+            assert!(!text.contains("clarify: false"));
+        }
+    }
+
     /// Pre-fix this whole module did not exist: `rg '"guide"' crates/cyrup-ext-subagents/src` was
     /// zero-hit, so there was no topic list to compare and no bytes to resolve.
     #[test]

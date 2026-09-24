@@ -437,7 +437,23 @@ pub fn resolve_capability_ceiling(
 pub fn resolve_current_capability_ceiling(
     session_id: Option<&str>,
 ) -> Result<Option<ResolvedCapabilityCeiling>, String> {
-    let raw = std::env::var(CAPABILITY_CEILING_ENV).ok();
+    resolve_current_capability_ceiling_from(session_id, &|key| std::env::var(key).ok())
+}
+
+/// [`resolve_current_capability_ceiling`] with the inherited half read through `env` rather than
+/// straight off this process — the crate's `&dyn Fn(&str) -> Option<String>` env seam, so a caller
+/// that holds the extension's `SubagentExtensionConfig::env_overrides` reads the same inherited
+/// ceiling its launches will be bound by, and a test can pin a value without mutating the process
+/// environment.
+///
+/// # Errors
+///
+/// As [`resolve_current_capability_ceiling`].
+pub fn resolve_current_capability_ceiling_from(
+    session_id: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<ResolvedCapabilityCeiling>, String> {
+    let raw = env(CAPABILITY_CEILING_ENV);
     let inherited = decode_capability_ceiling(raw.as_deref())?;
     Ok(resolve_capability_ceiling(session_id, inherited))
 }

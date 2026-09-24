@@ -42,6 +42,21 @@ pub(crate) const ACCEPTANCE_CONTRACT_HEADING: &str = "## Acceptance Contract";
 /// rather than upstream's `"\n## Acceptance Contract…"`.
 #[must_use]
 pub fn inject_acceptance_contract(task: &str, contract: &AcceptanceContract) -> String {
+    inject_acceptance_contract_for(task, contract, false)
+}
+
+/// SUBA-105 — [`inject_acceptance_contract`] for a child that finishes through
+/// `structured_output`: `structured_output` is upstream's `structuredOutput:
+/// Boolean(options.structuredOutput?.acceptanceReportPath)` (`execution.ts:1769` @v0.68.0), true
+/// for a step with an `outputSchema` whose `acceptance.report` is not `off`, and switches the
+/// block to "Include an `acceptanceReport` object in your final `structured_output` tool call"
+/// with an unfenced example ([`crate::exec::acceptance::model::format_acceptance_prompt_with`]).
+#[must_use]
+pub fn inject_acceptance_contract_for(
+    task: &str,
+    contract: &AcceptanceContract,
+    structured_output: bool,
+) -> String {
     if contract.is_no_op() {
         return task.to_string();
     }
@@ -53,9 +68,10 @@ pub fn inject_acceptance_contract(task: &str, contract: &AcceptanceContract) -> 
     // — so no cyrup agent can declare one and the predicate is `false` for every run. It is a
     // parameter rather than a hardcoded `false` inside the prompt builder so that porting
     // `agent-contract.ts` is a change at THIS seam only.
-    let block = crate::exec::acceptance::model::format_acceptance_prompt(
+    let block = crate::exec::acceptance::model::format_acceptance_prompt_with(
         &contract.to_resolved_config(),
         false,
+        structured_output,
     );
     // `format_acceptance_prompt`'s first line is deliberately empty (upstream's `lines[0] = ""`);
     // strip it, since the join below supplies the separator.

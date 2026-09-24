@@ -11,15 +11,15 @@
 //! assembles pi's `(pi, ctx)` pair out of cyrup's parts — the executor's discovery config (pi's
 //! `discoverAgentsAll(ctx.cwd)` plus its runtime-agent merge), the bound capability backend (pi's
 //! `ctx.ui` and `ctx.model`), and the [`crate::discovery::EXTRA_AGENT_DIRS_ENV_VAR`] entries that
-//! `isReadOnlyExtraAgent` (`subagents-admin.ts:139`) reads off `process.env`.
+//! `isReadOnlyExtraAgent` (`subagents-admin.ts:139`) reads off `process.env` — taken from the SAME
+//! [`crate::paths::Roots`] the discovery config was built from, so the agents the admin treats as
+//! read-only extra-dir agents are exactly the ones discovery loaded from those dirs.
 
 use std::path::Path;
 
 use crate::error::SubagentError;
 use crate::extension::host::SubagentsExtension;
-use crate::registration::subagents_admin::{
-    AdminContext, open_subagents_admin, parse_extra_agent_dirs,
-};
+use crate::registration::subagents_admin::{AdminContext, open_subagents_admin};
 
 impl SubagentsExtension {
     /// pi `openSubagentsAdmin(pi, ctx, args)` (`subagents-admin.ts:396`).
@@ -44,10 +44,11 @@ impl SubagentsExtension {
             // the no-UI text path — see `AdminContext::interactive`.
             services: services.as_deref(),
             has_ui,
-            // pi reads `process.env[EXTRA_AGENT_DIRS_ENV]` directly (`:140`); this goes through the
-            // extension's own resolver so `SubagentExtensionConfig::env_overrides` wins over the
-            // process environment, exactly as every other env-reading seam in this crate does.
-            extra_agent_dirs: parse_extra_agent_dirs(self.env_lookup()),
+            // pi reads `process.env[EXTRA_AGENT_DIRS_ENV]` directly (`:140`), the same variable its
+            // discovery reads (`agents.ts:2316`). Here both read the one resolved answer: the
+            // `roots` `cfg` was just built from (`discovery_dirs_config` prepends exactly these),
+            // so an extra-dir agent is read-only here iff discovery loaded it from an extra dir.
+            extra_agent_dirs: config.roots.extra_agent_dirs().to_vec(),
         };
         open_subagents_admin(&ctx, args).await
     }

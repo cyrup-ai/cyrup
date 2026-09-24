@@ -220,6 +220,21 @@ impl ChildWatchdog {
         }
     }
 
+    /// [`Self::handle_agent_end`] as called from the child's `AgentEnd` extension HANDLER: the whole
+    /// `reviewing` → review → terminal-phase sequence runs under one declared
+    /// [`cyrup_ext::native::SanctionedWaitKind::ModelReview`] wait, bounded by the runtime's
+    /// [`MainWatchdogRuntime::agent_end_wait_ceiling`]. Without it the dispatcher drops the handler
+    /// 5 s in, so a review longer than that never emits its terminal phase and the parent's view is
+    /// left at `reviewing` until its tail timer declares the review stale (UW-3).
+    pub async fn handle_agent_end_in_handler(&self, ctx: &cyrup_ext::native::HostCtx) {
+        self.runtime.refresh_config(&ctx.cwd);
+        let _review = ctx.begin_sanctioned_wait(
+            cyrup_ext::native::SanctionedWaitKind::ModelReview,
+            self.runtime.agent_end_wait_ceiling(),
+        );
+        self.handle_agent_end(&ctx.cwd).await;
+    }
+
     /// `session_shutdown` (`register-child.ts:111-115`).
     pub fn handle_session_shutdown(&self) {
         self.runtime.dispose();

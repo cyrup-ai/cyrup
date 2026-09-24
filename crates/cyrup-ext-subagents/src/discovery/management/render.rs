@@ -81,9 +81,25 @@ pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
             SystemPromptMode::Replace => "replace",
         }
     ));
+    // SUBA-100 — `[CYRUP-EXCEEDS-UPSTREAM]`: pi shows an agent's saved-machine placement only in
+    // `list` (`runnerListBadge`, `agent-management.ts:717,753` @v0.68.0); `get` — the view an
+    // operator opens to see where an agent will run — says it too, in the list's own words.
+    if let Some(machine) = &a.machine {
+        lines.push(format!("Machine: {machine} (saved Herdr placement)"));
+    }
     lines.push(format!(
         "Inherit project context: {}",
         if a.inherit_project_context {
+            "true"
+        } else {
+            "false"
+        }
+    ));
+    // SUBA-101 — pi `formatAgentDetail` (`agent-management.ts:947` @v0.68.0), always rendered,
+    // between the project-context and skills lines.
+    lines.push(format!(
+        "Inherit global context: {}",
+        if a.inherit_global_context {
             "true"
         } else {
             "false"
@@ -140,6 +156,18 @@ pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
         lines.push(format!(
             "Subagent-only extensions: {}",
             a.subagent_only_extensions.join(", ")
+        ));
+    }
+    // SUBA-102 — pi `if (agent.mutationTools !== undefined) lines.push(`Mutation tools: …`)`
+    // (`agent-management.ts:957` @v0.68.0): a declared-but-empty list renders `(none)`.
+    if let Some(names) = &a.mutation_tools {
+        lines.push(format!(
+            "Mutation tools: {}",
+            if names.is_empty() {
+                "(none)".to_string()
+            } else {
+                names.join(", ")
+            }
         ));
     }
     if let Some(thinking) = &a.thinking {

@@ -1,8 +1,33 @@
 //! Mirrors `tmp/herdr/src/api/schema/tabs.rs`.
 
-use serde::Deserialize;
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 
 use super::common::AgentStatus;
+
+/// `TabCreateParams` (`tmp/herdr/src/api/schema/tabs.rs:7-19`).
+///
+/// Answered by [`super::response::ResponseResult::TabCreated`] — the new tab and its root pane.
+/// Saved-machine placement opens one per placed run inside an owned workspace
+/// (`src/runs/shared/herdr-placed-run.ts:147` @v0.68.0).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TabCreateParams {
+    /// The workspace to open the tab in; herdr's focused workspace when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// The root pane's working directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Whether to focus it.
+    pub focus: bool,
+    /// The displayed label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Environment for the root pane's shell.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
 
 /// `TabRenameParams` (`tmp/herdr/src/api/schema/tabs.rs:27-31`).
 ///

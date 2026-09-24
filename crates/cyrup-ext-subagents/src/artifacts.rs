@@ -540,10 +540,10 @@ pub fn write_run_artifacts(
 /// `persistSingleResultMetadata`, `runs/foreground/execution.ts:128-167` — and the identical `metadataPath` write in the async
 /// runner, `runs/background/subagent-runner.ts:1121-1134` @v0.34.0). Carries the fields this
 /// crate's [`SingleResult`] actually knows: `runId`/`agent`/`task`/`exitCode`/`usage`/`model`/
-/// `attemptedModels`/`modelAttempts`/`toolCount`/`error`/`timestamp`. Pi additionally records
-/// `durationMs`/`skills`/`skillsWarning`, which `SingleResult` does not carry in this crate (they
-/// live on pi's richer `progressSummary`/skill-resolution shapes); those keys are omitted rather
-/// than faked.
+/// `attemptedModels`/`modelAttempts`/`toolCount`/`error`/`timestamp`, and `skillsWarning` when
+/// the run had one (PB-14). Pi additionally records `durationMs`/`skills`, which `SingleResult`
+/// does not carry in this crate (they live on pi's richer `progressSummary`/skill-resolution
+/// shapes); those keys are omitted rather than faked.
 ///
 /// SUBA-N03 moved this out of `extension.rs` (where it was `foreground_artifact_metadata`, private
 /// to the foreground path) so the detached hop-2 runner's own per-step artifact write emits the
@@ -569,7 +569,7 @@ pub(crate) fn run_artifact_metadata(run_id: &str, result: &SingleResult) -> serd
             })
         })
         .collect();
-    serde_json::json!({
+    let mut metadata = serde_json::json!({
         "runId": run_id,
         "agent": result.agent,
         "task": result.task,
@@ -613,7 +613,27 @@ pub(crate) fn run_artifact_metadata(run_id: &str, result: &SingleResult) -> serd
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0),
-    })
+    });
+    // PB-14 — pi persists `skillsWarning` into `_meta.json` (`execution.ts:174` @v0.68.0), and
+    // only when set (an `undefined` property is not serialized).
+    if let (Some(warning), Some(object)) =
+        (result.skills_warning.as_ref(), metadata.as_object_mut())
+    {
+        object.insert(
+            "skillsWarning".to_string(),
+            serde_json::Value::String(warning.clone()),
+        );
+    }
+    // SUBA-063 — pi `runtimeAcknowledgedExtensions: target.runtimeAcknowledgedExtensions` in
+    // `persistSingleResultMetadata` (`execution.ts:164` @v0.68.0), likewise only when set.
+    if let (Some(acknowledged), Some(object)) = (
+        result.runtime_acknowledged_extensions.as_ref(),
+        metadata.as_object_mut(),
+    ) && let Ok(value) = serde_json::to_value(acknowledged)
+    {
+        object.insert("runtimeAcknowledgedExtensions".to_string(), value);
+    }
+    metadata
 }
 
 /// The `.jsonl` event lines for one completed run (T6). pi's `.jsonl` is the raw NDJSON the child
@@ -658,6 +678,27 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
+
+    /// PB-14 — pi persists `skillsWarning` into `_meta.json` (`execution.ts:174` @v0.68.0), and
+    /// omits the key when there is none. Mutation killed: never inserting the key.
+    #[test]
+    fn metadata_carries_skills_warning() {
+        let mut result = crate::exec::pre_spawn_failure(
+            &crate::exec::testsupport::sample_agent_config("m1", &[]),
+            "task",
+            String::new(),
+        );
+        assert!(
+            run_artifact_metadata("r1", &result)
+                .get("skillsWarning")
+                .is_none()
+        );
+        result.skills_warning = Some("Skills not found: typo".to_string());
+        assert_eq!(
+            run_artifact_metadata("r1", &result)["skillsWarning"],
+            serde_json::json!("Skills not found: typo")
+        );
+    }
 
     /// SUBA-048 — pi `getArtifactsDir(sessionFile, projectCwd?, dirPreference = "project")`
     /// (`shared/artifacts.ts:160-183` @v0.43.0), all three arms plus their fall-throughs.

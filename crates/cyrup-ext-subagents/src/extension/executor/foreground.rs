@@ -24,8 +24,9 @@ use crate::extension::executor::paths::{
 };
 use crate::extension::executor::requests::{ForegroundRunRequest, SingleRunOverrides};
 use crate::extension::tool::task_items::{
-    normalize_single_output_override, parse_tool_output_mode, resolve_single_output_path,
-    resolve_single_run_output_base_dir, resolve_single_run_session_root,
+    normalize_single_output_override, parse_tool_output_mode, resolve_effective_output_mode,
+    resolve_single_output_path, resolve_single_run_output_base_dir,
+    resolve_single_run_session_root,
 };
 use crate::fork_context::{ContextMode, ContextRequest, ForkContext, resolve_effective_context};
 use crate::registration::SubagentExtensionConfig;
@@ -323,6 +324,23 @@ impl SubagentExecutor {
             effective_override,
             preferred_provider,
         } = self.resolve_run_agent(&req, &cfg, depth).await?;
+        // SUBA-100 — pi `runSinglePath` (`subagent-executor.ts:3823-3827` @v0.68.0):
+        // `params.machine ?? agentConfig.machine`, refused for a runner pane-native placement cannot
+        // honour and resolved against the catalog + `subagents.machines` BEFORE the run id is
+        // minted, so a bad machine fails the call with upstream's sentence and spawns nothing.
+        let placement = crate::placement::resolve::resolve_single_placement(
+            crate::placement::resolve::PlacementAgent {
+                name: &agent.name,
+                machine: agent.machine.as_deref(),
+                runner: agent.runner.as_ref(),
+            },
+            req.overrides.machine.as_deref(),
+            req.overrides.machine_cwd.as_deref(),
+            &mut crate::placement::resolve::launch_resolver(req.cwd, &cfg)?,
+        )
+        .await
+        .map_err(SubagentError::Management)?
+        .and_then(|placement| placement.resolved);
         let ForegroundRunRequest {
             overrides,
             cwd,
@@ -374,6 +392,15 @@ impl SubagentExecutor {
             art_dir: &art_dir,
             workflow_steer: workflow_steer.as_ref(),
         });
+        // SUBA-100 — the resolved placement rides on the run's options; `run_sync` launches the
+        // child in a Herdr pane on that machine instead of locally.
+        let run_options = RunOptions {
+            machine: placement,
+            // The extension's env seam, so the spawn preflight reads the inherited capability
+            // ceiling through `env_overrides` exactly as this extension's async launches do.
+            parent_env_overrides: cfg.env_overrides.clone(),
+            ..run_options
+        };
 
         // VL-S11b — the run's detach gate, minted BEFORE its control surface is published so the
         // handle `/subagents-detach` fires and the gate this driver races are one object. The
@@ -1044,8 +1071,10 @@ impl SubagentExecutor {
         // deliberately NOT the run cwd, so a bare `report.md` never lands in the user's repo.
         let output_base_dir = resolve_single_run_output_base_dir(cfg, &art_dir, &run_id);
         // pi `runSinglePath` (`subagent-executor.ts:3562-3564,3666`): the persona's own `output:` is
-        // the fallback for an omitted param and the referent of `output: true`; `outputMode` defaults
-        // to `inline` from the PARAM alone (pi never consults the persona's own mode here).
+        // the fallback for an omitted param and the referent of `output: true`. SUBA-096: the mode
+        // is `params.outputMode ?? a.outputMode ?? "inline"` (`subagent-executor.ts:3861`
+        // @v0.68.0; the agent rung has been there since v0.57.0) — the persona's own mode, from
+        // `outputMode:` frontmatter or an `agentOverrides` entry, is consulted before the default.
         let output_path = resolve_single_output_path(
             normalize_single_output_override(
                 overrides.output.as_ref(),
@@ -1058,8 +1087,10 @@ impl SubagentExecutor {
             .as_deref(),
             &output_base_dir,
         );
-        let output_mode = parse_tool_output_mode(overrides.output_mode.as_deref())
-            .unwrap_or(crate::discovery::types::OutputMode::Inline);
+        let output_mode = resolve_effective_output_mode(
+            parse_tool_output_mode(overrides.output_mode.as_deref()),
+            agent.output.as_ref(),
+        );
 
         // SUBA-041 / pi `subagent-executor.ts:5044-5052`: an explicit `sessionDir` is tilde-expanded
         // and `path.resolve`d and becomes the session ROOT verbatim; a configured
@@ -1125,6 +1156,12 @@ impl SubagentExecutor {
             workflow_steer,
         } = input;
         RunOptions {
+            machine: None,
+            // Fed from `SubagentExtensionConfig::env_overrides` by `run_foreground_impl`.
+            parent_env_overrides: std::collections::BTreeMap::new(),
+            // SUBA-096 — pi `params.fast ?? a.fast` (`execution.ts:416` @v0.68.0): the call rung
+            // over the persona's own `fast` (frontmatter or `agentOverrides`).
+            fast: overrides.fast.or(agent.fast) == Some(true),
             spawn_command,
             // WORKFLOW_2 — threaded from the caller's [`SingleRunOverrides::child_env`] instead of
             // being hardcoded empty. Every non-workflow caller still passes the `Default` (an
@@ -1611,6 +1648,11 @@ pub(crate) fn detach_receipt(
     DetachReceipt {
         output_save_error: output_path_configured.then(|| reason.output_save_error().to_string()),
         result: SingleResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            skills_warning: None,
+            watchdog: None,
             agent: agent.to_string(),
             task: task.to_string(),
             // pi `receipt.exitCode = -2` (`:618`).
@@ -1862,6 +1904,9 @@ mod tests {
     /// never quietly make these assertions pass for the wrong reason.
     fn gate_agent(model: Option<&str>, fallbacks: &[&str]) -> AgentDefinition {
         AgentDefinition {
+            inherit_global_context: false,
+            machine: None,
+            mutation_tools: None,
             name: "worker".to_string(),
             local_name: "worker".to_string(),
             package_name: None,
@@ -1892,6 +1937,7 @@ mod tests {
             default_turn_budget: None,
             default_acceptance: None,
             acceptance_role: None,
+            fast: None,
             permission_rules: None,
             runner: None,
             memory: None,

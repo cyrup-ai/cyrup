@@ -149,7 +149,23 @@ enum ScriptStep {
     /// that a scripting mistake degrades to observable-but-not-crashing behaviour, and the parent
     /// then reports its own genuine "missing structured output" failure.
     WriteStructuredOutput { value: serde_json::Value },
+    /// SUBA-063 — play the role of a real child runtime's acknowledgement FINALIZE: write `value`
+    /// verbatim, as JSON, to the path the parent handed this process in
+    /// `CYRUP_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS` (pi `RUNTIME_EXTENSION_ACK_PATH_ENV`,
+    /// `runtime-acknowledged-extensions.ts:6` @v0.64.0; the real writer is the prompt runtime's
+    /// collector at `agent_end`).
+    ///
+    /// Written RAW, not projected — so a test can hand the parent the untrusted shapes a misbehaving
+    /// child could write (invalid ids, duplicates, more than 32, a forged `omitted`) and prove the
+    /// parent's own sanitizer is what decides what reaches the result. With the env var absent the
+    /// step is a silent no-op, exactly as a real child registers no collector without it.
+    WriteRuntimeAcknowledgedExtensions { value: serde_json::Value },
 }
+
+/// The acknowledgement-path env var [`ScriptStep::WriteRuntimeAcknowledgedExtensions`] honours —
+/// `crate::exec::runtime_acknowledged_extensions::RUNTIME_EXTENSION_ACK_PATH_ENV`, restated for the
+/// same no-library-link reason as [`STRUCTURED_OUTPUT_CAPTURE_ENV`].
+const RUNTIME_ACK_PATH_ENV: &str = "CYRUP_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS";
 
 /// The capture-path env var [`ScriptStep::WriteStructuredOutput`] honours — the same constant
 /// `crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV` defines, restated here because this
@@ -421,6 +437,17 @@ async fn main() {
             }
             ScriptStep::WriteStructuredOutput { value } => {
                 write_structured_output_capture(value);
+            }
+            ScriptStep::WriteRuntimeAcknowledgedExtensions { value } => {
+                if let Some(path) = std::env::var_os(RUNTIME_ACK_PATH_ENV)
+                    && let Ok(bytes) = serde_json::to_vec(value)
+                    && let Err(err) = std::fs::write(&path, bytes)
+                {
+                    // stderr is diagnostic, never protocol data (R-SA-046).
+                    eprintln!(
+                        "cyrup-subagent-fixture: failed to write runtime acknowledgements: {err}"
+                    );
+                }
             }
         }
     }

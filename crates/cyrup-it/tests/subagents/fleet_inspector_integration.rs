@@ -269,7 +269,7 @@ async fn subagents_fleet_with_a_ui_renders_the_interactive_inspector_frame() {
     assert!(frame.contains("· live controls"), "got:\n{frame}");
     assert!(frame.contains("No tracked children"), "got:\n{frame}");
     assert!(
-        frame.contains("↑↓/jk agent · Enter/H Inspect · s steer · D stop"),
+        frame.contains("↑/k/↓/j agent · Enter/H Inspect · s steer · D stop"),
         "got:\n{frame}"
     );
     assert!(frame.contains('╭') && frame.contains('╰'), "got:\n{frame}");
@@ -336,8 +336,11 @@ async fn keystrokes_move_the_selection_and_escape_closes_the_hosted_inspector() 
 
     use cyrup_ext::{OverlayKey, OverlayKeyCode, OverlayOutcome};
     let ext = extension(cwd, home.path());
+    // Wide enough for the whole footer: pi's `${position}` readout is its LAST segment
+    // (`fleet.ts:1363-1368` @v0.68.0), after the `bindingLabel` list, so a narrower frame
+    // truncates it away exactly as upstream's `fit` does.
     let host = std::sync::Arc::new(OverlayHostServices::new(
-        100,
+        140,
         32,
         vec![
             OverlayKey::plain(OverlayKeyCode::Down),
@@ -484,7 +487,8 @@ async fn a_real_status_json_under_the_async_root_becomes_a_roster_row() {
     );
 
     let ext = extension(cwd, home.path());
-    let host = std::sync::Arc::new(OverlayHostServices::new(100, 32, Vec::new()));
+    // 140 columns: the `1/1` position readout is the footer's last segment (see above).
+    let host = std::sync::Arc::new(OverlayHostServices::new(140, 32, Vec::new()));
     ext.executor().set_host_services(host.clone());
     let ctx = HostCtx::command(ExtMode::Tui, true, cwd.to_path_buf());
     ext.execute_command("subagents-fleet", "", &ctx)
@@ -538,7 +542,8 @@ async fn the_history_scan_keeps_only_this_sessions_runs() {
     write_status_json(&roots.async_root, "runnosess01", "untagged", None);
 
     let ext = extension(cwd, home.path());
-    let host = std::sync::Arc::new(OverlayHostServices::new(100, 32, Vec::new()));
+    // 140 columns: the `1/1` position readout is the footer's last segment (see above).
+    let host = std::sync::Arc::new(OverlayHostServices::new(140, 32, Vec::new()));
     ext.executor().set_host_services(host.clone());
     let ctx = HostCtx::command(ExtMode::Tui, true, cwd.to_path_buf());
     ext.execute_command("subagents-fleet", "", &ctx)

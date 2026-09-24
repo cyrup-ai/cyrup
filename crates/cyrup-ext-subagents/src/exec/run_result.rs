@@ -10,6 +10,80 @@ use crate::exec::acceptance::AcceptanceLedger;
 use crate::exec::fallback::ModelAttempt;
 use crate::exec::tool_call_summary::ToolCallSummary;
 
+/// SUBA-063 — pi `RuntimeAcknowledgedChildExtensions` (`shared/types.ts:1201-1207` @v0.68.0): a
+/// best-effort child-runtime registration acknowledgement, not extension health.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeAcknowledgedChildExtensions {
+    /// Always `1`.
+    pub version: u8,
+    /// Always `"child-runtime"`.
+    pub source: String,
+    /// Validated, de-duplicated ids, at most 32.
+    pub ids: Vec<String>,
+    /// How many valid ids were dropped past the cap.
+    pub omitted: u32,
+}
+
+/// SUBA-100 — pi `result.execution` (`subagent-runner.ts:928` @v0.68.0): how a run's execution
+/// settled when its exit code alone cannot say it — a pane-native external run on a Herdr saved
+/// machine settles `{ status: "partial", success: false, exitCode: 1 }` from bounded terminal
+/// evidence, and a stopped one `{ status: "stopped", … }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionOutcome {
+    /// `"partial"` or `"stopped"`.
+    pub status: ExecutionStatus,
+    /// Always `false` for the two statuses upstream sets.
+    pub success: bool,
+    /// The settled exit code.
+    pub exit_code: i32,
+}
+
+/// [`ExecutionOutcome::status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionStatus {
+    /// Useful but unverified work (`partial`).
+    Partial,
+    /// Stopped by the user (`stopped`).
+    Stopped,
+}
+
+impl ExecutionOutcome {
+    /// `{ status: "partial", success: false, exitCode: 1 }`.
+    #[must_use]
+    pub const fn partial() -> Self {
+        Self {
+            status: ExecutionStatus::Partial,
+            success: false,
+            exit_code: 1,
+        }
+    }
+
+    /// `{ status: "stopped", success: false, exitCode: 1, stopped: true }`.
+    #[must_use]
+    pub const fn stopped() -> Self {
+        Self {
+            status: ExecutionStatus::Stopped,
+            success: false,
+            exit_code: 1,
+        }
+    }
+}
+
+/// pi `partialEvidenceResult(result)` (`subagent-runner.ts:1831-1842` @v0.68.0) over the one
+/// producer this build has: `partialExecutionWithUsefulMutation`'s pane-native arm — a result
+/// whose execution settled `partial` is a placed external run's (`:1835`, the only place
+/// [`ExecutionOutcome::partial`] is set, `exec/external_cli/placed.rs`), which upstream always
+/// counts as partial EVIDENCE: useful work the run reports as needing attention rather than as a
+/// failure. Upstream's other two arms read settlement effects no cyrup run records
+/// (`effects.settlementDiagnostic`, `effects.fileMutation`), so no native run settles `partial`.
+#[must_use]
+pub fn partial_evidence(execution: Option<&ExecutionOutcome>) -> bool {
+    execution.is_some_and(|execution| execution.status == ExecutionStatus::Partial)
+}
+
 /// The full, terminal outcome of one `run_sync` call (arch-SA §3.4). This is always the
 /// **compacted** (R-SA-043) shape: no raw per-turn messages — only the summarized fields below.
 /// The one opt-out is [`Self::progress`], which [`crate::exec::RunOptions::include_progress`] gates exactly as
@@ -81,6 +155,35 @@ pub struct SingleResult {
     /// field existed still round-trips, matching [`Self::timeout_recovery`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detached_reason: Option<String>,
+    /// The parent's folded view of an ARMED child's watchdog — pi `result.watchdog`
+    /// (`execution.ts:563-567` @v0.43.0). `None` for every child that ran unarmed, which is the
+    /// default: the child watchdog is opt-in on both sides.
+    ///
+    /// UW-3: before this field existed the parent parsed a child's `subagent.watchdog.status` line
+    /// to `SubagentEvent::Unknown` and discarded it, so an armed child that edited files was killed
+    /// one second into its own review and reported as a success. See
+    /// `.flux/todo/CHILD_STATUS_EVENTS.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog: Option<crate::watchdog::child_status::ChildWatchdogStateSnapshot>,
+    /// SUBA-063 — pi `result.runtimeAcknowledgedExtensions` (`shared/types.ts:1305` @v0.68.0): the
+    /// extension ids the child runtime acknowledged registering (best-effort, not health).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_acknowledged_extensions: Option<RuntimeAcknowledgedChildExtensions>,
+    /// SUBA-100 — pi `result.nativeMachine` (`shared/types.ts:1268` @v0.68.0, set at
+    /// `foreground/execution.ts:1293`): the authoritative before/after Git evidence a child placed
+    /// on a Herdr saved machine produced ON that machine. `None` for a local child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_machine: Option<crate::placement::native::NativeMachineEvidence>,
+    /// SUBA-100 — pi `result.execution` (see [`ExecutionOutcome`]). `None` wherever the exit code
+    /// says it all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionOutcome>,
+    /// pi `result.skillsWarning` (`shared/types.ts:1282`, set at `execution.ts:1902` @v0.68.0) —
+    /// the "skills not found" warning for a child whose declared skills did not resolve. PB-14:
+    /// before this field existed the warning was computed nowhere and the child ran silently
+    /// without the skills its persona named. The renderer and `_meta.json` read it from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_warning: Option<String>,
     /// A soft interrupt was observed (`RunOptions.interrupt` fired) — like a timeout, this
     /// terminates the fallback ladder outright without advancing, but is recorded under its own
     /// flag rather than folded into `timed_out` (R-SA-084 vs. R-SA-036 have distinct downstream

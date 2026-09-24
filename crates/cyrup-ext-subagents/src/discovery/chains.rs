@@ -496,6 +496,16 @@ fn parse_step_body(agent: &str, section_body: &str) -> Result<ChainStepConfig, S
         let raw_value = raw_value.trim();
 
         match key.as_str() {
+            // SUBA-100 — pi `parseStepBody`'s first arm (`chain-serializer.ts:25-28` @v0.68.0):
+            // a non-empty value is the step's Herdr saved machine. Carried in `extra` — the same
+            // home `cwd`/`fast` have — so a `.chain.json` and a `.chain.md` step read it
+            // identically.
+            "machine" => {
+                if !raw_value.is_empty() {
+                    step.extra
+                        .insert("machine".to_string(), Value::String(raw_value.to_string()));
+                }
+            }
             "output" => {
                 if raw_value == "false" {
                     step.output = Some(ChainOutputBinding::Toggle(false));
@@ -971,12 +981,16 @@ const DYNAMIC_PARALLEL_KEYS: &[&str] = &[
     "label",
     "outputSchema",
     "cwd",
+    // SUBA-100 — in upstream's `DYNAMIC_PARALLEL_KEYS` (`dynamic-fanout.ts:49` @v0.68.0).
+    "machine",
     "output",
     "outputMode",
     "reads",
     "progress",
     "skill",
     "model",
+    // SUBA-096 — in upstream's `DYNAMIC_PARALLEL_KEYS` (`dynamic-fanout.ts:49` @v0.68.0).
+    "fast",
     "acceptance",
 ];
 const DYNAMIC_COLLECT_KEYS: &[&str] = &["as", "outputSchema"];
@@ -1056,8 +1070,20 @@ fn is_non_negative_integer(value: &Value) -> bool {
 /// runtime contract is `run_single`'s job, at dispatch, exactly as upstream does it.
 pub fn chain_step_to_runner_step(step: &ChainStepConfig, default_concurrency: u32) -> RunnerStep {
     if let Some(Value::Array(items)) = &step.parallel {
-        let steps: Vec<SingleStepSpec> =
-            items.iter().filter_map(value_to_single_step_spec).collect();
+        // SUBA-100 — pi `buildSeqStep({ ...t, machine: t.machine ?? s.machine, … })`
+        // (`async-execution.ts:1269` @v0.68.0): a parallel step's own `machine` places every task
+        // that does not name its own.
+        let group_machine = step.extra.get("machine").and_then(Value::as_str);
+        let steps: Vec<SingleStepSpec> = items
+            .iter()
+            .filter_map(value_to_single_step_spec)
+            .map(|mut spec| {
+                if spec.machine.is_none() {
+                    spec.machine = group_machine.map(crate::placement::StepPlacement::requested);
+                }
+                spec
+            })
+            .collect();
         return RunnerStep::ParallelGroup(ParallelGroupSpec {
             steps,
             concurrency: chain_concurrency(step, default_concurrency),
@@ -1186,6 +1212,20 @@ fn chain_step_to_single_step_spec(step: &ChainStepConfig) -> SingleStepSpec {
             _ => None,
         },
         output_mode: step.output_mode.as_deref().and_then(parse_output_mode),
+        // SUBA-096 — pi `ChainStep.fast` / `DynamicParallelTemplate.fast` (`shared/settings.ts:44,70`,
+        // `extension/schemas.ts:199` @v0.68.0). Carried in `extra` like `cwd` above; only a real
+        // boolean counts.
+        fast: step.extra.get("fast").and_then(Value::as_bool),
+        // SUBA-100 — pi `ChainStep.machine` (`shared/types.ts` `SequentialStep.machine`,
+        // `chain-serializer.ts:25` @v0.68.0): the step rung of `s.machine ?? call ?? agent`. A
+        // blank value is no machine, exactly as the `.chain.md` parser drops it.
+        machine: step
+            .extra
+            .get("machine")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|machine| !machine.is_empty())
+            .map(crate::placement::StepPlacement::requested),
         reads: match &step.reads {
             Some(ChainListBinding::List(paths)) => Some(paths.iter().map(PathBuf::from).collect()),
             Some(ChainListBinding::Toggle(_)) | None => None,

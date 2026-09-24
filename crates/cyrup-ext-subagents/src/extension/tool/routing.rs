@@ -736,6 +736,12 @@ impl SubagentTool {
             .map_err(ToolError::new)?,
             output: p.output.clone(),
             output_mode: p.output_mode.clone(),
+            // SUBA-096 — the call rung of `params.fast ?? a.fast`.
+            fast: p.fast,
+            // SUBA-100 — the call rung of `params.machine ?? agentConfig.machine`, plus the
+            // machine-side cwd the tool boundary moved out of `cwd`.
+            machine: p.machine.clone(),
+            machine_cwd: p.machine_cwd.clone(),
             skills: normalize_skill_input(p.skill.as_ref()),
             acceptance: match p.acceptance.as_ref() {
                 Some(raw) => parse_single_acceptance(raw).map_err(ToolError::new)?,
@@ -836,6 +842,9 @@ impl SubagentTool {
         let run_id = self
             .executor
             .spawn_background(BackgroundSingleRequest {
+                // SUBA-100 — the call rung of the async single placement.
+                machine_cwd: p.machine_cwd.clone(),
+                machine: p.machine.clone(),
                 // SUBA-021 / pi `usageBudget: params.usageBudget` on the async SINGLE step builder
                 // (`async-execution.ts:1471`): the same validated caller rung the foreground path uses.
                 usage_budget: crate::exec::usage_budget::validate_usage_budget_config(
@@ -888,6 +897,8 @@ impl SubagentTool {
                 // explicit empty list rather than as "omitted").
                 output: overrides.output.clone(),
                 output_mode: overrides.output_mode.clone(),
+                // SUBA-096 — the same call rung the foreground path reads.
+                fast: overrides.fast,
                 skills: overrides.skills.clone(),
                 // SCOPE_19/A1: the caller's explicit reasoning level, from the SAME lowered
                 // `overrides` bundle the foreground path consumes — so `{thinking, async:true}` is
@@ -2176,13 +2187,39 @@ impl SubagentTool {
                 }
             }),
         };
-        match crate::discovery::management::handle_management_action(&cfg, action, &req).await {
-            Ok(outcome) if !outcome.is_error => Ok(ToolResult {
-                content: vec![cyrup_core::Content::text(outcome.text)],
-                details: Some(serde_json::json!({ "mode": "management", "results": [] })),
-                terminate: TerminateHint::Unspecified,
-                ..Default::default()
-            }),
+        // SUBA-104 — pi `params.capabilities === true` and `ctx.currentSessionId`
+        // (`agent-management.ts:975,989` @v0.68.0), read by `list` only.
+        let current_session_id = self.executor.current_session_id();
+        let env_overrides = self.executor.config_snapshot().await.env_overrides;
+        let list_options = crate::discovery::management::ListOptions {
+            capabilities: p.capabilities == Some(true),
+            current_session_id: current_session_id.as_deref(),
+            env_overrides: Some(&env_overrides),
+        };
+        match crate::discovery::management::handle_management_action_with(
+            &cfg,
+            action,
+            &req,
+            &list_options,
+        )
+        .await
+        {
+            Ok(outcome) if !outcome.is_error => {
+                // pi `result(text, false, details)` (`agent-management.ts:55-57`): the handler's
+                // extra members are spread over `{ mode: "management", results: [] }`.
+                let mut details = serde_json::json!({ "mode": "management", "results": [] });
+                if let (Some(base), Some(serde_json::Value::Object(extra))) =
+                    (details.as_object_mut(), outcome.details)
+                {
+                    base.extend(extra);
+                }
+                Ok(ToolResult {
+                    content: vec![cyrup_core::Content::text(outcome.text)],
+                    details: Some(details),
+                    terminate: TerminateHint::Unspecified,
+                    ..Default::default()
+                })
+            }
             Ok(outcome) => Err(ToolError::new(outcome.text)),
             Err(e) => Err(ToolError::new(e.to_string())),
         }
@@ -2634,7 +2671,12 @@ impl SubagentTool {
         if let Some(dup) = find_duplicate_parallel_output(&expanded) {
             return Err(ToolError::new(dup));
         }
-        let specs: Vec<SingleStepSpec> = expanded.iter().map(tool_task_to_spec).collect();
+        let mut specs: Vec<SingleStepSpec> = expanded.iter().map(tool_task_to_spec).collect();
+        // SUBA-096 — the call rung of `task.fast ?? params.fast ?? agent.fast`; the agent rung is
+        // folded at plan time, where the personas are.
+        for spec in &mut specs {
+            spec.fast = spec.fast.or(p.fast);
+        }
         let agents: Vec<String> = specs.iter().map(|spec| spec.agent.clone()).collect();
 
         let cfg = self.executor.config_snapshot().await;
@@ -2652,7 +2694,7 @@ impl SubagentTool {
         // verbatim, which is why this is one line and not a second validator.
         let lane = crate::workflows::normalize_workflow_lane_metadata(p.lane.as_ref(), "lane")
             .map_err(|error| ToolError::new(error.message().to_string()))?;
-        let group = RunnerStep::ParallelGroup(ParallelGroupSpec {
+        let mut group = RunnerStep::ParallelGroup(ParallelGroupSpec {
             steps: specs,
             concurrency,
             fail_fast: false,
@@ -2661,6 +2703,12 @@ impl SubagentTool {
             // the lane's `claims` and `outputPaths` survive the fan-out as durable evidence.
             lane,
         });
+        // SUBA-100 — the call rung of `t.machine ?? params.machine ?? a.machine` for every task.
+        crate::placement::resolve::apply_call_machine(
+            std::slice::from_mut(&mut group),
+            p.machine.as_deref(),
+            p.machine_cwd.as_deref(),
+        );
 
         let context = p.context_override();
         let depth = resolve_effective_depth(cfg.max_subagent_depth).current_depth;
@@ -2819,7 +2867,16 @@ impl SubagentTool {
     ) -> Result<ToolResult, ToolError> {
         let raw = p.chain.as_deref().unwrap_or(&[]);
         let cfg = self.executor.config_snapshot().await;
-        let graph = parse_tool_chain_items(raw, cfg.parallel_concurrency())?;
+        let mut graph = parse_tool_chain_items(raw, cfg.parallel_concurrency())?;
+        // SUBA-096 — the call rung of `s.fast ?? params.fast ?? a.fast` for every step.
+        crate::extension::host::slash_render::apply_call_fast(&mut graph, p.fast);
+        // SUBA-100 — the call rung of `s.machine ?? params.machine ?? a.machine` (and its
+        // `machineCwd`) for every step; the agent rung and the resolution follow at launch.
+        crate::placement::resolve::apply_call_machine(
+            &mut graph,
+            p.machine.as_deref(),
+            p.machine_cwd.as_deref(),
+        );
         let context = p.context_override();
         let depth = resolve_effective_depth(cfg.max_subagent_depth).current_depth;
         // pi `resolveForegroundTimeout` (`subagent-executor.ts:2689` @v0.57.0): `timeoutMs`/

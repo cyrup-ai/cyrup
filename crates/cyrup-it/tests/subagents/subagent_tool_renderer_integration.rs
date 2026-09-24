@@ -154,10 +154,12 @@ async fn the_call_row_renders_every_pi_branch() {
         draw(json!({"agent": "researcher", "async": true})).await,
         "subagent researcher [async]"
     );
-    // `:475` — suppressed while clarifying.
+    // PB-9 / `index.ts:800` @v0.68.0 — a `clarify` key no longer hides the badge (v0.43.0's
+    // renderer did; the preview it was for is gone). Mutation killed: restoring the
+    // `clarify != true` condition in `render_subagent_call`.
     assert_eq!(
         draw(json!({"agent": "researcher", "async": true, "clarify": true})).await,
-        "subagent researcher"
+        "subagent researcher [async]"
     );
     // `:476-481` — a chain names its LENGTH.
     assert_eq!(

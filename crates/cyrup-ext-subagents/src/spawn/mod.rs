@@ -642,7 +642,7 @@ pub struct SpawnedChild {
     /// the PARENT's heap without bound. This reader caps a single line at 16 MiB, recovers the two
     /// redundant aggregate records (`turn_end`/`agent_end`) that can legitimately exceed it, and
     /// surfaces anything else as [`ChildStep::ProtocolLimit`].
-    stdout: BoundedLineStream<ChildStdout>,
+    stdout: BoundedLineStream<ChildOutput>,
     /// The child's stderr, being drained CONCURRENTLY with the run by a background pump task from
     /// the moment the child is spawned — see [`CapturedStderr`] for why that concurrency is
     /// load-bearing rather than an optimisation. R-SA-046: stderr is diagnostic, never protocol
@@ -663,9 +663,119 @@ pub struct SpawnedChild {
     /// `wait()` has been called) — tracked so [`SpawnedChild::terminate`] and any caller-side
     /// drain-then-exit path never double-`wait()` the same child.
     exited: bool,
+    /// SUBA-100 — `Some` for a child that is NOT a local process: a pane-native child on a Herdr
+    /// saved machine, whose stdout and stderr arrive through the in-process placed-run relay
+    /// ([`SpawnedChild::relayed`]). `child` is then `None` from the start.
+    relay: Option<RelayedExit>,
+}
+
+/// SUBA-100 — the exit half of a relayed child: the relay task's handle, which resolves to the
+/// remote child's exit code, and that code once observed (a `JoinHandle` resolves only once).
+#[derive(Debug)]
+struct RelayedExit {
+    handle: tokio::task::JoinHandle<i32>,
+    status: Option<std::process::ExitStatus>,
+}
+
+impl RelayedExit {
+    /// Wait for the relay to end and record the child's exit status.
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        let code = (&mut self.handle).await.map_err(|error| {
+            std::io::Error::other(format!("the placed-run relay failed: {error}"))
+        })?;
+        let status = exit_status_from_code(code);
+        self.status = Some(status);
+        Ok(status)
+    }
+}
+
+/// A process exit status carrying `code` — how a relayed child's in-band exit code reaches the
+/// exit classification every local child's status goes through.
+#[cfg(unix)]
+fn exit_status_from_code(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+    std::process::ExitStatus::from_raw((code & 0xff) << 8)
+}
+
+/// A process exit status carrying `code`.
+#[cfg(windows)]
+fn exit_status_from_code(code: i32) -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt as _;
+    std::process::ExitStatus::from_raw(u32::try_from(code).unwrap_or(1))
+}
+
+/// Where a [`SpawnedChild`]'s stdout bytes come from: the local process's pipe, or — SUBA-100 —
+/// the placed-run relay's in-process stream.
+#[derive(Debug)]
+enum ChildOutput {
+    Process(ChildStdout),
+    Relay(tokio::io::DuplexStream),
+}
+
+impl tokio::io::AsyncRead for ChildOutput {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Process(pipe) => std::pin::Pin::new(pipe).poll_read(cx, buf),
+            Self::Relay(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+/// SUBA-100 — the parts of a relayed child: its stdout and stderr streams and the task that
+/// resolves to its exit code (see [`SpawnedChild::relayed`]).
+#[derive(Debug)]
+pub struct RelayedChild {
+    /// The child's NDJSON stdout, as relayed.
+    pub stdout: tokio::io::DuplexStream,
+    /// The child's stderr tail and any relay diagnostic.
+    pub stderr: tokio::io::DuplexStream,
+    /// Resolves to the child's exit code once every stdout byte has been written.
+    pub exit: tokio::task::JoinHandle<i32>,
 }
 
 impl SpawnedChild {
+    /// SUBA-100 — a child that runs on a Herdr saved machine and is observed through the
+    /// in-process placed-run relay rather than a local process: the SAME line reader, tee,
+    /// stderr capture and exit classification a local child gets, with [`Self::id`] `None` (there
+    /// is no local process to signal) and termination stopping the relay (the placed run's owner
+    /// closes the remote pane).
+    ///
+    /// # Errors
+    /// The `.jsonl` tee artifact cannot be created.
+    pub async fn relayed(relayed: RelayedChild, jsonl_path: &Path) -> Result<Self, SubagentError> {
+        let RelayedChild {
+            stdout,
+            stderr,
+            exit,
+        } = relayed;
+        let jsonl_writer = match BoundedJsonlWriter::create(jsonl_path).await {
+            Ok(writer) => writer,
+            Err(error) => {
+                exit.abort();
+                return Err(SubagentError::Spawn(error));
+            }
+        };
+        Ok(Self {
+            child: None,
+            stdout: BoundedLineStream::stdout(ChildOutput::Relay(stdout)),
+            stderr: Some(CapturedStderr::pump(stderr)),
+            jsonl_writer,
+            temp_files: Vec::new(),
+            exited: false,
+            relay: Some(RelayedExit {
+                handle: exit,
+                status: None,
+            }),
+        })
+    }
+
     /// Spawn `spec` as a real child OS process (R-SA-045/046/047/048).
     ///
     /// Stdio wiring is exactly `stdin: null, stdout: piped, stderr: piped` (R-SA-046) — this
@@ -718,13 +828,14 @@ impl SpawnedChild {
         match Self::spawn_wired(&spec, jsonl_path).await {
             Ok((child, stdout, stderr, jsonl_writer)) => Ok(Self {
                 child: Some(child),
-                stdout: BoundedLineStream::stdout(stdout),
+                stdout: BoundedLineStream::stdout(ChildOutput::Process(stdout)),
                 // Pumped from THIS instant, before anything can await the child — pi attaches its
                 // own `proc.stderr.on("data", …)` handler at the same point (`execution.ts:1056`).
                 stderr: Some(CapturedStderr::pump(stderr)),
                 jsonl_writer,
                 temp_files,
                 exited: false,
+                relay: None,
             }),
             Err(err) => {
                 // R-SA-067: the child never came into existence (or never became observable), so
@@ -888,14 +999,25 @@ impl SpawnedChild {
             stdout,
             jsonl_writer,
             exited,
+            relay,
             ..
         } = self;
 
-        let read = match (*exited, child.as_mut()) {
-            (false, Some(child)) => tokio::select! {
+        let read = match (*exited, child.as_mut(), relay.as_mut()) {
+            (false, Some(child), _) => tokio::select! {
                 biased;
                 line = stdout.next() => line,
                 status = child.wait() => {
+                    *exited = true;
+                    return ChildStep::Exited(status);
+                }
+            },
+            // SUBA-100 — a relayed child's "exit" is its relay ending, which happens only after
+            // every stdout byte was written; `biased` still lets a buffered line win the race.
+            (false, None, Some(relay)) => tokio::select! {
+                biased;
+                line = stdout.next() => line,
+                status = relay.wait() => {
                     *exited = true;
                     return ChildStep::Exited(status);
                 }
@@ -952,6 +1074,20 @@ impl SpawnedChild {
     /// timeout here does not send any signal, it only tells the caller the bounded wait is over
     /// so *they* can decide whether to escalate.
     pub async fn wait_final_drain(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if let Some(relay) = self.relay.as_mut() {
+            if self.exited {
+                return Ok(relay.wait().await.ok());
+            }
+            return tokio::select! {
+                biased;
+                result = relay.wait() => {
+                    let status = result?;
+                    self.exited = true;
+                    Ok(Some(status))
+                }
+                () = tokio::time::sleep(FINAL_DRAIN_TIMEOUT) => Ok(None),
+            };
+        }
         let Some(child) = self.child.as_mut() else {
             // Structurally unreachable: the `Child` is taken only by `terminate_with_graces`, which
             // consumes `self`. Reported as "not confirmed exited" rather than fabricating a status.
@@ -1011,6 +1147,25 @@ impl SpawnedChild {
         graces: signal::EscalationGraces,
     ) -> std::io::Result<signal::TerminationOutcome> {
         self.exited = true;
+        if let Some(mut relay) = self.relay.take() {
+            // SUBA-100 — there is no local process to signal: stopping the relay IS terminating
+            // this view of the child, and the placed run's owner closes the remote pane.
+            let status = match relay.status {
+                Some(status) => status,
+                None => {
+                    relay.handle.abort();
+                    match relay.wait().await {
+                        Ok(status) => status,
+                        Err(_) => exit_status_from_code(143),
+                    }
+                }
+            };
+            return Ok(signal::TerminationOutcome {
+                status,
+                stage: signal::EscalationStage::Sigterm,
+                signal_name: None,
+            });
+        }
         let Some(child) = self.child.take() else {
             // Structurally unreachable (the `Child` is taken only here, and this method consumes
             // `self`), and deliberately not a panic: this crate forbids them outside tests.
@@ -1086,6 +1241,11 @@ impl SpawnedChild {
 impl Drop for SpawnedChild {
     fn drop(&mut self) {
         cleanup_temp_files(&self.temp_files);
+        if let Some(relay) = self.relay.take() {
+            // SUBA-100 — an abandoned relayed child: stop the relay (its ssh processes die with it,
+            // `kill_on_drop`); the remote child lives in its pane, never under this process.
+            relay.handle.abort();
+        }
         if self.exited {
             return;
         }
@@ -1165,7 +1325,10 @@ impl CapturedStderr {
     /// The task owns the reader and runs to EOF on its own; dropping the returned handle does not
     /// stop it, which is deliberate — the pipe must keep being consumed for as long as the child
     /// might write to it, whether or not this run ever ends up wanting the text.
-    fn pump(stderr: ChildStderr) -> Self {
+    fn pump<R>(stderr: R) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
         // BOUNDED (pi `createBoundedByteTail()`, `execution.ts:1025`, read back at `:1077`): only
         // the LAST `MAX_CHILD_STDERR_BYTES` are retained. This string is surfaced verbatim as a
         // failed run's error, so an unbounded buffer here would let a chatty child grow the

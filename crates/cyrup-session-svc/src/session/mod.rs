@@ -653,6 +653,17 @@ async fn drive_injections(
         // has its own run latch) — not a poll, and not a check-then-act. Returns immediately when
         // the session is already idle.
         session.wait_for_idle().await;
+        // SUBA-017 — re-drain AFTER the idle wait, not only before it. A busy parent parks this
+        // task above for up to a whole turn, and every message that arrives in that window is
+        // already owed to the SAME next turn: without this second drain the batch taken before the
+        // wait runs alone and the late arrivals pay a turn of their own (a fan-out's completions
+        // split c1 | c2 | c3..cN — three turns where one suffices). It costs no latency: it only
+        // takes what is already queued, exactly like the drain above. It helps every producer
+        // (completions, steers, watchdog warnings, intercom), which is why it lives here and not in
+        // the completion batcher.
+        while let Ok(next) = rx.try_recv() {
+            inbox.push(next);
+        }
         let plan = merge_injection_batch(&inbox);
         // Exhaustive on purpose, with NO catch-all arm: the three outcomes demand three different
         // responses, and folding the last two together (as "any error means try again") turns a

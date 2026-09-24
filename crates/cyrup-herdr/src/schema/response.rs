@@ -7,6 +7,7 @@ use super::panes::{PaneInfo, PaneProcessInfo, PaneReadResult};
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
+use super::workspaces::WorkspaceInfo;
 use crate::error::{HerdrError, Result};
 
 /// `SuccessResponse` (`tmp/herdr/src/api/schema/response.rs:24-28`).
@@ -74,14 +75,45 @@ pub enum ResponseResult {
         /// The whole session.
         snapshot: Box<SessionSnapshot>,
     },
+    /// The answer to `workspace.create` (`response.rs:57-61`).
+    ///
+    /// Each record `Box`ed for the same reason `SessionSnapshot` is: three unboxed records would
+    /// set the size of every `ResponseResult` on the stack.
+    WorkspaceCreated {
+        /// The new workspace.
+        workspace: Box<WorkspaceInfo>,
+        /// Its first tab.
+        tab: Box<TabInfo>,
+        /// That tab's root pane — the pane a caller launches into.
+        root_pane: Box<PaneInfo>,
+    },
     /// The answer to `tab.get` **and** `tab.rename` (`response.rs:87-89`).
     TabInfo {
         /// The tab.
         tab: TabInfo,
     },
+    /// The answer to `tab.create` (`response.rs:90-93`).
+    TabCreated {
+        /// The new tab (boxed, as `WorkspaceCreated`'s records are).
+        tab: Box<TabInfo>,
+        /// Its root pane.
+        root_pane: Box<PaneInfo>,
+    },
     /// The answer to `agent.get` (`response.rs:97-99`).
     AgentInfo {
         /// The agent.
+        agent: AgentInfo,
+    },
+    /// The answer to `agent.start` (`response.rs:100-103`).
+    AgentStarted {
+        /// The agent, as herdr now records it.
+        agent: AgentInfo,
+        /// The argv herdr typed into the pane — `[<kind executable>, …args]`.
+        argv: Vec<String>,
+    },
+    /// The answer to `agent.prompt` (`response.rs:104-106`).
+    AgentPrompted {
+        /// The agent after the prompt (after the wait, when one was asked for).
         agent: AgentInfo,
     },
     /// The answer to `agent.list` (`response.rs:107-109`).
@@ -211,6 +243,10 @@ impl ResponseResult {
         match self {
             Self::Pong { .. } => "pong",
             Self::SessionSnapshot { .. } => "session_snapshot",
+            Self::WorkspaceCreated { .. } => "workspace_created",
+            Self::TabCreated { .. } => "tab_created",
+            Self::AgentStarted { .. } => "agent_started",
+            Self::AgentPrompted { .. } => "agent_prompted",
             Self::TabInfo { .. } => "tab_info",
             Self::AgentInfo { .. } => "agent_info",
             Self::AgentList { .. } => "agent_list",
@@ -257,6 +293,57 @@ impl ResponseResult {
         match self {
             Self::SessionSnapshot { snapshot } => Ok(*snapshot),
             other => other.unexpected(method, "session_snapshot"),
+        }
+    }
+
+    /// The new workspace, its first tab and root pane, from `workspace.create`.
+    ///
+    /// # Errors
+    /// [`HerdrError::UnexpectedResult`] for any other `type`.
+    pub fn workspace_created(
+        self,
+        method: &'static str,
+    ) -> Result<(WorkspaceInfo, TabInfo, PaneInfo)> {
+        match self {
+            Self::WorkspaceCreated {
+                workspace,
+                tab,
+                root_pane,
+            } => Ok((*workspace, *tab, *root_pane)),
+            other => other.unexpected(method, "workspace_created"),
+        }
+    }
+
+    /// The new tab and its root pane, from `tab.create`.
+    ///
+    /// # Errors
+    /// [`HerdrError::UnexpectedResult`] for any other `type`.
+    pub fn tab_created(self, method: &'static str) -> Result<(TabInfo, PaneInfo)> {
+        match self {
+            Self::TabCreated { tab, root_pane } => Ok((*tab, *root_pane)),
+            other => other.unexpected(method, "tab_created"),
+        }
+    }
+
+    /// The started agent and the argv herdr typed, from `agent.start`.
+    ///
+    /// # Errors
+    /// [`HerdrError::UnexpectedResult`] for any other `type`.
+    pub fn agent_started(self, method: &'static str) -> Result<(AgentInfo, Vec<String>)> {
+        match self {
+            Self::AgentStarted { agent, argv } => Ok((agent, argv)),
+            other => other.unexpected(method, "agent_started"),
+        }
+    }
+
+    /// The prompted agent, from `agent.prompt`.
+    ///
+    /// # Errors
+    /// [`HerdrError::UnexpectedResult`] for any other `type`.
+    pub fn agent_prompted(self, method: &'static str) -> Result<AgentInfo> {
+        match self {
+            Self::AgentPrompted { agent } => Ok(agent),
+            other => other.unexpected(method, "agent_prompted"),
         }
     }
 

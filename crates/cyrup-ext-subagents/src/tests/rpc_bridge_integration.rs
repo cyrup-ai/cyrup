@@ -216,10 +216,19 @@ struct Harness {
 
 impl Harness {
     async fn start(mode: RegistrationMode) -> Self {
+        Self::start_with(mode, |_| {}).await
+    }
+
+    /// [`Self::start`] with the sandboxed config adjusted first (SUBA-061's widget keys).
+    async fn start_with(
+        mode: RegistrationMode,
+        adjust: impl FnOnce(&mut SubagentExtensionConfig),
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_path_buf();
-        let config = sandboxed(home.path());
+        let mut config = sandboxed(home.path());
+        adjust(&mut config);
 
         let host = Arc::new(ExtensionHost::new(HostConfig {
             mode: ExtMode::Tui,
@@ -516,16 +525,19 @@ async fn a_host_drives_ping_over_the_inter_extension_bus_and_gets_a_reply() {
         json!(ASYNC_STATUS_SNAPSHOT_KIND)
     );
     // `pingData` must not advertise a capability nothing implements — see `rpc/ping.rs`.
-    for dropped in [
-        "nonRecoveringSteer",
-        "launchResolvedExtensions",
-        "runtimeAcknowledgedExtensions",
-    ] {
+    for dropped in ["nonRecoveringSteer", "launchResolvedExtensions"] {
         assert!(
             data["capabilities"].get(dropped).is_none(),
             "{dropped} has no backing seam and must not be advertised: {data}"
         );
     }
+    // SUBA-063 — `runtimeAcknowledgedExtensions` moved OUT of the dropped list when the protocol
+    // landed (`exec::runtime_acknowledged_extensions`): pi's exact `rpc.ts:457` value.
+    assert_eq!(
+        data["capabilities"]["runtimeAcknowledgedExtensions"],
+        json!({"version": 1, "source": "child-runtime", "event": "subagent:acknowledge-extension"}),
+        "the acknowledgement protocol is real now and must be advertised: {data}"
+    );
     // `events.childStatus` (`rpc.ts:465`) is `subagent:child-status`, emitted only by upstream's
     // inline `stopAsyncRun`; cyrup routes `stop` through the tool arm, so nothing emits it.
     assert!(
@@ -1588,46 +1600,92 @@ async fn the_rpc_mode_machine_document_gets_its_own_slot_and_leaves_the_fleet_wi
 ///
 /// An `--acp` session with live FOREGROUND work and no async runs is the common case —
 /// `async_status_snapshot_jobs_for_state` reads only `state.tracked_jobs`
-/// (`background/async_status_snapshot/state.rs`), never `foreground_controls` — so the empty
-/// branch fires constantly there. This test pins that the clear lands on `"subagent-async"` and
-/// that the fleet-status slot is not touched by this path at all.
+/// (`background/async_status_snapshot/state.rs`), never `foreground_controls`. Upstream's tracker
+/// renders the async slot only while it tracks async jobs (`if (state.asyncJobs.size > 0)
+/// refreshWidget(ctx)`, `extension/index.ts:916-918` @v0.68.0) and clears it once when the last
+/// one leaves (`async-job-tracker.ts:112-114,797`), so: an idle edge writes NOTHING (neither slot
+/// is touched); once the slot held a published roster, the edge after the last run leaves writes
+/// exactly one clear, and it lands on `"subagent-async"`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_rpc_roster_clears_only_the_async_slot() {
     use crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY;
-    use crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY;
 
     let harness = Harness::full().await;
-    // Deliberately NO `track_a_live_run`: the async roster is empty.
-    harness
-        .extension
-        .on_event(
-            &HostEvent::AgentEnd {
-                messages: Vec::new(),
-            },
-            &HostCtx::event(ExtMode::Rpc, true, harness.cwd.clone()),
-        )
-        .await;
-
+    let agent_end = || async {
+        harness
+            .extension
+            .on_event(
+                &HostEvent::AgentEnd {
+                    messages: Vec::new(),
+                },
+                &HostCtx::event(ExtMode::Rpc, true, harness.cwd.clone()),
+            )
+            .await;
+    };
+    // Deliberately NO `track_a_live_run` yet: the async roster is empty.
+    agent_end().await;
     assert_eq!(
         harness.widgets(),
-        vec![(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY.to_string(), None)],
-        "an empty roster clears the ASYNC slot and nothing else"
+        Vec::new(),
+        "an idle edge touches neither slot — above all, it never clears the fleet-status widget"
     );
+
+    harness.track_a_live_run("emptyrosterrun1").await;
+    agent_end().await;
     assert!(
-        !harness
-            .widget_keys()
-            .contains(&FLEET_STATUS_WIDGET_KEY.to_string()),
-        "the always-on fleet-status widget must never be cleared by the async path: {:?}",
+        matches!(
+            harness.last_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY),
+            Some(Some(_))
+        ),
+        "a live run publishes the async document: {:?}",
+        harness.widgets()
+    );
+    let published = harness.widgets().len();
+
+    harness
+        .extension
+        .executor()
+        .tracker()
+        .untrack(&crate::background::RunId::from_token(
+            "emptyrosterrun1".to_string(),
+        ));
+    agent_end().await;
+    let after: Vec<_> = harness
+        .widgets()
+        .into_iter()
+        .skip(published)
+        .filter(|(key, _)| key == ASYNC_STATUS_SNAPSHOT_WIDGET_KEY)
+        .collect();
+    assert_eq!(
+        after,
+        vec![(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY.to_string(), None)],
+        "the roster emptied: exactly one clear, on the ASYNC slot: {:?}",
+        harness.widgets()
+    );
+
+    agent_end().await;
+    assert_eq!(
+        harness
+            .widgets()
+            .into_iter()
+            .skip(published)
+            .filter(|(key, _)| key == ASYNC_STATUS_SNAPSHOT_WIDGET_KEY)
+            .count(),
+        1,
+        "a cleared slot is not cleared again on the next idle edge: {:?}",
         harness.widgets()
     );
 }
 
-/// The mirror image: in `ExtMode::Tui` the async slot is never touched at all, because upstream's
-/// branch is `ctx.mode === "rpc"` (`tui/render.ts:2999`) and a human gets the mounted component,
-/// not a `PI_SUBAGENT_ASYNC_JSON:` line.
+/// The mirror image: in `ExtMode::Tui` the async slot carries the HUMAN widget — upstream's
+/// `ctx.mode === "rpc"` branch (`tui/render.ts:2999`) sends a machine the document and mounts the
+/// component for a human (`:3003-3007`). This test used to assert the async slot was never touched
+/// in TUI mode, pinning C21's missing wiring (SUBA-061) as if it were upstream's behaviour.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tui_mode_publishes_only_the_human_fleet_widget() {
-    use crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY;
+async fn tui_mode_publishes_the_human_fleet_and_async_widgets() {
+    use crate::background::async_status_snapshot::{
+        ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, ASYNC_STATUS_SNAPSHOT_WIDGET_PREFIX,
+    };
     use crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY;
 
     let harness = Harness::full().await;
@@ -1644,14 +1702,22 @@ async fn tui_mode_publishes_only_the_human_fleet_widget() {
 
     assert_eq!(
         harness.widget_keys(),
-        vec![FLEET_STATUS_WIDGET_KEY.to_string()],
-        "a TUI session gets exactly the one always-on widget: {:?}",
+        vec![
+            ASYNC_STATUS_SNAPSHOT_WIDGET_KEY.to_string(),
+            FLEET_STATUS_WIDGET_KEY.to_string()
+        ],
+        "{:?}",
         harness.widgets()
     );
+    let published = harness
+        .last_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY)
+        .flatten()
+        .expect("content");
     assert!(
-        !harness
-            .widget_keys()
-            .contains(&ASYNC_STATUS_SNAPSHOT_WIDGET_KEY.to_string())
+        !published
+            .iter()
+            .any(|line| line.starts_with(ASYNC_STATUS_SNAPSHOT_WIDGET_PREFIX)),
+        "a human never gets the machine document: {published:?}"
     );
 }
 
@@ -1723,5 +1789,98 @@ async fn session_shutdown_clears_both_widget_slots() {
         Some(None),
         "`src/extension/index.ts:1063` — `fleetStatus?.dispose()` clears the human slot too: {:?}",
         harness.widgets()
+    );
+}
+
+// =================================================================================================
+// SUBA-061 — `asyncWidget`, and the async slot's independence from `fleetView`
+// =================================================================================================
+
+async fn repaint(harness: &Harness, mode: ExtMode) {
+    harness
+        .extension
+        .on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &HostCtx::event(mode, true, harness.cwd.clone()),
+        )
+        .await;
+}
+
+/// pi `renderWidget(ctx, widgetEnabled === false ? [] : jobs)` (`async-job-tracker.ts:114`
+/// @v0.68.0): `asyncWidget: false` CLEARS the async slot even with a live run, rather than
+/// publishing it. Mutation killed: ignoring the flag (the machine document is published).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_widget_false_clears_the_async_slot_in_rpc_mode() {
+    use crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY;
+    let harness = Harness::start_with(RegistrationMode::Full, |config| {
+        config.async_widget = Some(serde_json::Value::Bool(false));
+    })
+    .await;
+    harness.track_a_live_run("suba061offrunaa").await;
+    repaint(&harness, ExtMode::Rpc).await;
+    assert_eq!(
+        harness.last_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY),
+        Some(None),
+        "asyncWidget:false must clear the slot: {:?}",
+        harness.widgets()
+    );
+}
+
+/// `shared/types.ts:2610` @v0.68.0 — the async widget *"Defaults to true, including when
+/// FleetView is enabled"*: it is independent of `fleetView`. The RPC publish used to sit behind
+/// the fleet-view early return, so `fleetView: false` silenced it too. Mutation killed: moving
+/// the async publish back under the `fleet_view_enabled` gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_slot_survives_fleet_view_false() {
+    use crate::background::async_status_snapshot::{
+        ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, ASYNC_STATUS_SNAPSHOT_WIDGET_PREFIX,
+    };
+    use crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY;
+    let harness = Harness::start_with(RegistrationMode::Full, |config| {
+        config.fleet_view = false;
+    })
+    .await;
+    harness.track_a_live_run("suba061fleetoff").await;
+    repaint(&harness, ExtMode::Rpc).await;
+    let published = harness
+        .last_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY)
+        .expect("the async slot is published with the fleet view off")
+        .expect("as content");
+    assert!(published[0].starts_with(ASYNC_STATUS_SNAPSHOT_WIDGET_PREFIX));
+    assert!(
+        !harness
+            .widget_keys()
+            .contains(&FLEET_STATUS_WIDGET_KEY.to_string()),
+        "the fleet-status widget stays off: {:?}",
+        harness.widgets()
+    );
+}
+
+/// C21 wired: in an interactive session the async slot carries the HUMAN widget
+/// ([`crate::tui::events::render_async_jobs_widget`]), not the machine document, and names the
+/// live run's agent. Mutation killed: the old RPC-only guard (interactive mode publishes nothing
+/// into the slot).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_mode_publishes_the_human_async_widget() {
+    use crate::background::async_status_snapshot::{
+        ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, ASYNC_STATUS_SNAPSHOT_WIDGET_PREFIX,
+    };
+    let harness = Harness::full().await;
+    harness.track_a_live_run("suba061humanrun").await;
+    repaint(&harness, ExtMode::Tui).await;
+    let published = harness
+        .last_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY)
+        .expect("the interactive session publishes the async slot")
+        .expect("as content");
+    let text = published.join("\n");
+    assert!(
+        !text.starts_with(ASYNC_STATUS_SNAPSHOT_WIDGET_PREFIX),
+        "a human widget, not the machine document: {text}"
+    );
+    assert!(
+        text.contains("pb8worker"),
+        "the live run's agent is shown: {text}"
     );
 }

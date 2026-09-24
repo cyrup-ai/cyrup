@@ -1622,6 +1622,11 @@ mod tests {
     #[test]
     fn the_writers_own_output_renders_as_conversation_and_tool_rows() {
         let result = crate::exec::SingleResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            skills_warning: None,
+            watchdog: None,
             // SUBA-021: no usage budget on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

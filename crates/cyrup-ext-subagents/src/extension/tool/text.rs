@@ -542,6 +542,14 @@ pub(crate) const BLANK_ACTION_REFUSAL: &str = "action must be a non-empty manage
                                     action and provide an execution shape (agent/task, tasks, or \
                                     chain).";
 
+/// PB-9 — pi's refusal for ANY `clarify` value at the public boundary
+/// (`extension/public-execution.ts:143-145` @v0.68.0), verbatim. Upstream removed the launch
+/// preview (`clarify` left the schema at `39c37184`, v0.43.0; `ChainClarifyComponent` was deleted
+/// at `ef554d2a` #1166, v0.51.0), so the key names a UI that exists on neither side. The text names
+/// no parameter cyrup lacks, so unlike [`BLANK_ACTION_REFUSAL`] it needs no `[CYRUP-DELTA]`.
+pub(crate) const CLARIFY_REFUSAL: &str =
+    "Public workflowScript execution does not support clarify UI.";
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -941,6 +949,47 @@ mod tests {
                 .description(),
             CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION
         );
+    }
+
+    /// PB-9 — both model-facing registrations refuse ANY `clarify` value with upstream's text,
+    /// including `false`, `null` and a non-boolean, and including alongside a real action
+    /// (upstream refuses before action dispatch).
+    ///
+    /// Mutations killed: (i) dropping the clarify check (the calls dispatch and answer
+    /// otherwise); (ii) testing `clarify == Some(true)` instead of key presence (the `false`,
+    /// `null` and `"yes"` rows then pass through).
+    #[tokio::test]
+    async fn the_public_boundary_refuses_any_clarify_value_on_both_registrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = Arc::new(SubagentExecutor::new());
+        let root = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+        let child_safe = SubagentTool::new_child_safe(executor, dir.path().to_path_buf());
+        for (label, tool) in [("root", &root), ("child-safe", &child_safe)] {
+            for params in [
+                serde_json::json!({"agent": "worker", "task": "t", "clarify": true}),
+                serde_json::json!({"agent": "worker", "task": "t", "clarify": false}),
+                serde_json::json!({"agent": "worker", "task": "t", "clarify": null}),
+                serde_json::json!({"agent": "worker", "task": "t", "clarify": "yes"}),
+                serde_json::json!({"action": "status", "clarify": false}),
+            ] {
+                let err = dispatch_tool(tool, params.clone())
+                    .await
+                    .expect_err("clarify must be refused at the boundary");
+                assert_eq!(err.to_string(), CLARIFY_REFUSAL, "{label}: {params}");
+            }
+        }
+    }
+
+    /// PB-9 — upstream's order: the blank-action refusal (`:133-135`) comes BEFORE the clarify
+    /// refusal (`:143-145`). Mutation killed: swapping the two checks.
+    #[tokio::test]
+    async fn a_blank_action_is_refused_before_clarify() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = SubagentTool::new(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+        let err = dispatch_tool(&tool, serde_json::json!({"action": "  ", "clarify": true}))
+            .await
+            .expect_err("refused");
+        assert_eq!(err.to_string(), BLANK_ACTION_REFUSAL);
     }
 
     /// pi's public execution boundary — `executor.executePublic(...)`, which BOTH model-facing

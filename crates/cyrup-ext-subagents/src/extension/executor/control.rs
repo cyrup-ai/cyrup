@@ -392,16 +392,29 @@ impl SubagentExecutor {
         // LAUNCHED with, however the persona file has changed since. Only `AgentNotFound` is
         // synthesised over — a malformed file that claims the name still refuses (SUBA-086), as it
         // does on every other launch path.
-        let mut resolved_agents = match self.resolve_plan_personas(
+        //
+        // SUBA-103 — the discovered definition also yields the agent's CURRENT `fast`, the rung pi's
+        // relaunch falls back to (`params.fast ?? agentConfig.fast`, `async-execution.ts:1967`
+        // @v0.68.0, where `agentConfig` is the discovered base under the overlay and
+        // `applySteeringRecoveryAgentConfig` never touches `fast`, `async-resume.ts:604-632`). A
+        // synthesised base has no `fast` (`subagent-executor.ts:1894-1905`).
+        let (mut resolved_agents, current_agent_fast) = match self.resolve_plan_agents(
             &effective_cwd,
             [agent.clone()],
             AgentReadScope::Both,
             &roots,
         ) {
-            Ok(personas) => personas,
-            Err(SubagentError::AgentNotFound(_)) => {
-                BTreeMap::from([(agent.clone(), descriptor.synthesised_persona())])
-            }
+            Ok(agents) => (
+                agents
+                    .iter()
+                    .map(|(name, def)| (name.clone(), crate::exec::resolve_step_agent_config(def)))
+                    .collect::<BTreeMap<_, _>>(),
+                agents.get(&agent).and_then(|def| def.fast),
+            ),
+            Err(SubagentError::AgentNotFound(_)) => (
+                BTreeMap::from([(agent.clone(), descriptor.synthesised_persona())]),
+                None,
+            ),
             Err(error) => return Err(error),
         };
         if let Some(persona) = resolved_agents.get_mut(&agent) {
@@ -414,7 +427,15 @@ impl SubagentExecutor {
         // `outputPath`, `outputMode`, `skills`, `maxSubagentDepth`). `tools`/`extensions` stay
         // `None` on the step: the launch values ARE the persona's and rode the overlay above (pi
         // overlays `agentConfig.tools`/`.extensions`, never a per-call param).
-        let step = SingleStepSpec {
+        let mut step = SingleStepSpec {
+            // SUBA-100 — pi's relaunch places the revived child as `params.machine ??
+            // agentConfig.machine` (`async-execution.ts:1774` @v0.68.0) over the DISCOVERED base
+            // (`applySteeringRecoveryAgentConfig` never touches `machine`); a synthesised base has
+            // none. Resolved below, before the run exists.
+            machine: resolved_agents
+                .get(&agent)
+                .and_then(|persona| persona.machine.as_deref())
+                .map(crate::placement::StepPlacement::requested),
             skills: (!descriptor.skills.is_empty()).then(|| descriptor.skills.clone()),
             session_dir: descriptor.session_dir.clone(),
             agent: agent.clone(),
@@ -437,6 +458,16 @@ impl SubagentExecutor {
             output: None,
             output_path: descriptor.output_path.clone(),
             output_mode: Some(descriptor.output_mode),
+            // SUBA-103 — pi `fast: recoveryDescriptor?.fast` (`subagent-executor.ts:2147`
+            // @v0.68.0), relaunched as `params.fast ?? agentConfig.fast`
+            // (`async-execution.ts:1967`): the descriptor's value when it recorded one, else the
+            // agent's CURRENT `fast`. The descriptor holds the launch's EFFECTIVE value whenever
+            // some rung set it (see `RecoveryDescriptor::fast`), so a run launched fast resumes
+            // fast; a launch no rung set records nothing, and — exactly as upstream — its revive
+            // takes whatever the agent file says now. `[CYRUP-DELTA]`: a launch whose effective
+            // value was an explicit `false` records `false` (pi records only `true`), so that
+            // revive stays standard even if the file has since turned `fast` on.
+            fast: descriptor.fast.or(current_agent_fast),
             reads: None,
             acceptance: descriptor.acceptance.clone(),
             // pi `recoveryContext = recoveryDescriptor?.context ?? …` (`:1883`). `Fork` is what a
@@ -445,6 +476,31 @@ impl SubagentExecutor {
             context: Some(descriptor.context.unwrap_or(ContextMode::Fork)),
             agent_scope: None,
         };
+        // SUBA-100 — the revived step's placement is resolved like any launch's
+        // (`buildSeqStep`/`executeAsyncSingle`'s block). A placed revive then meets upstream's own
+        // refusal where upstream meets it — the relaunched child resumes a session file, and
+        // `serializeHerdrPiLaunch` refuses that in the runner: "Pane-native remote … does not
+        // support fork, resume, or revival; use fresh context." It never silently runs locally.
+        if step.machine.is_some() {
+            let placement_cfg = self.config_snapshot().await;
+            let runner = resolved_agents
+                .get(&agent)
+                .and_then(|persona| persona.runner.clone());
+            crate::placement::resolve::fold_step_placement(
+                &mut step,
+                crate::placement::resolve::PlacementAgent {
+                    name: &agent,
+                    machine: None,
+                    runner: runner.as_ref(),
+                },
+                None,
+                None,
+                false,
+                &mut crate::placement::resolve::launch_resolver(&effective_cwd, &placement_cfg)?,
+            )
+            .await
+            .map_err(SubagentError::Management)?;
+        }
         // Minted here rather than inline in the spec: the revival LEASE names the same run id the
         // launch uses, and a second `RunId::new()` would give the lease's owner record a run id
         // that appears nowhere else — so a reader of a refused revival's conflict sentence could
@@ -629,14 +685,56 @@ impl SubagentExecutor {
             .map(str::to_string);
         // pi validates every appended agent exists before enqueuing (`buildAsyncRunnerSteps` errors
         // on an unknown agent name); resolve it via real discovery for the same fail-fast behavior.
-        self.resolve_agent(cwd, agent, AgentReadScope::Both, &roots)
+        let agent_def = self
+            .resolve_agent(cwd, agent, AgentReadScope::Both, &roots)
             .map_err(|e| format!("Cannot append step to run '{run_id}': {e}"))?;
-        let step = SingleStepSpec {
+        // SUBA-103 — pi builds the appended step through `buildAsyncRunnerSteps`
+        // (`subagent-executor.ts:1370` @v0.68.0), whose per-step fast is `s.fast ?? params.fast
+        // ?? a.fast` (`async-execution.ts:1118`); the append call carries no call-level `fast`,
+        // so it is the step's own key, else the agent's. The runner holds only the step, so an
+        // unresolved `None` here would run an agent declaring `fast: true` at the standard tier.
+        let fast = step_val
+            .get("fast")
+            .and_then(serde_json::Value::as_bool)
+            .or(agent_def.fast);
+        // The same launch-time refusal the async launch applies (pi `async-execution.ts:1012`,
+        // inside `buildAsyncRunnerSteps`): a foreign runner cannot honour the priority tier, and
+        // an appended step is refused here rather than failing inside the running chain.
+        if fast == Some(true)
+            && let Some(runner_type) = crate::extension::executor::background::external_runner_type(
+                agent_def.runner.as_ref(),
+            )
+        {
+            return Err(format!(
+                "Agent '{}' uses runner.type='{runner_type}' and does not support: fast mode.",
+                agent_def.name
+            ));
+        }
+        // SUBA-100 — `buildAsyncRunnerSteps` folds each appended step's placement exactly as a
+        // launch does (`buildSeqStep`, `async-execution.ts:990-1001` @v0.68.0): `s.machine ??
+        // a.machine` (an append carries no call-level `machine`), the runner refusal, then the
+        // resolution against the run's own cwd (`cwd: status.cwd ?? input.requestCwd`,
+        // `subagent-executor.ts:1379`), with `s.cwd` as the directory ON the machine. Resolved
+        // here, before the step is enqueued, so the runner never meets a placed step it cannot
+        // run — and an unplaceable one is refused with upstream's sentence instead of enqueued.
+        let step_machine = step_val.get("machine").and_then(serde_json::Value::as_str);
+        if let Some(machine) = step_machine {
+            crate::placement::resolve::validate_machine_name(machine)?;
+        }
+        let placed = step_machine.is_some() || agent_def.machine.is_some();
+        let mut step = SingleStepSpec {
+            machine: step_machine.map(crate::placement::StepPlacement::requested),
             skills: None,
             session_dir: None,
             agent: agent.to_string(),
             task,
-            cwd: None,
+            // Only a placed step reads its `cwd` — as the directory ON the machine, moved into the
+            // resolved reference by the fold below.
+            cwd: step_val
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .filter(|_| placed)
+                .map(std::path::PathBuf::from),
             model: None,
             tools: None,
             extensions: None,
@@ -646,14 +744,44 @@ impl SubagentExecutor {
             output,
             output_path: None,
             output_mode: None,
+            fast,
             reads: None,
             acceptance: None,
             context: None,
             agent_scope: None,
         };
-        let roots = self.config_snapshot().await.roots;
+        let placement_cfg = self.config_snapshot().await;
+        let roots = placement_cfg.roots.clone();
         let async_root = default_async_root_in(&roots, cwd);
         let results_dir = default_results_dir_in(&roots, cwd);
+        if placed {
+            let paths = RunPaths::for_run(
+                &async_root,
+                &results_dir,
+                &RunId::from_token(run_id.to_string()),
+            );
+            let run_cwd = control::read_status_file(&paths.status)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|status| status.cwd)
+                .unwrap_or_else(|| cwd.to_path_buf());
+            let mut resolver = crate::placement::resolve::launch_resolver(&run_cwd, &placement_cfg)
+                .map_err(|error| format!("Cannot append step to run '{run_id}': {error}"))?;
+            crate::placement::resolve::fold_step_placement(
+                &mut step,
+                crate::placement::resolve::PlacementAgent {
+                    name: &agent_def.name,
+                    machine: agent_def.machine.as_deref(),
+                    runner: agent_def.runner.as_ref(),
+                },
+                None,
+                None,
+                false,
+                &mut resolver,
+            )
+            .await?;
+        }
         match control::append_step(
             &async_root,
             &results_dir,
@@ -772,6 +900,300 @@ mod tests {
         assert_eq!(
             bad_chain,
             "action='append-step' requires chain with exactly one step."
+        );
+    }
+
+    /// Every `fast` value found on an agent-running step object anywhere in `value`.
+    fn step_fast_values(value: &serde_json::Value, out: &mut Vec<(String, Option<bool>)>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let (Some(agent), Some(_task)) = (
+                    map.get("agent").and_then(serde_json::Value::as_str),
+                    map.get("task"),
+                ) {
+                    out.push((
+                        agent.to_string(),
+                        map.get("fast").and_then(serde_json::Value::as_bool),
+                    ));
+                }
+                for child in map.values() {
+                    step_fast_values(child, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    step_fast_values(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// SUBA-100 (append-step half) — `buildAsyncRunnerSteps` resolves every appended step's
+    /// placement as a launch does (`buildSeqStep`, `async-execution.ts:990-1001` @v0.68.0):
+    /// `s.machine ?? a.machine`, resolved against the run's cwd with `s.cwd` as the directory ON
+    /// the machine, BEFORE the step is enqueued; an unknown machine or an unplaceable runner is
+    /// refused with upstream's sentence and nothing is enqueued.
+    ///
+    /// *Gutted by*: `machine: None` on the appended spec (the agent's machine never reaches the
+    /// runner, which then refuses a requested-but-unresolved step or runs it locally), or dropping
+    /// the fold (the step reaches the runner unresolved).
+    #[tokio::test]
+    async fn append_step_places_the_step_or_refuses_it_before_enqueueing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agents = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents).expect("mkdir");
+        for (name, extra) in [
+            ("remote", "machine: fake-box\n"),
+            ("plain", ""),
+            (
+                "generic",
+                "machine: fake-box\nrunner: {\"type\": \"external-cli\", \"command\": \"my-cli\"}\n",
+            ),
+        ] {
+            std::fs::write(
+                agents.join(format!("{name}.md")),
+                format!("---\nname: {name}\ndescription: d\n{extra}---\n\nbody\n"),
+            )
+            .expect("write persona");
+        }
+        std::fs::write(
+            agents.join("settings.json"),
+            serde_json::json!({"subagents":{"machines":{"fake-box":{"cwd":"/srv/repo"}}}})
+                .to_string(),
+        )
+        .expect("settings");
+        let herdr = dir.path().join("fake-herdr");
+        std::fs::write(
+            &herdr,
+            "#!/bin/sh\nprintf '%s\\n' '{\"machines\":[{\"id\":\"m-fake\",\"label\":\"fake-box\",\"target\":\"me@fake-box\",\"enabled\":true}]}'\n",
+        )
+        .expect("herdr");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&herdr, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let executor = SubagentExecutor::new();
+        let roots = crate::paths::Roots::sandboxed(dir.path());
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = roots.clone();
+            cfg.env_overrides.insert(
+                cyrup_herdr::cli::HERDR_BIN.to_string(),
+                Some(herdr.display().to_string()),
+            );
+        }
+        let paths = RunPaths::for_run(
+            &default_async_root_in(&roots, dir.path()),
+            &default_results_dir_in(&roots, dir.path()),
+            &RunId::from_token("chainrun0002".to_string()),
+        );
+        std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
+        let mut status = crate::background::RunStatus::queued(
+            RunId::from_token("chainrun0002".to_string()),
+            RunMode::Chain,
+            Some(std::process::id()),
+        );
+        status.state = RunState::Running;
+        status.current_step = Some(0);
+        let mut first = crate::background::StepStatus::pending("plain");
+        first.status = crate::background::StepState::Running;
+        status.steps = vec![first];
+        std::fs::write(&paths.status, serde_json::to_string(&status).expect("json"))
+            .expect("write status");
+
+        for step in [
+            serde_json::json!({"agent": "remote", "task": "agent rung"}),
+            serde_json::json!({"agent": "plain", "task": "step rung", "machine": "fake-box", "cwd": "sub"}),
+            serde_json::json!({"agent": "plain", "task": "local"}),
+        ] {
+            executor
+                .control_append_step(
+                    dir.path(),
+                    Some("chainrun0002"),
+                    std::slice::from_ref(&step),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{step}: {e}"));
+        }
+        let unknown = executor
+            .control_append_step(
+                dir.path(),
+                Some("chainrun0002"),
+                &[serde_json::json!({"agent": "plain", "task": "t", "machine": "nope"})],
+            )
+            .await
+            .expect_err("an unknown machine is refused");
+        assert!(
+            unknown.starts_with("Herdr machine 'nope' was not found."),
+            "{unknown}"
+        );
+        let generic = executor
+            .control_append_step(
+                dir.path(),
+                Some("chainrun0002"),
+                &[serde_json::json!({"agent": "generic", "task": "t"})],
+            )
+            .await
+            .expect_err("a generic command cannot be placed");
+        assert!(
+            generic.contains("generic external-cli commands cannot be remote-wrapped safely"),
+            "{generic}"
+        );
+
+        let mut placements = Vec::new();
+        for entry in std::fs::read_dir(&paths.append_dir).expect("append dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("read");
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("json");
+            let text = value.to_string();
+            let task = if text.contains("agent rung") {
+                "agent rung"
+            } else if text.contains("step rung") {
+                "step rung"
+            } else {
+                "local"
+            };
+            let machine = find_key(&value, "machine").cloned();
+            placements.push((task, machine));
+        }
+        placements.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(
+            placements.len(),
+            3,
+            "three enqueued, two refused: {placements:?}"
+        );
+        let resolved = |machine: &Option<serde_json::Value>| {
+            machine
+                .as_ref()
+                .and_then(|m| m.get("resolved"))
+                .map(|r| (r["id"].clone(), r["cwd"].clone()))
+        };
+        assert_eq!(
+            resolved(&placements[0].1),
+            Some((serde_json::json!("m-fake"), serde_json::json!("/srv/repo")))
+        );
+        assert_eq!(
+            placements[1].1, None,
+            "an unplaced agent's step stays local"
+        );
+        assert_eq!(
+            resolved(&placements[2].1),
+            Some((
+                serde_json::json!("m-fake"),
+                serde_json::json!("/srv/repo/sub")
+            ))
+        );
+    }
+
+    fn find_key<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map
+                .get(key)
+                .filter(|found| !found.is_null())
+                .or_else(|| map.values().find_map(|inner| find_key(inner, key))),
+            serde_json::Value::Array(items) => items.iter().find_map(|inner| find_key(inner, key)),
+            _ => None,
+        }
+    }
+
+    /// SUBA-103 (append-step half) — pi builds the appended step through `buildAsyncRunnerSteps`
+    /// (`subagent-executor.ts:1370` @v0.68.0): its fast is `s.fast ?? a.fast`
+    /// (`async-execution.ts:1118`), and a foreign runner with fast is refused before anything
+    /// is enqueued (`:1012`). Mutation killed: `fast: None` on the appended spec (the agent's
+    /// `fast: true` never reaches the runner), dropping the step-key read, or dropping the
+    /// refusal (the foreign step is enqueued).
+    #[tokio::test]
+    async fn append_step_resolves_fast_and_refuses_it_for_a_foreign_runner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agents = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents).expect("mkdir");
+        for (name, extra) in [
+            ("fastie", "fast: true\n"),
+            ("plain", ""),
+            (
+                "foreign",
+                "fast: true\nrunner: {\"type\": \"external-cli\", \"command\": \"true\"}\n",
+            ),
+        ] {
+            std::fs::write(
+                agents.join(format!("{name}.md")),
+                format!("---\nname: {name}\ndescription: d\n{extra}---\n\nbody\n"),
+            )
+            .expect("write persona");
+        }
+        let executor = SubagentExecutor::new();
+        let roots = crate::paths::Roots::sandboxed(dir.path());
+        executor.config_cell().lock().await.roots = roots.clone();
+        let paths = RunPaths::for_run(
+            &default_async_root_in(&roots, dir.path()),
+            &default_results_dir_in(&roots, dir.path()),
+            &RunId::from_token("chainrun0001".to_string()),
+        );
+        std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
+        let mut status = crate::background::RunStatus::queued(
+            RunId::from_token("chainrun0001".to_string()),
+            RunMode::Chain,
+            Some(std::process::id()),
+        );
+        status.state = RunState::Running;
+        status.current_step = Some(0);
+        let mut first = crate::background::StepStatus::pending("plain");
+        first.status = crate::background::StepState::Running;
+        status.steps = vec![first];
+        std::fs::write(&paths.status, serde_json::to_string(&status).expect("json"))
+            .expect("write status");
+
+        for step in [
+            serde_json::json!({"agent": "fastie", "task": "agent rung"}),
+            serde_json::json!({"agent": "plain", "task": "step rung", "fast": true}),
+            serde_json::json!({"agent": "plain", "task": "neither"}),
+        ] {
+            executor
+                .control_append_step(
+                    dir.path(),
+                    Some("chainrun0001"),
+                    std::slice::from_ref(&step),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{step}: {e}"));
+        }
+        let refused = executor
+            .control_append_step(
+                dir.path(),
+                Some("chainrun0001"),
+                &[serde_json::json!({"agent": "foreign", "task": "t"})],
+            )
+            .await
+            .expect_err("a foreign runner cannot run fast");
+        assert_eq!(
+            refused,
+            "Agent 'foreign' uses runner.type='external-cli' and does not support: fast mode."
+        );
+
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&paths.append_dir).expect("append dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+            step_fast_values(&value, &mut found);
+        }
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("fastie".to_string(), Some(true)),
+                ("plain".to_string(), None),
+                ("plain".to_string(), Some(true)),
+            ],
+            "three enqueued, the foreign one refused"
         );
     }
 }

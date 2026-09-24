@@ -152,6 +152,53 @@ pub async fn evaluate_acceptance_with_cancel(
     file_output: Option<AcceptanceFileOutput<'_>>,
     cancel: &cyrup_core::CancelToken,
 ) -> AcceptanceLedger {
+    evaluate_acceptance_with_structured_report(
+        contract,
+        gate,
+        final_output,
+        completion_guard,
+        verify_cwd,
+        memo,
+        file_output,
+        &crate::exec::structured::StructuredAcceptanceReport::default(),
+        cancel,
+    )
+    .await
+}
+
+/// SUBA-105 — [`evaluate_acceptance_with_cancel`] with the acceptance report a structured-output
+/// child handed in its `structured_output` call (pi `evaluateAcceptance`'s `report` /
+/// `reportError` inputs, `acceptance.ts:1397-1398,1428-1437` @v0.68.0):
+///
+/// ```text
+/// const parsed = input.reportError ? { error: input.reportError }
+///     : input.report !== undefined ? validateAcceptanceReport(input.report) …
+///     : parseAcceptanceReportSources(input.output, input.fileOutput);
+/// ```
+///
+/// * `structured.error` (a `report: "on"` child that sent none, or an unreadable report file) is
+///   upstream's failed `attestation` check on a caller that is not `reportOptional` — no agent
+///   contract exists in this crate, so that is every caller — which rejects at once, before any
+///   `verify[]` command runs (`acceptance.ts:1452-1464`).
+/// * `structured.value` REPLACES every prose source: the assistant output and the child's output
+///   file are not searched. It is rendered as the fenced `acceptance-report` block the rungs below
+///   already read, so it passes through the same `validateAcceptanceReport` normalization and
+///   error text (`Failed to parse acceptance-report: Invalid acceptance-report: …`) a fenced block
+///   gets, and satisfies criteria and evidence exactly as one would.
+/// * neither: the prose sources, as before.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub async fn evaluate_acceptance_with_structured_report(
+    contract: &AcceptanceContract,
+    gate: CleanCompletionGate,
+    final_output: Option<&str>,
+    completion_guard: CompletionMutationGuardResult,
+    verify_cwd: &Path,
+    memo: Option<crate::exec::acceptance::model::VerifyMemoContext<'_>>,
+    file_output: Option<AcceptanceFileOutput<'_>>,
+    structured: &crate::exec::structured::StructuredAcceptanceReport,
+    cancel: &cyrup_core::CancelToken,
+) -> AcceptanceLedger {
     if !gate.is_clean() {
         return AcceptanceLedger::not_required();
     }
@@ -159,11 +206,31 @@ pub async fn evaluate_acceptance_with_cancel(
         return AcceptanceLedger::not_required();
     }
 
+    // SUBA-105 — `reportError` wins outright and rejects (`acceptance.ts:1428,1452-1464`).
+    if let Some(error) = structured.error.as_deref() {
+        return AcceptanceLedger {
+            status: AcceptanceStatus::Rejected,
+            evidence_status: crate::exec::acceptance::model::AcceptanceEvidenceStatus::Rejected,
+            detail: Some(error.to_string()),
+            verify_results: Vec::new(),
+        };
+    }
+    let structured_source = structured.value.as_ref().map(|report| {
+        format!(
+            "```acceptance-report\n{}\n```",
+            serde_json::to_string(report).unwrap_or_default()
+        )
+    });
+
     // G82 / pi `parseAcceptanceReportSources` (`acceptance.ts:753-771`): the acceptance report may
     // live in the assistant's own output OR in the artifact the child wrote to its configured
     // output path, and in `outputMode: "file-only"` the FILE is searched first. Resolved once here
-    // and used by every rung below that reads the report.
-    let report_source = select_acceptance_report_source(final_output, file_output.as_ref());
+    // and used by every rung below that reads the report. A structured report (SUBA-105) is the
+    // only source when present.
+    let report_source = match structured_source.as_deref() {
+        Some(source) => Some(source),
+        None => select_acceptance_report_source(final_output, file_output.as_ref()),
+    };
 
     // Step 2: self-report floor (Claimed / Attested).
     let mut achieved = self_report_floor(report_source);

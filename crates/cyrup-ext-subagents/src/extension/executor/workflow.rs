@@ -851,6 +851,11 @@ impl WorkflowScriptHost for WorkflowRunHost {
         overrides
             .child_env
             .insert(WORKFLOW_CHILD_ENV.to_string(), "1".to_string());
+        // SUBA-100 — pi `resolveWorkflowChildCwd` (`subagent-executor.ts:3548-3560` @v0.68.0): a
+        // placed child's typed `cwd` names a directory ON THE MACHINE. It is only ever read when
+        // the launch resolves a placement (the call's `machine` or the agent's own), so an
+        // unplaced child is unaffected.
+        overrides.machine_cwd = child.cwd.clone();
 
         // `ForegroundRunRequest<'a>` BORROWS `agent_name`/`task`/`cwd`, so both owned locals must
         // outlive the `.await` below.

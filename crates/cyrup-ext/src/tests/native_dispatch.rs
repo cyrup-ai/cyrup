@@ -1963,3 +1963,146 @@ async fn a_builtin_override_survives_the_filter() {
         .unwrap();
     assert_eq!(names(&active), ["read"]);
 }
+
+// ---------------------------------------------------------------------------
+// UW-3: the sanctioned-wait guard generalised past humans. A handler that DECLARES a bounded long
+// wait (the watchdog's agent-end model review) is not dropped at the budget; one that overruns its
+// declared ceiling is; and dropping the guard hands the rest of the handler back to the budget.
+// ---------------------------------------------------------------------------
+
+/// Holds a `ModelReview` sanctioned wait with `ceiling` across a `wait`, then (optionally after
+/// dropping the guard and doing `after` more work) Blocks with a recognisable reason.
+struct DeclaredWaitExt {
+    id: ExtensionId,
+    ceiling: Duration,
+    wait: Duration,
+    after: Duration,
+}
+#[async_trait::async_trait]
+impl NativeExtension for DeclaredWaitExt {
+    fn id(&self) -> ExtensionId {
+        self.id.clone()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.subscribe(&[EventKind::ToolCall]);
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
+        {
+            let _review =
+                ctx.begin_sanctioned_wait(crate::SanctionedWaitKind::ModelReview, self.ceiling);
+            tokio::time::sleep(self.wait).await;
+        }
+        tokio::time::sleep(self.after).await;
+        HookOutcome::Block {
+            reason: Some("review finished".to_string()),
+            terminate: TerminateHint::Unspecified,
+        }
+    }
+}
+
+/// Dispatch one `tool_call` at a declared-wait handler under an 80 ms budget.
+async fn dispatch_declared(ext: DeclaredWaitExt) -> Reduced {
+    use crate::{Dispatcher, NativeHandle, Subscriptions};
+    let subs = Subscriptions::empty().with(EventKind::ToolCall);
+    let ctx = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));
+    let handle = Arc::new(NativeHandle::new(Arc::new(ext), subs, ctx));
+    let dispatcher = Dispatcher::with_budget(Duration::from_millis(80));
+    dispatcher.add(handle).unwrap();
+    let ev = HostEvent::ToolCall {
+        call_id: "c-uw3".into(),
+        name: "bash".into(),
+        input: json!({ "command": "echo hi" }),
+    };
+    dispatcher
+        .dispatch_block_mutate(ev, &CancelToken::new())
+        .await
+}
+
+fn reason_of(reduced: &Reduced) -> String {
+    match reduced {
+        Reduced::Blocked { reason, .. } => reason.clone().unwrap_or_default(),
+        other => panic!("a tool_call handler always ends Blocked here, got {other:?}"),
+    }
+}
+
+/// A declared model-review wait five times the budget completes. Killing mutation: the dispatcher
+/// ignores the gate (plain `timeout` for every handler) — the review is dropped at 80 ms and the
+/// fail-closed fault text comes back instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_review_wait_outlives_the_budget() {
+    let reduced = dispatch_declared(DeclaredWaitExt {
+        id: "declared-review".into(),
+        ceiling: Duration::from_secs(10),
+        wait: Duration::from_millis(400),
+        after: Duration::ZERO,
+    })
+    .await;
+    assert_eq!(reason_of(&reduced), "review finished");
+}
+
+/// A declared wait that overruns its own CEILING is cut like any runaway. Killing mutation: the
+/// gate ignores `until` (every live guard forgives forever) — the 3 s wait then completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_wait_past_its_ceiling_is_cut() {
+    let reduced = dispatch_declared(DeclaredWaitExt {
+        id: "overrun-review".into(),
+        ceiling: Duration::from_millis(150),
+        wait: Duration::from_secs(3),
+        after: Duration::ZERO,
+    })
+    .await;
+    assert!(
+        reason_of(&reduced).contains("Extension failed, blocking execution"),
+        "an overrun past the declared ceiling is contained: {reduced:?}"
+    );
+}
+
+/// Dropping the guard hands the rest of the handler back to the budget: 200 ms declared, then
+/// 3 s undeclared, is cut. Killing mutation: the guard's `Drop` leaves its entry in the gate (the
+/// forgiveness latches on) — the undeclared 3 s then completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_guard_restores_the_budget() {
+    let reduced = dispatch_declared(DeclaredWaitExt {
+        id: "latched-review".into(),
+        ceiling: Duration::from_secs(60),
+        wait: Duration::from_millis(200),
+        after: Duration::from_secs(3),
+    })
+    .await;
+    assert!(
+        reason_of(&reduced).contains("Extension failed, blocking execution"),
+        "the undeclared tail is budgeted again: {reduced:?}"
+    );
+}
+
+/// The gate reports what is live, and forgets a guard the instant it drops.
+#[test]
+fn the_gate_tracks_each_guard_individually() {
+    let ctx = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));
+    let gate = ctx.human_wait_gate();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        assert!(!gate.is_waiting());
+        let human = ctx.begin_human_wait();
+        let review = ctx.begin_sanctioned_wait(
+            crate::SanctionedWaitKind::ModelReview,
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            gate.live_kinds(),
+            vec![
+                crate::SanctionedWaitKind::Human,
+                crate::SanctionedWaitKind::ModelReview
+            ]
+        );
+        drop(human);
+        assert!(gate.is_waiting(), "the review still forgives");
+        drop(review);
+        assert!(!gate.is_waiting());
+        assert!(gate.live_kinds().is_empty());
+    });
+}

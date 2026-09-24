@@ -53,15 +53,13 @@
 //! `env_overlay`, `NativeSupervisorChannel::with_root`, and the `_in`/`_with`/`_from` injected
 //! cores across `nested_events`, `registration` and `paths`. No `unsafe` and no lock is involved.
 //!
-//! Exactly ONE file in this binary still mutates the process environment, and it says why at its
-//! own `unsafe` block: `subagents_admin_integration`'s
-//! `an_extra_agent_dirs_agent_refuses_a_model_edit_as_read_only` sets
-//! `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS`, which `AgentDiscoveryConfig::with_env_extras`
-//! (`discovery/mod.rs:741-744`) reads from `std::env` directly with no injected lookup — and which
-//! pi's `isReadOnlyExtraAgent` check reads from the same place, so the behaviour under test IS the
-//! variable. It is sound because `cargo nextest` gives every test its own process (see the
-//! invocation note below) and nothing else in this binary reads that key. Every OTHER file names
-//! what it needs explicitly, through the seams listed above; the last holdout was
+//! No file in this binary mutates the process environment. Every file names what it needs
+//! explicitly, through the seams listed above. The last `set_var` was
+//! `subagents_admin_integration`'s `an_extra_agent_dirs_agent_refuses_a_model_edit_as_read_only`,
+//! which needed `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` because discovery read it straight off
+//! `std::env`; it is now resolved once into `paths::Roots::extra_agent_dirs` and pinned with
+//! `Roots::with_extra_agent_dirs`, which reaches discovery and the admin's read-only check alike.
+//! The holdout before that was
 //! `background_cascade_integration`, whose root is
 //! read MID-RUN by the cascade: `paths::Roots` is resolved once in `run_with` and carried on the
 //! per-run `TurnLoopIo` that `check_stop_flag`, `check_timeout_flag`, `check_interrupt_flag` and
@@ -90,6 +88,7 @@ mod support;
 mod child_protocol_stream_integration;
 mod child_stderr_drain_integration;
 mod child_transcript_live_integration;
+mod child_watchdog_status_integration;
 mod child_written_output_authorship;
 mod foreground_progress_stream_integration;
 
@@ -107,6 +106,9 @@ mod artifacts_run_integration;
 mod chain_step_child_detail_integration;
 mod exec_run_sync_integration;
 mod tool_parallel_chain_integration;
+// SUBA-100 — Herdr saved-machine placement: fake ssh + fake herdr, real tool, real runner.
+#[cfg(unix)]
+mod herdr_machine_placement_integration;
 
 // ---- acceptance & verification ledger ----
 mod acceptance_parser_state_model_interaction;
@@ -127,6 +129,12 @@ mod subagents_optin_gate_integration;
 mod wait_tool_registration_integration;
 mod watchdog_model_turn_integration;
 mod watchdog_permission_arbiter_integration;
+mod watchdog_review_budget_integration;
+// The headless auto-drain awaited inside both `AgentEnd` handlers, past the dispatch budget.
+mod auto_drain_budget_integration;
+// SUBA-063 — the child half of the runtime-acknowledged-extensions protocol (the parent half rides
+// `exec_run_sync_integration` and `background_runner_main_integration`).
+mod runtime_acknowledged_extensions_child_integration;
 
 // ---- companion subsystems: host services, intercom delivery, supervisor channel ----
 mod companions_hostservices_proof;

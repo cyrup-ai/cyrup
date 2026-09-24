@@ -73,6 +73,7 @@ fn message_end_line(text: &str) -> String {
 /// is decided by the child's own exit code and nothing else.
 fn reporter_persona() -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         name: "reporter".to_string(),
         model: Some(ModelId::from("fixture-model")),
@@ -88,6 +89,8 @@ fn reporter_persona() -> ResolvedAgentPersona {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -103,6 +106,7 @@ fn reporter_persona() -> ResolvedAgentPersona {
 
 fn step(output_path: Option<&str>) -> SingleStepSpec {
     SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: "reporter".to_string(),
@@ -117,6 +121,7 @@ fn step(output_path: Option<&str>) -> SingleStepSpec {
         output: None,
         output_path: output_path.map(str::to_string),
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,

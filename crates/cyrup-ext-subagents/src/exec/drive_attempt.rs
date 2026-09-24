@@ -13,6 +13,11 @@ use crate::exec::ndjson::SubagentEvent;
 use crate::exec::output::{is_terminal_assistant_stop, message_end_has_error_message};
 use crate::exec::progress::AgentProgress;
 use crate::spawn::SpawnedChild;
+use crate::watchdog::child_status::{
+    ChildWatchdogConfig, ChildWatchdogIdentity, ChildWatchdogPhase, ChildWatchdogStateSnapshot,
+    ChildWatchdogStatusEvent, accept_child_watchdog_event, child_watchdog_is_active,
+    is_child_watchdog_status_event,
+};
 
 /// The runtime facts [`crate::exec::fallback::AttemptRunner::run_attempt`]'s exit-0 re-diagnosis (pi
 /// `execution.ts:747-790`, T3 group A) needs from [`drive_attempt`] beyond the raw exit status.
@@ -58,6 +63,10 @@ pub(crate) struct DriveOutcome {
     /// which is every run today that does not pass one — so this field changes nothing on those
     /// paths.
     pub(crate) turn_budget: crate::exec::turn_budget::TurnBudgetTracker,
+    /// UW-3 — the parent's folded view of an ARMED child's watchdog as the attempt ended: pi's
+    /// `result.watchdog` (`execution.ts:563-567` @v0.43.0). `None` for an unarmed child and for an
+    /// armed one that never reported.
+    pub(crate) watchdog: Option<ChildWatchdogStateSnapshot>,
 }
 
 /// The final-stop grace window (pi `FINAL_STOP_GRACE_MS`, `execution.ts:333`): once a terminal
@@ -186,6 +195,16 @@ struct DriveState {
     /// `result.turnBudget*` fields, `execution.ts:483`/`:567-569`/`:759-782`), gathered into one
     /// value. Unarmed (and therefore inert on every path below) unless this run declared a budget.
     turn_budget: crate::exec::turn_budget::TurnBudgetTracker,
+    /// UW-3 — the child-watchdog config THIS attempt encoded into the child's env (pi
+    /// `childWatchdog`, `execution.ts:298-302`), or `None` when the child runs unarmed. It is the
+    /// gate on the whole fold (`if (!childWatchdog) return`, `:847`) and the source of the identity
+    /// the child's status events are filtered against.
+    child_watchdog: Option<ChildWatchdogConfig>,
+    /// pi `childWatchdogState` (`:562`): the last accepted snapshot.
+    watchdog_state: Option<ChildWatchdogStateSnapshot>,
+    /// pi `watchdogTailTimer` (`:561`): armed while an armed child that has finished its turn is
+    /// still reviewing; when it fires the review is declared stale and the drain starts.
+    watchdog_tail_at: Option<tokio::time::Instant>,
 }
 
 /// Which of [`drive_attempt`]'s exit paths is settling the attempt — the ONLY thing that differs
@@ -218,8 +237,11 @@ enum Settled {
 }
 
 impl DriveState {
-    fn new(opts: &RunOptions) -> Self {
+    fn new(opts: &RunOptions, child_watchdog: Option<ChildWatchdogConfig>) -> Self {
         Self {
+            child_watchdog,
+            watchdog_state: None,
+            watchdog_tail_at: None,
             final_drain_at: None,
             exit_drain_at: None,
             clean_terminal_stop: false,
@@ -249,9 +271,115 @@ impl DriveState {
             agent_settled: self.agent_settled,
             protocol_error: None,
             turn_budget: self.turn_budget.clone(),
+            watchdog: self.watchdog_state.clone(),
         }
     }
+
+    /// pi `startFinalDrain` (`execution.ts:584-605` @v0.43.0): an armed child that is still
+    /// reviewing is NOT drained — its watchdog tail is armed instead (`:585-588`). Otherwise the
+    /// final-stop grace window opens, once.
+    fn start_final_drain(&mut self) {
+        if child_watchdog_is_active(self.watchdog_state.as_ref()) {
+            self.arm_watchdog_tail();
+            return;
+        }
+        if self.final_drain_at.is_none() {
+            self.final_drain_at =
+                Some(tokio::time::Instant::now() + Duration::from_millis(FINAL_STOP_GRACE_MS));
+        }
+    }
+
+    /// pi `armWatchdogTail` (`:606-622`): only once the child has finished its turn (a clean
+    /// terminal stop or `agent_settled`), and only once. It lasts the child config's
+    /// `watchdogTailTimeoutMs` (pi's `?? 120_000`, `:621`, is unreachable here: the tail is only
+    /// ever armed off an ACTIVE snapshot, which only an armed child can produce).
+    fn arm_watchdog_tail(&mut self) {
+        if !(self.clean_terminal_stop || self.agent_settled) || self.watchdog_tail_at.is_some() {
+            return;
+        }
+        let tail_ms = self
+            .child_watchdog
+            .as_ref()
+            .map_or(DEFAULT_WATCHDOG_TAIL_TIMEOUT_MS, |config| {
+                config.watchdog_tail_timeout_ms
+            });
+        self.watchdog_tail_at = Some(tokio::time::Instant::now() + Duration::from_millis(tail_ms));
+    }
+
+    /// The tail timer's body (`:608-619`): the review is declared stale by the PARENT
+    /// (`timedOut: true` is the parent's mark, never the child's), and the drain starts.
+    fn watchdog_tail_expired(&mut self) {
+        self.watchdog_tail_at = None;
+        let seq = self.watchdog_state.as_ref().map_or(0, |state| state.seq) + 1;
+        self.watchdog_state = Some(ChildWatchdogStateSnapshot {
+            phase: ChildWatchdogPhase::Stale,
+            seq,
+            last_update: crate::time::now_epoch_millis(),
+            follow_up_pending: false,
+            reason: Some(WATCHDOG_TAIL_TIMEOUT_REASON.to_string()),
+            timed_out: Some(true),
+        });
+        self.start_final_drain();
+    }
+
+    /// UW-3 — pi's parent fold (`execution.ts:846-864` @v0.43.0; the runner's twin at
+    /// `subagent-runner.ts:626-645`), for a line that already parsed to
+    /// [`SubagentEvent::Unknown`]. `Some(())` when the line WAS a child-watchdog status event: it
+    /// is then fully consumed here, and the caller returns before the activity/progress folds, as
+    /// upstream `return`s before `progress.lastActivityAt = now` (`:864-869`). `None` for any other
+    /// line.
+    ///
+    /// The identity filter uses the config this attempt ENCODED, not upstream's literal
+    /// `options.index ?? 0`: cyrup omits `childIndex` when a run has no index
+    /// (`spawn_plan.rs`'s `opts.child_index.and_then(..)`), and a parent that required `Some(0)`
+    /// would reject every event such a child emits (`child_status.rs`'s index check).
+    fn fold_child_watchdog_line(&mut self, line: &str) -> Option<()> {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        if !is_child_watchdog_status_event(&value) {
+            return None;
+        }
+        // `if (!childWatchdog) return;` — an unarmed parent swallows the event.
+        let Some(config) = self.child_watchdog.as_ref() else {
+            return Some(());
+        };
+        let Ok(event) = serde_json::from_value::<ChildWatchdogStatusEvent>(value) else {
+            return Some(());
+        };
+        let identity = ChildWatchdogIdentity {
+            run_id: config.run_id.clone(),
+            agent: config.agent.clone(),
+            child_index: config.child_index,
+        };
+        // `if (!next) return;` — a rejected event (another run's, or not newer) is still consumed
+        // here: it is no more child activity than an accepted one.
+        let Some(next) =
+            accept_child_watchdog_event(self.watchdog_state.as_ref(), &event, &identity)
+        else {
+            return Some(());
+        };
+        let active = child_watchdog_is_active(Some(&next));
+        self.watchdog_state = Some(next);
+        if active {
+            // `clearFinalDrainTimers(); armWatchdogTail();`
+            self.final_drain_at = None;
+            self.arm_watchdog_tail();
+        } else {
+            // `clearWatchdogTailTimer(); if (clean || settled) startFinalDrain();`
+            self.watchdog_tail_at = None;
+            if self.clean_terminal_stop || self.agent_settled {
+                self.start_final_drain();
+            }
+        }
+        Some(())
+    }
 }
+
+/// pi's `childWatchdog?.watchdogTailTimeoutMs ?? 120_000` fallback (`execution.ts:621` @v0.43.0),
+/// equal to `settings.ts`'s own default for the key (cyrup `watchdog/settings.rs`).
+const DEFAULT_WATCHDOG_TAIL_TIMEOUT_MS: u64 = 120_000;
+
+/// The reason the parent stamps on the snapshot when its tail timer fires (`execution.ts:616`).
+pub(crate) const WATCHDOG_TAIL_TIMEOUT_REASON: &str = "child watchdog tail timeout";
 
 /// What [`handle_child_line`] tells the drive loop to do once one NDJSON line has been folded in.
 enum LineAction {
@@ -337,15 +465,14 @@ async fn handle_child_line(
         will_retry,
         terminal_stop,
     ) {
+        // pi `applyChildLifecycle` (`execution.ts:623-630` @v0.43.0): `cancel-drain` clears BOTH
+        // the drain timers and the watchdog tail — a retrying child is neither finished nor still
+        // reviewing its last turn.
         crate::exec::child_protocol::ChildLifecycleAction::CancelDrain => {
             state.final_drain_at = None;
+            state.watchdog_tail_at = None;
         }
-        crate::exec::child_protocol::ChildLifecycleAction::StartDrain => {
-            if state.final_drain_at.is_none() {
-                state.final_drain_at =
-                    Some(tokio::time::Instant::now() + Duration::from_millis(FINAL_STOP_GRACE_MS));
-            }
-        }
+        crate::exec::child_protocol::ChildLifecycleAction::StartDrain => state.start_final_drain(),
         crate::exec::child_protocol::ChildLifecycleAction::None => {}
     }
     // R-SA-037 detach-trigger arm: a child's blocking `contact_supervisor` ask
@@ -389,6 +516,14 @@ async fn handle_child_line(
     // before the control/progress folds because `record_event` consumes the event by value.
     if let Some(writer) = transcript {
         writer.write_child_event(&event).await;
+    }
+    // UW-3 — the child-watchdog status fold. AFTER the transcript write (upstream's
+    // `writeChildEvent`, `:842`, precedes it) and BEFORE the activity fold: upstream returns before
+    // `progress.lastActivityAt = now` (`:864-869`), so a status line is not child activity. Only a
+    // line that already degraded to `Unknown` is re-read, so every known event keeps its single
+    // parse.
+    if matches!(event, SubagentEvent::Unknown) && state.fold_child_watchdog_line(line).is_some() {
+        return LineAction::Continue;
     }
     // pi `processLine` (`execution.ts:775-890`): every parsed child event is fresh activity for the
     // control heuristics, and the tool-start / tool-result / assistant-turn folds feed the
@@ -556,6 +691,7 @@ pub(crate) async fn drive_attempt(
     deadline_sleep: Option<tokio::time::Sleep>,
     control: &mut crate::exec::control::ControlMonitor,
     mut transcript: Option<&mut ChildTranscriptWriter>,
+    child_watchdog: Option<ChildWatchdogConfig>,
 ) -> DriveOutcome {
     tokio::pin!(deadline_sleep);
     let cancel = opts.cancel.clone();
@@ -572,7 +708,7 @@ pub(crate) async fn drive_attempt(
         tokio::time::interval_at(tokio::time::Instant::now() + period, period)
     });
 
-    let mut state = DriveState::new(opts);
+    let mut state = DriveState::new(opts, child_watchdog);
 
     loop {
         let deadline_arm = async {
@@ -582,6 +718,7 @@ pub(crate) async fn drive_attempt(
             }
         };
         let final_drain_arm = pending_until(state.final_drain_at);
+        let watchdog_tail_arm = pending_until(state.watchdog_tail_at);
         let exit_drain_arm = pending_until(state.exit_drain_at);
 
         tokio::select! {
@@ -644,6 +781,11 @@ pub(crate) async fn drive_attempt(
                 // status flows through the normal post-loop path as an ordinary clean exit.
                 break;
             }
+            () = watchdog_tail_arm => {
+                // UW-3 — pi's `watchdogTailTimer` body (`execution.ts:608-619`): the armed child
+                // has been reviewing for its whole tail allowance. Mark it stale and drain.
+                state.watchdog_tail_expired();
+            }
             () = final_drain_arm => {
                 // The child emitted its terminal stop but did not exit within the grace window —
                 // force-drain it through the real signal ladder (pi's SIGTERM->SIGKILL). Whether
@@ -681,5 +823,137 @@ pub(crate) async fn drive_attempt(
             state.outcome(Settled::ForcedDrain, outcome.map(|o| Some(o.status)))
         }
         Err(err) => state.outcome(Settled::Exited, Err(err)),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    //! UW-3 — the parent fold, below the subprocess harness (`cyrup-it`'s
+    //! `child_watchdog_status_integration.rs` drives it end to end).
+
+    use super::*;
+
+    fn armed() -> ChildWatchdogConfig {
+        ChildWatchdogConfig {
+            enabled: true,
+            run_id: Some("run-1".to_string()),
+            agent: Some("worker".to_string()),
+            child_index: None,
+            watchdog_tail_timeout_ms: 1_500,
+            agent_end_timeout_ms: 30_000,
+            max_warnings: None,
+            model: None,
+            thinking: None,
+            lsp: crate::watchdog::types::WatchdogLspConfig {
+                enabled: false,
+                timeout_ms: 1_000,
+                max_files: 5,
+                max_diagnostics: 7,
+            },
+            auto_follow_blockers: false,
+            auto_follow_max_attempts: None,
+            stalemate_repeats: 2,
+        }
+    }
+
+    fn status(seq: u64, phase: &str) -> String {
+        serde_json::json!({
+            "type": "subagent.watchdog.status",
+            "runId": "run-1",
+            "agent": "worker",
+            "seq": seq,
+            "phase": phase,
+            "ts": 1_i64,
+            "followUpPending": false,
+        })
+        .to_string()
+    }
+
+    /// U1 — a status line is NOT child activity: upstream returns before `lastActivityAt = now`
+    /// (`execution.ts:864-869`). The monitor here raises an active-long-running notice on the very
+    /// first activity it sees, so any activity bump is observable. Killing mutation: moving the
+    /// fold after `control.observe_event`.
+    #[tokio::test]
+    async fn a_watchdog_status_line_is_not_child_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::exec::testsupport::base_opts(dir.path(), &["m"]);
+        let mut state = DriveState::new(&opts, Some(armed()));
+        let mut progress = AgentProgress::default();
+        let mut control = crate::exec::control::ControlMonitor::new(
+            crate::exec::control::ResolvedControlConfig {
+                enabled: true,
+                active_notice_after_ms: 1,
+                ..crate::exec::control::ResolvedControlConfig::default()
+            },
+            "run-1".to_string(),
+            "worker".to_string(),
+            None,
+            None,
+            0,
+        );
+        let action = handle_child_line(
+            &status(1, "reviewing"),
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+        )
+        .await;
+        assert!(matches!(action, LineAction::Continue));
+        assert_eq!(control.activity_state(), None, "no activity was noted");
+        assert!(
+            progress.all_events.is_empty(),
+            "not recorded as a child event either"
+        );
+        assert_eq!(
+            state.watchdog_state.as_ref().map(|s| s.phase),
+            Some(ChildWatchdogPhase::Reviewing),
+            "but it WAS folded"
+        );
+        // Control: an ordinary event through the same path IS activity.
+        handle_child_line(
+            "{\"type\":\"turn_start\"}",
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+        )
+        .await;
+        assert!(control.activity_state().is_some());
+    }
+
+    /// The active phase replaces an armed drain with the tail, and the idle phase that follows
+    /// re-arms the drain. Pure state, no subprocess. Killing mutations: an active event that does
+    /// not clear `final_drain_at`; an idle event that does not restart the drain after a clean stop.
+    #[tokio::test]
+    async fn reviewing_swaps_the_drain_for_the_tail_and_idle_swaps_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::exec::testsupport::base_opts(dir.path(), &["m"]);
+        let mut state = DriveState::new(&opts, Some(armed()));
+        state.clean_terminal_stop = true;
+        state.start_final_drain();
+        assert!(state.final_drain_at.is_some());
+        assert_eq!(
+            state.fold_child_watchdog_line(&status(1, "reviewing")),
+            Some(())
+        );
+        assert!(state.final_drain_at.is_none(), "the review holds the run");
+        assert!(state.watchdog_tail_at.is_some(), "under the tail");
+        assert_eq!(state.fold_child_watchdog_line(&status(2, "idle")), Some(()));
+        assert!(state.watchdog_tail_at.is_none());
+        assert!(state.final_drain_at.is_some(), "a finished review drains");
+        assert_eq!(
+            state.fold_child_watchdog_line(&status(1, "reviewing")),
+            Some(()),
+            "a rejected (not newer) status line is still consumed, never folded as activity"
+        );
+        assert!(state.watchdog_tail_at.is_none(), "and it changed nothing");
+        assert_eq!(
+            state.fold_child_watchdog_line("{\"type\":\"turn_start\"}"),
+            None
+        );
     }
 }
