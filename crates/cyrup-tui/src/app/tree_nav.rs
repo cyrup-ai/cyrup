@@ -1,5 +1,10 @@
 use super::*;
 
+/// pi's `showError` text when `/tree` is confirmed during a compaction (`interactive-mode.ts:5468`
+/// @v0.87.1) — the same sentence `navigate_tree` refuses with
+/// (`SessionServiceError::NavigateTreeWhileCompacting`).
+const COMPACTING_TREE_NAV_ERROR: &str = "Wait for the current compaction or tree navigation to finish before navigating the session tree.";
+
 /// Project one flattened [`SessionDagNode`] into the `/tree` selector's [`TreeNode`].
 ///
 /// `pub` so the projection can be driven directly from a test with a hand-built `SessionDagNode`:
@@ -122,11 +127,16 @@ impl<B: Backend> App<B> {
             // for the non-summarizing path, which makes no model call — and safe for the drain,
             // because with no run loop there is no `events` subscription for its fan-out to block
             // against (see [`Self::queue_drain_tx`]).
-            // Pi `:4781-4785` — `restoreQueuedMessagesToEditor()` then `session.abort()`.
-            if session.is_streaming().await {
+            // Pi `:4781-4785` — `restoreQueuedMessagesToEditor()` then `await session.abort()`,
+            // which settles the run: `navigate_tree` now refuses a live one (SEAM-124).
+            if session.is_run_active() {
                 self.dispatch_queue_drain(session, QueueDrainReason::TreeNav)
                     .await;
-                session.abort();
+                session.abort_and_settle().await;
+            }
+            if session.is_compacting() {
+                self.state.transcript.push_error(COMPACTING_TREE_NAV_ERROR);
+                return;
             }
             let outcome = session
                 .navigate_tree(entry, opts)
@@ -135,6 +145,14 @@ impl<B: Backend> App<B> {
             self.apply_tree_nav_outcome(TreeNavMsg { target, outcome });
             return;
         };
+        // TUI-104 — pi re-checks `isCompacting` "before replacing another operation's UI"
+        // (`interactive-mode.ts:5466-5472` @v0.87.1): refuse here, BEFORE the branch-summary
+        // indicator below would overwrite a running compaction's. A compaction that starts only
+        // after the abort in the task below is refused by `navigate_tree` itself (SEAM-124).
+        if session.is_compacting() {
+            self.state.transcript.push_error(COMPACTING_TREE_NAV_ERROR);
+            return;
+        }
         if summarize {
             // Pi shows the `BranchSummaryStatusIndicator` and rebinds Escape for the duration
             // (`:4796-4799`, `:4792-4795`); both are torn down in `apply_tree_nav_outcome`.
@@ -154,7 +172,7 @@ impl<B: Backend> App<B> {
         // editor restore travels back to the loop, over `queue_drain_tx`.
         let drain_tx = self.queue_drain_tx.clone();
         tokio::spawn(async move {
-            if session.is_streaming().await {
+            if session.is_run_active() {
                 let (steering, follow_up) = session.drain_queue().await;
                 if let Some(drain_tx) = drain_tx {
                     let _ = drain_tx.send(QueueDrain {
@@ -163,7 +181,7 @@ impl<B: Backend> App<B> {
                         reason: QueueDrainReason::TreeNav,
                     });
                 }
-                session.abort();
+                session.abort_and_settle().await;
             }
             let outcome = session
                 .navigate_tree(entry, opts)
