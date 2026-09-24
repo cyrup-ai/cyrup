@@ -769,7 +769,18 @@ impl AgentSessionRuntime {
         let file_name = resolved.file_name().ok_or_else(|| {
             SessionServiceError::ImportFileNotFound(resolved.display().to_string())
         })?;
-        let destination = session_dir.join(file_name);
+        // SEAM-122 — never overwrite a stored session. Pi (`agent-session-runtime.ts:372-380`
+        // @v0.87.1, since v0.85.0) keeps the basename only when the source IS the stored file;
+        // otherwise it probes `name-1.ext`, `name-2.ext`, … until one is free, BEFORE the veto, so
+        // `session_before_switch` names the path actually used. `fs::copy` onto an existing stored
+        // session truncated it and replaced its transcript with the (usually older) import.
+        let mut destination = session_dir.join(file_name);
+        let source_already_stored = std::fs::canonicalize(&destination)
+            .ok()
+            .is_some_and(|d| Some(d) == std::fs::canonicalize(&resolved).ok());
+        if !source_already_stored {
+            destination = free_import_destination(&session_dir, Path::new(file_name));
+        }
 
         // SEAM-012 — an import lands as a RESUME of the copied file (pi's `importFromJsonl` ends in
         // the same replace-and-announce protocol as `switchSession`,
@@ -791,9 +802,11 @@ impl AgentSessionRuntime {
         let previous = current_file.map(|p| p.display().to_string());
         drop(current);
 
-        // Copy the source into the sessions dir (skip when it is already the destination).
-        if std::fs::canonicalize(&destination).ok() != std::fs::canonicalize(&resolved).ok() {
-            std::fs::copy(&resolved, &destination)
+        // Copy the source into the sessions dir (skip when it is already the destination). Pi
+        // copies with `COPYFILE_EXCL` (`:389`): `create_new` is that flag, so a file that appeared
+        // at the chosen name since the probe fails the import instead of being truncated.
+        if !source_already_stored {
+            copy_exclusive(&resolved, &destination)
                 .map_err(|e| SessionServiceError::Io(e.to_string()))?;
         }
 
@@ -865,4 +878,38 @@ impl AgentSessionRuntime {
     pub fn cwd(&self) -> &Path {
         self.factory.cwd()
     }
+}
+
+/// The first of `<dir>/<file>`, `<dir>/<stem>-1<.ext>`, `<dir>/<stem>-2<.ext>`, … that does not
+/// exist (SEAM-122; pi's `parse(destinationPath)` + `existsSync` loop,
+/// `agent-session-runtime.ts:374-379` @v0.87.1). `file_stem`/`extension` split exactly as Node's
+/// `path.parse` does for the names that matter here: `a.b.jsonl` → `a.b` + `.jsonl`, and a dotfile
+/// or extensionless name keeps its whole name as the stem.
+fn free_import_destination(dir: &Path, file: &Path) -> PathBuf {
+    let mut candidate = dir.join(file);
+    let stem = file.file_stem().unwrap_or(file.as_os_str());
+    let ext = file.extension();
+    let mut suffix: u64 = 1;
+    while candidate.exists() {
+        let mut name = stem.to_os_string();
+        name.push(format!("-{suffix}"));
+        if let Some(ext) = ext {
+            name.push(".");
+            name.push(ext);
+        }
+        candidate = dir.join(name);
+        suffix += 1;
+    }
+    candidate
+}
+
+/// Copy `src` to a `dst` that must not exist yet — Node's `copyFileSync(src, dst, COPYFILE_EXCL)`.
+fn copy_exclusive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    std::io::copy(&mut from, &mut to)?;
+    to.sync_all()
 }

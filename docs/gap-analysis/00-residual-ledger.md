@@ -8,6 +8,9 @@ next work item**.
 # RE-MEASURED 2026-09-24, second pass (fourteenth edition) — every window the first pass left unread is now read; the set above medium grows from three rows to ten
 
 > **Read this block first. It supersedes the thirteenth edition below and every count beneath it.**
+>
+> **UPDATE 2026-09-24 — both criticals are closed on branch `claude/sess-056-unterminated-session-line`:** `SESS-056` in `c625fbc` (a session file's unterminated last line is terminated on load) and `SEAM-122` in `7522d80` (`/import` never overwrites a stored session). Each landed with a regression test that fails without it. The counted set above medium is now **eight rows, all high**; the struck rows below stay for the record.
+>
 > Same code (`ea23ca2`; HEAD `8d93b0e` is docs-only) and the same upstream tags as the thirteenth
 > edition, plus **herdr v0.9.1** (`065ef9d6`), now cloned at `tmp/herdr` from
 > <https://github.com/herdrdev/herdr>. **herdr is not a port.** `crates/cyrup-herdr` is cyrup's own
@@ -26,8 +29,8 @@ next work item**.
 >
 > | rank | ID | Sev | Area | Kind | Effort | Why it is here |
 > |---|---|---|---|---|---|---|
-> | 1 | `SESS-056` | **critical** | 03 | upstream-drift | S | If a session file's last line has no trailing newline (a crash mid-append, or a file written by something else), the next appended entry is glued onto it. That entry is lost on reload, and every later entry loses its parent chain. pi v0.84.4 repairs the tail before appending. Silent data loss after an ordinary crash |
-> | 2 | `SEAM-122` | **critical** | 08 | upstream-drift | S | Importing a session whose file name already exists in the session dir overwrites the stored session. pi v0.85.0 gives the copy a unique name and copies with `COPYFILE_EXCL` |
+> | 1 | ~~`SESS-056`~~ | ~~critical~~ **CLOSED 2026-09-24 (`c625fbc`)** | 03 | upstream-drift | S | If a session file's last line has no trailing newline (a crash mid-append, or a file written by something else), the next appended entry is glued onto it. That entry is lost on reload, and every later entry loses its parent chain. pi v0.84.4 repairs the tail before appending. Silent data loss after an ordinary crash |
+> | 2 | ~~`SEAM-122`~~ | ~~critical~~ **CLOSED 2026-09-24 (`7522d80`)** | 08 | upstream-drift | S | Importing a session whose file name already exists in the session dir overwrites the stored session. pi v0.85.0 gives the copy a unique name and copies with `COPYFILE_EXCL` |
 > | 3 | `ICOM-068` | **high** | 11 | parity-bug | M | An intercom message delivered without a turn is saved and drawn but never added to the model's transcript (`append_injected_message_durably` skips it). Covers every busy-session steer and idle delivery under `inboundTrigger: replies`/`never`. The code is in `cyrup-session-svc` (area 08), which has not filed it |
 > | 4 | `ICOM-035` | **high** | 11 | parity-bug | M | **Reopened (regression from `8de7460`).** The injection pump `drive_injections` waits for idle, so a peer message to a busy session is parked until the run ends and is then appended with no turn (then `ICOM-068` applies). Take it with `ICOM-068`: same pump |
 > | 5 | `ICOM-062` | **high** | 11 | upstream-drift | M | `is_idle` is true during `/compact`, so a peer message starts a model run alongside the compaction, and `compact`'s `set_messages` then replaces the transcript under that running turn. Depends on area 08's `SEAM-125` |
@@ -119,7 +122,7 @@ next work item**.
 >
 > | rank | ID | Sev | Area | Effort | Why it is first |
 > |---|---|---|---|---|---|
-> | 1 | `SEAM-122` | **critical** | 08 | S | Importing a session whose file name already exists in the session dir overwrites the stored session: data loss on an ordinary action. pi v0.85.0 renames the copy and copies with `COPYFILE_EXCL` |
+> | 1 | ~~`SEAM-122`~~ | ~~critical~~ **CLOSED 2026-09-24 (`7522d80`)** | 08 | S | Importing a session whose file name already exists in the session dir overwrites the stored session: data loss on an ordinary action. pi v0.85.0 renames the copy and copies with `COPYFILE_EXCL` |
 > | 2 | `TOOL-047` | **high** | 04 | S | A shell command killed by a signal is reported to the model as a success. pi v0.86.0 reports `128 + signo` as a failure. The model acts on a false result |
 > | 3 | `SUBA-110` | **high** | 09b | S | `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*` and similar are not removed before the background runner or an external CLI with no allowlist starts (pi-subagents v0.71.0), so a child's git can act on the wrong repository |
 >

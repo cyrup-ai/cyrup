@@ -9,10 +9,12 @@ per-entry fix sketches only. Every id and status here was re-checked against its
 `## Open items` row. The count comes from `python3 scripts/count_open_items.py`; re-run it rather than
 copying figures. Nothing here was observed at runtime.
 
+> **UPDATE 2026-09-24 — both criticals are closed on branch `claude/sess-056-unterminated-session-line`:** `SESS-056` in `c625fbc` (a session file's unterminated last line is terminated on load) and `SEAM-122` in `7522d80` (`/import` never overwrites a stored session). Each landed with a regression test that fails without it. The counted set above medium is now **eight rows, all high**; the struck rows below stay for the record.
+
 | rank | ID | Sev | Area | Gap class (Kind) | Effort | Gap |
 |---|---|---|---|---|---|---|
-| 1 | `SESS-056` | **critical** | 03 | Version lag (`upstream-drift`) | S | If a session file's last line has no newline, the next entry is glued onto it and lost, and later entries lose their parent chain (pi v0.84.4 repairs the tail) |
-| 2 | `SEAM-122` | **critical** | 08 | Version lag (`upstream-drift`) | S | Importing a session whose file name already exists overwrites the stored session (pi v0.85.0: unique name, `COPYFILE_EXCL`) |
+| 1 | ~~`SESS-056`~~ | ~~critical~~ **CLOSED 2026-09-24 (`c625fbc`)** | 03 | Version lag (`upstream-drift`) | S | If a session file's last line has no newline, the next entry is glued onto it and lost, and later entries lose their parent chain (pi v0.84.4 repairs the tail) |
+| 2 | ~~`SEAM-122`~~ | ~~critical~~ **CLOSED 2026-09-24 (`7522d80`)** | 08 | Version lag (`upstream-drift`) | S | Importing a session whose file name already exists overwrites the stored session (pi v0.85.0: unique name, `COPYFILE_EXCL`) |
 | 3 | `ICOM-068` | **high** | 11 | Port bug (`parity-bug`) | M | An intercom message delivered without a turn is saved and drawn but never reaches the model's transcript. The code is area 08's |
 | 4 | `ICOM-035` | **high** | 11 | Port bug (`parity-bug`) | M | **Reopened, a regression from `8de7460`:** a peer message to a busy session waits for idle instead of steering |
 | 5 | `ICOM-062` | **high** | 11 | Version lag (`upstream-drift`) | M | A peer message during `/compact` starts a run whose transcript `compact` then replaces (needs `SEAM-125`) |
@@ -993,7 +995,7 @@ Where the re-audit moved an item to a different class, the id moves section and 
 >
 > | ID | Sev | Area | Kind | Effort | Gap |
 > |---|---|---|---|---|---|
-> | `SEAM-122` | **critical** | 08 | upstream-drift | S | Importing a session whose file name already exists in the session dir overwrites the stored session (pi v0.85.0 renames the copy, `COPYFILE_EXCL`) |
+> | ~~`SEAM-122`~~ | ~~critical~~ **CLOSED 2026-09-24 (`7522d80`)** | 08 | upstream-drift | S | Importing a session whose file name already exists in the session dir overwrites the stored session (pi v0.85.0 renames the copy, `COPYFILE_EXCL`) |
 > | `TOOL-047` | **high** | 04 | upstream-drift | S | A shell command killed by a signal is reported as a success (pi v0.86.0: `128 + signo`, failure) |
 > | `SUBA-110` | **high** | 09b | upstream-drift | S | Git routing variables (`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, …) reach the background runner and allowlist-less external CLIs (pi-subagents v0.71.0) |
 >

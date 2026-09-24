@@ -411,6 +411,74 @@ async fn runtime_import_from_jsonl_switches_session() {
     }
 }
 
+/// SEAM-122 — re-importing a file whose basename matches a stored session must not overwrite it.
+/// Pi (`agent-session-runtime.ts:372-389` @v0.87.1, since v0.85.0) picks `name-1.ext`,
+/// `name-2.ext`, … and copies with `COPYFILE_EXCL`; importing the stored file itself copies nothing.
+/// Before the fix `fs::copy` truncated the stored session and replaced it with the older export.
+#[tokio::test]
+async fn seam122_reimport_never_overwrites_the_stored_session() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("seeded")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("continued")], StopReason::Stop),
+    ]);
+    let provider: Arc<dyn Provider> = faux.clone();
+
+    let source = SessionBuilder::new(provider.clone(), base_config(&fx))
+        .build()
+        .await
+        .unwrap();
+    let _ = source.prompt("seed message").await.unwrap();
+    source.wait_for_idle().await;
+    let export_path = fx.cwd.join("exported.jsonl");
+    source.export_to_jsonl(Some(&export_path)).await.unwrap();
+    drop(source);
+
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
+
+    // First import keeps the basename; the stored session then moves on past the export.
+    runtime.import_from_jsonl(&export_path, None).await.unwrap();
+    let stored = runtime.session().await.session_file().await.unwrap();
+    assert_eq!(stored.file_name().unwrap(), "exported.jsonl");
+    let session = runtime.session().await;
+    let _ = session.prompt("work after import").await.unwrap();
+    session.wait_for_idle().await;
+    drop(session);
+    let stored_bytes = std::fs::read(&stored).unwrap();
+    assert!(
+        String::from_utf8_lossy(&stored_bytes).contains("work after import"),
+        "fixture precondition: the stored session has diverged from the export"
+    );
+
+    // Re-importing the same export lands beside it, twice, and never touches the stored file.
+    let dir = stored.parent().unwrap().to_path_buf();
+    for expected in ["exported-1.jsonl", "exported-2.jsonl"] {
+        let result = runtime.import_from_jsonl(&export_path, None).await.unwrap();
+        assert!(!result.cancelled);
+        assert_eq!(
+            runtime.session().await.session_file().await.unwrap(),
+            dir.join(expected)
+        );
+        assert_eq!(
+            std::fs::read(&stored).unwrap(),
+            stored_bytes,
+            "the stored session must be left byte-identical"
+        );
+    }
+
+    // Importing the stored file itself copies nothing and switches to it.
+    runtime.import_from_jsonl(&stored, None).await.unwrap();
+    assert_eq!(
+        runtime.session().await.session_file().await.unwrap(),
+        stored
+    );
+    assert!(!dir.join("exported-3.jsonl").exists());
+}
+
 /// Pi `importFromJsonl` copies into `this.session.sessionManager.getSessionDir()`
 /// (agent-session-runtime.ts:367) — the ACTIVE session's own per-cwd directory
 /// (`<root>/--<enc-cwd>--`, session-manager.ts:484,999-1000), never the sessions ROOT. Landing it in
