@@ -260,7 +260,9 @@ impl SessionStore for DiskStore {
         let deferred = self.take_sync_error();
         let file = self.handle()?;
         // ONE `write` of `<json>\n` to an append-mode fd: a crash mid-write leaves a partial
-        // final line that the tolerant reader drops ("last good line wins" — R-04-032). The buffer
+        // final line that the tolerant reader drops ("last good line wins" — R-04-032), and that
+        // `load` terminates with a `\n` on the next open (SESS-056) so this append starts a fresh
+        // line instead of being glued onto the partial one and lost with it. The buffer
         // is assembled first *precisely* so this is a single `write(2)`: `O_APPEND` atomicity is
         // per-call, and that is what bounds a crash — or a concurrent appender on the same file —
         // to at most one partial final line.

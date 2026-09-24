@@ -813,3 +813,115 @@ fn v1_first_kept_entry_index_drops_for_every_json_number() {
         other => panic!("expected a parsed compaction, got {other:?}"),
     }
 }
+
+// ── SESS-056 — an unterminated last line is repaired on open ─────────────────────────────────────
+//
+// pi `loadEntriesFromFile` appends `\n` once the header validates (`session-manager.ts:668`
+// @v0.87.1, since v0.84.4). Without it, the next append is written onto the unterminated tail and
+// the merged line is dropped on the following load.
+
+/// A persisted session holding `user("first")` then an assistant reply, with the file's bytes then
+/// passed through `mangle`.
+fn persisted_session(dir: &Path, mangle: impl FnOnce(&mut Vec<u8>)) -> PathBuf {
+    let path = dir.join("s.jsonl");
+    let mut mgr = SessionManager::open(&path).unwrap();
+    mgr.append_message(user("first")).unwrap();
+    mgr.append_message(assistant_blocks(vec![Content::text("reply")]))
+        .unwrap();
+    drop(mgr);
+    let mut bytes = std::fs::read(&path).unwrap();
+    mangle(&mut bytes);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// The user-message texts on the path from the leaf back to the root, oldest first. Walking from the
+/// leaf is what proves the parent chain is intact.
+fn user_texts(mgr: &SessionManager) -> Vec<String> {
+    mgr.branch_path(None)
+        .into_iter()
+        .filter_map(|e| {
+            let v: serde_json::Value = serde_json::from_str(&e.to_line().unwrap()).unwrap();
+            (v["message"]["role"] == "user")
+                .then(|| {
+                    v["message"]["content"][0]["text"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+        .collect()
+}
+
+#[test]
+fn sess056_a_complete_but_unterminated_last_entry_survives_the_next_append() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = persisted_session(tmp.path(), |b| {
+        assert_eq!(
+            b.pop(),
+            Some(b'\n'),
+            "fixture ends in a newline before mangling"
+        );
+    });
+
+    let mut mgr = SessionManager::open(&path).unwrap();
+    assert_eq!(
+        mgr.entries().len(),
+        2,
+        "the unterminated last entry still parses"
+    );
+    mgr.append_message(user("second")).unwrap();
+    drop(mgr);
+
+    let reopened = SessionManager::open(&path).unwrap();
+    assert_eq!(
+        reopened.entries().len(),
+        3,
+        "neither the old last entry nor the new one is lost"
+    );
+    assert_eq!(user_texts(&reopened), ["first", "second"]);
+    assert!(std::fs::read(&path).unwrap().ends_with(b"\n"));
+}
+
+#[test]
+fn sess056_a_half_written_tail_is_dropped_and_the_next_append_survives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = persisted_session(tmp.path(), |b| {
+        b.extend_from_slice(br#"{"type":"message","id":"deadbeef","parentId":"#);
+    });
+
+    let mut mgr = SessionManager::open(&path).unwrap();
+    assert_eq!(mgr.entries().len(), 2, "the partial tail is dropped");
+    mgr.append_message(user("second")).unwrap();
+    drop(mgr);
+
+    let reopened = SessionManager::open(&path).unwrap();
+    assert_eq!(
+        reopened.entries().len(),
+        3,
+        "the entry appended after the crash is kept"
+    );
+    assert_eq!(user_texts(&reopened), ["first", "second"]);
+}
+
+#[test]
+fn sess056_a_terminated_file_and_a_non_session_file_are_left_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = persisted_session(tmp.path(), |_| {});
+    let before = std::fs::read(&path).unwrap();
+    drop(SessionManager::open(&path).unwrap());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "no stray blank line is added"
+    );
+
+    // pi validates the header before repairing and never mutates a non-session file.
+    let other = tmp.path().join("other.jsonl");
+    std::fs::write(&other, br#"{"type":"message","id":"x"}"#).unwrap();
+    assert!(SessionManager::open(&other).is_err());
+    assert_eq!(
+        std::fs::read(&other).unwrap(),
+        br#"{"type":"message","id":"x"}"#
+    );
+}

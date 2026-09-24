@@ -4,7 +4,7 @@
 //! [`SessionManager::open`]: super::SessionManager::open
 //! [`SessionManager::fork_from`]: super::SessionManager::fork_from
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::entry::Entry;
@@ -28,6 +28,15 @@ use crate::header::SessionHeader;
 /// `Session file is not a valid pi session: <path>` because `statSync(path).size > 0`
 /// (`session-manager.ts:900-906`). Only a MISSING or ZERO-LENGTH file is a soft new session, which
 /// [`crate::SessionManager::open_with_cwd`] handles before reaching here.
+///
+/// SESS-056 — once the header is known good, a file whose last byte is not `\n` is terminated in
+/// place, exactly as pi's `loadEntriesFromFile` does after validating the header
+/// (`if (pending) appendFileSync(resolvedFilePath, "\n")`, `session-manager.ts:668` @v0.87.1, first
+/// shipped in v0.84.4). Without it the next [`crate::store::SessionStore::append_line`] lands on the
+/// same physical line as the unterminated tail: a half-written entry from a crash, or a complete
+/// last entry written by another tool. The merged line fails to parse on the next load, so the new
+/// entry is lost (and, in the second case, the good entry before it), and every later entry's
+/// parent chain runs through the lost id. A file that fails the header check is never touched.
 pub(super) fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), SessionError> {
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
@@ -76,5 +85,26 @@ pub(super) fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), Ses
     let header = header.ok_or_else(|| SessionError::NotASession {
         path: path.to_path_buf(),
     })?;
+    terminate_last_line(path)?;
     Ok((header, entries, recovered))
+}
+
+/// Append a single `\n` when the file's final byte is anything else (SESS-056). The partial tail
+/// itself is left on disk as its own line, which the tolerant reader keeps dropping — the same
+/// bytes pi leaves behind.
+fn terminate_last_line(path: &Path) -> Result<(), SessionError> {
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last != *b"\n" {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)?
+            .write_all(b"\n")?;
+    }
+    Ok(())
 }
