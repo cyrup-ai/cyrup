@@ -11,7 +11,7 @@ copying figures. Nothing here was observed at runtime.
 
 | rank | ID | Sev | Area | Gap class (Kind) | Effort | Gap |
 |---|---|---|---|---|---|---|
-| 1 | `SESS-056` | **critical** | 03 | Version lag (`upstream-drift`) | S | If a session file's last line has no newline, the next entry is glued onto it and lost, and later entries lose their parent chain (pi v0.84.4 repairs the tail) |
+| 1 | ~~`SESS-056`~~ | ~~critical~~ **CLOSED 2026-09-24 (`c625fbc`)** | 03 | Version lag (`upstream-drift`) | S | If a session file's last line has no newline, the next entry is glued onto it and lost, and later entries lose their parent chain (pi v0.84.4 repairs the tail) |
 | 2 | `SEAM-122` | **critical** | 08 | Version lag (`upstream-drift`) | S | Importing a session whose file name already exists overwrites the stored session (pi v0.85.0: unique name, `COPYFILE_EXCL`) |
 | 3 | `ICOM-068` | **high** | 11 | Port bug (`parity-bug`) | M | An intercom message delivered without a turn is saved and drawn but never reaches the model's transcript. The code is area 08's |
 | 4 | `ICOM-035` | **high** | 11 | Port bug (`parity-bug`) | M | **Reopened, a regression from `8de7460`:** a peer message to a busy session waits for idle instead of steering |

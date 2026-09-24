@@ -54,7 +54,7 @@ fixing it (see `../REPRO-LOG.md`), and record the run.
 
 **1. Session data loss — the two criticals. Both are S effort.**
 
-- `SESS-056` (area 03): repair a session file's unterminated last line before appending, as pi
+- ~~`SESS-056`~~ **CLOSED 2026-09-24 (`c625fbc`).** (area 03): repair a session file's unterminated last line before appending, as pi
   v0.84.4 does. Today the next entry is glued onto the partial line and lost, and every later entry
   loses its parent chain.
 - `SEAM-122` (area 08): session import must not overwrite an existing file. Give the copy a unique
