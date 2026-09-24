@@ -42,6 +42,7 @@ pub(crate) fn bare_single_step(
     task: &str,
 ) -> crate::spawn::chain_graph::SingleStepSpec {
     crate::spawn::chain_graph::SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: agent.to_string(),
@@ -56,6 +57,7 @@ pub(crate) fn bare_single_step(
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,

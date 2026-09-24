@@ -41,15 +41,15 @@
 //! there (`tui::render::lines_to_plain_text`) because the renderer contract carries a serialized
 //! widget tree across the boundary rather than live `ratatui` values.
 //!
-//! **C21 IS NOT, AND CANNOT BE FROM THIS CRATE.** [`render_async_jobs_widget`] renders pi's
-//! PERSISTENT widget, which upstream installs with `ctx.ui.setWidget(WIDGET_KEY, …)`
-//! (`tui/render.ts:1265-1273`). cyrup's extension surface has no such capability: neither
-//! `cyrup_ext::native::InitApi` nor `HostCtx` exposes a widget slot, and the renderer contract
-//! covers only tool rows and custom messages. So this function's only caller remains its own test,
-//! and it stays that way until `cyrup-ext` grows a `set_widget` capability — a change outside this
-//! crate. The `render_result` seam is deliberately NOT abused to fake it: upstream's own
-//! `renderSubagentResult` sends an async start down the plain-text branch (`:1413-1423`), it does
-//! not draw a jobs widget there.
+//! **C21 IS WIRED (SUBA-061).** [`render_async_jobs_widget`] renders pi's PERSISTENT async-jobs
+//! widget, which upstream installs with `ctx.ui.setWidget(WIDGET_KEY, …)` (`tui/render.ts:3003-3007`
+//! @v0.68.0). An earlier revision of this doc said it "CANNOT BE" wired from this crate because
+//! `cyrup-ext` had no widget slot; that was false — `cyrup_ext::host::HostServices::set_widget`
+//! exists, and `SubagentsExtension::publish_async_status_snapshot_widget` now calls this in every
+//! non-RPC mode, gated by `config.asyncWidget` (RPC mode gets the machine document instead, as
+//! upstream). The `render_result` seam is still not used for it: upstream's own
+//! `renderSubagentResult` sends an async start down the plain-text branch, it does not draw a jobs
+//! widget there.
 
 use std::collections::VecDeque;
 
@@ -733,6 +733,15 @@ pub fn render_inline_result(payload: &SubagentUpdatePayload, tick: usize) -> Vec
             tick,
         ));
         out.push(entry.stats_line());
+        // PB-14 — pi `Warning: <skillsWarning>` in the warning colour, under the row
+        // (`tui/render.ts:3484-3486` single, `:3660-3662` multi, indented).
+        if let Some(warning) = result.skills_warning.as_deref() {
+            let indent = if payload.results.len() > 1 { "  " } else { "" };
+            out.push(Line::from(vec![Span::styled(
+                format!("{indent}Warning: {warning}"),
+                Style::default().fg(ratatui::style::Color::Yellow),
+            )]));
+        }
     }
     out
 }
@@ -984,6 +993,52 @@ mod tests {
         assert_eq!(round.progress.len(), 1);
         assert_eq!(round.progress[0].current_tool.as_deref(), Some("read"));
         assert_eq!(round.progress[0].tokens, 128);
+    }
+
+    fn pb14_result(agent: &str, warning: Option<&str>) -> SingleResult {
+        let mut result = crate::exec::pre_spawn_failure(
+            &crate::exec::testsupport::sample_agent_config("m1", &[]),
+            "do it",
+            String::new(),
+        );
+        result.agent = agent.to_string();
+        result.exit_code = 0;
+        result.error = None;
+        result.skills_warning = warning.map(str::to_string);
+        result
+    }
+
+    /// PB-14 — pi `Warning: <skillsWarning>` under the settled row (`tui/render.ts:3484-3486`
+    /// single, `:3660-3662` multi, indented), and no line when there is no warning. Mutation
+    /// killed: dropping the push.
+    #[test]
+    fn inline_result_renders_the_skills_warning_line() {
+        let payload = SubagentUpdatePayload {
+            results: vec![pb14_result("worker", Some("Skills not found: typo"))],
+            ..SubagentUpdatePayload::single_live(
+                ContextMode::Fresh,
+                LiveProgressSnapshot::default(),
+            )
+        };
+        let plain = lines_to_plain_text(&render_inline_result(&payload, 0));
+        assert!(
+            plain.iter().any(|l| l == "Warning: Skills not found: typo"),
+            "{plain:?}"
+        );
+        let multi = SubagentUpdatePayload {
+            results: vec![
+                pb14_result("a", Some("Skills not found: x")),
+                pb14_result("b", None),
+            ],
+            ..payload.clone()
+        };
+        let plain = lines_to_plain_text(&render_inline_result(&multi, 0));
+        assert_eq!(
+            plain.iter().filter(|l| l.contains("Warning:")).count(),
+            1,
+            "{plain:?}"
+        );
+        assert!(plain.iter().any(|l| l == "  Warning: Skills not found: x"));
     }
 
     #[test]

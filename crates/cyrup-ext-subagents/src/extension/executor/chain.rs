@@ -387,12 +387,42 @@ impl SubagentExecutor {
         // T0.1/C13: resolve every named persona up front (also the upfront agent-name validation —
         // an unresolvable agent fails here, before any child is spawned, matching pi's `/chain`//
         // `/parallel` name check).
-        let resolved_agents = self.resolve_plan_personas(
+        let plan_agents = self.resolve_plan_agents(
             cwd,
             plan_step_agent_names(&graph),
             AgentReadScope::Both,
             &cfg.roots,
         )?;
+        let resolved_agents: BTreeMap<String, crate::exec::ResolvedAgentPersona> = plan_agents
+            .iter()
+            .map(|(name, agent)| (name.clone(), crate::exec::resolve_step_agent_config(agent)))
+            .collect();
+        // SUBA-096: each step's agent-level output mode and fast flag, folded in while the
+        // resolved agents are here.
+        let mut graph = graph;
+        crate::extension::host::slash_render::apply_agent_launch_defaults(&mut graph, &plan_agents);
+        // SUBA-100 — pi `buildSeqStep`'s placement block (`async-execution.ts:990-1001` @v0.68.0)
+        // and the foreground chain/parallel launch: every step's `s.machine ?? launchMachine ??
+        // a.machine` (the call rung was already stamped on the steps at the tool boundary),
+        // refused per runner/worktree and resolved BEFORE any child of the graph is spawned.
+        let mut placement_resolver = crate::placement::resolve::launch_resolver(cwd, &cfg)?;
+        crate::placement::resolve_graph_placements(
+            &mut graph,
+            |name| {
+                plan_agents
+                    .get(name)
+                    .map(|agent| crate::placement::resolve::PlacementAgent {
+                        name: agent.name.as_str(),
+                        machine: agent.machine.as_deref(),
+                        runner: agent.runner.as_ref(),
+                    })
+            },
+            None,
+            None,
+            &mut placement_resolver,
+        )
+        .await
+        .map_err(SubagentError::Management)?;
         // Fork default-mode + per-index branch (Tier-2, R-SA-137/R-SA-138, pi
         // `resolveAgentDefaultContextPolicy` + `preflightForkSessionsForStaticTasks`): resolve EACH
         // step's effective context independently (an omitted call-site `context` defers to THAT
@@ -531,6 +561,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = SubagentExecutor::new();
         let graph = vec![RunnerStep::SingleStep(SingleStepSpec {
+            machine: None,
             skills: None,
             session_dir: None,
             agent: "does-not-exist".to_string(),
@@ -545,6 +576,7 @@ mod tests {
             output: None,
             output_path: None,
             output_mode: None,
+            fast: None,
             reads: None,
             acceptance: None,
             context: None,
@@ -591,6 +623,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let graph = vec![RunnerStep::SingleStep(
             crate::spawn::chain_graph::SingleStepSpec {
+                machine: None,
                 skills: None,
                 session_dir: None,
                 agent: "worker".to_string(),
@@ -605,6 +638,7 @@ mod tests {
                 output: None,
                 output_path: None,
                 output_mode: None,
+                fast: None,
                 reads: None,
                 acceptance: None,
                 context: None,

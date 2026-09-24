@@ -11,7 +11,7 @@ use crate::background::result_index::{self, ResultWrite};
 use crate::background::{ResultFile, RunMode, RunPaths, RunState, RunStatus};
 use crate::error::SubagentError;
 use crate::exec::SingleResult;
-use crate::jsonl::BoundedJsonlWriter;
+use crate::jsonl::RunEventLog;
 use std::path::PathBuf;
 
 /// Fold [`run_inner`](super::turn_loop::run_inner)'s outcome into the terminal `(state, results, error)` triple [`finish_run`]
@@ -19,32 +19,43 @@ use std::path::PathBuf;
 pub(super) async fn settle_loop_outcome(
     loop_outcome: Result<LoopOutcome, SubagentError>,
     config: &RunnerConfig,
-    events: &mut Option<BoundedJsonlWriter>,
+    events: &mut Option<RunEventLog>,
     duration_ms: i64,
 ) -> (RunState, Vec<SingleResult>, Option<String>) {
     let run_id_str = config.run_id.as_str().to_string();
     match loop_outcome {
         Ok(LoopOutcome::Completed { results }) => {
             let all_ok = results.iter().all(|r| r.exit_code == 0);
+            // SUBA-100 — pi `partialWithEvidence` (`subagent-runner.ts:4953` @v0.68.0): some
+            // result is partial evidence and none is a concrete failure (`concreteFailureResult`,
+            // `:1844-1846`, a non-success that is not partial evidence). The stop / signal /
+            // timeout / budget / interrupt rungs that precede it upstream are the other
+            // `LoopOutcome` arms here.
+            let partial_with_evidence = results
+                .iter()
+                .any(|r| crate::exec::run_result::partial_evidence(r.execution.as_ref()))
+                && !results.iter().any(|r| {
+                    r.exit_code != 0
+                        && !crate::exec::run_result::partial_evidence(r.execution.as_ref())
+                });
+            let state = if all_ok {
+                RunState::Complete
+            } else if partial_with_evidence {
+                RunState::Partial
+            } else {
+                RunState::Failed
+            };
             append_event(
                 events,
                 "subagent.run.completed",
                 Some(serde_json::json!({
                     "runId": run_id_str,
-                    "status": if all_ok { "complete" } else { "failed" },
+                    "status": state.as_wire_word(),
                     "durationMs": duration_ms,
                 })),
             )
             .await;
-            (
-                if all_ok {
-                    RunState::Complete
-                } else {
-                    RunState::Failed
-                },
-                results,
-                None,
-            )
+            (state, results, None)
         }
         Ok(LoopOutcome::Interrupted { results }) => {
             append_event(
@@ -272,6 +283,11 @@ pub(super) async fn finish_run(
 
     if !error.is_empty() && results.is_empty() {
         results.push(SingleResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            skills_warning: None,
+            watchdog: None,
             // SUBA-021: no usage budget on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
@@ -349,6 +365,39 @@ pub(super) async fn finish_run(
     // treated as a success, matching this crate's general "no work attempted, no work failed"
     // convention rather than requiring a nonsensical "at least one result" precondition).
     let success = terminal_state == RunState::Complete && results.iter().all(|r| r.exit_code == 0);
+
+    // SUBA-100 — pi's `if (partialWithEvidence)` block (`subagent-runner.ts:4991-4997` @v0.68.0):
+    // the run needs attention, its error is the partial result's own (when it has one), and
+    // every failed or partial step needs attention too.
+    if terminal_state == RunState::Partial {
+        status.telemetry.activity_state = Some(crate::background::ActivityState::NeedsAttention);
+        if let Some(error) = results
+            .iter()
+            .find(|r| crate::exec::run_result::partial_evidence(r.execution.as_ref()))
+            .and_then(|r| r.error.clone())
+        {
+            status.error = Some(error);
+        }
+        for step in &mut status.steps {
+            if matches!(
+                step.status,
+                crate::background::StepState::Failed | crate::background::StepState::Partial
+            ) {
+                step.telemetry.activity_state =
+                    Some(crate::background::ActivityState::NeedsAttention);
+            }
+        }
+    }
+
+    // SUBA-063 — pi `const singleRuntimeAcknowledgedExtensions = results.length === 1 ?
+    // results[0]?.runtimeAcknowledgedExtensions : undefined; … if (singleRuntimeAcknowledgedExtensions)
+    // statusPayload.runtimeAcknowledgedExtensions = …` (`subagent-runner.ts:4887`, `:5002` @v0.68.0):
+    // a ONE-result run lifts its child's acknowledgement onto the run-level status.
+    if let [only] = results.as_slice()
+        && let Some(acknowledged) = only.runtime_acknowledged_extensions.clone()
+    {
+        status.runtime_acknowledged_extensions = Some(acknowledged);
+    }
 
     // R-SA-077: status.json THEN ResultFile, in that exact order. Both writes are best-effort at
     // the OUTER level (a failure writing `status.json` here still attempts the `ResultFile` write,
@@ -562,6 +611,110 @@ mod tests {
         )
     }
 
+    /// SUBA-100 — pi `partialWithEvidence` (`subagent-runner.ts:4953-4997` @v0.68.0): a run whose
+    /// only shortfall is a placed external result (`execution.status: "partial"`) settles
+    /// `partial` — needs attention, not failed — while a concrete failure beside it keeps the run
+    /// `failed`; the partial run's status and its failed/partial steps need attention, and its
+    /// result is not a success.
+    ///
+    /// *Gutted by*: the `RunState::Partial` arm of `settle_loop_outcome` (the run is `failed`), or
+    /// the `needs_attention` block in `finish_run`.
+    #[tokio::test]
+    async fn a_run_whose_only_shortfall_is_placed_partial_evidence_settles_partial() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let run_id = RunId::from_token("run-partialevidence");
+        let run_paths = run_paths_in(dir.path(), &run_id);
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
+        tokio::fs::create_dir_all(dir.path().join("results"))
+            .await
+            .expect("mkdir results_dir");
+        let config: RunnerConfig = serde_json::from_value(serde_json::json!({
+            "runId": run_id,
+            "mode": "chain",
+            "steps": [],
+            "cwd": dir.path(),
+            "sessionId": "test-session",
+            "globalConcurrencyLimit": 4,
+            "maxSubagentDepth": 2,
+            "asyncRoot": dir.path().join("async"),
+            "resultsDir": dir.path().join("results"),
+            "resolvedAgents": {},
+            "originalTask": "t",
+        }))
+        .expect("minimal runner config");
+        let agent = crate::exec::testsupport::sample_agent_config("m1", &[]);
+        let result = |exit_code: i32, error: Option<&str>, partial: bool| {
+            let mut result = crate::exec::pre_spawn_failure(&agent, "t", String::new());
+            result.exit_code = exit_code;
+            result.error = error.map(str::to_string);
+            result.execution = partial.then(crate::exec::run_result::ExecutionOutcome::partial);
+            result
+        };
+        let placed = result(1, None, true);
+        let ok = result(0, None, false);
+        let failed = result(1, Some("boom"), false);
+        for (results, expected) in [
+            (vec![placed.clone(), ok.clone()], RunState::Partial),
+            (vec![placed.clone(), failed], RunState::Failed),
+            (vec![ok.clone()], RunState::Complete),
+        ] {
+            let (state, _, _) = settle_loop_outcome(
+                Ok(LoopOutcome::Completed { results }),
+                &config,
+                &mut None,
+                0,
+            )
+            .await;
+            assert_eq!(state, expected);
+        }
+
+        let mut status = crate::background::RunStatus::queued(
+            run_id.clone(),
+            RunMode::Chain,
+            Some(std::process::id()),
+        );
+        status.session_id = Some(crate::identity::SessionId::parse("test-session").expect("id"));
+        let mut partial_step = crate::background::StepStatus::pending("worker");
+        partial_step.status = crate::background::StepState::Partial;
+        let mut complete_step = crate::background::StepStatus::pending("worker");
+        complete_step.status = crate::background::StepState::Complete;
+        status.steps = vec![partial_step, complete_step];
+        finish_run(
+            &run_paths,
+            status,
+            RunState::Partial,
+            vec![placed, ok],
+            dir.path().to_path_buf(),
+            None,
+            String::new(),
+            WorkflowResultFields::default(),
+        )
+        .await;
+        let written: RunStatus =
+            serde_json::from_slice(&tokio::fs::read(&run_paths.status).await.expect("status"))
+                .expect("status json");
+        assert_eq!(written.state, RunState::Partial);
+        assert_eq!(
+            written.telemetry.activity_state,
+            Some(crate::background::ActivityState::NeedsAttention)
+        );
+        assert_eq!(
+            written.steps[0].telemetry.activity_state,
+            Some(crate::background::ActivityState::NeedsAttention)
+        );
+        assert_eq!(written.steps[1].telemetry.activity_state, None);
+        let result_file: ResultFile = serde_json::from_slice(
+            &tokio::fs::read(terminal_result_path(&run_paths, &run_id))
+                .await
+                .expect("result"),
+        )
+        .expect("result json");
+        assert_eq!(result_file.state, RunState::Partial);
+        assert!(!result_file.success);
+    }
+
     // ---------------------------------------------------------------------------------------
     // Second-pass adversarial-review regression: `run()`'s control-inbox-directory creation step
     // (between the initial status.json write and `run_inner`) must route ANY failure through
@@ -694,6 +847,11 @@ mod tests {
             status.clone(),
             RunState::Complete,
             vec![SingleResult {
+                execution: None,
+                native_machine: None,
+                runtime_acknowledged_extensions: None,
+                skills_warning: None,
+                watchdog: None,
                 // SUBA-021: no usage budget on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,

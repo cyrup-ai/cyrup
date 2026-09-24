@@ -52,6 +52,12 @@
 //! appended extras *after* the user dirs, inverting this so a bundled extra shadowed the user's
 //! own agent.)
 //!
+//! The variable is resolved ONCE, into [`crate::paths::Roots::extra_agent_dirs`], by the crate's
+//! one parser of it; this module never reads the environment for it. The discovery config builder
+//! prepends those dirs ([`AgentDiscoveryConfig::with_prepended_user_extras`]), and `/subagents`'
+//! read-only check reads the same field of the same `Roots`, so the two cannot disagree about
+//! which agents are extra-dir agents.
+//!
 //! # R-SA-007: legacy skill-path exclusion
 //!
 //! Any path under a directory segment literally named [`SKILLS_DIR_SEGMENT`] within an
@@ -69,6 +75,7 @@
 pub mod agent_memory;
 pub mod chains;
 pub mod frontmatter;
+pub mod key_census;
 pub mod management;
 pub mod merge;
 pub(crate) mod package_name;
@@ -169,11 +176,65 @@ fn is_project_root_candidate(dir: &Path) -> bool {
 /// this list's head; [`find_configured_project_root`] is this list filtered by the
 /// `subagents.projectRootResolution` setting. Always terminates at the filesystem-root fixpoint
 /// where `Path::parent` no longer yields a distinct ancestor (pi's `path.dirname(dir) === dir`).
+///
+/// #84 — the walk STOPS at a home directory (pi `// ~/.pi and ~/.agents are user configuration,
+/// never an implicit project.`, `agents.ts:833-854` @v0.68.0): a cwd anywhere under `$HOME` whose
+/// only config ancestor is `~/.cyrup` is NOT inside a project. Without it every such cwd resolved
+/// `$HOME` as its project root, so `/subagents` offered a "project" scope whose settings file IS the
+/// user settings file, and the user agent directory was scanned a second time as project scope.
+/// The home set is upstream's — `$HOME`, `%USERPROFILE%` and `%HOMEDRIVE%%HOMEPATH%`, non-blank,
+/// existing, compared by canonical path ([`ambient_home_dirs`]).
 #[must_use]
 pub fn find_project_root_candidates(cwd: &Path) -> Vec<PathBuf> {
+    find_project_root_candidates_excluding(cwd, &[])
+}
+
+/// pi's `homeDirs` set (`agents.ts:836-842` @v0.68.0): `os.homedir()`, `$HOME`, `%USERPROFILE%`
+/// and `%HOMEDRIVE%%HOMEPATH%`, each non-blank and an existing directory, canonicalized
+/// (`fs.realpathSync.native`). On unix `os.homedir()` is `$HOME` itself.
+fn ambient_home_dirs() -> Vec<PathBuf> {
+    let var = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    let windows_profile = var("HOMEDRIVE")
+        .zip(var("HOMEPATH"))
+        .map(|(drive, path)| format!("{drive}{path}"));
+    [var("HOME"), var("USERPROFILE"), windows_profile]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir())
+        .filter_map(|dir| dir.canonicalize().ok())
+        .collect()
+}
+
+/// [`find_project_root_candidates`] with further home directories excluded beside the ambient ones
+/// — the session's resolved user root ([`crate::paths::Roots::home`]), which is where cyrup's own
+/// user configuration (`<home>/.cyrup`) lives and therefore exactly the directory upstream's rule
+/// exists to keep from being mistaken for a project.
+#[must_use]
+pub fn find_project_root_candidates_excluding(cwd: &Path, extra_homes: &[&Path]) -> Vec<PathBuf> {
+    let mut homes = ambient_home_dirs();
+    homes.extend(
+        extra_homes
+            .iter()
+            .filter(|dir| dir.is_dir())
+            .filter_map(|dir| dir.canonicalize().ok()),
+    );
     let mut roots = Vec::new();
     let mut current = cwd;
     loop {
+        // pi `if (isDirectory(currentDir) && homeDirs.has(fs.realpathSync.native(currentDir)))
+        // return roots;` — the walk ends AT the home dir, never scanning it or anything above it.
+        if current.is_dir()
+            && current
+                .canonicalize()
+                .is_ok_and(|canonical| homes.contains(&canonical))
+        {
+            return roots;
+        }
         if is_project_root_candidate(current) {
             roots.push(current.to_path_buf());
         }
@@ -295,7 +356,20 @@ pub fn read_project_root_resolution(
 /// `projectRootResolution` at either consulted root aborts discovery (R-SA-009), it does not
 /// silently degrade to "nearest".
 pub fn find_configured_project_root(cwd: &Path) -> Result<Option<PathBuf>, SubagentError> {
-    let candidates = find_project_root_candidates(cwd);
+    find_configured_project_root_excluding(cwd, &[])
+}
+
+/// [`find_configured_project_root`] over [`find_project_root_candidates_excluding`] — the entry the
+/// executor's discovery config uses, handing in the session's resolved user root.
+///
+/// # Errors
+///
+/// As [`find_configured_project_root`].
+pub fn find_configured_project_root_excluding(
+    cwd: &Path,
+    extra_homes: &[&Path],
+) -> Result<Option<PathBuf>, SubagentError> {
+    let candidates = find_project_root_candidates_excluding(cwd, extra_homes);
     let Some(nearest_root) = candidates.first() else {
         return Ok(None);
     };
@@ -373,7 +447,7 @@ pub fn resolve_project_chain_read_dirs(project_root: &Path) -> Vec<PathBuf> {
 /// wins the last-directory-scanned reduce only once the user actually populates it, matching pi's
 /// `fs.existsSync(userDirNew) ? userDirNew : userDirOld` write-target selection over the same
 /// last-entry rule). [`EXTRA_AGENT_DIRS_ENV_VAR`] entries are prepended ahead of BOTH by
-/// [`AgentDiscoveryConfig::with_env_extras`] (R-SA-003).
+/// [`AgentDiscoveryConfig::with_prepended_user_extras`] (R-SA-003).
 #[must_use]
 pub fn resolve_user_agent_read_dirs(home: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![home.join(PROJECT_CONFIG_DIR_SEGMENT).join(AGENTS_SUBDIR)];
@@ -692,11 +766,11 @@ pub struct AgentDiscoveryConfig {
     /// alphabetical-by-filename), ordered lowest-precedence-first so the LAST entry wins a
     /// same-name collision under the User tier's last-directory-scanned-wins reduce (R-SA-002).
     /// Ordinary caller-supplied entries — [`EXTRA_AGENT_DIRS_ENV_VAR`] entries (R-SA-003) are
-    /// **prepended ahead of** this list by [`AgentDiscoveryConfig::with_env_extras`] /
-    /// [`resolve_extra_agent_dirs`] (extras are the lowest-precedence stream) rather than being
-    /// folded in silently by this struct's own constructor, so a caller inspecting
-    /// `user_agent_dirs` after construction sees exactly what it explicitly set unless it
-    /// explicitly opted into the env-var extension.
+    /// **prepended ahead of** this list by [`AgentDiscoveryConfig::with_prepended_user_extras`]
+    /// (extras are the lowest-precedence stream) rather than being folded in silently by this
+    /// struct's own constructor, so a caller inspecting `user_agent_dirs` after construction sees
+    /// exactly what it explicitly set unless it explicitly prepended the resolved
+    /// [`crate::paths::Roots::extra_agent_dirs`].
     pub user_agent_dirs: Vec<PathBuf>,
     /// User-scope chain directories, in fixed scan order — kept as an independent list from
     /// `user_agent_dirs` since chain files (`discovery::chains`) and agent files use different
@@ -728,28 +802,17 @@ pub struct AgentDiscoveryConfig {
 }
 
 impl AgentDiscoveryConfig {
-    /// **Prepend** [`EXTRA_AGENT_DIRS_ENV_VAR`]'s entries (if the variable is set and non-empty)
-    /// *ahead of* `user_agent_dirs`, in the order [`std::env::split_paths`] yields them — i.e.
-    /// *before* any ordinary user directories already present, so R-SA-002's
-    /// last-directory-scanned-wins User tier rule lets an ordinary user directory's same-named
-    /// agent win over an extra directory's, matching pi-subagents'
-    /// `[...userAgentsExtra, ...userAgentsOld, ...userAgentsNew]` placement for
-    /// `PI_SUBAGENT_EXTRA_AGENT_DIRS` (agents.ts:1752-1756). Extras are therefore the
+    /// **Prepend** the resolved [`EXTRA_AGENT_DIRS_ENV_VAR`] entries — always
+    /// [`crate::paths::Roots::extra_agent_dirs`], the crate's one resolution of that variable —
+    /// *ahead of* `user_agent_dirs`, in the order the variable lists them, i.e. *before* any
+    /// ordinary user directories already present, so R-SA-002's last-directory-scanned-wins User
+    /// tier rule lets an ordinary user directory's same-named agent win over an extra directory's,
+    /// matching pi-subagents' `[...userAgentsExtra, ...userAgentsOld, ...userAgentsNew]` placement
+    /// for `PI_SUBAGENT_EXTRA_AGENT_DIRS` (agents.ts:1752-1756). Extras are therefore the
     /// **lowest-precedence** User-tier stream (a read-only fallback), never an override of the
-    /// user's own agents. A no-op when the variable is absent or empty.
+    /// user's own agents. A no-op when `extras` is empty.
     #[must_use]
-    pub fn with_env_extras(self) -> Self {
-        let extras = resolve_extra_agent_dirs(|key| std::env::var(key).ok());
-        self.with_prepended_user_extras(extras)
-    }
-
-    /// The pure core of [`AgentDiscoveryConfig::with_env_extras`], parameterized over the already-
-    /// resolved `extras` list so the extras-first ordering can be exercised deterministically in
-    /// unit tests without touching real process environment state (this crate is
-    /// `#![forbid(unsafe_code)]`, so tests never call `std::env::set_var`). Prepends `extras`
-    /// ahead of any existing `user_agent_dirs`; a no-op when `extras` is empty.
-    #[must_use]
-    fn with_prepended_user_extras(mut self, extras: Vec<PathBuf>) -> Self {
+    pub fn with_prepended_user_extras(mut self, extras: Vec<PathBuf>) -> Self {
         if !extras.is_empty() {
             let mut combined = extras;
             combined.append(&mut self.user_agent_dirs);
@@ -757,24 +820,6 @@ impl AgentDiscoveryConfig {
         }
         self
     }
-}
-
-/// The pure core of [`AgentDiscoveryConfig::with_env_extras`], parameterized over the env lookup
-/// (R-SA-003) so it can be exercised deterministically in unit tests without mutating real
-/// process environment state — mirrors `spawn::resolve_spawn_command_from`'s and
-/// `spawn::depth::resolve_effective_depth_from`'s identical env-lookup-closure-injection pattern
-/// (this crate is `#![forbid(unsafe_code)]`, so tests never call `std::env::set_var`/`remove_var`
-/// directly).
-fn resolve_extra_agent_dirs(env_lookup: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
-    let Some(raw) = env_lookup(EXTRA_AGENT_DIRS_ENV_VAR) else {
-        return Vec::new();
-    };
-    if raw.is_empty() {
-        return Vec::new();
-    }
-    std::env::split_paths(&raw)
-        .filter(|p| !p.as_os_str().is_empty())
-        .collect()
 }
 
 // -------------------------------------------------------------------------------------------
@@ -804,8 +849,12 @@ pub fn parse_subagent_settings(
     validate_default_provider(value)?;
     validate_default_extensions(value)?;
     validate_override_default_providers(value)?;
+    validate_override_suba096_keys(value)?;
+    validate_override_context_and_mutation_keys(value)?;
+    validate_override_machine_key(value)?;
     let mut settings: SubagentSettings = serde_json::from_value(value.clone())
         .map_err(|e| SubagentError::MalformedSettings(e.to_string()))?;
+    settings.warnings = override_key_warnings(value);
     // pi `readSubagentSettings` (`agents.ts:874-881`): `defaultModel` must be a NON-EMPTY string;
     // an empty/whitespace-only value is malformed and MUST abort (R-SA-009). Stored trimmed so a
     // stray-whitespace value resolves to the same model everywhere it is consulted.
@@ -841,6 +890,14 @@ pub fn parse_subagent_settings(
             let trimmed = provider.trim();
             if trimmed.len() != provider.len() {
                 delta.default_provider = OverrideField::Value(trimmed.to_string());
+            }
+        }
+        // SUBA-100 — pi stores the machine `validateOptionalMachine` returned, i.e. TRIMMED
+        // (`agents.ts:982,1121` @v0.68.0).
+        if let OverrideField::Value(machine) = &delta.machine {
+            let trimmed = machine.trim();
+            if trimmed.len() != machine.len() {
+                delta.machine = OverrideField::Value(trimmed.to_string());
             }
         }
     }
@@ -1012,6 +1069,139 @@ fn validate_override_default_providers(subagents: &serde_json::Value) -> Result<
     Ok(())
 }
 
+/// SUBA-096 — pi `parseBuiltinOverride`'s three arms for the keys this port now models
+/// (`agents.ts:1016-1021`, `:1029-1032`, `:1079-1084` @v0.68.0), checked against the RAW object
+/// before serde runs, for the reason [`validate_override_default_providers`] states: serde's own
+/// error names no field, and two of the three would otherwise be ACCEPTED wrongly —
+///
+/// - `outputMode: false` would be refused by serde with a generic message (pi: its own message);
+/// - `acceptanceRole: "reviewer"` would fail `OverrideField<AcceptanceRole>`'s untagged parse with
+///   "data did not match any variant", naming nothing.
+///
+/// Presence-gated like every sibling: only an absent key is silent. The file path upstream
+/// interpolates is not in scope here and is dropped exactly as the siblings drop it; the reader
+/// ([`read_subagent_settings_file`]) prefixes it.
+fn validate_override_suba096_keys(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in entries {
+        if let Some(raw) = entry.get("outputMode")
+            && raw.as_str() != Some("inline")
+            && raw.as_str() != Some("file-only")
+        {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Builtin override '{name}' has invalid 'outputMode'; expected 'inline' or 'file-only'."
+            )));
+        }
+        if let Some(raw) = entry.get("fast")
+            && !raw.is_boolean()
+        {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Builtin override '{name}' has invalid 'fast'; expected a boolean."
+            )));
+        }
+        if let Some(raw) = entry.get("acceptanceRole")
+            && raw.as_str() != Some("read-only")
+            && raw.as_str() != Some("writer")
+            && raw != &serde_json::Value::Bool(false)
+        {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Builtin override '{name}' has invalid 'acceptanceRole'; expected 'read-only', 'writer', or false."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// SUBA-100 — pi `parseBuiltinOverride`'s `machine` arm (`agents.ts:1118-1121` @v0.68.0):
+/// `false` clears, anything else goes through `validateOptionalMachine` with the label
+/// `Builtin override '<name>' in '<file>' field 'machine'` and THROWS on a bad value. Checked
+/// against the RAW object before serde, like its siblings. The file half of the label is added by
+/// [`read_subagent_settings_file`]'s `settings file '<path>': ` prefix, which every settings
+/// refusal in this port carries.
+fn validate_override_machine_key(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in entries {
+        crate::placement::validate_optional_machine(
+            entry.get("machine"),
+            &format!("Builtin override '{name}' field 'machine'"),
+        )
+        .map_err(SubagentError::MalformedSettings)?;
+    }
+    Ok(())
+}
+
+/// SUBA-101 / SUBA-102 — pi `parseBuiltinOverride`'s arms for `inheritGlobalContext`
+/// (`agents.ts:1055-1060` @v0.68.0: a boolean, else THROW) and `mutationTools` (`:1152`, through
+/// `parseOverrideStringArrayOrFalse`, `:947-966`: an array whose every entry is a string, or the
+/// literal `false`, else THROW), checked against the RAW object before serde runs for the reason
+/// [`validate_override_default_providers`] states — serde's own error names no field.
+///
+/// The trim / drop-empty half of `parseOverrideStringArrayOrFalse` is applied where the override
+/// lands (`merge.rs`), because serde carries the raw list verbatim.
+fn validate_override_context_and_mutation_keys(
+    subagents: &serde_json::Value,
+) -> Result<(), SubagentError> {
+    let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in entries {
+        if let Some(raw) = entry.get("inheritGlobalContext")
+            && !raw.is_boolean()
+        {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Builtin override '{name}' has invalid 'inheritGlobalContext'; expected a boolean."
+            )));
+        }
+        if let Some(raw) = entry.get("mutationTools")
+            && raw != &serde_json::Value::Bool(false)
+            && !raw
+                .as_array()
+                .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+        {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Builtin override '{name}' has invalid 'mutationTools'; expected an array of strings or false."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// SUBA-096 — the non-fatal half of the override census: for every `agentOverrides.<name>`
+/// entry, one warning per key no reader consumes (see [`types::SubagentSettings::warnings`]).
+///
+/// The known set is [`types::AgentOverrideConfig`]'s own serde field list plus `toolBudget`,
+/// which is `skip_deserializing` (populated by [`populate_override_tool_budgets`]) and so absent
+/// from that list while still read.
+fn override_key_warnings(subagents: &serde_json::Value) -> Vec<String> {
+    let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut known: Vec<&str> = key_census::struct_fields::<types::AgentOverrideConfig>().to_vec();
+    known.push("toolBudget");
+    let mut warnings = Vec::new();
+    for (name, entry) in entries {
+        let Some(object) = entry.as_object() else {
+            continue;
+        };
+        let key_census = key_census::census(object, &known, types::UNPORTED_OVERRIDE_KEYS);
+        for (key, landing) in &key_census.unported {
+            warnings.push(format!(
+                "agentOverrides.{name}.{key} is not supported by this port ({landing}); it has no effect"
+            ));
+        }
+        for key in &key_census.unknown {
+            warnings.push(format!(
+                "agentOverrides.{name}.{key} is not an override key (ignored)"
+            ));
+        }
+    }
+    warnings
+}
+
 /// pi `readSubagentSettings`'s `defaultExtensions` gate (`agents.ts:890-897`): the value must be an
 /// ARRAY whose every entry is a non-empty string. An EMPTY array is legal — pi's `.some(...)` guard
 /// passes vacuously — and means "no extensions", which is distinct from an absent key.
@@ -1161,6 +1351,9 @@ fn resolve_layered_subagent_settings(
         // SUBA-078 / pi `resolveSubagentMaxThinking` (`agents.ts:1190-1197`) — project-wins-outright,
         // the same rule every other settings key above follows.
         max_thinking: project.max_thinking.or(user.max_thinking),
+        // Diagnostics are about FILES, not effective values: both scopes' stated keys are
+        // reported, whichever entry wins.
+        warnings: user.warnings.into_iter().chain(project.warnings).collect(),
     }
 }
 
@@ -1669,6 +1862,36 @@ fn run_discovery(
         diagnostics,
     } = scan_chain_scopes(&chain_scopes);
 
+    // SUBA-096 — every settings key no reader consumes, reported against the settings file it
+    // came from. `name: None` keeps these listing-only: `find_blocking_agent_diagnostic` matches by
+    // name, so a settings warning can never block an agent from resolving.
+    let mut agent_diagnostics = agent_diagnostics;
+    let override_settings = &cfg.override_settings;
+    let settings_scopes = [
+        (
+            AgentSource::User,
+            Some(&override_settings.user_settings_path),
+            &override_settings.user.warnings,
+        ),
+        (
+            AgentSource::Project,
+            override_settings.project_settings_path.as_ref(),
+            &override_settings.project.warnings,
+        ),
+    ];
+    for (source, path, warnings) in settings_scopes {
+        let Some(path) = path else { continue };
+        agent_diagnostics.extend(warnings.iter().map(|warning| AgentDiscoveryDiagnostic {
+            source,
+            file_path: path.clone(),
+            error: warning.clone(),
+            name: None,
+            runtime_name: None,
+            package_specified: false,
+            discovery_priority: None,
+        }));
+    }
+
     Ok(AgentDiscoveryResult {
         agents,
         chains,
@@ -1807,28 +2030,6 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // R-SA-003: extra agent directories via environment
     // -----------------------------------------------------------------------------------------
-
-    #[test]
-    fn resolve_extra_agent_dirs_splits_platform_path_list() {
-        let joined = if cfg!(windows) { "/a;/b" } else { "/a:/b" };
-        let dirs = resolve_extra_agent_dirs(|key| {
-            (key == EXTRA_AGENT_DIRS_ENV_VAR).then(|| joined.to_string())
-        });
-        assert_eq!(dirs, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
-    }
-
-    #[test]
-    fn resolve_extra_agent_dirs_is_empty_when_env_var_absent() {
-        let dirs = resolve_extra_agent_dirs(|_| None);
-        assert!(dirs.is_empty());
-    }
-
-    #[test]
-    fn resolve_extra_agent_dirs_is_empty_when_env_var_is_empty_string() {
-        let dirs =
-            resolve_extra_agent_dirs(|key| (key == EXTRA_AGENT_DIRS_ENV_VAR).then(String::new));
-        assert!(dirs.is_empty());
-    }
 
     #[test]
     fn with_prepended_user_extras_puts_extras_first_so_primary_user_dirs_win_last() {
@@ -2455,7 +2656,7 @@ mod tests {
                     "inheritProjectContext": true,
                     "inheritSkills": false,
                     "defaultContext": "fork",
-                    "acceptanceRole": "reviewer",
+                    "acceptanceRole": "writer",
                     "disabled": false,
                     "systemPrompt": "be terse",
                     "skills": ["tdd"],
@@ -2512,6 +2713,311 @@ mod tests {
             OverrideField::Value(vec!["bash".to_string()])
         );
         assert_eq!(reviewer.allow_nested_subagents, OverrideField::Value(true));
+        // SUBA-096: the three keys that used to be dropped. The fixture's `acceptanceRole` was
+        // `"reviewer"` — a value upstream REFUSES (`agents.ts:1079-1084` @v0.68.0 admits only
+        // `read-only`/`writer`/`false`) that passed only because the key was discarded. It is now
+        // `"writer"`. Mutation killed: removing any one of the three fields from
+        // `AgentOverrideConfig` (serde drops the key again and the assertion sees the default).
+        assert_eq!(
+            reviewer.acceptance_role,
+            OverrideField::Value(crate::exec::acceptance::model::AcceptanceRole::Writer)
+        );
+        assert_eq!(
+            reviewer.output_mode,
+            Some(types::OverrideOutputMode::FileOnly)
+        );
+        assert_eq!(reviewer.fast, OverrideField::Value(true));
+        assert!(
+            settings.warnings.is_empty(),
+            "every modeled key is read: {:?}",
+            settings.warnings
+        );
+    }
+
+    /// SUBA-096 — pi throws on `outputMode: false` (no clear form) and on cyrup's third spelling,
+    /// with its own field-naming text. Mutation killed: modeling the field as
+    /// `OverrideField<OutputMode>` (false becomes a silent clear, `file-and-inline` a value) or
+    /// deleting the raw check (serde's generic message names no field).
+    #[test]
+    fn override_output_mode_false_and_file_and_inline_are_refused_with_pis_text() {
+        for bad in [
+            serde_json::json!(false),
+            serde_json::json!("file-and-inline"),
+            serde_json::json!(null),
+        ] {
+            let raw = serde_json::json!({"agentOverrides": {"worker": {"outputMode": bad}}});
+            let err = parse_subagent_settings(Some(&raw)).expect_err("refused");
+            assert_eq!(
+                err.to_string(),
+                SubagentError::MalformedSettings(
+                    "Builtin override 'worker' has invalid 'outputMode'; expected 'inline' or 'file-only'."
+                        .to_string()
+                )
+                .to_string(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// SUBA-096 — the other two arms' refusals, verbatim. Mutation killed: dropping either check
+    /// (`fast: "yes"` then fails serde with a message naming no field; `acceptanceRole:
+    /// "reviewer"` fails the untagged parse the same way).
+    #[test]
+    fn override_fast_and_acceptance_role_are_refused_with_pis_text() {
+        let raw = serde_json::json!({"agentOverrides": {"worker": {"fast": "yes"}}});
+        assert!(
+            parse_subagent_settings(Some(&raw))
+                .expect_err("refused")
+                .to_string()
+                .contains("Builtin override 'worker' has invalid 'fast'; expected a boolean.")
+        );
+        let raw = serde_json::json!({"agentOverrides": {"worker": {"acceptanceRole": "reviewer"}}});
+        assert!(
+            parse_subagent_settings(Some(&raw))
+                .expect_err("refused")
+                .to_string()
+                .contains(
+                    "Builtin override 'worker' has invalid 'acceptanceRole'; expected 'read-only', 'writer', or false."
+                )
+        );
+        let raw = serde_json::json!({"agentOverrides": {"worker": {"acceptanceRole": false, "fast": false}}});
+        let settings = parse_subagent_settings(Some(&raw)).expect("false is admitted for both");
+        let worker = settings.overrides.get("worker").expect("worker");
+        assert_eq!(worker.acceptance_role, OverrideField::ExplicitClear);
+        assert_eq!(worker.fast, OverrideField::Value(false));
+    }
+
+    /// SUBA-096 §1.5 — a key that is not an override key is REPORTED rather than dropped, and the
+    /// report is non-fatal. SUBA-100 took `machine` — the last of the three v0.68.0 keys this
+    /// port had no reader for — off the unported list: it is READ now, so it raises no warning
+    /// (see `override_machine_is_read_trimmed_cleared_and_validated`). Mutation killed: dropping
+    /// the `warnings` assignment, or `machine` back on `UNPORTED_OVERRIDE_KEYS`.
+    #[test]
+    fn unported_and_unknown_override_keys_are_reported_not_dropped() {
+        let raw = serde_json::json!({"agentOverrides": {"worker": {
+            "model": "openai/gpt-5",
+            "machine": "gpu-box",
+            "modle": "typo"
+        }}});
+        let settings = parse_subagent_settings(Some(&raw)).expect("non-fatal");
+        let worker = settings.overrides.get("worker").expect("worker");
+        assert_eq!(
+            worker.model,
+            OverrideField::Value("openai/gpt-5".to_string()),
+            "the rest of the entry still applies"
+        );
+        assert_eq!(worker.machine, OverrideField::Value("gpu-box".to_string()));
+        // SUBA-101/102/100: `inheritGlobalContext`, `mutationTools` and `machine` left the
+        // unported list; only the typo is reported.
+        assert_eq!(settings.warnings.len(), 1, "{:?}", settings.warnings);
+        assert!(
+            settings.warnings.contains(
+                &"agentOverrides.worker.modle is not an override key (ignored)".to_string()
+            )
+        );
+    }
+
+    /// SUBA-100 — pi `parseBuiltinOverride`'s `machine` arm (`agents.ts:1118-1121` @v0.68.0):
+    /// a string is stored trimmed, `false` is an explicit clear, and every malformed value is
+    /// refused with `validateOptionalMachine`'s text (`:979-986`). Mutation killed: dropping the
+    /// raw check (`machine: 7` then fails serde naming no field), or the trim.
+    #[test]
+    fn override_machine_is_read_trimmed_cleared_and_validated() {
+        let raw = serde_json::json!({"agentOverrides": {
+            "worker": {"machine": "  gpu-box  "},
+            "scout": {"machine": false}
+        }});
+        let settings = parse_subagent_settings(Some(&raw)).expect("valid");
+        assert_eq!(
+            settings.overrides.get("worker").expect("worker").machine,
+            OverrideField::Value("gpu-box".to_string())
+        );
+        assert_eq!(
+            settings.overrides.get("scout").expect("scout").machine,
+            OverrideField::ExplicitClear
+        );
+        for (value, message) in [
+            (
+                serde_json::json!(7),
+                "Builtin override 'worker' field 'machine' must be a non-empty string or false.",
+            ),
+            (
+                serde_json::json!("  "),
+                "Builtin override 'worker' field 'machine' must be a non-empty string or false.",
+            ),
+            (
+                serde_json::json!(true),
+                "Builtin override 'worker' field 'machine' must be a non-empty string or false.",
+            ),
+            (
+                serde_json::json!("x".repeat(129)),
+                "Builtin override 'worker' field 'machine' must be 128 characters or fewer.",
+            ),
+            (
+                serde_json::json!("gpu\u{7}box"),
+                "Builtin override 'worker' field 'machine' contains control characters.",
+            ),
+        ] {
+            let raw = serde_json::json!({"agentOverrides": {"worker": {"machine": value}}});
+            let error = parse_subagent_settings(Some(&raw)).expect_err("refused");
+            assert!(error.to_string().ends_with(message), "{error}");
+        }
+    }
+
+    /// The warnings reach discovery's diagnostic list against the settings FILE, and never block
+    /// the agent. Mutation killed: dropping the `run_discovery` fold (no diagnostic), or stamping
+    /// `name: Some(agent)` (the diagnostic would then outrank and block the builtin).
+    ///
+    /// SUBA-100: this pinned `machine` as the reported key until `machine` was ported; it now
+    /// drives the same fold with a key that is not an override key at all.
+    #[test]
+    fn unported_override_keys_surface_as_non_blocking_discovery_diagnostics() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let settings_path = home.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"subagents": {"agentOverrides": {"worker": {"machnie": "gpu"}}}}"#,
+        )
+        .expect("write");
+        let project_dir = home.path().join("agents");
+        std::fs::create_dir_all(&project_dir).expect("mkdir");
+        std::fs::write(
+            project_dir.join("worker.md"),
+            "---\nname: worker\ndescription: d\n---\n\nBody\n",
+        )
+        .expect("write agent");
+        let cfg = AgentDiscoveryConfig {
+            override_settings: load_layered_override_settings(&settings_path, None).expect("loads"),
+            user_agent_dirs: vec![project_dir],
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents(&cfg, None).expect("discovery succeeds");
+        let diag = result
+            .agent_diagnostics
+            .iter()
+            .find(|d| d.file_path == settings_path)
+            .expect("the settings warning is a diagnostic");
+        assert_eq!(
+            diag.error,
+            "agentOverrides.worker.machnie is not an override key (ignored)"
+        );
+        assert_eq!(diag.name, None);
+        let worker: Vec<&AgentDefinition> = result
+            .agents
+            .iter()
+            .filter(|a| a.name == "worker")
+            .collect();
+        assert_eq!(worker.len(), 1, "the agent still resolves");
+        assert!(
+            find_blocking_agent_diagnostic("worker", &worker, &result.agent_diagnostics).is_none()
+        );
+    }
+
+    /// SUBA-101/102 — both keys are READ (no census warning) and each malformed shape is refused
+    /// with pi's own text (`agents.ts:1059`, `:954` @v0.68.0). Mutation killed: dropping either
+    /// raw check (`inheritGlobalContext: "yes"` then fails serde naming no field, and
+    /// `mutationTools: "edit"` likewise).
+    #[test]
+    fn override_inherit_global_context_and_mutation_tools_are_read_and_validated() {
+        let raw = serde_json::json!({"agentOverrides": {"worker": {
+            "inheritGlobalContext": true,
+            "mutationTools": [" apply_patch ", ""]
+        }}});
+        let settings = parse_subagent_settings(Some(&raw)).expect("both keys load");
+        let worker = settings.overrides.get("worker").expect("worker");
+        assert_eq!(worker.inherit_global_context, OverrideField::Value(true));
+        assert_eq!(
+            worker.mutation_tools,
+            OverrideField::Value(vec![" apply_patch ".to_string(), String::new()])
+        );
+        assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+
+        let raw = serde_json::json!({"agentOverrides": {"worker": {"mutationTools": false}}});
+        let settings = parse_subagent_settings(Some(&raw)).expect("false clears");
+        assert_eq!(
+            settings
+                .overrides
+                .get("worker")
+                .expect("worker")
+                .mutation_tools,
+            OverrideField::ExplicitClear
+        );
+
+        let raw =
+            serde_json::json!({"agentOverrides": {"worker": {"inheritGlobalContext": "yes"}}});
+        assert!(
+            parse_subagent_settings(Some(&raw))
+                .expect_err("refused")
+                .to_string()
+                .contains(
+                    "Builtin override 'worker' has invalid 'inheritGlobalContext'; expected a boolean."
+                )
+        );
+        for bad in [
+            serde_json::json!("edit"),
+            serde_json::json!(["edit", 3]),
+            serde_json::json!(true),
+        ] {
+            let raw = serde_json::json!({"agentOverrides": {"worker": {"mutationTools": bad}}});
+            assert!(
+                parse_subagent_settings(Some(&raw))
+                    .expect_err("refused")
+                    .to_string()
+                    .contains(
+                        "Builtin override 'worker' has invalid 'mutationTools'; expected an array of strings or false."
+                    ),
+                "{bad}"
+            );
+        }
+    }
+
+    /// SUBA-101/102 — the override reaches the DISCOVERED agent through the real settings file and
+    /// `discover_agents`, trimmed and with empties dropped (pi `parseOverrideStringArrayOrFalse`),
+    /// with provenance recorded. Mutation killed: removing either `apply_field_full_replace` arm in
+    /// `merge.rs` (the agent keeps its file values), or the trim/filter (`" apply_patch "` survives).
+    #[test]
+    fn override_inherit_global_context_and_mutation_tools_apply_through_discovery() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let settings_path = home.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"subagents": {"agentOverrides": {"worker": {"inheritGlobalContext": true, "mutationTools": [" apply_patch ", "", "notebook_edit"]}}}}"#,
+        )
+        .expect("write");
+        let agent_dir = home.path().join("agents");
+        std::fs::create_dir_all(&agent_dir).expect("mkdir");
+        std::fs::write(
+            agent_dir.join("worker.md"),
+            "---\nname: worker\ndescription: d\nmutationTools: sed_tool\n---\n\nBody\n",
+        )
+        .expect("write agent");
+        let cfg = AgentDiscoveryConfig {
+            override_settings: load_layered_override_settings(&settings_path, None).expect("loads"),
+            user_agent_dirs: vec![agent_dir],
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents(&cfg, None).expect("discovery succeeds");
+        let worker = result
+            .agents
+            .iter()
+            .find(|a| a.name == "worker")
+            .expect("worker");
+        assert!(worker.inherit_global_context);
+        assert_eq!(
+            worker.mutation_tools,
+            Some(vec!["apply_patch".to_string(), "notebook_edit".to_string()])
+        );
+        let info = worker.override_info.as_ref().expect("provenance");
+        assert!(info.fields.contains("inheritGlobalContext"));
+        assert!(info.fields.contains("mutationTools"));
+        assert!(
+            !result
+                .agent_diagnostics
+                .iter()
+                .any(|d| d.file_path == settings_path),
+            "no census warning for a ported key: {:?}",
+            result.agent_diagnostics
+        );
     }
 
     /// SUBA-092 — `excludeTools: false` is pi's explicit clear (`parseOverrideStringArrayOrFalse`,
@@ -3790,6 +4296,52 @@ mod tests {
         assert!(
             find_blocking_agent_diagnostic("worker", &[&candidate], diagnostics).is_some(),
             "local-name match unlocked by the candidate, and project outranks user"
+        );
+    }
+}
+
+#[cfg(test)]
+mod home_exclusion_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    /// #84 / pi `findProjectRootCandidates`'s home stop (`agents.ts:833-854` @v0.68.0): `~/.cyrup` is
+    /// user configuration, so a cwd under the home dir with no project of its own is in NO project,
+    /// and a real project under the home dir is found without the home dir being added after it.
+    ///
+    /// Gutted by: dropping the `homes.contains(&canonical)` stop (the home dir comes back as a
+    /// candidate in both cases).
+    #[test]
+    fn the_walk_stops_at_the_home_dir_and_never_takes_it_as_a_project() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".cyrup").join("agents")).unwrap();
+        let loose = home.path().join("work").join("deep");
+        std::fs::create_dir_all(&loose).unwrap();
+        let project = home.path().join("proj");
+        std::fs::create_dir_all(project.join(".cyrup")).unwrap();
+        let inside = project.join("src");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        assert_eq!(
+            find_project_root_candidates_excluding(&loose, &[home.path()]),
+            Vec::<PathBuf>::new(),
+            "a cwd whose only config ancestor is the home dir is in no project"
+        );
+        assert_eq!(
+            find_project_root_candidates_excluding(&inside, &[home.path()]),
+            vec![project.clone()],
+            "the real project is found and the walk stops before the home dir"
+        );
+        assert_eq!(
+            find_configured_project_root_excluding(&loose, &[home.path()]).unwrap(),
+            None
+        );
+        // Control: without the home named, the same tree DOES read the home dir as a project —
+        // which is what makes the two assertions above say something.
+        assert_eq!(
+            find_project_root_candidates(&loose),
+            vec![home.path().to_path_buf()]
         );
     }
 }

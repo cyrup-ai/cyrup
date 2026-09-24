@@ -271,6 +271,50 @@ pub fn apply_child_event_to_step(
     step.telemetry.last_activity_at = Some(now);
 }
 
+/// UW-3 — the child-watchdog branch of pi's `updateStepFromChildEvent`
+/// (`subagent-runner.ts:2711-2722` @v0.43.0; `:3016-3033` @v0.68.0), over one RAW child line (the
+/// status event has no [`crate::exec::ndjson::SubagentEvent`] variant; it parses to `Unknown`).
+///
+/// `None` when `raw` is not a child-watchdog status event — the caller folds it as usual. `Some`
+/// when it is, and the caller must NOT fold it further (upstream `return`s): `Some(true)` when it
+/// was accepted into `step.watchdog` (the step's `lastActivityAt` is bumped here and the caller
+/// bumps the run's, as upstream does on this path), `Some(false)` when it was rejected.
+///
+/// The identity is upstream's own for the runner: the run id, the step's agent and the step's FLAT
+/// index — the same flat index the runner hands its child as `childIndex`
+/// (`runner_main::executor`, `child_index: Some(ctx.step_slot.index())`), so it is the identity
+/// the child was actually armed with.
+pub fn apply_child_watchdog_line_to_step(
+    step: &mut StepStatus,
+    raw: &str,
+    run_id: &str,
+    flat_index: usize,
+    now: i64,
+) -> Option<bool> {
+    use crate::watchdog::child_status::{
+        ChildWatchdogIdentity, ChildWatchdogStatusEvent, accept_child_watchdog_event,
+        is_child_watchdog_status_event,
+    };
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if !is_child_watchdog_status_event(&value) {
+        return None;
+    }
+    let Ok(event) = serde_json::from_value::<ChildWatchdogStatusEvent>(value) else {
+        return Some(false);
+    };
+    let identity = ChildWatchdogIdentity {
+        run_id: Some(run_id.to_string()),
+        agent: Some(step.agent.clone()),
+        child_index: u64::try_from(flat_index).ok(),
+    };
+    let Some(next) = accept_child_watchdog_event(step.watchdog.as_ref(), &event, &identity) else {
+        return Some(false);
+    };
+    step.watchdog = Some(next);
+    step.telemetry.last_activity_at = Some(now);
+    Some(true)
+}
+
 /// Push `item` onto a bounded recent-ring, dropping the oldest entry once [`RECENT_RING_CAP`] is
 /// exceeded (pi keeps only a recent window, `subagent-runner.ts:1878,1914` @v0.34.0).
 fn push_bounded<T>(ring: &mut Vec<T>, item: T) {

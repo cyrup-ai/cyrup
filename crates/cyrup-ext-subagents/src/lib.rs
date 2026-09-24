@@ -47,6 +47,8 @@ pub mod native_supervisor;
 /// The crate's single port of pi's `shared/utils.ts` path helpers: the `CYRUP_HOME` -> `HOME` ->
 /// tempdir home ladder, `getAgentDir()` and `getProjectConfigDir()`. See [`paths`].
 pub mod paths;
+/// SUBA-100 — Herdr saved-machine placement: run a subagent on a machine saved in herdr.
+pub mod placement;
 pub mod prompt_runtime;
 pub mod registration;
 pub mod runner;

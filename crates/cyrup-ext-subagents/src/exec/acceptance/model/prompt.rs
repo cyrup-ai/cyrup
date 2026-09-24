@@ -69,6 +69,23 @@ pub fn format_acceptance_prompt(
     acceptance: &ResolvedAcceptanceConfig,
     report_optional: bool,
 ) -> String {
+    format_acceptance_prompt_with(acceptance, report_optional, false)
+}
+
+/// [`format_acceptance_prompt`] with upstream's second option, `structuredOutput`
+/// (`formatAcceptancePrompt(acceptance, { reportOptional, structuredOutput })`,
+/// `acceptance.ts:516` @v0.68.0). SUBA-105: `true` when the step finishes through
+/// `structured_output` AND its acceptance report rides in that call (`Boolean(structuredOutput?.
+/// acceptanceReportPath)`, `execution.ts:1769`, i.e. an `outputSchema` whose `acceptance.report`
+/// is not `off`). The child is then told to put an `acceptanceReport` object in its final
+/// `structured_output` call, and the example is not fenced — a fenced block in prose would be the
+/// wrong channel for that child.
+#[must_use]
+pub fn format_acceptance_prompt_with(
+    acceptance: &ResolvedAcceptanceConfig,
+    report_optional: bool,
+    structured_output: bool,
+) -> String {
     if acceptance.level == AcceptanceLevel::None {
         return String::new();
     }
@@ -136,16 +153,26 @@ pub fn format_acceptance_prompt(
         }
     }
     lines.push(String::new());
-    lines.push(
-        "Finish with a fenced JSON block tagged `acceptance-report` in this shape:".to_string(),
-    );
+    // `acceptance.ts:543-545` @v0.68.0.
+    lines.push(if structured_output {
+        "Include an `acceptanceReport` object in your final `structured_output` tool call in this shape:"
+            .to_string()
+    } else {
+        "Finish with a fenced JSON block tagged `acceptance-report` in this shape:".to_string()
+    });
     lines.push(
         "Use empty arrays when no items apply; array fields contain strings unless object entries are shown."
             .to_string(),
     );
-    lines.push("```acceptance-report".to_string());
+    // `...(options.structuredOutput ? [] : ["```acceptance-report"])` / `["```"]`
+    // (`acceptance.ts:551,563`).
+    if !structured_output {
+        lines.push("```acceptance-report".to_string());
+    }
     lines.push(ACCEPTANCE_REPORT_EXAMPLE.to_string());
-    lines.push("```".to_string());
+    if !structured_output {
+        lines.push("```".to_string());
+    }
     lines.join("\n")
 }
 

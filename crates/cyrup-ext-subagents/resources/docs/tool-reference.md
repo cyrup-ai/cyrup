@@ -102,7 +102,6 @@ deliberately stricter rule, so a loose typo is never nudged toward a destructive
 | `output`, `outputMode` | single, chain | Output path and `inline`/`fileAndInline`/`fileOnly` |
 | `outputSchema` | single | JSON Schema the child's structured output must satisfy |
 | `includeProgress`, `share` | all | Progress visibility |
-| `clarify` | single | Ask the child to clarify before working |
 | `control` | all | Per-run live-control thresholds |
 | `skill` | single | Skill injected into the child's prompt |
 | `model` | single | Model override |

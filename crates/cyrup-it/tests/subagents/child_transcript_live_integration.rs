@@ -199,6 +199,7 @@ async fn run_foreground_through_the_executor(
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        machine: None,
         acceptance_role: None,
         default_acceptance: None,
         name: "worker".to_string(),
@@ -215,6 +216,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -232,7 +235,10 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        parent_env_overrides: std::collections::BTreeMap::new(),
+        machine: None,
         model_exclusions: None,
+        fast: false,
         host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
@@ -284,6 +290,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         acceptance_role: None,
         default_acceptance: None,
@@ -301,6 +308,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -314,6 +323,7 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
 
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: agent.to_string(),
@@ -328,6 +338,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,

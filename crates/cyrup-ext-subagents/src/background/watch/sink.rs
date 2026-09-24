@@ -98,6 +98,9 @@ impl CompletionSink for HostServicesCompletionSink {
             display,
             trigger_turn,
             suppressible: _,
+            // This sink never batches (the batching one is `batch::BatchingHostServicesCompletionSink`).
+            group_part: _,
+            batch_key: _,
         } = message;
         let Ok(ack) = self.services.inject_message_ack(
             &content,

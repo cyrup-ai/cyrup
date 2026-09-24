@@ -154,6 +154,7 @@ pub use run_paths::{RunDir, RunPaths};
 pub use state::{RunMode, RunState, RunStateTransitionError, StepState};
 pub use telemetry::{
     ActivityState, RecentTool, RunTelemetry, StepTelemetry, TokenTotals, apply_child_event_to_step,
+    apply_child_watchdog_line_to_step,
 };
 pub use workflow_graph::{
     WorkflowDynamicChild, WorkflowDynamicGroupStatus, WorkflowDynamicMeta, WorkflowDynamicStepSpec,

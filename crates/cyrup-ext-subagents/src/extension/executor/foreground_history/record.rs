@@ -118,6 +118,14 @@ pub(crate) struct ForegroundHistoryChild {
     pub(crate) tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tool_count: Option<u64>,
+    /// SUBA-063 — pi `ForegroundResumeChild.runtimeAcknowledgedExtensions`
+    /// (`shared/types.ts:2118` @v0.68.0), copied from the settled result when present
+    /// (`subagent-executor.ts:815`, `:895`). IN-MEMORY ONLY: pi's `compactChild` does not persist
+    /// it (`foreground-history.ts:28-63`), so [`super::persist`] clears it before writing and a
+    /// restored run carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_acknowledged_extensions:
+        Option<crate::exec::run_result::RuntimeAcknowledgedChildExtensions>,
 }
 
 /// pi `ForegroundResumeRun` (`shared/types.ts:1470-1479`) as persisted.
@@ -266,6 +274,7 @@ impl SubagentExecutor {
                     let n = result.tool_calls.len() as u64;
                     (n > 0).then_some(n)
                 },
+                runtime_acknowledged_extensions: result.runtime_acknowledged_extensions.clone(),
             })
             .collect();
         let run = ForegroundHistoryRun {
@@ -357,6 +366,11 @@ impl SubagentExecutor {
 #[cfg(test)]
 pub(crate) fn test_single_result(agent: &str, exit_code: i32) -> SingleResult {
     SingleResult {
+        execution: None,
+        native_machine: None,
+        runtime_acknowledged_extensions: None,
+        skills_warning: None,
+        watchdog: None,
         usage_budget: None,
         turn_budget: None,
         turn_budget_exceeded: false,

@@ -69,6 +69,7 @@ impl HostServices for FixedSessionHost {
 
 fn worker_step() -> RunnerStep {
     RunnerStep::SingleStep(SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: "worker".to_string(),
@@ -83,6 +84,7 @@ fn worker_step() -> RunnerStep {
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,

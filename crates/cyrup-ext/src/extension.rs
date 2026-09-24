@@ -40,13 +40,12 @@ pub trait Extension: Send + Sync {
         cancel: &CancelToken,
     ) -> Result<HookOutcome, ExtError>;
 
-    /// The sanctioned-human-wait coordinator for this extension's dispatch-budget forgiveness (P-3,
-    /// `spec/extensions/cyrup-permission-system-port.md §4`). `None` (default) ⇒ no forgiveness: the
-    /// dispatcher applies the plain invocation-budget timeout (wasm guests already carry their own
-    /// epoch forgiveness for UI round-trips; almost no native ever blocks on a human). A native that
-    /// DOES block on a human (the permission gate) returns its ctx's gate so the dispatcher's budget
-    /// watchdog is suspended for the duration of the wait instead of failing OPEN. See
-    /// [`crate::native::HumanWaitGate`].
+    /// The sanctioned-long-wait coordinator for this extension's dispatch-budget forgiveness (P-3,
+    /// `spec/extensions/cyrup-permission-system-port.md §4`; UW-3). `None` (default) ⇒ no
+    /// forgiveness: the dispatcher applies the plain invocation-budget timeout (wasm guests already
+    /// carry their own epoch forgiveness for UI round-trips). A native returns its ctx's gate so a
+    /// handler that DECLARES a long wait — a human answer, a watchdog model review — is not dropped
+    /// mid-wait. See [`crate::native::SanctionedWaitGate`]. The name predates the generalisation.
     fn human_wait_gate(&self) -> Option<std::sync::Arc<crate::native::HumanWaitGate>> {
         None
     }

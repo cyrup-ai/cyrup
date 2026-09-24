@@ -3,7 +3,9 @@
 
 use serde::Serialize;
 
-use super::agents::{AgentViewClearParams, AgentViewSetParams};
+use super::agents::{
+    AgentPromptParams, AgentStartParams, AgentViewClearParams, AgentViewSetParams,
+};
 use super::common::{AgentTarget, EmptyParams, PaneTarget, TabTarget};
 use super::events::{EventsSubscribeParams, PaneWaitForOutputParams};
 use super::panes::{
@@ -12,7 +14,8 @@ use super::panes::{
     PaneReportMetadataParams, PaneSendInputParams, PaneSplitParams,
 };
 use super::server::PingParams;
-use super::tabs::TabRenameParams;
+use super::tabs::{TabCreateParams, TabRenameParams};
+use super::workspaces::WorkspaceCreateParams;
 
 /// `Request` (`tmp/herdr/src/api/schema.rs:35-39`).
 ///
@@ -60,6 +63,12 @@ pub enum Method {
     /// `session.snapshot` (`schema.rs:74-75`) — the whole session in one reply.
     #[serde(rename = "session.snapshot")]
     SessionSnapshot(EmptyParams),
+    /// `workspace.create` (`schema.rs:76-77`) — answers the new workspace, tab and root pane.
+    #[serde(rename = "workspace.create")]
+    WorkspaceCreate(WorkspaceCreateParams),
+    /// `tab.create` (`schema.rs:102-103`) — answers the new tab and its root pane.
+    #[serde(rename = "tab.create")]
+    TabCreate(TabCreateParams),
     /// `tab.get` (`schema.rs:106-107`).
     #[serde(rename = "tab.get")]
     TabGet(TabTarget),
@@ -84,6 +93,13 @@ pub enum Method {
     /// owns it.
     #[serde(rename = "agent.view.clear")]
     AgentViewClear(AgentViewClearParams),
+    /// `agent.start` (`schema.rs:134-135`) — answers `agent_started` with the argv herdr typed.
+    #[serde(rename = "agent.start")]
+    AgentStart(AgentStartParams),
+    /// `agent.prompt` (`schema.rs:136-137`) — answers `agent_prompted`; with a `wait` it is one of
+    /// herdr's in-band waits and holds the connection until the agent settles.
+    #[serde(rename = "agent.prompt")]
+    AgentPrompt(AgentPromptParams),
     /// `pane.split` (`schema.rs:140-141`) — answers the **new** pane's
     /// [`super::panes::PaneInfo`] (`tmp/herdr/src/app/api/panes.rs:132`).
     #[serde(rename = "pane.split")]
@@ -158,12 +174,16 @@ impl Method {
         match self {
             Self::Ping(_) => "ping",
             Self::SessionSnapshot(_) => "session.snapshot",
+            Self::WorkspaceCreate(_) => "workspace.create",
+            Self::TabCreate(_) => "tab.create",
             Self::TabGet(_) => "tab.get",
             Self::TabRename(_) => "tab.rename",
             Self::AgentList(_) => "agent.list",
             Self::AgentGet(_) => "agent.get",
             Self::AgentViewSet(_) => "agent.view.set",
             Self::AgentViewClear(_) => "agent.view.clear",
+            Self::AgentStart(_) => "agent.start",
+            Self::AgentPrompt(_) => "agent.prompt",
             Self::PaneSplit(_) => "pane.split",
             Self::PaneProcessInfo(_) => "pane.process_info",
             Self::PaneList(_) => "pane.list",

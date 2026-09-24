@@ -48,7 +48,7 @@ use crate::discovery::settings_write::{
     merge_builtin_agent_override, remove_builtin_agent_override_fields,
 };
 use crate::discovery::types::{AgentDefinition, AgentSource, OverrideScope};
-use crate::discovery::{AgentDiscoveryConfig, EXTRA_AGENT_DIRS_ENV_VAR, discover_agents_all};
+use crate::discovery::{AgentDiscoveryConfig, discover_agents_all};
 use crate::error::SubagentError;
 use crate::exec::output::normalize_lexically;
 use crate::exec::spawn_plan::{THINKING_LEVELS, split_known_thinking_suffix};
@@ -173,8 +173,8 @@ impl AdminAction {
 /// pi `readOnlyAgentMessage` (`subagents-admin.ts:150-160`) — the three refusals, verbatim.
 ///
 /// Only the ENV VAR NAME in the third differs from upstream's (`PI_SUBAGENT_EXTRA_AGENT_DIRS` →
-/// [`EXTRA_AGENT_DIRS_ENV_VAR`]), because that is cyrup's own variable; the sentence SHAPE is
-/// upstream's byte-for-byte.
+/// [`crate::discovery::EXTRA_AGENT_DIRS_ENV_VAR`]), because that is cyrup's own variable; the
+/// sentence SHAPE is upstream's byte-for-byte.
 ///
 /// Upstream surfaces these as a RESULT, not a throw: `saveAgentModel` returns the string
 /// (`:317-318`) and `openSubagentsAdmin` posts it with `ctx.ui.notify(message, "info")` (`:437`).
@@ -208,9 +208,11 @@ pub(crate) struct AdminContext<'a> {
     pub(crate) cwd: &'a Path,
     pub(crate) services: Option<&'a dyn HostServices>,
     pub(crate) has_ui: bool,
-    /// The already-parsed [`EXTRA_AGENT_DIRS_ENV_VAR`] entries (see [`parse_extra_agent_dirs`]),
-    /// injected rather than read from the process environment so this crate's
-    /// `#![forbid(unsafe_code)]` tests never need `std::env::set_var`.
+    /// The already-resolved [`crate::discovery::EXTRA_AGENT_DIRS_ENV_VAR`] entries — always
+    /// [`crate::paths::Roots::extra_agent_dirs`] of the SAME roots `cfg` was built from, so this
+    /// check and discovery agree about which agents are extra-dir agents. Injected rather than
+    /// read from the process environment, so a caller pins it with
+    /// [`crate::paths::Roots::with_extra_agent_dirs`] instead of `std::env::set_var`.
     pub(crate) extra_agent_dirs: Vec<PathBuf>,
 }
 
@@ -399,21 +401,6 @@ fn source_is_scope(source: AgentSource, scope: OverrideScope) -> bool {
         (source, scope),
         (AgentSource::User, OverrideScope::User) | (AgentSource::Project, OverrideScope::Project)
     )
-}
-
-/// pi's `process.env[EXTRA_AGENT_DIRS_ENV].split(path.delimiter).map(trim).filter(Boolean)`
-/// (`subagents-admin.ts:140`, `:143`), over [`EXTRA_AGENT_DIRS_ENV_VAR`].
-///
-/// `env_lookup` is injected (rather than read here) for the same reason
-/// [`crate::discovery::AgentDiscoveryConfig::with_env_extras`] injects it: this crate is
-/// `#![forbid(unsafe_code)]`, so tests never call `std::env::set_var`.
-pub(crate) fn parse_extra_agent_dirs(env_lookup: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
-    let Some(raw) = env_lookup(EXTRA_AGENT_DIRS_ENV_VAR) else {
-        return Vec::new();
-    };
-    std::env::split_paths(&raw)
-        .filter(|p| !p.as_os_str().is_empty())
-        .collect()
 }
 
 /// pi `isReadOnlyExtraAgent` (`subagents-admin.ts:139-148`): is this agent's file inside one of the
@@ -755,13 +742,14 @@ fn choose_thinking(
 /// Is there a project settings scope at all? pi's `d.projectSettingsPath` (`:268`, `:270`), which
 /// is `null` outside any project.
 ///
-/// cyrup's [`AgentDiscoveryConfig::override_settings`] always carries a project path — resolved
-/// from the project root when one exists and from the cwd otherwise
-/// (`extension/executor/resolve.rs:150-151`) — so presence of the PATH is not the question;
-/// presence of the ROOT is. Both are required, because the returned path is the one
-/// [`persist_settings_field`] will actually write.
+/// #84: this used to ALSO require `cfg.project_root`, on the theory that the path was always
+/// present and the root was the real question. Neither held: the producer
+/// (`extension/executor/resolve.rs`, `discovery_config_on_disk`) set the path for every cwd, and
+/// `project_root` falls back to the cwd too, so both were always `Some` and the check could not
+/// fail — `/subagents` offered a project scope outside any project. The producer now yields `None`
+/// exactly when pi's `getProjectAgentSettingsPath` returns `null`, so the path IS the answer, and
+/// it is the one [`persist_settings_field`] will actually write.
 fn project_settings_path(cfg: &AgentDiscoveryConfig) -> Option<&Path> {
-    cfg.project_root.as_ref()?;
     cfg.override_settings.project_settings_path.as_deref()
 }
 
@@ -1622,26 +1610,6 @@ mod tests {
 
         // `:140` — no configured extras means no refusal at all.
         assert!(!is_read_only_extra_agent(&inside, cwd, &[]));
-    }
-
-    /// [`parse_extra_agent_dirs`] over the platform path delimiter, dropping empty entries
-    /// (pi `:143`, `.filter(Boolean)`).
-    ///
-    /// Catches: splitting on a hard-coded `:` (which breaks Windows) and keeping empty segments
-    /// (which would make the cwd itself an extra directory and lock every user agent).
-    #[test]
-    fn parse_extra_agent_dirs_splits_and_drops_empties() {
-        let joined = std::env::join_paths([Path::new("/one"), Path::new("/two")])
-            .unwrap()
-            .into_string()
-            .unwrap();
-        let dirs = parse_extra_agent_dirs(|key| {
-            assert_eq!(key, EXTRA_AGENT_DIRS_ENV_VAR);
-            Some(joined.clone())
-        });
-        assert_eq!(dirs, vec![PathBuf::from("/one"), PathBuf::from("/two")]);
-        assert!(parse_extra_agent_dirs(|_| None).is_empty());
-        assert!(parse_extra_agent_dirs(|_| Some(String::new())).is_empty());
     }
 
     /// pi `savesThroughSettings` (`:125-137`), whole decision table.

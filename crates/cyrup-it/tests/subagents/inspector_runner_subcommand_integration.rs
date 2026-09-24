@@ -140,7 +140,7 @@ fn cyrup_subagent_inspector_renders_a_real_run_and_a_steer_line_lands() {
     let run_dir = seed_running_run(tmp.path(), run_id);
     let session_root = tmp.path().join("work");
     std::fs::create_dir_all(&session_root).unwrap();
-    let roots = encode_session_roots(&[session_root.clone()]);
+    let roots = encode_session_roots(std::slice::from_ref(&session_root));
 
     let mut cmd = crate::support::env::hermetic(crate::support::bins::cyrup(), tmp.path());
     cmd.arg(INSPECTOR_SUBCOMMAND)

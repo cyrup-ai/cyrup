@@ -12,7 +12,7 @@ use crate::background::child_stop::{
 };
 use crate::background::control;
 use crate::background::{RunPaths, RunState, StepState};
-use crate::jsonl::BoundedJsonlWriter;
+use crate::jsonl::RunEventLog;
 use std::sync::Arc;
 
 /// R-SA-082: control-inbox watcher, installed with the mandatory synchronous startup check
@@ -206,11 +206,13 @@ pub(super) fn spawn_control_watcher(
         child_stops,
     } = flags;
     let handle = tokio::spawn(async move {
-        // G90: the steer queue's own `events.jsonl` writer. A second `BoundedJsonlWriter` on the
-        // same file is safe and does NOT double the 50MB budget: `create` opens in append mode and
-        // seeds `bytes_written` from the file's CURRENT length, so each writer's cap is measured
-        // against the file as it actually is, not against its own contribution.
-        let mut events = BoundedJsonlWriter::create(&run_paths.events).await.ok();
+        // G90: the steer queue's own `events.jsonl` writer. A second `RunEventLog` on the same
+        // file is safe: it opens in append mode and writes each line in one `write_all`, and the
+        // steering lines it writes are LIFECYCLE lines, which are never capped (pi `appendJsonl`,
+        // `subagent-runner.ts:2865-2868` @v0.68.0). The diagnostic budget, which only the
+        // telemetry pump's handle spends, is measured against the file as it actually is, so these
+        // lines count against it exactly as upstream's shared per-path counter counts them.
+        let mut events = RunEventLog::create(&run_paths.events).await.ok();
         // pi's in-memory `pendingStepSteers` (`subagent-runner.ts:1332,2071-2075` @v0.34.0): a steer that
         // arrives while its target child is still `pending` is HELD, not dropped, and re-attempted.
         //
@@ -334,7 +336,7 @@ pub(super) fn spawn_control_watcher(
 async fn route_steer_requests(
     run_paths: &RunPaths,
     shared: &SharedStatus,
-    events: &mut Option<BoundedJsonlWriter>,
+    events: &mut Option<RunEventLog>,
     pending: &mut Vec<control::SteerRequest>,
 ) {
     let mut queue = std::mem::take(pending);
@@ -478,7 +480,7 @@ async fn route_steer_requests(
 async fn route_child_stop_requests(
     run_paths: &RunPaths,
     shared: &SharedStatus,
-    events: &mut Option<BoundedJsonlWriter>,
+    events: &mut Option<RunEventLog>,
     registry: &ChildStopRegistry,
 ) {
     let requests = control::consume_child_stop_requests(&run_paths.run_dir).await;
@@ -672,7 +674,7 @@ mod tests {
                 .expect("parent write");
         }
 
-        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut events = RunEventLog::create(&paths.events).await.ok();
         route_child_stop_requests(&paths, &shared, &mut events, &registry).await;
         drop(events);
 
@@ -780,7 +782,7 @@ mod tests {
         .await
         .expect("parent write");
 
-        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut events = RunEventLog::create(&paths.events).await.ok();
         let mut pending = Vec::new();
         route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
 
@@ -869,7 +871,7 @@ mod tests {
         .await
         .expect("parent write");
 
-        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut events = RunEventLog::create(&paths.events).await.ok();
         let mut pending = Vec::new();
         route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
 
@@ -945,7 +947,7 @@ mod tests {
             .await
             .expect("parent write");
 
-        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut events = RunEventLog::create(&paths.events).await.ok();
         let mut pending = Vec::new();
         route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
         assert_eq!(
@@ -980,7 +982,7 @@ mod tests {
             .await
             .expect("parent write");
 
-        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut events = RunEventLog::create(&paths.events).await.ok();
         let mut pending = Vec::new();
         route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
         assert!(
@@ -1028,7 +1030,7 @@ mod tests {
             .expect("write");
         }
 
-        let mut events = BoundedJsonlWriter::create(&paths.events).await.ok();
+        let mut events = RunEventLog::create(&paths.events).await.ok();
         let mut pending = Vec::new();
         route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
         drop(events);

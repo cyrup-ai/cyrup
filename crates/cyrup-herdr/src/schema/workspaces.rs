@@ -1,10 +1,11 @@
 //! Mirrors `tmp/herdr/src/api/schema/workspaces.rs`.
 //!
-//! Only the records reached through [`super::session::SessionSnapshot`] live here. None of
-//! `workspace.*`'s nine methods is ported — no cyrup consumer creates, closes, renames or reorders
-//! the user's workspaces — but a snapshot carries `workspaces: Vec<WorkspaceInfo>`
-//! (`tmp/herdr/src/api/schema/session.rs:18`), so the record is not optional even though its verbs
-//! are.
+//! The records reached through [`super::session::SessionSnapshot`] live here, plus the one
+//! `workspace.*` verb cyrup drives: `workspace.create`, whose caller is saved-machine placement
+//! (`crates/cyrup-ext-subagents/src/placement/`). pi-subagents opens a deterministic owned
+//! workspace on the remote herdr when no suitable one exists
+//! (`src/runs/shared/herdr-placed-run.ts:135-149` @v0.68.0). The other eight methods have no
+//! caller — no cyrup consumer closes, renames or reorders the user's workspaces.
 //!
 //! The file exists rather than these two types being folded into `session.rs` because herdr keeps
 //! them in `schema/workspaces.rs`, and the mirroring rule is what makes a diff against a future
@@ -12,9 +13,32 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::common::AgentStatus;
+
+/// `WorkspaceCreateParams` (`tmp/herdr/src/api/schema/workspaces.rs:7-20`).
+///
+/// Answered by [`super::response::ResponseResult::WorkspaceCreated`], which carries the new
+/// workspace, its first tab and that tab's root pane — so a caller that wants a fresh pane to
+/// launch into gets its id from this one call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WorkspaceCreateParams {
+    /// Workspace whose focused pane supplies the `follow` cwd policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_workspace_id: Option<String>,
+    /// The new workspace's working directory, on the machine herdr runs on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Whether to focus it. herdr's default is `false` (`#[serde(default)]`).
+    pub focus: bool,
+    /// The displayed label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Environment for the root pane's shell. `BTreeMap` for deterministic bytes (module doc).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
 
 /// `WorkspaceInfo` (`tmp/herdr/src/api/schema/workspaces.rs:61-76`).
 #[derive(Debug, Clone, PartialEq, Deserialize)]

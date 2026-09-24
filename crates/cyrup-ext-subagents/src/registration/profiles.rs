@@ -597,12 +597,35 @@ pub fn apply_profile_to_settings_file(
     // without it, a profile that clears every override would leave the previous profile's
     // overrides standing, which is precisely the un-switchable state pi's unconditional
     // assignment prevents.
+    let mut agent_overrides = match subagents_value.get("agentOverrides") {
+        Some(serde_json::Value::Object(map)) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    // SUBA-100 — pi `applySubagentProfile` (`profiles.ts:489-497` @v0.68.0): "Machine placement is
+    // not a model choice, so an existing pin survives a profile switch too." An on-disk override's
+    // STRING `machine` is carried into the profile's entry for that agent unless the profile states
+    // its own.
+    if let Some(serde_json::Value::Object(existing)) = root
+        .get("subagents")
+        .and_then(|subagents| subagents.get("agentOverrides"))
+    {
+        for (name, value) in existing {
+            let Some(machine) = value.get("machine").filter(|machine| machine.is_string()) else {
+                continue;
+            };
+            let entry = agent_overrides
+                .entry(name.clone())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let serde_json::Value::Object(entry) = entry
+                && !entry.contains_key("machine")
+            {
+                entry.insert("machine".to_string(), machine.clone());
+            }
+        }
+    }
     merged.insert(
         "agentOverrides".to_string(),
-        subagents_value
-            .get("agentOverrides")
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+        serde_json::Value::Object(agent_overrides),
     );
 
     root.insert("subagents".to_string(), serde_json::Value::Object(merged));

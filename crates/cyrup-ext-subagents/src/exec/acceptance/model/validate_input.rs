@@ -66,8 +66,11 @@ fn unsupported_evidence_kind_message(path_label: &str, item: &Value) -> String {
     )
 }
 
+/// `ACCEPTANCE_CONFIG_KEYS` (`acceptance.ts:53` @v0.68.0), in upstream's order — `report` sits
+/// right after `level` (SUBA-105; see [`super::report_mode`]).
 const ACCEPTANCE_CONFIG_KEYS: &[&str] = &[
     "level",
+    "report",
     "criteria",
     "evidence",
     "verify",
@@ -138,6 +141,13 @@ pub fn validate_acceptance_input(input: &Value, path_label: &str) -> Vec<String>
         errors.push(format!(
             "{path_label}.level must be one of auto, none, attested, checked, verified."
         ));
+    }
+    // SUBA-105 — `acceptance.ts:267-269` @v0.68.0: `report` is the structured-output acceptance
+    // report toggle and takes exactly `on` or `off`.
+    if let Some(report) = map.get("report")
+        && !matches!(report.as_str(), Some("on") | Some("off"))
+    {
+        errors.push(format!("{path_label}.report must be on or off."));
     }
     if map.get("level").and_then(Value::as_str) == Some("none")
         && map
@@ -456,6 +466,23 @@ mod tests {
                 "acceptance.criteria[1].id is required.".to_string(),
             ]
         );
+    }
+
+    /// SUBA-105 — `report` is an accepted policy key (`ACCEPTANCE_CONFIG_KEYS`,
+    /// `acceptance.ts:53` @v0.68.0) taking exactly `on`/`off` (`:267-269`); pi
+    /// `acceptance.test.ts:1469` `validateAcceptanceInput({ level: "checked", report: "on" })` is `[]`.
+    #[test]
+    fn report_is_a_supported_key_taking_only_on_or_off() {
+        let v = |value: Value| validate_acceptance_input(&value, "acceptance");
+        assert!(v(json!({"level": "checked", "report": "on"})).is_empty());
+        assert!(v(json!({"report": "off"})).is_empty());
+        for bad in [json!("yes"), json!(true), json!(null), json!(["on"])] {
+            assert_eq!(
+                v(json!({"level": "checked", "report": bad})),
+                vec!["acceptance.report must be on or off.".to_string()],
+                "{bad}"
+            );
+        }
     }
 
     // ---- validateAcceptanceInput ----

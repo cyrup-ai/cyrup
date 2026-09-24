@@ -214,14 +214,27 @@ impl SubagentExecutor {
     /// a live [`crate::background::watch::HostServicesCompletionSink`] when the P-1 `host_services` slot is bound (the real
     /// turn-injecting sink) → the graceful-degradation [`crate::background::watch::LoggingCompletionSink`]
     /// (stderr log + delete) when no host handle is present (the SDK-embedder / headless default).
-    fn effective_completion_sink(&self) -> Arc<dyn crate::background::watch::CompletionSink> {
+    ///
+    /// SUBA-017 — only the HOST arm batches: it is the one that starts turns, and it is the
+    /// injector, which is the only seam that can order a failure behind the held successes it
+    /// flushes (`background::watch::batch`). The override arm (a test's scripted sink) and the
+    /// logging arm (no turn to save) deliver per run exactly as before, so every per-run-counting
+    /// test keeps its meaning. `batch` is the resolved `completionBatch` and `ownership` the SAME
+    /// handle the watcher consumes against, re-checked per member when a held group is emitted.
+    fn effective_completion_sink(
+        &self,
+        batch: crate::background::watch::CompletionBatchConfig,
+        ownership: crate::background::delivery::ResultDeliveryOwnership,
+    ) -> Arc<dyn crate::background::watch::CompletionSink> {
         if let Some(sink) = &self.completion_sink_override {
             return sink.clone();
         }
         if let Some(services) = self.host_services() {
-            return Arc::new(crate::background::watch::HostServicesCompletionSink::new(
-                services,
-            ));
+            return Arc::new(
+                crate::background::watch::BatchingHostServicesCompletionSink::new(
+                    services, batch, ownership,
+                ),
+            );
         }
         Arc::new(crate::background::watch::LoggingCompletionSink)
     }
@@ -502,7 +515,32 @@ impl SubagentExecutor {
     /// create the results dir or attach the watch degrades to "no completion notifications this
     /// session" rather than failing session start.
     pub async fn install_completion_watcher(&self, cwd: &Path) {
-        let roots = self.config_snapshot().await.roots;
+        let config = self.config_snapshot().await;
+        // SUBA-017 — pi `resolveCompletionBatchConfig(config.completionBatch)` (`notify.ts:692`),
+        // resolved per install so "changes apply on the next session start" (upstream
+        // `docs/configuration.md`) falls out of the per-`SessionStart` reinstall.
+        let batch = crate::background::watch::resolve_completion_batch_config(
+            config.completion_batch.as_ref(),
+        );
+        let roots = config.roots;
+        // The identity pair that decides which completions this instance may consume — ONE handle,
+        // shared (clones share state) by the watcher and the batching sink, which re-checks it per
+        // member when a held group is emitted (pi `notify.ts:708-721`).
+        //
+        // `results_dir` is per-cwd, so every concurrent cyrup instance in this directory sees
+        // every other's results; ownership is what separates them. The session comes from the
+        // live host services and the owner id is this PROCESS's, minted once
+        // (`identity::current_completion_owner_id`).
+        //
+        // Re-installing on a later `SessionStart` overwrites `self.completion_watcher` below,
+        // and `CompletionWatcherHandle::drop` aborts the previous drain task — which is
+        // cyrup's structural equivalent of pi's `deliveryEpoch` lease
+        // (`result-watcher.ts:232-236`): the old watcher cannot deliver against a stale
+        // identity because it no longer exists.
+        let ownership = crate::background::delivery::ResultDeliveryOwnership::new(
+            crate::identity::SessionId::parse_opt(self.current_session_id().as_deref()),
+            Some(crate::identity::current_completion_owner_id()),
+        );
         let results_dir = default_results_dir_in(&roots, cwd);
         if crate::background::ensure_accessible_dir(&results_dir)
             .await
@@ -526,7 +564,7 @@ impl SubagentExecutor {
             // ever claiming, the decorator is a transparent pass-through, so the inner sink's
             // behaviour (including a test override's) is unchanged.
             Arc::new(crate::background::watch::InlineAnsweredSink::new(
-                self.effective_completion_sink(),
+                self.effective_completion_sink(batch, ownership.clone()),
                 self.inline_answers(),
             )),
             // SUBA-034: pi's async-complete EVENT has several independent listeners
@@ -607,22 +645,8 @@ impl SubagentExecutor {
                     ),
                 ]),
             )),
-            // The identity pair that decides which completions this instance may consume.
-            //
-            // `results_dir` is per-cwd, so every concurrent cyrup instance in this directory sees
-            // every other's results; ownership is what separates them. The session comes from the
-            // live host services and the owner id is this PROCESS's, minted once
-            // (`identity::current_completion_owner_id`).
-            //
-            // Re-installing on a later `SessionStart` overwrites `self.completion_watcher` below,
-            // and `CompletionWatcherHandle::drop` aborts the previous drain task — which is
-            // cyrup's structural equivalent of pi's `deliveryEpoch` lease
-            // (`result-watcher.ts:232-236`): the old watcher cannot deliver against a stale
-            // identity because it no longer exists.
-            crate::background::delivery::ResultDeliveryOwnership::new(
-                crate::identity::SessionId::parse_opt(self.current_session_id().as_deref()),
-                Some(crate::identity::current_completion_owner_id()),
-            ),
+            // The identity pair — see `ownership` above.
+            ownership,
         ) {
             Ok(handle) => {
                 *self.completion_watcher.lock().await = Some(handle);

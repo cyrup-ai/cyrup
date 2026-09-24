@@ -91,6 +91,11 @@ pub(crate) struct FleetInspectorHandle {
     /// pi's `state.fleetInspectorOpen` (`tui/fleet.ts:844-845`).
     pub(crate) fleet_inspector_open: Arc<AtomicBool>,
     pub(crate) fleet_status: Arc<std::sync::Mutex<SubagentFleetStatus>>,
+    /// SUBA-061 — `config.fleetKeybindings`, resolved. PR #151 made [`Self::open`] the single
+    /// place the inspector opens (both `/subagents-fleet` and the roster's `Enter`), so this is
+    /// the one place the bindings are threaded in (pi `extension/index.ts:502`,
+    /// `slash-commands.ts:863` @v0.68.0).
+    pub(crate) keybindings: crate::tui::fleet::FleetKeybindings,
 }
 
 impl FleetInspectorHandle {
@@ -120,7 +125,10 @@ impl FleetInspectorHandle {
             has_ui,
             already_open,
             state,
-            FleetViewOptions::default(),
+            FleetViewOptions {
+                keybindings: self.keybindings.clone(),
+                ..FleetViewOptions::default()
+            },
             initial_key,
             // `has_actions`: steer/stop route to `control_steer`/`control_stop`.
             true,
@@ -219,6 +227,7 @@ impl SubagentsExtension {
             fleet_open: Arc::clone(&self.fleet_open),
             fleet_inspector_open: Arc::clone(&self.fleet_inspector_open),
             fleet_status: Arc::clone(&self.fleet_status),
+            keybindings: self.fleet_keybindings.clone(),
         }
     }
 
@@ -358,6 +367,31 @@ mod tests {
     use super::*;
     use crate::background::RunMode;
     use crate::registration::SubagentExtensionConfig;
+
+    /// SUBA-061 — `config.fleetKeybindings` reaches the ONE place the inspector opens (PR #151's
+    /// `FleetInspectorHandle`), resolved per-action. Mutation killed: resolving the bindings to
+    /// `FleetKeybindings::default()` at construction (the configured stop key is then lost).
+    #[test]
+    fn configured_fleet_keybindings_reach_the_inspector_handle() {
+        use crate::tui::fleet::{FleetAction, FleetKey};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = SubagentExtensionConfig {
+            fleet_keybindings: Some(serde_json::json!({"stop": ["ctrl+x"]})),
+            ..SubagentExtensionConfig::default()
+        };
+        let ext = SubagentsExtension::with_config_and_cwd(config, dir.path().to_path_buf());
+        let handle = ext.fleet_inspector_handle();
+        assert!(
+            handle
+                .keybindings
+                .matches(FleetAction::Stop, FleetKey::Ctrl('x'))
+        );
+        assert!(
+            !handle
+                .keybindings
+                .matches(FleetAction::Stop, FleetKey::Char('D'))
+        );
+    }
     use crate::tui::fleet_state::{FleetState, ForegroundControlView};
     use crate::tui::fleet_status::SubagentFleetStatus;
 

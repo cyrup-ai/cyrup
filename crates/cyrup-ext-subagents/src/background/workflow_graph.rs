@@ -740,6 +740,7 @@ pub fn workflow_graph_from_run(
             StepState::Complete => "complete",
             StepState::Failed => "failed",
             StepState::Stopped => "stopped",
+            StepState::Partial => "partial",
         });
         step_statuses.push(WorkflowStepStatusInput {
             status: status_str.map(str::to_string),

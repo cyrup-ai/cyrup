@@ -229,13 +229,20 @@ pub fn apply_overrides(
                 disable_thinking,
                 &disable_thinking_meta,
             ),
-            AgentSource::User | AgentSource::Project => apply_custom_agent(agent, settings),
-            // Package-sourced agents are not exposed for settings-based override in pi's own source
-            // contract (only Builtin full-replace and User/Project fill-unset-only) — left untouched.
+            // pi `discoverAgents` runs `applyCustomAgentOverrides` over the user, project AND
+            // PACKAGE tiers (`agents.ts:2887,2895,2903` @v0.68.0; the package call has been there
+            // since v0.43.0). This arm used to leave Package agents untouched on the claim that pi
+            // exposes no override for them — false at every tag — so an `agentOverrides` entry
+            // naming a package agent was accepted and dropped, and `/subagents` (whose
+            // `saves_through_settings` routes every package edit into settings) wrote edits that
+            // then never applied.
+            AgentSource::User | AgentSource::Project | AgentSource::Package => {
+                apply_custom_agent(agent, settings);
+            }
             // SUBA-084: a Runtime agent never enters this map at all (`mergeRuntimeAgents` appends
             // AFTER discovery's override application, `runtime-agent-registry.ts:428` @v0.64.0), so
             // the arm exists only for totality and applies nothing.
-            AgentSource::Package | AgentSource::Runtime => {}
+            AgentSource::Runtime => {}
         }
     }
 
@@ -471,15 +478,18 @@ fn disable_delta() -> AgentOverrideConfig {
 /// excluded from the set rather than counted. Every other key applies whenever it is present in
 /// any of its three states, so for them "stated" and "applied" coincide.
 ///
-/// The list below is [`AgentOverrideConfig`]'s 21 fields, which is NOT upstream's 26 keys: the six
-/// pi declares and this crate does not model (`machine` `:87`, `outputMode` `:89`, `fast` `:93`,
-/// `inheritGlobalContext` `:97`, `acceptanceRole` `:100`, `mutationTools` `:109` — see that type's
-/// doc for why each) cannot be stated in a delta here and so can never be recorded, and
+/// The list below is [`AgentOverrideConfig`]'s 24 fields, which is NOT upstream's 26 keys: the
+/// three pi declares and this crate does not model (`machine` `:87`, `inheritGlobalContext` `:97`,
+/// `mutationTools` `:109` — [`crate::discovery::types::UNPORTED_OVERRIDE_KEYS`], reported when set)
+/// cannot be stated in a delta here and so can never be recorded, and
 /// `fallbackModels` runs the other way: it is this crate's own key, with no upstream counterpart in
 /// `BuiltinAgentOverrideConfig`, so pi's `fields` never carries it and pi's
 /// `EditableOverrideField` never asks for it. Neither gap reaches `/subagents`, which edits only
 /// `model`/`thinking`/`systemPrompt` (`subagents-admin.ts:117`) — all three modeled here under
 /// pi's own spelling.
+///
+/// *SUBA-101/102 (2026-09-23):* `inheritGlobalContext` and `mutationTools` are now fields of the
+/// delta and are recorded below like every other applied key.
 fn builtin_applied_keys(delta: &AgentOverrideConfig) -> BTreeSet<String> {
     let mut keys: BTreeSet<String> = BTreeSet::new();
     if matches!(delta.description, OverrideField::Value(_)) {
@@ -515,6 +525,18 @@ fn builtin_applied_keys(delta: &AgentOverrideConfig) -> BTreeSet<String> {
         ),
         ("completionGuard", delta.completion_guard.is_present()),
         ("toolBudget", delta.tool_budget.is_present()),
+        // SUBA-096.
+        ("outputMode", delta.output_mode.is_some()),
+        ("fast", delta.fast.is_present()),
+        // SUBA-101 / SUBA-102.
+        (
+            "inheritGlobalContext",
+            delta.inherit_global_context.is_present(),
+        ),
+        ("mutationTools", delta.mutation_tools.is_present()),
+        // SUBA-100.
+        ("machine", delta.machine.is_present()),
+        ("acceptanceRole", delta.acceptance_role.is_present()),
     ] {
         if present {
             keys.insert(key.to_string());
@@ -723,6 +745,59 @@ fn apply_builtin_override(
     apply_field_full_replace(&mut agent.tool_budget, &delta.tool_budget, None, |v| {
         Some(v.clone())
     });
+    // SUBA-096 / pi `agents.ts:1433` @v0.68.0: `next.outputMode = override.outputMode`, a plain
+    // assign that leaves `next.output` (the path) alone. cyrup keeps both in one `OutputSpec`, so
+    // this arm is the mirror image of `apply_output_override`: set the mode, keep the path, and
+    // create the spec when the agent had none.
+    if let Some(mode) = delta.output_mode {
+        agent
+            .output
+            .get_or_insert(OutputSpec {
+                path: None,
+                mode: None,
+            })
+            .mode = Some(mode.into());
+    }
+    // SUBA-096 / pi `:1443`: `next.fast = override.fast` (no clear form).
+    apply_field_full_replace(&mut agent.fast, &delta.fast, None, |v| Some(*v));
+    // SUBA-101 / pi `:1447`: `next.inheritGlobalContext = override.inheritGlobalContext`, a plain
+    // boolean (the `ExplicitClear` state is unreachable for `OverrideField<bool>`; see
+    // `AgentOverrideConfig`'s shape notes).
+    apply_field_full_replace(
+        &mut agent.inherit_global_context,
+        &delta.inherit_global_context,
+        false,
+        |v| *v,
+    );
+    // SUBA-102 / pi `:1459`: `mutationTools: false` -> `delete next.mutationTools`, else a copy.
+    // The copy is pi's `parseOverrideStringArrayOrFalse` output (`agents.ts:947-966`): each entry
+    // trimmed, empties dropped — applied here because serde carries the raw list verbatim.
+    apply_field_full_replace(
+        &mut agent.mutation_tools,
+        &delta.mutation_tools,
+        None,
+        |v| {
+            Some(
+                v.iter()
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )
+        },
+    );
+    // SUBA-100 / pi `:1431`: `machine: false` -> `delete next.machine`, else the (already
+    // trimmed and validated) selector.
+    apply_field_full_replace(&mut agent.machine, &delta.machine, None, |v| {
+        Some(v.clone())
+    });
+    // SUBA-096 / pi `:1450`: `acceptanceRole: false` -> `delete next.acceptanceRole`.
+    apply_field_full_replace(
+        &mut agent.acceptance_role,
+        &delta.acceptance_role,
+        None,
+        |r| Some(*r),
+    );
 
     // pi `agents.ts:1415-1424`: the provenance record carries the keys this delta stated, unioned
     // with whatever a previous pass recorded, and accumulates this pass's scope into each one.
@@ -880,19 +955,9 @@ fn apply_output_override(agent: &mut AgentDefinition, delta: &OverrideField<Stri
 /// `applyBuiltinOverrides` (`agents.ts:1492-1524`) is a single `return`-per-branch ladder; upstream
 /// deliberately runs the two agent kinds on different rules, and so does this module.
 ///
-/// How "project fields win" survives cyrup's retained fill-unset gate, which upstream no longer
-/// has: the gate tests the agent's own on-disk FRONTMATTER keys ([`AgentDefinition::present_fields`],
-/// fixed at parse time), not the running value, so a key the user pass filled is still unguarded on
-/// the project pass and the project value lands on top. Frontmatter beats both scopes, which is
-/// R-SA-010's custom-agent rule and unchanged here.
-///
-/// `disabled` was the one key that did NOT survive that reasoning, because its arm in
-/// [`apply_custom_override`] gated on the runtime value (`agent.disabled.is_none()`) rather than on
-/// frontmatter presence — so a user entry setting `disabled` would have frozen it against the
-/// project entry. Upstream hit exactly this and fixed it in the same change that introduced the
-/// layering; the guard is removed here for the same reason, and
-/// `agent-overrides.test.ts:646-684` is the upstream regression test (ported below as
-/// `custom_agent_project_scope_flips_disabled_set_by_user_scope`).
+/// Project fields win because the project pass runs second and every field it states is written
+/// unconditionally (see [`apply_custom_override`]): there is no frontmatter gate left to shield a
+/// value from it.
 fn apply_custom_agent(agent: &mut AgentDefinition, settings: &LayeredOverrideSettings) {
     // `:1547-1550` — the user entry first, unconditionally (the user settings path always exists).
     if let Some(delta) = settings.user.overrides.get(&agent.name) {
@@ -912,296 +977,41 @@ fn apply_custom_agent(agent: &mut AgentDefinition, settings: &LayeredOverrideSet
     }
 }
 
-/// pi `applyCustomAgentOverride` (`agents.ts:1527-1536` @v0.68.0, delegating to
-/// `applyBuiltinOverride` at `:1532`): fill-unset-only — a field is applied only when its
-/// frontmatter key was absent from the agent's own on-disk frontmatter (an explicitly present field
-/// blocks the override for that field unconditionally, regardless of the delta's own value).
-/// `systemPrompt` is deliberately NOT a custom-agent override (pi omits it here — it only ever
-/// replaces a BUILTIN body). Provenance uses the passed settings `scope`/`settings_path` (never the
-/// agent's own source), recorded only when at least one field actually applied.
+/// pi `applyCustomAgentOverride` (`agents.ts:1527-1536` @v0.68.0): `applyBuiltinOverride(agent,
+/// override, meta)` at `:1532`, plus bookkeeping of `agentFrontmatterFields` that is carried along
+/// and never consulted. So a custom agent's override is applied EXACTLY as a builtin's is — every
+/// stated field replaces the agent's own value, including one its frontmatter declares.
 ///
-/// **Called TWICE per agent** by [`apply_custom_agent`] — once for the user entry, once for the
-/// project entry (`agents.ts:1546-1558`). Every `applied.insert(..)` below therefore names the
-/// settings key that THIS pass applied, and [`record_override_info`] unions it into whatever the
-/// earlier pass recorded rather than overwriting. The set is also the "did anything apply?"
-/// predicate the old `applied_any` boolean served, so the two can never drift apart: a key is in
-/// [`AgentOverrideInfo::fields`] iff this function really wrote the corresponding definition field.
+/// **This is v0.64.0's rule, not v0.57.0's.** Until `31562d76` (*"fix: apply custom agent
+/// overrides consistently"*, #1798, first tag v0.64.0) upstream ran a separate fill-unset-only
+/// arm here: a field present in the agent's own frontmatter (`agentHasFrontmatterField`) blocked
+/// the override for that field. That commit deleted the gate and the helper, and upstream's docs
+/// changed with it (`docs/agents.md`: *"Matching package, user, and project agents also receive
+/// override fields, which replace the same fields declared in their frontmatter."*). This port
+/// kept the old gate while its doc cited v0.68.0 — so a custom agent declaring `model:` plus a
+/// settings override of `model` silently kept the frontmatter value. That silent drop is what
+/// this change removes. The admin surface (`registration::subagents_admin::saves_through_settings`)
+/// already carries the v0.64.0 shape of the same commit.
 ///
-/// `base_snapshot` is captured on entry but is DISCARDED on the second pass —
-/// [`record_override_info`] keeps the first pass's, per pi `:1417`'s
-/// `agent.override?.base ?? cloneOverrideBase(agent)`.
+/// Consequences, each upstream's:
+///
+/// - `systemPrompt` now applies to a custom agent too (`applyBuiltinOverride` sets
+///   `next.systemPrompt` for either kind), replacing the agent file's body prose.
+/// - [`AgentOverrideInfo::fields`] is keyed on what the delta STATED
+///   ([`builtin_applied_keys`]), the same set for both kinds.
+/// - An all-`Unset` delta records nothing (`apply_builtin_override`'s `is_empty` short-circuit),
+///   matching pi's parse, which drops an empty entry before it is ever applied.
+///
+/// **Called TWICE per agent** by [`apply_custom_agent`] — user then project. The second call
+/// EXTENDS the provenance through [`record_override_info`]: `base` stays the first pass's, `fields`
+/// unions, and a key both scopes set carries `{User, Project}` in `field_scopes`.
 fn apply_custom_override(
     agent: &mut AgentDefinition,
     delta: &AgentOverrideConfig,
     scope: OverrideScope,
     settings_path: PathBuf,
 ) {
-    let base_snapshot = Box::new(agent.clone());
-    let mut applied: BTreeSet<String> = BTreeSet::new();
-
-    // pi `description` custom arm (agents.ts:1380-1383): UNCONDITIONAL — no frontmatter gate and
-    // no clear form, unlike every fill below it.
-    if let OverrideField::Value(v) = &delta.description {
-        agent.description = v.clone();
-        applied.insert("description".to_string());
-    }
-    // pi `fill("output", ["output"], ...)` (agents.ts:1384-1386) — gated, but the concrete arm has
-    // to preserve `mode`, so it cannot go through `apply_field_fill_unset` (which cannot read the
-    // target). Mirrors the `disabled` arm below in hand-rolling the gate.
-    if !agent.present_fields.contains("output") && delta.output.is_present() {
-        apply_output_override(agent, &delta.output);
-        applied.insert("output".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.default_reads,
-        &["defaultReads"],
-        &agent.present_fields,
-        &delta.default_reads,
-        None,
-        |v| Some(v.iter().map(PathBuf::from).collect()),
-    ) {
-        applied.insert("defaultReads".to_string());
-    }
-    let model_applied = apply_field_fill_unset(
-        &mut agent.model,
-        &["model"],
-        &agent.present_fields,
-        &delta.model,
-        None,
-        |v| Some(cyrup_core::ModelId::from(v.clone())),
-    );
-    if model_applied {
-        // The fill only runs when `model` was absent from disk AND the delta stated it; a concrete
-        // value is a settings-override source, an explicit clear leaves no model.
-        agent.model_source = match &delta.model {
-            OverrideField::Value(_) => Some(AgentModelSourceInfo::SettingsOverride),
-            _ => None,
-        };
-        applied.insert("model".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.fallback_models,
-        &["fallbackModels"],
-        &agent.present_fields,
-        &delta.fallback_models,
-        Vec::new(),
-        |v| v.iter().cloned().map(cyrup_core::ModelId::from).collect(),
-    ) {
-        applied.insert("fallbackModels".to_string());
-    }
-    // SUBA-088: `modelProvider` has NO frontmatter key (pi's agent-file parser never reads one),
-    // so the fill-unset gate is vacuously open and this is the same set/clear pi's
-    // `applyCustomAgentOverride` performs by delegating to `applyBuiltinOverride`
-    // (`agents.ts:1481,1387-1390` @v0.64.0).
-    if apply_field_fill_unset(
-        &mut agent.model_provider,
-        &[],
-        &agent.present_fields,
-        &delta.default_provider,
-        None,
-        |v| Some(cyrup_core::ProviderId::from(v.as_str())),
-    ) {
-        applied.insert("defaultProvider".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.thinking,
-        &["thinking"],
-        &agent.present_fields,
-        &delta.thinking,
-        None,
-        |v| Some(v.clone()),
-    ) {
-        applied.insert("thinking".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.system_prompt_mode,
-        &["systemPromptMode"],
-        &agent.present_fields,
-        &delta.system_prompt_mode,
-        crate::discovery::types::SystemPromptMode::Replace,
-        |v| *v,
-    ) {
-        applied.insert("systemPromptMode".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.inherit_project_context,
-        &["inheritProjectContext"],
-        &agent.present_fields,
-        &delta.inherit_project_context,
-        false,
-        |v| *v,
-    ) {
-        applied.insert("inheritProjectContext".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.inherit_skills,
-        &["inheritSkills"],
-        &agent.present_fields,
-        &delta.inherit_skills,
-        false,
-        |v| *v,
-    ) {
-        applied.insert("inheritSkills".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.default_context,
-        &["defaultContext"],
-        &agent.present_fields,
-        &delta.default_context,
-        None,
-        |v| Some(*v),
-    ) {
-        applied.insert("defaultContext".to_string());
-    }
-    // pi `disabled` (`agents.ts:1451`): `if (override.disabled !== undefined) next.disabled =
-    // override.disabled` — UNCONDITIONAL. No frontmatter gate, no runtime-value gate, no `| false`
-    // clear form (an `OverrideField<bool>` never reaches `ExplicitClear`; see the field doc).
-    //
-    // The `agent.disabled.is_none()` guard that used to stand here is gone, and its removal is part
-    // of the same change that made [`apply_custom_agent`] cumulative — upstream removed the
-    // identical guard in the identical commit. `agent-overrides.test.ts:646-684` is the regression
-    // test, and its comment names the failure exactly: the guard was *"a stray `agent.disabled ===
-    // undefined` guard (a no-op before layering existed, since this function only ever ran once
-    // against the pristine base agent)"* that, once user-then-project layering arrived, *"silently
-    // blocked the project override from ever changing `disabled` once the user override had already
-    // set it — breaking this PR's own 'project wins' precedence for that one field."* Keeping it
-    // here would have made `disabled` the single key on which a user entry beat a project entry.
-    if let OverrideField::Value(v) = &delta.disabled {
-        agent.disabled = Some(*v);
-        applied.insert("disabled".to_string());
-    }
-    // pi checks BOTH `skill` and `skills` frontmatter keys for the skills fill (agents.ts:898).
-    if apply_field_fill_unset(
-        &mut agent.skills,
-        &["skill", "skills"],
-        &agent.present_fields,
-        &delta.skills,
-        Vec::new(),
-        |v| v.clone(),
-    ) {
-        applied.insert("skills".to_string());
-    }
-    // pi `tools` custom arm (agents.ts:1438-1441): the frontmatter gate is hand-rolled upstream
-    // too, because the four-state apply is a shared function rather than a value assignment.
-    if !agent.present_fields.contains("tools") && delta.tools.is_present() {
-        apply_tools_override(&mut agent.tools, &delta.tools);
-        applied.insert("tools".to_string());
-    }
-    // SUBA-092 / pi `agents.ts:1547-1552` @v0.62.0: `fill("excludeTools", ["excludeTools"],
-    // override.excludeTools === false ? undefined : [...])` and `fill("allowNestedSubagents",
-    // ["allowNestedSubagents"], ...)` — the same frontmatter-presence gate as every fill above.
-    // (At v0.64.0 `31562d76` collapsed `applyCustomAgentOverride` into `applyBuiltinOverride` for
-    // EVERY field, so the gate no longer exists upstream for any key; that is a cross-field
-    // precedence change to R-SA-010 and is tracked separately, not folded into this item.)
-    if apply_field_fill_unset(
-        &mut agent.exclude_tools,
-        &["excludeTools"],
-        &agent.present_fields,
-        &delta.exclude_tools,
-        None,
-        |v| Some(v.clone()),
-    ) {
-        applied.insert("excludeTools".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.allow_nested_subagents,
-        &["allowNestedSubagents"],
-        &agent.present_fields,
-        &delta.allow_nested_subagents,
-        None,
-        |v| Some(*v),
-    ) {
-        applied.insert("allowNestedSubagents".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.extensions,
-        &["extensions"],
-        &agent.present_fields,
-        &delta.extensions,
-        None,
-        |v| Some(v.clone()),
-    ) {
-        applied.insert("extensions".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.subagent_only_extensions,
-        &["subagentOnlyExtensions"],
-        &agent.present_fields,
-        &delta.subagent_only_extensions,
-        Vec::new(),
-        |v| v.clone(),
-    ) {
-        applied.insert("subagentOnlyExtensions".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.completion_guard,
-        &["completionGuard"],
-        &agent.present_fields,
-        &delta.completion_guard,
-        None,
-        |v| Some(*v),
-    ) {
-        applied.insert("completionGuard".to_string());
-    }
-    if apply_field_fill_unset(
-        &mut agent.tool_budget,
-        &["toolBudget"],
-        &agent.present_fields,
-        &delta.tool_budget,
-        None,
-        |v| Some(v.clone()),
-    ) {
-        applied.insert("toolBudget".to_string());
-    }
-
-    if !applied.is_empty() {
-        // pi `agents.ts:1415-1424`, reached through `applyCustomAgentOverride`'s delegation to
-        // `applyBuiltinOverride` (`agents.ts:1532`). On the SECOND (project) pass this EXTENDS the
-        // first pass's record instead of replacing it: `base` stays the user pass's (`:1417`),
-        // `fields` unions (`:1418`), and a key both scopes set ends up carrying `{User, Project}`
-        // in `field_scopes` (`:1421-1424`) — the two-element set `shadowsLowerScope`
-        // (`subagents-admin.ts:283`) exists to read, and which no winner-take-all merge can
-        // produce.
-        record_override_info(agent, scope, settings_path, base_snapshot, applied);
-    }
-}
-
-/// One field's fill-unset-only application (R-SA-010 custom branch). Returns `true` iff the field
-/// was actually applied (i.e. it was both present-in-delta and absent-from-disk) — used by the
-/// caller to decide whether [`AgentOverrideInfo`] provenance should be recorded at all (R-SA-010's
-/// data model note: "present only when at least one override field actually applied"). Takes a
-/// slice of `frontmatter_fields` (rather than a single name) because pi's `fill` gate checks a
-/// LIST of keys for at least one field — notably `skills`, which pi blocks on either `skill` OR
-/// `skills` being present on disk (`agents.ts:898`). Takes `clear_value` by parameter (rather than
-/// an `F: Default` bound) so this helper works uniformly across `Option<_>`/`Vec<_>` fields AND
-/// plain-value fields like `bool`/`SystemPromptMode` that have no `Default` impl of their own.
-fn apply_field_fill_unset<T, F>(
-    target: &mut F,
-    frontmatter_fields: &[&str],
-    present_fields: &std::collections::HashSet<String>,
-    delta: &OverrideField<T>,
-    clear_value: F,
-    to_target: impl FnOnce(&T) -> F,
-) -> bool {
-    if frontmatter_fields
-        .iter()
-        .any(|field| present_fields.contains(*field))
-    {
-        // Explicitly present on disk: the override is blocked for this field, full stop —
-        // regardless of the delta's own value or the delta's own Unset/ExplicitClear/Value state.
-        return false;
-    }
-    match delta {
-        OverrideField::Unset => false,
-        OverrideField::ExplicitClear => {
-            *target = clear_value;
-            true
-        }
-        OverrideField::Value(v) => {
-            *target = to_target(v);
-            true
-        }
-    }
+    apply_builtin_override(agent, delta, scope, settings_path);
 }
 
 #[cfg(test)]
@@ -1266,9 +1076,13 @@ mod tests {
 
     fn agent(name: &str, source: AgentSource, file_path: &str) -> AgentDefinition {
         AgentDefinition {
+            inherit_global_context: false,
+            machine: None,
+            mutation_tools: None,
             default_turn_budget: None,
             default_acceptance: None,
             acceptance_role: None,
+            fast: None,
             permission_rules: None,
             runner: None,
             name: name.to_string(),
@@ -1577,7 +1391,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // R-SA-010/011: fill-unset-only override semantics
+    // R-SA-010/011: override semantics (full replace for every agent kind since v0.64.0)
     // -----------------------------------------------------------------------------------------
 
     #[test]
@@ -1660,10 +1474,11 @@ mod tests {
         );
     }
 
+    /// v0.64.0+ (`31562d76`): `applyCustomAgentOverride` IS `applyBuiltinOverride`, which sets
+    /// `next.systemPrompt` for either kind — a custom agent's body is replaced too. This test
+    /// used to pin the v0.57.0 rule (custom agents ignore `systemPrompt`).
     #[test]
-    fn system_prompt_override_does_not_apply_to_a_custom_agent() {
-        // pi's `applyCustomAgentOverride` omits `systemPrompt` entirely (only `applyBuiltinOverride`
-        // sets it) — a custom agent's body is never replaced by a settings override.
+    fn system_prompt_override_replaces_a_custom_agents_body() {
         let mut merged = HashMap::new();
         let mut a = agent("implementer", AgentSource::Project, "/proj/impl.md");
         a.system_prompt_body = "custom implementer body".to_string();
@@ -1672,26 +1487,24 @@ mod tests {
         let settings = project_scope(settings_with_override(
             "implementer",
             AgentOverrideConfig {
-                system_prompt: OverrideField::Value("SHOULD NOT APPLY".to_string()),
+                system_prompt: OverrideField::Value("settings body".to_string()),
                 ..Default::default()
             },
         ));
 
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("implementer").expect("present");
+        assert_eq!(updated.system_prompt_body, "settings body");
         assert_eq!(
-            updated.system_prompt_body, "custom implementer body",
-            "systemPrompt is builtin-only; a custom agent body must be untouched"
+            updated.override_info.as_ref().expect("recorded").fields,
+            BTreeSet::from(["systemPrompt".to_string()])
         );
-        // systemPrompt was the ONLY delta field and it is not a custom-agent field, so nothing
-        // applied and no provenance is recorded.
-        assert!(updated.override_info.is_none());
     }
 
+    /// v0.64.0+: a field the agent's frontmatter declares no longer blocks its override — the
+    /// override wins for present and absent fields alike. (This test pinned the v0.57.0 gate.)
     #[test]
-    fn custom_agent_override_applies_only_to_absent_fields() {
-        // "model" is present on disk -> override MUST be blocked for it.
-        // "thinking" is absent on disk -> override MUST apply.
+    fn custom_agent_override_applies_to_present_and_absent_fields_alike() {
         let mut merged = HashMap::new();
         let mut a = agent_with_present(
             "reviewer",
@@ -1713,28 +1526,21 @@ mod tests {
 
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("reviewer").expect("present");
-        assert_eq!(
-            updated.model,
-            Some("anthropic/claude-sonnet-4".into()),
-            "present-on-disk field must block the override even though the override supplied a \
-             different value"
-        );
-        assert_eq!(
-            updated.thinking,
-            Some("high".to_string()),
-            "absent-on-disk field must accept the override value"
-        );
+        assert_eq!(updated.model, Some("openai/gpt-5".into()));
+        assert_eq!(updated.thinking, Some("high".to_string()));
     }
 
+    /// v0.64.0+: an explicit clear applies over a frontmatter-declared field too, and is recorded.
     #[test]
-    fn custom_agent_override_blocks_explicit_clear_when_field_present_on_disk() {
+    fn custom_agent_explicit_clear_applies_over_a_field_present_on_disk() {
         let mut merged = HashMap::new();
-        let a = agent_with_present(
+        let mut a = agent_with_present(
             "reviewer",
             AgentSource::User,
             "/user/reviewer.md",
             &["completionGuard"],
         );
+        a.completion_guard = Some(false);
         merged.insert("reviewer".to_string(), a);
 
         let settings = user_scope(settings_with_override(
@@ -1746,15 +1552,11 @@ mod tests {
         ));
 
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
-        // Presence on disk blocks the override outright — even though the on-disk value here
-        // happens to already be `None` (the test only marks the field "present", not populated),
-        // the point is the override must not be recorded as having "applied".
-        assert!(
-            merged
-                .get("reviewer")
-                .expect("present")
-                .override_info
-                .is_none()
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(updated.completion_guard, None);
+        assert_eq!(
+            updated.override_info.as_ref().expect("recorded").fields,
+            BTreeSet::from(["completionGuard".to_string()])
         );
     }
 
@@ -1774,29 +1576,6 @@ mod tests {
                 .override_info
                 .is_none()
         );
-    }
-
-    #[test]
-    fn package_sourced_agent_is_not_touched_by_settings_overrides() {
-        let mut merged = HashMap::new();
-        merged.insert(
-            "pkgagent".to_string(),
-            agent("pkgagent", AgentSource::Package, "/pkg/pkgagent.md"),
-        );
-        let settings = user_scope(settings_with_override(
-            "pkgagent",
-            AgentOverrideConfig {
-                thinking: OverrideField::Value("high".to_string()),
-                ..Default::default()
-            },
-        ));
-        apply_overrides(&mut merged, &settings).expect("apply succeeds");
-        let updated = merged.get("pkgagent").expect("present");
-        assert_eq!(
-            updated.thinking, None,
-            "package-sourced agents are not overridable"
-        );
-        assert!(updated.override_info.is_none());
     }
 
     #[test]
@@ -2132,6 +1911,163 @@ mod tests {
     /// becomes a precedence inversion with it: `disabled` would be the one key on which a USER
     /// entry beat a PROJECT entry. Both directions are covered, because a guard that only blocks
     /// `true -> false` would still pass a one-directional test.
+    /// §1.6 — upstream `31562d76` (v0.64.0): a custom agent's override REPLACES a field its own
+    /// frontmatter declares. Mutation killed: restoring the v0.57.0 frontmatter gate in
+    /// `apply_custom_override` (the frontmatter `model` then survives the override).
+    #[test]
+    fn custom_agent_override_replaces_a_frontmatter_declared_field() {
+        let mut merged = HashMap::new();
+        let mut a = agent("reviewer", AgentSource::User, "/u/reviewer.md");
+        a.model = Some("anthropic/frontmatter".into());
+        a.thinking = Some("low".to_string());
+        a.present_fields.insert("model".to_string());
+        a.present_fields.insert("thinking".to_string());
+        merged.insert("reviewer".to_string(), a);
+        let settings = user_scope(settings_with_override(
+            "reviewer",
+            AgentOverrideConfig {
+                model: OverrideField::Value("openai/gpt-5".to_string()),
+                thinking: OverrideField::ExplicitClear,
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(updated.model, Some("openai/gpt-5".into()));
+        assert_eq!(
+            updated.thinking, None,
+            "a clear applies over frontmatter too"
+        );
+        assert_eq!(
+            updated.override_info.as_ref().expect("recorded").fields,
+            BTreeSet::from(["model".to_string(), "thinking".to_string()])
+        );
+    }
+
+    /// pi runs `applyCustomAgentOverrides` over the PACKAGE tier too (`agents.ts:2903` @v0.68.0,
+    /// present since v0.43.0). Mutation killed: restoring the Package no-op arm in
+    /// `apply_overrides` (the override is then accepted and dropped).
+    #[test]
+    fn a_package_agent_receives_its_settings_override() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "pkg.worker".to_string(),
+            agent("pkg.worker", AgentSource::Package, "/pkg/worker.md"),
+        );
+        let settings = user_scope(settings_with_override(
+            "pkg.worker",
+            AgentOverrideConfig {
+                model: OverrideField::Value("openai/gpt-5".to_string()),
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("pkg.worker").expect("present");
+        assert_eq!(updated.model, Some("openai/gpt-5".into()));
+        assert_eq!(
+            updated.override_info.as_ref().expect("recorded").scope,
+            OverrideScope::User
+        );
+    }
+
+    /// SUBA-096 — `outputMode` and `output` are independent upstream; each override keeps the
+    /// other half of cyrup's merged `OutputSpec`. Mutation killed: a whole-spec replace in the
+    /// `outputMode` arm (the path is lost), or in `apply_output_override` (the mode is lost).
+    #[test]
+    fn output_override_preserves_mode_and_output_mode_override_preserves_path() {
+        let mut merged = HashMap::new();
+        let mut a = agent("delegate", AgentSource::Builtin, "/b/delegate.md");
+        a.output = Some(OutputSpec {
+            path: Some(PathBuf::from("declared.md")),
+            mode: None,
+        });
+        merged.insert("delegate".to_string(), a);
+        let settings = user_scope(settings_with_override(
+            "delegate",
+            AgentOverrideConfig {
+                output_mode: Some(crate::discovery::types::OverrideOutputMode::FileOnly),
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("delegate").expect("present").output,
+            Some(OutputSpec {
+                path: Some(PathBuf::from("declared.md")),
+                mode: Some(crate::discovery::types::OutputMode::FileOnly),
+            })
+        );
+
+        let mut merged = HashMap::new();
+        let mut b = agent("delegate", AgentSource::Builtin, "/b/delegate.md");
+        b.output = Some(OutputSpec {
+            path: None,
+            mode: Some(crate::discovery::types::OutputMode::Inline),
+        });
+        merged.insert("delegate".to_string(), b);
+        let settings = user_scope(settings_with_override(
+            "delegate",
+            AgentOverrideConfig {
+                output: OverrideField::Value("new.md".to_string()),
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("delegate").expect("present").output,
+            Some(OutputSpec {
+                path: Some(PathBuf::from("new.md")),
+                mode: Some(crate::discovery::types::OutputMode::Inline),
+            })
+        );
+    }
+
+    /// SUBA-096 — `acceptanceRole: false` is pi's `delete next.acceptanceRole`, including a role
+    /// the agent's frontmatter declared; a value sets it. Mutation killed: mapping
+    /// `ExplicitClear` to a no-op (the frontmatter role survives), or dropping the arm (neither
+    /// applies).
+    #[test]
+    fn acceptance_role_override_sets_and_false_clears() {
+        use crate::exec::acceptance::model::AcceptanceRole;
+        let mut merged = HashMap::new();
+        let mut a = agent("reviewer", AgentSource::Project, "/p/reviewer.md");
+        a.acceptance_role = Some(AcceptanceRole::ReadOnly);
+        a.present_fields.insert("acceptanceRole".to_string());
+        merged.insert("reviewer".to_string(), a);
+        merged.insert(
+            "worker".to_string(),
+            agent("worker", AgentSource::Builtin, "/b/worker.md"),
+        );
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "reviewer".to_string(),
+            AgentOverrideConfig {
+                acceptance_role: OverrideField::ExplicitClear,
+                ..Default::default()
+            },
+        );
+        overrides.insert(
+            "worker".to_string(),
+            AgentOverrideConfig {
+                acceptance_role: OverrideField::Value(AcceptanceRole::ReadOnly),
+                fast: OverrideField::Value(true),
+                ..Default::default()
+            },
+        );
+        let settings = project_scope(SubagentSettings {
+            overrides,
+            ..SubagentSettings::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("reviewer").expect("present").acceptance_role,
+            None
+        );
+        let worker = merged.get("worker").expect("present");
+        assert_eq!(worker.acceptance_role, Some(AcceptanceRole::ReadOnly));
+        assert_eq!(worker.fast, Some(true));
+    }
+
     #[test]
     fn custom_agent_project_scope_flips_disabled_set_by_user_scope() {
         let mut merged = HashMap::new();
@@ -2253,6 +2189,9 @@ mod tests {
         let settings = project_scope(settings_with_override(
             "reviewer",
             AgentOverrideConfig {
+                inherit_global_context: OverrideField::Unset,
+                machine: OverrideField::Unset,
+                mutation_tools: OverrideField::Unset,
                 model: OverrideField::Value("openai/gpt-5".to_string()),
                 default_provider: OverrideField::Value("openai".to_string()),
                 fallback_models: OverrideField::Value(vec![
@@ -2264,8 +2203,9 @@ mod tests {
                 inherit_skills: OverrideField::Value(true),
                 default_context: OverrideField::Value(ContextMode::Fork),
                 disabled: OverrideField::Value(true),
-                // systemPrompt is set but must NOT apply to a custom agent (builtin-only field).
-                system_prompt: OverrideField::Value("should not apply".to_string()),
+                // v0.64.0+: `applyCustomAgentOverride` IS `applyBuiltinOverride`, which sets
+                // `systemPrompt` for either kind.
+                system_prompt: OverrideField::Value("settings body".to_string()),
                 skills: OverrideField::Value(vec!["tdd".to_string()]),
                 tools: ToolsOverrideField::Value(vec![ToolRef::Builtin("read".to_string())]),
                 exclude_tools: OverrideField::Value(vec!["bash".to_string()]),
@@ -2283,6 +2223,12 @@ mod tests {
                     soft: Some(30),
                     block: ToolBudgetBlock::Names(vec!["read".to_string()]),
                 }),
+                // SUBA-096.
+                output_mode: Some(crate::discovery::types::OverrideOutputMode::FileOnly),
+                fast: OverrideField::Value(true),
+                acceptance_role: OverrideField::Value(
+                    crate::exec::acceptance::model::AcceptanceRole::Writer,
+                ),
             },
         ));
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
@@ -2302,8 +2248,8 @@ mod tests {
         assert_eq!(updated.default_context, Some(ContextMode::Fork));
         assert_eq!(updated.disabled, Some(true));
         assert_eq!(
-            updated.system_prompt_body, "reviewer body",
-            "systemPrompt is builtin-only and must not touch a custom agent's body"
+            updated.system_prompt_body, "settings body",
+            "v0.64.0+: systemPrompt replaces a custom agent's body too"
         );
         assert_eq!(updated.skills, vec!["tdd".to_string()]);
         assert_eq!(
@@ -2315,15 +2261,25 @@ mod tests {
             vec!["./tools/child-review.ts".to_string()]
         );
         assert_eq!(updated.completion_guard, Some(false));
-        // SUBA-081's five added fields, on the custom (fill-unset) path.
+        // SUBA-081's five added fields, on the custom path.
         assert_eq!(updated.description, "overridden description");
+        // SUBA-096: `output` sets the path, `outputMode` the mode — both land in the one spec.
         assert_eq!(
             updated.output,
             Some(OutputSpec {
                 path: Some(PathBuf::from("./out/review.md")),
-                mode: None,
+                mode: Some(crate::discovery::types::OutputMode::FileOnly),
             })
         );
+        assert_eq!(updated.fast, Some(true));
+        assert_eq!(
+            updated.acceptance_role,
+            Some(crate::exec::acceptance::model::AcceptanceRole::Writer)
+        );
+        let fields = &updated.override_info.as_ref().expect("recorded").fields;
+        for key in ["outputMode", "fast", "acceptanceRole"] {
+            assert!(fields.contains(key), "{key} is recorded as applied");
+        }
         assert_eq!(
             updated.default_reads,
             Some(vec![PathBuf::from("./AGENTS.md")])
@@ -2494,10 +2450,11 @@ mod tests {
         }
     }
 
+    /// v0.64.0+: `tools: "inherit"` drops even a frontmatter-declared allowlist on a custom agent
+    /// (upstream's docs at `31562d76`: *"Use `tools: "inherit"` when that one role should omit its
+    /// bundled or frontmatter tool allowlist"*). This test pinned the v0.57.0 gate.
     #[test]
-    fn custom_override_tools_inherit_is_blocked_by_frontmatter_tools() {
-        // The four-arm apply still goes through the fill-unset gate on the custom path: an agent
-        // that declared `tools:` on disk keeps its own list, `"inherit"` notwithstanding.
+    fn custom_override_tools_inherit_replaces_frontmatter_tools() {
         let mut merged = HashMap::new();
         let mut a = agent("reviewer", AgentSource::Project, "/proj/reviewer.md");
         a.tools = Some(vec![ToolRef::Builtin("read".to_string())]);
@@ -2513,14 +2470,8 @@ mod tests {
         ));
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("reviewer").expect("present");
-        assert_eq!(
-            updated.tools,
-            Some(vec![ToolRef::Builtin("read".to_string())])
-        );
-        assert!(
-            updated.override_info.is_none(),
-            "a fully-blocked delta applies nothing, so it records no provenance"
-        );
+        assert_eq!(updated.tools, None, "inherit = no allowlist at all");
+        assert!(updated.override_info.is_some());
     }
 
     #[test]
@@ -3277,11 +3228,10 @@ mod tests {
         assert_eq!(merged.get("delegate").expect("present").exclude_tools, None);
     }
 
-    /// SUBA-092 — the custom arm (`agents.ts:1547-1552` @v0.62.0, `fill(...)`): both fields obey
-    /// the frontmatter-presence gate every other custom fill obeys — an `excludeTools:` or
-    /// `allowNestedSubagents:` key present on disk blocks the override for THAT field only.
+    /// SUBA-092 fields on the custom path, v0.64.0+: a frontmatter-declared `excludeTools` is
+    /// replaced like any other field, and a `false` clear yields `None`.
     #[test]
-    fn custom_override_fills_exclude_tools_and_allow_nested_subagents_only_when_absent_on_disk() {
+    fn custom_override_replaces_exclude_tools_and_allow_nested_subagents() {
         let mut merged = HashMap::new();
         let mut a = agent_with_present(
             "reviewer",
@@ -3302,22 +3252,9 @@ mod tests {
         ));
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("reviewer").expect("present");
-        assert_eq!(
-            updated.exclude_tools,
-            Some(vec!["write".to_string()]),
-            "present-on-disk excludeTools must block the override"
-        );
-        assert_eq!(
-            updated.allow_nested_subagents,
-            Some(true),
-            "absent-on-disk allowNestedSubagents must accept the override"
-        );
-        assert!(
-            updated.override_info.is_some(),
-            "one field applied, so provenance is recorded"
-        );
+        assert_eq!(updated.exclude_tools, Some(vec!["bash".to_string()]));
+        assert_eq!(updated.allow_nested_subagents, Some(true));
 
-        // Neither key on disk: both fill, and a `false` clear on excludeTools yields `None`.
         let mut merged = HashMap::new();
         let mut a = agent("reviewer", AgentSource::User, "/user/reviewer.md");
         a.exclude_tools = Some(vec!["write".to_string()]);

@@ -76,7 +76,7 @@ pub use lattice::contract::{AcceptanceContract, ReviewerResult, VerifyCommand};
 pub use lattice::gate::{
     CleanCompletionGate, evaluate_acceptance, evaluate_acceptance_with_cancel,
 };
-pub use lattice::inject::inject_acceptance_contract;
+pub use lattice::inject::{inject_acceptance_contract, inject_acceptance_contract_for};
 pub use lattice::lowering::lower_acceptance_input;
 pub use lattice::post_hoc::{
     ACCEPTANCE_REJECTED_EXIT_CODE, PostHocCorrection, apply_post_hoc_correction,

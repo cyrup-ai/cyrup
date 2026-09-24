@@ -117,6 +117,7 @@
 //! for `print`/`json`'s "a subsequent separate invocation observes results" case), which is
 //! entirely the calling layer's concern, not this module's.
 
+mod batch;
 mod classify;
 mod install;
 mod message;
@@ -124,6 +125,10 @@ mod observer;
 mod results_watcher;
 mod sink;
 
+pub use batch::{
+    BatchState, BatchingHostServicesCompletionSink, CompletionBatchConfig, GroupPart,
+    format_grouped_completion, resolve_completion_batch_config,
+};
 pub use classify::{ClassifiedOutcome, classify_outcome};
 pub use install::{
     CompletionWatcherHandle, install_completion_watcher, install_completion_watcher_with_observer,
@@ -255,6 +260,11 @@ pub(crate) mod tests {
         exit_code: i32,
     ) -> SingleResult {
         SingleResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            skills_warning: None,
+            watchdog: None,
             // SUBA-021: no usage budget on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

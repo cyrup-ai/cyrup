@@ -91,6 +91,17 @@ pub struct CompletionMessage {
     /// no `wait` could ever have surfaced, so it is never suppressed by the inline-answer ledger
     /// ([`crate::background::watch::InlineAnsweredSink`]).
     pub suppressible: bool,
+    /// SUBA-017 — what this completion contributes to a GROUPED notice
+    /// ([`super::batch::format_grouped_completion`]). `Some` only for a message the completion
+    /// batcher may HOLD: an ordinary `completed` success from [`format_completion_message`]. A
+    /// failed/paused/stopped outcome and every loss notice carry `None` and bypass the batcher
+    /// (pi `notify.ts:785-788`). Built from the same fields as `content`, so the grouped renderer
+    /// never re-parses text.
+    pub group_part: Option<super::batch::GroupPart>,
+    /// SUBA-017 — the batch key (pi `completionBatchKey`, `notify.ts:544-549`): which held group a
+    /// bypassing message flushes before it goes out. `None` for a loss notice whose report names
+    /// no session.
+    pub batch_key: Option<String>,
 }
 
 /// pi's `"(no output)"` (`subagent-runner.ts:4744`, `notify.ts:242`). ONE constant, both sites.
@@ -311,6 +322,24 @@ pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
     // pi's `content` array: header, "", the schedule line when there is one, "", displaySummary,
     // then (only if a session line exists) "" and the session line, joined by "\n"
     // (`notify.ts:343-356`).
+    let group_part = (outcome == ClassifiedOutcome::Completed).then(|| super::batch::GroupPart {
+        agent: agent.to_string(),
+        schedule: result.schedule_origin.as_ref().map(|origin| {
+            (
+                origin.name.clone().unwrap_or_else(|| origin.id.clone()),
+                origin.id.clone(),
+            )
+        }),
+        preview: display_summary.clone(),
+        // pi re-renders the session line through `parseSubagentNotifyContent`, which LOWERCASES
+        // the label (`notify.ts:459`), then `formatSessionLine` (`:298-301`).
+        session_line: result
+            .session_file
+            .as_ref()
+            .map(|path| format!("session file: {}", path.display())),
+        session_id: result.session_id.clone(),
+        owner_id: result.completion_owner_id.clone(),
+    });
     let mut lines: Vec<String> = vec![
         format!("Background task {status}: **{agent}**"),
         String::new(),
@@ -341,6 +370,11 @@ pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
         // The one value-carrying completion shape: a `wait` that already surfaced this run's value
         // inline may suppress the standalone duplicate (`ASYNC_NOTIFY_BUG_REPORT` F3).
         suppressible: true,
+        group_part,
+        batch_key: Some(super::batch::batch_key(
+            result.session_id.as_ref(),
+            Some(result.cwd.as_path()),
+        )),
     }
 }
 
@@ -418,6 +452,9 @@ pub fn format_missing_payload_message(report: &LossReport) -> CompletionMessage 
         trigger_turn: true,
         // A loss report carries information no `wait` could have surfaced — never suppressed.
         suppressible: false,
+        // Never held (it is failure-class), and its report names no session to key a flush by.
+        group_part: None,
+        batch_key: None,
     }
 }
 
@@ -444,6 +481,10 @@ pub fn format_undeliverable_message(result: &ResultFile) -> CompletionMessage {
         // A delivery-failure report is exactly what a `wait` cannot have answered — never
         // suppressed (`ASYNC_NOTIFY_BUG_REPORT` F3.2).
         suppressible: false,
+        // Kept: `suppressible: false` alone routes it past the batcher, and the key tells it which
+        // held group to flush first.
+        group_part: base.group_part,
+        batch_key: base.batch_key,
     }
 }
 

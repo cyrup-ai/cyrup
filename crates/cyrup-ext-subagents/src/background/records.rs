@@ -126,6 +126,19 @@ pub struct StepStatus {
     /// carries).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_id: Option<String>,
+    /// pi `step.watchdog` (`subagent-runner.ts:2720` @v0.43.0) — the same folded child-watchdog
+    /// view as [`crate::exec::SingleResult::watchdog`], persisted into `status.json` for a
+    /// background step. `None` for an unarmed child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog: Option<crate::watchdog::child_status::ChildWatchdogStateSnapshot>,
+    /// SUBA-063 — pi `AsyncStatus.steps[].runtimeAcknowledgedExtensions` (`shared/types.ts:1979`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_acknowledged_extensions:
+        Option<crate::exec::run_result::RuntimeAcknowledgedChildExtensions>,
+    /// SUBA-100 — the step's placed-run Git evidence (pi `StepResult.nativeMachine`,
+    /// `subagent-runner.ts:1579` @v0.68.0), persisted beside the step's other settle fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_machine: Option<crate::placement::native::NativeMachineEvidence>,
     /// The stable workflow lane key this step belongs to — pi `AsyncStatus.steps[].workflowKey`
     /// (`shared/types.ts:1878`), read by `workflowChildSummary`'s step pass
     /// (`workflow-child-summary.ts:83-84`).
@@ -212,6 +225,9 @@ impl StepStatus {
     #[must_use]
     pub fn pending(agent: impl Into<String>) -> Self {
         Self {
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            watchdog: None,
             agent: agent.into(),
             status: StepState::Pending,
             session_file: None,
@@ -453,6 +469,13 @@ pub struct RunStatus {
     /// serialize at the same top level of `status.json` pi writes them at.
     #[serde(flatten, default)]
     pub telemetry: RunTelemetry,
+    /// SUBA-063 — pi `AsyncStatus.runtimeAcknowledgedExtensions` (`shared/types.ts:1889`
+    /// @v0.68.0): a ONE-result run's child-runtime acknowledgement, lifted from its only result at
+    /// the terminal write (`subagent-runner.ts:4887`, `:5002`). `None` for multi-result runs, whose
+    /// per-child values live on [`StepStatus::runtime_acknowledged_extensions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_acknowledged_extensions:
+        Option<crate::exec::run_result::RuntimeAcknowledgedChildExtensions>,
 }
 
 impl RunStatus {
@@ -494,6 +517,8 @@ impl RunStatus {
             // shape the runner will publish.
             process_terminal: None,
             telemetry: RunTelemetry::default(),
+            // SUBA-063: no child has run, so nothing has been acknowledged.
+            runtime_acknowledged_extensions: None,
         }
     }
 

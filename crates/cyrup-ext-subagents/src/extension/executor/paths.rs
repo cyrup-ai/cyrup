@@ -486,8 +486,8 @@ pub(crate) fn enumerate_installed_packages(
 /// binary that does not ship with an intact `CARGO_MANIFEST_DIR`-relative source tree (e.g. a
 /// release artifact that instead vendors the bundled personas into a fixed install-time location)
 /// — this crate takes no position on that packaging strategy itself, it just leaves the seam open
-/// via the same closure-injectable-env-lookup convention `resolve_extra_agent_dirs`
-/// (`discovery/mod.rs`) already establishes for `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS`. The default,
+/// via the same closure-injectable-env-lookup convention `crate::paths::Roots::from_lookup`
+/// uses for `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS`. The default,
 /// used by every real `cyrup` binary invocation and this crate's own tests today, resolves against
 /// this crate's own `CARGO_MANIFEST_DIR` (baked in at compile time), which is correct for every
 /// from-source build of this workspace.
@@ -625,6 +625,8 @@ mod tests {
 
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -643,6 +645,7 @@ mod tests {
                 // No `output`, and the builtin `worker` persona declares none of its own.
                 output: None,
                 output_mode: Some("file-only".to_string()),
+                fast: None,
                 skills: None,
                 share: None,
                 session_dir: None,
@@ -658,6 +661,63 @@ mod tests {
         assert!(
             !default_async_root_in(&crate::paths::Roots::from_env(), dir.path()).exists(),
             "the refusal must land BEFORE any run directory is created"
+        );
+    }
+
+    /// SUBA-096 — the AGENT's own `outputMode: file-only` (frontmatter) is consulted on the async
+    /// single path (pi `params.outputMode ?? agentConfig.outputMode ?? "inline"`,
+    /// `async-execution.ts:1836` @v0.68.0), so a file-only agent with no resolvable path is
+    /// refused before spawn exactly as an explicit `outputMode: "file-only"` is. Mutation killed:
+    /// reverting `background.rs` to the param-only resolution (the run then spawns inline).
+    #[tokio::test]
+    async fn an_agents_own_file_only_mode_is_consulted_on_the_async_single_path() {
+        let executor = SubagentExecutor::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agents_dir = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("mkdir");
+        std::fs::write(
+            agents_dir.join("reporter.md"),
+            "---\nname: reporter\ndescription: d\noutputMode: file-only\n---\nBody.\n",
+        )
+        .expect("write agent");
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = crate::paths::Roots::sandboxed(dir.path());
+        }
+
+        let err = executor
+            .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
+                thinking: None,
+                usage_budget: None,
+                turn_budget: None,
+                structured_output_schema: None,
+                tool_budget: None,
+                cwd: dir.path(),
+                agent_name: "reporter",
+                task: "do something",
+                context: Some(ContextRequest::Fresh),
+                model_override: None,
+                agent_scope: AgentReadScope::Both,
+                acceptance: None,
+                control: None,
+                include_progress: None,
+                output: None,
+                // No call-level mode: the agent's is the one that must be read.
+                output_mode: None,
+                fast: None,
+                skills: None,
+                share: None,
+                session_dir: None,
+                artifacts: None,
+                timeout_ms: None,
+            })
+            .await
+            .expect_err("the agent's file-only mode with no output path must be refused");
+        assert!(
+            matches!(err, SubagentError::OutputPathRequired),
+            "expected OutputPathRequired from the agent-level mode, got: {err:?}"
         );
     }
 
@@ -678,6 +738,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                machine_cwd: None,
+                machine: None,
                 thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
@@ -695,6 +757,7 @@ mod tests {
                 include_progress: None,
                 output: None,
                 output_mode: None,
+                fast: None,
                 skills: None,
                 share: None,
                 session_dir: None,
@@ -869,6 +932,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let step = RunnerStep::SingleStep(crate::spawn::chain_graph::SingleStepSpec {
+            machine: None,
             skills: None,
             session_dir: None,
             agent: "worker".to_string(),
@@ -883,6 +947,7 @@ mod tests {
             output: None,
             output_path: None,
             output_mode: None,
+            fast: None,
             reads: None,
             acceptance: None,
             context: None,

@@ -847,11 +847,23 @@ fn first_redirect_target(command: &str) -> Option<String> {
     None
 }
 
-/// pi `isMutatingTool` (`long-running-guard.ts:138-155`): `edit`/`write` always; `cursor` when its
-/// `activityTitle` starts with `Cursor edit`/`Cursor write` (case-insensitively); `bash` when its
-/// command is classified mutating by [`is_mutating_bash_command`]; nothing else.
+/// pi `isMutatingTool` (`long-running-guard.ts:144-155` @v0.68.0): any name in the agent's own
+/// `mutationTools` (SUBA-102, `:146`, checked FIRST so it can name any tool); `edit`/`write`
+/// always; `cursor` when its `activityTitle` starts with `Cursor edit`/`Cursor write`
+/// (case-insensitively); `bash` when its command is classified mutating by
+/// [`is_mutating_bash_command`]; nothing else. An empty name is never mutating, even if listed.
 #[must_use]
-pub fn is_mutating_tool(tool_name: &str, args: &serde_json::Value) -> bool {
+pub fn is_mutating_tool(
+    tool_name: &str,
+    args: &serde_json::Value,
+    mutation_tools: Option<&[String]>,
+) -> bool {
+    if tool_name.is_empty() {
+        return false;
+    }
+    if mutation_tools.is_some_and(|names| names.iter().any(|name| name == tool_name)) {
+        return true;
+    }
     match tool_name {
         "" => false,
         "edit" | "write" => true,
@@ -1065,6 +1077,10 @@ pub struct ControlMonitor {
     current_path: Option<String>,
     pending_tool_result: Option<PendingToolResult>,
     mutating_failures: MutatingFailureState,
+    /// SUBA-102 — the agent's own `mutationTools` (pi `isMutatingTool(…, agent.mutationTools)`,
+    /// `execution.ts:1059` / `subagent-runner.ts:3042` @v0.68.0): extra tool names whose calls
+    /// count as mutating for the failure-streak escalation. Set by [`Self::with_mutation_tools`].
+    mutation_tools: Option<Vec<String>>,
 }
 
 impl ControlMonitor {
@@ -1099,7 +1115,15 @@ impl ControlMonitor {
             current_path: None,
             pending_tool_result: None,
             mutating_failures: MutatingFailureState::default(),
+            mutation_tools: None,
         }
+    }
+
+    /// SUBA-102 — count the agent's own `mutationTools` as mutating (see the field doc).
+    #[must_use]
+    pub fn with_mutation_tools(mut self, mutation_tools: Option<Vec<String>>) -> Self {
+        self.mutation_tools = mutation_tools;
+        self
     }
 
     /// A disabled monitor for callers that raise nothing (the `controlConfig.enabled === false`
@@ -1327,7 +1351,7 @@ impl ControlMonitor {
                 self.current_tool = Some(tool_name.clone());
                 self.current_tool_started_at = Some(now);
                 self.current_path = resolve_current_path(tool_name, args);
-                let mutates = is_mutating_tool(tool_name, args);
+                let mutates = is_mutating_tool(tool_name, args, self.mutation_tools.as_deref());
                 self.pending_tool_result = Some(PendingToolResult {
                     tool: if tool_name.is_empty() {
                         "tool".to_string()
@@ -1785,25 +1809,29 @@ mod tests {
 
     #[test]
     fn is_mutating_tool_covers_edit_write_cursor_and_bash() {
-        assert!(is_mutating_tool("edit", &serde_json::json!({})));
-        assert!(is_mutating_tool("write", &serde_json::json!({})));
+        assert!(is_mutating_tool("edit", &serde_json::json!({}), None));
+        assert!(is_mutating_tool("write", &serde_json::json!({}), None));
         assert!(is_mutating_tool(
             "cursor",
-            &serde_json::json!({ "activityTitle": "Cursor edit main.rs" })
+            &serde_json::json!({ "activityTitle": "Cursor edit main.rs" }),
+            None
         ));
         assert!(!is_mutating_tool(
             "cursor",
-            &serde_json::json!({ "activityTitle": "Cursor editor opened" })
+            &serde_json::json!({ "activityTitle": "Cursor editor opened" }),
+            None
         ));
         assert!(is_mutating_tool(
             "bash",
-            &serde_json::json!({ "command": "rm -rf build" })
+            &serde_json::json!({ "command": "rm -rf build" }),
+            None
         ));
         assert!(!is_mutating_tool(
             "bash",
-            &serde_json::json!({ "command": "ls" })
+            &serde_json::json!({ "command": "ls" }),
+            None
         ));
-        assert!(!is_mutating_tool("read", &serde_json::json!({})));
+        assert!(!is_mutating_tool("read", &serde_json::json!({}), None));
     }
 
     #[test]

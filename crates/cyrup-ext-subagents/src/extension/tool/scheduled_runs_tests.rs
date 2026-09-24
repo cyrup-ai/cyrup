@@ -28,7 +28,7 @@ use crate::extension::tool::SubagentTool;
 /// A [`cyrup_ext::host::HostServices`] whose reported session id/file can be SWAPPED mid-test.
 ///
 /// That mutability is the whole point of two rows below: `current_session_id` is documented to
-/// read straight off the bound backend on every call, so a trigger that read it live would观察
+/// read straight off the bound backend on every call, so a trigger that read it live would observe
 /// a different identity after the swap. The pinned snapshot must not.
 struct SwappableSessionHost {
     session: Mutex<(Option<String>, Option<std::path::PathBuf>)>,

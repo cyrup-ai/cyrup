@@ -70,6 +70,7 @@ fn fixture_binary_path() -> PathBuf {
 
 fn agent_config(name: &str) -> AgentConfig {
     AgentConfig {
+        machine: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
         model_provider: None,
@@ -84,6 +85,8 @@ fn agent_config(name: &str) -> AgentConfig {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         // The completion-mutation guard is a separate gate; disabled so this run's outcome is
@@ -108,9 +111,12 @@ fn agent_config(name: &str) -> AgentConfig {
 /// therefore genuinely requires an `acceptance-report` block from somewhere.
 fn run_options(cwd: &Path, output_path: &Path) -> RunOptions {
     RunOptions {
+        parent_env_overrides: std::collections::BTreeMap::new(),
+        machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
         // nothing is recorded, which is this field's documented `None` behaviour.
         model_exclusions: None,
+        fast: false,
         host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,

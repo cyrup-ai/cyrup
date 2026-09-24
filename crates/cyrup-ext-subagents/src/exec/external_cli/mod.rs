@@ -16,6 +16,7 @@
 pub mod adapters;
 pub mod env;
 pub mod framing;
+mod placed;
 pub mod preflight;
 pub mod prompt;
 pub mod run;
@@ -219,6 +220,19 @@ pub async fn run_external_cli(
         )
     };
 
+    // SUBA-096 — pi refuses fast mode for a foreign runner before anything launches
+    // (`subagent-executor.ts:3353-3355`, `async-execution.ts:1012,1756` @v0.68.0): the priority
+    // tier is a request-body field on pi's OWN provider calls, which a foreign CLI never makes.
+    // `opts.fast` is already the effective `step > call > agent` value, so this one site covers
+    // the foreground, async and chain-step launches alike. `[CYRUP-DELTA]` (text only): upstream's
+    // async paths phrase it inside a list (`does not support: …, fast mode.`); every path here
+    // uses the foreground sentence, since cyrup has no multi-item external-runner refusal list.
+    if opts.fast {
+        return pre_spawn(format!(
+            "Agent '{}' uses runner.type='external-cli' and does not support fast mode.",
+            agent.name
+        ));
+    }
     // `buildExternalCliPrompt(step.systemPrompt ?? "", task)` (`subagent-runner.ts:1506`) — over
     // the POST-acceptance task. Upstream appends `formatAcceptancePrompt(step.effectiveAcceptance,
     // …)` to `task` at `:1462-1465`, ABOVE the `if (step.runner?.type === "external-cli")` branch
@@ -230,6 +244,45 @@ pub async fn run_external_cli(
         &agent.system_prompt_body,
         &crate::exec::acceptance::inject_acceptance_contract(task, contract),
     );
+    // SUBA-100 — a resolved machine sends an OWNED profile to a Herdr pane on that machine
+    // (`subagent-runner.ts:900-944` @v0.68.0). Its prompt goes through Herdr's `agent.prompt`, so
+    // the local delivery, environment and preflight below are not used. A generic command never
+    // reaches here placed — the launch refused it — and the backstop repeats that refusal.
+    if let Some(machine) = opts.machine.as_ref() {
+        let adapter = match agent.runner.as_ref() {
+            Some(crate::runner::AgentRunnerConfig::ExternalCli(cli)) => cli.adapter,
+            _ => None,
+        };
+        let Some(adapter) = adapter else {
+            return pre_spawn(
+                crate::placement::format_herdr_machine_runner_unsupported(
+                    Some(machine.display_name()),
+                    &agent.name,
+                    agent.runner.as_ref(),
+                    false,
+                )
+                .unwrap_or_else(|| {
+                    format!(
+                        "Agent '{}' requested a machine, but its runner has no pane-native profile.",
+                        agent.name
+                    )
+                }),
+            );
+        };
+        return placed::run_placed_external_cli(
+            agent,
+            task,
+            opts,
+            placed::PlacedExternalCli {
+                adapter,
+                machine,
+                prompt: &prompt_text,
+                status,
+                output_snapshot,
+            },
+        )
+        .await;
+    }
     let prepared = match delivery.prepare(&prompt_text) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -320,6 +373,11 @@ pub async fn run_external_cli(
     );
 
     SingleResult {
+        execution: None,
+        native_machine: None,
+        runtime_acknowledged_extensions: None,
+        skills_warning: None,
+        watchdog: None,
         agent: agent.name.clone(),
         task: task.to_string(),
         exit_code: outcome.exit_code,

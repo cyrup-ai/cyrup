@@ -609,8 +609,7 @@ async fn a_clean_shutdown_releases_the_pane_last() {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
         // The subscription connection is opened once at arm time and never carries another
         // request; it is not part of the report ordering.
-        .filter(|call| call["method"] != "events.subscribe" && call["method"] != "session.snapshot")
-        .next_back()
+        .rfind(|call| call["method"] != "events.subscribe" && call["method"] != "session.snapshot")
         .unwrap();
     assert_eq!(
         last["method"], "pane.release_agent",

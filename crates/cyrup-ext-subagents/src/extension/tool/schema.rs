@@ -147,12 +147,14 @@ fn sj_task_item() -> serde_json::Value {
             "agent": { "type": "string" },
             "task": { "type": "string" },
             "cwd": { "type": "string" },
+            "machine": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Herdr saved machine id or label." },
             "count": { "type": "integer", "minimum": 1 },
             "output": sj_output_override(),
             "outputMode": sj_output_mode(),
             "reads": sj_reads_override(),
             "progress": { "type": "boolean" },
             "model": { "type": "string" },
+            "fast": { "type": "boolean", "description": "Opt into priority service tier for supported native OpenAI-Codex child models. This can increase quota or cost." },
             "skill": sj_skill_override(),
             "acceptance": sj_acceptance_override()
         }
@@ -173,6 +175,7 @@ fn sj_parallel_task() -> serde_json::Value {
             "as": { "type": "string" },
             "outputSchema": sj_json_schema_object(),
             "cwd": { "type": "string" },
+            "machine": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Herdr saved machine id or label." },
             "count": { "type": "integer", "minimum": 1 },
             "output": sj_output_override(),
             "outputMode": sj_output_mode(),
@@ -180,6 +183,7 @@ fn sj_parallel_task() -> serde_json::Value {
             "progress": { "type": "boolean" },
             "skill": sj_skill_override(),
             "model": { "type": "string" },
+            "fast": { "type": "boolean", "description": "Opt into priority service tier for supported native OpenAI-Codex child models. This can increase quota or cost." },
             "acceptance": sj_acceptance_override()
         }
     })
@@ -199,12 +203,14 @@ fn sj_dynamic_parallel_template() -> serde_json::Value {
             "label": { "type": "string" },
             "outputSchema": sj_json_schema_object(),
             "cwd": { "type": "string" },
+            "machine": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Herdr saved machine id or label." },
             "output": sj_output_override(),
             "outputMode": sj_output_mode(),
             "reads": sj_reads_override(),
             "progress": { "type": "boolean" },
             "skill": sj_skill_override(),
             "model": { "type": "string" },
+            "fast": { "type": "boolean", "description": "Opt into priority service tier for supported native OpenAI-Codex child models. This can increase quota or cost." },
             "acceptance": sj_acceptance_override()
         }
     })
@@ -262,12 +268,14 @@ fn sj_chain_item() -> serde_json::Value {
             "as": { "type": "string" },
             "outputSchema": sj_json_schema_object(),
             "cwd": { "type": "string" },
+            "machine": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Herdr saved machine id or label." },
             "output": sj_output_override(),
             "outputMode": sj_output_mode(),
             "reads": sj_reads_override(),
             "progress": { "type": "boolean" },
             "skill": sj_skill_override(),
             "model": { "type": "string" },
+            "fast": { "type": "boolean", "description": "Opt into priority service tier for supported native OpenAI-Codex child models. This can increase quota or cost." },
             "acceptance": sj_acceptance_override(),
             "parallel": {
                 "anyOf": [
@@ -360,6 +368,9 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
             "description": "Management/control action. Omit for execution mode."
         }),
     );
+    // SUBA-104 — pi `capabilities` (`extension/schemas.ts:287` @v0.68.0), right after `action`
+    // as upstream, description VERBATIM.
+    props.insert("capabilities".to_string(), serde_json::json!({ "type": "boolean", "description": "list: compact capability rows/details without system prompts." }));
     // G90 (advertise-vs-dispatch, the OTHER direction): these three, plus `message` below, are the
     // schema properties `action='steer'` is addressed through, and all four dropped pi's own
     // `action='steer'` clause (`extension/schemas.ts:224,227,230,238` @v0.34.0, descriptions
@@ -541,6 +552,9 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // SCOPE_19/B [CYRUP-DELTA] — upstream leaves `cwd` undescribed; a property with no description
     // makes a careful caller set it defensively. It is read by every execution mode.
     props.insert("cwd".to_string(), serde_json::json!({ "type": "string", "description": "Working directory for the run (agent discovery root and base for relative paths). Default: the session's cwd." }));
+    // SUBA-100 — pi `machine` (`extension/schemas.ts:369` @v0.68.0), right after `cwd` as
+    // upstream: with a machine, `cwd` names the directory ON THAT MACHINE.
+    props.insert("machine".to_string(), serde_json::json!({ "type": "string", "minLength": 1, "maxLength": 128, "description": "Herdr saved machine id or label; runs the agent there (native cyrup or a built-in Claude, Codex, or Cursor profile). cwd then means the directory on that machine." }));
     props.insert("artifacts".to_string(), serde_json::json!({ "type": "boolean", "description": "Write debug artifacts (default: true)" }));
     // SUBA-N06: `includeProgress` is advertised again, in pi's own position (between `artifacts`
     // and `share`, `schemas.ts:271-273` @v0.34.0) and with pi's description verbatim. It was
@@ -553,9 +567,12 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("includeProgress".to_string(), serde_json::json!({ "type": "boolean", "description": "Include full progress in result (default: false)" }));
     props.insert("share".to_string(), serde_json::json!({ "type": "boolean", "description": "Upload session to GitHub Gist for sharing (default: false)" }));
     props.insert("sessionDir".to_string(), serde_json::json!({ "type": "string", "description": "Directory to store session logs (default: temp; enables sessions even if share=false)" }));
-    props.insert("clarify".to_string(), serde_json::json!({ "type": "boolean", "description": "Show TUI to preview/edit before execution. Explicit clarify: true keeps the run foreground for the clarify UI; omitted clarify can still run in the background when async: true is set." }));
-    // SUBA-N05: `control` is advertised again, in pi's own position (between `clarify` and the solo
-    // agent overrides, `schemas.ts:278-279` @v0.34.0). It reaches `resolveControlConfig`
+    // PB-9: `clarify` is NOT advertised. It left upstream's schema at `39c37184` (v0.43.0) and
+    // every public entry refuses it (`public-execution.ts:143-145` @v0.68.0); the preview UI it
+    // described ("Show TUI to preview/edit before execution") was deleted at `ef554d2a` (v0.51.0)
+    // and never existed here.
+    // SUBA-N05: `control` is advertised again, in pi's v0.34.0 position (after the since-removed
+    // `clarify` and before the solo agent overrides, `schemas.ts:278-279` @v0.34.0). It reaches `resolveControlConfig`
     // ([`crate::exec::control::resolve_control_config`]) on the foreground path via
     // `SingleRunOverrides::control` and on the async path via `RunnerConfig::control`, and drives
     // the live attention/notice pipeline in both. pi gives the top-level entry no description of
@@ -589,6 +606,8 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
         "description": "Skill name(s) to make available (comma-separated), array of strings, or boolean (false disables, true uses default)"
     }));
     props.insert("model".to_string(), serde_json::json!({ "type": "string", "description": "Override model for single agent (e.g. 'anthropic/claude-sonnet-4')" }));
+    // SUBA-096 — pi `fast` (`extension/schemas.ts:388` @v0.68.0), right after `model` as upstream.
+    props.insert("fast".to_string(), serde_json::json!({ "type": "boolean", "description": "Native OpenAI-Codex priority tier; default false, may cost more/quota." }));
     // SUBA-043 / pi `extension/schemas.ts:351` @v0.43.0 — `outputSchema:
     // Type.Optional(JsonSchemaObject)` is a TOP-LEVEL `SubagentParamsSchema` property, in exactly
     // this position (after `model`, before `agentContract`/`acceptance`) under upstream's "Workflow
@@ -743,6 +762,45 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    /// PB-9 — the schema does not advertise `clarify` (upstream dropped it at v0.43.0 and refuses
+    /// it at every public entry). Mutation killed: re-inserting the property.
+    #[test]
+    fn the_schema_does_not_advertise_clarify() {
+        let schema = subagent_tool_parameters();
+        assert!(
+            schema["properties"].get("clarify").is_none(),
+            "a key the boundary refuses must not be advertised"
+        );
+    }
+
+    /// SUBA-096 — pi advertises `fast` on the top level and on the three item schemas
+    /// (`extension/schemas.ts:167,199,229,388` @v0.68.0), with upstream's descriptions, and the
+    /// parser now reads it. Mutation killed: deleting any one of the four insertions.
+    #[test]
+    fn fast_is_advertised_on_the_top_level_and_every_item_schema() {
+        let schema = subagent_tool_parameters();
+        let props = &schema["properties"];
+        assert_eq!(props["fast"]["type"], serde_json::json!("boolean"));
+        assert_eq!(
+            props["fast"]["description"],
+            serde_json::json!(
+                "Native OpenAI-Codex priority tier; default false, may cost more/quota."
+            )
+        );
+        let item = |value: &serde_json::Value| value["properties"]["fast"]["type"].clone();
+        assert_eq!(item(&props["tasks"]["items"]), serde_json::json!("boolean"));
+        assert_eq!(item(&props["chain"]["items"]), serde_json::json!("boolean"));
+        assert_eq!(item(&sj_parallel_task()), serde_json::json!("boolean"));
+        assert_eq!(
+            item(&sj_dynamic_parallel_template()),
+            serde_json::json!("boolean")
+        );
+        let parsed: SubagentToolParams =
+            serde_json::from_value(serde_json::json!({"agent": "a", "task": "t", "fast": true}))
+                .expect("parses");
+        assert_eq!(parsed.fast, Some(true));
+    }
+
     /// C8: the LLM-facing `subagent` tool schema exposes pi's FULL parameter union
     /// (`schemas.ts:257-357`), not just the pre-C8 5-property single-task shape. Asserts every
     /// top-level pi property name is present, the 11-value management/control `action` enum is
@@ -807,7 +865,6 @@ mod tests {
             "includeProgress",
             "share",
             "sessionDir",
-            "clarify",
             "control",
             "output",
             "outputMode",

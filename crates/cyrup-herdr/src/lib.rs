@@ -68,26 +68,32 @@
 //! # What is ported, and what is deliberately not
 //!
 //! herdr publishes 105 renamed methods (`tmp/herdr/src/api/schema.rs:47-271`). [`HerdrClient`]
-//! carries **24** of them (every variant of [`schema::Method`]; 23 go through
-//! [`HerdrClient::call`] and the twenty-fourth, `events.subscribe`, keeps its connection and is
-//! driven by [`HerdrClient::subscribe`]). The remaining **81** are absent, and each block below
+//! carries **28** of them (every variant of [`schema::Method`]; 27 go through
+//! [`HerdrClient::call`] and the twenty-eighth, `events.subscribe`, keeps its connection and is
+//! driven by [`HerdrClient::subscribe`]). The remaining **77** are absent, and each block below
 //! says what would have to exist first — "large" is never the reason, because the envelope is
 //! generic and each method is one enum variant.
 //!
-//! **24 + 81 = 105, and the counts below add up to 81.** That is the point of stating them: a
+//! The four newest — `workspace.create`, `tab.create`, `agent.start` and `agent.prompt` — are
+//! saved-machine placement's (`crates/cyrup-ext-subagents/src/placement/`): it opens a
+//! herdr-owned pane on a remote machine through a forwarded socket ([`remote`]) and launches the
+//! placed child there, exactly the verbs pi-subagents drives
+//! (`src/runs/shared/herdr-placed-run.ts:135-175` @v0.68.0).
+//!
+//! **28 + 77 = 105, and the counts below add up to 77.** That is the point of stating them: a
 //! family whose size is guessed hides a method nobody decided about. `pane.rename`,
 //! `pane.send_text` and `pane.send_keys` were exactly that — absent from every row of this table
 //! while being absent from the client too.
 //!
 //! | not ported | count | what would need it |
 //! |---|---|---|
-//! | `events.wait`, `agent.prompt`, `agent.wait` | 3 | the other three methods that hold a connection open past the first answer (`tmp/herdr/src/api/server.rs:251-288`). Unlike `events.subscribe` they answer **once** and then close, so they need no stream — they need a *sibling-agent* caller, which no batch has yet. `agent.prompt`/`agent.wait` are the highest-value of the three: server-owned and pane-occupant-pinned (`socket-api.mdx:114`). |
+//! | `events.wait`, `agent.wait` | 2 | two of the methods that hold a connection open past the first answer (`tmp/herdr/src/api/server.rs:251-288`); the third, `agent.prompt`, is ported for placement and waits through its own `wait` option. Unlike `events.subscribe` they answer **once** and then close, so they need no stream — they need a *sibling-agent* caller, which no batch has yet. |
 //! | `pane.graphics.{info,set,clear,stream}`, plus the 4 `#[serde(skip)]` frame variants that are not among the 105 | 4 | the wire contract is a raw-byte side channel after the JSON header (`socket-api.mdx:204-236`). **cyrup has no image producer**, so these methods would have no argument to carry. |
 //! | `plugin.*` (11), `integration.*` (3) | 14 | require shipping a `herdr-plugin.toml` package (`socket-api.mdx:499-560`) — a distinct deliverable with its own install story. |
 //! | `worktree.*` | 4 | herdr worktrees create **herdr workspaces**. cyrup owns its worktrees through `gix` (`crates/cyrup-ext-subagents/src/spawn/worktree.rs`); adopting herdr's would move ownership of a feature that already works. |
 //! | pane geometry, scrollback and raw input — `swap` `move` `zoom` `resize` `neighbor` `edges` `focus_direction` `scroll` `copy_motion` `copy_search` `selection.read` `edit_scrollback` `clear` `input.set` `link.activate` `link.resolve` `layout` `rename` `send_text` `send_keys` + `layout.{export,apply,set_split_ratio}` | 23 | **no consumer arranges the user's terminal.** Every batch in flight splits, reads, writes and closes; none moves panes around. `send_text`/`send_keys` are the raw halves of `pane.send_input`, which is the one this client sends because it is what `herdr pane run` is (`tmp/herdr/src/cli/pane.rs:1046-1052`). Add on first caller. |
 //! | `server.stop`, `server.live_handoff` | 2 | destroy or restart the user's whole terminal session. |
-//! | `workspace.*` (9), `tab.{create,list,focus,move,close}` (5), `agent.{read,explain,send_keys,rename,focus,start}` (6), `command.invoke`, `popup.close`, `notification.show`, `client.window_title.{set,clear}` (2), `product_announcement.dismiss`, `release_notes.dismiss`, `server.reload_config`, `server.{agent_manifests,reload_agent_manifests}` (2) | 30 | no caller yet. |
+//! | `workspace.*` except `create` (8), `tab.{list,focus,move,close}` (4), `agent.{read,explain,send_keys,rename,focus}` (5), `command.invoke`, `popup.close`, `notification.show`, `client.window_title.{set,clear}` (2), `product_announcement.dismiss`, `release_notes.dismiss`, `server.reload_config`, `server.{agent_manifests,reload_agent_manifests}` (2) | 27 | no caller yet. |
 //! | `client_shell.surface.set` | 1 | **cannot be ported.** The raw socket refuses it by construction — `connection_local_only`, `tmp/herdr/src/api/server.rs:370-376`. It is absent, not deferred. |
 //!
 //! # A leaf, deliberately
@@ -123,8 +129,13 @@ pub mod cli;
 pub mod client;
 pub mod env;
 pub mod error;
+pub mod machine;
 pub mod probe;
 pub mod reconnect;
+#[cfg(unix)]
+pub mod relay;
+#[cfg(unix)]
+pub mod remote;
 pub mod schema;
 pub mod stream;
 pub mod transport;

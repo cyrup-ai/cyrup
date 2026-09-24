@@ -147,6 +147,7 @@ fn spawn_env_child_role_entry() {
 /// the persona name all come out of the same assembly a real `subagent` tool call performs.
 fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMap<String, String> {
     let agent = AgentConfig {
+        machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         name: CHILD_AGENT_NAME.to_string(),
@@ -164,6 +165,8 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -179,9 +182,12 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         runner: None, // SUBA-074: the native child, as before
     };
     let opts = RunOptions {
+        parent_env_overrides: std::collections::BTreeMap::new(),
+        machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
         // nothing is recorded, which is this field's documented `None` behaviour.
         model_exclusions: None,
+        fast: false,
         host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,

@@ -20,7 +20,7 @@ use crate::background::control;
 use crate::background::flat_index::flat_total;
 use crate::error::SubagentError;
 use crate::exec::SingleResult;
-use crate::jsonl::BoundedJsonlWriter;
+use crate::jsonl::RunEventLog;
 use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, StepResult};
 
 /// What [`run_inner`](super::turn_loop::run_inner)'s loop does next once a dispatched step's outcome has been recorded.
@@ -355,6 +355,9 @@ pub(super) async fn skip_child_stopped_step(
 /// (no child ever ran) and nothing timed out.
 pub(super) fn child_stopped_step_result() -> StepResult {
     StepResult {
+        execution: None,
+        native_machine: None,
+        runtime_acknowledged_extensions: None,
         success: false,
         structured_output: None,
         final_output: Some(control::STOP_MESSAGE.to_string()),
@@ -382,6 +385,7 @@ pub(super) fn child_stopped_step_result() -> StepResult {
         // No child ran, so no transcript writer ever existed.
         transcript_path: None,
         transcript_error: None,
+        watchdog: None,
     }
 }
 
@@ -392,6 +396,9 @@ pub(super) fn stopped_single_result(step: &RunnerStep) -> SingleResult {
     let mut single = step_result_to_single_result(
         step,
         &StepResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
             success: false,
             structured_output: None,
             final_output: Some(message.clone()),
@@ -419,6 +426,7 @@ pub(super) fn stopped_single_result(step: &RunnerStep) -> SingleResult {
             // No child ran, so no transcript writer ever existed.
             transcript_path: None,
             transcript_error: None,
+            watchdog: None,
         },
     );
     single.exit_code = 1;
@@ -430,7 +438,7 @@ pub(super) fn stopped_single_result(step: &RunnerStep) -> SingleResult {
 /// (`subagent-runner.ts:3008`/`:4335-4339`: `exitCode: 1`, `durationMs`) and the terminal
 /// `subagent.child-status` `stopped` (`appendTerminalChildStatusEvent`, `:2975-2978`).
 pub(super) async fn append_child_stopped_events(
-    events: &mut Option<BoundedJsonlWriter>,
+    events: &mut Option<RunEventLog>,
     config: &RunnerConfig,
     index: usize,
     summary: &crate::background::child_stop::ChildStoppedSummary,
@@ -473,7 +481,7 @@ pub(super) async fn append_child_stopped_events(
 pub(super) async fn cascade_to_descendants(
     roots: &crate::paths::Roots,
     config: &RunnerConfig,
-    events: &mut Option<BoundedJsonlWriter>,
+    events: &mut Option<RunEventLog>,
     verb: cascade::CascadeVerb,
 ) {
     let Some(route) = config.nested_route.as_ref() else {
@@ -588,6 +596,17 @@ pub(super) fn step_result_to_single_result_with(
 ) -> SingleResult {
     let ResultIdentity { agent, task } = identity;
     SingleResult {
+        // SUBA-100 — the step's result carries both onto the terminal result payload
+        // (`subagent-runner.ts:1579,928` @v0.68.0).
+        execution: result.execution,
+        native_machine: result.native_machine.clone(),
+        // SUBA-063 — pi's step results carry `runtimeAcknowledgedExtensions:
+        // r.runtimeAcknowledgedExtensions` onto the terminal result payload
+        // (`subagent-runner.ts:5068` @v0.68.0).
+        runtime_acknowledged_extensions: result.runtime_acknowledged_extensions.clone(),
+        skills_warning: None,
+        // UW-3 — pi's step results carry `watchdog: pr.watchdog` (`subagent-runner.ts:3565`).
+        watchdog: result.watchdog.clone(),
         // SUBA-021: no usage budget on this path (see the field doc).
         usage_budget: None,
         turn_budget: None,
@@ -684,6 +703,11 @@ pub(super) fn imported_root_to_single_result(
     imported: &control::ImportedAsyncRootResult,
 ) -> SingleResult {
     SingleResult {
+        execution: None,
+        native_machine: None,
+        runtime_acknowledged_extensions: None,
+        skills_warning: None,
+        watchdog: None,
         // SUBA-021: no usage budget on this path (see the field doc).
         usage_budget: None,
         turn_budget: None,

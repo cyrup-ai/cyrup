@@ -13,15 +13,15 @@
 //!   indistinguishable from a clean review.
 //! * **Child -> parent, continuously**: the child writes [`ChildWatchdogStatusEvent`] records to its
 //!   own stdout (`register-child.ts:48-56`), the parent filters them out of the NDJSON stream with
-//!   [`is_child_watchdog_status_event`] (`:168-181`) and folds them with
-//!   [`accept_child_watchdog_event`] (`:188-205`). That fold is what keeps a settled child open: the
+//!   [`is_child_watchdog_status_event`] (`:167-179` @v0.43.0) and folds them with
+//!   [`accept_child_watchdog_event`] (`:186-205`). That fold is what keeps a settled child open: the
 //!   parent's `watchdogTailTimer` (`execution.ts:608-621`, `subagent-runner.ts:860-871`) will not
-//!   close a run while [`child_watchdog_is_active`] (`:183-186`) is true.
+//!   close a run while [`child_watchdog_is_active`] (`:181-184`) is true.
 //!
 //! Two rules in the fold are easy to lose and are asserted below. **Identity filtering is per-field
-//! and only when the parent asked for it** (`:194-198`): a parent that passes `run_id: None` accepts
+//! and only when the parent asked for it** (`:193-196`): a parent that passes `run_id: None` accepts
 //! events from any run, but a parent that passes `Some` rejects a mismatch outright — including an
-//! event that carries no `runId` at all. **Sequence numbers are strictly increasing** (`:199`):
+//! event that carries no `runId` at all. **Sequence numbers are strictly increasing** (`:197`):
 //! `seq <= current.seq` is dropped, so a re-delivered or out-of-order event can never walk the phase
 //! backwards.
 //!
@@ -468,19 +468,14 @@ pub fn decode_child_watchdog_config(
     }))
 }
 
-/// `isChildWatchdogStatusEvent` (`child-status.ts:168-181`) — the parent's NDJSON filter.
+/// `isChildWatchdogStatusEvent` (`child-status.ts:167-179` @v0.43.0) — the parent's NDJSON filter.
 ///
-/// **No non-test caller yet, and the missing caller is not in this module.** Upstream consumes this
-/// predicate, [`child_watchdog_is_active`] and [`accept_child_watchdog_event`] together, in the two
-/// places that read a child's stdout: `runs/foreground/execution.ts:846-864` and
-/// `runs/background/subagent-runner.ts:626-645` (again at `:2711`). Both fold the event into a
-/// `childWatchdogState`, then use `childWatchdogIsActive` to arm a WATCHDOG TAIL timer that holds
-/// the run open while the child is still reviewing (`execution.ts:584-587`,
-/// `subagent-runner.ts:831`) instead of letting the final-drain timer terminate it. cyrup's
-/// counterparts are `crate::exec` and `crate::background`, and neither reads a child watchdog
-/// status event today, so an armed child that is mid-review can still be drained out from under
-/// itself. That is unported wiring in those modules; the three predicates here are faithful ports
-/// of `child-status.ts:167-205` and are what it will call.
+/// Consumed, with [`child_watchdog_is_active`] and [`accept_child_watchdog_event`], in the two places
+/// that read a child's stdout, as upstream consumes them (`runs/foreground/execution.ts:846-864`,
+/// `runs/background/subagent-runner.ts:626-645` @v0.43.0): the parent drive loop
+/// (`crate::exec::drive_attempt`, UW-3 — which holds a reviewing child open under a watchdog tail
+/// instead of force-draining it) and the background runner's `status.json` fold
+/// (`crate::background::apply_child_watchdog_line_to_step`, upstream `:2711-2722`).
 ///
 /// Every one of upstream's seven predicates is reproduced: the `type` discriminator, an integral
 /// non-negative `seq`, a finite numeric `ts`, a boolean `followUpPending`, and a `phase` that is a
@@ -506,7 +501,7 @@ pub fn is_child_watchdog_status_event(value: &Value) -> bool {
             .is_some_and(|phase| ChildWatchdogPhase::parse(phase).is_some())
 }
 
-/// `childWatchdogIsActive` (`child-status.ts:183-186`) — the predicate the parent's tail timer
+/// `childWatchdogIsActive` (`child-status.ts:181-184` @v0.43.0) — the predicate the parent's tail timer
 /// consults. `stale` and `failed` are terminal and do NOT hold the run open.
 #[must_use]
 pub fn child_watchdog_is_active(snapshot: Option<&ChildWatchdogStateSnapshot>) -> bool {
@@ -522,7 +517,7 @@ pub fn child_watchdog_is_active(snapshot: Option<&ChildWatchdogStateSnapshot>) -
         )
 }
 
-/// `acceptChildWatchdogEvent` (`child-status.ts:188-205`) — fold one event, or reject it.
+/// `acceptChildWatchdogEvent` (`child-status.ts:186-205` @v0.43.0) — fold one event, or reject it.
 ///
 /// `None` means "not for us, or not newer"; the caller keeps its existing snapshot unchanged. The
 /// index comparison uses `event.childIndex ?? event.stepIndex` (`:196`), so a chain step that only

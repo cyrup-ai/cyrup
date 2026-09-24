@@ -535,6 +535,22 @@ impl ExecSingleStepExecutor {
                 step.agent
             ))));
         };
+        // SUBA-100 — a placed step reaches this executor already RESOLVED (every launch path
+        // folds `s.machine ?? launchMachine ?? a.machine` against the catalog before any child
+        // spawns). A requested-but-unresolved placement, or a placed persona on an unplaced step,
+        // never ran through that fold — running it locally would silently move the work off the
+        // machine the caller named, so it is refused instead.
+        let unplaced = match step.machine.as_ref() {
+            Some(placement) if placement.resolved.is_none() => Some(placement.requested.clone()),
+            Some(_) => None,
+            None => persona.machine.clone(),
+        };
+        if let Some(machine) = unplaced {
+            return Err(Box::new(StepResult::failure(format!(
+                "Agent '{}' requested machine '{machine}', but this step was not placed at launch; relaunch it through the subagent tool so the placement resolves.",
+                step.agent
+            ))));
+        }
 
         // Reconstitute the execution-ready config from the persona, stamping THIS process's own
         // live depth envelope (a per-process runtime value the persona deliberately does not carry).
@@ -771,6 +787,18 @@ impl ExecSingleStepExecutor {
             }
         });
         RunOptions {
+            // The detached runner's own environment is its parent's hand-off: no overrides.
+            parent_env_overrides: std::collections::BTreeMap::new(),
+            // SUBA-100 — the launch-resolved placement the step carries (refused above when it
+            // was requested but never resolved).
+            machine: step
+                .machine
+                .as_ref()
+                .and_then(|placement| placement.resolved.clone()),
+            // SUBA-096 — the step's effective `fast` (`s.fast ?? params.fast ?? a.fast`), folded
+            // at plan time by the dispatch site (`apply_agent_launch_defaults`, the async-single
+            // builder); this runner holds only the step, so it reads the result.
+            fast: step.fast == Some(true),
             spawn_command: self.spawn_command.clone(),
             child_env: self.child_env.clone(),
             // pi `hostAvailableBuiltins` — the LAUNCHING process's host observation, applied per
@@ -1179,6 +1207,10 @@ fn build_step_result(
         control_events,
         transcript_path,
         transcript_error,
+        watchdog,
+        runtime_acknowledged_extensions,
+        native_machine,
+        execution,
         ..
     } = result;
     let mut step_result = if exit_code == 0 {
@@ -1224,6 +1256,18 @@ fn build_step_result(
     // `..` caveat as the fields above: dropping these lines builds clean and loses the path.
     step_result.transcript_path = transcript_path;
     step_result.transcript_error = transcript_error;
+    // UW-3 — pi `setOptionalProperty(step, "watchdog", singleResult.watchdog)`
+    // (`subagent-runner.ts:3508` @v0.43.0). Same trailing-`..` caveat as above.
+    step_result.watchdog = watchdog;
+    // SUBA-063 — pi `setOptionalProperty(requiredStatusStep(statusPayload, fi),
+    // "runtimeAcknowledgedExtensions", singleResult.runtimeAcknowledgedExtensions)`
+    // (`subagent-runner.ts:3834`/`:4253`/`:4738` @v0.68.0) and the chain-results copy (`:3870`,
+    // `:4635`) both read it off the step's own `singleResult`. Same trailing-`..` caveat as above.
+    step_result.runtime_acknowledged_extensions = runtime_acknowledged_extensions;
+    // SUBA-100 — pi `nativeMachine: finalResult?.nativeMachine` (`subagent-runner.ts:1579`
+    // @v0.68.0) and `execution` (`:928`) on the step's result. Same trailing-`..` caveat as above.
+    step_result.native_machine = native_machine;
+    step_result.execution = execution;
     // SUBA-N05: carry the events this step's control monitor raised out of `run_sync` so
     // `step_result_to_single_result` can put them on the terminal `ResultFile`. Without this
     // hop the whole async control path is inert: the thresholds are honoured, the events are

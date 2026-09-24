@@ -816,6 +816,11 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
         .steps
         .iter()
         .map(|step| crate::exec::SingleResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            skills_warning: None,
+            watchdog: None,
             // SUBA-021: no usage budget on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
@@ -891,6 +896,11 @@ pub(crate) fn placeholder_result(
 ) -> crate::exec::SingleResult {
     let _ = mode;
     crate::exec::SingleResult {
+        execution: None,
+        native_machine: None,
+        runtime_acknowledged_extensions: None,
+        skills_warning: None,
+        watchdog: None,
         // SUBA-021: no usage budget on this path (see the field doc).
         usage_budget: None,
         turn_budget: None,

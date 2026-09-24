@@ -142,120 +142,15 @@ pub(crate) fn editable_base(target: &AgentDefinition) -> AgentDefinition {
     base
 }
 
-/// pi `handleList` (`agent-management.ts:753-788` @v0.43.0 — thirty-six lines).
-///
-/// The proactive-skill block is spliced in exactly where upstream splices it: BETWEEN the `Chains:`
-/// block and the chain diagnostics, preceded by one blank line and only when it has lines
-/// (`agent-management.ts:784`'s
-/// `...(proactiveSuggestions.length ? ["", ...proactiveSuggestions] : [])`). Its two inputs — pi's
-/// `ctx.config?.proactiveSkillSubagents` and the result of its `discoverAvailableSkills(ctx.cwd)`
-/// closure — arrive on [`super::ManagementRequest::proactive_skills`]; see
-/// [`super::ProactiveSkillsInput`] for why the availability scan is pre-resolved by the async
-/// caller rather than run lazily here.
-///
-/// The recommender consults the SAME `agents`/`chains` bindings this function already rendered
-/// (upstream passes its own post-filter `agents` and `chains` locals), so a scope-filtered or
-/// disabled-filtered listing recommends only from what it listed.
-///
-/// There is no companion-suggestion block to port: upstream
-/// deleted `companionSuggestionLines` from `handleList`'s `ManagementContext` and from its rendered
-/// lines in `3ac0ef5` ("Make supervisor coordination native", 2026-07-03), together with the whole
-/// `extension/companion-suggestions.ts` module.
-pub(crate) fn handle_list(
-    cfg: &AgentDiscoveryConfig,
+/// The proactive skill-subagent block (pi `agent-management.ts:765-770,784` @v0.43.0; `:980-984,1001`
+/// @v0.68.0): computed from the executable agents (and chains) the listing rendered, appended with a
+/// leading blank line, and only when non-empty. Shared by the plain and the capability listing.
+fn append_proactive_suggestions(
+    lines: &mut Vec<String>,
     req: &ManagementRequest,
-) -> Result<ManagementOutcome, SubagentError> {
-    let scope = normalize_list_scope(req.agent_scope);
-    let d = discover_agents_all(cfg)?;
-
-    let mut agents: Vec<&AgentDefinition> = d
-        .agents
-        .iter()
-        .filter(|a| agent_in_list_scope(a.source, scope))
-        .filter(|a| !a.disabled.unwrap_or(false))
-        .collect();
-    agents.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let mut chains: Vec<&ChainDefinition> = d
-        .chains
-        .iter()
-        .filter(|c| chain_in_list_scope(c.source, scope))
-        .collect();
-    chains.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let diagnostics: Vec<&ChainDiscoveryDiagnostic> = d
-        .diagnostics
-        .iter()
-        .filter(|e| scope.is_none() || Some(e.source) == scope)
-        .collect();
-
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("Executable agents:".to_string());
-    if agents.is_empty() {
-        lines.push("- (none)".to_string());
-    } else {
-        for a in &agents {
-            let ctx = a
-                .default_context
-                .map(|c| format!(", context: {}", super::helpers::context_str(c)))
-                .unwrap_or_default();
-            // pi `agent-management.ts:774` @ v0.43.0 appends `, aliases: <a, b>` after the optional
-            // context segment and before the `: <description>` separator.
-            let aliases = if a.aliases.is_empty() {
-                String::new()
-            } else {
-                format!(", aliases: {}", a.aliases.join(", "))
-            };
-            // [CYRUP-DELTA] — pi `handleList` (`agent-management.ts:774` @v0.43.0) renders
-            // `- <name> (<source>[, context][, aliases]): <description>` and stops. The `, tools:`
-            // segment is cyrup's, added deliberately: pi's `handleGet` is the only surface that
-            // shows tools, so a parent following the documented `list` -> pick -> prompt flow never
-            // saw a tool list BEFORE it wrote a prompt that assumed one — and subagent tools are
-            // not inherited from the launching session, so that assumption is exactly the one that
-            // silently fails. Appended LAST, so every pi-shaped prefix stays byte-identical and a
-            // consumer parsing the leading segments is unaffected.
-            //
-            // `(unpinned)` rather than an empty list when the agent declares no `tools:` key: that
-            // child keeps its OWN default built-in set, which is not the same statement as "no
-            // tools" (which an explicitly-empty `tools:` would mean, and which renders as `tools: `
-            // with an empty list).
-            let tools = super::render::tool_list_str(a).map_or_else(
-                || ", tools: (unpinned)".to_string(),
-                |t| format!(", tools: {t}"),
-            );
-            lines.push(format!(
-                "- {} ({}{}{}{}): {}",
-                a.name,
-                source_str(a.source),
-                ctx,
-                aliases,
-                tools,
-                a.description
-            ));
-        }
-    }
-    lines.push(String::new());
-    lines.push("Chains:".to_string());
-    if chains.is_empty() {
-        lines.push("- (none)".to_string());
-    } else {
-        for c in &chains {
-            lines.push(format!(
-                "- {} ({}): {}",
-                c.name,
-                source_str(c.source),
-                c.description
-            ));
-        }
-    }
-    // SUBA-086 — pi `handleList` (`agent-management.ts:946-947` @v0.64.0) appends the agent
-    // diagnostics BEFORE the proactive suggestions, and hands it `d.agentDiagnostics` UNFILTERED
-    // (unlike `get`/`models`, which go through `diagnosticsForScope`) — so a `user`-scoped
-    // listing still shows a broken project file. Ported as written.
-    append_agent_diagnostic_lines(&mut lines, &d.agent_diagnostics);
-    // pi `agent-management.ts:765-770,784` @v0.43.0: the proactive suggestions are computed from the same
-    // filtered `agents`/`chains` this listing rendered, and spliced in after `Chains:` and before
-    // `Chain diagnostics:` — with a leading blank line, and only when non-empty.
+    agents: &[&AgentDefinition],
+    chains: &[&ChainDefinition],
+) {
     if let Some(proactive) = &req.proactive_skills {
         let agent_inputs: Vec<crate::discovery::skills::ProactiveAgentInput> = agents
             .iter()
@@ -280,6 +175,198 @@ pub(crate) fn handle_list(
             lines.extend(suggestions);
         }
     }
+}
+
+/// One plain `list` row (`- <name> (<source>[, placement][, context][, aliases], tools: …):
+/// <description>`). Shared by the executable listing and — SUBA-104 — the `Restricted agents`
+/// block pi appends with the same `formatLine` (`appendRestrictedAgentLines`,
+/// `agent-management.ts:852-859` @v0.68.0).
+fn format_agent_list_line(a: &AgentDefinition) -> String {
+    let ctx = a
+        .default_context
+        .map(|c| format!(", context: {}", super::helpers::context_str(c)))
+        .unwrap_or_default();
+    // pi `agent-management.ts:774` @ v0.43.0 appends `, aliases: <a, b>` after the optional
+    // context segment and before the `: <description>` separator.
+    let aliases = if a.aliases.is_empty() {
+        String::new()
+    } else {
+        format!(", aliases: {}", a.aliases.join(", "))
+    };
+    // [CYRUP-DELTA] — pi `handleList` (`agent-management.ts:774` @v0.43.0) renders
+    // `- <name> (<source>[, context][, aliases]): <description>` and stops. The `, tools:`
+    // segment is cyrup's, added deliberately: pi's `handleGet` is the only surface that
+    // shows tools, so a parent following the documented `list` -> pick -> prompt flow never
+    // saw a tool list BEFORE it wrote a prompt that assumed one — and subagent tools are
+    // not inherited from the launching session, so that assumption is exactly the one that
+    // silently fails. Appended LAST, so every pi-shaped prefix stays byte-identical and a
+    // consumer parsing the leading segments is unaffected.
+    //
+    // `(unpinned)` rather than an empty list when the agent declares no `tools:` key: that
+    // child keeps its OWN default built-in set, which is not the same statement as "no
+    // tools" (which an explicitly-empty `tools:` would mean, and which renders as `tools: `
+    // with an empty list).
+    let tools = super::render::tool_list_str(a).map_or_else(
+        || ", tools: (unpinned)".to_string(),
+        |t| format!(", tools: {t}"),
+    );
+    // SUBA-100 — pi `runnerListBadge` (`agent-management.ts:709-718` @v0.68.0), the
+    // segment right after the source: a placed native agent reads `machine: <m> (saved
+    // Herdr placement)`; a placed external-cli agent reads `external-cli:<cmd> @ <m> saved
+    // Herdr placement; transport ✓|missing; machine not preflighted` — only local ssh is
+    // checked at list time, the catalog and the remote CLI are checked at launch.
+    let placement = a
+        .machine
+        .as_deref()
+        .map(|machine| {
+            format!(
+                ", {}",
+                crate::placement::resolve::placement_list_badge(machine, a.runner.as_ref())
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "- {} ({}{}{}{}{}): {}",
+        a.name,
+        source_str(a.source),
+        placement,
+        ctx,
+        aliases,
+        tools,
+        a.description
+    )
+}
+
+/// pi `handleList` (`agent-management.ts:753-788` @v0.43.0 — thirty-six lines).
+///
+/// The proactive-skill block is spliced in exactly where upstream splices it: BETWEEN the `Chains:`
+/// block and the chain diagnostics, preceded by one blank line and only when it has lines
+/// (`agent-management.ts:784`'s
+/// `...(proactiveSuggestions.length ? ["", ...proactiveSuggestions] : [])`). Its two inputs — pi's
+/// `ctx.config?.proactiveSkillSubagents` and the result of its `discoverAvailableSkills(ctx.cwd)`
+/// closure — arrive on [`super::ManagementRequest::proactive_skills`]; see
+/// [`super::ProactiveSkillsInput`] for why the availability scan is pre-resolved by the async
+/// caller rather than run lazily here.
+///
+/// The recommender consults the SAME `agents`/`chains` bindings this function already rendered
+/// (upstream passes its own post-filter `agents` and `chains` locals), so a scope-filtered or
+/// disabled-filtered listing recommends only from what it listed.
+///
+/// There is no companion-suggestion block to port: upstream
+/// deleted `companionSuggestionLines` from `handleList`'s `ManagementContext` and from its rendered
+/// lines in `3ac0ef5` ("Make supervisor coordination native", 2026-07-03), together with the whole
+/// `extension/companion-suggestions.ts` module.
+///
+/// SUBA-104 — the capability ceiling split and the `capabilities: true` mode (`handleList`,
+/// `agent-management.ts:971-1005` @v0.68.0). The session's ceiling
+/// (`resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId)`) divides the visible agents
+/// into executable ones and a `Restricted agents (…)` block in BOTH modes; with
+/// [`super::ListOptions::capabilities`] the listing answers in
+/// [`super::capabilities::capability_listing`]'s compact rows and carries
+/// `details.agentCapabilities`.
+pub(crate) fn handle_list(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest,
+    list: &super::ListOptions<'_>,
+) -> Result<ManagementOutcome, SubagentError> {
+    let scope = normalize_list_scope(req.agent_scope);
+    let d = discover_agents_all(cfg)?;
+
+    let mut visible: Vec<&AgentDefinition> = d
+        .agents
+        .iter()
+        .filter(|a| agent_in_list_scope(a.source, scope))
+        .filter(|a| !a.disabled.unwrap_or(false))
+        .collect();
+    visible.sort_by(|a, b| a.name.cmp(&b.name));
+    // SUBA-104 — pi `:975-979`: a malformed inherited ceiling throws (fail closed), an unbounded
+    // agent axis keeps every agent executable. The inherited half is read through the
+    // extension's env seam ([`super::ListOptions::env_var`]), as the launches are.
+    let ceiling = crate::exec::capability_ceiling::resolve_current_capability_ceiling_from(
+        list.current_session_id,
+        &|key| list.env_var(key),
+    )
+    .map_err(SubagentError::CapabilityCeilingViolation)?;
+    let (agents, restricted): (Vec<&AgentDefinition>, Vec<&AgentDefinition>) =
+        visible.into_iter().partition(|a| {
+            crate::exec::capability_ceiling::is_agent_allowed(&a.name, ceiling.as_ref())
+        });
+    let restricted_sources =
+        crate::exec::capability_ceiling::capability_ceiling_agent_restriction_sources(
+            ceiling.as_ref(),
+        );
+
+    let mut chains: Vec<&ChainDefinition> = d
+        .chains
+        .iter()
+        .filter(|c| chain_in_list_scope(c.source, scope))
+        .collect();
+    chains.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let diagnostics: Vec<&ChainDiscoveryDiagnostic> = d
+        .diagnostics
+        .iter()
+        .filter(|e| scope.is_none() || Some(e.source) == scope)
+        .collect();
+
+    // SUBA-104 — capability mode (`agent-management.ts:989-1005` @v0.68.0): upstream's own
+    // v0.68.0 listing — source sections, restricted block, agent diagnostics, proactive
+    // suggestions — with no chain block (v0.68.0 lists no chains).
+    if list.capabilities {
+        let listing = super::capabilities::capability_listing(
+            &agents,
+            &restricted,
+            restricted_sources.as_deref(),
+        );
+        let mut lines = listing.lines;
+        append_agent_diagnostic_lines(&mut lines, &d.agent_diagnostics);
+        append_proactive_suggestions(&mut lines, req, &agents, &chains);
+        let mut outcome = ManagementOutcome::ok(lines.join("\n"));
+        outcome.details = Some(serde_json::json!({
+            "agentCapabilities": listing.agent_capabilities,
+        }));
+        return Ok(outcome);
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("Executable agents:".to_string());
+    if agents.is_empty() {
+        lines.push("- (none)".to_string());
+    } else {
+        for a in &agents {
+            lines.push(format_agent_list_line(a));
+        }
+    }
+    // SUBA-104 — pi `appendRestrictedAgentLines` (`agent-management.ts:998` @v0.68.0).
+    super::capabilities::append_restricted_agent_lines(
+        &mut lines,
+        &restricted,
+        restricted_sources.as_deref(),
+        &|a: &AgentDefinition| format_agent_list_line(a),
+    );
+    lines.push(String::new());
+    lines.push("Chains:".to_string());
+    if chains.is_empty() {
+        lines.push("- (none)".to_string());
+    } else {
+        for c in &chains {
+            lines.push(format!(
+                "- {} ({}): {}",
+                c.name,
+                source_str(c.source),
+                c.description
+            ));
+        }
+    }
+    // SUBA-086 — pi `handleList` (`agent-management.ts:946-947` @v0.64.0) appends the agent
+    // diagnostics BEFORE the proactive suggestions, and hands it `d.agentDiagnostics` UNFILTERED
+    // (unlike `get`/`models`, which go through `diagnosticsForScope`) — so a `user`-scoped
+    // listing still shows a broken project file. Ported as written.
+    append_agent_diagnostic_lines(&mut lines, &d.agent_diagnostics);
+    // pi `agent-management.ts:765-770,784` @v0.43.0: the proactive suggestions are computed from the same
+    // filtered `agents`/`chains` this listing rendered, and spliced in after `Chains:` and before
+    // `Chain diagnostics:` — with a leading blank line, and only when non-empty.
+    append_proactive_suggestions(&mut lines, req, &agents, &chains);
     if !diagnostics.is_empty() {
         lines.push(String::new());
         lines.push("Chain diagnostics:".to_string());
@@ -386,6 +473,7 @@ pub(crate) fn handle_get(
     Ok(ManagementOutcome {
         text: blocks.join("\n\n"),
         is_error: !any_found,
+        details: None,
     })
 }
 
@@ -509,13 +597,13 @@ pub(crate) fn handle_models(
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 
-/// pi `handleCreate` (`agent-management.ts:908-975`). Model/skills registry warnings are deferred
+/// pi `handleCreate` (`agent-management.ts:908-975`). The model-registry warning is deferred
 /// (see `discovery/management.rs`'s own C3 section header, preserved on
 /// [`crate::discovery::management::handle_management_action`]); the create + name-collision +
-/// shadow-note + unknown-agent warnings are faithful.
-pub(crate) fn handle_create(
+/// shadow-note + unknown-agent warnings, and (PB-14) the skills-not-found warning, are faithful.
+pub(crate) async fn handle_create(
     cfg: &AgentDiscoveryConfig,
-    req: &ManagementRequest,
+    req: &ManagementRequest<'_>,
 ) -> Result<ManagementOutcome, SubagentError> {
     use serde_json::Value;
     let cfg_map = match config_object(req.config) {
@@ -637,6 +725,17 @@ pub(crate) fn handle_create(
             "config.package is invalid after sanitization.",
         ));
     };
+    // PB-14 — pi `skillsWarning(ctx.cwd, agent)` (`agent-management.ts:1185-1186` @v0.68.0),
+    // appended AFTER the headline with the other warnings.
+    if let Some(warning) = management_skills_warning(
+        cfg,
+        fields.skills.as_deref().unwrap_or_default(),
+        &created.file_path,
+    )
+    .await
+    {
+        warnings.push(warning);
+    }
     let mut lines = vec![format!(
         "Created agent '{runtime_name}' at {}.",
         created.file_path.display()
@@ -645,12 +744,40 @@ pub(crate) fn handle_create(
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 
-/// pi `handleUpdate` (`agent-management.ts:977-1088`). Model/fallback/skills registry warnings are
-/// deferred; rename, package repackaging, unknown-agent warnings, and the still-referenced-after-
-/// rename warning are faithful.
-pub(crate) fn handle_update(
+/// PB-14 — pi `skillsWarning(cwd, agent)` (`agent-management.ts:221-230` @v0.68.0):
+/// `Warning: skills not found: <a, b>.` when any of the agent's declared skills does not resolve,
+/// `None` when it declares none or all resolve.
+///
+/// `[CYRUP-DELTA]`: the discovery config carries no request cwd, so the project root stands in
+/// for pi's `ctx.cwd` (the agent file's own directory when there is no project); the agent file's
+/// directory is the fallback, as upstream's `dirname(filePath)`. There is no `skillPath` term: this
+/// port has no per-agent skill path (`runtime_registry.rs`'s unrepresentable `skillPath`).
+async fn management_skills_warning(
     cfg: &AgentDiscoveryConfig,
-    req: &ManagementRequest,
+    skills: &[String],
+    agent_file: &std::path::Path,
+) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let agent_dir = agent_file.parent();
+    let primary = cfg.project_root.as_deref().or(agent_dir)?;
+    let resolution =
+        crate::discovery::skills::resolve_skills_with_fallback(skills, primary, agent_dir).await;
+    (!resolution.missing.is_empty()).then(|| {
+        format!(
+            "Warning: skills not found: {}.",
+            resolution.missing.join(", ")
+        )
+    })
+}
+
+/// pi `handleUpdate` (`agent-management.ts:977-1088`). Model/fallback registry warnings are
+/// deferred; the skills-not-found warning (PB-14) is ported; rename, package repackaging,
+/// unknown-agent warnings, and the still-referenced-after-rename warning are faithful.
+pub(crate) async fn handle_update(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest<'_>,
 ) -> Result<ManagementOutcome, SubagentError> {
     use serde_json::Value;
     if req.agent.is_none() && req.chain_name.is_none() {
@@ -738,12 +865,22 @@ pub(crate) fn handle_update(
             ));
         };
         let new_runtime = updated.definition.name.clone();
+        let updated_skills = updated.definition.skills.clone();
         let final_outcome: AgentMutationOutcome = if new_runtime != old_name {
             rename_agent(&updated.definition, &new_local)?
         } else {
             updated
         };
         let mut warnings: Vec<String> = Vec::new();
+        // PB-14 — pi `if (hasKey(cfg, "skills") || hasKey(cfg, "skillPath"))`
+        // (`agent-management.ts:1240-1243` @v0.68.0): only when the patch touched skills. There is
+        // no `skillPath` here (see `management_skills_warning`).
+        if cfg_map.contains_key("skills")
+            && let Some(warning) =
+                management_skills_warning(cfg, &updated_skills, &final_outcome.file_path).await
+        {
+            warnings.push(warning);
+        }
         if new_runtime != old_name {
             let refs: Vec<String> = discover_agents_all(cfg)?
                 .chains

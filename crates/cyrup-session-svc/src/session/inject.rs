@@ -279,9 +279,10 @@ pub(super) struct InjectionPlan {
 /// order, and which of them still need their own durable append — happens here, against explicit
 /// inputs.
 ///
-/// Members are merged by `(custom_type, display, trigger_turn)` — in practice every member of a
-/// background-completion batch is a `subagent-notify` — with the bodies joined by a blank line and
-/// `display`/`trigger_turn` OR'd, which is pi's own batching (`sendCompletion` builds one message
+/// Members are merged by `custom_type` alone — in practice every member of a background-completion
+/// batch is a `subagent-notify` — with the bodies joined by a blank line and `display`/`trigger_turn`
+/// OR'd across the group (so one loud member wakes a turn for its quiet siblings), which is pi's own
+/// batching (`sendCompletion` builds one message
 /// from an array of completion details and ORs their `triggerTurn`, `notify.ts:399-412` @v0.64.0).
 ///
 /// A `custom_type: None` member is never merged: a plain user message is a different kind of turn
@@ -341,4 +342,142 @@ pub(super) fn merge_injection_batch(
         }
     }
     plan
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    //! SUBA-017 — `merge_injection_batch` is the only thing between a fan-out's N completions and
+    //! N turns, and it had no test. Each test names the mutation it kills.
+
+    use super::{InjectionPlan, merge_injection_batch};
+    use crate::host_services::{InjectAck, InjectMessage, InjectRequest};
+    use cyrup_agent::AgentMessage;
+
+    fn req(kind: Option<&str>, body: &str, display: bool, trigger_turn: bool) -> InjectRequest {
+        InjectRequest {
+            message: InjectMessage {
+                content: body.to_string(),
+                custom_type: kind.map(str::to_string),
+                display,
+                details: None,
+                trigger_turn,
+            },
+            ack: InjectAck::detached(),
+        }
+    }
+
+    /// `(kind, body, display)` of a planned custom message; a user message reads as kind `"<user>"`.
+    fn shape(msg: &AgentMessage) -> (String, String, bool) {
+        match msg {
+            AgentMessage::Custom {
+                kind,
+                payload,
+                display,
+                ..
+            } => (
+                kind.clone(),
+                payload.as_str().unwrap_or_default().to_string(),
+                *display,
+            ),
+            AgentMessage::User { content, .. } => {
+                let text = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                ("<user>".to_string(), text, true)
+            }
+            other => panic!("unexpected planned message {other:?}"),
+        }
+    }
+
+    fn shapes(plan_half: &[AgentMessage]) -> Vec<(String, String, bool)> {
+        plan_half.iter().map(shape).collect()
+    }
+
+    /// Same-type members become ONE message whose bodies keep arrival order, and groups keep the
+    /// order of their first member. Kills: a hash-ordered grouping (group or body order scrambles),
+    /// and "no merge" (three `subagent-notify` turn messages instead of one).
+    #[test]
+    fn merge_injection_batch_merges_same_type_in_order() {
+        let inbox = vec![
+            req(Some("subagent-notify"), "c1", false, true),
+            req(Some("watchdog-warning"), "w1", true, true),
+            req(Some("subagent-notify"), "c2", false, true),
+            req(Some("subagent-notify"), "c3", false, true),
+        ];
+        let InjectionPlan { turn, durable } = merge_injection_batch(&inbox);
+        assert!(durable.is_empty(), "every member asked for a turn");
+        assert_eq!(
+            shapes(&turn),
+            vec![
+                ("subagent-notify".into(), "c1\n\nc2\n\nc3".into(), false),
+                ("watchdog-warning".into(), "w1".into(), true),
+            ],
+            "one message per type, bodies in arrival order, groups in first-arrival order"
+        );
+    }
+
+    /// `display` and `trigger_turn` OR across a group: one displayed member displays the group, and
+    /// one turn-triggering member carries its quiet siblings into the turn (pi `items.some(..)`).
+    /// Kills: AND instead of OR on either flag (the group would be hidden, or land in `durable`).
+    #[test]
+    fn a_groups_flags_are_ored_across_its_members() {
+        let inbox = vec![
+            req(Some("subagent-notify"), "quiet", false, false),
+            req(Some("subagent-notify"), "loud", true, true),
+        ];
+        let InjectionPlan { turn, durable } = merge_injection_batch(&inbox);
+        assert!(
+            durable.is_empty(),
+            "the loud member pulls the group into the turn"
+        );
+        assert_eq!(
+            shapes(&turn),
+            vec![("subagent-notify".into(), "quiet\n\nloud".into(), true)]
+        );
+    }
+
+    /// A group none of whose members asked for a turn is persisted, never run. Kills: routing on
+    /// anything but the group's OR'd `trigger_turn` (e.g. every group into `turn`).
+    #[test]
+    fn a_group_with_no_turn_request_is_durable_only() {
+        let inbox = vec![
+            req(Some("status-note"), "a", true, false),
+            req(Some("subagent-notify"), "b", false, true),
+            req(Some("status-note"), "c", false, false),
+        ];
+        let InjectionPlan { turn, durable } = merge_injection_batch(&inbox);
+        assert_eq!(
+            shapes(&turn),
+            vec![("subagent-notify".into(), "b".into(), false)]
+        );
+        assert_eq!(
+            shapes(&durable),
+            vec![("status-note".into(), "a\n\nc".into(), true)]
+        );
+    }
+
+    /// A plain user message (`custom_type: None`) keeps its own identity: two of them are two turn
+    /// inputs, never one merged body. Kills: dropping the `custom_type.is_some()` guard, which
+    /// would merge every `None` into one user message.
+    #[test]
+    fn plain_user_messages_are_never_merged() {
+        let inbox = vec![
+            req(None, "first", true, true),
+            req(None, "second", true, true),
+        ];
+        let InjectionPlan { turn, durable } = merge_injection_batch(&inbox);
+        assert!(durable.is_empty());
+        assert_eq!(
+            shapes(&turn),
+            vec![
+                ("<user>".into(), "first".into(), true),
+                ("<user>".into(), "second".into(), true),
+            ]
+        );
+    }
 }

@@ -294,9 +294,8 @@ pub enum OverrideField<T> {
 
 impl<T> OverrideField<T> {
     /// True unless this delta is `Unset` — i.e. the override delta says *something* (either an
-    /// explicit clear or an explicit value) about this field. Used by `merge.rs`'s
-    /// fill-unset-only walk (R-SA-010 custom-agent branch) to decide whether a field participates
-    /// in override application at all.
+    /// explicit clear or an explicit value) about this field. Used by `merge.rs` to decide which
+    /// settings keys an override applied (provenance) and whether an entry says anything at all.
     pub fn is_present(&self) -> bool {
         !matches!(self, OverrideField::Unset)
     }
@@ -470,7 +469,7 @@ pub enum ToolsOverrideField {
 
 impl ToolsOverrideField {
     /// True unless this delta is `Unset` — mirrors [`OverrideField::is_present`], including its
-    /// role in `merge.rs`'s fill-unset walk and in [`AgentOverrideConfig::is_empty`].
+    /// role in `merge.rs`'s provenance and in [`AgentOverrideConfig::is_empty`].
     pub fn is_present(&self) -> bool {
         !matches!(self, ToolsOverrideField::Unset)
     }
@@ -623,46 +622,26 @@ pub struct AgentOverrideInfo {
 /// (`agents/agents.ts:85-112` @v0.68.0 — note the PATH: the file moved to `src/agents/` and an
 /// unqualified `agents.ts:80-103` was both a v0.43.0 line range and a v0.43.0 location).
 ///
-/// **This is NOT the complete set, and the census below is re-counted at v0.68.0.** The previous
-/// revision of this paragraph said "22 keys at v0.43.0; 19 modeled; 3 unmodeled". Every one of
-/// those numbers is now stale. Counted off the interface itself (`:86-111` are the 26 field
-/// declarations inside the `:85-112` block):
+/// **The census, at v0.68.0** (`:86-111` are the 26 field declarations inside the `:85-112`
+/// block):
 ///
 /// - **26 keys upstream.**
-/// - **20 modeled here**, and `merge.rs`'s private `builtin_applied_keys` is the mechanical
-///   statement of which — its list carries 21 entries, being those 20 plus `fallbackModels`,
+/// - **23 modeled here**, and `merge.rs`'s private `builtin_applied_keys` is the mechanical
+///   statement of which — its list carries 24 entries, being those 23 plus `fallbackModels`,
 ///   which is cyrup's OWN key and has no `BuiltinAgentOverrideConfig` counterpart at any tag.
-/// - **6 unmodeled**: `machine`, `outputMode`, `fast`, `inheritGlobalContext`, `acceptanceRole`,
-///   `mutationTools`.
+///   SUBA-096 added the last three: [`Self::output_mode`], [`Self::fast`] and
+///   [`Self::acceptance_role`] — each with a reader, not just a slot: an override field nothing
+///   consumes is the same silent drop one layer down.
+/// - **3 unmodeled**: `machine`, `inheritGlobalContext`, `mutationTools`. They are named in
+///   [`UNPORTED_OVERRIDE_KEYS`] and REPORTED when set (a non-fatal settings diagnostic), never
+///   silently dropped. The census test `agent_override_config_models_every_v0_68_0_key_or_names_it_unported`
+///   pins the literal 26-key list against modeled ∪ unported.
+///   *SUBA-101/102 (2026-09-23):* `inheritGlobalContext` and `mutationTools` are now modeled —
+///   validated with pi's text in `parse_subagent_settings`, applied in `merge.rs`, consumed by
+///   the child prompt rewrite and the mutation classifier — and have left
+///   [`UNPORTED_OVERRIDE_KEYS`].
 ///
-/// The claim is retracted and re-derived rather than softened, because "pi has no others" is
-/// exactly the sentence that stops a reader from checking, and a wrong census misleads in the same
-/// way. (`defaultProvider` left this list with SUBA-088 — see [`Self::default_provider`].)
-///
-/// FIVE of the six are unmodeled because this crate's [`AgentDefinition`] has no field for them to
-/// land in (`acceptanceRole` is the partial case — the definition carries it, the override delta
-/// does not), and modeling them anyway would produce a settings key that parses and is then silently
-/// dropped — which, for an override delta, is indistinguishable from the setting not working at all:
-///
-/// - `fast?: boolean` — pi `AgentConfig.fast`; no counterpart here.
-/// - `machine?: string | false` — pi's remote-execution target; cyrup has no machine dispatch.
-/// - `inheritGlobalContext?: boolean` — the global half of pi's context inheritance; cyrup models
-///   only [`Self::inherit_project_context`].
-/// - `mutationTools?: string[] | false` — pi's per-agent mutation-tool allowlist.
-/// - `acceptanceRole?: AcceptanceRole | false` — pi `AgentConfig.acceptanceRole`. The definition
-///   DOES carry it now ([`AgentDefinition::acceptance_role`], SUBA-082's frontmatter half), but
-///   the settings-override delta for it is still unmodeled here (SUBA-081's remainder): pi's
-///   `agentOverrides.<name>.acceptanceRole` accepts `false` to CLEAR the agent's declared role
-///   (`applyAgentOverride`, `agents.ts` @v0.64.0), and that three-state (`unset`/`role`/`false`)
-///   needs its own field.
-///
-/// The SIXTH, `outputMode?: OutputMode` (`:89`), is a different case: it IS representable — this
-/// crate merges pi's independent `output` (a path string) and `outputMode` fields into a single
-/// [`OutputSpec`], so its target is [`OutputSpec::mode`] — and is unmodeled only because it fell
-/// outside the scope that added the other five. Note the consequence for [`Self::output`], which is
-/// handled in `merge.rs`: a concrete `output` override replaces the PATH and must PRESERVE any
-/// already-resolved `mode`, because upstream those are two independent fields and overriding one
-/// never touches the other.
+/// (`defaultProvider` left the unmodeled list with SUBA-088 — see [`Self::default_provider`].)
 ///
 /// Shapes:
 ///
@@ -807,7 +786,74 @@ pub struct AgentOverrideConfig {
     /// (R-SA-009) rather than a silently dropped budget.
     #[serde(skip_deserializing, skip_serializing_if = "OverrideField::is_unset")]
     pub tool_budget: OverrideField<ResolvedToolBudget>,
+    /// SUBA-096 — pi `outputMode?: OutputMode` (`agents.ts:89` @v0.68.0; parsed at `:1016-1021`,
+    /// applied at `:1433` as a plain assign). Lands in [`AgentDefinition::output`]'s
+    /// [`OutputSpec::mode`], leaving the PATH alone — the mirror image of the `output` arm's
+    /// mode preservation, because upstream these are two independent fields.
+    ///
+    /// Deliberately NOT an [`OverrideField`] and NOT cyrup's three-variant [`OutputMode`]: pi has no
+    /// clear form for this key (a `false` THROWS) and no `file-and-inline` spelling (it throws on
+    /// that too). `OverrideField<OutputMode>` would read `false` as a silent clear and accept the
+    /// third variant — both of which upstream refuses. [`OverrideOutputMode`] has exactly pi's two
+    /// values, and `parse_subagent_settings` refuses anything else with pi's own message before
+    /// serde runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_mode: Option<OverrideOutputMode>,
+    /// SUBA-096 — pi `fast?: boolean` (`agents.ts:93` @v0.68.0; parsed at `:1029-1032`, applied at
+    /// `:1443`). Lands in [`AgentDefinition::fast`]; a plain boolean with no clear form, so a JSON
+    /// `false` is a real `Value(false)` exactly as `disabled`'s is.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub fast: OverrideField<bool>,
+    /// SUBA-101 — pi `inheritGlobalContext?: boolean` (`agents.ts:97` @v0.68.0; parsed `:1055-1060`,
+    /// applied `:1447`). Plain boolean, no clear form.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub inherit_global_context: OverrideField<bool>,
+    /// SUBA-102 — pi `mutationTools?: string[] | false` (`agents.ts:109` @v0.68.0; parsed `:1152`,
+    /// applied `:1459`). `false` clears.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub mutation_tools: OverrideField<Vec<String>>,
+    /// SUBA-100 — pi `machine?: string | false` (`agents.ts:87` @v0.68.0; parsed `:1118-1121`,
+    /// applied `:1431`). `false` clears.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub machine: OverrideField<String>,
+    /// SUBA-096 — pi `acceptanceRole?: AcceptanceRole | false` (`agents.ts:100` @v0.68.0; parsed
+    /// at `:1079-1084`, applied at `:1450`, where `false` is `delete next.acceptanceRole`). Lands in
+    /// [`AgentDefinition::acceptance_role`], which `run_sync`'s acceptance inference already reads.
+    /// A value other than `read-only`/`writer`/`false` is refused by `parse_subagent_settings` with
+    /// pi's own message.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub acceptance_role: OverrideField<crate::exec::acceptance::model::AcceptanceRole>,
 }
+
+/// SUBA-096 — pi's override `OutputMode` (`"inline" | "file-only"`): exactly the two values
+/// `parseBuiltinOverride` admits (`agents.ts:1016-1021` @v0.68.0). See
+/// [`AgentOverrideConfig::output_mode`] for why cyrup's three-variant [`OutputMode`] is not used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverrideOutputMode {
+    Inline,
+    FileOnly,
+}
+
+impl From<OverrideOutputMode> for OutputMode {
+    fn from(mode: OverrideOutputMode) -> Self {
+        match mode {
+            OverrideOutputMode::Inline => OutputMode::Inline,
+            OverrideOutputMode::FileOnly => OutputMode::FileOnly,
+        }
+    }
+}
+
+/// SUBA-096 — the `agentOverrides.<name>` keys pi declares at v0.68.0 (`agents.ts:86-111`) that
+/// this port has no reader for, each with what it would drive. They are REPORTED — a non-fatal
+/// settings diagnostic per stated key, surfaced by `subagent list` and doctor — rather than dropped
+/// by serde. Each is an open feature gap, not a decision that it is out of scope.
+///
+/// A slice rather than a fixed-length array so a key leaving the list (SUBA-101/102 ported
+/// `inheritGlobalContext` and `mutationTools`) is a one-line removal. SUBA-100 ported `machine`,
+/// the last of the three, so the list is empty at v0.68.0: every declared key has a reader. It
+/// stays, with its census, as the place the NEXT upstream key goes until it is ported.
+pub const UNPORTED_OVERRIDE_KEYS: &[(&str, &str)] = &[];
 
 impl AgentOverrideConfig {
     /// True iff every field in this delta is `Unset` — an override entry that, once parsed,
@@ -833,7 +879,13 @@ impl AgentOverrideConfig {
             || self.extensions.is_present()
             || self.subagent_only_extensions.is_present()
             || self.completion_guard.is_present()
-            || self.tool_budget.is_present())
+            || self.tool_budget.is_present()
+            || self.output_mode.is_some()
+            || self.fast.is_present()
+            || self.inherit_global_context.is_present()
+            || self.mutation_tools.is_present()
+            || self.machine.is_present()
+            || self.acceptance_role.is_present())
     }
 }
 
@@ -901,6 +953,18 @@ pub struct SubagentSettings {
     /// agent file can never author its own ceiling (see `exec::thinking_ceiling`'s module doc).
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub max_thinking: Option<String>,
+    /// SUBA-096 — non-fatal diagnostics about keys in this block that no reader consumes: an
+    /// `agentOverrides.<name>` key pi declares and this port has not ported
+    /// ([`UNPORTED_OVERRIDE_KEYS`]), or one that is not an override key at all. Filled by
+    /// [`crate::discovery::parse_subagent_settings`] and surfaced by discovery as
+    /// [`AgentDiscoveryDiagnostic`]s against the settings file, which `subagent list` and doctor
+    /// render.
+    ///
+    /// Non-fatal on purpose: R-SA-009's abort would make a valid pi-authored settings file break
+    /// discovery wholesale, which is worse than the drop it reports. `skip` because it is derived
+    /// from the raw object, never read from or written to a settings file.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 /// The user- and project-scope [`SubagentSettings`] pair, each with its own on-disk
@@ -1175,6 +1239,18 @@ pub struct AgentDefinition {
     /// Defaults to `true` when `local_name == "delegate"`, else `false` (R-SA-018).
     pub inherit_project_context: bool,
     pub inherit_skills: bool,
+    /// SUBA-101 — pi `inheritGlobalContext: boolean` (`agents.ts:66,151` @v0.68.0): whether the
+    /// child inherits the parent's GLOBAL context files (`~/.pi/agent/AGENTS.md`, cyrup's user-level
+    /// equivalent), independently of [`Self::inherit_project_context`]. Frontmatter is strictly
+    /// `inheritGlobalContext: true` (`agents.ts:2070`); default `false`.
+    pub inherit_global_context: bool,
+    /// SUBA-102 — pi `mutationTools?: string[]` (`agents.ts:80,168` @v0.68.0): extra tool names
+    /// this agent's child counts as mutating (`run-child-session.ts:471`,
+    /// `isMutatingTool(…, input.mutationTools)`). `None` = the built-in set only.
+    pub mutation_tools: Option<Vec<String>>,
+    /// SUBA-100 — pi `machine?: string` (`agents.ts:56,180` @v0.68.0): the Herdr saved machine
+    /// (id or label) this agent's child is placed on. `None` = run locally.
+    pub machine: Option<String>,
     /// Skill-pointer names (not full content) proactively injected into this agent's assembled
     /// system prompt at spawn time (R-SA-017) — orthogonal to any on-demand skill-content loading
     /// the child performs for itself once running.
@@ -1249,6 +1325,13 @@ pub struct AgentDefinition {
     /// — see [`crate::exec::acceptance::model::AcceptanceRole`]. `None` (upstream's `undefined`)
     /// is the branch on which `inferLevel` falls back to agent-NAME guessing.
     pub acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
+    /// SUBA-096 — pi `AgentConfig.fast?: boolean` (`agents.ts` @v0.68.0), from `fast:` frontmatter
+    /// (strictly `true`/`false`, `agents.ts:2057-2062` @v0.64.0) or an `agentOverrides.<name>.fast`
+    /// entry. The agent rung of pi's `s.fast ?? params.fast ?? a.fast` (step > call > agent): when
+    /// the effective value is `true` the child runs its provider requests on the priority service
+    /// tier, and only on one of the two allowlisted OpenAI-Codex models
+    /// (`crate::exec::spawn_plan`'s fast-mode gate). `None` = the agent says nothing.
+    pub fast: Option<bool>,
     /// SUBA-073 — this agent's own `permission:`/`permissions:` frontmatter, already validated
     /// (`discovery/frontmatter.rs`). Merged with the global `config.permissions` rung at run time
     /// via [`crate::exec::permissions::resolve_permission_rules`] — this field alone is NOT the
@@ -1267,9 +1350,10 @@ pub struct AgentDefinition {
     pub system_prompt_body: String,
     pub source: AgentSource,
     pub file_path: PathBuf,
-    /// Which frontmatter keys were literally present on disk — required for R-SA-010's
-    /// fill-unset-only override semantics (a custom-agent override MUST be blocked for any field
-    /// present here, regardless of the override's own value).
+    /// Which frontmatter keys were literally present on disk. Read by the management serializer's
+    /// preserve rule. It no longer gates settings overrides: upstream dropped the custom-agent
+    /// frontmatter gate at `31562d76` (v0.64.0), and `merge.rs` follows (see
+    /// `apply_custom_override`).
     pub present_fields: HashSet<String>,
     /// Unknown-key round-trip preservation: any frontmatter key not recognized by this crate's
     /// parser is preserved verbatim here (as its raw string value) so re-serialization does not
@@ -1560,6 +1644,70 @@ mod tests {
         assert!(valued.is_present());
     }
 
+    /// SUBA-096 census — the literal 26 keys of pi's `BuiltinAgentOverrideConfig`
+    /// (`agents.ts:86-111` @v0.68.0) are each either read by this port (a serde field of
+    /// [`AgentOverrideConfig`], or `toolBudget`, which is populated by the settings parser) or
+    /// named in [`UNPORTED_OVERRIDE_KEYS`] — never both, never neither. `fallbackModels` is the one
+    /// modeled key upstream does not declare (cyrup's own).
+    ///
+    /// Mutation killed: removing a field from `AgentOverrideConfig` without listing it unported,
+    /// or listing a modeled key as unported.
+    #[test]
+    fn agent_override_config_models_every_v0_68_0_key_or_names_it_unported() {
+        const UPSTREAM: [&str; 26] = [
+            "description",
+            "machine",
+            "output",
+            "outputMode",
+            "defaultReads",
+            "model",
+            "defaultProvider",
+            "fast",
+            "thinking",
+            "systemPromptMode",
+            "inheritProjectContext",
+            "inheritGlobalContext",
+            "inheritSkills",
+            "defaultContext",
+            "acceptanceRole",
+            "disabled",
+            "systemPrompt",
+            "skills",
+            "tools",
+            "excludeTools",
+            "allowNestedSubagents",
+            "extensions",
+            "subagentOnlyExtensions",
+            "mutationTools",
+            "completionGuard",
+            "toolBudget",
+        ];
+        let mut modeled: BTreeSet<&str> =
+            crate::discovery::key_census::struct_fields::<AgentOverrideConfig>()
+                .iter()
+                .copied()
+                .collect();
+        modeled.insert("toolBudget");
+        let unported: BTreeSet<&str> = UNPORTED_OVERRIDE_KEYS.iter().map(|(k, _)| *k).collect();
+        assert!(
+            modeled.is_disjoint(&unported),
+            "{:?}",
+            modeled.intersection(&unported)
+        );
+        for key in UPSTREAM {
+            assert!(
+                modeled.contains(key) || unported.contains(key),
+                "upstream override key '{key}' is neither modeled nor named unported"
+            );
+        }
+        let extra: Vec<&&str> = modeled.iter().filter(|k| !UPSTREAM.contains(k)).collect();
+        assert_eq!(extra, vec![&"fallbackModels"]);
+        // 23 upstream keys + `fallbackModels` before the `1aecfca` contract; that contract added
+        // `machine`, `inheritGlobalContext` and `mutationTools` as serde fields, so all 26 upstream
+        // keys plus `fallbackModels` are now struct fields.
+        assert_eq!(modeled.len(), 27);
+    }
+
     #[test]
     fn agent_override_config_default_is_empty() {
         let cfg = AgentOverrideConfig::default();
@@ -1577,9 +1725,13 @@ mod tests {
 
     fn sample_agent(tools: Option<Vec<ToolRef>>) -> AgentDefinition {
         AgentDefinition {
+            inherit_global_context: false,
+            machine: None,
+            mutation_tools: None,
             default_turn_budget: None,
             default_acceptance: None,
             acceptance_role: None,
+            fast: None,
             permission_rules: None,
             runner: None,
             name: "reviewer".to_string(),

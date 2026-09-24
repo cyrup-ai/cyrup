@@ -64,6 +64,7 @@
 //! being distributed into `handlers`/`tier_actions`, which carry no tests of their own.
 
 mod agent_crud;
+mod capabilities;
 mod chain_crud;
 mod config_parse;
 mod frontmatter_write;
@@ -150,6 +151,10 @@ pub struct ProactiveSkillsInput<'a> {
 pub struct ManagementOutcome {
     pub text: String,
     pub is_error: bool,
+    /// SUBA-104 — pi `result(text, isError, details)`'s third argument (`agent-management.ts:55-57`
+    /// @v0.68.0): the extra `Details` members merged over `{ mode: "management", results: [] }`.
+    /// `Some({"agentCapabilities": …})` from a `capabilities: true` `list`; `None` everywhere else.
+    pub details: Option<serde_json::Value>,
 }
 
 impl ManagementOutcome {
@@ -157,12 +162,47 @@ impl ManagementOutcome {
         Self {
             text: text.into(),
             is_error: false,
+            details: None,
         }
     }
     fn err(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             is_error: true,
+            details: None,
+        }
+    }
+}
+
+/// SUBA-104 — the two `list` inputs pi's `handleList` reads beyond [`ManagementRequest`]:
+/// `params.capabilities === true` (`agent-management.ts:989` @v0.68.0; schema
+/// `extension/schemas.ts:287`) and `ctx.currentSessionId`, which selects the session's registered
+/// capability ceiling (`resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId)`, `:975`).
+///
+/// A separate value rather than two more [`ManagementRequest`] fields so every existing request
+/// literal keeps compiling; [`handle_management_action`] passes the default (plain listing, no
+/// session — the inherited env ceiling still applies, as upstream's `undefined` session id does).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ListOptions<'a> {
+    /// pi `params.capabilities === true`.
+    pub capabilities: bool,
+    /// pi `ctx.currentSessionId`.
+    pub current_session_id: Option<&'a str>,
+    /// The extension's env seam (`SubagentExtensionConfig::env_overrides`): a key present here
+    /// is read from it (`None` = scrubbed), any other key from this process. `list` reads the
+    /// inherited capability ceiling (`CYRUP_SUBAGENT_CAPABILITY_CEILING_V1`) through it, so the
+    /// listing is split by the same ceiling this extension's launches are bound by. `None` reads
+    /// the process environment only.
+    pub env_overrides: Option<&'a std::collections::BTreeMap<String, Option<String>>>,
+}
+
+impl ListOptions<'_> {
+    /// `key` through [`Self::env_overrides`], then this process.
+    #[must_use]
+    pub fn env_var(&self, key: &str) -> Option<String> {
+        match self.env_overrides.and_then(|overrides| overrides.get(key)) {
+            Some(pinned) => pinned.clone(),
+            None => std::env::var(key).ok(),
         }
     }
 }
@@ -200,12 +240,29 @@ pub async fn handle_management_action(
     action: &str,
     req: &ManagementRequest<'_>,
 ) -> Result<ManagementOutcome, crate::error::SubagentError> {
+    handle_management_action_with(cfg, action, req, &ListOptions::default()).await
+}
+
+/// [`handle_management_action`] with the `list`-only [`ListOptions`] — the entry the `subagent`
+/// tool's management arm calls (`extension::tool::routing`), carrying the call's `capabilities`
+/// flag and the live session id. Every other action ignores `list`.
+///
+/// # Errors
+///
+/// As [`handle_management_action`], plus a malformed inherited capability ceiling on `list`
+/// (upstream's `resolveCurrentSubagentCapabilityCeiling` throw).
+pub async fn handle_management_action_with(
+    cfg: &AgentDiscoveryConfig,
+    action: &str,
+    req: &ManagementRequest<'_>,
+    list: &ListOptions<'_>,
+) -> Result<ManagementOutcome, crate::error::SubagentError> {
     match action {
-        "list" => handlers::handle_list(cfg, req),
+        "list" => handlers::handle_list(cfg, req, list),
         "get" => handlers::handle_get(cfg, req),
         "models" => handlers::handle_models(cfg, req),
-        "create" => handlers::handle_create(cfg, req),
-        "update" => handlers::handle_update(cfg, req),
+        "create" => handlers::handle_create(cfg, req).await,
+        "update" => handlers::handle_update(cfg, req).await,
         "delete" => handlers::handle_delete(cfg, req),
         // SUBA-005 (pi `agent-management.ts:1046-1049`): the tier-aware / settings-writing four.
         "eject" => tier_actions::handle_eject(cfg, req),
@@ -718,6 +775,316 @@ mod tests {
         );
         // Builtins remain visible under any named scope (they are orthogonal to the user/project axis).
         assert!(t.contains("- reviewer (builtin"), "{t}");
+    }
+
+    /// PB-14 — pi `skillsWarning` on create (`agent-management.ts:1185-1186` @v0.68.0):
+    /// `Warning: skills not found: <names>.` AFTER the headline. Mutation killed: dropping the push,
+    /// or pushing it before the headline (the text then starts with the warning).
+    #[tokio::test]
+    async fn create_with_unknown_skill_warns_after_the_headline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let create_cfg = serde_json::json!({
+            "name": "Skilled",
+            "description": "Has a typo skill",
+            "skills": "no-such-skill-pb14"
+        });
+        let created =
+            handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg)))
+                .await
+                .expect("create ok");
+        assert!(!created.is_error, "{}", created.text);
+        let lines: Vec<&str> = created.text.lines().collect();
+        assert!(
+            lines[0].starts_with("Created agent 'skilled' at "),
+            "{}",
+            created.text
+        );
+        assert!(
+            lines.contains(&"Warning: skills not found: no-such-skill-pb14."),
+            "{}",
+            created.text
+        );
+    }
+
+    /// PB-14 — on update the warning fires only when the patch touched `skills` (pi
+    /// `agent-management.ts:1240-1243`). Mutation killed: warning unconditionally.
+    #[tokio::test]
+    async fn update_without_skills_in_the_patch_does_not_warn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let create_cfg = serde_json::json!({
+            "name": "Skilled",
+            "description": "Has a typo skill",
+            "skills": "no-such-skill-pb14"
+        });
+        handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg)))
+            .await
+            .expect("create ok");
+        let patch = serde_json::json!({"description": "renamed description"});
+        let updated = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("skilled"), None, None, Some(&patch)),
+        )
+        .await
+        .expect("update ok");
+        assert!(!updated.is_error, "{}", updated.text);
+        assert!(
+            !updated.text.contains("skills not found"),
+            "{}",
+            updated.text
+        );
+        let patch = serde_json::json!({"skills": "still-missing-pb14"});
+        let updated = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("skilled"), None, None, Some(&patch)),
+        )
+        .await
+        .expect("update ok");
+        assert!(
+            updated
+                .text
+                .contains("Warning: skills not found: still-missing-pb14."),
+            "{}",
+            updated.text
+        );
+    }
+
+    /// SUBA-101/102 — `config.inheritGlobalContext` and `config.mutationTools` on the management
+    /// tool (pi `applyAgentConfig`, `agent-management.ts:514-518,536-539` @v0.68.0): create writes
+    /// both into the file, `get` renders both (`:947,957`), an update's `mutationTools: false`
+    /// deletes the list and an update's `inheritGlobalContext: false` is written back (the key was
+    /// stated, so it is preserved — `:366-369`), and each malformed shape refuses with pi's text.
+    /// Mutation killed: dropping either `config_parse` arm (the key is silently ignored), the
+    /// serializer arms (the file loses the key and `get` shows the default), or the render lines.
+    #[tokio::test]
+    async fn management_config_inherit_global_context_and_mutation_tools_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let create_cfg = serde_json::json!({
+            "name": "keeper",
+            "description": "Keeps things",
+            "inheritGlobalContext": true,
+            "mutationTools": "apply_patch, , notebook_edit"
+        });
+        let created =
+            handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg)))
+                .await
+                .expect("create ok");
+        assert!(!created.is_error, "{}", created.text);
+        let file = tmp.path().join("user/agents/keeper.md");
+        let on_disk = std::fs::read_to_string(&file).expect("agent file written");
+        assert!(
+            on_disk.contains("\ninheritGlobalContext: true\n"),
+            "{on_disk}"
+        );
+        assert!(
+            on_disk.contains("\nmutationTools: apply_patch, notebook_edit\n"),
+            "{on_disk}"
+        );
+        let got = handle_management_action(&cfg, "get", &mreq(Some("keeper"), None, None, None))
+            .await
+            .expect("get ok");
+        assert!(
+            got.text.contains("Inherit global context: true"),
+            "{}",
+            got.text
+        );
+        assert!(
+            got.text
+                .contains("Mutation tools: apply_patch, notebook_edit"),
+            "{}",
+            got.text
+        );
+
+        let patch = serde_json::json!({"mutationTools": false, "inheritGlobalContext": false});
+        let updated = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("keeper"), None, None, Some(&patch)),
+        )
+        .await
+        .expect("update ok");
+        assert!(!updated.is_error, "{}", updated.text);
+        let on_disk = std::fs::read_to_string(&file).expect("agent file");
+        assert!(!on_disk.contains("mutationTools"), "{on_disk}");
+        assert!(
+            on_disk.contains("\ninheritGlobalContext: false\n"),
+            "{on_disk}"
+        );
+        let got = handle_management_action(&cfg, "get", &mreq(Some("keeper"), None, None, None))
+            .await
+            .expect("get ok");
+        assert!(
+            got.text.contains("Inherit global context: false"),
+            "{}",
+            got.text
+        );
+        assert!(!got.text.contains("Mutation tools:"), "{}", got.text);
+
+        let patch = serde_json::json!({"mutationTools": ""});
+        handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("keeper"), None, None, Some(&patch)),
+        )
+        .await
+        .expect("update ok");
+        let got = handle_management_action(&cfg, "get", &mreq(Some("keeper"), None, None, None))
+            .await
+            .expect("get ok");
+        // An empty list is not serialized (`joinComma` of `[]` is undefined), so after a re-read
+        // the agent declares none — pi's own round trip.
+        assert!(!got.text.contains("Mutation tools:"), "{}", got.text);
+
+        for (bad, text) in [
+            (
+                serde_json::json!({"inheritGlobalContext": "yes"}),
+                "config.inheritGlobalContext must be a boolean when provided.",
+            ),
+            (
+                serde_json::json!({"mutationTools": ["edit"]}),
+                "config.mutationTools must be a comma-separated string, empty string, or false when provided.",
+            ),
+        ] {
+            let out = handle_management_action(
+                &cfg,
+                "update",
+                &mreq(Some("keeper"), None, None, Some(&bad)),
+            )
+            .await
+            .expect("no discovery error");
+            assert!(out.is_error, "{bad}");
+            assert!(out.text.contains(text), "{}", out.text);
+        }
+    }
+
+    /// SUBA-101/102 — an update that does not state either key keeps both (pi `editableAgentConfig`
+    /// carries the base through, `agent-management.ts:304,318` @v0.68.0), and a line the file
+    /// already had is PRESERVED even where the value alone would not be written (pi
+    /// `agent-serializer.ts:90,127`: `config.inheritGlobalContext || preserve(…)`, `mutationToolsValue
+    /// || preserve(…)`): a hand-written `inheritGlobalContext: false` and an empty `mutationTools:`
+    /// survive an unrelated edit byte-for-byte.
+    ///
+    /// *Gutted by*, each alone: `merge_fields`' `.unwrap_or(existing.inherit_global_context)` ->
+    /// `.unwrap_or(false)` (the file then says `false`); its mutation-tools
+    /// `.unwrap_or_else(|| existing.mutation_tools.clone())` -> `.unwrap_or(None)` (an empty
+    /// preserved line replaces the list); dropping `|| preserve(&["inheritGlobalContext"])` or
+    /// `|| preserve(&["mutationTools"])` in `serialize_agent` (the hand-written line vanishes).
+    #[tokio::test]
+    async fn an_unrelated_update_keeps_global_context_and_mutation_tools_and_their_lines() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let create_cfg = serde_json::json!({
+            "name": "keeper",
+            "description": "Keeps things",
+            "inheritGlobalContext": true,
+            "mutationTools": "apply_patch"
+        });
+        let created =
+            handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg)))
+                .await
+                .expect("create ok");
+        assert!(!created.is_error, "{}", created.text);
+        let patch = serde_json::json!({"description": "Still keeps things"});
+        let updated = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("keeper"), None, None, Some(&patch)),
+        )
+        .await
+        .expect("update ok");
+        assert!(!updated.is_error, "{}", updated.text);
+        let on_disk =
+            std::fs::read_to_string(tmp.path().join("user/agents/keeper.md")).expect("agent file");
+        assert!(
+            on_disk.contains("\ninheritGlobalContext: true\n"),
+            "{on_disk}"
+        );
+        assert!(
+            on_disk.contains("\nmutationTools: apply_patch\n"),
+            "{on_disk}"
+        );
+
+        write_agent_md(
+            &tmp.path().join("user/agents"),
+            "plain.md",
+            "---\nname: plain\ndescription: Hand written\ninheritGlobalContext: false\n\
+mutationTools:\nthinking: low\n---\n\nBody\n",
+        );
+        let updated = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("plain"), None, None, Some(&patch)),
+        )
+        .await
+        .expect("update ok");
+        assert!(!updated.is_error, "{}", updated.text);
+        let on_disk =
+            std::fs::read_to_string(tmp.path().join("user/agents/plain.md")).expect("agent file");
+        assert!(
+            on_disk.contains("\ninheritGlobalContext: false\n"),
+            "{on_disk}"
+        );
+        assert!(on_disk.contains("\nmutationTools: \n"), "{on_disk}");
+    }
+
+    /// SUBA-101 — stating `inheritGlobalContext` on an update writes it even as `false` and even
+    /// when the file never had the line: pi `preservedAgentFrontmatterFields` re-adds the key after
+    /// marking it changed (`agent-management.ts:366-369` @v0.68.0), so the serializer's
+    /// `config.inheritGlobalContext || preserve("inheritGlobalContext")` emits it.
+    ///
+    /// *Gutted by*: dropping `set.insert("inheritGlobalContext")` in
+    /// `preserved_frontmatter_fields` (the stated `false` is silently not written).
+    #[tokio::test]
+    async fn a_stated_inherit_global_context_false_is_written_although_the_file_lacked_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        let create_cfg = serde_json::json!({"name": "plain", "description": "Plain"});
+        handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg)))
+            .await
+            .expect("create ok");
+        let file = tmp.path().join("user/agents/plain.md");
+        let before = std::fs::read_to_string(&file).expect("agent file");
+        assert!(!before.contains("inheritGlobalContext"), "{before}");
+        let patch = serde_json::json!({"inheritGlobalContext": false});
+        let updated = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("plain"), None, None, Some(&patch)),
+        )
+        .await
+        .expect("update ok");
+        assert!(!updated.is_error, "{}", updated.text);
+        let after = std::fs::read_to_string(&file).expect("agent file");
+        assert!(after.contains("\ninheritGlobalContext: false\n"), "{after}");
+    }
+
+    /// SUBA-102 — a DECLARED but empty list renders `Mutation tools: (none)` (pi `formatAgentDetail`,
+    /// `agent-management.ts:957` @v0.68.0: `agent.mutationTools.length ? join : "(none)"`). An
+    /// empty list is reachable through the runtime registry (`mutationTools: []`), which carries
+    /// the list verbatim.
+    ///
+    /// *Gutted by*: the `"(none)"` arm in `render.rs` replaced by `names.join(", ")` (the line reads
+    /// `Mutation tools: `).
+    #[test]
+    fn a_declared_empty_mutation_tools_list_renders_none() {
+        let mut def = crate::discovery::frontmatter::parse_agent_file(
+            "---\nname: bare\ndescription: d\n---\n\nBody\n",
+            AgentSource::User,
+            Path::new("/bare.md"),
+        )
+        .expect("parses");
+        def.mutation_tools = Some(Vec::new());
+        let text = render::format_agent_detail(&def);
+        assert!(text.contains("\nMutation tools: (none)"), "{text}");
+        def.mutation_tools = None;
+        assert!(
+            !render::format_agent_detail(&def).contains("Mutation tools:"),
+            "an undeclared list renders nothing"
+        );
     }
 
     #[tokio::test]

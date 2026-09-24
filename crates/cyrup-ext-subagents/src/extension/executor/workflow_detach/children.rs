@@ -306,6 +306,11 @@ pub(crate) fn workflow_result_children(
 /// through [`crate::workflows::workflow_output_path_mapping_summary`].
 fn step_child(step: &StepStatus, output: &str) -> SingleResult {
     SingleResult {
+        execution: None,
+        native_machine: None,
+        runtime_acknowledged_extensions: None,
+        skills_warning: None,
+        watchdog: None,
         agent: step.agent.clone(),
         task: String::new(),
         // `:84` — `success: step.status === "completed" || step.status === "complete"`. cyrup has

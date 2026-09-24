@@ -312,6 +312,9 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         // does not carry the reference. Absent is the honest answer, and the retention scan's
         // local `<run_dir>/handoff.json` probe still finds a manifest if one was written.
         parallel_handoff: None,
+        // SUBA-063: the run-level copy is lifted only by the runner's own terminal write; a repair
+        // leaves it absent, and the `ResultFile`'s per-result copies still carry each child's.
+        runtime_acknowledged_extensions: None,
     }
 }
 
@@ -3040,6 +3043,9 @@ fn imported_state(result: &ResultFile, child: Option<&SingleResult>) -> RunState
         return match result.state {
             RunState::Stopped => RunState::Stopped,
             RunState::Paused => RunState::Paused,
+            // SUBA-100 — pi `result.state === "partial" ? "partial"` (`chain-root-attachment.ts:
+            // 124` @v0.68.0).
+            RunState::Partial => RunState::Partial,
             _ => RunState::Failed,
         };
     }
@@ -3048,6 +3054,8 @@ fn imported_state(result: &ResultFile, child: Option<&SingleResult>) -> RunState
         RunState::Failed => RunState::Failed,
         RunState::Paused => RunState::Paused,
         RunState::Stopped => RunState::Stopped,
+        // SUBA-100 — passed straight through with the other terminal states (`:125` @v0.68.0).
+        RunState::Partial => RunState::Partial,
         RunState::Queued | RunState::Running => {
             if result.success {
                 RunState::Complete
@@ -3405,6 +3413,7 @@ mod tests {
 
     fn single_step(agent: &str, output: Option<&str>) -> SingleStepSpec {
         SingleStepSpec {
+            machine: None,
             skills: None,
             session_dir: None,
             agent: agent.to_string(),
@@ -3419,6 +3428,7 @@ mod tests {
             output: output.map(str::to_string),
             output_path: None,
             output_mode: None,
+            fast: None,
             reads: None,
             acceptance: None,
             context: None,
@@ -4023,6 +4033,11 @@ mod tests {
         }
         fn child(exit_code: i32, stopped: bool) -> crate::exec::SingleResult {
             crate::exec::SingleResult {
+                execution: None,
+                native_machine: None,
+                runtime_acknowledged_extensions: None,
+                skills_warning: None,
+                watchdog: None,
                 // SUBA-021: no usage budget on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -4977,6 +4992,11 @@ mod tests {
         error: Option<&str>,
     ) -> SingleResult {
         SingleResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            skills_warning: None,
+            watchdog: None,
             // SUBA-021: no usage budget on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

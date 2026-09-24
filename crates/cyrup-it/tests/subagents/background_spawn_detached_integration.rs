@@ -482,6 +482,7 @@ fn orchestrator_sim_binary_path() -> PathBuf {
 /// mode. Every step's agent must now have a plan-time persona in `resolved_agents`.
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -499,6 +500,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
+        inherit_global_context: false, // SUBA-101: parser default
+        mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
         completion_guard: Some(false),
@@ -524,6 +527,7 @@ fn all_personas() -> BTreeMap<String, ResolvedAgentPersona> {
 /// all-other-fields-`None` [`SingleStepSpec`] for `agent`/`task`.
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        machine: None,
         skills: None,
         session_dir: None,
         agent: agent.to_string(),
@@ -538,6 +542,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         output: None,
         output_path: None,
         output_mode: None,
+        fast: None,
         reads: None,
         acceptance: None,
         context: None,

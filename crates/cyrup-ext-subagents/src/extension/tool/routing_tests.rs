@@ -1597,6 +1597,88 @@ async fn a_control_action_refuses_a_malformed_acceptance_with_pis_own_prefix() {
     );
 }
 
+/// SUBA-105 — pi `validateExecutionAcceptance`'s `report` half (`runs/shared/acceptance.ts:404-430`
+/// @v0.68.0, reached from `validateExecutionInput`, `subagent-executor.ts:2541`, and from
+/// `appendStepToRun`, `:1257,1345`): EVERY site that declares `acceptance.report` without an
+/// `outputSchema` beside it (absent or `false`) is refused at the tool entry, before anything
+/// runs, with upstream's per-site label — `tasks[i]`, `chain[i]`, `chain[i].parallel[j]` and the
+/// dynamic template's bare `chain[i].parallel` — and every refusal is joined into one message. A
+/// site that carries its own schema is silent.
+#[tokio::test]
+async fn a_declared_report_without_a_schema_is_refused_per_site_at_the_tool_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    let refuse = |params: serde_json::Value| {
+        let tool = &tool;
+        async move {
+            dispatch_tool(tool, params)
+                .await
+                .expect_err("a declared report with no outputSchema must be refused")
+                .to_string()
+        }
+    };
+
+    assert_eq!(
+        refuse(serde_json::json!({
+            "agent": "worker",
+            "task": "t",
+            "acceptance": { "level": "checked", "report": "on" }
+        }))
+        .await,
+        "acceptance.report requires outputSchema."
+    );
+
+    assert_eq!(
+        refuse(serde_json::json!({
+            "tasks": [
+                { "agent": "worker", "task": "a",
+                  "acceptance": { "level": "checked", "report": "on" },
+                  "outputSchema": { "type": "object" } },
+                { "agent": "worker", "task": "b",
+                  "acceptance": { "level": "checked", "report": "off" } },
+                { "agent": "worker", "task": "c",
+                  "acceptance": { "report": "on" }, "outputSchema": false }
+            ]
+        }))
+        .await,
+        "tasks[1].acceptance.report requires outputSchema. \
+         tasks[2].acceptance.report requires outputSchema.",
+        "the schema-bearing task is silent; `outputSchema: false` counts as none"
+    );
+
+    assert_eq!(
+        refuse(serde_json::json!({
+            "chain": [
+                { "agent": "worker", "task": "a", "acceptance": { "report": "on" } },
+                { "parallel": [
+                    { "agent": "worker", "task": "b", "acceptance": { "report": "on" },
+                      "outputSchema": { "type": "object" } },
+                    { "agent": "worker", "task": "c", "acceptance": { "report": "off" } }
+                ] },
+                { "expand": { "from": { "output": "x" } },
+                  "parallel": { "agent": "worker", "task": "d",
+                                "acceptance": { "report": "on" } },
+                  "collect": { "as": "y" } }
+            ]
+        }))
+        .await,
+        "chain[0].acceptance.report requires outputSchema. \
+         chain[1].parallel[1].acceptance.report requires outputSchema. \
+         chain[2].parallel.acceptance.report requires outputSchema."
+    );
+
+    assert_eq!(
+        refuse(serde_json::json!({
+            "action": "append-step",
+            "id": "run00000000",
+            "chain": [{ "agent": "worker", "task": "t", "acceptance": { "report": "on" } }]
+        }))
+        .await,
+        "Cannot append step: chain[0].acceptance.report requires outputSchema.",
+        "the control action refuses with pi's own prefix, before the run lookup"
+    );
+}
+
 /// SUBA-086 — pi `canonicalizeAgentName` (`subagent-executor.ts:2336-2344` @v0.64.0) consults
 /// `findBlockingAgentDiagnostic` BEFORE the ambiguity/unknown branches, so a dispatch naming an
 /// agent whose highest-ranked definition is malformed is refused with the parse error — never
@@ -3278,5 +3360,77 @@ mod debug_run_refusals {
         .await
         .expect_err("an empty run dir is refused");
         assert_eq!(err.to_string(), "Status file not found.");
+    }
+}
+
+/// SUBA-096 — the FOREGROUND single path consults the agent's own `outputMode` (pi
+/// `params.outputMode ?? a.outputMode ?? "inline"`, `subagent-executor.ts:3861` @v0.68.0): an
+/// agent declaring `outputMode: file-only` with no output path is refused before anything spawns,
+/// exactly as an explicit `outputMode: "file-only"` is.
+///
+/// Mutation killed: reverting `foreground.rs`'s resolution to the call param alone (the run is
+/// then treated as inline and reaches the spawn, failing for an unrelated reason).
+#[tokio::test]
+async fn an_agents_own_file_only_mode_is_consulted_on_the_foreground_single_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agents_dir = dir.path().join(".cyrup").join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir");
+    std::fs::write(
+        agents_dir.join("reporter.md"),
+        "---\nname: reporter\ndescription: d\noutputMode: file-only\n---\nBody.\n",
+    )
+    .expect("write agent");
+    let tool = crate::extension::testsupport::scoped_tool(dir.path()).await;
+    let outcome = crate::extension::testsupport::dispatch_tool(
+        &tool,
+        serde_json::json!({"agent": "reporter", "task": "report", "async": false}),
+    )
+    .await;
+    let text = match &outcome {
+        Ok(result) => crate::extension::testsupport::tool_text(result),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        text.contains("output-file mode requires an output path"),
+        "the agent-level file-only mode must be enforced: {text}"
+    );
+}
+
+/// SUBA-100 — pi's schema declares every `machine` (`extension/schemas.ts:159,192,222,369`
+/// @v0.68.0) `minLength: 1` and `validateMachineName` trims it (`herdr-machine.ts:66-72`): a blank
+/// machine on the call, a `tasks[]` item, a chain step or a chain `parallel` group is refused with
+/// upstream's sentence — never read as "no machine" (which silently moved the call's `cwd` into
+/// `machineCwd` and then placed nothing).
+///
+/// The agent named is one that does not exist: upstream's schema check runs before anything is
+/// resolved, so the machine refusal must win over the unknown-agent refusal a later stage would
+/// raise — which is also what makes this test observe the BOUNDARY check rather than the
+/// resolver's own `validateMachineName` further down.
+#[tokio::test]
+async fn a_blank_machine_is_refused_at_the_tool_boundary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    for params in [
+        serde_json::json!({ "agent": "no-such-agent", "task": "t", "machine": "", "cwd": "sub" }),
+        serde_json::json!({ "tasks": [{ "agent": "no-such-agent", "task": "t", "machine": "  " }] }),
+        serde_json::json!({ "chain": [{ "agent": "no-such-agent", "task": "t", "machine": "" }] }),
+        serde_json::json!({
+            "chain": [{ "parallel": [{ "agent": "no-such-agent", "task": "t" }], "machine": " " }]
+        }),
+    ] {
+        let err = tool
+            .execute(
+                ToolCallId::from("t"),
+                params.clone(),
+                CancelToken::new(),
+                Box::new(|_u: cyrup_core::ToolUpdate| {}),
+            )
+            .await
+            .expect_err("a blank machine is refused");
+        assert_eq!(
+            err.to_string(),
+            "Herdr machine id or label is required.",
+            "{params}"
+        );
     }
 }

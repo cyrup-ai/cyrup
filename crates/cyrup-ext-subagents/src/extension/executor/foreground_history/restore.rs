@@ -126,6 +126,7 @@ mod tests {
                 final_output: None,
                 tokens: None,
                 tool_count: None,
+                runtime_acknowledged_extensions: None,
             }],
         }
     }

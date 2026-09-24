@@ -46,10 +46,10 @@ pub mod workspaces;
 pub mod worktrees;
 
 pub use agents::{
-    AgentInfo, AgentSessionInfo, AgentSessionRefKind, AgentView, AgentViewBuiltinField,
-    AgentViewBuiltinSortField, AgentViewClearParams, AgentViewContext, AgentViewField,
-    AgentViewFilter, AgentViewSetParams, AgentViewSort, AgentViewSortField, AgentViewSortOrder,
-    AgentViewValue,
+    AgentInfo, AgentPromptParams, AgentPromptWaitOptions, AgentSessionInfo, AgentSessionRefKind,
+    AgentStartParams, AgentView, AgentViewBuiltinField, AgentViewBuiltinSortField,
+    AgentViewClearParams, AgentViewContext, AgentViewField, AgentViewFilter, AgentViewSetParams,
+    AgentViewSort, AgentViewSortField, AgentViewSortOrder, AgentViewValue,
 };
 pub use common::{
     AgentStatus, AgentTarget, EmptyParams, PaneAgentState, PaneTarget, ReadFormat, ReadSource,
@@ -74,6 +74,6 @@ pub use response::{
 };
 pub use server::{PingParams, ServerCapabilities};
 pub use session::SessionSnapshot;
-pub use tabs::{TabInfo, TabRenameParams};
-pub use workspaces::{WorkspaceInfo, WorkspaceWorktreeInfo};
+pub use tabs::{TabCreateParams, TabInfo, TabRenameParams};
+pub use workspaces::{WorkspaceCreateParams, WorkspaceInfo, WorkspaceWorktreeInfo};
 pub use worktrees::WorktreeInfo;

@@ -242,6 +242,34 @@ pub(crate) fn apply_agent_config(
             return Err("config.subagentOnlyExtensions must be a comma-separated string, empty string, or false when provided.".to_string());
         }
     }
+    // SUBA-102 — pi `applyAgentConfig` (`agent-management.ts:514-518` @v0.68.0): `false` deletes
+    // the list, `""` sets it EMPTY, any other string is `parseCsv`'d, anything else refuses.
+    if let Some(v) = cfg.get("mutationTools") {
+        if v == &Value::Bool(false) {
+            fields.mutation_tools = Some(None);
+        } else if v.as_str() == Some("") {
+            fields.mutation_tools = Some(Some(Vec::new()));
+        } else if let Some(s) = v.as_str() {
+            fields.mutation_tools = Some(Some(parse_csv(s)));
+        } else {
+            return Err("config.mutationTools must be a comma-separated string, empty string, or false when provided.".to_string());
+        }
+    }
+    // SUBA-100 — the agent's Herdr saved machine. `false`/`""` deletes it (the management
+    // convention every clearable scalar here follows); any other value goes through pi's own
+    // `validateOptionalMachine` (`agents.ts:979-986` @v0.68.0) — the one validator frontmatter,
+    // `agentOverrides` and runtime definitions share — so a machine this surface writes is one
+    // every reader accepts.
+    if let Some(v) = cfg.get("machine") {
+        if v == &Value::Bool(false) || v.as_str() == Some("") {
+            fields.machine = Some(None);
+        } else {
+            fields.machine = Some(crate::placement::validate_optional_machine(
+                Some(v),
+                "config.machine",
+            )?);
+        }
+    }
     if let Some(v) = cfg.get("thinking") {
         // pi `applyAgentConfig` (`agent-management.ts:507-514`): `false`/`""` clears; any other
         // string sets the OPEN value (trimmed; a whitespace-only value clears). No closed-enum
@@ -277,6 +305,17 @@ pub(crate) fn apply_agent_config(
             None => {
                 return Err(
                     "config.inheritProjectContext must be a boolean when provided.".to_string(),
+                );
+            }
+        }
+    }
+    // SUBA-101 — pi `agent-management.ts:536-539` @v0.68.0.
+    if let Some(v) = cfg.get("inheritGlobalContext") {
+        match v.as_bool() {
+            Some(b) => fields.inherit_global_context = Some(b),
+            None => {
+                return Err(
+                    "config.inheritGlobalContext must be a boolean when provided.".to_string(),
                 );
             }
         }

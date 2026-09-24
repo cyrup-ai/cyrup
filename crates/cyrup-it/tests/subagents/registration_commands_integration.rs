@@ -315,6 +315,7 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
             model_scope: None,
             // SUBA-078 added this field; a profile declares no reasoning ceiling of its own.
             max_thinking: None,
+            warnings: Vec::new(),
         },
     };
     tokio::fs::write(
@@ -348,6 +349,7 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
             model_scope: None,
             // SUBA-078 added this field; a profile declares no reasoning ceiling of its own.
             max_thinking: None,
+            warnings: Vec::new(),
         },
     };
     tokio::fs::write(

@@ -33,12 +33,12 @@
 //!
 //! # Fields cyrup cannot carry (omitted from the struct, deliberately)
 //!
-//! `fast`, `mcpDirectTools`, `mutationTools`, `inheritGlobalContext`, `skillPath`,
-//! `intercomBridge`, `maxOutput`, `launchResolvedExtensions`, `modelResponseAliases`,
-//! `extensionBindings`, `requiredExtensions`, `agentContract`, `baseRef`: none of these has a
-//! cyrup concept on the async single path (see the `[AUG — descriptor]` field map for the
-//! per-field grep). `deny_unknown_fields` is safe because the writer and every reader of this
-//! file are in this crate.
+//! `mcpDirectTools`, `skillPath`, `intercomBridge`, `maxOutput`, `launchResolvedExtensions`,
+//! `modelResponseAliases`, `extensionBindings`, `requiredExtensions`, `agentContract`, `baseRef`:
+//! none of these has a cyrup concept on the async single path (see the `[AUG — descriptor]` field
+//! map for the per-field grep). `deny_unknown_fields` is safe because the writer and every reader
+//! of this file are in this crate. (`fast`, `mutationTools` and `inheritGlobalContext` left this
+//! list with SUBA-101/102/103 and are carried below.)
 //!
 //! # `[CYRUP-DELTA]` — four cyrup-only run-level keys
 //!
@@ -341,6 +341,22 @@ pub struct RecoveryDescriptor {
     pub inherit_project_context: bool,
     /// The persona's skills inheritance flag.
     pub inherit_skills: bool,
+    /// SUBA-101 — pi `inheritGlobalContext` (`async-resume.ts:368-369` @v0.68.0). A descriptor
+    /// written before this field existed reads as `None`; upstream then takes
+    /// `inheritProjectContext` (`:368`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_global_context: Option<bool>,
+    /// SUBA-102 — pi `mutationTools` (`async-resume.ts:323,372` @v0.68.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_tools: Option<Vec<String>>,
+    /// SUBA-103 — pi `fast` (`async-resume.ts:323`, validated `:362` @v0.68.0), written by
+    /// `async-execution.ts:2008`. The revive passes it as `params.fast` (`subagent-executor.ts:2147`)
+    /// and relaunches with `params.fast ?? agentConfig.fast` (`async-execution.ts:1967`), so an
+    /// ABSENT value falls back to the agent's current `fast` (`extension/executor/control.rs`'s
+    /// revive does the same). Present whenever some launch rung set it — including `false`, which
+    /// pi drops (see [`Self::for_single_launch`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
     /// The EFFECTIVE skill list (per-call override, else the persona's), written iff non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
@@ -512,6 +528,13 @@ impl RecoveryDescriptor {
             return None;
         };
         let persona = config.resolved_agents.get(&step.agent)?;
+        // SUBA-100 [CYRUP-DELTA] — upstream writes a descriptor for a placed native run too
+        // (`async-execution.ts:2049-2051` @v0.68.0), and it carries no machine, so a revive would
+        // quietly run the child LOCALLY. A placed run's session lives on the machine; it is not
+        // revivable here, and no descriptor claims otherwise.
+        if step.machine.is_some() || persona.machine.is_some() {
+            return None;
+        }
 
         let (model, derived_origin) =
             resolve_model_and_origin(step, persona, config.inherited_session_model.as_ref());
@@ -553,6 +576,24 @@ impl RecoveryDescriptor {
         });
 
         Some(Self {
+            // SUBA-103 — pi `...(params.fast ?? recoveryAgentConfig.fast ? { fast } : {})`
+            // (`async-execution.ts:2008` @v0.68.0). The step already carries the EFFECTIVE value
+            // (`s.fast ?? params.fast ?? a.fast`, folded at plan time by `spawn_background` /
+            // `apply_agent_launch_defaults`), which is `None` when NO rung set it — and then, as in
+            // pi, nothing is recorded and the revive falls back to the agent's current `fast`.
+            // `[CYRUP-DELTA]`: when the effective value is an explicit `false` (a call or step that
+            // said `fast: false`, or an agent file that did), it is recorded — pi drops it, so its
+            // revive falls back to whatever the agent file says NOW (`params.fast ??
+            // agentConfig.fast` with `params.fast` undefined, `async-execution.ts:1967`) and a run
+            // launched deliberately standard can revive fast; cyrup's revive replays the launch's
+            // own decision there.
+            fast: step.fast,
+            // SUBA-101 — pi writes `inheritGlobalContext: recoveryAgentConfig.inheritGlobalContext`
+            // unconditionally (`:2024`); `Option` only so a pre-field descriptor still reads.
+            inherit_global_context: Some(persona.inherit_global_context),
+            // SUBA-102 — pi `...(recoveryAgentConfig.mutationTools ? { mutationTools } : {})`
+            // (`:2020`).
+            mutation_tools: persona.mutation_tools.clone(),
             version: DescriptorVersion,
             launch_contract_digest,
             source_run_id: config.run_id.clone(),
@@ -722,10 +763,15 @@ impl RecoveryDescriptor {
                 "absoluteDeadlineAt must be a positive timestamp.".to_string(),
             ));
         }
-        let lists: [(&str, &[String]); 4] = [
+        let lists: [(&str, &[String]); 5] = [
             ("excludeTools", &self.exclude_tools),
             ("extensions", self.extensions.as_deref().unwrap_or_default()),
             ("subagentOnlyExtensions", &self.subagent_only_extensions),
+            // SUBA-102 — pi `:372-375` checks `mutationTools` with the other lists.
+            (
+                "mutationTools",
+                self.mutation_tools.as_deref().unwrap_or_default(),
+            ),
             ("skills", &self.skills),
         ];
         for (field, entries) in lists {
@@ -828,6 +874,11 @@ impl RecoveryDescriptor {
         }
         persona.system_prompt_mode = self.system_prompt_mode;
         persona.inherit_project_context = self.inherit_project_context;
+        // SUBA-101 — pi `inheritGlobalContext: descriptor.inheritGlobalContext` (`:621`), where
+        // the reader already defaulted a missing value to `inheritProjectContext` (`:368`).
+        persona.inherit_global_context = self.effective_inherit_global_context();
+        // SUBA-102 — pi `mutationTools: descriptor.mutationTools ? [...] : undefined` (`:617`).
+        persona.mutation_tools = self.mutation_tools.clone();
         persona.inherit_skills = self.inherit_skills;
         persona.skills = self.skills.clone();
         persona.file_path = self
@@ -838,6 +889,16 @@ impl RecoveryDescriptor {
         persona.memory = self.memory.clone();
         persona.tool_budget = self.initial_tool_budget.clone();
         persona.max_subagent_depth = Some(self.max_subagent_depth);
+    }
+
+    /// SUBA-101 — pi `readAsyncRecoveryDescriptor`'s legacy default (`async-resume.ts:368`
+    /// @v0.68.0): `if (parsed.inheritGlobalContext === undefined) parsed.inheritGlobalContext =
+    /// parsed.inheritProjectContext;` — a descriptor written before the field existed resumes with
+    /// global context exactly when it resumed with project context.
+    #[must_use]
+    pub fn effective_inherit_global_context(&self) -> bool {
+        self.inherit_global_context
+            .unwrap_or(self.inherit_project_context)
     }
 
     /// pi `subagent-executor.ts:1894-1905`: when discovery no longer finds the agent, a base
@@ -854,6 +915,10 @@ impl RecoveryDescriptor {
                 .join("recovery-agent")
         });
         let mut persona = ResolvedAgentPersona {
+            // pi `:1900`: `inheritGlobalContext: recoveryDescriptor.inheritGlobalContext`.
+            inherit_global_context: self.effective_inherit_global_context(),
+            machine: None,
+            mutation_tools: None,
             name: self.agent.clone(),
             model: None,
             model_provider: None,
@@ -932,6 +997,22 @@ fn definition_digest(persona: &ResolvedAgentPersona) -> String {
 /// pi `launchBindingDigest(projectLaunchBinding(input))` (`launch-contract.ts:137-139`), with
 /// `undefined` keys omitted exactly as `stableJson` omits them.
 fn launch_binding_digest(binding: LaunchBinding<'_>) -> LaunchContractDigest {
+    let digest = crate::workflows::stable_json_digest(&serde_json::Value::Object(
+        launch_binding_projection(binding),
+    ));
+    // `stable_json_digest` is 64 lower-hex by construction; the fallback below is unreachable
+    // and exists only so this function is total without an `expect`.
+    LaunchContractDigest::parse(&digest)
+        .unwrap_or_else(|_| LaunchContractDigest(sha256_hex(digest.as_bytes())))
+}
+
+/// pi `projectLaunchBinding` (`launch-contract.ts:111-135` @v0.68.0): the canonical projection
+/// [`launch_binding_digest`] hashes, split out so what it BINDS is assertable key by key — a
+/// digest-changes test alone cannot tell a key bound here from one that only moves the
+/// `definitionDigest` (the persona is serialized into that too).
+fn launch_binding_projection(
+    binding: LaunchBinding<'_>,
+) -> serde_json::Map<String, serde_json::Value> {
     use serde_json::Value;
     let LaunchBinding {
         step,
@@ -976,7 +1057,16 @@ fn launch_binding_digest(binding: LaunchBinding<'_>) -> LaunchContractDigest {
         "inheritProjectContext",
         Value::Bool(persona.inherit_project_context),
     );
+    // SUBA-101 — pi binds `inheritGlobalContext` beside the project flag (`launch-contract.ts:122`).
+    put(
+        "inheritGlobalContext",
+        Value::Bool(persona.inherit_global_context),
+    );
     put("inheritSkills", Value::Bool(persona.inherit_skills));
+    // SUBA-103 — pi binds the launch's `fast` (`launch-contract.ts:117`), omitted when undefined.
+    if let Some(fast) = step.fast {
+        put("fast", Value::Bool(fast));
+    }
     if !skills.is_empty() {
         put("skills", serde_json::json!(skills));
     }
@@ -1008,11 +1098,7 @@ fn launch_binding_digest(binding: LaunchBinding<'_>) -> LaunchContractDigest {
     if let Some(schema) = &step.structured_output_schema {
         put("structuredOutputSchema", schema.clone());
     }
-    let digest = crate::workflows::stable_json_digest(&Value::Object(projection));
-    // `stable_json_digest` is 64 lower-hex by construction; the fallback below is unreachable
-    // and exists only so this function is total without an `expect`.
-    LaunchContractDigest::parse(&digest)
-        .unwrap_or_else(|_| LaunchContractDigest(sha256_hex(digest.as_bytes())))
+    projection
 }
 
 #[cfg(test)]
@@ -1036,6 +1122,11 @@ mod tests {
     /// than a matching default.
     fn distinctive_persona() -> ResolvedAgentPersona {
         ResolvedAgentPersona {
+            // SUBA-101: `true` against `inherit_project_context: false`, so the legacy default
+            // (`None` -> the project flag) is distinguishable from the recorded value.
+            inherit_global_context: true,
+            machine: None,
+            mutation_tools: Some(vec!["apply_patch".to_string()]),
             name: "worker".to_string(),
             model: Some(ModelId::from("fixture/persona-model")),
             model_provider: Some(ProviderId::from("fixture")),
@@ -1077,6 +1168,7 @@ mod tests {
 
     fn distinctive_step() -> SingleStepSpec {
         SingleStepSpec {
+            machine: None,
             agent: "worker".to_string(),
             task: "do the thing".to_string(),
             cwd: None,
@@ -1089,6 +1181,7 @@ mod tests {
             output: None,
             output_path: Some("/out/out.md".to_string()),
             output_mode: Some(OutputMode::FileOnly),
+            fast: Some(true),
             reads: None,
             acceptance: Some(serde_json::json!({"level": "checked"})),
             skills: Some(vec!["beta".to_string()]),
@@ -1209,6 +1302,10 @@ mod tests {
         assert_eq!(d.system_prompt_mode, SystemPromptMode::Replace);
         assert!(!d.inherit_project_context);
         assert!(!d.inherit_skills);
+        // SUBA-101/102/103.
+        assert_eq!(d.inherit_global_context, Some(true));
+        assert_eq!(d.mutation_tools, Some(vec!["apply_patch".to_string()]));
+        assert_eq!(d.fast, Some(true), "the step's EFFECTIVE fast");
         assert_eq!(
             d.skills,
             vec!["beta".to_string()],
@@ -1435,9 +1532,105 @@ mod tests {
             serde_json::json!({"maxTurns": 9, "graceTurns": 1})
         );
         assert_eq!(raw["permissionRules"], serde_json::json!({"write": "deny"}));
+        // SUBA-101/102/103 — pi's key spellings (`async-resume.ts:323-324` @v0.68.0).
+        assert_eq!(raw["inheritGlobalContext"], true);
+        assert_eq!(raw["mutationTools"], serde_json::json!(["apply_patch"]));
+        assert_eq!(raw["fast"], true);
 
         let read = RecoveryDescriptor::read(&path).await.unwrap().unwrap();
         assert_eq!(read, written);
+    }
+
+    /// SUBA-101 — pi's legacy default (`async-resume.ts:368` @v0.68.0): a descriptor written
+    /// before `inheritGlobalContext` existed reads back with the PROJECT flag in its place, on
+    /// both reader paths (the overlay and the synthesised persona); a recorded value wins over it.
+    /// SUBA-102/103 — `mutationTools` entries must be non-empty strings (`:372-375`) and `fast`
+    /// a boolean (`:362`). Mutation killed: `effective_inherit_global_context` returning a
+    /// constant, dropping the `mutationTools` row from `validate`, or `apply_to_persona` not
+    /// copying `mutation_tools`.
+    #[tokio::test]
+    async fn a_pre_field_descriptor_takes_the_project_flag_and_the_new_fields_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery-descriptor.json");
+        let config = runner_config(distinctive_step(), distinctive_persona());
+        let written =
+            RecoveryDescriptor::for_single_launch(&config, LaunchInputs::default()).unwrap();
+        let mut legacy = serde_json::to_value(&written).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("inheritGlobalContext");
+        object.remove("mutationTools");
+        object.remove("fast");
+        for project in [true, false] {
+            object.insert("inheritProjectContext".into(), serde_json::json!(project));
+            std::fs::write(&path, serde_json::to_vec(&*object).unwrap()).unwrap();
+            let read = RecoveryDescriptor::read(&path).await.unwrap().unwrap();
+            assert_eq!(read.inherit_global_context, None);
+            assert_eq!(read.fast, None);
+            assert_eq!(read.effective_inherit_global_context(), project);
+            let mut persona = distinctive_persona();
+            persona.inherit_global_context = !project;
+            read.apply_to_persona(&mut persona);
+            assert_eq!(persona.inherit_global_context, project, "overlay, legacy");
+            assert_eq!(
+                persona.mutation_tools, None,
+                "the descriptor's absence wins"
+            );
+            assert_eq!(
+                read.synthesised_persona().inherit_global_context,
+                project,
+                "synthesised, legacy"
+            );
+        }
+
+        // A recorded value wins over the project flag, on both reader paths.
+        written.write(&path).await.unwrap();
+        let read = RecoveryDescriptor::read(&path).await.unwrap().unwrap();
+        assert!(!read.inherit_project_context);
+        assert!(read.effective_inherit_global_context());
+        let mut persona = distinctive_persona();
+        persona.inherit_global_context = false;
+        persona.mutation_tools = None;
+        read.apply_to_persona(&mut persona);
+        assert!(persona.inherit_global_context);
+        assert_eq!(
+            persona.mutation_tools,
+            Some(vec!["apply_patch".to_string()])
+        );
+        let synthesised = read.synthesised_persona();
+        assert!(synthesised.inherit_global_context);
+        assert_eq!(
+            synthesised.mutation_tools,
+            Some(vec!["apply_patch".to_string()])
+        );
+
+        let base = serde_json::to_value(&written).unwrap();
+        for (key, bad, needle) in [
+            (
+                "mutationTools",
+                serde_json::json!(["apply_patch", "  "]),
+                "mutationTools must contain non-empty strings.",
+            ),
+            // The two booleans are refused structurally by the field type (this reader's
+            // documented split with serde), so the detail is serde's, not pi's field sentence.
+            ("fast", serde_json::json!("yes"), "expected a boolean"),
+            (
+                "inheritGlobalContext",
+                serde_json::json!(1),
+                "expected a boolean",
+            ),
+        ] {
+            let mut doc = base.clone();
+            doc[key] = bad;
+            std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+            let err = RecoveryDescriptor::read(&path)
+                .await
+                .expect_err("refused")
+                .to_string();
+            assert!(
+                err.starts_with("Invalid async recovery descriptor") && err.contains(needle),
+                "{key}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1551,6 +1744,85 @@ mod tests {
         assert_ne!(da.launch_contract_digest, db.launch_contract_digest);
     }
 
+    /// SUBA-101/102/103 — the launch binding binds all three keys, as pi's does:
+    /// `inheritGlobalContext` and `fast` directly (`projectLaunchBinding`, `launch-contract.ts:117,
+    /// 122` @v0.68.0; `fast` omitted when unset, as `stableJson` drops `undefined`), and
+    /// `mutationTools` through the definition digest (`projectAgentDefinition`, `:62`). Asserted
+    /// on the PROJECTION key by key and on the digest end to end: the persona is serialized into
+    /// `definitionDigest`, so a digest-only test would stay green with the direct
+    /// `inheritGlobalContext` key gutted.
+    ///
+    /// *Gutted by*, each alone: dropping the `put("inheritGlobalContext", …)` (the key is missing);
+    /// dropping the `if let Some(fast) = step.fast { put("fast", …) }` (the key is missing and the
+    /// fast digest equals the base); `#[serde(skip)]` on `ResolvedAgentPersona::mutation_tools`
+    /// (the definition digest no longer moves).
+    #[test]
+    fn the_launch_digest_binds_global_context_mutation_tools_and_fast() {
+        let project = |step: &SingleStepSpec, persona: &ResolvedAgentPersona| {
+            launch_binding_projection(LaunchBinding {
+                step,
+                persona,
+                model: None,
+                thinking: None,
+                skills: &[],
+                output_mode: OutputMode::Inline,
+            })
+        };
+        let digest = |step: &SingleStepSpec, persona: &ResolvedAgentPersona| {
+            launch_binding_digest(LaunchBinding {
+                step,
+                persona,
+                model: None,
+                thinking: None,
+                skills: &[],
+                output_mode: OutputMode::Inline,
+            })
+        };
+        let mut step = distinctive_step();
+        step.fast = None;
+        let mut persona = distinctive_persona();
+        persona.inherit_global_context = false;
+        persona.mutation_tools = None;
+        let base = project(&step, &persona);
+        assert_eq!(
+            base.get("inheritGlobalContext"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(base.get("fast"), None, "an unset fast is omitted");
+        let base_digest = digest(&step, &persona);
+
+        let mut global = persona.clone();
+        global.inherit_global_context = true;
+        assert_eq!(
+            project(&step, &global).get("inheritGlobalContext"),
+            Some(&serde_json::json!(true))
+        );
+        assert_ne!(digest(&step, &global), base_digest);
+
+        let mut fast = step.clone();
+        fast.fast = Some(true);
+        assert_eq!(
+            project(&fast, &persona).get("fast"),
+            Some(&serde_json::json!(true))
+        );
+        assert_ne!(digest(&fast, &persona), base_digest);
+        fast.fast = Some(false);
+        assert_eq!(
+            project(&fast, &persona).get("fast"),
+            Some(&serde_json::json!(false)),
+            "a stated `false` is bound too"
+        );
+
+        let mut mutating = persona.clone();
+        mutating.mutation_tools = Some(vec!["apply_patch".to_string()]);
+        assert_ne!(
+            project(&step, &mutating).get("definitionDigest"),
+            base.get("definitionDigest"),
+            "mutationTools moves the definition digest"
+        );
+        assert_ne!(digest(&step, &mutating), base_digest);
+    }
+
     /// The two cross-checks, with pi's sentences.
     #[test]
     fn belongs_to_refuses_another_run_or_another_agent() {
@@ -1585,6 +1857,9 @@ mod tests {
         let config = runner_config(distinctive_step(), distinctive_persona());
         let d = RecoveryDescriptor::for_single_launch(&config, LaunchInputs::default()).unwrap();
         let mut widened = ResolvedAgentPersona {
+            inherit_global_context: false,
+            machine: None,
+            mutation_tools: None,
             name: "worker".to_string(),
             model: Some(ModelId::from("fixture/other-model")),
             model_provider: None,
@@ -1640,6 +1915,12 @@ mod tests {
             expected.inherit_project_context
         );
         assert_eq!(widened.inherit_skills, expected.inherit_skills);
+        // SUBA-101/102 — the file says `false`/`None`; the launch said `true`/`[apply_patch]`.
+        assert_eq!(
+            widened.inherit_global_context,
+            expected.inherit_global_context
+        );
+        assert_eq!(widened.mutation_tools, expected.mutation_tools);
         assert_eq!(
             widened.skills,
             vec!["beta".to_string()],

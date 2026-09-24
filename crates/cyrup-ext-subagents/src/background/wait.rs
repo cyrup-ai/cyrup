@@ -807,7 +807,9 @@ fn summarize_terminal_runs(terminal: &[super::RunStatus]) -> (usize, String) {
     for status in terminal {
         match status.state {
             RunState::Complete => complete += 1,
-            RunState::Failed => failed += 1,
+            // SUBA-100 — pi counts a partial run with the failed ones
+            // (`run.state === "failed" || run.state === "partial"`, `subagent-wait.ts:817`).
+            RunState::Failed | RunState::Partial => failed += 1,
             RunState::Paused => paused += 1,
             RunState::Stopped => stopped += 1,
             RunState::Queued | RunState::Running => {}

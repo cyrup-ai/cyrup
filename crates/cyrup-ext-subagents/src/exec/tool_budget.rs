@@ -36,6 +36,15 @@ pub const TOOL_BUDGET_ENV: &str = "CYRUP_SUBAGENT_TOOL_BUDGET";
 ///
 /// No `PI_` read alias, matching its sibling [`TOOL_BUDGET_ENV`] in this module: both are written
 /// by THIS crate's parent into the child env, never expected from an operator's shell.
+///
+/// `[CYRUP-DELTA]`: upstream **removed** this env var at v0.67.0 (`git grep ZERO_AUTH` is non-empty
+/// at v0.64.0 and empty at v0.67.0/v0.68.0), because its children became in-process and carry
+/// the authorisation on `ChildRuntimeConfig.toolBudget` (`subagent-prompt-runtime.ts:453`
+/// @v0.68.0). cyrup still spawns a subprocess per child, so the env var remains the right
+/// transport here. Its only upstream producer is the prompt-template delegation bridge
+/// (`slash/delegation-adapters.ts:301` @v0.68.0), which is `SUBA-022`; until that exists nothing
+/// in this crate writes it, and a public `hard: 0` is refused on every surface, as upstream's
+/// public path (`minimumHard: 1`) refuses it.
 pub const TOOL_BUDGET_ZERO_AUTH_ENV: &str = "CYRUP_SUBAGENT_TOOL_BUDGET_ZERO_AUTH";
 
 /// pi's `options.minimumHard?: 0 | 1` on `validateToolBudgetConfig` (`tool-budget.ts:16, 21`):

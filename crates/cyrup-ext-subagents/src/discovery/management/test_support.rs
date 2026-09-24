@@ -15,9 +15,13 @@ use super::super::types::{AgentDefinition, AgentSource, ChainDefinition, SystemP
 
 pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefinition {
     AgentDefinition {
+        inherit_global_context: false,
+        machine: None,
+        mutation_tools: None,
         default_turn_budget: None,
         default_acceptance: None,
         acceptance_role: None,
+        fast: None,
         permission_rules: None,
         runner: None,
         name: "reviewer".to_string(),

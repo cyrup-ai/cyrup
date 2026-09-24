@@ -101,6 +101,18 @@ pub struct AcceptanceContract {
     /// upstream: `formatAcceptancePrompt` emits them (`acceptance.ts:432-434`) and no upstream
     /// runtime check ever reads them back.
     pub stop_rules: Vec<String>,
+    /// SUBA-105 — pi `resolveAcceptanceReportMode(acceptance)` (`runs/shared/acceptance.ts:192-197`
+    /// @v0.68.0): whether a structured-output child hands its acceptance report inside its
+    /// `structured_output` call, may do so, or must. Set by
+    /// [`crate::exec::acceptance::lattice::lowering::lower_acceptance_input`] from the authored
+    /// policy; every other constructor leaves upstream's no-policy answer,
+    /// [`crate::exec::acceptance::model::AcceptanceReportMode::Optional`]. Read by `run_sync` when it
+    /// creates the structured-output runtime and by the prompt injection, never by the lattice.
+    pub report_mode: crate::exec::acceptance::model::AcceptanceReportMode,
+    /// SUBA-105 — pi `"report" in acceptance` (`acceptance.ts:428` @v0.68.0): the authored policy
+    /// DECLARED `report` (either value), which `validateAcceptanceReportMode` refuses on a step
+    /// with no `outputSchema`.
+    pub report_declared: bool,
 }
 
 impl AcceptanceContract {
@@ -131,7 +143,23 @@ impl AcceptanceContract {
             evidence: Vec::new(),
             review: None,
             stop_rules: Vec::new(),
+            report_mode: crate::exec::acceptance::model::AcceptanceReportMode::Optional,
+            report_declared: false,
         }
+    }
+
+    /// SUBA-105 — attach the authored `acceptance.report` resolution (builder-style): the mode
+    /// [`crate::exec::acceptance::model::resolve_acceptance_report_mode`] derives and whether the
+    /// key was declared at all ([`crate::exec::acceptance::model::acceptance_declares_report`]).
+    #[must_use]
+    pub fn with_report(
+        mut self,
+        mode: crate::exec::acceptance::model::AcceptanceReportMode,
+        declared: bool,
+    ) -> Self {
+        self.report_mode = mode;
+        self.report_declared = declared;
+        self
     }
 
     /// Attach the resolved `criteria`/`evidence`/`review`/`stopRules` half of an authored
@@ -290,6 +318,9 @@ impl AcceptanceContract {
             evidence: inferred.evidence,
             review: inferred.review,
             stop_rules: Vec::new(),
+            // No authored policy: `resolveAcceptanceReportMode(undefined)` is `optional`.
+            report_mode: crate::exec::acceptance::model::AcceptanceReportMode::Optional,
+            report_declared: false,
         }
     }
 

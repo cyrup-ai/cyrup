@@ -230,6 +230,53 @@ pub async fn drain_outstanding_work(
     Ok(())
 }
 
+/// The dispatch-budget ceiling an `AgentEnd`-handler drain declares
+/// ([`cyrup_ext::native::SanctionedWaitKind::AutoDrain`]): the drain's own `timeout_ms` plus one
+/// dispatch budget of slack for the probe/wait bookkeeping around it — the same shape as the
+/// watchdog review's `agent_end_wait_ceiling`.
+///
+/// Upstream awaits the drain inside its `agent_end` handler with no per-handler budget at all
+/// (`extension/index.ts:834`, `runs/shared/subagent-prompt-runtime.ts:500` @v0.68.0;
+/// `coding-agent/src/core/extensions/runner.ts:805-811`), so the ONLY bound is the drain's own
+/// deadline (`auto-drain.ts:48-59`). The ceiling reproduces exactly that bound: a drain that honours
+/// its deadline always finishes inside it, and one whose deadline logic is broken is still cut at
+/// the first dispatch-budget boundary past it.
+#[must_use]
+pub fn auto_drain_wait_ceiling(timeout_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(timeout_ms)
+        .saturating_add(cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET)
+}
+
+/// [`drain_outstanding_work`] as called from an `AgentEnd` extension HANDLER — both of them, the
+/// orchestrator's (`extension/host/native_impl.rs`) and a subagent child's (`prompt_runtime.rs`).
+///
+/// The drain is awaited under a declared [`cyrup_ext::native::SanctionedWaitKind::AutoDrain`] wait
+/// whose ceiling is [`auto_drain_wait_ceiling`]`(timeout_ms)`. Without it the dispatcher's 5 s
+/// per-handler budget (`cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET`, enforced by
+/// `Dispatcher::invoke_contained` for every `AgentEnd` the session's `ExtSubscriber` dispatches)
+/// DROPS the handler future mid-drain: a headless `cyrup -p` whose background child needs more than
+/// five seconds loses that child's completion, which is the one outcome this module exists to
+/// prevent. The guard is released the moment the drain returns, so the handler's remaining work is
+/// budgeted again.
+///
+/// # Errors
+///
+/// Exactly [`drain_outstanding_work`]'s.
+pub async fn drain_outstanding_work_in_handler(
+    ctx: &cyrup_ext::native::HostCtx,
+    session_id: &SessionId,
+    timeout_ms: u64,
+    now: &(dyn Fn() -> i64 + Send + Sync),
+    probe: &dyn DrainProbe,
+    waiter: &dyn DrainWaiter,
+) -> Result<(), String> {
+    let _drain = ctx.begin_sanctioned_wait(
+        cyrup_ext::native::SanctionedWaitKind::AutoDrain,
+        auto_drain_wait_ceiling(timeout_ms),
+    );
+    drain_outstanding_work(session_id, timeout_ms, now, probe, waiter).await
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

@@ -169,6 +169,11 @@ fn detached_step(agent: &str, lane: &str, run_id: Option<&str>) -> StepStatus {
 
 fn child_result(child_run_id: &str) -> SingleResult {
     SingleResult {
+        execution: None,
+        native_machine: None,
+        runtime_acknowledged_extensions: None,
+        skills_warning: None,
+        watchdog: None,
         agent: "researcher".to_string(),
         task: String::new(),
         exit_code: 0,
@@ -506,6 +511,62 @@ async fn another_open_detached_child_keeps_the_workflow_paused_and_logs_no_compl
     );
     // The result IS still published — the settled lane's evidence must reach a reader.
     assert_eq!(fixture.read_result().await.state, RunState::Paused);
+}
+
+/// Item 1 of the TAIL batch: the reconciler's `subagent.workflow.completed` line is a LIFECYCLE
+/// line (pi `appendDetachedWorkflowEvent`, a bare `fs.appendFileSync`,
+/// `workflow-detach-reconcile.ts:161-168` @v0.68.0) and so is never capped — exactly as the runner's
+/// `RunEventLog::write_line` treats its own lifecycle trail. The run's `events.jsonl` is pre-grown
+/// (sparsely) to the full default 50 MiB budget, the state in which the runner's own lifecycle
+/// trail has consumed it: the old silent `BoundedJsonlWriter` dropped the workflow's terminal
+/// completion line there without a trace.
+#[tokio::test]
+async fn a_full_event_log_still_receives_the_workflows_terminal_completion_line() {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let fixture = Fixture::new();
+    fixture
+        .seed(&paused_workflow(
+            &fixture.run_id,
+            vec![detached_step("a", "lane.a", Some(CHILD))],
+        ))
+        .await;
+    let full = crate::jsonl::DEFAULT_JSONL_CAP_BYTES;
+    std::fs::File::create(&fixture.run_paths.events)
+        .expect("events.jsonl")
+        .set_len(full)
+        .expect("grow events.jsonl to the full budget");
+    let result = child_result(CHILD);
+
+    assert!(
+        reconcile_detached_workflow_child_completion(completion(
+            &fixture.run_paths,
+            &result,
+            None,
+            &[]
+        ))
+        .await
+        .expect("reconciles")
+    );
+
+    let mut file = tokio::fs::File::open(&fixture.run_paths.events)
+        .await
+        .expect("events.jsonl");
+    let len = file.metadata().await.expect("metadata").len();
+    assert!(len > full, "a line was appended past the budget");
+    file.seek(std::io::SeekFrom::Start(full))
+        .await
+        .expect("seek");
+    let mut tail = String::new();
+    file.read_to_string(&mut tail).await.expect("tail");
+    let line: serde_json::Value =
+        serde_json::from_str(tail.trim_end()).expect("one whole JSON line after the budget");
+    assert_eq!(line["type"], "subagent.workflow.completed");
+    assert_eq!(line["runId"], fixture.run_id.as_str());
+    assert!(
+        !tail.contains(crate::jsonl::TRUNCATED_EVENT_TYPE),
+        "a lifecycle line is never refused, so no truncation marker is written for it"
+    );
 }
 
 #[tokio::test]

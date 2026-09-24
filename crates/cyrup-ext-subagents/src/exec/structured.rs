@@ -171,12 +171,103 @@ pub fn structured_output_instruction() -> &'static str {
     STRUCTURED_OUTPUT_INSTRUCTION
 }
 
+/// SUBA-105 — env var carrying the path the child's `structured_output` tool writes its
+/// `acceptanceReport` argument to (pi `StructuredOutputRuntime.acceptanceReportPath`,
+/// `structured-output.ts:17` @v0.68.0). Set only when the step's `acceptance.report` is not `off`;
+/// its presence is what gives the child tool an `acceptanceReport` parameter at all.
+pub const STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_ENV: &str =
+    "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_ACCEPTANCE_REPORT";
+
+/// SUBA-105 — env var carrying the report mode (`optional`/`required`) beside
+/// [`STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_ENV`] (pi `acceptanceReportRequired`,
+/// `structured-output.ts:18`, handed to the child as `ChildRuntimeConfig.structuredOutput.
+/// acceptanceReport`, `child-launch.ts:276-278` @v0.68.0).
+pub const STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_MODE_ENV: &str =
+    "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_ACCEPTANCE_REPORT_MODE";
+
+/// SUBA-105 — pi `MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR` (`structured-output.ts:11`
+/// @v0.68.0), verbatim: raised by the child tool when `acceptance.report` is `on` and the call
+/// carried no `acceptanceReport`, and by the parent read-back when the report file is absent.
+pub const MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR: &str =
+    "Missing acceptanceReport in structured_output call; acceptance.report is \"on\".";
+
 /// The parent-side runtime for one structured-output capture (pi `StructuredOutputRuntime`).
 #[derive(Debug, Clone)]
 pub struct StructuredOutputRuntime {
     pub schema: serde_json::Value,
     pub schema_path: std::path::PathBuf,
     pub output_path: std::path::PathBuf,
+    /// SUBA-105 — pi `acceptanceReportPath` (`structured-output.ts:17,144-146` @v0.68.0):
+    /// `<dir>/acceptance-report.json`, `Some` unless the step's `acceptance.report` is `off`.
+    pub acceptance_report_path: Option<std::path::PathBuf>,
+    /// SUBA-105 — pi `acceptanceReportRequired` (`structured-output.ts:18`): `report: "on"`.
+    pub acceptance_report_required: bool,
+}
+
+impl StructuredOutputRuntime {
+    /// The mode the child tool is armed with: `None` when there is no report channel (`off`).
+    #[must_use]
+    pub fn acceptance_report_mode(
+        &self,
+    ) -> Option<crate::exec::acceptance::model::AcceptanceReportMode> {
+        self.acceptance_report_path.as_ref().map(|_| {
+            if self.acceptance_report_required {
+                crate::exec::acceptance::model::AcceptanceReportMode::Required
+            } else {
+                crate::exec::acceptance::model::AcceptanceReportMode::Optional
+            }
+        })
+    }
+}
+
+/// SUBA-105 — what [`read_structured_output_acceptance_report`] found (pi's
+/// `{ value?: unknown; error?: string }`, `structured-output.ts:185-196` @v0.68.0). Both `None` is
+/// "no structured report": no channel, or an optional one the child left empty — the acceptance
+/// gate then reads the report from prose as it always has.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StructuredAcceptanceReport {
+    /// The child's `acceptanceReport` argument, raw — validated by the acceptance gate, which is
+    /// where upstream validates a caller-supplied report (`evaluateAcceptance`, `acceptance.ts:1431-1436`).
+    pub value: Option<serde_json::Value>,
+    /// A report that was required and never arrived, or could not be read.
+    pub error: Option<String>,
+}
+
+/// SUBA-105 — pi `readStructuredOutputAcceptanceReport` (`structured-output.ts:185-196` @v0.68.0):
+/// no channel is nothing; a missing file is [`MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR`] when the
+/// report was required and nothing otherwise; an unreadable one is `Failed to read structured
+/// output acceptance report: …`.
+#[must_use]
+pub fn read_structured_output_acceptance_report(
+    runtime: &StructuredOutputRuntime,
+) -> StructuredAcceptanceReport {
+    let Some(path) = runtime.acceptance_report_path.as_deref() else {
+        return StructuredAcceptanceReport::default();
+    };
+    if !path.exists() {
+        return StructuredAcceptanceReport {
+            value: None,
+            error: runtime
+                .acceptance_report_required
+                .then(|| MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR.to_string()),
+        };
+    }
+    match std::fs::read(path)
+        .map_err(|err| err.to_string())
+        .and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|err| err.to_string())
+        }) {
+        Ok(value) => StructuredAcceptanceReport {
+            value: Some(value),
+            error: None,
+        },
+        Err(err) => StructuredAcceptanceReport {
+            value: None,
+            error: Some(format!(
+                "Failed to read structured output acceptance report: {err}"
+            )),
+        },
+    }
 }
 
 /// pi `createStructuredOutputRuntime` (`structured-output.ts:127-136`): create a private temp dir
@@ -190,6 +281,25 @@ pub struct StructuredOutputRuntime {
 pub fn create_structured_output_runtime(
     schema: &serde_json::Value,
     base_dir: &std::path::Path,
+) -> std::io::Result<StructuredOutputRuntime> {
+    create_structured_output_runtime_with(
+        schema,
+        base_dir,
+        crate::exec::acceptance::model::AcceptanceReportMode::Off,
+    )
+}
+
+/// SUBA-105 — pi `createStructuredOutputRuntime(schema, baseDir, { acceptanceReport })`
+/// (`structured-output.ts:132-148` @v0.68.0): as [`create_structured_output_runtime`], plus the
+/// `acceptance-report.json` capture path unless `acceptance_report` is `off`.
+///
+/// # Errors
+///
+/// As [`create_structured_output_runtime`].
+pub fn create_structured_output_runtime_with(
+    schema: &serde_json::Value,
+    base_dir: &std::path::Path,
+    acceptance_report: crate::exec::acceptance::model::AcceptanceReportMode,
 ) -> std::io::Result<StructuredOutputRuntime> {
     std::fs::create_dir_all(base_dir)?;
     let dir = base_dir.join(format!(
@@ -208,10 +318,18 @@ pub fn create_structured_output_runtime(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&schema_path, std::fs::Permissions::from_mode(0o600));
     }
+    // `...(options.acceptanceReport && options.acceptanceReport !== "off" ? { acceptanceReportPath:
+    // path.join(dir, "acceptance-report.json"), acceptanceReportRequired: … === "required" } : {})`.
+    let acceptance_report_path = (acceptance_report
+        != crate::exec::acceptance::model::AcceptanceReportMode::Off)
+        .then(|| dir.join("acceptance-report.json"));
     Ok(StructuredOutputRuntime {
         schema: schema.clone(),
         schema_path,
         output_path,
+        acceptance_report_path,
+        acceptance_report_required: acceptance_report
+            == crate::exec::acceptance::model::AcceptanceReportMode::Required,
     })
 }
 
@@ -546,6 +664,8 @@ mod tests {
             schema: sample_schema(),
             schema_path: dir.join("schema.json"),
             output_path,
+            acceptance_report_path: None,
+            acceptance_report_required: false,
         });
         assert!(
             !dir.exists(),

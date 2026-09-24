@@ -602,7 +602,10 @@ impl NativeExtension for SubagentsExtension {
                 //
                 // pi `register-main.ts:427-430` — AWAITED (upstream RETURNS the promise from its
                 // handler, so pi's runner awaits it too).
-                self.watchdog.handle_agent_end(&ctx.cwd).await;
+                //
+                // UW-3 — under a declared model-review wait, or the dispatcher's 5 s handler
+                // budget drops the review mid-flight (upstream has no such budget).
+                self.watchdog.handle_agent_end_in_handler(ctx).await;
                 // pi `if (!ctx.hasUI) await drainOutstandingWork({ state, events: pi.events });`
                 // (`extension/index.ts:784`) — the FIRST line of the goal-mission handler, so it
                 // runs after the watchdog and before the goal scan. Headless only: an interactive
@@ -644,14 +647,19 @@ impl NativeExtension for SubagentsExtension {
                         .with_fail_on_failed_runs(true)
                         .with_fail_on_attention(true),
                     };
-                    if let Err(message) = crate::background::auto_drain::drain_outstanding_work(
-                        &session_id,
-                        crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
-                        &crate::time::now_epoch_millis,
-                        &probe,
-                        &waiter,
-                    )
-                    .await
+                    // Under a declared auto-drain wait: the dispatcher's 5 s handler budget would
+                    // otherwise drop the drain (and every completion it is holding the process open
+                    // for) mid-flight, where upstream awaits it to its own `timeoutMs`.
+                    if let Err(message) =
+                        crate::background::auto_drain::drain_outstanding_work_in_handler(
+                            ctx,
+                            &session_id,
+                            crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
+                            &crate::time::now_epoch_millis,
+                            &probe,
+                            &waiter,
+                        )
+                        .await
                     {
                         // [CYRUP-DELTA in mechanism, not in behaviour] upstream THROWS out of the
                         // handler (`auto-drain.ts:53,66`) — but that throw is not control flow: pi's
@@ -757,6 +765,8 @@ impl NativeExtension for SubagentsExtension {
                         None,
                         cyrup_ext::host::WidgetPlacement::default(),
                     );
+                    self.async_slot_occupied
+                        .store(false, std::sync::atomic::Ordering::Release);
                 }
                 // The join. Everything above has run; this is the only thing left to wait for, and
                 // it is bounded so that a herdr which stopped answering ends this handler
@@ -1092,6 +1102,11 @@ impl NativeExtension for SubagentsExtension {
         if key != TOOL_NAME {
             return None;
         }
+        // SUBA-061 — pi `summaryInlineToolDisplay ? renderSubagentSummary(…) :
+        // renderSubagentResult(…)` (`extension/index.ts:812-814` @v0.68.0).
+        if self.inline_tool_display_summary {
+            return Some(render_subagent_summary(result));
+        }
         Some(render_subagent_result(result))
     }
 }
@@ -1123,10 +1138,9 @@ fn render_subagent_call(args: &serde_json::Value) -> String {
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len)
     };
-    // `:475` — the `[async]` badge, suppressed while clarifying.
-    let async_label = if args.get("async") == Some(&serde_json::Value::Bool(true))
-        && args.get("clarify") != Some(&serde_json::Value::Bool(true))
-    {
+    // `index.ts:800` @v0.68.0 — `args.async === true ? "[async]" : ""`. The v0.43.0 renderer (`:475`)
+    // also hid the badge while `clarify: true`; v0.68.0 dropped that with the preview (PB-9).
+    let async_label = if args.get("async") == Some(&serde_json::Value::Bool(true)) {
         " [async]"
     } else {
         ""
@@ -1216,6 +1230,94 @@ fn render_subagent_result(result: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Array(lines.into_iter().map(serde_json::Value::String).collect())
 }
 
+/// SUBA-061 — pi `renderSubagentSummary` (`tui/render.ts:3318-3356` @v0.68.0), the
+/// `inlineToolDisplay: "summary"` renderer: ONE line, `<glyph> <label> · <state>`.
+///
+/// State precedence is upstream's: running > failed > stopped > paused > partial > completed.
+/// `partial` is reachable upstream only through a workflow graph's node statuses
+/// (`workflowGraphHasStatus`); cyrup's result details carry no workflow graph, so a run here is
+/// never `partial` — the rung is kept in the order so it cannot be mis-ranked if one appears. The
+/// label is the single run's display name (agent, else a one-line task) or the run mode.
+fn render_subagent_summary(result: &serde_json::Value) -> serde_json::Value {
+    use crate::tui::events::LiveProgressStatus;
+    let details = result.get("details").filter(|d| !d.is_null());
+    let payload = details.and_then(|d| {
+        serde_json::from_value::<crate::tui::events::SubagentUpdatePayload>(d.clone()).ok()
+    });
+    let results = payload
+        .as_ref()
+        .map(|p| p.results.as_slice())
+        .unwrap_or(&[]);
+    // pi `hasTerminalResultFlag` / `hasTerminalResult` / `isResultRunning` (`render.ts:908-921`).
+    let terminal_flag = |r: &crate::exec::SingleResult| r.detached || r.stopped || r.interrupted;
+    let progress_status = |r: &crate::exec::SingleResult| r.progress.as_ref().map(|p| p.status);
+    let is_terminal = |r: &crate::exec::SingleResult| {
+        terminal_flag(r)
+            || !matches!(
+                progress_status(r),
+                Some(LiveProgressStatus::Running | LiveProgressStatus::Pending)
+            )
+    };
+    let is_running = |r: &crate::exec::SingleResult| {
+        progress_status(r) == Some(LiveProgressStatus::Running) && !terminal_flag(r)
+    };
+    let single_terminal = results.len() == 1 && results.iter().all(is_terminal);
+    let all_terminal = !results.is_empty() && results.iter().all(is_terminal);
+    let details_running = payload.as_ref().is_some_and(|p| {
+        p.progress.iter().any(|entry| {
+            entry.status.is_running()
+                && results
+                    .get(entry.index as usize)
+                    .is_none_or(|r| !terminal_flag(r))
+        }) || p.results.iter().any(is_running)
+    });
+    let running = !single_terminal
+        && !all_terminal
+        && (payload.as_ref().is_some_and(|p| p.run_id.is_some()) || details_running);
+    let is_error = result.get("isError").and_then(serde_json::Value::as_bool) == Some(true);
+    let failed = is_error
+        || results
+            .iter()
+            .any(|r| !terminal_flag(r) && r.exit_code != 0 && !is_running(r));
+    let stopped = results.iter().any(|r| r.stopped);
+    let paused = results.iter().any(|r| r.interrupted || r.detached);
+    let state = if running {
+        "running"
+    } else if failed {
+        "failed"
+    } else if stopped {
+        "stopped"
+    } else if paused {
+        "paused"
+    } else {
+        "completed"
+    };
+    let glyph = match state {
+        "running" => "●",
+        "completed" => "✓",
+        "failed" => "✗",
+        _ => "■",
+    };
+    let mode = payload
+        .as_ref()
+        .and_then(|p| serde_json::to_value(p.mode).ok())
+        .and_then(|v| v.as_str().map(str::to_string));
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let label = match (mode.as_deref(), results) {
+        // pi `foregroundSingleDisplayName`: agent, then the one-line task, then "subagent".
+        (Some("single"), [only]) => Some(only.agent.as_str())
+            .filter(|agent| !agent.trim().is_empty())
+            .map(one_line)
+            .or_else(|| Some(one_line(&only.task)).filter(|task| !task.is_empty()))
+            .unwrap_or_else(|| "subagent".to_string()),
+        (Some(mode), _) => mode.to_string(),
+        (None, _) => "subagent".to_string(),
+    };
+    serde_json::Value::Array(vec![serde_json::Value::String(format!(
+        "{glyph} {label} · {state}"
+    ))])
+}
+
 /// Resolve one background run's nested descendants ONE level, by reading each nested run's own
 /// `status.json` — pi's `nestedChildren` on an `AsyncRunSummary` (`runs/background/
 /// async-status.ts:291`, rendered by `tui/fleet-status.ts:193,212`).
@@ -1250,4 +1352,89 @@ pub(crate) async fn read_nested_children(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod summary_render_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::render_subagent_summary;
+
+    fn test_single_result(agent: &str, exit_code: i32) -> crate::exec::SingleResult {
+        let mut result = crate::exec::pre_spawn_failure(
+            &crate::exec::testsupport::sample_agent_config("m1", &[]),
+            "do it",
+            String::new(),
+        );
+        result.agent = agent.to_string();
+        result.exit_code = exit_code;
+        result.error = None;
+        result
+    }
+
+    fn draw(mode: &str, results: Vec<crate::exec::SingleResult>, is_error: bool) -> String {
+        let result = serde_json::json!({
+            "content": [{"type": "text", "text": "done"}],
+            "details": {"mode": mode, "results": results},
+            "isError": is_error,
+        });
+        render_subagent_summary(&result)
+            .as_array()
+            .expect("one line")
+            .iter()
+            .map(|line| line.as_str().expect("text").to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// SUBA-061 — pi `renderSubagentSummary` (`tui/render.ts:3318-3356` @v0.68.0): one line per
+    /// result, state precedence running > failed > stopped > paused > completed. Mutation killed:
+    /// ranking `stopped` above `failed` (the third case then reads `stopped`), or dropping the
+    /// `isError` term.
+    #[test]
+    fn summary_mode_renders_one_line_per_state() {
+        assert_eq!(
+            draw("single", vec![test_single_result("worker", 0)], false),
+            "✓ worker · completed"
+        );
+        assert_eq!(
+            draw("single", vec![test_single_result("worker", 1)], false),
+            "✗ worker · failed"
+        );
+        let mut stopped_and_failed = test_single_result("worker", 1);
+        stopped_and_failed.stopped = true;
+        let mut other_failed = test_single_result("other", 2);
+        other_failed.stopped = false;
+        assert_eq!(
+            draw(
+                "parallel",
+                vec![stopped_and_failed.clone(), other_failed],
+                false
+            ),
+            "✗ parallel · failed",
+            "failed outranks stopped"
+        );
+        assert_eq!(
+            draw("single", vec![stopped_and_failed], false),
+            "■ worker · stopped",
+            "a stop flag is terminal, so its non-zero exit is not a failure"
+        );
+        let mut paused = test_single_result("worker", 0);
+        paused.interrupted = true;
+        assert_eq!(draw("single", vec![paused], false), "■ worker · paused");
+        assert_eq!(
+            draw("chain", vec![test_single_result("a", 0)], true),
+            "✗ chain · failed",
+            "the result's own isError fails it"
+        );
+        // An async launch receipt: a run id, no settled result yet.
+        let launched = serde_json::json!({
+            "content": [{"type": "text", "text": "Async run started"}],
+            "details": {"mode": "single", "runId": "abcd1234"},
+        });
+        assert_eq!(
+            render_subagent_summary(&launched)[0],
+            serde_json::json!("● single · running")
+        );
+    }
 }

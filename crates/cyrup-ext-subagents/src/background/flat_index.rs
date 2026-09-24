@@ -150,6 +150,7 @@ mod tests {
 
     fn spec(agent: &str) -> SingleStepSpec {
         SingleStepSpec {
+            machine: None,
             skills: None,
             session_dir: None,
             agent: agent.to_string(),
@@ -164,6 +165,7 @@ mod tests {
             output: None,
             output_path: None,
             output_mode: None,
+            fast: None,
             reads: None,
             acceptance: None,
             context: None,

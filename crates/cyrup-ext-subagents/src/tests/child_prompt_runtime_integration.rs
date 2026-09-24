@@ -513,3 +513,85 @@ async fn the_registered_structured_output_tool_advertises_rewritten_local_refs()
     assert!(result.terminate.requested());
     assert!(output_path.exists());
 }
+
+/// SUBA-101 — `inheritGlobalContext` end to end on the child side: the prompt is the one
+/// `cyrup-session` really assembles (the REAL `ContextFileLoader` reading a global agent dir and a
+/// project checkout, then the REAL `SystemPromptBuilder`), and it goes through the real extension
+/// host with the env the parent's spawn overlay writes. `0` removes only the agent dir's
+/// `AGENTS.md` and keeps the checkout's; `1` keeps both; `inheritProjectContext: 0` still removes
+/// everything whatever the global flag says (pi `rewriteSubagentPrompt`, `:206-214` @v0.68.0).
+/// Mutation killed: the runtime never reading `CYRUP_SUBAGENT_INHERIT_GLOBAL_CONTEXT`, or the
+/// strip comparing against any dir other than the one the child's env resolves.
+#[tokio::test]
+async fn inherit_global_context_false_removes_only_the_global_agents_md_from_the_real_prompt() {
+    use crate::prompt_runtime::INHERIT_GLOBAL_CONTEXT_ENV;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let agent_dir = root.path().join("agent");
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(&agent_dir).expect("mkdir agent");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    std::fs::write(agent_dir.join("AGENTS.md"), "GLOBAL-MARKER: user-wide rule").expect("write");
+    std::fs::write(repo.join("AGENTS.md"), "PROJECT-MARKER: repo rule").expect("write");
+    let (files, _diagnostics) =
+        cyrup_session::ContextFileLoader::new(repo.clone(), agent_dir.clone(), true, false).load();
+    assert!(
+        files
+            .iter()
+            .any(|f| f.scope == cyrup_session::ContextScope::Global),
+        "the loader read the global file"
+    );
+    let assembled = cyrup_session::SystemPromptBuilder::new().build(&cyrup_session::PromptInputs {
+        cwd: repo.clone(),
+        context_files: Arc::from(files),
+        ..cyrup_session::PromptInputs::default()
+    });
+    assert!(assembled.contains("GLOBAL-MARKER") && assembled.contains("PROJECT-MARKER"));
+
+    let agent_dir_text = agent_dir.display().to_string();
+    let rewrite_with = |project: &'static str, global: &'static str| {
+        let agent_dir_text = agent_dir_text.clone();
+        let assembled = assembled.clone();
+        async move {
+            let env = move |key: &str| {
+                if key == cyrup_config::paths::ENV_CODING_AGENT_DIR {
+                    Some(agent_dir_text.clone())
+                } else if key == INHERIT_PROJECT_CONTEXT_ENV {
+                    Some(project.to_string())
+                } else if key == INHERIT_GLOBAL_CONTEXT_ENV {
+                    Some(global.to_string())
+                } else {
+                    None
+                }
+            };
+            let host = ExtensionHost::new(cfg());
+            let ext = prompt_runtime_extension_from(&env)
+                .expect("builds")
+                .expect("a child env builds the runtime");
+            host.load_native(ext).await.expect("load_native");
+            host.emit_before_agent_start(
+                "Task: do the thing",
+                serde_json::Value::Null,
+                &assembled,
+                serde_json::Value::Null,
+                &CancelToken::new(),
+            )
+            .await
+            .and_then(|reduction| reduction.system_prompt)
+            .expect("the child rewrites its prompt")
+        }
+    };
+
+    let global_off = rewrite_with("1", "0").await;
+    assert!(!global_off.contains("GLOBAL-MARKER"), "{global_off}");
+    assert!(global_off.contains("PROJECT-MARKER"), "{global_off}");
+    assert!(global_off.contains("<project_context>"), "{global_off}");
+
+    let global_on = rewrite_with("1", "1").await;
+    assert!(global_on.contains("GLOBAL-MARKER"), "{global_on}");
+    assert!(global_on.contains("PROJECT-MARKER"), "{global_on}");
+
+    let project_off = rewrite_with("0", "1").await;
+    assert!(!project_off.contains("GLOBAL-MARKER"), "{project_off}");
+    assert!(!project_off.contains("PROJECT-MARKER"), "{project_off}");
+}

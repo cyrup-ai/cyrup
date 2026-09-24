@@ -1,20 +1,38 @@
-//! The shared, size-capped append-only JSONL primitive (R-SA-136/146): every `.jsonl` artifact
-//! this crate writes — the foreground/background-shared per-attempt child-output tee
-//! ([`crate::spawn::SpawnedChild`]'s `jsonl_writer`) and the background async-run event log
-//! (`<run_dir>/events.jsonl`, [`crate::background::RunPaths::events`]) — goes through
-//! [`BoundedJsonlWriter`], so there is exactly ONE byte-budget-enforcement implementation for the
-//! whole crate, not one per call site (mirroring `background::atomic`'s identical "one shared
-//! primitive, not two" convention for R-SA-076/135).
+//! The crate's append-only JSONL primitives (R-SA-136/146).
 //!
-//! # The cap contract (func-SA §5.6 R-SA-129/136; §8 R-SA-146)
+//! Two writers, because upstream caps two different things differently:
 //!
-//! > JSONL run-event logs... MUST be append-only, MUST silently cap total bytes written per file
-//! > at a fixed budget (target: 50MB) without erroring the run, and MUST NOT attempt to rewrite or
+//! - [`BoundedJsonlWriter`] — a silent, all-or-nothing byte cap. It backs the per-attempt
+//!   child-output tee ([`crate::spawn::SpawnedChild`]'s `jsonl_writer`), the child transcript, and
+//!   the maintenance log. It is ONE byte-budget implementation for those call sites, not one per
+//!   call site (mirroring `background::atomic`'s "one shared primitive, not two" convention).
+//! - [`RunEventLog`] — a background run's `events.jsonl` ([`crate::background::RunPaths::events`]).
+//!   Its LIFECYCLE lines (`subagent.run.*`, `subagent.step.*`, steering, process-terminal) are
+//!   **never** capped, and only its child DIAGNOSTIC lines are, with a one-shot
+//!   `subagent.events.truncated` marker written on the first overflow.
+//!
+//! # Why `events.jsonl` is not a [`BoundedJsonlWriter`]
+//!
+//! This module used to say the `events.jsonl` cap was "silent" and "a deliberate, disclosed port of
+//! a known `pi-subagents` limitation". Neither half was true. Upstream
+//! (`runs/background/subagent-runner.ts:266-330` @v0.43.0, `:317-386` @v0.68.0) caps **only**
+//! child diagnostic events (`appendDiagnosticJsonl`, called from `appendChildEvent` at `:590-604`
+//! @v0.43.0 / `:1223` @v0.68.0), reserves `TRUNCATION_MARKER_RESERVE_BYTES = 512` of the budget,
+//! and on the first overflow writes `{type:"subagent.events.truncated", ts, maxBytes,
+//! droppedEventType}` exactly once. Every lifecycle event goes through the **uncapped**
+//! `appendJsonl`. cyrup had it backwards: it capped the lifecycle trail through the silent writer
+//! and journaled no child events at all, so `CYRUP_SUBAGENT_ASYNC_EVENTS_MAX_BYTES=0` erased every
+//! `subagent.run.*`/`subagent.step.*` line without a trace, where upstream's `0` drops only the
+//! child diagnostics and says so. [`RunEventLog`] is the port.
+//!
+//! # The [`BoundedJsonlWriter`] contract (func-SA §5.6 R-SA-129/136; §8 R-SA-146)
+//!
+//! > JSONL ... logs MUST be append-only, MUST silently cap total bytes written per file at a
+//! > fixed budget (target: 50MB) without erroring the run, and MUST NOT attempt to rewrite or
 //! > truncate earlier lines.
 //!
-//! This is a deliberate, disclosed port of a known `pi-subagents` limitation (func-SA §5.6's own
-//! text), not a design flaw this port should "improve on" by, say, rotating files or erroring the
-//! run once the cap is hit. The contract this module implements, precisely:
+//! This is cyrup's own contract for the tee-style artifacts above; it is NOT upstream's
+//! `events.jsonl` semantics (see the section before this one). Precisely:
 //!
 //! - Every line successfully accepted BEFORE the cap is reached is written completely and
 //!   durably — never partially, never a torn line.
@@ -166,6 +184,134 @@ impl BoundedJsonlWriter {
     #[must_use]
     pub fn cap_bytes(&self) -> u64 {
         self.cap_bytes
+    }
+}
+
+/// pi `TRUNCATED_EVENT_TYPE` (`subagent-runner.ts:266` @v0.43.0, `:320` @v0.68.0): the one
+/// marker line [`RunEventLog::write_diagnostic_line`] writes on the first diagnostic overflow.
+pub const TRUNCATED_EVENT_TYPE: &str = "subagent.events.truncated";
+
+/// pi `TRUNCATION_MARKER_RESERVE_BYTES` (`subagent-runner.ts:267` @v0.43.0, `:321` @v0.68.0): the
+/// slice of the budget diagnostics may not use, so the truncation marker still fits after them.
+pub const TRUNCATION_MARKER_RESERVE_BYTES: u64 = 512;
+
+/// A background run's `events.jsonl`: lifecycle lines uncapped, child diagnostics capped with a
+/// one-shot truncation marker — pi `appendJsonl` / `appendDiagnosticJsonl`
+/// (`subagent-runner.ts:300-330` @v0.43.0, `:354-386` @v0.68.0). See the module doc for why this
+/// is not a [`BoundedJsonlWriter`].
+///
+/// # Byte accounting across writers
+///
+/// Several of these can be open on one `events.jsonl` at once (the runner's step loop, its control
+/// watcher, its telemetry pump). Upstream shares one in-process byte counter per path through a
+/// module-level map; here the diagnostic budget is measured against the file's CURRENT length
+/// (`fstat` on the append handle) at each diagnostic write, so every lifecycle line any writer
+/// has appended counts against the diagnostic budget exactly as upstream's shared counter makes it
+/// count. Lifecycle writes need no accounting: they are never refused.
+///
+/// The `diagnostics_truncated` latch is per handle. Only one handle — the telemetry pump's —
+/// writes diagnostics, so "the marker is written once" holds per run.
+pub struct RunEventLog {
+    file: tokio::fs::File,
+    cap_bytes: u64,
+    diagnostics_truncated: bool,
+}
+
+impl RunEventLog {
+    /// Open (creating if absent) `path` for append with the default 50 MiB diagnostic budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if `path` cannot be opened/created in append mode.
+    pub async fn create(path: &Path) -> io::Result<Self> {
+        Self::create_with_cap(path, DEFAULT_JSONL_CAP_BYTES).await
+    }
+
+    /// Open (creating if absent) `path` for append; `cap_bytes` bounds the file only as far as
+    /// DIAGNOSTIC lines are concerned (pi `maxAsyncEventsBytes()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if `path` cannot be opened/created in append mode.
+    pub async fn create_with_cap(path: &Path, cap_bytes: u64) -> io::Result<Self> {
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        Ok(Self {
+            file,
+            cap_bytes,
+            diagnostics_truncated: false,
+        })
+    }
+
+    async fn append(&mut self, line: &str) -> io::Result<()> {
+        // One `write_all` for line + newline, so two handles appending to the same file cannot
+        // interleave a line with another's newline.
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        self.file.write_all(&bytes).await?;
+        self.file.flush().await
+    }
+
+    /// Append one LIFECYCLE line (pi `appendJsonl`). Never capped: the run's own trail —
+    /// `subagent.run.*`, `subagent.step.*`, steering, process-terminal — survives any
+    /// `CYRUP_SUBAGENT_ASYNC_EVENTS_MAX_BYTES`, `0` included.
+    ///
+    /// # Errors
+    ///
+    /// A genuine I/O failure. Callers treat the log as best-effort and ignore it.
+    pub async fn write_line(&mut self, line: &str) -> io::Result<()> {
+        self.append(line).await
+    }
+
+    /// Append one child DIAGNOSTIC line (pi `appendDiagnosticJsonl`): written only while it fits
+    /// in `cap - 512`; the first line that does not fit is replaced by ONE
+    /// `{type:"subagent.events.truncated", ts, maxBytes, droppedEventType}` marker (written only if
+    /// the marker itself fits under the full cap), after which every diagnostic line is dropped.
+    /// A blank line is ignored, as upstream's `if (!line.trim()) return`.
+    ///
+    /// # Errors
+    ///
+    /// A genuine I/O failure (on the size probe or the write). Never for the cap itself.
+    pub async fn write_diagnostic_line(
+        &mut self,
+        line: &str,
+        dropped_event_type: Option<&str>,
+    ) -> io::Result<()> {
+        if line.trim().is_empty() || self.diagnostics_truncated {
+            return Ok(());
+        }
+        let current = self.file.metadata().await?.len();
+        let chunk = line.len() as u64 + 1;
+        let diagnostic_budget = self
+            .cap_bytes
+            .saturating_sub(TRUNCATION_MARKER_RESERVE_BYTES);
+        if current.saturating_add(chunk) <= diagnostic_budget {
+            return self.append(line).await;
+        }
+        let mut marker = serde_json::Map::new();
+        marker.insert("type".into(), TRUNCATED_EVENT_TYPE.into());
+        marker.insert("ts".into(), crate::time::now_epoch_millis().into());
+        marker.insert("maxBytes".into(), self.cap_bytes.into());
+        // pi `droppedEventType` is `undefined` for a typeless event, which `JSON.stringify` omits.
+        if let Some(kind) = dropped_event_type {
+            marker.insert("droppedEventType".into(), kind.into());
+        }
+        let marker = serde_json::Value::Object(marker).to_string();
+        self.diagnostics_truncated = true;
+        if current.saturating_add(marker.len() as u64 + 1) <= self.cap_bytes {
+            self.append(&marker).await?;
+        }
+        Ok(())
+    }
+
+    /// `true` once a diagnostic line has overflowed (and the marker was written, if it fit).
+    #[must_use]
+    pub fn diagnostics_truncated(&self) -> bool {
+        self.diagnostics_truncated
     }
 }
 
@@ -402,6 +548,147 @@ mod tests {
     /// The default cap constant matches R-SA-136's documented target (50MB) exactly, so a reader
     /// of this test can confirm the crate-wide default without needing to trust the doc comment
     /// alone.
+    /// Lifecycle lines are never capped: a zero cap drops nothing from the run's own trail.
+    /// Kills: routing `RunEventLog::write_line` through the diagnostic budget (the pre-fix
+    /// behaviour, where `CYRUP_SUBAGENT_ASYNC_EVENTS_MAX_BYTES=0` erased the whole trail).
+    #[tokio::test]
+    async fn a_zero_cap_still_journals_lifecycle_events() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut log = RunEventLog::create_with_cap(&path, 0).await.expect("opens");
+        for kind in [
+            "subagent.run.started",
+            "subagent.step.started",
+            "subagent.run.completed",
+        ] {
+            log.write_line(&format!(r#"{{"type":"{kind}"}}"#))
+                .await
+                .expect("lifecycle writes succeed");
+        }
+        let text = std::fs::read_to_string(&path).expect("readable");
+        let kinds: Vec<String> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).expect("json")["type"]
+                    .as_str()
+                    .expect("type")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "subagent.run.started",
+                "subagent.step.started",
+                "subagent.run.completed"
+            ]
+        );
+    }
+
+    /// The first diagnostic line that does not fit in `cap - 512` is replaced by exactly ONE
+    /// marker with upstream's keys, the marker fits inside the reserve, and every diagnostic after
+    /// it is dropped — while lifecycle lines keep landing. Kills: dropping the reserve (the
+    /// diagnostics fill the whole cap and the marker no longer fits), writing the marker on every
+    /// overflow (latch removed), and never writing the marker (the pre-fix silent cap).
+    #[tokio::test]
+    async fn the_first_overflowing_diagnostic_line_writes_one_marker_and_stops() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let path = dir.path().join("events.jsonl");
+        // Diagnostic budget: 1024 - 512 = 512 bytes. Each diagnostic line is 100 bytes + newline.
+        let cap = 1024u64;
+        let mut log = RunEventLog::create_with_cap(&path, cap)
+            .await
+            .expect("opens");
+        let diag = |n: usize| {
+            let head = format!(r#"{{"type":"tool_execution_end","n":"{n:02}","pad":""#);
+            let pad = "x".repeat(100 - head.len() - 2);
+            format!("{head}{pad}\"}}")
+        };
+        assert_eq!(diag(0).len(), 100);
+        for n in 0..20 {
+            log.write_diagnostic_line(&diag(n), Some("tool_execution_end"))
+                .await
+                .expect("never errors for the cap");
+        }
+        assert!(log.diagnostics_truncated());
+        log.write_line(r#"{"type":"subagent.run.completed"}"#)
+            .await
+            .expect("lifecycle still lands");
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every line is JSON"))
+            .collect();
+        let diagnostics = lines
+            .iter()
+            .filter(|v| v["type"] == "tool_execution_end")
+            .count();
+        assert_eq!(diagnostics, 5, "5 * 101 = 505 <= 512 < 606");
+        let markers: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|v| v["type"] == TRUNCATED_EVENT_TYPE)
+            .collect();
+        assert_eq!(markers.len(), 1, "exactly one marker: {text}");
+        let marker = markers[0].as_object().expect("object");
+        let mut keys: Vec<&str> = marker.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["droppedEventType", "maxBytes", "ts", "type"]);
+        assert_eq!(marker["maxBytes"], cap);
+        assert_eq!(marker["droppedEventType"], "tool_execution_end");
+        assert_eq!(
+            lines.last().expect("lines")["type"],
+            "subagent.run.completed",
+            "the lifecycle line after the overflow is not dropped"
+        );
+        let marker_line = text
+            .lines()
+            .find(|l| l.contains(TRUNCATED_EVENT_TYPE))
+            .expect("marker line");
+        assert!(
+            (marker_line.len() as u64) < TRUNCATION_MARKER_RESERVE_BYTES,
+            "the marker fits in the reserve"
+        );
+    }
+
+    /// Lifecycle bytes already in the file — written through ANOTHER handle — count against the
+    /// diagnostic budget, as upstream's shared per-path counter makes them count. Kills: measuring
+    /// the budget against only this handle's own diagnostic bytes (the 11-byte line would then fit
+    /// in 0 + 11 <= 188 and be written).
+    #[tokio::test]
+    async fn another_writers_lifecycle_bytes_count_against_the_diagnostic_budget() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let path = dir.path().join("events.jsonl");
+        // Diagnostic budget: 700 - 512 = 188 bytes.
+        let mut lifecycle = RunEventLog::create_with_cap(&path, 700)
+            .await
+            .expect("opens");
+        let mut diagnostics = RunEventLog::create_with_cap(&path, 700)
+            .await
+            .expect("opens");
+        let head = r#"{"type":"subagent.run.started","p":""#;
+        let line = format!("{head}{}\"}}", "y".repeat(179 - head.len() - 2));
+        assert_eq!(line.len(), 179);
+        lifecycle.write_line(&line).await.expect("lifecycle");
+        // 180 already on disk + 11 = 191 > 188: this diagnostic overflows.
+        diagnostics
+            .write_diagnostic_line(r#"{"n":1234}"#, Some("a"))
+            .await
+            .expect("diag");
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "the lifecycle line and the marker: {text}"
+        );
+        assert!(
+            text.lines()
+                .nth(1)
+                .unwrap_or_default()
+                .contains(TRUNCATED_EVENT_TYPE)
+        );
+    }
+
     #[test]
     fn default_cap_is_fifty_megabytes() {
         assert_eq!(DEFAULT_JSONL_CAP_BYTES, 50 * 1024 * 1024);

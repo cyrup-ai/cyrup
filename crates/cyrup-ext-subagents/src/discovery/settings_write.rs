@@ -207,6 +207,48 @@ pub async fn remove_builtin_agent_override(path: &Path, name: &str) -> Result<bo
     Ok(true)
 }
 
+/// SUBA-100 — pi `removeBuiltinAgentOverride(cwd, name, scope, { preserveMachine: true })`
+/// (`agents.ts:1631-1658` @v0.68.0), which is what `reset` calls (`agent-management.ts:1387`):
+/// the entry is cleared, EXCEPT a stated `machine` (a non-blank string, or `false`), which is kept
+/// as the entry's only field — machine placement is where an agent runs, not a customization of
+/// what it is. Returns `(removed, machine_preserved)`; `removed == false` wrote nothing.
+///
+/// # Errors
+///
+/// As [`merge_builtin_agent_override`].
+pub async fn reset_builtin_agent_override_preserving_machine(
+    path: &Path,
+    name: &str,
+) -> Result<(bool, bool), SubagentError> {
+    let _lock = lock_settings_file(path).await?;
+    let mut settings = read_settings_file_strict(path)?;
+    let Some(overrides) = overrides_of(&settings) else {
+        return Ok((false, false));
+    };
+    let Some(current) = overrides.get(name) else {
+        return Ok((false, false));
+    };
+    let machine = current.get("machine").filter(|value| {
+        **value == Value::Bool(false) || value.as_str().is_some_and(|s| !s.trim().is_empty())
+    });
+    let mut next_overrides = overrides.clone();
+    let preserved = match machine {
+        Some(machine) => {
+            let mut entry = serde_json::Map::new();
+            entry.insert("machine".to_string(), machine.clone());
+            next_overrides.insert(name.to_string(), Value::Object(entry));
+            true
+        }
+        None => {
+            next_overrides.remove(name);
+            false
+        }
+    };
+    store_overrides(&mut settings, next_overrides);
+    write_settings_file(path, &settings)?;
+    Ok((true, preserved))
+}
+
 /// pi `removeBuiltinAgentOverrideFields` (`agents.ts:1329-1371`): delete only the named `fields`
 /// from `subagents.agentOverrides.<name>`, leaving the entry's other fields intact — and delete the
 /// entry entirely if that emptied it. Returns whether any field was actually present and removed;

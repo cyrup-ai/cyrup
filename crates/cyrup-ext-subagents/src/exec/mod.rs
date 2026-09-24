@@ -97,6 +97,10 @@ pub mod run_fanout_budget;
 /// half; [`agent_config`] is the input-contract half).
 pub mod run_result;
 
+/// SUBA-063 — the runtime-acknowledged-extensions protocol (child collector, file hand-back,
+/// parent read-back and sanitizer).
+pub mod runtime_acknowledged_extensions;
+
 /// Pure computation of *what to spawn* for one model-fallback attempt: argv/env/system-prompt
 /// assembly, zero process handles, zero I/O (the spawn-plan-construction third of the former
 /// "SubagentSpawner" section).
@@ -351,6 +355,24 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // `:1491`, so a foreign process is told the contract exactly as a native child is.
     let contract = resolve_run_acceptance(opts, agent, task);
 
+    // Step 2' (SUBA-105) — pi `validateAcceptanceReportMode` (`acceptance.ts:423-430` @v0.68.0):
+    // `acceptance.report` (either value) only has a channel to act on when the child finishes
+    // through `structured_output`, so a policy declaring it on a run with no `outputSchema` is
+    // refused before anything spawns. Upstream runs this inside `validateExecutionAcceptance` at
+    // every launch entry, after the agent's `acceptance:` default is folded in
+    // (`applySingleAgentLaunchDefaults` then `validateExecutionInput`,
+    // `subagent-executor.ts:6891,6927`); `run_sync` is the chokepoint every one of those entries
+    // reaches with the effective policy and schema in hand.
+    if contract.report_declared && opts.structured_output_schema.is_none() {
+        return pre_spawn_failure(
+            agent,
+            task,
+            crate::exec::acceptance::model::acceptance_report_requires_output_schema_message(
+                "acceptance",
+            ),
+        );
+    }
+
     // Step 2a (SUBA-074) — REFUSE a runner this crate cannot honour, before the model-fallback
     // ladder rather than inside it. (Numbered `0b` until 2026-09-05, when it moved BELOW steps 1
     // and 2: the external arm needs the acceptance contract, and R-SA-025 binds on it too.) `build_attempt_spawn_plan`'s errors are per-ATTEMPT
@@ -505,7 +527,14 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // a deadline kill can be characterised against a known-good starting state. Deliberately
     // outside the ladder: a relaunch on the next model must be measured against the ORIGINAL
     // worktree, not against whatever the previous attempt left behind.
-    let mutation_snapshot = crate::exec::mutation_evidence::snapshot_tracked_mutations(&opts.cwd);
+    //
+    // SUBA-100 — a placed child works on the MACHINE, so the local checkout is not evidence of
+    // anything it did (pi `execution.ts:554` @v0.68.0): no local snapshot is taken at all.
+    let mutation_snapshot = if opts.machine.is_some() {
+        crate::placement::native::placed_mutation_snapshot(&opts.cwd)
+    } else {
+        crate::exec::mutation_evidence::snapshot_tracked_mutations(&opts.cwd)
+    };
 
     let outcome = drive_fallback_ladder(
         agent,
@@ -534,6 +563,24 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         mut error,
         final_output,
     } = SettledAttempt::from_ladder(last_signal.as_ref(), last_attempt.as_ref());
+    // SUBA-100 [CYRUP-DELTA] — a placed native child that failed gets upstream's remote-failure
+    // hint (`formatHerdrMachineHint`, `herdr-machine.ts`: missing remote binary, ssh auth,
+    // unreachable host, …) appended to its error, matched against the error AND the child's own
+    // stderr tail as `decorateHerdrMachineResult` matches it (`subagent-runner.ts:715-722`).
+    // Upstream's only caller of that decoration sits on its ssh-wrapped external-cli path, which
+    // its pane-native branch (`:900`) returns ahead of for every placed run; a placed native child
+    // fails for exactly the same remote reasons, so it gets the hint.
+    if let Some(machine) = opts.machine.as_ref()
+        && !timed_out
+        && !interrupted
+    {
+        let stderr_tail = last_attempt
+            .as_ref()
+            .and_then(|record| record.placed_stderr_tail.as_deref())
+            .unwrap_or_default();
+        error =
+            crate::placement::hints::decorate_machine_error(machine, exit_code, error, stderr_tail);
+    }
 
     let turn_budget_tracker = last_attempt
         .as_ref()
@@ -548,13 +595,37 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         .as_ref()
         .map(|record| record.tool_surface.clone())
         .unwrap_or_default();
+    // UW-3 — pi `result.watchdog` (`execution.ts:563-567` @v0.43.0): the WINNING attempt's folded
+    // child-watchdog view, taken here for the same reason as the tool surface above.
+    let winning_watchdog = last_attempt
+        .as_ref()
+        .and_then(|record| record.watchdog.clone());
+    // SUBA-063 — pi `result.runtimeAcknowledgedExtensions` (`execution.ts:1386` @v0.64.0): the
+    // WINNING attempt's child-runtime acknowledgement, taken here for the same reason as above.
+    let winning_runtime_acknowledged_extensions = last_attempt
+        .as_ref()
+        .and_then(|record| record.runtime_acknowledged_extensions.clone());
+    let winning_native_machine = last_attempt
+        .as_ref()
+        .and_then(|record| record.native_machine.clone());
 
     // pi `execution.ts:1474` — the final evidence collect, measured against the pre-ladder
     // snapshot.
-    let mutation_evidence = crate::exec::mutation_evidence::collect_tracked_mutation_evidence(
-        &mutation_snapshot,
-        &opts.cwd,
-    );
+    //
+    // SUBA-100 — a placed run's evidence is the remote before/after Git pair its relay fetched
+    // back (pi `execution.ts:1502-1503` @v0.68.0), never a local collect.
+    let mutation_evidence = if opts.machine.is_some() {
+        crate::placement::native::placed_mutation_evidence(
+            last_attempt
+                .as_ref()
+                .and_then(|record| record.native_machine.as_ref()),
+        )
+    } else {
+        crate::exec::mutation_evidence::collect_tracked_mutation_evidence(
+            &mutation_snapshot,
+            &opts.cwd,
+        )
+    };
 
     // pi `execution.ts:1481-1488` — is the run's REQUESTED report missing? `None` when the run
     // declared no output contract at all, which the summary reports as `not-requested` rather
@@ -649,7 +720,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         interrupted,
         timed_out,
     };
-    let structured_output = gates.apply_structured_output(structured_runtime.as_ref(), opts);
+    let (structured_output, structured_acceptance_report) =
+        gates.apply_structured_output(structured_runtime.as_ref(), opts);
     let guard_result = gates.apply_completion_guard(agent, task, &progress, &mut control);
     let acceptance_ledger = gates
         .apply_acceptance(
@@ -658,6 +730,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             opts,
             final_output.as_deref(),
             guard_result,
+            &structured_acceptance_report,
         )
         .await;
     let GateState {
@@ -716,6 +789,14 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         resolve_terminal_usage_budget(opts, &outcome.aggregate_usage, error);
 
     SingleResult {
+        execution: None,
+        runtime_acknowledged_extensions: winning_runtime_acknowledged_extensions,
+        // SUBA-100 — pi `result.nativeMachine = { provider: "herdr", machineId, initialGit?,
+        // finalGit? }` (`foreground/execution.ts:1293` @v0.68.0), the winning attempt's.
+        native_machine: winning_native_machine,
+        // PB-14 — pi `skillsWarning` (`execution.ts:1902` @v0.68.0), computed in `LadderSetup`.
+        skills_warning: setup.skills_warning,
+        watchdog: winning_watchdog,
         usage_budget,
         // SUBA-008 — pi `result.turnBudget` / `result.turnBudgetExceeded` / `result.wrapUpRequested`
         // (`execution.ts:1087`), published from the WINNING attempt's own latch. `None`/`false` for
@@ -1056,6 +1137,11 @@ async fn resolve_result_session_file(
 /// nothing was spawned.
 pub(crate) fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) -> SingleResult {
     SingleResult {
+        execution: None,
+        native_machine: None,
+        runtime_acknowledged_extensions: None,
+        skills_warning: None,
+        watchdog: None,
         usage_budget: None,
         turn_budget: None,
         turn_budget_exceeded: false,
@@ -1111,6 +1197,12 @@ struct LadderSetup {
     /// [`Self::skill_injection`] rather than being load-bearing by declaration order, because it
     /// outlives the injection string it is computed with.
     resolved_skill_names: Option<Vec<String>>,
+    /// PB-14 — pi `skillsWarning: missingSkills.length > 0 ? \`Skills not found: ${…join(", ")}\` :
+    /// undefined` (`runs/foreground/execution.ts:1902` @v0.68.0): the declared skills that did
+    /// not resolve. The run still spawns — only the orchestration skill hard-fails, above this.
+    /// `[CYRUP-DELTA]`: cyrup's detached runner shares this `run_sync`, so a background step
+    /// carries the warning too, where pi's async runner never sets it.
+    skills_warning: Option<String>,
     /// The output file's pre-ladder state (R-SA-031).
     output_snapshot: Option<crate::exec::output::OutputFileSnapshot>,
     /// This run's private scratch directory — [`crate::background::attempt_scratch_dir`]
@@ -1149,6 +1241,7 @@ async fn prepare_ladder(
     // `progress.skills` is seeded from (`:263`). Hoisted out of the `else` arm below because it
     // outlives the injection string it is computed alongside.
     let mut resolved_skill_names: Option<Vec<String>> = None;
+    let mut skills_warning: Option<String> = None;
     let skill_injection = if skill_names.is_empty() {
         String::new()
     } else {
@@ -1179,6 +1272,10 @@ async fn prepare_ladder(
         }
         resolved_skill_names = (!resolution.resolved.is_empty())
             .then(|| resolution.resolved.iter().map(|s| s.name.clone()).collect());
+        // PB-14 — AFTER the orchestration early return, exactly as upstream orders it (`:1783-1794`
+        // hard-fails first; `:1902` warns on what remains).
+        skills_warning = (!resolution.missing.is_empty())
+            .then(|| format!("Skills not found: {}", resolution.missing.join(", ")));
         crate::discovery::skills::build_skill_injection(&resolution.resolved)
     };
 
@@ -1264,8 +1361,20 @@ async fn prepare_ladder(
         .structured_output_schema
         .as_ref()
         .and_then(|schema| {
-            crate::exec::structured::create_structured_output_runtime(schema, &structured_base_dir)
-                .ok()
+            // SUBA-105 — pi `createStructuredOutputRuntime(schema, dir, { acceptanceReport:
+            // resolveAcceptanceReportMode(params.acceptance) })` (`subagent-executor.ts:3938`,
+            // `subagent-runner.ts:810` @v0.68.0). The explicit policy's mode, or upstream's
+            // no-policy `optional`.
+            let acceptance_report = opts.acceptance.as_ref().map_or(
+                crate::exec::acceptance::model::AcceptanceReportMode::Optional,
+                |contract| contract.report_mode,
+            );
+            crate::exec::structured::create_structured_output_runtime_with(
+                schema,
+                &structured_base_dir,
+                acceptance_report,
+            )
+            .ok()
         })
         .map(|runtime| {
             let mut guard = crate::exec::structured::StructuredOutputCleanupGuard::new(runtime);
@@ -1278,6 +1387,7 @@ async fn prepare_ladder(
     Ok(LadderSetup {
         skill_injection,
         resolved_skill_names,
+        skills_warning,
         output_snapshot,
         scratch_dir,
         structured_guard,
@@ -1491,7 +1601,31 @@ impl GateState {
     /// failed for another reason (non-zero exit, timeout, detach, interrupt) must not additionally
     /// be re-labeled by a structured-output check that never had a fair chance to run against a
     /// clean transcript.
+    ///
+    /// SUBA-105 — beside the value, the child's `acceptanceReport` (pi `readStructuredOutput
+    /// AcceptanceReport`, `structured-output.ts:185-196`, read at `subagent-runner.ts:1286-1288`
+    /// @v0.68.0) — read only once the structured value itself was captured and valid, exactly as
+    /// upstream reads it inside the "called" arm (`execution.ts:1452-1460`). The acceptance gate
+    /// consumes it in [`Self::apply_acceptance`].
     fn apply_structured_output(
+        &mut self,
+        structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
+        opts: &RunOptions,
+    ) -> (
+        Option<serde_json::Value>,
+        crate::exec::structured::StructuredAcceptanceReport,
+    ) {
+        let value = self.apply_structured_output_value(structured_runtime, opts);
+        let report = match (value.as_ref(), structured_runtime) {
+            (Some(_), Some(runtime)) => {
+                crate::exec::structured::read_structured_output_acceptance_report(runtime)
+            }
+            _ => crate::exec::structured::StructuredAcceptanceReport::default(),
+        };
+        (value, report)
+    }
+
+    fn apply_structured_output_value(
         &mut self,
         structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
         opts: &RunOptions,
@@ -1604,6 +1738,7 @@ impl GateState {
         opts: &RunOptions,
         final_output: Option<&str>,
         guard_result: CompletionMutationGuardResult,
+        structured_report: &crate::exec::structured::StructuredAcceptanceReport,
     ) -> Option<acceptance::AcceptanceLedger> {
         let post_guard_gate = self.gate();
 
@@ -1656,7 +1791,11 @@ impl GateState {
             // without the token, cancelling a run (Ctrl-C, orchestrator cancel, parent timeout) left
             // acceptance verification running, so the caller waited out a full per-command `timeoutMs`
             // — once per remaining command — after asking to stop.
-            let ledger = acceptance::evaluate_acceptance_with_cancel(
+            // SUBA-105 — pi `evaluateAcceptance({ …, report: result.structuredAcceptanceReport,
+            // reportError: result.structuredAcceptanceReportError })` (`execution.ts:2019-2020`,
+            // `subagent-runner.ts:1491-1492` @v0.68.0): a report handed in the `structured_output`
+            // call replaces every prose source, and a required one that never came rejects.
+            let ledger = acceptance::lattice::gate::evaluate_acceptance_with_structured_report(
                 contract,
                 post_guard_gate,
                 final_output,
@@ -1664,6 +1803,7 @@ impl GateState {
                 &opts.cwd,
                 memo,
                 file_output,
+                structured_report,
                 &opts.cancel,
             )
             .await;
@@ -1969,9 +2109,15 @@ fn build_progress_snapshot(
 /// `AgentDefinition` is only ever valid for this one guard call, not as a general conversion.
 pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinition {
     AgentDefinition {
+        inherit_global_context: false,
+        machine: None,
+        // SUBA-102 — pi `evaluateCompletionMutationGuard({ …, mutationTools })`
+        // (`completion-guard.ts:246` @v0.68.0): the agent's extra mutating tool names.
+        mutation_tools: agent.mutation_tools.clone(),
         default_turn_budget: None,
         default_acceptance: agent.default_acceptance.clone(),
         acceptance_role: agent.acceptance_role,
+        fast: None,
         permission_rules: None,
         runner: None,
         name: agent.name.clone(),
@@ -2461,6 +2607,98 @@ mod tests {
         assert!(output.contains("cargo test"), "{output}");
         // The RECORDED task stays the raw one, exactly as the native path records it.
         assert_eq!(result.task, "say hello");
+    }
+
+    /// PB-14 — pi `skillsWarning` (`runs/foreground/execution.ts:1902` @v0.68.0): a declared skill
+    /// that does not resolve is REPORTED on the result, and the run still goes ahead. `true(1)`
+    /// stands in for the child so the ladder really runs. Mutation killed: dropping the
+    /// `skills_warning: setup.skills_warning` assignment in `run_sync`'s result literal (or the
+    /// `LadderSetup` computation).
+    #[tokio::test]
+    async fn run_with_a_typo_skill_sets_skills_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.skills = vec!["no-such-skill-pb14".to_string()];
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.spawn_command = Some(crate::spawn::SpawnCommand {
+            binary: std::path::PathBuf::from("true"),
+            base_args: Vec::new(),
+        });
+        let result = run_sync(&agent, "do it", &opts).await;
+        assert_eq!(
+            result.skills_warning.as_deref(),
+            Some("Skills not found: no-such-skill-pb14"),
+            "{result:?}"
+        );
+        assert!(
+            !result.attempted_models.is_empty(),
+            "the run still spawned: {result:?}"
+        );
+    }
+
+    /// PB-14 — the orchestration skill still HARD-fails first (pi `:1783-1794` before `:1902`),
+    /// so it carries no warning: it never ran. Mutation killed: dropping the orchestration early
+    /// return (the run then goes ahead carrying a warning instead of failing).
+    #[tokio::test]
+    async fn orchestration_skill_still_hard_fails_and_carries_no_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.skills = vec![crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL.to_string()];
+        let opts = base_opts(dir.path(), &["m1"]);
+        let result = run_sync(&agent, "do it", &opts).await;
+        assert_eq!(result.exit_code, 1, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("Skills not found:")),
+            "{result:?}"
+        );
+        assert_eq!(result.skills_warning, None);
+    }
+
+    /// SUBA-096 — pi refuses fast mode for a foreign runner before anything launches
+    /// (`subagent-executor.ts:3353-3355` @v0.68.0). The script leaves a marker behind, which is
+    /// what proves nothing spawned. Mutation killed: deleting the `opts.fast` refusal in
+    /// `run_external_cli` (the script runs and the run succeeds).
+    #[tokio::test]
+    async fn external_cli_agent_refuses_fast() {
+        use crate::runner::{AgentRunnerConfig, ExternalCliRunner};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("it-ran");
+        let script = dir.path().join("touch-marker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\necho hi\n", marker.display()),
+        )
+        .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.name = "foreign".to_string();
+        agent.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
+            adapter: None,
+            command: script.display().to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: None,
+        }));
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.fast = true;
+
+        let result = run_sync(&agent, "say hello", &opts).await;
+
+        assert_eq!(result.exit_code, 1, "{result:?}");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Agent 'foreign' uses runner.type='external-cli' and does not support fast mode.")
+        );
+        assert!(!marker.exists(), "the foreign process must never run");
     }
 
     /// SUBA-074 review fix — R-SA-025 binds on the external path too.

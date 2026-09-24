@@ -443,7 +443,11 @@ pub(crate) async fn load_metadata(
 fn terminal_run_state(state: crate::background::RunState) -> bool {
     use crate::background::RunState;
     match state {
-        RunState::Complete | RunState::Failed | RunState::Paused | RunState::Stopped => true,
+        RunState::Complete
+        | RunState::Failed
+        | RunState::Paused
+        | RunState::Stopped
+        | RunState::Partial => true,
         RunState::Queued | RunState::Running => false,
     }
 }

@@ -20,7 +20,7 @@ use crate::background::session_lease::{
     inspect_session_lease, process_start_identity,
 };
 use crate::background::{RunDir, RunId, RunStatus};
-use crate::jsonl::BoundedJsonlWriter;
+use crate::jsonl::RunEventLog;
 
 use super::candidate::read_process_terminal_candidate;
 use super::proof::{ProofExpectation, read_process_terminal, unknown_proof};
@@ -278,7 +278,7 @@ pub async fn finalize_process_terminal(
     run_id: &RunId,
     close: &RunnerCloseObservation,
     lease_root: &Path,
-    events: &mut Option<BoundedJsonlWriter>,
+    events: &mut Option<RunEventLog>,
 ) -> ProcessTerminal {
     finalize_process_terminal_with(
         run_dir,
@@ -301,7 +301,7 @@ pub async fn finalize_process_terminal_with(
     run_id: &RunId,
     close: &RunnerCloseObservation,
     lease_root: &Path,
-    events: &mut Option<BoundedJsonlWriter>,
+    events: &mut Option<RunEventLog>,
     probe: &LeaseClaimProbe,
 ) -> ProcessTerminal {
     let expectation = ProofExpectation::new(run_id, &close.process_instance_id);
@@ -545,7 +545,7 @@ async fn build_proof(
 /// never part of the durability contract. The line is only ever reached on a durable proof write,
 /// which is the point of the ordering.
 async fn append_process_terminal_event(
-    events: &mut Option<BoundedJsonlWriter>,
+    events: &mut Option<RunEventLog>,
     run_id: &RunId,
     proof: &ProcessTerminal,
 ) {

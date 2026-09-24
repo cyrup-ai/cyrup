@@ -25,9 +25,9 @@
 //!   `registerAgentViaEvents` — synchronous `emit` with the handler mutating `request.result` in
 //!   place). cyrup's `SharedBus` queues emits and passes payloads by value, so that bridge needs a
 //!   request/response design of its own; it is a separate row.
-//! - Five `RuntimeAgentDefinition` fields have no [`AgentDefinition`] landing at HEAD
-//!   (`mcpDirectTools`, `inheritGlobalContext`, `mutationTools`, `skillPath`,
-//!   `defaultToolTimeoutMs`). They are validated EXACTLY as upstream validates them (so a
+//! - Three `RuntimeAgentDefinition` fields have no [`AgentDefinition`] landing at HEAD
+//!   (`mcpDirectTools`, `skillPath`, `defaultToolTimeoutMs`; `inheritGlobalContext` and
+//!   `mutationTools` landed with SUBA-101/102). They are validated EXACTLY as upstream validates them (so a
 //!   malformed value produces upstream's message) and are then REFUSED by name
 //!   ([`unrepresentable_field_error`]) rather than accepted and dropped — the same
 //!   refuse-don't-downgrade stance `crate::runner::dispatch::resolve_runner_dispatch` takes.
@@ -67,9 +67,10 @@ pub const MAX_SYSTEM_PROMPT_LENGTH: usize = 1024 * 1024;
 /// `MAX_FIELD_STRING_LENGTH` (`:16`).
 pub const MAX_FIELD_STRING_LENGTH: usize = 8_192;
 
-/// The 35 keys `validateDefinition` accepts (`:201-207`). Anything else is
+/// The 36 keys `validateDefinition` accepts (`:201-207` @v0.68.0 — the v0.64.0 35 plus `machine`,
+/// SUBA-100). Anything else is
 /// `Runtime agent definition has unknown fields: …` (`:208-209`).
-const SUPPORTED_FIELDS: [&str; 35] = [
+const SUPPORTED_FIELDS: [&str; 36] = [
     "description",
     "systemPrompt",
     "aliases",
@@ -91,6 +92,8 @@ const SUPPORTED_FIELDS: [&str; 35] = [
     "defaultAcceptance",
     "acceptanceRole",
     "runner",
+    // SUBA-100 — upstream's list carries `machine` at v0.68.0 (`:204`).
+    "machine",
     "skills",
     "skillPath",
     "extensions",
@@ -109,13 +112,14 @@ const SUPPORTED_FIELDS: [&str; 35] = [
 
 /// `[CYRUP-DELTA]` — the supported-upstream fields this port cannot carry onto an
 /// [`AgentDefinition`] yet: `(camelCase key, the landing it is waiting on)`. See the module doc.
-const UNREPRESENTABLE_FIELDS: [(&str, &str); 5] = [
+///
+/// SUBA-101/102: `inheritGlobalContext` and `mutationTools` left this list — both now land on
+/// [`AgentDefinition`] (see [`to_agent_definition`]). A slice so a later removal is one line.
+const UNREPRESENTABLE_FIELDS: &[(&str, &str)] = &[
     (
         "mcpDirectTools",
         "a standalone `mcp_direct_tools` list (cyrup only derives MCP direct tools from `mcp:`-prefixed `tools` entries)",
     ),
-    ("inheritGlobalContext", "an `inherit_global_context` flag"),
-    ("mutationTools", "a `mutation_tools` list"),
     ("skillPath", "a `skill_path` list"),
     (
         "defaultToolTimeoutMs",
@@ -157,7 +161,7 @@ impl RuntimeThinking {
 ///
 /// Field-count history: v0.57.0 declared 32 fields; v0.64.0 dropped `defaultTurnBudget` and added
 /// `excludeTools`, `allowNestedSubagents`, `inheritGlobalContext` and `mutationTools` (35). This
-/// is the v0.64.0 shape (ADR-0006).
+/// is the v0.64.0 shape (ADR-0006), plus v0.68.0's `machine` (SUBA-100): 36.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeAgentDefinition {
     pub description: String,
@@ -181,6 +185,8 @@ pub struct RuntimeAgentDefinition {
     pub default_acceptance: Option<Value>,
     pub acceptance_role: Option<AcceptanceRole>,
     pub runner: Option<AgentRunnerConfig>,
+    /// SUBA-100 — the Herdr saved machine (`RuntimeAgentDefinition.machine`, `:39` @v0.68.0).
+    pub machine: Option<String>,
     pub skills: Option<Vec<String>>,
     pub skill_path: Option<Vec<String>>,
     pub extensions: Option<Vec<String>>,
@@ -289,6 +295,7 @@ impl RuntimeAgentDefinition {
             string_list(&self.subagent_only_extensions),
         );
         put("mutationTools", string_list(&self.mutation_tools));
+        put("machine", self.machine.clone().map(Value::String));
         put("output", self.output.clone().map(Value::String));
         put(
             "outputMode",
@@ -645,15 +652,14 @@ fn validate_definition(value: &Value) -> Result<ValidatedDefinition, SubagentErr
             "Runtime agent definition must be an object.".to_string(),
         ));
     };
-    let unknown: Vec<&str> = definition
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !SUPPORTED_FIELDS.contains(key))
-        .collect();
-    if !unknown.is_empty() {
+    // One census answers both upstream checks: the unknown-field refusal here, and — after every
+    // per-field validator has run — the `[CYRUP-DELTA]` unrepresentable-field refusal below.
+    let key_census =
+        super::key_census::census(definition, &SUPPORTED_FIELDS, UNREPRESENTABLE_FIELDS);
+    if !key_census.unknown.is_empty() {
         return Err(management_error(format!(
             "Runtime agent definition has unknown fields: {}.",
-            unknown.join(", ")
+            key_census.unknown.join(", ")
         )));
     }
     let system_prompt_mode = enum_string(
@@ -754,6 +760,9 @@ fn validate_definition(value: &Value) -> Result<ValidatedDefinition, SubagentErr
     )?;
     let mutation_tools =
         validate_string_list(definition.get("mutationTools"), &field("mutationTools"))?;
+    // SUBA-100 — `validateOptionalString(definition.machine, "Runtime agent definition machine")`
+    // (`:240` @v0.68.0), in upstream's order: after `mutationTools`, before `output`.
+    let machine = validate_optional_string(definition.get("machine"), &field("machine"))?;
     let output = validate_optional_string(definition.get("output"), &field("output"))?;
     let default_reads =
         validate_string_list(definition.get("defaultReads"), &field("defaultReads"))?;
@@ -781,10 +790,8 @@ fn validate_definition(value: &Value) -> Result<ValidatedDefinition, SubagentErr
 
     // `[CYRUP-DELTA]` — after every upstream check has passed (so a malformed value reports
     // upstream's message first), refuse the fields this port cannot carry.
-    for (key, landing) in UNREPRESENTABLE_FIELDS {
-        if definition.contains_key(key) {
-            return Err(unrepresentable_field_error(key, landing));
-        }
+    if let Some((key, landing)) = key_census.unported.first() {
+        return Err(unrepresentable_field_error(key, landing));
     }
 
     Ok(ValidatedDefinition {
@@ -810,6 +817,7 @@ fn validate_definition(value: &Value) -> Result<ValidatedDefinition, SubagentErr
             default_acceptance,
             acceptance_role,
             runner,
+            machine,
             skills,
             skill_path,
             extensions,
@@ -992,6 +1000,15 @@ fn to_agent_definition(
         None
     };
     let agent = AgentDefinition {
+        // SUBA-101 — pi `inheritGlobalContext: definition.inheritGlobalContext ?? false` (`:341`
+        // @v0.68.0): no name-sensitive default, unlike `inheritProjectContext`.
+        inherit_global_context: definition.inherit_global_context.unwrap_or(false),
+        // SUBA-100 — pi `...(definition.machine !== undefined ? { machine } : {})` (`:357`
+        // @v0.68.0): validated by `validate_optional_string`; the catalog check is at launch.
+        machine: definition.machine,
+        // SUBA-102 — pi `...(definition.mutationTools !== undefined ? { mutationTools: [...] } :
+        // {})` (`:356`): carried verbatim, already validated by `validate_string_list`.
+        mutation_tools: definition.mutation_tools,
         name: name.to_string(),
         local_name: name.to_string(),
         package_name: None,
@@ -1038,6 +1055,7 @@ fn to_agent_definition(
         default_turn_budget: None,
         default_acceptance: definition.default_acceptance,
         acceptance_role: definition.acceptance_role,
+        fast: None,
         permission_rules,
         runner: definition.runner,
         disabled: None,
@@ -1593,13 +1611,22 @@ mod tests {
             )),
             "Runtime agent definition inheritGlobalContext must be a boolean when provided."
         );
+        // SUBA-101/102 took `inheritGlobalContext`/`mutationTools` off the refusal list; a key
+        // still on it (`skillPath`) keeps the validate-then-refuse order.
+        assert_eq!(
+            err_text(reg.register_value(
+                "a",
+                &json!({"description":"d","systemPrompt":"p","skillPath":"./skills"})
+            )),
+            "Runtime agent definition skillPath must be an array of strings when provided."
+        );
         let refused = err_text(reg.register_value(
             "a",
-            &json!({"description":"d","systemPrompt":"p","inheritGlobalContext":true}),
+            &json!({"description":"d","systemPrompt":"p","skillPath":["./skills"]}),
         ));
         assert!(
             refused.starts_with(
-                "Runtime agent definition inheritGlobalContext is not supported by this cyrup build"
+                "Runtime agent definition skillPath is not supported by this cyrup build"
             ),
             "{refused}"
         );
@@ -1608,6 +1635,46 @@ mod tests {
         typed.mcp_direct_tools = Some(vec!["srv.tool".into()]);
         assert!(err_text(reg.register("a", &typed)).contains("mcpDirectTools is not supported"));
         assert!(reg.is_empty());
+    }
+
+    /// SUBA-101/102 — both keys are ACCEPTED and land on the registered definition (pi
+    /// `toAgentConfig`, `runtime-agent-registry.ts:341,356` @v0.68.0): `inheritGlobalContext`
+    /// defaults to `false` with no name-sensitive rung, `mutationTools` is carried verbatim.
+    /// Mutation killed: restoring either key to `UNREPRESENTABLE_FIELDS` (registration refuses),
+    /// or the `to_agent_definition` placeholders (`false`/`None` land instead).
+    #[test]
+    fn inherit_global_context_and_mutation_tools_register_and_land() {
+        let reg = registry();
+        let _handle = reg
+            .register_value(
+                "a",
+                &json!({
+                    "description": "d",
+                    "systemPrompt": "p",
+                    "inheritGlobalContext": true,
+                    "mutationTools": ["apply_patch", "notebook_edit"]
+                }),
+            )
+            .expect("both keys are accepted");
+        let _plain = reg
+            .register_value(
+                "delegate-ish",
+                &json!({"description": "d", "systemPrompt": "p"}),
+            )
+            .expect("plain");
+        let agents = reg.list();
+        let a = agents.iter().find(|agent| agent.name == "a").expect("a");
+        assert!(a.inherit_global_context);
+        assert_eq!(
+            a.mutation_tools,
+            Some(vec!["apply_patch".to_string(), "notebook_edit".to_string()])
+        );
+        let plain = agents
+            .iter()
+            .find(|agent| agent.name == "delegate-ish")
+            .expect("plain");
+        assert!(!plain.inherit_global_context);
+        assert_eq!(plain.mutation_tools, None);
     }
 
     /// `registerRuntimeAgent` order (`:376-382`): the reserved-name guard fires before the builtin

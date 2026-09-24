@@ -47,6 +47,7 @@ pub mod evaluate;
 pub mod level;
 pub mod prompt;
 pub mod report;
+pub mod report_mode;
 pub mod types;
 pub mod validate_input;
 pub mod verify;
@@ -60,11 +61,18 @@ pub use level::{
     AcceptanceResolveInput, SubagentRunMode, normalize_acceptance_input, normalize_criteria,
     resolve_effective_acceptance, unique_evidence,
 };
-pub use prompt::{acceptance_requires_child_report, format_acceptance_prompt};
+pub use prompt::{
+    acceptance_requires_child_report, format_acceptance_prompt, format_acceptance_prompt_with,
+};
 pub use report::parse::{
     ACCEPTANCE_REPORT_NOT_FOUND, ParsedAcceptanceReport, parse_acceptance_report,
     parse_acceptance_report_sources, strip_acceptance_report,
     strip_acceptance_report_from_message_text,
+};
+pub use report_mode::{
+    AcceptanceReportMode, acceptance_declares_report,
+    acceptance_report_requires_output_schema_message, resolve_acceptance_report_mode,
+    validate_acceptance_report_mode, validate_execution_acceptance_report_modes,
 };
 pub use types::{
     AcceptanceConfig, AcceptanceEvidenceKind, AcceptanceEvidenceStatus, AcceptanceGate,

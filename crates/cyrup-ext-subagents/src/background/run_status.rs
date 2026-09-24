@@ -52,6 +52,8 @@ pub(crate) fn run_state_label(state: RunState) -> &'static str {
         // G77: its own word, never `"failed"` — every upstream reader that renders a run's state
         // for a human prints `"stopped"` verbatim (`run-status.ts:478-479`, `notify.ts:210`).
         RunState::Stopped => "stopped",
+        // SUBA-100 — its own word too (`async-status.ts:99` @v0.68.0).
+        RunState::Partial => "partial",
     }
 }
 
@@ -71,6 +73,8 @@ pub(crate) fn step_state_label(state: StepState) -> &'static str {
         StepState::Failed => "failed",
         // G77 — pi `step.status = "stopped"` (`subagent-runner.ts:2967`).
         StepState::Stopped => "stopped",
+        // SUBA-100 — pi step `status = "partial"` (`subagent-runner.ts:3804` @v0.68.0).
+        StepState::Partial => "partial",
     }
 }
 
@@ -810,7 +814,12 @@ fn list_rank(state: RunState) -> u8 {
         // holds queued/running rows, so every terminal state collapses to one bucket here; the
         // `Stopped` arm is spelled out rather than swept into a catch-all so a future state cannot
         // silently inherit rank 2.
-        RunState::Paused | RunState::Complete | RunState::Failed | RunState::Stopped => 2,
+        // SUBA-100 — `case "partial": return 2;` (`async-status.ts:470` @v0.68.0).
+        RunState::Paused
+        | RunState::Complete
+        | RunState::Failed
+        | RunState::Stopped
+        | RunState::Partial => 2,
     }
 }
 
@@ -1221,6 +1230,7 @@ mod tests {
 
     fn single_step_spec(agent: &str) -> SingleStepSpec {
         SingleStepSpec {
+            machine: None,
             skills: None,
             session_dir: None,
             agent: agent.to_string(),
@@ -1235,6 +1245,7 @@ mod tests {
             output: None,
             output_path: None,
             output_mode: None,
+            fast: None,
             reads: None,
             acceptance: None,
             context: None,

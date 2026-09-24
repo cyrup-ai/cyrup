@@ -43,6 +43,12 @@ pub struct AgentFields {
     pub system_prompt_mode: Option<SystemPromptMode>,
     pub inherit_project_context: Option<bool>,
     pub inherit_skills: Option<bool>,
+    /// SUBA-101 — pi `config.inheritGlobalContext`.
+    pub inherit_global_context: Option<bool>,
+    /// SUBA-102 — pi `config.mutationTools`; `Some(None)` clears.
+    pub mutation_tools: Option<Option<Vec<String>>>,
+    /// SUBA-100 — pi `config.machine`; `Some(None)` clears.
+    pub machine: Option<Option<String>>,
     pub skills: Option<Vec<String>>,
     pub default_reads: Option<Option<Vec<PathBuf>>>,
     pub default_progress: Option<Option<bool>>,
@@ -244,6 +250,13 @@ fn build_definition(
 ) -> AgentDefinition {
     let runtime_name = AgentDefinition::qualified_name(local_name, package_name.as_deref());
     AgentDefinition {
+        // SUBA-101 — pi `agentCreate`'s `inheritGlobalContext: false` seed (`agent-management.ts:1176`
+        // @v0.68.0), then `applyAgentConfig`'s `config.inheritGlobalContext` (`:536-539`).
+        inherit_global_context: fields.inherit_global_context.unwrap_or(false),
+        // SUBA-100 — `config.machine`; absent means the agent runs locally.
+        machine: fields.machine.clone().unwrap_or(None),
+        // SUBA-102 — pi `config.mutationTools` (`:514-518`); absent means none declared.
+        mutation_tools: fields.mutation_tools.clone().unwrap_or(None),
         name: runtime_name,
         local_name: local_name.to_string(),
         package_name,
@@ -289,6 +302,7 @@ fn build_definition(
         // hand-editing the file's `acceptance:`/`acceptanceRole:` frontmatter).
         default_acceptance: None,
         acceptance_role: None,
+        fast: None,
         // SUBA-073: same rule — no management field exists for it, so a CREATED agent declares
         // none (an author sets it by hand-editing the agent file's `permissions:` frontmatter).
         permission_rules: None,
@@ -316,6 +330,23 @@ fn merge_fields(
 ) -> AgentDefinition {
     let runtime_name = AgentDefinition::qualified_name(local_name, package_name.as_deref());
     AgentDefinition {
+        // SUBA-101 — an update edits it only when `config.inheritGlobalContext` is stated; else the
+        // editable base's value survives (`editableAgentConfig`, `agent-management.ts:304`).
+        inherit_global_context: fields
+            .inherit_global_context
+            .unwrap_or(existing.inherit_global_context),
+        // SUBA-100 — `Some(None)` deletes the placement; an unstated key keeps the base's machine
+        // (upstream's `editableAgentConfig` spread carries `machine` through, `:293`).
+        machine: fields
+            .machine
+            .clone()
+            .unwrap_or_else(|| existing.machine.clone()),
+        // SUBA-102 — `Some(None)` is pi's `delete target.mutationTools`; an unstated key keeps the
+        // base's list (`editableAgentConfig`, `:318`).
+        mutation_tools: fields
+            .mutation_tools
+            .clone()
+            .unwrap_or_else(|| existing.mutation_tools.clone()),
         name: runtime_name,
         local_name: local_name.to_string(),
         package_name,
@@ -393,6 +424,7 @@ fn merge_fields(
         // (`agent-management.ts:314-315` @v0.64.0).
         default_acceptance: existing.default_acceptance.clone(),
         acceptance_role: existing.acceptance_role,
+        fast: existing.fast,
         // SUBA-073: an UPDATE never edits it but must not DROP it either — see the note above.
         permission_rules: existing.permission_rules.clone(),
         // SUBA-074: an UPDATE never edits it but must not DROP it either — see the note above.

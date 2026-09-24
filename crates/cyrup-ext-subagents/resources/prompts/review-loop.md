@@ -8,7 +8,7 @@ Use the `subagent` tool. Keep the parent session as the loop controller and fina
 
 Default to a maximum of 3 review rounds unless I specify a different cap. Count a review round each time fresh-context reviewers inspect the current diff after a worker pass. Stop early when reviewers find no blockers or fixes worth doing now.
 
-If the invocation includes an implementation request, first launch one async `worker` to implement the approved scope. If the current diff is already the target, start with review. The sequence can be launched up front as an async/background chain when the workflow is already clear, or continued as follow-up subagent runs after each async completion. For an initial chain, pass `async: true` so the main chat is unblocked; do not set `clarify: true` unless I explicitly want the foreground clarify UI. Use only one writer against the active worktree at a time unless I explicitly ask for isolated worktrees.
+If the invocation includes an implementation request, first launch one async `worker` to implement the approved scope. If the current diff is already the target, start with review. The sequence can be launched up front as an async/background chain when the workflow is already clear, or continued as follow-up subagent runs after each async completion. For an initial chain, pass `async: true` so the main chat is unblocked. Use only one writer against the active worktree at a time unless I explicitly ask for isolated worktrees.
 
 For each review round, launch fresh-context `reviewer` agents in parallel. Reviewers must inspect the repository, relevant instructions, and current diff directly from files and commands. They must not rely on the main conversation history and must not edit files.
 

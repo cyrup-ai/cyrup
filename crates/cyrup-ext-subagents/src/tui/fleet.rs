@@ -235,13 +235,18 @@ pub struct FleetActionTarget {
 /// `markdownTheme` (delta 4) and the `asyncDirRoot`/`resultsDir` pair, which the caller resolves
 /// into [`FleetState::history_jobs`] before constructing the component
 /// ([`collect_fleet_history`] is that resolution).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FleetViewOptions {
     /// pi `refreshMs`.
     pub refresh_ms: u64,
     /// pi `options.limit` — how many terminal background runs the roster keeps
     /// (`fleet.ts:182,204`).
     pub limit: usize,
+    /// SUBA-061 — pi `options.keybindings` (`fleet.ts` @v0.68.0,
+    /// `this.keybindings = resolveFleetKeybindings(options.keybindings)`): the inspector's
+    /// per-action bindings, from `config.fleetKeybindings`. [`FleetKeybindings::default`] is
+    /// upstream's `DEFAULT_FLEET_KEYBINDINGS`.
+    pub keybindings: FleetKeybindings,
 }
 
 impl Default for FleetViewOptions {
@@ -249,6 +254,7 @@ impl Default for FleetViewOptions {
         Self {
             refresh_ms: REFRESH_MS,
             limit: MAX_RECENT_ASYNC_RUNS,
+            keybindings: FleetKeybindings::default(),
         }
     }
 }
@@ -1334,6 +1340,322 @@ pub fn structured_header(
 }
 
 // =================================================================================================
+// Keybindings (pi `FLEET_KEYBINDING_ACTIONS` + `resolveFleetKeybindings`, SUBA-061)
+// =================================================================================================
+
+/// pi `FLEET_KEYBINDING_ACTIONS` (`shared/types.ts:2552-2567` @v0.68.0): the fourteen inspector
+/// actions `config.fleetKeybindings` may rebind, in upstream's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FleetAction {
+    Close,
+    ScrollUp,
+    ScrollDown,
+    SelectUp,
+    SelectDown,
+    SelectFirst,
+    SelectLast,
+    PageUp,
+    PageDown,
+    Refresh,
+    Steer,
+    Inspect,
+    Stop,
+    ToggleTools,
+}
+
+impl FleetAction {
+    /// Every action, in pi's declaration order.
+    pub const ALL: [FleetAction; 14] = [
+        FleetAction::Close,
+        FleetAction::ScrollUp,
+        FleetAction::ScrollDown,
+        FleetAction::SelectUp,
+        FleetAction::SelectDown,
+        FleetAction::SelectFirst,
+        FleetAction::SelectLast,
+        FleetAction::PageUp,
+        FleetAction::PageDown,
+        FleetAction::Refresh,
+        FleetAction::Steer,
+        FleetAction::Inspect,
+        FleetAction::Stop,
+        FleetAction::ToggleTools,
+    ];
+
+    /// The order pi's normal-mode `if` ladder tests the actions in (`fleet.ts:1151-1215`
+    /// @v0.68.0): a key bound to two actions goes to the earlier one here. Not [`Self::ALL`]'s
+    /// declaration order — upstream tests `inspect` last.
+    pub const DISPATCH_ORDER: [FleetAction; 14] = [
+        FleetAction::Close,
+        FleetAction::ScrollUp,
+        FleetAction::ScrollDown,
+        FleetAction::SelectUp,
+        FleetAction::SelectDown,
+        FleetAction::SelectFirst,
+        FleetAction::SelectLast,
+        FleetAction::PageUp,
+        FleetAction::PageDown,
+        FleetAction::Refresh,
+        FleetAction::Steer,
+        FleetAction::Stop,
+        FleetAction::ToggleTools,
+        FleetAction::Inspect,
+    ];
+
+    /// The config key spelling (`close`, `scrollUp`, …).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetAction::Close => "close",
+            FleetAction::ScrollUp => "scrollUp",
+            FleetAction::ScrollDown => "scrollDown",
+            FleetAction::SelectUp => "selectUp",
+            FleetAction::SelectDown => "selectDown",
+            FleetAction::SelectFirst => "selectFirst",
+            FleetAction::SelectLast => "selectLast",
+            FleetAction::PageUp => "pageUp",
+            FleetAction::PageDown => "pageDown",
+            FleetAction::Refresh => "refresh",
+            FleetAction::Steer => "steer",
+            FleetAction::Inspect => "inspect",
+            FleetAction::Stop => "stop",
+            FleetAction::ToggleTools => "toggleTools",
+        }
+    }
+
+    /// The action a config key names, if any.
+    #[must_use]
+    pub fn parse(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.as_str() == key)
+    }
+
+    /// pi `DEFAULT_FLEET_KEYBINDINGS` (`tui/fleet.ts:33-48` @v0.68.0).
+    #[must_use]
+    pub fn default_bindings(self) -> &'static [&'static str] {
+        match self {
+            FleetAction::Close => &["escape", "ctrl+c", "q"],
+            FleetAction::ScrollUp => &["K"],
+            FleetAction::ScrollDown => &["J"],
+            FleetAction::SelectUp => &["up", "k"],
+            FleetAction::SelectDown => &["down", "j"],
+            FleetAction::SelectFirst => &["home"],
+            FleetAction::SelectLast => &["end"],
+            FleetAction::PageUp => &["pageUp"],
+            FleetAction::PageDown => &["pageDown"],
+            FleetAction::Refresh => &["r", "R"],
+            FleetAction::Steer => &["s"],
+            FleetAction::Inspect => &["return", "H"],
+            FleetAction::Stop => &["D"],
+            FleetAction::ToggleTools => &["x", "X", "ctrl+o"],
+        }
+    }
+}
+
+/// pi `validateFleetKeybindingsConfig` (`extension/config.ts:64-74` @v0.68.0), its four messages
+/// verbatim, over the RAW `config.fleetKeybindings` value (absent is fine).
+///
+/// # Errors
+/// `config.fleetKeybindings must be a JSON object`; `config.fleetKeybindings.<a> is not a
+/// supported Fleet action`; `config.fleetKeybindings.<a> must be a non-empty array of strings`;
+/// `config.fleetKeybindings.<a> entries must be non-empty strings`.
+pub fn validate_fleet_keybindings(
+    raw: Option<&serde_json::Value>,
+) -> Result<std::collections::BTreeMap<FleetAction, Vec<String>>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(value) = raw else {
+        return Ok(out);
+    };
+    let Some(object) = value.as_object() else {
+        return Err("config.fleetKeybindings must be a JSON object".to_string());
+    };
+    for (action, bindings) in object {
+        let Some(parsed) = FleetAction::parse(action) else {
+            return Err(format!(
+                "config.fleetKeybindings.{action} is not a supported Fleet action"
+            ));
+        };
+        let Some(list) = bindings.as_array().filter(|list| !list.is_empty()) else {
+            return Err(format!(
+                "config.fleetKeybindings.{action} must be a non-empty array of strings"
+            ));
+        };
+        let mut specs = Vec::with_capacity(list.len());
+        for binding in list {
+            match binding.as_str() {
+                Some(text) if !text.trim().is_empty() => specs.push(text.to_string()),
+                _ => {
+                    return Err(format!(
+                        "config.fleetKeybindings.{action} entries must be non-empty strings"
+                    ));
+                }
+            }
+        }
+        out.insert(parsed, specs);
+    }
+    Ok(out)
+}
+
+/// One binding string (a pi `KeyId`, `ctrl+o`, `pageUp`, `K`) parsed into what it matches.
+/// `None` for a spec cyrup cannot match — reported as a config warning naming the action
+/// (`[CYRUP-DELTA]`: pi's `matchesKey` just never matches it, silently).
+#[must_use]
+pub fn parse_fleet_key_spec(spec: &str) -> Option<FleetKey> {
+    // pi `matchesFleetBinding` (`fleet.ts:58-61`): a single uppercase letter means `shift+<lower>`.
+    let mut chars = spec.chars();
+    if let (Some(c), None) = (chars.next(), chars.next())
+        && c.is_ascii_uppercase()
+    {
+        return Some(FleetKey::Char(c));
+    }
+    let lower = spec.to_ascii_lowercase();
+    let mut parts: Vec<&str> = lower.split('+').collect();
+    let base = parts.pop()?;
+    let (mut ctrl, mut alt, mut shift) = (false, false, false);
+    for modifier in parts {
+        match modifier {
+            "ctrl" if !ctrl => ctrl = true,
+            "alt" if !alt => alt = true,
+            "shift" if !shift => shift = true,
+            // `super`, repeats, and anything else: nothing cyrup's key seam carries.
+            _ => return None,
+        }
+    }
+    let single = {
+        let mut it = base.chars();
+        match (it.next(), it.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        }
+    };
+    match (ctrl, alt, shift, single) {
+        (false, false, false, Some(c)) => return Some(FleetKey::Char(c)),
+        (false, false, true, Some(c)) if c.is_ascii_alphabetic() => {
+            return Some(FleetKey::Char(c.to_ascii_uppercase()));
+        }
+        (true, false, false, Some('c')) => return Some(FleetKey::CtrlC),
+        (true, false, false, Some('o')) => return Some(FleetKey::CtrlO),
+        (true, false, false, Some(c)) if c.is_ascii_alphanumeric() => {
+            return Some(FleetKey::Ctrl(c));
+        }
+        (false, true, false, Some(c)) if c.is_ascii_alphanumeric() => {
+            return Some(FleetKey::Alt(c));
+        }
+        (_, _, _, Some(_)) => return None,
+        _ => {}
+    }
+    let named = match base {
+        "up" => FleetKey::Up,
+        "down" => FleetKey::Down,
+        "left" => FleetKey::Left,
+        "right" => FleetKey::Right,
+        "home" => FleetKey::Home,
+        "end" => FleetKey::End,
+        "pageup" => FleetKey::PageUp,
+        "pagedown" => FleetKey::PageDown,
+        "return" | "enter" => FleetKey::Enter,
+        "escape" | "esc" => FleetKey::Escape,
+        "tab" => FleetKey::Tab,
+        "backspace" => FleetKey::Backspace,
+        "delete" => FleetKey::Delete,
+        "insert" => FleetKey::Insert,
+        "space" => FleetKey::Char(' '),
+        _ => return None,
+    };
+    match (ctrl, alt, shift, named) {
+        (false, false, false, key) => Some(key),
+        (false, false, true, FleetKey::Tab) => Some(FleetKey::BackTab),
+        _ => None,
+    }
+}
+
+/// pi `ResolvedFleetKeybindings` (`fleet.ts:50-56` @v0.68.0): per action, the configured list
+/// REPLACES the default one (never merges), and an action the config does not name keeps its
+/// defaults. Parsed once, at construction, so a keystroke is a table lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FleetKeybindings {
+    bindings: std::collections::BTreeMap<FleetAction, (Vec<String>, Vec<FleetKey>)>,
+}
+
+impl Default for FleetKeybindings {
+    fn default() -> Self {
+        Self::resolve(&std::collections::BTreeMap::new())
+    }
+}
+
+impl FleetKeybindings {
+    /// pi `resolveFleetKeybindings(config)` over an already-validated config
+    /// ([`validate_fleet_keybindings`]). A spec [`parse_fleet_key_spec`] cannot read is kept for
+    /// the footer label (it is what the user wrote) but matches nothing.
+    #[must_use]
+    pub fn resolve(config: &std::collections::BTreeMap<FleetAction, Vec<String>>) -> Self {
+        let bindings = FleetAction::ALL
+            .into_iter()
+            .map(|action| {
+                let specs: Vec<String> = config.get(&action).cloned().unwrap_or_else(|| {
+                    action
+                        .default_bindings()
+                        .iter()
+                        .map(|spec| (*spec).to_string())
+                        .collect()
+                });
+                let keys = specs
+                    .iter()
+                    .filter_map(|spec| parse_fleet_key_spec(spec))
+                    .collect();
+                (action, (specs, keys))
+            })
+            .collect();
+        Self { bindings }
+    }
+
+    /// pi `matchesFleetAction(data, bindings, action)` (`fleet.ts:63-65`).
+    #[must_use]
+    pub fn matches(&self, action: FleetAction, key: FleetKey) -> bool {
+        self.bindings
+            .get(&action)
+            .is_some_and(|(_, keys)| keys.contains(&key))
+    }
+
+    /// pi `bindingLabel(bindings, action)` (`fleet.ts:67-72`): `up`→`↑`, `down`→`↓`,
+    /// `escape`→`Esc`, `return`→`Enter`, everything else verbatim, joined with `/`.
+    #[must_use]
+    pub fn label(&self, action: FleetAction) -> String {
+        self.bindings
+            .get(&action)
+            .map(|(specs, _)| {
+                specs
+                    .iter()
+                    .map(|spec| match spec.as_str() {
+                        "up" => "↑",
+                        "down" => "↓",
+                        "escape" => "Esc",
+                        "return" => "Enter",
+                        other => other,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every configured spec cyrup cannot match, as `(action, spec)` — the loader's warning list.
+    #[must_use]
+    pub fn unmatchable_specs(
+        config: &std::collections::BTreeMap<FleetAction, Vec<String>>,
+    ) -> Vec<(FleetAction, String)> {
+        config
+            .iter()
+            .flat_map(|(action, specs)| {
+                specs
+                    .iter()
+                    .filter(|spec| parse_fleet_key_spec(spec).is_none())
+                    .map(move |spec| (*action, spec.clone()))
+            })
+            .collect()
+    }
+}
+
+// =================================================================================================
 // Key input (pi's raw `data: string` in `handleInput`)
 // =================================================================================================
 
@@ -1366,6 +1688,21 @@ pub enum FleetKey {
     CtrlC,
     /// pi `matchesKey(data, "ctrl+o")`.
     CtrlO,
+    /// SUBA-061 — any other `Ctrl` chord (lowercased), so a `config.fleetKeybindings` entry such
+    /// as `ctrl+x` can match. Never typed into a steer draft: only [`FleetKey::Char`] is text.
+    Ctrl(char),
+    /// SUBA-061 — an `Alt` chord (lowercased), for the same reason.
+    Alt(char),
+    /// Cursor left — bindable, unbound by default.
+    Left,
+    /// Cursor right — bindable, unbound by default.
+    Right,
+    /// Delete — bindable, unbound by default.
+    Delete,
+    /// Insert — bindable, unbound by default.
+    Insert,
+    /// Shift+Tab (pi `shift+tab`) — bindable, unbound by default.
+    BackTab,
     /// A printable character.
     Char(char),
 }
@@ -1889,35 +2226,47 @@ impl SubagentFleetComponent {
             }
         }
 
-        // --- normal mode (pi `:660-712`) ---
-        match key {
-            FleetKey::Escape | FleetKey::CtrlC | FleetKey::Char('q') => FleetInputOutcome::Close,
-            FleetKey::Char('K') => self.scroll_detail(-1),
-            FleetKey::Char('J') => self.scroll_detail(1),
-            FleetKey::Up | FleetKey::Char('k') => self.move_selection(-1),
-            FleetKey::Down | FleetKey::Char('j') => self.move_selection(1),
-            FleetKey::Home => {
+        // --- normal mode (pi `fleet.ts:1151-1215` @v0.68.0) ---
+        //
+        // SUBA-061: every action dispatches through the configured bindings
+        // (`matchesFleetAction(data, this.keybindings, …)`), in upstream's own test order, so a
+        // rebinding REPLACES the default for that action and a key two actions share goes to the
+        // earlier one, exactly as upstream's `if` ladder decides it. pi's `p` (Prompt Audit, `:1170`)
+        // has no counterpart in this port; it is not a configurable action upstream either.
+        let Some(action) = FleetAction::DISPATCH_ORDER
+            .into_iter()
+            .find(|action| self.options.keybindings.matches(*action, key))
+        else {
+            return FleetInputOutcome::Ignored;
+        };
+        match action {
+            FleetAction::Close => FleetInputOutcome::Close,
+            FleetAction::ScrollUp => self.scroll_detail(-1),
+            FleetAction::ScrollDown => self.scroll_detail(1),
+            FleetAction::SelectUp => self.move_selection(-1),
+            FleetAction::SelectDown => self.move_selection(1),
+            FleetAction::SelectFirst => {
                 let len = self.snapshot.items.len() as isize;
                 self.move_selection(-len)
             }
-            FleetKey::End => {
+            FleetAction::SelectLast => {
                 let len = self.snapshot.items.len() as isize;
                 self.move_selection(len)
             }
-            FleetKey::PageUp => {
+            FleetAction::PageUp => {
                 let height = self.detail_viewport_height as isize;
                 self.scroll_detail(-height)
             }
-            FleetKey::PageDown => {
+            FleetAction::PageDown => {
                 let height = self.detail_viewport_height as isize;
                 self.scroll_detail(height)
             }
-            FleetKey::Char('r') | FleetKey::Char('R') => {
+            FleetAction::Refresh => {
                 self.transcript_cache = None;
                 self.refresh();
                 FleetInputOutcome::Rerender
             }
-            FleetKey::Char('s') => {
+            FleetAction::Steer => {
                 match self.resolve_action_target("Fleet controls are unavailable in this context.")
                 {
                     Err(reason) => self.set_action_notice(FleetActionResult::error(reason)),
@@ -1930,13 +2279,7 @@ impl SubagentFleetComponent {
                 }
                 FleetInputOutcome::Rerender
             }
-            // pi `DEFAULT_FLEET_KEYBINDINGS.inspect = ["return", "H"]` (`fleet.ts:45`) — **Enter as
-            // well as H**, both dispatched through the one `inspectSelected()` (`:1021`'s
-            // `matchesBinding(data, this.keybindings.inspect)`). `Enter` reaches this arm only in
-            // normal mode: the steer draft (pi `:607-643`) and the stop confirmation (`:644-659`)
-            // both return above it, exactly as upstream's earlier branches do.
-            FleetKey::Enter | FleetKey::Char('H') => self.inspect_selected(),
-            FleetKey::Char('D') => {
+            FleetAction::Stop => {
                 match self.resolve_action_target("Fleet controls are unavailable in this context.")
                 {
                     Err(reason) => self.set_action_notice(FleetActionResult::error(reason)),
@@ -1949,12 +2292,15 @@ impl SubagentFleetComponent {
                 }
                 FleetInputOutcome::Rerender
             }
-            FleetKey::Char('x') | FleetKey::Char('X') | FleetKey::CtrlO => {
+            FleetAction::ToggleTools => {
                 self.expanded_tools = !self.expanded_tools;
                 self.transcript_cache = None;
                 FleetInputOutcome::Rerender
             }
-            _ => FleetInputOutcome::Ignored,
+            // pi `DEFAULT_FLEET_KEYBINDINGS.inspect = ["return", "H"]` (`fleet.ts:45`) — Enter
+            // reaches this only in normal mode: the steer draft and the stop confirmation both
+            // return above, exactly as upstream's earlier branches do.
+            FleetAction::Inspect => self.inspect_selected(),
         }
     }
 
@@ -2298,13 +2644,21 @@ impl SubagentFleetComponent {
                 self.snapshot.items.len()
             )
         };
-        // pi `fleet.ts:1368`, whose inspect label is `bindingLabel(keybindings, "inspect")` —
-        // `["return", "H"]` rendered by `:67-71`, which maps `return` to `Enter` and joins with
-        // `/`. So upstream's own footer reads `Enter/H Inspect`, and the word is **Inspect**, not
-        // a backend name: `grep -n Herdr` over `fleet.ts` @v0.68.0 is zero-hit.
+        // pi `fleet.ts:1368` @v0.68.0 — the footer is GENERATED from the bindings
+        // (`bindingLabel`), so a rebinding is what the human is told. Upstream's `p Prompt Audit`
+        // segment is omitted: this port has no Prompt Audit view.
+        let bindings = &self.options.keybindings;
         let footer = format!(
-            " ↑↓/jk agent · Enter/H Inspect · s steer · D stop · x/Ctrl+O tools · r refresh · Esc \
-             close · {position}"
+            " {}/{} agent · {} Inspect · {} steer · {} stop · {} tools · {} refresh · {} close · \
+             {position}",
+            bindings.label(FleetAction::SelectUp),
+            bindings.label(FleetAction::SelectDown),
+            bindings.label(FleetAction::Inspect),
+            bindings.label(FleetAction::Steer),
+            bindings.label(FleetAction::Stop),
+            bindings.label(FleetAction::ToggleTools),
+            bindings.label(FleetAction::Refresh),
+            bindings.label(FleetAction::Close),
         );
         let mut footer_row = vec![th::fg(Role::Border, "│")];
         footer_row.extend(th::fit(&Line::from(vec![th::fg(Role::Dim, footer)]), inner_width).spans);
@@ -3185,7 +3539,7 @@ mod tests {
             "the title suffix is dim"
         );
         assert!(
-            th::paints_as(th::painted_style(&frame, 100, "↑↓/jk agent"), Role::Dim),
+            th::paints_as(th::painted_style(&frame, 100, "↑/k/↓/j agent"), Role::Dim),
             "the footer is dim"
         );
         // The title itself is bold and UNCOLOURED — a colour here would be a repaint.
@@ -3468,6 +3822,115 @@ mod tests {
         c.handle_input(FleetKey::Char('s'));
         c.handle_input(FleetKey::Escape);
         assert!(c.steer_draft().is_none());
+    }
+
+    fn rebound(action: FleetAction, specs: &[&str]) -> FleetViewOptions {
+        FleetViewOptions {
+            keybindings: FleetKeybindings::resolve(&std::collections::BTreeMap::from([(
+                action,
+                specs.iter().map(|spec| (*spec).to_string()).collect(),
+            )])),
+            ..FleetViewOptions::default()
+        }
+    }
+
+    /// SUBA-061 — pi `validateFleetKeybindingsConfig` (`extension/config.ts:64-74` @v0.68.0), all
+    /// four messages verbatim. Mutation killed: dropping any one branch (that input then
+    /// validates, or fails with a different message).
+    #[test]
+    fn fleet_keybindings_validator_messages_are_upstreams() {
+        let err = |value: serde_json::Value| {
+            validate_fleet_keybindings(Some(&value)).expect_err("invalid")
+        };
+        assert_eq!(
+            err(serde_json::json!(["x"])),
+            "config.fleetKeybindings must be a JSON object"
+        );
+        assert_eq!(
+            err(serde_json::json!({"explode": ["x"]})),
+            "config.fleetKeybindings.explode is not a supported Fleet action"
+        );
+        assert_eq!(
+            err(serde_json::json!({"stop": []})),
+            "config.fleetKeybindings.stop must be a non-empty array of strings"
+        );
+        assert_eq!(
+            err(serde_json::json!({"stop": ["  "]})),
+            "config.fleetKeybindings.stop entries must be non-empty strings"
+        );
+        assert!(
+            validate_fleet_keybindings(None)
+                .expect("absent is fine")
+                .is_empty()
+        );
+    }
+
+    /// SUBA-061 — per-action REPLACEMENT (pi `resolveFleetKeybindings`, `fleet.ts:52-56`):
+    /// `{"stop": ["X"]}` makes `X` (shift+x) enter stop-confirm and the default `D` does nothing.
+    /// Mutation killed: merging the configured list with the defaults (`D` would still stop), or
+    /// ignoring the bindings in `handle_input` (`X` would toggle tools, its default action).
+    #[test]
+    fn a_rebound_stop_key_fires_and_the_default_no_longer_does() {
+        let mut c = SubagentFleetComponent::new(
+            busy_state(),
+            rebound(FleetAction::Stop, &["X"]),
+            None,
+            true,
+            false,
+        );
+        c.handle_input(FleetKey::Down);
+        assert_eq!(
+            c.handle_input(FleetKey::Char('D')),
+            FleetInputOutcome::Ignored
+        );
+        assert!(!c.stop_confirming(), "the default D no longer stops");
+        c.handle_input(FleetKey::Char('X'));
+        assert!(c.stop_confirming(), "X is the configured stop key");
+        // `X` is also a DEFAULT toggleTools key; upstream's ladder tests `stop` first, so the
+        // rebinding wins — and toggleTools keeps `x` and `ctrl+o`.
+        assert!(FleetKeybindings::default().matches(FleetAction::ToggleTools, FleetKey::Char('X')));
+    }
+
+    /// SUBA-061 — the footer is GENERATED from the bindings (pi `bindingLabel`, `fleet.ts:1368`).
+    /// Mutation killed: keeping the literal footer.
+    #[test]
+    fn footer_reflects_rebinding() {
+        let mut c = SubagentFleetComponent::new(
+            busy_state(),
+            rebound(FleetAction::Steer, &["ctrl+s", "S"]),
+            None,
+            true,
+            false,
+        );
+        c.set_terminal_rows(40);
+        let text = th::lines_text(&c.render(160, 10_000));
+        assert!(text.contains("ctrl+s/S steer"), "{text}");
+        assert!(!text.contains(" s steer"), "{text}");
+    }
+
+    /// The key-spec parser: pi's uppercase-letter-means-shift rule, named keys, chords, and a
+    /// spec cyrup cannot match (reported by the config loader, never silently dropped).
+    #[test]
+    fn fleet_key_specs_parse_to_the_keys_they_name() {
+        assert_eq!(parse_fleet_key_spec("K"), Some(FleetKey::Char('K')));
+        assert_eq!(parse_fleet_key_spec("shift+k"), Some(FleetKey::Char('K')));
+        assert_eq!(parse_fleet_key_spec("k"), Some(FleetKey::Char('k')));
+        assert_eq!(parse_fleet_key_spec("pageUp"), Some(FleetKey::PageUp));
+        assert_eq!(parse_fleet_key_spec("return"), Some(FleetKey::Enter));
+        assert_eq!(parse_fleet_key_spec("ctrl+c"), Some(FleetKey::CtrlC));
+        assert_eq!(parse_fleet_key_spec("ctrl+x"), Some(FleetKey::Ctrl('x')));
+        assert_eq!(parse_fleet_key_spec("alt+x"), Some(FleetKey::Alt('x')));
+        assert_eq!(parse_fleet_key_spec("shift+tab"), Some(FleetKey::BackTab));
+        assert_eq!(parse_fleet_key_spec("super+x"), None);
+        assert_eq!(parse_fleet_key_spec("hyperdrive"), None);
+        let config = std::collections::BTreeMap::from([(
+            FleetAction::Close,
+            vec!["q".to_string(), "super+q".to_string()],
+        )]);
+        assert_eq!(
+            FleetKeybindings::unmatchable_specs(&config),
+            vec![(FleetAction::Close, "super+q".to_string())]
+        );
     }
 
     #[test]
@@ -3765,7 +4228,8 @@ mod tests {
         assert!(text.contains("· live controls"), "{text}");
         assert!(text.contains("› ● coder"), "{text}");
         assert!(
-            text.contains("↑↓/jk agent · Enter/H Inspect · s steer · D stop"),
+            // pi `bindingLabel` over `DEFAULT_FLEET_KEYBINDINGS` (`fleet.ts:67-72,1368` @v0.68.0).
+            text.contains("↑/k/↓/j agent · Enter/H Inspect · s steer · D stop"),
             "{text}"
         );
         assert!(text.contains("1/2"), "{text}");
@@ -3784,7 +4248,9 @@ mod tests {
             true,
             false,
         );
-        let text = th::lines_text(&c.render(100, 0));
+        // Wide enough for the generated footer (SUBA-061: `bindingLabel` over the defaults is
+        // longer than the old literal) to keep its position counter.
+        let text = th::lines_text(&c.render(160, 0));
         assert!(text.contains("no children"), "{text}");
         assert!(text.contains("No tracked children"), "{text}");
         assert!(text.contains("0/0"), "{text}");
