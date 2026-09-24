@@ -251,9 +251,13 @@ pub(crate) async fn run_bash(
             truncated,
             full_output_path,
         }),
-        Ok(ExitStatus::Signaled) => Ok(BashResult {
+        // TOOL-047 — pi's user bash runs on the same local shell operations as the tool, which report
+        // a signal-killed shell as `128 + signo` since v0.86.0 (`tools/bash.ts:139-142` @v0.87.1).
+        // Without a signal number (a guest backend's `exitCode: null`) pi's `executeBashWithOperations`
+        // keeps `exitCode: undefined` (`core/bash-executor.ts:125`).
+        Ok(ExitStatus::Signaled(signo)) => Ok(BashResult {
             output,
-            exit_code: None,
+            exit_code: signo.map(|n| 128 + n),
             cancelled: false,
             truncated,
             full_output_path,

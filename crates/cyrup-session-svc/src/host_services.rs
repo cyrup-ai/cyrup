@@ -1821,7 +1821,7 @@ impl HostServices for LiveHostServices {
         let killed = out.killed;
         let code = match out.status {
             ExitStatus::Exited(n) => n,
-            ExitStatus::Signaled | ExitStatus::Killed | ExitStatus::TimedOut => 0,
+            ExitStatus::Signaled(_) | ExitStatus::Killed | ExitStatus::TimedOut => 0,
         };
         Ok(ExecOutput {
             code,

@@ -1985,6 +1985,37 @@ async fn bash_nonzero_exit_empty_output_labels_no_output() {
     );
 }
 
+// TOOL-047 — a shell killed by a signal FAILS with the shell's `128 + signo` code, keeping its
+// partial output. Pi's local shell operations report `exitCode ?? 128 + signals[signalCode]` since
+// v0.86.0 (`tools/bash.ts:139-142` @v0.87.1, #9577); cyrup used to return these as successes.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_signal_killed_command_fails_with_128_plus_signo() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    for (command, code) in [
+        ("printf partial; kill -KILL $$", 137),
+        ("printf partial; kill -SEGV $$", 139),
+    ] {
+        let err = bash
+            .execute(
+                cid(),
+                serde_json::json!({ "command": command }),
+                CancelToken::new(),
+                noop_sink(),
+            )
+            .await
+            .expect_err("a signal-killed command is a failure, not a success");
+        assert_eq!(
+            err.to_string(),
+            format!("partial\n\nCommand exited with code {code}"),
+            "{command}"
+        );
+        let details = err.details.as_ref().expect("the code is carried structurally");
+        assert_eq!(details["exitCode"], code, "{command}");
+    }
+}
+
 // ACP-141 — a non-zero exit reports its code STRUCTURALLY, not only inside the sentence.
 //
 // The message is unchanged (the assertion above still pins it byte-for-byte); what is added is

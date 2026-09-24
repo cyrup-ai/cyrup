@@ -78,9 +78,20 @@ fn exit_from(status: std::process::ExitStatus) -> ExitStatus {
     match status.code() {
         Some(code) => ExitStatus::Exited(code),
         // No exit code ⇒ died to a signal we did not send (the cancel/timeout branches break with
-        // their own statuses before reaching here). Pi maps this to `exitCode: null` ⇒ success.
-        None => ExitStatus::Signaled,
+        // their own statuses before reaching here). The signal number is kept (TOOL-047): pi's
+        // local shell operations turn it into `128 + signo` (`tools/bash.ts:139-142` @v0.87.1).
+        None => ExitStatus::Signaled(signal_of(status)),
     }
+}
+
+#[cfg(unix)]
+fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(&status)
+}
+
+#[cfg(not(unix))]
+fn signal_of(_status: std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 /// Read one chunk; `None` on EOF/error (or never resolves when the reader is absent).
