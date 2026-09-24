@@ -79,6 +79,10 @@ being `pub(crate)` — all rest on the WASM-guest capability model and do not ap
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** `mcp-auth-fetch.ts` → **`MCP-568`** (origin-scoped headers; note rmcp `with_client` + reqwest `default_headers` is **not** origin-scoped) and **`MCP-569`** (request timeout, `6ba7d36`); `PI_MCP_OAUTH_LOG` → **struck, withdrawn upstream** (`bdb89b7`); `{port}` redirects → **`MCP-570`**; stale re-registration / refresh-capable credential preservation → **`MCP-571`** (the `readAuthEntry` `cache` flag half was withdrawn with the transactions). From v2.34–v2.37: CIMD → **`MCP-574`**; expired-token rejection (#646) → **`MCP-577`**. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: none closed; `MCP-300` restated (only `MCP-347`'s suite remains); `MCP-309`, `313`, `324`, `326`, `341`, `342`, `347` confirmed. Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or

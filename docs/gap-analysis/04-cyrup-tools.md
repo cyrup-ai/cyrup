@@ -121,7 +121,7 @@ This area covers `crates/cyrup-tools` — the seven built-in tools (`read`, `wri
 > | | measured at | read this pass | still unread |
 > |---|---|---|---|
 > | `cyrup` | **`ea23ca2`** (2026-09-24) | `9aeba769..ea23ca2` (18 non-merge commits, 485 files, +164 754 / −4 932 under `crates/`). **`crates/cyrup-tools` is byte-identical across it** — `git diff --name-only 9aeba769..ea23ca2 -- crates/cyrup-tools` is empty — so every closure in the table below carries forward by identity, not by re-reading. The one fix-site crate this file routes to that moved is `cyrup-tui`, and only in five `src/app/` files (`terminal_input.rs` is new, for UW-7); nothing under `src/transcript/`, where `TOOL-015`/`TOOL-017`/`TOOL-022` were closed, changed | — |
-> | `pi` | **v0.87.1** (was v0.85.1; new tags v0.86.0 · v0.86.1 · v0.87.0 · v0.87.1) | **`v0.85.1..v0.87.1` over this area's paths, read in full, both sides:** `packages/coding-agent/src/core/tools/**` + `core/experimental.ts` + `utils/mime.ts` = 7 files, +34 / −22. Four changes, four items (`TOOL-046`, `-047`, `-048`, `-050`). **Two `v0.84.1..v0.85.1` leads re-read on both sides** — one filed (`TOOL-049`), one refuted (below) | **`v0.84.1..v0.85.1`** except those two leads: the 2026-09-14 lead list below is still UNVERIFIED. `packages/agent/src/harness/**` is not the reference path and was not walked |
+> | `pi` | **v0.87.1** (was v0.85.1; new tags v0.86.0 · v0.86.1 · v0.87.0 · v0.87.1) | **`v0.85.1..v0.87.1` over this area's paths, read in full, both sides:** `packages/coding-agent/src/core/tools/**` + `core/experimental.ts` + `utils/mime.ts` = 7 files, +34 / −22. Four changes, four items (`TOOL-046`, `-047`, `-048`, `-050`). **Two `v0.84.1..v0.85.1` leads re-read on both sides** — one filed (`TOOL-049`), one refuted (below) | **CLOSED by the second pass below.** *First-pass text:* **`v0.84.1..v0.85.1`** except those two leads: the 2026-09-14 lead list below is still UNVERIFIED. `packages/agent/src/harness/**` is not the reference path and was not walked |
 > | siblings | pi-subagents **v0.71.0** · pi-intercom **v0.14.0** · pi-permission-system v0.8.0 · pi-mcp-adapter **v2.37.0** · code_puppy_core_plugins **v0.0.62** · pi-acp v0.0.33 | not censused — none has a built-in-tool file in this area | the "does not touch this area" finding is still the v0.47.1-era one |
 >
 > **Open set before this pass: zero.** Every row in `## Open items` was already closed (`TOOL-015`'s
@@ -148,8 +148,31 @@ This area covers `crates/cyrup-tools` — the seven built-in tools (`read`, `wri
 > `detect_image_mime` (the CLI `@file` path) is a hand-rolled copy of pi's `detectSupportedImageMimeType`
 > that already matches `GIF87a`/`GIF89a` but omits the APNG, JPEG-`0xf7` and `isBmp` checks that
 > `ImageMime::from_magic_unbounded` carries — area 08's surface, recorded as a lead, not an item.
+>
+> ### RE-MEASURE — 2026-09-24, second pass (the unread window above, closed)
+>
+> **Read this pass, both sides:** every remaining entry of the 2026-09-14 `v0.84.1..v0.85.1` lead
+> list below (each now carries its disposition in place); `utils/shell.ts` at v0.84.1/v0.84.4/v0.87.1;
+> the renderer-extraction commit `eb3e9feed` as a removed-vs-added line comparison;
+> `core/extensions/{wrapper,runner}.ts` for the per-call `ctx.cwd` question; `cli.ts` @v0.83.0 and
+> `cli/setup.ts` @v0.87.1. Filed: **`TOOL-051`**. Struck with evidence: the harness capture/spill
+> model (not the reference path), per-call cwd (refuted), the renderer move (pure move), the `fd`/`rg`
+> bootstrap (not applicable), `CYRUP_CODING_AGENT` (declared rename; `TOOL-031` stays closed).
+>
+> **The `detect_image_mime` second-sniffer lead above is PROMOTED to area 08's `SEAM-133`** (both
+> sides read: `crates/cyrup/src/input.rs:158-172` vs `utils/mime.ts` at v0.83.0 and v0.87.1 — a
+> baseline parity bug, `BM`-prefixed text sniffed as a bitmap), not filed here.
+>
+> **Still unread after this pass:** none of this area's `v0.84.1..v0.87.1` window. Siblings: none of
+> pi-subagents v0.71.0, pi-intercom v0.14.0, pi-permission-system v0.8.0, pi-mcp-adapter v2.37.0 has a
+> built-in-tool file in this area's scope (the `taskkill` copies in `cyrup-ext-subagents` and
+> `cyrup-mcp` are cross-referenced from `TOOL-051`, not re-audited here).
 
 ## UNVERIFIED — 2026-09-14 census of the `v0.84.1..v0.85.1` window (leads, not items)
+
+> **All resolved 2026-09-24 (second pass).** Every entry below now ends in a bold disposition —
+> filed (with its id), refuted, struck with its reason, or routed to the owning area's id. The
+> heading is kept so earlier citations of this section still resolve; nothing below is an open lead.
 
 **Nothing in this section is an item.** No `TOOL-` id is assigned, because id assignment belongs to a
 pass that read both sides and this one did not read both sides everywhere. No row in `## Open items`
@@ -198,6 +221,10 @@ plus `packages/agent/src/harness/{types.ts,env/nodejs.ts,utils/output-capture.ts
   only at the description string and the module header** — cyrup already streams combined
   stdout+stderr (`tools/bash.rs:1`), so the capture rework is largely a mechanism difference. **Lead
   only** for the spill/checkpoint model.
+  **— STRUCK 2026-09-24 (second pass): not on the reference path.** The whole rework lives in
+  `packages/agent/src/harness/**`; the coding-agent tool this area measures has none of it —
+  `git show v0.87.1:packages/coding-agent/src/core/tools/bash.ts | grep -n 'spill\|checkpoint\|capture'`
+  is empty. *Falsification:* reopen if `core/tools/bash.ts` adopts the harness `capture`/spill model.
 - **`taskkill` resolved from System32 instead of PATH** · S — upstream
   `packages/coding-agent/src/utils/shell.ts:215-233` @v0.85.1: `killProcessTree` on win32 spawns
   `join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe")` rather than the bare
@@ -207,6 +234,8 @@ plus `packages/agent/src/harness/{types.ts,env/nodejs.ts,utils/output-capture.ts
   `taskkill.exe` earlier on PATH is executed — the hazard upstream's own comment ("so cleanup does not
   depend on PATH") names. Small, security-adjacent. Note the Node-specific half of upstream's fix (the
   async `error` event) has no cyrup analogue and is excluded below.
+  **— NO LONGER A LEAD: FILED 2026-09-24 (second pass) as `TOOL-051`** (v0.84.4), with the
+  Rust-specific narrowing of the hazard stated in the item.
 
 ### Per-call context
 
@@ -222,6 +251,12 @@ plus `packages/agent/src/harness/{types.ts,env/nodejs.ts,utils/output-capture.ts
   mechanism that hands a tool a different cwd for one call has no analogue here. **Whether pi actually
   varies `ctx.cwd` per call was NOT verified** — that needs a read of the dispatch site in
   `packages/agent`.
+  **— REFUTED 2026-09-24 (second pass): no observable difference.** The `ctx` a built-in receives is
+  `runner.createContext()` (`core/extensions/wrapper.ts:17-18` @v0.87.1), whose `cwd` getter returns
+  the runner's constructor-time `cwd` (`core/extensions/runner.ts:397`, `:826-828`) — the same session
+  cwd the tool was built with, and both are rebuilt together on a runtime replacement. `ctx?.cwd ||
+  cwd` therefore never differs from `cwd` on pi's own path. *Falsification:* reopen if the runner's
+  `cwd` becomes mutable within a runtime.
 
 ### Refactors that are the natural place for drift to hide
 
@@ -235,6 +270,13 @@ plus `packages/agent/src/harness/{types.ts,env/nodejs.ts,utils/output-capture.ts
   `:541`). **Filed as a lead because the extraction is exactly the moment per-renderer output drift
   would have crept in, and no renderer's output was diffed line by line.** This is also the change
   that invalidates the line offsets named in the provenance block above.
+  **— STRUCK 2026-09-24 (second pass): a pure move.** The extraction is one commit, `eb3e9feed`
+  ("split tool renderers and theme validation from their implementations"). Its removed lines under
+  `core/tools/*.ts` and added lines under `core/tools/renderers/*.ts` were compared as normalized line
+  sets: every added line absent from the removed set is wiring (the `*Renderers` exports,
+  `createAllToolRenderers`, `withBuiltInRenderers`, the `createShellRenderers("$" | "PS>")` split and
+  `renderCall`/`renderResult` delegation) — no format string, truncation rule or colour choice is new.
+  Renderer drift AFTER the move is read per tag (`TOOL-050` came from exactly that).
 - **`fd`/`rg` bootstrap: release resolution, musl assets, status callback** · S — upstream
   `packages/coding-agent/src/utils/tools-manager.ts:104-133`,`:262-268`,`:339-400` @v0.85.1.
   `getLatestVersion` no longer calls `api.github.com` (anonymous 60/hr quota, exhausted behind shared
@@ -246,6 +288,8 @@ plus `packages/agent/src/harness/{types.ts,env/nodejs.ts,utils/output-capture.ts
   runs grep/find in-process over the `ignore` crate (`ops/mod.rs:245-291`). **Recorded not as a gap
   but because this area's `ops` seam documents pi's `ensureTool("rg")` call at `ops/mod.rs:259`, and
   that citation is now stale** (see the offset warning above).
+  **— STRUCK 2026-09-24 (second pass): not applicable** (cyrup downloads no `fd`/`rg`); the stale
+  in-source citation is a comment, not behaviour.
 
 ### cyrup-side surfaces landed in this window with no ledger row
 
@@ -262,6 +306,14 @@ plus `packages/agent/src/harness/{types.ts,env/nodejs.ts,utils/output-capture.ts
   closure is reopened as stated, whether or not the rename is defensible. cyrup and the ledger were
   read at `b28d3ff`; **pi's `cli.ts:13` at v0.83.0 was NOT re-read this pass**, so the upstream half is
   inherited from the item's own text. **`TOOL-031`'s row and status are unchanged by this census.**
+  **— STRUCK 2026-09-24 (second pass): a declared rename, not a regression.** Upstream re-read:
+  `cli.ts:13` @v0.83.0 sets `process.env.PI_CODING_AGENT = "true"`; at v0.87.1 the same line lives in
+  `cli/setup.ts` beside `AI_AGENT = "pi"`. cyrup's `crates/cyrup-tools/src/tools/bash.rs:305-321`
+  carries `[CYRUP-DELTA — KEY; hard rename]` for `CYRUP_CODING_AGENT=true` and `AI_AGENT=cyrup`, the
+  same `PI_`→`CYRUP_` policy area 05 records (`CFG-069`, and the struck `PI_*`-alias lead there). The
+  scrub of an inherited `PI_CODING_AGENT` keeps a pi parent's marker from leaking into a cyrup child.
+  **`TOOL-031` stays closed; its Verify line must read `${CYRUP_CODING_AGENT:-ABSENT}`**, not the pi
+  spelling — read its literal text as history.
 
 ### Cleared in this window — read and deliberately not filed
 
@@ -413,6 +465,7 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 | TOOL-048 | medium | upstream-drift | S | **NEW 2026-09-24.** `read` classifies any file whose first three bytes are `GIF` as an image; pi v0.87.0 requires `GIF87a`/`GIF89a` — see the body. |
 | TOOL-049 | low | upstream-drift | S | **NEW 2026-09-24.** `write`'s result text still carries the UTF-16 count (`Successfully wrote N bytes to …`); pi v0.85.0 removed the count — see the body. |
 | TOOL-050 | low | upstream-drift | S | **NEW 2026-09-24.** `bash`/`powershell` durations always render as `N.Ns`; pi v0.86.0 renders `Xm Ys` / `Xh Ym Zs` from one minute up — **FIX SITE `crates/cyrup-tui`** — see the body. |
+| TOOL-051 | low | upstream-drift | S | **NEW 2026-09-24 (second pass; was a 2026-09-14 lead).** On Windows every process-tree kill spawns the bare name `taskkill`; pi v0.84.4 spawns `%SystemRoot%\\System32\\taskkill.exe` so cleanup does not depend on the search path — see the body. |
 
 ## TOOL-046 — Built-in tools declare `constrainedSampling` only under the experimental flag; pi v0.86.0 declares it unconditionally
 
@@ -459,6 +512,15 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 **Impact**   — a ten-minute build shows `600.0s` where pi shows `10m 0s`.
 **Fix**      — port the three branches; `ms` is already an integer.
 **Verify**   — unit cases `59_949 → "59.9s"`, `60_000 → "1m 0s"`, `3_725_000 → "1h 2m 5s"`.
+
+## TOOL-051 — Windows process-tree kills resolve `taskkill` by name, not from System32
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; Windows-only, not run)
+**cyrup**    — `crates/cyrup-tools/src/ops/local/signal.rs:42`, `:79`, `:151` — `std::process::Command::new("taskkill")` for the shutdown drain and both `bash`/shell tree kills. The same bare name is spawned by `crates/cyrup-ext-subagents/src/spawn/signal.rs:436` (area 09) and `crates/cyrup-mcp/src/request_headers_command.rs:546` (area 13).
+**upstream** — `packages/coding-agent/src/utils/shell.ts:218-230` @v0.87.1 — `spawn(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/F","/T","/PID", pid], …)` under the comment "Use the trusted System32 executable so cleanup does not depend on PATH", plus a no-op `child.once("error")` (Node-only; no analogue). v0.84.4 (#6596); v0.84.1 spawned the bare `"taskkill"` (`:204`).
+**Impact**   — narrower than upstream's because Rust's Windows `Command` does not search `PATH` first (`std::process::Command`'s documented resolution since Rust 1.58, not re-verified by a run here): it tries the application's own directory, then the system directories, then `PATH`. So the residual hazard is a `taskkill.exe` placed beside `cyrup.exe` (or in a child `PATH` set on the `Command`), which runs with cyrup's privileges every time a tool call is cancelled. pi's absolute path removes the lookup entirely.
+**Fix**      — build the path as pi does (`SystemRoot` else `C:\\Windows`, `System32\\taskkill.exe`) in one helper in `ops/win.rs` and use it at all five sites (the two outside this crate belong to areas 09 and 13 but should share the helper).
+**Verify**   — a Windows test that places a `taskkill.exe` stub next to the test binary and cancels a running `bash` call: the stub is not executed and the tree is killed.
 
 ## TOOL-039 — `CYRUP_SHELL` silently redirects every `bash` tool call to an arbitrary interpreter; pi has no shell env var
 

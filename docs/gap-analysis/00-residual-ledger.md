@@ -5,9 +5,108 @@ next work item**.
 
 ---
 
+# RE-MEASURED 2026-09-24, second pass (fourteenth edition) — every window the first pass left unread is now read; the set above medium grows from three rows to ten
+
+> **Read this block first. It supersedes the thirteenth edition below and every count beneath it.**
+> Same code (`ea23ca2`; HEAD `8d93b0e` is docs-only) and the same upstream tags as the thirteenth
+> edition, plus **herdr v0.9.1** (`065ef9d6`), now cloned at `tmp/herdr` from
+> <https://github.com/herdrdev/herdr>. **herdr is not a port.** `crates/cyrup-herdr` is cyrup's own
+> client of herdr's socket API, and area 16 measures whether that client conforms to the herdr
+> release it targets.
+>
+> **THE COUNT is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints.** Re-run it
+> rather than quoting this block. The script now reads areas `16` (herdr client) and `17` (pi harness
+> and durable, all trackers). It also stops counting a row whose `Dedup` cell names an open canonical
+> row: `DRIFT-056` now follows `EXT-077`. Areas 13 and 15 stay outside the count by the standing rule.
+>
+> ## Ranked: every open item above medium in the counted areas
+>
+> Each id and status below was re-checked against its own area file's `## Open items` row on
+> 2026-09-24. None was observed at runtime; every one is a static read of both sides.
+>
+> | rank | ID | Sev | Area | Kind | Effort | Why it is here |
+> |---|---|---|---|---|---|---|
+> | 1 | `SESS-056` | **critical** | 03 | upstream-drift | S | If a session file's last line has no trailing newline (a crash mid-append, or a file written by something else), the next appended entry is glued onto it. That entry is lost on reload, and every later entry loses its parent chain. pi v0.84.4 repairs the tail before appending. Silent data loss after an ordinary crash |
+> | 2 | `SEAM-122` | **critical** | 08 | upstream-drift | S | Importing a session whose file name already exists in the session dir overwrites the stored session. pi v0.85.0 gives the copy a unique name and copies with `COPYFILE_EXCL` |
+> | 3 | `ICOM-068` | **high** | 11 | parity-bug | M | An intercom message delivered without a turn is saved and drawn but never added to the model's transcript (`append_injected_message_durably` skips it). Covers every busy-session steer and idle delivery under `inboundTrigger: replies`/`never`. The code is in `cyrup-session-svc` (area 08), which has not filed it |
+> | 4 | `ICOM-035` | **high** | 11 | parity-bug | M | **Reopened (regression from `8de7460`).** The injection pump `drive_injections` waits for idle, so a peer message to a busy session is parked until the run ends and is then appended with no turn (then `ICOM-068` applies). Take it with `ICOM-068`: same pump |
+> | 5 | `ICOM-062` | **high** | 11 | upstream-drift | M | `is_idle` is true during `/compact`, so a peer message starts a model run alongside the compaction, and `compact`'s `set_messages` then replaces the transcript under that running turn. Depends on area 08's `SEAM-125` |
+> | 6 | `TUI-104` | **high** | 07 | upstream-drift | S | `/tree` is not refused while a compaction runs. The compaction entry lands on the branch the user moved to, with its kept range pointing into the abandoned branch, so earlier history drops out of the model's context. **The session half is `SEAM-124` (area 08), rated medium**; the two ratings disagree and should be settled when the pair is fixed together |
+> | 7 | `TOOL-047` | **high** | 04 | upstream-drift | S | A shell command killed by a signal is reported to the model as a success. pi v0.86.0 reports `128 + signo` as a failure |
+> | 8 | `SUBA-115` | **high** | 09b | upstream-drift | S | Stopping, interrupting or timing out a nested run also hits sibling subtrees it never launched (pi-subagents v0.68.0 confines it to the subtree) |
+> | 9 | `SUBA-114` | **high** | 09b | stale-port | M | A child's tools are cut down to the tools the parent session started with, so reviewer/scout launches are refused under a narrow `--tools`. Upstream removed this at v0.70.0 |
+> | 10 | `SUBA-110` | **high** | 09b | upstream-drift | S | `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*` and similar are not removed before the background runner or an allowlist-less external CLI starts, so a child's git can act on the wrong repository (pi-subagents v0.71.0) |
+>
+> **Take these mediums with the set above, because they are the same failure or the same code.**
+> `SEAM-124`/`SEAM-125` (area 08) with `TUI-104` and `ICOM-062`. `SESS-061`/`SESS-062` (compaction
+> removes nothing when tool results alone overflow; `abort()` does not cancel compaction) and
+> `SEAM-126`/`SEAM-127` (no threshold compaction between tool turns; `triggerTurn:false` still
+> starts a turn) all touch the run/compaction seam. `EXT-077` (`user_bash` fails open; `DRIFT-056` is
+> its duplicate) and `SUBA-111` (`allowedAgents` kept but never enforced) are the two fail-open
+> mediums. `HERDR-001` (medium, area 16): `pane split --current` splits the human's focused pane,
+> possibly in another workspace, rather than the caller's own pane.
+>
+> **Above medium, outside the count by the standing rule (area 13, `13-cyrup-mcp-STATUS.md` is the
+> authority).** Critical `MCP-500`. High, filed or raised on 2026-09-24: `MCP-553` (`inheritEnv:false`
+> ignored, so the full parent environment reaches a stdio child), `MCP-576` (a rotating `!command`
+> bearer token is resolved once per connect, so the server returns 401 until restart), `MCP-585` (an
+> Agent Plugin header's `!command` runs through `/bin/sh` and `${VAR}` is expanded into it, so an
+> HTTP-only plugin can run a local command or send env vars to its own URL), `MCP-211` (`describe`
+> shows the model a placeholder instead of a tool's parameters) and `MCP-454` (sampling cannot see a
+> model whose only credential is a stored login). Also still open at high: `MCP-540`, `MCP-501`,
+> `502`, `504`, `507`, `508`, `510`, `513`, `515`, `068`, `079`, `134`, `191`, `196`, `249`, `324`,
+> `326`, `398`, `458`, `483`, `484`, `490`, `492`, `496`. **Area 15 has nothing above medium**
+> (5 open: `ACP-014` medium, four low).
+>
+> ## Closed or narrowed this pass
+>
+> * Area 13, outside the count: `MCP-137` → implemented; **94 more rows moved to implemented** on the
+>   third pass, 4 moved missing → partial. `MCP-014`, `131`, `143` lowered high → medium.
+> * Area 15, outside the count: **90 rows closed**, each naming its Rust symbol, commit and upstream
+>   line range (four close on a decision or an accepted divergence and carry a reopen condition).
+> * `CFG-067` narrowed: the `LLM_INTENT_ARBITER` limb closed (pi-subagents v0.71.0 removed the
+>   variable); `TOOL_TIMEOUT_MS` stays open. `CFG-074` narrowed from nine variables to six.
+> * **Reopened:** `ICOM-035` (above). No counted row closed.
+>
+> ## Filed this pass
+>
+> * **01/12:** `PROV-083`…`100`, `DRIFT-058`, `DRIFT-059`.
+> * **02/03/06:** `AGENT-042`…`044`, `SESS-056`…`063`, `EXT-081`…`087`, tracker `EXT-088` (chord).
+> * **04/05/08:** `TOOL-051`, `CFG-086`…`093`, `SEAM-123`…`131`, `SEAM-133`, tracker `SEAM-132`
+>   (`/bug`, crash log).
+> * **07:** `TUI-104`…`122` (`TUI-118` is a tracker owned by `SEAM-132`).
+> * **09b:** `SUBA-114`…`143` (`SUBA-142` tracker). Next free id `SUBA-144`.
+> * **11:** `ICOM-068`…`070`; `ICOM-062` raised to high.
+> * **16 (new, herdr client):** `HERDR-001`…`003`. **17 (new):** trackers `HARN-001`, `HARN-002`.
+> * **13, outside the count:** `MCP-551`…`585`. Next free id `MCP-586`. **15:** `ACP-297`, `ACP-298`.
+>
+> ## Still unread
+>
+> No upstream window assigned to this pass is unread. What remains, each with its reason:
+>
+> * **pi `v0.87.1..HEAD` and every other upstream's post-tag commits:** untagged, so recorded only as
+>   leads by the hard rule (pi `7fd564cbb` — pi.dev serves a catalog version by user agent — is the
+>   one to check first).
+> * **pi `harness/**`, `packages/durable`, `packages/agent/docs/**`, `pico-v5.md` §2–§11:** nothing
+>   pi ships to users reaches them (area 17). Read them if a `HARN-*` escalation condition fires.
+> * **pi `packages/chord`:** checked by importer only; tracker `EXT-088`.
+> * **`packages/tui` component diffs outside the assigned leads, and `packages/tui/test/**`** (area 07).
+> * **pi-subagents `v0.57.0..v0.67.0` `src/` diff line by line** (207 files; its leads are all
+>   resolved) and the Herdr-placement hunks (`SUBA-100`).
+> * **pi-mcp-adapter:** the non-theme hunks of the two panel files in `977577f` (sampled); the 347
+>   `implemented` rows not re-read as a regression set.
+> * **cyrup side:** the summarization-auth call site (pi v0.86.0 `getAuth` cancellation);
+>   `cyrup-herdr`'s `relay.rs`, the ssh-runner half of `remote.rs`, and `cli.rs` beyond its verbs.
+> * **`@agentclientprotocol/sdk` 0.26** is not in `tmp/pi-acp`, so what upstream answers for
+>   unimplemented methods (`ACP-014`) is unread.
+
+---
+
 # RE-MEASURED 2026-09-24 (thirteenth edition) — upstreams re-pulled, every area re-read at `ea23ca2`; the set above medium refills with three rows
 
-> **Read this block first. It supersedes every count below it and nothing else.** Upstream tags:
+> **SUPERSEDED by the fourteenth edition above** (same day, second pass). Kept as filed.
+>
+> Upstream tags:
 > pi **v0.87.1**, pi-subagents **v0.71.0**, pi-intercom **v0.14.0**, pi-mcp-adapter **v2.37.0**,
 > code_puppy_core_plugins **v0.0.62**, pi-acp **v0.0.33**, pi-permission-system **v0.8.0**. Window
 > stats and per-area pins are in `README.md` *Baselines measured against*.
@@ -1422,7 +1521,7 @@ script's `carried_medium` list emptied. Everything else in the twenty-five rows 
 trailing-messages estimate (`compaction.ts:202-230`, `:146-148` @v0.84.4); cyrup's
 `ContextUsage::from_last_assistant` is the four-field sum alone (low, area 08, unfiled). (2) `PROV-014`
 review: `baseten` (`all.ts:95` @v0.84.4) is now the one unregistered v0.84.x built-in, with no row
-(area 01). (3) `EXT-041`: `ReplayItem` has no custom-entry variant, so `cyrup-intercom`'s inbound card
+(area 01). *(Stale, corrected 2026-09-24: `baseten` IS registered at `ea23ca2` — `crates/cyrup-provider/src/providers/all.rs` lists it as a fleet provider with a dynamic catalog, under `DRIFT-009`.)* (3) `EXT-041`: `ReplayItem` has no custom-entry variant, so `cyrup-intercom`'s inbound card
 is lost on `/resume` (area 08 producer). (4) `TUI-068`: pi refuses to delete the CURRENT session from
 `/resume` (`session-selector.ts:398-401` @v0.84.4); neither cyrup delete path has that guard (low, 07).
 (5) `TUI-081`: pi's `MissingSessionCwdError` re-prompt (`interactive-mode.ts:6084-6095`) unported;

@@ -94,6 +94,10 @@ else in these eleven files ports.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** `resources_discover` plugin skills → **`MCP-565`** (the host event exists: `cyrup-ext` `HostEvent`/`EventKind::ResourcesDiscover`, so the seam is `host-verb`); `provisionalInstalls` → folded into **`MCP-563`** (install); the `getConfigPathFromArgv` narration → **`MCP-551`**; the agent-dir ladder correction **confirmed** at `ea23ca2` (`cyrup-config/src/paths.rs` `ENV_AGENT_DIR_KEYS = ["CYRUP_AGENT_DIR", "CYRUP_CODING_AGENT_DIR"]`, no `PI_*` rung); `MCP-027a` as prerequisite stands, recorded on **`MCP-564`**. From v2.34–v2.37: `deferWithMissingMetadata` → **`MCP-572`**. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: `MCP-008`, `009`, `010`, `011`, `015`, `016`, `017`, `018`, `020`, `021`, `022`, `023`, `024`, `026`, `027`, `028`, `029`, `031`, `032`, `033`, `036`, `037`, `040`, `041`, `042`, `043`, `046`, `049` → **implemented**; `MCP-014` stays partial (test-only; high → medium), `MCP-039` stays partial, restated (a frozen surface skips `syncPromptCommands`; medium → low); `MCP-012`, `013`, `027a` confirmed. New: **`MCP-583`** (#566 resource-discovery failure flag and metadata retirement). Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or

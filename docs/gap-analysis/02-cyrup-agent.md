@@ -136,7 +136,7 @@ turns AGENT-029 from latent into live.
 > of all of it: `crates/cyrup-session` ports `src/harness/compaction/**` and
 > `src/harness/session/context.ts` by name, and area 03 owns those. The genuinely unowned part is
 > `src/harness/{runtime,execution,session/jsonl,session/testing}/**` plus `agent-harness.ts` and the
-> new `hooks.ts`. **`AGENT-028`'s row and status are unchanged**; this is a lead against it.
+> new `hooks.ts`. **`AGENT-028`'s row and status are unchanged**; this is a lead against it *(folded into `AGENT-028`'s row by the 2026-09-24 second pass)*.
 
 > ### RE-MEASURED 2026-09-24 — cyrup **`ea23ca2`**, pi **`v0.87.1`**. This block supersedes the pin table above.
 >
@@ -154,21 +154,70 @@ turns AGENT-029 from latent into live.
 > terminal, v0.85.0) and **`AGENT-041`** (proxy `providerThinkingLevel`, v0.85.0). The last two are
 > the 2026-09-14 census's proxy leads, now promoted after a re-read; the census's *second steering
 > poll* lead is `AGENT-036`'s own steering half and is NOT re-filed; its *abort guard before an
-> already-prepared call* lead is still unread on the cyrup side and stays a lead.
+> already-prepared call* lead is still unread on the cyrup side and stays a lead *(resolved by the
+> second pass below → `AGENT-042`)*.
 >
 > **Census of `v0.85.1..v0.87.1`, `packages/agent/src` outside `harness/**` (the whole non-harness
 > source delta is these four files, +268 / −98):** `agent-loop.ts` +145 → `AGENT-038`, `AGENT-039`;
 > `agent.ts` +99 → `AGENT-039` (initial-state system message, `reset()` now retains the replayed
 > prompt/tool baseline, `continue()` refuses an all-system transcript) and one un-filed addition,
-> `Agent.peekQueuedMessages()` (v0.87.0, a read-only preview — leads only, no cyrup consumer
-> identified); `types.ts` +114 → the same two items; `proxy.ts` +8 → a `Context`→`TranscriptContext`
+> `Agent.peekQueuedMessages()` (v0.87.0, a read-only preview — *filed by the second pass as
+> `AGENT-043`*); `types.ts` +114 → the same two items; `proxy.ts` +8 → a `Context`→`TranscriptContext`
 > signature change only, subsumed by `AGENT-039`. **Negative result:** `packages/agent/src/agent.ts`'s
 > error strings that `AGENT-034` ported are byte-unchanged at v0.87.1 (`"No messages to continue
 > from"`, `"Agent is already processing…"`).
 
-## UNVERIFIED — 2026-09-14 census of the `v0.84.1..v0.85.1` window (leads, not items)
+> ### RE-MEASURE — 2026-09-24, second pass (unread windows closed). cyrup `ea23ca2`, pi `v0.87.1`.
+>
+> **Read this pass, in full:** `git -C tmp/pi diff v0.84.1..v0.87.1 -- packages/agent/src
+> ':!packages/agent/src/harness'` — all six non-harness files, +390 / −143 (`agent-loop.ts`, `agent.ts`,
+> `types.ts`, `proxy.ts`, `index.ts`, `search/index.ts`; the "four files" of the brief are the four
+> that carry behaviour, `index.ts`/`search/index.ts` are barrel/interface only), plus
+> `v0.87.1:packages/agent/src/agent-loop.ts::executeToolCallsParallel` and `::createErrorToolResult`,
+> the tag-by-tag presence of the prepared-call abort guard (`v0.84.1`–`v0.84.4` = 2 hits of
+> `createErrorToolResult("Operation aborted")`, `v0.85.0` = 3; commit `afda4d620`), and every
+> consumer of `AgentTool.replay` and `peekQueuedMessages` at v0.87.1. cyrup side:
+> `crates/cyrup-agent/src/agent/run/tools/{exec,finalize}.rs`, `agent/facade.rs`, `queue.rs`,
+> `crates/cyrup-core/src/tool.rs`, `crates/cyrup-tools/src/{details.rs,tools/{bash,write}.rs}`,
+> `crates/cyrup/src/timings.rs`.
+>
+> **Filed:** `AGENT-042` (low — a parallel batch still starts calls prepared before an abort; pi
+> v0.85.0 short-circuits them with `Operation aborted`), `AGENT-043` (low — `Agent.peekQueuedMessages()`,
+> v0.87.0), `AGENT-044` (low, `cyrup-original` — failing tool results persist a non-empty `details`,
+> contradicting the closed `AGENT-009`'s Verify).
+>
+> **Every 2026-09-14 lead below is now dispositioned — none remains open as a lead:**
+>
+> | lead | disposition |
+> |---|---|
+> | `prepareNextTurn` ordering (BREAKING, v0.84.4) | **already `AGENT-036`** (hook order); the v0.87.0 successor shape is `AGENT-038`. Not re-filed |
+> | second steering poll after preparation | **already `AGENT-036`**'s steering half. Not re-filed |
+> | abort guard before an already-prepared call | **promoted → `AGENT-042`** (cyrup side read: `exec.rs::execute_parallel` phase two starts every deferred call, its own comment says so) |
+> | proxy clean EOF with no terminal event | **`AGENT-040`** (promoted in the first pass) |
+> | proxy `toolcall_end` carries the finalized `ToolCall` | **`AGENT-037`** |
+> | proxy `providerThinkingLevel` | **`AGENT-041`** |
+> | `AgentTool.replay` / durable invocations | **struck — not applicable to this area's surface.** At v0.87.1 `replay` is declared in `types.ts` but read only under `src/harness/**` (`runtime/drive/tools.ts:496,527`, `pico3/kinds/tool.ts:113,137`) and `coding-agent/src/experimental/micro/tools.ts`; `agent-loop.ts` never reads it. It belongs to the harness scope question `AGENT-028` already holds |
+> | `ToolError::details` / `BashDetails::exit_code` vs `AGENT-009` | **promoted → `AGENT-044`** (pi `createErrorToolResult` @v0.87.1 `:863-868` still writes `details: {}`) |
+> | `AGENT-027`'s impact names an inert `PI_TIMING` | **fixed in `AGENT-027`'s Impact text this pass** — `timings.rs:31` reads `CYRUP_TIMING` only |
+> | `Agent.peekQueuedMessages()` (first-pass census) | **promoted → `AGENT-043`** |
+> | `AGENT-028`'s "harness is owned by no area file" | **folded into `AGENT-028`'s row** as a scope correction (below) |
+>
+> **Negative results from the full non-harness read.** `index.ts`: barrel churn only
+> (`LaneSnapshotReduction`/`reduceLaneSnapshot`, `harness/context.ts`, shell-output types are harness
+> re-exports). `search/index.ts`: a bare `SessionSearchService` interface with no implementation in
+> `packages/agent` — nothing to compare. `PendingMessageQueue.drain()` is now `peek()`+slice — same
+> result as cyrup's `PendingQueue::drain` for both modes. `agent.ts`'s `defaultConvertToLlm` passing
+> `system`, `reset()` keeping the baseline system message and `continue()` refusing an all-system
+> transcript are all `AGENT-039`. `explicitContinuation` and `prepareRequest` are `AGENT-038`.
+>
+> **Still unread, and why:** `packages/agent/src/harness/**` for `v0.84.1..v0.87.1` — outside this
+> pass's brief (non-harness source only) and owned by the `AGENT-028` scope question; `harness/pico3/**`
+> alone is ~9k net-new lines. Nothing else in `packages/agent/src` is unread.
 
-**Nothing in this section is an item.** No `AGENT-` id is assigned, because id assignment belongs to
+## RESOLVED 2026-09-24 — the 2026-09-14 census of the `v0.84.1..v0.85.1` window (history; every lead dispositioned in the block above)
+
+**Nothing in this section is an item, and nothing in it is still a lead** — each bullet's disposition
+is in the table above; the bullets are kept verbatim as the record of what the census saw. No `AGENT-` id is assigned, because id assignment belongs to
 a pass that read both sides and this one did not read both sides everywhere. No row in
 `## Open items` is opened, closed or re-ranked by anything here. This is a worklist for the next
 pass; each entry states what was read on which side, and where only one side was read it says so.
@@ -432,7 +481,7 @@ Part 0 and Appendix B of nine parts were read.
 |---|---|---|---|---|
 | ~~AGENT-020~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `continue_run` drains the steering/follow-up queue before the run-active check — **REFUTED as filed 2026-08-13: the predicted loss does not occur on the normal path (5/5 delivered); critical → low** — **CLOSED 2026-08-14**: sweep 1 — the run-active guard is the first statement of `Agent::continue_run` and both drain sites restore via `PendingQueue::push_front` on `Err(RunActive)`; pinned by `src/tests/agent_loop.rs`. Re-verified by reading the code in sweep 2: the AGENT-020 comment cites agent.ts:351-353 @v0.83.0 and states plainly that it is a fast path only, because pi gets check-then-claim atomicity from single-threaded JS. |
 | ~~AGENT-030~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | M | `AgentSession::prompt` gates on the agent's per-run flag, so a prompt in the post-run gap starts a second run — **CLOSED 2026-08-14**: sweep 1 — `AgentSession::is_run_active()` exists (`cyrup-session-svc/src/session.rs:638`) as `!self.is_idle()` (driver_tx OR `agent.is_running()`), with an AGENT-030 citation block. |
-| ~~AGENT-009~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | Error tool results diverge in `details` and in `tool_execution_end.result` shape — **CLOSED 2026-08-14**: sweep 1. |
+| ~~AGENT-009~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | Error tool results diverge in `details` and in `tool_execution_end.result` shape — **CLOSED 2026-08-14**: sweep 1. **2026-09-24: its Verify (`details == {}`) is false for a failing `bash` by design — see `AGENT-044`; closure stands.** |
 | ~~AGENT-016~~ | ~~medium~~ **CLOSED 2026-08-14** | cyrup-original | S | Panicking tool in a parallel batch vanishes (unwind builds only) — **CLOSED 2026-08-14**: sweep 1 — both batch modes wrap `tool.execute` in `AssertUnwindSafe(..).catch_unwind()` and convert an unwind into `Err(ToolError)`; pinned by `agent016_panicking_tool_keeps_its_slot_in_a_{parallel,sequential}_batch`. |
 | ~~AGENT-017~~ | ~~medium~~ **CLOSED 2026-08-14** | stale-port | S | Per-turn refresh re-pushes only `tools`; mid-run model / thinking-level change never reaches the loop — **CLOSED 2026-08-14**: sweep 1 — `cyrup-session-svc/src/hooks.rs:193-196` stamps `update.model` and `update.thinking_level` after the inner hook. The "Caveat from the refuter" about the hooks.rs:154-156 comment claiming the ordering "matches Pi exactly" was re-checked by area 08 in sweep 2 and is superseded by DRIFT-033's port. |
 | ~~AGENT-021~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `loop_fn::build_run_ctx` hardcodes `headers: None`, orphaning `AgentLoopConfig.gen_config.headers` — **CLOSED 2026-08-14**: sweep 1. |
@@ -451,7 +500,7 @@ Part 0 and Appendix B of nine parts were read.
 | ~~AGENT-025~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | A `transform_context` / `convert_to_llm` failure emits the wrong `agent_end.messages` and never reports `aborted` — **CLOSED 2026-08-14**: sweep 1. |
 | ~~AGENT-026~~ | ~~low~~ **CLOSED 2026-09-04** | upstream-drift | S | `samplingParams` absent from the proxy request body and from `StreamOptions` — **CLOSED 2026-09-04**: area 01's residual (recorded as blocked as of 2026-08-14) has since landed. `cyrup_provider::StreamOptions::sampling_params` (`crates/cyrup-provider/src/stream.rs:178`) and `Model::sampling_params` (`crates/cyrup-provider/src/model.rs:73`) now exist, merged per-key by `merge_sampling_params` (`crates/cyrup-provider/src/utils/simple_options.rs:64-77`) inside `build_base_options`, and applied by all three OpenAI-compatible adapters via `apply_sampling_params` (`crates/cyrup-provider/src/api/openai_completions/params.rs:231-236`, reused from `openai_responses/params.rs` and `azure_openai_responses.rs`) — matching upstream's "only OpenAI-compatible adapters apply it". This crate's own half is wired too: `ProxyStreamFn::options_from` (`crates/cyrup-agent/src/proxy/stream_fn.rs::options_from`, `:46-70`) copies `opts.sampling_params.clone()` at `:54` into `ProxyStreamOptions::sampling_params` (`crates/cyrup-agent/src/proxy/options.rs:17-23`), pinned by `agent026_proxy_stream_fn_threads_sampling_params_into_wire_body` (`proxy/stream_fn.rs`) plus `crates/cyrup-provider/src/tests/sampling_params.rs`. Both crates read and re-verified at HEAD `2571969`. |
 | AGENT-027 | low — **PARTIALLY CLOSED 2026-08-14** | not-ported | S | `timings.ts` ported as one hardcoded namespace with 3 of 12 marks — **PARTIALLY CLOSED 2026-08-14**: sweep 2 (area 08) — `crates/cyrup/src/timings.rs` is now a namespaced port of `timings.ts` (process-global insertion-ordered table behind a `OnceLock<Mutex<..>>`, closed `TimingLabel { Main, Extensions }`, free `reset_timings`/`time`/`print_timings`, one titled group per namespace) and `main.rs` gained `createSessionManager`, `createRuntime`, `createAgentSessionRuntime`, `createAgentSession`, `resolveModelScope`, `readPipedStdin`, `prepareInitialMessage`. Two findings the item did not have: (a) `print_timings()` sat ABOVE the stdin-read/prompt-assembly block in the interactive and print/json arms, so any mark taken there was recorded and never printed — moved to pi's position (main.ts:899/:902); (b) `initTheme` has no cyrup counterpart at pi's position because cyrup's theme boot lives inside `run_interactive`, downstream of the print. **RESIDUAL: the `extensions` namespace producers in cyrup-ext's loader (`${extensionPath} module import` / `factory`) — area 06.** OWNERSHIP: nothing in crates/cyrup-agent marks or reads a timing; two consecutive sweeps reported it not-reached for that reason. — **RE-READ 2026-09-14 at `9aeba769`, STILL OPEN (low, `not-ported`).** The claim as written ("one hardcoded namespace with 3 of 12 marks") is half-dead and half-alive, and the live half is exactly the residual recorded above. **DEAD half, audited rather than taken on trust:** `crates/cyrup/src/timings.rs` is a genuine namespaced port — `TimingLabel{Main,Extensions}` (`:46-64`), a process-global `OnceLock<Mutex<Vec<(TimingLabel,TimingNamespace)>>>` in insertion order (`:74-80`), `reset_timings` replacing in place while keeping key position (Map.set semantics, `:84-100`), and `print_timings` emitting one `Startup Timings: {ns}` group per namespace. The `main` namespace now carries **11** marks — parseArgs, runMigrations, firstTimeSetup, createSessionManager, createRuntime, createAgentSessionRuntime, createAgentSession, resolveModelScope, readPipedStdin, prepareInitialMessage, interactiveMode.init (`crates/cyrup/src/main.rs:245,339,425,439,550,628,647,662,664,863,865` + `session_launch.rs:222,226,238`) — against pi's 12 @v0.85.1 (`packages/coding-agent/src/main.ts:613,650,659,698,840,846,877,884,888,895,907,948`); the only absentee is `initTheme` (`main.ts:888`), which has no cyrup position because theme boot lives inside `run_interactive`, downstream of the print. Both documented divergences are defensible: dropping pi's `ms >= 0` filter is vacuous under monotonic `Instant`, and reading only `CYRUP_TIMING` is a deliberate spelling change. **LIVE half:** the `extensions` namespace has ZERO producers anywhere in the workspace — `git grep TimingLabel::Extensions 9aeba769 -- crates/` returns four hits, ALL inside `timings.rs`'s own `#[cfg(test)]` block (`:202,:203,:206,:225`), and `git grep -nE 'timings\|TimingLabel' 9aeba769 -- crates/cyrup-ext/src` returns nothing at all, while pi still fills that namespace per extension (`core/extensions/loader.ts:560,575`) and resets it (`core/resource-loader.ts:389`) @v0.85.1. So this item's own Verify clause STILL fails on its second assertion: a `CYRUP_TIMING=1` run emits `--- Startup Timings: main ---` and can never emit `--- Startup Timings: extensions ---`. **Kind stays `not-ported`, settled by presence at the PORTED tag rather than by date:** both extensions producers and the `resetTimings("extensions")` call exist at v0.83.0 (`loader.ts:465,473,496`, `resource-loader.ts:388`), so this is a gap in the ORIGINAL port, not drift. Severity stays **low** — it is a diagnostic, not a behaviour. **One thing the Fix does not say and whoever schedules it needs:** the residual is not a matter of adding two `time()` calls. `timings` lives in `crates/cyrup/src/timings.rs`, i.e. the top-level bin+lib crate, and `crates/cyrup-ext/Cargo.toml` @`9aeba769` depends on cyrup-core/config/agent/tools/provider/session and **NOT** on `cyrup` — the dependency arrow points the other way, so the module has to move down a crate before `cyrup-ext` can mark into it. That makes the effort S-plus-a-refactor rather than S; the Effort field is left unmoved on that alone. Separately: the Impact paragraph still reads "`CYRUP_TIMING=1` / `PI_TIMING=1` is a supported diagnostic" while `timings.rs:31`'s `timing_enabled()` matches only `CYRUP_TIMING` — the stale-text nit already filed at this file's lines 255-259, still unfixed. **RE-CONFIRMED 2026-09-16 at `cc7818b` by identity** (`crates/cyrup-agent` and `crates/cyrup` are byte-identical across `9aeba769..cc7818b`). Still partially closed; still blocked outside this crate. **RE-CONFIRMED 2026-09-24 at `ea23ca2`, STILL PARTIALLY CLOSED.** `crates/cyrup/src/timings.rs` is unchanged since `9aeba769`, and `git grep -nE 'TimingLabel|timings::' ea23ca2 -- crates/cyrup-ext/src` is still empty — the `extensions` namespace still has no producer. `cyrup-ext` did change in the window (`838eac7`, `df3e9a8`: terminal-input keys, sanctioned-wait gate) but added no timing mark. |
-| AGENT-028 | *(tracker)* | upstream-drift | L | pi v0.84.x's typed telemetry contract has no cyrup counterpart — scope decision, not counted **RE-CONFIRMED 2026-09-16 at `cc7818b`; this row carries no 2026-09-14 marker.** Still a `tracker` and still outside any tally — the harness-telemetry scope question is unanswered and nothing in `9aeba769..cc7818b` touches it (the window is `cyrup-ext-subagents`, `cyrup-tui` and `cyrup-it` only). **Kind `upstream-drift` is correct and needs no reclassification**, unlike `EXT-058`: a tracker still carries a kind, and this one's subject is a real pi v0.84.x contract that landed after the ported baseline. **RE-CONFIRMED 2026-09-24 at `ea23ca2`.** Still a tracker. The scope question it forces has grown: `v0.85.1..v0.87.1` adds `packages/agent/src/harness/pico3/**` (~9k lines, a third harness generation, not opened this pass) — any escalation of this tracker must now name which harness generation it would port. |
+| AGENT-028 | *(tracker)* | upstream-drift | L | pi v0.84.x's typed telemetry contract has no cyrup counterpart — scope decision, not counted **RE-CONFIRMED 2026-09-16 at `cc7818b`; this row carries no 2026-09-14 marker.** Still a `tracker` and still outside any tally — the harness-telemetry scope question is unanswered and nothing in `9aeba769..cc7818b` touches it (the window is `cyrup-ext-subagents`, `cyrup-tui` and `cyrup-it` only). **Kind `upstream-drift` is correct and needs no reclassification**, unlike `EXT-058`: a tracker still carries a kind, and this one's subject is a real pi v0.84.x contract that landed after the ported baseline. **RE-CONFIRMED 2026-09-24 at `ea23ca2`.** Still a tracker. The scope question it forces has grown: `v0.85.1..v0.87.1` adds `packages/agent/src/harness/pico3/**` (~9k lines, a third harness generation, not opened this pass) — any escalation of this tracker must now name which harness generation it would port. **SCOPE CORRECTION 2026-09-24 (second pass), folding the 2026-09-14 provenance lead:** "`src/harness/**` is owned by no area file" is too broad — `crates/cyrup-session` ports `harness/compaction/**` and `harness/session/context.ts` by name and area 03 owns those. The unowned residue this tracker speaks for is `harness/{runtime,execution,session/jsonl,session/testing,pico3}/**` plus `agent-harness.ts` and `hooks.ts`; `AgentTool.replay` (`types.ts` @v0.87.1, consumed only under `harness/**`) belongs here too. Still a tracker. |
 | ~~AGENT-031~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `websocket_connect_timeout_ms` unreachable from the agent; the parsed setting has no consumer — **CLOSED 2026-08-14**: sweep 1. |
 | ~~AGENT-032~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Two JS-falsy `\|\|` fallbacks ported as `Option`-only fallbacks — **CLOSED 2026-08-14**: sweep 1. |
 | ~~AGENT-033~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | A panicking event subscriber is swallowed where pi fails the run — **CLOSED 2026-08-14**: sweep 1 — disposition taken: option (a), pi parity. Records the resulting tension with cyrup's own R-02-048 wording ("a subscriber failure MUST NOT halt the loop"), which `spec/` is absent to adjudicate; the no-deadlock half of R-02-048 is preserved by `SettlementGuard` and is still asserted by the rewritten test. |
@@ -467,6 +516,9 @@ Part 0 and Appendix B of nine parts were read.
 | AGENT-039 | low | upstream-drift | L | **NEW 2026-09-24.** pi v0.86.0 moved the system prompt and tool declarations out of `Context.systemPrompt`/`Context.tools` and into transcript `role:"system"` messages (`TranscriptContext`, `declareToolChanges`), deleted `AgentToolResult.addedToolNames` / `ToolResultMessage.addedToolNames`, and made `Agent.reset()` keep the prompt/tool baseline; cyrup has no `system` message role and still writes `addedToolNames`. Root of `SESS-051` and `EXT-079`. See body. |
 | AGENT-040 | low | upstream-drift | S | **NEW 2026-09-24** (promoted from the 2026-09-14 census). pi v0.85.0 `streamProxy` turns a clean EOF with no `done`/`error` frame into a terminal `error` carrying the partial and `"Connection closed by proxy server before the response completed"`; cyrup's proxy transport ends silently and the agent loop substitutes a fresh, EMPTY errored message with a different text. See body. |
 | AGENT-041 | low | upstream-drift | S | **NEW 2026-09-24** (promoted from the 2026-09-14 census). pi v0.85.0 proxy `done`/`error` frames carry `providerThinkingLevel`, copied onto the partial; cyrup's wire variants and `AssistantMessage` have no such field. Proxy half only — the message field is area 01's. See body. |
+| AGENT-042 | low | upstream-drift | S | **NEW 2026-09-24 (second pass)** — promoted from the 2026-09-14 census. pi v0.85.0 (`afda4d620`) makes each deferred parallel-batch closure check `signal.aborted` first and finalize with `Operation aborted` without executing; cyrup's `execute_parallel` phase two still starts every call prepared before the abort (its own comment says so) and runs `after_tool_call` on it. Built-in tools early-exit on a cancelled token; an extension/MCP tool that does not check first runs its effect. See body. |
+| AGENT-043 | low | upstream-drift | S | **NEW 2026-09-24 (second pass).** pi v0.87.0 `Agent.peekQueuedMessages()` — a non-consuming, mode-respecting preview of the next queue-selected batch; cyrup's `Agent` exposes only `has_queued_messages` and the consuming drains. See body. |
+| AGENT-044 | low | cyrup-original | S | **NEW 2026-09-24 (second pass)** — promoted from the 2026-09-14 census. A failing `bash` persists `details: {exitCode, truncation?, fullOutputPath?}` (`ACP-141`, `ToolError::with_details`); pi's `createErrorToolResult` still writes `details: {}` at v0.87.1. The closed `AGENT-009`'s Fix and Verify assert `{}` and are now false for one tool. See body. |
 
 ## AGENT-020 — `continue_run` drains the steering/follow-up queue before the run-active check
 
@@ -1325,8 +1377,9 @@ at `pi/packages/coding-agent/src/core/resource-loader.ts:388` and filled per ext
 `pi/packages/coding-agent/src/core/extensions/loader.ts:501` (`${extensionPath} module import`),
 `:509` and `:532` (`${extensionPath} factory`).
 
-**Impact** — `CYRUP_TIMING=1` / `PI_TIMING=1` is a supported diagnostic (documented in the module
-header at `timings.rs:1-8`) that answers a different question in cyrup than in pi: the whole
+**Impact** — `CYRUP_TIMING=1` is a supported diagnostic (documented in the module
+header at `timings.rs:1-8`; *corrected 2026-09-24: `PI_TIMING=1` was dropped by `dd44b3c` and is inert —
+`timings.rs:31` matches `CYRUP_TIMING` only*) that answers a different question in cyrup than in pi: the whole
 extension-loading phase — the most common cause of a slow start, and the only phase attributable to a
 specific user-installed extension — is invisible, as are session-manager creation, runtime creation,
 piped-stdin read, theme init and model-scope resolution. A maintainer profiling startup gets a
@@ -1771,6 +1824,117 @@ field to both wire variants and copy it onto the partial in `proxy/builder.rs`'s
 
 **Verify** — A `done` frame with `"providerThinkingLevel":"high"` yields an assistant message with
 that value.
+
+---
+
+## AGENT-042 — A parallel batch still starts tool calls that were prepared before an abort; pi v0.85.0 finalizes them as `Operation aborted` without executing
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; not observed live)
+
+> **Filed 2026-09-24 (second pass)**, promoted from the 2026-09-14 census (*abort guard before an
+> already-prepared call*). Bisected: `createErrorToolResult("Operation aborted")` occurs twice in
+> `packages/agent/src/agent-loop.ts` at every tag `v0.84.1`–`v0.84.4` and three times from `v0.85.0`
+> (commit `afda4d620`, "fix(agent): stop prepared tools after preflight abort (#8936)"). Present at
+> v0.87.1 unchanged.
+
+**cyrup** — `crates/cyrup-agent/src/agent/run/tools/exec.rs::execute_parallel`: phase one prepares
+calls in source order and breaks on `self.cancel.is_cancelled()` (`:70`); phase two (`:75-…`) then
+spawns EVERY `PreparedCall` in `deferred`, and the comment at `:76-78` states the intent: "Calls
+deferred before an abort broke the loop are still started, exactly as Pi's already-pushed closures
+are." Each spawned body calls `tool.execute(cid, args, child, on_update)` with a child of the already
+cancelled token, and the `Finished` arm then runs finalization — `after_tool_call` included — on the
+result (`tools/finalize.rs`).
+
+**upstream** — `git -C tmp/pi show v0.87.1:packages/agent/src/agent-loop.ts`,
+`executeToolCallsParallel` (`:583-…`): each deferred closure pushed into `finalizedCalls` now opens
+with `if (signal?.aborted) { … result: createErrorToolResult("Operation aborted"), isError: true …;
+await emitToolExecutionEnd(finalized, emit); return finalized; }` (`:617-625`), so a call prepared
+before the abort is never executed and never reaches `finalizeExecutedToolCall` (no `afterToolCall`).
+The closures run from `Promise.all(finalizedCalls.map(…))` at `:643`, so the check sees the signal as
+it stands when the batch starts, after every `beforeToolCall` has resolved. cyrup's comment describes
+pi as it was at v0.84.x.
+
+**Impact** — The case is an abort that lands while a later call in the same batch is still being
+prepared — typically the user pressing Escape at a permission dialog for call #2 while call #1 was
+already approved. pi v0.85+ runs neither; cyrup runs call #1. The built-in tools blunt this: `write`
+checks `cancel.is_cancelled()` after taking its lock and before writing
+(`crates/cyrup-tools/src/tools/write.rs:108-110`), and `bash` returns `Command aborted` before
+resolving its shell (`tools/bash.rs:397`). An extension or MCP tool that does not poll its cancel
+token before acting performs its effect after the user aborted. The result text differs too
+(`Command aborted` vs `Operation aborted`), and `after_tool_call` runs on a call pi never finalizes.
+
+**Fix** — In `execute_parallel`'s phase two, before spawning each `PreparedCall`, check
+`self.cancel.is_cancelled()`; if set, emit `ToolExecutionEnd` with
+`ToolError::new("Operation aborted")` mapped through the ordinary error-result path, store it in its
+source slot, and do not spawn. Rewrite the `:76-78` comment to cite v0.85.0's guard.
+
+**Verify** — A two-call parallel batch whose second `before_tool_call` hook cancels the run: the first
+tool's `execute` is never entered (a counting tool records 0 calls), both results read
+`Operation aborted`, and `after_tool_call` is invoked for neither.
+
+---
+
+## AGENT-043 — `Agent.peekQueuedMessages()` (pi v0.87.0) has no counterpart
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
+
+> **Filed 2026-09-24 (second pass)**, promoted from the first pass's census note. Absent at v0.86.1,
+> present at v0.87.0 (`packages/agent/CHANGELOG.md` 0.87.0: "Added `Agent.peekQueuedMessages()` to
+> preview the next queue-selected batch without consuming it").
+
+**cyrup** — `crates/cyrup-agent/src/agent/facade.rs` exposes `has_queued_messages` (`:246`) and the
+consuming `drain_queues_for_restore` (`:201`); `crates/cyrup-agent/src/queue.rs::PendingQueue` has
+`drain`, `take_all`, `push_front`, `is_empty` and no non-consuming read.
+
+**upstream** — `packages/agent/src/agent.ts` @v0.87.1: `PendingMessageQueue.peek()` (the first
+message in `one-at-a-time` mode, all of them in `all` mode) with `drain()` rewritten as
+`peek()` + slice; `Agent.peekQueuedMessages()` (`:326-330`) returns the steering queue's peek if
+non-empty, else the follow-up queue's. No consumer in `packages/coding-agent` at v0.87.1 (`git grep
+peekQueuedMessages v0.87.1 -- packages` hits only `agent.ts`, the README and `test/agent.test.ts`).
+
+**Impact** — An SDK/embedder capability only; nothing in the shipped pi binary calls it, so no
+user-visible difference today. Recorded because it is public API on the ported `Agent`.
+
+**Fix** — `PendingQueue::peek(&self) -> Vec<AgentMessage>` honouring `mode`, and
+`Agent::peek_queued_messages()` returning steering's peek when non-empty, else follow-up's.
+
+**Verify** — Port pi's `agent.test.ts:970-972` and `:1117-1119` cases: peek returns the steering
+message, then (after it is consumed) the follow-up; a peek never changes `has_queued_messages`.
+
+---
+
+## AGENT-044 — A failing `bash` result persists a non-empty `details`; pi's error results are always `details: {}`, and the closed `AGENT-009` still asserts `{}`
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+> **Filed 2026-09-24 (second pass)**, promoted from the 2026-09-14 census lead against `AGENT-009`.
+
+**cyrup** — `crates/cyrup-core/src/tool.rs` carries `ToolError::details` with a written
+`[CYRUP-DELTA]` (`:151-…`) and `ToolError::with_details` (`:177`);
+`crates/cyrup-agent/src/agent/run/tools/finalize.rs`'s `From<Result<ToolResult, ToolError>>` writes
+`details: Some(e.details.clone().unwrap_or_else(empty_details))` (`:38`). The one opt-in is the bash
+non-zero-exit path, `crates/cyrup-tools/src/tools/bash.rs:616-630`, which attaches
+`BashDetails { truncation, full_output_path, exit_code: Some(code) }` (`crates/cyrup-tools/src/details.rs`,
+`exit_code` documented as `ACP-141`).
+
+**upstream** — `packages/agent/src/agent-loop.ts` @v0.87.1: every thrown tool error becomes
+`createErrorToolResult(message)` = `{ content: [{type:"text", text}], details: {} }` (`:863-868`, used
+at `:767`, `:808`, `:851`); `packages/coding-agent/src/core/tools/bash.ts` @v0.87.1 reports a non-zero
+exit only by throwing `Command exited with code ${exitCode}` (`:371-372`).
+
+**Impact** — A persisted failing-bash `toolResult` carries `details.exitCode` (and `truncation` /
+`fullOutputPath` when computed) where pi's is `{}`. pi's reader tolerates the extra keys, so this is
+not a compatibility break; it is a cyrup-original surface that the ledger did not record, and it makes
+the closed `AGENT-009`'s Fix ("so `details` serializes as `{}`") and Verify (asserts `details == {}`)
+false for one tool. A later pass re-verifying `AGENT-009` literally would "reopen" it.
+
+**Fix** — No code change is proposed: amend `AGENT-009`'s Verify to "`{}` for every tool that does not
+call `ToolError::with_details`" and name `bash`'s non-zero exit as the one opt-in; add a unit test in
+`crates/cyrup-agent/src/tests/` pinning that a plain `ToolError` still finalizes to `details: {}`, so
+the opt-in cannot silently spread to every error path.
+
+**Verify** — The new test passes; a failing `bash` row's `details` has `exitCode`, a failing `read`
+row's is `{}`.
 
 ---
 

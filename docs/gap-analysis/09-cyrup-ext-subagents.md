@@ -31,6 +31,13 @@ clone-HEAD line numbers and file existence both mislead here).
 > **`09b-cyrup-ext-subagents-v0.64-drift.md`**. That file was created by this pass and files
 > `SUBA-107`…`SUBA-113`. The 2026-09-14 census below is still a list of UNVERIFIED leads. Items filed
 > in `09b` do not close or re-verify any lead here.
+>
+> **Pin pointer, `09b` pass 2 (2026-09-24, same pins):** `09b` read `v0.67.0..v0.71.0`'s large files
+> line by line, resolved every `v0.57.0..v0.67.0` lead in `09a`/`09b`, read the ten post-`v0.71.0`
+> commits as leads, and filed `SUBA-114`…`SUBA-143`; **the next free `SUBA-` id is `SUBA-144`**. Two of
+> those are in-baseline and so by scope this file's: `SUBA-117` (the worktree clean check, upstream
+> v0.43.0) and the ownerless top-level `gate` tool-parameter lead recorded in `09b`'s *Leads*. This
+> file's own census below was not touched.
 
 > ### RECONCILIATION 2026-09-16 — the ten open rows re-read against `cc7818b`; three closed, three partially closed
 >

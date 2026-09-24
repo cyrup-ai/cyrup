@@ -77,6 +77,10 @@ non-obvious obligation in this section.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** `claudePlugins` + `claude-plugin-loader.ts` + `normalizeProgrammaticConfig` → **`MCP-565`**; `caFile` (config half) → **`MCP-566`**, with `MCP-500` to land at six; the exclusive-mode override → **`MCP-552`** — reading the cyrup side showed the **whole** exclusive mode (`v2.28.0`, `5088b4e`) is absent, not only the v2.33.0 override; `getConfigPathFromArgv` → **`MCP-551`**; `directTools: "search"` type widening → **`MCP-561`** (`lenient` reads `"search"` as absent). From v2.34–v2.37: `ancestorConfigRoots` → **`MCP-573`**; `allowInstall` → folded into `MCP-563`. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: `MCP-070`, `073`, `078`, `087`, `094` → **implemented**; `MCP-068`, `079`, `085`, `086`, `089`, `090`, `091`, `093`, `098` confirmed. New: **`MCP-585`** (#572, Agent Plugin `args`/`cwd`/`headers` literal — high) and **`MCP-584`** (2026 `input_required`, which also carries `errors.ts`' `InputRequiredNeedsUiError` for `MCP-089`). Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or

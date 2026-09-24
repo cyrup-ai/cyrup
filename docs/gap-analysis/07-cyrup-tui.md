@@ -7,7 +7,55 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 > | | measured at | how | still unmeasured |
 > |---|---|---|---|
 > | `cyrup/` | HEAD **`ea23ca2`** (2026-09-23 merge of `#152`). Previous full re-read of the open rows: `cc7818b` (2026-09-16 block in `## Open items`) | `git diff --stat cc7818b..ea23ca2 -- crates/cyrup-tui` touches **five** files, all UW-7 fleet-roster wiring: `app/terminal_input.rs` (new, 629 lines — the host side of the EXT-021 `terminal_input` fold), `app/run_action.rs` (+28, the fold call ahead of `handle_input`), `app/state.rs` (+11, `editor_focus_mirror`), `app/extension_ui.rs` (+13, attaching/publishing that mirror), `app/mod.rs` (+2). `crates/cyrup/src/main.rs` gained only the `__subagent-inspector` pre-dispatch arm. **None of the five is a file any open row cites**, so every open row's evidence carries forward from `cc7818b` by identity; the spot re-greps recorded in the 2026-09-24 note under `## Open items` were re-run anyway. | nothing on the cyrup side for this area |
-> | `pi/` | **v0.87.1** (newest tag; was v0.85.1). `packages/tui` + `modes/interactive/`: `v0.85.1..v0.87.1` = 66 files, `+3 525 / −590` (of which `packages/tui/native/**` is prebuilt `.node` binaries + C/ObjC helpers for the bundled clipboard) | `v0.85.1..v0.87.1` **read** for every `src/` hunk under `packages/tui` and the `components/` + `interactive-mode.ts` hunks named in the census below; six items filed (`TUI-098`…`TUI-103`) | `interactive-mode.ts` (+431/−) was read only at the hunks the census names — the `/bug` flow (`bug-report.ts`, net-new 298 lines), cache-warming wiring and the `--resume` progressive loader were skimmed, not read against cyrup. `v0.84.3..v0.85.1` remains the 2026-09-14 **UNVERIFIED lead list** below, except the two leads this pass read on both sides and filed (Zed → `TUI-098`; LaTeX join symbols → `TUI-099`) |
+> | `pi/` | **v0.87.1** (newest tag; was v0.85.1). `packages/tui` + `modes/interactive/`: `v0.85.1..v0.87.1` = 66 files, `+3 525 / −590` (of which `packages/tui/native/**` is prebuilt `.node` binaries + C/ObjC helpers for the bundled clipboard) | `v0.85.1..v0.87.1` **read** for every `src/` hunk under `packages/tui` and the `components/` + `interactive-mode.ts` hunks named in the census below; six items filed (`TUI-098`…`TUI-103`) | ~~`interactive-mode.ts` (+431/−) was read only at the hunks the census names … `v0.84.3..v0.85.1` remains the 2026-09-14 UNVERIFIED lead list~~ **Closed by the second pass below.** What remains is listed there |
+>
+> **SECOND PASS, 2026-09-24 — the unread windows above, read in full. Still cyrup `ea23ca2` × pi v0.87.1.**
+> *Read, both sides:* (1) `modes/interactive/interactive-mode.ts` **`v0.84.3..v0.87.1` in full** — all
+> 1 167 diff lines, every hunk, including `/bug` + crash log, cache-warming wiring, the progressive
+> `--resume` loader (`components/session-selector.ts`, whole diff), `turn_start` moving progress and
+> the working indicator, the `entry_appended` arms, the thinking-drop notice, post-login model
+> selection, `/tree`'s compaction recheck, `preferSelection`, and `/hotkeys`; plus `tui-renderer.ts`
+> and `chat-viewport.ts` (new at v0.86.0). (2) **`packages/tui/src` `v0.84.3..v0.85.1`** — every
+> hunk of `terminal.ts`, `terminal-image.ts`, `latex.ts`, `autocomplete.ts`, `layout.ts`,
+> `components/{editor,input,select-list,settings-list,loader,box,scroll-view,mouse-region}.ts`,
+> `tui.ts` and `tui-main-screen.ts`; `tui-alt-screen.ts` for every non-search feature
+> (`alt-screen-search.ts` only to confirm it is still the ADR-0005 cut). `v0.85.1..v0.87.1` was the
+> first pass's; re-read here for `latex.ts`, `tui-alt-screen.ts` and `utils.ts`. (3) Every lead in
+> both census sections — resolution tables in each. **Filed:** `TUI-104`…`TUI-122` (`TUI-118` as a
+> tracker owned by area 08's `SEAM-132`). **Amended:** `TUI-040` (Fix text), `TUI-100` (post-tag
+> lead), `TUI-102` (fullscreen copy-flash half). **Closed:** none — no open row's cited code moved.
+> *Negative results:* `fuzzy.ts` (first pass); `native-platform.ts`/`native/**` (substrate);
+> `tui-main-screen.ts`'s `BoundedTerminalWriter` (a V8 string-length limit, no Rust analogue);
+> `PI_DEBUG_REDRAW` → `PI_TUI_DEBUG_REDRAW` and the `PI_CLEAR_ON_SHRINK`/`PI_HARDWARE_CURSOR` removals
+> (cyrup has no env defaults for either — nothing to rename); `refreshTerminalDimensions`' EACCES
+> guard (cyrup never self-signals `SIGWINCH`); `Input`'s `prompt`/`placeholder` options (consumers
+> are the search panel and `/bug`, both covered above); `handleCopyCommand({preferSelection})`,
+> `fullscreenCopyOnSelect` and its `/settings` row (ported, `app/execute_misc.rs:28-36`,
+> `CFG-078`); `restoreQueuedMessagesToEditor` now awaiting `session.abort()` (session semantics —
+> `SESS-062`); `user_bash` failing closed (`EXT-077`); `setCapabilityOverrides` from
+> `terminal.{images,trueColor,hyperlinks}` settings (area 05's lead; cyrup's env layer is ported);
+> `/reload` applying runtime settings before the theme (only matters with settings-level capability
+> overrides, which cyrup lacks); `toggleThinkingBlockVisibility` no longer rebuilding the chat
+> (same user-visible result upstream; cyrup's divergence is `TUI-N06`).
+> *Post-tag leads (pi `v0.87.1..b45597504`, untagged, NOT items):* `36af9dc48` (#9944) replaces
+> v0.86.0's skill-ranking key with a bare-name-then-full-name two-pass filter — noted under
+> `TUI-100`; `8d897edaa` (#9863) adds extension-loader **warnings** to the startup diagnostics
+> panel — a lead against `TUI-006`'s "2 of 4 diagnostic sources", to be read when tagged.
+> *A lead this pass did not finish (outside the assigned window):* the footer's `(provider)`
+> prefix count is computed from `session.model_catalog()`, which is `provider.current().models()`
+> (`cyrup-session-svc/src/session/accessors.rs:406-408`), i.e. the **current** provider's models,
+> not pi's auth-filtered snapshot of every provider (`updateAvailableProviderCount`,
+> `interactive-mode.ts:5092-5098` @v0.87.1). Whether any `Provider` implementation lists other
+> providers' models was not traced; if none does, the prefix can never appear. `TUI-105`'s Fix
+> already moves the count to the auth-filtered catalog.
+> **Still unread, and why:** (a) `modes/interactive/components/` diffs **outside the leads** —
+> `model-selector.ts`, `scoped-models-selector.ts` (#8900 active markers / strike-through),
+> `thinking-selector.ts` (#9149 save keybindings), `trust-selector.ts`, `settings-selector.ts`,
+> `extension-{editor,input,selector}.ts`, `assistant-message.ts` beyond its `MouseRegion`,
+> `custom-editor.ts` beyond `TUI-103`, `session-share.ts` — not in this pass's assignment;
+> CHANGELOG-level only. (b) `packages/tui/test/**` — not read; tests were not used as evidence.
+> (c) `packages/chord` — owned by no area (README). Nothing else in `packages/tui/src` or
+> `interactive-mode.ts` between v0.84.3 and v0.87.1 is unread.
 >
 > **Per-module baseline, restated.** The crate still cites a range, not a tag: `altscreen/{mouse,wheel}.rs`
 > and `keymap.rs` at **@v0.84.3**, `markdown/latex.rs:1` at **v0.84.1**, `autocomplete.rs:6` at
@@ -66,7 +114,22 @@ desktop session · `TUI-103` status spinners are a band above the editor, not em
 border. `TUI-098` and `TUI-099` promote two leads from the 2026-09-14 list below (window
 `v0.84.3..v0.85.1`); the other four are from `v0.85.1..v0.87.1`.
 
-**Leads — read on the upstream side only, or skimmed; NOT filed, no ids.**
+**RESOLVED 2026-09-24 (second pass) — every lead below now has a disposition; the list is kept as history.**
+
+| lead | disposition |
+|---|---|
+| click toggling of summary / skill entries | **promoted → `TUI-107`** (with the component mouse protocol lead) |
+| blank row under an empty fullscreen footer (#8919) | **promoted → `TUI-119`** (cyrup gives a custom footer the built-in footer's rows in both modes) |
+| `/tree` racing compaction (#9179) | **promoted → `TUI-104`** (UI half; session guard is area 08's `SEAM-124`, filed concurrently) |
+| `/bug` | **promoted → `TUI-118`, a tracker owned by area 08's `SEAM-132`** |
+| new entry types in the UI | `/tree` rendering **promoted → `TUI-120`**. **Struck:** `footer.ts` summing `usage` entries — owned by `SESS-051` (its Impact already names the missing cache-warm spend; the footer is one reader of the same totals); the `entry_appended` arms for `custom_message`-with-`display` and boundary `compaction` re-render — their only producer is v0.87.0's boundary drafts (`agent-session.ts:817-820` @v0.87.1), i.e. `EXT-078`, and cyrup's `EntryAppended` is emitted only by `append_entry` for `custom` (`cyrup-session-svc/src/host_services.rs:1921-1937`), so the UI arm has no input until `EXT-078` lands; the `case "system": break` arm — `SESS-051`/`AGENT-039` |
+| `Cache warming` `/settings` row, `/session` Cache Warming section, cache-warm usage notice | **struck — follow the feature.** The warmer is unported everywhere (`rg -i 'cache_warm' crates/` → zero); area 05's lead and `EXT-085` own it. The three UI surfaces (`settings-selector.ts`, `interactive-mode.ts:6472-6480`, `addCacheWarmingUsage` `:3962-3966` @v0.87.1) are schedulable only after it |
+| async Kitty conversion replacing newer images (#8743) | **struck — not applicable.** pi's bug is an index-keyed async `convertToPng` cache going stale; cyrup decodes each result's images synchronously from the current payload (`transcript/images.rs:73-98`) and has no conversion cache |
+| fullscreen Kitty images erased by later row clears in WezTerm (#9169) | **struck — not applicable.** No Kitty sequence reaches the fullscreen transcript: tool-result images are half-block cells (`altscreen/images.rs:10-24`), and the only Kitty emitter, the attachment strip, has no production caller (`TUI-064`) |
+| LaTeX `cases` / vertical scripts (#9564, #7929) | **promoted → `TUI-112`** (with the v0.84.2 newline half of the 2026-09-14 lead) |
+| `--resume` progressive results | **promoted → `TUI-121`**; reading it surfaced **`TUI-122`** (in-session `/resume` has no all-projects scope) |
+
+**Leads — read on the upstream side only, or skimmed; NOT filed, no ids.** *(History — see the resolution table above.)*
 
 - **Click toggling of branch-summary / compaction-summary / skill-invocation entries** (CHANGELOG
   [0.86.0], `components/{branch-summary,compaction-summary,skill-invocation}-message.ts`, +19/+19/+17).
@@ -106,6 +169,24 @@ border. `TUI-098` and `TUI-099` promote two leads from the 2026-09-14 list below
   behaviour change.
 
 ## UNVERIFIED census 2026-09-14 — leads, not findings
+
+> **RESOLVED 2026-09-24 (second pass).** Every entry below was read on both sides and now has a
+> disposition; the entries are kept verbatim as history.
+>
+> | lead | disposition |
+> |---|---|
+> | component-level mouse dispatch protocol | **promoted → `TUI-107`**. Its open question is settled: the editor, autocomplete, selector slot and status band are shared chrome painted in fullscreen too (`altscreen/mod.rs:296-297`), and a pointer report reaches only scrollbar → selection → wheel (`:816-850`) |
+> | Alt-modifier 5× wheel | **promoted → `TUI-108`**; crossterm does report ALT on SGR wheel events (`crossterm-0.29.0/src/event/sys/unix/parse.rs:802-803`) |
+> | `scrollToEndIndicator` | **promoted → `TUI-109`** |
+> | scrollbar track/thumb split and v0.84.4 redesign | **promoted → `TUI-110`**, decomposed in its body: track + glyphs + fg tokens, two-row minimum, hover-on-track reveal, track-click jump+drag. Background preservation is subsumed (cyrup paints a bg-coloured space) |
+> | alternate-screen transcript search | **struck — decision of record** (`ADR-0005`, cited in `altscreen/keys.rs:52-54`). Not a parity item. Re-read at v0.87.1: the cut surface still grows (v0.85.0 search-latency work; `alt-screen-search.ts` +268 in `v0.84.3..v0.85.1`) — relevant only if ADR-0005 is reopened |
+> | Zed capability detection | already **`TUI-098`** |
+> | escape-vs-sequence timeout, SSH widening, `PI_TUI_ESC_TIMEOUT` | **promoted → `TUI-106`** (static; carries a falsification note against `TUI-045`'s closure) |
+> | autocomplete base-dir-first ordering | **promoted → `TUI-111`**; the open question is settled: cyrup ranks in `mention_autocomplete` with a stable `fuzzy::filter` sort, so ties keep `fd`'s alphabetical order |
+> | LaTeX join symbols / control-space across line endings | symbols already **`TUI-099`**; the newline half **promoted → `TUI-112`** (cyrup side now read: `latex.rs:1187-1203`, `:1464-1467`) |
+> | `SettingsList.selectItem(id)` / submenu `navigateTo` | **struck — no user-visible surface.** Present already at v0.84.3 (inside this area's per-module baseline), and pi's own app never calls it: `git -C tmp/pi grep -n 'navigateTo\|selectItem(' v0.87.1 -- 'packages/coding-agent/src/modes/**'` → zero. A library API for extension components cyrup does not host |
+> | `Loader` embedded working-indicator seam | the embedding half is **`TUI-103`**. The `invalidate()` re-derive half is **struck — not applicable**: cyrup's indicator is immediate-mode and re-derives spinner, colours and message from the live `UiTheme` on every frame (`status_indicator.rs:394-450` `lines_at(elapsed, theme, …)`), so there is no cached frame to go stale |
+> | `TUI-040`'s Fix cites a removed alias convention | **resolved — `TUI-040`'s Fix text corrected** (no `PI_` alias) |
 
 Twelve candidate surfaces from the `v0.84.1..v0.85.1` window (`packages/tui` = 45 files,
 `+4 478 / −347`), plus one ledger-text defect found on the cyrup side at `b28d3ff`.
@@ -993,6 +1074,25 @@ above opened nothing, closed nothing and re-severitied nothing.
 | TUI-101 | low | upstream-drift | S | Autocomplete token boundaries and path quoting ignore CJK punctuation: `，@src` opens no mention popup and a completed path containing `，` is not quoted — pi v0.86.0 treats whitespace **or** CJK punctuation as a separator — **filed 2026-09-24** |
 | TUI-102 | medium | upstream-drift | M | `/copy` reports `copied last message` on a desktop Linux session where every clipboard backend failed, because an unverifiable OSC 52 write is counted as success; pi v0.86.0 emits OSC 52 only when remote or headless, otherwise throws an actionable `Clipboard unavailable: install …` message, and adds a WSL Windows-clipboard backend — **filed 2026-09-24** |
 | TUI-103 | low | upstream-drift | M | Working / compaction / branch-summary / retry spinners render as cyrup's 2-row band above the editor; pi embeds them in the default editor's top border (`embedWorkingStatus: true`, working at v0.85.0, the other three at v0.86.0) — **filed 2026-09-24**; supersedes the 2026-09-14 "`Loader` embedded working-indicator seam" lead, whose cyrup side is now read |
+| TUI-104 | **high** | upstream-drift | S | `/tree` navigation is not refused while a compaction (or another summarizing `/tree`) runs: neither the UI (`app/tree_nav.rs:107`) nor `navigate_tree` (`cyrup-session-svc/src/session/forking.rs:114`; session half owned by area 08's `SEAM-124`) checks `is_compacting()`, so the compaction entry is appended under the NEW leaf with a `first_kept_entry_id` on the abandoned branch, and the rebuilt context keeps nothing before it — pi v0.86.0 throws in `navigateTree` and re-checks in the UI (#9179) — **filed 2026-09-24 (second pass)**; static, race not observed |
+| TUI-105 | medium | parity-bug | M | `/login` never selects the provider's default model when the session has none, never refreshes the provider's model catalog, and never recounts providers — `finish_login` (`app/login.rs:425`) prints only the status line; pi's `completeProviderAuthentication` has done all three since before v0.83.0, and v0.87.0 defers the selection until a dynamic catalog refresh lands — **filed 2026-09-24 (second pass)** |
+| TUI-106 | low | upstream-drift | S | A held lone `ESC` is released after one 20 ms idle poll whatever the link; pi v0.84.2 waits 100 ms under `SSH_CONNECTION`/`SSH_TTY` and honours `PI_TUI_ESC_TIMEOUT` (#7899), so a split `Alt+Enter`/arrow over a slow SSH link can still arrive as `Escape` in cyrup — **filed 2026-09-24 (second pass)**, promoted from the 2026-09-14 lead against `TUI-045`; static only, needs a live SSH repro before its severity can move |
+| TUI-107 | low | upstream-drift | L | Fullscreen pointer input reaches only the scrollbar, the text selection and the wheel (`altscreen/mod.rs:816-850`); the editor, autocomplete, selectors and settings lists are painted in fullscreen but a click on them does nothing, and no transcript block (thinking, tool result, compaction/branch summary, skill invocation) toggles on click — pi v0.85.0's component mouse protocol and v0.86.0's click-to-toggle entries — **filed 2026-09-24 (second pass)**, promotes two leads |
+| TUI-108 | low | upstream-drift | S | Holding Alt while wheel-scrolling in fullscreen does not scroll 5× faster (`altscreen/wheel.rs:74-85` ignores `ev.modifiers`; crossterm does report ALT on SGR wheel reports) — pi v0.85.1 (#9166) — **filed 2026-09-24 (second pass)** |
+| TUI-109 | low | upstream-drift | M | No "↓ Jump to latest message · <key>" label while the fullscreen transcript is scrolled away from its tail — the `tui.altScreen.bottom` action exists, the indicator and its click do not — pi v0.85.0 (#9080) — **filed 2026-09-24 (second pass)** |
+| TUI-110 | low | upstream-drift | M | The fullscreen scrollbar is the pre-v0.84.4 design: a background-coloured space thumb with no track, `scrollbarThumb` a bg token, hover only on the thumb and only while visible, and a track press that pages by a viewport; pi v0.84.4 draws a `│` track and `┃`/`█` thumb in fg `scrollbarTrack`/`scrollbarThumb` colours, reveals a hidden `auto` bar on pointer entry, and jumps-then-drags on a track press — **filed 2026-09-24 (second pass)** |
+| TUI-111 | low | upstream-drift | S | `@`-mention results with equal scores keep `fd`'s alphabetical order, and the candidate set is `fd`'s first 2 000 lines with no depth-1 pass; pi v0.84.4 (#8669) adds a `--max-depth 1` base-directory pass ahead of the recursive one and breaks score ties by depth, then length, then path — **filed 2026-09-24 (second pass)** |
+| TUI-112 | low | upstream-drift | S | `latex.rs` renders `cases` as flush `⎧ … ⎩` lines with no value alignment and no centring on the surrounding equation, has no vertical layout for display-mode scripts it cannot express in Unicode, and still stops a required argument or a control space at a line ending — pi v0.86.0 (#9564, #7929) and v0.84.2 — **filed 2026-09-24 (second pass)**; completes what `TUI-099` left out |
+| TUI-113 | low | stale-port | S | The default working label is `Working...` (`status_indicator.rs:373`, and `Working... ({key} to interrupt)` on reset); pi v0.85.0 changed `defaultWorkingMessage` to `Working` — and `tests/footer_chrome_fidelity.rs:494-523` pins the old text — **filed 2026-09-24 (second pass)** |
+| TUI-114 | low | upstream-drift | S | `/hotkeys` still describes Ctrl+X as `Copy last assistant message` (`app/hotkeys.rs:57`) although cyrup ported the selection-first behaviour; pi v0.86.0 reads `Copy selection or last assistant message` — `tests/app_global_actions.rs:171` pins the old text — **filed 2026-09-24 (second pass)** |
+| TUI-115 | low | upstream-drift | S | The editor's `↑ N more` / `↓ N more` scroll rules are left-anchored (`editor/render.rs:226`); pi v0.85.0 centres the label when it fits and keeps the left-anchored form only as the narrow fallback — **filed 2026-09-24 (second pass)** |
+| TUI-116 | low | upstream-drift | S | Terminal progress (OSC 9;4) is raised only on `agent_start` (`app/events_fold.rs:37`), so after a mid-run compaction clears it the taskbar indicator stays off for the rest of the run; pi v0.86.0 moved the raise (and the working indicator) to `turn_start` — **filed 2026-09-24 (second pass)** |
+| TUI-117 | low | upstream-drift | M | No `Anthropic dropped N thinking blocks (details in session)` transcript warning; pi v0.86.0 derives it from the `anthropic_input_transformations` diagnostic its Anthropic adapter attaches — which cyrup's provider does not produce either (**provider half ownerless**) — **filed 2026-09-24 (second pass)** |
+| TUI-118 | tracker | upstream-drift | L | **Tracker — owned by area 08's `SEAM-132` (filed concurrently); no schedulable work until that scope question is decided.** No `/bug` command, no crash record (`crashes.json`), no `crashed on … Run /bug` startup notice, no one-per-session `/bug` hint after a non-retryable error, and no extension-in-stack-trace hint — pi v0.86.0–v0.87.0. **A product decision precedes the upload half** (pi uploads to its own Radius service) — **filed 2026-09-24 (second pass)**, promotes the `/bug` lead |
+| TUI-119 | low | parity-bug | S | An extension footer is always given the built-in footer's rows (`app/layout.rs:146-150`: floor 1, up to 2 or 3) whatever it renders, so an empty custom footer leaves blank rows; pi sizes the footer container to its content and, since v0.86.0 (#8919), lets it collapse to zero rows in fullscreen — **filed 2026-09-24 (second pass)** |
+| TUI-120 | low | upstream-drift | S | `/tree` on a pi v0.86+ session lists every `usage` and `context_edit` entry as a bare `(entry)` message row (`cyrup-session-svc/src/session/transcript.rs:388` → `TreeKind::Message`); pi always hides `usage` and shows `context_edit` only outside the default filter, as `[context omit\|replace: <id>]` — **filed 2026-09-24 (second pass)**; the entry types themselves are `SESS-051`/`SESS-052` |
+| TUI-121 | low | upstream-drift | M | In-session `/resume` lists sessions synchronously on the run loop (`app/execute_session.rs:502`, `session.list_sessions()` reads every file's full text) before the picker opens, where pi streams partial results into an open picker and cancels outstanding reads on selection (v0.86.0) — **filed 2026-09-24 (second pass)** |
+| TUI-122 | low | parity-bug | S | In-session `/resume` never supplies the all-projects set (`SessionSelector::set_all_rows` has no caller under `crates/cyrup-tui/src/app/`), so `Tab` is swallowed and does nothing; pi's `showSessionSelector` has wired `SessionManager.listAll` since before v0.83.0, and cyrup's startup `--resume` picker wires it — **filed 2026-09-24 (second pass)** |
 
 ## TUI-042 — The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message
 
@@ -2174,7 +2274,7 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 
 **Impact** This matters more in cyrup than upstream. This workspace's own rule is that the TUI is not done until it has been run in a real terminal, and every one of the `-S` closures recorded this pass (`keyboard_protocol.rs`, `terminal_query.rs`, `drain.rs`, `terminal_progress.rs`, `terminal_title.rs`) is argued from byte constants and module docs alone. The write log is exactly the instrument that would let those be confirmed against a live kitty/iTerm2/tmux, and it is the one piece of pi's TUI debug surface nobody filed.
 
-**Fix** Add a `CYRUP_TUI_WRITE_LOG` (accepting `PI_TUI_WRITE_LOG` as an alias, consistent with the env aliasing in `crates/cyrup-config/src/env.rs`) resolved once at `App::into_stdout`, and tee every write in the same place `draw_synchronized` and the raw-sequence writers already funnel through. Accept a directory and derive `tui-{timestamp}-{pid}.log` as pi does.
+**Fix** Add a `CYRUP_TUI_WRITE_LOG` — **no `PI_TUI_WRITE_LOG` alias** (Fix text corrected 2026-09-24, second pass: commit `dd44b3c` removed every `PI_*` alias, and `crates/cyrup-config/src/env.rs` now documents the upstream spellings as not honoured, e.g. `:115-119` for `PI_CODING_AGENT_DIR`; an alias here would be the only one left) — resolved once at `App::into_stdout`, and tee every write in the same place `draw_synchronized` and the raw-sequence writers already funnel through. Accept a directory and derive `tui-{timestamp}-{pid}.log` as pi does.
 
 **Verify** With the variable pointing at a temp directory, one session produces a single log file whose bytes contain the OSC-0 title write, the keyboard-protocol negotiation and the drain-time disable sequences, in order.
 
@@ -3445,6 +3545,7 @@ If either condition is false live, the authoritative `Content::Thinking` blocks 
 **Impact**   — a skill whose bare name exactly matches the query ranks below weaker matches; the user has to type `skill:` to reach it quickly.
 **Fix**      — in `command_name_context`, key the filter on the name with `skill:` stripped when `query` does not start with `skill:`; leave `Completion::value` as the full name.
 **Verify**   — registry with builtin `/reload` and skill `skill:review`: `/rev` ranks `skill:review` first; `/skill:r` still matches it.
+**Post-tag lead (pi `v0.87.1..b45597504`, commit `36af9dc48`, #9944 — untagged, not part of this row's evidence).** Upstream found its own v0.86.0 rule broke `/skill` (a query that is not a subsequence of any bare skill name returned nothing) and now runs two passes: bare-name matches first, then the `skill:` rows that matched only on the full name. If that ships in the next tag, the Fix above should port the two-pass shape rather than the v0.86.0 single key function.
 
 ## TUI-101 — Autocomplete boundaries ignore CJK punctuation
 
@@ -3464,6 +3565,7 @@ If either condition is false live, the authoritative `Content::Thinking` blocks 
 **Impact**   — the user is told the message was copied when it was not; on failure they get no hint which tool to install; WSL without WSLg has no working backend except OSC 52. The area-05 clipboard row `CFG-066` concerns the native-backend construction, not this write-side gate — no overlap in fix site.
 **Fix**      — split `osc52_required` into `remote || (!copied && headless)` with pi's headless test; when OSC 52 is not emitted and nothing copied, return an error enum carrying pi's four messages and surface it through `push_error`; add the WSL arm. Keep the remote-always emission.
 **Verify**   — `clipboard_write_plan`-level tests: `DISPLAY` set, all steps fail → no OSC 52, error is the X11 install hint; no `DISPLAY`/`WAYLAND_DISPLAY` → OSC 52 and success; `SSH_CONNECTION` → OSC 52 even after a local success.
+**Same fix, fullscreen half (added 2026-09-24, second pass; both sides read).** pi v0.86.0 (#9618) also changed `TuiAltScreen.copySelection` to return `boolean | string` and flashes the returned message for `COPY_ERROR_FLASH_DURATION_MS = 5000` instead of a generic `Copy failed` (`git -C tmp/pi show v0.87.1:packages/tui/src/tui-alt-screen.ts`, `:80`, `:1456-1463`; `modes/interactive/tui-renderer.ts:36-43` passes the thrown message through). cyrup's `AppAction::CopySelection` arm still flashes a bare `Copy failed` with the default duration (`app/run_action.rs:31-35`, `flash(message, None)`). Once `copy_to_clipboard` returns pi's messages, route them into that flash with a 5 s dwell.
 
 ## TUI-103 — Status spinners are a band above the editor, not embedded in its top border
 
@@ -3473,6 +3575,180 @@ If either condition is false live, the authoritative `Content::Thinking` blocks 
 **Impact**   — layout differs from pi on every turn: cyrup spends two rows on the band where pi spends none. Nothing is lost; it is chrome parity.
 **Fix**      — give the editor's top-border render an optional status slot fed by the active indicator, port the width/overflow fallback, and keep the band only for the extension-editor case (`TUI-030`'s `setEditorComponent` non-port means that case may not arise in cyrup — decide that first).
 **Verify**   — `TestBackend` render during a turn: row 0 of the editor block reads `── ⠋ Working... ───…`, and no blank band precedes it; narrow width shows the spinner alone.
+
+## TUI-104 — `/tree` navigation is not refused while a compaction runs; the compaction then lands on the navigated-to branch
+
+**Kind** upstream-drift · **Severity** high · **Effort** S · **Confidence** confirmed static read of both sides; the race itself was not driven live
+**cyrup**    — `crates/cyrup-tui/src/app/tree_nav.rs:107-176` `begin_tree_navigation`: aborts a streaming turn, sets the `BranchSummary` indicator when summarizing (`:139-147`, overwriting a live `Compaction` indicator) and calls `session.navigate_tree`. Nothing on the path reads `state.compacting` (its only readers are the Escape rebind at `app/input.rs:294` and the fold). `crates/cyrup-session-svc/src/session/forking.rs:114-141` `navigate_tree` checks no-op, model and target — not `is_compacting()` (`session/auto_compaction.rs:25-29`, which covers manual, auto and branch-summary work). The compaction's commit is `session.append_compaction(…)` (`crates/cyrup-session/src/compaction/mod.rs:316`) → `append.rs:53-71`, whose `make_base()` parents the entry on the **current** leaf. `build_context_messages` (`crates/cyrup-session/src/context.rs:187-203`) keeps the pre-compaction entries only from `first_kept_entry_id` onward along the current path; an id that is not on the path keeps **nothing**.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/coding-agent/src/core/agent-session.ts`, `navigateTree` `:3585-3592`: throws `Wait for the current compaction or tree navigation to finish before navigating the session tree.` when `isCompacting`. `…/modes/interactive/interactive-mode.ts:5466-5472` re-checks after the summary dialogs and the streaming abort, **before** replacing another operation's status indicator, and shows the same message as an error. At v0.84.3 neither check exists (`navigateTree` throws only on `isStreaming`, `:3035`); v0.86.0, #9179.
+**Impact**   — Confirm a `/tree` target during an auto-compaction (10–20 s, editor live) or during another summarizing `/tree`: the progress indicator is replaced, both operations run, and if the leaf moves first the compaction entry is appended under the new branch carrying a `first_kept_entry_id` from the abandoned one. From then on the model's context on that branch is the abandoned branch's summary plus only what follows the compaction — the branch's own earlier turns are silently dropped. Nothing is deleted from disk; the damage is to what the model is sent. Rated high on the wrong-result definition; it would be critical ("silent wrong output") if observed, which is why the mechanism is stated as a hypothesis until driven.
+**Owner split (added after a concurrent area-08 pass filed `SEAM-124`).** The session-layer guard — step (1) below — is **`SEAM-124`'s** (area 08, filed the same day, medium, covering also the extension and command-API callers). This row owns the TUI half — step (2) — and the consequence traced above. **Severity disagreement for the reconciler:** `SEAM-124` rates the missing guard medium; the `context.rs:187-203` read here shows the TUI path produces a branch whose context silently loses its pre-compaction history, which is why this row is high. One of the two ratings should move.
+**Fix**      — (1) [`SEAM-124`] In `navigate_tree`, return a new `SessionServiceError` when `self.is_compacting()` (after the streaming abort pi also requires). (2) In `begin_tree_navigation`, after the drain/abort and before touching the indicator, `if session.is_compacting()` push pi's error and return (and do the same inside the spawned task, which is where the abort completes). (3) Belt-and-braces: make the compactor capture the leaf it prepared against and refuse to append if the leaf moved.
+**Verify**   — session-svc test: hold an auto-compaction open on a gated summarizer, call `navigate_tree` → `Busy`, leaf unchanged; TUI test: `state.compacting = true`, confirm a tree row → error line, indicator still `Compaction`.
+
+## TUI-105 — `/login` never selects a default model, refreshes the catalog or recounts providers
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-tui/src/app/login.rs:425-468` `finish_login`: on success it updates the OAuth set, repaints the ` (sub)` marker and pushes `Logged in to {name}. Credentials saved to {path}` — the only half of pi's `completeProviderAuthentication` it ports, although its comments cite that function. `rg -n 'default_model|refresh' app/login.rs` finds no model selection and no catalog refresh; the provider count feeding the footer's `(provider)` prefix is set once, at boot (`crates/cyrup/src/interactive.rs:466-469`, `status.set_provider_count`), and has no other production caller.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/coding-agent/src/modes/interactive/interactive-mode.ts`, `completeProviderAuthentication` `:5879-5970`: when the session's model is unknown it picks `defaultModelPerProvider[providerId]` from the provider's available models (Radius falls back to the first catalog model, `:5913`), `setModel(…, {persist: true})`, reports `Selected <id>` or one of four actionable errors (`llama.cpp` guidance; no default configured; no models; default unavailable), then refreshes that provider's catalog with a 15 s timeout, warns on timeout/error, and calls `updateAvailableProviderCount()`. v0.87.0 adds `deferSelection` (`:5889-5895`, `:5961-5963`): if the default is not in the snapshot yet, report `Refreshing model catalog…` and select after the refresh, unless the user or session changed meanwhile. The non-deferred version is present at v0.83.0 (`completeProviderAuthentication` `:5095`, `isUnknownModel(previousModel)` `:5107`).
+**Impact**   — A user who starts cyrup with no usable model and runs `/login` is told they are logged in and is still left with no model; the next prompt fails until they find `/model`. The footer's provider prefix also never appears or disappears as providers are added.
+**Fix**      — After a successful login in `finish_login` (or the task that sends `LoginUiMsg::Finished`), port the selection block against `session.available_model_catalog()` and the default-model table; then spawn the catalog refresh with pi's timeout and re-run the selection if it was deferred and neither the session nor its model changed. Recompute the provider count from the auth-filtered catalog there, on `/logout`, on `/reload` and on model change.
+**Verify**   — App test with an unconfigured session and a stub login: after `Finished(Ok)` the session model is the provider default and the status reads `… Selected <id>. Credentials saved to …`; with the default missing, the error names it.
+
+## TUI-106 — No SSH escape-timeout widening and no escape-timeout override
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed that the mechanism is absent; **user-visible effect unverified** (needs a live high-latency link)
+**cyrup**    — `crates/cyrup-tui/src/app/input_reader.rs:25` `HELD_FLUSH_INTERVAL = 20ms`; `:368-369` polls for that long while `EscapeReassembler` or `StrayReplyFilter` holds an event, and an empty poll flushes the held prefix as-is (`escape_reassembly.rs:73`). The interval is the same on every link: `rg 'SSH_CONNECTION|SSH_TTY' crates/cyrup-tui/src` hits only `clipboard.rs`, and `rg -i 'esc_timeout' crates/` is empty.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/tui/src/terminal.ts:116` `DEFAULT_SSH_ESCAPE_TIMEOUT_MS = 100`, `:123-131` `resolveEscapeTimeoutMs` (a positive `PI_TUI_ESC_TIMEOUT` wins; else 100 ms when `SSH_CONNECTION` or `SSH_TTY` is set), `:214` passes it as `escapeTimeout`; `stdin-buffer.ts:23-24` (`DEFAULT_SEQUENCE_TIMEOUT_MS = 50`, `DEFAULT_ESCAPE_TIMEOUT_MS = 10`), `:388` picks the escape timeout only when the buffer is a lone `ESC`. Absent at v0.84.1 (`grep -c resolveEscapeTimeoutMs` → 0), present at v0.84.3: v0.84.2, #7899 (split `Alt+Enter` over SSH read as Escape).
+**Impact**   — Over a link whose inter-packet gap exceeds 20 ms, the second half of a split escape sequence can arrive after cyrup has already released the `ESC`: at idle that types stray characters, mid-stream the bare Escape aborts the turn (the failure `TUI-045` measured). How often cyrup's event-driven reassembler actually hits this over SSH cannot be settled statically.
+**Fix**      — Make the held-flush interval a resolved value: `CYRUP_TUI_ESC_TIMEOUT` (positive integer ms) if set, else 100 ms when `SSH_CONNECTION`/`SSH_TTY` is set, else 20 ms; apply it only while a lone `ESC` is held, keeping the short interval for other held prefixes.
+**Verify**   — unit test on the resolver (three cases); live: `tmux send-keys -H 1b`, 60 ms pause, `5b 41` inside an `SSH_TTY`-set shell → one `Up`, no Escape.
+**Falsification note for `TUI-045`'s closure** — `TUI-045`'s regression tests (`escape_reassembly.rs:884-895`) feed the split with no idle gap, so they do not exercise the 20 ms flush. The closure should be re-driven with the 60 ms live gap its own REPRO-LOG entry used; if that re-drive fails, `TUI-045` reopens and this row folds into it.
+
+## TUI-107 — Fullscreen clicks reach only the scrollbar, the selection and the wheel
+
+**Kind** upstream-drift · **Severity** low · **Effort** L · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-tui/src/app/input.rs:224-249` sends every `InputEvent::Mouse` to `AltScreen::handle_mouse` (`altscreen/mod.rs:816-850`), which offers it to the scrollbar, then the text selection, then the wheel — nothing else. The editor, its autocomplete list, the selector slot and the status band are shared chrome both renderers paint (`altscreen/mod.rs:296-297`), so they **are** on screen in fullscreen, but no component has a mouse method (`component.rs` declares `render` and `invalidate` only; `rg -i 'MouseRegion|handle_mouse' crates/cyrup-tui/src/component.rs crates/cyrup-tui/src/transcript` → zero). `altscreen/selection.rs` handles copy and OSC-8 link clicks; it has no expand/toggle path.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/tui/src/tui.ts` (`TuiMouseEvent`, `TuiMouseEventResult`, `dispatchMouseEvent`, `Component.handleMouse?`), `components/mouse-region.ts`, `components/box.ts` `handleMouse`; `components/editor.ts` `handleMouse` (click positions the cursor by grapheme, a click in the autocomplete list selects the item), `select-list.ts`/`settings-list.ts` `handleMouse` (press selects, click activates, wheel moves, hover never changes selection); coding-agent `components/assistant-message.ts:164` wraps thinking in a `MouseRegion`, `tool-execution.ts:297` routes into self-rendered tools, and `branch-summary-message.ts`, `compaction-summary-message.ts`, `skill-invocation-message.ts` toggle expansion on left click. Protocol and the thinking/tool expansion: v0.85.0 (`handleMouse` count 0 at v0.84.4, 3 at v0.85.0); summary/skill click toggles: v0.86.0.
+**Impact**   — In `--tui-mode fullscreen`, clicking an autocomplete row, a `/model` or `/settings` row, or a spot in a multi-line prompt does nothing (or starts a text selection), and collapsed thinking/tool/summary blocks can only be expanded by keyboard. The keyboard paths all work, so nothing is unreachable.
+**Fix**      — Record ADR-0005 §Decision B's position first: the protocol post-dates the decision's unit list. If adopted: give `AltScreen::handle_mouse` a component hit-test over the last frame's chrome rects (editor, autocomplete, selector) and map press/click/wheel to the existing keyboard actions (`SelectAction::{Up,Down,Confirm}`, editor cursor placement); then add per-entry hit rectangles in the transcript view for the click-to-toggle entries.
+**Verify**   — fullscreen `TestBackend`: open `/model`, click row 3 → that model is selected; click inside a two-line prompt → cursor at that grapheme; click a collapsed compaction summary → expanded.
+
+## TUI-108 — Alt + wheel does not scroll five times faster in fullscreen
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-tui/src/altscreen/wheel.rs:61` `WHEEL_SCROLL_LINES = 1`; `notch` (`:74-85`) reads only `ev.kind`. crossterm 0.29 sets `KeyModifiers::ALT` from SGR button bit 8 on wheel reports (`crossterm-0.29.0/src/event/sys/unix/parse.rs:802-803`), so the modifier is available and unread.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/tui/src/tui-alt-screen.ts:75` `ALT_WHEEL_SCROLL_MULTIPLIER = 5`, `:972` `(button & 8) !== 0 ? wheelScrollLines * ALT_WHEEL_SCROLL_MULTIPLIER : wheelScrollLines`. v0.85.1, #9166; the module doc of `wheel.rs` pins itself to v0.84.3.
+**Impact**   — Long transcripts scroll at one line per notch whatever the user holds.
+**Fix**      — In `route`, multiply the notch by 5 when `ev.modifiers.contains(KeyModifiers::ALT)`.
+**Verify**   — `wheel.rs` unit test: `ScrollDown` with `ALT` moves `scroll_top` by 5.
+
+## TUI-109 — No clickable "Jump to latest message" indicator while scrolled up
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (static read)
+**cyrup**    — The action exists: `keymap.rs:1934` `AltScreenAction::Bottom` (`tui.altScreen.bottom`) and `altscreen/scroll.rs` re-arms the tail follow. `rg -i 'jump to latest|scroll_to_end_indicator' crates/cyrup-tui/src` → zero: nothing is drawn while the view is away from its tail.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/tui/src/tui-alt-screen.ts:181` `scrollToEndIndicator?: () => string` and its renderer (a label centred on the last row of a `follow: "end"` primary scroll view, clipped before the scrollbar column, recorded as `scrollToEndIndicatorRect`) plus `handleScrollToEndIndicatorMouseEvent` (click → `scrollToBottom()`); `modes/interactive/tui-renderer.ts:29-33` supplies `` ` ↓ Jump to latest message · ${keyDisplayText("tui.altScreen.bottom")} ` `` on `selectedBg`. v0.85.0, #9080; the centring moved to the clip width in v0.86.x.
+**Impact**   — A user who scrolled back has no on-screen cue that newer output is arriving, and no one-click way back.
+**Fix**      — In `AltScreen`'s paint, when `!follow_end_armed && scroll_top < max`, composite the label on the viewport's last row (centred, stopping before the scrollbar column) and store its rect; in `handle_mouse`, a left press inside it runs the `Bottom` action. The render half can ship before `TUI-107`.
+**Verify**   — fullscreen `TestBackend`: scroll up 10 rows → last row contains `Jump to latest message`; click it → follow re-armed and the label gone.
+
+## TUI-110 — The fullscreen scrollbar is the pre-v0.84.4 design
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-tui/src/altscreen/scroll.rs` `draw` (`:596-627`): ratatui `Scrollbar` with no track symbol and `thumb_symbol(" ")` on `bg(scrollbar_thumb)`; `theme.rs:541` resolves `scrollbarThumb` as a **background** falling back to `selectedBg`, and there is no `scrollbarTrack` key (`rg scrollbarTrack crates/cyrup-tui/src` → zero). Thumb size is ratatui's arithmetic (`thumb_span`, `:546`), with no two-row minimum. `scrollbar_drag.rs:142-151` `update_hover` sets hover only when the pointer is on the thumb of an already-visible bar. A track press calls `page_toward` (`:316-326`), which scrolls a whole viewport and starts no drag; its own doc (`:335-337`) still says upstream "has no trough behaviour".
+**upstream** — `git -C tmp/pi show v0.87.1:packages/tui/src/layout.ts`: `getScrollbarGeometry(box, includeHiddenAuto)` (`:280`) with `minThumbHeight = Math.min(2, trackHeight)` (`:288`); `paintScrollbar` (`:309`) paints every track row — `scrollbarTrackStyle("│")`, thumb `scrollbarThumbStyle(isScrollbarActive ? "█" : "┃")` — through `replaceScrollbarCell`, which keeps the cell's background except in `always` mode. `components/scroll-view.ts` defaults the two styles to fg `90`/`37`. `tui-alt-screen.ts`: `getScrollbarTargetAt(x, y, includeHiddenAuto)` hit-tests the whole track, `updateScrollbarHover` reveals a hidden `auto` bar on pointer entry, and a press off the thumb calls `scrollScrollbarToPointer` with `grabOffset = floor(thumbHeight / 2)` then starts a drag. Coding-agent theme: `scrollbarTrack`/`scrollbarThumb` optional **fg** colours falling back to `muted`/`text` (`theme.ts:270-271`, `:305-306`). v0.84.4 (CHANGELOG), with the style split landing in `scroll-view.ts` by v0.85.1.
+**Impact**   — Visual and pointer differences only: no visible track, a thumb that can shrink to one row, a hidden `auto` bar that cannot be found by pointing, and a track click that pages instead of jumping to the pointer. A theme written for pi's `scrollbarThumb` (an fg colour) is read by cyrup as a background.
+**Fix**      — Replace `draw` with a per-row painter over `geometry` (track `│`, thumb `┃`, `█` while hovered/dragged) using new fg tokens `scrollbar_track`/`scrollbar_thumb` with pi's fallbacks; add the two-row minimum to `thumb_span` and `geometry` together; widen `update_hover` to the track column including a hidden `auto` bar; turn a track press into jump-to-pointer plus a drag with the half-thumb grab offset, and delete the stale doc sentence.
+**Verify**   — `TestBackend`: overflowing transcript in `always` mode → every row of the last column is `│` or `┃`; press mid-track → `scroll_top` jumps so the thumb centres on the pointer and a following drag moves it.
+
+## TUI-111 — `@`-mention ordering has no base-directory pass and no depth tie-break
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed for the tie-break; the truncation effect depends on `fd`'s traversal order and was not measured
+**cyrup**    — `crates/cyrup-tui/src/autocomplete.rs:820-853` `fd_list` runs `fd` once over the whole tree, `.take(limit)` (2 000 from `editor/completion.rs:135`) **before** `files.sort()`; `mention_autocomplete` (`:757-775`) ranks with `fuzzy::filter`, whose sort is stable (`fuzzy.rs:183-184`), so equal scores keep alphabetical order. The module doc pins the fd arguments to `autocomplete.ts:124-146 @v0.84.3`.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/tui/src/autocomplete.ts`: `getBaseDirSuggestions` (`:733`) runs `walkDirectoryWithFd(..., maxDepth = 1)` and puts those entries first, deduplicated, ahead of the recursive run; the sort (`:784-795`) breaks score ties by path depth, then length, then `localeCompare`. v0.84.4, #8669 (absent at v0.84.3).
+**Impact**   — When the scorer ties, `@readme` can list `docs/archive/old/README.md` before `README.md`; in a tree whose `fd` output exceeds 2 000 lines, a top-level match may not be in the candidate set at all.
+**Fix**      — Sort ties by depth, then length, then path in `mention_autocomplete`; in `fd_list`, run a `--max-depth 1` pass first and merge it ahead of the capped recursive list.
+**Verify**   — candidates `["a/b/c/main.rs", "main.rs"]`, query `main` → `main.rs` first.
+
+## TUI-112 — `latex.rs`: `cases` layout, vertical display scripts, and line endings inside commands
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (static read of both sides)
+**cyrup**    — `crates/cyrup-tui/src/markdown/latex.rs:1598-1633`: `cases` joins `⎧ value if cond` lines with `\n` — no value-column alignment, no `LayoutNode`, so it is not centred on the surrounding equation. `LayoutNode` (`:792`) has `Fraction`, `Operator` and `Matrix` only; `^`/`_` go through `format_script` (`:672`), with no two-row fallback when Unicode cannot express a script. `parse_required_argument_value` (`:1464-1467`) skips only space and tab, and `parse_command` (`:1187-1203`) has no arm for a backslash followed by `\n`/`\r\n`, so that falls through to the unknown-command tail and drops the expression to raw source.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/tui/src/latex.ts`: `renderCases` (`:1393-1422`) pads values to a common width and emits a `matrix` layout node whose baseline is the middle row, inserting a bare `⎨` row for an even count; `ScriptNode` (`:680`) and `parseScripts` (`:949-1005`) pair a following opposite script and, in display mode, lay out non-Unicode or nested (`scriptDepth > 0`) scripts vertically; `:1023-1029` returns a space for a backslash before a line ending, and `parseRequiredArgumentValue` (`:1260`) skips all whitespace. The two parser fixes are v0.84.2 (absent at v0.84.1, present at v0.84.3 — cyrup's `latex.rs:1` says v0.84.1); `cases` and scripts are v0.86.0 (#9564, #7929).
+**Impact**   — Display maths with piecewise definitions renders ragged and detached from its left-hand side; `x^{\alpha+1}_{ij}` style scripts that Unicode cannot express print flattened; a `\frac` whose argument starts on the next line, or a `\` at a line end, renders as raw LaTeX.
+**Fix**      — Port `renderCases`, `ScriptNode`/`parseScripts` (with `scriptDepth`) and the two whitespace fixes; `TUI-099`'s symbol/font-switch fix shares the file.
+**Verify**   — renderer tests with pi's own cases (`packages/tui/test/latex.test.ts` at v0.87.1) for an even-row `cases`, `\frac\n{a}{b}` → `a/b`, and a nested display script.
+
+## TUI-113 — The default working label is still `Working...`
+
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-tui/src/status_indicator.rs:373` `IndicatorKind::Working => "Working..."`, reused by `reset_extension_working_state` (`:336-345`) as `Working... ({key} to interrupt)`. `tests/footer_chrome_fidelity.rs:494-523` (C12) asserts the three dots, citing `interactive-mode.ts:420`.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/coding-agent/src/modes/interactive/interactive-mode.ts:451` `defaultWorkingMessage = "Working"` and `:2382` `` `${this.defaultWorkingMessage} (${keyText("app.interrupt")} to interrupt)` ``. `"Working..."` at v0.84.3 (`:455`), `"Working"` from v0.85.0 (#8799, the same change that embeds the indicator — `TUI-103`). The other three kinds keep their `...`.
+**Impact**   — Every turn shows `Working...` where pi shows `Working`; the test enshrines the stale text.
+**Fix**      — Change the literal and the module doc; update C12 to assert `Working` and cite v0.87.1.
+**Verify**   — the updated C12.
+
+## TUI-114 — `/hotkeys` describes Ctrl+X by its pre-v0.86.0 meaning
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-tui/src/app/hotkeys.rs:57` `| {copy_message} | Copy last assistant message |`, while `app/execute_misc.rs:28-36` `prefers_active_selection` already copies a live fullscreen selection first. `tests/app_global_actions.rs:171` (and the ordering asserts at `:204`, `:208`) pin the old text.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/coding-agent/src/modes/interactive/interactive-mode.ts:6623` `Copy selection or last assistant message`; the old text at v0.85.1, the new at v0.86.0.
+**Impact**   — The help table misdescribes a key whose behaviour cyrup already matches.
+**Fix**      — Change the row text and the three test strings.
+**Verify**   — `app_global_actions` with the new text.
+
+## TUI-115 — The editor's scroll-indicator rule is not centred
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-tui/src/editor/render.rs:197-245` `scroll_border` is the v0.84.3 `createScrollBorder`: `─── ↑ N more ` then fill.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/tui/src/components/editor.ts:276-290`: when ` ↑ N more ` plus two rule cells fits, the label is centred with `─` on both sides; the left-anchored form is kept only as the fallback. Absent at v0.84.4, present at v0.85.0.
+**Impact**   — Cosmetic: a scrolled multi-line prompt's top/bottom rule differs from pi's.
+**Fix**      — Add the centred branch ahead of the existing one; keep the exact-width invariant the existing test pins.
+**Verify**   — width 40, hidden 3 → `─` × 14 + ` ↑ 3 more ` + `─` × 16.
+
+## TUI-116 — Terminal progress is not re-raised after a mid-run compaction
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-tui/src/app/events_fold.rs:37` raises terminal progress on `AgentStart`; `:298` clears it on `CompactionEnd`, which the arm's own comment says also fires inside a still-streaming turn; `TurnStart` is a no-op (`:60`). Nothing raises it again until the next `AgentStart`.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/coding-agent/src/modes/interactive/interactive-mode.ts:3292-3314`: `agent_start` no longer touches progress or the indicator; `turn_start` raises progress and shows the working indicator unless one is already showing. Moved in v0.86.0 alongside mid-run threshold compaction ("restores interactive progress when that run resumes", #6879).
+**Impact**   — After an auto-compaction between a tool result and the next assistant response, the terminal's taskbar/tab progress indicator is off for the rest of the run. The working band itself is restored (`:299-303`).
+**Fix**      — Raise `terminal_progress` in the `TurnStart` arm (and call `indicator.working()` there if the band is idle and working is visible), leaving `AgentStart` to reset handlers only.
+**Verify**   — fold `AgentStart, TurnStart, CompactionStart, CompactionEnd, TurnStart` → progress `true` at the end.
+
+## TUI-117 — No "Anthropic dropped N thinking blocks" notice
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (static read); the provider half is **ownerless** — no area-01 row covers it
+**cyrup**    — `rg 'thinking_dropped|input_transformations' crates/ -g '*.rs'` → zero, on both the provider and the TUI side. cyrup has the neighbouring cache-miss notice (`app/events.rs:326-329`, gated on `show_cache_miss_notices`).
+**upstream** — `git -C tmp/pi show v0.87.1:packages/ai/src/api/anthropic-messages.ts:800-812` appends an `anthropic_input_transformations` diagnostic listing the API's input transformations; `…/interactive-mode.ts:3985-4025` `countDroppedThinkingBlocks` / `maybeShowThinkingDropNotice` warn `Anthropic dropped N thinking block(s) (details in session)` on `message_end`, only when the count rose over the previous assistant message and only when cache-miss notices are on. Absent at v0.84.3; v0.86.0.
+**Impact**   — When Anthropic silently drops prior thinking blocks (which also costs cache), pi tells the user and cyrup does not.
+**Fix**      — Provider first (area 01 — **no row yet; this entry is the pointer**): carry the response's input transformations into an assistant-message diagnostic. Then the TUI notice in the `message_end` path beside the cache-miss check.
+**Verify**   — a recorded Anthropic response with one `thinking_dropped` transformation → one warning line; a second message with the same count → none.
+
+## TUI-118 — `/bug`, crash records and the post-crash notice are absent
+
+**Kind** upstream-drift · **Severity** tracker (outside every tally) · **Effort** L · **Confidence** confirmed (static read); **scope question open**
+**Owner** — area 08's `SEAM-132` (tracking row filed by a concurrent pass the same day) owns the scope decision and the session-svc half. This row records only the TUI surface that decision would schedule. **Escalation:** when `SEAM-132` is decided in favour of any `/bug` or crash-notice port, this row becomes a `low` item for the TUI half named below.
+**cyrup**    — `commands.rs` has no `bug`; `rg 'crashes.json|crash_log' crates/ -g '*.rs'` → zero. `crates/cyrup-tui/src/panic_hook.rs` restores the terminal on a panic and records nothing.
+**upstream** — `git -C tmp/pi show v0.87.1:packages/coding-agent/src/modes/interactive/bug-report.ts` (298 lines: consent, optional transcript or model-written summary, upload to the Radius gateway or zip export, a session record); `core/crash-log.ts` (`~/.pi/agent/crashes.json`, 5 records, 7 days, `findExtensionStackMatches`); `interactive-mode.ts:1153-1159` warns on start `… crashed on <when> (<message>). Run /bug …`; `:2109-2113` `maybeSuggestBugReport` adds one muted `/bug` hint per session after a non-retryable, non-cancellation error; `:2047-2071` records fatal errors and names extensions found in the stack. Both files absent at v0.84.3; v0.86.0, refined v0.86.1/v0.87.0 (offline mode, line breaks, hint suppression).
+**Impact**   — After a crash the user gets no pointer to what happened or which extension was involved on the next start, and there is no in-product way to assemble a redacted diagnostic bundle.
+**Fix**      — Decide the upload target first (pi's is its own service). Independently of that, the crash record + startup notice + extension-stack hint and a zip-export `/bug` are local and portable: persist from `panic_hook` and the fatal-error path, surface on the next start.
+**Verify**   — simulated fatal error → `crashes.json` gains a record; next start shows the notice once.
+
+## TUI-119 — A custom footer is always given the built-in footer's rows
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-tui/src/app/layout.rs:98-102` sizes the footer region to 2 (3 with extension statuses) and `:146-150` gives it a floor of 1 before surplus; `app/render.rs:163-174` then paints `state.extension_footer` into that region whatever its line count. An extension footer that renders nothing leaves one to three blank rows; one that renders four lines is cut to three.
+**upstream** — pi's footer is a `Container` sized by its content in regular mode; in fullscreen `git -C tmp/pi show v0.87.1:packages/coding-agent/src/modes/interactive/chat-viewport.ts:36` gives it `minSize: 0` (it was `minSize: 1` in the inline `VStack` at v0.85.1), so an empty custom footer takes no row — v0.86.0, #8919 (commit `f53ac1135`).
+**Impact**   — Blank rows under the editor for extensions that hide the footer; truncated custom footers taller than three rows.
+**Fix**      — When `extension_footer` is set, size the footer region to its line count (floor 0) instead of the built-in footer's bounds.
+**Verify**   — `setFooter` returning `""` → editor bottom border is the last row; returning 4 lines → 4 footer rows.
+
+## TUI-120 — `/tree` shows pi v0.86+ `usage` and `context_edit` entries as `(entry)` rows
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (static read)
+**cyrup**    — `crates/cyrup-session-svc/src/session/transcript.rs:388` maps every `Entry::Unknown` to `(SessionDagKind::Other, "(entry)")`, and `crates/cyrup-tui/src/app/tree_nav.rs:11` turns `Other` into `TreeKind::Message`. Both types load as `Entry::Unknown` (`SESS-051`, `SESS-052`).
+**upstream** — `git -C tmp/pi show v0.87.1:packages/coding-agent/src/modes/interactive/components/tree-selector.ts`: `:341` filters `usage` out unconditionally; `:361` lists `context_edit` with the settings/bookkeeping entries hidden in the default view; `:611-613` and `:844-846` render it as `[context omit|replace: <targetId>]`. Absent at v0.84.3.
+**Impact**   — Opening a pi v0.86+ session in cyrup's `/tree` shows one meaningless `(entry)` row per cache-warm refresh and per context edit.
+**Fix**      — Independently of `SESS-051`/`052`: read the raw `type` of an `Entry::Unknown`; drop `usage`, and map `context_edit` to the bookkeeping kind with pi's label.
+**Verify**   — fixture session with one of each → no `usage` row; `context_edit` only under the all-entries filter, labelled.
+
+## TUI-121 — In-session `/resume` loads the whole list synchronously before the picker opens
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (static read); latency not measured
+**cyrup**    — `crates/cyrup-tui/src/app/execute_session.rs:502` `session.list_sessions()` (`cyrup-session-svc/src/session/files.rs:41-48` → `cyrup_session::listing::list_in_dir`, blocking `std::fs` reads that build each row's full `all_messages_text`) runs on the run-loop task; the picker opens only after it returns, with no progress and no cancellation. `session_selector.rs:286-288` records that cyrup's picker is "fed synchronously".
+**upstream** — `git -C tmp/pi show v0.87.1:packages/coding-agent/src/modes/interactive/components/session-selector.ts`: loaders take `(onProgress, signal)`; `onProgress` carries `partialSessions` that are shown as they arrive, the user's selection is preserved across updates (`selectionTouched`), and `cancelLoads()` aborts outstanding reads on select/cancel/exit; `interactive-mode.ts:5549-5566` passes the signal to `SessionManager.list`/`listAll`. v0.86.0 ("results appear progressively, using file modification times to prioritize").
+**Impact**   — With many or large sessions the UI freezes between `/resume` and the picker appearing, and keystrokes queue behind the scan.
+**Fix**      — Move the listing to `spawn_blocking`, open the picker immediately in its loading state, stream batches into it, and drop the task on close. The mtime ordering is area 03's listing.
+**Verify**   — a selector test fed two batches shows the first before the second, keeps a moved selection, and a close cancels the task.
+
+## TUI-122 — In-session `/resume` has no all-projects scope
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed (static read)
+**cyrup**    — `SessionSelector::set_all_rows` has production callers only in `crates/cyrup/src/startup_ui.rs:218` (the `--resume` picker); `crates/cyrup-tui/src/app/execute_session.rs:497-560` never calls it, so `all_rows` stays `None` and `Tab` is swallowed with nowhere to go (`session_selector.rs:160-162`).
+**upstream** — `git -C tmp/pi show v0.83.0:packages/coding-agent/src/modes/interactive/interactive-mode.ts:4784-4790` hands `SessionSelectorComponent` both `SessionManager.list` and `SessionManager.listAll` (unchanged in shape at v0.87.1, `:5549-5566`).
+**Impact**   — From inside a session the user cannot resume another project's session; `Tab` looks broken.
+**Fix**      — In `execute_open_session_selector`, build the all-projects rows the way `startup_ui.rs` does and call `set_all_rows` plus `set_session_cwds`; fold into `TUI-121`'s async loader if that lands first.
+**Verify**   — open `/resume` with a session in another project's directory, press `Tab` → it is listed with its cwd.
 
 ## Coverage
 

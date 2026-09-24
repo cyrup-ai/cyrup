@@ -404,7 +404,7 @@ on 2026-09-24 against cyrup `ea23ca2`.
 | `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.37.0 | v2.37.0 |
 | `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.62 | v0.0.62 |
 | `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 | v0.0.33 |
-| herdr (Rust) | `cyrup-herdr` | — | pinned to v0.9.1, no ledger area yet |
+| [`herdrdev/herdr`](https://github.com/herdrdev/herdr) (Rust) | `cyrup-herdr` (a client, not a port) | v0.9.1 | v0.9.1, checked for client conformance |
 
 "Measured to" means the newest window was read and its drift filed as ledger items. It does not
 mean that drift is closed. `cyrup-permission-system` is fully caught up with its upstream. Flux's

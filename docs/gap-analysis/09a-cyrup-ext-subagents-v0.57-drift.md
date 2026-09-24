@@ -28,6 +28,10 @@ so a single maintainer can reconcile all of them in one pass.
 > **dead**, because upstream removed and now refuses the key at v0.68.0. The in-process child-session
 > lead is still open. Ids that this file already filed past its own scope line (`SUBA-092`…`SUBA-106`)
 > **stay here**. Ids are never moved.
+>
+> **Pass 2, same day:** `09b` resolved every lead in the census below (see its *Resolution* table)
+> and filed `SUBA-114`…`SUBA-143`. One of them, `SUBA-119`, sits partly in THIS file's own window:
+> native-child model verification entered in `v0.47.1..v0.57.0` and was missed here.
 
 > ### PROVENANCE CORRECTION 2026-09-14 — pins re-derived; this file was NOT re-read
 >
@@ -77,7 +81,39 @@ so a single maintainer can reconcile all of them in one pass.
 >    zero v0.65.x/v0.67.0. A surface absent from cyrup but stamped `@v0.64.0` elsewhere in the crate is
 >    a miss, not lag.
 
-## UNVERIFIED census 2026-09-14 — `v0.57.0..v0.67.0` leads
+## Census 2026-09-14 — `v0.57.0..v0.67.0` leads — ALL RESOLVED 2026-09-24 (`09b` pass 2)
+
+> ### Resolution — every lead below, read on both sides by `09b`'s pass 2 (cyrup `ea23ca2`, pi-subagents `v0.71.0`)
+>
+> The census text below is kept unchanged as history. **Nothing in it is an open lead any more**;
+> this table is the disposition of record. New ids live in `09b` (`SUBA-114`…`SUBA-143`).
+>
+> | census lead | disposition | evidence (cyrup · upstream) |
+> |---|---|---|
+> | In-process child sessions | **tracker `SUBA-142`** | `spawn/mod.rs`, `exec/spawn_plan.rs` · `child-launch.ts::buildInProcessChildLaunch` @v0.71.0 |
+> | Watchdog `fallbackModels` chains | **struck — dead** (settled by `09b` pass 1) | upstream refuses the key since v0.68.0 (`watchdog/child-status.ts:131-132`) |
+> | Abort-recovery resume plan | **promoted → `SUBA-118`** | `exec/fallback.rs:1336-1338` · `abort-recovery.ts:3,67-116` |
+> | Read-only 429 model continuation | **struck — removed upstream** | deleted at v0.68.0 (`f58dfcb5`); never ported (`exec/fallback.rs:1338` says so, and that note is now stale — `SUBA-109`) |
+> | OpenCode session headers | **struck — ported where cyrup has the call** | `watchdog/agent_turn.rs:78-95,445` serves review and permission arbiter · `shared/opencode-session-headers.ts:23-30`. The task-mutation arbiter was deleted upstream at v0.70.1; prompt audit has no cyrup module (ownerless lead, `09b` *Leads*) |
+> | `modelResponseAliases` | **promoted → `SUBA-119`** (the consumer is native-child model verification, which is itself unported) | `model-resolution.ts:14-34`, `execution.ts:1100-1102` |
+> | Per-child async completion (`onChildSettled`) | **struck — subsumed** | async workflows only; cyrup refuses async workflows (`extension/tool/routing.rs:587`) — `09`'s lead at `09:192` |
+> | `<advertised_subagents>` catalog | **promoted → `SUBA-133`** | opt-in per agent (`advertise: true`, `agents.ts:2107-2110`) |
+> | `subagents.agentScanDirs` | **promoted → `SUBA-123`** (with `agentExcludeDirs`, `defaultSubagentOnlyExtensions`) | silently dropped: census covers only `agentOverrides` (`discovery/mod.rs:1179-1203`) |
+> | `worktreeProvider: auto\|native\|worktrunk` | **stays in tracker `SUBA-113`** | `registration/mod.rs::UNPORTED_CONFIG_KEYS` reports it; not silent |
+> | Plan-only worktree cleanup + manifest | **struck — ported** | `spawn/cleanup_plan/` (9 modules, `MAX_DISCOVERED_HANDOFFS`/`MAX_PLAN_ENTRIES` in `model.rs`), dispatched at `extension/tool/routing.rs:1509-1528` |
+> | Bounded worktree setup-command execution | **promoted → `SUBA-130`** | `spawn/worktree.rs:265-281` unbounded · `worktree-setup-command.ts`, `worktree.ts:239-252` |
+> | Inspector plugin architecture + Ghostty | **struck — ported**; the v0.69.0 bundle-id fix → **`SUBA-137`** | `inspectors/{plugins,ghostty,herdr,runner,shell_command,session_roots_codec}.rs` · `inspectors/ghostty/plugin.ts:5,20-24` |
+> | `/subagents-steer` | **struck — ported** | `registration/slash_commands.rs:148,183` |
+> | Supervisor request/reply rendering | **promoted → `SUBA-136`** | no renderer registered (`extension/host/native_impl.rs:308`) · `intercom/supervisor-ui.ts`, `extension/index.ts:652` |
+> | Child session names | **promoted → `SUBA-134`** | zero hits · `shared/child-session-name.ts:27` |
+> | Launch-cwd preflight | **promoted → `SUBA-135`** | `extension/tool/routing.rs:367-372` · `runs/shared/launch-cwd.ts:3-16` |
+> | `alignForkedSessionCwd` | **struck — not applicable** | a cyrup child's tools and system prompt use the process cwd (`cyrup-session-svc/src/builder.rs:772`, `cfg.cwd`), not the session header's; the header cwd reaches only `SessionManager::cwd()` (`cyrup-session/src/manager/lifecycle.rs:60-65`). *Falsified if* any tool, prompt or path resolution in a `--session`-resumed child reads `SessionManager::cwd()` |
+> | Agent-plugin / package MCP config sources | **promoted → `SUBA-124`** | `exec/mcp_direct_tools.rs:514-541` · `mcp-config-sources.ts:83-146` |
+> | Retained nested-route liveness + pi-web provider | **struck — not applicable** | the retained route set's only consumer is the pi-web session-liveness provider (`integrations/pi-web-session-liveness.ts:27-54`, `retained-nested-route-tracker.ts`); cyrup has no pi-web host |
+> | *Exclusion:* "scheduled-runs subsystem is absent" | **corrected — false at `ea23ca2`** | `background/scheduled_runs/` exists and `SUBA-016` closed it (`09`) |
+> | *Exclusion:* `completion-evidence.ts` partially present | **struck — covered by `SUBA-107`** | upstream deleted it at v0.70.1 with the guard |
+> | *Exclusion:* field-level sweep of the seven workflow modules | **still not done** | a recommendation, not a lead; recorded as unread in `09b`'s RE-MEASURE block |
+
 
 **Nothing in this section is a finding.** These are leads from a census pass that read both sides at
 the pins above; none has been through this file's adversarial refutation pass, none carries a `SUBA-`
@@ -579,6 +615,23 @@ corrections are applied and recorded at the item.
 > id order; a one-line pointer stays at its old location. `scripts/count_open_items.py`'s
 > hand-enumerated `carried_high` list was emptied in the same commit, so the three count once, as
 > closed rows of the table, and not a second time as open carried rows.
+>
+> **Pass 2 dispositions (2026-09-24, cyrup `ea23ca2`, pi-subagents `v0.71.0`) for the residual leads
+> listed next — none is an open lead any more:**
+> - *`inferLevel` omits inferred acceptance for read-only reviewers* — **struck, superseded by
+>   `SUBA-108`** (`09b`): at v0.70.1 upstream stopped inferring from agent names and task wording at
+>   all (`src/runs/shared/acceptance.ts:81-122` @v0.71.0), so the v0.63.0 refinement has no target.
+> - *custom-agent override precedence* — **struck, closed in code**: `discovery/merge.rs::apply_custom_override`
+>   (`:1008-1015`) now delegates to `apply_builtin_override` for every key, as upstream's
+>   `applyCustomAgentOverride` does (`src/agents/agents.ts:1557-1566` @v0.71.0).
+> - *runtime-agent EVENT bridge* — **promoted → `SUBA-143`** (`09b`): still present at v0.71.0
+>   (`src/agents/runtime-agent-events.ts:4-70`); cyrup has only the native `register_agent`
+>   (`extension/host/mod.rs:432`, `extension/executor/mod.rs:396`) and no bus topic.
+> - *five unrepresentable `RuntimeAgentDefinition` fields* — **re-read: three remain**
+>   (`mcpDirectTools`, `skillPath`, `defaultToolTimeoutMs`, `discovery/runtime_registry.rs:118-128`);
+>   `inheritGlobalContext` and `mutationTools` landed with the `SUBA-101`…`SUBA-103` closures. All three are loud
+>   refusals, not silent drops, and each closes with the row that lands its field. Not a lead.
+> - *rustfmt* — tooling, ownerless, out of this area.
 >
 > **Residual leads recorded by the five closures, NOT filed as rows — ownerless until a pass reads
 > them on the confirmed bar** (the citations below were read by the implementers and the reviewer;

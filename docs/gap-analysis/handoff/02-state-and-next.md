@@ -1,9 +1,9 @@
 # 02 — State, and what to do next
 
-State section rewritten 2026-09-24 against cyrup code HEAD `ea23ca2`. The
-sections after it (*Read this before planning*, *The queue after that*, the open question, MCP) were
-written at `e815e08` and are **not** re-verified; read them as history. In particular, MCP is no
-longer "not started": `crates/cyrup-mcp` exists and area 13 tracks what is built.
+Rewritten 2026-09-24 after the second re-measure pass, against cyrup code `ea23ca2` (HEAD `8d93b0e`
+is docs-only). The earlier text of this file (the "reconcile first" advice, the area-07 queue, the
+claim that MCP is out of scope) is in `git log -p -- docs/gap-analysis/handoff/02-state-and-next.md`.
+It was written at `e815e08` and no longer describes the project.
 
 ---
 
@@ -12,123 +12,94 @@ longer "not started": `crates/cyrup-mcp` exists and area 13 tracks what is built
 | | |
 |---|---|
 | workspace | **24 crates, 1,044,991 lines of Rust under `crates/`**; 28,706 `.ts:N` upstream citations naming 16,976 distinct upstream locations; 974 `CYRUP-DELTA` markers |
-| unit gate | **11,311 passed, 0 failed, 9 skipped**, line coverage 86.3% (per the root `README.md`, measured at `ea23ca2`; not re-run by this pass) |
-| since the last re-measure | `9aeba769..ea23ca2`: 18 non-merge commits, 485 files, +164,754 / −4,932 under `crates/`: subagents SCOPE/lanes/runner identity, the 18-command slash surface, the UW-7 fleet roster, and the new `cyrup-herdr` crate (herdr v0.9.1, no area file, upstream not cloned) |
-| upstream tags measured against | pi **v0.87.1**, pi-subagents **v0.71.0**, pi-intercom **v0.14.0**, pi-mcp-adapter **v2.37.0**, code_puppy_core_plugins **v0.0.62**, pi-acp **v0.0.33**, pi-permission-system **v0.8.0**. Window stats are in `../README.md` *Baselines measured against* |
+| unit gate | **11,311 passed, 0 failed, 9 skipped**, line coverage 86.3% (per the root `README.md`, measured at `ea23ca2`; not re-run by either 2026-09-24 pass) |
+| ported upstreams, at their latest tags | pi **v0.87.1**, pi-subagents **v0.71.0**, pi-intercom **v0.14.0**, pi-mcp-adapter **v2.37.0**, code_puppy_core_plugins **v0.0.62**, pi-acp **v0.0.33**, pi-permission-system **v0.8.0** |
+| herdr — **a client, not a port** | `crates/cyrup-herdr` is cyrup's own client of herdr's socket API (<https://github.com/herdrdev/herdr>). It is now measured, as client conformance against herdr **v0.9.1**, in area 16 (`../16-cyrup-herdr.md`). Do not plan "port herdr" work |
+| what is unread | **every upstream window up to each latest tag has been read.** The remainder (post-tag commits, pi's unshipped harness/durable design material, a few component diffs and one cyrup call site) is listed with reasons in `../README.md` *Where this analysis is blind → What is still unread* |
 
 ### Open ledger rows
 
-Derive the number; do not copy it from here. `python3 docs/gap-analysis/scripts/count_open_items.py`
-at the end of the 2026-09-24 pass printed **124 open (1 critical, 2 high, 24 medium, 97 low), 7
-trackers, 621 closed** across areas 01–12, 09a, 09b and 14. The script now reads `09b`. Areas 13 and
-15 are outside that count by the standing rule.
+Derive the number; do not copy it from here: `python3 docs/gap-analysis/scripts/count_open_items.py`.
+The script now reads areas 16 (herdr client; its `client-bug`/`protocol-drift` kinds fold into Port
+bug / Version lag) and 17 (all trackers), and no longer counts `DRIFT-056`, a duplicate of `EXT-077`.
+Areas 13 and 15 stay outside the count by the standing rule.
 
-**The set above medium, empty since 2026-09-05, has refilled with three rows**, all
-`upstream-drift`, all filed in this pass:
+**The set above medium is now ten rows: 2 critical, 8 high.** The first pass found three; the second
+pass added seven, one of them a reopened closure. The ranked table with reasons is at the top of
+`../00-residual-ledger.md` and of `../PARITY-GAPS.md`.
 
-- `SEAM-122` (critical, area 08): importing a session whose file name already exists in the session
-  dir overwrites the stored session. pi v0.85.0 renames the copy.
-- `TOOL-047` (high, area 04): a shell command killed by a signal is reported to the model as a
-  success. pi v0.86.0 reports `128 + signo` as a failure.
-- `SUBA-110` (high, area 09b): `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*` and similar are not
-  removed before the background runner or an external CLI starts (pi-subagents v0.71.0).
+### What the second pass did
 
-Outside the count: `MCP-540` (high, area 13), a higher-precedence config that switches a server
-between `command` and `url` keeps the old transport's fields.
-
-### What the 2026-09-24 pass did
-
-- **Re-pulled every upstream into `tmp/`** and re-read every area file at `ea23ca2` against the new
-  tags. Each file carries a 2026-09-24 pin block. `09b` is new and owns pi-subagents
-  `v0.57.0..v0.71.0`.
-- **Closed:** `CFG-073` (refuted). In area 15, `ACP-121`, `145`, `209`, `219`, `291` (critical) and
-  `ACP-005`, `056`, `122`, `140`, `221` (high), all built in `0aefd08`/`cb290d1`.
-- **Filed:** area 01/12 `PROV-073`…`082`, `DRIFT-056`/`057`; area 02/03/06 `AGENT-038`…`041`,
-  `SESS-051`…`055`, `EXT-077`…`080`; area 04/05/08 `TOOL-046`…`050`, `CFG-081`…`085`,
-  `SEAM-120`…`122`; area 07 `TUI-098`…`103`; area 09b `SUBA-107`…`113`; area 11 `ICOM-062`…`067`;
-  area 13 `MCP-540`…`550` (next id `MCP-551`).
-- **`user_bash` fails open in cyrup and closed in pi v0.86.0.** It is filed twice, as `DRIFT-056`
-  and `EXT-077`; fix it once.
-
-### Windows still unmeasured
-
-- pi `v0.84.1..v0.85.1`: the 2026-09-14 census leads are still mostly unverified.
-- pi `v0.85.1..v0.87.1`: `packages/agent/src/harness/**` (incl. ~9k-line `pico3`), `packages/durable`,
-  `packages/chord`, the `packages/ai` anthropic/openai-responses/codex adapters, and most of
-  `agent-session.ts`, `interactive-mode.ts`, `runner.ts`, `loader.ts`.
-- pi-subagents `v0.57.0..v0.67.0` (leads only) and the large modified files in `v0.67.0..v0.71.0`.
-- pi-intercom: no surface sweep of `v0.10.1..v0.14.0`.
-- pi-mcp-adapter `v2.32.1..v2.33.0` (leads only), and 159 area-13 rows never re-checked against the
-  TypeScript.
-- Area 15: the rows not closed this pass were not re-read.
-- `cyrup-herdr`: unmeasured entirely.
+- Read every window the first pass left unmeasured: pi `packages/ai` (anthropic, openai-responses,
+  codex, types, generator), the agent/session/extension and tools/config/session-svc windows, the TUI
+  lead lists, pi `harness/**` and `packages/durable` (new area 17), pi-subagents `v0.57.0..v0.71.0`,
+  pi-intercom `v0.10.1..v0.14.0` (a surface sweep), pi-mcp-adapter `v2.32.1..v2.33.0` plus every open
+  area-13 row, pi-acp's full `src/`, and herdr (new area 16).
+- Every lead in every area file now has a written disposition: promoted to an item, or struck with
+  evidence.
+- **Reopened:** `ICOM-035`, a regression. `8de7460`'s injection pump waits for idle, so a busy
+  session is no longer steered.
+- **Closed:** no counted row. Area 13 re-ruled `MCP-137` and a large share of its open units to
+  implemented; area 15 closed most of its open rows on landed code (`0aefd08`, `cb290d1`). `CFG-067`
+  and `CFG-074` were narrowed.
+- **Filed:** see the fourteenth-edition block of `../00-residual-ledger.md` for the full id ranges.
+  Next free ids: `SUBA-144`, `MCP-586`, `HERDR-004`.
 
 ---
 
-## Read this before planning anything
+## Recommended next work — highest severity first
 
-**The ledger overstates remaining work, substantially, and this is now the most important fact about
-it.** In the last two batches, refutations roughly equalled fixes — **29 refuted / 29 fixed**, then
-**15 refuted / 11 fixed** — and independent reviewers confirmed those refutations row by row. Almost
-all of them read "already closed at HEAD": earlier sweeps fixed the code and never marked the row.
+Every item below is a static read of both sides. None was reproduced. Reproduce each one before
+fixing it (see `../REPRO-LOG.md`), and record the run.
 
-Consequences you must plan around:
+**1. Session data loss — the two criticals. Both are S effort.**
 
-1. **A count of open rows is not a count of remaining work.** Do not report progress as "N of 118".
-2. **Every batch currently spends its first third re-verifying finished work.** That is pure waste.
-3. **Area headers disagree with their own contents.** Area 04's header said 11 items; the file's own
-   sweep-9 recount block said 8, and the recount was right. **Trust the recount block over the
-   header, and say which you used.**
+- `SESS-056` (area 03): repair a session file's unterminated last line before appending, as pi
+  v0.84.4 does. Today the next entry is glued onto the partial line and lost, and every later entry
+  loses its parent chain.
+- `SEAM-122` (area 08): session import must not overwrite an existing file. Give the copy a unique
+  name and copy with create-new semantics (pi v0.85.0).
 
-### Therefore: do the reconciliation pass first
+**2. Intercom delivery — three highs, one change in area 08's `cyrup-session-svc`.** Take `ICOM-035`
+(the pump parks busy-session messages until idle), `ICOM-068` (a message delivered without a turn
+never reaches the model's transcript) and `ICOM-062` (a peer message during `/compact` starts a run
+under the compaction) together. `ICOM-062` needs `SEAM-125` (`is_idle` true during manual
+compaction). Area 08 has not filed the `ICOM-035`/`068` code as its own rows; file or cross-reference
+them there when the work starts. Note that the existing tests use a `HostServices` double that never
+runs the pump, which is why they passed.
 
-This is the highest-value next move, and it is cheap because it needs no fixes — only reading.
+**3. Tree navigation during compaction — `TUI-104` (high) with `SEAM-124` (medium).** One guard in
+`navigate_tree` plus the UI refusal. Settle the rating disagreement when fixing the pair. The same
+seam carries `SEAM-126`, `SEAM-127`, `SESS-061` and `SESS-062`; batch them if the agent has room.
 
-For each area file, walk every non-struck row in `## Open items`, check it against the code at HEAD,
-and mark the ones already closed with the evidence. Do not fix anything; just make the ledger true.
-Partition by area, run it wide, and finish with a corrected census.
+**4. `TOOL-047` (high, area 04, S).** Report a signal-killed shell command as a failure with exit code
+`128 + signo`.
 
-You will get a real number to work against, and every subsequent batch gets a third cheaper.
+**5. Subagents — three highs in `09b`.** `SUBA-115` (a nested stop/interrupt/timeout cascades into
+sibling subtrees; S), `SUBA-110` (strip git routing variables before the background runner and
+allowlist-less external CLIs; S), `SUBA-114` (stop pruning child tools to the parent's start-up tool
+set; M, `stale-port`). The fail-open `SUBA-111` belongs in the same batch.
 
----
+**6. Area 13's highs, outside the count but user-facing.** `MCP-585` (an Agent Plugin header's
+`!command` runs through `/bin/sh`: an HTTP-only plugin can run a local command), `MCP-553`
+(`inheritEnv:false` ignored) and `MCP-576` (a rotating bearer token is never re-resolved) first, then
+critical `MCP-500` with `MCP-501`, as `13-cyrup-mcp-STATUS.md` already sequences them.
 
-## The queue after that
+**7. The medium tier.** Start with the fail-open `EXT-077` (`DRIFT-056` closes with it), `HERDR-001`
+(project panes may open beside the human's focused pane in another workspace), and area 01's
+provider mediums (`PROV-083` first: pi v0.86.0's transcript-based system prompt and tool changes).
 
-**1. Area 07 — `cyrup-tui` (47 rows, plus 8 routed `CFG-*`).** The largest remaining area.
-
-There is a hard house rule here, learned expensively: **a TUI change is not done until it has been
-run in a real terminal.** `TestBackend` unit tests pass while the assembled application has layout
-and empty-state bugs they cannot see. Plan for a live run, and if you cannot do one, say so plainly
-rather than reporting the area closed.
-
-The 8 routed `CFG-*` rows that land in `cyrup-tui`: `CFG-014` (consumer half), `CFG-015`, `CFG-021`,
-`CFG-038`, `CFG-063`, `CFG-064`, `CFG-065`, `CFG-066`.
-
-**2. The re-unblocked subagents work.** Two items were blocked on reasoning that turned out to be
-wrong, and re-reading them removed most of the cost:
-
-- **`SUBA-016` — scheduled runs, nine `schedule.*` verbs.** Blocked as "needs `workflowScript`,
-  which is a Node VM sandbox." **Wrong for the scheduler**: `ScheduledRunManagerDeps.launch` is an
-  *injected dependency*, and the manager never compiles, parses or executes a script.
-  **~750 of 753 upstream lines are JS-free** — relative/absolute time parsing, interval math,
-  `catchUp: 'latest'` skip-ahead, `MAX_TIMER_DELAY_MS` chunking, `overlap: 'skip'`, a 100-entry
-  history ring, stale-launch-claim reclaim, and the nine-arm dispatch. It ports onto tokio.
-  `AuthorityAction::ScheduleCreate` is already pre-wired in `registration/authority.rs`.
-- **`SUBA-026` — the subagents admin picker.** Blocked as "a TUI subsystem, not a verb." The row has
-  **three defects**: it cites `tui/selector.ts`, which **exists at no tag** (the real file is
-  `slash/selector.ts`); that file is **147 lines** whose own doc says it is *"composed from pi's own
-  TUI primitives"*; and `subagents-admin.ts` has exactly one UI primitive, everything else being
-  config shaping and persistence that cyrup already has in `discovery/management.rs`. cyrup ships
-  `ListSelector` (1,484 lines, three test files) and `fleet_overlay.rs` already hosts a subagents
-  component through the same `InteractiveOverlay` seam. **Real size M, not L.**
-
-**3. The ~44 rows blocked with measured sizes.** These are genuine feature work, each already sized
-in its row by the agent that blocked it. Schedule them individually with room, not as part of a
-wide sweep — a sweep with a dozen items cannot land a 400-line subsystem.
+**Directory work that blocks nothing but should not slip:** check pi `7fd564cbb` (pi.dev chooses a
+catalog version by user agent) against the live server; open the summarization-auth call site; and
+re-run the area-13 census by script rather than trusting its hand arithmetic.
 
 ---
 
 ## The one open question that is the owner's, not yours
+
+*Carried from the `e815e08` edition and not re-verified in 2026-09-24's passes. The mention of the
+nine `schedule.*` verbs predates their landing; the second pass found cyrup does have scheduled runs
+(see `../09a-cyrup-ext-subagents-v0.57-drift.md`). The authoring question itself is still open.*
 
 **`workflowScript`'s authoring surface.** pi's workflow script is *source text the model emits inline
 at tool-call time* — `sanitizeTarget` literally instructs it to write
@@ -151,10 +122,3 @@ workflowScript port is a call-site change rather than a second port of this file
 
 ---
 
-## MCP is out of scope until parity closes
-
-`docs/gap-analysis/13*.md` and `MCP-PORT-METHODOLOGY.md` are a delivered, verified plan for porting
-`pi-mcp-adapter` into a new `crates/cyrup-mcp` — 433 port units, sequenced into 13 phases. It is
-owned separately, excluded from every count in this ledger, and **explicitly deferred by the owner
-until the parity gaps above are closed.** Do not start it. Do not re-audit the plan; it has been
-verified at length already.

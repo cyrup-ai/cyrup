@@ -78,6 +78,10 @@ reports the six places it has fallen behind rather than restating the algorithm.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** `http-ca.ts` → **`MCP-566`**; macOS Local Network Privacy → **`MCP-567`** (the SSE cause-capture half is Cut 1, not owed); `inheritEnv` → **`MCP-553`** (high: `secrets.rs` `resolve_env` always starts from the full parent environment, and `lenient` drops the key silently); `directToolCount` → **`MCP-554`**, and `MCP-137` itself re-ruled `implemented` (`live.rs` `create_mcp_status_snapshot` exists). The `13c:1003` ladder correction is confirmed. From v2.34–v2.37: command-backed bearer TTL + 401 reconnect → **`MCP-576`** (high); atomic reconnect (#629) → **`MCP-578`**. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: `MCP-100`, `101`, `105`, `115`, `116`, `122`, `124`, `125`, `127`, `128`, `130`, `135`, `138`, `140`, `144`, `145` → **implemented**; `MCP-129` and `MCP-134` `missing` → **partial**; `MCP-131` and `MCP-143` restated (high → medium); `MCP-103`, `104`, `106`, `107`, `108`, `120`, `123`, `132`, `133` confirmed. New: **`MCP-583`**, **`MCP-585`**. Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or

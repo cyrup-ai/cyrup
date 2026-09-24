@@ -86,6 +86,10 @@ to the approval section. The seam is stated below.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** cross-process credential transactions → **struck, withdrawn upstream** (`bdb89b7`, #563); `ConsentManager.restoreDecision` → **struck, not applicable** — Cut 2 stands, since at v2.37.0 the consent manager is *read* only by `ui-server.ts`; `MCP-559` carries the obligation to skip `kind:"consent"` records; the ladder corrections are confirmed at `ea23ca2`. From v2.34–v2.37: `encrypted-file` store → **`MCP-575`**; bearer command TTL → **`MCP-576`**; Linux keyring recovery for bearer/Jev stores → carried as an amendment to `MCP-501` (moot until it exists). Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: `MCP-260` → **implemented** (`crates/cyrup/src/mcp_keyring_helper_cmd.rs`); `MCP-269`, `278`, `283`, `287` confirmed (their `TODO(MCP-NNN)` markers stand). Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or

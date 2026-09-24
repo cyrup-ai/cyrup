@@ -196,13 +196,69 @@ auto-compaction trigger (SESS-028) even though both `estimatedTokensAfter` sites
 > adjacent to open `SESS-014`); progressive/cancellable `listSessions` (v0.86.0); mid-run threshold
 > compaction no longer skipping oversized trailing tool results (#9740, v0.86.0); cancellation races
 > that could start auto-compaction (#9340/#9777, v0.86.0). Each needs a both-sides read before it is
-> an item.
+> an item. *(Every one is dispositioned by the second pass below.)*
 
-## UNVERIFIED — 2026-09-14 census of the `v0.84.1..v0.85.1` window (leads, not items)
+> ### RE-MEASURE — 2026-09-24, second pass (unread windows closed). cyrup `ea23ca2`, pi `v0.87.1`.
+>
+> **Read this pass, in full:** `git -C tmp/pi diff v0.84.1..v0.85.1 --` `packages/coding-agent/src/core/`
+> `{session-manager.ts, messages.ts, session-export.ts (new), compaction/compaction.ts,
+> compaction/branch-summarization.ts, system-prompt.ts}` — this area's coding-agent session files for
+> the window the 2026-09-14 block said had never been measured — each hunk bisected to its tag
+> (`d711bd5f0` v0.84.3, `0b5ee5d8b` v0.84.4, `2631b25c3` v0.85.0, `e44d75c20` v0.85.0, `1d6dbf9e3`
+> v0.85.0, `58302d34e` v0.84.3); and, for the first pass's `v0.85.1..v0.87.1` lead list, commits
+> `8bdcd4498` (#9740) and `de2de549b` (#9340/#9777), `session-manager.ts::{appendCompaction,
+> sessionEntryToContextMessages, findMostRecentSession}` @v0.87.1, and `agent-session.ts::{abort,
+> _runDefaultCompaction, _emitAgentSettled}` @v0.87.1. cyrup side:
+> `crates/cyrup-session/src/{manager/{load,lifecycle,append,navigate,branched_session,accessors}.rs,
+> store.rs, listing.rs, context.rs, compaction/{cutpoint,branch,summarize}.rs, prompt/builder.rs}`,
+> `crates/cyrup-session-svc/src/session/{queue,retry,compaction,auto_compaction,run,forking,
+> transcript}.rs`, `crates/cyrup-tui/src/app/execute_session.rs`.
+>
+> **Filed (eight):** `SESS-056` (**critical** — a session file whose last line is unterminated is not
+> repaired on open, so the next append is glued onto it and lost, v0.84.4), `SESS-057` (medium — fork
+> drops a compaction's kept region when `firstKeptEntryId` names a dropped label, v0.85.0), `SESS-058`
+> (low — `/export x.jsonl` writes the whole tree, pi the linearised branch, at every tag),
+> `SESS-059` (low — skills section suppressed for a bash-only tool set, v0.85.0), `SESS-060` (low —
+> branch-summary output cap 2048 vs `min(4096, model.maxTokens)`, v0.85.0), `SESS-061` (medium —
+> `find_cut_point` keeps everything when trailing tool results alone exceed the budget, v0.86.0),
+> `SESS-062` (medium — `abort()` cancels neither compaction nor branch summary and there is no run-abort
+> latch on the post-run loop, v0.85.0/v0.86.0), `SESS-063` (low — `branch_with_summary` records the
+> destination as `fromId`; pi v0.84.3 records the pre-navigation leaf).
+>
+> **Dispositions of every lead in this file (the 2026-09-14 census below and the first pass's list above):**
+>
+> | lead | disposition |
+> |---|---|
+> | error/aborted assistant excluded from context + `retainedTail` filter | **retired by the first pass** (harness-only rule); unchanged |
+> | harness JSONL v4 header reshape / `storageVersion` | **struck — not applicable**: cyrup parses the coding-agent v3 format (`crates/cyrup-session/src/header.rs`), which did not change shape in `v0.84.1..v0.87.1` beyond the v0.86.0 additions already filed as `SESS-051` |
+> | `BranchSummaryMessage.fromId` nullable | **struck — type-only.** `packages/coding-agent/src/core/messages.ts` widened `fromId` to `string \| null` (v0.84.x) but `BranchSummaryEntry.fromId` is still `string` (`session-manager.ts:108` @v0.87.1) and `createBranchSummaryMessage` still takes `string`; cyrup's projection takes no `fromId` at all (`context.rs::branch_summary_message`). The related *which id* change is `SESS-063` |
+> | harness summary-request boundary / `options.sessionId ?? uuidv7()` | **struck — no shipped caller.** The coding-agent twin (`58302d34e`, v0.84.3) threads an optional `sessionId` through `compact`, but `agent-session.ts::_runDefaultCompaction` passes `undefined` (`:2382` @v0.87.1) and branch summaries pass none, so every shipped path still gets a fresh id — what `summarize.rs:312` does. Re-open if any pi caller passes one |
+> | summary refusal on `length`/`error` | **already `SESS-049`** (closed 2026-09-04, four call sites) |
+> | `build_context_entries` citations unverified at v0.84.4 | **verified**: `buildContextEntries` is `session-manager.ts:418-453` and the method `:1277-1279` @v0.84.4, exactly as `crates/cyrup-session/src/context.rs:359` and `manager/context.rs:96` cite; the producer is `EXT-041`'s (closed) |
+> | retain-none compaction (v0.87.0) | **struck here, folded into `EXT-078`**: its only upstream producer is `CompactionEntryDraft.firstKeptEntryId: null` on the actionable-boundary result (`extensions/types.ts:786`, `agent-session.ts:762-768` @v0.87.1). Reading is already equivalent: a self-id `firstKeptEntryId` keeps nothing in pi's loop, as `None` does in `context.rs:187-203` |
+> | `SessionManager` canonical for provider context (v0.87.0 *Breaking*) | **struck — SDK contract, no cyrup analogue to break.** Its observable consequences are `SESS-052` (`context_edit`, including the v0.87.0 persisted post-run recovery omissions) and `AGENT-038` (`prepareRequest` is where the canonical context is installed) |
+> | `findMostRecentSession` stops at the first match (v0.86.0) | **struck — performance only, same result.** Both sides pick the newest-mtime matching header; cyrup's `listing.rs::newest_session` reads every header through the bounded reader (`SESS-014`, closed), pi now stops early. Only equal-mtime tie order can differ |
+> | progressive/cancellable `listSessions` (v0.86.0) | **struck here — area 07's** (the `--resume` picker is in area 07's own blind list) |
+> | #9740 oversized trailing tool results | **promoted → `SESS-061`** |
+> | #9340/#9777 cancellation races | **promoted → `SESS-062`** (the abort-latch half; the auth-wait half is the same fix site) |
+>
+> **Negative results.** `UPDATE_SUMMARIZATION_PROMPT`'s v0.85.0 split into `…_INSTRUCTIONS` recombines
+> to the byte-identical string. `system-prompt.ts`'s PowerShell file-exploration guideline (v0.85.0) is
+> already ported (`prompt/builder.rs:234-240`). `session-manager.ts`'s `_loadEntries`/`inMemory(…,
+> entries)` (v0.84.x) is an SDK constructor with no cyrup caller to affect. The custom-prompt branch's
+> trailing `\n` after `Current working directory:` (v0.85.0) is superseded by `SESS-054`'s v0.86.0
+> re-layout and is carried there. The extension-driven model/thinking change stays session-scoped on
+> both sides (`2ff8ba622`, v0.84.3; cyrup's `set_model_resolved` never writes the settings default).
+>
+> **Still unread, and why:** `agent-session.ts` `v0.84.1..v0.85.1` (+468) beyond the abort, compaction
+> and model-mutation hunks named above — area 08 owns that file; `packages/agent/src/harness/{session,
+> compaction}/**` — harness, not cyrup's format (see `AGENT-028`); `skills.ts`/`resource-loader.ts` —
+> area 05's paths.
 
-**Nothing in this section is an item.** No `SESS-` id is assigned, because id assignment belongs to a
-pass that read both sides and this one did not read both sides everywhere. No row in `## Open items`
-is opened, closed or re-ranked by anything here. Each entry states what was read on which side.
+## RESOLVED 2026-09-24 — the 2026-09-14 census of the `v0.84.1..v0.85.1` window (history; every lead dispositioned above)
+
+**Nothing in this section is an item, and nothing in it is still a lead** — the second pass's table
+above disposes of each bullet; they are kept verbatim as the record of what the census saw.
 
 Census method: upstream read only via `git -C tmp/pi show <tag>:<path>` and
 `git diff v0.84.1..v0.85.1`, covering `src/harness/session/{context,types,index}.ts`,
@@ -514,6 +570,14 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 | SESS-053 | low | upstream-drift | S | **NEW 2026-09-24.** pi v0.87.1 rewrote `TURN_PREFIX_SUMMARIZATION_PROMPT` and replaced the `<conversation>…</conversation>` framing of the turn-prefix request with `# Conversation` / `# Instructions` (#9908, a model refusing the old prompt); cyrup carries the v0.87.0 text byte-for-byte. See body. |
 | SESS-054 | low | upstream-drift | M | **NEW 2026-09-24.** pi v0.86.0 renders the default system prompt as named sections — untagged preamble, then `<tools>`, `<rules>`, `<docs>`, `<addendum>`, `<project_context>`, `<skills>`, `<cwd>` joined by blank lines — dropping the `Available tools:` / `Guidelines:` headers and the `Current working directory:` footer cyrup still emits. See body. |
 | SESS-055 | low | upstream-drift | S | **NEW 2026-09-24.** pi v0.86.0 resolves `reserveTokens`/`keepRecentTokens` through `compaction.modelOverrides["provider/modelId"]` before the ordinary setting, and throws on a non-integer value; cyrup's `CompactionSettings` has no override map. See body. |
+| SESS-056 | **critical** | upstream-drift | S | **NEW 2026-09-24 (second pass).** A session file whose last line has no trailing newline (a crash mid-append, or an externally written file) is loaded without repair, so the next `append_line` writes its JSON straight onto that partial line; on the next open the merged line fails to parse and is dropped — the new entry is lost and every later entry's `parentId` points at a missing id. pi v0.84.4 (`0b5ee5d8b`) appends `"\n"` after a successful header check. See body. |
+| SESS-057 | medium | upstream-drift | S | **NEW 2026-09-24 (second pass).** `create_branched_session` drops `Label` entries and re-chains, but does not remap a compaction's `firstKeptEntryId` that named one of them, so the forked session's compaction keeps NOTHING before it. pi v0.85.0 (#8990) remaps it to the next retained entry. See body. |
+| SESS-058 | low | parity-bug | S | **NEW 2026-09-24 (second pass).** `/export <file>.jsonl` writes the whole tree with original `parentId`s and the stored header; pi (every tag since v0.83.0) writes only the current branch, linearised, under a fresh header. Sibling of area 12's `DRIFT-055` (`/share`), which deliberately left this path alone. See body. |
+| SESS-059 | low | upstream-drift | S | **NEW 2026-09-24 (second pass).** The skills section is emitted only when `read` is selected; pi v0.85.0 (#8552) also emits it when only `bash` is, with a bash-specific load instruction. See body. |
+| SESS-060 | low | upstream-drift | S | **NEW 2026-09-24 (second pass).** Branch summaries are capped at a fixed 2048 output tokens in both cyrup copies; pi v0.85.0 raised the cap to `min(4096, model.maxTokens)`. With `SESS-049`'s `Length` refusal landed, a summary between the two caps now fails in cyrup and succeeds in pi. See body. |
+| SESS-061 | medium | upstream-drift | S | **NEW 2026-09-24 (second pass).** When the trailing entries alone exceed `keepRecentTokens` and no valid cut point lies at or after the crossing, `find_cut_point` keeps the default first cut point — compacting nothing — where pi v0.86.0 (#9740) falls back to the LAST valid cut point. See body. |
+| SESS-062 | medium | upstream-drift | M | **NEW 2026-09-24 (second pass).** `AgentSession::abort()` is `abort_retry()` + `agent.abort()`; pi v0.85.0 also aborts compaction and branch summarization, and v0.86.0 latches `_agentRunAbortRequested` so the post-run loop stops retrying, compacting and continuing. An RPC/ACP/SIGINT abort during an overflow-recovery compaction lets it finish and the run continue. See body. |
+| SESS-063 | low | upstream-drift | S | **NEW 2026-09-24 (second pass).** `branch_with_summary` records the navigation DESTINATION as `fromId`; pi v0.84.3 (`d711bd5f0`) records the pre-navigation leaf. The closed `SESS-017` aligned cyrup with the pre-v0.84.3 rule, which upstream then reversed. See body. |
 
 ## SESS-040 — Compaction cannot be cancelled from the shipped binary: the Escape rebind was never ported, `AbortCompaction` has zero callers, and the indicator advertises "(esc to cancel)"
 
@@ -1402,6 +1466,279 @@ the error on a malformed value; pass the active model from the compaction call s
 
 **Verify** — With `modelOverrides["anthropic/x"].reserveTokens = 1000`, compaction for that model
 reserves 1000 and for any other model the global value.
+
+---
+
+## SESS-056 — An unterminated last line is not repaired on open, so the next appended entry is glued onto it and lost
+
+**Kind** upstream-drift · **Severity** critical · **Effort** S · **Confidence** confirmed by reading both sides; not reproduced live
+
+> **Filed 2026-09-24 (second pass).** Bisected: `if (pending) appendFileSync(resolvedFilePath, "\n")`
+> is absent from `packages/coding-agent/src/core/session-manager.ts` at v0.84.1–v0.84.3 and present
+> from v0.84.4 (`0b5ee5d8b`, "fix(coding-agent): repair unterminated session files"). Past the ported
+> v0.83.0 baseline, hence `upstream-drift`; the severity follows the README definition (data loss),
+> which carries no reachability qualifier.
+
+**cyrup** — `crates/cyrup-session/src/manager/load.rs::load` reads with `BufReader::lines()`, which
+yields a final line whether or not it ends in `\n`; a complete-but-unterminated last entry is parsed
+and kept, a partial one is dropped with `recovered = true`. Nothing writes to the file:
+`manager/lifecycle.rs::open_with_cwd` (`:106-125`) rewrites only on `migrated && !recovered`, and
+otherwise hands the file to `DiskStore`. `crates/cyrup-session/src/store.rs::DiskStore::append_line`
+(`:254-282`) then does one `write(2)` of `<json>\n` to the `O_APPEND` fd — directly after the last byte
+on disk. Its own comment (`:262-266`) names the precondition: "a crash mid-write leaves a partial final
+line that the tolerant reader drops".
+
+**upstream** — `git -C tmp/pi show v0.87.1:packages/coding-agent/src/core/session-manager.ts`,
+`loadEntriesFromFile` (`:627-670`): the trailing `pending` remainder is parsed as a final entry
+(`:654-656`), the header is validated, and then `if (pending) appendFileSync(resolvedFilePath, "\n")`
+(`:668`) terminates the line before any append can reach it.
+
+**Impact** — Two ways in, one outcome. (a) A crash or kill mid-append leaves a partial line; cyrup
+drops it in memory (correct), resumes, and appends the next entry — normally the user's next message —
+onto the partial bytes. (b) A file whose final, complete line lacks `\n` (written by another tool, an
+editor, or a truncated copy) loads fine; the next append makes `{…last…}{…new…}\n`. On the next open
+the merged line does not parse and `load` drops it: in (b) the previously good last entry is lost as
+well. Every entry appended after that point has a `parentId` chain passing through the lost id, so
+`branch_path` from the new leaf breaks at the gap — the resumed conversation silently loses its tail
+from context and from `/tree`. Nothing is reported except `recovered = true`.
+
+**Fix** — In `load.rs::load` track whether the file ended in `\n` (read the last byte, or use
+`read_until(b'\n')` and check the final chunk); return it. In `open_with_cwd`, after the header check
+succeeds and before constructing `DiskStore`, if it did not, append a single `\n` (`OpenOptions::
+append`). Do not do this for a file that failed the header check — pi validates first (`:661-666`) and
+never mutates a non-session file.
+
+**Verify** — Write a header + one complete entry with no trailing newline; `open`, append a user
+message, drop, `open` again: both entries are present and the leaf is the new one. Repeat with a
+half-written JSON tail: the tail is dropped, the new entry survives.
+
+---
+
+## SESS-057 — Forking drops a compaction's kept region when its `firstKeptEntryId` names a label entry
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read; not reproduced live)
+
+> **Filed 2026-09-24 (second pass).** `replacementByLabelId` is absent from `session-manager.ts` at
+> v0.84.4 and present from v0.85.0 (`2631b25c3`, "fix(coding-agent): preserve compaction boundary when
+> forking (#8990)", fixes #8989).
+
+**cyrup** — `crates/cyrup-session/src/manager/branched_session.rs::create_branched_session`
+(`:43-56`) skips every `KnownEntry::Label` on the path and re-chains `parent_id`, cloning every other
+entry unchanged — a `Compaction`'s `first_kept_entry_id` included. `crates/cyrup-session/src/context.rs::
+build_context_messages` (`:187-203`) keeps pre-compaction entries only from the one whose id equals
+`first_kept_entry_id`; an id not on the path keeps nothing.
+
+**upstream** — `session-manager.ts` @v0.87.1, `createBranchedSession` (`:1625-…`): while dropping labels
+it records each dropped label id against the next retained entry (`replacementByLabelId`) and rewrites
+a compaction's `firstKeptEntryId` through that map (`:1656`), so the boundary survives.
+
+**Impact** — Only when a compaction's first kept entry is a `label` entry (pi fixed a reported case,
+#8989). Then the forked session's context is the compaction summary plus what came after it — every
+message the compaction deliberately kept is silently missing from the fork's model context. The
+source session is unaffected.
+
+**Fix** — In the re-chain loop, keep a `pending_labels: Vec<EntryId>`; on each retained entry, map
+every pending label id to that entry's id; when cloning a `Compaction`, replace `first_kept_entry_id`
+through the map.
+
+**Verify** — Build `user, assistant, label(L), user, assistant, compaction(firstKept = L)`, fork at the
+leaf: the forked compaction's `first_kept_entry_id` is the `user` after `L`, and
+`build_context_messages` on the fork returns the summary plus both kept messages.
+
+---
+
+## SESS-058 — `/export <file>.jsonl` writes the whole session tree; pi writes the current branch, linearised, under a fresh header
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read at the ported tag and at v0.87.1)
+
+> **Filed 2026-09-24 (second pass).** Present in pi at v0.83.0 (`AgentSession.exportToJsonl`,
+> `agent-session.ts` `getBranch()` + `parentId: prevId`), extracted unchanged to
+> `core/session-export.ts::exportSessionToJsonl` at v0.84.3 — so this is a gap in the original port,
+> not drift. Area 12's `DRIFT-055` covers the same function's `/share` caller and explicitly left
+> "`cyrup --export`'s whole-tree dump alone"; that exclusion does not cover `/export`, whose pi
+> counterpart is branch-only.
+
+**cyrup** — `crates/cyrup-tui/src/app/execute_session.rs` routes a `.jsonl` target (`:87-92`) to
+`AgentSession::export_to_jsonl` (`crates/cyrup-session-svc/src/session/transcript.rs:57-73`), which
+calls `SessionManager::export_jsonl` (`crates/cyrup-session/src/manager/accessors.rs:20-30`): the
+stored header (its original `timestamp`, `parentSession` if any) with only `cwd` overwritten, then
+**every** entry in `self.entries`, `parentId`s intact.
+
+**upstream** — `packages/coding-agent/src/core/session-export.ts` @v0.87.1: a fresh header
+`{type, version, id, timestamp: now, cwd}` (no `parentSession`), then `sessionManager.getBranch()`
+with each `parentId` rewritten to the previous entry's id (`:13-24`); `interactive-mode.ts`'s
+`handleExportCommand` sends `.jsonl` there (v0.83.0 `:5438-5439`).
+
+**Impact** — An exported transcript carries abandoned branches the user navigated away from, and a
+reader resuming it lands on whatever leaf `import_jsonl` picks rather than a single linear
+conversation. Nothing is lost; more is disclosed than pi discloses.
+
+**Fix** — Give `SessionManager` a `export_branch_jsonl` (current `branch_path`, re-chained, fresh
+header without `parent_session`) and use it for `/export *.jsonl` and for `DRIFT-055`'s `/share` in one
+change; keep the whole-tree dump only where a caller asks for it by name.
+
+**Verify** — Two branches, leaf on the second: the exported file has only the second branch's entries,
+`parentId`s form one chain from `null`, and the header timestamp is the export time.
+
+---
+
+## SESS-059 — The skills section is suppressed for a bash-only tool set; pi v0.85.0 emits it with a bash load instruction
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
+
+> **Filed 2026-09-24 (second pass).** `skillFileReadTool` is absent from `system-prompt.ts` at v0.84.4
+> and present from v0.85.0 (`1d6dbf9e3`, "keep skills available with bash-only tools (#8552)"); still
+> present at v0.87.1 inside the v0.86.0 sectioned layout (`:165-167`).
+
+**cyrup** — `crates/cyrup-session/src/prompt/builder.rs::SystemPromptBuilder::build` computes
+`read_available = is_selected(selected_tools, "read")` (`:166`) and emits the skills section only
+`if read_available` (`:186-189`), with the read-tool wording.
+
+**upstream** — `system-prompt.ts` @v0.87.1: `skillFileReadTool = ["read","bash"].find(t =>
+selectedTools.includes(t))`, and `formatSkillsForPrompt(skills, skillFileReadTool)`;
+`skills.ts::formatSkillsForPrompt` (`:355-366`) says "Use the read tool to load a skill's file…" for
+`read` and "Use bash to load a skill's file…" for `bash`.
+
+**Impact** — A session launched with `--tools bash` (or any set with `bash` and not `read`) gets no
+`<available_skills>` block, so the model never learns the skills exist; pi lists them and tells it to
+`cat` the file.
+
+**Fix** — Replace `read_available` with `skill_file_read_tool: Option<&str>` (`read` first, then
+`bash`) and thread it into `emit_skills_section` to pick the instruction line. Coordinate with
+`SESS-054`, which re-lays the whole prompt.
+
+**Verify** — `selected_tools = [bash]` with one skill: the prompt contains `<available_skills>` and
+"Use bash to load a skill's file"; `[read, bash]` keeps the read wording; `[edit]` emits none.
+
+---
+
+## SESS-060 — Branch-summary output is capped at 2048 tokens; pi v0.85.0 caps at `min(4096, model.maxTokens)`
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
+
+> **Filed 2026-09-24 (second pass).** `Math.min(4096` enters `branch-summarization.ts` at v0.85.0
+> (`e44d75c20`, "raise branch summary output cap"); present at v0.87.1 (`:345`, used at `:352`).
+
+**cyrup** — `max_tokens: 2048` in both branch-summary request builders:
+`crates/cyrup-session/src/compaction/branch.rs:309` (doc at `:254` still cites the fixed 2048) and the
+copy `/tree` actually runs, `crates/cyrup-session-svc/src/session/forking.rs:437`.
+
+**upstream** — `const maxTokens = Math.min(4096, model.maxTokens > 0 ? model.maxTokens :
+Number.POSITIVE_INFINITY)` (`:345`) passed as the request's `maxTokens`.
+
+**Impact** — Since `SESS-049` landed, a `Length` stop is refused as an incomplete summary. A branch
+summary that needs between 2048 and 4096 tokens therefore fails with "Branch summarization failed:
+generation hit the token cap…" in cyrup and succeeds in pi.
+
+**Fix** — Compute `min(4096, model.max_tokens)` (zero = unbounded) at both sites; better, route
+`forking.rs` through `branch.rs`'s builder so the two cannot drift again.
+
+**Verify** — A faux model reporting `max_tokens = 8192` receives a 4096 cap; one reporting `1000`
+receives 1000.
+
+---
+
+## SESS-061 — When trailing tool results alone exceed the keep budget, `find_cut_point` compacts nothing; pi v0.86.0 cuts at the last valid point
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read)
+
+> **Filed 2026-09-24 (second pass).** `8bdcd4498` ("fix(coding-agent): compact oversized trailing tool
+> results", closes #9740), first tagged at v0.86.0 (coding-agent CHANGELOG 0.86.0: "Fixed mid-run
+> threshold compaction silently skipping oversized trailing tool results").
+
+**cyrup** — `crates/cyrup-session/src/compaction/cutpoint.rs::find_cut_point`: `cut_idx` defaults to
+`valid.first()` (`:138`); on crossing the budget it snaps to `valid.iter().find(|&&v| v >= i)` and,
+when that is `None`, leaves the default in place (`:148-152`). Tool results are not valid cut points,
+so a tail of tool results larger than `keep_recent_tokens` crosses the budget with no valid point at
+or after it — and the cut lands on the FIRST valid point, keeping the whole history.
+
+**upstream** — `compaction.ts` @v0.87.1, `findCutPoint` (`:468-…`): `cutIndex = cutPoints.find(c =>
+c >= i) ?? cutPoints[cutPoints.length - 1]` (`:498`), i.e. keep from the assistant tool call that
+precedes the oversized results. The projected variant has the same fallback (`:848`).
+
+**Impact** — The case is a turn whose tool output (a large `read`, a verbose `bash`) is by itself
+over the keep budget — exactly when compaction is needed most. cyrup's threshold compaction runs,
+summarises nothing, and the next request goes out at full size, heading for a context overflow;
+pi compacts everything before the tool call.
+
+**Fix** — `.or_else(|| valid.last().copied())` on the snap, then the existing back-scan.
+
+**Verify** — Port the case `8bdcd4498` added to `test/compaction.test.ts`: history of small turns,
+then an assistant tool call and a tool result larger than `keep_recent_tokens`; the cut is the tool
+call's index, not the first message's.
+
+---
+
+## SESS-062 — `abort()` cancels neither compaction nor branch summarization, and no run-abort latch stops the post-run loop
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed (both sides read; not reproduced live)
+
+> **Filed 2026-09-24 (second pass).** Bisected on `AgentSession.abort()`: `abortRetry(); agent.abort();
+> await waitForIdle()` at v0.83.0–v0.84.4; `abortCompaction(); abortBranchSummary();` added by v0.85.1;
+> the `_agentRunAbortRequested` latch added at v0.86.0 (`de2de549b`, closes #9340/#9777).
+
+**cyrup** — `crates/cyrup-session-svc/src/session/queue.rs::abort` (`:96-99`) is `abort_retry()` +
+`agent.abort()`; `abort_and_settle` adds a bounded idle wait. `abort_compaction`/`abort_branch_summary`
+exist (`session/compaction.rs:406-420`) but only the TUI's Escape-during-compaction path calls the
+former (`crates/cyrup-tui/src/app/run_action.rs:92`). Auto-compaction runs on a child of
+`session_cancel` (`session/auto_compaction.rs:202`), which `agent.abort()` does not touch. The post-run
+loop `while self.handle_post_agent_run().await { continue_run … }` (`session/run.rs:303`) re-checks
+nothing: `handle_post_agent_run` (`:369-…`) goes on to retry, run `check_compaction(&msg, true)`
+(`:388`) and continue for queued messages regardless of an abort that arrived after `agent_end`.
+`cyrup-acp`'s cancel (`sessions.rs:1094`, `turn.rs:887`) and SIGINT (`crates/cyrup/src/signals.rs:318`)
+both call `abort()`.
+
+**upstream** — `agent-session.ts` @v0.87.1: `abort()` (`:2075-2085`) sets `_agentRunAbortRequested`
+when a run is active, then `abortRetry(); abortCompaction(); abortBranchSummary(); … agent.abort()`;
+`_runAgentPrompt` checks the latch around every continuation (`:1469-1484`) and
+`_handlePostAgentRun` returns `false` on it before and after retry and compaction (`:1497-1528`);
+`_willRetryAfterAgentEnd` refuses a retry once it is set (`:977`).
+
+**Impact** — An editor's cancel (ACP) or Ctrl-C landing during a post-run overflow-recovery
+compaction does not stop it; the compaction completes and the driver calls `continue_run`, starting a
+turn the user just cancelled. An abort in the gap between `agent_end` and the post-run step (no
+active agent run, so `agent.abort()` is a no-op) is lost the same way. The interactive Escape path is
+unaffected (it calls `abort_compaction`).
+
+**Fix** — In `queue.rs::abort`, also call `abort_compaction()` and `abort_branch_summary()`, and set
+an `abort_requested` flag when `is_run_active()`; clear it at the top of each run; in the `run.rs:303`
+loop and inside `handle_post_agent_run` return `false` when it is set (mirroring pi's four checks),
+and make `will_retry_after_agent_end` refuse while it is set.
+
+**Verify** — A faux provider returning a context-overflow error; call `abort()` while the resulting
+auto-compaction is awaiting its summary: `compaction_end` reports `aborted`, no second `agent_start`
+follows, and the run settles once.
+
+---
+
+## SESS-063 — `branch_with_summary` records the navigation destination as `fromId`; pi v0.84.3 records the pre-navigation leaf
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
+
+> **Filed 2026-09-24 (second pass).** `const fromId = this.leafId ?? "root"` enters
+> `session-manager.ts::branchWithSummary` at v0.84.3 (`d711bd5f0`, "preserve branch summary source
+> leaf": "Record the pre-navigation leaf in branch summary fromId instead of the destination node").
+> At v0.83.0–v0.84.2 pi wrote `fromId: branchFromId ?? "root"` — the destination — which is what the
+> closed `SESS-017` aligned cyrup to. Upstream then reversed.
+
+**cyrup** — `crates/cyrup-session/src/manager/navigate.rs::branch_with_summary` (`:31-52`) moves the
+leaf to `to` and writes `from_id = to.cloned().unwrap_or("root")` (`:43`). Both callers use it:
+`crates/cyrup-session/src/compaction/mod.rs:447` and `/tree`'s
+`crates/cyrup-session-svc/src/session/forking.rs:321`. (`append_branch_summary`, `:58-…`, which takes an
+explicit navigated-FROM id, has no caller.)
+
+**upstream** — `session-manager.ts` @v0.87.1 `:1598-1612`: `fromId` is captured from `this.leafId`
+BEFORE `this.leafId = branchFromId`.
+
+**Impact** — The persisted `branch_summary.fromId` names the node the user went TO, so anything that
+reads it to find the abandoned branch (the summary's own provenance, a tree renderer, an extension on
+`session_tree`) points at the wrong subtree; pi files written after v0.84.3 disagree with cyrup's on
+the same navigation. Context projection is unaffected — neither side feeds `fromId` to the model.
+
+**Fix** — Capture `let from_id = self.leaf_id().cloned().unwrap_or("root")` before the `branch`/
+`reset_leaf` call. Update the branch-summary tests that assert `from_id` (the pair `SESS-032` re-pointed when it closed), which now pin the destination rule.
+
+**Verify** — Leaf at `B`, navigate to `A` with a summary: the new entry's `from_id` is `B`.
 
 ---
 

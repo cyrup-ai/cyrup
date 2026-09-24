@@ -67,6 +67,10 @@ upstream conformance cases that transfer verbatim.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** install → **`MCP-563`** (absorbs `provisionalInstalls`, `allowInstall` and the `withFileMutationQueue` seam gap); background auth watcher → **`MCP-564`**; the gateway-description and `hasGatewayMode` changes land with the feature each describes (`MCP-561`, `MCP-563`, `MCP-564`) — the description is a pure function of them. From v2.34–v2.37: pre-dispatch argument validation (#602) → **`MCP-579`**; CJK lexical search (#613) → **`MCP-580`**. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: `MCP-193` → **implemented**; `MCP-174` confirmed (medium → low); `MCP-191`, `196` confirmed. New: **`MCP-584`** (2026 `input_required` on the proxy path). Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or

@@ -74,6 +74,10 @@ unfiltered text entering the model's context under either system.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** search-mode lazy registration → **`MCP-561`**; `connectAndReport` → **`MCP-562`**; `session-approvals.ts` half (b) → **`MCP-559`** (half (a) was already `MCP-232`'s 2026-09-14 re-ruling); brokers-before-grants → **struck, not applicable** (cyrup's broker is the `before_tool_call` gate, which runs before `execute` and so before the cache); `formatServerNamespace` → already `MCP-513`; `outputSchema` → **struck** (only reader at v2.37.0 is `mcp-code.ts`, Cut 4); host truncation → **`MCP-558`** (inverts `MCP-226`'s premise; row untouched). From v2.34–v2.37: #612 and #603 amend `MCP-516`; the large-tools advisory (#634) → **`MCP-581`**. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: `MCP-204`, `214`, `217b`, `231` → **implemented**; `MCP-211` confirmed `missing` and raised medium → **high** (`mcp({describe})` shows the model a placeholder instead of any parameters); `MCP-217a` restated (medium → low); `MCP-215`, `232`, `249` confirmed. New: **`MCP-584`** (direct-tool half). Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or

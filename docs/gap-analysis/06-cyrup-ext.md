@@ -58,14 +58,82 @@ This area covers the extension host itself: the event catalog and dispatch reduc
 > no ledger row:** `SanctionedWaitGate`/`SanctionedWaitKind` generalise the permission gate's
 > budget forgiveness to any DECLARED bounded wait (`crates/cyrup-ext/src/native.rs`, `dispatch.rs::
 > invoke_with_sanctioned_wait_forgiveness`) — a cyrup-original widening of the dispatch budget with no
-> pi counterpart (pi has no dispatch budget); cyrup-side read only.
+> pi counterpart (pi has no dispatch budget); cyrup-side read only. *(Every lead in this paragraph is
+> dispositioned by the second pass below.)*
 
-## UNVERIFIED census 2026-09-14 — leads, not findings
+> ## RE-MEASURE — 2026-09-24, second pass (unread windows closed). cyrup `ea23ca2`, pi `v0.87.1`.
+>
+> **Read this pass, in full:** `git -C tmp/pi diff v0.84.1..v0.87.1 --`
+> `packages/coding-agent/src/core/extensions/{runner.ts,loader.ts}` (the whole diff, not the named
+> functions), and `v0.84.1..v0.85.1` of `core/extensions/{index.ts,types.ts}` — i.e. the whole
+> `v0.84.1..v0.85.1` window of this directory, per release: v0.84.2 +4/−3 (`expandPromptTemplates`),
+> v0.84.3 +171/−57 (transactional factory load `a69bef789`, flag-default check `f47faf459`, Node SEA
+> loader), v0.84.4 +76/−1 (UI-prompt wrapping), **v0.84.4..v0.85.0 +9/−5** (the brief's unread hunk:
+> `isBundledNode` moved into `config.ts`, and the `setModel`/`setThinkingLevel` doc comments now say
+> "for the current session without changing the configured default"), v0.85.0..v0.85.1 empty. Every
+> feature bisected tag by tag (`load.commit`, object-schema check, flag-default check,
+> `snapshotEventHandlers`, `withUIPrompt`, `forceSystemPrompt`, `emitCacheWarmingDecision`). Also:
+> `modes/{interactive/interactive-mode.ts,rpc/rpc-mode.ts}` `emitUserBash` callers, `agent-session.ts::
+> {sendUserMessage, _emitAgentSettled, setModel}`, `model-registry.ts` stream/complete by tag, chord's
+> escalation conditions at v0.87.1. cyrup side: `crates/cyrup-ext/src/{facade.rs (load paths,
+> emit_before_agent_start, materialize_guest_tools, reserve/release_id), registry.rs (validate,
+> register_{guest_tool,provider,flag}), contract.rs, dispatch.rs (subscribers_for, dispatch_notify),
+> bus.rs, lib.rs (CYRUP-DELTA registers), host/{live.rs (call_init, register_*, send_message,
+> send_user_message), services.rs (ControlOp, require_command_tier, get_flag, invalidate)},
+> wit/world.wit (control, models)}`, `crates/cyrup-session-svc/src/{session/{control,commands,inject,
+> run,model}.rs, event.rs}`.
+>
+> **Filed:** `EXT-081` (medium — a WASM guest whose `init` fails leaves its registrations and its id
+> behind), `EXT-082` (low — registration-time validation: a schema-less tool is dropped silently, a
+> mistyped flag default accepted), `EXT-083` (medium — guest `sendUserMessage` discards its options:
+> `deliverAs` ignored, content always expanded), `EXT-084` (low — mutable `systemPromptOptions` on
+> `before_agent_start`, v0.86.0), `EXT-085` (low — `cache_warming_decision`, blocked on a warmer no area
+> owns), `EXT-086` (low — no guest model-call verb for `ctx.modelRegistry.complete/stream/streamSimple`),
+> `EXT-087` (medium — guest `sendMessage`/`sendUserMessage` are command-tier-gated; pi allows them from
+> any handler), `EXT-088` (`tracker` — chord, watch-do-not-port).
+>
+> **`EXT-077` is the canonical row for the `user_bash` fail-open defect; area 12's `DRIFT-056` is its
+> duplicate** (same upstream change, pi v0.86.0 #9068, same cyrup site). Schedule and close it here.
+> This pass also read the pi callers `EXT-077` said it had not: see its body.
+>
+> **Dispositions of every lead in this file** (the first pass's list above and the 2026-09-14 census below):
+>
+> | lead | disposition |
+> |---|---|
+> | `cache_warming_decision` (v0.86.0) | **promoted → `EXT-085`** |
+> | `ctx.modelRegistry.stream()`/`streamSimple()` (v0.86.0) | **promoted → `EXT-086`** (with `complete()`, present since v0.84.1) |
+> | tools without a parameter schema rejected (#9300, v0.86.0) | **promoted → `EXT-082`** — cyrup already refuses the descriptor (`registry.rs::ToolDescriptor::validate`) but swallows the refusal |
+> | `before_agent_start` mutable `systemPromptOptions` (v0.86.0) | **promoted → `EXT-084`** |
+> | `agent_settled` requested runs deferred (v0.87.0) | **struck as its own item, subsumed by `EXT-087`**: no cyrup guest can request a run from any event handler at all, so pi's reentrancy fix has nothing to apply to until `EXT-087` lands; `EXT-087`'s Fix carries the deferral |
+> | `ProviderConfig.streamSimple` receives a `TranscriptContext` (v0.86.0) | **struck — consequence of `AGENT-039`**: cyrup has no transcript context to hand a guest provider; the provider seam follows whatever `AGENT-039` decides |
+> | `ProviderModelConfig.{inputLimits,promptCache}` | **struck here — owned by `CFG-085`** (area 05) |
+> | `SanctionedWaitGate` / `SanctionedWaitKind` (cyrup-original) | **struck — not a parity gap.** It widens budget forgiveness for DECLARED waits whose upstream handlers are awaited with no per-handler budget at all (`native.rs:76-…` cites them), i.e. it moves a cyrup-original limit toward pi's behaviour |
+> | chord: watch, do not port | **filed as `tracker` `EXT-088`**; escalation conditions re-checked at v0.87.1, none met. Slice (a) (harness `Context` re-founded on chord) is harness scope — `AGENT-028` / area 12 |
+> | `--tools` allowlist now applies to extension tools (cyrup `b28d3ff`) | **verified fixed, nothing to file**: pi `_refreshToolRegistry`'s `isAllowedTool` filters `allCustomTools` at v0.83.0 (`agent-session.ts:2460-2470`); cyrup's `ExtensionHost::active_tools_filtered` (`facade.rs:653-668`) is called from `builder.rs:1566`, `:3639` and `session/tools.rs:95` at `ea23ca2`. A pre-existing defect fixed with no id; recorded here as its only ledger trace |
+> | `HostServices::inject_message_ack` + `InjectOutcome` (cyrup-original) | **struck — not a parity gap**: an acknowledging variant for a native caller, default-deny, no pi surface to diverge from; noted so the host-services inventory is not silently stale |
+>
+> **Negative results from the full `runner.ts`/`loader.ts` read.** `snapshotEventHandlers` (v0.86.0):
+> cyrup already snapshots — `Dispatcher::subscribers_for` collects a `Vec` before the handler loop
+> (`dispatch.rs:290-295`, `:326`). Extension `setModel`/`setThinkingLevel` stay session-scoped on both
+> sides (pi `2ff8ba622`; cyrup `session/model.rs::set_model_resolved` never writes the settings default).
+> PowerShell `tool_call`/`tool_result` typings are TypeScript narrowing only; cyrup's events carry
+> `toolName` generically. `registerFlag`'s discriminated-union options are type-level; the runtime half
+> is `EXT-082`. The lazy jiti loaders, `virtual-modules.ts` and Node SEA / bundled-Node detection are
+> loader mechanism with no WASM counterpart. `withUIPrompt` → `EXT-075`; `emitBoundary` → `EXT-078`;
+> `restoreSystemMessages`/`context_with_system` → `EXT-079`; `isUserBashEventResult` + re-throw →
+> `EXT-077`; `on()` returning an unsubscribe → `EXT-080`; transactional load → `EXT-081`.
+>
+> **Still unread, and why:** `packages/chord/src/{delta/index.ts,facets/host.ts}` and
+> `coding-agent/src/experimental/**` — `EXT-088` is a tracker whose escalation conditions were checked,
+> not a port; the ~9k-line `packages/agent/src/harness/**` is `AGENT-028`'s. Nothing in
+> `core/extensions/` is unread for `v0.84.1..v0.87.1`.
+
+## RESOLVED 2026-09-24 — the 2026-09-14 census (history; every lead dispositioned in the block above)
 
 Three candidate surfaces: one from the `v0.84.1..v0.85.1` upstream window, two from
 `824a539e..b28d3ff` on the cyrup side.
 
-**Read this as a lead list.** No entry is audited. No entry carries a ledger id — id assignment
+**Read this as the record of a lead list — every entry is now dispositioned in the 2026-09-24 second-pass block above.** At the time of writing no entry was audited. No entry carries a ledger id — id assignment
 belongs to a pass that has read both sides. **No row in `## Open items` was opened, closed,
 re-severitied or otherwise touched.** Where an entry bears on a row that already exists, it is
 recorded as a lead against that row's id and the row is left exactly as it stands.
@@ -495,10 +563,18 @@ above opened nothing, closed nothing and re-severitied nothing.
 | ~~EXT-073~~ | ~~medium~~ **CLOSED 2026-08-15** | stale-port | S | Two fabrications in the WIT — **CLOSED 2026-08-15 on the residual.** All nine `:1135-1161` citations rewritten to the re-derived overload lines (`tool_call :1228`, `tool_result :1229`, `context :1207`, `message_end :1222`, `before_agent_start :1214`, `input :1231`, `user_bash :1230`, `before_provider_request :1209`, `after_provider_response :1213`), and both header occurrences of `session_info_changed … :1203` → `:1193`, in both copies. **A TENTH instance the item did not have, found by the guard:** `agent_settled … subscribed at :1225` — `:1225` is `tool_execution_end`, eight events away — live in FOUR files (both `world.wit` copies, `cyrup-ext-sdk/src/api.rs:51`, `cyrup-ext/src/event.rs:50`), and `session_info_changed … :1203` was in those same two `.rs` files too. **GUARD:** `every_subscribed_at_citation_names_the_event_pi_subscribes_on_that_line` pins the full 33-entry overload map and checks the cited line against the event the comment is about — a range check would have missed all eight of these, since every one is INSIDE `:1190-1231`. **Measured RED before: 8 sites.** |
 | ~~EXT-074~~ | ~~medium~~ **FILED AND CLOSED 2026-08-15** | stale-port | S | `models.set-model`/`set-thinking-level` advertised a COMMAND-only tier gate the host stopped enforcing — **FILED AND CLOSED 2026-08-15**, found while porting EXT-061's tier gate, not from the backlog. `world.wit` said `set-model: … // COMMAND-only at the host` and, for `set-thinking-level`, "an event-tier call is REJECTED with an observable error (like every `control.*` op) — never a silent no-op". Neither is true at HEAD: GAP-11 removed both gates (`host/live.rs:561-562` and `:580-581` take the UNGATED `guest_of`, each with an in-source note explaining why the deferral through the `control` mpsc dissolves the R-08-008 deadlock), and the comments never moved. `cyrup-ext-sdk/src/ctx.rs:68` carried the same claim in the file a guest author reads. **This is the MIRROR of this area's characteristic defect** — EXT-066 was a capability declared in the world with a dead backend; this is a RESTRICTION declared in the world that the backend does not apply — and it is the more dangerous direction on a parity surface, because a guest author who believes it writes their own tier plumbing to work around a gate that is not there. pi is ungated too (`setModel` `core/extensions/loader.ts:359-362`, `setThinkingLevel` `:369-372` @v0.83.0, both bound with only `assertActive`), so the CODE was the parity-correct half and the comments were the stale one — fixed in that direction at all three sites. |
 | EXT-075 | low | upstream-drift | S | `ui_prompt_start`/`ui_prompt_end` (pi v0.84.4) have no counterpart — **new, filed 2026-09-04** from the `v0.84.1..v0.84.4` diff-stat skim: `grep -rin ui_prompt crates/cyrup-ext/ crates/cyrup-ext-sdk/` is empty; pi wraps every guest-facing `ExtensionUIContext` prompt call (`select`/`confirm`/`input`/`editor`/`custom`) with a depth-tracked start/end event pair (`runner.ts:441-486` @v0.84.4) so a second extension can tell when another is blocking on its own UI prompt. Not covered by any existing item. **RE-READ 2026-09-14 at `9aeba769` — STILL OPEN at low; the newest row in the set holds unchanged, now verified at the CURRENT tag rather than the `v0.84.4` diff-stat skim it was filed from.** cyrup: a case-insensitive grep for ui_prompt / ui-prompt across `crates/cyrup-ext/` and `crates/cyrup-ext-sdk/` still returns ZERO — no WIT event in either `world.wit` copy, no `on-ui-prompt-*` export, no depth counter, no wrapping of the guest-facing prompt calls; `crates/cyrup-ext-sdk/src/ctx/ui.rs` reaches the host imports directly (the `set_status` wrapper at `:104-112` is representative of the shape — a thin passthrough with nothing around it). Upstream: the pair not only survived `v0.84.4 -> v0.85.1` but is fully wired at **v0.85.1** — `UIPromptKind` at `packages/coding-agent/src/core/extensions/types.ts:745`, `UIPromptStartEvent` at `:748-753` (`type: "ui_prompt_start"`, `reason: "ui_prompt"`, `kind`), `UIPromptEndEvent` at `:756-761`, both in the `SessionEvent` union at `:1098-1099` and on `ExtensionAPI.on` at `:1286-1287`. The runner mechanism the `Fix` must mirror is intact at v0.85.1: `private uiPromptDepth = 0` at `runner.ts:299`, the wrapper installed at `:437` (`this.uiContext = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext`), `wrapUIPromptContext` wrapping all five methods at `:441-449` (select/confirm/input/editor/custom), and `withUIPrompt` at `:453-462` with the outer-call-only guard `const outerPrompt = this.uiPromptDepth++ === 0` and the symmetric `if (--this.uiPromptDepth > 0) return;`. Kind `upstream-drift` SETTLED AT THE TAGS per the directory rule, not inferred from dates: the grep count for `UIPromptStartEvent` in `core/extensions/types.ts` is 0 @v0.83.0 AND 0 @v0.84.1, non-zero @v0.85.1 — it landed strictly after the ported baseline. Severity `low` correct (the impact really is limited to inter-extension coordination), and it remains uncovered by any other row. **RE-CONFIRMED STILL OPEN 2026-09-16 at `cc7818b`, re-measured rather than carried forward:** `git grep -in 'ui_prompt_start\|ui_prompt_end\|ui-prompt' -- crates/` is **0** workspace-wide — no counterpart in the WIT, the host or the SDK. **RE-CONFIRMED 2026-09-24**: `ui_prompt` still absent from `crates/cyrup-ext/src`, both WITs and `crates/cyrup-session-svc/src` at `ea23ca2`; upstream still subscribes `ui_prompt_start`/`ui_prompt_end` at v0.87.1. |
-| EXT-077 | medium | upstream-drift | S | **NEW 2026-09-24.** pi v0.86.0 made `user_bash` fail CLOSED: a throwing handler, or one returning anything but `undefined` / exactly one of `{operations}` / `{result}`, aborts the `!` command instead of running it locally. cyrup's `emit_user_bash` still fails OPEN (a faulting guard is contained and the command runs on the host) and accepts any `handled` value. See body. |
-| EXT-078 | low | upstream-drift | M | **NEW 2026-09-24.** pi v0.87.0 made `turn_end` actionable (`{entries, continue}` result, `messageEntryId`/`toolResultEntryIds`/`context` preview on the event) and added `agent_before_settle` with the same contract; cyrup's `on-turn-end` is notify-only and `agent_before_settle` does not exist. Needs `AGENT-038` and `SESS-052`. See body. |
+| EXT-077 | medium | upstream-drift | S | **NEW 2026-09-24.** pi v0.86.0 made `user_bash` fail CLOSED: a throwing handler, or one returning anything but `undefined` / exactly one of `{operations}` / `{result}`, aborts the `!` command instead of running it locally. cyrup's `emit_user_bash` still fails OPEN (a faulting guard is contained and the command runs on the host) and accepts any `handled` value. See body. **CANONICAL ROW (2026-09-24 second pass): area 12's `DRIFT-056` files the same defect (same pi v0.86.0 change, same `emit_user_bash` site) and is its duplicate — schedule, fix and close it here; `DRIFT-056` follows this row's status.** |
+| EXT-078 | low | upstream-drift | M | **NEW 2026-09-24.** pi v0.87.0 made `turn_end` actionable (`{entries, continue}` result, `messageEntryId`/`toolResultEntryIds`/`context` preview on the event) and added `agent_before_settle` with the same contract; cyrup's `on-turn-end` is notify-only and `agent_before_settle` does not exist. Needs `AGENT-038` and `SESS-052`. See body. **2026-09-24 second pass:** also carries retain-none compaction (a `CompactionEntryDraft` with `firstKeptEntryId: null`, v0.87.0), folded in from area 03's lead list. |
 | EXT-079 | low | upstream-drift | S | **NEW 2026-09-24.** pi v0.87.0 added `context_with_system` (runs after every `context` handler on the full transcript INCLUDING system messages; result sent verbatim) and stopped showing system messages to `context` handlers; cyrup has neither. Blocked on `AGENT-039`. See body. |
 | EXT-080 | low | upstream-drift | S | **NEW 2026-09-24.** pi v0.86.0's `pi.on()` returns an unsubscribe function (additions/removals during a dispatch apply to later dispatches); cyrup's event subscriptions are a registration-time bitset with no removal. See body. |
+| EXT-081 | medium | parity-bug | M | **NEW 2026-09-24 (second pass).** A WASM guest whose `init` fails (returns `Err`, traps, times out) leaves every registration it made during `init` — tools, commands, providers, flags, shortcuts, bus subscriptions — written through into the shared registry, and `load_wasm_with_caps` never releases its reserved id. pi drops a failed factory's extension object at every tag, and since v0.84.3 (`a69bef789`) also discards its queued provider registrations, flag defaults and loading-time bus subscriptions. See body. |
+| EXT-082 | low | upstream-drift | S | **NEW 2026-09-24 (second pass).** Registration-time validation is not surfaced: a guest tool with a non-object `parameters` is refused by `ToolDescriptor::validate` but the import discards the error, so the tool silently vanishes and `init` succeeds (pi v0.86.0 #9300 throws, failing the load with a named error); a flag whose `default` does not match its `type` is accepted and served (pi v0.84.3 `f47faf459` throws). See body. |
+| EXT-083 | medium | parity-bug | S | **NEW 2026-09-24 (second pass).** A guest `sendUserMessage` loses its options bag: `apply_pending_control` destructures `SendUserMessage { content, .. }` and calls `send_user_message(content, None)`, so `deliverAs: "followUp"` becomes a steer, and the text goes through `UserInput::text`'s `expand_templates: true` — slash-command dispatch, skill and template expansion — where pi never expands an extension's `sendUserMessage` (v0.83.0) unless it opts in with `expandPromptTemplates` (v0.84.2). See body. |
+| EXT-084 | low | upstream-drift | M | **NEW 2026-09-24 (second pass).** pi v0.86.0 makes `before_agent_start`'s `systemPromptOptions` a mutable, normalized sections object that later handlers observe and the final prompt is re-rendered from (`systemPrompt` becomes a derived getter; a returned `systemPrompt` sets `forceSystemPrompt`); cyrup passes `options` as an opaque read-only value and reduces only a whole-prompt replacement. See body. |
+| EXT-085 | low | upstream-drift | M | **NEW 2026-09-24 (second pass).** pi v0.86.0 `cache_warming_decision` (last handler's `action` wins, `runner.ts::emitCacheWarmingDecision`) has no counterpart. Blocked: the prompt-cache warmer it rides on (`core/cache-warmer.ts`) has no cyrup counterpart and **no area item owns it**. See body. |
+| EXT-086 | low | upstream-drift | M | **NEW 2026-09-24 (second pass).** A guest cannot make a model call through the session's configured providers: pi's `ctx.modelRegistry.complete()` (v0.84.1) and `stream()`/`streamSimple()` (v0.86.0, #8964) have no WIT verb; `interface models` is read-only plus `set-model`/`set-thinking-level`. See body. |
+| EXT-087 | medium | parity-bug | M | **NEW 2026-09-24 (second pass).** Guest `send-message` and `send-user-message` call `require_command_tier()`, so from any EVENT handler (`agent_end`, `agent_settled`, `tool_result`, …) they return the "deadlock guard" error; pi's `pi.sendMessage`/`pi.sendUserMessage` are plain `ExtensionAPI` methods callable from any handler (v0.83.0 `loader.ts:304-311`), and v0.87.0 defers a run requested from `agent_settled` until the settled dispatch ends. Subsumes the `agent_settled` deferral lead. See body. |
+| EXT-088 | *(tracker)* | not-ported | L | **NEW 2026-09-24 (second pass).** `@earendil-works/chord` — watch, do not port. Escalates when any of: `coding-agent/src/experimental/` loses its prefix; `core/extensions/` is deleted; a shipped release loads a chord facet bundle on the default CLI path; `packages/chord` declares a stable public API. None holds at v0.87.1. Not counted. See body. |
 
 ## EXT-054 — `ExtensionManifest.capabilities` is never read by any code path — the declared per-extension WASM sandbox grant model is entirely inert
 
@@ -1925,6 +2001,16 @@ Taken with `EXT-054`, **neither of cyrup's two controls stands between an instal
 
 **Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read; the pi caller that turns the throw into an aborted command was NOT read — the abort is the CHANGELOG's statement plus the runner's re-throw)
 
+> **CANONICAL ROW — 2026-09-24 second pass.** Area 12's `DRIFT-056` is a duplicate of this item (same
+> upstream change, pi v0.86.0 #9068; same cyrup site, `emit_user_bash`). Fix and close it here.
+> **The unread caller is now read:** `modes/interactive/interactive-mode.ts::handleBashCommand` @v0.87.1
+> wraps `emitUserBash` in `try { … } catch { return; }` with the comment "The extension runner already
+> reported the error. Do not fall back to local execution." (`:6733-6743`), so the interactive `!`
+> command is dropped silently after the error report; `modes/rpc/rpc-mode.ts`'s `bash` command
+> (`:564-…`) does not catch, so the throw propagates to the RPC command handler as an error response.
+> Both paths run nothing locally. The Fix's "render it as an aborted command" should therefore read:
+> interactive — report the extension error and do nothing else; RPC — return an error response.
+
 > **Filed 2026-09-24** at cyrup `ea23ca2` against pi `v0.87.1`. Kind settled by presence:
 > `isUserBashEventResult` occurs 0 times in `runner.ts` at v0.85.1 and 2 at v0.86.0.
 
@@ -2067,6 +2153,301 @@ dispatcher already snapshots `subscribers_for(kind)` per dispatch, which gives p
 
 **Verify** — A guest that unsubscribes from `turn_end` inside its own `turn_end` handler is called
 for the current dispatch and not the next one.
+
+---
+
+## EXT-081 — A WASM guest whose `init` fails leaves its registrations in the shared registry and its id reserved
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** confirmed (both sides read; not reproduced live)
+
+> **Filed 2026-09-24 (second pass).** Two halves with different provenance. The per-extension half
+> (tools, commands, shortcuts, handlers vanish with a failed factory) holds at pi v0.83.0 — the failed
+> `Extension` object is simply never added to `extensions` — so it is a gap in the original port. The
+> runtime half (provider registrations, flag defaults, loading-time bus subscriptions discarded) is pi
+> v0.84.3, `a69bef789` "fix(coding-agent): discard failed extension factory state (#8424)" — first
+> tagged at v0.84.3, present at v0.87.1. Filed once, as `parity-bug`, because one fix covers both.
+
+**cyrup** — `crates/cyrup-ext/src/facade.rs::load_wasm_with_caps` (`:1969-…`) calls
+`self.reserve_id(&id)?` (`:1978`) and then `LiveExtension::load(…).await?` (`:2006`); on an `Err` the
+`?` returns with the id still in `loaded` — `release_id` (`:2579`) is called only from the native path
+(`load_native_inner`, `:402-418`, whose own comment concedes registrations "are left in place"). Inside
+`LiveExtension::load`, `call_init` (`host/live.rs:1573-1577`) maps a guest `Err`, a trap or an epoch
+timeout to `ExtError`, but every `registration.*` import the guest made before failing has already
+written through: `register_tool` → `registry.register_guest_tool` (`live.rs:108-152`),
+`register_command` (`:169-174`), `register_shortcut` (`:177-…`), `register_flag` → `registry.register_flag`
+(`:194-203`), `register_provider` → `registry.register_provider` → `ProviderHub::register`, "immediate
+upsert if the model registry is bound" (`live.rs:210-216`, `registry.rs:1114-1127`), and bus
+subscriptions on the host-shared `SharedBus`. Nothing unwinds them: `SharedBus::unsubscribe_all` runs
+only from `GuestState::invalidate` on reload (`host/services.rs:2024-2038`).
+`discover_and_load` records the failure (`facade.rs:2086-2091`) and moves on.
+
+**upstream** — `packages/coding-agent/src/core/extensions/loader.ts` @v0.87.1:
+`createExtensionAPI` (`:228-…`) returns `{api, commit, discard}`; while `state === "loading"`,
+`registerProvider`/`unregisterProvider` are queued (`applyRuntimeChange`, `:425`), flag defaults go to
+`pendingFlagValues`, and `events.on` subscriptions are tracked in `loadingUnsubscribers`;
+`initializeExtension` (`:536-…`) calls `commit()` only after the factory resolves and `discard()` on a
+throw — `discard` (`:462-…`) marks the API `failed` (every later call throws "failed to load and its API
+is no longer active"), unsubscribes the loading-time bus handlers and drops the queues. The failed
+extension's own `tools`/`commands`/`shortcuts`/`handlers` maps die with its object at every tag.
+
+**Impact** — One extension whose `init` fails midway (a bad config, a missing capability, a trap)
+leaves: its commands in `/` autocomplete, answering "no live owner" when run; its tool names claimed
+under first-wins, so a later extension offering the same name is refused with a conflict diagnostic
+naming a broken extension; its provider's models listed in `/model` and selectable, failing at the first
+request; its flags registered; its bus subscriptions receiving deliveries for an instance that does not
+exist. A retry of the same id in the same process fails with `DuplicateId`. `materialize_guest_tools`
+also re-arms the tools-dirty flag on every refresh for the dead owner's descriptors (`facade.rs:720-724`),
+so the refresh never goes quiet.
+
+**Fix** — Make the guest load transactional the way pi's is. Simplest correct shape: on any `Err` after
+`reserve_id`, call a new `ExtensionRegistry::purge_owner(&id)` (drop guest tools, commands,
+autocomplete opt-ins, shortcuts, renderers, flags it owns, providers it owns via `provider_owner` —
+unregistering them from the hub — and its recorded provenance), `bus.unsubscribe_all(&id)`, and
+`release_id(&id)`. Use the same purge on the native path in place of its "left in place" note.
+
+**Verify** — A guest that registers a tool, a command, a provider and a flag and then returns `Err`
+from `init`: after the load, none of the four is visible (`extension_tools`, `get_commands`,
+`provider_pending_ids`/model list, `get_flag`), and loading a fixed build under the same id succeeds.
+
+---
+
+## EXT-082 — Registration-time validation is swallowed: a schema-less tool vanishes silently and a mistyped flag default is accepted
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
+
+> **Filed 2026-09-24 (second pass).** Tool half: pi v0.86.0 (#9300) — "must define an object parameter
+> schema" absent from `loader.ts` at v0.85.1, present at v0.86.0. Flag half: pi v0.84.3 (`f47faf459`,
+> "register flag type mismatch (#8123)") — "Invalid default for flag" absent at v0.84.2, present from
+> v0.84.3.
+
+**cyrup** — Tool: `crates/cyrup-ext/src/registry.rs::ToolDescriptor::validate` (`:57-71`) already
+refuses a non-object `parameters` — the same rule as pi — but `host/live.rs::register_tool` builds
+`parameters` with `serde_json::from_str(..).unwrap_or(Value::Null)` (`:110`) and discards
+`register_guest_tool`'s result with `let _ =` (`:148-151`), and the import returns `()`, so the guest
+never learns and `init` succeeds with the tool silently absent. Flag: `live.rs::register_flag`
+(`:194-203`) stores any spec; `host/services.rs::GuestState::get_flag` (`:2119-2142`) returns its
+`default` whatever its JSON type.
+
+**upstream** — `loader.ts` @v0.87.1: `registerTool` throws `Tool "<name>" registered by extension
+"<path>" must define an object parameter schema.` (`:274-279`); `registerFlag` throws `Invalid default
+for flag "<name>": expected <type>, got <typeof default>` (`:312-316`). Both throw inside the factory,
+so the load fails and the error is reported against the extension.
+
+**Impact** — A guest author who ships a malformed schema sees an extension that "loads" and a tool that
+is not there, with no diagnostic anywhere; pi names the tool and the extension. A `boolean` flag with a
+string default reads back as a string. Low: authoring errors, not runtime behaviour.
+
+**Fix** — Have `register_tool` and `register_flag` record a load diagnostic on refusal (the import
+signatures cannot change without a world bump, so collect the error on `GuestState` and fail
+`LiveExtension::load` after `call_init` returns if any was recorded — pi's outcome). Validate a flag's
+`default` against its `type` in `ExtensionRegistry::register_flag`.
+
+**Verify** — A guest registering `parameters_json = "[]"` fails to load with an error naming the tool;
+one registering `{"type":"boolean","default":"yes"}` fails with pi's message.
+
+---
+
+## EXT-083 — A guest `sendUserMessage` loses its options: `deliverAs` is ignored and the text is always expanded
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read at v0.83.0 and v0.87.1)
+
+> **Filed 2026-09-24 (second pass)**, from the v0.84.2 `expandPromptTemplates` hunk in this pass's
+> `core/extensions` window. The expansion half is a gap at the ported tag: pi v0.83.0's
+> `AgentSession.sendUserMessage` calls `prompt(text, { expandPromptTemplates: false, streamingBehavior:
+> options?.deliverAs })` unconditionally. v0.84.2 made the `false` a default the caller may override.
+
+**cyrup** — `crates/cyrup-ext/src/host/live.rs::send_user_message` (`:1304-1315`) queues
+`ControlOp::SendUserMessage { content, opts }` (`host/services.rs:159-162`) with the parsed options.
+`crates/cyrup-session-svc/src/session/control.rs::apply_pending_control` destructures it as
+`ControlOp::SendUserMessage { content, .. }` and calls `self.send_user_message(content, None)`
+(`:127-135`) — `opts` is dropped. `send_user_message` (`session/inject.rs:37-53`) then routes a
+running session to `steer` for any `deliver_as` other than `FollowUp`, i.e. always, and converts the
+`String` through `UserInput::text`, which sets `expand_templates: true` (`event.rs:39-46`); `prepare`
+honours it — extension-command dispatch for a leading `/` (`session/run.rs:482-489`) and skill /
+template expansion.
+
+**upstream** — `agent-session.ts` @v0.87.1 `sendUserMessage` (`:2004-2032`):
+`expandPromptTemplates: options?.expandPromptTemplates ?? false`, `streamingBehavior: options?.deliverAs`;
+`types.ts` documents the option as opt-in ("Set expandPromptTemplates to dispatch extension commands and
+expand skill commands and prompt templates").
+
+**Impact** — An extension that relays text (a chat bridge, a macro, a subagent summary) and happens to
+send something beginning with `/` runs that slash command in cyrup instead of sending it as a message;
+text containing a skill or template reference is rewritten before the model sees it. An extension that
+asks for `deliverAs: "followUp"` while the agent is running gets a steer — its message interrupts the
+current turn instead of waiting for it to finish.
+
+**Fix** — In `control.rs`, parse `opts` into `{deliverAs, expandPromptTemplates}`; build the
+`UserInput` with `expand_templates = expandPromptTemplates.unwrap_or(false)` and pass `deliverAs`
+through to `send_user_message`. Mirror it in the native `HostCtx` path and in `cyrup-ext-sdk`'s typed
+options.
+
+**Verify** — A command-tier guest sends `"/foo"` with `{}` while `/foo` is a registered command: the
+command does not run and a user message `/foo` is sent; with `{"expandPromptTemplates": true}` it runs.
+While streaming, `{"deliverAs":"followUp"}` lands in the follow-up queue.
+
+---
+
+## EXT-084 — `before_agent_start`'s `systemPromptOptions` became mutable sections in pi v0.86.0; cyrup's is an opaque read-only value
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed
+
+> **Filed 2026-09-24 (second pass).** `forceSystemPrompt` absent from `runner.ts` at v0.85.1, present
+> at v0.86.0. Bears on the closed `EXT-061` (`getSystemPromptOptions`), which ported the v0.85 read-only
+> shape.
+
+**cyrup** — `crates/cyrup-ext/src/facade.rs::emit_before_agent_start` (`:881-918`) dispatches
+`HostEvent::BeforeAgentStart { prompt, images, system_prompt, options, injected }`; the reduction in
+`contract.rs` (`:154-169`) applies only `EventPatch::SystemPromptAndInject { system, inject }` —
+a whole-prompt replacement and injected messages. `options` goes out and never comes back.
+
+**upstream** — `runner.ts` @v0.87.1 `emitBeforeAgentStart` (`:1312-…`): `currentOptions =
+normalizeBuildSystemPromptOptions(options)` is handed to every handler as a MUTABLE object;
+`event.systemPrompt` is a getter re-rendering `buildSystemPrompt(currentOptions)`, so a later handler
+sees an earlier handler's section edits; a returned `systemPrompt` sets
+`currentOptions.forceSystemPrompt` (`:1347`); the result is `{messages, systemPromptOptions}`, and
+`agent-session.ts` (`:1703-1714`) keeps a handler's `selectedTools` edit or falls back to the live
+loadout. `types.ts` `BeforeAgentStartEvent` (`:737-747`): "Mutable prompt sections. Later handlers
+observe mutations made by earlier handlers."
+
+**Impact** — An extension that wants to add one section (a rule, a context file, a tool snippet)
+must, in cyrup, rebuild and replace the entire prompt string, discarding any other extension's
+section edits and every future pi change to the base prompt; in pi it edits the section and the host
+renders. Depends on `SESS-054` (pi's sectioned prompt), which cyrup does not yet render.
+
+**Fix** — After `SESS-054`: carry a typed `SystemPromptOptions` on the event, accept an
+`EventPatch::SystemPromptOptions` from each handler, re-render between handlers, and treat a returned
+string as `force_system_prompt`. Thread the resulting options (not a string) back into the session's
+prompt build.
+
+**Verify** — Two guests: the first appends a rule via options, the second reads `systemPrompt` and
+sees it; the final prompt contains the rule; a third returning a string replaces everything.
+
+---
+
+## EXT-085 — `cache_warming_decision` (pi v0.86.0) has no counterpart, and the warmer it rides on has no owner
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (upstream read; cyrup absence by `grep -rniI 'cache.warm\|cache_warm\|warmer' crates/` = empty at `ea23ca2`)
+
+> **Filed 2026-09-24 (second pass)**, promoted from the first pass's lead list. `emitCacheWarmingDecision`
+> absent from `runner.ts` at v0.85.1, present from v0.86.0.
+
+**cyrup** — No event kind, no WIT export, no host call; and no prompt-cache warmer at all.
+
+**upstream** — `runner.ts` @v0.87.1 `emitCacheWarmingDecision` (`:1020-…`): runs every handler, the
+last defined `result.action` wins, the event's own `action` otherwise; wired from `sdk.ts:309` into
+`core/cache-warmer.ts`. `types.ts` registers `on("cache_warming_decision", …)` (`:1385`).
+
+**Impact** — None until cyrup has a cache warmer: an extension that would veto or force a warm has
+nothing to decide. Recorded because **the warmer itself has no item in any area file** — area 05 notes
+the `cacheWarming` setting as a lead and `CFG-085` carries only `promptCache` metadata.
+
+**Fix** — Blocked. When a warmer is ported (area 01/08 to own it), add `EventKind::CacheWarmingDecision`
+with a last-wins reduction over `{action}`.
+
+**Verify** — With a warmer present: a guest returning `{action: "skip"}` suppresses the warm.
+
+---
+
+## EXT-086 — A guest cannot make a model call through the session's providers (`ctx.modelRegistry.complete/stream/streamSimple`)
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed
+
+> **Filed 2026-09-24 (second pass)**, promoted from the first pass's lead list. Bisected on
+> `coding-agent/src/core/model-registry.ts`: no `complete`/`stream`/`streamSimple` method at v0.83.0;
+> `complete` at v0.84.1 and v0.85.1 (`:103`); all three at v0.86.0 (coding-agent CHANGELOG 0.86.0:
+> "Added `ctx.modelRegistry.stream()` and `streamSimple()` for extension model calls through configured
+> providers with resolved authentication (#8964)").
+
+**cyrup** — `crates/cyrup-ext/wit/world.wit` `interface models` (`:849-…`) offers `list-models`,
+`scoped-models`, `current`, `set-model`, `context-usage`, `thinking-level`, `set-thinking-level` — no
+call verb. `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register (`:35-39`) records `modelRegistry` as a
+live object deliberately not mirrored and says its DATA is exposed via `models`; a model call is an
+operation, not data, so the register does not cover it. The new cyrup-original
+`HostServices::registered_provider` hands the session provider to a NATIVE caller only.
+
+**upstream** — `model-registry.ts` @v0.87.1: `streamSimple(model, context, options)` (`:115-117`) and
+`complete(…)` (`:119-…`) delegate to the model runtime with auth resolved; reachable from any handler
+as `ctx.modelRegistry`.
+
+**Impact** — A guest that needs an LLM call (summarise, classify, a review pass) must bring its own
+HTTP client, endpoint and API key under the `net` capability, bypassing the user's configured
+providers, OAuth and the `before_provider_request` hooks; pi extensions reuse the session's auth.
+
+**Fix** — A `models.complete: func(model-json, context-json, opts-json) -> result<string, string>`
+(and, if streaming is wanted, a chunked variant polled like `host-tool.is-cancelled`), served by
+`HostServices` through the session's provider registry with auth resolved, gated by a manifest
+capability. Record the decision either way; if deferred, extend the CYRUP-DELTA register to say so.
+
+**Verify** — A guest calls `models.complete` against the faux provider and receives its text; a guest
+without the capability is refused.
+
+---
+
+## EXT-087 — Guest `sendMessage`/`sendUserMessage` are command-tier only; pi allows both from any handler
+
+**Kind** parity-bug · **Severity** medium · **Effort** M · **Confidence** confirmed (both sides read; mechanism divergence that costs behaviour)
+
+> **Filed 2026-09-24 (second pass)**, while resolving the `agent_settled` deferral lead (pi v0.87.0),
+> which it subsumes. The gate is cyrup's deadlock rule (arch-08 §6.3), a stated mechanism difference;
+> README's rule keeps it on the list because it costs behaviour.
+
+**cyrup** — `crates/cyrup-ext/src/host/live.rs::send_message` (`:1291-1303`) and `send_user_message`
+(`:1304-1315`) both open with `guest.require_command_tier()?`, which returns
+`"deadlock guard: session-mutating control op from an event handler"` unless the guest is running a
+command (`host/services.rs:2082-2093`, whose doc lists `send-message`/`send-user-message` among the
+gated ops). `world.wit` states the rule on `interface control` (`:1136-1141`). `set-model` /
+`set-thinking-level` were exempted (GAP-11) and queue unconditionally; the two send ops were not.
+Queued control ops are drained after a command handler (`session/commands.rs:62`, `:159`) — there is no
+drain point after an event dispatch for them.
+
+**upstream** — `loader.ts` @v0.83.0 `sendMessage` / `sendUserMessage` (`:304-311`) — only
+`runtime.assertActive()`; callable from every event handler. `agent-session.ts` handles a call during a
+run by queueing (`deliverAs`) and, since v0.87.0, a call during the `agent_settled` dispatch by
+deferring it until every settled handler finishes (`_isEmittingAgentSettled` /
+`_deferredSettledActions`, `:873-890`, `:1607-1608`, `:1956-1957`).
+
+**Impact** — The common extension patterns built on these calls cannot be written as guests:
+continue-after-`agent_end` loops, "on `tool_result`, inject a follow-up", "on `agent_settled`, start
+the next queued job", a watchdog that sends a correction message. The guest gets an error string.
+
+**Fix** — Exempt `send-message`/`send-user-message` from `require_command_tier` the way GAP-11 exempted
+the model ops: queue them unconditionally, and drain them at the session's store-free points — after
+`agent_end`/`agent_settled` dispatch (deferring a run request until the settled dispatch completes, as
+pi v0.87.0 does) and at the turn-boundary drain for steer/follow-up delivery while running. The
+deadlock the gate prevents is re-entry into a guest's store; a queued op applied after the dispatch
+returns cannot re-enter it.
+
+**Verify** — A guest whose `agent_settled` handler calls `send-user-message("next")`: no error, exactly
+one new run starts after the settled dispatch, and the handler is not re-entered by that run's
+`agent_start` during its own dispatch.
+
+---
+
+## EXT-088 — `@earendil-works/chord`: watch, do not port
+
+**Kind** not-ported · **Severity** *(tracker)* · **Effort** L · **Confidence** upstream re-read at v0.87.1 for the escalation conditions only
+
+> **Filed 2026-09-24 (second pass)** as the `tracker` the 2026-09-14 census recommended. Proposes no
+> schedulable work and is outside every tally.
+
+**cyrup** — no counterpart: `crates/cyrup-ext/wit/world.wit` has no service-token, keyed-instance,
+replicated-state or per-process-facet concept (the census's negative greps).
+
+**upstream** — `packages/chord` (0 files at v0.84.4, 39 at v0.85.0, `package.json` version `0.87.1` at
+v0.87.1) is an application-composition runtime whose only coding-agent consumer is
+`src/experimental/**` (47 files at v0.85.1, 55 at v0.87.1), exported only as `./experimental/plugin` and
+excluded from the published build (`package.json:25-33` @v0.87.1: `"!dist/experimental"`).
+`core/extensions/` is still the production path at v0.87.1 and grew (`jiti-loader.ts`,
+`jiti-static-loader.ts`, `virtual-modules.ts`). `PLANNING.md:3` still reads "This is not a stable public
+API contract yet."
+
+**Escalation — enters the work set when ANY holds at a pi tag:** (1) `src/experimental/` loses the
+`experimental` prefix or the `./experimental/plugin` export is renamed to a stable subpath;
+(2) `core/extensions/` is deleted or stops being loaded on the default CLI path; (3) a shipped release
+loads a chord facet bundle on the default CLI path; (4) `packages/chord` declares a stable public API.
+**None holds at v0.87.1.** Slice (a) of the census — pi's harness `Context` re-founded on
+`@earendil-works/chord/context` — is harness scope and belongs to `AGENT-028` / area 12, not here.
 
 ---
 
