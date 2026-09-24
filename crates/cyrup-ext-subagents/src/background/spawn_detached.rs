@@ -211,6 +211,10 @@ pub fn spawn_detached_runner_with_command(
     let stderr_file = std::fs::File::create(stderr_log_path).map_err(SubagentError::Spawn)?;
 
     let mut command = tokio::process::Command::new(&spawn_command.binary);
+    // SUBA-110: drop inherited git routing variables BEFORE the overlay (pi
+    // `async-execution.ts:729` @v0.71.0 spreads `omitGitRoutingEnv(process.env)` first). This
+    // removes named keys only, so the crate's "never `env_clear`" rule below still holds.
+    crate::spawn::git_env::omit_inherited_git_routing_env(command.as_std_mut());
     command
         .args(&spawn_command.base_args)
         .arg(SUBAGENT_RUNNER_SUBCOMMAND)

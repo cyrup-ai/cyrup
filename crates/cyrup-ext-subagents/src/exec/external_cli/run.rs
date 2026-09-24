@@ -179,6 +179,11 @@ pub async fn run_external_cli_process(
     command.stdin(std::process::Stdio::piped());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
+    if plan.env.is_none() {
+        // SUBA-110: the inherited default drops git routing variables (pi
+        // `external-cli-runner.ts:91` @v0.71.0); an adapter allowlist below is left as written.
+        crate::spawn::git_env::omit_inherited_git_routing_env(command.as_std_mut());
+    }
     if let Some(env) = &plan.env {
         // The ONE place this crate calls `env_clear`. `crate::spawn::ChildSpawnSpec` documents the
         // opposite rule for the native subagent child, and that rule is right there and wrong here:
