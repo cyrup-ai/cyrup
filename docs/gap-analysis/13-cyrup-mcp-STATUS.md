@@ -7,6 +7,15 @@
 
 ## Provenance
 
+> ### CURRENT PIN — 2026-09-24. cyrup **`ea23ca2`** · `pi-mcp-adapter` **v2.37.0** (`28049de`)
+>
+> | | measured at | window read this pass | window still unread |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **v2.37.0** (clone at `86f3e20` = `v2.37.0-2-g86f3e20`) | `v2.33.0..v2.37.0` = **173 files, +15 550 / −4 169, 57 non-merge commits** (140 files / +13 027 / −2 677 excluding `dist/` and `package-lock.json`), triaged commit by commit — see *Re-measure — 2026-09-24* below. 11 units filed (`MCP-540`–`MCP-550`), each read on both sides | **`v2.32.1..v2.33.0` is still held only as the 2026-09-14 UNVERIFIED lead list** — no unit was filed from it this pass either (two of its leads are withdrawn upstream, below). Commits in `v2.33.0..v2.37.0` that are listed as *leads* below were read on the upstream side only. `v2.37.0..HEAD` (2 commits, 7 files, +157 / −14) is untagged and not measured |
+> | `cyrup` | **`ea23ca2`** | `git diff 9aeba769..ea23ca2 -- crates/cyrup-mcp` is **one line** (`owner.rs`: the `editor_has_focus` arm in `OwnedServices`' `fenced!` block, from `838eac7`). `git diff 16edcde..ea23ca2 -- crates/cyrup-mcp` — i.e. since the squash that landed the crate, which the 2026-09-04 re-audit read — is 6 files, +71 / −82: `0aefd08` (two test assertions flipped by `serde_json/preserve_order`), `dd44b3c` (the `PI_MCP_ADAPTER_*` aliases dropped), `838eac7` (the line above) | The 159 open rows the 2026-09-04 sample did not draw were **not re-derived from the TypeScript** this pass either; see the method note below for what "re-verified" means here |
+>
+> Numbering resumes from **`MCP-551`**.
+
 > ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
 >
 > Everything in this file is history and is correct as written. Its 2026-08-21 census was audited
@@ -45,6 +54,164 @@ any single row below as a lead rather than a verdict.
 **What this is not.** No row here was verified by building or running anything; every ruling is a
 reading of source. `cut` and `open-decision` units are reported `not-applicable` and are NOT work.
 
+
+## Re-measure — 2026-09-24, at cyrup `ea23ca2` / `pi-mcp-adapter` v2.37.0
+
+**Method.** Upstream read only as `git -C tmp/pi-mcp-adapter show v2.37.0:<path>` (and `v2.34.0`,
+`v2.35.0` where a change's landing tag mattered), plus `git diff v2.33.0..v2.37.0 -- <path>` and
+`git show <commit>`; never the working tree. cyrup read at `ea23ca2`. No build, no test, no clippy —
+this is a reading of source, like every pass before it. A unit below was filed only where **both**
+sides were opened: the upstream function at the tag, and the cyrup function that does or does not
+do the same thing. Everything read on one side only is in *Leads*, labelled so.
+
+### Open rows re-verified — none moves, by observation, not by argument
+
+The code under every open row is **byte-identical** to what the 2026-09-14 pass read at `9aeba769`,
+except one line: `git diff 9aeba769..ea23ca2 -- crates/cyrup-mcp` is the single added
+`fn editor_has_focus(&self) -> bool => false;` arm in `owner.rs`'s `OwnedServices` `fenced!` block
+(`838eac7`), which keeps `MCP-006`'s "every `HostServices` method is fenced" obligation met as the
+trait grew (`cyrup-ext/src/host/services.rs` gained the method in the same window). No other crate an
+area-13 row cites moved in a way that touches a row: `cyrup-ext`'s `native.rs` change is the
+`SanctionedWaitGate` rename (subagents' dispatch budget), and `register_late_tool` /
+`take_tools_dirty` (`MCP-037a`) are unchanged in `cyrup-ext/src/facade.rs`. **So no `partial` or
+`missing` row can have been closed by code since its last reading**, and none is closed here.
+Falsification condition: any non-test hunk in `git diff 9aeba769..<sha> -- crates/cyrup-mcp` other
+than that `owner.rs` line voids this paragraph.
+
+The 13 `TODO(MCP-NNN)` marker ids are re-counted at `ea23ca2` and are the same 13 (`MCP-082`,
+`MCP-084` — the latter a historical mention in `secrets.rs`' doc, the unit is `implemented` —
+`MCP-235`, `MCP-269`, `MCP-278`, `MCP-283`, `MCP-287`, `MCP-309`, `MCP-312` ×3, `MCP-341`, `MCP-347`,
+`MCP-368`, `MCP-377`).
+
+**One `implemented` row's evidence is re-ruled in place: `MCP-282`.** Both sides read. Upstream at
+v2.37.0 still spells every switch `PI_MCP_ADAPTER_*` and has **added two**:
+`PI_MCP_ADAPTER_BEARER_COMMAND_TTL_MS` (`bearer-command-resolver.ts:4`) and
+`PI_MCP_ADAPTER_OAUTH_FILE_KEY` (the encrypted-file store, `mcp-auth.ts`). cyrup's
+`credentials.rs` declares the six as single-name `&str` constants (`TEST_AUTH_STORE_ENV` …
+`TEST_LINUX_KEYRING_RECOVERY_ENV`) read through `env_lookup` — the dual-read the row's evidence
+describes was deleted by `dd44b3c` as a workspace-wide owner decision ("Drop every PI_* env-var
+alias in favor of CYRUP_-only"). Status stays **`implemented`** against the obligation *restated*
+as "each surviving switch honoured under its `CYRUP_MCP_*` name"; the `PI_*` half is a recorded,
+deliberate divergence, not open work. The two new switches belong to units that do not exist in
+cyrup yet (`MCP-541`'s neighbours in *Leads*), not to `MCP-282`.
+
+### The census, re-derived (counted, 488 units)
+
+Re-parsed from the rows of *Every unit, by section* (437) plus tables A/B (40) plus table C below
+(11) — one bold status cell per row, counted by script. It supersedes the 2026-09-04 counted column,
+which predates the 2026-09-14 re-rulings.
+
+| status | 2026-09-04 (437, counted) | 2026-09-24 — the 437 | + A/B `MCP-500`–`539` | + C `MCP-540`–`550` | **2026-09-24 total (488)** |
+|---|---:|---:|---:|---:|---:|
+| `implemented` | 244 | **252** | 0 | 0 | **252** |
+| `partial` | 82 | **75** | 0 | 0 | **75** |
+| `missing` | 84 | **83** | 35 | 10 | **128** |
+| `not-applicable` | 27 | **27** | 5 | 1 | **33** |
+
+By section, the 437: 13a 17/18/15/1 · 13b 33/9/5/4 · 13c 16/14/16/5 · 13d 32/3/1/0 ·
+13e 39/4/5/5 · 13f 32/5/0/4 · 13g 38/7/1/3 · 13h 35/6/13/1 · 13i 10/9/27/4
+(implemented / partial / missing / n-a). **This is still a floor on done-ness and a ceiling on
+nothing**: 159 open rows have not been re-derived from the TypeScript since 2026-08-21, the
+2026-09-04 sample says roughly four in five of those are stale in the "actually done" direction, and
+no pass has yet re-read the 252 `implemented` rows against v2.33.0+ upstream — this pass found three
+whose *upstream* obligation moved under them (`MCP-061`, `MCP-072`, `MCP-222`; see table C).
+
+### The upstream window `v2.33.0..v2.37.0`
+
+Releases 2.34.0 (2026-09-14), 2.35.0 (2026-09-20), 2.36.0 (2026-09-21), 2.37.0 (2026-09-23).
+Production TypeScript (`*.ts` excluding `__tests__/`, `dist/`, `conformance/`, `examples/`,
+`*.test.ts`, `*.d.ts` — a narrower filter than the 2026-09-14 census used, so its 72/84 figures do
+not compare) went **73 → 81 files, 28 109 → 31 379 lines**. New production modules:
+`mcp-tasks.ts`, `bearer-command-resolver.ts`, `direct-tool-surface.ts`, `secure-keyring.ts`,
+`semantic-search.ts`, `jev-client.ts`, `jev-contracts.ts`, `jev-key-store.ts`,
+`agent-plugin-provenance.ts`. **Deleted**: `mcp-refresh-lock.ts` and `oauth-diagnostics.ts`
+(`bdb89b7`, #563, "withdraw preview transaction dependencies"; the 2.34.0 changelog: "Cross-process
+OAuth transaction serialization remains unavailable until the official SDK exposes the required
+support").
+
+**Two 2026-09-14 leads are withdrawn by upstream itself** and must not be filed: the
+cross-process OAuth credential-transaction lock (13f's lead on `mcp-refresh-lock.ts`) and the
+`PI_MCP_OAUTH_LOG` transaction diagnostics (13g's lead on `oauth-diagnostics.ts`). Both files exist at
+v2.33.0 and at no later tag (`git cat-file -e v2.37.0:<file>` fails). Their lead text in 13f/13g is
+left standing because it is true at v2.33.0; this note is the correction.
+
+**Table C — both sides read.** Kind for every row: `upstream-drift`.
+
+| id | sev | § | verdict | status | title | upstream | cyrup at `ea23ca2` |
+|---|---|---|---|---|---|---|---|
+| `MCP-540` | **high** | 13b | `hand-written` | **missing** | a higher-precedence source that switches a server's transport drops the other transport's fields | `v2.37.0:config.ts:688-712` `mergeServerMaps`: an override carrying `command` deletes `url headers requestHeadersCommand caFile auth bearerToken bearerTokenEnv bearerTokenStore oauth httpTransport socket` from the inherited entry; one carrying `url` deletes `command args env cwd pluginDataDir literalEnv inheritEnv socket`. Present since **v2.27.0** (`1ead3a6`, the package-manifest commit — so this is `v2.26.1..v2.32.1` drift the 2026-09-04 triage did not catch); `bearerTokenStore` joined the `command` arm at v2.34.0 (`6f4a8f8`, #552) | `config.rs` `merge_entry` handles only the URL-change strip, and its doc comment states the opposite of upstream: *"The `command` ⇄ `url` case is deliberately not handled: upstream v2.25.0 does not handle it either, so a base `{command}` overridden by `{url}` produces a two-transport entry … and fails at connect"* with `runtime.rs` `select_transport`'s `must configure exactly one of command or url`. So a project `.mcp.json` that repoints a user-global stdio server at an HTTP URL (or the reverse) — a layering upstream supports — connects upstream and fails in cyrup. The v2.25.0 premise was true; it stopped being true at v2.27.0. Land with `MCP-500` (same function, same exhaustive destructure) |
+| `MCP-541` | medium | 13b/13e | `hand-written` | **missing** | self-namespaced tool names are not double-prefixed, and a formatted name produced by more than one tool or resource is **dropped and reported** rather than first-wins | `v2.37.0:types.ts:849-859` `formatToolName` returns the sanitised name unchanged when it already starts with `${prefix}_`; `:870 resolveUniqueNameOwnership` partitions entries into unique owners and collisions; `tool-metadata.ts:128-131` pushes every colliding `originalName` into `failedTools` and keeps only the unique ones (same helper at `metadata-cache.ts:255`, `mcp-references.ts:158`, `direct-tool-surface.ts:181`). v2.35.0, `1a5df72` (#614), `9bd91f4` (#600). At v2.33.0 `tool-metadata.ts` was first-wins via `seenNames` | `registration.rs` `format_tool_name` always emits `{p}_{sanitized}` (its test `format_tool_name_replaces_dots_only` pins that); `build_tool_metadata` is the v2.33.0 first-wins shape — `seen_names.contains(&name) ⇒ continue`, the loser neither registered nor reported. **Changes the upstream obligation under `MCP-072` and `MCP-207`, both recorded `implemented`**; neither row is edited — they were right at their tag |
+| `MCP-542` | medium | 13e | `hand-written` | **missing** | `structuredContent` is appended alongside ordinary content, not only used as the empty-content fallback | `v2.37.0:tool-registrar.ts:236-246 resolveMcpResultContent` — when both exist, returns `[...blocks, {type:"text", text:"structuredContent:\n" + JSON.stringify(sc, null, 2)}]`. v2.35.0, `97435aa` (#605) | `renderers.rs` `resolve_mcp_result_content` returns the transformed blocks as soon as they are non-empty; `structuredContent` is consulted only when they are empty. A server that sends a text summary **and** structured data loses the structured half before the model sees it. **Changes the upstream obligation under `MCP-222` (`implemented`)** |
+| `MCP-543` | medium | 13e | `hand-written` | **missing** | a fourth approval option, "Allow server for this session", bound to the server definition's hash | `v2.37.0:tool-approval.ts:151-194` — options `["Allow once","Allow for session","Allow server for this session","Deny"]` with a scope sentence in the dialog body; the grant is keyed to `session-approvals.ts:164 getServerApprovalIdentity` (the live definition object **and** `sha256(stableStringify(definition))`), re-checked before use and dropped on mismatch; `restoreSessionApprovalState` replaces `approvedServers` wholesale (`:182`) so a dialog opened on an old branch cannot grant. v2.35.0, `4becf97` (#628) | `proxy/constants.rs` `APPROVAL_OPTIONS` is `[&str; 3]`; `proxy/approval.rs` `ensure_tool_call_approved` has no server-scope grant. Sits beside the still-`partial` `MCP-232` (definition-hash cache key) — the two share the definition-hash computation and should land together |
+| `MCP-544` | medium | 13b | `hand-written` | **missing** | config writes resolve a symlinked target and preserve its file mode | `v2.37.0:config.ts:1161 writeConfigText` — `realpathSync(writePath)` then `statSync(...).mode & 0o777`, tmp written with that mode, `chmodSync`, rename onto the **real** path; tmp removed on failure. v2.35.0, `e9f9366` (#601) | `config.rs` `write_raw_config_object` renames `<path>.<pid>.tmp` onto `path` itself, and every config writer goes through it (`write_shared_server_entry`, `write_direct_tools_config`, `write_project_server_disabled_override`, `ensure_compatibility_imports`, `enable_host_config_discovery`): a symlinked `mcp.json` (a dotfiles checkout) is **replaced by a regular file** on the first such write, and a `0600` file becomes umask-default. Silent — the write reports success. Changes the upstream obligation under `MCP-061` |
+| `MCP-545` | medium | 13h | `host-verb` | **missing** | `/mcp edit [project\|global]` — open the shared config in the host editor, refuse non-object JSONC, reload after save | `v2.37.0:commands.ts:53 editSharedConfig` (`ctx.ui.editor`, default body `{"mcpServers": {}}`), `config.ts:1184 writeSharedConfigText` (top-level must be an object), `index.ts:1236` / `:1357` (the completion row and the dispatch arm). v2.35.0, `e9f9366` (#601) | `commands.rs` `MCP_SUBCOMMANDS` is the eight `reconnect tools prompts setup logout disable enable status`; no `edit`. Upstream's list is eleven at v2.37.0 (`jev` is `MCP-550`; `token` is the existing `MCP-504`). Depends on `MCP-544` for its write |
+| `MCP-546` | medium | 13i | `hand-written` | **missing** | the MCP Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663): poll task-handle tool results to completion, route task-time elicitation/sampling through the normal handlers, cancel the remote task on abort; per-server `tasks: false` | `v2.37.0:mcp-tasks.ts` (467 lines, new) — `:51 TASKS_EXTENSION_ID`, `:95 RawRequestChannel`, `:270 serverAdvertisesTasks`, `:311 attachTaskSession`, `:425 callToolViaTaskSession`; attached only when the connected 2026-07-28 server advertises it (`server-manager.ts:1190`), consumed from `direct-tools.ts:316` and `proxy-modes.ts:1619`; `ServerEntry.tasks` at `types.ts:509`. v2.35.0, `67b5f02` (#627) | `live.rs` `call_tool` answers `ServerResult::CreateTaskResult` with the error *"deferred the call to a task; this client does not poll `tasks/get`"*, and `sampling.rs`' `SAMPLING_TASKS_UNSUPPORTED` doc states the client never declares the extension. **Reachability**: a conforming server only returns a task handle to a client that opted in, so today's user-visible cost is "task-only tools are unusable", not a wrong result — the refusal is honest. Needs an rmcp-support check before it is sized |
+| `MCP-547` | medium | 13f | `hand-written` | **missing** | keychain payloads are chunked only on Windows; reassembly verifies the chunk digest; existing chunked records are compacted on an ordinary read | `v2.37.0:mcp-auth.ts:791 shouldChunkAuthPayload` — `store.kind !== 'encrypted-file' && length > AUTH_SECRET_CHUNK_SIZE && (process.platform === 'win32' \|\| TEST_AUTH_STORE_ENV === 'sizelimited')`; `:830` digest check on reassembly. v2.34.0, `49d9121` (#565), whose message names the user cost: every chunk is a separate macOS Keychain item that prompts separately, and "Always Allow" cannot stick across writes that mint new account names | `credentials.rs` `write_secure_auth_entry_to_store` chunks whenever `payload.len() > AUTH_SECRET_CHUNK_SIZE`, on every platform; `AUTH_SECRET_CHUNK_SIZE`'s doc calls it "both the chunk width **and** the chunking threshold" — the v2.33.0 shape. No compaction path |
+| `MCP-548` | low | 13b | `hand-written` | **missing** | a blank, whitespace-only or comments-only optional config layer is absent, not a load failure | `v2.37.0:config.ts:842` — `if (stripJsonComments(text, {trailingCommas:true}).trim() === "") return null;` before parsing. v2.34.0, `cfbade4` (#568) | `config.rs` `read_validated_config` hands the text straight to `parse_json_config` → `cyrup_permission_system::jsonc::parse_into`, whose `serde_json::from_str` fails on empty input, so an empty `.mcp.json` produces a `Failed to load MCP config from …` diagnostic every start. Loads the same servers; the cost is a spurious warning |
+| `MCP-549` | medium | 13b | `hand-written` | **missing** | `McpSettings` 26 → **33** keys, and the one of them with a merge-time default: `settings.exposeResources` | New at v2.34.0–v2.37.0 (`types.ts:590-682`): `allowInstall` (`:593`), `ancestorConfigRoots` (`:603`), `deferWithMissingMetadata` (`:609`), `namespaceProxyTools` (`:612`), `exposeResources` (`:628`), `jev` (`:630`), `oauthCredentialStore` (`:682`). `exposeResources` is the one this unit implements: `config.ts:382 applySettingDefaults` fills every entry whose own `exposeResources` is `undefined` from the setting (entry wins). `d417fb8` (#636) | `config.rs` `McpSettings` has 23 fields (upstream 26 minus Cut-4 `scriptMode` minus `MCP-503`'s two) and none of the seven; its doc still says "23 keys upstream". `ServerEntry::expose_resources` is per-entry only. `McpSettings` is `lenient`, so a v2.37.0 config parses — the new keys are silently ignored, which for `allowInstall: false` is the wrong direction to fail in once an install action exists. The other six keys' behaviour is in *Leads* |
+| `MCP-550` | n/a | 13d | `open-decision` | **not-applicable** | Jev / "System One" semantic tool search and script evaluation (`/mcp jev setup`, `settings.jev`, `SYSTEMONE_*` / `TYPESAFE_*` keys) | `jev-client.ts`, `jev-key-store.ts`, `semantic-search.ts`, `commands.ts setupJevSemanticSearch`; v2.35.0 `199b4da` (#616), v2.36.0 `39c94db` (#630), v2.37.0 `6aafee0` (#647). A third-party hosted ranking service with its own credential store | Ruled `open-decision` exactly as `MCP-529` (the Parallel Search preset) and `MCP-048` were: a vendor integration, not a parity obligation. Recorded so the next pass does not re-derive it. `mcpScript` evaluation half is Cut 4 regardless |
+
+**Totals after this pass: 488 units** — 477 + 11. Of the 11, 10 are open work, 1 is `open-decision`.
+
+### Leads — upstream read, cyrup side grep-only (NOT units; no id)
+
+Each names its commit. A "grep = 0" is over `crates/cyrup-mcp/src` at `ea23ca2`.
+
+- **`settings.deferWithMissingMetadata`** (13a) — `index.ts:672`, `:1115`; `e194276` (#643). Start
+  without connecting even when cached metadata is missing; those servers show no tools until the first
+  `mcp` call. grep = 0.
+- **`settings.ancestorConfigRoots`** (13b) — `config.ts:599 getConfiguredAncestorRoot`,
+  `:633 getAncestorProjectDirs`; `f0b83bc` (#556). A bounded ancestor-directory config source, read
+  **only** from user-global/explicit layers (a project file cannot widen it), realpath-contained under
+  `$HOME`, deepest root wins, farthest-first loading. A new rung shape for `ConfigContext::sources()`,
+  so it collides with `MCP-502` the same way. grep = 0.
+- **`settings.allowInstall: false`** (13a/13h) — `index.ts:1597`; `0e88e19` (#639). Gates the
+  `mcp({action:"install"})` path from the still-unfiled v2.33.0 one-URL-install lead; nothing to gate
+  in cyrup until that exists.
+- **`settings.namespaceProxyTools: false`** (13e) — `namespace-tools.ts:80`, `mcp-references.ts:101`;
+  `9561c80` (#599). An amendment to `MCP-513` (still `missing`), not a unit.
+- **`oauth.clientMetadataUrl` — Client ID Metadata Documents, SEP-991** (13g) — `mcp-auth-flow.ts:211`,
+  `config.ts:1039`; `b8fbc9c` (#571). cyrup's only mention is a comment in `oauth.rs` stating the
+  adapter publishes no CIMD document — true at v2.33.0, not at v2.34.0.
+- **`settings.oauthCredentialStore: "encrypted-file"`** (13f) — `mcp-auth.ts:44`, `mcp-auth-flow.ts:151`;
+  `e4cd1c8` (#580). AES-256-GCM files keyed by `PI_MCP_ADAPTER_OAUTH_FILE_KEY`, explicit opt-in, no
+  automatic fallback; Windows error 1312 points at it. grep = 0.
+- **Command-backed bearer tokens behind a TTL cache, 401 reconnect** (13f/13c) —
+  `bearer-command-resolver.ts` (new, 193 lines; `PI_MCP_ADAPTER_BEARER_COMMAND_TTL_MS`); `fbed2d6`
+  (#615). Not read against `secrets.rs`' command resolution.
+- **OAuth reconnect paths and expired-token rejection** (13g) — `234c6b7` (#629, "preserve OAuth state
+  during atomic reconnect"), `d3adc40` (#646, `getMcpOAuthTokensForUrl` no longer returns an expired
+  token with no refresh token). Not read against `oauth.rs`.
+- **Linux revoked-session-keyring recovery for bearer and Jev stores** (13f) — `secure-keyring.ts`
+  (new), `81f6731` (#626). cyrup already carries the keyctl recovery switches for OAuth
+  (`KEYRING_RECOVERY_*`); whether they cover the bearer store is moot until `MCP-501` exists.
+- **Direct tools** (13e) — `direct-tool-surface.ts` (new, 244 lines) extracted from `direct-tools.ts`;
+  `b835b0f` (#642) keeps `directTools: "search"` tools inactive until a search selects them even if
+  another extension re-enables them (amends the unfiled v2.33.0 search-mode lead); `db08047` (#612)
+  recovers stringified arguments through type arrays and unions (amends `MCP-516`/`MCP-517`);
+  `89c1b07` (#602) server-returned tool errors lose the input-schema guidance.
+- **Search ranking** (13d) — `12461cf` (#613) CJK and mixed-script lexical matching in
+  `search-ranking.ts`. Not read against `proxy/ranking.rs`.
+- **Output guard / footer** (13e/13h) — `de0dc45` (#603) oversized `structuredContent` summaries
+  self-identify as omitted; `7248ba0` (#604) footer status during deferred startup
+  (`utils.ts formatMcpFooterStatus`); `60aa1c6` (#634) the large-direct-tools advisory goes through the
+  UI.
+- **Cut, recorded so the cuts stay deliberate** — MCP Apps sandbox navigation and CSP (`f618d4d`,
+  `ui-server.ts`, `sandbox-proxy-template.ts`, `host-html-template.ts`) is **Cut 2**; `mcp-code.ts`,
+  `mcp-script-worker.mjs` and the `mcp-scripting` skill gating (`33bdc38`) are **Cut 4**; `67b5f02`'s
+  task-aware *MCP App* execution half is Cut 2 (its Tasks half is `MCP-546`).
+
+### A cyrup-side fact this pass found that no row holds
+
+`0aefd08` (`cyrup-acp`) turned `serde_json/preserve_order` on graph-wide, so `serde_json::Map` is now
+an `IndexMap` in this crate. Six doc comments in `crates/cyrup-mcp/src` still state the opposite as
+the premise of a design choice — `config.rs` (the `RawJson` type doc and `parse_json_config`'s
+"Do not route this through `serde_json::Value`" note), `proxy/tool.rs`, `proxy/approval.rs` (`approval_argument_preview`'s
+"recorded display divergence", which the flip in fact **resolves**: the preview now shows the
+model's key order, as upstream's does), `renderers.rs`, and `schema.rs` (`get_or_compile`'s "canonical
+key", which is now order-sensitive — a cache-efficiency cost only). The two places the order is
+load-bearing for correctness — the approval cache key and the metadata-cache server hash — go through
+`dirs::stable_stringify`, which sorts by construction, and are unaffected. Ownerless; a doc-only fix.
 
 ## UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not status)
 
@@ -1154,7 +1321,7 @@ divergence inside something that already exists, which is why they read as `part
 | `MCP-278` | medium | `hand-written` | **partial** | The storage acceptance suite (17 tests) | Definitively missing: the two subprocess cases — `routes revoked Linux keyring operations through the recovery helper` and `does not use the recovery helper for generic secure-store failures` (the fake `keyctl` exiting 99 and the assertion that the fake store file was never created). … |
 | `MCP-280` | high | `hand-written` | **implemented** | The keychain service name, and what happens to a co-installed pi-mcp-adapter | /home/user/cyrup/crates/cyrup-mcp/src/credentials.rs `AUTH_SECRET_SERVICE = "cyrup.mcp.oauth"` (125) and `LEGACY_AUTH_SECRET_SERVICE = … |
 | `MCP-281` | medium | `hand-written` | **implemented** | Adopt the keychain-mandatory posture | The unit's verify is only half covered: `the_store_unavailable_sentence_is_verbatim` asserts the sentence on the error type, but there is no … |
-| `MCP-282` | low | `hand-written` | **implemented** | Env-var namespace for the surviving switches | /home/user/cyrup/crates/cyrup-mcp/src/credentials.rs declares all six switches as `[&str; 2]` pairs with `CYRUP_MCP_*` first: `TEST_AUTH_STORE_ENV` … |
+| `MCP-282` | low | `hand-written` | **implemented** | Env-var namespace for the surviving switches | /home/user/cyrup/crates/cyrup-mcp/src/credentials.rs declares all six switches as `[&str; 2]` pairs with `CYRUP_MCP_*` first: `TEST_AUTH_STORE_ENV` … — **Re-ruled 2026-09-24 at `ea23ca2` (evidence, not status): the dual-read described above no longer exists.** `dd44b3c` collapsed all six to single-name `&str` `CYRUP_MCP_*` constants read through `env_lookup`, as a workspace-wide owner decision. Stays `implemented` against the obligation restated as "each surviving switch honoured under its `CYRUP_MCP_*` name"; the `PI_MCP_ADAPTER_*` half is a recorded divergence. See *Re-measure — 2026-09-24*. |
 | `MCP-283` | medium | `hand-written` | **partial** | The cache acceptance suite (13 tests) | Not ported, each a distinct upstream case: (a) `normalizes publication exactly as a later store reload does` — no test asserting an unknown key is dropped identically on the publish (hit) path and the store-reload (miss) path; only the generic `unknown_keys_are_dropped_not_rejected` exists; (b) the … |
 | `MCP-284` | medium | `hand-written` | **implemented** | The parse-error wrapping asymmetry between read and remove | /home/user/cyrup/crates/cyrup-mcp/src/credentials.rs `read_auth_entry_from_store` (2549) wraps **only** the backend `store.read` in … |
 | `MCP-285` | medium | `hand-written` | **implemented** | Remove-path chunk cleanup is fatal, not best-effort | /home/user/cyrup/crates/cyrup-mcp/src/credentials.rs `remove_chunk_payloads` (2269, `?` on every chunk removal) is used only by … |

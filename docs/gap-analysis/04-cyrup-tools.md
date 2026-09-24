@@ -116,6 +116,39 @@ This area covers `crates/cyrup-tools` — the seven built-in tools (`read`, `wri
 > planner sizing the gap from the raw 338-file diff will over-count by a large margin; the real
 > unmeasured window for several surfaces here is **`v0.84.4..v0.85.1` (223 files, +17 908 / −3 954)**.
 
+> ### RE-MEASURED 2026-09-24 — cyrup `ea23ca2`, pi **v0.87.1**. Authoritative over the pin table above.
+>
+> | | measured at | read this pass | still unread |
+> |---|---|---|---|
+> | `cyrup` | **`ea23ca2`** (2026-09-24) | `9aeba769..ea23ca2` (18 non-merge commits, 485 files, +164 754 / −4 932 under `crates/`). **`crates/cyrup-tools` is byte-identical across it** — `git diff --name-only 9aeba769..ea23ca2 -- crates/cyrup-tools` is empty — so every closure in the table below carries forward by identity, not by re-reading. The one fix-site crate this file routes to that moved is `cyrup-tui`, and only in five `src/app/` files (`terminal_input.rs` is new, for UW-7); nothing under `src/transcript/`, where `TOOL-015`/`TOOL-017`/`TOOL-022` were closed, changed | — |
+> | `pi` | **v0.87.1** (was v0.85.1; new tags v0.86.0 · v0.86.1 · v0.87.0 · v0.87.1) | **`v0.85.1..v0.87.1` over this area's paths, read in full, both sides:** `packages/coding-agent/src/core/tools/**` + `core/experimental.ts` + `utils/mime.ts` = 7 files, +34 / −22. Four changes, four items (`TOOL-046`, `-047`, `-048`, `-050`). **Two `v0.84.1..v0.85.1` leads re-read on both sides** — one filed (`TOOL-049`), one refuted (below) | **`v0.84.1..v0.85.1`** except those two leads: the 2026-09-14 lead list below is still UNVERIFIED. `packages/agent/src/harness/**` is not the reference path and was not walked |
+> | siblings | pi-subagents **v0.71.0** · pi-intercom **v0.14.0** · pi-permission-system v0.8.0 · pi-mcp-adapter **v2.37.0** · code_puppy_core_plugins **v0.0.62** · pi-acp v0.0.33 | not censused — none has a built-in-tool file in this area | the "does not touch this area" finding is still the v0.47.1-era one |
+>
+> **Open set before this pass: zero.** Every row in `## Open items` was already closed (`TOOL-015`'s
+> ID cell is not struck, but its Severity cell is, which is the counting rule). **After: five open,
+> all `upstream-drift` — 0 critical · 1 high · 2 medium · 2 low.** The high is `TOOL-047`: a shell
+> command killed by a signal is reported to the model as a SUCCESS, which pi stopped doing at v0.86.0.
+>
+> **Lead dispositions from the 2026-09-14 census (both sides read this pass):**
+> - *`write` result text drops the byte count* — **confirmed on pi's reference path and FILED as
+>   `TOOL-049`.** The census cited `packages/agent/src/harness/tools/write.ts`; the coding-agent copy
+>   changed too: `Successfully wrote ${content.length} bytes to ${path}` (`core/tools/write.ts:227`
+>   @v0.84.1, still at v0.84.4) → `Successfully wrote to ${path}` (`:86` @v0.85.0 and @v0.87.1).
+> - *`bash` description "Returns stdout and stderr." → "Returns combined stdout and stderr."* —
+>   **REFUTED for this area.** The wording change is in `packages/agent/src/harness/tools/bash.ts`
+>   only. The coding-agent tool, which is the reference, still reads `Returns stdout and stderr.` at
+>   `core/tools/bash.ts:239` @v0.87.1, byte-identical to `crates/cyrup-tools/src/tools/bash.rs:149`.
+>   Do not file it.
+>
+> **Leads from `v0.85.1..v0.87.1` deliberately NOT filed here (routed, not skipped):**
+> `read`'s per-model resize profile (`resizeOptions: ctx?.model?.inputLimits?.images?.resize ??
+> fallbackResizeOptions`, `core/tools/read.ts:112-118` @v0.87.1) has no input to read until models.json
+> carries `inputLimits` — filed as the config half in area 05 (`CFG-085`), which is where the fix
+> starts. **A second, divergent image sniffer exists**: `crates/cyrup/src/input.rs:158`
+> `detect_image_mime` (the CLI `@file` path) is a hand-rolled copy of pi's `detectSupportedImageMimeType`
+> that already matches `GIF87a`/`GIF89a` but omits the APNG, JPEG-`0xf7` and `isBmp` checks that
+> `ImageMime::from_magic_unbounded` carries — area 08's surface, recorded as a lead, not an item.
+
 ## UNVERIFIED — 2026-09-14 census of the `v0.84.1..v0.85.1` window (leads, not items)
 
 **Nothing in this section is an item.** No `TOOL-` id is assigned, because id assignment belongs to a
@@ -140,11 +173,14 @@ plus `packages/agent/src/harness/{types.ts,env/nodejs.ts,utils/output-capture.ts
   `content.length` — JS string length = UTF-16 code units — not the UTF-8 byte count, and uses the
   verb 'Successfully wrote' (write.ts:222). Match both exactly." That deliberate match is now the
   divergence. Three cyrup tests assert the old string (`src/tests/tools.rs:577`,`:1823`,
-  `src/tests/isolation.rs:361`).
+  `src/tests/isolation.rs:361`). **— NO LONGER A LEAD: FILED 2026-09-24 as `TOOL-049`** (the coding-agent
+  reference path changed too, at v0.85.0).
 - **`bash` tool description: "Returns stdout and stderr." → "Returns combined stdout and stderr."** · S
   — upstream `packages/agent/src/harness/tools/bash.ts:9` @v0.85.1. cyrup still emits the v0.84.1
   wording at `crates/cyrup-tools/src/tools/bash.rs:149`. A prompt-visible, byte-for-byte surface; this
-  is the confidently-readable half of the bash entry below.
+  is the confidently-readable half of the bash entry below. **— REFUTED 2026-09-24:** the wording change is in
+  `packages/agent/src/harness/tools/bash.ts` only; the coding-agent reference still reads `Returns
+  stdout and stderr.` at `core/tools/bash.ts:239` @v0.87.1, matching cyrup. Not filed.
 
 ### Shell and execution environment
 
@@ -372,6 +408,57 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 | ~~TOOL-043~~ | ~~low~~ **CLOSED 2026-08-15** | cyrup-original | S | `bash`'s `promptGuidelines` string diverges from the ported tag TWICE and neither delta carried a `[CYRUP-DELTA]` tag — **CLOSED 2026-08-15**: both tags added at `crates/cyrup-tools/src/tools/bash.rs` in the `prompt_guidelines` doc block (`[CYRUP-DELTA — version lag, AHEAD of the ported tag; wording only]` and `[CYRUP-DELTA — deliberate, value only; the variable-family name inside the string]`). Neither delta reverted, as the item asked. Both upstream facts RE-DERIVED at their tags this pass rather than carried: the imperative is **v0.83.0 `bash.ts:330`** and the softened form is **v0.84.1 `bash.ts:47`** (the row's own `:328-331`/`:330` cites were close but the const hoist moved the line — state the tag you read). Pinned by `bash_prompt_guideline_deltas_are_tagged_cyrup_delta` in `src/tests/pi_tool_semantics.rs` — a source scan, because the artifact under test is source text; RED before (one `[CYRUP-DELTA` in the whole file, the `AI_AGENT` one in `execute`, zero in the guideline block). |
 | ~~TOOL-044~~ | ~~low~~ **CLOSED 2026-08-15** | parity-bug | S | The serialized `details.truncation` payload diverged from pi's `TruncationResult` on three fields — **CLOSED 2026-08-15**: the residual (`content`) is **PORTED**, so the row's decision is taken and recorded rather than re-routed. `Truncation.content` is now the first field of the struct, matching `truncate.ts:17`. **The decision and its reasoning are in `truncate.rs`'s own doc so this is not re-litigated a third time:** the size cost is exactly the cost pi pays for the identical record, so the divergence was never *forced*, and an unforced divergence is what the port rule does not permit. Read side carries `#[serde(default)]` so a pre-existing session file still loads; the write side is unconditional. Pinned by `truncation_details_carry_pis_content_field` (`src/tests/pi_tool_semantics.rs`), RED before — `serde_json::to_value` had no `content` member on any branch. All five pi call sites re-derived at v0.83.0: `read.ts:294`/`:305`, `grep.ts:348`, `find.ts:199`/`:336`, `ls.ts:193`, and `bash.ts:356`/`:409` via `output-accumulator.ts:100-107`'s `{...tailTruncation}` spread. |
 | ~~TOOL-045~~ | ~~low~~ **CLOSED 2026-08-15** | not-ported | S | No built-in overrode `Tool::label`, so all seven returned the trait default `None` — **CLOSED 2026-08-15**: all seven now return `Some(<name>)`. Upstream re-derived at v0.83.0 by command (`grep -n '^\s*name:\|^\s*label:'` over each tool file): `read.ts:210-211`, `bash.ts:325-326`, `edit.ts:293-294`, `write.ts:187-188`, `grep.ts:129-130`, `find.ts:115-116`, `ls.ts:101-102` — the row's cites were correct. Pinned inside `assert_meta` in `src/tests/pi_schema.rs`, i.e. through the `Arc<dyn Tool>` vtable, so `all_seven_tool_metadata_match_pi_verbatim` was RED for all seven before the change. No behaviour changed today (the only non-test reader is `cyrup-ext/src/wrapper.rs:102`, which forwards); the point is that the field is no longer set by nobody. |
+| TOOL-046 | medium | upstream-drift | S | **NEW 2026-09-24.** Built-in `read`/`write`/`edit`/`bash`/`powershell` still declare `constrainedSampling` only under the experimental flag; pi v0.86.0 declares it unconditionally — see the body. |
+| TOOL-047 | **high** | upstream-drift | S | **NEW 2026-09-24.** A shell command killed by a signal is returned to the model as a SUCCESS; pi v0.86.0 reports `128 + signo` as a failed exit — see the body. |
+| TOOL-048 | medium | upstream-drift | S | **NEW 2026-09-24.** `read` classifies any file whose first three bytes are `GIF` as an image; pi v0.87.0 requires `GIF87a`/`GIF89a` — see the body. |
+| TOOL-049 | low | upstream-drift | S | **NEW 2026-09-24.** `write`'s result text still carries the UTF-16 count (`Successfully wrote N bytes to …`); pi v0.85.0 removed the count — see the body. |
+| TOOL-050 | low | upstream-drift | S | **NEW 2026-09-24.** `bash`/`powershell` durations always render as `N.Ns`; pi v0.86.0 renders `Xm Ys` / `Xh Ym Zs` from one minute up — **FIX SITE `crates/cyrup-tui`** — see the body. |
+
+## TOOL-046 — Built-in tools declare `constrainedSampling` only under the experimental flag; pi v0.86.0 declares it unconditionally
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup-tools/src/tools/{read.rs:99,write.rs:94,edit.rs:242,bash.rs:264}` — each `constrained_sampling()` returns `cyrup_core::experimental_tool_sampling()` (`crates/cyrup-core/src/constrained_sampling.rs:119`), i.e. `None` unless the experimental flag is set. `powershell` inherits the `bash.rs` declaration through the shared `ShellTool` engine. Each tool file pins the gated behaviour with a `*_declares_constrained_sampling_exactly_when_the_experimental_flag_is_on` test.
+**upstream** — `packages/coding-agent/src/core/tools/{bash.ts:243,read.ts:80,edit.ts:156,write.ts:57}` @v0.87.1 — `constrainedSampling: { type: "json_schema", strict: "prefer" }`, unconditional; `getExperimentalToolSampling` is deleted from `core/experimental.ts`. At v0.85.1 it was `constrainedSampling: getExperimentalToolSampling()` (`bash.ts:239`). CHANGELOG 0.86.0: *"Enabled strict-prefer JSON-schema sampling by default for built-in `read`, `bash`, `powershell`, `edit`, and `write` tools, without requiring `PI_EXPERIMENTAL`."*
+**Impact**   — on every provider that honours strict JSON-schema sampling, pi constrains the model's tool arguments for the five mutating/reading built-ins and cyrup does not, so cyrup sees more malformed tool calls and a different request body for every turn. `grep`, `find` and `ls` are unaffected on both sides.
+**Fix**      — return a `static` `ConstrainedSampling { json_schema, strict: prefer }` from the four `constrained_sampling()` overrides and invert the four flag tests to assert it is present with the flag unset. Leave `experimental_tool_sampling` only if something else reads it (it is otherwise dead). The extension opt-out (`constrainedSampling: false` on re-registration) needs no work here — `TOOL-016`'s vtable already carries the override.
+**Verify**   — with the experimental flag unset, a provider request built for `read` carries the strict-prefer declaration (the `prov011_a_*` agent-loop test shape, `crates/cyrup-agent/src/tests/agent_loop.rs`), and `grep` does not.
+
+## TOOL-047 — A shell command killed by a signal is returned to the model as a success
+
+**Kind** upstream-drift · **Severity** high · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup-tools/src/ops/local/proc.rs:77-83` `exit_from` maps a status with no exit code to `ExitStatus::Signaled`, discarding the signal number; `crates/cyrup-tools/src/tools/bash.rs:593-606` then matches `ExitStatus::Exited(0) | ExitStatus::Signaled` into the same `Ok(ToolResult)` arm, under the comment *"Pi treats a signal-killed process (exitCode null) as success with output preserved."* `ops/mod.rs:466-475` documents the same contract on the enum. Shared by `bash` and `powershell`.
+**upstream** — `packages/coding-agent/src/core/tools/bash.ts:139-142` @v0.87.1 — `createLocalShellOperations` returns `exitCode ?? (signalCode ? 128 + os.constants.signals[signalCode] : 1)`; `:368-373` throws `Command terminated without an exit code` for a null code from custom operations, and `Command exited with code ${exitCode}` otherwise. At v0.85.1 (`:364`) and at the ported baseline v0.83.0 (`:451`) the guard was `exitCode !== 0 && exitCode !== null`, so cyrup's comment was correct when written. CHANGELOG 0.86.0: *"Fixed signal-terminated local shell commands being reported as successful with partial output (#9577)."*
+**Impact**   — an OOM-killed build, a segfaulting test binary or anything else that dies to SIGKILL/SIGSEGV/SIGABRT is presented to the model as a clean success carrying whatever partial output it wrote. The model proceeds on a false premise and the transcript row renders as succeeded. **Rated high rather than critical** because the output text itself is not altered and often contains the crash; a reviewer applying the severity definition's "silent wrong output" literally may raise it.
+**Fix**      — carry the signal: `ExitStatus::Signaled(Option<i32>)` filled from `std::os::unix::process::ExitStatusExt::signal()` in `exit_from`; in `bash.rs` map `Signaled(Some(n))` to the `Exited(128 + n)` failure arm and `Signaled(None)` to pi's `Command terminated without an exit code` failure. Update `ops/mod.rs`'s doc, the three `ops/local/tests/exec_argv.rs` assertions of `ExitStatus::Signaled`, and the one other producer, `crates/cyrup-ext/src/host/live.rs:1777-1781`, which yields `Signaled` for a guest backend's `exitCode: null` — that is pi's `Command terminated without an exit code` case, so it maps to `Signaled(None)`.
+**Verify**   — a `bash` call running `kill -KILL $$` returns an error whose text ends `Command exited with code 137`, and `details.exitCode == 137`; `sh -c 'kill -SEGV $$'` yields 139.
+
+## TOOL-048 — `read` classifies any file starting with `GIF` as an image
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup-tools/src/ops/mod.rs:139`, inside `ImageMime::from_magic_unbounded` — `if starts_with_ascii(buf, 0, b"GIF") { return Some(ImageMime::Gif); }`. Pinned by `src/tests/tools.rs:1884` only for `GIF89a`, so the loose prefix is untested.
+**upstream** — `packages/coding-agent/src/utils/mime.ts:13` @v0.87.1 — `startsWithAscii(buffer, 0, "GIF87a") || startsWithAscii(buffer, 0, "GIF89a")`; it was `startsWithAscii(buffer, 0, "GIF")` at v0.85.1. CHANGELOG 0.87.0: *"Fixed text files beginning with `GIF` being misclassified as images and omitted from `read` and CLI `@file` input (#9755)."*
+**Impact**   — a text file whose content begins `GIF` (a changelog headed `GIFs`, a note starting `GIFT…`) is routed down the image path, fails decoding and comes back as an image-failure note instead of its text. The CLI `@file` half of pi's fix is already correct in cyrup by accident: `crates/cyrup/src/input.rs:158` `detect_image_mime` is a separate copy that checks `GIF87a`/`GIF89a` (see the header block for why that copy is itself a lead).
+**Fix**      — replace the `b"GIF"` test with the two six-byte signatures; add the negative case (`b"GIFT list"` → `None`) beside `tools.rs:1884`.
+**Verify**   — `read` of a file containing `GIFs I like\n` returns that text.
+
+## TOOL-049 — `write`'s result text still reports a UTF-16 count that pi removed
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24)
+**cyrup**    — `crates/cyrup-tools/src/tools/write.rs:128-135` computes `len_utf16 = input.content.encode_utf16().count()` and returns `Successfully wrote {len_utf16} bytes to {path}`, under a comment recording that this deliberately matched pi's `content.length`. Asserted by `src/tests/tools.rs:577`, `:1823` and `src/tests/isolation.rs:361`.
+**upstream** — `packages/coding-agent/src/core/tools/write.ts:86` @v0.87.1 (and @v0.85.0) — `Successfully wrote to ${path}`; at v0.84.1 it was `:227` `Successfully wrote ${content.length} bytes to ${path}`, unchanged through v0.84.4. CHANGELOG 0.85.0 names the reason: the count was UTF-16 code units, not bytes, and was removed rather than corrected.
+**Impact**   — model-visible text differs on every `write`; the number cyrup reports is wrong as a byte count for any non-ASCII content, which is the defect upstream removed it for.
+**Fix**      — emit `Successfully wrote to {path}`, delete `len_utf16`, and update the three assertions.
+**Verify**   — writing `"é"` returns exactly `Successfully wrote to <path>`.
+
+## TOOL-050 — Shell tool durations of a minute or more render as seconds only
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not observed on screen)
+**FIX SITE** `crates/cyrup-tui` (the renderer), not `crates/cyrup-tools`.
+**cyrup**    — `crates/cyrup-tui/src/transcript/tool_result.rs:134-135` `format_duration(ms)` is `format!("{:.1}s", ms as f64 / 1000.0)` for every value.
+**upstream** — `packages/coding-agent/src/core/tools/renderers/bash.ts:32-42` @v0.87.1 — `< 60 s` → `${s.toFixed(1)}s`; `< 60 min` → `${m}m ${s}s`; else `${h}h ${m}m ${s}s`, whole seconds by `Math.floor`. At v0.85.1 it was the single `toFixed(1)` form. CHANGELOG 0.86.0 (#9628).
+**Impact**   — a ten-minute build shows `600.0s` where pi shows `10m 0s`.
+**Fix**      — port the three branches; `ms` is already an integer.
+**Verify**   — unit cases `59_949 → "59.9s"`, `60_000 → "1m 0s"`, `3_725_000 → "1h 2m 5s"`.
 
 ## TOOL-039 — `CYRUP_SHELL` silently redirects every `bash` tool call to an arbitrary interpreter; pi has no shell env var
 

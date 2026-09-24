@@ -54,6 +54,28 @@ exists.
 
 ---
 
+> ### CURRENT PIN — 2026-09-24. cyrup **`ea23ca2`** · `pi-mcp-adapter` **v2.37.0** (`28049de`)
+>
+> This file's body is still cited at v2.25.0 and its retarget section at v2.26.1 (Rule 1 below), and
+> **the body was not re-read this pass**. What moved: the upstream window `v2.33.0..v2.37.0` —
+> **173 files, +15 550 / −4 169, 57 non-merge commits** — was triaged against cyrup at `ea23ca2` in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Re-measure — 2026-09-24*, which files
+> **11 units, `MCP-540`–`MCP-550`**, each read on both sides. Numbering resumes from **`MCP-551`**.
+> `v2.32.1..v2.33.0` remains a lead list only (the section below and its 13a–13i siblings), and two
+> of those leads — the cross-process OAuth transaction lock and `PI_MCP_OAUTH_LOG` diagnostics — are
+> **withdrawn by upstream** at v2.34.0 (`bdb89b7`: `mcp-refresh-lock.ts` and `oauth-diagnostics.ts`
+> exist at no later tag). cyrup side: `crates/cyrup-mcp` is 43 `.rs` files / 79 931 lines under `src`
+> at `ea23ca2`, and `git diff 9aeba769..ea23ca2 -- crates/cyrup-mcp` is a single line, so **no unit's
+> status moved on the cyrup side** since the 2026-09-14 pass.
+>
+> **One statement in this file's seam material is now false at upstream, and the code repeats it.**
+> The canonical table's only unit for `mergeServerMaps`' transport handling is `MCP-054` — the
+> v2.25.0 socket ⇄ command/url swap, cut with Cut 3 — and `crates/cyrup-mcp/src/config.rs`' `merge_entry` documents "the `command` ⇄ `url` case is
+> deliberately not handled: upstream … does not handle it either". Upstream has cleared the other
+> transport's fields on a `command`/`url` switch since **v2.27.0** — filed as `MCP-540` (high).
+> Census totals at 2026-09-24, counted: **488 units — 252 implemented · 75 partial · 128 missing ·
+> 33 not-applicable** (a floor on done-ness; see the STATUS file for why).
+
 > ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
 >
 > Everything in this file is history and is correct as written. Its body was audited against
@@ -113,6 +135,19 @@ headline features the `README.md` baselines row names were located in source and
 section files. Beyond the tag, the clone's HEAD `23c2852` is a further **9 commits / 74 files /
 +3 231 / −1 377**, untagged and therefore deliberately not measured — but note `#572` ("preserve
 built-in Agent Plugin boundaries") is already in it and touches the plugin surface this census filed.
+
+## Retarget — v2.33.0 → v2.37.0 (pointer)
+
+**Dated 2026-09-24.** Triaged commit by commit in
+[`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Re-measure — 2026-09-24*, which files
+`MCP-540`–`MCP-550` (table C) and lists the rest as labelled leads. Counts this document carries that
+the window supersedes, recorded here rather than edited in place: `McpSettings` is **33** keys at
+v2.37.0 (`allowInstall`, `ancestorConfigRoots`, `deferWithMissingMetadata`, `namespaceProxyTools`,
+`exposeResources`, `jev`, `oauthCredentialStore` joined — `MCP-549`); `ServerEntry` gains `tasks`
+(`MCP-546`) and `OAuthConfig` gains `clientMetadataUrl`; `URL_BOUND_AUTH_FIELDS` is unchanged at
+**six** since v2.33.0 (`v2.37.0:config.ts:668`), so `MCP-500`'s restated obligation stands; the `/mcp`
+subcommand list is **eleven** (`edit` — `MCP-545`; `jev` — `MCP-550`, ruled `open-decision`; `token`
+— the existing `MCP-504`).
 
 ## Retarget — v2.26.1 → v2.32.1 (pointer)
 

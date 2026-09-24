@@ -1441,6 +1441,13 @@ rename breaks existing scripts.
 decision. `MCP_OAUTH_DIR` stays **unprefixed and unchanged**, because it names a directory a user may
 deliberately share with a real pi install. `…_KEYRING_RECOVERY_NODE` is dropped outright (MCP-260).
 **verify** — each switch honoured under both names, with `CYRUP_*` winning.
+**Restated 2026-09-24 (cyrup `ea23ca2`, upstream v2.37.0).** The dual-read above is superseded by
+owner decision `dd44b3c` ("Drop every PI_* env-var alias in favor of CYRUP_-only"): `credentials.rs`
+reads the six as single-name `CYRUP_MCP_*` constants through `env_lookup`. The obligation is now
+"each surviving switch honoured under its `CYRUP_MCP_*` name"; the `PI_MCP_ADAPTER_*` spelling is a
+recorded divergence. Upstream added `PI_MCP_ADAPTER_BEARER_COMMAND_TTL_MS` and
+`PI_MCP_ADAPTER_OAUTH_FILE_KEY` in `v2.33.0..v2.37.0`; they belong to unported surfaces (leads in
+[`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Re-measure — 2026-09-24*), not to this unit.
 
 **MCP-290 — Persist the DCR client record rmcp's `StoredCredentials` drops** · medium · S · **hand-written**
 **upstream** — `mcp-oauth-provider.ts`'s `saveClientInformation` / `clientInformation` over

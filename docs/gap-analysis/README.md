@@ -5,10 +5,12 @@ work backlog. Every entry is work: there is no "accepted divergence" category an
 status. Mechanism may differ where the language forces it — port the behaviour, state the mechanism
 difference and its reason, and if the mechanism difference costs behaviour, it stays on the list.
 
-**Five upstreams are ported**: the four TypeScript ones — `pi`, `pi-subagents`,
-`pi-permission-system`, `pi-intercom` — plus **`code_puppy_core_plugins`, which is Python**, ported
-as `crates/cyrup-flux`. Two more are TypeScript and **not** ported: `pi-mcp-adapter` (area 13,
-below) and `pi-acp` (area 15, below).
+**Seven upstreams are ported**: the six TypeScript ones — `pi`, `pi-subagents`,
+`pi-permission-system`, `pi-intercom`, `pi-mcp-adapter` (as `crates/cyrup-mcp`, area 13) and `pi-acp`
+(as `crates/cyrup-acp`, area 15) — plus **`code_puppy_core_plugins`, which is Python**, ported as
+`crates/cyrup-flux`. Areas 13 and 15 began as port plans for code that did not exist; both crates now
+exist and those areas track what is built. An eighth crate, `cyrup-herdr`, follows herdr v0.9.1 and
+has no area file (see *Baselines measured against*).
 The hard rule `git -C <repo> show <tag>:<path>` applies to all of them; only the language differs.
 
 **Where the work is:**
@@ -53,11 +55,12 @@ covers.
 | [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes |
 | [`09-cyrup-ext-subagents.md`](09-cyrup-ext-subagents.md) | subagent delegation |
 | [`09a-cyrup-ext-subagents-v0.57-drift.md`](09a-cyrup-ext-subagents-v0.57-drift.md) | subagent drift against a later `pi-subagents` tag — a supplement to area 09, with its own item ids and its own severities. **Not covered by area 09's table**; read both |
+| [`09b-cyrup-ext-subagents-v0.64-drift.md`](09b-cyrup-ext-subagents-v0.64-drift.md) | subagent drift over `pi-subagents` `v0.57.0..v0.71.0`, the window neither 09 nor 09a covers. Its own ids and its own `## Open items` table; read all three |
 | [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate |
 | [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker |
 | [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline |
 | [`14-cyrup-flux.md`](14-cyrup-flux.md) | the Flux pipeline — the fifth ported upstream, and the first that is neither pi nor TypeScript |
-| [`15-cyrup-acp.md`](15-cyrup-acp.md) | **the `cyrup-acp` port plan** — the Agent Client Protocol adapter, following `svkozak/pi-acp`. Like area 13 it specifies code that does not exist yet, so it is **counted separately from the twelve** for the same structural reason; its own tables are the authority for its unit inventory |
+| [`15-cyrup-acp.md`](15-cyrup-acp.md) | **the `cyrup-acp` port plan** — the Agent Client Protocol adapter, following `svkozak/pi-acp`. Like area 13 it began as a spec for code that did not exist yet and tracks port units rather than defects, so it is **counted separately from the twelve** for the same structural reason; its own tables are the authority for its unit inventory |
 
 ## Reading the area tables
 
@@ -81,10 +84,11 @@ tree is not in this workspace, so exact alignment with it is unverified.
 
 ## Area 13 — the MCP adapter port
 
-A **fifth upstream**, `pi-mcp-adapter` v2.25.0 (~24k lines of TypeScript, 203 paths), which has never
-been ported. **Area 13 is scoped and counted separately from the twelve areas, and the separation is
-load-bearing**: the twelve measure drift in code that exists, while area 13 specifies code that does
-not exist yet, so a forward-looking port unit and a backward-looking defect cannot be added together
+A **fifth upstream**, `pi-mcp-adapter`, planned at v2.25.0 (~24k lines of TypeScript, 203 paths)
+before any of it was ported. `crates/cyrup-mcp` now exists and area 13 is re-measured at v2.37.0.
+**Area 13 is scoped and counted separately from the twelve areas, and the separation is
+load-bearing**: the twelve measure drift in code that exists, while area 13 tracks port units (implemented /
+partial / missing) against a plan, so a forward-looking port unit and a backward-looking defect cannot be added together
 into anything a planner can act on. **The exclusion runs both ways: nothing in `README.md`,
 `00-residual-ledger.md` or `PARITY-GAPS.md` speaks for `13-cyrup-mcp.md`, `13a`–`13i` or
 `MCP-PORT-METHODOLOGY.md` — and those files' own tables are the authority for their unit inventory
@@ -127,10 +131,10 @@ the signal rather than deferring it. Dormant only because `register_late_tool` h
 anywhere in the workspace. Filed as `MCP-037a`.
 
 A **seventh upstream**, `svkozak/pi-acp` v0.0.33 (4 238 lines of TypeScript across 17 `src/` files),
-which has also never been ported. `cyrup-acp` is the Agent Client Protocol adapter that lets an
+planned before any of it was ported. `crates/cyrup-acp` now exists. `cyrup-acp` is the Agent Client Protocol adapter that lets an
 editor — Zed is the reference client — drive cyrup over JSON-RPC on stdio. **Area 15 is scoped and
-counted separately from the twelve for the same structural reason as area 13**: it specifies code
-that does not exist yet, so its units cannot be added to a backward-looking defect count. The
+counted separately from the twelve for the same structural reason as area 13**: it began as a spec
+for code that did not exist yet, and its port units cannot be added to a backward-looking defect count. The
 exclusion runs both ways, and [`15-cyrup-acp.md`](15-cyrup-acp.md)'s own tables are the authority
 for its unit inventory and status.
 
@@ -186,53 +190,60 @@ a deletion — `SEAM-035`…`SEAM-046` never existed, and area 08 records the ch
 
 ## Baselines measured against
 
+Re-measured **2026-09-24**, every figure below from `git diff --shortstat` / `git rev-list --no-merges --count`
+run in `tmp/<repo>`. Earlier values are in `git log -p -- docs/gap-analysis/README.md`.
+
 | repo | HEAD | cyrup ported baseline | latest tag | delta |
 |---|---|---|---|---|
-| `cyrup/` | **`9aeba769`** — last CODE commit as of the 2026-09-14 upstream-tag re-measure (`fix(subagents,it): zombie-blind group probe, result_large_err, cyrup-it API drift, fmt`). *Superseded: `824a539e` (batch 3), `6cf2cb9f` (batch 2).* **Re-measure before trusting any status: the port moves faster than this directory does.** `824a539e..9aeba769` is **32 code commits, 453 files, +98 509 / −15 880** under `crates/`+`xtask` — the `workflowScript` runtime (`WORKFLOW_1`…`17`), the net-new `cyrup-workflow-runtime` crate, and this pass's gate repair — and **no area file has been re-read against it** | — | — | **23 crates, 885 555 lines of Rust under `crates/`** (re-derived 2026-09-14: `find crates -name '*.rs' -type f \| xargs wc -l`). Gates at this sha: `fmt --check` clean, all three clippy surfaces at zero findings, `cargo nextest run --workspace --features test-fixtures` 9 886 passed / 0 failed / 9 skipped |
-| `pi/` | `71dca871b` = `v0.85.1-67-g71dca871b` | **v0.83.0** | **v0.85.1** *(was v0.84.4)* | `v0.83.0..v0.85.1` = **1 087 files, +142 846 / −23 694**, 1 050 non-merge commits. **Newly opened and UNMEASURED: `v0.84.4..v0.85.1` = 708 files, +96 348 / −25 254, 428 non-merge commits** — `packages/agent` +54 223, `packages/coding-agent` +17 908, `packages/chord` +10 840 (service wire semantics, delta-backed replicated state), `packages/ai` +2 787, `packages/tui` +2 485. Nothing in that window is filed |
-| `pi-subagents/` | `b0e3a480` = `v0.67.0-56-gb0e3a480` | **≈v0.43.0** (inferred — the crate records no version string) | **v0.67.0** *(was v0.64.0)* | `v0.43.0..v0.67.0` = **613 files, +123 871 / −31 254**, 720 non-merge commits. **Newly opened and UNMEASURED: `v0.64.0..v0.67.0` = 370 files, +42 205 / −24 183, 170 non-merge commits**, of which `src/` is 159 files / +10 919 / −6 444 with **30 net-new source files** — in-process pi child sessions, bounded SSH project execution, watchdog model-fallback chains, per-child async completion notification. Nothing in that window is filed |
-| `pi-permission-system/` | `9affcc9` — **re-checked 2026-09-14, unchanged** | **v0.7.1** | **v0.8.0** — **re-checked 2026-09-14, still the newest tag; no new upstream release** | 28 files, +4 023 / −1 851 (re-measured identical to the prior record). Absorbed into the code: zero drift rows |
-| `pi-intercom/` | `199279a` — **re-checked 2026-09-14, unchanged** | **v0.9.2** — *not v0.7.0; every prior doc had this wrong* | **v0.13.0** — **re-checked 2026-09-14, still the newest tag; no new upstream release** | true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 (re-measured identical) |
-| `code_puppy_core_plugins/` | `dcda61f` = `v0.0.50` | **v0.0.6** — *not recorded anywhere in `crates/cyrup-flux`; see `FLUX-007`* | **v0.0.50** *(was v0.0.40)* | 190 files, +16 472 / −4 288 across the whole repo — but the ported surface is **still unchanged**: `git diff --stat v0.0.6..v0.0.50 -- code_puppy_core_plugins/flux_bootstrap/ tests/test_flux_bootstrap.py` is empty, and re-checked tag-by-tag 2026-09-14 it is byte-identical at **all 39 intervening tags**. Ported surface is `flux_bootstrap/` — 18 bundled commands, 4 `_docs` files, 3 renderer scripts. cyrup ships 15 templates + 3 native renderers = the same 18 |
-| `pi-acp/` | `d1cffc0` = `v0.0.33-2-gd1cffc0` — **re-checked 2026-09-14, unchanged** | **not ported** — area 15 is the plan | **v0.0.33** — **still the newest tag; no new upstream release** | 17 `.ts` under `src/` = 4 238 lines, plus 3 265 lines of `test/` across 25 files; MIT © Sergii Kozak. The `v0.0.33..HEAD` window is one line in one non-`src/` file |
-| `pi-mcp-adapter/` | `23c2852` = `v2.33.0-9-g23c2852` — clone re-pulled 2026-09-14. **Area 13's last re-audit is `11b9994a` (2026-09-04) at v2.32.1** — its counted census (**244 implemented / 82 partial / 84 missing / 27 n-a of 437**, a floor rather than an answer) and its 40 newly filed units both stop at that tag. *Superseded: `6ba7d36` = `v2.32.1-3-g6ba7d36`, `14c0e6c` = `v2.25.0-4-g14c0e6c`.* | **not ported** — area 13 is the plan | **v2.33.0** *(was v2.32.1)* | `v2.26.1..v2.33.0` = **204 files, +25 303 / −2 187**, 101 non-merge commits. **Newly opened and UNMEASURED: `v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits** — one-URL server install, per-server HTTPS CA bundles, per-server env-inheritance opt-out, `directTools: "search"` lazy activation, trusted local Claude-plugin bundles, cross-process OAuth credential transactions. Non-test, non-`dist/` TypeScript grew 72 → 84 files and 28 787 → 32 041 lines. Nothing in that window is filed. Drift past the tag to HEAD is 74 files, +3 231 / −1 377 |
+| `cyrup/` | **`ea23ca2`** (2026-09-23), the last code commit every area file was re-read against on 2026-09-24. *Superseded: `9aeba769`, `824a539e`, `6cf2cb9f`.* `9aeba769..ea23ca2` under `crates/` is **18 non-merge commits, 485 files, +164 754 / −4 932**: the subagents SCOPE/lanes/runner-identity work, the 18-command slash surface, the UW-7 fleet roster, and the new `cyrup-herdr` crate. **Re-measure before trusting any status: the port moves faster than this directory does** | — | — | **24 crates, 1 044 991 lines of Rust under `crates/`** (`find crates -name '*.rs' -type f \| xargs cat \| wc -l`). **28 706** `.ts:N` upstream citations in `.rs` files, naming **16 976** distinct upstream locations; **974** `CYRUP-DELTA` markers in `.rs` files. Gates were not re-run by this pass |
+| `pi/` | `b45597504` = `v0.87.1-16-gb45597504` | **v0.83.0** | **v0.87.1** (`f07218c4d`, 2026-09-22) *(was v0.85.1)* | `v0.83.0..v0.87.1` = **1 392 files, +217 038 / −40 736**, 1 248 non-merge commits. **New window `v0.85.1..v0.87.1` = 667 files, +79 789 / −22 639, 201 non-merge commits**: `packages/agent` 125 files +36 468 / −1 316 (mostly `harness/**`, of which `harness/pico3/**` is ~9k new lines), `packages/coding-agent` 242 files +18 411 / −15 390, `packages/durable` (new package) 27 files +8 533, `packages/ai` 127 files +4 910 / −2 058, `packages/chord` 26 files +4 228 / −529, `packages/tui` 48 files +2 665 / −397. Breaking changes: v0.86.0 (`TranscriptContext`, `user_bash` fails closed) and v0.87.0 (`finishTurn`, `context_edit`, actionable `turn_end`). The previous window measures `v0.84.1..v0.85.1` = 883 files, +111 832 / −27 415, **708** non-merge commits, and `v0.84.4..v0.85.1` = 708 files, 426 non-merge commits (the 428 recorded before was off by two). `v0.87.1..HEAD` = 240 files, 15 commits, untagged and unanalysed |
+| `pi-subagents/` | `6f1027f7` = `v0.71.0-10-g6f1027f7` | **≈v0.68.0 by citation census** (v0.68.0 × 840, v0.43.0 × 668, v0.64.0 × 377, nothing at v0.69 or later). The crate records no version string; the old ≈v0.43.0 figure is where the port started, not where it stands | **v0.71.0** (`4af5e85a`) *(was v0.67.0)* | `v0.43.0..v0.71.0` = **690 files, +138 768 / −35 061**, 878 non-merge commits. **New window `v0.67.0..v0.71.0` = 386 files, +25 038 / −13 948, 158 non-merge commits**, of which `src/` is 147 files, +7 377 / −4 886. `v0.71.0..HEAD` = 10 commits, unread |
+| `pi-permission-system/` | `9affcc9` = `v0.8.0`, **re-checked 2026-09-24, unchanged** | **v0.7.1** | **v0.8.0**, still the newest tag; `v0.8.0..HEAD` is empty | `v0.7.1..v0.8.0` = 28 files, +4 023 / −1 851, 9 non-merge commits. Absorbed into the code: zero drift rows |
+| `pi-intercom/` | `6c15527` = `v0.14.0` | **v0.9.2** (*not v0.7.0; older docs had this wrong*) | **v0.14.0** *(was v0.13.0)* | `v0.9.2..v0.14.0` = 32 files, +9 176 / −3 677, 36 non-merge commits. **New window `v0.13.0..v0.14.0` = 20 files, +4 451 / −2 677, 8 non-merge commits**, mostly `package-lock.json` churn |
+| `code_puppy_core_plugins/` | `6d4e26a` = `v0.0.62-1-g6d4e26a` | **v0.0.6**, *not recorded anywhere in `crates/cyrup-flux`; see `FLUX-007`* | **v0.0.62** (`720a885`) *(was v0.0.50)* | `v0.0.50..v0.0.62` = 65 files, +2 499 / −452, 33 non-merge commits across the whole repo, **none of it on the ported surface**: `git diff --quiet v0.0.6 <tag> -- code_puppy_core_plugins/flux_bootstrap/ tests/test_flux_bootstrap.py` holds at every tag from v0.0.50 to v0.0.62 (re-checked 2026-09-24). The ported surface is `flux_bootstrap/`: 18 bundled commands, 4 `_docs` files, 3 renderer scripts. cyrup ships 15 templates + 3 native renderers = the same 18. The second upstream, `code_puppy` itself, is at v0.0.867 and unpinned past v0.0.720 |
+| `pi-acp/` | `42926cc` = `v0.0.33-8-g42926cc` | **v0.0.33**, ported as `crates/cyrup-acp` (area 15) | **v0.0.33**, still the newest tag | 17 `.ts` under `src/` = 4 238 lines. `v0.0.33..HEAD` = 15 files, +859 / −52, 6 non-merge commits, of which `src/` is 3 files, +155 / −43 (context-window usage, stats timeout, Windows session path). Untagged, so a lead only |
+| `pi-mcp-adapter/` | `86f3e20` = `v2.37.0-2-g86f3e20` | **v2.37.0**, ported as `crates/cyrup-mcp` (area 13). Its counted unit census at this tag lives in `13-cyrup-mcp-STATUS.md` | **v2.37.0** (`28049de`) *(was v2.33.0)* | `v2.26.1..v2.37.0` = 260 files, +38 861 / −4 364, 158 non-merge commits. **New window `v2.33.0..v2.37.0` = 173 files, +15 550 / −4 169, 57 non-merge commits.** Production TypeScript is 81 files / 31 379 lines by area 13's filter (73 / 28 109 at v2.33.0; the old 72/84 figures used a different filter and do not compare). `v2.37.0..HEAD` = 7 files, 2 commits, untagged |
+
+**`cyrup-herdr` is a new crate with no upstream clone and no area file.** It is pinned in its own
+`Cargo.toml` and `lib.rs` to **herdr v0.9.1 (`d59d060`)**, but `tmp/herdr` does not exist, so no
+upstream citation in it can be checked from this workspace, and no area file measures it. Until one
+does, treat it as unmeasured.
 
 **Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree.** Clone-HEAD line
 numbers and file existence both mislead; items have named files that never existed at any tag.
 
 ### Which area file is pinned where, and what each is blind to
 
-The table above is the state of the **upstreams**. It cannot answer the question a planner actually
-asks — *how stale is the file I am about to open?* — because every area file carries its own pin, set
-when that file was last read, and those pins have never agreed with each other or with the table
-above. Recovering them meant grepping sixteen headers. This is that grep, done once, on 2026-09-14.
+The table above is the state of the **upstreams**. This one answers the question a planner actually
+asks: *how stale is the file I am about to open?* Every area file carries its own pin block; this is
+those blocks, collected on 2026-09-24. Older pins stay in each file's header and in git history.
 
 **Read it as staleness, not as work.** A blind window is a range in which this directory has no
 opinion; it is not a backlog and it is not a count. **Where an area file states its own per-module
-range, that range wins over the single tag in this column** — area 07 is the live example, and area
-09 is the live warning. Nothing in this table re-verifies any file; it only says how old each one is.
+range, that range wins over the single tag in this column.** Nothing in this table re-verifies any
+file; it only says how old each one is.
 
-| area file(s) | pinned at, per its own header (history — do not rewrite) | blind window | 2026-09-14 census |
+| area file(s) | pinned at (2026-09-24) | blind window | 2026-09-24 pass |
 |---|---|---|---|
-| `01` · `02` · `03` · `05` · `06` · `12` | pi **v0.83.0** ported / **v0.84.1** drift target | `v0.84.1..v0.85.1` | censused as UNVERIFIED leads; nothing filed |
-| `04` · `08` | pi **v0.84.1** (area 08 also skimmed `modes/rpc/` + `json-event.ts` to v0.84.4) | `v0.84.1..v0.85.1` | censused as UNVERIFIED leads; nothing filed. **The pin understates the port**: `powershell`, `defaultTools`, `clear_queue` and the json-event projection are already chased to v0.84.2–v0.84.4 |
-| `07` | pi **v0.84.1** declared — but the crate's own module docs cite **@v0.84.3** (`altscreen/{mouse,wheel}.rs`, `keymap.rs:2041-2045`) | `v0.84.1..v0.85.1` for `packages/tui` + `modes/interactive/`; `packages/chord` is net-new and unowned | censused as UNVERIFIED leads. **Its header records a per-module range of v0.84.1–v0.84.3, not a single tag; believe that over this row** |
-| `09` | pi-subagents **≈v0.43.0** ported (inferred) / **v0.47.1** measured. The crate's own citation census — v0.43.0 × 611, **v0.64.0 × 330**, v0.57.0 × 120 — says it has no single baseline | `v0.47.1..v0.67.0`, of which `v0.47.1..v0.57.0` is area 09a's | censused as UNVERIFIED leads |
-| `09a` | pi-subagents **v0.47.1 → v0.57.0** by its `## Scope`; `v0.57.0..v0.64.0` skimmed, one item filed | `v0.57.0..v0.67.0` | censused as UNVERIFIED leads, filed into 09a as the drift-holder. **No file's scope covers `v0.57.0..v0.67.0`; a `09b` is the structurally correct home**, on the precedent that created 09a |
-| `10` | pi-permission-system **v0.8.0** = the latest tag | none | not censused — nothing to census |
-| `11` | pi-intercom **v0.9.2** ported (corrected from v0.7.0) / **v0.10.1** measured; its own body flags `v0.10.1..v0.12.0` as *unopened* | `v0.10.1..v0.13.0` | **not censused this pass** |
-| `13` · `13a`–`13i` | pi-mcp-adapter **v2.25.0**; `13-cyrup-mcp.md`'s *Retarget* section also holds **v2.26.1** | `v2.32.1..v2.33.0`. `v2.25.0..v2.26.1` is held by that retarget section and `v2.26.1..v2.32.1` by `13-cyrup-mcp-STATUS.md` | censused as UNVERIFIED leads; no `MCP-` id assigned, numbering resumes from `MCP-539` |
-| `13-cyrup-mcp-STATUS.md` | pi-mcp-adapter **v2.26.1** (2026-08-21 census) / **v2.32.1** (2026-09-04 re-audit) | `v2.32.1..v2.33.0` | censused as UNVERIFIED leads; **no status cell moved** |
-| `14` | code_puppy_core_plugins **v0.0.6** ported / **v0.0.40** measured | `v0.0.40..v0.0.50` — **empty on the ported surface**, which is byte-identical across all 39 tags | not censused; the second upstream (`code_puppy` itself) is a separate, unpinned question — see `FLUX-007` |
-| `15` | pi-acp **v0.0.33** = the latest tag | none upstream. Its *cyrup* side is the stale axis: three commits touching `crates/cyrup-acp` post-date its last correction | censused; its own provenance block carries the correction |
+| `01` · `12` | cyrup `ea23ca2` × pi **v0.87.1** (ported v0.83.0) | `v0.84.1..v0.85.1`: census leads not promoted are still unverified. `v0.85.1..v0.87.1` in `packages/ai`: `anthropic-messages`, the `openai-responses` and codex adapters, `types.ts` and `generate-models.ts` unread. Outside `packages/ai` (agent `pico3`, `packages/durable`, `TranscriptContext`/`ContextEditEntry`, chord/tui/evals): changelog-level leads only | every open row re-read; `PROV-073`…`082` and `DRIFT-056`/`057` filed |
+| `02` · `03` · `06` | cyrup `ea23ca2` × pi **v0.87.1** | pi `packages/agent/src/harness/**` `v0.85.1..v0.87.1` (+9 910); `agent-session.ts` beyond two sections; `runner.ts`/`loader.ts` beyond the functions named; `core/extensions` `v0.84.1..v0.85.1`; `packages/coding-agent` `v0.84.1..v0.85.1` outside the session files | every open row re-confirmed; `AGENT-038`…`041`, `SESS-051`…`055`, `EXT-077`…`080` filed |
+| `04` · `05` · `08` | cyrup `ea23ca2` × pi **v0.87.1**, the new window read for these areas' paths only | the `v0.84.1..v0.85.1` lead lists (three resolved this pass); `core/agent-session.ts` beyond `steer`/`followUp`, plus `sdk.ts`, `cache-warmer.ts`, `bug-report*`, `crash-log.ts`, `experimental/micro`; sibling upstreams not re-walked for `CFG-067`/`CFG-074` | `CFG-073` closed (refuted); `SEAM-120`…`122`, `TOOL-046`…`050`, `CFG-081`…`085` filed |
+| `07` | cyrup `ea23ca2` × pi **v0.87.1**. The crate's own module docs still cite a per-module range of v0.84.1–v0.84.3; believe that over this row | `interactive-mode.ts` beyond the named hunks (`/bug`, cache-warming, the progressive `--resume` loader only skimmed); `v0.84.3..v0.85.1` lead list; the unfiled leads in its new census section. `packages/chord` is still owned by no area | `TUI-098`…`103` filed |
+| `09` · `09a` | cyrup `ea23ca2` × pi-subagents **v0.71.0** | the windows they declare in `## Scope`; everything later is `09b`'s | every open row re-read; `SUBA-024` re-kinded `not-ported` |
+| `09b` (**new**) | cyrup `ea23ca2` × pi-subagents **v0.57.0..v0.71.0**, the window neither 09 nor 09a covers | `v0.57.0..v0.67.0` is leads only; `v0.67.0..v0.71.0`'s large modified files (`subagent-runner.ts`, `execution.ts`, …) not read line by line; `v0.71.0..HEAD` (10 commits) unread | `SUBA-107`…`113` filed |
+| `10` | cyrup `ea23ca2` × pi-permission-system **v0.8.0** = the latest tag | none | re-measured; nothing to census |
+| `11` | cyrup `ea23ca2` × pi-intercom **v0.14.0** | no surface-driven sweep has covered `v0.10.1..v0.14.0`; v0.14.0's tests, SKILL.md and README unread; `cli.ts` read only to its flags, registration and exit codes | `ICOM-062`…`067` filed |
+| `13` · `13a`–`13i` · `13-cyrup-mcp-STATUS.md` | cyrup `ea23ca2` × pi-mcp-adapter **v2.37.0**; `13-cyrup-mcp.md` carries a *Retarget — v2.33.0 → v2.37.0* pointer | `v2.32.1..v2.33.0` is leads only; about a dozen v2.34–v2.37 changes read upstream-side only (leads); `v2.37.0..HEAD` untagged; 159 open rows the 2026-09-04 sample did not draw never re-checked against the TypeScript | `MCP-540`…`550` filed; **numbering resumes at `MCP-551`** |
+| `14` | code_puppy_core_plugins **v0.0.6** ported / **v0.0.62** measured | none: the ported surface is byte-identical from v0.0.6 to v0.0.62. `code_puppy` itself past v0.0.720 is a separate, unpinned question (`FLUX-007`) | nothing filed |
+| `15` | cyrup `ea23ca2` × pi-acp **v0.0.33** = the latest tag | no upstream window. The gap is the cyrup side: the rows not closed this pass were not re-read (`crates/cyrup-acp` is unchanged since `9aeba769`). `v0.0.33..HEAD` `src/` changes are an untagged lead | critical/high rows closed on landed code, recorded in its `## 6. Open items`; nothing filed |
+| *(none)* | `crates/cyrup-herdr` × herdr **v0.9.1** (`d59d060`) | the whole crate: upstream not cloned in `tmp/`, no area file | not measured |
 
-**Two things this table makes visible that no single file could.** (1) **The directory holds at least
-five different pins against `pi` alone** — v0.83.0, v0.84.1, v0.84.3, v0.84.4 and v0.85.1 — and the
-difference between them is not uniformly staleness: areas 04, 07 and 08 are ported *ahead* of their
-recorded pin on specific surfaces, so a census that assumes the recorded tag files already-closed
-work. (2) **One upstream window is owned by no file at all**: pi-subagents `v0.57.0..v0.67.0` falls
-outside area 09's settled range and outside 09a's declared `## Scope`, so leads filed into 09a sit
-under a scope line that excludes them.
+**What this table shows that no single file could.** (1) **Every pi area is now pinned at the same
+tag, v0.87.1, but the blind windows are not the same.** Each pi area read the new window only for its
+own paths, and the `v0.84.1..v0.85.1` census leads are still unverified in most of them. A shared pin
+is not a shared depth. (2) **pi-subagents `v0.57.0..v0.71.0` now has an owner** (`09b`), which ends
+the problem of leads filed into `09a` under a scope that excluded them. (3) **Two things are still
+owned by no file**: pi's `packages/chord` and `packages/durable`, and the `cyrup-herdr` crate.
 
 > **LINE-CITATION SHIFT, stated so nobody re-verifies against the wrong line.** Inserting this
 > section moved **43 lines** into this file immediately above *Three standing hazards*. Every
@@ -241,7 +252,8 @@ under a scope line that excludes them.
 > `:552-555`. Citations above 203 (`:3-4`, `:68`, `:106-107`, `:133`, `:196-199`) are unaffected.
 > Those citations live in files this pass does not own and were **not** edited; this note is the
 > repair instruction, and it is one more instance of the dangling-citation problem *Work this
-> directory owns* already names.
+> directory owns* already names. **The 2026-09-24 rewrite of this section moved lines again; cite
+> this file by heading, not by line.**
 
 Three standing hazards:
 

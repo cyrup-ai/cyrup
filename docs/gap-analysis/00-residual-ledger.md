@@ -5,6 +5,60 @@ next work item**.
 
 ---
 
+# RE-MEASURED 2026-09-24 (thirteenth edition) — upstreams re-pulled, every area re-read at `ea23ca2`; the set above medium refills with three rows
+
+> **Read this block first. It supersedes every count below it and nothing else.** Upstream tags:
+> pi **v0.87.1**, pi-subagents **v0.71.0**, pi-intercom **v0.14.0**, pi-mcp-adapter **v2.37.0**,
+> code_puppy_core_plugins **v0.0.62**, pi-acp **v0.0.33**, pi-permission-system **v0.8.0**. Window
+> stats and per-area pins are in `README.md` *Baselines measured against*.
+>
+> **THE COUNT, from `python3 docs/gap-analysis/scripts/count_open_items.py`** (which now also reads
+> `09b`): **124 open, 1 critical, 2 high, 24 medium, 97 low; 7 trackers; 621 closed.** Re-run it
+> rather than quoting this.
+>
+> ## Ranked: the set above medium, all `upstream-drift`, all filed 2026-09-24
+>
+> | rank | ID | Sev | Area | Effort | Why it is first |
+> |---|---|---|---|---|---|
+> | 1 | `SEAM-122` | **critical** | 08 | S | Importing a session whose file name already exists in the session dir overwrites the stored session: data loss on an ordinary action. pi v0.85.0 renames the copy and copies with `COPYFILE_EXCL` |
+> | 2 | `TOOL-047` | **high** | 04 | S | A shell command killed by a signal is reported to the model as a success. pi v0.86.0 reports `128 + signo` as a failure. The model acts on a false result |
+> | 3 | `SUBA-110` | **high** | 09b | S | `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*` and similar are not removed before the background runner or an external CLI with no allowlist starts (pi-subagents v0.71.0), so a child's git can act on the wrong repository |
+>
+> **Mediums worth taking alongside them, because they are the same failure class.**
+> `DRIFT-056` (area 12) and `EXT-077` (area 06) are one defect filed twice: `user_bash` fails open
+> in cyrup (a faulting handler lets the command run on the local shell) where pi v0.86.0 fails
+> closed. Fix it once and close both. `SUBA-111` (09b) is the other fail-open: a declared
+> `allowedAgents` restriction is kept and never enforced.
+>
+> **Outside the count, by the standing rule:** `MCP-540` (high, area 13 / `13b`): a
+> higher-precedence config that switches a server between `command` and `url` keeps the old
+> transport's fields, so a layered config that works upstream fails to connect.
+>
+> ## Closed this pass
+>
+> * `CFG-073` (low): refuted. The one `NO_COLOR` write is a faithful port of pi-subagents.
+> * Area 15, outside the count: `ACP-121`, `ACP-145`, `ACP-209`, `ACP-219`, `ACP-291` (critical) and
+>   `ACP-005`, `ACP-056`, `ACP-122`, `ACP-140`, `ACP-221` (high), built in `0aefd08` / `cb290d1`.
+>   None had a row in this ledger.
+>
+> ## Filed this pass (medium and below)
+>
+> `PROV-073`…`082`, `DRIFT-057`; `AGENT-038`…`041`, `SESS-051`…`055`, `EXT-078`…`080`;
+> `TOOL-046`, `048`…`050`, `CFG-081`…`085`, `SEAM-120`, `SEAM-121`; `TUI-098`…`103`;
+> `SUBA-107`…`109`, `111`…`113`; `ICOM-062`…`067`; area 13 `MCP-541`…`550`. Each area file's pin
+> block lists them with evidence.
+>
+> ## Still unmeasured
+>
+> pi `v0.84.1..v0.85.1` census leads (mostly unverified); pi `v0.85.1..v0.87.1` in
+> `packages/agent/src/harness/**`, `packages/durable`, `packages/chord` and the `packages/ai`
+> anthropic/openai-responses/codex adapters; pi-subagents `v0.57.0..v0.67.0` (leads) and the large
+> files of `v0.67.0..v0.71.0`; pi-intercom `v0.10.1..v0.14.0` (no surface sweep); pi-mcp-adapter
+> `v2.32.1..v2.33.0` (leads) and 159 area-13 rows never re-checked; area 15's rows not closed this
+> pass; and `crates/cyrup-herdr` (herdr v0.9.1), which has no area file.
+
+---
+
 # FILED 2026-09-21 — four residuals from the VL-S11/S12/S8 batch, each with a TRUE premise and the grep that proves it
 
 > **UPDATE 2026-09-21 — three of the four are now CLOSED.** `R-VLS11b-02`, `R-VLS11b-03` and

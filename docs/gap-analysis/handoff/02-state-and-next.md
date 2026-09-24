@@ -1,6 +1,9 @@
 # 02 — State, and what to do next
 
-Written at HEAD `e815e08`, branch `david/cyrup`.
+State section rewritten 2026-09-24 against cyrup code HEAD `ea23ca2`. The
+sections after it (*Read this before planning*, *The queue after that*, the open question, MCP) were
+written at `e815e08` and are **not** re-verified; read them as history. In particular, MCP is no
+longer "not started": `crates/cyrup-mcp` exists and area 13 tracks what is built.
 
 ---
 
@@ -8,38 +11,57 @@ Written at HEAD `e815e08`, branch `david/cyrup`.
 
 | | |
 |---|---|
-| unit gate | **7,112 tests, 7,112 passed, 8 skipped, ~18s** |
-| `cargo check --workspace --all-targets` | clean |
-| `cargo clippy --workspace --all-targets` | clean; 79 warnings, all pre-existing |
-| `await_holding_lock` | **0** (was 5) |
-| integration suite | **not run recently — see `03-verification.md` before trusting its numbers** |
+| workspace | **24 crates, 1,044,991 lines of Rust under `crates/`**; 28,706 `.ts:N` upstream citations naming 16,976 distinct upstream locations; 974 `CYRUP-DELTA` markers |
+| unit gate | **11,311 passed, 0 failed, 9 skipped**, line coverage 86.3% (per the root `README.md`, measured at `ea23ca2`; not re-run by this pass) |
+| since the last re-measure | `9aeba769..ea23ca2`: 18 non-merge commits, 485 files, +164,754 / −4,932 under `crates/`: subagents SCOPE/lanes/runner identity, the 18-command slash surface, the UW-7 fleet roster, and the new `cyrup-herdr` crate (herdr v0.9.1, no area file, upstream not cloned) |
+| upstream tags measured against | pi **v0.87.1**, pi-subagents **v0.71.0**, pi-intercom **v0.14.0**, pi-mcp-adapter **v2.37.0**, code_puppy_core_plugins **v0.0.62**, pi-acp **v0.0.33**, pi-permission-system **v0.8.0**. Window stats are in `../README.md` *Baselines measured against* |
 
 ### Open ledger rows
 
-**118 open — 2 high, 43 medium, 73 low**, across areas 01–12. Area 02 (`cyrup-agent`) is fully
-closed at every severity. MCP (`13*`) is excluded from every count and is not started.
+Derive the number; do not copy it from here. `python3 docs/gap-analysis/scripts/count_open_items.py`
+at the end of the 2026-09-24 pass printed **124 open (1 critical, 2 high, 24 medium, 97 low), 7
+trackers, 621 closed** across areas 01–12, 09a, 09b and 14. The script now reads `09b`. Areas 13 and
+15 are outside that count by the standing rule.
 
-**Treat 118 as an upper bound, not a work estimate.** See "read this before planning" below.
+**The set above medium, empty since 2026-09-05, has refilled with three rows**, all
+`upstream-drift`, all filed in this pass:
 
-### What landed most recently
+- `SEAM-122` (critical, area 08): importing a session whose file name already exists in the session
+  dir overwrites the stored session. pi v0.85.0 renames the copy.
+- `TOOL-047` (high, area 04): a shell command killed by a signal is reported to the model as a
+  success. pi v0.86.0 reports `128 + signo` as a failure.
+- `SUBA-110` (high, area 09b): `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*` and similar are not
+  removed before the background runner or an external CLI starts (pi-subagents v0.71.0).
 
-```
-e815e08  batch C — ext, session-svc, intercom, permission, and the locks
-831321b  batch B — config, resources, tools, session, drift
-68bbd39  batch A — subagents and provider
-646e739  docs: state the upstream rule instead of recommending against the project
-4dfdd03  fix(plumbing): close the six seams that needed more than one crate
-37c2833  fix(plumbing): the seams that compiled, returned a plausible value, and lied
-320a1a2  docs: re-true the user-facing docs against HEAD
-```
+Outside the count: `MCP-540` (high, area 13), a higher-precedence config that switches a server
+between `command` and `url` keeps the old transport's fields.
 
-The two `plumbing` commits are worth reading before you start. They closed a whole defect
-class — **seams that compile, return a plausible value, and are wrong, because nothing ever called
-them.** Examples: the entire *read* half of the session interface (`entries`/`branch`/`tree`)
-returned `[]`/`[]`/`null` forever while the *write* half worked; `oauth_prompt`/`oauth_select`
-denied against a capability nothing grants, with test doubles as their only implementors; on Windows
-two of three termination signals were no-ops, so the ladder waited out both grace periods for
-signals it never sent and then orphaned the child's whole descendant subtree.
+### What the 2026-09-24 pass did
+
+- **Re-pulled every upstream into `tmp/`** and re-read every area file at `ea23ca2` against the new
+  tags. Each file carries a 2026-09-24 pin block. `09b` is new and owns pi-subagents
+  `v0.57.0..v0.71.0`.
+- **Closed:** `CFG-073` (refuted). In area 15, `ACP-121`, `145`, `209`, `219`, `291` (critical) and
+  `ACP-005`, `056`, `122`, `140`, `221` (high), all built in `0aefd08`/`cb290d1`.
+- **Filed:** area 01/12 `PROV-073`…`082`, `DRIFT-056`/`057`; area 02/03/06 `AGENT-038`…`041`,
+  `SESS-051`…`055`, `EXT-077`…`080`; area 04/05/08 `TOOL-046`…`050`, `CFG-081`…`085`,
+  `SEAM-120`…`122`; area 07 `TUI-098`…`103`; area 09b `SUBA-107`…`113`; area 11 `ICOM-062`…`067`;
+  area 13 `MCP-540`…`550` (next id `MCP-551`).
+- **`user_bash` fails open in cyrup and closed in pi v0.86.0.** It is filed twice, as `DRIFT-056`
+  and `EXT-077`; fix it once.
+
+### Windows still unmeasured
+
+- pi `v0.84.1..v0.85.1`: the 2026-09-14 census leads are still mostly unverified.
+- pi `v0.85.1..v0.87.1`: `packages/agent/src/harness/**` (incl. ~9k-line `pico3`), `packages/durable`,
+  `packages/chord`, the `packages/ai` anthropic/openai-responses/codex adapters, and most of
+  `agent-session.ts`, `interactive-mode.ts`, `runner.ts`, `loader.ts`.
+- pi-subagents `v0.57.0..v0.67.0` (leads only) and the large modified files in `v0.67.0..v0.71.0`.
+- pi-intercom: no surface sweep of `v0.10.1..v0.14.0`.
+- pi-mcp-adapter `v2.32.1..v2.33.0` (leads only), and 159 area-13 rows never re-checked against the
+  TypeScript.
+- Area 15: the rows not closed this pass were not re-read.
+- `cyrup-herdr`: unmeasured entirely.
 
 ---
 

@@ -384,29 +384,34 @@ unix-socket transport, and `mcpScript`.
 
 ## Upstreams
 
-cyrup tracks seven upstream projects, six TypeScript and one Python. The core is
+cyrup tracks eight upstream projects: six TypeScript, one Python and one Rust. The core is
 [`earendil-works/pi`](https://github.com/earendil-works/pi). Five optional subsystems follow
 standalone Pi extensions, since Pi core ships no permission system, no MCP client and no editor
-protocol of its own. Flux follows `code_puppy_core_plugins`, which is Python.
+protocol of its own. Flux follows `code_puppy_core_plugins`, which is Python. `cyrup-herdr` is a
+client for herdr's socket API rather than a port, pinned to the version whose schema it was checked
+against.
 
-Each row records the upstream a subsystem follows and the newest tag tracked, re-checked with
-`git ls-remote --tags`.
+Each row records the upstream a subsystem follows, the newest upstream tag, and the tag the
+[parity ledger](docs/gap-analysis/README.md) was last measured against. The ledger was re-measured
+on 2026-09-24 against cyrup `ea23ca2`.
 
-| upstream | followed by | latest tag tracked |
-|---|---|---|
-| `earendil-works/pi` | most crates | v0.85.1 |
-| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | v0.67.0 |
-| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.8.0 |
-| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.13.0 |
-| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.33.0 |
-| `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.50 |
-| `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 |
+| upstream | followed by | newest tag | ledger measured to |
+|---|---|---|---|
+| `earendil-works/pi` | most crates | v0.87.1 | v0.87.1 |
+| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | v0.71.0 | v0.71.0 (ported surface ≈ v0.68.0) |
+| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.8.0 | v0.8.0 |
+| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.14.0 | v0.14.0 |
+| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.37.0 | v2.37.0 |
+| `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.62 | v0.0.62 |
+| `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 | v0.0.33 |
+| herdr (Rust) | `cyrup-herdr` | — | pinned to v0.9.1, no ledger area yet |
 
-`cyrup-permission-system` is fully caught up with its upstream. Flux's ported surface
-(`flux_bootstrap/`) is byte-identical at every tag from `v0.0.6` through `v0.0.50`, so its version
-span carries no behavioural difference at all.
+"Measured to" means the newest window was read and its drift filed as ledger items. It does not
+mean that drift is closed. `cyrup-permission-system` is fully caught up with its upstream. Flux's
+ported surface (`flux_bootstrap/`) is byte-identical at every tag from `v0.0.6` through `v0.0.62`,
+so its version span carries no behavioural difference at all.
 
-The pi-acp row is the newest. `cyrup-acp` speaks the
+`cyrup-acp` is the newest port. It speaks the
 [Agent Client Protocol](https://agentclientprotocol.com) over stdio so an editor — Zed is the
 reference client — can drive cyrup the way it drives any other ACP agent: `initialize`,
 `session/new`, `session/prompt` and the rest, with the turn streamed back as `session/update`
@@ -419,7 +424,7 @@ its stdout, because it is a separate npm package; `cyrup-acp` is a workspace cra
 `AgentSession` in-process instead, which deletes the whole subprocess surface and replaces
 `Record<string, unknown>` event probing with the typed `AgentSessionEvent`.
 
-Clone all seven under `./tmp/` (gitignored) before working a ledger row;
+Clone the seven Pi-family upstreams under `./tmp/` (gitignored) before working a ledger row;
 `.claude/hooks/session-start.sh` does it for you. The area files cite them as
 `git -C tmp/<repo> show <tag>:<path>`, at a named tag rather than from a working tree, so a citation
 still resolves months later. [`docs/gap-analysis/README.md`](docs/gap-analysis/README.md) records

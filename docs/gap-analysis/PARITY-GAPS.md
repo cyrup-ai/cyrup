@@ -881,6 +881,25 @@ Where the re-audit moved an item to a different class, the id moves section and 
 
 ## 0a. Everything above medium, in one table
 
+> **TENTH EDITION 2026-09-24, cyrup code HEAD `ea23ca2`, upstreams re-pulled (pi v0.87.1,
+> pi-subagents v0.71.0, pi-intercom v0.14.0, pi-mcp-adapter v2.37.0). The set is no longer empty.**
+> `python3 docs/gap-analysis/scripts/count_open_items.py` prints `Above-medium open rows (3)`, all
+> filed by this re-measure against new upstream tags, none against landed cyrup code:
+>
+> | ID | Sev | Area | Kind | Effort | Gap |
+> |---|---|---|---|---|---|
+> | `SEAM-122` | **critical** | 08 | upstream-drift | S | Importing a session whose file name already exists in the session dir overwrites the stored session (pi v0.85.0 renames the copy, `COPYFILE_EXCL`) |
+> | `TOOL-047` | **high** | 04 | upstream-drift | S | A shell command killed by a signal is reported as a success (pi v0.86.0: `128 + signo`, failure) |
+> | `SUBA-110` | **high** | 09b | upstream-drift | S | Git routing variables (`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, …) reach the background runner and allowlist-less external CLIs (pi-subagents v0.71.0) |
+>
+> Not in this table by the standing counting rule: `MCP-540` (high, area 13) — transport switch in a
+> layered config keeps the old transport's fields. Area 15 closed five criticals and five highs this
+> pass (`ACP-121`, `145`, `209`, `219`, `291`; `ACP-005`, `056`, `122`, `140`, `221`); none was in
+> this table. The caveats of the ninth edition below still apply: severity is a per-row judgement,
+> and whatever is open is a floor.
+>
+> Every block below this one is superseded.
+
 > **NINTH EDITION 2026-09-05 (batch 4), cyrup code HEAD `f2630a7a` — THE SET IS STILL EMPTY, for the
 > second consecutive edition. This section remains a statement, not a table.**
 >

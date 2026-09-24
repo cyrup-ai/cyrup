@@ -32,6 +32,10 @@ WHAT IT PARSES
     against a later `pi-subagents` tag than the one cyrup ported — recorded
     here so the classification is not re-derived by hand next time.
 
+    Area 09b (`09b-cyrup-ext-subagents-v0.64-drift.md`, pi-subagents
+    v0.57.0..v0.71.0) uses the standard `## Open items` table and is read
+    as a standard area.
+
 CLOSED-ROW DETECTION
     A row counts as CLOSED if its Severity cell contains a struck span
     (`~~...~~`) — this is the one reliable signal: some rows strike only
@@ -81,6 +85,7 @@ STANDARD_AREAS = [
     ("07", "07-cyrup-tui.md"),
     ("08", "08-cyrup-session-svc-and-modes.md"),
     ("09", "09-cyrup-ext-subagents.md"),
+    ("09b", "09b-cyrup-ext-subagents-v0.64-drift.md"),
     ("10", "10-cyrup-permission-system.md"),
     ("11", "11-cyrup-intercom.md"),
     ("12", "12-upstream-drift-pi-core.md"),
