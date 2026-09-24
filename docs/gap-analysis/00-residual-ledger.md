@@ -11,6 +11,8 @@ next work item**.
 >
 > **UPDATE 2026-09-24 — both criticals are closed on branch `claude/sess-056-unterminated-session-line`:** `SESS-056` in `c625fbc` (a session file's unterminated last line is terminated on load) and `SEAM-122` in `7522d80` (`/import` never overwrites a stored session). Each landed with a regression test that fails without it. The counted set above medium is now **eight rows, all high**; the struck rows below stay for the record.
 >
+> **UPDATE 2026-09-24 (later) — five more closed on `claude/easy-highs`:** `TOOL-047` (`6a3f162`), `SUBA-110` (`c936d8c`), `SUBA-115` (`7ba9e03`), and `TUI-104` with its session half `SEAM-124` (`0820d97`). Each landed with a regression test. Four highs remain: `SUBA-114`, `ICOM-035`, `ICOM-062`, `ICOM-068` (all effort M; the three `ICOM` rows share the injection pump).
+>
 > Same code (`ea23ca2`; HEAD `8d93b0e` is docs-only) and the same upstream tags as the thirteenth
 > edition, plus **herdr v0.9.1** (`065ef9d6`), now cloned at `tmp/herdr` from
 > <https://github.com/herdrdev/herdr>. **herdr is not a port.** `crates/cyrup-herdr` is cyrup's own
@@ -34,11 +36,11 @@ next work item**.
 > | 3 | `ICOM-068` | **high** | 11 | parity-bug | M | An intercom message delivered without a turn is saved and drawn but never added to the model's transcript (`append_injected_message_durably` skips it). Covers every busy-session steer and idle delivery under `inboundTrigger: replies`/`never`. The code is in `cyrup-session-svc` (area 08), which has not filed it |
 > | 4 | `ICOM-035` | **high** | 11 | parity-bug | M | **Reopened (regression from `8de7460`).** The injection pump `drive_injections` waits for idle, so a peer message to a busy session is parked until the run ends and is then appended with no turn (then `ICOM-068` applies). Take it with `ICOM-068`: same pump |
 > | 5 | `ICOM-062` | **high** | 11 | upstream-drift | M | `is_idle` is true during `/compact`, so a peer message starts a model run alongside the compaction, and `compact`'s `set_messages` then replaces the transcript under that running turn. Depends on area 08's `SEAM-125` |
-> | 6 | `TUI-104` | **high** | 07 | upstream-drift | S | `/tree` is not refused while a compaction runs. The compaction entry lands on the branch the user moved to, with its kept range pointing into the abandoned branch, so earlier history drops out of the model's context. **The session half is `SEAM-124` (area 08), rated medium**; the two ratings disagree and should be settled when the pair is fixed together |
-> | 7 | `TOOL-047` | **high** | 04 | upstream-drift | S | A shell command killed by a signal is reported to the model as a success. pi v0.86.0 reports `128 + signo` as a failure |
-> | 8 | `SUBA-115` | **high** | 09b | upstream-drift | S | Stopping, interrupting or timing out a nested run also hits sibling subtrees it never launched (pi-subagents v0.68.0 confines it to the subtree) |
+> | 6 | ~~`TUI-104`~~ | ~~high~~ **CLOSED 2026-09-24 (`0820d97`)** | 07 | upstream-drift | S | `/tree` is not refused while a compaction runs. The compaction entry lands on the branch the user moved to, with its kept range pointing into the abandoned branch, so earlier history drops out of the model's context. **The session half is `SEAM-124` (area 08), rated medium**; the two ratings disagree and should be settled when the pair is fixed together |
+> | 7 | ~~`TOOL-047`~~ | ~~high~~ **CLOSED 2026-09-24 (`6a3f162`)** | 04 | upstream-drift | S | A shell command killed by a signal is reported to the model as a success. pi v0.86.0 reports `128 + signo` as a failure |
+> | 8 | ~~`SUBA-115`~~ | ~~high~~ **CLOSED 2026-09-24 (`7ba9e03`)** | 09b | upstream-drift | S | Stopping, interrupting or timing out a nested run also hits sibling subtrees it never launched (pi-subagents v0.68.0 confines it to the subtree) |
 > | 9 | `SUBA-114` | **high** | 09b | stale-port | M | A child's tools are cut down to the tools the parent session started with, so reviewer/scout launches are refused under a narrow `--tools`. Upstream removed this at v0.70.0 |
-> | 10 | `SUBA-110` | **high** | 09b | upstream-drift | S | `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*` and similar are not removed before the background runner or an allowlist-less external CLI starts, so a child's git can act on the wrong repository (pi-subagents v0.71.0) |
+> | 10 | ~~`SUBA-110`~~ | ~~high~~ **CLOSED 2026-09-24 (`c936d8c`)** | 09b | upstream-drift | S | `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*` and similar are not removed before the background runner or an allowlist-less external CLI starts, so a child's git can act on the wrong repository (pi-subagents v0.71.0) |
 >
 > **Take these mediums with the set above, because they are the same failure or the same code.**
 > `SEAM-124`/`SEAM-125` (area 08) with `TUI-104` and `ICOM-062`. `SESS-061`/`SESS-062` (compaction
@@ -123,8 +125,8 @@ next work item**.
 > | rank | ID | Sev | Area | Effort | Why it is first |
 > |---|---|---|---|---|---|
 > | 1 | ~~`SEAM-122`~~ | ~~critical~~ **CLOSED 2026-09-24 (`7522d80`)** | 08 | S | Importing a session whose file name already exists in the session dir overwrites the stored session: data loss on an ordinary action. pi v0.85.0 renames the copy and copies with `COPYFILE_EXCL` |
-> | 2 | `TOOL-047` | **high** | 04 | S | A shell command killed by a signal is reported to the model as a success. pi v0.86.0 reports `128 + signo` as a failure. The model acts on a false result |
-> | 3 | `SUBA-110` | **high** | 09b | S | `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*` and similar are not removed before the background runner or an external CLI with no allowlist starts (pi-subagents v0.71.0), so a child's git can act on the wrong repository |
+> | 2 | ~~`TOOL-047`~~ | ~~high~~ **CLOSED 2026-09-24 (`6a3f162`)** | 04 | S | A shell command killed by a signal is reported to the model as a success. pi v0.86.0 reports `128 + signo` as a failure. The model acts on a false result |
+> | 3 | ~~`SUBA-110`~~ | ~~high~~ **CLOSED 2026-09-24 (`c936d8c`)** | 09b | S | `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*` and similar are not removed before the background runner or an external CLI with no allowlist starts (pi-subagents v0.71.0), so a child's git can act on the wrong repository |
 >
 > **Mediums worth taking alongside them, because they are the same failure class.**
 > `DRIFT-056` (area 12) and `EXT-077` (area 06) are one defect filed twice: `user_bash` fails open

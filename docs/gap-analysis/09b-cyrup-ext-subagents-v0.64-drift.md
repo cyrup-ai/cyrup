@@ -135,7 +135,7 @@ v0.70.1 and v0.71.0.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| SUBA-110 | high | upstream-drift | S | Git routing variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, …) are not removed from the background runner's environment or from an inherited external-CLI environment |
+| ~~SUBA-110~~ | ~~high~~ **CLOSED 2026-09-24** | upstream-drift | S | Git routing variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, …) are not removed from the background runner's environment or from an inherited external-CLI environment — **CLOSED 2026-09-24** (`c936d8c`): new `spawn/git_env.rs` ports `git-environment.ts` (the 16 names plus `GIT_CONFIG_{KEY,VALUE}_<n>`, case-insensitive); applied before the overlay in `background/spawn_detached.rs` and on the inherited arm of `exec/external_cli/run.rs`; an adapter allowlist is left as written. Verify: `spawn::git_env::tests` (predicate; removals-then-overlay; a real `git rev-parse` resolves the parent repo through an inherited `GIT_DIR` and the child's own repo once filtered). The two call sites are not driven by a test (`#![forbid(unsafe_code)]` rules out setting `GIT_DIR` on the test process). |
 | SUBA-107 | medium | stale-port | M | The completion-mutation guard still fails a successful run because its task wording "looked like" an implementation task. Upstream deleted the guard at v0.70.1 |
 | SUBA-108 | medium | stale-port | M | Acceptance-level inference still reads task wording and agent-name regexes. At v0.70.1 upstream infers only from the declared `acceptanceRole` |
 | SUBA-111 | medium | upstream-drift | M | Agent `allowedAgents` (frontmatter and `agentOverrides`, v0.70.0) is unported. The frontmatter key is silently kept as an extra field, so a declared delegation restriction fails open |
@@ -143,7 +143,7 @@ v0.70.1 and v0.71.0.
 | SUBA-112 | low | upstream-drift | S | The bundled `worker` still has `defaultContext: fork` (upstream: `fresh`, v0.71.0) and has no `acceptanceRole: writer` (v0.70.1) |
 | SUBA-113 | tracker | tracker | — | Thirteen `config.json` keys are declared unported in source (`registration/mod.rs::UNPORTED_CONFIG_KEYS`), which says "the ledger carries them". No ledger item did until this row |
 | SUBA-114 | high | stale-port | M | Child tool plans are still pruned to the PARENT session's tool registry, and reviewer/scout launches are refused when the parent was started with a narrow `--tools`. Upstream removed the prediction at v0.70.0 |
-| SUBA-115 | high | upstream-drift | S | A nested run's stop / interrupt / timeout cascade reaches every live run on the ROOT route, including sibling subtrees it did not launch (v0.68.0 confines it to the issuing subtree) |
+| ~~SUBA-115~~ | ~~high~~ **CLOSED 2026-09-24** | upstream-drift | S | A nested run's stop / interrupt / timeout cascade reaches every live run on the ROOT route, including sibling subtrees it did not launch (v0.68.0 confines it to the issuing subtree) — **CLOSED 2026-09-24** (`7ba9e03`): `background/cascade.rs::is_control_descendant` ports `isNestedControlDescendant`; `settle.rs::cascade_to_descendants` passes this run's id as issuer when `nested_self` is set, for stop, interrupt and timeout. Verify: `background::cascade::tests::a_nested_issuer_reaches_only_its_own_subtree` (red with the filter removed). Reach note: cyrup does not yet mint a nested route for its own children (`exec/spawn_plan.rs:993`), so today the cascade only has a route when cyrup was itself launched under an inherited one. |
 | SUBA-116 | medium | upstream-drift | M | A paused async run cannot be stopped (refused as "No running or queued async run"), so it keeps its active-capacity slot until resumed |
 | SUBA-117 | medium | parity-bug | S | The worktree clean-tree check does not exclude the crate's own `.cyrup-subagents/` project directory, so the crate's own chain-run / refinement / schedule files make `worktree: true` refuse a clean repository |
 | SUBA-118 | medium | upstream-drift | M | Abort recovery is unported: a child whose provider/transport aborted after compaction settled, with useful progress, fails instead of being resumed once |
@@ -177,7 +177,7 @@ v0.70.1 and v0.71.0.
 
 ## SUBA-110 — Git routing variables reach the background runner and inherited external CLIs
 
-**Kind** upstream-drift · **Severity** high · **Effort** S · **Confidence** confirmed (both sides read; not observed live)
+**Kind** upstream-drift · **Severity** high · **Effort** S · **Confidence** confirmed (both sides read; not observed live) · **CLOSED 2026-09-24** (`c936d8c`): new `spawn/git_env.rs` ports `git-environment.ts` (the 16 names plus `GIT_CONFIG_{KEY,VALUE}_<n>`, case-insensitive); applied before the overlay in `background/spawn_detached.rs` and on the inherited arm of `exec/external_cli/run.rs`; an adapter allowlist is left as written. Verify: `spawn::git_env::tests` (predicate; removals-then-overlay; a real `git rev-parse` resolves the parent repo through an inherited `GIT_DIR` and the child's own repo once filtered). The two call sites are not driven by a test (`#![forbid(unsafe_code)]` rules out setting `GIT_DIR` on the test process).
 
 **cyrup** — The detached background runner is spawned at
 `crates/cyrup-ext-subagents/src/background/spawn_detached.rs:213-228`. It uses
@@ -472,7 +472,7 @@ succeeds.
 
 ## SUBA-115 — Nested control cascades escape the issuing subtree
 
-**Kind** upstream-drift · **Severity** high · **Effort** S · **Confidence** confirmed (both sides read)
+**Kind** upstream-drift · **Severity** high · **Effort** S · **Confidence** confirmed (both sides read) · **CLOSED 2026-09-24** (`7ba9e03`): `background/cascade.rs::is_control_descendant` ports `isNestedControlDescendant`; `settle.rs::cascade_to_descendants` passes this run's id as issuer when `nested_self` is set, for stop, interrupt and timeout. Verify: `background::cascade::tests::a_nested_issuer_reaches_only_its_own_subtree` (red with the filter removed). Reach note: cyrup does not yet mint a nested route for its own children (`exec/spawn_plan.rs:993`), so today the cascade only has a route when cyrup was itself launched under an inherited one.
 
 **cyrup** — `background/cascade.rs::cascade_to_nested_async_descendants` (`:167-230`) projects the
 whole registry of the ROOT route (`project_nested_events_in(&roots.nested_events(), route)`),

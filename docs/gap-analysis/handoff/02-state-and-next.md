@@ -24,7 +24,7 @@ The script now reads areas 16 (herdr client; its `client-bug`/`protocol-drift` k
 bug / Version lag) and 17 (all trackers), and no longer counts `DRIFT-056`, a duplicate of `EXT-077`.
 Areas 13 and 15 stay outside the count by the standing rule.
 
-**The set above medium was ten rows: 2 critical, 8 high. Both criticals are now closed (`SESS-056` in `c625fbc`, `SEAM-122` in `7522d80`), leaving eight highs.** The first pass found three; the second
+**The set above medium was ten rows: 2 critical, 8 high. Both criticals are now closed (`SESS-056` in `c625fbc`, `SEAM-122` in `7522d80`), leaving eight highs.** **Later the same day, five more closed (`TOOL-047`, `SUBA-110`, `SUBA-115`, `TUI-104` + `SEAM-124`), leaving four highs: `SUBA-114` and the three `ICOM` rows.** The first pass found three; the second
 pass added seven, one of them a reopened closure. The ranked table with reasons is at the top of
 `../00-residual-ledger.md` and of `../PARITY-GAPS.md`.
 
@@ -68,14 +68,14 @@ compaction). Area 08 has not filed the `ICOM-035`/`068` code as its own rows; fi
 them there when the work starts. Note that the existing tests use a `HostServices` double that never
 runs the pump, which is why they passed.
 
-**3. Tree navigation during compaction — `TUI-104` (high) with `SEAM-124` (medium).** One guard in
+**3. Tree navigation during compaction — `TUI-104` (high) with `SEAM-124` (medium).** **DONE 2026-09-24 (`0820d97`).** One guard in
 `navigate_tree` plus the UI refusal. Settle the rating disagreement when fixing the pair. The same
 seam carries `SEAM-126`, `SEAM-127`, `SESS-061` and `SESS-062`; batch them if the agent has room.
 
-**4. `TOOL-047` (high, area 04, S).** Report a signal-killed shell command as a failure with exit code
+**4. `TOOL-047` (high, area 04, S).** **DONE 2026-09-24 (`6a3f162`).** Report a signal-killed shell command as a failure with exit code
 `128 + signo`.
 
-**5. Subagents — three highs in `09b`.** `SUBA-115` (a nested stop/interrupt/timeout cascades into
+**5. Subagents — three highs in `09b`.** **`SUBA-115` DONE 2026-09-24 (`7ba9e03`); `SUBA-110` DONE 2026-09-24 (`c936d8c`); `SUBA-114` still open.** `SUBA-115` (a nested stop/interrupt/timeout cascades into
 sibling subtrees; S), `SUBA-110` (strip git routing variables before the background runner and
 allowlist-less external CLIs; S), `SUBA-114` (stop pruning child tools to the parent's start-up tool
 set; M, `stale-port`). The fail-open `SUBA-111` belongs in the same batch.
