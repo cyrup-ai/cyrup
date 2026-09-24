@@ -93,6 +93,10 @@ over existing host verbs.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** panel theme → **`MCP-560`**; `logoutServer` ordering → **`MCP-555`** (v2.37.0 keeps close-first but restores two distinct failure messages, not the single v2.33.0 one); `hasCachedData` scope → **`MCP-556`**. The non-theme hunks of the two panel files remain sampled rather than read line by line; nothing in them was found to change behaviour. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: `MCP-362`, `368`, `377`, `381`, `383`, `384`, `385a`, `386`, `387`, `388`, `389`, `391`, `392`, `395`, `396`, `397a`, `399` → **implemented**; `MCP-382` restated (medium → low); `MCP-398` confirmed `missing` — a registered prompt command cannot run (no `prompts/get` anywhere). Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or

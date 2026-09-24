@@ -141,7 +141,68 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 > `PROV-054` in the census section immediately following). Re-derive both sides before quoting any
 > row, per `README.md` → *Working an item*.
 
-## UNVERIFIED — 2026-09-14 census of the `v0.84.1..v0.85.1` window (leads, not items)
+> ### RE-MEASURE — 2026-09-24. **cyrup `ea23ca2`, pi `v0.87.1`.** This block supersedes the pin table immediately above.
+>
+> | | measured at | window read this pass | window still unread |
+> |---|---|---|---|
+> | `cyrup` | **`ea23ca2`** (2026-09-24) | `9aeba769..ea23ca2` — 46 commits, and **zero bytes changed in this area's crates**: `git diff --quiet 9aeba769 ea23ca2 -- crates/cyrup-provider crates/cyrup-core crates/cyrup-config crates/cyrup-agent crates/cyrup-session crates/cyrup-modes crates/cyrup-resources crates/cyrup-tools xtask` exits 0. The window's code landed in `cyrup-ext-subagents`, the new `cyrup-herdr`, `cyrup-it`, `cyrup-tui`, `cyrup-ext`, `cyrup-session-svc` and `crates/cyrup` (none of it provider-facing; `git grep 'refresh_models\|RadiusProviderOptions\|radius_provider_with' -- crates ':!crates/cyrup-provider'` is still empty) | — |
+> | `pi` `packages/ai` | **`v0.87.1`** (2026-09-22) | `v0.85.1..v0.87.1` — `packages/ai` **127 files, +4 910 / −2 058**, 67 non-merge commits (releases v0.86.0 · v0.86.1 · v0.87.0 · v0.87.1). Read: `CHANGELOG.md` in full; source diffs of `utils/{retry,overflow}.ts`, `providers/{all,meta,opencode,opencode-go,opencode-headers,radius}.ts`, `auth/oauth/{meta,load}.ts`, `env-api-keys.ts`, `api/openai-completions.ts` (the two v0.86.1..v0.87.1 commits), `api/bedrock-converse-stream.ts`, the `claudeCodeVersion` constant, `utils/transcript.ts` (head only). **Plus five `v0.84.1..v0.85.1` leads from the census below, promoted after both sides were re-read at this pass's pins** | `v0.85.1..v0.87.1`: `api/anthropic-messages.ts` (273 lines changed), `api/openai-responses*.ts`, `api/openai-codex-responses.ts`, `api/google-*.ts` beyond the one fix filed, `api/mistral-conversations.ts`, `types.ts` (+219), `utils/{estimate,event-stream,text}.ts`, `scripts/generate-models.ts` (+705 lines) — see `### 2026-09-24 census note` below. ~~`v0.84.1..v0.85.1`: every census lead below not promoted is still UNVERIFIED~~ — **both halves of this cell were read by the SECOND PASS below; nothing remains** |
+>
+> **Every open row was re-read against both sides at these pins; none closed** — the cyrup side of each is byte-identical to its 2026-09-14/16 reading, and each upstream falsifier was re-run at v0.87.1 (stamps in the rows). **Ten items filed, `PROV-073` … `PROV-082`**, bodies under `## Findings filed 2026-09-24`. Upstream is cited only as `git -C tmp/pi show <tag>:<path>`.
+>
+> **SECOND PASS, 2026-09-24 (same pins) — the "window still unread" cell above is now CLOSED.** Read in
+> full: `api/anthropic-messages.ts`, `api/openai-responses.ts`, `api/openai-responses-shared.ts`,
+> `api/azure-openai-responses.ts`, `api/openai-codex-responses.ts`, `types.ts`, `utils/transcript.ts`,
+> `utils/{text,estimate,event-stream}.ts`, `api/{transform-messages,simple-options,pi-messages}.ts`,
+> `models.ts`, `compat.ts`, `index.ts`, every `api/google-*.ts` and `api/mistral-conversations.ts` commit in
+> the window, the two `api/openai-completions.ts` commits the first pass skipped, the whole
+> `scripts/generate-models.ts` diff, `image-models.generated.ts` and `models.generated.ts`. The first pass's
+> `bedrock-converse-stream.ts` read was re-used, and its census leads were re-read on both sides. **Every
+> 2026-09-14 lead and every 2026-09-24 census lead is dispositioned** (tables in the two census sections).
+> **Eighteen items filed, `PROV-083` … `PROV-100`**; `PROV-040`, `PROV-071`, `PROV-078` amended with growth;
+> closed `PROV-025`/`PROV-S04` annotated (their upstream targets were deleted in v0.86.0); `PROV-054`'s
+> closure re-audited and upheld. No item closed. **Still unread in `packages/ai` v0.84.1..v0.87.1: nothing
+> port-relevant** — `test/**` was read only as evidence for specific items, and `CHANGELOG.md`/`README.md`
+> are not port surfaces. The pi.dev catalog DATA (gitignored at every tag) remains unreadable from git by
+> construction; that is `PROV-071`'s standing limitation, not an unread window. Post-tag commits
+> `v0.87.1..b45597504` touching `packages/ai` are recorded as leads under the 2026-09-24 census note.
+
+## RESOLVED — 2026-09-14 census of the `v0.84.1..v0.85.1` window (historical leads, every one dispositioned 2026-09-24)
+
+> **2026-09-24, second pass — EVERY lead in this section is now resolved; none remains unverified.**
+> Each was re-read on both sides (cyrup `ea23ca2`, pi `v0.87.1` via `git show`), so the bullets below are
+> kept as the historical census, not as open work. Dispositions:
+>
+> | lead | disposition |
+> |---|---|
+> | Anthropic: beta namespace / body `betas[]` | **Struck as a mechanism difference that costs no behaviour** — cyrup's header overlay reproduces pi's rules exactly: a caller `anthropic-beta` header replaces the computed set and a `None` suppresses it (`api/anthropic_messages/headers.rs`, overlay merged last). The one real difference, the interleaved-thinking gate, is folded into `PROV-091` |
+> | Anthropic: server-side refusal fallback | **→ `PROV-090`** |
+> | Anthropic: mid-conversation per-turn effort | **→ `PROV-091`** |
+> | Anthropic: `claudeCodeVersion` | `PROV-077` (first pass) |
+> | Responses: `supportsMaxOutputTokens` · GPT-5.6 `ttl:"30m"` | **→ `PROV-093`** (one item, one code block) |
+> | Responses: `supportsAdditionalTools` | **→ `PROV-083`** — upstream re-anchored it at mid-conversation system messages in v0.86.0, so it is no longer a separate compat-key gap |
+> | Codex SSE EOF | **→ `PROV-084`**, which is wider: cyrup's shared framer also drops the trailing Anthropic event pi has flushed since before v0.83.0 |
+> | Completions: `reasoning_details` rewrite | **→ `PROV-092`** |
+> | Completions: `thinkingTokenBudgetField` + `$var`, `vllmPriority` | **→ `PROV-100`** (the `$var` half is resolved: cyrup mis-resolves it as an effort) |
+> | Completions: DeepSeek · Kimi `cached_tokens` | `PROV-074` · `PROV-076` (first pass) |
+> | Google: `thinkingLevelMap` / `resolveGoogleThinkingLevel` | **→ `PROV-087`** (merged with v0.86.0 #9455); finish-reason half is `PROV-075` |
+> | Bedrock: redacted reasoning · empty-key sanitize · response headers | **→ `PROV-097`** — the "(b) is a lead" half was read: `convert.rs` replays `tc.arguments` verbatim |
+> | Mistral tool-call key | `PROV-073` (first pass) |
+> | `pi` default `User-Agent` | **→ `PROV-095`** |
+> | `NO_PROXY` subdomains / IPv6 / case | **→ `PROV-096`** |
+> | Retry: eighth literal | **→ growth on `DRIFT-057`** (area 12, same list, same fix). The `errorMessage` deletion half is **struck — already ported**: `utils/retry.rs` sets `error_message = None` on a backoff abort |
+> | `normalizeOptionalNulls` | **Struck — already ported**: `crates/cyrup-provider/src/validate.rs::normalize_optional_nulls` removes a `null` optional whose schema rejects null |
+> | `toolChoice` on `SimpleStreamOptions` | **Struck — refuted**: `utils/simple_options.rs:127` forwards `base.tool_choice`. Reading it found a different, real gap → **`PROV-094`** |
+> | Copilot rate-limited discovery / selective policies | **→ `PROV-098`** |
+> | OpenRouter `anthropic-messages` route | **→ `PROV-099`**. xAI half: **resolved, no gap** — all three `xai.json` rows are `openai-responses` |
+> | `Models.streamDeferred()` | **→ growth on `PROV-040`** (row amended) |
+> | Generator rewrite | **→ growth on `PROV-071`** (row amended with the v0.87.1 generator deltas) and `PROV-083`/`PROV-090`/`PROV-091` for the behaviour it feeds |
+> | cyrup-side: XAI_1 manifest · `CatalogOverlaySlot` · `preserve_order` | **Struck as leads** — cyrup-only surfaces with no upstream claim to test; `PROV-071`'s row already records XAI_1 as shipped state, and the overlay slot is a fix with no residual behaviour gap found |
+> | `PROV-054` supersession flag | **Resolved — closure holds**: every embedded `xai` row is `openai-responses`, from the live pi.dev fetch |
+> | `PROV-040` / `PROV-060` / adjacency notes | bookkeeping, applied |
+
+> **2026-09-24 — five leads below are now items**, re-read on both sides at cyrup `ea23ca2` / pi `v0.87.1`: the Mistral tool-call key → `PROV-073`; DeepSeek `useMaxTokens` → `PROV-074`; the Google non-STOP finish-reason override → `PROV-075`; Kimi top-level `cached_tokens` → `PROV-076`; `claudeCodeVersion` → `PROV-077` (which has moved again, to `2.1.280`, at v0.87.1). The second pass the same day dispositioned every remaining lead — see the table immediately below.
+
 
 **Nothing in this section is an item.** No `PROV-`/`DRIFT-` id is assigned, because id assignment
 belongs to a pass that read both sides and this one did not read both sides everywhere. No row in
@@ -322,7 +383,7 @@ faster than this directory does.
   upstream `utils/validation.ts:240-269` new `normalizeOptionalNulls()`, called at `:319`, v0.84.2.
   Strict schemas wrap optionals in `anyOf:[T,null]`, so models now emit explicit `null` for omitted
   optionals and this recursively deletes those keys. cyrup has the strict-schema half
-  (`utils/constrained_sampling.rs:217`,`:233`) but **the cyrup side is UNVERIFIED** — no
+  (`utils/constrained_sampling.rs:217`,`:233`) but **the cyrup side was UNVERIFIED at the census** *(resolved 2026-09-24: `validate.rs::normalize_optional_nulls` exists — already ported)* — no
   `normalize_optional_nulls` counterpart was located and cyrup's tool-argument validator was not read.
   Filed because the two halves shipped as one change. Adjacent to open `PROV-016`/`PROV-046`.
 
@@ -465,6 +526,67 @@ the wider `v0.84.4..v0.85.1` window are unmeasured here; several leads above (th
 frame reducer, `streamDeferred`, durable retry) are the `ai`-side half of agent-side work living in
 those packages, and none of the three can be sized honestly until a pass scoped to `packages/agent`
 runs.
+
+### 2026-09-24 census note — `v0.85.1..v0.87.1` (leads, not items)
+
+Upstream-side reads only unless stated. **Cleared (read, not filed):** OpenCode's new
+`providers/opencode-headers.ts` `withOpenCodeSessionHeader` (v0.86.0, #9326) moves `x-opencode-session`
+into the ai layer; cyrup already sends it on every session request via
+`crates/cyrup-session-svc/src/attribution.rs::session_headers`, and the one bare-agent path
+(`crates/cyrup-ext-subagents/src/watchdog/agent_turn.rs::opencode_session_headers`) ports pi-subagents'
+copy — no user-visible gap, though a non-session SDK caller of `cyrup-provider` would still omit it.
+`PROV-071`'s upstream falsifier (a) was re-run: all **41** `*.models.ts` under `packages/ai/src/providers/`
+at v0.87.1 are re-exports of gitignored `data/*.json` (0 files in `git ls-tree v0.87.1 packages/ai/src/providers/data`),
+now including `meta.models.ts` and a new `radius.models.ts` — premise holds.
+**Leads (no id) — all dispositioned by the second pass, see the paragraph after this one:** (1) **the v0.86.0 `TranscriptContext` break** — `ProviderStreams` take a
+normalized transcript whose leading `role:"system"` message carries prompt + `toolsAdded`, with
+mid-conversation `SystemMessage`s (`types.ts:491-505` @v0.87.1, `utils/transcript.ts`) replayed natively
+where `supportsMidConvoSystemMessages`/`supportsMidConvoToolAdditions` hold and collapsed otherwise;
+`git grep -n 'tools_added\|mid_convo_system' -- crates/` is empty. Strategic, crosses cyrup-core/agent/session;
+sized as a lead for `DRIFT-040`'s owner, not filed. (2) `Model.promptCache` lifetime metadata and cache
+warming (v0.86.0). (3) Codex `Off` reasoning effort sent rather than omitted (#9191). (4) OpenRouter
+`x-session-id` on Chat Completions + Anthropic Messages (#9102); Baseten session-affinity headers
+(#9629). (5) Mistral `reasoning_effort` for all `mistral-medium-*` and Mistral-hosted GLM-5.2
+(#8700, #9375). (6) Anthropic-compatible relays reporting a different response model (#9188);
+Vercel AI Gateway unsigned-thinking replay (#9676); Google thinking-level resolution when reasoning is
+omitted (#9455). (7) `EventStream` quadratic drain (#9055) — cyrup's stream is a channel, likely N/A,
+not read. (8) `ToolCall.arguments`/`ToolResultMessage.details` narrowed to JSON values — type-only in TS,
+cyrup already uses `serde_json::Value`. (9) New catalog rows (Opus 5.5, GPT-6 Sol/Luna, Grok 4.7 as the
+xai default) — `PROV-071`'s class; pi's data is not readable from git. (10) v0.86.0 public Radius baseline
+catalog — recorded as growth on `PROV-014`.
+
+
+> **2026-09-24, second pass — every numbered lead above is resolved:** (1) `TranscriptContext` → **`PROV-083`**
+> (the ai-side half; the session-format half is area 03's). (2) `Model.promptCache` is catalog metadata
+> (`ANTHROPIC_PROMPT_CACHE = {short:300, long:3600}`, direct Anthropic only) that cyrup's `ModelCompat`/`Model`
+> ignore on the overlay; the warming behaviour it feeds lives in `packages/coding-agent` — recorded as
+> growth on `PROV-071`, not an ai-layer item. (3) Codex Off → **`PROV-085`**. (4) OpenRouter `x-session-id`
+> → **`PROV-086`**; Baseten is data-only and arrives via the overlay — struck. (5) Mistral → **`PROV-088`**.
+> (6) #9188 relay model: **struck for cyrup** — cyrup never overwrote `model` from `message_start`, so the
+> thinking-replay loss never existed; the `responseModel` record is folded into `PROV-090`. Vercel unsigned
+> thinking (#9676) is the generator's `compat: { allowEmptySignature: true }` on all 190 Vercel rows,
+> which cyrup's `allow_empty_signature` already honours when the overlay supplies it — catalog-floor growth on
+> `PROV-071`. #9455 → **`PROV-087`**. (7) `EventStream` quadratic drain — **struck, N/A**: cyrup's
+> `AssistantMessageEventStream` is `cyrup_core::finalizing_channel`, a tokio `mpsc::unbounded_channel`, O(1)
+> per event. (8) JSON-typed `ToolCall.arguments`/`details` — **struck**, type-level only; cyrup already uses
+> `serde_json` values. (9) new rows (Opus 5.5, GPT-6 Sol/Luna, `deepseek-flash`) → growth on `PROV-071`.
+> (10) Radius baseline catalog — growth on `PROV-014`, as recorded. Also read and **cleared**: Cerebras
+> strict exclusion (#9804, v0.86.1) is recorded as growth on `PROV-078` (same expression, same fix).
+
+### Post-tag leads (pi v0.87.1..b45597504) — not items; README cites upstream only at tags
+
+Read at the commit, one-sided where stated. **(a) `7fd564cbb`** "share model catalog protocol with pi.dev":
+pi.dev selects a catalog revision by the client's `pi/<version>` User-Agent and **serves the DEFAULT (newest)
+revision to any other agent**. cyrup's catalog fetch sends `cyrup/<version> (…)`
+(`remote_catalog.rs::cyrup_user_agent`), so it is served catalogs shaped for the newest pi — e.g. OpenRouter
+`anthropic/*` rows on `anthropic-messages` (`PROV-099`) and compat keys it ignores (`PROV-083`, `PROV-091`).
+Not verified live. **(b) `a328aa89a`** unifies image and classifier models, bumps the generated-data schema
+to v6 and deletes `image-models.generated.ts` — the deadline in `PROV-089`. **(c) `667fc3dd3`** Vercel AI
+Gateway reports 1-hour cache writes in `message_delta`; cyrup's
+`api/anthropic_messages/usage.rs::apply_message_delta_usage` reads only `cache_creation_input_tokens` there
+(both sides read) — a `PROV-081`-class pricing gap. **(d) `002fc8385`** `onProviderStreamEvent` /
+`provider_stream_event` extension event — area 06's surface. **(e) `fde38ed7c`**, **`4c2dfd936`** — generator
+data only (Copilot Opus 5.5 effort map; image regeneration).
 
 ## Status since the c8bd2ab baseline
 
@@ -693,7 +815,7 @@ runs.
 | ~~PROV-048~~ | ~~high~~ **CLOSED 2026-08-14** | parity-bug | S | A lone-surrogate `\uXXXX` escape in a provider SSE frame kills the whole turn — **CLOSED 2026-08-14**: sweep 1 — one predicate over the SSE JSON repair path; lone-surrogate escape no longer kills the turn. |
 | ~~PROV-003~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | `ApiKeyAuth` has no `login`; `Models` has no `login`/`logout` (OAuth flow half now closed) — **CLOSED 2026-08-14**: sweep 1 — closed in FULL. The `ApiKeyAuth::login` half was already done at HEAD by c8c86bc (the item was stale on that point); anthropic api-key login and `Models::login`/`logout` are now in. The status line still saying "partially-closed" is superseded. |
 | ~~PROV-011~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | L | `constrainedSampling` / grammar-constrained tools not modeled — **four** affected sites (six at HEAD) — **CLOSED 2026-08-14**: sweep 6 — the ends were ported by sweeps 2-5; the two frames between them (`cyrup-agent/src/agent.rs:818` hard-coding `constrained_sampling: None`, and `cyrup-ext/src/wrapper.rs`'s hand-written `impl Tool for RegisteredTool` omitting the method) dropped the value, so no tool could opt in at all. Both closed; pinned by `agent_loop.rs::prov011_a_tools_constrained_sampling_declaration_reaches_the_provider`. **Do not add opt-ins to cyrup-tools' built-ins — no pi built-in declares `constrainedSampling`** (three grep hits at v0.83.0, all in `types.ts:463` / `tool-definition-wrapper.ts:14,:42`). |
-| PROV-014 | ~~medium~~ low — **PARTIALLY CLOSED 2026-09-04** | parity-bug | M | radius + qwen-token-plan ×2 unregistered (pi-messages half closed) — **NOT STARTED 2026-08-15 (sweep 11), and the reason is a scheduling one, recorded so the next attempt does not re-derive it.** Half of the item is already done and this row did not say so: `env_api_keys.rs:53-54`,`:66` carries all three arms (`QWEN_TOKEN_PLAN_API_KEY`, `QWEN_TOKEN_PLAN_CN_API_KEY`, `RADIUS_API_KEY`) with the `env-api-keys.ts` citations. What remains splits into two pieces of very different size. **(a) qwen-token-plan ×2 — S, but it belongs to the CATALOG owner.** pi's providers are three-line `createProvider` calls (`providers/qwen-token-plan.ts` @v0.83.0: base URL `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`, `envApiKeyAuth("Qwen Token Plan API key")`, `openAICompletionsApi()`), so cyrup needs two `providers/fleet.rs` rows and two catalog JSON files sourced from `qwen-token-plan{,-cn}.models.ts`. **Hand-writing those two files is exactly the failure the Routing note above forbids**: they must come out of `xtask gen-catalogs` or `catalog_manifest.json` is invalidated on the next `--check`. Schedule with the generator, not against a provider agent. **(b) radius — M, and it is a NEW PROVIDER KIND, not a fleet row.** `providers/radius.ts` @v0.83.0 is hand-written, not `createProvider`: a `pi-messages` provider with a gateway option, `lazyOAuth`, and a `refreshModels` that reads a persisted store, imports a legacy pre-`ModelsStore` catalog when the stored entry is absent and the credential is OAuth, and refreshes dynamically — plus the whole of `providers/radius-config.ts` (`DEFAULT_RADIUS_GATEWAY`, `normalizeRadiusGatewayUrl`, `getRadiusModels`, `getRadiusModelsFromConfig`, `loadRadiusGatewayConfig`). The OAuth flow at `auth/oauth/radius.rs` is ported and ready; the provider around it is not. `builtin_oauth.rs:17`'s "radius … has no built-in provider in cyrup" is the accurate statement of that, and it is now the only radius claim in-tree that is not stale. — **PARTIALLY CLOSED 2026-09-04** (commit `1471a16f`; residual **low**): all three v0.83.0 built-ins — and v0.84.4's fourth, `qwen-token-plan-individual` — are now REGISTERED, resolve auth from their env vars, and stream against a faux origin. **qwen-token-plan ×3** are `providers/fleet.rs` members (`QWEN_TOKEN_PLAN`, `QWEN_TOKEN_PLAN_CN`, `QWEN_TOKEN_PLAN_INDIVIDUAL`; id/name/`baseUrl`/`envApiKeyAuth` label field-for-field against `ai/src/providers/qwen-token-plan{,-cn,-individual}.ts:6-15` @v0.84.4, registered `all.ts:118-120`) with `FleetCatalog::Dynamic` — a NEW two-variant enum on `FleetSpec.catalog` (`Embedded(&str)` | `Dynamic`) — and the provider-level `baseUrl` upstream's `createProvider` carries, now `FleetSpec.base_url` → `WireProvider::with_base_url`. **Why no catalog files, stated as evidence not convenience:** pi's rows for these are models.dev `alibaba-token-plan[-cn]` data (`ai/scripts/generate-models.ts:2303-2380` @v0.84.4) generated into gitignored `providers/data/*.json`; the providers were added at `bbb91fa8a` (v0.81.0~25) and `c03d78bdc`, both AFTER `b0c2a90e`, the last revision at which any `*.models.ts` was a data literal and the only revision `xtask gen-catalogs` can extract from — so the rows are in git at NO revision (`git -C tmp/pi log --all --diff-filter=A -- 'packages/ai/src/providers/data/*.json'` is empty), and both runtime sources (models.dev, pi.dev) are unreachable from this workspace (proxy 403). The previous row's own instruction — the files must come from the generator, never by hand — is therefore satisfied by shipping none: the runtime catalog arrives through the pi.dev overlay (`remote_catalog.rs` fetches `/api/models/providers/<id>` for every configured provider; `AuthStore::has_auth` counts the env key, so an exported `QWEN_TOKEN_PLAN_API_KEY` triggers it in rpc/interactive) and through `models.json`. `catalog_data.rs::DYNAMIC_ONLY_PROVIDERS` pins the four dynamic-only ids in BOTH directions so an accidentally empty catalog still fails. **radius** is a new provider kind, `crates/cyrup-provider/src/providers/radius.rs` (`RadiusProvider`, `RadiusProviderOptions`, `radius_provider_with`, `radius_auth`): a `pi-messages` provider over a `WireProvider` (every `Provider` method delegated by name, PROV-M01) with `envApiKeyAuth("Radius API key", [RADIUS_API_KEY])` + a gateway-bound `RadiusOAuth` (`radius.ts:30-33` @v0.84.4; `builtin_oauth.rs` gained the `"radius"` arm and its `:17` claim is gone), and the whole of `radius-config.ts` @v0.84.4 (byte-identical at v0.83.0): `DEFAULT_RADIUS_GATEWAY` (`:4`), `RadiusGatewayModel`/`RadiusGatewayConfig` (`:6-20`), `is_radius_gateway_model`/`sanitize_radius_gateway_config` (`:26-50`, rows FILTERED never fatal), `radius_credential_config`/`radius_models` (`:57-73`, read from `Credential::Oauth.ext["gatewayConfig"]`), `radius_models_from_config` (`:61-68`), `truncate_http_body` (`:75-78`), `load_radius_gateway_config` (`:80-96`, both error strings verbatim). `RadiusProvider::refresh_models` is `radius.ts:35-78` @v0.84.4 — legacy import, `allowNetwork`/abort gate, key via `resolve_provider_auth` (= `resolveRefreshCredential`, `models.ts:448-474`), fetch, publish to the attached `ModelsStore` — deduplicated with `RefreshDedup`; restore is the overlay loader's job (`RemoteCatalog::load_overlay` → `CatalogOverlay::apply`), the same split `remote_catalog.rs` documents, with ONE `[CYRUP-DELTA]`: the persisted entry stamps `last_modified = checked_at` so the overlay's pi #7016 staleness guard (vacuous for a provider with no embedded rows) does not discard it. Shell: `crates/cyrup/src/provider.rs::pi_dev_catalog_providers` excludes `radius` from the pi.dev fetch list, mirroring `model-runtime.ts:183-189` @v0.84.4 (`provider.id === "radius" ? provider : withRemoteCatalog(…)`). `env_api_keys.rs` gained the v0.84.4 `qwen-token-plan-individual` arm (`env-api-keys.ts:83`, same variable as `qwen-token-plan`). **Tests** (all red before — the ids/symbols did not exist, the registry asserted their ABSENCE, and the shell test counted two pi.dev requests where one is now issued): `fleet.rs::qwen_token_plan_members_match_upstream`, `fleet_has_nineteen_providers`; `all.rs::registry_contains_implemented_provider_ids` (three ids moved from the not-yet list to the expected list; `baseten` entered the not-yet list), `radius_registers_with_both_auth_strategies_and_takes_the_overlay`; `builtin_oauth.rs::only_the_five_built_ins_carry_oauth`, `subscription_split_matches_upstream`; `env_api_keys.rs::qwen_token_plan_and_radius_rows_match_upstream`; `radius.rs` ×16 (sanitize filter/reject, models-from-config stamping, legacy credential config, `truncate_http_body` 512-char cap, origin-resolved `/v1/config`, loopback `GET /v1/config` request shape with/without bearer, 503 and invalid-body messages verbatim, cancelled token opens no socket, static without a store, refresh publishes + restores through the real overlay loader with the built-in floor stamp, cache-only issues no request, legacy import, 500 persists nothing, a gateway row STREAMS over `POST /v1/messages` with `Authorization: Bearer` from `RADIUS_API_KEY`); `catalog_data.rs::every_registered_provider_has_a_non_empty_catalog` (two-directional exemption); `crates/cyrup/src/tests/catalog_refresh_modes.rs::update_models_never_fetches_radius_from_pi_dev`; `help.rs` env-block row for the Individual plan. `cargo nextest run -p cyrup-provider`: 1151 passed; `-p cyrup` green; clippy `-D warnings` and `RUSTDOCFLAGS='-D warnings' cargo doc` clean on both. **RESIDUAL (low), three pieces, none a registration gap:** (1) the three Qwen catalogs stay `Dynamic` until the models.dev/pi.dev data is reachable from a workspace — same constraint class as PROV-004's Coverage note; the git-derivable facts (ids, compat, thinking maps, `qwen-token-plan-models.test.ts` @v0.84.4) are recorded on each `fleet.rs` member for that day; (2) the shell never calls `Provider::refresh_models` — its refresh drives `RemoteCatalog` directly — so `RadiusProvider`'s gateway refresh runs only through `Models::refresh_with` on a store-attached instance (`all_providers()` constructs it static); wiring pi's `Models.refresh` trigger into `spawn_model_catalog_refresh`/`refresh_model_catalogs` with the `auth.json`-backed credential store is an S shell change; (3) `configureRadiusProviders` (`model-runtime.ts:219-233` @v0.84.4 — a `models.json` block with `"oauth": "radius"` becomes a `radiusProvider({ id, name, gateway })` instance) is not wired: `cyrup-config/src/model/compose.rs` composes the block's models but no `RadiusProvider` is constructed for it; `RadiusProviderOptions` is the ready-made shape. Separately noted, NOT this item: `baseten` (`all.ts:95` @v0.84.4) is the one v0.84.x built-in still unregistered — it is in `all.rs`'s not-yet guard with no ledger id. — **RE-READ 2026-09-14 at `9aeba769`, STILL OPEN (low); all three residual pieces survive verbatim, and the CLOSED half was re-audited for what its code DOES, not that it exists.** Registration is true against the CURRENT tag, not only v0.84.4: radius is constructed at `providers/all.rs:260` (`radius_provider_with` pushed), the guard array is now empty (`all.rs:419` `const NOT_YET: &[&str] = &[]`), and pi's `builtinProviders()` is unchanged at 40 entries (`packages/ai/src/providers/all.ts:89-129` @v0.85.1; `git diff v0.84.4 v0.85.1 -- all.ts` is empty, as are the diffs for `providers/radius.ts`, `radius-config.ts`, `qwen-token-plan.ts` and `env-api-keys.ts`). The three Qwen plans are real FLEET members with `base_url` + `envApiKeyAuth`. Residuals, each re-read on BOTH sides: **(1)** the three Qwen members are still `FleetCatalog::Dynamic` with zero embedded rows (`providers/fleet.rs:179,183,189`; `:209` `FleetCatalog::Dynamic => Vec::new()`) and upstream's data is still unobtainable — see `PROV-071`; **(2)** `git grep refresh_models 9aeba769 -- crates/cyrup crates/cyrup-config` is 0 hits — no crate outside `cyrup-provider` mentions `refresh_models` at all — so the shell still never drives `Provider::refresh_models` and `RadiusProvider`'s gateway refresh remains library-reachable only; **(3)** `configureRadiusProviders` (`packages/coding-agent/src/core/model-runtime.ts:219-233` @v0.85.1, byte-identical to v0.84.4, called at `:198` and `:700`) is still unported — `cyrup-config/src/model/compose.rs:134,163-166` handles only the `"oauth":"radius"` baseUrl rule and constructs no `RadiusProvider`, and `RadiusProviderOptions`/`radius_provider_with` have no caller outside `cyrup-provider` (only the `lib.rs`/`providers/mod.rs` re-exports and the doc mention at `crates/cyrup/src/provider.rs:98`). Severity stays **low**; Kind stays `parity-bug` (piece 3 is v0.83.0-era shell behaviour, not drift). **ONE STALE SUB-CLAIM, corrected here rather than rewritten above:** the trailing "`baseten` … is the one v0.84.x built-in still unregistered" is no longer true — `baseten` is a registered `Dynamic` fleet member (`providers/fleet.rs:151-156`, citing `DRIFT-009` in-source), which is precisely why `NOT_YET` is empty. **Falsification:** pieces (2)/(3) reopen-or-close by measurement — if any crate outside `cyrup-provider` gains a `refresh_models` call site, or `RadiusProviderOptions` gains a construction site driven by a `models.json` `"oauth":"radius"` block, re-audit those two pieces; piece (1) closes only when the three Qwen catalogs carry embedded rows and their ids leave `catalog_data.rs::DYNAMIC_ONLY_PROVIDERS`. **RE-CONFIRMED 2026-09-16 at `cc7818b` by identity:** `crates/cyrup-provider` and `crates/cyrup-core` are byte-identical across `9aeba769..cc7818b`, so the 2026-09-14 reading stands unchanged. The scheduling note still governs. |
+| PROV-014 | ~~medium~~ low — **PARTIALLY CLOSED 2026-09-04** | parity-bug | M | radius + qwen-token-plan ×2 unregistered (pi-messages half closed) — **NOT STARTED 2026-08-15 (sweep 11), and the reason is a scheduling one, recorded so the next attempt does not re-derive it.** Half of the item is already done and this row did not say so: `env_api_keys.rs:53-54`,`:66` carries all three arms (`QWEN_TOKEN_PLAN_API_KEY`, `QWEN_TOKEN_PLAN_CN_API_KEY`, `RADIUS_API_KEY`) with the `env-api-keys.ts` citations. What remains splits into two pieces of very different size. **(a) qwen-token-plan ×2 — S, but it belongs to the CATALOG owner.** pi's providers are three-line `createProvider` calls (`providers/qwen-token-plan.ts` @v0.83.0: base URL `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`, `envApiKeyAuth("Qwen Token Plan API key")`, `openAICompletionsApi()`), so cyrup needs two `providers/fleet.rs` rows and two catalog JSON files sourced from `qwen-token-plan{,-cn}.models.ts`. **Hand-writing those two files is exactly the failure the Routing note above forbids**: they must come out of `xtask gen-catalogs` or `catalog_manifest.json` is invalidated on the next `--check`. Schedule with the generator, not against a provider agent. **(b) radius — M, and it is a NEW PROVIDER KIND, not a fleet row.** `providers/radius.ts` @v0.83.0 is hand-written, not `createProvider`: a `pi-messages` provider with a gateway option, `lazyOAuth`, and a `refreshModels` that reads a persisted store, imports a legacy pre-`ModelsStore` catalog when the stored entry is absent and the credential is OAuth, and refreshes dynamically — plus the whole of `providers/radius-config.ts` (`DEFAULT_RADIUS_GATEWAY`, `normalizeRadiusGatewayUrl`, `getRadiusModels`, `getRadiusModelsFromConfig`, `loadRadiusGatewayConfig`). The OAuth flow at `auth/oauth/radius.rs` is ported and ready; the provider around it is not. `builtin_oauth.rs:17`'s "radius … has no built-in provider in cyrup" is the accurate statement of that, and it is now the only radius claim in-tree that is not stale. — **PARTIALLY CLOSED 2026-09-04** (commit `1471a16f`; residual **low**): all three v0.83.0 built-ins — and v0.84.4's fourth, `qwen-token-plan-individual` — are now REGISTERED, resolve auth from their env vars, and stream against a faux origin. **qwen-token-plan ×3** are `providers/fleet.rs` members (`QWEN_TOKEN_PLAN`, `QWEN_TOKEN_PLAN_CN`, `QWEN_TOKEN_PLAN_INDIVIDUAL`; id/name/`baseUrl`/`envApiKeyAuth` label field-for-field against `ai/src/providers/qwen-token-plan{,-cn,-individual}.ts:6-15` @v0.84.4, registered `all.ts:118-120`) with `FleetCatalog::Dynamic` — a NEW two-variant enum on `FleetSpec.catalog` (`Embedded(&str)` | `Dynamic`) — and the provider-level `baseUrl` upstream's `createProvider` carries, now `FleetSpec.base_url` → `WireProvider::with_base_url`. **Why no catalog files, stated as evidence not convenience:** pi's rows for these are models.dev `alibaba-token-plan[-cn]` data (`ai/scripts/generate-models.ts:2303-2380` @v0.84.4) generated into gitignored `providers/data/*.json`; the providers were added at `bbb91fa8a` (v0.81.0~25) and `c03d78bdc`, both AFTER `b0c2a90e`, the last revision at which any `*.models.ts` was a data literal and the only revision `xtask gen-catalogs` can extract from — so the rows are in git at NO revision (`git -C tmp/pi log --all --diff-filter=A -- 'packages/ai/src/providers/data/*.json'` is empty), and both runtime sources (models.dev, pi.dev) are unreachable from this workspace (proxy 403). The previous row's own instruction — the files must come from the generator, never by hand — is therefore satisfied by shipping none: the runtime catalog arrives through the pi.dev overlay (`remote_catalog.rs` fetches `/api/models/providers/<id>` for every configured provider; `AuthStore::has_auth` counts the env key, so an exported `QWEN_TOKEN_PLAN_API_KEY` triggers it in rpc/interactive) and through `models.json`. `catalog_data.rs::DYNAMIC_ONLY_PROVIDERS` pins the four dynamic-only ids in BOTH directions so an accidentally empty catalog still fails. **radius** is a new provider kind, `crates/cyrup-provider/src/providers/radius.rs` (`RadiusProvider`, `RadiusProviderOptions`, `radius_provider_with`, `radius_auth`): a `pi-messages` provider over a `WireProvider` (every `Provider` method delegated by name, PROV-M01) with `envApiKeyAuth("Radius API key", [RADIUS_API_KEY])` + a gateway-bound `RadiusOAuth` (`radius.ts:30-33` @v0.84.4; `builtin_oauth.rs` gained the `"radius"` arm and its `:17` claim is gone), and the whole of `radius-config.ts` @v0.84.4 (byte-identical at v0.83.0): `DEFAULT_RADIUS_GATEWAY` (`:4`), `RadiusGatewayModel`/`RadiusGatewayConfig` (`:6-20`), `is_radius_gateway_model`/`sanitize_radius_gateway_config` (`:26-50`, rows FILTERED never fatal), `radius_credential_config`/`radius_models` (`:57-73`, read from `Credential::Oauth.ext["gatewayConfig"]`), `radius_models_from_config` (`:61-68`), `truncate_http_body` (`:75-78`), `load_radius_gateway_config` (`:80-96`, both error strings verbatim). `RadiusProvider::refresh_models` is `radius.ts:35-78` @v0.84.4 — legacy import, `allowNetwork`/abort gate, key via `resolve_provider_auth` (= `resolveRefreshCredential`, `models.ts:448-474`), fetch, publish to the attached `ModelsStore` — deduplicated with `RefreshDedup`; restore is the overlay loader's job (`RemoteCatalog::load_overlay` → `CatalogOverlay::apply`), the same split `remote_catalog.rs` documents, with ONE `[CYRUP-DELTA]`: the persisted entry stamps `last_modified = checked_at` so the overlay's pi #7016 staleness guard (vacuous for a provider with no embedded rows) does not discard it. Shell: `crates/cyrup/src/provider.rs::pi_dev_catalog_providers` excludes `radius` from the pi.dev fetch list, mirroring `model-runtime.ts:183-189` @v0.84.4 (`provider.id === "radius" ? provider : withRemoteCatalog(…)`). `env_api_keys.rs` gained the v0.84.4 `qwen-token-plan-individual` arm (`env-api-keys.ts:83`, same variable as `qwen-token-plan`). **Tests** (all red before — the ids/symbols did not exist, the registry asserted their ABSENCE, and the shell test counted two pi.dev requests where one is now issued): `fleet.rs::qwen_token_plan_members_match_upstream`, `fleet_has_nineteen_providers`; `all.rs::registry_contains_implemented_provider_ids` (three ids moved from the not-yet list to the expected list; `baseten` entered the not-yet list), `radius_registers_with_both_auth_strategies_and_takes_the_overlay`; `builtin_oauth.rs::only_the_five_built_ins_carry_oauth`, `subscription_split_matches_upstream`; `env_api_keys.rs::qwen_token_plan_and_radius_rows_match_upstream`; `radius.rs` ×16 (sanitize filter/reject, models-from-config stamping, legacy credential config, `truncate_http_body` 512-char cap, origin-resolved `/v1/config`, loopback `GET /v1/config` request shape with/without bearer, 503 and invalid-body messages verbatim, cancelled token opens no socket, static without a store, refresh publishes + restores through the real overlay loader with the built-in floor stamp, cache-only issues no request, legacy import, 500 persists nothing, a gateway row STREAMS over `POST /v1/messages` with `Authorization: Bearer` from `RADIUS_API_KEY`); `catalog_data.rs::every_registered_provider_has_a_non_empty_catalog` (two-directional exemption); `crates/cyrup/src/tests/catalog_refresh_modes.rs::update_models_never_fetches_radius_from_pi_dev`; `help.rs` env-block row for the Individual plan. `cargo nextest run -p cyrup-provider`: 1151 passed; `-p cyrup` green; clippy `-D warnings` and `RUSTDOCFLAGS='-D warnings' cargo doc` clean on both. **RESIDUAL (low), three pieces, none a registration gap:** (1) the three Qwen catalogs stay `Dynamic` until the models.dev/pi.dev data is reachable from a workspace — same constraint class as PROV-004's Coverage note; the git-derivable facts (ids, compat, thinking maps, `qwen-token-plan-models.test.ts` @v0.84.4) are recorded on each `fleet.rs` member for that day; (2) the shell never calls `Provider::refresh_models` — its refresh drives `RemoteCatalog` directly — so `RadiusProvider`'s gateway refresh runs only through `Models::refresh_with` on a store-attached instance (`all_providers()` constructs it static); wiring pi's `Models.refresh` trigger into `spawn_model_catalog_refresh`/`refresh_model_catalogs` with the `auth.json`-backed credential store is an S shell change; (3) `configureRadiusProviders` (`model-runtime.ts:219-233` @v0.84.4 — a `models.json` block with `"oauth": "radius"` becomes a `radiusProvider({ id, name, gateway })` instance) is not wired: `cyrup-config/src/model/compose.rs` composes the block's models but no `RadiusProvider` is constructed for it; `RadiusProviderOptions` is the ready-made shape. Separately noted, NOT this item: `baseten` (`all.ts:95` @v0.84.4) is the one v0.84.x built-in still unregistered — it is in `all.rs`'s not-yet guard with no ledger id. — **RE-READ 2026-09-14 at `9aeba769`, STILL OPEN (low); all three residual pieces survive verbatim, and the CLOSED half was re-audited for what its code DOES, not that it exists.** Registration is true against the CURRENT tag, not only v0.84.4: radius is constructed at `providers/all.rs:260` (`radius_provider_with` pushed), the guard array is now empty (`all.rs:419` `const NOT_YET: &[&str] = &[]`), and pi's `builtinProviders()` is unchanged at 40 entries (`packages/ai/src/providers/all.ts:89-129` @v0.85.1; `git diff v0.84.4 v0.85.1 -- all.ts` is empty, as are the diffs for `providers/radius.ts`, `radius-config.ts`, `qwen-token-plan.ts` and `env-api-keys.ts`). The three Qwen plans are real FLEET members with `base_url` + `envApiKeyAuth`. Residuals, each re-read on BOTH sides: **(1)** the three Qwen members are still `FleetCatalog::Dynamic` with zero embedded rows (`providers/fleet.rs:179,183,189`; `:209` `FleetCatalog::Dynamic => Vec::new()`) and upstream's data is still unobtainable — see `PROV-071`; **(2)** `git grep refresh_models 9aeba769 -- crates/cyrup crates/cyrup-config` is 0 hits — no crate outside `cyrup-provider` mentions `refresh_models` at all — so the shell still never drives `Provider::refresh_models` and `RadiusProvider`'s gateway refresh remains library-reachable only; **(3)** `configureRadiusProviders` (`packages/coding-agent/src/core/model-runtime.ts:219-233` @v0.85.1, byte-identical to v0.84.4, called at `:198` and `:700`) is still unported — `cyrup-config/src/model/compose.rs:134,163-166` handles only the `"oauth":"radius"` baseUrl rule and constructs no `RadiusProvider`, and `RadiusProviderOptions`/`radius_provider_with` have no caller outside `cyrup-provider` (only the `lib.rs`/`providers/mod.rs` re-exports and the doc mention at `crates/cyrup/src/provider.rs:98`). Severity stays **low**; Kind stays `parity-bug` (piece 3 is v0.83.0-era shell behaviour, not drift). **ONE STALE SUB-CLAIM, corrected here rather than rewritten above:** the trailing "`baseten` … is the one v0.84.x built-in still unregistered" is no longer true — `baseten` is a registered `Dynamic` fleet member (`providers/fleet.rs:151-156`, citing `DRIFT-009` in-source), which is precisely why `NOT_YET` is empty. **Falsification:** pieces (2)/(3) reopen-or-close by measurement — if any crate outside `cyrup-provider` gains a `refresh_models` call site, or `RadiusProviderOptions` gains a construction site driven by a `models.json` `"oauth":"radius"` block, re-audit those two pieces; piece (1) closes only when the three Qwen catalogs carry embedded rows and their ids leave `catalog_data.rs::DYNAMIC_ONLY_PROVIDERS`. **RE-CONFIRMED 2026-09-16 at `cc7818b` by identity:** `crates/cyrup-provider` and `crates/cyrup-core` are byte-identical across `9aeba769..cc7818b`, so the 2026-09-14 reading stands unchanged. The scheduling note still governs. **RE-VERIFIED STILL OPEN 2026-09-24 at `ea23ca2` / pi `v0.87.1`:** cyrup side byte-identical: `git diff --quiet 9aeba769 ea23ca2 -- crates/cyrup-provider crates/cyrup-core crates/cyrup-config xtask` exits 0, and `git grep 'refresh_models\|RadiusProviderOptions\|radius_provider_with' -- crates ':!crates/cyrup-provider'` is still empty, so pieces (2) and (3) stand. **Upstream GROWTH on piece (1), not a closure:** v0.86.0 gave Radius a generated public baseline catalog — `packages/ai/src/providers/radius.ts` @v0.87.1 seeds `baselineModels` from `RADIUS_MODELS` (`radius.models.ts`, a re-export of gitignored `data/radius.json`) when the gateway is the default one and overlays dynamic rows by id, so pi lists Radius models offline where cyrup lists none. The data is unreadable from git (`PROV-071`'s class); `qwen-token-plan*.ts`, `radius-config.ts` and `model-runtime.ts`'s `configureRadiusProviders` carry no behaviour change in `v0.85.1..v0.87.1`. |
 | ~~PROV-016~~ | ~~medium~~ **CLOSED 2026-08-14** | stale-port | S | Tool-argument coercion ignores `allOf` — **CLOSED 2026-08-14**: sweep 1 — confirmed at HEAD exactly as filed; citations resolved clean at v0.83.0. |
 | ~~PROV-018~~ | ~~medium~~ **CLOSED 2026-08-15** | tooling | M | No catalog generator, no drift check — **CLOSED 2026-08-15**: sweep 10 — `xtask` exists and generates all 35 catalogs plus `catalog_manifest.json` from one pinned revision. **The Fix's stated mechanism was replaced and the reason is recorded**: it said to run pi's `npm run generate-models` "because the tree can no longer simply be read", which PROV-060 refutes — at `b0c2a90e` the `*.models.ts` modules are data literals, so `git show` + a scanner needs no `npm install`, no generator run and no network. Drift check: `gen-catalogs --check` (byte-exact) and `--diff` (structural), plus the `#[ignore]`d `gen_catalogs_check_reports_no_drift_against_the_pinned_revision`. |
 | ~~PROV-019~~ | ~~medium~~ **CLOSED 2026-08-14** | stale-port | S | `max_output_tokens` floor of 16 unported in both Responses APIs — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
@@ -710,24 +832,24 @@ runs.
 | ~~PROV-017~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `Provider` trait exposes no `name`/`base_url`/`headers` — **CLOSED 2026-08-14**: sweep 1 — landed together, as PROV-032's own Fix predicted. Two deltas documented in-tree: `check_auth` resolves against the provider's first catalog row (cyrup's `ApiKeyAuth::resolve` takes a `&Model`), and pi's optional `ApiKeyAuth.check?` (auth/types.ts:173) has no cyrup counterpart and no upstream implementor. |
 | ~~PROV-020~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `toolResult` JSONL key order diverges: `isError` emitted too early — **CLOSED 2026-08-14**: sweep 1 — `toolResult` JSONL key order corrected. |
 | ~~PROV-023~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `prompt_cache_options` unported — one-shot requests implicitly cache-write — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
-| ~~PROV-025~~ | ~~low~~ **CLOSED 2026-08-15 — REFUTED** | parity-bug | M | `deferredToolsMode: "kimi"` unported — **REFUTED, CLOSED 2026-08-15**: sweep 11 — **fully ported at HEAD and has been for at least one sweep; this row was stale, not the code.** The item's evidence (`rg --type rust 'deferred_tools_mode\|DeferredToolsMode' crates/` = 0 hits) now returns 12 production hits. `DeferredToolsMode::Kimi` is on `ModelCompat` (`api/compat.rs`), detected `None` and resolved with `.or(detected)` in `get_compat`, and BOTH halves of pi's rendering are in `api/openai_completions.rs`: `deferred_tool_names` is the separate `getDeferredToolNames` accessor (`openai-completions.ts:91-101`, insertion-ordered) filtering the top-level `tools` array (`:719-721`), and `convert_messages` pushes the two-key `{role:"system", tools:[…]}` message at upstream's exact position — after the image/`lastRole` handling, immediately before the `continue` (`:1266-1276`). Verified line-for-line against `git show v0.83.0:packages/ai/src/api/openai-completions.ts`. A body test already exists at `openai_completions.rs:2380` and states its own red-before condition. |
+| ~~PROV-025~~ | ~~low~~ **CLOSED 2026-08-15 — REFUTED** | parity-bug | M | `deferredToolsMode: "kimi"` unported — **REFUTED, CLOSED 2026-08-15**: sweep 11 — **fully ported at HEAD and has been for at least one sweep; this row was stale, not the code.** The item's evidence (`rg --type rust 'deferred_tools_mode\|DeferredToolsMode' crates/` = 0 hits) now returns 12 production hits. `DeferredToolsMode::Kimi` is on `ModelCompat` (`api/compat.rs`), detected `None` and resolved with `.or(detected)` in `get_compat`, and BOTH halves of pi's rendering are in `api/openai_completions.rs`: `deferred_tool_names` is the separate `getDeferredToolNames` accessor (`openai-completions.ts:91-101`, insertion-ordered) filtering the top-level `tools` array (`:719-721`), and `convert_messages` pushes the two-key `{role:"system", tools:[…]}` message at upstream's exact position — after the image/`lastRole` handling, immediately before the `continue` (`:1266-1276`). Verified line-for-line against `git show v0.83.0:packages/ai/src/api/openai-completions.ts`. A body test already exists at `openai_completions.rs:2380` and states its own red-before condition. **NOTE 2026-09-24 (second pass), not reopened:** upstream DELETED `deferredToolsMode` in v0.86.0 (`9e05370b2`); Kimi K3's `{role:"system", tools}` item is now gated on `supportsMidConvoSystemMessages && supportsMidConvoToolAdditions`. The ported flag is a stale shape, tracked in `PROV-083`. |
 | ~~PROV-031~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | M | `Models` has no `get_available`/`check_auth`/`login`/`logout` — **CLOSED 2026-08-14**: sweep 1 — landed together, as PROV-032's own Fix predicted. Two deltas documented in-tree: `check_auth` resolves against the provider's first catalog row (cyrup's `ApiKeyAuth::resolve` takes a `&Model`), and pi's optional `ApiKeyAuth.check?` (auth/types.ts:173) has no cyrup counterpart and no upstream implementor. |
 | ~~PROV-034~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | openai-responses always emits `"strict": false` — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
 | ~~PROV-036~~ | ~~low~~ **CLOSED 2026-08-15** | not-ported | S | `getUsageCostBreakdown` unported — one cost total, no per-model breakdown — **CLOSED 2026-08-15**: sweep 11 — ported as `cyrup-session-svc/src/state.rs::usage_cost_breakdown` (1:1 with `core/usage-totals.ts:37-70` @v0.83.0: the `provider/responseModel ?? model` key, the literal `Tools/summaries` bucket for toolResult + compaction + branch-summary usage, the `cost > 0 \|\| tokens > 0` filter and the cost-DESCENDING sort), surfaced as `AgentSession::usage_cost_breakdown()`, and rendered in `cyrup-tui/src/app/execute_session.rs:184-192`'s `/session` block under pi's `usageBreakdown.length > 1` guard (`interactive-mode.ts:5699`). Sweep 8's routing note was right that this needs `cyrup-session-svc` + `cyrup-tui` together; both landed in one pass. Pinned by `prov036_breakdown_keys_attribute_sort_and_reconcile`, which asserts pi's own stated invariant — the rows sum to `SessionStats::cost` exactly. |
 | ~~PROV-037~~ | ~~low~~ **CLOSED 2026-08-15** | not-ported | S | Two `auth-guidance.ts` formatters and the OAuth-expiry preflight branch unported — **CLOSED 2026-08-15**: sweep 11 — sweep 8's correction was right (ONE formatter missing, not two, and the fix site is `cyrup-session-svc`). `format_no_api_key_found_message` is in `auth_guidance.rs` **with the `UNKNOWN_PROVIDER` → "the selected model" carve-out** (`auth-guidance.ts:23`), alongside a factored `format_oauth_reauthenticate_message` for the string pi builds inline and identically at `agent-session.ts:1188-1192` and `:432-436`. The preflight at `session.rs` step 3 now reproduces `agent-session.ts:1182-1195` in full: no model ⇒ `NoModelSelected`; not configured ⇒ a live re-check before refusing; on refusal ⇒ the OAuth-expiry message when the stored credential is `oauth` (pi `isUsingOAuth`, `model-runtime.ts:368-370`), else `formatNoApiKeyFoundMessage`. Carried by a new `SessionServiceError::AuthPreflightRefused` whose `Display` is `{0}` so pi's text reaches the user unprefixed. **One `[CYRUP-DELTA]` recorded in-source**: the second chance refreshes the `AuthStore` snapshot and re-asks `has_configured_auth` rather than composing a whole `Models` per refusal — same observable difference (a credential written after startup now proceeds), and the ambient-auth gap it does not cover is identical before and after. |
 | ~~PROV-038~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | Catalog roster guard is a tautology; 5 catalogs get no per-field checks — **CLOSED 2026-08-14**: sweep 1 — closed together. The `tests/` path in both items was stale: the file is `crates/cyrup-provider/src/tests/catalog_data.rs` (moved in 63d729a/c3982b5). Blind spot 1's "the roster test currently passes" is confirmed — it did, tautologically. |
 | ~~PROV-039~~ | ~~low~~ **CLOSED 2026-08-14** | stale-port | S | `catalog_manifest.json` staleness floor predates the newest embedded data — **CLOSED 2026-08-14**: sweep 1 — closed together. The `tests/` path in both items was stale: the file is `crates/cyrup-provider/src/tests/catalog_data.rs` (moved in 63d729a/c3982b5). Blind spot 1's "the roster test currently passes" is confirmed — it did, tautologically. |
-| PROV-040 | low | upstream-drift | M | `fetchDeferred`/`cancelDeferred` unported — **RE-CONFIRMED AT HEAD, NOT STARTED 2026-08-15 (sweep 11).** `rg 'fetch_deferred\|cancel_deferred' crates/` is still exactly 0 hits, so the item is accurate as filed; the data half remains fully ported. Size, measured rather than estimated: four seams (`ApiImpl` in `api/mod.rs`, `Provider` in `provider.rs`, `Models` in `collection.rs`, and `faux.rs` mirroring `providers/faux.ts:567-660`) plus `DeferredFetchOptions.wait` on the request options — the same shape and roughly the same reach as `PROV-S05`'s `RefreshModelsContext` threading, which took one focused pass. Note for whoever takes it: this is v0.84.1-only drift (`git show v0.83.0:packages/ai/src/types.ts \| grep fetchDeferred` is empty), so it lands as a documented forward-port with the same `[CYRUP-DELTA]` treatment `PROV-063` just received, or it waits for the v0.84.1 rebase. — **RE-READ 2026-09-14 at `9aeba769`, STILL OPEN (low); claim holds exactly as filed.** The behaviour half is absent from the ENTIRE workspace, measured not sampled: `git grep -iE 'fetch_deferred\|cancel_deferred' 9aeba769 -- crates/` returns rc=1, ZERO hits; `cyrup-provider`'s `provider.rs`, `collection.rs` and `api/mod.rs` contain no `deferred` identifier at all (`api/mod.rs:275` is an unrelated "construction really is deferred" comment). The data half still round-trips. Kind settled by TAG PRESENCE rather than by date: `fetchDeferred` is absent at v0.83.0 and present at v0.84.1/v0.85.1, so this is genuine post-baseline `upstream-drift`. Severity stays **low** for the reason this row gives — `packages/ai/src/providers/faux.ts:567,633,659-660,694-695` @v0.85.1 is STILL the only first-party implementor. **Two amendments that do not change the verdict.** **(a)** The cyrup citations above are stale PATHS: `message.rs` was split into a module, so `StopReason::Deferred` is now `cyrup-core/src/message/stop_reason.rs:100` (with `:95` admitting `fetchDeferred`/`cancelDeferred` are unported) and the handle is `cyrup-core/src/message/assistant.rs:71` (`pub deferred: Option<Box<DeferredHandle>>`) / `:111` (`pub struct DeferredHandle`); `cyrup-test-support/src/tests/deferred_interop.rs` should be re-pinned by whoever takes the item. **(b) ITEM GROWTH at v0.85.1 — the surface is no longer four seams.** The shell now carries two more: `packages/coding-agent/src/core/model-runtime.ts:654-678` (a `Models`-shaped `fetchDeferred`/`cancelDeferred` pair with its own provider-missing throw) and `provider-composer.ts:522-528` (the decorator must forward BOTH or a composed provider silently loses the capability — the same trait-default trap `PROV-M01` recorded). A port that stops at `ApiImpl`/`Provider`/`Models`/`faux` leaves the composer seam unported. Upstream re-pins @v0.85.1: `packages/ai/src/types.ts:227` (`DeferredFetchOptions`), `:236` (`DeferredCancelOptions`), `:275-280` (on `ProviderStreams`); `models.ts:143-148,222-227`, `:718-744` (the `Provider ${model.provider} does not support deferred responses` dispatch) and `:848-864` (multi-api composition). **Falsification:** any hit for `fetch_deferred`/`cancel_deferred` under `crates/` reopens the measurement; the severity floor rises the moment a non-faux upstream provider implements `fetchDeferred` (re-grep `git grep -l fetchDeferred <tag> -- packages/ai/src/providers/` — at v0.85.1 it is `faux.ts` alone). **RE-CONFIRMED STILL OPEN 2026-09-16 at `cc7818b`, re-measured rather than carried forward:** `git grep -n 'fetch_deferred\|cancel_deferred' -- crates/` is still **0 hits** workspace-wide. |
+| PROV-040 | low | upstream-drift | M | `fetchDeferred`/`cancelDeferred` unported — **RE-CONFIRMED AT HEAD, NOT STARTED 2026-08-15 (sweep 11).** `rg 'fetch_deferred\|cancel_deferred' crates/` is still exactly 0 hits, so the item is accurate as filed; the data half remains fully ported. Size, measured rather than estimated: four seams (`ApiImpl` in `api/mod.rs`, `Provider` in `provider.rs`, `Models` in `collection.rs`, and `faux.rs` mirroring `providers/faux.ts:567-660`) plus `DeferredFetchOptions.wait` on the request options — the same shape and roughly the same reach as `PROV-S05`'s `RefreshModelsContext` threading, which took one focused pass. Note for whoever takes it: this is v0.84.1-only drift (`git show v0.83.0:packages/ai/src/types.ts \| grep fetchDeferred` is empty), so it lands as a documented forward-port with the same `[CYRUP-DELTA]` treatment `PROV-063` just received, or it waits for the v0.84.1 rebase. — **RE-READ 2026-09-14 at `9aeba769`, STILL OPEN (low); claim holds exactly as filed.** The behaviour half is absent from the ENTIRE workspace, measured not sampled: `git grep -iE 'fetch_deferred\|cancel_deferred' 9aeba769 -- crates/` returns rc=1, ZERO hits; `cyrup-provider`'s `provider.rs`, `collection.rs` and `api/mod.rs` contain no `deferred` identifier at all (`api/mod.rs:275` is an unrelated "construction really is deferred" comment). The data half still round-trips. Kind settled by TAG PRESENCE rather than by date: `fetchDeferred` is absent at v0.83.0 and present at v0.84.1/v0.85.1, so this is genuine post-baseline `upstream-drift`. Severity stays **low** for the reason this row gives — `packages/ai/src/providers/faux.ts:567,633,659-660,694-695` @v0.85.1 is STILL the only first-party implementor. **Two amendments that do not change the verdict.** **(a)** The cyrup citations above are stale PATHS: `message.rs` was split into a module, so `StopReason::Deferred` is now `cyrup-core/src/message/stop_reason.rs:100` (with `:95` admitting `fetchDeferred`/`cancelDeferred` are unported) and the handle is `cyrup-core/src/message/assistant.rs:71` (`pub deferred: Option<Box<DeferredHandle>>`) / `:111` (`pub struct DeferredHandle`); `cyrup-test-support/src/tests/deferred_interop.rs` should be re-pinned by whoever takes the item. **(b) ITEM GROWTH at v0.85.1 — the surface is no longer four seams.** The shell now carries two more: `packages/coding-agent/src/core/model-runtime.ts:654-678` (a `Models`-shaped `fetchDeferred`/`cancelDeferred` pair with its own provider-missing throw) and `provider-composer.ts:522-528` (the decorator must forward BOTH or a composed provider silently loses the capability — the same trait-default trap `PROV-M01` recorded). A port that stops at `ApiImpl`/`Provider`/`Models`/`faux` leaves the composer seam unported. Upstream re-pins @v0.85.1: `packages/ai/src/types.ts:227` (`DeferredFetchOptions`), `:236` (`DeferredCancelOptions`), `:275-280` (on `ProviderStreams`); `models.ts:143-148,222-227`, `:718-744` (the `Provider ${model.provider} does not support deferred responses` dispatch) and `:848-864` (multi-api composition). **Falsification:** any hit for `fetch_deferred`/`cancel_deferred` under `crates/` reopens the measurement; the severity floor rises the moment a non-faux upstream provider implements `fetchDeferred` (re-grep `git grep -l fetchDeferred <tag> -- packages/ai/src/providers/` — at v0.85.1 it is `faux.ts` alone). **RE-CONFIRMED STILL OPEN 2026-09-16 at `cc7818b`, re-measured rather than carried forward:** `git grep -n 'fetch_deferred\|cancel_deferred' -- crates/` is still **0 hits** workspace-wide. **RE-VERIFIED STILL OPEN 2026-09-24 at `ea23ca2` / pi `v0.87.1`:** `git grep -n 'fetch_deferred\|cancel_deferred' -- crates/` is 0 hits. Falsifier re-run: `git grep -l fetchDeferred v0.87.1 -- packages/ai/src/providers/ packages/ai/src/api/` returns `providers/faux.ts` and `api/lazy.ts` — the latter is the lazy-loading forwarder, not an implementor — so faux is still the only first-party implementor and the severity floor does not rise. **GROWTH 2026-09-24 (second pass):** a third method, `streamDeferred(model, handle, options)`, returns the lazy stream and `fetchDeferred` becomes `.result()` on it (`models.ts`, v0.84.4; still present @v0.87.1); `grep -rn "fn fetch_deferred\|fn stream_deferred" crates/` is still 0. Port all three together. |
 | ~~PROV-041~~ | ~~low~~ **CLOSED 2026-08-15** | stale-port | S | False in-tree provenance citations, incl. a wrong "1:1 port" claim — **PARTIALLY CLOSED 2026-08-14**: sweep 1 + 2 — down to ONE live instance: `crates/cyrup-ext-subagents/src/extension.rs` ("PROV-003 — cyrup ships no login flow at all"), plus the unbuilt CI citation lint. Instance (1) was corrected by sweep 1, instance (3) was already gone, and the fourth instance sweep 1 folded in (cyrup-core's stale `raw_stop_reason` comment) is fixed — see PROV-012 in the status table. — **CLOSED 2026-08-15**: sweep 11. Two corrections to the row itself: the `cyrup-ext-subagents/src/extension.rs` instance was ALREADY fixed at HEAD (`:12558-12566` now records the correction explicitly), and instance (3) was **not** gone — `providers/openai_codex.rs` still claimed the `openai-codex-responses` impl was "not registered today … cannot yet stream" while `api::register_builtins` registers it; corrected and pinned by `prov041_openai_codex_responses_is_registered`. **The item's Verify clause was then executed rather than deferred**: all 126 `*models.ts:NNN` citations in `cyrup-provider` were re-resolved against `git show v0.83.0:packages/ai/src/models.ts`, and **20 were wrong at the tag they name** — `provider.rs` ×4 (`refresh_models` cited `:63`, which is `ModelsApiStreamOptions`; `stream_simple` cited `:71`, a prose line; `baseUrl`/`headers` off by one), `collection.rs` ×12 (four section headers, `getAuth` ×3 at `:216` = `mergeHeaders`' closing brace, the refresh-dispatch header repeating the exact `:198-214` error this item was filed for, `getSupportedThinkingLevels` ×3 at `:670` = the `return true` beneath the branch), `catalog.rs` ×3 (the catch-and-skip contract cited the `refreshModels?` docblock), `wire.rs` ×2 (`applyAuth` at `:240-241`/`:252`, both inside other functions) and `simple_options.rs` ×1. All corrected with the construct named and `@v0.83.0` stamped. **RESIDUAL, stated plainly:** the CI citation lint is still not built; the sweep above was manual. Its natural home is now the `xtask` PROV-018 landed (a `git show`-based extractor already exists there), ~S. |
 | ~~PROV-043~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | Bedrock has no request retry where pi inherits the AWS SDK's default — **CLOSED 2026-08-14**: sweep 1 — Bedrock request retry and `AWS_BEDROCK_FORCE_HTTP1` ported. |
 | ~~PROV-044~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `AWS_BEDROCK_FORCE_HTTP1` unported; client negotiates h2 with no override — **CLOSED 2026-08-14**: sweep 1 — Bedrock request retry and `AWS_BEDROCK_FORCE_HTTP1` ported. |
 | ~~PROV-045~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | openai-responses `reasoning` branch drops the xAI `include` and the summary-only trigger — **CLOSED 2026-08-14**: sweep 1 — landed together on both openai routes plus azure and codex, sharing one `SessionAffinityFormat`. PROV-034 additionally required CORRECTING a test that pinned `strict == false` with no compat (a new test-defect instance). |
 | ~~PROV-046~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Boolean tool-arg coercion accepts `"True"`/`" true "` where pi rejects the call — **CLOSED 2026-08-14**: sweep 1 — confirmed at HEAD exactly as filed; citations resolved clean at v0.83.0. |
 | ~~PROV-051~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Codex header-phase timeout substituted with a whole-stream read timeout; pi's message and abort/timeout distinction lost — **CLOSED 2026-08-14**: sweep 1 — Codex header-phase timeout restored with pi's message and the abort/timeout distinction. |
-| ~~PROV-S04~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `estimateContextTokens`' message-anchored added-tool accounting unported — **CLOSED 2026-08-14**: sweep 1 — CLASSIFICATION CORRECTED: the item said the added-tool block was post-baseline (3d8f7435) and cyrup was "a faithful stale port". `git show v0.83.0:packages/ai/src/utils/estimate.ts` has it at :118-133, byte-identical to v0.84.1. It was a port omission. Citation-sweep miss of the same class as the nine already recorded. |
+| ~~PROV-S04~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `estimateContextTokens`' message-anchored added-tool accounting unported — **CLOSED 2026-08-14**: sweep 1 — CLASSIFICATION CORRECTED: the item said the added-tool block was post-baseline (3d8f7435) and cyrup was "a faithful stale port". `git show v0.83.0:packages/ai/src/utils/estimate.ts` has it at :118-133, byte-identical to v0.84.1. It was a port omission. Citation-sweep miss of the same class as the nine already recorded. **NOTE 2026-09-24 (second pass), not reopened:** v0.86.0 deleted the `addedToolNames` accounting this closure ported; `estimate.ts` now counts system messages' `toolsAdded`/`toolsRemoved`. Tracked in `PROV-083`. |
 | ~~PROV-S05~~ | ~~low~~ **CLOSED 2026-08-15** | not-ported | M | `Models::refresh` has no `force`, no abort signal, no per-provider error map — **CLOSED 2026-08-15**: sweep 11 — `Models::refresh_with(provider, ModelsRefreshOptions)` returns `ModelsRefreshResult { aborted, errors }` and reproduces every clause of `models.ts:276-328` @v0.83.0 in upstream's order, including the two a shorter port drops: an ABORTED provider records **no** error (`:305`'s `if (!signal?.aborted)` guard — cancellation is not a provider failure), and any failure is followed by the `allowNetwork:false` cache-restore re-invocation whose own failure is swallowed (`:313-322`), built WITHOUT `force` exactly as upstream builds it. `Provider::refresh_models` now takes a `RefreshModelsContext` (pi `models.ts:34-44`), forwarded unchanged by both delegating decorators. **The abort was treated as guarantee-sensitive and is tested as two separate properties**, because a signal that is accepted and ignored is the failure mode this project keeps finding: `prov_s05_cancel_actually_aborts_an_in_flight_refresh` parks a provider inside its fetch, asserts the refresh has NOT settled, cancels, and requires it to return within 5 s (it can only do so via the token it was handed) with `aborted == true` and an EMPTY error map; `prov_s05_a_pre_cancelled_refresh_calls_no_provider` pins `:286`'s pre-check. `refresh(Option<&str>)` survives as the compatibility shape and its doc now says outright that `refresh(None) == Ok(())` for a wholly failed refresh is the hole, and that callers who care must use `refresh_with`. Two `[CYRUP-DELTA]`s recorded: `provider: Option<&str>` has no upstream counterpart, and `credential`/`store` are not threaded because the persisting fetcher owns both. The false "1:1 port" doc above the method (PROV-041 instance 1) was rewritten in the same edit. |
 | PROV-053 | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2).** `EnvAuthContext` diverged from pi's `defaultProviderAuthContext()` (ai/src/auth/context.ts:22-40 @v0.83.0) in two ways: `file_exists` did not expand a leading `~` (pi does, at :29-33), and `env` returned `Some("")` for a blank variable where pi returns undefined unless `value.trim().length > 0` (:24-25). The first made the Vertex ADC arm unreachable **on every machine** — `ctx.fileExists(VERTEX_ADC_PATH)` was always false — and was PROV-030's real hidden blocker. The second is the more general hazard: every precedence chain ported from a JS `??` or truthiness test reads `Some("")` as CONFIGURED, which INVERTS the upstream semantics; the concrete instance is `GOOGLE_CLOUD_API_KEY=""` winning the coalesce at providers/google_vertex.rs:301-304 and suppressing the ADC fallback. Both fixed in `auth/types.rs` with the pi citations inline and pinned by two tests. **Worth a sweep: any other `ctx.env(...)`-fed `??` chain in this crate may have been written around the old `Some("")` behaviour.** — **THAT SWEEP WAS RUN 2026-08-15 (sweep 11) AND CAME BACK CLEAN.** All 42 `ctx.env(...)` call sites in `cyrup-provider` were read against their upstream operator: every JS-`\|\|`/truthiness site filters empty explicitly (`auth/helpers.rs`, `env_api_keys.rs::get_provider_env_value`, `providers/anthropic.rs`, `utils/node_http_proxy.rs`, `auth/google_adc.rs::provider_env_value`), the `OverlayEnvContext` at `auth/resolve.rs:124-129` correctly falls THROUGH an empty overlay value (pi `env[name] \|\| base.env(name)`, `auth/resolve.ts:73-78`), and the two nullish-`??` chains — `providers/amazon_bedrock.rs` and `providers/google_vertex.rs` — deliberately let a stored `""` win the coalesce and then fail the surrounding truthiness test, with the reasoning written out above each. No second instance of the PROV-053 class exists in this crate. Recorded here so nobody re-derives it. |
-| ~~PROV-054~~ | ~~**high**~~ **CLOSED 2026-08-15** | stale-port | S | `xai/grok-4.5` routed over the WRONG WIRE API on the xai DEFAULT model — **CLOSED 2026-08-15**: sweep 10 — closed BY THE REGENERATION, not by hand, exactly as this item's Fix required. `xai.json` now comes from `b0c2a90e` via `cargo run -p xtask -- gen-catalogs`: `api: openai-responses`, `compat {supportsLongCacheRetention:false}`, `thinkingLevelMap {off:null,minimal:null}`, and the five retired rows gone in the same write. Confirmed at the PORTED TAG too — `XAI_RESPONSES_MODEL_ID = "grok-4.5"` (`ai/scripts/generate-models.ts:378` @v0.83.0), selected at `:1408`, compat at `:390-392`, map at `:386-389`. |
+| ~~PROV-054~~ | ~~**high**~~ **CLOSED 2026-08-15** | stale-port | S | `xai/grok-4.5` routed over the WRONG WIRE API on the xai DEFAULT model — **CLOSED 2026-08-15**: sweep 10 — closed BY THE REGENERATION, not by hand, exactly as this item's Fix required. `xai.json` now comes from `b0c2a90e` via `cargo run -p xtask -- gen-catalogs`: `api: openai-responses`, `compat {supportsLongCacheRetention:false}`, `thinkingLevelMap {off:null,minimal:null}`, and the five retired rows gone in the same write. Confirmed at the PORTED TAG too — `XAI_RESPONSES_MODEL_ID = "grok-4.5"` (`ai/scripts/generate-models.ts:378` @v0.83.0), selected at `:1408`, compat at `:390-392`, map at `:386-389`. **RE-AUDITED 2026-09-24 (second pass) — closure holds:** the 2026-09-14 supersession flag asked whether the v0.85 all-xAI-on-Responses rule moved the premise; every row of the embedded `xai.json` (live pi.dev fetch, XAI_1) is `openai-responses`. |
 | ~~PROV-055~~ | ~~**high**~~ **CLOSED 2026-08-15** | stale-port | S | `opencode` leaked a `session_id` header pi suppresses on every `openai-responses` row — **CLOSED 2026-08-15**: sweep 10 — closed by the regeneration; all **19** rows (16 + the GPT-5.6 trio PROV-057 added) now carry `sessionAffinityFormat: "openai-nosession"`. Confirmed at the ported tag: pi sets it on every `@ai-sdk/openai` OpenCode variant at `ai/scripts/generate-models.ts:1666` @v0.83.0. The **stopgap this item proposed was NOT taken**: `detect_session_affinity_format` is unchanged and still answers `Openai` for opencode — the fix is data, which is what upstream resolves it from. |
 | ~~PROV-056~~ | ~~**high**~~ **CLOSED 2026-08-15** | stale-port | S | `kimi-coding` sent a non-adaptive thinking block plus a beta pi suppresses, on every model the provider has — **CLOSED 2026-08-15**: sweep 10 — closed by the regeneration; all **5** rows (3 + the two PROV-057 added) carry `forceAdaptiveThinking: true` and the two Kimi-For-Coding variants carry `allowEmptySignature: true`. Confirmed at the ported tag: `ai/scripts/generate-models.ts:1861-1864` @v0.83.0 builds every row that way. The zero pricing on the same three rows (PROV-059(a)) went with it. |
 | ~~PROV-057~~ | ~~medium~~ **CLOSED 2026-08-15** | stale-port | M | 25 model ids that resolve in pi and errored here — **CLOSED 2026-08-15**: sweep 10 — the regeneration added exactly the 25 this item enumerated, no more and no fewer; the count and the per-catalog breakdown reproduced independently by `gen-catalogs --diff`. |
@@ -743,10 +865,37 @@ runs.
 | ~~PROV-067~~ | ~~low~~ **CLOSED 2026-08-15** | cyrup-original | S | The wire-api registry is a fn-pointer factory table where pi's laziness is per-module dynamic `import()` — **CLOSED 2026-08-15**: sweep 11 — the sign-off this item asked for is now a `[CYRUP-DELTA, mechanism]` block in `api/mod.rs`'s header, naming `api/*.lazy.ts` and `lazyApi` (`api/lazy.ts:66-75` @v0.83.0, verified present at the tag), stating why the substitution is forced (Rust has no dynamic `import()`, so there is no module-load event to defer and no import cache to share — the only deferrable thing left is construction of the impl value) and why it is equivalent (nothing on either side depends on module-load timing). Pinned by `prov067_registry_constructs_nothing_until_the_first_get`, which asserts the id set equals pi's 10 `KnownApi` entries, that `builtin_registry()` constructs nothing, that `contains` stays free, and that the first `get` constructs exactly one impl. **Stated loudly: that test cannot go red before this change** — it goes red if a factory is replaced by an eager `register_impl`, or if the id set drifts. |
 | ~~PROV-068~~ | ~~high~~ **CLOSED 2026-09-04 — REFUTED** | port-bug | S | An explicit `null` in `thinkingLevelMap` read as UNSUPPORTED, collapsing most reasoning models to two rungs — **REFUTED, CLOSED 2026-09-04**: landed in cyrup `24b6ffe` (between this file's `4fb5e40` baseline and HEAD `2571969`), and independently re-verified here against the ported tag rather than taken from the commit message. `null` really does mean unsupported; the "no provider-specific value" reading this row proposed is what ABSENCE already means, and the two are kept distinct on both ends. **Upstream, read at `v0.83.0` (the file's own ported baseline, not just the commit's later citations):** `if (mapped === null) return false;` (`packages/ai/src/models.ts:668`); the wire gate that proves absence and null are different cases, `else if (model.thinkingLevelMap?.off !== null)` (`packages/ai/src/api/openai-completions.ts:774`) — an absent `off` still emits the generic level name, a null `off` suppresses the parameter outright. Two upstream tests pin the exact three-way reading: `{off,minimal,low,medium: null, xhigh: "max"}` → `["high","xhigh"]` (`packages/coding-agent/test/model-registry.test.ts:1012-1019` @v0.83.0) and `{xhigh: null, max: "max"}` → `[off,minimal,low,medium,high,max]` (`packages/ai/test/max-thinking.test.ts:59-66` @v0.83.0). And the Kimi K2.6 row this item's own report was about is upstream's, verbatim: `thinkingLevelMap: { minimal: null, low: null, medium: null }` (`packages/ai/test/together-models.test.ts:24` @v0.83.0) — a two-rung ladder is pi's own catalog behaviour for that model, not a cyrup defect. **cyrup at HEAD**, `crates/cyrup-provider/src/collection.rs::get_supported_thinking_levels`, unchanged in logic (`Some(None) => false`, matching `mapped === null`) but now carries this citation trail in its doc comment. `crates/cyrup-provider/src/providers/together.rs`'s `moonshotai/Kimi-K3` row keeps `thinking_level_map: None` (full ladder) as a documented, deliberate choice for a model with no upstream row (`PROV-070`), not a hedge on this item's resolution — inverting the reading would have changed 159 catalog models and put `off` on models that cannot disable reasoning. |
 | ~~PROV-069~~ | ~~critical~~ **CLOSED 2026-08-15** | port-bug | S | The model's `max_tokens` never reached the request, so the server applied its own ceiling — **CLOSED 2026-08-15** in `e677555`. **Root cause:** `GenConfig::max_tokens` has no production writer (`grep -rn '\.max_tokens(' crates/ | grep -v tests` is empty; the builder at `agent.rs:2294` is test-only), and the body emitted the key only when that option was `Some`, so it was never emitted at all. **The catalog's `max_tokens` — all 1087 rows, regenerated from pinned `b0c2a90e`, reconciled field-by-field, covered by tests — was decorative.** **MEASURED against the live provider, not inferred:** the same prompt to `moonshotai/Kimi-K3` with `max_tokens` omitted returns `finish_reason: length` at `completion_tokens: 2048` (**Together's default cap**), of which **1438 were reasoning tokens** — leaving ~610 for the visible answer; with `max_tokens: 131072` it returns `finish_reason: stop` at 3135 tokens. Fix sends the caller's ceiling when present and the model's otherwise, which is upstream's own rule at `anthropic-messages.ts:989` (`options?.maxTokens ?? model.maxTokens`) and the stated intent of `adjustMaxTokensForThinking`; recorded as a `CYRUP-DELTA` because `openai-completions.ts:716` guards on the caller value alone. **Test note:** every other wire test hand-supplies `max_tokens: Some(...)`, proving serialisation and hiding the only path that ships — 7112 tests passed while the product sent no ceiling. Verified RED by removing the fallback. **Two wrong diagnoses recorded so they are not retried:** the agent loop is a faithful port (`agent.rs:593` == `agent-loop.ts:196-200`) and was never implicated; and a port of pi's `isRecoverableLength` was drafted and REVERTED because it routes a truncated turn into `run_auto_compaction`, which at 3% of a 1M window trades truncation for compaction spam — it treats the symptom. **`PROV-068` compounds this** (reasoning pinned to `high` burns the ceiling) but is a separate defect and remains open. |
-| PROV-070 | low | cyrup-original | S | **`moonshotai/Kimi-K3` is a Together roster row cyrup ships and pi does not — the first deliberate ADDITION to a ported provider catalog, and it had no row in this file.** Landed `2add245` (2026-08-15). The model is `providers/together.rs:278-288` (`cost(3.0, 15.0, 0.3)`, `1_000_000` context, `131_072` max_tokens, `together_compat(false, Some(ThinkingFormat::Together))`), under a 21-line provenance comment at `:257-277` recording that every value except `max_tokens` was MEASURED from `GET https://api.together.xyz/v1/models` on 2026-08-15 and that `131_072` was verified with a live request that returned `finish_reason: stop`. Upstream's `together.models.ts` @`b0c2a90e` stops at K2.7-Code — K3 shipped 2026-07-26, after the pinned revision — so this is a signed-off divergence, not drift. **It is GUARDED, which is why the severity is `low`**: sweep 10's roster test was renamed and widened to `full_catalog_ported_from_pi_plus_recorded_additions` (`:442`), asserting `models.len() == 20 + ADDITIONS.len()` (`:448`) against `const ADDITIONS: &[&str] = &["moonshotai/Kimi-K3"]` (`:447`), so an ACCIDENTAL extra row still fails while a NAMED one does not. **NOT a regeneration hazard — checked, against the obvious assumption from `PROV-018`/`PROV-060`:** `together` has no entry in the generator's `CATALOGS` at all (`xtask/src/main.rs:65-66`: "cyrup hand-ports Together's rows as Rust literals … so this generator cannot own them") and the manifest note restates the exception (`xtask/src/main.rs:588`), so nothing regenerates this roster and the `DELTAS` table is the wrong instrument for it. **The live hook is `PROV-068`, which is still open at `high`:** this row's `thinking_level_map` is `None` (`providers/together.rs:286`) where both Kimi siblings — K2.6 (`:247`) and K2.7-Code (`:290`) — pass `Some(m())`, and `m` (`:100`) is `level_map(&[("minimal", None), ("low", None), ("medium", None)])`, i.e. the three explicit nulls `get_supported_thinking_levels` (`collection.rs:787-810`) reads as UNSUPPORTED — `Some(None) => false` at `:800`. `None` was chosen deliberately so K3 keeps the full ladder while `PROV-068` is open, and the reasoning is in-source at `providers/together.rs:272-277`. **`PROV-068` must revisit this row either way it resolves** — if explicit-null comes to mean "supported, send no provider value" the asymmetry is pointless; if it keeps meaning "unsupported" then the siblings are the bug and K3 is the template. **RESIDUAL, one line:** `xtask/src/main.rs:65` still says cyrup "hand-ports Together's **20** rows"; it is 21 (re-verified 2026-09-04: now at `:74`, text unchanged). — **`PROV-068` RESOLVED 2026-09-04, REFUTED — this row's "either way" is settled, not pointless.** `PROV-068` closed on the "unsupported" reading, and the siblings are NOT the bug: `together-models.test.ts:24` @v0.83.0 shows the K2.6 map `{minimal: null, low: null, medium: null}` is pi's own catalog data, not a cyrup invention, so K2.6/K2.7-Code's two-rung ladder is a correct port. K3's `thinking_level_map: None` therefore stays exactly what `together.rs`'s comment (updated in the same commit, `24b6ffe`) now says: a deliberate cyrup-original choice for a model with no upstream row to copy, not a hedge against an open question. This item's own severity and scope are otherwise unchanged — it is still the one-line `xtask` residual above. — **RE-READ 2026-09-14 at `9aeba769`, STILL OPEN (low); the item is exactly its one-line residual and nothing has been done to it.** The generator's doc comment still says Together is **20** rows where cyrup ships 21; the text is identical and only the offset moved again (`:65` → `:74` → now `xtask/src/main.rs:98`). The guarded-addition machinery this row credits for the low severity is intact, and what it ENFORCES was read rather than assumed: `crates/cyrup-provider/src/providers/together.rs:449-459` (`full_catalog_ported_from_pi_plus_recorded_additions`) asserts `models.len() == 20 + ADDITIONS.len()` with `ADDITIONS = ["moonshotai/Kimi-K3"]` and that each named addition is present, so an ACCIDENTAL extra row still fails; the file has 21 `model(` rows and the K3 row is at `:286` with `thinking_level_map: None`, under the 21-line provenance comment at `:257-284` that now carries `PROV-068`'s resolution. The `cyrup-original` classification also survives: `together.models.ts` @`b0c2a90e` has exactly 20 `id: "..."` rows and `grep -n Kimi-K3` there is empty, and `git grep -n Kimi-K3 v0.85.1 -- packages/` returns nothing. **IMPORTANT LIMIT on that last point — it is `PROV-071`'s, not a new defect:** at v0.85.1 `together.models.ts` is an 8-line re-export of gitignored `./data/together.json`, so pi's CURRENT Together roster is not measurable from git at all; "pi does not ship K3" is provable only against `b0c2a90e`. Whoever fixes the xtask line should write 21 **and** say which revision the 20 is counted from. **Falsification:** if pi's Together data ever becomes readable from this workspace (a `data/together.json` landing in git, or a reachable `https://pi.dev/api/models/providers/together`) and it contains `moonshotai/Kimi-K3`, this row reclassifies from `cyrup-original` to converged `upstream-drift`, and `together.rs`'s `ADDITIONS` entry plus its provenance comment must be retired in the same change. Closing the residual requires `xtask/src/main.rs:98` to read 21 (or to stop asserting a count). **RE-CONFIRMED STILL OPEN 2026-09-16 at `cc7818b`, re-measured:** `moonshotai/Kimi-K3` is still shipped in the Together roster — `crates/cyrup-provider/src/providers/together.rs:286`, and still declared as a deliberate addition at `:454` (`const ADDITIONS: &[&str] = &["moonshotai/Kimi-K3"]`). The `ADDITIONS` const is the mechanism this row asked for and it is intact; what stays open is the upstream-facing question, not the bookkeeping. |
-
-| PROV-071 | medium | tooling | L | **Every embedded catalog is frozen at `b0c2a90e` for the same structural reason — this was never an xai defect** — 39/39 of pi's `*.models.ts` modules at HEAD `71dca871b` are the post-`a9f6a3159` re-export of gitignored data, so `git show` recovers nothing for ANY provider at any revision after `b0c2a90e`. `XAI_1` unfroze ONE (`xai`) by fetching `https://pi.dev/api/models/providers/<id>`, which serves rows pre-shaped into cyrup's native `Model` JSON — a materially lower-effort route than porting `generate-models.ts`'s per-provider transform. The other 34 are NOT fixed by XAI_1..XAI_4 and are tracked here as unscheduled follow-up. Amends `DRIFT-009`, whose bolded prohibition on seeding from pi.dev was scoped to the blocked four (where `git show` WAS available) and does not reach a provider for which the pinned path is provably dead. See also `PROV-018`, `PROV-039`, `PROV-060`. — **RE-READ 2026-09-14 at `9aeba769`, STILL OPEN (medium); the claim holds unchanged on BOTH halves at the newer tag.** **Upstream, the structural cause has not reverted**, measured mechanically rather than sampled: all 39 `packages/ai/src/providers/*.models.ts` at v0.85.1 contain `with { type: "json" }` — 39/39 are the re-export shape, ZERO are data literals — while `.gitignore:11` @v0.85.1 is `packages/ai/src/providers/data/` and `git ls-tree -r v0.85.1 -- packages/ai/src/providers/data` is empty, so `git show` recovers nothing newer for ANY of the 39. By contrast `together.models.ts` @`b0c2a90e` is still a full 20-row literal, confirming `b0c2a90e` remains the only reachable data revision. **cyrup side:** `xtask/src/main.rs:70` still pins `DEFAULT_REV = "b0c2a90e"`, `:74` `DEFAULT_REV_TIMESTAMP = "2026-07-17T09:00:03Z"`, `:103-140` CATALOGS (34 pinned specs incl. the openrouter-images special case), and `:156-162` `LIVE_CATALOGS` still holds exactly ONE entry (`xai`) under its own comment stating the other 34 are affected by the same upstream change and are deliberately NOT there; `crates/cyrup-provider/src/providers/catalog/` holds 35 files and `catalog_manifest.json:1-3` still stamps `"generatedAt": "2026-07-17T09:00:03Z"` / `"source": "pi@b0c2a90e"`, 34-of-35 from the pinned revision. Nothing in `XAI_1..XAI_4` touched the other 34, precisely as this row says. Severity stays **medium**: the embedded floor is now ~2 months stale for 34 providers, and a stale row degrades to confidently-wrong rather than to missing. **FRESH MEASUREMENT, dated as this row demands and NOT inherited:** from this workspace on **2026-09-14**, `https://models.dev/api.json` and `https://pi.dev/api/models/providers/xai` BOTH fail — the agent proxy reports `connect_rejected`, HTTP code 000 — the opposite of the 200/200 recorded on 2026-09-13, and back to `DRIFT-009`'s 403. The demonstrated fix route is therefore not executable from here today, which STRENGTHENS rather than weakens the item. **Checked and NOT reportable as a new defect:** a blocked fetch does not break the build — `xtask/src/live_catalog.rs:189-221` maps a fetch error to `LiveOutcome::Skipped` and leaves the existing file, so `gen-catalogs` degrades to the pinned path rather than failing. **Falsification, two measurable conditions.** **(a) The upstream cause:** re-run the 39-module shape scan at the next tag — if any `*.models.ts` returns to a data literal, or `packages/ai/src/providers/data/*.json` appears in `git ls-tree`, the pinned path is alive again and this row's premise dies. **(b) The cyrup side:** the row closes only when `LIVE_CATALOGS` (or an equivalent) accounts for all 35 catalogs with per-provider `fetchedAt`/`revision` in `catalog_manifest.json` **and** `fleet.rs`'s `EXPECTED_COUNTS` assertions have been rewritten in the same change — a live-fetch generalization landing without that assertion rewrite is a regression, not a closure. Network reachability must be re-measured and re-dated on every pass: it flipped 200 → blocked in one day here. **RE-CONFIRMED 2026-09-16 at `cc7818b` by identity** (`crates/cyrup-provider` unchanged in `9aeba769..cc7818b`; `xtask/` likewise untouched, so the generator and its `--check` drift guard are as read on 2026-09-14). **This is area 01's only open medium** and the `b0c2a90e`-plus-unbounded-delta residue is unchanged. |
-| PROV-072 | low | cyrup-original | S | **The bundled OAuth flow-loader registry is dead — a complete, tested, documented subsystem with no production caller** — **FILED 2026-09-22 at `14e6c56`**, by the `PARITY-GAPS.md` `UW-` sweep, which `UW-11` had explicitly asked a later pass to run: *"`register_bundled_oauth_flow_loaders` (`auth/oauth/load.rs:111`) was not re-greped this pass. If it still has zero callers it is a live UW-class defect with no id."* It does, and it is worse than the registrar alone — the registry is dead on BOTH sides. **Write side:** `grep -rn 'register_bundled_oauth_flow_loaders' crates/ --include=*.rs` returns the definition (`crates/cyrup-provider/src/auth/oauth/load.rs:111`), two re-exports (`auth/oauth/mod.rs:62`, `auth/mod.rs:19`), four doc references (`load.rs:12`, `:64`, `auth/oauth/github_copilot.rs:838`, `auth/oauth/kimi_coding.rs:766`) and three CALLS — `load.rs:239`, `:277`, `:322` — **all three after the `#[cfg(test)]` that opens at `load.rs:198`** (`grep -n '#\[cfg(test)\]' crates/cyrup-provider/src/auth/oauth/load.rs` → `198`). Zero production callers. **Read side:** `grep -rn 'registered_oauth_flows' crates/ --include=*.rs \| grep -v 'auth/oauth/load.rs'` returns **nothing** — `registered_oauth_flows` (`load.rs:118`), whose own doc says it exists *"for status UIs that list which logins are actually available"*, has zero callers outside its module, and no status UI reads it. The backing `registry()` (`load.rs:104`) is therefore written by nobody and read only by its own two accessors. **Severity `low`, deliberately:** nothing user-visible breaks. `/login` resolves through `provider.provider_auth().oauth` (`cyrup-config/src/login.rs`), not through this registry, and `PROV-029` closed the flows-unreachable defect by wiring the provider side. This is dead weight plus a doc comment that promises a consumer that does not exist. **Fix:** discharge the second half of `UW-11`'s Fix as written — *either populate the flow registry or delete it*. Deleting is the smaller change and is the default unless a status UI is actually planned; if it is kept, the `"for status UIs"` doc must name the caller. **Verify:** after the fix, `grep -rn 'registered_oauth_flows' crates/ --include=*.rs` either has a production hit outside `load.rs`, or has none because the symbol is gone. A pass that leaves it hit-only-from-tests has not closed this. |
+| PROV-070 | low | cyrup-original | S | **`moonshotai/Kimi-K3` is a Together roster row cyrup ships and pi does not — the first deliberate ADDITION to a ported provider catalog, and it had no row in this file.** Landed `2add245` (2026-08-15). The model is `providers/together.rs:278-288` (`cost(3.0, 15.0, 0.3)`, `1_000_000` context, `131_072` max_tokens, `together_compat(false, Some(ThinkingFormat::Together))`), under a 21-line provenance comment at `:257-277` recording that every value except `max_tokens` was MEASURED from `GET https://api.together.xyz/v1/models` on 2026-08-15 and that `131_072` was verified with a live request that returned `finish_reason: stop`. Upstream's `together.models.ts` @`b0c2a90e` stops at K2.7-Code — K3 shipped 2026-07-26, after the pinned revision — so this is a signed-off divergence, not drift. **It is GUARDED, which is why the severity is `low`**: sweep 10's roster test was renamed and widened to `full_catalog_ported_from_pi_plus_recorded_additions` (`:442`), asserting `models.len() == 20 + ADDITIONS.len()` (`:448`) against `const ADDITIONS: &[&str] = &["moonshotai/Kimi-K3"]` (`:447`), so an ACCIDENTAL extra row still fails while a NAMED one does not. **NOT a regeneration hazard — checked, against the obvious assumption from `PROV-018`/`PROV-060`:** `together` has no entry in the generator's `CATALOGS` at all (`xtask/src/main.rs:65-66`: "cyrup hand-ports Together's rows as Rust literals … so this generator cannot own them") and the manifest note restates the exception (`xtask/src/main.rs:588`), so nothing regenerates this roster and the `DELTAS` table is the wrong instrument for it. **The live hook is `PROV-068`, which is still open at `high`:** this row's `thinking_level_map` is `None` (`providers/together.rs:286`) where both Kimi siblings — K2.6 (`:247`) and K2.7-Code (`:290`) — pass `Some(m())`, and `m` (`:100`) is `level_map(&[("minimal", None), ("low", None), ("medium", None)])`, i.e. the three explicit nulls `get_supported_thinking_levels` (`collection.rs:787-810`) reads as UNSUPPORTED — `Some(None) => false` at `:800`. `None` was chosen deliberately so K3 keeps the full ladder while `PROV-068` is open, and the reasoning is in-source at `providers/together.rs:272-277`. **`PROV-068` must revisit this row either way it resolves** — if explicit-null comes to mean "supported, send no provider value" the asymmetry is pointless; if it keeps meaning "unsupported" then the siblings are the bug and K3 is the template. **RESIDUAL, one line:** `xtask/src/main.rs:65` still says cyrup "hand-ports Together's **20** rows"; it is 21 (re-verified 2026-09-04: now at `:74`, text unchanged). — **`PROV-068` RESOLVED 2026-09-04, REFUTED — this row's "either way" is settled, not pointless.** `PROV-068` closed on the "unsupported" reading, and the siblings are NOT the bug: `together-models.test.ts:24` @v0.83.0 shows the K2.6 map `{minimal: null, low: null, medium: null}` is pi's own catalog data, not a cyrup invention, so K2.6/K2.7-Code's two-rung ladder is a correct port. K3's `thinking_level_map: None` therefore stays exactly what `together.rs`'s comment (updated in the same commit, `24b6ffe`) now says: a deliberate cyrup-original choice for a model with no upstream row to copy, not a hedge against an open question. This item's own severity and scope are otherwise unchanged — it is still the one-line `xtask` residual above. — **RE-READ 2026-09-14 at `9aeba769`, STILL OPEN (low); the item is exactly its one-line residual and nothing has been done to it.** The generator's doc comment still says Together is **20** rows where cyrup ships 21; the text is identical and only the offset moved again (`:65` → `:74` → now `xtask/src/main.rs:98`). The guarded-addition machinery this row credits for the low severity is intact, and what it ENFORCES was read rather than assumed: `crates/cyrup-provider/src/providers/together.rs:449-459` (`full_catalog_ported_from_pi_plus_recorded_additions`) asserts `models.len() == 20 + ADDITIONS.len()` with `ADDITIONS = ["moonshotai/Kimi-K3"]` and that each named addition is present, so an ACCIDENTAL extra row still fails; the file has 21 `model(` rows and the K3 row is at `:286` with `thinking_level_map: None`, under the 21-line provenance comment at `:257-284` that now carries `PROV-068`'s resolution. The `cyrup-original` classification also survives: `together.models.ts` @`b0c2a90e` has exactly 20 `id: "..."` rows and `grep -n Kimi-K3` there is empty, and `git grep -n Kimi-K3 v0.85.1 -- packages/` returns nothing. **IMPORTANT LIMIT on that last point — it is `PROV-071`'s, not a new defect:** at v0.85.1 `together.models.ts` is an 8-line re-export of gitignored `./data/together.json`, so pi's CURRENT Together roster is not measurable from git at all; "pi does not ship K3" is provable only against `b0c2a90e`. Whoever fixes the xtask line should write 21 **and** say which revision the 20 is counted from. **Falsification:** if pi's Together data ever becomes readable from this workspace (a `data/together.json` landing in git, or a reachable `https://pi.dev/api/models/providers/together`) and it contains `moonshotai/Kimi-K3`, this row reclassifies from `cyrup-original` to converged `upstream-drift`, and `together.rs`'s `ADDITIONS` entry plus its provenance comment must be retired in the same change. Closing the residual requires `xtask/src/main.rs:98` to read 21 (or to stop asserting a count). **RE-CONFIRMED STILL OPEN 2026-09-16 at `cc7818b`, re-measured:** `moonshotai/Kimi-K3` is still shipped in the Together roster — `crates/cyrup-provider/src/providers/together.rs:286`, and still declared as a deliberate addition at `:454` (`const ADDITIONS: &[&str] = &["moonshotai/Kimi-K3"]`). The `ADDITIONS` const is the mechanism this row asked for and it is intact; what stays open is the upstream-facing question, not the bookkeeping. **RE-VERIFIED STILL OPEN 2026-09-24 at `ea23ca2`:** cyrup side byte-identical: `git diff --quiet 9aeba769 ea23ca2 -- crates/cyrup-provider crates/cyrup-core crates/cyrup-config xtask` exits 0; `xtask/src/main.rs:98` still reads "Together's 20 rows" and `providers/together.rs:454` still declares `ADDITIONS = ["moonshotai/Kimi-K3"]`. pi's Together data remains unreadable at v0.87.1 (`together.models.ts` is a `data/*.json` re-export), so the falsifier cannot fire. |
+| PROV-071 | medium | tooling | L | **Every embedded catalog is frozen at `b0c2a90e` for the same structural reason — this was never an xai defect** — 39/39 of pi's `*.models.ts` modules at HEAD `71dca871b` are the post-`a9f6a3159` re-export of gitignored data, so `git show` recovers nothing for ANY provider at any revision after `b0c2a90e`. `XAI_1` unfroze ONE (`xai`) by fetching `https://pi.dev/api/models/providers/<id>`, which serves rows pre-shaped into cyrup's native `Model` JSON — a materially lower-effort route than porting `generate-models.ts`'s per-provider transform. The other 34 are NOT fixed by XAI_1..XAI_4 and are tracked here as unscheduled follow-up. Amends `DRIFT-009`, whose bolded prohibition on seeding from pi.dev was scoped to the blocked four (where `git show` WAS available) and does not reach a provider for which the pinned path is provably dead. See also `PROV-018`, `PROV-039`, `PROV-060`. — **RE-READ 2026-09-14 at `9aeba769`, STILL OPEN (medium); the claim holds unchanged on BOTH halves at the newer tag.** **Upstream, the structural cause has not reverted**, measured mechanically rather than sampled: all 39 `packages/ai/src/providers/*.models.ts` at v0.85.1 contain `with { type: "json" }` — 39/39 are the re-export shape, ZERO are data literals — while `.gitignore:11` @v0.85.1 is `packages/ai/src/providers/data/` and `git ls-tree -r v0.85.1 -- packages/ai/src/providers/data` is empty, so `git show` recovers nothing newer for ANY of the 39. By contrast `together.models.ts` @`b0c2a90e` is still a full 20-row literal, confirming `b0c2a90e` remains the only reachable data revision. **cyrup side:** `xtask/src/main.rs:70` still pins `DEFAULT_REV = "b0c2a90e"`, `:74` `DEFAULT_REV_TIMESTAMP = "2026-07-17T09:00:03Z"`, `:103-140` CATALOGS (34 pinned specs incl. the openrouter-images special case), and `:156-162` `LIVE_CATALOGS` still holds exactly ONE entry (`xai`) under its own comment stating the other 34 are affected by the same upstream change and are deliberately NOT there; `crates/cyrup-provider/src/providers/catalog/` holds 35 files and `catalog_manifest.json:1-3` still stamps `"generatedAt": "2026-07-17T09:00:03Z"` / `"source": "pi@b0c2a90e"`, 34-of-35 from the pinned revision. Nothing in `XAI_1..XAI_4` touched the other 34, precisely as this row says. Severity stays **medium**: the embedded floor is now ~2 months stale for 34 providers, and a stale row degrades to confidently-wrong rather than to missing. **FRESH MEASUREMENT, dated as this row demands and NOT inherited:** from this workspace on **2026-09-14**, `https://models.dev/api.json` and `https://pi.dev/api/models/providers/xai` BOTH fail — the agent proxy reports `connect_rejected`, HTTP code 000 — the opposite of the 200/200 recorded on 2026-09-13, and back to `DRIFT-009`'s 403. The demonstrated fix route is therefore not executable from here today, which STRENGTHENS rather than weakens the item. **Checked and NOT reportable as a new defect:** a blocked fetch does not break the build — `xtask/src/live_catalog.rs:189-221` maps a fetch error to `LiveOutcome::Skipped` and leaves the existing file, so `gen-catalogs` degrades to the pinned path rather than failing. **Falsification, two measurable conditions.** **(a) The upstream cause:** re-run the 39-module shape scan at the next tag — if any `*.models.ts` returns to a data literal, or `packages/ai/src/providers/data/*.json` appears in `git ls-tree`, the pinned path is alive again and this row's premise dies. **(b) The cyrup side:** the row closes only when `LIVE_CATALOGS` (or an equivalent) accounts for all 35 catalogs with per-provider `fetchedAt`/`revision` in `catalog_manifest.json` **and** `fleet.rs`'s `EXPECTED_COUNTS` assertions have been rewritten in the same change — a live-fetch generalization landing without that assertion rewrite is a regression, not a closure. Network reachability must be re-measured and re-dated on every pass: it flipped 200 → blocked in one day here. **RE-CONFIRMED 2026-09-16 at `cc7818b` by identity** (`crates/cyrup-provider` unchanged in `9aeba769..cc7818b`; `xtask/` likewise untouched, so the generator and its `--check` drift guard are as read on 2026-09-14). **This is area 01's only open medium** and the `b0c2a90e`-plus-unbounded-delta residue is unchanged. **RE-VERIFIED STILL OPEN 2026-09-24 at `ea23ca2` / pi `v0.87.1`:** cyrup side byte-identical: `git diff --quiet 9aeba769 ea23ca2 -- crates/cyrup-provider crates/cyrup-core crates/cyrup-config xtask` exits 0. Falsifier (a) re-run at v0.87.1: **41/41** `*.models.ts` (now incl. `meta.models.ts`, `radius.models.ts`) are re-exports and `git ls-tree -r v0.87.1 --name-only packages/ai/src/providers/data` is empty, so the pinned path is still dead. The rows this staleness now hides include v0.87.1's Opus 5.5 / GPT-6 Sol / GPT-6 Luna / Grok 4.7 (xai default) additions and v0.86.0's removal of GPT-5.4/-mini from Codex (per `packages/ai/CHANGELOG.md`, not a field diff). **GROWTH 2026-09-24 (second pass), read from `scripts/generate-models.ts` `v0.85.1..v0.87.1` (the script is in git; the data it writes is not):** hard-coded values the frozen floor lacks — `OPENAI_STANDARD_COSTS` now pins `gpt-5.6-sol` at 4/20/0.4/5 (cyrup `openai.json`/`openai-codex.json`: 5/30/0.5/6.25) and adds `gpt-6-sol`/`gpt-6-luna`/`gpt-6-astra`; DeepSeek's hand-written rows reprice `deepseek-v4-pro` to 1.32/3.96/0.044 (cyrup: 0.435/0.87/0.003625, about 3x under) and replace `deepseek-v4-flash` with `deepseek-flash` (V4.1, 0.3/1.2/0.006); `claude-opus-5-5` and Copilot `claude-opus-5.5`/`gpt-6-*` rows; Vercel `allowEmptySignature:true` on every row (#9676); Fireworks Messages `allowEmptySignature` + catalog-driven `forceAdaptiveThinking` (#9323); Copilot `gpt-*` to Responses; `supportsStrictMode` as explicit metadata (`PROV-078`); `supportsMidConvo*`, `promptCache`, `inputLimits` (`PROV-083`/`PROV-091`); `deferredToolsMode` removed. **Online these rows arrive through the pi.dev overlay, which cyrup applies per provider (`remote_catalog.rs`); the floor is what an offline or first-run user prices against** — why this stays `medium` and was not split into per-price items. |
+| PROV-072 | low | cyrup-original | S | **The bundled OAuth flow-loader registry is dead — a complete, tested, documented subsystem with no production caller** — **FILED 2026-09-22 at `14e6c56`**, by the `PARITY-GAPS.md` `UW-` sweep, which `UW-11` had explicitly asked a later pass to run: *"`register_bundled_oauth_flow_loaders` (`auth/oauth/load.rs:111`) was not re-greped this pass. If it still has zero callers it is a live UW-class defect with no id."* It does, and it is worse than the registrar alone — the registry is dead on BOTH sides. **Write side:** `grep -rn 'register_bundled_oauth_flow_loaders' crates/ --include=*.rs` returns the definition (`crates/cyrup-provider/src/auth/oauth/load.rs:111`), two re-exports (`auth/oauth/mod.rs:62`, `auth/mod.rs:19`), four doc references (`load.rs:12`, `:64`, `auth/oauth/github_copilot.rs:838`, `auth/oauth/kimi_coding.rs:766`) and three CALLS — `load.rs:239`, `:277`, `:322` — **all three after the `#[cfg(test)]` that opens at `load.rs:198`** (`grep -n '#\[cfg(test)\]' crates/cyrup-provider/src/auth/oauth/load.rs` → `198`). Zero production callers. **Read side:** `grep -rn 'registered_oauth_flows' crates/ --include=*.rs \| grep -v 'auth/oauth/load.rs'` returns **nothing** — `registered_oauth_flows` (`load.rs:118`), whose own doc says it exists *"for status UIs that list which logins are actually available"*, has zero callers outside its module, and no status UI reads it. The backing `registry()` (`load.rs:104`) is therefore written by nobody and read only by its own two accessors. **Severity `low`, deliberately:** nothing user-visible breaks. `/login` resolves through `provider.provider_auth().oauth` (`cyrup-config/src/login.rs`), not through this registry, and `PROV-029` closed the flows-unreachable defect by wiring the provider side. This is dead weight plus a doc comment that promises a consumer that does not exist. **Fix:** discharge the second half of `UW-11`'s Fix as written — *either populate the flow registry or delete it*. Deleting is the smaller change and is the default unless a status UI is actually planned; if it is kept, the `"for status UIs"` doc must name the caller. **Verify:** after the fix, `grep -rn 'registered_oauth_flows' crates/ --include=*.rs` either has a production hit outside `load.rs`, or has none because the symbol is gone. A pass that leaves it hit-only-from-tests has not closed this. **RE-VERIFIED STILL OPEN 2026-09-24 at `ea23ca2`:** cyrup side byte-identical: `git diff --quiet 9aeba769 ea23ca2 -- crates/cyrup-provider crates/cyrup-core crates/cyrup-config xtask` exits 0; outside `auth/oauth/load.rs`, `register_bundled_oauth_flow_loaders` appears only in the two re-exports and two doc comments, and `registered_oauth_flows` has no hit at all. Upstream note: `auth/oauth/load.ts` @v0.87.1 added a `meta` loader to the bundled set — relevant only once `PROV-080` lands. |
+| PROV-073 | medium | upstream-drift | S | **Mistral streaming tool calls are keyed `{callId}:{index}`, so a continuation chunk that omits the id opens a SECOND block and splits the arguments** — pi v0.84.4 (#8387) keys on `index ?? callId`. **FILED 2026-09-24** from the census lead; body below. |
+| PROV-074 | medium | upstream-drift | S | **DeepSeek requests send `max_completion_tokens`, which pi stopped sending at v0.84.2 in favour of `max_tokens`; DeepSeek detection is also case-sensitive** — the same expression and failure family as the closed `DRIFT-013`. **FILED 2026-09-24**; body below. |
+| PROV-075 | medium | upstream-drift | S | **Google / Vertex: any finish reason with a tool call present becomes `toolUse` and the error is cleared** — pi v0.84.2 overrides only when the mapped reason is `stop`, so a `MAX_TOKENS`/`SAFETY` turn keeps its `length`/`error`. **FILED 2026-09-24**; body below. |
+| PROV-076 | low | upstream-drift | S | **Kimi's top-level `usage.cached_tokens` is not read as cache reads** — pi v0.84.3 (#8075) added it as the third fallback; cyrup mis-costs Kimi turns. **FILED 2026-09-24**; body below. |
+| PROV-077 | low | upstream-drift | S | **Anthropic OAuth `user-agent` still claims `claude-cli/2.1.75`** — pi moved it to `2.1.251` (v0.85.0) and `2.1.280` (v0.87.1). **FILED 2026-09-24**; body below. |
+| PROV-078 | medium | upstream-drift | S | **Unknown OpenAI-compatible endpoints are still detected as strict-capable, so every tool carries a `strict` key** — pi v0.87.0 (#9816) defaults runtime detection to `supportsStrictMode: false` and moves the built-in "capable" set into generated metadata. **FILED 2026-09-24**; body below. **GROWTH 2026-09-24 (second pass):** v0.86.1 `af7359b90` (#9804) also excludes Cerebras (`isCerebras` in detection) because mixed strict/non-strict tools 400 there; cyrup's `detect_compat` does not, and `cerebras.json` rows carry no override — so a BUILT-IN provider still receives the key. Same expression, same fix. |
+| PROV-079 | low | upstream-drift | S | **Image-only user messages on openai-completions carry an empty `{"type":"text","text":""}` part** that some providers reject — pi v0.87.1 (#9797) filters empty text parts. **FILED 2026-09-24**; body below. |
+| PROV-080 | low | upstream-drift | M | **The `meta` provider (Meta Model API key + Muse subscription device-code OAuth) is unported** — added to pi's `builtinProviders()` at v0.86.1. **FILED 2026-09-24**; body below. |
+| PROV-081 | low | upstream-drift | S | **Bedrock never populates `cache_write_1h`, so one-hour cache writes are priced at the five-minute rate** — pi v0.86.0 (#9457) sums `cacheDetails` with `ttl === 1h`. **FILED 2026-09-24**; body below. |
+| PROV-082 | medium | upstream-drift | S | **Overflow classification: z.ai's `Prompt too long` is missed, and a bodyless `400`/`413` from ANY provider is classified as context overflow** — pi v0.86.0/v0.86.1 (#9482, #9805) widen the Anthropic pattern and gate the bodyless pattern on `provider === "cerebras"`. **FILED 2026-09-24**; body below. |
+| PROV-083 | medium | upstream-drift | L | **pi v0.86.0 moved the system prompt and every tool change into the transcript (`TranscriptContext`, `role:"system"` messages with `toolsAdded`/`toolsRemoved`/`sections`); cyrup still carries v0.85's `addedToolNames` deferred-tool model, whose Anthropic `tool_reference` path, `deferredToolsMode:"kimi"` flag and `addedToolNames` estimate accounting upstream DELETED** — so the pre-v0.86 wire shapes cyrup emits (tool_reference in tool results, `tool_search_call` anchored at a tool result) are ones pi no longer produces, and pi's replacements (`tool_addition`/`tool_removal`, native mid-conversation system messages, fold-back for models that do not accept them) have no cyrup counterpart. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-084 | medium | parity-bug | S | **The shared SSE framer drops a final event that is not followed by a blank line**, so an Anthropic `message_stop` (or any last frame) cut at EOF becomes `Anthropic stream ended before message_stop` and the turn fails — pi's Anthropic decoder flushed the trailing event since before v0.83.0 (`flushSseEvent`), and v0.85.0 (#9047) made Codex do the same. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-085 | medium | upstream-drift | S | **Codex with thinking `off` omits `reasoning`, so the server default effort applies and the model still reasons** — pi v0.86.0 (#9191) sends the model's Off effort (`"none"`, or the mapped value) unless the map says Off is unsupported. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-086 | low | upstream-drift | S | **OpenRouter Chat Completions requests never send `x-session-id`** — pi v0.86.0 (#9102) defaults `sendSessionAffinityHeaders` to true for OpenRouter endpoints, so cyrup loses OpenRouter's sticky routing and its prompt-cache hits. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-087 | medium | upstream-drift | M | **Gemini thinking levels are chosen from a hard-coded model-id family table, not from the model's `thinkingLevelMap`** — pi v0.84.3 (`resolveGoogleThinkingLevel`) and v0.86.0 (#9455, `usesGoogleThinkingLevel` + `getDisabledGoogleThinkingConfig`) take the level and the disabled level from the map, so a Gemini 3.x / custom model whose supported levels differ gets a level the API rejects. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-088 | medium | upstream-drift | S | **Mistral reasoning is sent as `prompt_mode:"reasoning"` for every `mistral-medium-*` except 3.5 and for Mistral-hosted GLM-5.2** — pi v0.86.0 (#8700, #9375) sends `reasoning_effort` for them, since `prompt_mode` is ignored or unsupported there. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-089 | low | upstream-drift | S | **`openrouter-images.json` is 20 rows behind a source that is still in git**: 35 rows (pi `b0c2a90e`) against 55 in `image-models.generated.ts` at v0.87.1 — the one embedded catalog `PROV-071`'s "no revision can yield newer rows" does not apply to, and it stops applying after the next pi tag (post-tag `a328aa89a` deletes the file). **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-090 | medium | upstream-drift | M | **Anthropic server-side refusal fallback is unported** — no `fallbacks` request field, no `server-side-fallback-2026-07-01` beta, no fallback-model repricing, no hard error on a mid-output `fallback` block. pi v0.84.3 (#8017, #8285) + v0.86.0; the generator gives `claude-fable-5` and `claude-opus-5` fallback targets. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-091 | medium | upstream-drift | L | **Anthropic mid-conversation effort is unported** — no `supportsMidConvoEffort`, no `providerThinkingLevel` on `AssistantMessage`, no synthetic `system` effort messages, no `block_binding: drop_block`, no `mid-conversation-output-config`/`thinking-binding-controls` betas; also the interleaved-thinking beta is sent even when thinking is off. pi v0.85.0 says the managed path exists "so prefix mismatches can be dropped instead of surfacing as persistent 400 responses". **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-092 | medium | upstream-drift | M | **openai-completions `reasoning_details` replay is the pre-v0.84.3 shape**: only `reasoning.encrypted` entries keyed to a tool-call id are kept; `reasoning.text`/`reasoning.summary` are dropped, deltas are not merged, and nothing is anchored on the thinking block — so OpenRouter reasoning replay loses signed reasoning text. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-093 | low | upstream-drift | S | **openai-responses has no `supportsMaxOutputTokens` gate and sends `prompt_cache_retention:"24h"` even to GPT-5.6+ explicit-cache models**, where pi v0.85.0/v0.85.1 suppress `max_output_tokens` on request and send `prompt_cache_options.ttl:"30m"` instead of `24h`. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-094 | low | parity-bug | S | **openai-responses and azure-openai-responses never emit `tool_choice`** — `StreamOptions.tool_choice` is read by completions, Anthropic, Google, Bedrock, Mistral and Codex but not by either Responses adapter; pi has sent it on openai-responses since before v0.83.0 and on Azure since v0.84.3. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-095 | low | upstream-drift | S | **No default `User-Agent` on seven adapters** — pi v0.84.3 (#8305) sends `pi (<platform> <release>; <arch>)` on completions, Responses, Azure, Anthropic, Google, Vertex and Mistral unless the caller overrides it; cyrup sends none (reqwest has no default). **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-096 | medium | upstream-drift | S | **`NO_PROXY=internal.corp` does not exempt `api.internal.corp`**: cyrup carries pi's pre-v0.85.0 exact-host rule, with no lower-casing and no IPv6 bracket handling, so a corporate internal gateway is sent through the proxy. pi v0.85.0 (#8737). **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-097 | medium | upstream-drift | M | **Bedrock: redacted reasoning is dropped, empty-key tool arguments are replayed verbatim, and `onResponse` sees only `x-amzn-requestid`** — pi v0.84.2/v0.84.3 (#8314, #7882, #8234). **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-098 | medium | upstream-drift | M | **GitHub Copilot login accepts the policy of every catalog model at once (`join_all`), with no 429 handling** — pi v0.84.2/v0.84.3 (#6187, #7850) enables only models whose policy is `unconfigured`, one at a time, stopping on rate limit. **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-099 | low | upstream-drift | M | **OpenRouter `anthropic/*` models are routed over openai-completions; pi v0.85.0 registers OpenRouter with both apis and the generator sends every `anthropic/*` row over anthropic-messages** (base `https://openrouter.ai/api`). **FILED 2026-09-24 (second pass)**; body below. |
+| PROV-100 | low | upstream-drift | S | **openai-completions compat keys `thinkingTokenBudgetField`, `{"$var":"thinking.budget"}` and `vllmPriority` are unported** — the `$var` case is worse than absent: cyrup resolves `thinking.budget` as an effort string. pi v0.84.3 (#8275) and v0.85.0 (#9004); `models.json`-only surfaces. **FILED 2026-09-24 (second pass)**; body below. |
 
 ## PROV-003 — `ApiKeyAuth` has no `login`; `Models` has no `login`/`logout` (OAuth flow half closed)
 
@@ -2361,6 +2510,662 @@ its own `fetchedAt`/`revision`.
 **NOT closed by XAI_1..XAI_4.** Those four tasks fix xai's data, its stale assertions, and the
 runtime refresh path. The other 34 catalogs are untouched and unscheduled. This row is the record
 that they are stale, not merely un-audited.
+
+## Findings filed 2026-09-24 (re-measure at cyrup `ea23ca2`, pi `v0.87.1`)
+
+Every item here was read on both sides at the pins named: cyrup at `ea23ca2` (this area's crates are
+byte-identical to `9aeba769`), and upstream only as `git -C tmp/pi show <tag>:<path>`. The tag where
+each upstream change landed was settled by `git tag --contains` on the `git log -S` commit, not by date.
+Static analysis: nothing was built or run, and every **Verify** line is a design. Severities rest on
+the Impact prose and on upstream's own bug report; none is an observation of cyrup.
+
+## PROV-073 — Mistral streaming tool calls are keyed `{callId}:{index}`; an id-less continuation chunk splits the call
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/api/mistral_conversations/blocks.rs::process_tool_call` derives
+`call_id` from the chunk's `id`, or, when absent/empty/`"null"`, from
+`derive_mistral_tool_call_id(&format!("toolcall:{index}"), 0)`, then keys the open-block map on
+`format!("{call_id}:{index}")`. A first chunk carrying `id: "abc", index: 0` opens `abc:0`; a
+continuation carrying only `index: 0` computes the DERIVED id and opens a second block.
+
+**upstream** — `packages/ai/src/api/mistral-conversations.ts:691-695` @v0.87.1: `const key =
+toolCall.index ?? callId;` — the index alone keys the block whenever it is present. At v0.84.1 the key
+was `` `${callId}:${toolCall.index || 0}` `` (`:438`), exactly cyrup's shape; the change landed in
+**v0.84.4** (#8387).
+
+**Impact** — a Mistral stream that sends the id once and then streams argument fragments by index
+produces two tool-call blocks: one with the name and a prefix of the JSON, one with a synthetic id and
+the rest. The tool runs with truncated or unparseable arguments, or twice.
+
+**Fix** — key `tool_blocks_by_key` on `index` when present, falling back to `call_id` only when the
+chunk carries no index; keep the first-seen id on the block.
+
+**Verify** — a decode test feeding `{id:"abc",index:0,function:{name,arguments:"{\"a\""}}` then
+`{index:0,function:{arguments:":1}"}}` yields ONE tool call `abc` with `{"a":1}`.
+
+## PROV-074 — DeepSeek requests send `max_completion_tokens`; detection is case-sensitive
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/api/compat.rs::detect_compat`: `use_max_tokens` is
+`chutes.ai || is_moonshot || is_cloudflare_ai_gateway || is_together || is_nvidia || is_ant_ling ||
+is_zai` — no DeepSeek arm — and `is_deepseek` is `provider == "deepseek" ||
+base_url.contains("deepseek.com")` on the raw URL. `providers/catalog/deepseek.json`'s two rows carry no
+`maxTokensField` override, so the detected `max_completion_tokens` is what ships.
+
+**upstream** — `packages/ai/src/api/openai-completions.ts:1603` @v0.87.1 lowercases the base URL
+(`baseUrl.toLowerCase().includes("deepseek.com")`), `:1612` puts `isDeepSeek` in `isNonStandard`, and
+`:1621-1623` puts it in `useMaxTokens`. `git show v0.84.1:…` has no `isDeepSeek` in `useMaxTokens`;
+`v0.84.2` does ("send max_tokens to DeepSeek APIs", #7933).
+
+**Impact** — the completion cap never reaches DeepSeek in the field it reads, the same effectively
+uncapped completion `DRIFT-013` fixed for Z.AI; a custom `models.json` entry pointing at
+`https://API.DeepSeek.com` also loses the DeepSeek thinking format and reasoning-content replay.
+
+**Fix** — add `|| is_deepseek` to `use_max_tokens`, hoist `is_deepseek` above `is_non_standard`, and
+test the lowered base URL. Schedule with `DRIFT-013`'s expression (same code block).
+
+**Verify** — `detect_compat` for `provider:"deepseek"` and for a custom model with base URL
+`https://API.DEEPSEEK.COM/v1` both yield `max_tokens_field == "max_tokens"`.
+
+## PROV-075 — Google / Vertex rewrite any finish reason to `toolUse` when a tool call is present, and clear the error
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/api/google_generative_ai/parts.rs::process_chunk`: after
+`map_stop_reason(reason)`, `if dec.blocks.iter().any(|b| matches!(b, Content::ToolCall(_)))` sets
+`StopReason::ToolUse` and `dec.error_message = None` unconditionally. `api/google_vertex.rs` imports the
+same `decode_stream`, so Vertex inherits it.
+
+**upstream** — `packages/ai/src/api/google-generative-ai.ts:225-227` @v0.87.1 and
+`api/google-vertex.ts:234-235`: `if (output.content.some((b) => b.type === "toolCall") &&
+output.stopReason === "stop") output.stopReason = "toolUse";`. The `&& … === "stop"` guard landed in
+**v0.84.2** (#8059/#8135); at v0.84.1 (`:217-219`) the override was unconditional, as in cyrup. pi never
+cleared `errorMessage` at any tag — that half is cyrup-original.
+
+**Impact** — a `MAX_TOKENS` turn whose tool call was cut mid-arguments, or a `SAFETY`/`RECITATION`
+stop, is reported as a clean `toolUse`: the agent executes a truncated call and the diagnostic is
+erased, where pi surfaces `length`/`error`.
+
+**Fix** — gate the override on the mapped reason being `Stop` and stop clearing `error_message`.
+
+**Verify** — a decode test with a tool-call part and `finishReason:"MAX_TOKENS"` yields
+`StopReason::Length`; with `"SAFETY"` yields `Error` with its message intact; with `"STOP"` still
+yields `ToolUse`.
+
+## PROV-076 — Kimi's top-level `usage.cached_tokens` is not counted as cache reads
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/api/openai_completions/finalize.rs::parse_usage`: `cache_read` is
+`prompt_tokens_details.cached_tokens`, else `prompt_cache_hit_tokens`, else 0.
+
+**upstream** — `packages/ai/src/api/openai-completions.ts:1524` @v0.87.1: `…?.cached_tokens ??
+rawUsage.prompt_cache_hit_tokens ?? rawUsage.cached_tokens ?? 0`, with the comment at `:1527-1530`
+("Kimi documents top-level usage.cached_tokens on the final usage chunk"). Landed v0.84.3 (#8075).
+
+**Impact** — Kimi cache hits are billed and displayed as uncached input; `/session` cost and the
+cache-stats notices are wrong for that provider.
+
+**Fix** — add `.or_else(|| raw.get("cached_tokens").and_then(Value::as_u64))` as the third fallback.
+
+**Verify** — `parse_usage` on `{"prompt_tokens":100,"cached_tokens":60}` yields `cache_read == 60`.
+
+## PROV-077 — Anthropic OAuth `user-agent` still claims `claude-cli/2.1.75`
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/api/anthropic_messages/headers.rs`: `const CLAUDE_CODE_VERSION:
+&str = "2.1.75";`, sent as `claude-cli/{CLAUDE_CODE_VERSION}` on OAuth requests.
+
+**upstream** — `packages/ai/src/api/anthropic-messages.ts:87` @v0.87.1 is `"2.1.280"`, used at `:952`.
+It was `2.1.75` at v0.83.0 through v0.84.4, `2.1.251` at v0.85.0 through v0.87.0, and moved to
+`2.1.280` at v0.87.1 ("Fixed Anthropic OAuth requests reporting an outdated Claude Code version").
+
+**Impact** — every OAuth Anthropic request identifies as a client two upstream bumps out of date; the
+upstream changelog treats that as a bug.
+
+**Fix** — set the constant to `2.1.280` and cite the tag in the doc comment.
+
+**Verify** — the existing OAuth header test asserts `claude-cli/2.1.280`.
+
+## PROV-078 — Unknown OpenAI-compatible endpoints are detected as strict-capable, so every tool carries `strict`
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/api/compat.rs::detect_compat` sets `supports_strict_mode:
+!is_moonshot && …` — i.e. `true` for any endpoint it does not recognise — and
+`api/openai_completions/tools.rs::convert_tools` inserts `"strict"` on every function whenever
+`compat.supports_strict_mode` holds.
+
+**upstream** — `packages/ai/src/api/openai-completions.ts:1667` @v0.87.1: `detectCompat` returns
+`supportsStrictMode: false` ("OpenAI compatibility alone does not imply strict JSON-schema tool
+support"). The old expression moved into `scripts/generate-models.ts`'s
+`detectOpenAICompletionsCompat` so BUILT-IN models keep strict as explicit catalog metadata, and the
+generator's `OPENAI_COMPLETIONS_DEFAULT_COMPAT.supportsStrictMode` flipped to `false`. Landed
+**v0.87.0** (`890f92088`, #9816). v0.86.1 had separately excluded Cerebras (#9804).
+
+**Impact** — a `models.json` model on an unrecognised OpenAI-compatible server receives a `strict` key
+(and strict-subset schemas where a tool requests strict sampling); upstream's report is HTTP 400 on
+such servers. Predicted from that report, not observed here.
+
+**Fix** — flip the detected default to `false` AND carry `supportsStrictMode: true` on the built-in
+catalog rows that detection used to mark capable — the second half is generator work
+(`PROV-018`/`PROV-071`), and flipping the default alone would drop strict from built-in OpenAI rows.
+
+**Verify** — `detect_compat` for an unknown base URL yields `supports_strict_mode == false`; the
+built-in `openai` rows still emit `"strict"`.
+
+## PROV-079 — Image-only user messages on openai-completions carry an empty text part
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/api/openai_completions/convert.rs::user_content` pushes
+`{"type":"text","text":…}` for every `Content::Text` block, empty or not, whenever the content is not
+text-only.
+
+**upstream** — `packages/ai/src/api/openai-completions.ts:1261` @v0.87.1: `.filter((item) => item.type
+!== "text" || item.text.length > 0)` before mapping (`1b6ddca87`, v0.87.1, #9797).
+
+**Impact** — an attachment sent with no prompt text produces `[{"type":"text","text":""},
+{"type":"image_url",…}]`, which upstream reports some OpenAI-compatible providers reject.
+
+**Fix** — skip empty `Content::Text` blocks in the array branch of `user_content`.
+
+**Verify** — `user_content(&[Text(""), Image{..}], true)` returns a one-element array.
+
+## PROV-080 — The `meta` provider is unported
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — no provider id `meta`: `git grep -n 'api\.meta\.ai\|META_API_KEY' -- crates/` is empty, and
+`crates/cyrup-provider/src/providers/all.rs`'s built-in list and `env_api_keys.rs` have no arm for it.
+
+**upstream** — `packages/ai/src/providers/meta.ts` @v0.87.1 (absent at v0.85.1): `openai-responses`
+at `https://api.meta.ai/v1`, `envApiKeyAuth("Meta Model API key", ["META_API_KEY"])` and a lazy
+subscription OAuth (`loginLabel: "Sign in with Meta"`). `auth/oauth/meta.ts` is an RFC 8628 device
+flow against `auth.meta.com` whose identity token is exchanged for a day-lived Model API key at
+`https://api.meta.ai/muse-code/key`, stored as `refresh`/`access` so the ordinary refresh scheduler
+re-mints it. Registered at `providers/all.ts:108`, `env-api-keys.ts` gains `meta: "META_API_KEY"`,
+`auth/oauth/load.ts:57-59` adds `loadMetaOAuth`. Landed v0.86.1 (#9096).
+
+**Impact** — `/login meta` and `META_API_KEY` do nothing in cyrup; Muse Spark models are unavailable.
+
+**Fix** — a fleet-shaped provider row plus an `auth/oauth/meta.rs` device-code flow on the existing
+`poll_oauth_device_code_flow`; catalog rows must come from the generator (`PROV-071`), not by hand.
+
+**Verify** — `all_providers()` contains `meta` with both auth strategies; a device-flow test drives
+authorize → token → key-mint against a stub.
+
+## PROV-081 — Bedrock never populates `cache_write_1h`; one-hour writes are priced at the five-minute rate
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/api/bedrock_converse_stream/` requests one-hour cache points
+(`convert.rs` inserts `"ttl": "1h"`) but no file under that directory mentions `cache_write_1h` or
+`cacheDetails`; `crates/cyrup-provider/src/usage.rs` already prices `cache_write_1h` separately when
+it is set.
+
+**upstream** — `packages/ai/src/api/bedrock-converse-stream.ts:712-717` @v0.87.1 sums
+`event.usage.cacheDetails` entries with `ttl === CacheTTL.ONE_HOUR` into `usage.cacheWrite1h` before
+`calculateCost`; `models.ts:912` prices it. Landed v0.86.0 (#9457).
+
+**Impact** — Bedrock sessions with long cache retention under-report cost.
+
+**Fix** — parse `usage.cacheDetails[]` in the metadata event and set `cache_write_1h`.
+
+**Verify** — a decode test with `cacheDetails:[{ttl:"1h",inputTokens:1000}]` yields
+`cache_write_1h == Some(1000)` and the 1h-rate cost.
+
+## PROV-082 — z.ai's `Prompt too long` is not an overflow; any provider's bodyless `400`/`413` is
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/utils/overflow.rs`: `OVERFLOW_PATTERNS` holds
+`r"prompt is too long"` and, unconditionally, `r"^4(?:00|13)\s*(?:status code)?\s*\(no body\)"`;
+`is_context_overflow` tests the list with no provider check.
+
+**upstream** — `packages/ai/src/utils/overflow.ts` @v0.87.1: `:38` is `/prompt (?:is )?too long/i`
+("Anthropic and z.ai"); the bodyless pattern moved out of the list into
+`CEREBRAS_BODYLESS_OVERFLOW_PATTERN` (`:64`), tested only `if (message.provider === "cerebras")`
+(`:145`). Landed v0.86.0 (#9482) and v0.86.1 (#9805).
+
+**Impact** — a z.ai overflow is not recognised, so no auto-compaction and the turn just fails; and a
+bodyless 400/413 from any other provider is treated as overflow, triggering a lossy compaction and
+retry for an error that has nothing to do with context size.
+
+**Fix** — widen the Anthropic pattern and split the bodyless pattern out behind
+`message.provider == "cerebras"`.
+
+**Verify** — `is_context_overflow` is true for a z.ai error `{"code":"1261","message":"Prompt too
+long"}`, true for `"400 (no body)"` from `cerebras`, false for the same text from `openai`.
+
+## Findings filed 2026-09-24, second pass (the `packages/ai` windows the first pass left unread)
+
+Read in full this pass, upstream only as `git -C tmp/pi show <tag>:<path>` / `git diff v0.85.1..v0.87.1`:
+`api/anthropic-messages.ts`, `api/openai-responses.ts`, `api/openai-responses-shared.ts`,
+`api/azure-openai-responses.ts`, `api/openai-codex-responses.ts`, `types.ts`, `utils/transcript.ts`
+(whole file), `utils/{text,estimate,event-stream}.ts`, `api/{transform-messages,simple-options,pi-messages}.ts`,
+`models.ts`, `compat.ts`, `index.ts`, the `google-*`/`mistral-conversations.ts` commits (`16235fd93`,
+`96617628e`, `4bd3f48df`), the two `openai-completions.ts` commits the first pass skipped (`bbb61e34a`,
+`af7359b90`), `scripts/generate-models.ts` (the whole 705-line diff), `image-models.generated.ts` and
+`models.generated.ts`. cyrup at `ea23ca2` (this area's crates byte-identical to `9aeba769`). Landing tags
+by `git tag --contains`. Static analysis: nothing was built or run; **Verify** lines are designs.
+
+## PROV-083 — The transcript-carried system prompt and tool changes (v0.86.0) are unported; cyrup still emits the deleted v0.85 deferred-tool shapes
+
+**Kind** upstream-drift (with a `stale-port` component) · **Severity** medium · **Effort** L · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — the v0.85 model, end to end: `cyrup-core` `ToolResultMessage.added_tool_names` +
+`Context.tools`; `crates/cyrup-provider/src/utils/deferred_tools.rs` (the `splitDeferredTools` port);
+Anthropic `api/anthropic_messages/compat.rs::default_supports_tool_references` and
+`tools.rs` (`defer_loading`) with `tool_reference` blocks in tool results (`convert.rs`, pinned by
+`tests/deferred_tools.rs`); openai-responses `convert.rs` anchoring `tool_search_call`/`tool_search_output`
+at the tool result; openai-completions `DeferredToolsMode::Kimi` (`api/compat.rs`, `convert.rs:118`,
+`params.rs:149`); `utils/estimate.rs` added-tool accounting (`PROV-S04`). No `role:"system"` message
+variant exists (`git grep -n 'tools_added\|mid_convo_system' -- crates/` is empty).
+
+**upstream** — `9e05370b2` "Mid conversation system messages (#9548)", **v0.86.0**. `types.ts` @v0.87.1:
+`SystemMessage { content, sections?, toolsAdded?, toolsRemoved?, timestamp }` joins `Message`;
+`ToolResultMessage.addedToolNames` is deleted; `ProviderStreams.stream(model, TranscriptContext, …)` takes a
+normalized transcript whose leading system message carries prompt + tools (`utils/transcript.ts`
+`normalizeContext`, `resolveTranscript`, `collapseSystemMessages`, `resolveTranscriptTools`).
+`utils/deferred-tools.ts` is deleted. Per adapter: Anthropic drops `supportsToolReferences` and
+`tool_reference` results and instead, when `supportsMidConvoSystemMessages && supportsMidConvoToolChanges`
+(generator: first-party `claude-opus-4-8`/`opus-5`/`opus-5-5`/`fable|mythos-5.x`), declares later tools
+`defer_loading` behind a `__pi_deferred_placeholder__` and surfaces them with `tool_addition`/`tool_removal`
+blocks in a mid-conversation `system` message plus the `mid-conversation-tool-changes-2026-07-01` beta;
+otherwise it sends the CURRENT tool list. Responses anchors `additional_tools` / the tool-search pair at
+the system message, not the tool result (`openai-responses-shared.ts` `appendSystemToolAdditions`).
+Completions sends Kimi's `{role:"system", tools}` item under `supportsMidConvoSystemMessages &&
+supportsMidConvoToolAdditions` (the flag `deferredToolsMode` is gone; generator: Kimi K3 only).
+`estimate.ts` counts system messages. `transform-messages.ts` holds a system message that lands between a
+tool call and its result.
+
+**Impact** — (1) **Stale wire shapes**: on first-party Claude ≥4.5, a tool added mid-run reaches the model
+as a `tool_reference` inside a tool result, a mechanism pi no longer sends; on models pi now serves
+natively (Opus 4.8+/5.x) cyrup cannot use `tool_addition`, and on everything else pi sends the full
+current list while cyrup still splits. (2) **Cache**: pi's placeholder exists because "the first real late
+tool does not invalidate the cache (measured: full miss without it)"; cyrup has no equivalent. (3) **No
+mid-conversation instruction or tool-removal channel**: prompt changes rewrite the head, so the cached
+prefix breaks on every change where pi appends. (4) Closed `PROV-025` (Kimi mode ported) and `PROV-S04`
+(estimate accounting ported) now describe shapes upstream deleted; neither is reopened, both are subsumed here.
+
+**Fix** — a design decision first, because it crosses cyrup-core (a `System` message variant and its
+JSONL form), cyrup-agent (who emits tool-change system messages) and cyrup-session (area 03, persisted).
+Then per adapter: port `utils/transcript.ts`; replace `deferred_tools.rs` and `added_tool_names`
+consumers with `resolve_transcript_tools`; add `supports_mid_convo_system_messages`,
+`supports_mid_convo_tool_changes` (Anthropic) and `supports_mid_convo_tool_additions` (completions) to
+`ModelCompat` and retire `deferred_tools_mode`. Catalog flags arrive by regeneration (`PROV-071`).
+
+**Verify** — the upstream fixtures `test/transcript-tool-changes.test.ts` and
+`test/system-message-replay.test.ts` @v0.87.1 translated to cyrup: a late tool on `claude-opus-4-8`
+yields `tool_addition` + the placeholder + the beta; on `claude-haiku-4-5` it yields the full current
+tool list and no `tool_reference`.
+
+## PROV-084 — The SSE framer drops a final event not followed by a blank line; an Anthropic `message_stop` cut at EOF fails the turn
+
+**Kind** parity-bug (Anthropic half, pre-v0.83.0) + upstream-drift (Codex half, v0.85.0) · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/stream/framer.rs::frame_bytes`: at EOF the unfold returns `None`
+("An unterminated trailing line is dropped") without dispatching the pending event buffer. Every SSE
+adapter reads through it (`wire.rs` `open_sse` for Anthropic and the rest; `openai_codex_responses/driver.rs`).
+Anthropic's driver then reports `Anthropic stream ended before message_stop`
+(`api/anthropic_messages/driver.rs`).
+
+**upstream** — `api/anthropic-messages.ts` @v0.83.0 and @v0.87.1: `iterateSseMessages` decodes a residual
+unterminated line and then `flushSseEvent(state)` (`:340`, called at `:461` @v0.87.1) yields the pending
+event. `api/openai-codex-responses.ts` @v0.87.1 `:794` "Treat EOF as terminating the residual SSE frame",
+with `if (done) break` moved after draining (`:822`) — v0.85.0 (#9047). The OpenAI SDK paths drop it, as
+cyrup does.
+
+**Impact** — a relay or proxy that closes the connection right after the last `data:` line (the #9047
+report) turns a complete Anthropic or Codex response into an error and a lost turn.
+
+**Fix** — flush the framer's pending data at EOF, gated to the two adapters upstream flushes for (or
+unconditionally, with a note on the OpenAI paths).
+
+**Verify** — `decode_sse_bytes("event: message_stop\ndata: {\"type\":\"message_stop\"}\n")` yields one
+frame; an Anthropic fixture ending that way finishes with `stop`.
+
+## PROV-085 — Codex with thinking `off` omits `reasoning`, so the server's default effort applies
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `api/openai_codex_responses/request.rs`: `if clamped != ModelThinkingLevel::Off { … }` — Off
+emits nothing ("Codex has no … off branch").
+
+**upstream** — `api/openai-codex-responses.ts:595-597` @v0.87.1: `else if (model.reasoning &&
+model.thinkingLevelMap?.off !== null) body.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" }`;
+the explicit-`"none"` branch also honours a mapped Off. `e86102f18`, **v0.86.0** (#9191).
+
+**Impact** — a user who turns thinking off on a Codex model still gets (and waits for) default-effort
+reasoning.
+
+**Fix** — mirror the `else if` in `request.rs`.
+
+**Verify** — a reasoning Codex model at Off emits `"reasoning":{"effort":"none"}`; a model whose map sets
+`off: null` emits no `reasoning`.
+
+## PROV-086 — OpenRouter Chat Completions never sends `x-session-id`
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `api/compat.rs::detect_compat` returns `send_session_affinity_headers: false` for every
+endpoint; `openrouter.json` rows carry no override; `api/openai_completions/headers.rs:81-85` only sends
+`x-session-id` when the flag holds.
+
+**upstream** — `api/openai-completions.ts:1672` @v0.87.1 `sendSessionAffinityHeaders: isOpenRouter`;
+the same commit gives Anthropic Messages an OpenRouter default (`sessionAffinityFormat: "openrouter"` →
+`x-session-id`). `bbb61e34a`, **v0.86.0** (#9102). The Baseten half of census lead (4) is data-only
+(`sendSessionAffinityHeaders: true` in the generator) and reaches cyrup's dynamic Baseten rows through the
+pi.dev overlay — not filed.
+
+**Impact** — OpenRouter requests are not pinned to a replica, so prompt-cache hits are lost and turns cost
+more.
+
+**Fix** — `send_session_affinity_headers: is_openrouter`; add the Anthropic OpenRouter default when
+`PROV-099` lands.
+
+**Verify** — an OpenRouter completions request with a session id and caching on carries `x-session-id`;
+`sendSessionAffinityHeaders:false` in `models.json` suppresses it.
+
+## PROV-087 — Gemini thinking levels come from a model-id family table, not the model's `thinkingLevelMap`
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `api/google_generative_ai/thinking.rs`: `thinking_level` hard-codes Gemini-3-Pro →
+LOW/HIGH, Gemma-4 → MINIMAL/HIGH, else the identity map; `disabled_thinking_config` hard-codes LOW for
+Gemini-3-Pro and MINIMAL for Flash/Gemma-4. `grep -rn resolve_google_thinking_level crates/` is empty.
+Vertex reuses the same `build_params`.
+
+**upstream** — `api/google-shared.ts` @v0.87.1: `resolveGoogleThinkingLevel` (`:48`, v0.84.3, #8059/#8135)
+maps through `model.thinkingLevelMap` and throws on an unmappable value; `usesGoogleThinkingLevel` (`:72`)
+only picks the wire format; `getDisabledGoogleThinkingConfig` (`:102`) disables via
+`clampThinkingLevel(model, "off")`. `google-generative-ai.ts:323` routes Off to `thinking.enabled:false`.
+The per-family tables moved into the generator as data (`getGoogleThinkingLevelMap` from models.dev
+`reasoning_options`). `16235fd93`, **v0.86.0** (#9455).
+
+**Impact** — a Gemini 3.x or custom Google model whose supported levels differ from cyrup's family guess is
+sent a level the API rejects (#9455's report); a `models.json` `thinkingLevelMap` on a Google model is
+ignored.
+
+**Fix** — port `resolveGoogleThinkingLevel`, `usesGoogleThinkingLevel` and
+`getDisabledGoogleThinkingConfig`; delete the family tables once the catalog carries the maps (`PROV-071`).
+
+**Verify** — a Google model with `thinkingLevelMap:{low:"HIGH"}` at `low` sends `HIGH`; Off on a model
+whose map sets `off:null`, `minimal:"LOW"` sends `thinkingLevel: LOW`.
+
+## PROV-088 — Mistral sends `prompt_mode:"reasoning"` where pi sends `reasoning_effort`
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `api/mistral_conversations/reasoning.rs::uses_reasoning_effort` matches exactly
+`mistral-small-2603 | mistral-small-latest | mistral-medium-3.5`; every other reasoning model falls to
+`prompt_mode`.
+
+**upstream** — `api/mistral-conversations.ts:898` @v0.87.1 adds `id.startsWith("mistral-medium-")` and
+`zai-glm-5-2`. `96617628e` (#8700) and `4bd3f48df` (#9375), both **v0.86.0**.
+
+**Impact** — reasoning is silently not enabled (GLM-5.2 ignores `prompt_mode`) or rejected (#8700) on
+those models.
+
+**Fix** — widen the predicate.
+
+**Verify** — `mistral-medium-3.6` and `zai-glm-5-2` at `high` send `reasoning_effort` and no `prompt_mode`.
+
+## PROV-089 — `openrouter-images.json` is 20 rows behind a source still in git
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `crates/cyrup-provider/src/providers/catalog/openrouter-images.json`: 35 rows, generated from
+`image-models.generated.ts`'s `openrouter` record at `DEFAULT_REV = "b0c2a90e"` (`xtask/src/main.rs`,
+closed `PROV-065`).
+
+**upstream** — `packages/ai/src/image-models.generated.ts` is a tracked data literal at every tag: 40 rows
+@v0.83.0, 52 @v0.85.1, **55 @v0.87.1**. Missing from cyrup: the Seedream 5.0 pair, `inclusionai/ming-image-0.1-design`,
+the three Krea 2 models, `meta/muse-image`, `microsoft/mai-image-2.5-pro`/`2.6`/`2.6-flash`,
+`openai/gpt-image-2.5-flare`/`-sunburst`, `openrouter/auto-beta`, the Qwen Image 3 pair, the four Recraft V4
+Styles models and `x-ai/grok-imagine-image-2.0`. Four MAI rows were also renamed ("Microsoft AI: …").
+
+**Impact** — twenty image models pi offers are absent. Unlike the chat catalogs, nothing blocks the refresh
+— **until the next pi tag**: post-tag `a328aa89a` deletes `image-models.generated.ts` and moves these rows
+into the gitignored `openrouter.json`, after which this becomes `PROV-071`'s class.
+
+**Fix** — pin the `openrouter-images` roster entry to v0.87.1 and regenerate, before bumping past it.
+
+**Verify** — `gen-catalogs --check` against v0.87.1 reports 55 rows and no diff.
+
+## PROV-090 — Anthropic server-side refusal fallback is unported
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `grep -rn 'allowed_fallback\|fallbacks' crates/cyrup-provider/src` hits only OpenRouter's
+unrelated `allow_fallbacks`; `api/anthropic_messages/driver.rs` `message_start` reads only `id` and usage.
+
+**upstream** — `api/anthropic-messages.ts` @v0.87.1: `params.fallbacks` from
+`compat.allowedFallbackModels` (`:1199-1202`), `server-side-fallback-2026-07-01` beta, `message_start`
+repricing through the fallback's `cost` and `output.responseModel` (`:605-614`), and a hard error on a
+`fallback` content block after output started (`:627-629`). Generator: `ANTHROPIC_ALLOWED_FALLBACK_MODELS =
+{ "claude-fable-5": [opus-4-8, opus-5], "claude-opus-5": [opus-4-8] }`. v0.84.3 (#8017, #8285); the
+`responseModel` split v0.86.0 (`1283afd0d`, #9188).
+
+**Impact** — on `claude-fable-5` (in cyrup's catalog) a refusal ends the turn where pi is answered by the
+fallback model; if a fallback ever does occur it is billed at the requested model's rate and not recorded.
+
+**Fix** — `allowed_fallback_models` on `ModelCompat`; emit `fallbacks` + beta; reprice and set
+`response_model` on `message_start`; error on a late `fallback` block.
+
+**Verify** — upstream `test/anthropic-sse-parsing.test.ts` fallback cases translated.
+
+## PROV-091 — Anthropic mid-conversation effort is unported
+
+**Kind** upstream-drift · **Severity** medium · **Effort** L · **Confidence** confirmed (mechanism); consequence predicted · **Filed** 2026-09-24
+
+**cyrup** — no `supports_mid_convo_effort` on `ModelCompat`, no `provider_thinking_level` on
+`crates/cyrup-core/src/message/assistant.rs`; `api/anthropic_messages/headers.rs` sends
+`interleaved-thinking-2025-05-14` whenever `interleavedThinking` is not false and the model is not
+adaptive — with no `model.reasoning` / thinking-enabled gate.
+
+**upstream** — `api/anthropic-messages.ts` @v0.87.1: `providerThinkingLevel` recorded on output; for
+`supportsMidConvoEffort` models `thinking:{type:"adaptive", block_binding:{prefix_mismatch_behavior:"drop_block"}}`
+and `output_config.effort:"high"` (`:1150-1158`, with the in-source reason "so prefix mismatches can be
+dropped instead of surfacing as persistent 400 responses"), `insertThinkingLevelMessages` adds a
+`{role:"system", content:[], output_config:{effort}}` before each historical turn and one for the active
+effort (`:1434-1447`), plus two betas; `getBetaFeatures` gates interleaved thinking on `model.reasoning &&
+thinkingEnabled === true` (`:1019-1025`). Generator: Anthropic + OpenRouter, `claude-opus-5`, `opus-5-5`,
+`fable|mythos-5.1`, except OpenRouter Opus 5. `4e69b0c28`, v0.85.0.
+
+**Impact** — changing thinking level mid-session on those models is predicted, by upstream's own comment,
+to produce persistent 400s. None of them is in cyrup's embedded catalog, but the pi.dev overlay serves them
+(with the compat key cyrup ignores). The interleaved-beta gate is cosmetic on first-party Anthropic.
+
+**Fix** — port the compat key, the persisted field (JSONL: area 03), the message insertion, the thinking
+block and the betas; gate interleaved-thinking as upstream does.
+
+**Verify** — `test/anthropic-mid-conversation-effort.test.ts` @v0.87.1 translated.
+
+## PROV-092 — openai-completions `reasoning_details` replay is the pre-v0.84.3 shape
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `api/openai_completions/decode.rs` (step 4) keeps only details that
+`encrypted_reasoning_detail_id` accepts, storing each as the matching tool call's `thought_signature`;
+`convert.rs` (≈`:267-289`) rebuilds `reasoning_details` by parsing tool-call signatures.
+
+**upstream** — `api/openai-completions.ts` @v0.87.1: all three variants (`reasoning.text`/`.summary`/
+`.encrypted`, `:135-139`), consecutive text/summary deltas merged by `appendOpenAIReasoningDetail`
+(`:252`), the array stored once on the THINKING block's `thinkingSignature` (`:664-674`), replay preferring
+it and falling back to `parseLegacyEncryptedReasoningDetail` (`:225`, `:1304-1312`), and a raw reasoning
+field sent only when no details are preserved. v0.84.3/v0.84.4 (#7994, #8246, #8605).
+
+**Impact** — on OpenRouter, signed reasoning text (Anthropic/Gemini models behind it) is never replayed,
+so reasoning continuity is lost across tool turns; reasoning with no tool call is dropped entirely.
+
+**Fix** — port the variant union, the merge and the thinking-block anchoring, keeping the legacy parse for
+old sessions.
+
+**Verify** — `test/openai-completions-reasoning-details.test.ts` @v0.87.1 translated.
+
+## PROV-093 — openai-responses: no `supportsMaxOutputTokens`, and `24h` retention sent to GPT-5.6+
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `api/openai_responses/params.rs`: `max_output_tokens` whenever `max_tokens > 0`; `"24h"` on
+`Long` whenever `supports_long_cache_retention`, independent of `supports_explicit_prompt_cache_mode`; no
+`ttl`. Neither compat key exists.
+
+**upstream** — `api/openai-responses.ts` @v0.87.1 `:79` `supportsMaxOutputTokens ?? true`, `:321`;
+`getPromptCacheRetention` returns `24h` only when `!supportsExplicitPromptCacheMode` and
+`getPromptCacheOptions` returns `{ttl:"30m"}` for Long on explicit-mode models (`:83-99`). v0.85.0 (#8941),
+v0.85.1.
+
+**Impact** — a Codex-protocol gateway that rejects `max_output_tokens` cannot be configured to work; GPT-5.6+
+long retention asks for a `24h` the model family does not use and never gets the `30m` TTL. Same code
+block as closed `PROV-019`/`PROV-023`. cyrup's embedded GPT-5.6 rows also lack
+`supportsExplicitPromptCacheMode` (catalog, `PROV-071`).
+
+**Fix** — both compat keys and the two helpers.
+
+**Verify** — `test/cache-retention.test.ts` and `openai-responses-compat.test.ts` @v0.87.1 translated.
+
+## PROV-094 — openai-responses and azure-openai-responses never emit `tool_choice`
+
+**Kind** parity-bug (openai-responses) + upstream-drift (Azure, v0.84.3) · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `grep -rn tool_choice crates/cyrup-provider/src/api/openai_responses crates/cyrup-provider/src/api/azure_openai_responses.rs`
+is empty outside tests; the completions, Anthropic, Google/Vertex, Bedrock, Mistral and Codex adapters
+all read `StreamOptions.tool_choice`. (The census lead that `SimpleStreamOptions` lacks the field is
+refuted: `utils/simple_options.rs:127` forwards `base.tool_choice`.)
+
+**upstream** — `api/openai-responses.ts:308-309` @v0.83.0 and `:340-341` @v0.87.1; Azure `:323-324`
+@v0.87.1 (fixed v0.84.3).
+
+**Impact** — a forced or suppressed tool choice is silently ignored on the two Responses adapters. No
+production caller in cyrup sets one today; extensions and SDK callers can.
+
+**Fix** — emit `tool_choice` from `opts.tool_choice` in both `build_params`.
+
+**Verify** — a Responses request with `ToolChoice::None` carries `"tool_choice":"none"`.
+
+## PROV-095 — No default `User-Agent` on seven adapters
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — only Codex (`api/openai_codex_responses/headers.rs:95`) and the catalog fetch
+(`remote_catalog.rs::cyrup_user_agent`) set one; no `.user_agent(` on any client builder.
+
+**upstream** — `utils/pi-user-agent.ts` @v0.87.1, applied in `openai-completions.ts:760`,
+`openai-responses.ts:248`, `azure-openai-responses.ts:259`, `anthropic-messages.ts:295`,
+`google-generative-ai.ts:357`, `google-vertex.ts:398`, `mistral-conversations.ts:338`. v0.84.3 (#8305).
+
+**Impact** — gateways that reject or rate-limit requests without a User-Agent treat cyrup differently from pi.
+
+**Fix** — a `cyrup (<os> <release>; <arch>)` default under caller headers on those seven.
+
+**Verify** — each adapter's request carries the default and a caller `User-Agent` overrides it.
+
+## PROV-096 — `NO_PROXY` bare-domain entries do not match subdomains
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `utils/node_http_proxy.rs` (`should_proxy_hostname` port): an entry not starting with `.`/`*`
+is an exact-host test (`hostname != proxy_hostname`); no lower-casing; `rsplit_once(':')` mis-parses a
+bracketed IPv6 entry.
+
+**upstream** — `utils/node-http-proxy.ts` @v0.87.1: `parseNoProxyEntry` (`:41`, lower-cases, brackets,
+IPv6) and `shouldProxyHostname` (`:74`), which exempts both the exact host and `endsWith("." + domain)`
+(`:110`). v0.85.0 (#8737).
+
+**Impact** — `NO_PROXY=internal.corp` still proxies `llm.internal.corp`; an internal gateway reached
+through a corporate proxy typically fails.
+
+**Fix** — port `parseNoProxyEntry` and the new matcher.
+
+**Verify** — `NO_PROXY=internal.corp` exempts `api.internal.corp`; `NO_PROXY=[::1]:8080` exempts that port only.
+
+## PROV-097 — Bedrock: redacted reasoning dropped, empty-key arguments replayed, response headers truncated
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `api/bedrock_converse_stream/events.rs` reads `reasoningContent` text/signature only and
+`blocks.rs:148` sets `redacted: false` unconditionally (`grep -rn redactedContent crates/` empty);
+`convert.rs` replays `toolUse.input` as `tc.arguments` verbatim; `driver.rs` hands `on_response` a map
+holding only `x-amzn-requestid`.
+
+**upstream** — `api/bedrock-converse-stream.ts` @v0.87.1: `redactedContent` buffered with the
+`[Reasoning redacted]` placeholder (`:658-674`) and replayed as `redactedContent` (`:1016`);
+`sanitizeBedrockDocument` drops empty keys recursively (`:921`, used at `:1008`);
+`addResponseHeadersMiddleware` passes every response header (`:510`). v0.84.2/v0.84.3 (#8314, #7882, #8234).
+
+**Impact** — a Claude-on-Bedrock turn whose reasoning was redacted loses the block, so the tool-use
+continuation that must replay it is rejected or loses context; a tool call with an empty-string key is
+rejected on replay; `onResponse` consumers see one header.
+
+**Fix** — the three ports, in `events.rs`, `convert.rs` and `driver.rs`.
+
+**Verify** — `test/bedrock-redacted-reasoning.test.ts` and `bedrock-response-headers.test.ts` @v0.87.1 translated.
+
+## PROV-098 — GitHub Copilot login accepts every catalog model's policy at once
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `auth/oauth/github_copilot.rs::enable_all_models` maps `enable_model` over
+`github_copilot_models()` and `join_all`s them, ignoring every result; no 429 handling.
+
+**upstream** — `auth/oauth/github-copilot.ts` @v0.87.1: `parseGitHubCopilotModelCatalog` returns
+`policyModelIds` (only `policyState === "unconfigured"` models pi knows, `:93-132`),
+`fetchWithRateLimitRetry` (`:135`, 429 + `retry-after` within a time budget), sequential enablement that
+stops the batch on rate limit, run only when `policyModelIds.length > 0` (`:472`). v0.84.2/v0.84.3 (#6187, #7850).
+
+**Impact** — each login fires one POST per catalog model concurrently; GitHub rate-limits the burst, so
+some policies are silently not enabled, and policies already configured are re-posted. `PROV-029` made this
+path reachable.
+
+**Fix** — port the policy filter, the retrying fetch and the sequential loop.
+
+**Verify** — against a mock returning 429 on the second call, login makes two calls and stops; an
+`enabled` policy is never posted.
+
+## PROV-099 — OpenRouter `anthropic/*` models are routed over openai-completions
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `providers/fleet.rs` registers `openrouter` as `Completions`; the 15 `anthropic/*` rows in
+`openrouter.json` carry `api: openai-completions`, base `https://openrouter.ai/api/v1`.
+
+**upstream** — `providers/openrouter.ts` @v0.85.1 and @v0.87.1 registers both `anthropic-messages` and
+`openai-completions`; the generator's `fetchOpenRouterModels` sends every `anthropic/*` (non-`:batch`) row
+over `anthropic-messages` at `https://openrouter.ai/api`. v0.85.0. (The xAI half of this census lead is
+resolved: all three `xai.json` rows are `openai-responses`.)
+
+**Impact** — OpenRouter Claude turns lose native thinking-signature replay and cannot take the per-turn
+effort path (`PROV-091`). Note the post-tag lead below: pi.dev may already serve cyrup the anthropic-messages
+rows, which cyrup would dispatch to its Anthropic impl with OpenRouter's base URL — unverified.
+
+**Fix** — register OpenRouter with both apis and take routing from the catalog.
+
+**Verify** — an overlay row `anthropic/claude-sonnet-5` with `api: anthropic-messages` streams against a
+mock OpenRouter `/api/v1/messages`.
+
+## PROV-100 — `thinkingTokenBudgetField`, `{"$var":"thinking.budget"}` and `vllmPriority` unported
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-09-24
+
+**cyrup** — `ModelCompat` has none of the three; `api/openai_completions/reasoning.rs` resolves any
+`$var` other than `thinking.enabled` through the effort map, so `thinking.budget` becomes an effort string.
+
+**upstream** — `types.ts` @v0.87.1 `:93`, `:98`, `:725`, `:750`; `api/openai-completions.ts:866-867`
+(`priority`), `:870`/`:976-977` (budget field). v0.84.3 (#8275) and v0.85.0 (#9004). Never set by the
+generated catalog.
+
+**Impact** — vLLM/SGLang/llama.cpp users configuring a thinking budget or request priority through
+`models.json` get no budget, or a string where a number is expected.
+
+**Fix** — port the three keys and the `simple-options.ts` budget table they share.
+
+**Verify** — `test/openai-completions-vllm-priority.test.ts` and the budget-field cases @v0.87.1 translated.
 
 ## Coverage
 

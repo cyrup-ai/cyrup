@@ -11,11 +11,39 @@ backbone.
 
 > **Status:** pre-release, and not yet versioned. The agent loop, provider layer, tool set, session
 > tree, terminal interface, extension host, all five run modes, the MCP client, the ACP adapter, the
-> `workflowScript` runtime and the Flux development pipeline work end to end. 23 crates, 885,555
-> lines of Rust and 9,886 workspace tests passing — measured at `9aeba769`
-> (`cargo nextest run --workspace --features test-fixtures`, 0 failed, 9 skipped; `test-fixtures` is
-> required or the two subagent-subprocess fixture binaries never build and their tests silently do
-> not run). `cyrup-it`, the gated integration crate, adds 523 more across nine binaries.
+> `workflowScript` runtime, the Flux development pipeline, background and remote subagent delegation,
+> and the [herdr](#herdr) integration work end to end.
+
+| measured at `ea23ca2` (2026-09-24) | |
+|---|---|
+| crates | 24 |
+| lines of Rust under `crates/` | 1,044,991 |
+| workspace tests | **11,311 passed, 0 failed**, 9 skipped |
+| line coverage | **86.3%** (368,184 of 426,789 executable lines) |
+| function coverage | 84.0% (37,304 of 44,404) |
+| region coverage | 86.2% |
+| gated integration suite (`cyrup-it`) | ~590 more test functions across nine binaries |
+| upstream citations in source | 28,706, naming 16,976 distinct `.ts` locations |
+
+Tests: `cargo nextest run --workspace --features test-fixtures`. `test-fixtures` is required, or the
+two subagent-subprocess fixture binaries never build and their tests silently do not run. Coverage:
+the same run under `cargo llvm-cov`, see [Measuring coverage](#measuring-coverage). It counts only
+the workspace suite, so crates whose real exercise lives in `cyrup-it` (`cyrup-ext`, `cyrup-ext-sdk`,
+the binary, `cyrup-sdk`) read lower than they are tested.
+
+Since the previous measure (`9aeba769`, 2026-09-14: 23 crates, 885,555 lines, 9,886 tests) the
+workspace grew by 46 commits and +164,754 / −4,932 lines, most of it subagent delegation:
+
+- **Background subagents.** A session index, durable replay, wait subscriptions, detached-child
+  reconciliation, capacity limits, retention, scheduled runs and a steer handle.
+- **Delegation end to end.** Lanes and handoff manifests, safe worktree cleanup, resumed runs that
+  keep their launch contract, a watchdog that can make decisions, `children.list` and `debug.run`,
+  runner process identity, placement on a herdr machine, and upstream's v0.68.0 agent keys.
+- **The full slash surface.** 18 of 18 `/subagents-*` commands, including a detach that does not
+  kill the child, plus the keyboard-driven fleet roster.
+- **herdr.** A new `cyrup-herdr` crate and the integration built on it.
+- **The rest of the `workflowScript` runtime surface.**
+
 
 ## Install
 
@@ -82,11 +110,25 @@ the command palette.
   for scripting and embedding, and `--mode acp` to run as an
   [editor's agent](docs/guide/guides/zed-acp.md). `--tui-mode fullscreen` switches to an
   alternate-screen renderer with mouse capture, a scrollbar, text selection and image support.
-- **Subagent delegation** — including `workflowScript`, where the agent writes its orchestration
-  plan once as JavaScript and the plan runs without further inference — a runtime permission gate
-  over every tool call, a Unix-socket broker for supervisor-to-subagent coordination, an MCP client,
-  and the Flux development pipeline.
+- **Subagent delegation** in the foreground or background, as single runs, chains, parallel fans
+  or `workflowScript` plans, where the agent writes its orchestration once as JavaScript and the plan
+  runs without further inference. Background runs survive a restart via a session index and durable
+  replay, can be steered, detached, waited on (`bg_wait`) and inspected, and are watched by a child
+  watchdog with model-fallback chains. Children can be placed on a herdr saved machine. All 18 of
+  upstream's `/subagents-*` slash commands are present, and a fleet roster in the TUI lets you pick a
+  running child with the keyboard and open its inspector.
+- **A runtime permission gate** over every tool call, a **Unix-socket broker** for
+  supervisor-to-subagent coordination, and the **Flux** development pipeline.
 - **MCP over stdio and OAuth-protected HTTP**, with sampling, elicitation and a JSON-RPC wire tracer.
+
+## herdr
+
+Run cyrup inside [herdr](https://github.com/herdr) and the herdr sidebar shows which pane is
+blocked waiting on you: permission and MCP dialogs raise the signal, and it is released on exit so
+no phantom `working` row is left behind. An agent can open, drive, inspect and close inspector and
+project panes through seven tool verbs, and subagents can run on a herdr saved machine, with events
+and exit relayed back to the supervisor. Without herdr installed, every herdr surface reports that
+it is unavailable and does nothing else.
 
 ## Extensions are WebAssembly components
 
@@ -166,14 +208,14 @@ session tree in memory and repaints a terminal.
 
 ## Following Pi closely
 
-cyrup cites its upstream in the source: 25,892 citations pointing at the exact `.ts` file and line a
-given Rust item mirrors, naming 15,209 distinct upstream locations
+cyrup cites its upstream in the source: 28,706 citations pointing at the exact `.ts` file and line a
+given Rust item mirrors, naming 16,976 distinct upstream locations
 (`grep -rhoE '[A-Za-z0-9_./-]+\.ts:[0-9]+' crates --include='*.rs'`). That index is how equivalence
 gets audited. `grep -rn "agent-loop.ts:226" crates` finds the code that answers for it.
 
 Rust is not TypeScript, so where the languages differ cyrup ports the behaviour and records the
 mechanism difference in a `CYRUP-DELTA` comment naming the upstream line and the reason. There are
-748 of them. For example:
+974 of them. For example:
 
 - A JavaScript `async` function always settles. A Rust future can be dropped at any `.await`, so
   anything registered before an await and cleaned up only on the success path leaks forever. cyrup
@@ -188,34 +230,37 @@ mechanism difference in a `CYRUP-DELTA` comment naming the upstream line and the
 
 ## Workspace layout
 
-Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, and
+Line counts are every line of every `.rs` file in the crate, comments and inline tests included,
+measured at `ea23ca2`. Coverage comes from the workspace run above. `cyrup-it` is measured by running
+it, not by coverage. Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, and
 `cyrup-session-svc` is the single integration point the front-ends consume.
 
-| Crate | Role |
-|-------|------|
-| `cyrup-core` | shared substrate: ids, `Content`/`Message`, `EventStream<T>`, `CancelToken`, the `Tool` trait |
-| `cyrup-provider` | vendor-neutral LLM layer: 40 providers over 10 wire APIs, 35 embedded catalogs, auth, streaming, images |
-| `cyrup-agent` | the turn loop: tool execution, hooks, steering and follow-up queues, abort |
-| `cyrup-tools` | built-in tools over an `FsOps`/`ProcOps` interface |
-| `cyrup-session` | JSONL session tree, compaction, system-prompt and context assembly |
-| `cyrup-config` | layered settings, project trust, auth store, model resolution |
-| `cyrup-ext` | WASM Component Model host (Wasmtime) plus the native built-in tier |
-| `cyrup-resources` | skills, prompt templates, themes, packages |
-| `cyrup-tui` | ratatui + crossterm front-end, regular and alternate-screen modes |
-| `cyrup-modes` | print / json / rpc adapters, and an RPC client |
-| `cyrup-sdk` | public embeddable API |
-| `cyrup-session-svc` | the `AgentSession` facade wiring everything together |
-| `cyrup` | the CLI binary |
-| `cyrup-ext-subagents` | OS-subprocess subagent delegation and the `workflowScript` runtime (the largest crate) |
-| `cyrup-workflow-runtime` | `workflowScript`'s `deno_core` ops and `prelude.js`, split out so a consumer's `build.rs` can snapshot them |
-| `cyrup-permission-system` | runtime allow / ask / deny policy over every tool call |
-| `cyrup-intercom` | Unix-socket broker for supervisor-to-subagent coordination |
-| `cyrup-flux` | the Flux structured development pipeline |
-| `cyrup-mcp` | MCP client: servers, tools, OAuth, sampling, elicitation, wire tracer, the `/mcp` surface |
-| `cyrup-acp` | Agent Client Protocol adapter: an editor (Zed is the reference client) drives cyrup over ACP JSON-RPC on stdio |
-| `cyrup-ext-sdk` | guest SDK for authoring extensions (`wasm32-wasip2`) |
-| `cyrup-test-support` | faux provider plus differential, interop and golden harnesses |
-| `cyrup-it` | the gated integration-test harness |
+| Crate | Lines | Line cov. | Role |
+|-------|------:|------:|------|
+| `cyrup-core` | 5,339 | 88.2% | shared substrate: ids, `Content`/`Message`, `EventStream<T>`, `CancelToken`, the `Tool` trait |
+| `cyrup-provider` | 82,769 | 91.4% | vendor-neutral LLM layer: 40 providers over 10 wire APIs, 35 embedded catalogs, auth, streaming, images |
+| `cyrup-agent` | 15,399 | 93.4% | the turn loop: tool execution, hooks, steering and follow-up queues, abort |
+| `cyrup-tools` | 25,784 | 91.4% | built-in tools over an `FsOps`/`ProcOps` interface |
+| `cyrup-session` | 16,531 | 91.6% | JSONL session tree, compaction, system-prompt and context assembly |
+| `cyrup-config` | 17,594 | 90.5% | layered settings, project trust, auth store, model resolution |
+| `cyrup-ext` | 33,929 | 70.6% | WASM Component Model host (Wasmtime) plus the native built-in tier |
+| `cyrup-resources` | 12,136 | 87.6% | skills, prompt templates, themes, packages |
+| `cyrup-tui` | 116,159 | 79.4% | ratatui + crossterm front-end, regular and alternate-screen modes |
+| `cyrup-modes` | 9,538 | 71.3% | print / json / rpc adapters, and an RPC client |
+| `cyrup-sdk` | 944 | 0.0% | public embeddable API |
+| `cyrup-session-svc` | 42,886 | 86.8% | the `AgentSession` facade wiring everything together |
+| `cyrup` | 19,971 | 63.6% | the CLI binary |
+| `cyrup-ext-subagents` | 401,244 | 90.3% | OS-subprocess subagent delegation and the `workflowScript` runtime (the largest crate) |
+| `cyrup-workflow-runtime` | 322 | 63.9% | `workflowScript`'s `deno_core` ops and `prelude.js`, split out so a consumer's `build.rs` can snapshot them |
+| `cyrup-permission-system` | 20,431 | 83.1% | runtime allow / ask / deny policy over every tool call |
+| `cyrup-intercom` | 31,837 | 76.8% | Unix-socket broker for supervisor-to-subagent coordination |
+| `cyrup-flux` | 5,260 | 97.7% | the Flux structured development pipeline |
+| `cyrup-herdr` | 13,497 | 86.5% | the one client for herdr's NDJSON socket API: typed methods, event subscription, reconnect, the pane status bridge |
+| `cyrup-mcp` | 79,931 | 81.4% | MCP client: servers, tools, OAuth, sampling, elicitation, wire tracer, the `/mcp` surface |
+| `cyrup-acp` | 21,179 | 94.0% | Agent Client Protocol adapter: an editor (Zed is the reference client) drives cyrup over ACP JSON-RPC on stdio |
+| `cyrup-ext-sdk` | 10,128 | 41.0% | guest SDK for authoring extensions (`wasm32-wasip2`) |
+| `cyrup-test-support` | 3,363 | 86.9% | faux provider plus differential, interop and golden harnesses |
+| `cyrup-it` | 58,820 | — | the gated integration-test harness |
 
 ## Documentation
 
@@ -246,7 +291,7 @@ cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p cyrup-ext-sdk --target wasm32-wasip2   # --workspace does not reach the guest SDK
 cargo clippy -p cyrup-it --features it --all-targets   # nor the gated harness
-cargo nextest run --workspace --features test-fixtures # 9,886 tests, 9 skipped
+cargo nextest run --workspace --features test-fixtures # 11,311 tests, 9 skipped
 cargo run -p xtask -- feature-matrix                   # non-default feature combos, and runs the integration suite
 cargo doc --workspace --no-deps --bins                 # rustdoc links are denied, not warned
 ```
@@ -267,6 +312,24 @@ states the obligation it discharges and prints it on failure.
 
 Edition 2024, `resolver = "3"`, stable toolchain.
 
+### Measuring coverage
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+eval "$(cargo llvm-cov show-env --export-prefix)"
+export LLVM_PROFILE_FILE="$PWD/target/cyrup-%8m.profraw"
+cargo llvm-cov clean --workspace
+cargo nextest run --workspace --features test-fixtures
+cargo llvm-cov report --summary-only
+```
+
+Do not use `cargo llvm-cov nextest` directly on this workspace. Nextest runs each test in its own
+process and the default profile pattern includes `%p`, so it writes one raw profile per test. That
+comes to 11,000 files of a multi-megabyte binary's counters, and it filled a 28 GB disk before the
+run finished. `%8m` without `%p` merges the counters into eight pooled files per binary. The
+instrumented build takes about 11 GB.
+
 ### The integration suite
 
 Almost all tests are unit tests inline under `crates/*/src/`. The heavy ones, which spawn the binary,
@@ -275,7 +338,7 @@ process, live in one gated crate:
 
 ```sh
 cargo build -p cyrup-ext-sdk --target wasm32-wasip2
-cargo nextest run -p cyrup-it --features it        # 523 test functions across 9 binaries
+cargo nextest run -p cyrup-it --features it        # ~590 test functions across 9 binaries
 ```
 
 `cyrup-it` is behind `required-features = ["it"]`, so the everyday gate never builds it. Its
@@ -321,29 +384,34 @@ unix-socket transport, and `mcpScript`.
 
 ## Upstreams
 
-cyrup tracks seven upstream projects, six TypeScript and one Python. The core is
+cyrup tracks eight upstream projects: six TypeScript, one Python and one Rust. The core is
 [`earendil-works/pi`](https://github.com/earendil-works/pi). Five optional subsystems follow
 standalone Pi extensions, since Pi core ships no permission system, no MCP client and no editor
-protocol of its own. Flux follows `code_puppy_core_plugins`, which is Python.
+protocol of its own. Flux follows `code_puppy_core_plugins`, which is Python. `cyrup-herdr` is a
+client for herdr's socket API rather than a port, pinned to the version whose schema it was checked
+against.
 
-Each row records the upstream a subsystem follows and the newest tag tracked, re-checked with
-`git ls-remote --tags`.
+Each row records the upstream a subsystem follows, the newest upstream tag, and the tag the
+[parity ledger](docs/gap-analysis/README.md) was last measured against. The ledger was re-measured
+on 2026-09-24 against cyrup `ea23ca2`.
 
-| upstream | followed by | latest tag tracked |
-|---|---|---|
-| `earendil-works/pi` | most crates | v0.85.1 |
-| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | v0.67.0 |
-| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.8.0 |
-| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.13.0 |
-| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.33.0 |
-| `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.50 |
-| `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 |
+| upstream | followed by | newest tag | ledger measured to |
+|---|---|---|---|
+| `earendil-works/pi` | most crates | v0.87.1 | v0.87.1 |
+| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | v0.71.0 | v0.71.0 (ported surface ≈ v0.68.0) |
+| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.8.0 | v0.8.0 |
+| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.14.0 | v0.14.0 |
+| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.37.0 | v2.37.0 |
+| `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.62 | v0.0.62 |
+| `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 | v0.0.33 |
+| [`herdrdev/herdr`](https://github.com/herdrdev/herdr) (Rust) | `cyrup-herdr` (a client, not a port) | v0.9.1 | v0.9.1, checked for client conformance |
 
-`cyrup-permission-system` is fully caught up with its upstream. Flux's ported surface
-(`flux_bootstrap/`) is byte-identical at every tag from `v0.0.6` through `v0.0.50`, so its version
-span carries no behavioural difference at all.
+"Measured to" means the newest window was read and its drift filed as ledger items. It does not
+mean that drift is closed. `cyrup-permission-system` is fully caught up with its upstream. Flux's
+ported surface (`flux_bootstrap/`) is byte-identical at every tag from `v0.0.6` through `v0.0.62`,
+so its version span carries no behavioural difference at all.
 
-The pi-acp row is the newest. `cyrup-acp` speaks the
+`cyrup-acp` is the newest port. It speaks the
 [Agent Client Protocol](https://agentclientprotocol.com) over stdio so an editor — Zed is the
 reference client — can drive cyrup the way it drives any other ACP agent: `initialize`,
 `session/new`, `session/prompt` and the rest, with the turn streamed back as `session/update`
@@ -356,7 +424,7 @@ its stdout, because it is a separate npm package; `cyrup-acp` is a workspace cra
 `AgentSession` in-process instead, which deletes the whole subprocess surface and replaces
 `Record<string, unknown>` event probing with the typed `AgentSessionEvent`.
 
-Clone all seven under `./tmp/` (gitignored) before working a ledger row;
+Clone the seven Pi-family upstreams under `./tmp/` (gitignored) before working a ledger row;
 `.claude/hooks/session-start.sh` does it for you. The area files cite them as
 `git -C tmp/<repo> show <tag>:<path>`, at a named tag rather than from a working tree, so a citation
 still resolves months later. [`docs/gap-analysis/README.md`](docs/gap-analysis/README.md) records

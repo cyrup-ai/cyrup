@@ -86,6 +86,10 @@ to the approval section. The seam is stated below.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** cross-process credential transactions → **struck, withdrawn upstream** (`bdb89b7`, #563); `ConsentManager.restoreDecision` → **struck, not applicable** — Cut 2 stands, since at v2.37.0 the consent manager is *read* only by `ui-server.ts`; `MCP-559` carries the obligation to skip `kind:"consent"` records; the ladder corrections are confirmed at `ea23ca2`. From v2.34–v2.37: `encrypted-file` store → **`MCP-575`**; bearer command TTL → **`MCP-576`**; Linux keyring recovery for bearer/Jev stores → carried as an amendment to `MCP-501` (moot until it exists). Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: `MCP-260` → **implemented** (`crates/cyrup/src/mcp_keyring_helper_cmd.rs`); `MCP-269`, `278`, `283`, `287` confirmed (their `TODO(MCP-NNN)` markers stand). Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
@@ -1441,6 +1445,13 @@ rename breaks existing scripts.
 decision. `MCP_OAUTH_DIR` stays **unprefixed and unchanged**, because it names a directory a user may
 deliberately share with a real pi install. `…_KEYRING_RECOVERY_NODE` is dropped outright (MCP-260).
 **verify** — each switch honoured under both names, with `CYRUP_*` winning.
+**Restated 2026-09-24 (cyrup `ea23ca2`, upstream v2.37.0).** The dual-read above is superseded by
+owner decision `dd44b3c` ("Drop every PI_* env-var alias in favor of CYRUP_-only"): `credentials.rs`
+reads the six as single-name `CYRUP_MCP_*` constants through `env_lookup`. The obligation is now
+"each surviving switch honoured under its `CYRUP_MCP_*` name"; the `PI_MCP_ADAPTER_*` spelling is a
+recorded divergence. Upstream added `PI_MCP_ADAPTER_BEARER_COMMAND_TTL_MS` and
+`PI_MCP_ADAPTER_OAUTH_FILE_KEY` in `v2.33.0..v2.37.0`; they belong to unported surfaces (leads in
+[`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Re-measure — 2026-09-24*), not to this unit.
 
 **MCP-290 — Persist the DCR client record rmcp's `StoredCredentials` drops** · medium · S · **hand-written**
 **upstream** — `mcp-oauth-provider.ts`'s `saveClientInformation` / `clientInformation` over

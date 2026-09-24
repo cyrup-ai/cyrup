@@ -43,7 +43,93 @@ the embedder SDK (`cyrup/crates/cyrup-sdk/`), measured against
 > The `## UNVERIFIED census` immediately below is a lead list drawn from that window; it is not a
 > re-audit and closes nothing.
 
+> ## RE-MEASURED 2026-09-24 — cyrup `ea23ca2`, pi **v0.87.1**. Authoritative over the pin table above.
+>
+> | | measured at | read this pass | still unread |
+> |---|---|---|---|
+> | `cyrup/` | **`ea23ca2`** (2026-09-24) | `9aeba769..ea23ca2` (18 non-merge commits, 485 files, +164 754 / −4 932 under `crates/`). Of this area's crates **`cyrup-modes` and `cyrup-sdk` are byte-identical**; `cyrup-session-svc` changed in 7 files (`host_services.rs`, `session/inject.rs` + a new re-drain test, `builder.rs`, `lib.rs`, `session/mod.rs` — the subagent/herdr host-service plumbing, `18194d7`/`dc52eeb`/`df3e9a8`); the binary changed in `main.rs`, `predispatch.rs`, `subagent_config.rs`, `subagent_runner_cmd.rs` and a new `subagent_inspector_cmd.rs`. **None of the four open rows' evidence moved**: `crates/cyrup/src/cli/**` and `crates/cyrup-config` are unchanged (`SEAM-020`, `SEAM-057`, `SEAM-073` half (a)), `--use-theme` is still absent workspace-wide (`SEAM-119`). **Negative result, recorded so it is not re-derived:** the new internal `__subagent-inspector` argv verb (`crates/cyrup/src/subagent_inspector_cmd.rs`) is a third hidden verb, but it carries its own `[CYRUP-DELTA] (SEAM-109)` block naming pi-subagents' `inspector-runner.mjs` launch (`src/inspectors/actions.ts:90-104` @v0.68.0) — `SEAM-109`'s closure covers it and nothing is filed | — |
+> | `pi/` | **v0.87.1** (was v0.85.1; new tags v0.86.0 · v0.86.1 · v0.87.0 · v0.87.1). `packages/coding-agent`: 242 files, +18 411 / −15 390, 91 non-merge commits | **`v0.85.1..v0.87.1` for `cli/args.ts`, `main.ts`, `modes/rpc/rpc-mode.ts`, `cli/file-processor.ts`, both sides** (the whole diff of each), and the `steer`/`followUp`/`_queueUserInput` region of `core/agent-session.ts`. **One `v0.84.1..v0.85.1` lead re-read on both sides and FILED** (`SEAM-122`, the import-collision data loss). Items filed: `SEAM-120`, `SEAM-121`, `SEAM-122` | **CLOSED by the second pass below, except one cyrup-side call site it names.** *First-pass text, kept as history:* **`core/agent-session.ts`** (+1 097 lines in this window alone — canonical `SessionManager` context, `context_edit` entries, actionable `turn_end`/`agent_before_settle` boundaries, transcript-backed system-prompt/tool changes) was NOT read beyond `steer`/`followUp`; `core/sdk.ts` (+127), `core/session-manager.ts` (+522, area 03's), `core/cache-warmer.ts`, `core/bug-report*.ts`, `core/crash-log.ts`, `experimental/micro/**`. And the rest of the 2026-09-14 `v0.84.1..v0.85.1` lead list below |
+> | siblings | pi-subagents **v0.71.0** · pi-intercom **v0.14.0** · pi-mcp-adapter **v2.37.0** · code_puppy_core_plugins **v0.0.62**; pi-permission-system v0.8.0 and pi-acp v0.0.33 unchanged | not censused — none has a surface in this area | — |
+>
+> **Leads from `v0.85.1..v0.87.1` NOT filed (pi side read, cyrup side not):**
+> - **Exact session-id lookup by header** — `main.ts` `findLocalSessionByExactId` now calls
+>   `SessionManager.findById` (headers only) before falling back to the full listing for prefix
+>   matches; `--resume` lists progressively with cancellation; `--continue` scans headers in mtime
+>   order and stops at the first match (CHANGELOG 0.86.0, #9601). Performance-shaped; cyrup's
+>   `--session`/`--continue` resolution was not opened.
+> - **`main.ts` stops resizing `@file` images at startup** (`processFileArguments(…, { autoResizeImages:
+>   false })`, "AgentSession resizes these after extension hooks select the request model") — pairs
+>   with `CFG-085`'s per-model resize profile; cyrup's `build_inputs` path was not re-read.
+> - **`/bug`** (bug report upload/zip export, a `pi.bug-report` session entry) and **`crash-log.ts`**
+>   (crash records, extension hints in stack traces) — new features with a session-svc and process
+>   bootstrap surface; unowned until someone decides they are in scope.
+> - **The `META_API_KEY` line added to `--help`'s environment block** (`cli/args.ts:426` @v0.87.1)
+>   follows the Meta provider, which cyrup does not ship (area 01); `SEAM-102`'s set-equality rule
+>   means the help line must NOT be added ahead of the provider.
+>
+> ### RE-MEASURE — 2026-09-24, second pass (the unread windows above, closed)
+>
+> **Read this pass, both sides unless stated:** `core/agent-session.ts` **in full** for
+> `v0.84.1..v0.85.1` (971 diff lines, 19 commits) and `v0.85.1..v0.87.1` (1 806 diff lines, 12
+> commits); `core/sdk.ts` `v0.84.1..v0.87.1` in full; `core/cache-warmer.ts`, `core/crash-log.ts`,
+> `core/bug-report.ts` and `core/bug-report-upload.ts` at v0.87.1 in full; `main.ts`, `cli/args.ts`
+> and `core/agent-session-runtime.ts` `v0.84.1..v0.85.1` in full (the `v0.85.1..v0.87.1` halves were
+> read by the first pass); `experimental/micro/{README.md,main.ts}` and its entry points; `utils/mime.ts`
+> and `cli/file-processor.ts` for area 04's `@file` sniffer lead. Items filed: `SEAM-123`…`SEAM-131`,
+> `SEAM-133`, tracker `SEAM-132`.
+>
+> **The first pass's header leads, resolved:**
+> - *Exact session-id lookup by header* — **struck, behaviour-neutral.** pi v0.86.0 only reorders
+>   the work (`SessionManager.findById` over headers, then the full listing for a prefix match); the
+>   result — exact id first, then first prefix match — is what v0.85.1 already returned. Nothing to
+>   port but speed.
+> - *`main.ts` stops resizing `@file` images at startup* — **promoted into `SEAM-128`** (the session
+>   now owns all prompt-image normalization).
+> - *`/bug` and `crash-log.ts`* — **tracker `SEAM-132`** (scope question: the upload target is pi's
+>   own service).
+> - *`META_API_KEY` help line* — stays unfiled by rule (`SEAM-102`); nothing to resolve.
+>
+> **`agent-session.ts` changes read and deliberately NOT filed here, each with its owner:**
+> `_agentRunAbortRequested`, `abort()` aborting compaction/branch summary, `_finishCancelledRetry`
+> and the compaction-cancellation race fixes (`de2de549b`, `bea67d90d`) → **`SESS-062`** (area 03);
+> `context_edit` entries, the canonical `buildSessionProjection`, `_omitRecoveryAttempt`'s durable
+> omission of a failed retry/overflow attempt, and projection-based `getContextUsage` →
+> **`SESS-052`**/**`SESS-051`** (area 03; cyrup's `drop_trailing_assistant`, `session/retry.rs:152`,
+> is the v0.85 in-memory-only form and becomes the consumer once `context_edit` exists);
+> actionable `turn_end` / `agent_before_settle` boundaries → **`EXT-078`** + **`AGENT-038`**;
+> transcript `system` messages, `_preparePromptAndToolLoadout`, `_restoreToolsFromTranscript` →
+> **`PROV-083`**/**`AGENT-039`**/**`SESS-054`**; forced `before_agent_start` prompts
+> (`e4c75a732`, `16292398a`) → **`EXT-084`**; queued-input `input` handlers → **`SEAM-121`**;
+> `retryDelayMs` cap → **`DRIFT-057`** (config half `CFG-081`); per-model compaction budgets →
+> **`SESS-055`** (config half `CFG-082`); `session_compact_failed` → **`SESS-050`**; per-model thinking
+> on model switch and `{persist}` model/thinking mutations (#8356) → already ported
+> (`session/model.rs:595-630`, `crates/cyrup-tui/src/app/execute_misc.rs:48-63`);
+> `sendUserMessage({expandPromptTemplates})` (#7857) → **`EXT-083`**'s surface (area 06);
+> `exportToHtml({themeName})` → rides `SEAM-119`; `getAuth(model, {signal})` for summarization
+> auth — **not compared** (cyrup's summarization auth path was not opened; listed under
+> *still unread* below). `_handlePostAgentRun` returning `hasQueuedMessages()` when the run produced
+> no assistant message (cyrup's `run.rs:370-372` returns `false`) → the post-run loop rework
+> `SESS-062` already schedules; recorded there by reference, not filed twice.
+>
+> **`sdk.ts` `v0.84.1..v0.87.1`:** `defaultTools` → `CFG-079` (closed, ported); per-model thinking
+> fallback at session creation → ported (`builder.rs:2340-2350`); `createPowerShellTool` export →
+> ported (area 04); `buildRequestOptions`/`onPayload`/`onResponse` refactor — no behaviour change;
+> `initialState.messages` restore order — no observable change; the cache warmer → `SEAM-131`.
+>
+> **`experimental/micro/**`** (v0.86.0+, ~1 500 lines) is launched only by running
+> `experimental/micro/main.ts` through `tsx` by hand: no `package.json` bin, no `cli.ts`/`main.ts`
+> path reaches it (`git grep micro v0.87.1 -- packages/coding-agent/src/{cli.ts,main.ts}` and
+> `package.json` → 0). Same disposition as `SEAM-058`'s experimental tree: track, do not port.
+> `runtime.ts`/`tui.ts` were not line-read for that reason.
+>
+> **Still unread after this pass:** cyrup's summarization/compaction auth path, for the
+> `getAuth(model, {signal})` cancellation change (v0.86.0) — one call site, not opened.
+
 ## UNVERIFIED census 2026-09-14 — leads, not findings
+
+> **All resolved 2026-09-24 (second pass).** Every entry below now ends in a bold disposition —
+> filed (with its id), refuted, struck with its reason, or routed to the owning area's id. The
+> heading is kept so earlier citations of this section still resolve; nothing below is an open lead.
 
 Eight candidate surfaces from the `v0.84.1..v0.85.1` window under `packages/coding-agent`.
 
@@ -65,6 +151,9 @@ row's id and the row is left exactly as it stands. Sizes are the census agent's 
   `crates/cyrup/src/diagnostics.rs:504-505` asserts `--` passes through as a literal arg. Both sides
   read. **Not verified: whether clap's own `--` handling intercepts it downstream of this partition**
   — that leg needs a live run.
+  **— NO LONGER A LEAD: FILED 2026-09-24 (second pass) as `SEAM-123`.** The open leg is settled by
+  reading, not a run: `apply_arg_leniency` (`diagnostics.rs:306-313`) runs before clap and reports a
+  dash-leading token after `--` as `Unknown option`, so clap never sees it. Added at v0.84.3.
 - **`--use-theme <name>` flag and startup theme override** — S. `cli/args.ts:45,180-187,309 @v0.85.1`;
   `main.ts:662-664`, `:944`. A new flag distinct from the existing `--theme <path>` loader: it sets
   the initial interactive theme for one run via
@@ -92,6 +181,8 @@ row's id and the row is left exactly as it stands. Sizes are the census agent's 
   and calls `std::fs::copy(&resolved, &destination)` guarded only by a canonicalize inequality —
   **`fs::copy` truncates, so importing a file whose basename already exists in the session dir
   destroys the stored session.** Both sides read. Worth a severity read ahead of the rest of this list.
+  **— NO LONGER A LEAD: FILED 2026-09-24 as `SEAM-122` (critical).** Re-read on both sides at cyrup
+  `ea23ca2` / pi v0.87.1; the fix landed upstream at v0.85.0 (absent at v0.84.4).
 - **Fork ordering: teardown before the new session is created** — S.
   `core/agent-session-runtime.ts:333-341 @v0.85.1`. `await this.teardownCurrent("fork",
   sessionManager.getSessionFile())` moved ABOVE the `newSession`/`createBranchedSession` call, and the
@@ -101,6 +192,9 @@ row's id and the row is left exactly as it stands. Sizes are the census agent's 
   `crates/cyrup-session-svc/src/session/forking.rs:498,554,609` plus `runtime.rs:616`, a different
   decomposition, and whether the same before/after-teardown hazard exists there needs a dedicated
   read.
+  **— NO LONGER A LEAD: FILED 2026-09-24 (second pass) as `SEAM-130`** for the in-memory arm (the only
+  arm upstream changed, `56c6fb33c`, v0.85.0). cyrup's persisted arms open a throwaway manager from the
+  file, as pi's do, and are unaffected.
 - **`isIdle` includes compaction; `abort()` aborts compaction and branch summary** — M.
   `core/agent-session.ts:620,925,1621,1926,2061,2074,2092,2432,3305 @v0.85.1`. `get isIdle` became
   `!_isAgentRunActive && !isCompacting`; `_resolveIdleWaitIfIdle` guards on `!this.isIdle` instead of
@@ -111,6 +205,8 @@ row's id and the row is left exactly as it stands. Sizes are the census agent's 
   RPC/print-mode-visible contract** — squarely this area's surface. **Upstream read at both tags;
   cyrup side NOT read** — `waitForIdle`/abort live in `cyrup-session-svc` and `cyrup-agent` and were
   not opened.
+  **— RESOLVED 2026-09-24 (second pass), split in two:** the `abort()` half is area 03's `SESS-062`
+  (filed the same day, both sides read); the `isIdle`/`waitForIdle` half is **`SEAM-125`**.
 
 ### Events emitted across the session-svc surface
 
@@ -127,6 +223,8 @@ row's id and the row is left exactly as it stands. Sizes are the census agent's 
   `ui_prompt_start`/`ui_prompt_end`, and `EXT-S04` gained a note that v0.84.4 independently added
   `session_compact_failed`. Recorded here only because it also changes what the session-svc surface
   emits — **do not file a second id for it.**
+  **— STRUCK 2026-09-24 (second pass): duplicate.** `EXT-075` owns `ui_prompt_*`; `session_compact_failed`
+  is area 03's `SESS-050`. Nothing is owed on this surface beyond those two.
 
 ### Session manager, reached through the session-svc/RPC surface
 
@@ -142,6 +240,10 @@ row's id and the row is left exactly as it stands. Sizes are the census agent's 
   (in-memory sessions, fork/branch paths). **The `firstKeptEntryId` remap is the one with a concrete
   failure mode** and should be paired with the existing `first_kept_entry_id` work noted in
   `12-upstream-drift-pi-core.md` (`DRIFT-037`).
+  **— ROUTED 2026-09-24 (second pass):** the `firstKeptEntryId` remap is filed as area 03's `SESS-057`.
+  `_loadEntries`/`inMemory(…, entries)` have exactly one new caller at v0.87.1, the boundary preview
+  manager in `agent-session.ts` (`_createBoundaryPreviewManager`), which cyrup cannot need until
+  `EXT-078`'s boundaries exist; no session-svc surface of cyrup's reaches them today. Area 03's.
 
 ### Process bootstrap and distribution
 
@@ -157,6 +259,14 @@ row's id and the row is left exactly as it stands. Sizes are the census agent's 
   Coverage section). **The managed-install machinery (`package-manager-cli.ts` +219: staging, npm ci,
   verify, activate, cleanup) is a distribution mechanism that may be out of scope for cyrup entirely
   — that call has not been made**, and making it is the first step of any work here.
+  **— STRUCK 2026-09-24 (second pass), part by part:** `process.title` → `SEAM-070`/`DRIFT-051`
+  (already filed); `PI_CODING_AGENT`/`AI_AGENT` → the documented hard rename at
+  `crates/cyrup-tools/src/tools/bash.rs:305-321` (`CYRUP_CODING_AGENT`, `AI_AGENT=cyrup`; `CFG-069`);
+  `process.emitWarning`, `isBundledNode`/`PI_BUNDLED_NODE` and `configureHttpDispatcher` are Node
+  runtime concerns with no Rust analogue; `cleanupManagedInstall()` (`package-manager-cli.ts:150-169`
+  @v0.87.1) only clears the staging dir of pi's npm-managed self-update root under its lock — a
+  distribution mechanism cyrup, a single binary, does not have. **Falsification condition:** reopen if
+  cyrup adopts a staged, lock-guarded self-update install root.
 
 ---
 
@@ -727,6 +837,19 @@ the check that establishes it. Do not "recover" them.
 | ~~SEAM-085~~ | ~~low~~ **FILED AND CLOSED 2026-08-14** | stale-port | S | The `message_update` v0.84.1 projection is disclosed, but four of its supporting citations were **v0.84.1 line numbers presented against v0.83.0 paths with no version tag** — **FIXED 2026-08-14 (ext-rpc surface enumeration)**: `rpc.rs:304-305` and `:328-329` asserted `Pi's output(toJsonEvent(event)) (rpc-mode.ts:356)` where v0.83.0's `:355` is a bare `output(event)`, `:356` is the `agent_settled` line, and `toJsonEvent` is not in the tree at all; `json_event.rs:56` cited `coding-agent/docs/rpc.md:952-956` for the omission contract where v0.83.0's `:952-956` is the streaming example that SHOWS `message` and `partial` — the exact opposite. All now carry `@v0.84.1` plus what the same line is at the ported tag. Comment-only. |
 | ~~SEAM-086~~ | ~~low~~ **FILED AND CLOSED 2026-08-14** | parity-bug | S | An `extension_ui_response` with a missing or non-string `id` was answered with an `Unknown command: extension_ui_response` error response where pi writes nothing — **FIXED 2026-08-14 (ext-rpc surface enumeration)**: the intercept now keys on the `type` discriminant alone and always `continue`s, as pi's unconditional `return` does (`rpc-mode.ts:763-777` @v0.83.0). Test `rpc_malformed_extension_ui_response_is_swallowed_not_answered` (`crates/cyrup-modes/src/tests/modes.rs`), RED before. |
 | SEAM-119 | low | upstream-drift | S | **NEW 2026-09-16.** `--use-theme <name>` is not a cyrup flag, so a pi command line carrying it EXITS 1 instead of starting — **upstream** `packages/coding-agent/src/cli/args.ts:45`, `:180-187` (parse + the two diagnostics: missing value, dash-leading value) and the help line at `:309` @v0.85.1; `main.ts:662-664` feeds it to `startupSettingsManager.applyOverrides({theme})` and `:944` to `InteractiveMode({initialThemeSetting})`, i.e. a ONE-RUN named-theme override distinct from the existing `--theme <path>` loader, which both sides have. **Classification settled by PRESENCE, not by date**, per README's second standing hazard: `git -C tmp/pi show <tag>:packages/coding-agent/src/cli/args.ts \| grep -c use-theme` is **0** at `v0.83.0` (the ported baseline) and **0** at `v0.84.1` (this file's pin), then **3** at `v0.84.4`, `v0.85.0` and `v0.85.1` — so it landed inside `v0.84.1..v0.84.4` and `upstream-drift` is right. **cyrup** — `grep -rn 'use-theme\|use_theme' --include='*.rs' crates/` returns **ZERO hits workspace-wide** at `cc7818b` (the 2026-09-14 census had grepped only `crates/cyrup/src` and `crates/cyrup-modes/src`; this widens it and the answer is the same). It is therefore absent from `crates/cyrup/src/cli/argv.rs`'s `KNOWN_LONG_FLAGS` (`:104-150`), so `partition_extension_flags` (`:47-99`) captures it as an EXTENSION flag and swallows the following token as its value (`:77-84`), and — no extension having registered the name — the reconciliation reports `Unknown option: --use-theme` and exits 1 (the path `cyrup-it/tests/bin/unknown_flag_exit.rs` pins end-to-end). **How it was found, so the method is repeatable:** a mechanical set-difference run for `SEAM-057` — every `"--x"` literal in `KNOWN_LONG_FLAGS` (43) against every `"--x"` literal in `args.ts` @v0.85.1 (41). The cyrup-only side is `SEAM-057`'s four; the **pi-only** side is exactly `{--use-theme, --}`, and the second of those is the `--` end-of-options separator the same census already describes (still unowned, deliberately not filed here because its remaining leg — whether clap intercepts `--` downstream of the partition — needs a live run). **Impact** — a command line copied from pi's own help does not degrade, it FAILS: `cyrup --use-theme dark` prints `Error: Unknown option: --use-theme` and exits 1, and the theme name is consumed as the phantom flag's value rather than reaching the prompt. Low: opt-in, one run, no data loss and no wrong output. **Fix** — add `--use-theme <name>` to `Cli` and to `KNOWN_LONG_FLAGS` + `KNOWN_VALUE_LONG_FLAGS`, port the two parse diagnostics verbatim, and hand the name to the startup settings override. **Split, as the census said:** the flag surface is this area's; the named-theme override and `setThemeJsonValidator(validateThemeJson)` (`main.ts` @v0.85.1) are **area 07's** and must not be built blind here. **Verify** — `cyrup --use-theme <a-known-theme> --help` exits 0 with no `Unknown option`; `cyrup --use-theme` alone reproduces pi's "requires a theme name" diagnostic; and an interactive run starts on the named theme without writing it to settings. |
+| SEAM-120 | medium | upstream-drift | S | **NEW 2026-09-24.** An invalid or missing `--mode` value is silently dropped and the run proceeds in text mode; pi v0.87.1 reports an error and exits non-zero — see the body. |
+| SEAM-121 | medium | upstream-drift | S | **NEW 2026-09-24.** `steer`/`follow_up` (RPC, SDK and every other caller of `AgentSession::steer`/`follow_up`) never run the extension `input` handlers; pi v0.86.0 routes both through them — see the body. |
+| SEAM-122 | **critical** | upstream-drift | S | **NEW 2026-09-24 (was a 2026-09-14 lead).** Importing a session file whose basename already exists in the session dir OVERWRITES the stored session; pi v0.85.0 uniquifies the name and copies with `COPYFILE_EXCL` — see the body. |
+| SEAM-123 | medium | upstream-drift | S | **NEW 2026-09-24 (second pass; was a 2026-09-14 lead).** A bare `--` is not end-of-options: it is captured as an extension flag with an empty name, so `cyrup -p -- "- Summarize…"` (pi's own documented example, v0.84.3) exits 1 — see the body. |
+| SEAM-124 | medium | parity-bug | S | **NEW 2026-09-24 (second pass).** `navigate_tree` refuses nothing: no "wait for the current response" guard (pi, every tag since v0.83.0) and no "wait for the current compaction" guard (pi v0.86.0, #9179), so an extension command or RPC `navigate_tree` moves the leaf under a live run — see the body. |
+| SEAM-125 | low | upstream-drift | S | **NEW 2026-09-24 (second pass; the idle half of a 2026-09-14 lead).** `is_idle`/`wait_for_idle` ignore a running MANUAL compaction or branch summary; pi v0.85.0's `isIdle` is `!_isAgentRunActive && !isCompacting` — see the body. |
+| SEAM-126 | medium | upstream-drift | M | **NEW 2026-09-24 (second pass).** No threshold compaction before a post-tool model request: cyrup compacts only after `agent_end`, so a long tool loop runs into the provider's context limit mid-run; pi v0.84.4 (#8782) compacts in `prepareNextTurn` — see the body. |
+| SEAM-127 | medium | upstream-drift | S | **NEW 2026-09-24 (second pass).** An extension `sendMessage(msg, {triggerTurn:false})` during a run is steered (or follow-up-queued) into the loop, driving another model turn; pi v0.84.2 (#8022) + v0.84.4 append it at the end of the current turn and start nothing — see the body. |
+| SEAM-128 | low | upstream-drift | M | **NEW 2026-09-24 (second pass; absorbs the 2026-09-24 `@file`-resize lead).** Prompt images from RPC/SDK/extensions reach the provider unresized and unvalidated; pi v0.87.0 normalizes every prompt image in `AgentSession.prompt` against the request model's resize profile and folds failures into text hints — see the body. |
+| SEAM-129 | low | parity-bug | S | **NEW 2026-09-24 (second pass).** A `prompt` submitted while `agent_settled` is being delivered is refused with `StreamingNeedsBehavior`; pi accepts it (v0.83.0 clears the run latch before emitting; v0.87.0 defers it until the emit returns) — see the body. |
+| SEAM-130 | low | upstream-drift | S | **NEW 2026-09-24 (second pass; was a 2026-09-14 lead).** An in-memory fork branches the live manager BEFORE settling the outgoing run, so the aborted turn's tail lands in the fork; pi v0.85.0 (#8937) settles first — cyrup's comment still describes the v0.84 order as pi's — see the body. |
+| SEAM-131 | low | upstream-drift | L | **NEW 2026-09-24 (second pass).** Prompt-cache warming (`core/cache-warmer.ts`, pi v0.86.0, default mode `streaming`) is not ported: no warm requests, no `usage` entries, no `/session` status. Owns the blocker `EXT-085` names; the settings key is `CFG-093` — see the body. |
+| SEAM-133 | medium | parity-bug | S | **NEW 2026-09-24 (second pass; promoted from area 04's header lead).** The CLI `@file` image sniffer treats any file starting `BM` as a BMP and any `FF D8 FF` as JPEG, and takes animated PNGs; pi's `detectSupportedImageMimeType` (every tag since v0.83.0) requires a valid BMP header, rejects JPEG `0xF7` and APNG. Also no BOM strip on `@file` text (v0.84.3) — see the body. |
 
 **43 items — 0 critical, 8 high, 20 medium, 15 low.** (SEAM-071, SEAM-072 and SEAM-073 were added by
 the later suite-verification pass, SEAM-072 closed on arrival; the 40/7/19/14 counts below predate
@@ -741,6 +864,124 @@ Keeps its ID and its body; proposes no schedulable work today.
 | ID | Kind | Note |
 |---|---|---|
 | SEAM-058 | tracking | pi's experimental `server`/`client` command tree, `create-harness.ts` and `remote-session.ts`. Its own Fix is "track, do not build, until upstream wires it into `main()`", and the reachability re-check confirms upstream has not: at v0.84.1 `git grep -n experimentalCli` matches only the file itself and its test. The **action** it owes is a re-diff at the next upstream tag (its Verify line), not an implementation. Escalate it back into the counted set the moment `main()` references `experimentalCli`. |
+| SEAM-132 | tracking | **NEW 2026-09-24 (second pass).** pi v0.86.0–v0.87.0 `/bug`: `core/bug-report.ts` (bundle, redaction, `summary.md`, a `pi.bug-report` custom session entry recording the delivery), `core/bug-report-upload.ts` (multipart POST to pi's Radius gateway `/v1/bug-reports`), `AgentSession.summarizeForBugReport` (`agent-session.ts:3942` @v0.87.1, a model summary when the user declines to share the transcript) and `core/crash-log.ts` (`<agentDir>/crashes.json`, last 5 records / 7 days, written only by `interactive-mode.ts:2054`/`:4217` and read by `/bug` and a next-start notice). All read in full; cyrup has none of it (`crates/cyrup-tui/src/panic_hook.rs` restores the terminal and records nothing). **Scope question, not work:** the upload target is pi's own infrastructure, so the feature cannot be ported literally; the local half (crash log + zip export) could be. Escalates to items when an owner decides cyrup ships a `/bug` (then: session-svc summary + entry here, TUI command in area 07). Area 07 recorded the same lead; this row owns it. |
+
+## SEAM-120 — An invalid or missing `--mode` value is silently ignored; pi now errors
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup/src/diagnostics.rs:144-155` (`apply_arg_leniency`): `--mode <value>` with a value outside `VALID_MODES` (`:71`, `text|json|rpc|acp`) drops BOTH tokens with no diagnostic, under the comment *"silently ignored (Pi args.ts:80-82)"*. A dash-leading value (`--mode --model x`) is consumed as the bad value, so the following flag is lost too. Pinned as correct by `crates/cyrup/src/cli/tests/argv.rs:159-163` (`// Bad --mode: silently ignored ⇒ default text mode, no diagnostics.`).
+**upstream** — `packages/coding-agent/src/cli/args.ts:95-110` @v0.87.1 — a missing or `-`-leading value pushes the error diagnostic `--mode requires text, json, or rpc` WITHOUT consuming the next token; any other value outside `text|json|rpc` consumes it and pushes `Invalid mode "<value>". Valid values: text, json, rpc`. Error diagnostics end the process non-zero. At v0.85.1 it was the silent `if (mode === …) result.mode = mode;`. CHANGELOG 0.87.1 (#9045).
+**Impact**   — a script running `cyrup --mode jsonl -p …` gets text output and exit 0 instead of a failure, so a downstream JSON consumer breaks with no error at the source; `--mode --model x` also silently loses `--model`.
+**Fix**      — in `apply_arg_leniency`, push pi's two error diagnostics (keeping `acp` as the `[CYRUP-DELTA]` it already is — the "Valid values" string then needs a decision: pi's literal, or pi's literal plus `acp`); do not consume a dash-leading value. Invert the `argv.rs:159` test.
+**Verify**   — `cyrup --mode bogus -p hi` prints `Invalid mode "bogus". Valid values: text, json, rpc` and exits 1; `cyrup --mode --model m -p hi` prints `--mode requires text, json, or rpc` and `--model m` is still parsed.
+
+## SEAM-121 — `steer` and `follow_up` bypass the extension `input` handlers
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup-session-svc/src/session/run.rs:820-853` `AgentSession::steer` / `follow_up` check for an extension command, expand skills/templates and queue — no `emit_input_event`. The `input` event is emitted only on the `prompt` path (`prepare`, `:471`, the call at `:501-505`). The RPC arms `crates/cyrup-modes/src/rpc/mod.rs:910-929` call these two methods directly, as does every SDK caller.
+**upstream** — `packages/coding-agent/src/core/agent-session.ts:1860-1874` @v0.87.1 — `steer(text, images, { source })` / `followUp(…)` both go through `_queueUserInput` (`:1823-1848`), which runs `_runInputHandlers(text, images, source, isStreaming ? behavior : undefined)` (`:1555-1573`) BEFORE expansion: a `handled` result drops the message, a `transform` result rewrites it. `modes/rpc/rpc-mode.ts:418-425` passes `{ source: "rpc" }`. At v0.85.1 `steer` (`:1387-1395`) went straight from the extension-command check to expansion, as cyrup does. CHANGELOG 0.86.0 (#8718).
+**Impact**   — an extension that filters, redacts or rewrites user input (or that handles a message itself) is enforced for prompts but not for anything sent while the agent is streaming, and not at all for an RPC client's `steer`/`follow_up`. cyrup already maps `InputSource::Rpc` to the handler-visible `rpc` source (`run.rs:51-60`), so only the call is missing.
+**Fix**      — have `steer`/`follow_up` take the caller's `InputSource`, call `emit_input_event(&mut ui, is_streaming.then_some(behavior))` before `throw_if_extension_command`'s expansion, return `PromptAccepted::Handled` on `Handled`; RPC passes `InputSource::Rpc`. Keep pi's order: the extension-command check precedes the handlers (`:1829-1831`).
+**Verify**   — an extension whose `input` handler returns `transform` to `"X"` sees an RPC `steer {message:"a"}` queue `"X"` with source `rpc`; one returning `handled` leaves the steering queue empty and emits no `queue_update`.
+
+## SEAM-122 — Importing a session whose basename already exists overwrites the stored session
+
+**Kind** upstream-drift · **Severity** critical · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup-session-svc/src/runtime.rs:736` `import_from_jsonl`: `destination = session_dir.join(file_name)` (`:772`), then, when the canonical paths differ, `std::fs::copy(&resolved, &destination)` (`:795-797`). `fs::copy` truncates an existing destination.
+**upstream** — `packages/coding-agent/src/core/agent-session-runtime.ts:372-389` @v0.87.1 (identical from v0.85.0; absent at v0.84.4, where `:376-380` was an unconditional `copyFileSync(resolvedPath, destinationPath)`): when the source is not already the stored file, the destination is uniquified `name-1.ext`, `name-2.ext`, … while it `existsSync`, the `session_before_switch` event is emitted with the FINAL path, and the copy uses `constants.COPYFILE_EXCL`.
+**Impact**   — **data loss.** Importing a JSONL whose basename matches a stored session — the ordinary case of re-importing an exported or copied session file after the stored one has moved on — replaces the stored transcript with the older copy, silently. Reachable from the TUI `/import` command (`crates/cyrup-tui/src/app/execute_session.rs:622`, pi's `interactive-mode.ts:6322`/`:6335`) and from any SDK embedder calling `import_from_jsonl`; RPC has no import verb on either side. Rated critical on consequence per the severity definition; blast radius is limited to basename collisions, which session files' timestamp+uuid names make rare unless the file is a copy of a stored session — which is exactly when it happens.
+**Fix**      — port the loop (`Path::file_stem` + `extension`, suffix from 1) before the `SessionBeforeSwitch` veto so `target_session_file` names the final path, and copy with `std::fs::OpenOptions::new().write(true).create_new(true)` + `io::copy` (the `COPYFILE_EXCL` analogue) so a race still cannot truncate.
+**Verify**   — with `<session_dir>/s.jsonl` present, importing a different `/tmp/s.jsonl` leaves the stored file byte-identical and creates `s-1.jsonl`; a second import creates `s-2.jsonl`; importing the stored file itself copies nothing.
+
+## SEAM-123 — A bare `--` is captured as an empty-named extension flag instead of ending option parsing
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup/src/cli/argv.rs:47-90` `partition_extension_flags`: `"--".strip_prefix("--")` is `""`, which is not in `KNOWN_LONG_FLAGS`, so `--` becomes `ExtensionFlag { name: "", … }` and swallows the next token as its value unless that token starts with `-`/`@`. A dash-leading token after it (`"- Summarize…"`) then reaches `apply_arg_leniency` (`crates/cyrup/src/diagnostics.rs:306-313`), which reports `Unknown option: - Summarize…` and exits 1. `diagnostics.rs:504-505` pins `--` as passing through the leniency pass untouched.
+**upstream** — `packages/coding-agent/src/cli/args.ts:82-91` @v0.87.1 (added v0.84.3; absent at v0.84.2): `--` ends parsing — every later token goes to `fileArgs` (leading `@` stripped) or `messages`, verbatim. Help: usage line `[--]` (`:275`), the option row (`:329`) and the example `pi -p -- "- Summarize these points"` (`:355`).
+**Impact**   — a prompt that begins with `-` cannot be passed at all (there is no other escape), and `cyrup -- hello` exits 1 on an unknown extension flag instead of sending `hello`. Scripts written against pi's documented form fail.
+**Fix**      — in `partition_extension_flags`, on `arg == "--"` push `--` and every remaining token into `clean` unmodified and stop; make `apply_arg_leniency` stop at `--` too; let clap's own `--` handling (or an explicit split before clap) route the tail to the positional message/`@file` lists. Add the `[--]` usage line, option row and example to `crates/cyrup/src/cli/help.rs`.
+**Verify**   — `cyrup -p -- "- Summarize these points"` sends that exact text as the prompt; `cyrup -p -- @notes.md --model x` treats `@notes.md` as a file argument and `--model x` as message text.
+
+## SEAM-124 — `navigate_tree` has neither of pi's two refusal guards
+
+**Kind** parity-bug (streaming guard, present at the ported v0.83.0) + upstream-drift (compaction guard, v0.86.0) · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup-session-svc/src/session/forking.rs:114-118` `navigate_tree` begins with the already-at-target no-op; nothing checks `is_run_active()` or `is_compacting()` (`session/auto_compaction.rs:25`). The TUI checks `is_streaming()` before calling it (`crates/cyrup-tui/src/app/tree_nav.rs`), but the two other callers do not: the extension control op `control_navigate_tree` (`session/control.rs:200-223`, pi's `ctx.navigateTree`) and the command API arm `C::NavigateTree` (`command.rs:223-225`).
+**upstream** — `core/agent-session.ts:3581-3592` @v0.87.1 — `if (this.isStreaming) throw new Error("Wait for the current response to finish before navigating the session tree.")` (present at v0.83.0 `:2899-2901`), then from v0.86.0 (`e687434a6`, #9179) `if (this.isCompacting) throw new Error("Wait for the current compaction or tree navigation to finish before navigating the session tree.")`.
+**Impact**   — an extension command (which runs while the agent streams) or an SDK/RPC caller can move the session leaf while a run is still appending to the old branch, or while a compaction is about to write its entry against the old leaf; the next appends land on whichever branch the leaf now names. pi refuses both with an actionable message. The TUI path is safe for streaming but not for compaction.
+**Fix**      — at the top of `navigate_tree`, return a new `SessionServiceError` carrying pi's first string when `is_run_active()`, and pi's second when `is_compacting()`; the TUI then surfaces the same text (#9179's UI half is area 07's).
+**Verify**   — a native extension command calling `navigate_tree` during a run returns the streaming error and leaves `leaf_id` unchanged; the same call during `/compact` returns the compaction error.
+
+## SEAM-125 — `is_idle` and `wait_for_idle` ignore a running manual compaction or branch summary
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup-session-svc/src/session/mod.rs:473-475` `is_idle` is `!driver_tx && !agent.is_running()`; `wait_for_idle` (`session/run.rs:808-816`) waits on the same two latches. A manual `/compact`/RPC `compact` and a `/tree` branch summary run outside the post-run driver, so both report idle while they are in flight. `is_compacting()` exists (`session/auto_compaction.rs:25-29`) but neither reads it.
+**upstream** — `core/agent-session.ts` @v0.85.1 `:925` `get isIdle() { return !this._isAgentRunActive && !this.isCompacting; }` (v0.84.1: `!this._isAgentRunActive`); `_resolveIdleWaitIfIdle` guards on `!this.isIdle`, and the manual-compaction and branch-summary `finally` blocks now call it (`_clearManualCompactionState`, `:2386` @v0.87.1), so `waitForIdle()` also waits them out.
+**Impact**   — an extension reading `ctx.isIdle()` during a manual compaction is told the session is idle and may start work that races it; `print`/SDK callers of `wait_for_idle` return before a compaction they triggered has finished. The `abort()` half of the same upstream change is `SESS-062` (area 03), not this row.
+**Fix**      — `is_idle` also requires `!is_compacting()`; make `wait_for_idle` additionally await the compaction/branch-summary cancel slots clearing (a `watch` flipped where `compaction_cancel`/`branch_summary_cancel` are cleared).
+**Verify**   — during a manual `compact()` whose summarizer is held open, `is_idle()` is false and a concurrent `wait_for_idle()` resolves only after `compaction_end`.
+
+## SEAM-126 — No threshold compaction before a post-tool model request
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — the only threshold check is `check_compaction` (`crates/cyrup-session-svc/src/session/auto_compaction.rs:45`, threshold arm `:108-162`), reached from `handle_post_agent_run` after `agent_end` (`session/run.rs:388`) and before a new prompt. The per-turn hook `PolicyHooks::prepare_next_turn` (`crates/cyrup-session-svc/src/hooks.rs:270-298`) refreshes tools, system prompt, model and thinking level and never estimates context.
+**upstream** — `core/agent-session.ts:587-605` @v0.87.1 `_compactBeforeNextAssistantResponse`, called at the head of the `prepareNextTurnWithContext` override (`:687-…`): if `shouldCompact(estimate, contextWindow, settings)` it runs `_runAutoCompaction("threshold", false)` and hands the loop the compacted messages. Added v0.84.4 (`56700d42e`, #8782); v0.87.0 estimates over the canonical session projection.
+**Impact**   — inside one long tool loop (many reads, a large grep) the context grows past the threshold and keeps growing until the provider rejects the request; cyrup then pays an overflow error plus the compact-and-retry recovery, where pi compacted quietly between turns. With `retry` exhausted or a provider that truncates instead of erroring, the run fails or degrades.
+**Fix**      — in `prepare_next_turn`, estimate the next request (the same `raw_context_messages` basis `check_compaction` uses) against the model window and `compaction_settings()`; over threshold, run `run_auto_compaction(Threshold, false)` and return the rebuilt context as the `TurnUpdate`'s messages. Area 02 owns the hook shape; `AGENT-038`'s `prepareRequest` is not needed for this.
+**Verify**   — a scripted run whose third tool result pushes the estimate over `contextWindow - reserveTokens` emits `compaction_start{reason:"threshold"}` before the fourth provider request, and that request carries the compacted context.
+
+## SEAM-127 — `sendMessage(…, {triggerTurn:false})` during a run drives another turn
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup-session-svc/src/session/control.rs:254-277`: `triggerTurn` is read with `unwrap_or(false)`, so an explicit `false` and an absent key are the same value; everything that is not an idle trigger-turn goes to `send_custom_message` (`session/inject.rs:59-110`), whose `is_run_active()` arm (`:90-93`) calls `agent.follow_up(msg)` for `deliverAs:"followUp"` and `agent.steer(msg)` otherwise. `send_custom_message` has no `trigger_turn` parameter at all.
+**upstream** — `core/agent-session.ts:1949-1966` @v0.87.1: the steer/follow-up arm is `this.isStreaming && options?.triggerTurn !== false` (v0.84.2, `47b5119d0`, #8022 "trigger turn false should not start turn"); a streaming `triggerTurn:false` message is pushed to `_pendingCustomMessages` and appended — persisted and emitted — by `_flushPendingCustomMessages` (`:1988`) after the current turn's tool results (on `turn_end`) or at settle (v0.84.4, `240eb29c4`), so it never sits between a tool call and its result and never starts a turn.
+**Impact**   — an extension that attaches context mid-run (a status note, a diagnostic) with `triggerTurn:false` makes cyrup run at least one more model turn — a steer is a new user-side message the loop answers — costing tokens and changing the conversation. With `deliverAs:"followUp"` it starts a whole extra run after the current one ends.
+**Fix**      — keep the raw `Option<bool>`; route `is_run_active() && trigger_turn == Some(false)` (and `deliverAs` set) to a pending-custom queue flushed in the `turn_end` subscriber and in `settle_run` before `emit_agent_settled`, persisting and emitting exactly like the idle append arm.
+**Verify**   — during a run, `sendMessage({customType:"x"}, {triggerTurn:false})` produces no extra provider request; the entry is persisted after the turn's last `toolResult`, and `message_start`/`message_end` for it are emitted then, not at the call.
+
+## SEAM-128 — Prompt images are not normalized in the session
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — images on a prompt are carried verbatim: `crates/cyrup-session-svc/src/session/run.rs:708` copies `input.images` into the user message; the RPC `prompt` arm builds `user_input(message, images)` straight from the wire (`crates/cyrup-modes/src/rpc/mod.rs:892-896`). The only resize is the CLI `@file` path, `crates/cyrup/src/input.rs:288-400` (`MAX_IMAGE_EDGE = 2000`, the 4.5 MB base64 cap), a fixed profile applied at startup.
+**upstream** — `core/agent-session.ts:1575-1590` @v0.87.1 `_normalizePromptImages`: every prompt image goes through `processImage` with `autoResizeImages` and the request model's `inputLimits.images.resize`; an image that fails becomes a text hint appended to the prompt (`:1716-1719`). `before_agent_start` now runs first so an extension-selected model decides the profile. `main.ts` passes `autoResizeImages:false` to `processFileArguments` because the session does it. Added v0.87.0 (`f5c946480`, #9631).
+**Impact**   — an RPC/SDK client or an extension sending a large screenshot gets a provider-side rejection (or pays for an oversized image) where pi resizes it; an undecodable image errors the request instead of becoming a hint. The `@file` path is already resized, but with a fixed profile rather than the model's.
+**Fix**      — move `input.rs`'s `process_image` into a shared crate, call it in `prepare` after the `before_agent_start` dispatch with the model's resize options (`CFG-085` supplies them), fold failures into hints; drop the startup resize in `input.rs` as pi did.
+**Verify**   — an RPC `prompt` carrying a 6 000 px PNG reaches the provider at ≤2 000 px; a corrupt PNG yields a prompt whose text ends with the processing hint and no image block.
+
+## SEAM-129 — A prompt submitted while `agent_settled` is being delivered is refused
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed by reading (a timing window; not reproduced)
+**cyrup**    — `settle_run` (`crates/cyrup-session-svc/src/session/run.rs:322-346`) calls `emit_agent_settled` (extension dispatch, then the fan-out) and only afterwards flips `driver_tx` to false. `prompt` (`:124-126`) returns `SessionServiceError::StreamingNeedsBehavior` whenever `is_run_active()`, which is `!is_idle()` = `driver_tx || agent.is_running()` (`session/mod.rs:473-495`). A listener that submits a prompt on `agent_settled` — the natural "run the next task when idle" pattern for an SDK host or an RPC client — can be refused.
+**upstream** — `_emitAgentSettled` (`core/agent-session.ts:582-588` @v0.83.0) sets `_isAgentRunActive = false` BEFORE emitting, so a prompt from a settled handler starts at once. v0.87.0 keeps that and adds `_isEmittingAgentSettled` (`:873`): `prompt()` (`:1606-1609`) and `sendMessage(…, {triggerTurn:true})` (`:1955-1958`) are pushed to `_deferredSettledActions` and run right after the emit, before the idle wait resolves.
+**Impact**   — a host driving a task queue off `agent_settled` intermittently gets an error instead of a new run, depending on how fast its handler runs relative to `settle_run`. Guest extensions are not affected today only because `EXT-087` blocks `sendUserMessage` from event handlers outright.
+**Fix**      — port v0.87.0's shape: a `emitting_settled` flag set around `emit_agent_settled`; `prompt`/trigger-turn submissions seen while it is set are queued and run after the emit, before `driver_tx` goes false.
+**Verify**   — a subscriber that calls `prompt("next")` on `AgentSettled` always starts a second run, and `wait_for_idle` returns only after it.
+
+## SEAM-130 — An in-memory fork branches before the outgoing run settles
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup-session-svc/src/runtime.rs:689-708` (non-persisted arm of `fork`): `branch_live_manager(leaf)` → `abort_and_settle()` → `take_manager()`. The comment states that pi "branches `this.session.sessionManager` in place and only THEN awaits `teardownCurrent` (agent-session-runtime.ts:333-341)" and chooses the same order so the dying run's appends land in the fork.
+**upstream** — `core/agent-session-runtime.ts:333-341` @v0.85.1 (unchanged at v0.87.1): `await this.teardownCurrent("fork", …)` now comes FIRST, then `newSession({parentSession: previousSessionFile})` / `createBranchedSession(targetLeafId)`. Commit `56c6fb33c` "settle active turn before in-memory fork" (#8937, fixes #8724), v0.85.0. The comment's description was true at v0.84.1.
+**Impact**   — forking an unsaved (`--no-session`) session mid-run carries the aborted turn's partial assistant message and tool results into the new branch after the fork point, which is the bug upstream fixed; the persisted paths are unaffected.
+**Fix**      — `abort_and_settle()` first, then `branch_live_manager(leaf)`, then `take_manager()`; correct the comment. The no-leaf arm already records `previous` as the parent.
+**Verify**   — in-memory session, fork at an earlier user message while a tool call is running: the forked session's entries end at the fork point, with no entry from the aborted turn.
+
+## SEAM-131 — Prompt-cache warming is not ported
+
+**Kind** upstream-drift · **Severity** low · **Effort** L · **Confidence** confirmed (both sides read 2026-09-24)
+**cyrup**    — nothing: `grep -rni 'cache_warm\|cachewarm' crates/` is empty. No warmer, no `usage` session entry type (area 03's `SESS-051`), no `cacheWarming` setting (`CFG-093`), no `cache_warming_decision` event (`EXT-085`).
+**upstream** — `core/cache-warmer.ts` @v0.87.1 (453 lines, read in full): after each session request `sdk.ts:383` starts a `CacheWarmer` run keyed on the request's model and message prefix; before the prompt-cache TTL (`model.promptCache[short|long]`, 90% of it, ≥10 s margin) it re-sends the identical request with `maxTokens:1, maxRetries:0` if expected savings (`p·missCost − warmCost`, p = 1 while streaming, 0.15 idle) are ≥ $0.05, persisting each warm as a `usage` entry (`appendUsage("cache_warm", …)`) and emitting `entry_appended`. Modes `off`/`streaming`/`idle` (default `streaming`), a 1 h streaming and 30 min idle safety limit, a refresh deadline, extension override via `cache_warming_decision`, `AgentSession.cacheWarmingStatus`/`setCacheWarmingMode` (`agent-session.ts:694-703`), and `formatCacheWarmingStatus` for `/session`. Budget-thinking Anthropic requests are never replayed (`isReplayable`). v0.86.0 (`c596d09d9`, #9668).
+**Impact**   — with pi's default (`streaming`), a tool call or subagent that outlasts the provider's cache TTL (5 min on Anthropic's short tier) costs pi one cheap warm and cyrup a full cache re-write of the whole prompt on the next turn. Cost only; no wrong output.
+**Fix**      — a `CacheWarmer` in `cyrup-session-svc` fed from the stream seam (`sdk.ts:370-385` is the reference: only session requests, not compaction/summaries), gated on `CFG-093` and on `CFG-085`'s `promptCache`; the `usage` entry (`SESS-051`), the decision event (`EXT-085`) and the `/session` line (area 07) follow.
+**Verify**   — with a model whose `promptCache.short` is 300 s and a tool that sleeps 290 s, one `usage` entry with `source:"cache_warm"` appears before the next real request, and none with `cacheWarming:"off"`.
+
+## SEAM-133 — The CLI `@file` image sniffer is looser than pi's, and `@file` text keeps its BOM
+
+**Kind** parity-bug (the sniffer, present at the ported v0.83.0) + upstream-drift (the BOM, v0.84.3) · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read 2026-09-24; not run)
+**cyrup**    — `crates/cyrup/src/input.rs:158-172` `detect_image_mime`, used for every `@file` at `:490`: PNG by the 8-byte signature alone, JPEG by `FF D8 FF` alone, BMP by the two bytes `BM` alone. Pinned by `:757-765`, which has no negative case beyond `plain text`. A text `@file` is read without stripping a UTF-8 BOM. `crates/cyrup-tools` already carries the faithful sniffer (`ImageMime::from_magic_unbounded`, `ops/mod.rs`), so the workspace has two that disagree.
+**upstream** — `packages/coding-agent/src/utils/mime.ts` @v0.87.1 (same checks at v0.83.0): JPEG returns `null` when `buffer[3] === 0xf7`; PNG requires `isPng` (IHDR chunk) and `!isAnimatedPng`; BMP requires `isBmp(buffer)`; the sniff reads the first 4 100 bytes. `cli/file-processor.ts:49` uses it, and `:77` reads text through `stripBom` (v0.84.3). A `null` sniff means the file is inlined as TEXT.
+**Impact**   — an `@notes.txt` whose content begins `BMW …` or `BMI …` is treated as a bitmap: decoding fails and the model gets a processing-failure hint instead of the file's text; an animated PNG is sent as an image pi would not send. A BOM'd text file reaches the model with a stray U+FEFF.
+**Fix**      — delete `detect_image_mime` and call `cyrup_tools`' `ImageMime` sniffer over the first 4 100 bytes (keeping `TOOL-048`'s GIF fix in the one copy); strip a leading BOM from `@file` text. Natural to do together with `SEAM-128`, which moves this module's image processing into the session.
+**Verify**   — `@f.txt` containing `BMW service log` inlines as text; a 1-frame APNG and a JPEG with `FF D8 FF F7` inline as text; a BOM'd text file inlines without U+FEFF.
 
 ## SEAM-047 — First SIGTERM/SIGHUP neither tears down nor exits 143/129; `--mode rpc` keeps running forever and never emits session_shutdown
 

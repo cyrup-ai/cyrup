@@ -32,6 +32,22 @@ WHAT IT PARSES
     against a later `pi-subagents` tag than the one cyrup ported — recorded
     here so the classification is not re-derived by hand next time.
 
+    Area 09b (`09b-cyrup-ext-subagents-v0.64-drift.md`, pi-subagents
+    v0.57.0..v0.71.0) uses the standard `## Open items` table and is read
+    as a standard area.
+
+    Areas 16 (`16-cyrup-herdr.md`) and 17 (`17-pi-harness-and-durable.md`)
+    use the standard table too. Area 16 is NOT a port: `cyrup-herdr` is
+    cyrup's own client of herdr's socket API, so its `client-bug` /
+    `protocol-drift` kinds are client conformance and are folded into Port
+    bug / Version lag (see KIND_TO_CLASS). Areas 13 and 15 stay outside this
+    census by README's standing rule; their own files count them.
+
+DUPLICATES
+    A row whose `Dedup` column reads `duplicate-of: <ID>` is dropped from
+    every open tally when <ID> is an open counted row elsewhere, and is
+    listed under "Duplicates not counted". See tally().
+
 CLOSED-ROW DETECTION
     A row counts as CLOSED if its Severity cell contains a struck span
     (`~~...~~`) — this is the one reliable signal: some rows strike only
@@ -81,10 +97,19 @@ STANDARD_AREAS = [
     ("07", "07-cyrup-tui.md"),
     ("08", "08-cyrup-session-svc-and-modes.md"),
     ("09", "09-cyrup-ext-subagents.md"),
+    ("09b", "09b-cyrup-ext-subagents-v0.64-drift.md"),
     ("10", "10-cyrup-permission-system.md"),
     ("11", "11-cyrup-intercom.md"),
     ("12", "12-upstream-drift-pi-core.md"),
     ("14", "14-cyrup-flux.md"),
+    # 16 is NOT a port: cyrup-herdr is cyrup's own client of herdr's socket
+    # API (https://github.com/herdrdev/herdr). Its rows measure client
+    # conformance against a herdr release; see KIND_TO_CLASS below for how its
+    # client-side kinds map onto the census classes.
+    ("16", "16-cyrup-herdr.md"),
+    # 17 records pi's experimental harness (pico3) and packages/durable, which
+    # pi ships to no user; at the time of writing every row is a tracker.
+    ("17", "17-pi-harness-and-durable.md"),
 ]
 AREA_09A = ("09a", "09a-cyrup-ext-subagents-v0.57-drift.md")
 
@@ -100,6 +125,18 @@ KIND_TO_CLASS = {
     "test-defect": "Test defect",
     "cyrup-original": "Invented surface",
     "tooling": "Tooling",
+    # Area 16 (cyrup-herdr) is a CLIENT of herdr, not a port of it, so its
+    # kinds describe conformance to herdr's socket API rather than parity
+    # with a ported upstream. They are folded into the two census classes
+    # whose meaning matches, and the folding is stated here so nobody reads
+    # a herdr row as a port gap:
+    #   client-bug     -- cyrup's client disagrees with the herdr release it
+    #                     targets, in code cyrup wrote: counted as Port bug.
+    #   protocol-drift -- herdr changed its API after the release the client
+    #                     targets, and the client has not followed: counted
+    #                     as Version lag.
+    "client-bug": "Port bug",
+    "protocol-drift": "Version lag",
 }
 
 # A handful of rows carry a Kind cell that is not one of the seven-value
@@ -262,6 +299,7 @@ def parse_standard_area(path):
     sev_idx = header_cells.index("severity")
     kind_idx = header_cells.index("kind") if "kind" in header_cells else None
     title_idx = header_cells.index("title") if "title" in header_cells else None
+    dedup_idx = header_cells.index("dedup") if "dedup" in header_cells else None
 
     parsed = []
     for lineno, cells in rows:
@@ -290,6 +328,11 @@ def parse_standard_area(path):
         kind = None
         if kind_idx is not None and len(cells) > kind_idx:
             kind = cells[kind_idx].strip().lower()
+        dup_of = None
+        if dedup_idx is not None and len(cells) > dedup_idx:
+            m = re.search(r"duplicate-of:\s*`?([A-Z]+-[A-Za-z0-9.]+)`?", cells[dedup_idx])
+            if m:
+                dup_of = m.group(1)
         parsed.append(
             {
                 "id": item_id,
@@ -298,6 +341,7 @@ def parse_standard_area(path):
                 "severity": sev_token,
                 "kind": kind,
                 "raw_severity_cell": raw_sev_cell,
+                "duplicate_of": dup_of,
             }
         )
     return parsed
@@ -392,14 +436,29 @@ def parse_09a(path):
 
 
 def tally(all_items):
+    # DUPLICATES: a row whose Dedup column (area 12's) reads
+    # `duplicate-of: <ID>` is not counted when <ID> is itself an OPEN,
+    # counted row in some area this script reads -- the canonical row
+    # already carries the work, and counting both books one fix twice
+    # (DRIFT-056 -> EXT-077 is the case that prompted this). When the named
+    # id is closed, a tracker, or outside the counted set (e.g. a
+    # PARITY-GAPS `VL-P*` entry), the row keeps counting: nothing else
+    # carries its work.
+    open_ids = set()
+    for items in all_items.values():
+        for it in items:
+            if not it["closed"] and it["severity"] in SEVERITIES:
+                open_ids.add(it["id"])
     per_area = {}
     class_totals = {}
     unclassified = {}
     above_medium = []
+    duplicates = []
 
     for area_id, items in all_items.items():
         counts = {"open": 0, "critical": 0, "high": 0, "medium": 0, "low": 0,
-                  "trackers": 0, "closed": 0, "excluded_other": 0, "unclassified_sev": 0}
+                  "trackers": 0, "closed": 0, "excluded_other": 0, "unclassified_sev": 0,
+                  "duplicates": 0}
         for it in items:
             sev = it["severity"]
             if sev == "tracker":
@@ -414,6 +473,11 @@ def tally(all_items):
             if sev is None:
                 counts["unclassified_sev"] += 1
                 continue
+            dup = it.get("duplicate_of")
+            if dup and dup != it["id"] and dup in open_ids:
+                counts["duplicates"] += 1
+                duplicates.append((area_id, it["id"], dup))
+                continue
             counts["open"] += 1
             counts[sev] += 1
             if sev in ("critical", "high"):
@@ -427,7 +491,7 @@ def tally(all_items):
                 class_totals[cls] = class_totals.get(cls, 0) + 1
         per_area[area_id] = counts
 
-    return per_area, class_totals, unclassified, above_medium
+    return per_area, class_totals, unclassified, above_medium, duplicates
 
 
 def main():
@@ -444,7 +508,7 @@ def main():
     path_09a = os.path.join(args.dir, AREA_09A[1])
     all_items["09a"] = parse_09a(path_09a)
 
-    per_area, class_totals, unclassified, above_medium = tally(all_items)
+    per_area, class_totals, unclassified, above_medium, duplicates = tally(all_items)
 
     if args.json:
         print(json.dumps({
@@ -452,18 +516,29 @@ def main():
             "class_totals": class_totals,
             "unclassified": unclassified,
             "above_medium": above_medium,
+            "duplicates": duplicates,
         }, indent=2, sort_keys=True))
         return
 
     order = [a for a, _ in STANDARD_AREAS] + ["09a"]
-    total = {"open": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "trackers": 0, "closed": 0}
-    print(f"{'area':<5}{'open':>6}{'crit':>6}{'high':>6}{'med':>6}{'low':>6}{'trackers':>10}{'closed':>8}")
+    total = {"open": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "trackers": 0, "closed": 0,
+             "duplicates": 0}
+    print(f"{'area':<5}{'open':>6}{'crit':>6}{'high':>6}{'med':>6}{'low':>6}{'trackers':>10}{'closed':>8}{'dups':>6}")
     for a in order:
         c = per_area[a]
-        print(f"{a:<5}{c['open']:>6}{c['critical']:>6}{c['high']:>6}{c['medium']:>6}{c['low']:>6}{c['trackers']:>10}{c['closed']:>8}")
+        print(f"{a:<5}{c['open']:>6}{c['critical']:>6}{c['high']:>6}{c['medium']:>6}{c['low']:>6}{c['trackers']:>10}{c['closed']:>8}{c['duplicates']:>6}")
         for k in total:
             total[k] += c[k]
-    print(f"{'TOTAL':<5}{total['open']:>6}{total['critical']:>6}{total['high']:>6}{total['medium']:>6}{total['low']:>6}{total['trackers']:>10}{total['closed']:>8}")
+    print(f"{'TOTAL':<5}{total['open']:>6}{total['critical']:>6}{total['high']:>6}{total['medium']:>6}{total['low']:>6}{total['trackers']:>10}{total['closed']:>8}{total['duplicates']:>6}")
+    print("(areas 13 and 15 are counted in their own files by the standing rule; area 16 is a")
+    print(" client of herdr, not a port -- its client-bug/protocol-drift kinds fold into Port bug /")
+    print(" Version lag as documented in KIND_TO_CLASS)")
+
+    if duplicates:
+        print()
+        print("Duplicates not counted (row -> canonical open row):")
+        for area_id, iid, canon in duplicates:
+            print(f"  {area_id} {iid} -> {canon}")
 
     print()
     print("Gap class (open, non-tracker rows only):")

@@ -2,6 +2,45 @@
 
 ---
 
+## Above medium — every open item, ranked (2026-09-24, second pass, cyrup `ea23ca2`)
+
+**This is the current §0a.** Everything under the `⚠` notes below is older and is kept for its
+per-entry fix sketches only. Every id and status here was re-checked against its own area file's
+`## Open items` row. The count comes from `python3 scripts/count_open_items.py`; re-run it rather than
+copying figures. Nothing here was observed at runtime.
+
+| rank | ID | Sev | Area | Gap class (Kind) | Effort | Gap |
+|---|---|---|---|---|---|---|
+| 1 | `SESS-056` | **critical** | 03 | Version lag (`upstream-drift`) | S | If a session file's last line has no newline, the next entry is glued onto it and lost, and later entries lose their parent chain (pi v0.84.4 repairs the tail) |
+| 2 | `SEAM-122` | **critical** | 08 | Version lag (`upstream-drift`) | S | Importing a session whose file name already exists overwrites the stored session (pi v0.85.0: unique name, `COPYFILE_EXCL`) |
+| 3 | `ICOM-068` | **high** | 11 | Port bug (`parity-bug`) | M | An intercom message delivered without a turn is saved and drawn but never reaches the model's transcript. The code is area 08's |
+| 4 | `ICOM-035` | **high** | 11 | Port bug (`parity-bug`) | M | **Reopened, a regression from `8de7460`:** a peer message to a busy session waits for idle instead of steering |
+| 5 | `ICOM-062` | **high** | 11 | Version lag (`upstream-drift`) | M | A peer message during `/compact` starts a run whose transcript `compact` then replaces (needs `SEAM-125`) |
+| 6 | `TUI-104` | **high** | 07 | Version lag (`upstream-drift`) | S | `/tree` during a compaction leaves the compaction's kept range on the abandoned branch, so history drops out of context. Session half `SEAM-124` is rated medium; settle the rating when the pair is fixed together |
+| 7 | `TOOL-047` | **high** | 04 | Version lag (`upstream-drift`) | S | A shell command killed by a signal is reported as a success (pi v0.86.0: `128 + signo`, failure) |
+| 8 | `SUBA-115` | **high** | 09b | Version lag (`upstream-drift`) | S | Stop/interrupt/timeout of a nested run also hits sibling subtrees it never launched (v0.68.0) |
+| 9 | `SUBA-114` | **high** | 09b | Reverse lag (`stale-port`) | M | Child tools are cut to the parent session's start-up tools, so reviewer/scout launches are refused under a narrow `--tools` (removed upstream at v0.70.0) |
+| 10 | `SUBA-110` | **high** | 09b | Version lag (`upstream-drift`) | S | `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_CONFIG_*` reach the background runner and allowlist-less external CLIs (v0.71.0) |
+
+**Not in this table by the standing rule**, which keeps areas 13 and 15 out of this file: area 13
+has critical `MCP-500` and, among its highs, three filed on 2026-09-24 that a user would feel first:
+`MCP-553` (`inheritEnv:false` ignored), `MCP-576` (a rotating `!command` bearer token is never
+re-resolved) and `MCP-585` (an Agent Plugin header's `!command` is run through the shell).
+`13-cyrup-mcp-STATUS.md` is the authority for the full list. Area 15 has nothing above medium. Area 16
+(herdr) is counted here but is **not a port**: `crates/cyrup-herdr` is cyrup's own client of herdr's
+socket API (<https://github.com/herdrdev/herdr>). Its highest row is `HERDR-001` (medium).
+
+**Folded in from the 2026-09-24 second pass** (medium and below; bodies in the area files):
+`PROV-083`…`100`, `DRIFT-058`/`059`, `AGENT-042`…`044`, `SESS-057`…`063`, `EXT-081`…`087`,
+`TOOL-051`, `CFG-086`…`093`, `SEAM-123`…`131`, `SEAM-133`, `TUI-105`…`122`, `SUBA-116`…`143`,
+`ICOM-069`/`070`, `HERDR-001`…`003`; trackers `EXT-088`, `SEAM-132`, `TUI-118`, `SUBA-142`, `HARN-001`,
+`HARN-002`. **Duplicate:** `DRIFT-056` is `EXT-077` (area 06 is canonical); the script no longer
+counts it twice. **Struck or narrowed:** `CFG-067`'s `LLM_INTENT_ARBITER` limb (upstream removed the
+variable) and three of `CFG-074`'s nine variables (renames of real upstream variables). No counted
+row closed outright. `ICOM-035` reopened.
+
+---
+
 ## ⚠ 2026-09-16 — the SCOPE sequence (#137 / #139 / #140) landed; §0, §1b and §2 are reconciled against it, and the rest of this file is NOT
 
 **Why this note exists.** Three PRs merged after the twelfth-edition census was written —
@@ -210,6 +249,66 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 ---
 
 ## 0. Census — every open item in the fourteen area files, by class
+
+> **FOURTEENTH EDITION 2026-09-24 (second pass), cyrup code `ea23ca2`.** The script changed: it now
+> reads areas `16` (the herdr **client**; its `client-bug`/`protocol-drift` kinds fold into Port
+> bug/Version lag, which the script documents) and `17` (pi harness/durable, trackers only), and it
+> drops a row whose `Dedup` cell names an open canonical row (`DRIFT-056` → `EXT-077`). Its output,
+> verbatim:
+>
+> ```text
+> area   open  crit  high   med   low  trackers  closed  dups
+> 01       33     0     0    17    16         0      57     0
+> 02       10     0     0     0    10         1      28     0
+> 03       16     1     0     4    11         1      32     0
+> 04        6     0     1     2     3         0      34     0
+> 05       24     0     0     6    18         0      56     0
+> 06       21     0     0     5    16         1      63     0
+> 07       45     0     1     2    42         1      86     0
+> 08       17     1     0     7     9         0      72     0
+> 09        2     0     0     0     2         0      51     0
+> 09b      35     0     3    14    18         2       0     0
+> 10        1     0     0     0     1         1      22     0
+> 11       13     0     3     0    10         0      50     0
+> 12        6     0     0     1     5         3      32     1
+> 14        1     0     0     0     1         0       6     0
+> 16        3     0     0     1     2         0       0     0
+> 17        0     0     0     0     0         2       0     0
+> 09a       1     0     0     0     1         0      31     0
+> TOTAL   234     2     8    59   165        12     620     1
+> (areas 13 and 15 are counted in their own files by the standing rule; area 16 is a
+>  client of herdr, not a port -- its client-bug/protocol-drift kinds fold into Port bug /
+>  Version lag as documented in KIND_TO_CLASS)
+>
+> Duplicates not counted (row -> canonical open row):
+>   12 DRIFT-056 -> EXT-077
+>
+> Gap class (open, non-tracker rows only):
+>   Port bug               60
+>   Version lag           147
+>   Reverse lag             6
+>   Test defect             0
+>   Invented surface       17
+>   Tooling                 3
+>   TOTAL                 233
+>
+> UNCLASSIFIED kind values (need a manual look / a KIND_TO_CLASS entry):
+>   10 PERM-032: kind='*unclassified — lead*'
+>
+> Above-medium open rows (10):
+>   03   SESS-056     critical  kind=upstream-drift
+>   08   SEAM-122     critical  kind=upstream-drift
+>   04   TOOL-047     high      kind=upstream-drift
+>   07   TUI-104      high      kind=upstream-drift
+>   09b  SUBA-110     high      kind=upstream-drift
+>   09b  SUBA-114     high      kind=stale-port
+>   09b  SUBA-115     high      kind=upstream-drift
+>   11   ICOM-035     high      kind=parity-bug
+>   11   ICOM-062     high      kind=upstream-drift
+>   11   ICOM-068     high      kind=parity-bug
+> ```
+>
+> The thirteenth edition below is superseded.
 
 > **THIRTEENTH EDITION 2026-09-16, cyrup code HEAD `cc7818b` — the same script, unchanged, re-run
 > after the SCOPE sequence (#137/#139/#140, +45 072 lines under `crates/`). This is the first
@@ -880,6 +979,31 @@ Where the re-audit moved an item to a different class, the id moves section and 
 ---
 
 ## 0a. Everything above medium, in one table
+
+> **ELEVENTH EDITION 2026-09-24 (second pass), same code — ten rows: 2 critical, 8 high.** The
+> ranked table is at the top of this file (*Above medium — every open item, ranked*), so it is read
+> first. The tenth edition's three rows are all still open and are ranks 2, 7 and 10 there.
+>
+> Every block below this one is superseded.
+
+> **TENTH EDITION 2026-09-24, cyrup code HEAD `ea23ca2`, upstreams re-pulled (pi v0.87.1,
+> pi-subagents v0.71.0, pi-intercom v0.14.0, pi-mcp-adapter v2.37.0). The set is no longer empty.**
+> `python3 docs/gap-analysis/scripts/count_open_items.py` prints `Above-medium open rows (3)`, all
+> filed by this re-measure against new upstream tags, none against landed cyrup code:
+>
+> | ID | Sev | Area | Kind | Effort | Gap |
+> |---|---|---|---|---|---|
+> | `SEAM-122` | **critical** | 08 | upstream-drift | S | Importing a session whose file name already exists in the session dir overwrites the stored session (pi v0.85.0 renames the copy, `COPYFILE_EXCL`) |
+> | `TOOL-047` | **high** | 04 | upstream-drift | S | A shell command killed by a signal is reported as a success (pi v0.86.0: `128 + signo`, failure) |
+> | `SUBA-110` | **high** | 09b | upstream-drift | S | Git routing variables (`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, …) reach the background runner and allowlist-less external CLIs (pi-subagents v0.71.0) |
+>
+> Not in this table by the standing counting rule: `MCP-540` (high, area 13) — transport switch in a
+> layered config keeps the old transport's fields. Area 15 closed five criticals and five highs this
+> pass (`ACP-121`, `145`, `209`, `219`, `291`; `ACP-005`, `056`, `122`, `140`, `221`); none was in
+> this table. The caveats of the ninth edition below still apply: severity is a per-row judgement,
+> and whatever is open is a floor.
+>
+> Every block below this one is superseded.
 
 > **NINTH EDITION 2026-09-05 (batch 4), cyrup code HEAD `f2630a7a` — THE SET IS STILL EMPTY, for the
 > second consecutive edition. This section remains a statement, not a table.**
@@ -2369,7 +2493,7 @@ commits are accounted for commit-by-commit in area 11. The 13 items are `ICOM-03
 - **medium** — `ICOM-035` (busy inbound **parked until idle instead of steered**; upstream deleted the
   entire park branch at v0.9.3 — this one also keeps `ICOM-023`/`ICOM-032` alive, and its fix does
   **not** need a `HostServices` change: `AgentSession::inject_message` already routes to `agent.steer`
-  when `is_streaming()` at `session.rs:3752-3754`), `ICOM-036` (reply targeting by sender-ID prefix +
+  when `is_streaming()` at `session.rs:3752-3754` — **no longer true: `ICOM-035` was REOPENED at high on 2026-09-24, because `8de7460`'s injection pump waits for idle; see the ranked table at the top of this file**), `ICOM-036` (reply targeting by sender-ID prefix +
   four disambiguation errors; upstream **replaced** the function `ICOM-001` closed against, at
   v0.9.3), `ICOM-037` (a `send` to the sole pending asker is not treated as its reply), `ICOM-038`
   (no client liveness heartbeat — a half-open broker socket strands a session invisibly), `ICOM-039`

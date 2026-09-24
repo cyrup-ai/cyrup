@@ -2,6 +2,23 @@
 
 This area covers `crates/cyrup-intercom` — the Unix-socket supervisor↔subagent broker, its client transport, inbound-message delivery, presence/lifecycle reporting, the `intercom` / `contact_supervisor` tool surface, and the broker binary.
 
+> ### PIN 2026-09-24 — cyrup `ea23ca2` × pi-intercom **v0.14.0** (`6c15527`, 2026-09-23)
+>
+> **This is the file's current pin; every older pin below is history.** The three rows open at
+> `cc7818b` were re-read at `ea23ca2` on both sides and all three stay open; the new upstream window
+> `v0.13.0..v0.14.0` was censused and **six `upstream-drift` rows filed (`ICOM-062`…`ICOM-067`)**.
+> Details, the census, and what stays unread are in the `RE-MEASURE 2026-09-24` block at the head of
+> `## Open items`. **Window still not walked by any surface-driven sweep: `v0.10.1..v0.14.0`** —
+> `v0.10.1..v0.13.0` was covered by commit-by-commit skim plus targeted item reads, and
+> `v0.13.0..v0.14.0` by a full read of the non-test, non-lockfile diff, but no pass has enumerated
+> upstream's exports/events/config keys at `v0.14.0` against cyrup consumers.
+>
+> **Superseded the same day by the SURFACE SWEEP 2026-09-24 block under `## Open items`**: the
+> `v0.10.1..v0.14.0` window is now read in full (every src diff, SKILL.md, README.md, all new tests)
+> and no upstream window stays unread. That pass **reopened `ICOM-035`** (regression, high), filed
+> `ICOM-068`…`ICOM-070`, promoted the receipt-ordering lead to `ICOM-069`, and settled `ICOM-062`
+> (confirmed, re-rated high).
+
 > ### RE-BASELINE 2026-08-27 — verified against cyrup HEAD `9962e0f`, tree clean
 >
 > **This file contradicted itself in four places.** Its header said **44 open**, `:63` said **14**,
@@ -37,7 +54,7 @@ This area covers `crates/cyrup-intercom` — the Unix-socket supervisor↔subage
 > | ICOM-024 | medium | Blocked two-deep, as sweep 9 recorded: the seam `render_call(&self, _key, _call)` (`cyrup-ext/src/native.rs:617`) carries no `options`/`theme`, **and** ICOM-029's `details` is still absent. Note the renderers themselves exist and are wired (`cyrup-intercom/src/tools/render.rs` × 4, dispatched at `extension.rs:700-711`) — the gap is the seam, not the renderer. |
 > | ICOM-029 | medium | `cyrup-ext/src/host/services.rs:437` `inject_message` takes four parameters (`_content`, `_custom_type`, `_display`, `_trigger_turn`) — no `details`. **Citation drift corrected: the row said `:417`.** |
 > | ICOM-042 | medium · partial | The cwd half **is** ported — `cwd.rs` (`normalize_cwd`, `same_cwd`, `resolve_path`) and `project_target.rs` (`resolve_target_in_cwd`, `format_session_refs`). `openProjectPaneIfMissing` appears in comments only; that half stays unported. |
-> | ICOM-052 | low · partial | The SUN_LEN **diagnostic** is present — `broker/lifecycle.rs` names the endpoint and its byte length on bind failure. The **guard** is deliberately absent, recorded there as a CYRUP-DELTA because upstream has none either. |
+> | ICOM-052 | low · partial | The SUN_LEN **diagnostic** is present — `broker/lifecycle.rs` names the endpoint and its byte length on bind failure. The **guard** is deliberately absent, recorded there as a CYRUP-DELTA because upstream has none either. — **RE-READ 2026-09-24 at `ea23ca2` — STILL OPEN at low.** cyrup: `transport/target.rs:228-230` `unix_socket_path` is still `intercom_dir.join("broker.sock")`, no length check or fallback; the only `sun_path` hit is still the diagnostic comment at `broker/lifecycle.rs:141-142`. `crates/cyrup-intercom` changed in this window only in `project_pane.rs`/`Cargo.toml` (`dc52eeb`), neither on this path. Upstream re-measured at **v0.14.0**: `getBrokerSocketPath` (`broker/paths.ts:65-74`) still has no length guard, so `cyrup-original` (shared gap) holds at the new tag. |
 > | ICOM-053 | medium | Confirmed unchanged, and now measured: `cyrup-it` is `required-features = ["it"]`, there is **no `.github/` in this repo**, and `xtask` does not invoke the suite. The 79 tests above execute only when a human types `--features it`. This is the largest live risk in the area — 6,777 lines of integration proof that nothing runs by default. |
 >
 > ### The baseline itself is measured against the wrong upstream version
@@ -380,6 +397,136 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 > 2026-09-14 re-audit read. Every citation below was still re-opened at `cc7818b`.
 
 
+> ### RE-MEASURE 2026-09-24 — cyrup `ea23ca2`, pi-intercom **v0.14.0** (new tag; was v0.13.0)
+>
+> **Upstream moved.** `git -C tmp/pi-intercom tag --sort=-v:refname | head -1` → **v0.14.0**
+> (`6c15527`, 2026-09-23); `describe --tags` → `v0.14.0` exactly, nothing past the tag. The window
+> `v0.13.0..v0.14.0` is **7 non-merge commits, 20 files, +4 451 / −2 677** — of which
+> `package-lock.json` is 5 082 lines of churn and four test files (`cli.test.ts`,
+> `herdr-location.test.ts`, `human-priority.pi.test.ts`, `intercom.integration.test.ts`) are ~1 240
+> added lines. The shipping delta is `index.ts` (+175), `cli.ts` (+256, new), `herdr-location.ts`
+> (+137, new), `broker/protocol.ts` (+33), `broker/broker.ts` (+27), `types.ts` (+26),
+> `extension-api.ts` (+14), `config.ts` (+12), `ui/session-list.ts` (+12), `project-agent.ts` (one
+> `export`), `skills/pi-intercom/SKILL.md` (+7/−2) and `README.md` (+52/−7).
+>
+> **cyrup moved too, but not under any open row.** `git diff --stat 9aeba769..ea23ca2 --
+> crates/cyrup-intercom` = `Cargo.toml` (+6) and `project_pane.rs` (+346/−253), both from `dc52eeb`
+> (2026-09-21, "herdr fully works"): the `ICOM-042` launcher now sits on the new `cyrup-herdr` crate
+> (`project_pane.rs:316` `HerdrLauncher`, `impl ProjectPaneLauncher` at `:502`, `cyrup_herdr::cli`
+> imports at `:24-32`). `ICOM-042` stays closed; its launcher was re-read, not re-tested.
+>
+> **Re-verified at `ea23ca2` — all three prior open rows stay open (details in each row):**
+> `ICOM-052` (no socket-length guard — still none on either side at v0.14.0), `ICOM-057` (no
+> persisted pending-ask record), `ICOM-061` (no `/alias`). **Closed this pass: none.**
+>
+> **Census of `v0.13.0..v0.14.0` — every commit read with `git -C tmp/pi-intercom diff
+> v0.13.0..v0.14.0 -- <file>`; cyrup grepped for each surface at `ea23ca2`:**
+>
+> | upstream commit | what it adds | cyrup at `ea23ca2` | disposition |
+> |---|---|---|---|
+> | `17699ba` (#136) | hold inbound messages that arrive while busy **without** an agent run (compaction) | `decide_inbound_policy` (`inbound.rs:104-123`) reads `is_idle`/`has_ui` only; `agent_running` (`session_state.rs:136`) is tracked for status, never consulted | **filed `ICOM-062`** |
+> | `0ce2dcd` (#128) | opt-in `busyDelivery: "human-first"` + the held-inbound queue and its receipts | 0 hits for `busy_delivery`/`human-first`/held queue | **filed `ICOM-063`** |
+> | `eae462a` (#135) | `intercom:session-identity` claim event | 0 hits | **filed `ICOM-064`** |
+> | `0ffe1d5` (#129) | Herdr workspace/tab/pane location in `list` | 0 hits for `herdr_pane_id`/`herdr_location`; `cyrup-herdr` has the pane-id env but no snapshot join | **filed `ICOM-065`** |
+> | `a0cc5a1` (#127) | collapsed one-line `list` rendering via `details.roster` | 0 hits for `roster` in tool results | **filed `ICOM-066`** |
+> | `41dc8f6` (#131) | `cli.ts` scripting client (`list`/`send`/`ask`) | only the hidden `__intercom-broker` subcommand exists | **filed `ICOM-067`** |
+> | `17699ba` (#136), second half | `"injected"` receipt now emitted **after** `pi.sendMessage` rather than before (`index.ts` `sendIncomingMessage`) | cyrup emits it before `inject_message` (`inbound.rs:231`, `:281`) | ~~lead, not filed~~ **PROMOTED 2026-09-24 (surface sweep) → `ICOM-069`**: a consumer does observe it — the sender's `latestDeliveryState`, quoted in the ask-timeout text |
+> | `a0beb6a` (#137), `6c15527` | dev-dependency bump, release prep | — | nothing to port |
+>
+> **Not read this pass, so not claimed clean:** the four new test files beyond the compaction test
+> names; `skills/pi-intercom/SKILL.md`'s v0.14.0 edits vs cyrup's ported copy
+> (`crates/cyrup-intercom/resources/skills/pi-intercom/SKILL.md`); `README.md`. `cli.ts` was read to
+> its registration/exit-code contract only. Nothing was executed (no cargo run this pass).
+>
+> **Counted set after this pass: 0 critical · 0 high · 1 medium · 8 low = 9 open** (3 carried +
+> 6 filed), hand-counted from the table — `scripts/count_open_items.py` was not run.
+
+> ### SURFACE SWEEP 2026-09-24 (second pass) — cyrup `ea23ca2`, pi-intercom `v0.10.1..v0.14.0`, read in full
+>
+> **What was read.** Upstream, every file in `git -C tmp/pi-intercom diff --stat v0.10.1..v0.14.0`
+> except `package-lock.json`/`package.json`/`CHANGELOG.md` (read for claims only): `index.ts`
+> (the `v0.13.0..v0.14.0` hunks line by line, the `v0.10.1..v0.13.0` hunks walked for surfaces not
+> owned by `ICOM-054`…`061`), `broker/{broker,client,protocol,spawn}.ts`, `config.ts`,
+> `extension-api.ts`, `types.ts`, `reply-tracker.ts`, `project-agent.ts`, `herdr-location.ts`,
+> `cli.ts` (**now in full**, not only its flags), `ui/{inline-message,session-list}.ts`,
+> `skills/pi-intercom/SKILL.md`, `README.md`, and the test names plus pinned assertions of
+> `intercom.integration.test.ts`, `human-priority.pi.test.ts`, `herdr-location.test.ts`,
+> `cli.test.ts`, `config.test.ts`, `reply-tracker.test.ts`, `broker/{extension,spawn}.test.ts`.
+> A surface census at both tags (every `pi.on`, `pi.events.on/emit`, `registerCommand`,
+> `registerShortcut`, `registerTool`, `registerMessageRenderer`, `process.env.*`, tool-schema
+> field) found exactly five new surfaces — outbox request/result (`ICOM-056`, closed), the
+> session-identity claim (`ICOM-064`), `HERDR_PANE_ID` (`ICOM-065`), `TMUX_PANE` (`ICOM-058`,
+> closed), `/alias` (`ICOM-061`) — and no tool-schema change. cyrup, for each: the consuming code
+> named in the rows below, **and the delivery path end to end through `cyrup-session-svc`**
+> (`HostServices::inject_message` → `enqueue_injection` → the session's injection pump
+> `drive_injections` → `deliver_injection_inbox` / `run_injection` / `append_injected_message_durably`,
+> plus `AgentSession::{is_idle, compact}` and `Agent::set_messages`), because `ICOM-062` could not
+> be settled without it.
+>
+> **The headline is a regression, not drift.** Reading the path end to end showed that the
+> premise `ICOM-035` was closed on — *"`AgentSession::inject_message` routes to `agent.steer(msg)`
+> whenever `is_streaming()`"* — has been false since `8de7460` (2026-09-08) replaced that routing with
+> a single-consumer injection pump that **waits for idle before it delivers anything**. A peer
+> message to a busy interactive session is therefore not steered: it waits out the run and is then
+> appended with no turn. **`ICOM-035` is REOPENED at high.** And the durable append it falls into
+> never reaches the agent's in-memory transcript (`ICOM-068`, high), so in this process the model
+> does not see it at all. Both are invisible to this crate's tests, which assert against a
+> `HostServices` double that records `inject_message` calls and never runs the pump
+> (`cyrup-it/tests/intercom/dismiss_incoming_ask.rs` `IdleControlledHost`) — README blind spot 4's
+> *delivered-but-never-rendered* shape.
+>
+> | disposition | id | one line |
+> |---|---|---|
+> | **REOPENED** | `ICOM-035` | busy inbound is parked until idle, not steered — regression from `8de7460`'s pump; re-rated **high** |
+> | **settled** | `ICOM-062` | confirmed on both sides; cyrup's consequence is worse than upstream's (a concurrent run races manual compaction) — re-rated **high**, confidence confirmed |
+> | **filed** | `ICOM-068` | high · parity-bug — a no-turn injected intercom message is persisted and drawn but never enters the agent transcript |
+> | **filed (lead promoted)** | `ICOM-069` | low · upstream-drift — `"injected"` receipt emitted before injection, and on a failed enqueue |
+> | **filed** | `ICOM-070` | low · parity-bug — both tool `description`s are cyrup one-liners, not upstream's text |
+> | **amended** | `ICOM-063` | an invalid `busyDelivery` fails the whole config closed upstream; `human-priority.pi.test.ts`'s seven pinned behaviours added to Verify |
+> | **amended** | `ICOM-065` | Fix corrected: herdr is consumed through `cyrup-herdr`'s client (not ported), and the session-path join key needs cyrup to call `report_agent_session`, which nothing does today |
+> | **amended** | `ICOM-067` | `cli.ts` now read in full; confidence raised to confirmed |
+> | **noted, no item** | `ICOM-061` / `ICOM-065` | the v0.13/v0.14 `SKILL.md` edits (`/name`→`/alias`, the Herdr-location paragraph) ride those two rows; cyrup's `/name` exists (`cyrup-tui/src/commands.rs:167`), so the ported v0.10.1 skill text is still true for this build |
+>
+> **Read, nothing to file (negative results — do not re-derive).**
+> - `broker/spawn.ts` `dd1b36b` (UTF-16LE+BOM `.vbs`, `//E:VBScript`): not applicable — cyrup does
+>   not launch through `wscript.exe`; `transport/spawn.rs:186-200` requests
+>   `DETACHED_PROCESS | CREATE_NO_WINDOW` directly.
+> - `ui/inline-message.ts` provenance lines: ported (`ui/inline_message.rs:215-222`, `:258-260`);
+>   cyrup's presence check equals upstream's `type === "extension_outbox"` because
+>   `ProvenanceKind` has that single variant (`transport/protocol.rs:388-391`).
+> - `broker/client.ts` exact-send / `DeliveryDetails` / scope on register, `broker/protocol.ts`
+>   `endpointEpoch`/`provenance`/`tmuxPane` validators, `reply-tracker.ts`
+>   `findActiveReplyTargetMismatch`: owned by closed `ICOM-054`/`055`/`056`/`058`/`060`; tool
+>   results carry `delivery`/`retryable`/`outcomeKnown` (`tools/mod.rs:56-59`).
+> - Delivery-record keys: upstream's `JSON.stringify([from, id])` (`broker.ts:1081-1083`) vs cyrup's
+>   tuple `(SessionKey, String)` (`broker/delivery.rs:99`) — both collision-free, so the new
+>   colon-ID test pins nothing cyrup lacks (`send.rs` `delivery_record_keys_do_not_collide_across_senders`).
+> - Stale `cancel_ask` from a replaced socket: `handle_cancel_ask` requires both socket and edge
+>   ownership (`broker/send.rs:697-701`), which is what the new stable-ID test pins.
+> - `config.ts` obsolete `toolVisibility`: cyrup reads known keys only, so it is ignored as upstream now documents.
+> - Scope, epochs, outbox, pending-ask records, misdirected-reply tests: cyrup carries named
+>   counterparts (`a_rebound_target_is_retried_exactly_once_under_the_same_message_id`,
+>   `the_roster_is_scope_relative_and_unscoped_is_not_a_wildcard`,
+>   `active_ask_context_does_not_trust_sender_names_as_destination_identity`, …) except the
+>   pending-ask record tests, which ride open `ICOM-057`.
+>
+> **Cross-area handoffs from this pass (not filed there — this pass edits area 11 only).**
+> `ICOM-035`/`ICOM-068`'s defect lives in `crates/cyrup-session-svc` (**area 08**): the pump drops
+> pi's `deliverAs: "steer"` routing and the durable arm skips pi's `agent.state.messages.push`. Every
+> no-turn injector shares it (subagent notifications with `triggerTurn: false` included), so area 08
+> should own the fix; until it files one, these two rows are the only record. `ICOM-062` depends on
+> area 08's **`SEAM-125`** (`is_idle` ignores a manual compaction).
+>
+> **Post-tag leads:** none — `describe --tags` is `v0.14.0` exactly and `v0.14.0..HEAD` is empty.
+>
+> **Still unread: nothing in the upstream window.** Not done, by rule: nothing was executed (no
+> cargo), so every item here is a static read; the `ICOM-035`/`068`/`062` mechanisms are the
+> strongest candidates in this file for a live repro (README blind spot 2).
+>
+> **Counted set after this pass: 0 critical · 3 high (`ICOM-035`, `ICOM-062`, `ICOM-068`) ·
+> 0 medium · 10 low = 13 open**, hand-counted from the table — `scripts/count_open_items.py` was not run.
+
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | ICOM-052 | low — **PARTIALLY CLOSED 2026-08-14** | cyrup-original | S | The broker socket path has no `SUN_LEN` guard — **PARTIALLY CLOSED 2026-08-14** (fix (b), the named bind error + captured stderr); **residual re-confirmed open 2026-08-15 (sweep 9), unchanged and still a design decision**: fix (a) is a hashed temp-dir fallback socket path, which relocates the socket out of the agent dir and therefore changes where every peer looks for it — and pi has no such fallback either (`broker/paths.ts:65-74` has no length guard), so this is a deliberate divergence to authorize, not a parity gap to close. Reconfirmed at HEAD: `paths.rs:89` is still `intercom_dir.join("broker.sock")` with no length check. **NEEDS one yes/no on relocating the socket.** **Re-confirmed 2026-09-04: `transport/target.rs::unix_socket_path` still has no length guard or fallback; fix (b)'s stderr capture is confirmed still landed (`transport/spawn.rs:168`, `:243-249`). Not re-reproduced on this host — the original finding was `observed` via a long-`HOME` repro that was not re-run this pass.** — **RE-READ 2026-09-14 at `9aeba769` (verified re-audit): still open, narrowed to fix (a) exactly as this row's partial-closure narration says. READ ON BOTH SIDES.** cyrup: the socket path now lives ONLY in `crates/cyrup-intercom/src/transport/target.rs:226-229` (`unix_socket_path` = `intercom_dir.join("broker.sock")`) — no byte-length check, no hashed temp-dir fallback; `broker_socket_path_for` merely wraps it on the POSIX arm. A crate-wide grep for `sun_len`/`sun_path` at `9aeba769` returns exactly ONE hit, the explanatory comment at `broker/lifecycle.rs:141-142` — the diagnostic, not a guard. Upstream @v0.13.0 `getBrokerSocketPath` (`broker/paths.ts:65-74`) is still `join(getIntercomDirPath(agentDir), "broker.sock")` with no length check either, so `Kind: cyrup-original` (a SHARED robustness gap, not a parity divergence) is still right at the CURRENT tag, not merely at `v0.9.2`. **Fix (b) was audited end-to-end rather than taken on the row's word, and it is genuinely wired:** `BrokerListener::bind` failure is rewrapped as `failed to bind the intercom broker endpoint at {endpoint} ({n} bytes): {e}` (`broker/lifecycle.rs:138-156`, naming both the path and its byte count); `broker::run`'s `Err` reaches `crates/cyrup/src/intercom_broker_cmd.rs:48-56`, which `eprintln!`s it and exits 1; the parent pipes ONLY stderr (`transport/spawn.rs:176-181`), drains it to EOF into a 4 KB char-boundary-safe tail (`BrokerStderrTail::drain`, `:226-256`), and `decorate` appends a `Broker stderr:` section on EVERY startup-failure arm after a 50 ms drain grace (`:205`, `:258-269`). **Still ruled still-open rather than close** because the row's title claim is literally about (a), the row explicitly holds (a) open as a design yes/no (a hashed fallback relocates the socket out of the agent dir and moves where every peer looks), and closing on (b) alone would delete a live deep-path failure from the backlog. **Two stale citations to fix in this row:** the stderr capture is now `transport/spawn.rs:176-181` and `:258-269` (not `:168`, `:243-249`), and the residual's home is `transport/target.rs`, not `paths.rs:89`. Note on (b): nothing in the tree PINS that chain — grep for `Broker stderr` at `9aeba769` hits the source only, zero tests — so it rests on a read, not a measurement; it would be reopened by running the real `__intercom-broker` under a >104-byte `<agentDir>/intercom/broker.sock` and observing a parent-visible `IntercomError::Broker` without the `Broker stderr:` section or without the bind endpoint path. — **RE-READ 2026-09-16 at `cc7818b` — STILL OPEN at low, narrowed to fix (a) exactly as before; BOTH SIDES RE-OPENED and the two stale citations this row was told to fix are now fixed here.** `crates/cyrup-intercom` did not change in `9aeba769..cc7818b` (`git diff --stat` over the crate is empty), so this is a re-read of the same bytes and is labelled as such. **cyrup:** the socket path is still `unix_socket_path(intercom_dir) = intercom_dir.join("broker.sock")` at `transport/target.rs:228-230` (the row's `:226-229` was one doc-comment line off; `broker_socket_path_for` still only wraps it on the POSIX arm), with no byte-length check and no hashed temp-dir fallback. A crate-wide grep for `sun_len`/`sun_path` returns **exactly one hit** — the explanatory comment at `broker/lifecycle.rs:141`, i.e. the DIAGNOSTIC, not a guard. **Fix (b) re-audited end-to-end and still wired:** `BrokerListener::bind` failure is rewrapped as `failed to bind the intercom broker endpoint at {endpoint} ({n} bytes): {e}` (`broker/lifecycle.rs:146-156`, naming path and byte count), the parent captures only stderr and drains it through `BrokerStderrTail::drain` (`transport/spawn.rs:205`, `:221-256`) and appends a `Broker stderr:` section on the failure arms (`:258-269`) — the row's older `:168` / `:243-249` citations are superseded by `:205` / `:258-269`. **Upstream re-measured: pi-intercom is still v0.13.0** (`describe --tags` → `v0.13.0`, HEAD `199279a`, unchanged), and `getBrokerSocketPath` (`broker/paths.ts:65-74`) still has no length check either — so `Kind: cyrup-original`, a SHARED robustness gap rather than a parity divergence, is right at the current tag and not merely at the ported one. Still **not closed on (b) alone**, for the reason the row gives: its title claim is (a), and (a) is a design yes/no about relocating the socket out of the agent dir. The (b) reopening condition is unchanged and still unpinned by any test (`grep -rn 'Broker stderr' crates/cyrup-intercom/src` hits source only, zero tests). |
@@ -395,7 +542,7 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 | ~~ICOM-030~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | `contact_supervisor` registered alongside an active native supervisor channel — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-031~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Presence identity never re-synced on `turn_start` or at a tool call — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-033~~ | ~~medium~~ **CLOSED 2026-08-14 — REFUTED** | not-ported | M | No tool renderers for `intercom` / `contact_supervisor` — **REFUTED, CLOSED 2026-08-14**: sweep 6 — `crates/cyrup-intercom/src/tools/render.rs` is the full `renderCall`/`renderResult` port for both tools (pi-intercom v0.10.1 `index.ts:1743-1774`, `:2298-2331`). **The sequencing blocker the 2026-08-14 note added is DISCHARGED:** `tools/mod.rs::text_result` no longer sets `details: None`, it sets pi's `{}`, and `detailed_result` carries the load-bearing `details.messageId`. The three unreachable-branch carve-outs that note demanded (no theme, no `isPartial`, no `context.isError`/expanded) are documented at the head of `render.rs`. |
-| ~~ICOM-035~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | M | Busy inbound parked until idle instead of steered — **CLOSED 2026-08-14**: sweep 1 — the queue is DELETED, not merely fixed. Blind spot 7 ("confirm pi's `deliverAs:'steer'` means what `AgentSession::steer` means") is answered: `cyrup-session-svc/src/session.rs:3926-3928` routes any custom message to `agent.steer` whenever `is_streaming()`, so no HostServices change was needed. |
+| ICOM-035 | **high — REOPENED 2026-09-24 (regression)** | parity-bug | M | Busy inbound parked until idle instead of steered — **REOPENED 2026-09-24**: the closure's premise below (`inject_message` steers when streaming) stopped being true at `8de7460` (2026-09-08), whose injection pump waits for idle before delivering anything; the busy `Steer` arm now lands after the run, with no turn, and — via `ICOM-068` — outside the agent transcript. Kind moved `upstream-drift` → `parity-bug` (the behaviour was ported, then regressed). See the section. *Superseded closure, kept for audit:* **CLOSED 2026-08-14**: sweep 1 — the queue is DELETED, not merely fixed. Blind spot 7 ("confirm pi's `deliverAs:'steer'` means what `AgentSession::steer` means") is answered: `cyrup-session-svc/src/session.rs:3926-3928` routes any custom message to `agent.steer` whenever `is_streaming()`, so no HostServices change was needed. |
 | ~~ICOM-036~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | No reply targeting by sender-ID prefix; four disambiguation errors absent — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-037~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | S | A `send` to the sole pending asker is not treated as its reply — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-038~~ | ~~medium~~ **CLOSED 2026-08-14** | upstream-drift | M | No client liveness heartbeat — **CLOSED 2026-08-14**: sweep 2 — pi's client liveness heartbeat ported end to end: `CYRUP_INTERCOM_LIVENESS_INTERVAL_MS`/`_TIMEOUT_MS` with defaults 30 s/5 s and the `Math.min(raw, interval)` clamp applied in the CONFIGURED branch only (an unset timeout is a flat 5000 and is NOT clamped by a shorter interval — upstream's asymmetry, reproduced); a real `Number.parseInt(x,10)` port (`js_parse_int_base10`), NOT the `Number()` that `getNamePollMs` uses; `LivenessConfig`, `ClientInner.liveness_abort` (pi's `livenessTimer`) started at the connect success arm (pi's `onRegistered`) and stopped in `teardown` (pi's `onClose`) and `disconnect()`; `liveness_task` as an `interval_at` tick loop under `MissedTickBehavior::Skip`; `force_close` (pi's `socket.destroy()`) feeding the shared onClose tail; and `list_sessions_inner(inner, timeout)` driving the existing `list` round trip under `getLivenessTimeoutMs()`. The env names live in `identity.rs` (the crate's single env inventory), as the Fix directed. Two mechanism notes recorded so nobody "restores" them: pi's `livenessInFlight` boolean has no counterpart because the probe is awaited inline and `MissedTickBehavior::Skip` reproduces the same observable schedule; and `tokio::time::interval` fires its first tick IMMEDIATELY where `setInterval` waits one period, hence `interval_at(now + interval, …)`. |
@@ -421,11 +568,20 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 | ~~ICOM-054~~ | ~~medium~~ **CLOSED 2026-09-05** | not-ported | L | **Broker-owned endpoint epochs are absent** — upstream `636f61e` (#109, v0.11.0) adds "broker-owned endpoint epochs, exact-send retry handling, and bounded delivery records **so stale endpoints are refused**", +422/−107 over `broker/broker.ts`, `broker/client.ts`, `broker/protocol.ts`, `index.ts`, `types.ts`. **Correctness, not cosmetics:** without it a send can be accepted against an endpoint the broker has already replaced. — **CLOSED 2026-09-05 at `87421cd7`**, ported in full at **v0.13.0** per ADR-0006. Tag-to-tag note: `636f61e`'s exact-target block has ONE combined missing-or-rebound arm; at v0.13.0 `089b631` (ICOM-055, closed at `c440c038`) had already split it into `E_TARGET_NOT_FOUND` + `E_TARGET_REBOUND` and made the lookup `sessions.get(scopedSessionKey(fromSession.scopeId, targetId))` — **the v0.13.0 shape is what landed**, on top of the `ScopeId`/`SessionKey` types that item introduced. **(1) The broker owns the epoch.** `SessionInfo::endpoint_epoch` (`v0.13.0 types.ts:14-16`, `[NON-NULL]` per `broker/protocol.ts:142-144`) is stamped `Some(Uuid::new_v4())` in `broker/session.rs` on EVERY register, a stable-id takeover included (`v0.13.0 broker/broker.ts:466`) — the id names the identity, the epoch names this socket binding of it. Never read from the registration (`SessionRegistration` omits it upstream, `types.ts:102`). `registered` now advertises `["extension-bus-v1", "exact-send-v1"]` (`:498-502`). **(2) A superseded endpoint is refused.** `ClientMessage::Send.target` carries the flattened `targetId`/`targetEpoch` pair (`types.ts:111`); `broker/send.rs`'s exact-target block runs BEFORE name resolution (`:624-654`) because a valid exact target REPLACES `to` rather than filtering it. Half-set / non-string / empty is `delivery_failed` + `E_INVALID_TARGET` — not a connection kill, and never a silent degrade to name routing. Every other refusal in both send handlers gains its upstream `code` with the reason string byte-identical (`E_INVALID_MESSAGE`, `E_SENDER_NOT_FOUND`, `E_REPLY_TARGET`, `E_SUPERSEDE_TARGET`, `E_MUTUAL_ASK`, `E_AMBIGUOUS_TARGET`, `E_TARGET_DISCONNECTED`, `E_TARGET_NOT_FOUND`); `cancel_message`'s two acks and its "cannot be cancelled" refusal stay **BARE**, exactly as `636f61e` left them (`:829,835-839,856`), which is why all four ack detail fields are optional on the wire. **(3) Bounded delivery records.** New `broker/delivery.rs` (`:44-46,65-74,1043-1110`): one record per `(sender SessionKey, message id)`, 1 h TTL, 4096-entry FIFO cap, with `delivery_record_order` supplying the JS `Map` insertion order a `HashMap` lacks. `replay_or_reject` runs on **all three** send arms, so any resend of an id replays its recorded ack without re-injecting the message and any resend with different authored content is `E_MESSAGE_ID_REUSE`; the one hole is the retryable `E_TARGET_REBOUND` record, which is what lets the client's single retry through under the same id. Six lifecycle events update records in place (`:709,823,856,1005,1021,1162`), including the `queued` → `socket_delivered` flip on a mailbox flush. **Client** (`transport/client.rs`): `Registered.features` is stored instead of discarded, `supports_feature` ports `supportsFeature` (`broker/client.ts:93-95` — **citation corrected 2026-09-05 at `824a539e` from review**: this row, the commit body and the doc comment on `IntercomClient::supports_feature` all said `:817-819`, which cannot resolve — `broker/client.ts` is 793 lines at `v0.13.0`; the code comment is fixed in the same commit), and `send` becomes gate → resolve → `send_once` → **at most one** re-resolve on `E_TARGET_REBOUND`, under the same message id (`:645-690`). A reply is never exact-sent and a broker that never advertised `exact-send-v1` gets the v0.9.2 frame byte-for-byte; `resolve_exact_target` reuses `broker::routing::find_session_ids` rather than restating `findSessions`, and a peer with no `endpointEpoch` degrades to a plain send. `SendResult` grows `delivery`/`code`/`retryable`/`outcome_known` with upstream's absent-field defaults; the two disconnect drains are the crate's only producers of `DeliveryState::Unknown`. **Surfaces:** `tools::delivery_details` ports `deliveryDetails` (`v0.13.0 index.ts:116-126`) into `intercom{send}`/`{reply}`'s existing details maps, and the ask-timeout message reports the send's real delivery state (`index.ts:2464`) instead of hard-coding `socket_delivered`, so an offline peer now reads `queued`. **Deleted:** `BrokerState::clear_ask_edges_for_session` and its only call site — `636f61e` removed that call from the register-time takeover, leaving the method dead upstream at `broker/broker.ts:1176`; once the epoch refuses stale sends, wiping a replaced endpoint's ask edges is unnecessary AND harmful (it refuses a reply arriving after a stable-id replacement). Mailbox recovery is untouched. **Renamed, no behaviour change:** `ConnectSupervisor::epoch` → `reconnect_generation`, a purely local reconnect counter that shared nothing but a name — `grep epoch` now means what it says. **Design decisions (four, recorded in the commit body with the rejected alternatives):** (a) `DeliveredState`/`FailedState` beside the wide `DeliveryState` encode pi's **asymmetric** ack acceptance sets (`broker/client.ts:375,392`), so a `delivered` frame typed as failed — or the reverse — is unrepresentable; rejected one wide enum on both variants (looser than pi one way, nonsense the other) and a `String`. (b) `ExactTarget` has private fields, two total constructors and one `as_pair` reader, so a cyrup client cannot EMIT a half-set pair and no caller can use one half — but the rule is deliberately **not** in `Deserialize`, because pi answers a half-set frame with `E_INVALID_TARGET` rather than a type-guard throw (contrast `ExtensionOwnerRef`, whose pairing rule IS in `Deserialize`); enforcing it there would make cyrup fatally stricter than pi on a frame pi merely refuses. (c) `RecordedOutcome` collapses the record's `state`/`reason`/`code`/`retryable` quartet into a sum type: a delivered record cannot carry a failure code and a failed record cannot lack one, which makes upstream's `record.reason ?? …` / `record.code ?? …` defaults (`:1074`) unreachable by construction rather than merely unused. (d) `ReplayVerdict` replaces `replayOrReject`'s bare `bool` at the one point where inverting it delivers a message twice; `#[must_use]`. **Not done on purpose:** no newtype for message ids or epochs (pi compares them as opaque strings; this item establishes no rule about their shape) and no typestate (a send's state is decided per frame by received data, not by a legal sequence). **Tests: 15 added, 313 → 328, red before / green after.** RED was established by neutering the implementation in place and restoring — the epoch/feature pair, the exact-target block, `replay_or_reject`, the flush record flip, the client's feature gate, the eviction order, the order-vector prune, the fingerprint field set and the record key each in turn: 10 of the 15 failed under those neuters; `a_live_identity_takeover_preserves_the_ask_edge` was made red by restoring the deleted `clear_ask_edges_for_session` call; the remaining four (the three `transport/protocol.rs` wire tests and the client's plain-frame test) are red against the pre-change tree by non-compilation, since `ExactTarget`, `DeliveredState`/`FailedState` and `ClientInner::features` did not exist. Measured at `87421cd7`: `cargo nextest run -p cyrup-intercom` **328/328**, `CYRUP_IT_BIN_DIR=… cargo nextest run -p cyrup-it --features it -E 'binary(intercom)'` **80/80** (includes the real-socket broker round-trip; two `cyrup-it` helpers updated for the new `SessionInfo` field), `cargo clippy -p cyrup-intercom --all-targets -- -D warnings` clean, `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-intercom --no-deps` clean, `cargo fmt -p cyrup-intercom -- --check` / `-p cyrup-it -- --check` clean. **Residuals (low, none filed as new ids):** upstream's `writePendingAskRecord` / `removePendingAskRecord` calls inside the ported send arms are still absent — those records are exactly what **ICOM-057** adds, and it should write them where the citations here mark them; and the tool layer's FAILURE arms still return a `ToolError` where upstream returns a details-bearing result, so `deliveryDetails` reaches only the two success sites — converting that channel would change every failure string and belongs to a gap of its own, not to `636f61e`. |
 | ~~ICOM-055~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | M | **Scoped routing is absent** — upstream `089b631` (v0.12.0) adds opt-in broker-enforced `PI_INTERCOM_SCOPE_ID` routing scopes (issue #112). cyrup has no scope concept on the wire or in the broker. Without it every registered session is mutually addressable with no isolation boundary. — **CLOSED 2026-09-04 at `c440c038`**, ported in full at `pi-intercom` **v0.13.0** per ADR-0006. **Tag-to-tag evidence, CORRECTED 2026-09-05 (review pass).** The sentence this replaces — and the identical sentence in `c440c038`'s commit body, which cannot be amended without rewriting a landed commit and is therefore superseded here — said `git diff v0.12.0 v0.13.0` *touches `config.ts` only, −15 lines*. That does not reproduce: `git -C tmp/pi-intercom diff --stat v0.12.0 v0.13.0` is **13 files, +356 / −171** (`CHANGELOG.md`, `README.md`, `broker/spawn.ts`, `broker/spawn.test.ts`, `config.ts`, `config.test.ts`, `index.ts` at +124, `intercom.integration.test.ts` at +227, `package.json`, `package-lock.json`, `reply-tracker.ts`, `reply-tracker.test.ts`, `skills/pi-intercom/SKILL.md`). The CONCLUSION is unchanged and is re-derived the right way: the feature lives in four production files — `git -C tmp/pi-intercom grep -c scopeId v0.13.0` gives `broker/broker.ts` 71, `broker/client.ts` 2, `config.ts` 2, `types.ts` 1 (plus two test files) — and of those only `config.ts` appears in the tag-to-tag diff, where the whole change is the −15-line removal of ICOM-059's withdrawn `toolVisibility` and `getIntercomScopeId` (`config.ts:21-24`) is byte-identical at both tags. **No file the feature lives in changed between the tags**, so what landed is `089b631` unchanged at v0.13.0. **Env + wire:** `ENV_INTERCOM_SCOPE_ID = "CYRUP_INTERCOM_SCOPE_ID"` (`identity.rs`) and `config::intercom_scope_id{,_from}` port `getIntercomScopeId` (`v0.13.0 config.ts:6,21-24`) in the crate's established const-in-`identity`/resolver-in-`config` split; `ClientMessage::Register.scope_id` (`transport/protocol.rs`) carries it with `skip_serializing_if`, so an **unscoped register frame is byte-identical to the pre-scope one** (`...(scopeId ? { scopeId } : {})`, `v0.13.0 broker/client.ts:286-292`; `types.ts:107`), and `IntercomClient::connect_target` resolves the scope where `client.ts` does. Deliberately NOT an `IntercomConfig` key — upstream reads it from the environment only, because `config.json` is machine-global. **Broker enforcement** (`crates/cyrup-intercom/src/broker/`, never the tool layer): the scoped `findSessions` ladder in all three tiers (`routing.rs::find_session_keys`, `v0.13.0 broker/broker.ts:1247-1262`), the scope-relative `list` roster (`state.rs::session_infos_in_scope`, `:596-597`), scoped `broadcast` for `session_joined`/`session_left`/`presence_update` (`state.rs`, `:1312-1318` called at `:327,:504,:540,:957`), the scoped disconnected-session and mailbox ladders including both `targetScopeId` and `fromScopeId` (`mailbox.rs`, `:1120-1131`, `:1264-1279`, `:1299-1310`), scoped ask edges and receipt routes, and the **extension bus** — one owner elected per scope (`NamespaceKey`, `scopedExtensionKey`, `:152-154`, `:1346-1424`), publish and state-commit fan-out filtered (`:1504-1506`, `:1668-1670`), and `scoped_extension_state_namespace` (`:156-161`) whose UNSCOPED arm returns the **bare** namespace so every file already under `<intercomDir>/extension-state/` keeps its name. `handle_send`'s sender lookup is hoisted to the top as upstream hoisted its own (`:614-618`), which also deletes the duplicated `"Sender session not found"` block. **Amended 2026-09-05 (review pass), no behaviour change:** `handle_send_to_disconnected`'s reply-edge guard read `edge.to != *current_key \|\| edge.from.id != target.id` — comparing the bare ID on the second conjunct where upstream compares the whole composite key (`replyEdge.from !== disconnectedTarget.key`, `v0.13.0 broker/broker.ts:747`). It was unreachable in practice (an edge whose `from` sits in another scope has its `to` there too, so the first conjunct rejects it first) but it was the one hand-written place that stepped around the `SessionKey` discipline this row advertises as *a scope-forgetting lookup is a compile error*. The resolved key now travels with the info out of the `find_disconnected_session_keys` match and the guard reads `edge.from != target_key`; `cargo nextest run -p cyrup-intercom` **328/328** after (313 at closure; the rest are ICOM-054's). **Design decision (two types, recorded in the commit body with the rejected alternatives):** `ScopeId` is a parse-don't-validate newtype whose only constructor trims and maps blank to unscoped — an untrimmed scope (which would split one boundary in two) and a blank scope (an isolation class no unscoped session could reach) become unrepresentable; it has no `Deserialize` derive, so serde cannot bypass the parser. `SessionKey { scope, id }` (plus `NamespaceKey`) replaces upstream's stringified composite as the key of `sessions`, `disconnected_sessions`, `AskEdge`, `MessageReceiptRoute` and `MailboxMessage`, so a scope-forgetting lookup is a **compile** error rather than upstream's silent miss, and the derived `Eq` IS `sameScope` — `None` is a scope, never a wildcard. Rejected: a parallel `scope_id` field beside a `String` key (leaves `sessions.get(&id)` compiling); upstream's stringified key (opaque, re-parses on read); a derived `Deserialize` on `ScopeId` (bypasses the parser); `Option<String>` inside `SessionKey` (scatters the trim/blank rule); typestate (wrong shape — a scope is selected by an external event, not a legal sequence). **Unchanged by design:** `tools/intercom/list.rs` and `project_target.rs` (they render a roster the broker already filtered — a client-side filter is the anti-pattern the feature exists to avoid), `IntercomConfig`, the global `MAX_SESSIONS` cap, and ~~`BrokerMessage::DeliveryFailed`'s v0.9.2 shape (upstream's `E_SENDER_NOT_FOUND` code belongs to a different gap)~~ **— that last clause is STALE as of `87421cd7` and is struck 2026-09-05 by the batch-3 ledger pass: `ICOM-054` was the "different gap", it landed later in the same batch, and every refusal in `crates/cyrup-intercom/src/broker/send.rs` now carries its upstream code.** **One behaviour change for unscoped sessions, upstream's own** (`:592-595`): a `list` arriving on a SUPERSEDED socket is now a protocol error instead of a full-roster reply. A `list` before registration was already a protocol error via `dispatch`, so that is not a change. **Tests: 17 added, red before / green after.** `broker/scoped.rs` (new, 12) drives the whole definition of done — roster isolation with unscoped proved not to be a wildcard; a cross-scope `send` by full id, name and id prefix answered exactly like a never-registered name, with a same-scope positive control; join/presence/leave never crossing; parked mail never flushing into another scope; the same id coexisting in two scopes; a non-string `scopeId` fatal and a blank one unscoped; the superseded-socket `list`; per-scope owner election and publish isolation; the bare-when-unscoped state namespace; and the unscoped register frame asserted byte-for-byte. `routing.rs` +2 pins every resolution tier; `config.rs` +1 and `transport/protocol.rs` +2 pin the trim/blank/non-string trio on the env and wire paths. RED was established by neutering the enforcement in place (`SessionKey::in_scope` to `true`, the register-frame guard to silently-unscoped, the `list` requester check removed, the mailbox target-scope skip off): 7/12 in `scoped.rs` and 2/2 in `routing.rs` failed, then passed on restore; the other five are red against the pre-change tree by non-compilation. Measured at `c440c038`: `cargo nextest run -p cyrup-intercom` **313/313** (was 296/296), `CYRUP_IT_BIN_DIR=… cargo nextest run -p cyrup-it --features it -E 'binary(intercom)'` **80/80**, `cargo clippy -p cyrup-intercom --all-targets -- -D warnings` clean, `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-intercom --no-deps` clean, `cargo fmt --all -- --check` clean. **Residual (low, folded into ICOM-057 rather than filed as a new id):** `scopedPendingAskRecordPath` (`v0.13.0 broker/broker.ts:163-169`) is not ported because this crate has **no on-disk pending-ask records to scope** (no `PENDING_ASKS_DIR`, 0 hits) — those records are exactly what ICOM-057 adds, and it should now write them scoped from birth, inheriting `ScopeId`/`SessionKey` as things that already exist. |
 | ~~ICOM-056~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | L | The extension outbox API and message provenance — **CLOSED 2026-09-04**: `crates/cyrup-intercom/src/outbox.rs` (671 lines) implements `IntercomOutboxRequestV1`/`IntercomOutboxResultV1` (`parse_outbox_request`, `resolve_outbox_target`, the generation-fenced delivery leg, build/emit/settle/fail), and `MessageProvenance`/`ProvenanceKind` are modelled on the envelope with `present_non_null` (`transport/protocol.rs:318-403`). The one edge-case the closing task file (`.flux/done/2026-08-28-02-56/ICOM-056_EXTENSION_OUTBOX_AND_PROVENANCE.md`) flagged as outstanding — `delivery_failed` emitting an empty `messageId` when a send tears down in flight — is already fixed in the code read: `outbox.rs:592-607` falls back to the request id (`rid`) when `result.id.is_empty()`, with an in-source comment explaining why an empty id would be meaningless to an extension correlating results. |
-| ICOM-057 | low | not-ported | S | **Pending blocking-ask records are not persisted** — upstream `d69854d` (v0.11.0, issue #104) persists local pending-ask observability records for delivered blocking asks. cyrup has no equivalent (0 non-comment hits for a persisted ask record). Observability only; no delivery-path effect. **Re-confirmed 2026-09-04: `.flux/todo/ICOM-057_PERSIST_PENDING_ASKS.md` is still unstarted (todo, not done) and `grep` for a persisted-record shape in `crates/cyrup-intercom/src/` is still empty.** — **RE-READ 2026-09-14 at `9aeba769` (verified re-audit): still open, unchanged. BOTH SIDES READ.** Upstream @v0.13.0: `PENDING_ASKS_DIR = join(INTERCOM_DIR, "pending-asks")` (`broker/broker.ts:30`), the `PendingAskRecord` interface (`:99-107` — askId/messageId/asker{sessionId,name}/target{sessionId,name}/question/createdAt/expiresAt), `scopedPendingAskRecordPath` (`:163-169`, sha256 scope-hash prefix), `isPendingAskRecord` (`:175-193`), `ensurePendingAskRecordDir` at 0o700 (`:195-199`) called from the constructor together with `prunePendingAskRecords` (`:221-222`), ONE `writePendingAskRecord` on the delivered-ask arm (`:684`) and **eleven** `removePendingAskRecord` call sites across reply, cancel, dismiss, mailbox eviction and ask-edge expiry (`:718,:773,:827,:854,:872,:1002,:1018,:1167,:1171,:1180,:1185-1215`). Classification settled by PRESENCE, not by date: `git grep -c PENDING_ASKS_DIR v0.9.2 -- broker/broker.ts` returns no match (exit 1), so the feature landed AFTER the ported baseline — `not-ported` is correct. cyrup: zero on-disk record. `crates/cyrup-intercom/src/broker/` is 22 files, none of them a pending-ask record, and a grep for `pending_ask_record`/`pending-asks`/`PENDING_ASKS` across `crates/cyrup-intercom/src/` hits ONLY `reply_tracker.rs`'s in-memory `pending_asks: HashMap<String, IntercomContext>` (`:101,:112,:133,:161,:184,:196,:239,:298,:316,:325,:333`) — that is the client-side reply tracker (pi's `reply-tracker.ts`), a DIFFERENT object from the broker's observability files, and it never touches the filesystem. Every `fs::write` under `crates/cyrup-intercom/src/broker/` was enumerated: `extension_state.rs:327` (extension state), `lifecycle.rs:191` (`broker.port.json`), `:196` (`broker.pid`), and the rest are test fixtures in `listener.rs`/`runtime_claim.rs`. Nothing writes an ask record. `.flux/todo/ICOM-057_PERSIST_PENDING_ASKS.md` is still in `todo/` — its frontmatter `status: done` means the *aug* stage completed, not the work; there is no file for it in `.flux/done/`. Severity `low` stays right: observability only, no delivery-path read. **Note for whoever takes it:** `ICOM-054`'s and `ICOM-055`'s closures both marked their citation sites for this item, and `ScopeId`/`SessionKey` now exist, so `scopedPendingAskRecordPath` has a native counterpart to build on. — **RE-READ 2026-09-16 at `cc7818b` — STILL OPEN at low, unchanged on both sides, and the negative result was re-derived rather than carried.** cyrup: `crates/cyrup-intercom/src/broker/` is still **22 files** and none of them is a pending-ask record; a case-insensitive grep for `pending_asks` / `pending-asks` / `PENDING_ASKS` across `crates/cyrup-intercom/src/` hits **only** `reply_tracker.rs:101,:112,:133,:161,:184,:196,:239,:298,:316,:325,:333` — the client-side in-memory `pending_asks: HashMap<String, IntercomContext>` (pi's `reply-tracker.ts`), which never touches the filesystem and is a different object from the broker's observability files. Every `fs::write` under `broker/` was re-enumerated and is accounted for: `extension_state.rs:327` (extension state), `lifecycle.rs:191` (`broker.port.json`) and `:196` (`broker.pid`); the remaining hits (`listener.rs:331`, `:374`, `runtime_claim.rs:235`–`:361`) are test fixtures. **Nothing writes an ask record.** Upstream re-measured: **pi-intercom is still v0.13.0**, so the `PENDING_ASKS_DIR` / `PendingAskRecord` / `scopedPendingAskRecordPath` surface recorded on 2026-09-14 is current, and the presence test that settles the classification is unchanged (`git grep -c PENDING_ASKS_DIR v0.9.2 -- broker/broker.ts` → no match, so `not-ported` stands). `.flux/todo/ICOM-057_PERSIST_PENDING_ASKS.md` is still in `todo/` with nothing in `.flux/done/` — and note that `ICOM-054` and `ICOM-055`, both CLOSED in the table above, also still have files in `.flux/todo/`, so **the presence of a todo file is not evidence of an open item here and must not be read as one.** Severity `low` (observability only) stands. |
+| ICOM-057 | low | not-ported | S | **Pending blocking-ask records are not persisted** — upstream `d69854d` (v0.11.0, issue #104) persists local pending-ask observability records for delivered blocking asks. cyrup has no equivalent (0 non-comment hits for a persisted ask record). Observability only; no delivery-path effect. **Re-confirmed 2026-09-04: `.flux/todo/ICOM-057_PERSIST_PENDING_ASKS.md` is still unstarted (todo, not done) and `grep` for a persisted-record shape in `crates/cyrup-intercom/src/` is still empty.** — **RE-READ 2026-09-14 at `9aeba769` (verified re-audit): still open, unchanged. BOTH SIDES READ.** Upstream @v0.13.0: `PENDING_ASKS_DIR = join(INTERCOM_DIR, "pending-asks")` (`broker/broker.ts:30`), the `PendingAskRecord` interface (`:99-107` — askId/messageId/asker{sessionId,name}/target{sessionId,name}/question/createdAt/expiresAt), `scopedPendingAskRecordPath` (`:163-169`, sha256 scope-hash prefix), `isPendingAskRecord` (`:175-193`), `ensurePendingAskRecordDir` at 0o700 (`:195-199`) called from the constructor together with `prunePendingAskRecords` (`:221-222`), ONE `writePendingAskRecord` on the delivered-ask arm (`:684`) and **eleven** `removePendingAskRecord` call sites across reply, cancel, dismiss, mailbox eviction and ask-edge expiry (`:718,:773,:827,:854,:872,:1002,:1018,:1167,:1171,:1180,:1185-1215`). Classification settled by PRESENCE, not by date: `git grep -c PENDING_ASKS_DIR v0.9.2 -- broker/broker.ts` returns no match (exit 1), so the feature landed AFTER the ported baseline — `not-ported` is correct. cyrup: zero on-disk record. `crates/cyrup-intercom/src/broker/` is 22 files, none of them a pending-ask record, and a grep for `pending_ask_record`/`pending-asks`/`PENDING_ASKS` across `crates/cyrup-intercom/src/` hits ONLY `reply_tracker.rs`'s in-memory `pending_asks: HashMap<String, IntercomContext>` (`:101,:112,:133,:161,:184,:196,:239,:298,:316,:325,:333`) — that is the client-side reply tracker (pi's `reply-tracker.ts`), a DIFFERENT object from the broker's observability files, and it never touches the filesystem. Every `fs::write` under `crates/cyrup-intercom/src/broker/` was enumerated: `extension_state.rs:327` (extension state), `lifecycle.rs:191` (`broker.port.json`), `:196` (`broker.pid`), and the rest are test fixtures in `listener.rs`/`runtime_claim.rs`. Nothing writes an ask record. `.flux/todo/ICOM-057_PERSIST_PENDING_ASKS.md` is still in `todo/` — its frontmatter `status: done` means the *aug* stage completed, not the work; there is no file for it in `.flux/done/`. Severity `low` stays right: observability only, no delivery-path read. **Note for whoever takes it:** `ICOM-054`'s and `ICOM-055`'s closures both marked their citation sites for this item, and `ScopeId`/`SessionKey` now exist, so `scopedPendingAskRecordPath` has a native counterpart to build on. — **RE-READ 2026-09-16 at `cc7818b` — STILL OPEN at low, unchanged on both sides, and the negative result was re-derived rather than carried.** cyrup: `crates/cyrup-intercom/src/broker/` is still **22 files** and none of them is a pending-ask record; a case-insensitive grep for `pending_asks` / `pending-asks` / `PENDING_ASKS` across `crates/cyrup-intercom/src/` hits **only** `reply_tracker.rs:101,:112,:133,:161,:184,:196,:239,:298,:316,:325,:333` — the client-side in-memory `pending_asks: HashMap<String, IntercomContext>` (pi's `reply-tracker.ts`), which never touches the filesystem and is a different object from the broker's observability files. Every `fs::write` under `broker/` was re-enumerated and is accounted for: `extension_state.rs:327` (extension state), `lifecycle.rs:191` (`broker.port.json`) and `:196` (`broker.pid`); the remaining hits (`listener.rs:331`, `:374`, `runtime_claim.rs:235`–`:361`) are test fixtures. **Nothing writes an ask record.** Upstream re-measured: **pi-intercom is still v0.13.0**, so the `PENDING_ASKS_DIR` / `PendingAskRecord` / `scopedPendingAskRecordPath` surface recorded on 2026-09-14 is current, and the presence test that settles the classification is unchanged (`git grep -c PENDING_ASKS_DIR v0.9.2 -- broker/broker.ts` → no match, so `not-ported` stands). `.flux/todo/ICOM-057_PERSIST_PENDING_ASKS.md` is still in `todo/` with nothing in `.flux/done/` — and note that `ICOM-054` and `ICOM-055`, both CLOSED in the table above, also still have files in `.flux/todo/`, so **the presence of a todo file is not evidence of an open item here and must not be read as one.** Severity `low` (observability only) stands. — **RE-READ 2026-09-24 at `ea23ca2` — STILL OPEN at low.** cyrup: a grep for `pending_ask_record`/`pending-asks`/`PENDING_ASKS` outside `reply_tracker.rs` across `crates/cyrup-intercom/src` is still empty; the broker files did not change this window. Upstream at **v0.14.0**: `PENDING_ASKS_DIR` is now `broker/broker.ts:31` (was `:30`; the file grew +27 for the Herdr join, `ICOM-065`), the record surface otherwise unchanged. |
 | ~~ICOM-058~~ | ~~low~~ **CLOSED 2026-09-04** | not-ported | S | `tmuxPane` neither modelled nor surfaced — **CLOSED 2026-09-04**: `identity.rs:89-116` (`ENV_TMUX_PANE = "TMUX_PANE"`, `current_tmux_pane_from`/`current_tmux_pane`, trimmed and empty-filtered exactly as upstream's `process.env.TMUX_PANE?.trim()`); `connect.rs:601` sets `tmux_pane` in the live registration; `broker/session.rs:105` copies `registration.tmux_pane` onto the stored `SessionInfo`; `tools/intercom/mod.rs:358-361` surfaces it in the `list` roster row. Landed via `.flux/done/2026-08-28-02-56/ICOM-058_TMUX_PANE_ROSTER.md`, corroborated by the code read above. |
 | ~~ICOM-059~~ | ~~low~~ **CLOSED 2026-09-04 — REFUTED, upstream withdrew the feature** | not-ported | S | `toolVisibility` config key absent — **CLOSED 2026-09-04, not by porting.** Upstream added `IntercomToolVisibility`/`"after-first-use"` at v0.12.0 (`12f4b6c`) and **removed it two commits later** at v0.12.1, `ee0d74c` ("fix: remove lazy intercom tool visibility (#120)"): `config.ts`, `index.ts` and the tests all drop every `toolVisibility` reference, and CHANGELOG 0.12.1 states why — "The generic `intercom` tool now stays in the active tool set, which avoids a late-session prompt-cache reset when intercom first becomes useful." `git -C tmp/pi-intercom show v0.13.0:config.ts \| grep toolVisibility` returns nothing (confirmed this pass). cyrup never having ported the withdrawn feature is now the CORRECT state, not a gap — there is no upstream behaviour left to match. No `.flux` task file was ever started for this item, consistent with it having always been dead by the time anyone got to it. |
 | ~~ICOM-060~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | M | No guard against a misdirected reply during an ask-triggered turn — upstream `5fe0ee3` (v0.12.1, #119, "fix: guard active intercom replies") — **CLOSED 2026-09-04 at `a91e3c41`**: `ReplyTracker::find_active_reply_target_mismatch(&mut self, to, now)` (`crates/cyrup-intercom/src/reply_tracker.rs`, beside `find_unique_pending_ask_from`) ports `findActiveReplyTargetMismatch` (v0.13.0 `reply-tracker.ts:124-130`, unchanged since `5fe0ee3`): prune, then `None` unless the current turn context is an ask whose `from.id` differs from the RESOLVED target — id only, no name or prefix arm. `tools/intercom/send.rs::action_send` consults it between the self-target guard and the ICOM-037 inferred-reply lookup, only when `replyTo` is absent, keyed on the resolved id exactly like that lookup (v0.13.0 `index.ts:2320-2328`), and refuses with the upstream string verbatim (`This turn is responding to an intercom ask from "<name || id>". Use intercom({ action: "reply", message: "..." }) or set replyTo: "<ask id>". Refusing non-reply send to "<targetDisplay>" to avoid a misdirected reply.`) as a `ToolError`. Pinned by `reply_tracker.rs` `tests::active_ask_context_flags_non_reply_sends_to_a_different_target` / `…does_not_trust_sender_names_as_destination_identity` (the two upstream `reply-tracker.test.ts` cases) and `…is_silent_without_a_live_ask_turn` (did not compile before — method absent), and by the seam test `crates/cyrup-it/tests/intercom/tool_actions.rs` `send_refuses_a_different_target_during_an_active_inbound_ask_turn` (the port of `intercom.integration.test.ts` "intercom send refuses a different target during an active inbound ask turn", real broker: planner asks worker through the broker, worker's turn adopts it, `send` to `orchestrator` is refused naming `planner` and `cwd-hierarchy-ask`, the orchestrator receives nothing, the ask stays pending; then the same turn's `send` to `planner-id` is the inferred reply and lands with `replyTo`). Run with `send.rs` at the pre-fix HEAD it FAILED with `Ok(Message sent to orchestrator)` — the misdirected delivery itself; passes at `a91e3c41`; `intercom` seam target 80/80, `cargo nextest run -p cyrup-intercom` 296/296. **Residual (low):** upstream's refusal also carries `details: { error: true, replyTo }`; cyrup's `ToolError` is message-only (the crate's standing convention for every upstream `details.error` result), so the ask id reaches the model in the text, not as a structured field. |
-| ICOM-061 | low | not-ported | S | **New 2026-09-04.** No `/alias` command — upstream `90e6ad4` (v0.13.0, #126, "feat: add intercom alias command") adds `pi.registerCommand("alias", …)` (`index.ts:2812-2815`): `/alias <name>` (or bare `/alias` / `/alias menu`, which opens an interactive input when a UI is present) calls `pi.setSessionName(alias)` then immediately `syncPresenceIdentity(sessionId)`, so the new name reaches intercom peers at once rather than waiting for the idle name poll (ICOM-006) or the next `turn_start`/tool-call sync (ICOM-031). `crates/cyrup-intercom/src/extension.rs:472-479` (`init`) registers exactly two commands — `intercom-id` and the overlay-open command — `grep -rn '"alias"' crates/cyrup-intercom/src/extension.rs` finds neither a registration nor a handler. **Impact bounded and not fully characterised**: whatever mechanism cyrup already exposes for renaming a session outright (if any — not checked here) is unaffected; the gap is specifically the intercom-side command that renames AND immediately pushes the new identity to connected peers in one step. **Confidence: medium** — the upstream contract was read from the commit diff, not the full `index.ts` command-registration context. **Fix** — register an `alias` command in `IntercomExtension::init` that resolves `HostServices::session_name()`/`set_session_name` (if such a seam exists; if not, this item's Fix needs a cross-area handoff) and then calls the existing `sync_presence_identity` helper ICOM-031 introduced. **Verify** — dispatch `alias` with a bare name in a non-UI context; assert the session's advertised presence name changes without waiting for a poll tick. — **RE-READ 2026-09-14 at `9aeba769` (verified re-audit): still open, and its CONFIDENCE RISES from medium to high** — the row's own stated weakness ("read from the commit diff, not the full `index.ts` command-registration context") is now discharged. BOTH SIDES READ. Upstream @v0.13.0, full context: `pi.registerCommand("alias", { description: "Set the current session alias (usage: /alias <name> or /alias menu)", handler: async (args, ctx) => setIntercomAlias(args, ctx) })` at `index.ts:2812-2815`, sitting alongside the two commands cyrup DID port (`intercom` `:2801`, `intercom-id` `:2806`) plus the `alt+m` shortcut. `setIntercomAlias` (`:2679-2731`) is richer than the row's one-line summary, and the row's Verify clause should be tightened to match it: bare `/alias` or `/alias menu` opens `ui.input` when `hasUI`, but in a NON-UI context it does NOT rename — bare `/alias` REPORTS the current alias ("Session alias: X" / "No session alias set.") and `/alias menu` warns "The alias menu requires an interactive UI"; only the `<name>` form calls `pi.setSessionName(alias)` then `syncPresenceIdentity(liveContext.sessionManager.getSessionId())` (`:2720`, `:2728`, the latter defined at `:908-916`) and notifies "Session alias set: X". Classification settled by PRESENCE at the baseline, not by date: `git show v0.9.2:index.ts` registers exactly `intercom` (`:2360`) and `intercom-id` (`:2365`), with no `setSessionName` anywhere — so `not-ported` (drift past `v0.9.2`) is correct. cyrup: `IntercomExtension::init` registers exactly two commands (`extension.rs:564-584`, consts at `:55-63`) and `execute_command` (`:675-705`) matches `intercom-id` then `intercom` and returns ``ExtError::Component("native extension has no handler for command `{name}`")`` for anything else — no alias registration, no handler. **ONE MATERIAL UPDATE TO THE ROW'S FIX:** its hedge ("if such a seam exists; if not, this item's Fix needs a cross-area handoff") is **RESOLVED — the seam exists and no handoff is needed.** `HostServices::session_name() -> Option<String>` (`crates/cyrup-ext/src/host/services.rs:425-427`) and `HostServices::set_session_name(&str)` (`:694`, no-op default, documented as pi `setSessionName`, `agent-session.ts:2272-2274`) sit on the SAME trait the extension already reaches through `HostCtx` for `set_editor_text`, and the live impl is bound at `crates/cyrup-session-svc/src/host_services.rs:1499` and `:1836` (emitting `session_info_changed`, pinned by session-svc `tests/round8_postrun.rs:426,:489`); `IntercomExtension::sync_presence_identity` (`extension.rs:278-280` → `session_state.rs:702`) is the ported `syncPresenceIdentity`. So the whole fix is self-contained in `cyrup-intercom`: one const, one `register_command`, one `execute_command` arm. Severity stays `low` — a rename still reaches peers via the idle name poll (`ICOM-006`) and the turn-start / tool-call identity sync (`ICOM-031`); only the immediacy and the command surface are missing. — **RE-READ 2026-09-16 at `cc7818b` — STILL OPEN at low, unchanged, with two citations corrected.** cyrup: `grep -rn '"alias"' crates/cyrup-intercom/src/` returns **zero** hits — no registration and no handler. `IntercomExtension::init` still registers exactly two commands, `INTERCOM_COMMAND` (`extension.rs:56`, registered `:567-574`) and `INTERCOM_ID_COMMAND` (`:63`, registered `:577-585`), plus the inbound message renderer at `:563`; `execute_command` (`:675`) matches `intercom-id` (`:682`) then `intercom` (`:685`) and returns the no-handler error for anything else. **Citation correction:** the row's `extension.rs:564-584` / consts `:55-63` are now `:567-585` / `:56` and `:63` — the crate did not change in this window (`git diff --stat 9aeba769 cc7818b -- crates/cyrup-intercom` is empty), so the earlier numbers were slightly off rather than stale. Upstream re-measured: **pi-intercom is still v0.13.0**, so the full `setIntercomAlias` contract read on 2026-09-14 (`index.ts:2812-2815` registration, `:2679-2731` handler, `:908-916` `syncPresenceIdentity`) is current, and the `v0.9.2` presence test that settles `not-ported` is unchanged. The resolved Fix also re-verified: `HostServices::session_name()` / `set_session_name` still sit on the trait the extension already reaches (`crates/cyrup-ext/src/host/services.rs`, unchanged this window) and `sync_presence_identity` is still `extension.rs:278-280` → `session_state.rs:702`, so the whole fix remains self-contained in `cyrup-intercom`: one const, one `register_command`, one `execute_command` arm. Confidence stays high; severity stays `low`. |
+| ICOM-061 | low | not-ported | S | **New 2026-09-04.** No `/alias` command — upstream `90e6ad4` (v0.13.0, #126, "feat: add intercom alias command") adds `pi.registerCommand("alias", …)` (`index.ts:2812-2815`): `/alias <name>` (or bare `/alias` / `/alias menu`, which opens an interactive input when a UI is present) calls `pi.setSessionName(alias)` then immediately `syncPresenceIdentity(sessionId)`, so the new name reaches intercom peers at once rather than waiting for the idle name poll (ICOM-006) or the next `turn_start`/tool-call sync (ICOM-031). `crates/cyrup-intercom/src/extension.rs:472-479` (`init`) registers exactly two commands — `intercom-id` and the overlay-open command — `grep -rn '"alias"' crates/cyrup-intercom/src/extension.rs` finds neither a registration nor a handler. **Impact bounded and not fully characterised**: whatever mechanism cyrup already exposes for renaming a session outright (if any — not checked here) is unaffected; the gap is specifically the intercom-side command that renames AND immediately pushes the new identity to connected peers in one step. **Confidence: medium** — the upstream contract was read from the commit diff, not the full `index.ts` command-registration context. **Fix** — register an `alias` command in `IntercomExtension::init` that resolves `HostServices::session_name()`/`set_session_name` (if such a seam exists; if not, this item's Fix needs a cross-area handoff) and then calls the existing `sync_presence_identity` helper ICOM-031 introduced. **Verify** — dispatch `alias` with a bare name in a non-UI context; assert the session's advertised presence name changes without waiting for a poll tick. — **RE-READ 2026-09-14 at `9aeba769` (verified re-audit): still open, and its CONFIDENCE RISES from medium to high** — the row's own stated weakness ("read from the commit diff, not the full `index.ts` command-registration context") is now discharged. BOTH SIDES READ. Upstream @v0.13.0, full context: `pi.registerCommand("alias", { description: "Set the current session alias (usage: /alias <name> or /alias menu)", handler: async (args, ctx) => setIntercomAlias(args, ctx) })` at `index.ts:2812-2815`, sitting alongside the two commands cyrup DID port (`intercom` `:2801`, `intercom-id` `:2806`) plus the `alt+m` shortcut. `setIntercomAlias` (`:2679-2731`) is richer than the row's one-line summary, and the row's Verify clause should be tightened to match it: bare `/alias` or `/alias menu` opens `ui.input` when `hasUI`, but in a NON-UI context it does NOT rename — bare `/alias` REPORTS the current alias ("Session alias: X" / "No session alias set.") and `/alias menu` warns "The alias menu requires an interactive UI"; only the `<name>` form calls `pi.setSessionName(alias)` then `syncPresenceIdentity(liveContext.sessionManager.getSessionId())` (`:2720`, `:2728`, the latter defined at `:908-916`) and notifies "Session alias set: X". Classification settled by PRESENCE at the baseline, not by date: `git show v0.9.2:index.ts` registers exactly `intercom` (`:2360`) and `intercom-id` (`:2365`), with no `setSessionName` anywhere — so `not-ported` (drift past `v0.9.2`) is correct. cyrup: `IntercomExtension::init` registers exactly two commands (`extension.rs:564-584`, consts at `:55-63`) and `execute_command` (`:675-705`) matches `intercom-id` then `intercom` and returns ``ExtError::Component("native extension has no handler for command `{name}`")`` for anything else — no alias registration, no handler. **ONE MATERIAL UPDATE TO THE ROW'S FIX:** its hedge ("if such a seam exists; if not, this item's Fix needs a cross-area handoff") is **RESOLVED — the seam exists and no handoff is needed.** `HostServices::session_name() -> Option<String>` (`crates/cyrup-ext/src/host/services.rs:425-427`) and `HostServices::set_session_name(&str)` (`:694`, no-op default, documented as pi `setSessionName`, `agent-session.ts:2272-2274`) sit on the SAME trait the extension already reaches through `HostCtx` for `set_editor_text`, and the live impl is bound at `crates/cyrup-session-svc/src/host_services.rs:1499` and `:1836` (emitting `session_info_changed`, pinned by session-svc `tests/round8_postrun.rs:426,:489`); `IntercomExtension::sync_presence_identity` (`extension.rs:278-280` → `session_state.rs:702`) is the ported `syncPresenceIdentity`. So the whole fix is self-contained in `cyrup-intercom`: one const, one `register_command`, one `execute_command` arm. Severity stays `low` — a rename still reaches peers via the idle name poll (`ICOM-006`) and the turn-start / tool-call identity sync (`ICOM-031`); only the immediacy and the command surface are missing. — **RE-READ 2026-09-16 at `cc7818b` — STILL OPEN at low, unchanged, with two citations corrected.** cyrup: `grep -rn '"alias"' crates/cyrup-intercom/src/` returns **zero** hits — no registration and no handler. `IntercomExtension::init` still registers exactly two commands, `INTERCOM_COMMAND` (`extension.rs:56`, registered `:567-574`) and `INTERCOM_ID_COMMAND` (`:63`, registered `:577-585`), plus the inbound message renderer at `:563`; `execute_command` (`:675`) matches `intercom-id` (`:682`) then `intercom` (`:685`) and returns the no-handler error for anything else. **Citation correction:** the row's `extension.rs:564-584` / consts `:55-63` are now `:567-585` / `:56` and `:63` — the crate did not change in this window (`git diff --stat 9aeba769 cc7818b -- crates/cyrup-intercom` is empty), so the earlier numbers were slightly off rather than stale. Upstream re-measured: **pi-intercom is still v0.13.0**, so the full `setIntercomAlias` contract read on 2026-09-14 (`index.ts:2812-2815` registration, `:2679-2731` handler, `:908-916` `syncPresenceIdentity`) is current, and the `v0.9.2` presence test that settles `not-ported` is unchanged. The resolved Fix also re-verified: `HostServices::session_name()` / `set_session_name` still sit on the trait the extension already reaches (`crates/cyrup-ext/src/host/services.rs`, unchanged this window) and `sync_presence_identity` is still `extension.rs:278-280` → `session_state.rs:702`, so the whole fix remains self-contained in `cyrup-intercom`: one const, one `register_command`, one `execute_command` arm. Confidence stays high; severity stays `low`. — **RE-READ 2026-09-24 at `ea23ca2` — STILL OPEN at low.** cyrup: `grep -rn '"alias"' crates/cyrup-intercom/src` → 0 hits; `extension.rs` untouched this window. Upstream at **v0.14.0**: registration moved to `index.ts:2911` and `setIntercomAlias` to `:2779` (line drift from the +175 `index.ts` delta), contract unchanged. |
+| ICOM-062 | **high** (was medium) | upstream-drift | M | **New 2026-09-24; settled the same day by the surface sweep.** A peer message arriving during a manual compaction is not held — upstream `17699ba` (v0.14.0, #136). **Confirmed on both sides, end to end:** cyrup's `is_idle` is true during `/compact`, so the message takes the trigger arm and the injection pump starts a model run concurrently with the compaction, whose `set_messages` then replaces the transcript under the running turn. Not observed live. See the section. |
+| ICOM-063 | low | upstream-drift | M | **New 2026-09-24.** Opt-in `busyDelivery: "human-first"` and its held-inbound queue (with `queued` / `expired` / `cancelled` / `superseded` / `acknowledged` receipts for held messages) are absent — upstream `0ce2dcd` (v0.14.0, #128). Default behaviour upstream is unchanged, so this is opt-in surface only. |
+| ICOM-064 | low | upstream-drift | S | **New 2026-09-24.** No `intercom:session-identity` claim event, so no extension can give one session a fixed intercom id without the process-wide `CYRUP_INTERCOM_STABLE_ID` / `stableId` — upstream `eae462a` (v0.14.0, #135). |
+| ICOM-065 | low | upstream-drift | M | **New 2026-09-24.** `list` / the session overlay do not report a Herdr-hosted session's current workspace / tab / pane — upstream `0ffe1d5` (v0.14.0, #129): `HERDR_PANE_ID` + session-file registration hint, broker-side live `herdr api snapshot` join, `herdrLocation` on list responses. **Fix corrected by the surface sweep:** herdr is consumed through `cyrup-herdr`'s client, not ported, and the session-path join needs cyrup to report its session to herdr, which nothing does yet. |
+| ICOM-066 | low | upstream-drift | S | **New 2026-09-24.** `list` / `list-cwd` results carry no `details.roster`, so the TUI cannot collapse them to one line — upstream `a0cc5a1` (v0.14.0, #127). Display only; the model-visible text is unchanged upstream. |
+| ICOM-067 | low | upstream-drift | M | **New 2026-09-24.** No scripting client for the local broker (`list` / `send` / `ask`, `--json`, exit 2 on ask timeout) — upstream `41dc8f6` (v0.14.0, #131), `cli.ts`. Only the hidden `__intercom-broker` subcommand exists in cyrup. `cli.ts` read in full by the surface sweep; confidence confirmed. |
+| ICOM-068 | **high** | parity-bug | M | **New 2026-09-24 (surface sweep).** An injected intercom message that asks for no turn — every busy-session `Steer` delivery (`ICOM-035`) and every idle delivery under `inboundTrigger: "replies"`/`"never"` — is persisted and drawn but **never pushed onto the agent's transcript**, so the model does not see it in this process. Upstream pushes it (`agent.state.messages.push`). Defect lives in `cyrup-session-svc` (area 08 handoff). |
+| ICOM-069 | low | upstream-drift | S | **New 2026-09-24 (promoted lead).** The `"injected"` receipt is emitted before `inject_message`, so a failed enqueue — and, under cyrup's pump, a message still waiting out a busy run — reports `injected` to the sender's `latestDeliveryState` — upstream `17699ba` moved it after `pi.sendMessage`. |
+| ICOM-070 | low | parity-bug | S | **New 2026-09-24 (surface sweep).** The `intercom` and `contact_supervisor` tool `description`s are cyrup one-liners, not upstream's text: the model loses the targeting rules, the per-action usage block, and v0.11.0's "Re-list before reusing a session ID; skip if it resolves to self." |
 | ~~ICOM-027~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Non-trigger inbound messages persisted with `display=false` — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-028~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED** | cyrup-original | M | `intercom_message` entry surface has no renderer — **REFUTED, CLOSED 2026-08-14**: sweep 6 — closed at HEAD as **the item's own option (a)**: `IntercomExtension::render_entry` draws the durable `intercom_message` entry (`extension.rs:690-707`, `:832`), with the in-source note recording that option (b) still depends on `ICOM-024`/`ICOM-029`. |
 | ~~ICOM-032~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Session shutdown leaves the pending-idle queue populated — **CLOSED 2026-08-14**: sweep 1 — closed as SUBSUMED by ICOM-035, not as independently fixed: the machinery they described (`pending_idle`, `flush_timer`, `schedule_inbound_flush`, `flush_idle_messages`, `PendingInbound`, `InboundPolicy::Queue`) no longer exists. |
@@ -853,6 +1009,61 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 
 ## ICOM-035 — Busy inbound messages are parked until idle instead of steered onto the live run
 
+> **REOPENED 2026-09-24 (surface sweep) — Kind `parity-bug` · Severity high · Effort M ·
+> Confidence confirmed by reading both sides end to end; not observed live.** The body below is the
+> 2026-08-14 original, kept for audit; its **cyrup** paragraph (the queue machine) is history — the
+> queue really is gone — but its **Fix** paragraph's premise is the thing that regressed.
+>
+> **cyrup at `ea23ca2`.** The intercom side is still right: a busy interactive session takes
+> `InboundPolicy::Steer` (`crates/cyrup-intercom/src/inbound.rs:104-123`) and calls
+> `send_incoming_message(…, InboundDelivery::Steer)`, which computes `trigger_turn = false`
+> (`:251-252`) and calls `services.inject_message(…, false)` (`:253-259`). The inline comment there
+> still says the host *"routes to `agent.steer(msg)` whenever `is_run_active()`"* — **that is no
+> longer what the host does.** `LiveHostServices::inject_message`
+> (`crates/cyrup-session-svc/src/host_services.rs:1644-1666`) only calls `enqueue_injection`
+> (`:1139-1162`), which sends an `InjectRequest` to the session's single consumer
+> `drive_injections` (`session/mod.rs:624`). That task **awaits `session.wait_for_idle()` before it
+> delivers anything** (`:655`), then `deliver_injection_inbox` (`session/inject.rs:125`) appends
+> every no-turn member through `append_injected_message_durably` (`:131`, `:146-172`). Nothing on
+> the path calls `agent.steer`. So a peer message to a busy session waits out the whole run
+> (retry / auto-compaction / continuations included, since `wait_for_idle` watches `driver_tx`)
+> and is then appended **with no turn** — and, per `ICOM-068`, outside the agent transcript. The
+> pump landed in `8de7460` (2026-09-08; `git log -S 'async fn drive_injections'`), after this
+> item's 2026-08-14 closure, whose own rationale (`session.rs:3926-3928` routing on
+> `is_streaming()`) was true when written.
+>
+> **upstream.** pi-intercom v0.14.0 `sendIncomingMessage` (`index.ts:1221-1246`) calls
+> `pi.sendMessage(…, { deliverAs: "steer" })` for a busy session; pi `sendCustomMessage` routes
+> that to `this.agent.steer(appMessage)` while streaming (pi v0.83.0
+> `packages/coding-agent/src/core/agent-session.ts:1444-1449`; v0.87.1 `:1949-1954`). README
+> v0.14.0: busy interactive recipients *"enter Pi's steering queue at the next safe model boundary
+> without aborting the run"*.
+>
+> **Impact.** The supervisor→worker redirect intercom exists for does not happen: the running
+> agent never sees the message while it works, a blocking `ask` from the peer waits (10-minute
+> default) for a turn that is not coming, and the reply hint rewritten for steer mode points at a
+> message the model will not read. The TUI still draws the card after the run (via `message_end`),
+> so the human sees a message the agent silently ignored.
+>
+> **Why the tests stay green.** Every cyrup test of this arm substitutes a `HostServices` double
+> that counts `inject_message` calls (`cyrup-it/tests/intercom/dismiss_incoming_ask.rs`
+> `IdleControlledHost`, `inbound.rs` test doubles) — none runs `LiveHostServices` and its pump.
+>
+> **Fix (area 08 owns the code).** Restore pi's routing inside the pump's contract without
+> re-introducing the lost-steer race the pump was built to close: in `enqueue_injection` or at the
+> head of `drive_injections`, a request with `trigger_turn == false` that arrives while
+> `is_run_active()` goes to `agent.steer(msg)` (pi's `deliverAs: "steer"` default) **and** is
+> tracked so that a steer landing past the run's last `poll_steering` is re-offered at the idle
+> edge instead of stranding (the pump's stated reason for existing). Or give `HostServices` an
+> explicit `DeliverAs` (the optional half of the original Fix) and route `Steer` to
+> `AgentSession::send_custom_message(…, Some(DeliverAs::Steer))`, whose `is_run_active()` arm
+> already steers (`session/inject.rs:90-93`). Correct the stale comment at `inbound.rs:246-250`.
+>
+> **Verify.** A `cyrup-it` test over a real `AgentSession` (not a `HostServices` double) with a
+> scripted provider that holds a run open across two tool calls: deliver an intercom message
+> mid-run and assert it appears in the provider's second request of the SAME run, as a custom
+> message, with no extra turn started afterwards.
+
 **Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** high
 
 **cyrup** — The whole queue machine is present and is the only busy-path behaviour: `crates/cyrup-intercom/src/inbound.rs:42-46` (`INBOUND_FLUSH_DELAY_MS = 200`, `INBOUND_IDLE_RETRY_MS = 500`), `:141-146` (`queue_idle_message`), `:179-188` (`schedule_inbound_flush`), `:195-210` (`flush_idle_messages`), `InboundPolicy::Queue` at `:67-70` returned by `decide_inbound_policy` at `:113`; storage at `session_state.rs:39-41` + `:123-176`; drivers at `extension.rs:587` and `:609`.
@@ -1179,6 +1390,261 @@ With a short `HOME` the broker starts and stays up, so this is path-length depen
 
 ---
 
+## ICOM-062 — A message arriving during a manual compaction is not held; in cyrup it starts a run that races the compaction
+
+**Kind** upstream-drift · **Severity** high (was medium) · **Effort** M · **Confidence** confirmed — both sides read end to end on 2026-09-24 (surface sweep); not observed live
+
+> *Settled 2026-09-24.* The first filing (same day) rated this `medium` on upstream's reported
+> consequence with **low** confidence on cyrup's, because the cyrup path past `inject_message` had
+> not been read. It now has, and cyrup's consequence is different from — and worse than —
+> upstream's.
+
+**cyrup** — end to end at `ea23ca2`:
+1. `/compact` → `AgentSession::compact` (`crates/cyrup-session-svc/src/session/compaction.rs:39`,
+   called from `cyrup-tui/src/app/execute_session.rs:58`/`:63`, `command.rs:150`, `session/control.rs:141`)
+   runs `abort_and_settle()` (`:49`) and then summarizes **without setting `driver_tx` or the
+   agent's run latch**. `AgentSession::is_idle` is `!driver_tx && !agent.is_running()`
+   (`session/mod.rs:473-475`), so throughout a manual compaction the session reads **idle**
+   (this is area 08's `SEAM-125`).
+2. The intercom inbound loop reads that through `SharedIntercomState::is_idle` →
+   `HostServices::is_idle` (`host_services.rs:1711-1717`) and takes
+   `InboundPolicy::Deliver { trigger }` (`inbound.rs:104-123`, dispatched at `:483-503`), so
+   `inject_message(…, trigger_turn = true)` under the default `inboundTrigger: "always"`.
+   The extension's own `agent_running` flag (`session_state.rs:136`) is never consulted.
+3. The injection pump's `wait_for_idle()` (`session/mod.rs:655`) returns at once (idle by the
+   same definition) and `run_injection` (`session/run.rs:238-262`) sets `driver_tx` and calls
+   `agent.prompt(messages)` — **a model run starts while the compaction is still summarizing**,
+   over the agent's pre-compaction transcript plus the intercom message. Nothing on the path
+   checks `is_compacting()` (the TUI's Submit arm does; the pump does not).
+4. When the summary lands, `compact` replaces the agent's transcript unconditionally —
+   `self.agent.set_messages(compacted_messages)` (`compaction.rs:263`), and `Agent::set_messages`
+   (`cyrup-agent/src/agent/facade.rs:130-132`) is a bare assignment with no run-latch check —
+   **under the run started in step 3**. The intercom message that run was answering is no longer
+   in the transcript the run continues on, and the provider request that run already sent carried
+   the uncompacted context the user was compacting to get rid of.
+
+**upstream** — `git -C tmp/pi-intercom show v0.14.0:index.ts`: `handleIncomingMessage` holds the
+entry when `heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || …human-first…))`
+(`:1336-1341`, with the in-source reason "Busy without an agent run cannot steer; manual
+compaction can discard an appended custom entry"). pi's `isIdle` is true of a compaction only
+before v0.85.1; from v0.85.1 it is `!_isAgentRunActive && !isCompacting` (pi
+`agent-session.ts` v0.87.1 `:1234-1236`, `bea67d90d`), so upstream reads a compaction as busy and
+`agentRunning` false → hold. Held entries get a `queued` receipt (`holdIncomingBrokerMessage`,
+`:1294-1301`); a 100 ms interval (`flushHeldInboundMessages`, `:1276-1289`) delivers them once
+`isIdle() || agentRunning`; `agent_start` flushes; `session_start` / `session_shutdown` expire them
+with `expired` receipts (`:1661`, `:1799`). Note the rule is general, not compaction-specific: a
+busy **non-interactive** session without an agent run now holds instead of auto-replying. Pinned by
+`intercom.integration.test.ts` "busy without an agent run holds inbound messages through compaction
+{success,failure,abort,cancel}" (receipts exactly `receiver_received, acknowledged` while held,
+then `…, injected`; both delivered with `{ triggerTurn: true }` in order), "shutdown discards …",
+"runtime replacement discards …", "cancelling a compaction-held message drops it before
+injection", "held inbound messages steer when an agent run is busy after compaction" (steered on
+`agent_start`) and "human-first leaves non-UI sessions on the busy auto-reply path after
+compaction". Absent at v0.13.0.
+
+**Impact** — a peer message landing during a manual `/compact` (a window of one summarization
+call, often tens of seconds) starts an unrequested model turn over the full pre-compaction context
+— the size the user was compacting away from, so it can overflow — and the compaction then swaps
+the transcript out from under that turn, leaving the peer's message out of the model's context and
+the turn's own output appended to a context that no longer contains its prompt. Silent wrong
+result on a normal path; rated high.
+
+**Fix** — two halves, and the first belongs to area 08:
+(a) **`SEAM-125`** — make `is_idle`/`wait_for_idle` count a running manual compaction (pi v0.85.1's
+`!isCompacting`), which by itself stops step 3 (the pump's `wait_for_idle` would park) and turns
+the intercom decision into `Steer`;
+(b) in this crate, port the hold: a held-inbound `VecDeque` on `SharedIntercomState`, entered when
+`!is_idle && !agent_running` (upstream's exact rule, including the non-UI case), a `queued`
+receipt on entry, flushed on `AgentStart` and on the next idle edge, expired with
+`MessageReceiptStatus::Expired` on session start/shutdown, dropped with `acknowledged` / `cancelled`
+/ `superseded` in `dismiss_incoming_ask` / `handle_message_control`. Shares its queue with
+`ICOM-063`; land them together. (b) without (a) is not enough — cyrup would still read the
+compaction as idle.
+
+**Verify** — upstream's compaction test shape against a **real** `AgentSession` with a scripted
+provider and a slow summarizer: start `/compact`, deliver a peer message, assert no `agent.prompt`
+happens until `compaction_end`, then exactly one triggered turn whose request contains the
+compacted context plus the message, and receipts `receiver_received, acknowledged, queued,
+injected`. **Falsification (close as REFUTED):** that test passes at `ea23ca2` unchanged.
+
+## ICOM-063 — Opt-in `busyDelivery: "human-first"` and the held-inbound queue are absent
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read)
+
+**cyrup** — `crates/cyrup-intercom/src/config.rs` parses `brokerCommand`…`replyHint`/`status`/`stableId`; `grep -rniE 'busy_delivery|busyDelivery|human.first|held_inbound' crates/cyrup-intercom/src` → 0 hits. An unknown `busyDelivery` key is silently ignored (`parse_config` reads known keys off the object, `config.rs:115-175`), so a user config written for v0.14.0 loads without error and without effect.
+
+**upstream** — v0.14.0 `config.ts`: `BusyDeliveryPolicy = "steer" | "human-first"`, default `"steer"`, strict validation (`"busyDelivery" must be "steer" or "human-first"`). `index.ts`: with `human-first` and a UI, busy inbound messages are held (`:1337`) and released one per `turn_end` as a steer when the assistant turn did not abort/error and nothing else is pending (`:1810-1822`), or one per flush tick once idle (`:1276-1283`); `dismissIncomingAsk` and `handleMessageControl` drop a held message with `acknowledged` / `cancelled` / `superseded` receipts before injection. Introduced by `0ce2dcd` (#128); test file `human-priority.pi.test.ts` (+488, not read).
+
+**Impact** — an operator cannot opt into "don't interrupt me while I type"; peers keep being steered mid-run (and, until `ICOM-035` is fixed, cyrup does not steer at all). Default behaviour is otherwise identical. *Added 2026-09-24 (surface sweep):* upstream's strict parse means `busyDelivery: "bogus"` makes `loadConfig` throw, which fails the whole config closed to `inboundTrigger: "never"` (README v0.14.0; `config.test.ts` "loadConfig rejects invalid busyDelivery values"); cyrup ignores the key, so the same file keeps auto-triggering here.
+
+**Fix** — `BusyDelivery` enum + strict parse in `config.rs`; the held queue from `ICOM-062`; a `TurnEnd` arm that steers one held message under upstream's six conditions; drop-with-receipt in the reply-dismiss and message-control paths.
+
+**Verify** — config parse tests for both values and the error string; then upstream's seven `human-priority.pi.test.ts` cases (read 2026-09-24): a held peer is steered into the same run at the next turn boundary; human steer/followUp arriving after a held peer are processed first; multiple held peers drain one per turn with human input winning between them; held peers hand off one triggered turn when a run ends without a turn boundary; a held ask answered mid-run is dropped with `acknowledged`, not injected; cancelled/superseded held peers are dropped before injection; held peers expire on shutdown. Upstream's `turn_end` release also requires `stopReason` not `aborted`/`error` and `!ctx.hasPendingMessages()` (`index.ts:1810-1822`).
+
+## ICOM-064 — No `intercom:session-identity` claim event
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+**cyrup** — the intercom id is the session id unless `CYRUP_INTERCOM_STABLE_ID` or `config.stable_id` overrides it (`crates/cyrup-intercom/src/connect.rs:650-660` `configured_stable_session_id`); both are process- or machine-wide. `grep -rniE 'session-identity|SESSION_IDENTITY' crates/cyrup-intercom/src` → 0 hits.
+
+**upstream** — v0.14.0 `extension-api.ts`: `INTERCOM_SESSION_IDENTITY_EVENT = "intercom:session-identity"` and `IntercomSessionIdentityRequestV1 { version: 1; claim(stableId) }`. `index.ts:1643-1653`: at `session_start` the extension emits the event on `pi.events`; the first non-empty synchronous claim wins over `PI_INTERCOM_STABLE_ID` and `stableId`. Introduced by `eae462a` (#135), motivated by pi-subagents' readable-child-name problem.
+
+**Impact** — a launcher (e.g. `cyrup-ext-subagents`) cannot pin a child's routing address per session while leaving its name free for a human label. cyrup's subagent path currently addresses children by presence name, so nothing breaks today; this is missing extension surface.
+
+**Fix** — emit a claim request on the extension bus in the session-start arm before resolving the id; take the first non-empty trimmed claim ahead of `configured_stable_session_id`.
+
+**Verify** — a unit test with a second native extension that claims `"child-7"`; assert the registration id is `child-7` while the presence name is unchanged.
+
+## ICOM-065 — `list` does not report a Herdr-hosted session's current location
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read)
+
+**cyrup** — `grep -rniE 'herdr_pane_id|herdr_location|herdr_session_path' crates/cyrup-intercom/src` → 0 hits; the registration has `tmux_pane` (`ICOM-058`) but no Herdr field, and the broker's `list` answers from its session map only. The substrate exists: `crates/cyrup-herdr` exposes `HERDR_PANE_ID` discovery (`env.rs`, `HerdrPane::discover`) and a client that already speaks herdr's snapshot (`client.rs:35-47` `session.snapshot` / `bootstrap`; `cli.rs:22` wraps `api snapshot`), used today only by `project_pane.rs`'s `HerdrLauncher` and the status bridge.
+
+**upstream** — v0.14.0: the client registers `herdrPaneId` from `HERDR_PANE_ID` and, when present, `herdrSessionPath` = the session file (`index.ts:526-529`, registration at `:909-925`). The broker keeps `herdrSessionPath` private (`broker/broker.ts` `ConnectedSession`), and on every `list` resolves all hosted sessions against one un-cached `herdr api snapshot` (`herdr-location.ts`, 137 lines) into `herdrLocation: current{workspace,tab,paneId,refreshedAt} | not_hosted | unavailable{paneId,reason}`, falling back to `unavailable/command_failed` on error. `broker/protocol.ts` validates both new fields; `index.ts:541` `formatHerdrLocation` and `ui/session-list.ts` print them. Introduced by `0ffe1d5` (#129).
+
+**Impact** — in a Herdr layout, `intercom{list}` cannot tell the model or the human where a peer's pane is. Informational only.
+
+**Fix** — *corrected 2026-09-24 (surface sweep), with `herdr-location.ts` now read in full.* **herdr is not ported; cyrup has a client for it (`crates/cyrup-herdr`), and this item consumes that client.** What is ported is pi-intercom's own join logic, not herdr: (1) registration fields `herdrPaneId` (from `cyrup_herdr::env`'s `HERDR_PANE_ID`) and the broker-private `herdrSessionPath` + protocol validation (`isHerdrLocation`, the five `unavailable` reasons); (2) a broker-side join over ONE `HerdrClient::session_snapshot` per `list` (in place of upstream's `herdr api snapshot` subprocess — same data, over the socket client cyrup already has), in-flight-shared but never cached, skipped entirely when no session carries a pane id (upstream preserves the roster byte-for-byte then); (3) upstream's join order: `pane.agent_session {kind:"path", value == herdrSessionPath}` first (ambiguous → `invalid_response`), else a direct `pane_id` lookup, then tab/workspace labels, with the failure mapping `HERDR_UNAVAILABLE → herdr_unavailable`, unsupported version → `unsupported`, anything else → `command_failed`; (4) list-row (`· Herdr <ws> [<id>] / <tab> [<id>] / pane <id>`, `not under Herdr`, `Herdr location unavailable: <reason> (pane <id>)`) and overlay text with upstream's literals. **The item's earlier "no new herdr plumbing is needed" was wrong in one respect:** upstream's session-path key works because herdr itself reports pi sessions (`source: "herdr:pi"`); nothing reports a cyrup session — `HerdrClient::report_agent_session` (`crates/cyrup-herdr/src/client.rs:204-208`) has no caller outside `cyrup-herdr`'s own tests. So either cyrup reports its session file through that existing client call at session start (and the join accepts cyrup's own `source`), or the join falls back to the direct pane-id lookup and a moved pane reads `unavailable/pane_missing`, as an old upstream client does. The v0.14.0 `SKILL.md` "Use list location instead of guessing" paragraph rides this item.
+
+**Verify** — upstream's `herdr-location.test.ts` cases against a stub `HerdrClient`: no snapshot call and unchanged roster when every session is non-Herdr; hosted + non-Herdr resolved from one snapshot; a moved pane re-resolved rather than retained; a missing pane `unavailable/pane_missing`; duplicate session identities not guessed between (`invalid_response`); a failing snapshot keeps the roster and marks hosted sessions `unavailable`.
+
+## ICOM-066 — `list` / `list-cwd` results carry no `details.roster`, so they cannot collapse
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+**cyrup** — `grep -rn roster crates/cyrup-intercom/src/tools` finds no `roster` details key; `tools/render.rs` renders list results from the text content.
+
+**upstream** — v0.14.0 `index.ts:2280` / `:2334`: `details: { roster: { peers, total[, cwd] } }`; the result renderer shows `N other sessions[ in cwd] (M connected)` when not expanded and not failed. Introduced by `a0cc5a1` (#127). The model still gets the full text.
+
+**Impact** — display only: long rosters fill the transcript.
+
+**Fix** — add the `roster` details on both actions and the collapsed arm in `tools/render.rs`, with upstream's strings.
+
+**Verify** — render test: collapsed shows the one-line summary; expanded shows the full list.
+
+## ICOM-067 — No scripting client for the local broker
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed — `cli.ts` (256 lines) read in full on 2026-09-24 (surface sweep), with `cli.test.ts`'s 17 cases
+
+**cyrup** — the only intercom CLI surface is the hidden `__intercom-broker` subcommand (`crates/cyrup/src/intercom_broker_cmd.rs`, dispatched from `predispatch.rs:61`).
+
+**upstream** — v0.14.0 `cli.ts` (256 lines, `41dc8f6`, #131): `list [--json]`, `send --to --text [--name] [--json]`, `ask --to --text [--timeout-ms N] [--name] [--json]`; registers with the broker as an ordinary session (default name `pi-intercom-cli`) so replies route back to it; default ask timeout 120 000 ms; exit codes 0 ok / 1 usage-connection-delivery failure / 2 ask timeout. Pitched for scripts and for use over `ssh` without a network listener.
+
+*Details read 2026-09-24:* the CLI never starts a broker (connect failure → exit 1 with "cannot reach the local intercom broker … is a pi session with pi-intercom loaded currently running on this machine?"); it registers `model: "pi-intercom-cli"`, `status: "idle"`, cwd/pid of the process; `--timeout-ms` must match `^[0-9]+$` and be a positive safe integer; `ask` buffers a reply that arrives before `send` resolves its id and ignores replies to other ids; `--json` prints `{ok:true,…}` / `{ok:false,error[,reason:"timeout"]}` on stdout for every outcome including usage errors; plain `list` prints tab-separated `name id[0..8] model status cwd`. The client it reuses applies `PI_INTERCOM_SCOPE_ID`, so the cyrup port must honour `CYRUP_INTERCOM_SCOPE_ID` (`ICOM-055`) too.
+
+**Impact** — scripts and remote shells cannot talk to running cyrup sessions over intercom.
+
+**Fix** — a `cyrup intercom list|send|ask` subcommand over the existing `transport` client, with upstream's flags and exit codes.
+
+**Verify** — integration test against a real broker: `send` delivers, `ask` gets a reply, `ask` with no reply exits 2; plus `cli.test.ts`'s parse and `--json` failure-shape cases.
+
+## ICOM-068 — A no-turn injected intercom message never enters the agent transcript
+
+**Kind** parity-bug · **Severity** high · **Effort** M · **Confidence** confirmed by reading both sides; not observed live
+
+**cyrup** — `crates/cyrup-intercom/src/inbound.rs` hands two kinds of delivery to `inject_message`
+with `trigger_turn = false` (`:251-259`): every busy-session `Steer` (`ICOM-035`) and every idle
+`Deliver { trigger: false }` under `inboundTrigger: "replies"` (non-reply messages) or `"never"`.
+In the live host these become `plan.durable` members of the injection pump
+(`crates/cyrup-session-svc/src/session/inject.rs` `merge_injection_batch`), and
+`deliver_injection_inbox` (`:125-140`) passes each to `append_injected_message_durably`
+(`:146-172`), which **only** appends to the session tree (`manager.append_custom_message`) and
+emits `message_start`/`message_end`. It never touches the agent: no `agent.steer`, no push onto
+the transcript, and no rebuild of it — the run path reads the transcript from the agent
+(`session/run.rs` consults the tree only for `pending_next_turn`, `:712`), and the only writers of
+the whole transcript are compaction, auto-compaction and fork (`set_messages`, `compaction.rs:263`,
+`auto_compaction.rs:359`, `forking.rs:355`). `AgentSession::send_custom_message`'s idle arm
+(`inject.rs:94-106`) has the same omission. So the message is on screen and in the JSONL file,
+and absent from what the model is sent — until a resume, fork or compaction re-seeds the
+transcript from the tree.
+
+**upstream** — pi `sendCustomMessage`'s no-turn, not-streaming arm is
+`this.agent.state.messages.push(appMessage); this.sessionManager.appendCustomMessageEntry(…); emit
+message_start/message_end` (pi v0.83.0 `packages/coding-agent/src/core/agent-session.ts:1452-1461`);
+at v0.87.1 it is `_appendCustomMessage` → `_refreshFinalizedContext()`, which re-seeds
+`agent.state.messages` from the session projection (`:1968-1982`, `:730-736`) — same outcome, the
+model sees it on the next turn. pi-intercom relies on that: with `inboundTrigger: "never"` a
+message is "still delivered, just without driving a turn" (cyrup's own doc on
+`InboundPolicy::Deliver`, `inbound.rs:59-66`).
+
+**Impact** — with `inboundTrigger: "replies"` or `"never"`, a peer's message is shown to the human
+and never reaches the model on the user's next prompt; combined with `ICOM-035`, the same happens
+to every message sent to a busy session under the default config. The human reasonably assumes
+the agent has read what is on screen. Silent wrong result; rated high.
+
+**Fix** — area 08 owns the code (cross-area handoff; not filed there by this pass): in
+`append_injected_message_durably` (and `send_custom_message`'s idle arm) also append the message
+to the agent transcript, under the run latch — `Agent::edit_transcript`
+(`cyrup-agent/src/agent/facade.rs:142-151`) already refuses while a run is active, which is the
+right guard because the pump only reaches this point after `wait_for_idle`. Keep the append and
+the transcript push in one critical section so a racing prompt cannot observe one without the
+other.
+
+**Verify** — over a real `AgentSession` with a scripted provider: inject a custom message with
+`trigger_turn = false` while idle, then `prompt("next")`; assert the provider's request contains
+the custom message before `next`. Repeat through the intercom path with `inboundTrigger: "never"`.
+
+## ICOM-069 — The `"injected"` receipt is emitted before injection, including when injection fails
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+*Promoted 2026-09-24 from the RE-MEASURE block's `17699ba` second-half lead ("confirm whether any
+consumer observes it"). A consumer does.*
+
+**cyrup** — `send_incoming_message_at` and `trigger_turn_over_inbound` emit
+`MessageReceiptStatus::Injected` (`crates/cyrup-intercom/src/inbound.rs:231`, `:281`) and only
+then call `services.inject_message` (`:253`, `:294`), whose `Err` is warn-logged and swallowed. The
+sender records the receipt (`session_state.rs:262` `record_outbound_receipt`) and its only reader,
+`latest_delivery_state` (`:279`), is what the ask-timeout text quotes as "Last known delivery
+state". Under cyrup's pump the gap is wider than a failure case: `inject_message` returning `Ok`
+means *enqueued*, and a busy session's message then waits out the run (`ICOM-035`).
+
+**upstream** — v0.13.0 emitted `injected` before `pi.sendMessage` (as v0.10.1 `index.ts:881`);
+`17699ba` (v0.14.0) moved it after the call (`index.ts:1234-1245`), so a `sendMessage` that throws
+emits nothing and the sender's last state stays `acknowledged`.
+
+**Impact** — a supervisor whose `ask` times out is told the worker had the message *injected*
+when it was never handed to the agent (enqueue failed) or is still parked behind a run, and so
+waits instead of re-sending or cancelling. Diagnostic text only.
+
+**Fix** — move both `emit_message_receipt(…, Injected, None)` calls after a successful
+`inject_message`; skip them on `Err`. Truthful "injected" for the busy case additionally needs the
+pump's ack (`HostServices::inject_message_ack`, `host_services.rs:1669`) — emit on
+`InjectOutcome::Accepted` rather than on enqueue.
+
+**Verify** — a `HostServices` double whose `inject_message` returns `Err`: assert the sender's
+receipts for that id stop at `acknowledged`.
+
+## ICOM-070 — The `intercom` and `contact_supervisor` tool descriptions are not upstream's
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+**cyrup** — `IntercomTool::description` (`crates/cyrup-intercom/src/tools/intercom/mod.rs:483-485`)
+returns one line: "Coordinate with other local agent sessions over the intercom broker:
+list/list-cwd/send/ask/reply/pending/status/cancel." `contact_supervisor`'s
+(`tools/contact_supervisor.rs:727-729`) is likewise a cyrup paraphrase. The neighbouring
+`label`, `prompt_snippet` and `prompt_guidelines` are ported verbatim, with doc comments saying so.
+
+**upstream** — v0.14.0 `index.ts:2182-2199` (v0.10.1 `:1782-…`): a paragraph on targeting ("by
+name, full session ID, or the short id shown in parentheses by \"list\" (a leading prefix of the
+ID is enough). Prefer the short id when two sessions share a name."), v0.11.0 `006af91`'s added
+sentence "Re-list before reusing a session ID; skip if it resolves to self.", and a `Usage:` block
+with one example per action including `cwd` + `openProjectPaneIfMissing` and `cancel`.
+`contact_supervisor` (`:1911`) describes when each `reason` blocks and "Do not use for routine
+completion handoffs." (the last is carried by cyrup's guidelines, the rest is not).
+
+**Impact** — the model is told less about how to address peers than upstream tells it: no
+prefix-targeting rule, no stale-ID warning (the one #103 added because agents reused dead ids),
+no per-action call shapes. The parameter descriptions still carry some of it. No wrong result is
+guaranteed; addressing mistakes become likelier.
+
+**Fix** — port both descriptions verbatim with the crate's `pi` → `cyrup` product-name rule; add a
+test that pins them the way `prompt_guidelines` is pinned.
+
+**Verify** — string-equality test against the upstream text at the pinned tag (after the
+product-name substitution).
+
 ## Coverage
 
 ### Read first-hand (cyrup, HEAD `04c1ba2`, tree clean)
@@ -1314,7 +1780,7 @@ No finding was fully refuted this pass, but **five were corrected** and one **ev
 ### Cross-area handoffs
 
 - **ICOM-029** needs a signature change in **area 06 (cyrup-ext)** and **area 08 (session-svc)**: `HostServices::inject_message` gains a `details` argument.
-- **ICOM-035** may need the same two areas to expose an explicit steer delivery mode (optional — see its Fix).
+- **ICOM-035** may need the same two areas to expose an explicit steer delivery mode (optional — see its Fix). **2026-09-24: no longer optional.** The reopened `ICOM-035` and new `ICOM-068` are defects in **area 08**'s injection pump (`cyrup-session-svc/src/session/{mod,inject}.rs`); `ICOM-062` depends on area 08's `SEAM-125`. Area 08 has not filed the pump defects; until it does, those rows are the only record.
 - **ICOM-030**'s env var is written by **area 09 (cyrup-ext-subagents)**, `exec/mod.rs:1811`; the fix itself is entirely inside area 11.
 - **ICOM-027** depends on **area 07 (cyrup-tui)**'s replay gate at `app/session_bind.rs:269`, which is a **correct** port of Pi and must NOT be changed — the fix belongs on the intercom side.
 - **ICOM-040**'s alias length is coupled to **area 09**'s `orchestrator_presence_target`; changing one without the other breaks child→supervisor addressing.

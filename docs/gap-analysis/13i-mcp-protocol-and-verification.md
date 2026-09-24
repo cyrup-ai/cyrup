@@ -84,6 +84,10 @@ port starts from an empty baseline and writes it from observed failures.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
+> **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** sampling via `ModelRegistry.complete` → **`MCP-557`** (`stale-port`, low; needs a follow-or-diverge ruling). `MCP-452`'s row is untouched. From v2.34–v2.37: nothing further for this section beyond the already-filed `MCP-546`. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
+
+> **THIRD PASS 2026-09-24 (every open unit re-checked on both sides, cyrup `ea23ca2` × v2.37.0).** This section's units re-ruled: `MCP-450`, `451`, `453`, `456`, `461`–`465`, `467`–`471`, `473`–`477`, `479`–`481` → **implemented**; `MCP-454` `missing` → **partial** and medium → **high** (builtin models over an empty credential store), `MCP-458` `missing` → **partial** (current model gated on a UI; no turn-cancel); `MCP-490` restated; `MCP-483`–`487`, `491`, `492`, `493`, `495`, `496`, `498` confirmed. Evidence and upstream cites are in each unit's row in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) *Every unit, by section* and in §*Third pass — 2026-09-24* (table E, census). The unit bodies below are not rewritten; where a body and its STATUS row disagree, the row is current.
+
 **Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
 pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
 from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
