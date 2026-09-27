@@ -2127,8 +2127,18 @@ impl SubagentPromptRuntime {
         self
     }
 
-    /// SUBA-045 — pi `refreshChildToolDiagnostic(pi)` (`subagent-prompt-runtime.ts:98-103`), fired
-    /// from `agent_start` (`:514-516`).
+    /// SUBA-045 — pi's `agent_start` tool check (`subagent-prompt-runtime.ts:496-501` @v0.71.0):
+    /// diff the required list against the child's REAL registry, record the diagnostic, and REFUSE
+    /// the run when anything is missing.
+    ///
+    /// Upstream's handler `throw new Error(formatChildToolDiagnostic(diagnostic))` (#1356, v0.55.0),
+    /// and its foreground parent aborts the child the moment `agent_start` carries a diagnostic
+    /// (`foreground/execution.ts:982-993`). cyrup's child is its own process, so the refusal happens
+    /// here, in the child: [`ControlOp::Abort`](cyrup_ext::host::ControlOp::Abort) stops the run this
+    /// `agent_start` opened, before its first model call, and the parent reports the file's text as
+    /// the run's error (`attempt_runner::diagnose_attempt_error`, which ranks it above the aborted
+    /// assistant message). This check is the ONLY guard on a child's real tool menu now that the
+    /// parent no longer predicts it (SUBA-114).
     ///
     /// The available list is `pi.getAllTools().map((tool) => tool.name)`, which is
     /// [`cyrup_ext::host::HostServices::all_tool_names`]. A backend that cannot answer is treated as
@@ -2145,16 +2155,28 @@ impl SubagentPromptRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let Some(available) = services.and_then(|s| s.all_tool_names()) else {
+        let Some(services) = services else {
             return;
         };
-        crate::exec::tool_availability::write_child_tool_diagnostic(
+        let Some(available) = services.all_tool_names() else {
+            return;
+        };
+        let Some(diagnostic) = crate::exec::tool_availability::write_child_tool_diagnostic(
             &plan.path,
             &plan.required,
             &available,
             plan.agent.as_deref(),
             plan.mcp_direct_tools.as_deref(),
-        );
+        ) else {
+            return;
+        };
+        // Upstream's thrown message, in the child's own log — the parent's copy comes from the
+        // file, but a child run by hand (or whose parent died) still says why it stopped.
+        let message = crate::exec::tool_availability::format_child_tool_diagnostic(&diagnostic);
+        tracing::warn!(%message, "subagent child refused at agent_start: required tools missing");
+        if let Err(err) = services.control(cyrup_ext::host::ControlOp::Abort) {
+            tracing::warn!(%err, "subagent child tool check could not abort its run");
+        }
     }
 
     /// The child watchdog this runtime drives, if any — exposed so a test can drive the real
@@ -2460,9 +2482,9 @@ impl NativeExtension for SubagentPromptRuntime {
                 _ => {}
             }
         }
-        // SUBA-045 / pi `onRuntimeEvent("agent_start", …)` (`subagent-prompt-runtime.ts:514-516`).
-        // Same rule as the two blocks around it: a pure side effect that falls through, never a
-        // `HookOutcome`.
+        // SUBA-045 / pi `onRuntimeEvent("agent_start", …)` (`subagent-prompt-runtime.ts:496-501`
+        // @v0.71.0). Falls through like the two blocks around it: `agent_start` has no blocking
+        // `HookOutcome`, so the refusal is an abort of the run (see `refresh_tool_diagnostic`).
         if matches!(ev, HostEvent::AgentStart) {
             self.refresh_tool_diagnostic();
         }
@@ -3010,8 +3032,8 @@ pub fn prompt_runtime_from_env(
             )),
         )
         .with_watchdog(watchdog, services)
-        // SUBA-045 / pi `refreshChildToolDiagnostic` (`subagent-prompt-runtime.ts:98-103`), armed
-        // from the pair of env vars the parent writes at `pi-args.ts:610-616`.
+        // SUBA-045 / pi's `agent_start` tool check (`subagent-prompt-runtime.ts:496-501` @v0.71.0),
+        // armed from the pair of env vars the parent writes at `pi-args.ts:610-616`.
         .with_tool_diagnostic(get)
         // SUBA-096 — pi loads `fast-mode-extension.ts` into the child only when the launch plan
         // resolved fast mode; the parent's equivalent decision arrives as `FAST_MODE_ENV = "1"`.
@@ -3677,6 +3699,87 @@ mod tests {
         }
     }
 
+    /// A [`RegistryHost`] that also records every `control` op — the seam the `agent_start`
+    /// refusal aborts the run through.
+    struct AbortRecordingHost {
+        registry: Vec<String>,
+        aborts: std::sync::atomic::AtomicUsize,
+    }
+    impl cyrup_ext::host::HostServices for AbortRecordingHost {
+        fn all_tool_names(&self) -> Option<Vec<String>> {
+            Some(self.registry.clone())
+        }
+        fn control(&self, op: cyrup_ext::host::ControlOp) -> Result<(), String> {
+            if matches!(op, cyrup_ext::host::ControlOp::Abort) {
+                self.aborts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    /// pi `agent_start` → `throw new Error(formatChildToolDiagnostic(diagnostic))` (#1356,
+    /// `subagent-prompt-runtime.ts:496-501` @v0.71.0): a child whose REAL registry lacks a
+    /// required tool — here the `bash`/`edit` of a fork host whose builtin menu differs, which the
+    /// deleted v0.43.0 floor used to wave through — refuses its run from `agent_start`. A healthy
+    /// registry is not aborted.
+    #[tokio::test]
+    async fn agent_start_aborts_the_run_when_the_real_registry_lacks_a_required_tool() {
+        use crate::exec::tool_availability as ta;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ta::tool_diagnostic_path_in(dir.path());
+        let path_string = path.display().to_string();
+        let env = move |key: &str| -> Option<String> {
+            match key {
+                k if k == ta::CHILD_TOOL_DIAGNOSTIC_PATH_ENV => Some(path_string.clone()),
+                k if k == crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS => {
+                    Some(r#"["read","bash","edit"]"#.to_string())
+                }
+                k if k == crate::spawn::intercom_target::ENV_CHILD_AGENT => {
+                    Some("worker".to_string())
+                }
+                _ => None,
+            }
+        };
+        for (registry, expected_aborts) in [
+            (vec!["read".to_string()], 1),
+            (
+                vec!["read".to_string(), "bash".to_string(), "edit".to_string()],
+                0,
+            ),
+        ] {
+            let host = Arc::new(AbortRecordingHost {
+                registry,
+                aborts: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let runtime =
+                SubagentPromptRuntime::from_parts(None, None, false).with_tool_diagnostic(&env);
+            runtime.set_host_services(host.clone());
+            runtime
+                .on_event(
+                    &HostEvent::AgentStart,
+                    &HostCtx::event(cyrup_ext::native::ExtMode::Json, false, PathBuf::from(".")),
+                )
+                .await;
+            assert_eq!(
+                host.aborts.load(std::sync::atomic::Ordering::SeqCst),
+                expected_aborts
+            );
+            if expected_aborts == 1 {
+                let reported = ta::read_child_tool_diagnostic_error(Some(&path))
+                    .expect("the refusal is recorded for the parent");
+                assert!(
+                    reported.starts_with(
+                        "Agent 'worker' requested unavailable child tools: bash, edit."
+                    ),
+                    "{reported}"
+                );
+            } else {
+                assert!(!path.exists(), "a healthy child leaves no diagnostic");
+            }
+        }
+    }
+
     /// SUBA-045 — the whole child-side hop: the parent's two env vars arm the diagnostic, an
     /// `agent_start` diffs the required list against the LIVE registry, and the file is written
     /// only when something is genuinely absent.
@@ -3735,7 +3838,9 @@ mod tests {
             "{reported}"
         );
         assert!(
-            reported.contains("host/pi-mcp-adapter registration problem"),
+            reported.contains(
+                "Resolved MCP direct tools missing from the child registry: mcp__srv__gone."
+            ),
             "the MCP-direct half must be attributed, not folded into the generic line: {reported}"
         );
 

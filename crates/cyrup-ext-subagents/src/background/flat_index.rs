@@ -300,7 +300,6 @@ mod tests {
             orchestrator_intercom_target: None,
             inherited_session_model: None,
             inherited_session_thinking: None,
-            host_available_builtins: None,
             model_scope: None,
             nested_route: None,
             nested_self: None,

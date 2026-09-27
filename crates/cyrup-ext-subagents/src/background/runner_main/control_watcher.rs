@@ -792,7 +792,6 @@ mod tests {
             lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
-            host_available_builtins: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
@@ -848,7 +847,6 @@ mod tests {
                 max_depth: 5,
             },
             Arc::new(BTreeMap::new()),
-            None,
             None,
             None,
             None,

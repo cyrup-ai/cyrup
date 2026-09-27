@@ -85,7 +85,6 @@ async fn write_descriptor_with_the_production_writer(
         orchestrator_intercom_target: None,
         inherited_session_model: None,
         inherited_session_thinking: None,
-        host_available_builtins: None,
         turn_budget: None,
         permission_rules: None,
         usage_budget: None,

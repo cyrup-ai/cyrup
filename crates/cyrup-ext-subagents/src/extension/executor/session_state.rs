@@ -484,7 +484,6 @@ mod tests {
             orchestrator_intercom_target: None,
             inherited_session_model: None,
             inherited_session_thinking: None,
-            host_available_builtins: None,
             model_scope: Some(scope.clone()),
             nested_route: None,
             nested_self: None,
@@ -503,9 +502,8 @@ mod tests {
         assert_eq!(round_tripped.model_scope, Some(scope));
     }
 
-    /// A `RunnerConfig` carrying a host observation, for the two tests below. Mirrors the fixture
-    /// above; only `host_available_builtins` differs.
-    fn config_with_host(host: Option<Vec<String>>) -> crate::background::runner_main::RunnerConfig {
+    /// A minimal `RunnerConfig`, mirroring the fixture above.
+    fn minimal_runner_config() -> crate::background::runner_main::RunnerConfig {
         crate::background::runner_main::RunnerConfig {
             runner_process_instance_id: None,
             revival_lease: None,
@@ -535,7 +533,6 @@ mod tests {
             orchestrator_intercom_target: None,
             inherited_session_model: None,
             inherited_session_thinking: None,
-            host_available_builtins: host,
             model_scope: None,
             nested_route: None,
             nested_self: None,
@@ -545,48 +542,28 @@ mod tests {
         }
     }
 
-    /// The REGRESSION GUARD for hop 2. The detached runner is a separate OS process with no
-    /// host-services backend and a tool registry that is not the parent's, so the serialized
-    /// `RunnerConfig` is the ONLY channel by which the launching process's host observation reaches
-    /// it. Let this degrade to `None` and the host intersection, the `unavailableHostBuiltins`
-    /// diagnostic and the review-lane refusal all go inert for every async/background run — which is
-    /// exactly the fan-out shape the mechanism was built for.
+    /// SUBA-114 — a `RunnerConfig` written by an orchestrator from BEFORE the parent-registry
+    /// prediction was removed carries `hostAvailableBuiltins` (it was `#[serde(default)]`, and a
+    /// detached runner or a revival can read a config written by the previous binary). The field
+    /// is gone and `RunnerConfig` does not deny unknown fields, so that config must still decode —
+    /// and must re-serialize without the key, so nothing downstream ever sees it again.
     #[test]
-    fn the_host_observation_reaches_the_detached_runner_through_the_serialized_config() {
-        let observed = vec!["read".to_string(), "grep".to_string()];
-        let config = config_with_host(Some(observed.clone()));
-
-        let json = serde_json::to_value(&config).expect("config serializes");
-        assert_eq!(
-            json.get("hostAvailableBuiltins"),
-            Some(&serde_json::json!(["read", "grep"])),
-            "the observation must be present, under pi's own camelCase key, in the on-disk config \
-             handed to the child: {json}"
-        );
-
-        let round_tripped: crate::background::runner_main::RunnerConfig =
-            serde_json::from_value(json).expect("config round-trips");
-        assert_eq!(round_tripped.host_available_builtins, Some(observed));
-    }
-
-    /// `#[serde(default)]`, proven against a REAL serialized payload with the key removed rather
-    /// than a hand-written JSON literal that could drift from the struct. An older on-disk config
-    /// still decodes, and to `None` — UNKNOWN, the pre-mechanism behaviour.
-    #[test]
-    fn a_runner_config_without_the_field_still_decodes() {
-        let mut json = serde_json::to_value(config_with_host(Some(vec!["read".to_string()])))
-            .expect("config serializes");
-        let removed = json
-            .as_object_mut()
-            .expect("config serializes to an object")
-            .remove("hostAvailableBuiltins");
+    fn a_runner_config_carrying_the_removed_host_observation_still_decodes() {
+        let mut json = serde_json::to_value(minimal_runner_config()).expect("config serializes");
         assert!(
-            removed.is_some(),
-            "the key must have been present to begin with, or this proves nothing"
+            json.get("hostAvailableBuiltins").is_none(),
+            "the field no longer exists: {json}"
         );
+        json.as_object_mut()
+            .expect("config serializes to an object")
+            .insert(
+                "hostAvailableBuiltins".to_string(),
+                serde_json::json!(["read", "subagent"]),
+            );
 
         let decoded: crate::background::runner_main::RunnerConfig =
-            serde_json::from_value(json).expect("a config omitting the field still decodes");
-        assert_eq!(decoded.host_available_builtins, None);
+            serde_json::from_value(json).expect("an old on-disk config still decodes");
+        let back = serde_json::to_value(&decoded).expect("config re-serializes");
+        assert!(back.get("hostAvailableBuiltins").is_none(), "{back}");
     }
 }

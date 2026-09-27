@@ -83,7 +83,7 @@ use crate::services::AgentSessionServices;
 use crate::subscriber::Fanout;
 use crate::tools::DynamicToolState;
 use cyrup_ext::host::InjectOutcome;
-use inject::merge_injection_batch;
+use inject::{CompactionGate, SteeredInjection, merge_injection_batch, split_by_group_trigger};
 use run::InjectionOffer;
 
 use adapters::{SessionActivityHandle, SessionCatalogHandle};
@@ -292,6 +292,13 @@ pub struct AgentSession {
     /// A keep-alive receiver so `driver_tx.send` never fails for want of a live receiver (a watch
     /// `Sender` with zero receivers drops the sent value); `wait_for_idle` subscribes fresh ones.
     _driver_keepalive: tokio::sync::watch::Receiver<bool>,
+    /// Bumped every time a compaction or branch-summary cancel slot is cleared — the idle edge of a
+    /// compaction (SEAM-125). [`Self::is_idle`] counts a running compaction as busy (pi v0.85.1+
+    /// `isIdle = !_isAgentRunActive && !isCompacting`), so [`Self::wait_for_idle`] needs something
+    /// to wake on when one ends; pi resolves its idle wait from `_clearManualCompactionState()`
+    /// (`agent-session.ts:2386-2388` @v0.87.1). Raised only by `CompactionCancelGuard::clear`.
+    /// Written with `send_modify`, which never needs a live receiver.
+    compaction_settled: tokio::sync::watch::Sender<u64>,
     // ---- extension control sinks (SEAM-003 / EXT-005) ----
     /// The RUNTIME-tier control sink (Pi `ExtensionCommandContextActions`, extensions/types.ts:
     /// 1652-1672), installed by [`crate::AgentSessionRuntime`] before this session is announced.
@@ -381,6 +388,7 @@ impl AgentSession {
             last_assistant: Mutex::new(None),
             driver_tx: driver_tx_init,
             _driver_keepalive: driver_keepalive,
+            compaction_settled: tokio::sync::watch::channel(0).0,
             runtime_actions: OnceLock::new(),
             shutdown_requested: AtomicBool::new(false),
         }
@@ -466,12 +474,39 @@ impl AgentSession {
         arc
     }
 
-    /// Whether NO agent work is in flight (Pi `isIdle`, agent-session.ts:759). True only when both
-    /// the post-run driver loop (retry / auto-compaction / queued continuation) and the agent's own
-    /// run have settled — the same two latches [`Self::wait_for_idle`] waits on, read without
-    /// awaiting so the SYNC `ctx.isIdle()` host import can answer.
+    /// Whether NO session work is in flight (Pi `isIdle`): no agent run or post-run continuation
+    /// (retry / auto-compaction / queued continuation) AND no compaction or branch summary — the
+    /// same latches [`Self::wait_for_idle`] waits on, read without awaiting so the SYNC
+    /// `ctx.isIdle()` host import can answer.
+    ///
+    /// SEAM-125 — pi v0.85.1 (`bea67d90d`) made this `!this._isAgentRunActive && !this.isCompacting`
+    /// (`agent-session.ts:1234-1236` @v0.87.1). A manual `/compact` and a `/tree` branch summary run
+    /// OUTSIDE the post-run driver, so before this read `driver_tx` and the agent latch only, the
+    /// session reported idle for the whole summarization call: an extension reading `ctx.isIdle()`
+    /// (pi-intercom's inbound decision) was told to start work, and the injection pump started a
+    /// model run over the pre-compaction transcript that the compaction then swapped out from under
+    /// it with `set_messages` (ICOM-062).
+    ///
+    /// This is NOT the complement of [`Self::is_run_active`], exactly as pi's `isIdle` is not the
+    /// complement of its `isStreaming`: a compaction is busy without being a run, and submissions
+    /// route on the run latch alone.
     pub fn is_idle(&self) -> bool {
-        !*self.driver_tx.borrow() && !self.agent.is_running()
+        !self.is_run_active() && !self.is_compacting()
+    }
+
+    /// Wake every [`Self::wait_for_idle`] parked behind a compaction or branch summary. Called by
+    /// `CompactionCancelGuard::clear` right after it empties its slot.
+    pub(super) fn notify_compaction_settled(&self) {
+        self.compaction_settled
+            .send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Whether either steering/follow-up queue of the AGENT still holds a message (pi
+    /// `agent.hasQueuedMessages()`). Unlike [`Self::pending_message_count`], which counts only the
+    /// user-text mirrors pi's `pendingMessageCount` counts, this sees a custom message an extension
+    /// or the injection pump steered onto the live run (ICOM-035).
+    pub fn has_queued_messages(&self) -> bool {
+        self.agent.has_queued_messages()
     }
 
     /// Whether the session is processing an agent run **or a post-run continuation** — pi's
@@ -487,11 +522,13 @@ impl AgentSession {
     /// auto-compaction, a queued continuation) would start a SECOND run that races `drive_run`'s
     /// `continue_run()` — every routing site therefore reads this predicate.
     ///
-    /// The two latches are the exact complement of [`Self::is_idle`]: `driver_tx` covers the whole
-    /// post-run loop on a BOUND session, and `agent.is_running()` covers an unbound session, where
-    /// `spawn_run` drives `agent.prompt` directly and no driver loop exists.
+    /// Two latches: `driver_tx` covers the whole post-run loop on a BOUND session, and
+    /// `agent.is_running()` covers an unbound session, where `spawn_run` drives `agent.prompt`
+    /// directly and no driver loop exists. A running compaction is deliberately NOT part of it
+    /// (pi's `isStreaming` is `_isAgentRunActive` alone) — see [`Self::is_idle`] for the predicate
+    /// that does count it (SEAM-125).
     pub fn is_run_active(&self) -> bool {
-        !self.is_idle()
+        *self.driver_tx.borrow() || self.agent.is_running()
     }
 
     /// Lock a `std::sync::Mutex` ignoring poisoning (no panic; arch-00 no-panic).
@@ -621,17 +658,35 @@ impl Drop for AgentSession {
 /// the run loop's last `poll_steering`/`poll_follow_up` strands with the session idle), there is
 /// no instant at which a message is nobody's responsibility — which is what lets the ack mean
 /// something.
+///
+/// # A no-turn message steers onto a live run — and stays owned until the idle edge (ICOM-035)
+///
+/// pi delivers `sendCustomMessage(msg, { deliverAs: "steer" })` to a streaming session with
+/// `agent.steer` (`agent-session.ts:1949-1954` @v0.87.1), which is how a peer's intercom message
+/// reaches a BUSY session's running model at its next steering boundary. So while a run is active
+/// this task does not merely park: it keeps receiving, and hands every message injected with that
+/// delivery ([`cyrup_ext::host::HostServices::inject_message_steer`]) to the run's steering queue
+/// the moment it arrives. It keeps each one (with its ack) in `steered`, and at
+/// the idle edge [`AgentSession::append_no_turn_messages`] takes back any the run never drained —
+/// the stranded steer this task was built to prevent — and appends them to the tree and transcript
+/// instead. A turn-triggering message still waits for the idle edge, as it always has.
 async fn drive_injections(
     session: Weak<AgentSession>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<InjectRequest>,
 ) {
     let mut inbox: Vec<InjectRequest> = Vec::new();
+    let mut steered: Vec<SteeredInjection> = Vec::new();
+    // `false` once every producer is gone; what is already owned is still delivered.
+    let mut open = true;
     loop {
-        if inbox.is_empty() {
+        if inbox.is_empty() && steered.is_empty() {
+            if !open {
+                return;
+            }
             match rx.recv().await {
                 Some(req) => inbox.push(req),
                 // Every producer is gone (the host services backend dropped): nothing more can
-                // ever arrive, and the inbox is empty, so there is nothing to answer for.
+                // ever arrive, and nothing is owned, so there is nothing to answer for.
                 None => return,
             }
         }
@@ -640,58 +695,131 @@ async fn drive_injections(
         // ORs their `triggerTurn` (`notify.ts:399-412` @v0.64.0), so one turn carrying three
         // notifications is upstream's own shape — and it is what lets an orchestrator answer about
         // a whole fan-out in a single turn instead of three sequential ones.
-        while let Ok(next) = rx.try_recv() {
-            inbox.push(next);
+        if open {
+            open = drain_ready(&mut rx, &mut inbox);
         }
         let Some(session) = session.upgrade() else {
             for req in inbox.drain(..) {
                 req.ack.answer(InjectOutcome::SessionUnavailable);
             }
+            for s in steered.drain(..) {
+                s.ack.answer(InjectOutcome::SessionUnavailable);
+            }
             return;
         };
-        // A real await on the session's two idle latches (`driver_tx` is a `watch`, and the agent
-        // has its own run latch) — not a poll, and not a check-then-act. Returns immediately when
-        // the session is already idle.
-        session.wait_for_idle().await;
-        // SUBA-017 — re-drain AFTER the idle wait, not only before it. A busy parent parks this
-        // task above for up to a whole turn, and every message that arrives in that window is
-        // already owed to the SAME next turn: without this second drain the batch taken before the
-        // wait runs alone and the late arrivals pay a turn of their own (a fan-out's completions
-        // split c1 | c2 | c3..cN — three turns where one suffices). It costs no latency: it only
-        // takes what is already queued, exactly like the drain above. It helps every producer
-        // (completions, steers, watchdog warnings, intercom), which is why it lives here and not in
-        // the completion batcher.
-        while let Ok(next) = rx.try_recv() {
-            inbox.push(next);
+        // The busy phase: steer what can be steered, keep receiving, and wait for the idle edge.
+        // `wait_for_idle` is a real await on the session's latches (the run driver's `watch`, the
+        // agent's run latch and the compaction-settled signal) — not a poll, and not a
+        // check-then-act — and it returns at once when the session is already idle.
+        loop {
+            session.steer_injections_onto_live_run(&mut inbox, &mut steered);
+            if session.is_idle() {
+                break;
+            }
+            tokio::select! {
+                () = session.wait_for_idle() => {}
+                next = rx.recv(), if open => match next {
+                    Some(req) => {
+                        inbox.push(req);
+                        open = drain_ready(&mut rx, &mut inbox);
+                    }
+                    None => open = false,
+                },
+            }
         }
-        let plan = merge_injection_batch(&inbox);
+        // SUBA-017 — re-drain AFTER the idle wait, not only before it. Every message that arrived
+        // while the session was busy is owed to the SAME next turn: without this the batch taken
+        // before the wait runs alone and the late arrivals pay a turn of their own (a fan-out's
+        // completions split c1 | c2 | c3..cN — three turns where one suffices). It costs no latency:
+        // it only takes what is already queued. It helps every producer (completions, steers,
+        // watchdog warnings, intercom), which is why it lives here and not in the completion batcher.
+        if open {
+            open = drain_ready(&mut rx, &mut inbox);
+        }
+        let (durable, turn) = split_by_group_trigger(std::mem::take(&mut inbox));
+        // The no-turn half first: it is independent of the turn, and answering it before a possible
+        // `AgentBusy` on the turn below is what keeps a re-offered batch from appending it twice.
+        let durable_messages = merge_injection_batch(&durable).durable;
+        match session
+            .append_no_turn_messages(durable_messages, &steered, CompactionGate::Wait)
+            .await
+        {
+            Ok(InjectionOffer::Taken) => {
+                for req in durable {
+                    req.ack.answer(InjectOutcome::Accepted);
+                }
+                for s in steered.drain(..) {
+                    s.ack.answer(InjectOutcome::Accepted);
+                }
+            }
+            // The session went busy again in the gap after the idle wait (a user prompt, a
+            // compaction). Not a failure, and reported to nobody: everything is still owned and the
+            // next pass parks until it settles. The yield only guarantees forward progress if the
+            // session flip-flops idle/busy faster than this loop can observe it.
+            Ok(InjectionOffer::AgentBusy) => {
+                inbox = durable;
+                inbox.extend(turn);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            // A fault that waiting cannot fix (a poisoned append, …). Hand every message back so
+            // its producer keeps whatever it was announcing and can retry on its own terms.
+            Err(fault) => {
+                tracing::warn!(error = %fault, "session cannot accept injected messages");
+                for req in durable.into_iter().chain(turn) {
+                    req.ack.answer(InjectOutcome::SessionUnavailable);
+                }
+                for s in steered.drain(..) {
+                    s.ack.answer(InjectOutcome::SessionUnavailable);
+                }
+                continue;
+            }
+        }
+        if turn.is_empty() {
+            continue;
+        }
+        let plan = merge_injection_batch(&turn);
         // Exhaustive on purpose, with NO catch-all arm: the three outcomes demand three different
         // responses, and folding the last two together (as "any error means try again") turns a
         // permanent fault into an unbounded spin that delivers nothing and answers nobody.
-        match session.deliver_injection_inbox(plan).await {
+        //
+        // Pi `_runAgentPrompt(appMessage)`: the turn's input IS the injected message(s). On `Taken`
+        // the agent has claimed its latch with these messages already pushed onto the run's
+        // transcript, so `message_end` — and therefore the durable persist — necessarily follows;
+        // that is what makes acceptance a sufficient acknowledgement.
+        match session.run_injection(plan.turn).await {
             Ok(InjectionOffer::Taken) => {
-                // In the transcript (or persisted on the no-turn path): the producers may release
-                // their copies.
-                for req in inbox.drain(..) {
+                for req in turn {
                     req.ack.answer(InjectOutcome::Accepted);
                 }
             }
-            // A user prompt claimed the latch in the gap after `wait_for_idle` returned. Not a
-            // failure, and reported to nobody: the inbox still holds every message and the
-            // `wait_for_idle` at the top of the next iteration parks this task until that run
-            // settles. The yield only guarantees forward progress if the session flip-flops
-            // idle/busy faster than this loop can observe it.
-            Ok(InjectionOffer::AgentBusy) => tokio::task::yield_now().await,
-            // A fault that waiting cannot fix (no model selected, a poisoned append, …). Hand the
-            // messages back so their producers keep whatever they were announcing and can retry on
-            // their own terms — the alternative is holding an inbox nobody can deliver while the
-            // producers block on an answer that never comes.
+            // A user prompt claimed the latch in the gap after `wait_for_idle` returned. The inbox
+            // holds every turn message again and the next pass parks until that run settles.
+            Ok(InjectionOffer::AgentBusy) => {
+                inbox = turn;
+                tokio::task::yield_now().await;
+            }
             Err(fault) => {
                 tracing::warn!(error = %fault, "session cannot accept injected messages");
-                for req in inbox.drain(..) {
+                for req in turn {
                     req.ack.answer(InjectOutcome::SessionUnavailable);
                 }
             }
+        }
+    }
+}
+
+/// Move every request already queued on `rx` into `inbox` without waiting. Returns `false` once the
+/// channel is closed and empty — every producer is gone.
+fn drain_ready(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<InjectRequest>,
+    inbox: &mut Vec<InjectRequest>,
+) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(req) => inbox.push(req),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return true,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return false,
         }
     }
 }

@@ -396,11 +396,6 @@ fn build_chain_context(
         // SCOPE_19/A1: and the parent session's reasoning level, carried the same way and for the
         // same reason — this detached process cannot probe the parent's thinking level itself.
         inherited_session_thinking: config.inherited_session_thinking.clone(),
-        // pi `ctx.hostAvailableBuiltins` (`subagent-runner.ts:3703`): the LAUNCHING orchestrator's
-        // host observation, carried the same way and for the same reason as the two fields above —
-        // this detached process has no host-services backend, and its own tool registry is not the
-        // parent's, so re-reading here would answer a different question.
-        host_available_builtins: config.host_available_builtins.clone(),
         // SUBA-003: the model-scope policy the orchestrator authorized this run under, carried in
         // the one-shot config for the same reason as the two fields above — this process performs
         // no discovery and reads no settings.

@@ -52,7 +52,7 @@ impl AgentSession {
         // [`CompactionCancelGuard`] for why a hand-written clear at each `return` is not enough in
         // Rust, and why the ordered `clear()` calls below still stand.
         let mut cancel_slot =
-            CompactionCancelGuard::install(&self.compaction_cancel, cancel.clone());
+            CompactionCancelGuard::install(self, &self.compaction_cancel, cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason })
             .await;
 
@@ -445,23 +445,43 @@ impl AgentSession {
 /// after the emit and reintroduce that race, so this guard is a backstop for the dropped-future
 /// path, not a replacement for the ordered clear. Once cleared it disarms, so it can never wipe a
 /// token a later compaction installed.
+///
+/// # It is also the idle edge of a compaction (SEAM-125)
+///
+/// [`AgentSession::is_idle`] counts a running compaction or branch summary as busy (pi v0.85.1
+/// `isIdle = !_isAgentRunActive && !isCompacting`), so [`AgentSession::wait_for_idle`] must wake
+/// when one ends — pi's `_clearManualCompactionState()` calls `_resolveIdleWaitIfIdle()`
+/// (`agent-session.ts:2386-2388` @v0.87.1). Every clear goes through [`Self::clear`], so that is
+/// where the session's compaction-settled signal is raised, on the ordered path and the
+/// dropped-future path alike.
 pub(super) struct CompactionCancelGuard<'a> {
+    session: &'a AgentSession,
     slot: &'a Mutex<Option<CancelToken>>,
     armed: bool,
 }
 
 impl<'a> CompactionCancelGuard<'a> {
-    /// Install `cancel` into `slot` and arm the guard.
-    pub(super) fn install(slot: &'a Mutex<Option<CancelToken>>, cancel: CancelToken) -> Self {
+    /// Install `cancel` into `slot` (one of `session`'s three compaction/branch-summary slots) and
+    /// arm the guard.
+    pub(super) fn install(
+        session: &'a AgentSession,
+        slot: &'a Mutex<Option<CancelToken>>,
+        cancel: CancelToken,
+    ) -> Self {
         *AgentSession::lock(slot) = Some(cancel);
-        Self { slot, armed: true }
+        Self {
+            session,
+            slot,
+            armed: true,
+        }
     }
 
-    /// Clear the slot now (pi's ordered clear), and disarm.
+    /// Clear the slot now (pi's ordered clear), wake every idle waiter, and disarm.
     pub(super) fn clear(&mut self) {
         if self.armed {
             *AgentSession::lock(self.slot) = None;
             self.armed = false;
+            self.session.notify_compaction_settled();
         }
     }
 }

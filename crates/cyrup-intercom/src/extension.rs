@@ -711,6 +711,14 @@ impl NativeExtension for IntercomExtension {
                 // starts, so the inbound delivery policy (`inbound.rs`) can pick the interactive
                 // trigger-turn branch vs. the non-interactive busy auto-reply (index.ts:739-758).
                 self.state.set_has_ui(ctx.has_ui);
+                // `agentRunning = false; expireHeldInboundMessages("session replaced before
+                // injection")` (`v0.14.0 index.ts:1660-1661`, ICOM-062): a message held for the
+                // previous runtime is never injected into this one. Run BEFORE `begin_runtime`
+                // drops the previous client, so the sender is still told `expired` — upstream
+                // expires after nulling its client and so tells nobody.
+                self.state.set_agent_running(false);
+                self.state
+                    .expire_held_inbound("session replaced before injection");
                 // `startSessionRuntime` (index.ts:926-951): publish the params every connect attempt
                 // rebuilds its registration from, clear the shutdown latch, bump the generation and
                 // reset the backoff ladder.
@@ -746,6 +754,11 @@ impl NativeExtension for IntercomExtension {
                 // reconnect: a deliberate shutdown never reconnects.
                 connect::shutdown(&self.state);
                 self.state.waiter.fail_pending("Session shutting down");
+                // `expireHeldInboundMessages("session shut down before injection")`
+                // (`v0.14.0 index.ts:1799`, ICOM-062) — before the disconnect below, so the
+                // `expired` receipts still reach the senders.
+                self.state
+                    .expire_held_inbound("session shut down before injection");
                 if let Some(client) = self.state.client() {
                     client.disconnect();
                 }
@@ -760,9 +773,16 @@ impl NativeExtension for IntercomExtension {
                 HookOutcome::Noop
             }
             HostEvent::AgentStart => {
-                // `agentRunning = true; activeTools.clear(); syncPresenceStatus()`
-                // (`v0.10.1 index.ts:1429-1431`).
+                // `agentRunning = true; if (runtimeContext) flushHeldInboundMessages(runtimeContext,
+                // runtimeGeneration); activeTools.clear(); syncPresenceStatus()`
+                // (`v0.14.0 index.ts:1824-1832`). The flush is ICOM-062's `agent_start` edge: a
+                // message held while the session was busy without a run is steered onto the run
+                // that has just started (or, non-interactive, auto-replied).
                 self.state.set_agent_running(true);
+                crate::inbound::flush_held_inbound_messages(
+                    &self.state,
+                    self.state.connect.generation(),
+                );
                 self.sync_presence_status();
                 HookOutcome::Noop
             }

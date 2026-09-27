@@ -128,7 +128,6 @@ fn run_options(cwd: &Path) -> RunOptions {
         // nothing is recorded, which is this field's documented `None` behaviour.
         model_exclusions: None,
         fast: false,
-        host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),

@@ -76,6 +76,21 @@ impl PendingQueue {
         }
     }
 
+    /// Remove every message `pred` selects and return them in queue order; the rest keep theirs.
+    pub fn take_where(&mut self, mut pred: impl FnMut(&AgentMessage) -> bool) -> Vec<AgentMessage> {
+        let mut taken = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.items.len());
+        for m in self.items.drain(..) {
+            if pred(&m) {
+                taken.push(m);
+            } else {
+                kept.push_back(m);
+            }
+        }
+        self.items = kept;
+        taken
+    }
+
     /// Take everything (for abort restore, func-02 R-02-037), ignoring mode.
     pub fn take_all(&mut self) -> Vec<AgentMessage> {
         self.items.drain(..).collect()
@@ -148,6 +163,29 @@ mod tests {
         assert_eq!(texts(&q).len(), 3);
         let again = q.drain();
         assert_eq!(again.len(), 3, "and they drain again normally");
+    }
+
+    /// ICOM-035 — `take_where` removes exactly the selected messages, in queue order, and leaves
+    /// the rest (a user's own queued steers) in theirs.
+    #[test]
+    fn take_where_takes_only_the_selected_messages_and_keeps_both_orders() {
+        let mut q = PendingQueue::new(QueueMode::OneAtATime);
+        for t in ["user-1", "mine-1", "user-2", "mine-2"] {
+            q.push(user(t));
+        }
+        let taken = q.take_where(|m| {
+            matches!(m, AgentMessage::User { content, .. }
+                if content.iter().any(|c| matches!(c, cyrup_core::Content::Text { text, .. } if text.starts_with("mine"))))
+        });
+        let taken_texts: Vec<String> = {
+            let mut tq = PendingQueue::new(QueueMode::All);
+            for m in taken {
+                tq.push(m);
+            }
+            texts(&tq)
+        };
+        assert_eq!(taken_texts, vec!["mine-1", "mine-2"]);
+        assert_eq!(texts(&q), vec!["user-1", "user-2"]);
     }
 
     /// The `OneAtATime` default drains a single message; restoring it must not reorder the tail.

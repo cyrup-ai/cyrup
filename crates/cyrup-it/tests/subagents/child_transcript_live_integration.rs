@@ -239,7 +239,6 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         machine: None,
         model_exclusions: None,
         fast: false,
-        host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
@@ -376,7 +375,6 @@ async fn prepare_background_run(
     let config = RunnerConfig {
         runner_process_instance_id: None,
         revival_lease: None,
-        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,

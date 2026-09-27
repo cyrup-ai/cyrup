@@ -67,9 +67,6 @@ pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions
         structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
-        // No host observation on this fixture: `None` is UNKNOWN, which skips the intersection and
-        // is the pre-mechanism behaviour every existing test was written against.
-        host_available_builtins: None,
         // SUBA-021: no usage budget on this path (see the field doc).
         usage_budget: None,
         turn_budget: None,
@@ -157,23 +154,6 @@ pub(crate) fn read_system_prompt_arg(plan: &AttemptSpawnPlan) -> String {
 
 // ================================================================================================
 // Hermetic direct-MCP layouts
-// ================================================================================================
-
-/// A [`cyrup_ext::host::HostServices`] double answering only the ROWS seam — the
-/// `cyrup-session-svc/src/host_services.rs:2075` shape. Every other capability keeps the trait's
-/// default, exactly as `prompt_runtime.rs:3010`'s `RegistryHost` does.
-///
-/// Lives here rather than in `tool_surface.rs`'s own `mod tests` because two modules now need it:
-/// that module's [`crate::exec::tool_surface::host_builtin_tool_names`] tests and
-/// `extension::executor`'s test that the observation seam reads the live host.
-pub(crate) struct RowsHost(pub(crate) Option<Vec<serde_json::Value>>);
-
-impl cyrup_ext::host::HostServices for RowsHost {
-    fn all_tools(&self) -> Option<Vec<serde_json::Value>> {
-        self.0.clone()
-    }
-}
-
 // ================================================================================================
 
 /// A throwaway `$HOME` + project pair with an [`McpDirs`] pointing into it, so a test can drive the

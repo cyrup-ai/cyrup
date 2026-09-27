@@ -1,5 +1,5 @@
 //! SUBA-045 — the child tool-availability diagnostic: a 1:1 port of
-//! `pi-subagents/src/runs/shared/tool-availability.ts` @v0.43.0.
+//! `pi-subagents/src/runs/shared/tool-availability.ts` @v0.43.0, brought to v0.71.0.
 //!
 //! # The failure this exists to name
 //!
@@ -17,21 +17,26 @@
 //!    [`CHILD_TOOL_DIAGNOSTIC_PATH_ENV`] pointing at `tool-diagnostic.json` inside the attempt's
 //!    private temp dir, and [`MCP_DIRECT_CHILD_TOOLS_ENV`] carrying the RESOLVED direct-MCP names.
 //!    Both are written only when the required list is non-empty, exactly as upstream gates them.
-//! 2. **Child, at `agent_start`** (`subagent-prompt-runtime.ts:514-516` → `:98-103`): it diffs the
-//!    required list against its own live registry plus the [`CORE_CHILD_TOOLS`] floor and writes
-//!    [`write_child_tool_diagnostic`]'s 0600 JSON — or DELETES the file when nothing is missing, so
-//!    the file's mere existence is the signal.
+//! 2. **Child, at `agent_start`** (`subagent-prompt-runtime.ts:496-501` @v0.71.0): it diffs the
+//!    required list against its own live registry and writes [`write_child_tool_diagnostic`]'s 0600
+//!    JSON — or DELETES the file when nothing is missing, so the file's mere existence is the
+//!    signal — and, when something IS missing, REFUSES the run: upstream throws
+//!    `formatChildToolDiagnostic(diagnostic)` from that handler (#1356, v0.55.0), and cyrup's child
+//!    aborts its own in-flight run from the same hook (`prompt_runtime`'s
+//!    `refresh_tool_diagnostic`), before its first model call.
 //! 3. **Parent, at settle** (`foreground/execution.ts:1072-1079`,
 //!    `background/subagent-runner.ts:1442`): `closeError = result.error ?? toolDiagnosticError ??
 //!    assistantError`, so a missing tool outranks the model's own apology as the run's error.
 //!
-//! # The floor, and why it is not the same as "the child's tools"
+//! # No builtin floor
 //!
-//! [`CORE_CHILD_TOOLS`] is pi's `PI_CORE_CHILD_TOOLS` (`tool-availability.ts:16`) and is UNIONED
-//! into the available set before the diff. It exists because the child's registry snapshot is taken
-//! at `agent_start`, which can precede a builtin's own registration; treating the seven core tools
-//! as always-present keeps the diagnostic from crying wolf about them. It deliberately does NOT
-//! include anything an extension supplies — those are exactly the names worth reporting.
+//! The v0.43.0 port unioned pi's `PI_CORE_CHILD_TOOLS` (`bash, edit, find, grep, ls, read, write`)
+//! into the available set before the diff. Upstream deleted that floor in #1356 (`51cca33e`,
+//! v0.55.0, "fail when child write tools are unavailable"): `evaluateChildToolDiagnostic`
+//! (`child-runtime-config.ts:123-137` @v0.71.0) diffs against the registry ALONE. It is also what
+//! makes SUBA-114 safe — once the parent stopped predicting a child's builtins from its own
+//! registry, this check is the one place a child whose builtin menu genuinely differs is caught,
+//! and a floor would have waved exactly those seven names through.
 
 use std::path::{Path, PathBuf};
 
@@ -52,10 +57,6 @@ pub const MCP_DIRECT_CHILD_TOOLS_ENV: &str = "CYRUP_SUBAGENT_MCP_DIRECT_TOOLS";
 /// (pi `path.join(tempDir, "tool-diagnostic.json")`, `pi-args.ts:614`).
 pub const CHILD_TOOL_DIAGNOSTIC_FILE: &str = "tool-diagnostic.json";
 
-/// pi `PI_CORE_CHILD_TOOLS` (`tool-availability.ts:16`) — the builtin floor unioned into the
-/// available set before the diff. Upstream's set literal, in its own order.
-pub const CORE_CHILD_TOOLS: [&str; 7] = ["bash", "edit", "find", "grep", "ls", "read", "write"];
-
 /// pi `ChildToolDiagnostic` (`tool-availability.ts:8-14`).
 ///
 /// `agent` and `missing_mcp_direct_tools` are both `skip_serializing_if` because upstream spreads
@@ -69,17 +70,17 @@ pub struct ChildToolDiagnostic {
     pub agent: Option<String>,
     /// The allowlist the parent required.
     pub required: Vec<String>,
-    /// What the child's registry actually had (the floor is NOT folded in here — upstream records
-    /// the raw registry list and applies the floor only to the diff).
+    /// What the child's registry actually had, raw.
     pub available: Vec<String>,
-    /// `required` minus `available ∪ CORE_CHILD_TOOLS`.
+    /// `required` minus `available`.
     pub missing: Vec<String>,
     /// The subset of `missing` that came from resolved direct-MCP selectors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing_mcp_direct_tools: Option<Vec<String>>,
 }
 
-/// pi `writeChildToolDiagnostic` (`tool-availability.ts:18-44`), child-side.
+/// pi `writeChildToolDiagnostic` (`tool-availability.ts:18-44` @v0.54.0; since #1844 upstream's
+/// in-process `evaluateChildToolDiagnostic`, `child-runtime-config.ts:123-137` @v0.71.0), child-side.
 ///
 /// Returns `Some(diagnostic)` and writes the 0600 JSON when something is missing; returns `None`
 /// and REMOVES any stale file when nothing is. The removal is load-bearing and is upstream's
@@ -92,11 +93,8 @@ pub fn write_child_tool_diagnostic(
     agent: Option<&str>,
     mcp_direct_tools: Option<&[String]>,
 ) -> Option<ChildToolDiagnostic> {
-    let available_names: std::collections::HashSet<&str> = available
-        .iter()
-        .map(String::as_str)
-        .chain(CORE_CHILD_TOOLS)
-        .collect();
+    let available_names: std::collections::HashSet<&str> =
+        available.iter().map(String::as_str).collect();
     let missing: Vec<String> = required
         .iter()
         .filter(|name| !available_names.contains(name.as_str()))
@@ -185,8 +183,13 @@ pub fn read_child_tool_diagnostic(
     Ok(Some(parsed))
 }
 
-/// pi `formatChildToolDiagnostic` (`tool-availability.ts:64-74`) — five lines, verbatim, with the
-/// MCP line present only when that key is.
+/// pi `formatChildToolDiagnostic` (`tool-availability.ts:15-37` @v0.71.0, the runner/default arm)
+/// — five lines, verbatim, with the MCP line present only when that key is.
+///
+/// Upstream's other arm (`host: "parent"`, "ran as a foreground child, which never loads the
+/// parent's ambient extensions") describes an IN-PROCESS foreground child. A cyrup child is
+/// always its own `cyrup` process that loads its own ambient extensions, so that arm's claim would
+/// be false here and only this one is ported.
 #[must_use]
 pub fn format_child_tool_diagnostic(diagnostic: &ChildToolDiagnostic) -> String {
     let subject = match diagnostic.agent.as_deref() {
@@ -206,8 +209,9 @@ pub fn format_child_tool_diagnostic(diagnostic: &ChildToolDiagnostic) -> String 
         .filter(|names| !names.is_empty())
     {
         lines.push(format!(
-            "Resolved MCP direct tools missing from the child registry: {}. This indicates a \
-             host/pi-mcp-adapter registration problem, not a tool-call failure.",
+            "Resolved MCP direct tools missing from the child registry: {}. Resolved names must \
+             match what the host or pi-mcp-adapter registers; check the MCP direct-tool \
+             registration before treating this as a tool-call failure.",
             mcp.join(", ")
         ));
     }
@@ -307,24 +311,33 @@ mod tests {
         );
     }
 
-    /// pi's `PI_CORE_CHILD_TOOLS` floor: the seven builtins count as available even when the
-    /// child's registry snapshot did not list them, so the diagnostic never cries wolf about
-    /// `read`/`bash`/… while the registry is still filling.
+    /// No builtin floor (pi #1356, v0.55.0): a child registry without `bash`/`edit` — the "fork
+    /// host whose builtin menu differs" upstream's SUBA-114 commit relies on this check to catch —
+    /// is reported like any other missing tool. The v0.43.0 floor used to wave these through.
     #[test]
-    fn the_core_tool_floor_is_unioned_into_available() {
+    fn a_missing_core_builtin_is_reported_there_is_no_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = tool_diagnostic_path_in(dir.path());
-        assert!(
-            write_child_tool_diagnostic(&path, &names(&CORE_CHILD_TOOLS), &[], None, None)
-                .is_none(),
-            "every core tool must be treated as present against an EMPTY registry"
+        let diagnostic = write_child_tool_diagnostic(
+            &path,
+            &names(&["read", "bash", "edit"]),
+            &names(&["read", "subagent"]),
+            Some("worker"),
+            None,
+        )
+        .expect("a registry without bash/edit must be reported");
+        assert_eq!(diagnostic.missing, names(&["bash", "edit"]));
+        assert_eq!(
+            format_child_tool_diagnostic(&diagnostic).lines().next(),
+            Some("Agent 'worker' requested unavailable child tools: bash, edit.")
         );
+        assert!(path.exists());
     }
 
     /// The MCP half: `missingMcpDirectTools` is the intersection of `missing` with the resolved
     /// direct-MCP names, it is an ABSENT key when that intersection is empty (upstream's
-    /// conditional spread, not `[]`), and its presence adds the extra "host/pi-mcp-adapter
-    /// registration problem" line to the formatted text.
+    /// conditional spread, not `[]`), and its presence adds upstream's extra MCP registration line
+    /// to the formatted text.
     #[test]
     fn the_mcp_subset_is_intersected_omitted_when_empty_and_drives_the_extra_line() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -351,7 +364,11 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("host/pi-mcp-adapter registration problem"),
+            text.contains(
+                "Resolved MCP direct tools missing from the child registry: mcp__srv__a. Resolved \
+                 names must match what the host or pi-mcp-adapter registers; check the MCP \
+                 direct-tool registration before treating this as a tool-call failure."
+            ),
             "{text}"
         );
 

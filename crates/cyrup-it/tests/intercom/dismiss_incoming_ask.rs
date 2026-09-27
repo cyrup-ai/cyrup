@@ -152,8 +152,12 @@ async fn replying_mid_run_dismisses_the_pending_ask_and_never_redelivers() {
     state.set_client(Some(agent_client.clone()));
     state.set_host_services(host.clone());
     state.set_has_ui(true);
+    // The run is an AGENT run: the extension has seen `agent_start` (pi `agentRunning = true`).
+    // Since v0.14.0 (`17699ba`, ICOM-062) a session that is busy WITHOUT an agent run — a manual
+    // compaction — HOLDS the message instead; that path is pinned in `inbound_live_session.rs`.
+    state.set_agent_running(true);
     // The REAL production inbound loop: it records the ask, surfaces it, and applies the delivery
-    // policy (busy + has_ui ⇒ `InboundPolicy::Steer`).
+    // policy (busy + has_ui + agent running ⇒ `InboundPolicy::Steer`).
     spawn_inbound_loop(state.clone(), agent_client.clone());
 
     // The PEER stays connected for the whole test — the `reply` below only dismisses on a CONFIRMED

@@ -141,14 +141,11 @@ impl SubagentTool {
         if let Some(tools) = step_tools {
             config.tools = Some(tools.clone());
         }
-        // The HOST slot stays `None` here, unlike every launch path: this is a DISPLAY
-        // path with no `RunOptions` in hand, and a surface rendered for `action:"list"` is a
-        // statement about the AGENT, not about one launch's host snapshot. Intersecting it against
-        // this process's live registry would make a listing's verdict depend on when it was asked.
-        // `structured_output: false` for the same reason the HOST slot above is `None`: a listing has
-        // no launch behind it, so it has no `outputSchema` either. pi's `internalTools`
-        // (`child-tool-plan.ts:456`) is a grant the RUN makes, and there is no run here.
-        crate::exec::tool_surface::resolve_tool_surface(&config, false, None, None, false, cwd).ok()
+        // `structured_output: false`: a surface rendered for `action:"list"` is a statement about
+        // the AGENT, not about one launch, so it has no `outputSchema` either. pi's
+        // `internalTools` (`child-tool-plan.ts:456`) is a grant the RUN makes, and there is no run
+        // here.
+        crate::exec::tool_surface::resolve_tool_surface(&config, false, None, false, cwd).ok()
     }
 
     /// The comma-joined discovered agent names (or `"none"`) pi's "Provide exactly one mode. Agents:

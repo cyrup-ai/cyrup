@@ -414,9 +414,8 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     // derives `allowedTools` AND `denyExtensions` itself, so the `allowedTools` narrowing, the
     // direct-MCP resolution and `denyExtensions`' effect on `tool_extension_paths` all happen in
     // exactly one place (and one place can name the ceiling's `sources` in a refusal). The
-    // ceiling's `read` throw moved with them — pi orders the HOST refusal ahead of the CEILING one
-    // (`child-tool-plan.ts:384-389` before `:390-394`), which is only expressible from inside the
-    // resolver that knows both. Upstream likewise asserts the thinking ceiling BEFORE resolving the
+    // ceiling's `read` throw moved with them, so every tool-plan refusal lives in that one
+    // resolver. Upstream likewise asserts the thinking ceiling BEFORE resolving the
     // tool plan at every call site (`async-execution.ts:950,968` -> `:977`; `:1733,1770` -> `:1776`;
     // `subagent-runner.ts:1084` -> `:1142`), so relocating the refusal below the thinking gate below
     // is parity, not drift.
@@ -483,18 +482,15 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         model_arg,
     ];
 
-    // The ONE resolution: the `tools` split, both `read` refusals, the ceiling filter, the host
-    // intersection, the `excludeTools` subtraction, `fanoutAuthorized`, the fanout refusal and the
-    // direct-MCP resolution. Everything below reads this value; nothing below re-derives any of it.
+    // The ONE resolution: the `tools` split, the ceiling's `read` refusal, the ceiling filter, the
+    // `excludeTools` subtraction, `fanoutAuthorized`, the fanout refusal and the direct-MCP
+    // resolution. Everything below reads this value; nothing below re-derives any of it. SUBA-114:
+    // the launching session's own registry is NOT an input (pi `b12496b8`, v0.70.0) — the child
+    // checks its real registry against `REQUIRED_CHILD_TOOLS` at `agent_start`.
     let surface = crate::exec::tool_surface::resolve_tool_surface(
         agent,
         require_read_tool,
         capability_ceiling.as_ref(),
-        // pi `hostAvailableBuiltins` — observed ONCE in the LAUNCHING process (the foreground
-        // executor, or the orchestrator that wrote this run's `RunnerConfig`) and carried here on
-        // `RunOptions`. Never re-read at this depth: `build_attempt_spawn_plan` is a free function
-        // with no host handle, and on hop 2 the surrounding process's registry is not the parent's.
-        opts.host_available_builtins.as_deref(),
         // pi `input.structuredOutput` (`child-tool-plan.ts:456`), whose `internalTools` term re-grants
         // `structured_output` to a run that declared an `outputSchema`. `structured_runtime` IS that
         // bit: its own doc above says `None` = the step declared no `outputSchema`.
@@ -693,7 +689,7 @@ fn preflight_capability_ceiling(
 ///
 /// Every resolution decision was already made by
 /// [`crate::exec::tool_surface::resolve_tool_surface`] before this is called — the `tools` split,
-/// both `read` refusals, the ceiling filter, the host intersection, the `excludeTools` subtraction,
+/// the ceiling's `read` refusal, the ceiling filter, the `excludeTools` subtraction,
 /// `fanoutAuthorized`, the fanout refusal and the direct-MCP resolution all live there now. Two
 /// homes for one plan was the drift this collapse exists to close: a published surface must not be
 /// able to describe a child the argv builder never produced.
@@ -6070,83 +6066,34 @@ mod tests {
         );
     }
 
-    /// THE BEHAVIOURAL POINT OF THE HOST-AVAILABILITY MECHANISM, driven end to end through the REAL
-    /// chain a launch takes: `RunOptions` → `build_attempt_spawn_plan` → `resolve_tool_surface` →
-    /// the review-lane refusal.
-    ///
-    /// The resolver-level halves of this were already pinned by TOOLCON_5's own tests, but those
-    /// call `resolve_tool_surface` directly and so cannot see the one thing that was actually
-    /// broken: the plan path passed a hard-coded `None` into the host slot, which made the whole
-    /// mechanism inert no matter how correct the resolver was. `Some(vec![])` here is a REAL
-    /// observation of a host providing nothing — distinct from `None`/UNKNOWN, which must (and,
-    /// per the sibling test below, does) still launch.
+    /// SUBA-114, through the REAL plan chain a launch takes (`RunOptions` →
+    /// `build_attempt_spawn_plan` → `resolve_tool_surface` → argv/env). `RunOptions` no longer
+    /// carries any observation of the launching session's registry, so nothing a parent was
+    /// started with can narrow this: a `worker` gets every tool it declares, and a `reviewer` and a
+    /// `scout` — which the deleted review-lane contract refused whenever the parent lacked a
+    /// repository tool — launch like any other agent. The child's own registry is checked against
+    /// `REQUIRED_CHILD_TOOLS` at its `agent_start`, so all declared tools are required there.
     #[test]
-    fn a_reviewer_launch_with_a_host_missing_read_is_refused_through_run_options() {
+    fn declared_tools_reach_the_child_argv_and_required_env_for_every_lane() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = sample_agent_config("m1", &[]);
-        agent.name = "reviewer".to_string();
-        agent.tools = Some(vec![
-            ToolRef::Builtin("read".to_string()),
-            ToolRef::Builtin("grep".to_string()),
-        ]);
-
-        let mut opts = base_opts(dir.path(), &["m1"]);
-        // A real observation of a host that provides NOTHING — not UNKNOWN.
-        opts.host_available_builtins = Some(Vec::new());
-
-        let Err(err) = build_attempt_spawn_plan(
-            &agent,
-            &ModelId::from("m1"),
-            "review the change",
-            &opts,
-            DepthEnvelope {
-                current_depth: 0,
-                max_depth: 5,
-            },
-            dir.path(),
-            None,
-        ) else {
-            panic!(
-                "a reviewer whose permitted repository tools the host does not provide must be \
-                 REFUSED, not launched to produce a review it cannot possibly perform"
+        for (name, declared) in [
+            ("worker", &["read", "bash", "edit"][..]),
+            ("reviewer", &["read", "grep", "find", "ls", "bash"][..]),
+            ("scout", &["read", "grep", "find", "ls", "bash"][..]),
+        ] {
+            let mut agent = sample_agent_config("m1", &[]);
+            agent.name = name.to_string();
+            agent.tools = Some(
+                declared
+                    .iter()
+                    .map(|t| ToolRef::Builtin((*t).to_string()))
+                    .collect(),
             );
-        };
-
-        assert!(
-            matches!(err, SubagentError::ToolContractUnsatisfiable(_)),
-            "{err:?}"
-        );
-        assert!(
-            err.to_string().starts_with(
-                "Agent 'reviewer': tool contract could not be satisfied; host runtime does not \
-                 provide permitted required repository tools [read, grep]."
-            ),
-            "{err}"
-        );
-    }
-
-    /// The other side of the same seam, and the reason the field is `Option<Vec<String>>` rather
-    /// than `Vec<String>`: `None` is UNKNOWN, so the intersection is skipped entirely and the same
-    /// launch proceeds. Inverting this would refuse every review lane on any headless host.
-    #[test]
-    fn the_same_reviewer_launch_proceeds_when_the_host_is_unknown() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = sample_agent_config("m1", &[]);
-        agent.name = "reviewer".to_string();
-        agent.tools = Some(vec![
-            ToolRef::Builtin("read".to_string()),
-            ToolRef::Builtin("grep".to_string()),
-        ]);
-
-        let opts = base_opts(dir.path(), &["m1"]);
-        assert_eq!(opts.host_available_builtins, None, "the fixture is UNKNOWN");
-
-        assert!(
-            build_attempt_spawn_plan(
+            let plan = build_attempt_spawn_plan(
                 &agent,
                 &ModelId::from("m1"),
-                "review the change",
-                &opts,
+                "do the thing",
+                &base_opts(dir.path(), &["m1"]),
                 DepthEnvelope {
                     current_depth: 0,
                     max_depth: 5,
@@ -6154,8 +6101,25 @@ mod tests {
                 dir.path(),
                 None,
             )
-            .is_ok(),
-            "an unobserved host must not be treated as a host that provides nothing"
-        );
+            .unwrap_or_else(|err| panic!("a {name} launch must not be refused: {err}"));
+            let argv = plan.spec.build_argv();
+            let idx = argv
+                .iter()
+                .position(|a| a == "--tools")
+                .unwrap_or_else(|| panic!("{name}: --tools missing from {argv:?}"));
+            assert_eq!(
+                argv.get(idx + 1).map(String::as_str),
+                Some(declared.join(",").as_str()),
+                "{name}"
+            );
+            let required: Vec<String> = serde_json::from_str(
+                plan.spec
+                    .env_overlay
+                    .get(crate::native_supervisor::ENV_REQUIRED_CHILD_TOOLS)
+                    .expect("REQUIRED_CHILD_TOOLS is set for a pinned child"),
+            )
+            .expect("REQUIRED_CHILD_TOOLS is a JSON array");
+            assert_eq!(required, declared, "{name}");
+        }
     }
 }

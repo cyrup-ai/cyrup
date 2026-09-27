@@ -12,18 +12,20 @@ copying figures. Nothing here was observed at runtime.
 > **UPDATE 2026-09-24 — both criticals are closed on branch `claude/sess-056-unterminated-session-line`:** `SESS-056` in `c625fbc` (a session file's unterminated last line is terminated on load) and `SEAM-122` in `7522d80` (`/import` never overwrites a stored session). Each landed with a regression test that fails without it. The counted set above medium is now **eight rows, all high**; the struck rows below stay for the record.
 >
 > **UPDATE 2026-09-24 (later) — five more closed on `claude/easy-highs`:** `TOOL-047` (`6a3f162`), `SUBA-110` (`c936d8c`), `SUBA-115` (`7ba9e03`), and `TUI-104` with its session half `SEAM-124` (`0820d97`). Each landed with a regression test. Four highs remain: `SUBA-114`, `ICOM-035`, `ICOM-062`, `ICOM-068` (all effort M; the three `ICOM` rows share the injection pump).
+>
+> **UPDATE 2026-09-27 — all four closed on `claude/gap-analysis-continued`:** `SUBA-114` (`924b361`) and, uncommitted on the same branch, `ICOM-035`, `ICOM-062` and `ICOM-068` together with their area-08 dependency `SEAM-125`. Each landed with production-path tests over a real `AgentSession` (and, for the `ICOM` rows, a real broker): `crates/cyrup-it/tests/intercom/inbound_live_session.rs` and `crates/cyrup-it/tests/session_svc/injection_pump.rs`. **The counted set above medium is now empty: 0 critical · 0 high** (`count_open_items.py`, 2026-09-27). The struck rows below stay for the record.
 
 | rank | ID | Sev | Area | Gap class (Kind) | Effort | Gap |
 |---|---|---|---|---|---|---|
 | 1 | ~~`SESS-056`~~ | ~~critical~~ **CLOSED 2026-09-24 (`c625fbc`)** | 03 | Version lag (`upstream-drift`) | S | If a session file's last line has no newline, the next entry is glued onto it and lost, and later entries lose their parent chain (pi v0.84.4 repairs the tail) |
 | 2 | ~~`SEAM-122`~~ | ~~critical~~ **CLOSED 2026-09-24 (`7522d80`)** | 08 | Version lag (`upstream-drift`) | S | Importing a session whose file name already exists overwrites the stored session (pi v0.85.0: unique name, `COPYFILE_EXCL`) |
-| 3 | `ICOM-068` | **high** | 11 | Port bug (`parity-bug`) | M | An intercom message delivered without a turn is saved and drawn but never reaches the model's transcript. The code is area 08's |
-| 4 | `ICOM-035` | **high** | 11 | Port bug (`parity-bug`) | M | **Reopened, a regression from `8de7460`:** a peer message to a busy session waits for idle instead of steering |
-| 5 | `ICOM-062` | **high** | 11 | Version lag (`upstream-drift`) | M | A peer message during `/compact` starts a run whose transcript `compact` then replaces (needs `SEAM-125`) |
+| 3 | ~~`ICOM-068`~~ | ~~high~~ **CLOSED 2026-09-27 (uncommitted, `claude/gap-analysis-continued`)** | 11 | Port bug (`parity-bug`) | M | An intercom message delivered without a turn is saved and drawn but never reaches the model's transcript. The code is area 08's |
+| 4 | ~~`ICOM-035`~~ | ~~high~~ **CLOSED 2026-09-27 (uncommitted, `claude/gap-analysis-continued`)** | 11 | Port bug (`parity-bug`) | M | **Reopened, a regression from `8de7460`:** a peer message to a busy session waits for idle instead of steering |
+| 5 | ~~`ICOM-062`~~ | ~~high~~ **CLOSED 2026-09-27 (uncommitted, `claude/gap-analysis-continued`)** | 11 | Version lag (`upstream-drift`) | M | A peer message during `/compact` starts a run whose transcript `compact` then replaces (needs `SEAM-125`) |
 | 6 | ~~`TUI-104`~~ | ~~high~~ **CLOSED 2026-09-24 (`0820d97`)** | 07 | Version lag (`upstream-drift`) | S | `/tree` during a compaction leaves the compaction's kept range on the abandoned branch, so history drops out of context. Session half `SEAM-124` is rated medium; settle the rating when the pair is fixed together |
 | 7 | ~~`TOOL-047`~~ | ~~high~~ **CLOSED 2026-09-24 (`6a3f162`)** | 04 | Version lag (`upstream-drift`) | S | A shell command killed by a signal is reported as a success (pi v0.86.0: `128 + signo`, failure) |
 | 8 | ~~`SUBA-115`~~ | ~~high~~ **CLOSED 2026-09-24 (`7ba9e03`)** | 09b | Version lag (`upstream-drift`) | S | Stop/interrupt/timeout of a nested run also hits sibling subtrees it never launched (v0.68.0) |
-| 9 | `SUBA-114` | **high** | 09b | Reverse lag (`stale-port`) | M | Child tools are cut to the parent session's start-up tools, so reviewer/scout launches are refused under a narrow `--tools` (removed upstream at v0.70.0) |
+| 9 | ~~`SUBA-114`~~ | ~~high~~ **CLOSED 2026-09-26 (uncommitted, `claude/gap-analysis-continued`)** | 09b | Reverse lag (`stale-port`) | M | Child tools are cut to the parent session's start-up tools, so reviewer/scout launches are refused under a narrow `--tools` (removed upstream at v0.70.0) |
 | 10 | ~~`SUBA-110`~~ | ~~high~~ **CLOSED 2026-09-24 (`c936d8c`)** | 09b | Version lag (`upstream-drift`) | S | `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_CONFIG_*` reach the background runner and allowlist-less external CLIs (v0.71.0) |
 
 **Not in this table by the standing rule**, which keeps areas 13 and 15 out of this file: area 13
@@ -253,6 +255,50 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 ---
 
 ## 0. Census — every open item in the fourteen area files, by class
+
+> **UPDATE 2026-09-27 — census re-run on `claude/gap-analysis-continued` after the last four highs closed** (`SUBA-114`, `ICOM-035`, `ICOM-062`, `ICOM-068`, plus `SEAM-125`). Same script, unchanged. Its output, verbatim — it supersedes the fourteenth edition's table below:
+>
+> ```text
+> area   open  crit  high   med   low  trackers  closed  dups
+> 01       33     0     0    17    16         0      57     0
+> 02       10     0     0     0    10         1      28     0
+> 03       15     0     0     4    11         1      33     0
+> 04        5     0     0     2     3         0      35     0
+> 05       24     0     0     6    18         0      56     0
+> 06       21     0     0     5    16         1      63     0
+> 07       44     0     0     2    42         1      87     0
+> 08       14     0     0     6     8         0      75     0
+> 09        2     0     0     0     2         0      51     0
+> 09b      32     0     0    14    18         2       3     0
+> 10        1     0     0     0     1         1      22     0
+> 11       10     0     0     0    10         0      53     0
+> 12        6     0     0     1     5         3      32     1
+> 14        1     0     0     0     1         0       6     0
+> 16        3     0     0     1     2         0       0     0
+> 17        0     0     0     0     0         2       0     0
+> 09a       1     0     0     0     1         0      31     0
+> TOTAL   222     0     0    58   164        12     632     1
+> (areas 13 and 15 are counted in their own files by the standing rule; area 16 is a
+>  client of herdr, not a port -- its client-bug/protocol-drift kinds fold into Port bug /
+>  Version lag as documented in KIND_TO_CLASS)
+>
+> Duplicates not counted (row -> canonical open row):
+>   12 DRIFT-056 -> EXT-077
+>
+> Gap class (open, non-tracker rows only):
+>   Port bug               57
+>   Version lag           139
+>   Reverse lag             5
+>   Test defect             0
+>   Invented surface       17
+>   Tooling                 3
+>   TOTAL                 221
+>
+> UNCLASSIFIED kind values (need a manual look / a KIND_TO_CLASS entry):
+>   10 PERM-032: kind='*unclassified — lead*'
+>
+> Above-medium open rows (0):
+> ```
 
 > **FOURTEENTH EDITION 2026-09-24 (second pass), cyrup code `ea23ca2`.** The script changed: it now
 > reads areas `16` (the herdr **client**; its `client-bug`/`protocol-drift` kinds fold into Port

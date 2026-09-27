@@ -138,7 +138,6 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 
 fn base_config(run_id: RunId, steps: Vec<RunnerStep>, dir: &Path) -> RunnerConfig {
     RunnerConfig {
-        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,

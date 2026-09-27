@@ -1170,13 +1170,6 @@ impl SubagentExecutor {
             // own `subagent` tool learns to refuse a nested `workflowScript`. `RunOptions`
             // layers this FIRST, so the crate's identity/depth/child-role entries still win.
             child_env: overrides.child_env,
-            // pi `hostAvailableBuiltins` (`subagent-executor.ts:3895`): the LIVE host tool registry,
-            // observed HERE — the one place on this path that holds the `HostServices` handle — and
-            // carried on `RunOptions` to `resolve_tool_surface`, which never re-reads it. `None` (a
-            // headless embedder with no host bound) is UNKNOWN and skips the intersection.
-            host_available_builtins: crate::exec::tool_surface::host_builtin_tool_names(
-                self.host_services().as_deref(),
-            ),
             // SUBA-021 — pi `config.usageBudget` (`subagent-runner.ts:172`), the caller's single
             // rung. The terminal check lives at `run_sync`'s settle (`exec/mod.rs`).
             usage_budget: overrides.usage_budget,
