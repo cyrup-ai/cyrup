@@ -71,11 +71,9 @@ pub const NATIVE_SUPERVISOR_TOOL_NAME: &str = "subagent_supervisor";
 pub const INTERCOM_TOOL_NAME: &str = "intercom";
 
 /// The canonical upward-contact tool name (pi `contact_supervisor`). A constant because
-/// `requiredChildTools`' filter (`child-tool-plan.ts:477`) and
-/// [`crate::exec::tool_surface::NATIVE_COORDINATION_TOOL_NAMES`] must name the SAME string: the
-/// filter drops it from the required list precisely because the coordination-name exemption keeps
-/// it in the `--tools` CSV, and the two reading different literals is the drift that reconnects
-/// them wrongly.
+/// `requiredChildTools`' filter (`child-tool-plan.ts:477`) and the native supervisor's own
+/// registration must name the SAME string: the filter keeps it in the `--tools` CSV but drops it
+/// from the required list, because the child registers it at RUNTIME.
 pub const CONTACT_SUPERVISOR_TOOL_NAME: &str = "contact_supervisor";
 
 /// `MAX_MESSAGE_BYTES` (`:22`).

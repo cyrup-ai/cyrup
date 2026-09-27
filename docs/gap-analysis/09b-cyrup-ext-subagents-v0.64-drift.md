@@ -142,7 +142,7 @@ v0.70.1 and v0.71.0.
 | SUBA-109 | low | stale-port | M | `fallbackModels`, the same-launch model ladder and persistent model exclusions are still live. Since v0.68.0 upstream rejects the key by name |
 | SUBA-112 | low | upstream-drift | S | The bundled `worker` still has `defaultContext: fork` (upstream: `fresh`, v0.71.0) and has no `acceptanceRole: writer` (v0.70.1) |
 | SUBA-113 | tracker | tracker | — | Thirteen `config.json` keys are declared unported in source (`registration/mod.rs::UNPORTED_CONFIG_KEYS`), which says "the ledger carries them". No ledger item did until this row |
-| SUBA-114 | high | stale-port | M | Child tool plans are still pruned to the PARENT session's tool registry, and reviewer/scout launches are refused when the parent was started with a narrow `--tools`. Upstream removed the prediction at v0.70.0 |
+| ~~SUBA-114~~ | ~~high~~ **CLOSED 2026-09-26** | stale-port | M | Child tool plans are still pruned to the PARENT session's tool registry, and reviewer/scout launches are refused when the parent was started with a narrow `--tools`. Upstream removed the prediction at v0.70.0 — **CLOSED 2026-09-26** (uncommitted on `claude/gap-analysis-continued`): `b12496b8` ported — `exec/tool_surface.rs` has no parent-registry input (`host_builtin_tool_names`, the partition, the host `read` throw, the review/scout lane refusal, the omission warning and `unavailableHostBuiltins`/`warnings` are gone), and `RunOptions`/`RunnerConfig`/`ExecSingleStepExecutor` no longer carry `host_available_builtins` (an old runner config carrying the key still decodes). The child-side guard is brought to v0.71.0 (#1356): no builtin floor, and the child ABORTS its run at `agent_start` when its real registry lacks a required tool (`prompt_runtime::refresh_tool_diagnostic`). Verify: `cyrup-it --test subagents child_tool_plan_not_predicted_from_parent::*` (5, real parent `AgentSession`). See the section. |
 | ~~SUBA-115~~ | ~~high~~ **CLOSED 2026-09-24** | upstream-drift | S | A nested run's stop / interrupt / timeout cascade reaches every live run on the ROOT route, including sibling subtrees it did not launch (v0.68.0 confines it to the issuing subtree) — **CLOSED 2026-09-24** (`7ba9e03`): `background/cascade.rs::is_control_descendant` ports `isNestedControlDescendant`; `settle.rs::cascade_to_descendants` passes this run's id as issuer when `nested_self` is set, for stop, interrupt and timeout. Verify: `background::cascade::tests::a_nested_issuer_reaches_only_its_own_subtree` (red with the filter removed). Reach note: cyrup does not yet mint a nested route for its own children (`exec/spawn_plan.rs:993`), so today the cascade only has a route when cyrup was itself launched under an inherited one. |
 | SUBA-116 | medium | upstream-drift | M | A paused async run cannot be stopped (refused as "No running or queued async run"), so it keeps its active-capacity slot until resumed |
 | SUBA-117 | medium | parity-bug | S | The worktree clean-tree check does not exclude the crate's own `.cyrup-subagents/` project directory, so the crate's own chain-run / refinement / schedule files make `worktree: true` refuse a clean repository |
@@ -434,7 +434,75 @@ for async single runs) and `worktreeBranchPrefix`. Each needs its own row, with 
 
 ## SUBA-114 — Child tool plans are still pruned to the parent session's registry
 
-**Kind** stale-port · **Severity** high · **Effort** M · **Confidence** confirmed (both sides read; not observed live)
+**Kind** stale-port · **Severity** high · **Effort** M · **Confidence** confirmed (both sides read; not observed live) · **CLOSED 2026-09-26** (uncommitted on `claude/gap-analysis-continued`, off `7f33ed2`)
+
+> **Closure evidence.**
+>
+> * **The prediction is gone, everywhere it reached** (pi `b12496b8`). `exec/tool_surface.rs`:
+>   `host_builtin_tool_names`, `HOST_BUILTIN_TOOL_NAMES`, `REPOSITORY_INSPECTION_TOOLS`,
+>   `NATIVE_COORDINATION_TOOL_NAMES` (no other consumer), the host partition, the host `read`
+>   throw, `is_review_or_scout_lane_agent` / `missing_permitted_repository_inspection_tools` /
+>   `format_review_lane_tool_contract_failure`, the omission warning, and the
+>   `ResolvedToolSurface::{unavailable_host_builtins, warnings}` wire fields (their only producer)
+>   are deleted; `resolve_tool_surface{,_in}` lost the host parameter. `RunOptions`,
+>   `RunnerConfig`, `ExecSingleStepExecutor` (field + `foreground` argument) and every launch site
+>   (`extension/executor/{foreground,background,chain}.rs`) no longer carry
+>   `host_available_builtins`; `task_intent::is_review_or_scout_lane_agent` went with its only
+>   caller; `SubagentError::ToolContractUnsatisfiable` keeps one producer (the fanout refusal).
+>   Old payloads stay readable: neither `RunnerConfig` nor `ResolvedToolSurface` denies unknown
+>   fields (`RecoveryDescriptor` does, but never carried the key) —
+>   `session_state::tests::a_runner_config_carrying_the_removed_host_observation_still_decodes`,
+>   `tool_surface::tests::a_payload_carrying_the_removed_host_fields_still_decodes`.
+> * **The child-side guard, brought to v0.71.0.** Upstream deleted `PI_CORE_CHILD_TOOLS` in #1356
+>   (`51cca33e`, v0.55.0) and throws from `agent_start`; cyrup still carried the v0.43.0 floor
+>   (which would have waved a missing `bash`/`edit` through) and only wrote a file. Now
+>   `tool_availability::write_child_tool_diagnostic` diffs against the registry alone, the MCP
+>   line is v0.71.0's wording, and `prompt_runtime::refresh_tool_diagnostic` aborts the child's own
+>   run (`ControlOp::Abort`) when anything is missing; the parent reports the file as the run's
+>   error (`attempt_runner::diagnose_attempt_error`, unchanged rank). Upstream's `host:"parent"`
+>   diagnostic arm (in-process foreground child) is not ported: a cyrup child is always its own
+>   process.
+> * **Verify (production path, real parent `AgentSession`)** —
+>   `crates/cyrup-it/tests/subagents/child_tool_plan_not_predicted_from_parent.rs`: a parent built
+>   with `--tools subagent,read` AND a registry of only those two (asserted: no `bash`/`edit`/`grep`
+>   definition) launches `worker` (`read, bash, edit`), `reviewer` and `scout` in the foreground
+>   (`a_narrow_parent_launches_foreground_children_with_every_declared_tool`), a `/chain` step
+>   (`…_a_chain_step_…`) and a detached background run through the written `runner-config.json`
+>   and production `run_with` (`…_a_detached_background_child_…`); each child's REAL argv carries
+>   the full `--tools`. `a_child_whose_registry_lacks_a_required_tool_is_refused_at_agent_start`:
+>   a real child session (`--tools read,bash,edit`, registry `read` only, runtime from
+>   `prompt_runtime_from_env`) ends its turn ABORTED without the model request ever being polled,
+>   with upstream's five-line message; `the_parent_reports_the_childs_agent_start_refusal_as_the_run_error`
+>   carries it back as the subagent run's error. Unit: `tool_surface::tests::{every_declared_core_tool_is_kept_so_the_child_registry_decides,
+>   review_and_scout_lanes_resolve_like_any_other_agent, a_capability_ceiling_is_still_honoured}`,
+>   `spawn_plan::tests::declared_tools_reach_the_child_argv_and_required_env_for_every_lane`,
+>   `tool_availability::tests::a_missing_core_builtin_is_reported_there_is_no_floor`,
+>   `prompt_runtime::tests::agent_start_aborts_the_run_when_the_real_registry_lacks_a_required_tool`.
+> * **Correction to the reach stated below.** The CLI `--tools` bounds the ACTIVE set; cyrup's
+>   registry (`DynamicToolState`, what `all_tools` reads) is bounded by `tool_availability`
+>   (`Availability`, the SDK's `allowedToolNames`), which the CLI never sets. So on the CLI the
+>   prediction mostly saw all eight built-ins and pruned little; it bit when the registry was
+>   narrowed (SDK/harness) and for review/scout lanes there. The fix is the same either way; the IT
+>   parent is narrowed on both axes so the deleted code would have pruned it.
+> * **Tests deleted or rewritten** (they pinned the removed behaviour): `tool_surface` — the 6
+>   `host_builtin_tool_names_*`/`a_malformed_tool_row_*` observer tests, the vocabulary guards
+>   (`host_builtin_tool_names_track_the_tool_registry`, `repository_inspection_tools_match_upstream`,
+>   `native_coordination_names_match_the_crate_constants`,
+>   `every_intercom_persona_is_covered_by_the_coordination_exemption`), the 7 host-intersection
+>   tests (two rewritten host-free as `a_capability_ceiling_is_still_honoured` and
+>   `an_intentionally_empty_review_allowlist_launches_with_no_tools`),
+>   `the_host_read_throw_precedes_the_ceiling_read_throw`,
+>   `a_host_that_omits_subagent_does_not_revoke_the_supervisor_tool`, all 11 review-lane/warning
+>   tests (the port of upstream's deleted `child-tool-plan-diagnostics.test.ts`) and the two wire
+>   tests for the removed fields; `spawn_plan` —
+>   `a_reviewer_launch_with_a_host_missing_read_is_refused_through_run_options` and
+>   `the_same_reviewer_launch_proceeds_when_the_host_is_unknown` (replaced by
+>   `declared_tools_reach_the_child_argv_and_required_env_for_every_lane`); `runner_main::executor`
+>   — `the_step_executor_forwards_the_observation_to_every_step`,
+>   `the_foreground_chain_executor_carries_the_observation`; `extension::executor` —
+>   `the_observation_seam_reads_the_live_host`; `session_state` — the two round-trip tests
+>   (replaced by the legacy-decode test); `tool_availability::tests::the_core_tool_floor_is_unioned_into_available`
+>   (replaced by `a_missing_core_builtin_is_reported_there_is_no_floor`).
 
 **cyrup** — `exec/tool_surface.rs::host_builtin_tool_names` (`:130-160`) reads the LAUNCHING session's
 `HostServices::all_tools`, and production passes it into every launch: `extension/executor/foreground.rs:1177`,

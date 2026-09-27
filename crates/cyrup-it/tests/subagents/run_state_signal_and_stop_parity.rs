@@ -162,7 +162,6 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         // nothing is recorded, which is this field's documented `None` behaviour.
         model_exclusions: None,
         fast: false,
-        host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
@@ -676,7 +675,6 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
     let config = RunnerConfig {
         runner_process_instance_id: None,
         revival_lease: None,
-        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,

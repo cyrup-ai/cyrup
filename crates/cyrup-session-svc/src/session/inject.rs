@@ -13,6 +13,27 @@ use crate::event::{AgentSessionEvent, PromptAccepted, StreamingBehavior, UserInp
 
 use super::run::InjectionOffer;
 use super::{AgentSession, now_ms};
+use crate::host_services::{InjectAck, InjectRequest};
+
+/// A no-turn injection the pump handed to a live run's steering queue, kept with its ack until the
+/// idle edge settles whether the run drained it (ICOM-035).
+#[derive(Debug)]
+pub(super) struct SteeredInjection {
+    /// The exact message steered — compared by value to find it in the agent's queue again.
+    pub(super) message: AgentMessage,
+    /// Answered once its fate is settled.
+    pub(super) ack: InjectAck,
+}
+
+/// Whether a no-turn append waits out a running compaction ([`AgentSession::append_no_turn_messages`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CompactionGate {
+    /// The injection pump: a compaction is busy (SEAM-125), so report
+    /// [`InjectionOffer::AgentBusy`] and let the next idle edge re-offer.
+    Wait,
+    /// `send_custom_message`: append now, as pi's `_appendCustomMessage` does.
+    Ignore,
+}
 
 impl AgentSession {
     /// Persist a custom (non-LLM) message via the session tree (Pi `sendCustomMessage` durable path,
@@ -91,85 +112,186 @@ impl AgentSession {
                 Some(DeliverAs::FollowUp) => self.agent.follow_up(msg),
                 _ => self.agent.steer(msg),
             },
+            // ICOM-068 — pi's not-streaming, no-trigger arm is `_appendCustomMessage`: the tree
+            // append AND `_refreshFinalizedContext()`, which re-seeds `agent.state.messages` from the
+            // session projection (`agent-session.ts:1968-1982`, `:730-736` @v0.87.1), so the model
+            // sees the message on the next prompt. This arm used to do the tree append alone: the
+            // message was drawn and persisted and never sent to the model until a resume, fork or
+            // compaction re-seeded the transcript from the tree.
             _ => {
-                self.manager.lock().await.append_custom_message(
-                    custom_type,
-                    content,
-                    display,
-                    details,
-                )?;
-                self.fanout_emit(AgentSessionEvent::MessageStart {
-                    message: msg.clone(),
-                })
-                .await;
-                self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg })
-                    .await;
+                match self
+                    .append_no_turn_messages(vec![msg.clone()], &[], CompactionGate::Ignore)
+                    .await?
+                {
+                    InjectionOffer::Taken => {}
+                    // A run claimed the latch between the routing read above and the append's
+                    // critical section. It is streaming now, so this is pi's streaming arm.
+                    InjectionOffer::AgentBusy => self.agent.steer(msg),
+                }
             }
         }
         Ok(())
     }
 
-    /// Deliver one coalesced injection plan as ONE turn.
+    /// ICOM-035 — hand every no-turn custom injection in `inbox` to the live run's steering queue.
     ///
-    /// Called only by the session's injection pump, which owns the batch and re-offers it on the
-    /// next idle edge when this reports [`InjectionOffer::AgentBusy`]. That ownership is why this
-    /// function has no queueing arm and no retry of its own: the two things the previous
-    /// implementation did here — `agent.steer` onto an active run, and a `spawn_run` whose
-    /// refusal was swallowed by the driver — are exactly the two ways an injected message used to
-    /// disappear.
+    /// pi routes `sendCustomMessage(msg, { deliverAs: "steer" })` to `this.agent.steer(appMessage)`
+    /// while `isStreaming` (`agent-session.ts:1949-1954` @v0.87.1), which is how pi-intercom's busy
+    /// delivery (`index.ts:1221-1246` @v0.14.0) reaches the running model at its next steering
+    /// boundary, in the SAME run. The pump used to hold these until the run was over and then append
+    /// them with no turn, so a supervisor's redirect arrived after the work it was redirecting.
+    ///
+    /// Steering is not the end of the pump's responsibility: a steer that lands after the run
+    /// loop's last `poll_steering` is left in the agent's queue with the session idle — the stranding
+    /// the pump exists to prevent. Each steered message therefore moves into `steered` together
+    /// with its ack, and [`Self::append_no_turn_messages`] settles its fate at the idle edge: drained
+    /// by the run (delivered), or still queued (taken back and appended then).
+    ///
+    /// Only messages injected with pi's `deliverAs: "steer"`
+    /// ([`cyrup_ext::host::HostServices::inject_message_steer`]) steer. A turn-triggering one keeps
+    /// waiting for the idle edge (the pump's documented turn-boundary contract), and so does a
+    /// plain no-turn message: pi defers `{ triggerTurn: false }` on a streaming session instead of
+    /// steering it (`_pendingCustomMessages`, `agent-session.ts:1962-1967`), because a steer the
+    /// model answers can extend the run — which a notice that asked for no turn must never do.
+    pub(super) fn steer_injections_onto_live_run(
+        &self,
+        inbox: &mut Vec<InjectRequest>,
+        steered: &mut Vec<SteeredInjection>,
+    ) {
+        if inbox.is_empty() || !self.is_run_active() {
+            return;
+        }
+        let mut kept = Vec::with_capacity(inbox.len());
+        for req in inbox.drain(..) {
+            let InjectRequest { message, ack } = req;
+            let Some(kind) = message
+                .custom_type
+                .clone()
+                .filter(|_| message.steer && !message.trigger_turn)
+            else {
+                kept.push(InjectRequest { message, ack });
+                continue;
+            };
+            let msg = AgentMessage::Custom {
+                kind,
+                payload: serde_json::Value::String(message.content),
+                details: message.details,
+                display: message.display,
+                timestamp: Some(now_ms()),
+            };
+            self.agent.steer(msg.clone());
+            steered.push(SteeredInjection { message: msg, ack });
+        }
+        *inbox = kept;
+    }
+
+    /// Append no-turn custom messages to the session tree AND the agent's transcript, as ONE
+    /// critical section, and surface them — pi's `_appendCustomMessage` (`agent-session.ts:1968-1982`
+    /// @v0.87.1: `appendCustomMessageEntry` → `_refreshFinalizedContext()` → `message_start`/`_end`).
+    ///
+    /// `steered` are the pump's messages already handed to a run ([`Self::steer_injections_onto_live_run`]):
+    /// any of them still sitting in the agent's steering queue landed past that run's last poll, so
+    /// they are taken back and appended here, AHEAD of `messages` (they arrived first). The ones the
+    /// run drained are already in its transcript and tree and are left alone.
+    ///
+    /// # Why one critical section (ICOM-068)
+    ///
+    /// The tree append runs under the manager lock, which a starting run's `message_end` persist
+    /// also needs, and the transcript push goes through [`cyrup_agent::Agent::edit_transcript`],
+    /// which reads the run latch under the state lock a run's claim snapshots under. So a racing
+    /// prompt either sees neither (the edit refused: [`InjectionOffer::AgentBusy`], nothing written,
+    /// any taken-back steer restored to the queue head for that run to drain) or both, in the same
+    /// order in the tree and in its request.
     ///
     /// # Errors
     ///
-    /// A durable append failure, or an agent fault that waiting cannot fix. A busy agent is NOT an
-    /// error: it is [`InjectionOffer::AgentBusy`].
-    pub(super) async fn deliver_injection_inbox(
+    /// A tree append failure. The transcript push for the messages the tree did not take is rolled
+    /// back first, so the two never disagree about a message that failed.
+    pub(super) async fn append_no_turn_messages(
         &self,
-        plan: InjectionPlan,
+        messages: Vec<AgentMessage>,
+        steered: &[SteeredInjection],
+        compaction: CompactionGate,
     ) -> Result<InjectionOffer, SessionServiceError> {
-        // The no-turn members first: they are independent of the run latch, and persisting them
-        // before a possible `AgentBusy` below means a re-offered batch never re-persists them.
-        for msg in plan.durable {
-            self.append_injected_message_durably(msg).await?;
-        }
-        if plan.turn.is_empty() {
+        // Only a custom message has a no-turn delivery (pi's `sendMessage`); anything else here is a
+        // producer bug that was always dropped, and stays dropped rather than guessed at.
+        let messages: Vec<AgentMessage> = messages
+            .into_iter()
+            .filter(|m| matches!(m, AgentMessage::Custom { .. }))
+            .collect();
+        if messages.is_empty() && steered.is_empty() {
             return Ok(InjectionOffer::Taken);
         }
-        // Pi `_runAgentPrompt(appMessage)`: the turn's input IS the injected message(s). On
-        // `Taken` the agent has claimed its latch with these messages already pushed onto the
-        // run's transcript, so `message_end` — and therefore the durable persist — necessarily
-        // follows; that is what makes acceptance a sufficient acknowledgement.
-        self.run_injection(plan.turn).await
-    }
-
-    /// Persist an injected message that asked for no turn, and surface it (Pi's else-branch,
-    /// agent-session.ts:1337-1370).
-    async fn append_injected_message_durably(
-        &self,
-        msg: AgentMessage,
-    ) -> Result<(), SessionServiceError> {
-        let AgentMessage::Custom {
-            kind,
-            payload,
-            details,
-            display,
-            ..
-        } = &msg
-        else {
-            return Ok(());
+        let mut manager = self.manager.lock().await;
+        // Re-read under the lock: the caller's idle observation is already stale. A manual
+        // compaction is honoured by the pump (it can discard what is appended under it — pi-intercom
+        // holds for exactly that reason, `index.ts:1336`) and ignored by the public
+        // `send_custom_message`, whose pi counterpart appends regardless.
+        if self.is_run_active()
+            || (matches!(compaction, CompactionGate::Wait) && self.is_compacting())
+        {
+            return Ok(InjectionOffer::AgentBusy);
+        }
+        let mut owned: Vec<&AgentMessage> = steered.iter().map(|s| &s.message).collect();
+        let stranded = self.agent.take_steering_where(|queued| {
+            match owned.iter().position(|mine| *mine == queued) {
+                Some(index) => {
+                    owned.remove(index);
+                    true
+                }
+                None => false,
+            }
+        });
+        let mut batch = stranded.clone();
+        batch.extend(messages);
+        if batch.is_empty() {
+            // Every steer was drained by its run: delivered, nothing left to append.
+            return Ok(InjectionOffer::Taken);
+        }
+        let Ok(len_after) = self.agent.edit_transcript(|transcript| {
+            transcript.extend(batch.iter().cloned());
+            transcript.len()
+        }) else {
+            // A run claimed the latch after the read above. Its snapshot is taken after this edit
+            // would have been, so hand it the stranded steers back to drain.
+            self.agent.restore_steering_front(stranded);
+            return Ok(InjectionOffer::AgentBusy);
         };
-        self.manager.lock().await.append_custom_message(
-            kind,
-            payload.clone(),
-            *display,
-            details.clone(),
-        )?;
-        self.fanout_emit(AgentSessionEvent::MessageStart {
-            message: msg.clone(),
-        })
-        .await;
-        self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg })
+        for (index, msg) in batch.iter().enumerate() {
+            let AgentMessage::Custom {
+                kind,
+                payload,
+                details,
+                display,
+                ..
+            } = msg
+            else {
+                continue;
+            };
+            if let Err(fault) =
+                manager.append_custom_message(kind, payload.clone(), *display, details.clone())
+            {
+                let unpersisted = batch.len() - index;
+                // Best effort: refused only if a run has claimed since, in which case it already
+                // snapshotted the messages and there is nothing coherent left to undo.
+                let _ = self.agent.edit_transcript(|transcript| {
+                    if transcript.len() == len_after {
+                        transcript.truncate(len_after - unpersisted);
+                    }
+                });
+                return Err(fault.into());
+            }
+        }
+        drop(manager);
+        for msg in batch {
+            self.fanout_emit(AgentSessionEvent::MessageStart {
+                message: msg.clone(),
+            })
             .await;
-        Ok(())
+            self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg })
+                .await;
+        }
+        Ok(InjectionOffer::Taken)
     }
 
     /// Inject a host-originated message into the live session and optionally trigger an agent turn
@@ -251,10 +373,23 @@ impl MergeGroup {
         self.display = self.display || message.display;
         self.trigger_turn = self.trigger_turn || message.trigger_turn;
         self.bodies.push(message.content.clone());
-        if self.details.is_none() {
-            self.details = message.details.clone();
-        }
     }
+}
+
+/// The key a message merges under, or `None` when it must stay its own message.
+///
+/// A plain user message (`custom_type: None`) keeps its identity: it is a different kind of turn
+/// input. So does a custom message that carries `details` — its renderer payload describes THAT
+/// message only (an intercom card is the sender, the envelope and the body of one message), so a
+/// merge could neither concatenate two payloads into a value no renderer declared nor keep one
+/// without drawing every other member's body under the first member's card. Upstream never has to
+/// choose: each `pi.sendMessage` is its own message. The subagent completion batches this merging
+/// exists for carry no `details`, so they merge exactly as before.
+fn merge_key(message: &crate::host_services::InjectMessage) -> Option<&str> {
+    if message.details.is_some() {
+        return None;
+    }
+    message.custom_type.as_deref()
 }
 
 /// One coalesced batch, split by what it needs from the session.
@@ -270,6 +405,43 @@ pub(super) struct InjectionPlan {
     pub(super) durable: Vec<AgentMessage>,
 }
 
+/// Split an inbox into the requests whose merge group asks for NO turn and those whose group does,
+/// by exactly [`merge_injection_batch`]'s grouping rule (by `custom_type`, `trigger_turn` OR'd across
+/// the group; a `custom_type: None` member is its own group) — so merging each half yields the
+/// `durable` and the `turn` half of merging the whole, in the same order.
+///
+/// The pump needs the split at the REQUEST level: the no-turn half is delivered (and its acks
+/// answered) before the turn half is offered to the agent, and when that offer comes back
+/// [`InjectionOffer::AgentBusy`] only the turn half may be kept for the next idle edge. Re-merging
+/// the whole inbox there persisted the no-turn members a second time.
+pub(super) fn split_by_group_trigger(
+    inbox: Vec<InjectRequest>,
+) -> (Vec<InjectRequest>, Vec<InjectRequest>) {
+    let group_triggers = |key: &str| {
+        inbox
+            .iter()
+            .filter(|req| merge_key(&req.message) == Some(key))
+            .any(|req| req.message.trigger_turn)
+    };
+    let triggers: Vec<bool> = inbox
+        .iter()
+        .map(|req| match merge_key(&req.message) {
+            Some(key) => group_triggers(key),
+            None => req.message.trigger_turn,
+        })
+        .collect();
+    let mut durable = Vec::new();
+    let mut turn = Vec::new();
+    for (req, triggers) in inbox.into_iter().zip(triggers) {
+        if triggers {
+            turn.push(req);
+        } else {
+            durable.push(req);
+        }
+    }
+    (durable, turn)
+}
+
 /// Split one coalesced inbox into an [`InjectionPlan`].
 ///
 /// # The functional core of the injection pump
@@ -279,14 +451,15 @@ pub(super) struct InjectionPlan {
 /// order, and which of them still need their own durable append — happens here, against explicit
 /// inputs.
 ///
-/// Members are merged by `custom_type` alone — in practice every member of a background-completion
-/// batch is a `subagent-notify` — with the bodies joined by a blank line and `display`/`trigger_turn`
+/// Members are merged by `custom_type` ([`merge_key`]) — in practice every member of a
+/// background-completion batch is a `subagent-notify` — with the bodies joined by a blank line and `display`/`trigger_turn`
 /// OR'd across the group (so one loud member wakes a turn for its quiet siblings), which is pi's own
 /// batching (`sendCompletion` builds one message
 /// from an array of completion details and ORs their `triggerTurn`, `notify.ts:399-412` @v0.64.0).
 ///
 /// A `custom_type: None` member is never merged: a plain user message is a different kind of turn
-/// input and must keep its own identity.
+/// input and must keep its own identity. Nor is a member that carries `details` (see
+/// [`merge_key`]).
 pub(super) fn merge_injection_batch(
     inbox: &[crate::host_services::InjectRequest],
 ) -> InjectionPlan {
@@ -295,15 +468,13 @@ pub(super) fn merge_injection_batch(
     let mut groups: Vec<MergeGroup> = Vec::new();
     for req in inbox {
         let message = &req.message;
-        let existing = message
-            .custom_type
-            .is_some()
-            .then(|| {
-                groups
-                    .iter()
-                    .position(|group| group.custom_type == message.custom_type)
+        // A group formed by a message that carries `details` has `details: Some` and so is never
+        // joined: `merge_key` is `None` for it, and only same-key, detail-free groups match.
+        let existing = merge_key(message).and_then(|key| {
+            groups.iter().position(|group| {
+                group.details.is_none() && group.custom_type.as_deref() == Some(key)
             })
-            .flatten();
+        });
         match existing.and_then(|index| groups.get_mut(index)) {
             Some(group) => group.absorb(message),
             None => groups.push(MergeGroup::new(message)),
@@ -350,7 +521,7 @@ mod tests {
     //! SUBA-017 — `merge_injection_batch` is the only thing between a fan-out's N completions and
     //! N turns, and it had no test. Each test names the mutation it kills.
 
-    use super::{InjectionPlan, merge_injection_batch};
+    use super::{InjectionPlan, merge_injection_batch, split_by_group_trigger};
     use crate::host_services::{InjectAck, InjectMessage, InjectRequest};
     use cyrup_agent::AgentMessage;
 
@@ -362,6 +533,7 @@ mod tests {
                 display,
                 details: None,
                 trigger_turn,
+                steer: false,
             },
             ack: InjectAck::detached(),
         }
@@ -477,6 +649,76 @@ mod tests {
             vec![
                 ("<user>".into(), "first".into(), true),
                 ("<user>".into(), "second".into(), true),
+            ]
+        );
+    }
+
+    /// The pump's request-level split agrees with the message-level merge: a no-turn member whose
+    /// group has a turn-triggering sibling rides the turn, a group with none is durable, a plain
+    /// user message is its own group, and each half keeps arrival order. Kills: splitting per
+    /// request instead of per group (the quiet `subagent-notify` sibling would land in `durable`
+    /// and be appended as well as run).
+    #[test]
+    fn split_by_group_trigger_matches_the_merge_grouping() {
+        let inbox = vec![
+            req(Some("subagent-notify"), "quiet", false, false),
+            req(Some("intercom_message"), "note-1", true, false),
+            req(None, "user-quiet", true, false),
+            req(Some("subagent-notify"), "loud", true, true),
+            req(Some("intercom_message"), "note-2", true, false),
+        ];
+        let (durable, turn) = split_by_group_trigger(inbox);
+        let bodies = |v: &[crate::host_services::InjectRequest]| -> Vec<String> {
+            v.iter().map(|r| r.message.content.clone()).collect()
+        };
+        assert_eq!(bodies(&durable), vec!["note-1", "user-quiet", "note-2"]);
+        assert_eq!(bodies(&turn), vec!["quiet", "loud"]);
+        let InjectionPlan { turn: planned, .. } = merge_injection_batch(&turn);
+        assert_eq!(
+            shapes(&planned),
+            vec![("subagent-notify".into(), "quiet\n\nloud".into(), true)]
+        );
+    }
+
+    /// A custom message that carries `details` (a renderer payload such as an intercom card) is
+    /// never merged: two held intercom messages flushed together stay two messages, each with its
+    /// own card, and a detail-free sibling of the same type does not absorb into either. Kills:
+    /// merging on `custom_type` alone (one message, the second card's payload silently dropped).
+    #[test]
+    fn a_message_with_details_keeps_its_own_identity() {
+        let with_details = |body: &str| {
+            let mut r = req(Some("intercom_message"), body, true, true);
+            r.message.details = Some(serde_json::json!({ "card": body }));
+            r
+        };
+        let inbox = vec![
+            with_details("m1"),
+            with_details("m2"),
+            req(Some("intercom_message"), "plain", true, true),
+        ];
+        let InjectionPlan { turn, durable } = merge_injection_batch(&inbox);
+        assert!(durable.is_empty());
+        assert_eq!(
+            shapes(&turn),
+            vec![
+                ("intercom_message".into(), "m1".into(), true),
+                ("intercom_message".into(), "m2".into(), true),
+                ("intercom_message".into(), "plain".into(), true),
+            ]
+        );
+        let details: Vec<_> = turn
+            .iter()
+            .map(|m| match m {
+                AgentMessage::Custom { details, .. } => details.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            details,
+            vec![
+                Some(serde_json::json!({ "card": "m1" })),
+                Some(serde_json::json!({ "card": "m2" })),
+                None
             ]
         );
     }

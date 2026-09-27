@@ -110,21 +110,18 @@ pub enum SubagentError {
     #[error("{0}")]
     CapabilityCeilingViolation(String),
 
-    /// The launch's tool contract cannot be satisfied. Three producers, all upstream throws and
-    /// all carrying pi's verbatim text:
+    /// The launch's tool contract cannot be satisfied: the effective surface holds
+    /// `subagent_supervisor` without fanout authorization (pi `child-tool-plan.ts:342-344`
+    /// @v0.71.0). Carries pi's verbatim text as the whole message.
     ///
-    /// * the host runtime does not provide a required `read` (pi `child-tool-plan.ts:384-389`);
-    /// * the effective surface holds `subagent_supervisor` without fanout authorization (`:421-423`);
-    /// * a `reviewer`/`scout` launch's permitted, non-excluded repository-inspection tools are
-    ///   host-missing (`:531-543`, the review-LANE contract).
+    /// SUBA-114: the two other producers this variant used to have — the HOST `read` refusal and
+    /// the review/scout lane contract — were upstream's prediction of the child's tools from the
+    /// PARENT session's registry, deleted in `b12496b8` (v0.70.0). A tool the child genuinely lacks
+    /// is refused by the child itself at `agent_start` (`exec::tool_availability`).
     ///
-    /// Fail-CLOSED for the same reason [`Self::CapabilityCeilingViolation`] is: a review lane
-    /// without repository access cannot produce a review, and returning one anyway would report
-    /// success for work that never happened.
-    ///
-    /// Carries pi's verbatim text as the whole message. Not retryable — no
-    /// `RETRYABLE_MODEL_FAILURE_PATTERNS` needle matches it, so the fallback ladder stops on
-    /// attempt 1 rather than re-running the same impossible launch on every candidate model.
+    /// Not retryable — no `RETRYABLE_MODEL_FAILURE_PATTERNS` needle matches it, so the fallback
+    /// ladder stops on attempt 1 rather than re-running the same impossible launch on every
+    /// candidate model.
     #[error("{0}")]
     ToolContractUnsatisfiable(String),
 

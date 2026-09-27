@@ -42,6 +42,10 @@ mod support;
 // ---------------------------------------------------------------------------------------------
 
 mod gap11_event_tier_verify;
+// Not drained from `crates/cyrup-session-svc/tests`: written here, because its proofs need the
+// assembled session's injection pump and post-run driver running against a scripted provider
+// (ICOM-035 / ICOM-068 / SEAM-125).
+mod injection_pump;
 mod install_noop;
 mod late_tools;
 mod model_registry;

@@ -206,7 +206,6 @@ async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -
     let config = RunnerConfig {
         runner_process_instance_id: None,
         revival_lease: None,
-        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour

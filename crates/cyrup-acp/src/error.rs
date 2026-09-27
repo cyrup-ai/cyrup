@@ -125,6 +125,8 @@ impl AcpFailure {
             | E::MissingSessionCwd(_)
             | E::NoModelForSummarization
             | E::StreamingNeedsBehavior
+            | E::NavigateTreeWhileStreaming
+            | E::NavigateTreeWhileCompacting
             | E::ExtensionCommandNotQueueable(_)
             | E::NoActiveRun
             | E::NothingToCompact

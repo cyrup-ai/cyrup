@@ -1213,7 +1213,6 @@ mod tests {
             orchestrator_intercom_target: None,
             inherited_session_model: Some(ModelId::from("anthropic/session-model")),
             inherited_session_thinking: Some("medium".to_string()),
-            host_available_builtins: None,
             turn_budget: Some(ResolvedTurnBudget {
                 max_turns: 9,
                 grace_turns: 1,

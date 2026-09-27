@@ -216,23 +216,6 @@ pub struct RunnerConfig {
     /// on-disk config still deserialize — `None` leaves each step on its persona's own level.
     #[serde(default)]
     pub inherited_session_thinking: Option<String>,
-    /// pi `config.hostAvailableBuiltins` (`subagent-runner.ts:702`, read at `:3703`, `:4115`, `:4517`)
-    /// — the builtin tool names the LAUNCHING orchestrator's host registry reported, observed ONCE at
-    /// plan time by [`crate::exec::tool_surface::host_builtin_tool_names`] and carried verbatim into
-    /// the detached runner.
-    ///
-    /// Carried for the same reason as [`Self::inherited_session_model`] and one stronger: this detached
-    /// process has NO host-services backend to observe with, and its own tool registry is NOT the
-    /// parent's — re-reading here would answer a different question. This field is the only channel by
-    /// which the parent's observation reaches hop 2, and without it every async/background run launches
-    /// with `None` and the whole host-availability mechanism (the intersection, the
-    /// `unavailableHostBuiltins` diagnostic, the review-lane refusal) is inert for exactly the fan-out
-    /// shape it was built for.
-    ///
-    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize — `None` is UNKNOWN,
-    /// which is the pre-mechanism behaviour.
-    #[serde(default)]
-    pub host_available_builtins: Option<Vec<String>>,
     /// SUBA-008 — the run-level assistant-TURN budget (pi `params.turnBudget`,
     /// `runs/background/async-execution.ts:165`/`:214`, threaded to the runner as `ctx.turnBudget`,
     /// `subagent-runner.ts:1091`, and from there onto every step's `runSubagentProcess` call at
@@ -620,7 +603,6 @@ mod tests {
             orchestrator_intercom_target: None,
             inherited_session_model: None,
             inherited_session_thinking: None,
-            host_available_builtins: None,
             model_scope: None,
             nested_route: None,
             nested_self: None,
@@ -687,7 +669,6 @@ mod tests {
             orchestrator_intercom_target: None,
             inherited_session_model: None,
             inherited_session_thinking: None,
-            host_available_builtins: None,
             model_scope: None,
             nested_route: None,
             nested_self: None,

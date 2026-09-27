@@ -116,7 +116,7 @@ impl AgentSession {
     /// hang forever. On expiry the caller proceeds exactly as the old fire-and-forget `abort()` did.
     pub async fn abort_and_settle(&self) {
         self.abort();
-        let _ = tokio::time::timeout(ABORT_SETTLE_TIMEOUT, self.wait_for_idle()).await;
+        let _ = tokio::time::timeout(ABORT_SETTLE_TIMEOUT, self.wait_for_run_settled()).await;
     }
 
     /// The agent's current steering mode (Pi `steeringMode` getter, agent-session.ts:845).

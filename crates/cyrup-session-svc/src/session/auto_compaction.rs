@@ -204,7 +204,7 @@ impl AgentSession {
         // but `check_compaction` is also awaited from `prepare` on the CALLER's future
         // (`:1199`), which a racing caller can drop.
         let mut cancel_slot =
-            CompactionCancelGuard::install(&self.auto_compaction_cancel, cancel.clone());
+            CompactionCancelGuard::install(self, &self.auto_compaction_cancel, cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason })
             .await;
 

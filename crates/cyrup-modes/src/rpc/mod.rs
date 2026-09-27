@@ -865,11 +865,13 @@ async fn dispatch(
 /// never returned, and `run_rpc_dispatch`'s `runtime.dispose()` — hence `session_shutdown` — never
 /// ran (SEAM-002's RPC leg).
 ///
-/// [`AgentSession::is_idle`] is the same two-latch readback `wait_for_idle` waits on (the post-run
-/// driver plus the agent's own run, Pi `isIdle`, agent-session.ts:759), so a steer that lands ON a
-/// live run still holds the EOF exit open — which is the case the latch was written for.
+/// [`AgentSession::is_run_active`] is the two-latch run readback (the post-run driver plus the
+/// agent's own run, Pi `isStreaming`), so a steer that lands ON a live run still holds the EOF exit
+/// open — which is the case the latch was written for. Not `is_idle`: since SEAM-125 that also
+/// counts a running compaction, which ends in `compaction_end`, never in the `agent_settled` that
+/// clears this latch — a steer queued during `/compact` would hold the exit open forever.
 fn latch_if_running(session: &AgentSession, in_flight: &mut bool) {
-    if !session.is_idle() {
+    if session.is_run_active() {
         *in_flight = true;
     }
 }

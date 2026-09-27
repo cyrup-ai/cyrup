@@ -187,7 +187,6 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     let config = RunnerConfig {
         runner_process_instance_id: None,
         revival_lease: None,
-        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
@@ -416,7 +415,6 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     let config = RunnerConfig {
         runner_process_instance_id: None,
         revival_lease: None,
-        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -516,7 +514,6 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         // nothing is recorded, which is this field's documented `None` behaviour.
         model_exclusions: None,
         fast: false,
-        host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
@@ -796,7 +793,6 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     let config = RunnerConfig {
         runner_process_instance_id: None,
         revival_lease: None,
-        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,

@@ -160,7 +160,19 @@ enum ScriptStep {
     /// parent's own sanitizer is what decides what reaches the result. With the env var absent the
     /// step is a silent no-op, exactly as a real child registers no collector without it.
     WriteRuntimeAcknowledgedExtensions { value: serde_json::Value },
+    /// SUBA-045 / SUBA-114 — play the role of a real child's `agent_start` tool check REFUSING
+    /// its run: write `value` verbatim, as JSON, to the path the parent handed this process in
+    /// `CYRUP_SUBAGENT_TOOL_DIAGNOSTIC_PATH` (the real writer is the prompt runtime's
+    /// `refresh_tool_diagnostic`, which then aborts the run). Written RAW so a test controls the
+    /// exact diagnostic the parent reads back. With the env var absent the step is a silent no-op,
+    /// exactly as a real child with no required-tools contract never checks.
+    WriteToolDiagnostic { value: serde_json::Value },
 }
+
+/// The diagnostic-path env var [`ScriptStep::WriteToolDiagnostic`] honours —
+/// `crate::exec::tool_availability::CHILD_TOOL_DIAGNOSTIC_PATH_ENV`, restated for the same
+/// no-library-link reason as [`STRUCTURED_OUTPUT_CAPTURE_ENV`].
+const TOOL_DIAGNOSTIC_PATH_ENV: &str = "CYRUP_SUBAGENT_TOOL_DIAGNOSTIC_PATH";
 
 /// The acknowledgement-path env var [`ScriptStep::WriteRuntimeAcknowledgedExtensions`] honours —
 /// `crate::exec::runtime_acknowledged_extensions::RUNTIME_EXTENSION_ACK_PATH_ENV`, restated for the
@@ -437,6 +449,15 @@ async fn main() {
             }
             ScriptStep::WriteStructuredOutput { value } => {
                 write_structured_output_capture(value);
+            }
+            ScriptStep::WriteToolDiagnostic { value } => {
+                if let Some(path) = std::env::var_os(TOOL_DIAGNOSTIC_PATH_ENV)
+                    && let Ok(bytes) = serde_json::to_vec(value)
+                    && let Err(err) = std::fs::write(&path, bytes)
+                {
+                    // stderr is diagnostic, never protocol data (R-SA-046).
+                    eprintln!("cyrup-subagent-fixture: failed to write the tool diagnostic: {err}");
+                }
             }
             ScriptStep::WriteRuntimeAcknowledgedExtensions { value } => {
                 if let Some(path) = std::env::var_os(RUNTIME_ACK_PATH_ENV)

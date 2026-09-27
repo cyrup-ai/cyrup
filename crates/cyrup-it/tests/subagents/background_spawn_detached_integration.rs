@@ -580,7 +580,6 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     let runner_config = RunnerConfig {
         runner_process_instance_id: None,
         revival_lease: None,
-        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
@@ -823,7 +822,6 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     let runner_config = RunnerConfig {
         runner_process_instance_id: None,
         revival_lease: None,
-        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,

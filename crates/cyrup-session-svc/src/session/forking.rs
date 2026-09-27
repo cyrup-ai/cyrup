@@ -71,7 +71,13 @@ impl AgentSession {
         .with_observer(retry_observer);
         let compactor = Compactor::new(summarizer, NoHooks);
         let cancel = self.session_cancel.child_token();
-        *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
+        // SEAM-125 — through the guard, so the slot's clear is also the idle edge `wait_for_idle`
+        // wakes on (a branch summary counts as busy, pi `isCompacting`).
+        let mut cancel_slot = super::compaction::CompactionCancelGuard::install(
+            self,
+            &self.branch_summary_cancel,
+            cancel.clone(),
+        );
 
         let mut guard = self.manager.lock().await;
         let old_leaf = guard.leaf_id().cloned();
@@ -91,7 +97,7 @@ impl AgentSession {
         // `spawn_event_pump`).
         drop(compactor);
         let _ = retry_pump.await;
-        *Self::lock(&self.branch_summary_cancel) = None;
+        cancel_slot.clear();
         Ok(entry_opt?.map(|e| e.summary))
     }
 
@@ -296,7 +302,11 @@ impl AgentSession {
             let budget = branch_token_budget(&model, self.branch_summary_settings.reserve_tokens);
             let prep = prepare_branch_entries(&collection.entries, budget);
             let cancel = self.session_cancel.child_token();
-            *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
+            let mut cancel_slot = super::compaction::CompactionCancelGuard::install(
+                self,
+                &self.branch_summary_cancel,
+                cancel.clone(),
+            );
             let result = self
                 .generate_branch_summary_with_instructions(
                     &prep,
@@ -306,7 +316,7 @@ impl AgentSession {
                     cancel,
                 )
                 .await;
-            *Self::lock(&self.branch_summary_cancel) = None;
+            cancel_slot.clear();
             match result {
                 Ok(produced) => {
                     let details = serde_json::to_value(prep.file_ops.to_details())

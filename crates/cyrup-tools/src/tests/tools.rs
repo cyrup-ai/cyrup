@@ -2011,7 +2011,10 @@ async fn bash_signal_killed_command_fails_with_128_plus_signo() {
             format!("partial\n\nCommand exited with code {code}"),
             "{command}"
         );
-        let details = err.details.as_ref().expect("the code is carried structurally");
+        let details = err
+            .details
+            .as_ref()
+            .expect("the code is carried structurally");
         assert_eq!(details["exitCode"], code, "{command}");
     }
 }

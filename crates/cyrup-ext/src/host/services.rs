@@ -585,6 +585,35 @@ pub trait HostServices: Send + Sync {
         Err("message injection not available".into())
     }
 
+    /// Inject a custom message with pi's `{ deliverAs: "steer" }` delivery and no `triggerTurn`
+    /// (`pi.sendMessage(message, { deliverAs: "steer" })` → `sendCustomMessage`,
+    /// `agent-session.ts:1949-1954` @v0.87.1): while an agent run is active the message goes to
+    /// that run's steering queue and reaches the model at its next steering boundary, in the SAME
+    /// run; while the session is idle it is appended to the session and the agent transcript with
+    /// no turn (pi `_appendCustomMessage`).
+    ///
+    /// # Why this is not `inject_message(…, trigger_turn = false)`
+    ///
+    /// pi gives the two a different busy arm. `{ triggerTurn: false }` on a streaming session is
+    /// deferred to the end of the current turn and never drives the model on its own
+    /// (`_pendingCustomMessages`); `{ deliverAs: "steer" }` is `agent.steer`, which the model
+    /// answers — so a steer that lands in the run's final turn extends the run. pi-intercom's busy
+    /// delivery (`index.ts:1221-1246` @v0.14.0) depends on the second; a background notice that
+    /// asked for no turn must not get it. One boolean cannot carry both (ICOM-035).
+    ///
+    /// The default falls back to [`Self::inject_message`] with `trigger_turn = false`, so a
+    /// backend with no live run to steer into — and every existing double — keeps delivering the
+    /// message without a turn.
+    fn inject_message_steer(
+        &self,
+        content: &str,
+        custom_type: Option<&str>,
+        display: bool,
+        details: Option<&Value>,
+    ) -> Result<(), String> {
+        self.inject_message(content, custom_type, display, details, false)
+    }
+
     // --- models ---
     fn models(&self) -> Value {
         json!([])

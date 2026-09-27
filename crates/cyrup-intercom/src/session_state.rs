@@ -17,7 +17,8 @@ use crate::error::{IntercomError, Result};
 use crate::reply_tracker::{OutboundReplyWaiter, ReplyTracker};
 use crate::transport::client::{IntercomClient, SendOptions};
 use crate::transport::protocol::{
-    MessageControl, MessageControlAction, MessageReceipt, MessageReceiptStatus, now_ms,
+    Message, MessageControl, MessageControlAction, MessageReceipt, MessageReceiptStatus,
+    SessionInfo, now_ms,
 };
 
 /// `INBOUND_MESSAGE_DEDUPE_MAX` (`v0.10.1 index.ts:32`).
@@ -100,6 +101,25 @@ pub struct PresenceContext {
     pub window: Option<Option<serde_json::Number>>,
 }
 
+/// One inbound message held until delivery is safe — an entry of pi-intercom's
+/// `heldInboundMessages` (`v0.14.0 index.ts:628`, `InboundMessageEntry`). cyrup rebuilds the
+/// delivered card from `from` + `message` at delivery time, so those two are the whole entry.
+#[derive(Clone, Debug)]
+pub struct HeldInbound {
+    /// The sender.
+    pub from: SessionInfo,
+    /// The message, already stamped with `receiverReceivedAt`.
+    pub message: Message,
+}
+
+/// The held-inbound flush timer (`heldInboundTimer`, `v0.14.0 index.ts:629`): the task, tagged with
+/// a per-timer serial so a timer that exits on its own clears only its OWN slot.
+#[derive(Debug)]
+struct HeldInboundTimer {
+    serial: u64,
+    task: tokio::task::JoinHandle<()>,
+}
+
 /// The shared, session-scoped intercom state.
 pub struct SharedIntercomState {
     client: Mutex<Option<Arc<IntercomClient>>>,
@@ -132,8 +152,22 @@ pub struct SharedIntercomState {
     /// Cleared wholesale on `agent_start`/`agent_end` (`:1430`, `:1452`) and on shutdown (`:1409`).
     active_tools: Mutex<Vec<(cyrup_core::ToolCallId, String)>>,
     /// Whether an agent run is in flight (pi `agentRunning`, `v0.10.1 index.ts:524`) — the
-    /// `thinking` vs `idle` axis of `currentStatus` once no tool is active.
+    /// `thinking` vs `idle` axis of `currentStatus` once no tool is active, and (ICOM-062) the
+    /// second half of the hold rule: a session that is busy WITHOUT an agent run cannot take a
+    /// steer, so an inbound message waits in [`Self::held_inbound`].
     agent_running: AtomicBool,
+    /// `heldInboundMessages` (`v0.14.0 index.ts:628`, `17699ba`) — inbound messages that arrived
+    /// while the session was busy without an agent run (a manual `/compact`, a branch summary, the
+    /// post-run gap), in arrival order. Upstream's reason, verbatim: "Busy without an agent run
+    /// cannot steer; manual compaction can discard an appended custom entry." Drained by
+    /// [`crate::inbound::flush_held_inbound_messages`] on `agent_start` and on the idle edge (the
+    /// 100 ms timer), expired on session start/shutdown, dropped by a reply or a peer's
+    /// cancel/supersede before it is ever injected. ICOM-062.
+    held_inbound: Mutex<VecDeque<HeldInbound>>,
+    /// The timer draining [`Self::held_inbound`] (`heldInboundTimer`), `None` when none runs.
+    held_inbound_timer: Mutex<Option<HeldInboundTimer>>,
+    /// Source of [`HeldInboundTimer::serial`].
+    held_inbound_timer_serial: std::sync::atomic::AtomicU64,
     /// This session's child-orchestrator metadata, published by
     /// [`crate::extension::IntercomExtension::new`] so [`Self::sync_presence_identity`] derives the
     /// same presence name `crate::connect::build_registration` did. Upstream needs no equivalent:
@@ -198,6 +232,9 @@ impl SharedIntercomState {
             has_ui: AtomicBool::new(false),
             active_tools: Mutex::new(Vec::new()),
             agent_running: AtomicBool::new(false),
+            held_inbound: Mutex::new(VecDeque::new()),
+            held_inbound_timer: Mutex::new(None),
+            held_inbound_timer_serial: std::sync::atomic::AtomicU64::new(0),
             presence_metadata: Mutex::new(None),
             last_presence_identity: Mutex::new(None),
             name_poll_task: Mutex::new(None),
@@ -297,11 +334,35 @@ impl SharedIntercomState {
     /// actions retract the pending ask, and only the receipt they emit differs. Getting that order
     /// wrong would leave a superseded ask in the peer's `pending` list forever, which is the exact
     /// symptom ICOM-017 records.
+    ///
+    /// ICOM-062 (`v0.14.0 index.ts:685-696`): a message still HELD is dropped before it can be
+    /// injected, and the receipt says so — `cancelled` ("dropped before injection") or
+    /// `superseded` — INSTEAD of the `cancellation_requested` hedge, which exists only because an
+    /// already-injected message cannot be recalled.
     pub fn handle_message_control(&self, control: &MessageControl) {
         self.tracker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .dismiss_pending_ask(&control.message_id);
+        let superseded_detail = control
+            .superseded_by
+            .as_deref()
+            .map(|by| format!("superseded by {by}"));
+        let dropped = match control.action {
+            MessageControlAction::Cancel => self.drop_held_inbound(
+                &control.message_id,
+                MessageReceiptStatus::Cancelled,
+                Some("dropped before injection"),
+            ),
+            MessageControlAction::Supersede => self.drop_held_inbound(
+                &control.message_id,
+                MessageReceiptStatus::Superseded,
+                superseded_detail.as_deref(),
+            ),
+        };
+        if dropped {
+            return;
+        }
         match control.action {
             MessageControlAction::Cancel => self.emit_message_receipt(
                 &control.message_id,
@@ -410,6 +471,136 @@ impl SharedIntercomState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(id, _)| id != call_id);
+    }
+
+    /// `agentRunning` (`v0.14.0 index.ts:627`) — whether the extension has seen `agent_start`
+    /// without the matching `agent_end`.
+    #[must_use]
+    pub fn agent_running(&self) -> bool {
+        self.agent_running.load(Ordering::SeqCst)
+    }
+
+    /// How many inbound messages are held (`heldInboundMessages.length`).
+    #[must_use]
+    pub fn held_inbound_len(&self) -> usize {
+        self.held_inbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// `heldInboundMessages.push(entry)` — the queue half of `holdIncomingBrokerMessage`
+    /// (`v0.14.0 index.ts:1294-1301`); the receipt and the timer are
+    /// [`crate::inbound::hold_incoming_broker_message`]'s.
+    pub fn push_held_inbound(&self, entry: HeldInbound) {
+        self.held_inbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(entry);
+    }
+
+    /// `heldInboundMessages.shift()` — the oldest held message, if any.
+    pub fn pop_held_inbound(&self) -> Option<HeldInbound> {
+        self.held_inbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+    }
+
+    /// `dropHeldInboundMessage(messageId, receipt)` (`v0.14.0 index.ts:630-637`): remove a held
+    /// message by id and emit `status`; `false` (and no receipt) when it is not held — it was never
+    /// held, or it has already been injected.
+    pub fn drop_held_inbound(
+        &self,
+        message_id: &str,
+        status: MessageReceiptStatus,
+        detail: Option<&str>,
+    ) -> bool {
+        let removed = {
+            let mut held = self.held_inbound.lock().unwrap_or_else(|e| e.into_inner());
+            match held.iter().position(|e| e.message.id == message_id) {
+                Some(index) => held.remove(index).is_some(),
+                None => false,
+            }
+        };
+        if removed {
+            self.emit_message_receipt(message_id, status, detail);
+        }
+        removed
+    }
+
+    /// `expireHeldInboundMessages(detail)` (`v0.14.0 index.ts:638-643`): every held message gets
+    /// an `expired` receipt and is forgotten; the timer is cleared. Run on `session_start` (a
+    /// replaced runtime) and `session_shutdown`.
+    pub fn expire_held_inbound(&self, detail: &str) {
+        let expired: Vec<HeldInbound> = self
+            .held_inbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for entry in expired {
+            self.emit_message_receipt(
+                &entry.message.id,
+                MessageReceiptStatus::Expired,
+                Some(detail),
+            );
+        }
+        self.clear_held_inbound_timer();
+    }
+
+    /// `clearHeldInboundTimer()` (`v0.14.0 index.ts:1290-1293`).
+    pub fn clear_held_inbound_timer(&self) {
+        if let Some(timer) = self
+            .held_inbound_timer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            timer.task.abort();
+        }
+    }
+
+    /// Start the held-inbound timer unless one is running (`if (!heldInboundTimer) heldInboundTimer =
+    /// setInterval(...)`, `v0.14.0 index.ts:1297-1300`). `spawn` receives the new timer's serial and
+    /// returns its task; it is called with the slot locked, so two holds cannot start two timers.
+    pub fn ensure_held_inbound_timer(
+        &self,
+        spawn: impl FnOnce(u64) -> tokio::task::JoinHandle<()>,
+    ) {
+        let mut slot = self
+            .held_inbound_timer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let serial = self
+                .held_inbound_timer_serial
+                .fetch_add(1, Ordering::SeqCst);
+            *slot = Some(HeldInboundTimer {
+                serial,
+                task: spawn(serial),
+            });
+        }
+    }
+
+    /// The timer's own exit: clear the slot iff it still holds timer `serial` and the held queue is
+    /// empty (or `force`). Returns whether the timer should stop. Checked with the slot locked, so a
+    /// hold that pushes after this sees an empty slot and starts a fresh timer rather than relying
+    /// on one that is about to return.
+    pub fn retire_held_inbound_timer(&self, serial: u64, force: bool) -> bool {
+        let mut slot = self
+            .held_inbound_timer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mine = slot.as_ref().is_some_and(|t| t.serial == serial);
+        if !mine {
+            return true;
+        }
+        if force || self.held_inbound_len() == 0 {
+            *slot = None;
+            return true;
+        }
+        false
     }
 
     /// `activeTools.clear()` (`v0.10.1 index.ts:1430`, `:1452`, `:1409`) plus the `agentRunning`

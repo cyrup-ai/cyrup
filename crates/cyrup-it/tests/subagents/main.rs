@@ -148,6 +148,9 @@ mod native_supervisor_channel_integration;
 mod result_intercom_delivery_integration;
 
 // ---- persona resolution, mode overrides, CYRUP_HOME sandboxing ----
+// SUBA-114 — a narrow parent session no longer narrows its children; the child's own registry
+// check at `agent_start` is the guard.
+mod child_tool_plan_not_predicted_from_parent;
 mod cyrup_home_env_sandboxed_tests;
 mod single_mode_overrides_integration;
 mod subagent_persona_and_depth_integration;

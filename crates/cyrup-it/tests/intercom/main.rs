@@ -54,6 +54,9 @@ mod child_bridge_activation;
 mod compose_send_leg;
 mod dismiss_incoming_ask;
 mod human_surface;
+// Written here, not drained: the live-session proofs for ICOM-035 / ICOM-062 / ICOM-068 — the
+// production `IntercomExtension` inside a real `AgentSession`, against a real broker.
+mod inbound_live_session;
 mod intercom_command_transcript;
 mod intercom_id_command;
 mod presence_context_usage;

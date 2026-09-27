@@ -801,11 +801,38 @@ impl AgentSession {
         messages
     }
 
-    /// Await full settlement of the in-flight run AND its post-run loop (R-11-005). On a bound session
-    /// the agent goes briefly idle BETWEEN a completed turn and a retry/compaction continuation, so
-    /// this first awaits the post-run driver (`driver_tx` is `true` for the whole loop) and only then
-    /// the agent — otherwise a one-shot caller would resume mid-loop.
+    /// Await [`Self::is_idle`]: full settlement of the in-flight run AND its post-run loop
+    /// (R-11-005), AND of any running compaction or branch summary (SEAM-125, pi v0.85.1's
+    /// `isIdle = !_isAgentRunActive && !isCompacting`, whose manual-compaction and branch-summary
+    /// `finally` blocks resolve the idle wait — `_clearManualCompactionState`,
+    /// `agent-session.ts:2386-2388` @v0.87.1). A `print`/SDK caller that triggered `/compact`, an
+    /// extension's `ctx.waitForIdle()`, and the injection pump therefore all wait a manual
+    /// compaction out instead of starting work that races it.
     pub async fn wait_for_idle(&self) {
+        loop {
+            // Subscribe BEFORE reading the slots: a clear that lands between the read and the await
+            // is then still observed as a change, so the wait cannot miss its own wake-up.
+            let mut settled = self.compaction_settled.subscribe();
+            self.wait_for_run_settled().await;
+            if !self.is_compacting() {
+                return;
+            }
+            if settled.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Await settlement of the in-flight run AND its post-run loop only — the two run latches
+    /// [`Self::is_run_active`] reads. On a bound session the agent goes briefly idle BETWEEN a
+    /// completed turn and a retry/compaction continuation, so this first awaits the post-run driver
+    /// (`driver_tx` is `true` for the whole loop) and only then the agent — otherwise a one-shot
+    /// caller would resume mid-loop.
+    ///
+    /// [`Self::abort_and_settle`] waits on this rather than [`Self::wait_for_idle`]: `abort()` does
+    /// not yet cancel a compaction (that is area 03's `SESS-062`), so waiting for one there would
+    /// hold a teardown or a `/compact` preflight for the whole summarization call.
+    pub(super) async fn wait_for_run_settled(&self) {
         let mut rx = self.driver_tx.subscribe();
         while *rx.borrow_and_update() {
             if rx.changed().await.is_err() {

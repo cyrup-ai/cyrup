@@ -139,14 +139,24 @@ impl Agent {
     /// The AGENT-030 post-run gap — after `agent_end` releases this latch but before the session's
     /// driver decides whether to continue — is the SESSION's to gate: `is_run_active()` reads
     /// `driver_tx`, which the agent cannot see. This method is the second line, not the first.
+    ///
+    /// # The latch is read UNDER the state lock (ICOM-068)
+    ///
+    /// A run is claimed in two steps — the latch CAS, then the transcript snapshot under this same
+    /// state lock (`claim_and_snapshot`). Reading the latch before taking the lock left a gap in
+    /// which a claim could land between the check and the edit: the edit then went into
+    /// `state.messages` AFTER the run had snapshotted, so the run's model request lacked it while
+    /// every later run saw it out of order. Checking with the lock held closes that gap: a claim
+    /// that lands before the check is refused here, and one that lands after it cannot snapshot
+    /// until this edit has released the lock — so the run it starts sees the edit.
     pub fn edit_transcript<R>(
         &self,
         f: impl FnOnce(&mut Vec<AgentMessage>) -> R,
     ) -> Result<R, AgentError> {
+        let mut st = lock(&self.state);
         if self.is_running() {
             return Err(AgentError::RunActive(BusyEntry::Edit));
         }
-        let mut st = lock(&self.state);
         Ok(f(&mut st.messages))
     }
 
@@ -182,6 +192,29 @@ impl Agent {
 
     pub fn set_follow_up_mode(&self, mode: QueueMode) {
         lock(&self.follow_up).set_mode(mode);
+    }
+
+    /// Remove and return every queued steering message `pred` selects, preserving the order of
+    /// both what is taken and what is left.
+    ///
+    /// ICOM-035 — the session's injection pump steers a no-turn message onto a live run and has to
+    /// find out, once the run is over, whether the run's loop drained it or whether it landed after
+    /// the loop's last `poll_steering` and is still sitting here. Taking exactly its own messages
+    /// back (never the user's queued steers) is what lets the pump re-deliver a stranded one instead
+    /// of leaving it for whichever unrelated run polls the queue next.
+    pub fn take_steering_where(
+        &self,
+        pred: impl FnMut(&AgentMessage) -> bool,
+    ) -> Vec<AgentMessage> {
+        lock(&self.steering).take_where(pred)
+    }
+
+    /// Put a batch previously taken with [`Self::take_steering_where`] back at the HEAD of the
+    /// steering queue, in its own order — the undo for a take whose follow-up could not happen.
+    pub fn restore_steering_front(&self, batch: Vec<AgentMessage>) {
+        if !batch.is_empty() {
+            lock(&self.steering).push_front(batch);
+        }
     }
 
     pub fn clear_steering_queue(&self) {

@@ -142,8 +142,10 @@ pub enum InboundDelivery {
 /// ```
 ///
 /// v0.9.2's second half — splicing the id out of `pendingIdleMessages` — went away with the queue
-/// itself at v0.9.3 (`25ffb96`). A busy interactive message is now steered onto the live run
-/// immediately, so there is nothing left holding a copy to re-inject.
+/// itself at v0.9.3 (`25ffb96`), and came back in a narrower form at v0.14.0 (`17699ba`): a message
+/// HELD because the session was busy without an agent run (ICOM-062) is dropped with an
+/// `acknowledged` receipt ("answered before injection", `v0.14.0 index.ts:651-654`), so an ask
+/// answered during a `/compact` is not injected afterwards as if it were still open.
 ///
 /// Every pi call site is a point where the inbound ask has just been ANSWERED or has become
 /// undeliverable: the busy non-interactive auto-reply (`v0.10.1 index.ts:975`), a `send` carrying
@@ -155,6 +157,140 @@ pub fn dismiss_incoming_ask(state: &SharedIntercomState, message_id: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .dismiss_pending_ask(message_id);
+    state.drop_held_inbound(
+        message_id,
+        MessageReceiptStatus::Acknowledged,
+        Some("answered before injection"),
+    );
+}
+
+/// The held-inbound flush interval (`setInterval(…, 100)`, `v0.14.0 index.ts:1298`).
+pub const HELD_INBOUND_FLUSH_INTERVAL_MS: u64 = 100;
+
+/// Whether an inbound message must be HELD rather than delivered now — pi-intercom v0.14.0
+/// `handleIncomingMessage` (`index.ts:1336-1341`, `17699ba`):
+///
+/// ```text
+/// // Busy without an agent run cannot steer; manual compaction can discard an appended custom entry.
+/// if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || …human-first…)))
+/// ```
+///
+/// A session that is busy WITHOUT an agent run — a manual `/compact`, a `/tree` branch summary
+/// (both busy since SEAM-125), or the gap between one agent loop's `agent_end` and the next
+/// continuation — has no run to steer into, and delivering with a turn would race the compaction.
+/// The rule is general, not compaction-specific: a busy NON-interactive session without a run holds
+/// too, instead of auto-replying. Anything already held keeps later messages behind it, so arrival
+/// order survives the hold. The `human-first` clause is `busyDelivery` (ICOM-063), not ported.
+#[must_use]
+pub fn should_hold_inbound(held: usize, is_idle: bool, agent_running: bool) -> bool {
+    held > 0 || (!is_idle && !agent_running)
+}
+
+/// `holdIncomingBrokerMessage(entry, ctx, generation)` (`v0.14.0 index.ts:1294-1301`): queue the
+/// message, tell the sender it is `queued` ("held until delivery is safe"), and make sure the
+/// 100 ms flush timer runs.
+pub fn hold_incoming_broker_message(
+    state: &Arc<SharedIntercomState>,
+    from: SessionInfo,
+    message: Message,
+    generation: u64,
+) {
+    let id = message.id.clone();
+    state.push_held_inbound(crate::session_state::HeldInbound { from, message });
+    state.emit_message_receipt(
+        &id,
+        MessageReceiptStatus::Queued,
+        Some("held until delivery is safe"),
+    );
+    state.ensure_held_inbound_timer(|serial| {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let period = std::time::Duration::from_millis(HELD_INBOUND_FLUSH_INTERVAL_MS);
+            let mut ticker = tokio::time::interval(period);
+            // `setInterval` does not fire immediately; tokio's first tick does.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                flush_held_inbound_messages(&state, generation);
+                // A timer whose runtime is gone can never flush again; `expire` on the next
+                // `session_start`/`session_shutdown` answers for what it held.
+                let dead = !crate::connect::is_live_at(&state, generation);
+                if state.retire_held_inbound_timer(serial, dead) {
+                    return;
+                }
+            }
+        })
+    });
+}
+
+/// `flushHeldInboundMessages(ctx, generation)` (`v0.14.0 index.ts:1276-1289`, the non-`human-first`
+/// arm): deliver held messages, oldest first, for as long as the session is idle OR an agent run is
+/// in flight (a run can take a steer) and the runtime is still `generation`'s. Called by the 100 ms
+/// timer — which is how the idle edge after a compaction is observed — and on `agent_start`.
+pub fn flush_held_inbound_messages(state: &Arc<SharedIntercomState>, generation: u64) {
+    loop {
+        if state.held_inbound_len() == 0
+            || !(state.is_idle() || state.agent_running())
+            || !crate::connect::is_live_at(state, generation)
+        {
+            return;
+        }
+        let Some(entry) = state.pop_held_inbound() else {
+            return;
+        };
+        deliver_incoming_broker_message(state, &entry.from, &entry.message, generation);
+    }
+}
+
+/// `deliverIncomingBrokerMessage(entry, ctx, generation)` (`v0.14.0 index.ts:1247-1275`): the
+/// delivery decision for a message that is NOT (or is no longer) held — [`decide_inbound_policy`]
+/// over the live `isIdle`/`hasUI`, then the matching arm.
+///
+/// The busy non-interactive auto-reply is fire-and-forget, exactly as upstream's `void (async …)()`:
+/// a flush on `agent_start` must not stall the agent's event dispatch on a broker round trip.
+pub fn deliver_incoming_broker_message(
+    state: &Arc<SharedIntercomState>,
+    from: &SessionInfo,
+    message: &Message,
+    generation: u64,
+) {
+    // `const activeContext = getLiveContext(ctx, generation); if (!activeContext) return;`
+    if !crate::connect::is_live_at(state, generation) {
+        return;
+    }
+    match decide_inbound_policy(
+        state.is_idle(),
+        state.has_ui(),
+        state.config.inbound_trigger,
+        message,
+    ) {
+        // `sendIncomingBrokerMessage(entry, "trigger", generation)`.
+        InboundPolicy::Deliver { .. } => {
+            send_incoming_message_at(state, from, message, InboundDelivery::Trigger, generation);
+        }
+        // `sendIncomingBrokerMessage(entry, "steer", generation)` — v0.14.0 passes the generation
+        // on this arm too.
+        InboundPolicy::Steer => {
+            send_incoming_message_at(state, from, message, InboundDelivery::Steer, generation);
+        }
+        InboundPolicy::AutoReply => {
+            // Busy + non-interactive: nothing is injected, so the durable entry IS the surface.
+            // Drawn by `IntercomExtension::render_entry` from the pre-rendered card.
+            surface_incoming_message(state, from, message);
+            let state = state.clone();
+            let from = from.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                auto_reply_non_interactive_at(&state, &from, &message, generation).await;
+            });
+        }
+        InboundPolicy::SurfaceOnly => {
+            // Busy + non-interactive + the message is itself a reply: no auto-reply and no
+            // injection, so this arm is the durable surface and nothing else. Without it the
+            // message would be recorded and then drawn by nothing.
+            surface_incoming_message(state, from, message);
+        }
+    }
 }
 
 /// `sendIncomingMessage(entry, delivery, generation?, forceTrigger?)`
@@ -243,22 +379,18 @@ pub fn send_incoming_message_at(
     let card = build_inline_message_for(state, from, message, delivery);
     let content = card.content_markdown();
     let details = serde_json::to_value(&card).ok();
-    // `{ triggerTurn: true }` vs `{ deliverAs: "steer" }`. cyrup's seam takes the boolean:
-    // `AgentSession::inject_message` routes to `agent.steer(msg)` whenever `is_run_active()`
-    // regardless of the flag (`cyrup-session-svc/src/session/inject.rs`), so a busy session's
-    // delivery steers exactly as upstream's `deliverAs: "steer"` does, and the flag only decides
-    // whether an IDLE session spawns a run over the message.
+    // `{ triggerTurn: true }` vs `{ deliverAs: "steer" }` (`v0.14.0 index.ts:1236-1238`) — two
+    // different host deliveries, so two different seam calls (ICOM-035). The steer goes through
+    // `HostServices::inject_message_steer`: the live host's injection pump (`cyrup-session-svc`
+    // `session/mod.rs` `drive_injections`) hands it to the running agent's steering queue the moment
+    // it arrives while a run is active — pi's `agent.steer(appMessage)` for a streaming session
+    // (`agent-session.ts:1949-1954` @v0.87.1) — and, when the session is idle (or the steer landed
+    // past the run's last steering poll), appends it to the session tree AND the agent transcript
+    // with no turn, pi's `_appendCustomMessage` (ICOM-068). Upstream takes the steer branch for every
+    // delivery that does not trigger, so an idle `inboundTrigger: "never"` delivery is one too.
     let trigger_turn = delivery == InboundDelivery::Trigger
         && should_trigger_inbound_message(state.config.inbound_trigger, message);
-    if let Err(e) = services.inject_message(
-        &content,
-        Some(INBOUND_MESSAGE_CUSTOM_TYPE),
-        true,
-        details.as_ref(),
-        trigger_turn,
-    ) {
-        tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
-    }
+    deliver_card(services.as_ref(), &content, details.as_ref(), trigger_turn);
     true
 }
 
@@ -291,16 +423,33 @@ pub fn trigger_turn_over_inbound(
     let card = build_inline_message(state, from, message);
     let content = card.content_markdown();
     let details = serde_json::to_value(&card).ok();
-    if let Err(e) = services.inject_message(
-        &content,
-        Some(INBOUND_MESSAGE_CUSTOM_TYPE),
-        true,
-        details.as_ref(),
-        trigger,
-    ) {
+    deliver_card(services.as_ref(), &content, details.as_ref(), trigger);
+    true
+}
+
+/// `pi.sendMessage({ customType: "intercom_message", content, display: true, details }, trigger ?
+/// { triggerTurn: true } : { deliverAs: "steer" })` (`v0.14.0 index.ts:1230-1238`) — the one place
+/// an inbound card is handed to the host.
+fn deliver_card(
+    services: &dyn cyrup_ext::HostServices,
+    content: &str,
+    details: Option<&serde_json::Value>,
+    trigger_turn: bool,
+) {
+    let delivered = if trigger_turn {
+        services.inject_message(
+            content,
+            Some(INBOUND_MESSAGE_CUSTOM_TYPE),
+            true,
+            details,
+            true,
+        )
+    } else {
+        services.inject_message_steer(content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), true, details)
+    };
+    if let Err(e) = delivered {
         tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
     }
-    true
 }
 
 /// `{ ...entry.message, injectedAt: Date.now() }` (`v0.10.1 index.ts:878`) — the per-delivery copy
@@ -471,7 +620,8 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                     //     host/broker seam: an IDLE session (interactive or not) is delivered
                     //     through `inject_message`; a BUSY interactive one is STEERED onto the live
                     //     run (`v0.10.1 index.ts:956`); a BUSY non-interactive one sends the sender
-                    //     the busy auto-reply.
+                    //     the busy auto-reply; and one that is busy WITHOUT an agent run (a
+                    //     compaction, the post-run gap) is HELD until it can do one of those.
                     // `const activeContext = getLiveContext(liveContext, messageGeneration);`
                     // `if (!activeContext) return;` (`v0.10.1 index.ts:937-940`) — the head of the
                     // async IIFE, i.e. the re-check after the synchronous recording work above and
@@ -480,52 +630,22 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                     if !crate::connect::is_live_at(&state, message_generation) {
                         continue;
                     }
-                    match decide_inbound_policy(
+                    // ICOM-062 — `if (heldInboundMessages.length > 0 || (!isIdle && !agentRunning))
+                    // holdIncomingBrokerMessage(…) else deliverIncomingBrokerMessage(…)`
+                    // (`v0.14.0 index.ts:1336-1341`).
+                    if should_hold_inbound(
+                        state.held_inbound_len(),
                         state.is_idle(),
-                        state.has_ui(),
-                        state.config.inbound_trigger,
-                        &message,
+                        state.agent_running(),
                     ) {
-                        InboundPolicy::Deliver { .. } => {
-                            // `if (getLiveContext(liveContext, messageGeneration)) {`
-                            // `  sendIncomingMessage(entry, "trigger", messageGeneration); }`
-                            // (`:962-963`) — the trigger arm is the only one upstream double-checks
-                            // AND stamps, because it is the one that spawns a whole new run.
-                            if crate::connect::is_live_at(&state, message_generation) {
-                                send_incoming_message_at(
-                                    &state,
-                                    &from,
-                                    &message,
-                                    InboundDelivery::Trigger,
-                                    message_generation,
-                                );
-                            }
-                        }
-                        InboundPolicy::Steer => {
-                            // `sendIncomingMessage(entry, "steer");` (`:961`) — no explicit
-                            // generation, so upstream's default (`= runtimeGeneration`) applies and
-                            // the guard degenerates to the disposed/shuttingDown/no-context check.
-                            send_incoming_message(&state, &from, &message, InboundDelivery::Steer);
-                        }
-                        InboundPolicy::AutoReply => {
-                            // Busy + non-interactive: nothing is injected, so the durable entry IS
-                            // the surface. Drawn by `IntercomExtension::render_entry` from the
-                            // pre-rendered card.
-                            surface_incoming_message(&state, &from, &message);
-                            auto_reply_non_interactive_at(
-                                &state,
-                                &from,
-                                &message,
-                                message_generation,
-                            )
-                            .await;
-                        }
-                        InboundPolicy::SurfaceOnly => {
-                            // Busy + non-interactive + the message is itself a reply: no auto-reply
-                            // and no injection, so this arm is the durable surface and nothing else.
-                            // Without it the message would be recorded and then drawn by nothing.
-                            surface_incoming_message(&state, &from, &message);
-                        }
+                        hold_incoming_broker_message(&state, from, message, message_generation);
+                    } else {
+                        deliver_incoming_broker_message(
+                            &state,
+                            &from,
+                            &message,
+                            message_generation,
+                        );
                     }
                 }
                 Ok(InboundEvent::Disconnected(reason)) => {
@@ -1311,6 +1431,195 @@ mod tests {
         assert!(
             !content.contains("To reply"),
             "reply hint off ⇒ no instruction: {content:?}"
+        );
+    }
+
+    /// ICOM-062 — upstream's hold rule (`v0.14.0 index.ts:1336-1341`, `human-first` clause aside),
+    /// as a truth table: held iff something is already held, or the session is busy WITHOUT an
+    /// agent run. Busy WITH a run steers; idle delivers.
+    #[test]
+    fn the_hold_rule_is_busy_without_an_agent_run_or_anything_already_held() {
+        // (held, is_idle, agent_running) → hold?
+        assert!(!should_hold_inbound(0, true, false), "idle: deliver");
+        assert!(
+            !should_hold_inbound(0, true, true),
+            "idle with a run flag: deliver"
+        );
+        assert!(
+            !should_hold_inbound(0, false, true),
+            "busy with a run: steer"
+        );
+        assert!(
+            should_hold_inbound(0, false, false),
+            "busy without a run: hold"
+        );
+        assert!(
+            should_hold_inbound(1, true, false),
+            "anything held keeps order: hold"
+        );
+        assert!(
+            should_hold_inbound(1, false, true),
+            "anything held keeps order: hold"
+        );
+    }
+
+    /// A `HostServices` double whose `is_idle` the test flips, recording `inject_message` — for the
+    /// hold/flush state machine, whose whole point is a busy-to-idle transition.
+    struct FlippableHost {
+        idle: std::sync::atomic::AtomicBool,
+        injected: std::sync::Mutex<Vec<InjectedCall>>,
+    }
+    impl cyrup_ext::HostServices for FlippableHost {
+        fn is_idle(&self) -> bool {
+            self.idle.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn append_entry(
+            &self,
+            _custom_type: &str,
+            _data: &serde_json::Value,
+        ) -> std::result::Result<String, String> {
+            Ok("entry-1".to_string())
+        }
+        fn inject_message(
+            &self,
+            content: &str,
+            custom_type: Option<&str>,
+            display: bool,
+            _details: Option<&serde_json::Value>,
+            trigger_turn: bool,
+        ) -> std::result::Result<(), String> {
+            self.injected.lock().unwrap().push((
+                content.to_string(),
+                custom_type.map(str::to_string),
+                display,
+                trigger_turn,
+            ));
+            Ok(())
+        }
+    }
+
+    fn flippable(idle: bool) -> Arc<FlippableHost> {
+        Arc::new(FlippableHost {
+            idle: std::sync::atomic::AtomicBool::new(idle),
+            injected: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn msg(id: &str, text: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            ..ask(text)
+        }
+    }
+
+    /// ICOM-062 — the state machine in isolation: a flush while busy-without-a-run delivers
+    /// nothing; the `agent_start` edge steers (no turn) in arrival order; the idle edge triggers a
+    /// turn per message. The production-path proofs over a real `AgentSession` are in
+    /// `crates/cyrup-it/tests/intercom/inbound_live_session.rs`.
+    #[tokio::test]
+    async fn held_messages_flush_in_order_on_agent_start_as_steers_and_on_idle_as_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(state(false));
+        let host = flippable(false);
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+        crate::connect::begin_runtime(
+            &s,
+            crate::connect::ConnectParams {
+                agent_dir: dir.path().join("agent"),
+                metadata: None,
+                model: None,
+            },
+        );
+        let generation = s.connect.generation();
+
+        hold_incoming_broker_message(&s, from(), msg("m1", "first"), generation);
+        hold_incoming_broker_message(&s, from(), msg("m2", "second"), generation);
+        assert_eq!(s.held_inbound_len(), 2);
+        flush_held_inbound_messages(&s, generation);
+        assert!(
+            host.injected.lock().unwrap().is_empty(),
+            "busy without an agent run: nothing is delivered"
+        );
+
+        // The `agent_start` edge: busy WITH a run ⇒ both steered, oldest first, with no turn.
+        s.set_agent_running(true);
+        flush_held_inbound_messages(&s, generation);
+        let steered = host.injected.lock().unwrap().clone();
+        assert_eq!(s.held_inbound_len(), 0);
+        assert_eq!(steered.len(), 2);
+        assert!(steered[0].0.ends_with("first") && steered[1].0.ends_with("second"));
+        assert!(
+            steered.iter().all(|c| !c.3),
+            "a steer never asks for a turn"
+        );
+
+        // The idle edge: held again (busy, no run), then delivered with a turn once idle.
+        host.injected.lock().unwrap().clear();
+        s.set_agent_running(false);
+        hold_incoming_broker_message(&s, from(), msg("m3", "third"), generation);
+        host.idle.store(true, std::sync::atomic::Ordering::SeqCst);
+        flush_held_inbound_messages(&s, generation);
+        let triggered = host.injected.lock().unwrap().clone();
+        assert_eq!(triggered.len(), 1);
+        assert!(
+            triggered[0].3,
+            "idle delivery drives a turn under inboundTrigger: always"
+        );
+    }
+
+    /// ICOM-062 — a held message leaves the queue without ever being injected when it is answered
+    /// (`dismissIncomingAsk`), cancelled or superseded (`handleMessageControl`), or expired
+    /// (`session_start`/`session_shutdown`), and a stale-generation flush delivers nothing.
+    #[tokio::test]
+    async fn held_messages_are_dropped_before_injection_by_answer_control_and_expiry() {
+        use crate::transport::protocol::{MessageControl, MessageControlAction};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(state(false));
+        let host = flippable(false);
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+        let params = || crate::connect::ConnectParams {
+            agent_dir: dir.path().join("agent"),
+            metadata: None,
+            model: None,
+        };
+        crate::connect::begin_runtime(&s, params());
+        let generation = s.connect.generation();
+        for id in ["answered", "cancelled", "superseded", "kept"] {
+            hold_incoming_broker_message(&s, from(), msg(id, id), generation);
+        }
+        dismiss_incoming_ask(&s, "answered");
+        s.handle_message_control(&MessageControl {
+            message_id: "cancelled".to_string(),
+            action: MessageControlAction::Cancel,
+            timestamp: 1u64.into(),
+            superseded_by: None,
+            detail: None,
+            extra: Default::default(),
+        });
+        s.handle_message_control(&MessageControl {
+            message_id: "superseded".to_string(),
+            action: MessageControlAction::Supersede,
+            timestamp: 1u64.into(),
+            superseded_by: Some("newer".to_string()),
+            detail: None,
+            extra: Default::default(),
+        });
+        assert_eq!(s.held_inbound_len(), 1, "only `kept` is still held");
+
+        // A runtime replacement: the old generation's flush must not deliver into the new one.
+        crate::connect::begin_runtime(&s, params());
+        host.idle.store(true, std::sync::atomic::Ordering::SeqCst);
+        flush_held_inbound_messages(&s, generation);
+        assert!(host.injected.lock().unwrap().is_empty());
+
+        s.expire_held_inbound("session replaced before injection");
+        assert_eq!(s.held_inbound_len(), 0);
+        flush_held_inbound_messages(&s, s.connect.generation());
+        assert!(
+            host.injected.lock().unwrap().is_empty(),
+            "an expired message is never injected"
         );
     }
 }

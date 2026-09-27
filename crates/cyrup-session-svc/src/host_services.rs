@@ -549,6 +549,12 @@ pub struct InjectMessage {
     pub details: Option<serde_json::Value>,
     /// Whether to re-enter the agent turn loop over the injected message (Pi `{ triggerTurn: true }`).
     pub trigger_turn: bool,
+    /// Pi `{ deliverAs: "steer" }` (ICOM-035): while an agent run is active, hand the message to
+    /// that run's steering queue at once rather than holding it for the idle edge. Only meaningful
+    /// with `trigger_turn = false` — [`HostServices::inject_message_steer`] is its one producer.
+    ///
+    /// [`HostServices::inject_message_steer`]: cyrup_ext::host::HostServices::inject_message_steer
+    pub steer: bool,
 }
 
 /// The obligation to answer for one injected message, exactly once.
@@ -1136,29 +1142,12 @@ impl LiveHostServices {
     ///
     /// No sink bound (default host / headless-by-value session), or the pump has exited — in both
     /// cases nothing was queued and the caller still owns whatever the message announced.
-    fn enqueue_injection(
-        &self,
-        content: &str,
-        custom_type: Option<&str>,
-        display: bool,
-        details: Option<&serde_json::Value>,
-        trigger_turn: bool,
-        ack: InjectAck,
-    ) -> Result<(), String> {
+    fn enqueue_injection(&self, message: InjectMessage, ack: InjectAck) -> Result<(), String> {
         let sink = Self::lock(&self.inject_sink)
             .clone()
             .ok_or("message injection not wired to a live session")?;
-        sink.send(InjectRequest {
-            message: InjectMessage {
-                content: content.to_string(),
-                custom_type: custom_type.map(str::to_string),
-                display,
-                details: details.cloned(),
-                trigger_turn,
-            },
-            ack,
-        })
-        .map_err(|_| "session injection pump is no longer running".to_string())
+        sink.send(InjectRequest { message, ack })
+            .map_err(|_| "session injection pump is no longer running".to_string())
     }
 
     /// Share the session's authoritative dynamic-tool view so a guest's `setActiveTools`/
@@ -1657,11 +1646,38 @@ impl HostServices for LiveHostServices {
         // No sink (default host / headless-by-value session) ⇒ the seam is unavailable, matching
         // the trait deny default.
         self.enqueue_injection(
-            content,
-            custom_type,
-            display,
-            details,
-            trigger_turn,
+            InjectMessage {
+                content: content.to_string(),
+                custom_type: custom_type.map(str::to_string),
+                display,
+                details: details.cloned(),
+                trigger_turn,
+                steer: false,
+            },
+            InjectAck::detached(),
+        )
+    }
+
+    fn inject_message_steer(
+        &self,
+        content: &str,
+        custom_type: Option<&str>,
+        display: bool,
+        details: Option<&serde_json::Value>,
+    ) -> Result<(), String> {
+        // ICOM-035 — the same queue and the same single consumer as every other injection; the
+        // `steer` flag only tells the pump it may hand the message to a live run's steering queue
+        // instead of holding it for the idle edge (see `drive_injections`). Fire-and-forget like
+        // `inject_message`: the caller (pi-intercom's `sendMessage`) awaits nothing.
+        self.enqueue_injection(
+            InjectMessage {
+                content: content.to_string(),
+                custom_type: custom_type.map(str::to_string),
+                display,
+                details: details.cloned(),
+                trigger_turn: false,
+                steer: true,
+            },
             InjectAck::detached(),
         )
     }
@@ -1675,7 +1691,17 @@ impl HostServices for LiveHostServices {
         trigger_turn: bool,
     ) -> Result<tokio::sync::oneshot::Receiver<InjectOutcome>, String> {
         let (ack, rx) = InjectAck::channel();
-        self.enqueue_injection(content, custom_type, display, details, trigger_turn, ack)?;
+        self.enqueue_injection(
+            InjectMessage {
+                content: content.to_string(),
+                custom_type: custom_type.map(str::to_string),
+                display,
+                details: details.cloned(),
+                trigger_turn,
+                steer: false,
+            },
+            ack,
+        )?;
         Ok(rx)
     }
 
@@ -2310,6 +2336,7 @@ mod tests {
                 display: false,
                 details: None,
                 trigger_turn: true,
+                steer: false,
             },
             ack,
         };
