@@ -130,6 +130,14 @@ pub async fn run() -> std::io::Result<()> {
     // — a stale `broker.pid` left by a SIGKILLed broker is still reclaimable, or a crash would wedge
     // intercom until a human deleted the file. See `broker::runtime_claim`.
     runtime_claim::assert_no_live_broker(&pid_path)?;
+    // ICOM-057 — `ensurePendingAskRecordDir(); this.prunePendingAskRecords();`
+    // (`v0.14.0 broker/broker.ts:225-226`), in upstream's position: after the runtime claim, before
+    // the stale-socket unlink. A failure here is upstream's constructor throw — the broker does not
+    // start.
+    let pending_ask_records = super::pending_asks::PendingAskRecords::open(
+        super::pending_asks::pending_asks_dir_path(&intercom_dir),
+        crate::transport::protocol::now_ms(),
+    )?;
 
     // Unlink a stale socket left by a crashed broker (`v0.9.2 broker/broker.ts:233-238`;
     // `v0.7.0 broker/broker.ts:143-148`), under upstream's own
@@ -204,7 +212,8 @@ pub async fn run() -> std::io::Result<()> {
             shutdown.clone(),
             paths::extension_state_dir_path(&intercom_dir),
         )
-        .with_listen_endpoint(listener.is_trusted_local(), endpoint_state_id),
+        .with_listen_endpoint(listener.is_trusted_local(), endpoint_state_id)
+        .with_pending_ask_records(pending_ask_records),
     ));
     let mut next_conn_id: u64 = 0;
 

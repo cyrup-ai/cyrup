@@ -395,6 +395,8 @@ fn registration() -> SessionRegistration {
         last_activity: now_ms().into(),
         status: None,
         tmux_pane: None,
+        herdr_pane_id: None,
+        herdr_session_path: None,
         extra: Default::default(),
     }
 }

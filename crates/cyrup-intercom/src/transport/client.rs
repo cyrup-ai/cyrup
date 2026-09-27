@@ -1393,6 +1393,8 @@ mod tests {
             last_activity: now_ms().into(),
             status: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_session_path: None,
             extra: Default::default(),
         }
     }
@@ -1836,6 +1838,8 @@ mod tests {
             context_tokens: None,
             context_window: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_location: None,
             extra: Default::default(),
         };
         let message = Message {
@@ -1901,6 +1905,8 @@ mod tests {
             context_tokens: None,
             context_window: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_location: None,
             extra: Default::default(),
         }
     }

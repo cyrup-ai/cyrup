@@ -141,6 +141,11 @@ impl BrokerState {
             // un-copied field would be dropped by a cyrup broker even though the registration
             // carried it — the roster is built from THIS value, not from the registration.
             tmux_pane: registration.tmux_pane,
+            // `...(session.herdrPaneId !== undefined ? { herdrPaneId: session.herdrPaneId } : {})`
+            // (`v0.14.0 broker/broker.ts:480`) — the launch-time alias, whitelisted like `tmuxPane`.
+            herdr_pane_id: registration.herdr_pane_id,
+            // Never stored: `list` resolves it fresh per request (`handle_list`).
+            herdr_location: None,
             peer_uid: None,
             // `trustedLocal` — broker-owned, never from the payload (`broker.ts:374`), and a
             // property of the BOUND ENDPOINT rather than of the platform (ICOM-015): false for the
@@ -180,6 +185,9 @@ impl BrokerState {
                 last_presence_broadcast_at: now,
                 owner_order,
                 extensions,
+                // `...(session.herdrSessionPath ? { herdrSessionPath } : {})` (`broker.ts:492`) —
+                // JS-truthy, so a blank path is not kept.
+                herdr_session_path: registration.herdr_session_path.filter(|p| !p.is_empty()),
             },
         );
         // `this.disconnectedSessions.delete(id)` (`v0.10.1 broker/broker.ts:377`): this identity is
@@ -309,13 +317,46 @@ impl BrokerState {
         else {
             return FrameResult::protocol_error();
         };
-        send_msg(
-            self_tx,
-            &BrokerMessage::Sessions {
-                request_id: request_id.to_string(),
-                sessions: self.session_infos_in_scope(requester.scope.as_ref()),
-            },
-        );
+        let sessions = self.session_infos_in_scope(requester.scope.as_ref());
+        // ICOM-065 — `resolveHerdrLocations(sessions, { sessionPaths })` (`v0.14.0
+        // broker/broker.ts:605-624`): "Resolve all hosted panes from one bounded live snapshot.
+        // Never retain the result: moved panes must be re-resolved by the next list request."
+        //
+        // A roster with no hosted session is answered here, synchronously and byte-for-byte as
+        // before — upstream's resolver returns the same array without contacting Herdr. Only a
+        // roster that needs the snapshot answers from a task, as upstream's `void …then(write)`
+        // does, so a slow Herdr never holds the broker state.
+        if !crate::herdr_location::any_hosted(&sessions) {
+            send_msg(
+                self_tx,
+                &BrokerMessage::Sessions {
+                    request_id: request_id.to_string(),
+                    sessions,
+                },
+            );
+            return FrameResult::cont();
+        }
+        let session_paths: std::collections::HashMap<String, String> = self
+            .sessions_in_order()
+            .filter(|(key, _)| key.in_scope(requester.scope.as_ref()))
+            .filter_map(|(_, s)| {
+                s.herdr_session_path
+                    .clone()
+                    .map(|path| (s.info.id.clone(), path))
+            })
+            .collect();
+        let tx = self_tx.clone();
+        let request_id = request_id.to_string();
+        tokio::spawn(async move {
+            let sessions = crate::herdr_location::resolve_current(sessions, &session_paths).await;
+            send_msg(
+                &tx,
+                &BrokerMessage::Sessions {
+                    request_id,
+                    sessions,
+                },
+            );
+        });
         FrameResult::cont()
     }
 }

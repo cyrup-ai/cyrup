@@ -163,7 +163,7 @@ v0.70.1 and v0.71.0.
 | SUBA-131 | low | upstream-drift | M | An external-CLI step is never flagged `needs_attention` when idle; upstream now tracks its stdout/stderr and Git fingerprint as activity |
 | SUBA-132 | low | not-ported | S | `SingleResult` carries no `toolBudgetBlocked`, so a tool-budget-blocked workflow child never settles `budget_exhausted` (self-declared in `workflows/settlement.rs`) |
 | SUBA-133 | low | upstream-drift | S | Agent `advertise: true` and the `<advertised_subagents>` catalog in the parent's system prompt are unported |
-| SUBA-134 | low | upstream-drift | S | Child sessions get no derived human-readable name (`deriveChildSessionName` → `setSessionName`, `sessionName` in results, the `intercom:session-identity` claim) |
+| SUBA-134 | low | upstream-drift | S | Child sessions get no derived human-readable name (`deriveChildSessionName` → `setSessionName`, `sessionName` in results, the `intercom:session-identity` claim) — **2026-09-27:** the intercom half is in (`ICOM-064`, on `claude/intercom-lows`): answer the `intercom:session-identity` request by emitting `intercom:session-identity-claim` `{version:1, stableId:<routing name>}` before the first `agent_start` |
 | SUBA-135 | low | upstream-drift | S | No launch-cwd preflight: a missing or non-directory `cwd` fails at spawn with an OS error instead of upstream's named refusal before launch |
 | SUBA-136 | low | upstream-drift | S | No renderer for `subagent_supervisor_request` messages and no `subagent_supervisor_reply` session entry |
 | SUBA-137 | low | upstream-drift | S | The Ghostty inspector activates on `TERM_PROGRAM=ghostty` alone; v0.69.0 also requires the macOS host bundle id, so cmux-style embedders stop misfiring |

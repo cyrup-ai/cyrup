@@ -328,6 +328,22 @@ impl BrokerState {
                 );
                 return FrameResult::cont();
             }
+            // ICOM-057 — `this.writePendingAskRecord(message, fromSession, target.info,
+            // brokerReceivedAt)` (`v0.14.0 broker/broker.ts:709`), before the edge exists and before
+            // anything is delivered, so a failed write (upstream: a throw that destroys this socket)
+            // leaves neither behind.
+            if let Some(target) = self.sessions.get(&target_key)
+                && let Err(error) = self.write_pending_ask_record(
+                    &current_key,
+                    &message,
+                    &from_info,
+                    &target.info,
+                    now,
+                )
+            {
+                tracing::warn!(%error, "intercom broker: could not write a pending-ask record");
+                return FrameResult::protocol_error();
+            }
             self.ask_edges.insert(
                 message.id.clone(),
                 AskEdge {
@@ -392,6 +408,8 @@ impl BrokerState {
         }
         if let Some(rt) = &message.reply_to {
             self.ask_edges.remove(rt);
+            // ICOM-057 — `v0.14.0 broker/broker.ts:743`.
+            self.remove_pending_ask_record(current_key.scope.as_ref(), rt);
         }
         // `this.messageReceiptRoutes.set(...)` (`v0.10.1 broker/broker.ts:580`), dated from
         // `brokerReceivedAt` — NOT from the delivery — so the 1 h retention measures how long ago
@@ -600,6 +618,8 @@ impl BrokerState {
         // `:656-658`
         if let Some(rt) = &message.reply_to {
             self.ask_edges.remove(rt);
+            // ICOM-057 — `v0.14.0 broker/broker.ts:798`.
+            self.remove_pending_ask_record(current_key.scope.as_ref(), rt);
         }
         // `recordDelivery(currentKey, message.id, fingerprint, liveMailboxTarget ?
         // "socket_delivered" : "queued")` (`v0.13.0 broker/broker.ts:775-776`) — a PARKED message
@@ -698,6 +718,8 @@ impl BrokerState {
         let owns_edge = self.ask_edges.get(message_id).map(|e| &e.from) == Some(&current_key);
         if owns_socket && owns_edge {
             self.ask_edges.remove(message_id);
+            // ICOM-057 — `v0.14.0 broker/broker.ts:897`.
+            self.remove_pending_ask_record(current_key.scope.as_ref(), message_id);
         }
         FrameResult::cont()
     }

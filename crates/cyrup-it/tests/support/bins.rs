@@ -35,6 +35,12 @@ pub fn intercom_child_fixture() -> PathBuf {
     PathBuf::from(env!("CYRUP_IT_BIN_CYRUP_INTERCOM_CHILD_FIXTURE"))
 }
 
+/// The intercom scripting client (`crates/cyrup-intercom/src/bin/cyrup-intercom-cli.rs`, the port
+/// of pi-intercom's `cli.ts`).
+pub fn intercom_cli() -> PathBuf {
+    PathBuf::from(env!("CYRUP_IT_BIN_CYRUP_INTERCOM_CLI"))
+}
+
 /// The scripted-NDJSON `cyrup`-shaped subagent double (arch-SA §11), driven by a JSON script named
 /// via `CYRUP_SUBAGENT_FIXTURE_SCRIPT`. This is the usual value for `CYRUP_SUBAGENT_BINARY`.
 pub fn subagent_fixture() -> PathBuf {

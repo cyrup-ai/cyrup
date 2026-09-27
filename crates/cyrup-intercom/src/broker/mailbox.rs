@@ -100,6 +100,8 @@ impl BrokerState {
         for (from_key, message_id, expects_reply) in expired {
             if expects_reply {
                 self.ask_edges.remove(&message_id);
+                // ICOM-057 — `v0.14.0 broker/broker.ts:1027`.
+                self.remove_pending_ask_record(from_key.scope.as_ref(), &message_id);
             }
             self.message_receipt_routes.remove(&message_id);
             // ICOM-054 — `updateDeliveryRecord(entry.fromKey, entry.message.id, "failed", …)`
@@ -137,6 +139,11 @@ impl BrokerState {
             let evicted = self.mailbox_messages.remove(0);
             if evicted.message.expects_reply == Some(true) {
                 self.ask_edges.remove(&evicted.message.id);
+                // ICOM-057 — `v0.14.0 broker/broker.ts:1043`.
+                self.remove_pending_ask_record(
+                    evicted.from_key.scope.as_ref(),
+                    &evicted.message.id,
+                );
             }
             self.message_receipt_routes.remove(&evicted.message.id);
             // ICOM-054 — `v0.13.0 broker/broker.ts:1021`.

@@ -676,6 +676,13 @@ fn parse_structured_supervisor_reply(
     }
 }
 
+/// The `contact_supervisor` parameter schema — `v0.14.0 index.ts:1919-1939`, every `description`
+/// verbatim (ICOM-070).
+///
+/// `options` is `Type.Array(Type.Any())` upstream (`:1935`), not an array of strings:
+/// [`validate_supervisor_interview_request`] accepts an option object with a `label` as well as a
+/// bare string, and a string-typed schema had the agent's preflight refuse that shape before the
+/// validator ever saw it.
 fn parameters_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -683,12 +690,12 @@ fn parameters_schema() -> serde_json::Value {
             "reason": {
                 "type": "string",
                 "enum": ["need_decision", "progress_update", "interview_request"],
-                "description": "Why you are contacting the supervisor."
+                "description": "Contact reason: 'need_decision' waits for a reply; 'interview_request' sends structured questions and waits for a reply; 'progress_update' sends a non-blocking update"
             },
-            "message": { "type": "string", "description": "The message to the supervisor (required for need_decision/progress_update)." },
+            "message": { "type": "string", "description": "Decision request, optional interview note, or meaningful progress update for the supervisor" },
             "interview": {
                 "type": "object",
-                "description": "A structured interview request (interview_request).",
+                "description": "Structured interview request for reason='interview_request'",
                 "properties": {
                     "title": { "type": "string" },
                     "description": { "type": "string" },
@@ -698,9 +705,13 @@ fn parameters_schema() -> serde_json::Value {
                             "type": "object",
                             "properties": {
                                 "id": { "type": "string" },
-                                "type": { "type": "string", "enum": ["single", "multi", "text", "image", "info"] },
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["single", "multi", "text", "image", "info"],
+                                    "description": "Question type: single, multi, text, image, or info"
+                                },
                                 "question": { "type": "string" },
-                                "options": { "type": "array", "items": { "type": "string" } },
+                                "options": { "type": "array" },
                                 "context": { "type": "string" }
                             },
                             "required": ["id", "type", "question"]
@@ -724,8 +735,16 @@ impl Tool for ContactSupervisorTool {
         &self.parameters
     }
 
+    /// `description` (`v0.14.0 index.ts:1911`), verbatim (ICOM-070). It is the one place the tool
+    /// itself says which `reason`s wait for the supervisor's reply and which do not; the text has no
+    /// product name in it, so nothing is substituted.
     fn description(&self) -> &str {
-        "Contact your supervising orchestrator over the intercom: need_decision (blocks for an answer), progress_update (fire-and-forget), or interview_request (blocks for structured answers)."
+        "Subagent-only tool for contacting the supervisor agent that delegated this task. Use \
+         need_decision when blocked, uncertain, needing approval, or facing a product/API/scope \
+         decision before continuing; this waits for the supervisor's reply. Use interview_request \
+         when multiple structured questions need supervisor answers; this also waits for a reply. \
+         Use progress_update only for meaningful progress or unexpected discoveries that change the \
+         plan; this does not wait for a reply. Do not use for routine completion handoffs."
     }
 
     /// `label: "Contact Supervisor"` (`v0.10.1 index.ts:1510`). Matches the sibling
@@ -832,6 +851,42 @@ mod tests {
         for bullet in tool.prompt_guidelines() {
             assert!(bullet.contains("contact_supervisor"), "R-03-039: {bullet}");
         }
+        // ICOM-070 — the description and every parameter description, `v0.14.0 index.ts:1911-1938`.
+        assert_eq!(
+            tool.description(),
+            "Subagent-only tool for contacting the supervisor agent that delegated this task. Use need_decision when blocked, uncertain, needing approval, or facing a product/API/scope decision before continuing; this waits for the supervisor's reply. Use interview_request when multiple structured questions need supervisor answers; this also waits for a reply. Use progress_update only for meaningful progress or unexpected discoveries that change the plan; this does not wait for a reply. Do not use for routine completion handoffs.",
+            "`v0.14.0 index.ts:1911` verbatim"
+        );
+        let props = &tool.parameters()["properties"];
+        assert_eq!(
+            props["reason"]["description"],
+            "Contact reason: 'need_decision' waits for a reply; 'interview_request' sends structured questions and waits for a reply; 'progress_update' sends a non-blocking update"
+        );
+        assert_eq!(
+            props["message"]["description"],
+            "Decision request, optional interview note, or meaningful progress update for the supervisor"
+        );
+        assert_eq!(
+            props["interview"]["description"],
+            "Structured interview request for reason='interview_request'"
+        );
+        let question = &props["interview"]["properties"]["questions"]["items"]["properties"];
+        assert_eq!(
+            question["type"]["description"],
+            "Question type: single, multi, text, image, or info"
+        );
+        // `Type.Array(Type.Any())` (`:1935`): an option object with a `label` — which the validator
+        // accepts — must not be ruled out by the schema before the validator runs.
+        assert!(
+            question["options"].get("items").is_none(),
+            "options items are unconstrained upstream: {}",
+            question["options"]
+        );
+        let object_option = serde_json::json!({
+            "questions": [{ "id": "q1", "type": "single", "question": "Pick", "options": [{ "label": "a" }] }]
+        });
+        validate_supervisor_interview_request(&object_option)
+            .expect("the validator accepts the object option the schema now admits");
     }
 
     fn sample_interview(extra_question: Option<serde_json::Value>) -> serde_json::Value {

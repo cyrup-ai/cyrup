@@ -45,6 +45,10 @@ use cyrup_session_svc::{
 };
 use tempfile::TempDir;
 
+/// ICOM-063 — `busyDelivery: "human-first"`, over this file's live-session harness.
+#[path = "busy_delivery_human_first.rs"]
+mod busy_delivery_human_first;
+
 const INTERCOM_TYPE: &str = "intercom_message";
 /// The summarization system prompt's opening words (`cyrup-session` `SUMMARIZATION_SYSTEM_PROMPT`).
 const SUMMARIZER_PROMPT_HEAD: &str = "You are a context summarization assistant";
@@ -204,8 +208,12 @@ impl NativeExtension for HeldVeto {
 struct Options {
     has_ui: bool,
     inbound_trigger: Option<&'static str>,
+    /// `busyDelivery` (ICOM-063); `None` leaves the key out, i.e. upstream's `"steer"` default.
+    busy_delivery: Option<&'static str>,
     settings: cyrup_config::Settings,
     extra: Option<Arc<dyn NativeExtension>>,
+    /// An extension loaded BEFORE the intercom one, so it sees each event first.
+    first: Option<Arc<dyn NativeExtension>>,
 }
 
 impl Options {
@@ -213,8 +221,10 @@ impl Options {
         Self {
             has_ui: true,
             inbound_trigger: None,
+            busy_delivery: None,
             settings: compaction_settings(),
             extra: None,
+            first: None,
         }
     }
 }
@@ -313,7 +323,7 @@ impl Live {
     }
 }
 
-fn write_config(intercom_dir: &Path, inbound_trigger: Option<&str>) {
+fn write_config(intercom_dir: &Path, inbound_trigger: Option<&str>, busy_delivery: Option<&str>) {
     std::fs::create_dir_all(intercom_dir).unwrap();
     let mut body = serde_json::json!({
         "brokerCommand": broker_bin().to_string_lossy(),
@@ -321,6 +331,9 @@ fn write_config(intercom_dir: &Path, inbound_trigger: Option<&str>) {
     });
     if let Some(trigger) = inbound_trigger {
         body["inboundTrigger"] = serde_json::json!(trigger);
+    }
+    if let Some(policy) = busy_delivery {
+        body["busyDelivery"] = serde_json::json!(policy);
     }
     std::fs::write(config_path(intercom_dir), body.to_string()).unwrap();
 }
@@ -333,7 +346,11 @@ async fn live(options: Options, turn: TurnFn, summarize: SummaryFn) -> Live {
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::write(cwd.join("notes.txt"), "file contents\n").unwrap();
     let intercom_dir = intercom_dir_path(&agent_dir);
-    write_config(&intercom_dir, options.inbound_trigger);
+    write_config(
+        &intercom_dir,
+        options.inbound_trigger,
+        options.busy_delivery,
+    );
     let socket = broker_socket_path(&intercom_dir);
     let broker = spawn_broker(&agent_dir);
     wait_for_broker(&socket, Duration::from_secs(20))
@@ -358,9 +375,12 @@ async fn live(options: Options, turn: TurnFn, summarize: SummaryFn) -> Live {
     } else {
         AppMode::Print
     };
-    let mut builder = SessionBuilder::new(faux as Arc<dyn Provider>, cfg)
-        .cli_settings(options.settings)
-        .with_native_extension(ext.clone());
+    let mut builder =
+        SessionBuilder::new(faux as Arc<dyn Provider>, cfg).cli_settings(options.settings);
+    if let Some(first) = options.first {
+        builder = builder.with_native_extension(first);
+    }
+    builder = builder.with_native_extension(ext.clone());
     if let Some(extra) = options.extra {
         builder = builder.with_native_extension(extra);
     }
@@ -949,10 +969,12 @@ async fn held_inbound_messages_steer_when_an_agent_run_starts() {
 }
 
 /// ICOM-062 — `human-first leaves non-UI sessions on the busy auto-reply path after compaction`
-/// (`:2423-2448`), minus the `busyDelivery` knob (ICOM-063, not ported): the hold rule is general,
-/// so a NON-interactive session busy without a run holds the peer's ask too; the flush on the next
-/// `agent_start` then finds it busy with a run and no UI, and takes the busy auto-reply path —
-/// the peer is answered, nothing is injected.
+/// (`:2423-2448`), under upstream's `withIntercomConfig({ busyDelivery: "human-first" })`. The
+/// `human-first` clause of the hold rule (ICOM-063, covered for interactive sessions by
+/// `busy_delivery_human_first`) applies only with a UI, so it adds nothing here: a NON-interactive
+/// session busy without a run holds the peer's ask through the general clause; the flush on the next
+/// `agent_start` then finds it busy with a run and no UI, and takes the busy auto-reply path — the
+/// peer is answered, nothing is injected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_non_ui_session_holds_then_takes_the_busy_auto_reply_path() {
     let turn: TurnFn = Arc::new(|n, _| {
@@ -963,6 +985,7 @@ async fn a_non_ui_session_holds_then_takes_the_busy_auto_reply_path() {
     });
     let options = Options {
         has_ui: false,
+        busy_delivery: Some("human-first"),
         settings: slow_retry_settings(),
         ..Options::interactive()
     };

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use cyrup_core::{ToolError, ToolResult};
 
 use crate::identity::short_session_id;
-use crate::tools::text_result;
+use crate::tools::detailed_result;
 use crate::transport::client::IntercomClient;
 use crate::transport::protocol::SessionInfo;
 
@@ -93,6 +93,17 @@ impl IntercomTool {
                     .join("\n")
             )
         };
-        Ok(text_result(format!("{current_section}\n\n{other_section}")))
+        // `details: { roster: { peers, total, cwd: filterCwd } }` (`v0.14.0 index.ts:2334`,
+        // ICOM-066) — the RESOLVED filter cwd, so the collapsed row names the directory it counted.
+        Ok(detailed_result(
+            format!("{current_section}\n\n{other_section}"),
+            serde_json::json!({
+                "roster": {
+                    "peers": other_sessions.len(),
+                    "total": sessions.len(),
+                    "cwd": filter_cwd,
+                }
+            }),
+        ))
     }
 }

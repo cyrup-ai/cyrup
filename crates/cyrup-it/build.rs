@@ -76,6 +76,10 @@ const BINS: &[(&str, &str, &[&str])] = &[
         "cyrup-intercom",
         &["test-fixtures"],
     ),
+    // ICOM-067: the scripting client (`cli.ts`). Not a fixture — it needs no feature of its own —
+    // but listed under the broker's feature set so it rides in the SAME nested build as the broker
+    // it talks to, rather than costing a fourth `cargo build -p cyrup-intercom`.
+    ("cyrup-intercom-cli", "cyrup-intercom", &["test-fixtures"]),
     (
         "cyrup-subagent-fixture",
         "cyrup-ext-subagents",
@@ -150,8 +154,8 @@ fn main() {
         let target_dir = out_dir().join("it-bins");
         let mut pending: Vec<&(&str, &str, &[&str])> = BINS.iter().collect();
         while let Some(head) = pending.first().copied() {
-            // One cargo invocation per (package, feature-set): the three fixture bins come in two
-            // groups, so this is three nested builds, not five.
+            // One cargo invocation per (package, feature-set): the three fixture bins and the
+            // intercom CLI come in two groups, so this is three nested builds, not six.
             let (_, pkg, features) = *head;
             let group: Vec<&str> = pending
                 .iter()

@@ -114,6 +114,8 @@ async fn run() -> i32 {
         // This binary registers as a genuine broker participant, so it reports its pane like any
         // other session; a hard-coded `None` would be a silent divergence from every real client.
         tmux_pane: cyrup_intercom::identity::current_tmux_pane(),
+        herdr_pane_id: cyrup_intercom::identity::current_herdr_pane(),
+        herdr_session_path: None,
         extra: Default::default(),
     };
 

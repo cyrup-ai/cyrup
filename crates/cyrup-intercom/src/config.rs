@@ -29,7 +29,24 @@ pub enum InboundTrigger {
     Never,
 }
 
-/// `IntercomConfig` (`config.ts:22-43`). `broker_command`/`broker_args` are parsed for wire-parity
+/// `BusyDeliveryPolicy` (`v0.14.0 config.ts:27`, `0ce2dcd`): how a peer message that arrives while an
+/// interactive session's agent run is in flight is delivered. Default `Steer` (`config.ts:67`), so
+/// the opt-in changes nothing for a config that does not name it.
+///
+/// README v0.14.0: "`"steer"` promptly steers peers into active interactive runs. Opt into
+/// `"human-first"` to hold peers until a turn boundary with no pending human input; one held peer
+/// is released per turn. Non-interactive busy behavior is unchanged."
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BusyDelivery {
+    /// Steer the peer straight onto the live run (v0.9.3 `25ffb96`).
+    #[default]
+    Steer,
+    /// Hold the peer until a turn boundary with no pending human input
+    /// ([`crate::inbound::release_held_inbound_at_turn_end`]), or until the session is idle.
+    HumanFirst,
+}
+
+/// `IntercomConfig` (`v0.14.0 config.ts:29-53`). `broker_command`/`broker_args` are parsed for wire-parity
 /// with pi's `config.json`, but cyrup's broker spawn re-execs `current_exe __intercom-broker`
 /// (`transport::spawn`) rather than shelling out to `npx tsx`, so they are informational on cyrup.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +59,9 @@ pub struct IntercomConfig {
     pub confirm_send: bool,
     /// Inbound auto-trigger policy (`config.ts:53`, `Always`).
     pub inbound_trigger: InboundTrigger,
+    /// "Delivery priority for peers arriving during interactive agent runs" (`v0.14.0 config.ts:42-43`,
+    /// `Steer`).
+    pub busy_delivery: BusyDelivery,
     /// Optional custom status suffix (`config.ts:37`).
     pub status: Option<String>,
     /// `stableId` (`v0.10.1 config.ts:38-39`) — "Optional stable intercom session ID for
@@ -63,6 +83,7 @@ impl Default for IntercomConfig {
             broker_args: vec!["--no-install".to_string(), "tsx".to_string()],
             confirm_send: false,
             inbound_trigger: InboundTrigger::Always,
+            busy_delivery: BusyDelivery::Steer,
             status: None,
             stable_id: None,
             enabled: true,
@@ -164,6 +185,15 @@ fn parse_config(raw: &str) -> Result<IntercomConfig, String> {
                     "\"inboundTrigger\" must be \"always\", \"replies\", or \"never\"".to_string(),
                 );
             }
+        };
+    }
+    // `v0.14.0 config.ts:138-143`: strict — any other value (a typo, a non-string) fails the whole
+    // config rather than being ignored, so a v0.14.0 config never loads here without its effect.
+    if let Some(v) = obj.get("busyDelivery") {
+        config.busy_delivery = match v.as_str() {
+            Some("steer") => BusyDelivery::Steer,
+            Some("human-first") => BusyDelivery::HumanFirst,
+            _ => return Err("\"busyDelivery\" must be \"steer\" or \"human-first\"".to_string()),
         };
     }
     if let Some(v) = obj.get("replyHint") {
@@ -356,6 +386,42 @@ mod tests {
         assert_eq!(
             parse_config(r#"{"stableId":"   "}"#).expect_err("blank"),
             "\"stableId\" must not be empty"
+        );
+    }
+
+    /// ICOM-063 — `v0.14.0 config.ts:138-143` and `config.test.ts` "loadConfig rejects invalid
+    /// busyDelivery values": both values parse, the default is `steer`, and anything else is a hard
+    /// error with upstream's message — through `load_config`, so it names the file.
+    #[test]
+    fn busy_delivery_parses_both_values_and_rejects_anything_else() {
+        assert_eq!(
+            parse_config("{}").expect("valid").busy_delivery,
+            BusyDelivery::Steer
+        );
+        assert_eq!(
+            parse_config(r#"{"busyDelivery":"steer"}"#)
+                .expect("valid")
+                .busy_delivery,
+            BusyDelivery::Steer
+        );
+        assert_eq!(
+            parse_config(r#"{"busyDelivery":"human-first"}"#)
+                .expect("valid")
+                .busy_delivery,
+            BusyDelivery::HumanFirst
+        );
+        for bad in [r#""humanFirst""#, r#""bogus""#, "true", "null", "1"] {
+            assert_eq!(
+                parse_config(&format!(r#"{{"busyDelivery":{bad}}}"#)).expect_err(bad),
+                "\"busyDelivery\" must be \"steer\" or \"human-first\""
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(config_path(dir.path()), r#"{"busyDelivery":"bogus"}"#).unwrap();
+        let err = load_config(dir.path()).expect_err("an invalid busyDelivery fails the config");
+        assert!(
+            err.ends_with(": \"busyDelivery\" must be \"steer\" or \"human-first\""),
+            "{err}"
         );
     }
 

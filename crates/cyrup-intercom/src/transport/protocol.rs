@@ -236,6 +236,91 @@ pub fn as_epoch_ms(value: &serde_json::Number) -> Option<u64> {
     value.as_u64()
 }
 
+/// One half of a [`HerdrLocation::Current`] — a Herdr workspace or tab, by its opaque id and its
+/// readable label (`v0.14.0 types.ts:16-17`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HerdrLabelRef {
+    /// Herdr's opaque id (`w5`, `w5:t2`).
+    pub id: String,
+    /// The label Herdr shows for it.
+    pub label: String,
+}
+
+/// `HerdrLocation["reason"]` (`v0.14.0 types.ts:26`) — a CLOSED vocabulary: `isHerdrLocation`
+/// compares it against exactly these five strings (`broker/protocol.ts:20-24`), so an unknown reason
+/// fails the whole `SessionInfo`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdrUnavailableReason {
+    /// Herdr is not running or not reachable.
+    HerdrUnavailable,
+    /// This Herdr build does not answer the snapshot request.
+    Unsupported,
+    /// The snapshot request failed for any other reason.
+    CommandFailed,
+    /// The session's pane is not in the current snapshot.
+    PaneMissing,
+    /// The snapshot could not be joined unambiguously.
+    InvalidResponse,
+}
+
+impl HerdrUnavailableReason {
+    /// The wire string, which is also what the list row and the overlay print.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HerdrUnavailable => "herdr_unavailable",
+            Self::Unsupported => "unsupported",
+            Self::CommandFailed => "command_failed",
+            Self::PaneMissing => "pane_missing",
+            Self::InvalidResponse => "invalid_response",
+        }
+    }
+}
+
+/// `HerdrLocation` (`v0.14.0 types.ts:13-28`, `0ffe1d5`), guarded by `isHerdrLocation`
+/// (`broker/protocol.ts:16-35`) — where a Herdr-hosted session's pane is NOW, resolved by the broker
+/// from one live snapshot per `list` ([`crate::herdr_location`]).
+///
+/// Internally tagged on `status`, the same discriminator upstream switches on, so an unknown status
+/// is a decode failure exactly as `isHerdrLocation` returns `false` for it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum HerdrLocation {
+    /// Freshly resolved for this `list` request.
+    Current {
+        /// The pane's current workspace.
+        workspace: HerdrLabelRef,
+        /// The pane's current tab.
+        tab: HerdrLabelRef,
+        /// The pane's CURRENT id — which differs from the launch-time `herdrPaneId` after a move.
+        pane_id: String,
+        /// "Time when the broker requested the live Herdr snapshot." — `[JS-NUMBER]`.
+        refreshed_at: serde_json::Number,
+    },
+    /// The session registered no Herdr pane.
+    NotHosted,
+    /// The session registered a pane, and it could not be resolved.
+    Unavailable {
+        /// The launch-time pane id the session registered.
+        pane_id: String,
+        /// Why.
+        reason: HerdrUnavailableReason,
+        /// `detail === undefined || typeof detail === "string"` (`broker/protocol.ts:25`), so
+        /// `[NON-NULL]`.
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        detail: Option<String>,
+    },
+}
+
 /// `SessionInfo` (`v0.9.2 types.ts:3-22`), guarded by `isSessionInfo`
 /// (`v0.9.2 broker/client.ts:152-189`).
 ///
@@ -374,6 +459,26 @@ pub struct SessionInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub tmux_pane: Option<String>,
+    /// `herdrPaneId` (`v0.14.0 types.ts:60-61`): "Launch-time Herdr pane alias. It may differ from
+    /// the current pane id after a move." Read from `$HERDR_PANE_ID` at registration
+    /// ([`crate::identity::current_herdr_pane`]) and copied onto the stored `SessionInfo` by the
+    /// broker (`broker/broker.ts:480`). `[NON-NULL]` (`broker/protocol.ts:192`).
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub herdr_pane_id: Option<String>,
+    /// `herdrLocation` (`v0.14.0 types.ts:62-64`): "Present on list responses. `current` is freshly
+    /// resolved for that request; other states explicitly distinguish non-Herdr sessions from
+    /// failures." Never stored by the broker — added per `list` ([`crate::herdr_location`]) and
+    /// absent everywhere else. `[NON-NULL]`, and validated (`broker/protocol.ts:195`).
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub herdr_location: Option<HerdrLocation>,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`. A newer pi broker's additive keys survive a cyrup hop,
     /// and a JSON array can no longer fill this struct positionally.
     #[serde(flatten)]
@@ -870,6 +975,27 @@ pub struct SessionRegistration {
         skip_serializing_if = "Option::is_none"
     )]
     pub tmux_pane: Option<String>,
+    /// `herdrPaneId` (`v0.14.0 index.ts:912,923`) — `$HERDR_PANE_ID`, trimmed. Validated by
+    /// `isSessionRegistration` (`broker/protocol.ts:233`), so `[NON-NULL]`.
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub herdr_pane_id: Option<String>,
+    /// `herdrSessionPath` (`v0.14.0 types.ts:126-127`): "Broker-only join hint; never returned in
+    /// the public roster." Kept on the broker's `ConnectedSession`, never copied onto the stored
+    /// `SessionInfo` (`broker/broker.ts:492`). Validated at `broker/protocol.ts:236`, so
+    /// `[NON-NULL]`.
+    ///
+    /// A cyrup client never sends it — see [`crate::connect`]'s registration builder for why — but
+    /// a pi v0.14 peer does, and a cyrup broker joins on it exactly as pi's does.
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub herdr_session_path: Option<String>,
     #[serde(flatten)]
     pub extra: UnknownFields,
 }
@@ -1621,6 +1747,8 @@ mod tests {
                 last_activity: 2u64.into(),
                 status: None,
                 tmux_pane: None,
+                herdr_pane_id: None,
+                herdr_session_path: None,
                 extra: UnknownFields::default(),
             },
             session_id: Some("sess-1".to_string()),
@@ -1704,6 +1832,8 @@ mod tests {
                 last_activity: 0u64.into(),
                 status: None,
                 tmux_pane: None,
+                herdr_pane_id: None,
+                herdr_session_path: None,
                 extra: UnknownFields::default(),
             },
             session_id: None,
