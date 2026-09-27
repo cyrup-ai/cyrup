@@ -95,10 +95,16 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
             .map(|ac| ac.list.rendered_height())
             .unwrap_or(0)
     };
-    let footer_max: u16 = if state.status.has_extension_statuses() {
-        3
-    } else {
-        2
+    // TUI-119 — the 2/3-row budget is the BUILT-IN footer's. Pi's `footerContainer` is a plain
+    // `Container` sized by what it holds (`interactive-mode.ts:614`, `:2437-2445` @v0.87.1), docked
+    // at `minSize: 0` in fullscreen (`chat-viewport.ts:36`, v0.86.0 #8919), so an extension footer
+    // that swapped the built-in out takes exactly the rows it renders: the `content.lines()` that
+    // [`render`] paints into the footer rect, one row for a one-liner and four for four, where the
+    // built-in budget left a one-liner a blank row and cut a four-liner to its first two or three.
+    let footer_max: u16 = match state.extension_footer.as_deref() {
+        Some(content) => content.lines().count().min(u16::MAX as usize) as u16,
+        None if state.status.has_extension_statuses() => 3,
+        None => 2,
     };
     let want_status = state.indicator.is_active() || state.reserve_status_rows;
     let want_images: u16 =
@@ -143,7 +149,7 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
     let mut remaining = avail;
     let slot_floor = want_slot.min(EDITOR_MIN_ROWS).min(remaining);
     remaining = remaining.saturating_sub(slot_floor);
-    let footer_floor = 1u16.min(remaining);
+    let footer_floor = 1u16.min(footer_max).min(remaining);
     remaining = remaining.saturating_sub(footer_floor);
     // Surplus, in the old order: the footer fills out to `footer_max`, then the slot to `want_slot`.
     let footer_extra = footer_max.saturating_sub(footer_floor).min(remaining);

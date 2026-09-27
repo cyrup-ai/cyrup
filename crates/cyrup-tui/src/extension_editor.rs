@@ -574,7 +574,7 @@ mod tests {
             // above are `61 - want_body` — and 54 (its `?? 24` default's 7) if the dialog never
             // handed its terminal height down.
             assert!(
-                rows[body_top].starts_with(&format!("─── ↑ {} more ", 61 - want_body)),
+                rows[body_top].trim_matches('─') == format!(" ↑ {} more ", 61 - want_body),
                 "at {term_rows} terminal rows the embedded editor DRAWS {want_body} text rows: \
                  {rows:?}"
             );

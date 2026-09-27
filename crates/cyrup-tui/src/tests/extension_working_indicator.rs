@@ -100,14 +100,15 @@ impl Wired {
 /// (`interactive-mode.ts:2377-2382`).
 ///
 /// PRE-FIX: `LiveHostServices::set_working_message` did not exist, so the trait's empty default ran,
-/// nothing reached the effect channel, and the band still read `Working...` — the first
+/// nothing reached the effect channel, and the band still read `Working` — the first
 /// `assert!(after.contains("indexing 412 files"))` fails.
 #[test]
 fn a_working_message_replaces_the_band_copy_live_and_none_restores_the_default() {
     let mut w = wired();
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
     assert!(
-        w.screen().contains("Working..."),
+        w.screen().contains("Working"),
         "fixture: the default band is up"
     );
 
@@ -119,7 +120,7 @@ fn a_working_message_replaces_the_band_copy_live_and_none_restores_the_default()
         "the extension's copy must replace it:\n{after}"
     );
     assert!(
-        !after.contains("Working..."),
+        !after.contains("Working"),
         "…and the default must be gone:\n{after}"
     );
 
@@ -128,7 +129,7 @@ fn a_working_message_replaces_the_band_copy_live_and_none_restores_the_default()
     w.pump();
     let restored = w.screen();
     assert!(
-        restored.contains("Working..."),
+        restored.contains("Working"),
         "`None` restores the default:\n{restored}"
     );
     assert!(
@@ -138,8 +139,8 @@ fn a_working_message_replaces_the_band_copy_live_and_none_restores_the_default()
 }
 
 /// **`setWorkingMessage` persists across turns.** Upstream seeds every new `WorkingStatusIndicator`
-/// from `this.workingMessage` (`interactive-mode.ts:3116-3120`), so the override survives the turn
-/// it was set in — an extension sets it once, not once per turn.
+/// from `this.workingMessage` (`showWorkingStatusIndicator`, called from `turn_start`), so the
+/// override survives the turn it was set in — an extension sets it once, not once per turn.
 ///
 /// PRE-FIX: fails for the same reason as the test above — the override never arrived at all.
 #[test]
@@ -149,6 +150,7 @@ fn a_working_message_survives_the_turn_it_was_set_in() {
     w.pump();
     // Set while IDLE: nothing is on screen yet, and the next turn must pick it up.
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
     assert!(
         w.screen().contains("waiting on the build"),
         "seeded into the next turn's band"
@@ -159,6 +161,7 @@ fn a_working_message_survives_the_turn_it_was_set_in() {
         will_retry: false,
     });
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
     let second = w.screen();
     assert!(
         second.contains("waiting on the build"),
@@ -166,23 +169,24 @@ fn a_working_message_survives_the_turn_it_was_set_in() {
     );
 }
 
-/// **`setWorkingVisible`.** Pi: `false` ⇒ `clearStatusIndicator("working")`; a later `agent_start`
+/// **`setWorkingVisible`.** Pi: `false` ⇒ `clearStatusIndicator("working")`; a later `turn_start`
 /// takes the `else { this.clearStatusIndicator() }` branch instead of mounting a loader
-/// (`interactive-mode.ts:2091-2108`, `:3114-3124`).
+/// (`interactive-mode.ts:2091-2108`; `:3307-3313` @v0.87.1, `agent_start` until v0.84.4).
 ///
 /// PRE-FIX: `set_working_visible` was the trait's empty default, so the band stayed up and the
-/// `assert!(!hidden.contains("Working..."))` fails.
+/// `assert!(!hidden.contains("Working"))` fails.
 #[test]
 fn working_visible_false_takes_the_band_down_and_keeps_it_down_next_turn() {
     let mut w = wired();
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
-    assert!(w.screen().contains("Working..."), "fixture: the band is up");
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
+    assert!(w.screen().contains("Working"), "fixture: the band is up");
 
     w.svc.set_working_visible(false);
     w.pump();
     let hidden = w.screen();
     assert!(
-        !hidden.contains("Working..."),
+        !hidden.contains("Working"),
         "the band must come down at once:\n{hidden}"
     );
 
@@ -192,9 +196,10 @@ fn working_visible_false_takes_the_band_down_and_keeps_it_down_next_turn() {
         will_retry: false,
     });
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
     let next = w.screen();
     assert!(
-        !next.contains("Working..."),
+        !next.contains("Working"),
         "…and stay down for the next turn:\n{next}"
     );
 
@@ -203,7 +208,7 @@ fn working_visible_false_takes_the_band_down_and_keeps_it_down_next_turn() {
     w.pump();
     let back = w.screen();
     assert!(
-        back.contains("Working..."),
+        back.contains("Working"),
         "`true` mid-stream brings it back:\n{back}"
     );
 }
@@ -246,6 +251,7 @@ fn working_visible_false_leaves_a_retry_band_alone() {
 fn a_custom_working_indicator_replaces_the_frames_and_empty_frames_hide_the_glyph() {
     let mut w = wired();
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
     assert!(
         SPINNER_FRAMES.iter().any(|f| w.screen().contains(f)),
         "fixture: the built-in Braille spinner is drawing"
@@ -266,7 +272,7 @@ fn a_custom_working_indicator_replaces_the_frames_and_empty_frames_hide_the_glyp
         "…and the built-in Braille frames must be gone:\n{custom}"
     );
     assert!(
-        custom.contains("Working..."),
+        custom.contains("Working"),
         "the MESSAGE is independent of the glyph:\n{custom}"
     );
 
@@ -281,7 +287,7 @@ fn a_custom_working_indicator_replaces_the_frames_and_empty_frames_hide_the_glyp
         "`frames: []` draws no spinner at all:\n{bare}"
     );
     assert!(
-        bare.contains("Working..."),
+        bare.contains("Working"),
         "…but the band and its message stay:\n{bare}"
     );
 
@@ -366,9 +372,10 @@ fn a_session_swap_restores_every_working_default() {
     w.app.state_mut().transcript.set_hide_thinking_block(true);
     w.app.state_mut().transcript.push_thinking_delta("secret");
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
     let before = w.screen();
     assert!(
-        !before.contains("Working..."),
+        !before.contains("Working"),
         "pre-swap: the band is hidden:\n{before}"
     );
     assert!(
@@ -382,9 +389,10 @@ fn a_session_swap_restores_every_working_default() {
     w.app.state_mut().transcript.set_hide_thinking_block(true);
     w.app.state_mut().transcript.push_thinking_delta("secret");
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
     let after = w.screen();
     assert!(
-        after.contains("Working..."),
+        after.contains("Working"),
         "visibility and message reset:\n{after}"
     );
     assert!(!after.contains("ZQX"), "the custom frame is gone:\n{after}");
@@ -399,5 +407,31 @@ fn a_session_swap_restores_every_working_default() {
     assert!(
         !after.contains("[withheld]"),
         "…and the override is gone:\n{after}"
+    );
+}
+
+/// **`turn_start` leaves a live working band alone.** Pi's arm is `if (this.activeStatusIndicator
+/// ?.kind !== "working") this.showWorkingStatusIndicator()` (`interactive-mode.ts:3308-3310`
+/// @v0.87.1): the next turn of a run does not rebuild a band that is already up, so the `(… to
+/// interrupt)` copy `resetExtensionUI` put on the LIVE band (`:2380-2383`) survives into that turn.
+///
+/// FAILS if `TurnStart` re-mounts unconditionally: the band is re-messaged to the bare default.
+#[test]
+fn a_later_turn_start_keeps_the_live_working_band_and_its_copy() {
+    let mut w = wired();
+    w.app.ingest_event(&AgentSessionEvent::AgentStart);
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
+    w.app.reset_extension_ui();
+    let reset = w.screen();
+    assert!(
+        reset.contains("Working (escape to interrupt)"),
+        "fixture: the reset re-messaged the live band:\n{reset}"
+    );
+
+    w.app.ingest_event(&AgentSessionEvent::TurnStart);
+    let next = w.screen();
+    assert!(
+        next.contains("Working (escape to interrupt)"),
+        "the next turn keeps the band it found:\n{next}"
     );
 }

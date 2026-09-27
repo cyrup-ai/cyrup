@@ -18,11 +18,92 @@ pub fn write_terminal_title(title: &str) {
 /// How long the reader thread idles between `event::poll` rounds when nothing is held.
 pub(crate) const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The much shorter poll used while [`StrayReplyFilter`] is holding events. A held opener (a bare
-/// `Esc`, or `Alt+]`) is released after at most this long, so a real `Escape` press costs one
-/// imperceptible tick rather than a full [`INPUT_POLL_INTERVAL`] — the standard escape-timeout
-/// trade every terminal app makes to tell `ESC` from an escape *sequence*.
+/// The much shorter poll used while [`EscapeReassembler`] or [`StrayReplyFilter`] is holding
+/// events. A held prefix (`ESC [`, an OSC 11 opener, `Alt+]`) is released after at most this long,
+/// and so is a lone `Esc` on a local link (see [`resolve_escape_timeout`]), so a real `Escape` press
+/// costs one imperceptible tick rather than a full [`INPUT_POLL_INTERVAL`] — the standard
+/// escape-timeout trade every terminal app makes to tell `ESC` from an escape *sequence*.
 pub(crate) const HELD_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Pi `DEFAULT_SSH_ESCAPE_TIMEOUT_MS` (v0.84.2 `tui/src/terminal.ts:116`, #7899): how long a lone
+/// `ESC` is held under SSH, where the two halves of a split `Alt+Enter` or arrow key can arrive
+/// further apart than [`HELD_FLUSH_INTERVAL`].
+pub(crate) const SSH_ESCAPE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Pi's `PI_TUI_ESC_TIMEOUT` in cyrup's spelling. Only the `CYRUP_` name is read, as with
+/// `CYRUP_HYPERLINKS` and the other capability overrides.
+pub(crate) const ENV_ESC_TIMEOUT: &str = "CYRUP_TUI_ESC_TIMEOUT";
+
+/// Pi `resolveEscapeTimeoutMs` (v0.84.2 `tui/src/terminal.ts:123-131`): how long the reader holds a
+/// lone `ESC` before releasing it as the `Escape` key. A positive [`ENV_ESC_TIMEOUT`] wins; else
+/// [`SSH_ESCAPE_TIMEOUT`] when `SSH_CONNECTION` or `SSH_TTY` is set (JS truthiness: non-empty);
+/// else [`HELD_FLUSH_INTERVAL`], cyrup's local hold, where Pi's is 10 ms.
+///
+/// The override is parsed the way `Number(env.PI_TUI_ESC_TIMEOUT)` parses it ([`js_number`]), and
+/// the result is bounded the way Node's `setTimeout` bounds the delay Pi hands it: anything outside
+/// `1..=2^31-1` ms becomes 1 ms (`lib/internal/timers.js`, `TIMEOUT_MAX`). That bound also keeps
+/// `event::poll` clear of an unrepresentable deadline.
+pub(crate) fn resolve_escape_timeout(env: impl Fn(&str) -> Option<String>) -> Duration {
+    const NODE_TIMEOUT_MAX_MS: f64 = 2_147_483_647.0;
+    let configured = env(ENV_ESC_TIMEOUT).as_deref().and_then(js_number);
+    if let Some(ms) = configured.filter(|ms| ms.is_finite() && *ms > 0.0) {
+        let ms = if (1.0..=NODE_TIMEOUT_MAX_MS).contains(&ms) {
+            ms
+        } else {
+            1.0
+        };
+        return Duration::from_secs_f64(ms / 1000.0);
+    }
+    let set = |k: &str| env(k).is_some_and(|v| !v.is_empty());
+    if set("SSH_CONNECTION") || set("SSH_TTY") {
+        return SSH_ESCAPE_TIMEOUT;
+    }
+    HELD_FLUSH_INTERVAL
+}
+
+/// JavaScript's `Number(string)`, as far as a timeout needs it: surrounding whitespace is ignored,
+/// an empty string is `0`, a `0x`/`0o`/`0b` prefix selects the radix, and anything else is a decimal
+/// literal. `None` is JS's `NaN`. Rust's `f64` parser is looser than JS only on non-finite spellings
+/// (`inf`, `nan`), which the caller rejects either way.
+fn js_number(s: &str) -> Option<f64> {
+    let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if s.is_empty() {
+        return Some(0.0);
+    }
+    let radix = match s.get(..2).map(str::to_ascii_lowercase).as_deref() {
+        Some("0x") => 16,
+        Some("0o") => 8,
+        Some("0b") => 2,
+        _ => return s.parse().ok(),
+    };
+    let digits = s.get(2..).filter(|d| !d.is_empty())?;
+    digits.chars().try_fold(0.0, |acc: f64, c| {
+        c.to_digit(radix)
+            .map(|d| acc * f64::from(radix) + f64::from(d))
+    })
+}
+
+/// The reader thread's next `event::poll` timeout. A lone held `ESC` waits `escape_timeout` (Pi
+/// picks `escapeTimeoutMs` only when `this.buffer === ESC`, v0.84.2 `stdin-buffer.ts:388`); any
+/// other held prefix waits [`HELD_FLUSH_INTERVAL`]; nothing held waits [`INPUT_POLL_INTERVAL`].
+///
+/// Only the reassembler's state decides the lone-`ESC` case: the filter never keeps a bare `Esc`
+/// across a poll unless the reassembler is holding the `Esc` behind it (`Esc` `Esc`), because every
+/// other way an `Esc` reaches the filter is followed by its successor in the same push or by
+/// [`StrayReplyFilter::flush`] on the same idle tick.
+pub(crate) fn reader_poll_wait(
+    reassembler: &EscapeReassembler,
+    filter: &StrayReplyFilter,
+    escape_timeout: Duration,
+) -> Duration {
+    if reassembler.is_holding_lone_escape() {
+        escape_timeout
+    } else if reassembler.is_holding() || filter.is_holding() {
+        HELD_FLUSH_INTERVAL
+    } else {
+        INPUT_POLL_INTERVAL
+    }
+}
 
 // ------------------------------------------------- TUI-092: the unblockable escape hatch ----
 //
@@ -345,9 +426,11 @@ impl Escalation {
 /// module's safety contract.
 ///
 /// Both hold, so both are flushed on the *same* idle tick and in the same order: a lone `Escape`
-/// costs one [`HELD_FLUSH_INTERVAL`] in total, not one per machine.
+/// costs one escape timeout in total ([`resolve_escape_timeout`], read once here as Pi reads it
+/// once in `ProcessTerminal.start`), not one per machine.
 pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
+    let escape_timeout = resolve_escape_timeout(|k| std::env::var(k).ok());
     std::thread::spawn(move || {
         let mut reassembler = EscapeReassembler::new();
         let mut filter = StrayReplyFilter::new();
@@ -365,17 +448,13 @@ pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
         // life across the window where teardown has been REQUESTED but has not COMPLETED — which is
         // precisely the window a wedged teardown must remain escapable in.
         'reader: while !tx.is_closed() && (!cancel.is_cancelled() || escalation.holds_open()) {
-            let wait = if reassembler.is_holding() || filter.is_holding() {
-                HELD_FLUSH_INTERVAL
-            } else {
-                INPUT_POLL_INTERVAL
-            };
+            let wait = reader_poll_wait(&reassembler, &filter, escape_timeout);
             match event::poll(wait) {
                 Ok(true) => match event::read() {
                     Ok(ev) => {
                         // TUI-092 — recognised BEFORE `EscapeReassembler`/`StrayReplyFilter`: a
                         // machine mid-hold would otherwise delay the one chord that exists to
-                        // escape a wedge by up to `HELD_FLUSH_INTERVAL`, and could swallow it into
+                        // escape a wedge by up to the escape timeout, and could swallow it into
                         // a reassembled sequence. Read-only on a borrow; the event is pushed below
                         // unchanged, so neither machine's state is disturbed. It must also run
                         // before the `tx.send` at the foot of this loop, which starts failing the
@@ -486,5 +565,146 @@ pub(crate) fn map_event_on(
         // `PointerOutcome::Copy` clipboard write and the `PointerOutcome::Paste` editor insert are
         // all unreachable in fullscreen.
         Event::Mouse(m) => crate::altscreen::mouse::map_reader_event(m),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! TUI-106 — the lone-`ESC` hold. These live INLINE because `input_reader` is a private module
+    //! of `crate::app` and its items are not re-exported to `crate::tests`.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// An env lookup over a fixed table (missing keys ⇒ `None`, exactly like `std::env::var`).
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Pi `resolveEscapeTimeoutMs`'s three outcomes: override, SSH, local.
+    #[test]
+    fn escape_timeout_is_widened_under_ssh_and_overridable() {
+        assert_eq!(resolve_escape_timeout(env_of(&[])), HELD_FLUSH_INTERVAL);
+        for var in ["SSH_CONNECTION", "SSH_TTY"] {
+            assert_eq!(
+                resolve_escape_timeout(env_of(&[(var, "10.0.0.1 5000 10.0.0.2 22")])),
+                Duration::from_millis(100),
+                "{var} set ⇒ 100 ms"
+            );
+            assert_eq!(
+                resolve_escape_timeout(env_of(&[(var, "")])),
+                HELD_FLUSH_INTERVAL,
+                "an empty {var} is falsy in JS"
+            );
+        }
+        // A positive override wins over SSH.
+        assert_eq!(
+            resolve_escape_timeout(env_of(&[
+                (ENV_ESC_TIMEOUT, "250"),
+                ("SSH_TTY", "/dev/pts/3")
+            ])),
+            Duration::from_millis(250)
+        );
+        // Pi reads only its own spelling; cyrup reads only `CYRUP_`.
+        assert_eq!(
+            resolve_escape_timeout(env_of(&[("PI_TUI_ESC_TIMEOUT", "250")])),
+            HELD_FLUSH_INTERVAL
+        );
+    }
+
+    /// `Number(...)`'s parse, then `> 0 && isFinite`: a non-positive or unparseable override falls
+    /// through to the SSH / local choice rather than disabling the hold.
+    #[test]
+    fn escape_timeout_override_parses_like_js_number() {
+        let ssh = |v: &'static str| {
+            resolve_escape_timeout(env_of(&[(ENV_ESC_TIMEOUT, v), ("SSH_TTY", "/dev/pts/3")]))
+        };
+        for fallthrough in ["", "0", "-5", "abc", "12ms", "Infinity", "NaN", "0x"] {
+            assert_eq!(ssh(fallthrough), SSH_ESCAPE_TIMEOUT, "{fallthrough:?}");
+        }
+        assert_eq!(ssh(" 40\n"), Duration::from_millis(40));
+        assert_eq!(ssh("1e2"), Duration::from_millis(100));
+        assert_eq!(ssh("0x40"), Duration::from_millis(64));
+        assert_eq!(ssh("12.5"), Duration::from_micros(12_500));
+        // Node's `setTimeout` turns a delay outside `1..=2^31-1` into 1 ms.
+        assert_eq!(ssh("0.5"), Duration::from_millis(1));
+        assert_eq!(ssh("1e12"), Duration::from_millis(1));
+    }
+
+    /// The reader's poll: the escape timeout applies to a lone held `ESC` and to nothing else.
+    #[test]
+    fn only_a_lone_held_escape_waits_the_escape_timeout() {
+        let timeout = SSH_ESCAPE_TIMEOUT;
+        let mut r = EscapeReassembler::new();
+        let f = StrayReplyFilter::new();
+        let mut out = Vec::new();
+        assert_eq!(reader_poll_wait(&r, &f, timeout), INPUT_POLL_INTERVAL);
+        r.push(key(KeyCode::Esc), &mut out);
+        assert_eq!(reader_poll_wait(&r, &f, timeout), timeout);
+        // `ESC [` is a sequence prefix, not a lone `ESC`: the short hold.
+        r.push(key(KeyCode::Char('[')), &mut out);
+        assert_eq!(reader_poll_wait(&r, &f, timeout), HELD_FLUSH_INTERVAL);
+        assert!(out.is_empty());
+    }
+
+    /// `REPRO-LOG.md`'s `TUI-045` split (`1b`, 60 ms, `5b 41`) under SSH, driven through the same
+    /// two machines and the same wait the reader thread uses. `event::poll(wait)` returns `false`
+    /// (idle ⇒ flush) exactly when the next byte is further away than `wait`.
+    #[test]
+    fn a_split_arrow_over_ssh_reassembles_across_a_60ms_gap() {
+        let deliver = |escape_timeout: Duration| {
+            let mut r = EscapeReassembler::new();
+            let mut f = StrayReplyFilter::new();
+            let (mut mid, mut out) = (Vec::new(), Vec::new());
+            let gap = Duration::from_millis(60);
+            for (before, ev) in [
+                (Duration::ZERO, key(KeyCode::Esc)),
+                (gap, key(KeyCode::Char('['))),
+                (
+                    Duration::ZERO,
+                    Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+                ),
+            ] {
+                if before >= reader_poll_wait(&r, &f, escape_timeout) {
+                    r.flush(&mut mid);
+                    for ev in mid.drain(..) {
+                        f.push(ev, &mut out);
+                    }
+                    f.flush(&mut out);
+                }
+                r.push(ev, &mut mid);
+                for ev in mid.drain(..) {
+                    f.push(ev, &mut out);
+                }
+            }
+            r.flush(&mut mid);
+            for ev in mid.drain(..) {
+                f.push(ev, &mut out);
+            }
+            f.flush(&mut out);
+            out
+        };
+        let ssh = resolve_escape_timeout(env_of(&[("SSH_CONNECTION", "a 1 b 22")]));
+        assert_eq!(deliver(ssh), vec![key(KeyCode::Up)], "one Up, no Escape");
+        let local = resolve_escape_timeout(env_of(&[]));
+        assert_eq!(
+            deliver(local)[0],
+            key(KeyCode::Esc),
+            "a local 20 ms hold still releases the ESC across a 60 ms gap"
+        );
     }
 }

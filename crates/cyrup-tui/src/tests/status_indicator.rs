@@ -45,9 +45,10 @@ fn working_band_shows_spinner_message_and_cancel_hint() {
         "first band line should be blank (loader spacer)"
     );
     let msg = line_text(&lines[1]);
-    // `defaultWorkingMessage = "Working..."` — ASCII, v0.84.1 `interactive-mode.ts:420`.
+    // `defaultWorkingMessage = "Working"` — no trailing dots since v0.85.0 (#8799),
+    // `interactive-mode.ts:451` @v0.87.1.
     assert!(
-        msg.contains("Working..."),
+        msg.ends_with(" Working "),
         "working message missing: [{msg}]"
     );
     // `WorkingStatusIndicator` passes the message straight through and appends NOTHING
@@ -108,16 +109,25 @@ fn retry_uses_warning_spinner_color() {
 }
 
 #[test]
-fn agent_start_renders_band_and_agent_end_clears_it() {
-    // gap 11: AgentStart activates the working band in the live region; AgentEnd returns it to idle
-    // (blank) — the band is rendered between the active turn and the editor.
+fn turn_start_renders_band_and_agent_end_clears_it() {
+    // gap 11: TurnStart activates the working band in the live region; AgentEnd returns it to idle
+    // (blank) — the band is rendered between the active turn and the editor. `agent_start` has not
+    // touched the band since v0.84.4 (#8782); `turn_start` shows it (`interactive-mode.ts:3307-3313`
+    // @v0.87.1), and the production agent loop emits it right after `agent_start`.
     let mut app = App::new(TestBackend::new(60, 16), UiTheme::dark()).unwrap();
     app.ingest_event(&AgentSessionEvent::AgentStart);
     app.draw().unwrap();
+    assert!(
+        !buf_text(&app).contains("Working"),
+        "agent_start alone mounts no band:\n{}",
+        buf_text(&app)
+    );
+    app.ingest_event(&AgentSessionEvent::TurnStart);
+    app.draw().unwrap();
     let working = buf_text(&app);
     assert!(
-        working.contains("Working..."),
-        "working band not rendered after AgentStart:\n{working}"
+        working.contains("Working") && !working.contains("Working..."),
+        "working band not rendered after TurnStart:\n{working}"
     );
     assert!(
         !working.contains("to cancel"),
@@ -135,7 +145,7 @@ fn agent_start_renders_band_and_agent_end_clears_it() {
     app.draw().unwrap();
     let idle = buf_text(&app);
     assert!(
-        !idle.contains("Working..."),
+        !idle.contains("Working"),
         "working band lingered after AgentEnd:\n{idle}"
     );
 }
@@ -476,7 +486,7 @@ fn working_indicator_options_resolve_exactly_as_pis_loader_does() {
     ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"frames": []}))));
     assert_eq!(
         text(&ind, 0),
-        " Working... ",
+        " Working ",
         "`frames: []` hides the indicator entirely"
     );
 
@@ -492,7 +502,7 @@ fn working_indicator_options_resolve_exactly_as_pis_loader_does() {
     assert!(text(&ind, 0).contains(SPINNER_FRAMES[0]));
 }
 
-/// `resetExtensionUI`'s working block (`interactive-mode.ts:2210-2218`), including the one place
+/// `resetExtensionUI`'s working block (`interactive-mode.ts:2376-2384` @v0.87.1), including the one place
 /// upstream ever suffixes a working message — and it says "to interrupt", not "to cancel".
 #[test]
 fn reset_extension_working_state_restores_the_defaults_and_pis_interrupt_suffix() {
@@ -516,7 +526,7 @@ fn reset_extension_working_state_restores_the_defaults_and_pis_interrupt_suffix(
     ind.working();
     let msg = line_text(&ind.lines_at(Duration::ZERO, &theme, None)[1]);
     assert!(
-        msg.contains("Working..."),
+        msg.ends_with(" Working "),
         "visibility + message restored: [{msg}]"
     );
     assert!(!msg.contains(" A "), "the custom frame is gone: [{msg}]");
@@ -531,7 +541,7 @@ fn reset_extension_working_state_restores_the_defaults_and_pis_interrupt_suffix(
     live.reset_extension_working_state(Some("escape"));
     let msg = line_text(&live.lines_at(Duration::ZERO, &theme, None)[1]);
     assert!(
-        msg.contains("Working... (escape to interrupt)"),
-        "pi's `:2213-2217` copy, and it is `to interrupt`, not `to cancel`: [{msg}]"
+        msg.ends_with(" Working (escape to interrupt) "),
+        "pi's `:2382` copy, and it is `to interrupt`, not `to cancel`: [{msg}]"
     );
 }

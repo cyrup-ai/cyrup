@@ -485,13 +485,15 @@ fn c3_mirror_short_status_row_has_no_ellipsis() {
 
 /// **C4.** `Loader extends Text` constructed `super("", 1, 0)` (`loader.ts:35`) — paddingX 1 — and
 /// `Text.render` emits `leftMargin + line + rightMargin` (`text.ts:70,76`). The rendered row is
-/// ` ⠋ Working... `, inset one column.
+/// ` ⠋ Working `, inset one column.
 ///
 /// **C5.** `WorkingStatusIndicator` (`status-indicator.ts:29-40`) is constructed with
 /// `this.workingMessage ?? this.defaultWorkingMessage` and appends nothing
 /// (`interactive-mode.ts:2074-2080`).
 ///
-/// **C12.** `defaultWorkingMessage = "Working..."` — three ASCII dots (`interactive-mode.ts:420`).
+/// **C12.** `defaultWorkingMessage = "Working"` — no dots at all (`interactive-mode.ts:451`
+/// @v0.87.1). It was `"Working..."`, three ASCII dots, through v0.84.4; v0.85.0 dropped them (#8799,
+/// the change that embedded the indicator). The other three kinds keep their ASCII `...`.
 ///
 /// FAILS before the fix on all three: `⠋ Working… (esc to cancel)` at column 0.
 #[test]
@@ -511,12 +513,12 @@ fn c4_c5_c12_working_band_is_inset_ascii_and_carries_no_cancel_suffix() {
         "paddingX 1 right margin missing: [{msg}]"
     );
     assert!(
-        msg.contains("Working..."),
-        "ASCII `...`, not U+2026: [{msg}]"
+        msg.ends_with(" Working "),
+        "`Working` with neither `...` nor U+2026 after it: [{msg}]"
     );
     assert!(
-        !msg.contains('…'),
-        "U+2026 is 1 column where pi draws 3: [{msg}]"
+        !msg.contains('…') && !msg.contains("..."),
+        "no trailing dots since v0.85.0: [{msg}]"
     );
     assert!(
         !msg.contains("to cancel"),
@@ -1277,4 +1279,64 @@ fn c14_mirror_the_segments_pi_does_build_are_all_present_and_ordered() {
             .unwrap_or_else(|| panic!("segment {seg:?} missing or out of order in [{cluster}]"));
         at += found + seg.len();
     }
+}
+
+// ============================================ TUI-119 — an extension footer's own height ======
+
+/// The live region's rows, trailing blanks trimmed.
+fn live_rows(app: &App<TestBackend>) -> Vec<String> {
+    live_text(app)
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+/// **TUI-119.** An extension footer swaps the built-in out of `footerContainer`
+/// (`interactive-mode.ts:2437-2445` @v0.87.1), and that container is sized by what it holds — a
+/// plain `Container` inline, a `minSize: 0` dock entry in fullscreen (`chat-viewport.ts:36`, v0.86.0
+/// #8919). So a one-line custom footer is ONE row directly under the editor's bottom rule, and a
+/// four-line one is four rows, however many the built-in footer would have taken.
+///
+/// FAILS before the fix: the region kept the built-in's 2-row budget, so the one-liner left a blank
+/// row under itself and the four-liner lost its last two lines.
+#[test]
+fn an_extension_footer_takes_exactly_the_rows_it_renders() {
+    let mut app = app(80, 24);
+    let is_rule = |r: &str| !r.is_empty() && r.chars().all(|c| c == '─');
+
+    app.apply_ui_effect(cyrup_session_svc::UiEffect::SetFooter {
+        content: "EXTFOOT".to_string(),
+    });
+    app.draw().unwrap();
+    let rows = live_rows(&app);
+    let n = rows.len();
+    assert_eq!(
+        rows[n - 1],
+        "EXTFOOT",
+        "the one-liner is the LAST row, no blank under it:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        is_rule(&rows[n - 2]),
+        "…directly under the editor's bottom rule:\n{}",
+        rows.join("\n")
+    );
+
+    app.apply_ui_effect(cyrup_session_svc::UiEffect::SetFooter {
+        content: "F-ONE\nF-TWO\nF-THREE\nF-FOUR".to_string(),
+    });
+    app.draw().unwrap();
+    let rows = live_rows(&app);
+    let n = rows.len();
+    assert_eq!(
+        rows[n - 4..],
+        ["F-ONE", "F-TWO", "F-THREE", "F-FOUR"],
+        "all four lines, none cut:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        is_rule(&rows[n - 5]),
+        "…under the editor's bottom rule:\n{}",
+        rows.join("\n")
+    );
 }

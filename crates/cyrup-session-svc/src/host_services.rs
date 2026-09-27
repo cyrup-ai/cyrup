@@ -212,7 +212,8 @@ pub enum UiEffect {
     // INTERACTIVE TUI is a real consumer.
     /// Pi `setWorkingMessage(message?)`, `extensions/types.ts:151` @v0.83.0; the interactive handler
     /// is `interactive-mode.ts:2377-2382` @v0.84.2. `None` is upstream's no-argument call — restore
-    /// `defaultWorkingMessage` (`"Working..."`, `:434`).
+    /// `defaultWorkingMessage` (`"Working"` since v0.85.0 #8799, `interactive-mode.ts:451` @v0.87.1;
+    /// `"Working..."` at `:434` @v0.84.2).
     SetWorkingMessage { message: Option<String> },
     /// Pi `setWorkingVisible(visible)`, `extensions/types.ts:154` @v0.83.0; the interactive handler
     /// is `interactive-mode.ts:2091-2108` @v0.84.2. Independent of the message, which is exactly what

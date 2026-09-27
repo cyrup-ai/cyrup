@@ -1459,6 +1459,12 @@ at all**, so this fix must add one, not merely correct one.)* Add a `delete_sess
 
 ## SEAM-048 — RPC get_commands enumerates the last-wins command HashMap; pi's name:N disambiguation tier is dead code — **CLOSED 2026-08-15 (FIXED — the routed residual was refuted; the real one was `native_command_names`)**
 
+> **Note 2026-09-27 (on `claude/tui-lows`, `TUI-076`).** `slash_command_catalog()` rows now carry a
+> cyrup-original `registeredName` (the pre-suffix name, set only when it differs from `invocationName`) so
+> the TUI can drop a suffixed builtin collision the way pi's interactive filter does. It is in-process
+> only: `slash_command_catalog_wire()` (`session/commands.rs:180`) strips it from RPC `get_commands` and
+> the guest `get-commands` import, so the wire rows still match pi's.
+
 **Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** high
 
 > **Corrected this pass.** The auditor filed this as "the catalog and the dispatcher use two

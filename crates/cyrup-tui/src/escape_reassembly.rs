@@ -153,6 +153,14 @@ impl EscapeReassembler {
         !self.held.is_empty()
     }
 
+    /// Whether the one held event is a bare `Esc` — Pi's `this.buffer === ESC` (v0.84.2
+    /// `stdin-buffer.ts:388`), the only hold that gets the escape timeout rather than the sequence
+    /// timeout. The reader thread widens its poll to that timeout for exactly this state (`TUI-106`).
+    #[must_use]
+    pub fn is_holding_lone_escape(&self) -> bool {
+        self.state == State::Esc
+    }
+
     /// Feed one crossterm event, appending whatever should be forwarded to `out`.
     pub fn push(&mut self, ev: Event, out: &mut Vec<Event>) {
         match self.step(ev) {

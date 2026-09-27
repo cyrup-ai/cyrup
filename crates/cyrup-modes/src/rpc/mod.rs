@@ -1326,7 +1326,7 @@ async fn handle(
         SessionCommand::GetCommands => RpcResponse::ok(
             "get_commands",
             raw_id.clone(),
-            Some(json!({ "commands": session.slash_command_catalog() })),
+            Some(json!({ "commands": session.slash_command_catalog_wire() })),
         ),
 
         // Unreachable: `dispatch` intercepts the `#[serde(other)]` unknown-type variant before it

@@ -134,6 +134,12 @@ pub struct Autocomplete {
     completions: Vec<Completion>,
     /// The rendered popup widget (selection/scroll state).
     pub list: SelectList,
+    /// Whether the popup came from a FORCED request — pi's `autocompleteState === "force"`
+    /// (`components/editor.ts:2409` @v0.86.0). The editor re-asks with the same `force` on every
+    /// edit while the popup stays open (`:2468`), so a Tab-opened path list keeps narrowing on a
+    /// `/`-line that the unforced branch treats as terminal. Set by the editor, never by
+    /// [`Autocomplete::compute`], which only answers the request it was given.
+    pub(crate) forced: bool,
 }
 
 impl Autocomplete {
@@ -160,22 +166,30 @@ impl Autocomplete {
         // 1. Slash command (`autocomplete.ts:313-363` @v0.84.3) — the name list before the first
         //    space, the argument list after it.
         //
-        //    DEVIATION, deliberate: upstream gates this whole arm on `!options.force` (`:313`), so
-        //    `/mod` + Tab there falls through to `extractPathPrefix` and lists the working
-        //    directory. cyrup tries it on the forced path too — completing a command (or its
-        //    argument) is exactly what Tab is for, and answering `/model g<Tab>` with a directory
-        //    listing is a wrong answer rather than a missing one.
+        //    DEVIATION, deliberate: upstream gates this whole arm on `!options.force`
+        //    (`autocomplete.ts:318` @v0.86.0). pi's Tab never forces a `/name` still being typed
+        //    (`handleTabCompletion`, `components/editor.ts:2263-2274` @v0.86.0 — ported in
+        //    `InputEditor::trigger_completion`), so the gate only bites once a space is typed:
+        //    `/model g<Tab>` there skips the argument list and lists the working directory. cyrup
+        //    tries the argument list on the forced path too — completing an argument is exactly
+        //    what Tab is for, and answering it with a directory listing is a wrong answer rather
+        //    than a missing one.
         if let Some(ac) = slash_context(registry, arguments, &before) {
             return Some(ac);
         }
-        // A `/name <arg>` line whose command OWNS a completer is TERMINAL: upstream returns out of
-        // the slash branch whether or not it found items (`:351-353` no completer → `null`,
-        // `:356-357` empty result → `null`, `:358-363` otherwise). Without this the no-match case
-        // would fall through and answer a model query with a directory listing.
-        //
-        // A `/`-line with NO completer still falls through, which is a pre-existing cyrup
-        // deviation and the reason `/export ./sr<Tab>` completes a path.
+        // The forced half of the deviation above: a `/name <arg>` line whose command OWNS a
+        // completer stays terminal on Tab too, rather than falling through to a path listing.
         if argument_completer(registry, &before).is_some() {
+            return None;
+        }
+        // TUI-077 — the unforced slash branch is TERMINAL upstream: every exit of the
+        // `!options.force && textBeforeCursor.startsWith("/")` block returns — the name list or
+        // `null` (`:345`), no completer (`:361`), an empty argument answer (`:366`) — and
+        // `extractPathPrefix` (`:375`) is reached only outside it. So `/export ./sr` and
+        // `/Users/dav` offer no paths while a popup is open. A FORCED popup (Tab on `/export ./sr`)
+        // is unaffected: the editor re-asks with `force` for as long as it stays open, pi's
+        // `autocompleteState === "force"` (`components/editor.ts:2468`).
+        if !force && before.starts_with('/') {
             return None;
         }
         // 2. Bare path.
@@ -221,16 +235,18 @@ impl Autocomplete {
                 if completion.is_dir { "" } else { " " },
                 0,
             ),
-            // Mention: `@{path}` — quote the path when it contains whitespace
-            // (`buildCompletionValue`, `autocomplete.ts:106-120`, `@"…"`). A FILE closes the token
-            // with a space; a DIRECTORY does not, so the user can keep autocompleting inside it —
-            // `const suffix = isDirectory ? "" : " "` under the comment "Don't add space after
-            // directories so user can continue autocompleting" (`:414-417`). The `/` that makes it
-            // `@src/` rather than `@src` is already on `completion.value`, from the candidate
-            // (`completionPath = isDirectory ? `${displayPath}/` : displayPath`, `:794`).
+            // Mention: `@{path}` — quote the path when it contains whitespace or CJK punctuation
+            // (`buildCompletionValue`, `autocomplete.ts:112-125` @v0.86.0, `@"…"`; the test is
+            // `autocompleteSeparatorRegex.test(path)`, `:116`), since either would re-split it.
+            // A FILE closes the token with a space; a DIRECTORY does not, so the user can keep
+            // autocompleting inside it — `const suffix = isDirectory ? "" : " "` under the comment
+            // "Don't add space after directories so user can continue autocompleting"
+            // (`:414-417`). The `/` that makes it `@src/` rather than `@src` is already on
+            // `completion.value`, from the candidate (`completionPath = isDirectory ?
+            // `${displayPath}/` : displayPath`, `:794`).
             CompletionContext::Mention => {
                 let path = &completion.value;
-                let quoted = path.contains(char::is_whitespace);
+                let quoted = path.chars().any(is_autocomplete_separator);
                 let rendered = if quoted {
                     format!("@\"{path}\"")
                 } else {
@@ -331,6 +347,7 @@ fn argument_context(
         prefix: argument.to_string(),
         completions,
         list,
+        forced: false,
     })
 }
 
@@ -504,10 +521,38 @@ fn thinking_rows(levels: &[String], argument: &str) -> Option<(Vec<SelectItem>, 
 /// The command-NAME list (`autocomplete.ts:316-341` @v0.84.3): fuzzy-filter every registered command
 /// by the text after the `/`, with `prefix = textBeforeCursor` (`:340`) — the whole `/…` token, which
 /// is what [`Autocomplete::apply`]'s slash arm replaces.
+///
+/// TUI-100 — a skill row is ranked on its BARE name, so `/rev` scores `skill:review` from the `r`
+/// rather than past a six-character prefix; the inserted value is still the full `skill:<name>`.
+///
+/// Two passes, not v0.86.0's single key function. v0.86.0 (#9120, `autocomplete.ts:335-339`)
+/// keyed skills on the bare name unless the query started with `skill:`, which made `/skill` — a
+/// prefix of every skill's full name and a subsequence of none of their bare names — list no skill
+/// at all (#9944). Upstream's fix, `36af9dc48` (after v0.87.1, not yet in a tag), is what is ported:
+/// every command ranked with skills on their bare name, then the skills that matched only on the
+/// full name, ranked on it, after them.
 fn command_name_context(registry: &CommandRegistry, before: &str) -> Option<Autocomplete> {
+    const SKILL_PREFIX: &str = "skill:";
     let query = before.get(1..).unwrap_or("");
     let commands = registry.commands();
-    let matches = fuzzy::filter(commands, query, |c| c.name.as_ref());
+    // `bareNameMatches`: `item.name.startsWith("skill:") ? item.name.slice(6) : item.name`.
+    let mut matches = fuzzy::filter(commands, query, |c| {
+        let name = c.name.as_ref();
+        name.strip_prefix(SKILL_PREFIX).unwrap_or(name)
+    });
+    // `fullNameOnlyMatches`: the skill rows the first pass did not take, keyed on the full name.
+    let full_name_only: Vec<(usize, &crate::commands::SlashCommand)> = commands
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| c.name.starts_with(SKILL_PREFIX) && !matches.iter().any(|m| m.index == *i))
+        .collect();
+    let second = fuzzy::filter(&full_name_only, query, |(_, c)| c.name.as_ref());
+    matches.extend(second.into_iter().filter_map(|m| {
+        full_name_only.get(m.index).map(|&(index, _)| fuzzy::Match {
+            index,
+            score: m.score,
+        })
+    }));
     if matches.is_empty() {
         return None;
     }
@@ -535,6 +580,7 @@ fn command_name_context(registry: &CommandRegistry, before: &str) -> Option<Auto
         prefix: before.to_string(),
         completions,
         list,
+        forced: false,
     })
 }
 
@@ -558,6 +604,38 @@ pub fn is_command_prefix(registry: &CommandRegistry, query: &str) -> bool {
 
 /// Path delimiters that bound the trailing token (`PATH_DELIMITERS`, `autocomplete.ts:7`).
 const PATH_DELIMS: [char; 5] = [' ', '\t', '"', '\'', '='];
+
+/// pi's `cjkPunctuationRegex` (`utils.ts:58-61` @v0.86.0, #9746):
+/// `(?:(?=\p{Punctuation})${cjkBreakRegex.source}|[，．：；！？（）［］｛｝“”‘’…—])` — punctuation that is
+/// ALSO in one of `cjkBreakRegex`'s five `Script_Extensions` (`:54-55`), plus a fixed list of
+/// fullwidth/typographic marks that sit in `Common`. The lookahead is a class intersection here.
+/// CJK LETTERS are deliberately not separators ("CJK letters remain part of words and paths",
+/// `:57`), so `文件/说明.md` stays one token.
+const CJK_PUNCTUATION_PATTERN: &str = r"^(?:[\p{Punctuation}&&[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}\p{scx=Hangul}\p{scx=Bopomofo}]]|[，．：；！？（）［］｛｝“”‘’…—])$";
+
+/// [`CJK_PUNCTUATION_PATTERN`], compiled once. A constant pattern, so `None` is unreachable.
+static CJK_PUNCTUATION: std::sync::LazyLock<Option<regex::Regex>> =
+    std::sync::LazyLock::new(|| regex::Regex::new(CJK_PUNCTUATION_PATTERN).ok());
+
+/// pi's `autocompleteSeparatorRegex` (`utils.ts:62` @v0.86.0): whitespace or CJK punctuation — the
+/// boundary a completion token starts after and the characters that force a completed path into
+/// quotes. `char::is_whitespace` is Unicode `White_Space`, which is JS `\s` less U+FEFF plus U+0085;
+/// neither is a character a key event or `sanitize_paste` leaves in the buffer.
+fn is_autocomplete_separator(c: char) -> bool {
+    if c.is_whitespace() {
+        return true;
+    }
+    let mut buf = [0u8; 4];
+    CJK_PUNCTUATION
+        .as_ref()
+        .is_some_and(|re| re.is_match(c.encode_utf8(&mut buf)))
+}
+
+/// `findLastDelimiter`'s per-character test (`autocomplete.ts:47-57` @v0.86.0):
+/// `PATH_DELIMITERS.has(character) || autocompleteSeparatorRegex.test(character)`.
+fn is_path_delimiter(c: char) -> bool {
+    PATH_DELIMS.contains(&c) || is_autocomplete_separator(c)
+}
 
 /// Bare-path context (`extractPathPrefix` `:480-507` + `getFileSuggestions` `:560-693`).
 fn path_context(before: &str, force: bool, cwd: &Path) -> Option<Autocomplete> {
@@ -608,6 +686,7 @@ fn path_context(before: &str, force: bool, cwd: &Path) -> Option<Autocomplete> {
         prefix: raw_token,
         completions,
         list,
+        forced: false,
     })
 }
 
@@ -627,14 +706,16 @@ fn find_unclosed_quote_start(text: &str) -> Option<usize> {
     in_quotes.then_some(quote_start)
 }
 
-/// `isTokenStart` (`autocomplete.ts:70-72`): index 0, or preceded by a [`PATH_DELIMS`] character.
+/// `isTokenStart` (`autocomplete.ts:75-77` @v0.86.0): index 0, or preceded by a [`PATH_DELIMS`]
+/// character or an autocomplete separator — `tokenStartRegex` is `(?:^|separator)$` over
+/// `text.slice(0, index)` (`:9`), so `，@src` starts a token as `␠@src` does.
 fn is_token_start(text: &str, index: usize) -> bool {
     if index == 0 {
         return true;
     }
     text.get(..index)
         .and_then(|s| s.chars().next_back())
-        .is_some_and(|c| PATH_DELIMS.contains(&c))
+        .is_some_and(is_path_delimiter)
 }
 
 /// `extractQuotedPrefix` (`autocomplete.ts:74-92`): when a quote is open, the token is everything
@@ -655,7 +736,8 @@ fn extract_quoted_prefix(text: &str) -> Option<String> {
     text.get(quote_start..).map(str::to_string)
 }
 
-/// The trailing token of `before`, bounded by [`PATH_DELIMS`] / start-of-line.
+/// The trailing token of `before`, bounded by [`PATH_DELIMS`], an autocomplete separator, or
+/// start-of-line.
 ///
 /// **TUI-013.** An unclosed quote wins over the delimiter split, exactly as
 /// `extractPathPrefix`/`extractAtPrefix` order the two upstream (`autocomplete.ts:463-470` and
@@ -667,8 +749,15 @@ fn trailing_token(before: &str) -> String {
     if let Some(quoted) = extract_quoted_prefix(before) {
         return quoted;
     }
-    match before.rfind(PATH_DELIMS) {
-        Some(idx) => before.get(idx + 1..).unwrap_or("").to_string(),
+    // `findLastDelimiter` (`autocomplete.ts:47-57` @v0.86.0) — CJK punctuation bounds the token
+    // too (TUI-101), so `看看，@src` yields `@src` rather than one unbroken `看看，@src`. The token
+    // starts past the delimiter's full UTF-8 width: `，` is three bytes, not one.
+    match before
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| is_path_delimiter(c))
+    {
+        Some((idx, c)) => before.get(idx + c.len_utf8()..).unwrap_or("").to_string(),
         None => before.to_string(),
     }
 }
@@ -763,16 +852,27 @@ pub fn mention_autocomplete(before: &str, candidates: &[String]) -> Option<Autoc
     }
     // Pi's `score > 0` guard is implied — every row `fuzzy::filter` returns already matched — with
     // one exception it also encodes: for an EMPTY query pi never calls `scoreEntry` at all
-    // (`:769` `fdQuery ? this.scoreEntry(…) : 1`), so a bare `@` gets no bonus and the whole tree
-    // stays in its listed order. `sort_by` is stable, so equal adjusted scores keep fuzzy's order.
+    // (`:769` `fdQuery ? this.scoreEntry(…) : 1`), so a bare `@` gets no bonus and every entry
+    // ties.
     if !query.is_empty() {
         for m in &mut matches {
             if candidates.get(m.index).is_some_and(|p| p.ends_with('/')) {
                 m.score -= DIRECTORY_SCORE_BONUS;
             }
         }
-        matches.sort_by(|a, b| a.score.total_cmp(&b.score));
     }
+    // TUI-111 — ties break by path depth, then length, then path (`autocomplete.ts:771-784`
+    // @v0.84.4, #8669), so `@readme` offers `README.md` ahead of `docs/archive/README.md` and a
+    // bare `@` lists the top level first. Runs for the empty query too, where upstream's constant
+    // score of `1` makes the tie-break the whole ordering.
+    matches.sort_by(|a, b| {
+        a.score.total_cmp(&b.score).then_with(|| {
+            match (candidates.get(a.index), candidates.get(b.index)) {
+                (Some(pa), Some(pb)) => mention_tie_break(pa, pb),
+                _ => std::cmp::Ordering::Equal,
+            }
+        })
+    });
     let mut items = Vec::with_capacity(matches.len());
     let mut completions = Vec::with_capacity(matches.len());
     for m in &matches {
@@ -793,7 +893,25 @@ pub fn mention_autocomplete(before: &str, candidates: &[String]) -> Option<Autoc
         prefix: token,
         completions,
         list,
+        forced: false,
     })
+}
+
+/// The equal-score order of two mention candidates (`autocomplete.ts:771-784` @v0.84.4):
+/// `split("/").filter(Boolean).length` depth, then `path.length` (UTF-16 units, as JS counts them —
+/// a directory's trailing `/` included, as in the `fd` line upstream measures), then the path.
+///
+/// DEVIATION: the last rung is `localeCompare` upstream. cyrup-tui carries no collator, so this is
+/// the lowercase-then-byte order `auth_select::provider_rows` already uses for pi's
+/// `localeCompare` — the same answer for the ASCII paths it has to separate, and reached only by
+/// two paths of equal score, depth and length.
+fn mention_tie_break(a: &str, b: &str) -> std::cmp::Ordering {
+    let depth = |p: &str| p.split('/').filter(|s| !s.is_empty()).count();
+    depth(a)
+        .cmp(&depth(b))
+        .then_with(|| a.encode_utf16().count().cmp(&b.encode_utf16().count()))
+        .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+        .then_with(|| a.cmp(b))
 }
 
 /// List repo files AND directories for `@`-mention search (`autocomplete.ts:719-772`), capped at
@@ -817,40 +935,87 @@ pub fn list_files(cwd: &Path, limit: usize) -> Vec<String> {
 /// store. A directory is marked by the trailing `/` fd prints for it, which is exactly how pi tags
 /// its own results (`:205-207` `const hasTrailingSeparator = displayLine.endsWith("/")`); the
 /// candidate list therefore stays a plain `Vec<String>`.
+///
+/// TUI-111 — two runs, as pi's `getFuzzyFileSuggestions` (`autocomplete.ts:749-759` @v0.84.4,
+/// #8669): a `--max-depth 1` pass over the base directory (`getBaseDirSuggestions`, `:724-734`)
+/// and then the recursive one, merged base-first by [`merge_base_first`] before the cap. `fd`'s
+/// recursive order follows its parallel walk, so without the first pass a tree that prints more
+/// than `limit` lines can leave a top-level file out of the candidate set altogether.
 fn fd_list(cwd: &Path, limit: usize) -> Option<Vec<String>> {
-    let output = std::process::Command::new("fd")
-        .args([
-            "--type",
-            "f",
-            "--type",
-            "d",
-            "--follow",
-            "--hidden",
-            "--color",
-            "never",
-            "--strip-cwd-prefix",
-            "--exclude",
-            ".git",
-            "--exclude",
-            ".git/*",
-            "--exclude",
-            ".git/**",
-        ])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut files: Vec<String> = text
-        .lines()
-        .filter(|l| !l.is_empty())
-        .take(limit)
-        .map(|l| l.replace('\\', "/"))
-        .collect();
+    fd_list_with(limit, |max_depth| {
+        let output = std::process::Command::new("fd")
+            .args(fd_args(max_depth))
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        Some(
+            text.lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| l.replace('\\', "/"))
+                .collect(),
+        )
+    })
+}
+
+/// [`fd_list`]'s two-pass shape over an injected `run` (one `fd` invocation for a given
+/// `--max-depth`), so the pass order and the merge are testable without `fd` installed: the
+/// depth-1 pass, then the recursive pass, merged base-first and capped, then sorted. Either run
+/// failing is `None`, which sends [`list_files`] to the fallback walk.
+pub(crate) fn fd_list_with(
+    limit: usize,
+    mut run: impl FnMut(Option<&str>) -> Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let base = run(Some("1"))?;
+    let recursive = run(None)?;
+    let mut files = merge_base_first(base, recursive, limit);
     files.sort();
     Some(files)
+}
+
+/// The `fd` argv for one pass. `max_depth` is appended as pi does,
+/// `if (maxDepth !== undefined) args.push("--max-depth", String(maxDepth))` (`:151-153` @v0.84.4).
+pub(crate) fn fd_args(max_depth: Option<&str>) -> Vec<&str> {
+    let mut args = vec![
+        "--type",
+        "f",
+        "--type",
+        "d",
+        "--follow",
+        "--hidden",
+        "--color",
+        "never",
+        "--strip-cwd-prefix",
+        "--exclude",
+        ".git",
+        "--exclude",
+        ".git/*",
+        "--exclude",
+        ".git/**",
+    ];
+    if let Some(depth) = max_depth {
+        args.extend(["--max-depth", depth]);
+    }
+    args
+}
+
+/// Merge the depth-1 and recursive `fd` runs the way pi does (`autocomplete.ts:751-759` @v0.84.4):
+/// every base-directory entry first, then each recursive entry not already seen, de-duplicated by
+/// path — and only THEN cap at `limit`, so the base directory survives a truncated recursive run.
+pub(crate) fn merge_base_first(
+    base: Vec<String>,
+    recursive: Vec<String>,
+    limit: usize,
+) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    base.into_iter()
+        .chain(recursive)
+        .filter(|path| seen.insert(path.clone()))
+        .take(limit)
+        .collect()
 }
 
 /// A bounded breadth-first walk used when `fd` is not installed: visits at most `limit * 8` entries,

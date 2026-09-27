@@ -595,6 +595,20 @@ pub fn dynamic_commands_from_catalog_gated(
                 "skill" => return None,
                 _ => return None,
             };
+            // TUI-076 — pi filters extension commands on the ORIGINAL registered name and only then
+            // maps to `invocationName` (`interactive-mode.ts:748-753` @v0.87.1), so a builtin
+            // collision drops out of the menu even after the runner suffixed it to `model:1`. The
+            // catalog's `name` is already the invocation name; the original rides alongside as
+            // `registeredName` when the two differ, and is `name` itself otherwise.
+            if kind == CommandSource::Extension {
+                let registered = row
+                    .get("registeredName")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(name);
+                if BUILTIN_SLASH_COMMANDS.iter().any(|c| c.name == registered) {
+                    return None;
+                }
+            }
             let description = row
                 .get("description")
                 .and_then(serde_json::Value::as_str)

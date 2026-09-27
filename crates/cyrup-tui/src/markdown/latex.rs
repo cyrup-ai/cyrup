@@ -1,4 +1,7 @@
-//! LaTeX math → terminal Unicode, a port of `pi/packages/tui/src/latex.ts` (v0.84.1, 1373 lines).
+//! LaTeX math → terminal Unicode, a port of `pi/packages/tui/src/latex.ts` (v0.84.1, 1373 lines),
+//! brought to v0.86.0 (1506 lines): the v0.84.2 line-ending fixes, the v0.85.0 join symbols, and
+//! the v0.86.0 font switches, `cases` layout and display-script layout. Bare `latex.ts:N` cites
+//! are v0.84.1 lines; the v0.84.2+ additions cite their tag.
 //!
 //! A child module of `markdown` because it has exactly one consumer, matching upstream's own
 //! `import { renderLatex } from "../latex.ts"` at `markdown.ts:2`.
@@ -40,6 +43,7 @@ static SYMBOLS: &[(&str, &str)] = &[
     ("Delta", "Δ"),
     ("Gamma", "Γ"),
     ("Im", "ℑ"),
+    ("Join", "⋈"),
     ("Lambda", "Λ"),
     ("Leftarrow", "⇐"),
     ("Leftrightarrow", "⇔"),
@@ -81,6 +85,7 @@ static SYMBOLS: &[(&str, &str)] = &[
     ("bigvee", "⋁"),
     ("bigwedge", "⋀"),
     ("bot", "⊥"),
+    ("bowtie", "⋈"),
     ("bullet", "•"),
     ("cap", "∩"),
     ("cdot", "·"),
@@ -110,6 +115,7 @@ static SYMBOLS: &[(&str, &str)] = &[
     ("eta", "η"),
     ("exists", "∃"),
     ("forall", "∀"),
+    ("fullouterjoin", "⟗"),
     ("gamma", "γ"),
     ("ge", "≥"),
     ("geq", "≥"),
@@ -141,6 +147,7 @@ static SYMBOLS: &[(&str, &str)] = &[
     ("leftarrow", "←"),
     ("leftharpoondown", "↽"),
     ("leftharpoonup", "↼"),
+    ("leftouterjoin", "⟕"),
     ("leftrightarrow", "↔"),
     ("leftrightharpoons", "⇋"),
     ("leq", "≤"),
@@ -153,6 +160,7 @@ static SYMBOLS: &[(&str, &str)] = &[
     ("longrightarrow", "→"),
     ("lor", "∨"),
     ("lozenge", "◊"),
+    ("ltimes", "⋉"),
     ("lvert", "|"),
     ("mapsto", "↦"),
     ("mid", "∣"),
@@ -200,7 +208,9 @@ static SYMBOLS: &[(&str, &str)] = &[
     ("rightharpoondown", "⇁"),
     ("rightharpoonup", "⇀"),
     ("rightleftharpoons", "⇌"),
+    ("rightouterjoin", "⟖"),
     ("rightsquigarrow", "⇝"),
+    ("rtimes", "⋊"),
     ("rvert", "|"),
     ("searrow", "↘"),
     ("setminus", "∖"),
@@ -428,6 +438,7 @@ static DISPLAY_LIMIT_SYMBOLS: &[&str] = &[
 ];
 /// `RELATION_COMMANDS` (`latex.ts`), sorted for binary search.
 static RELATION_COMMANDS: &[&str] = &[
+    "Join",
     "Leftarrow",
     "Leftrightarrow",
     "Longleftarrow",
@@ -438,11 +449,13 @@ static RELATION_COMMANDS: &[&str] = &[
     "Vvdash",
     "approx",
     "asymp",
+    "bowtie",
     "cong",
     "dashv",
     "doteq",
     "downarrow",
     "equiv",
+    "fullouterjoin",
     "ge",
     "geq",
     "geqslant",
@@ -458,6 +471,7 @@ static RELATION_COMMANDS: &[&str] = &[
     "leftarrow",
     "leftharpoondown",
     "leftharpoonup",
+    "leftouterjoin",
     "leftrightarrow",
     "leftrightharpoons",
     "leq",
@@ -467,6 +481,7 @@ static RELATION_COMMANDS: &[&str] = &[
     "longleftrightarrow",
     "longmapsto",
     "longrightarrow",
+    "ltimes",
     "mapsto",
     "mid",
     "models",
@@ -487,7 +502,9 @@ static RELATION_COMMANDS: &[&str] = &[
     "rightharpoondown",
     "rightharpoonup",
     "rightleftharpoons",
+    "rightouterjoin",
     "rightsquigarrow",
+    "rtimes",
     "searrow",
     "sim",
     "simeq",
@@ -527,6 +544,9 @@ static SPACING_COMMANDS: &[&str] = &[
 ];
 /// `NEGATIVE_SPACING_COMMANDS` (`latex.ts`), sorted for binary search.
 static NEGATIVE_SPACING_COMMANDS: &[&str] = &["!", "negmedspace", "negthickspace", "negthinspace"];
+/// `FONT_SWITCH_COMMANDS` (v0.86.0 `latex.ts:526`), sorted for binary search — the legacy
+/// `{\bf x}` forms, which change the font of the rest of their group and so take no argument.
+static FONT_SWITCH_COMMANDS: &[&str] = &["bf", "cal", "it", "rm", "sf", "sl", "tt"];
 /// `IGNORED_COMMANDS` (`latex.ts`), sorted for binary search.
 static IGNORED_COMMANDS: &[&str] = &[
     "displaystyle",
@@ -634,7 +654,7 @@ fn replace_characters(
     Some(out)
 }
 
-/// `value.replace(/\s*([=+-])\s*/g, "$1")` (`latex.ts:602`).
+/// `value.replace(/\s*([=+-])\s*/g, "$1")` (v0.86.0 `latex.ts:615`).
 fn collapse_around_ops(s: &str) -> String {
     let mut out = String::new();
     let mut it = s.chars().peekable();
@@ -666,15 +686,26 @@ fn is_digits_dot(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_numeric() || c == '.')
 }
 
-/// `formatScript` (`latex.ts:599-612`): Unicode super/subscripts when EVERY character maps, else the
-/// `^x` / `_x` / `^(xy)` textual fallback. The fallback tests the pre-collapse `value`, not the
-/// collapsed one — `:606-610` reads `value`, and `:602` only fed the lookup.
-fn format_script(value: &str, sub: bool) -> String {
-    let value = value.trim();
+/// `normalizeScriptValue` (v0.86.0 `latex.ts:614-616`).
+fn normalize_script_value(value: &str) -> String {
+    collapse_around_ops(value.trim())
+}
+
+/// `formatUnicodeScript` (v0.86.0 `latex.ts:618-620`) — Unicode super/subscripts when EVERY
+/// character maps.
+fn format_unicode_script(value: &str, sub: bool) -> Option<String> {
     let table = if sub { SUBSCRIPTS } else { SUPERSCRIPTS };
-    if let Some(u) = replace_characters(&collapse_around_ops(value), table) {
+    replace_characters(&normalize_script_value(value), table)
+}
+
+/// `formatScript` (v0.86.0 `latex.ts:622-634`): [`format_unicode_script`], else the `^x` / `_x` /
+/// `^(xy)` textual fallback over the normalized value.
+fn format_script(value: &str, sub: bool) -> String {
+    let value = normalize_script_value(value);
+    if let Some(u) = format_unicode_script(&value, sub) {
         return u;
     }
+    let value = value.as_str();
     let prefix = if sub { '_' } else { '^' };
     let single = value.chars().count() == 1;
     let alpha_sub = sub && !value.is_empty() && value.chars().all(|c| c.is_ascii_alphabetic());
@@ -796,6 +827,12 @@ enum LayoutNode {
     },
     Operator {
         operator: String,
+        lower: Option<String>,
+        upper: Option<String>,
+    },
+    /// `ScriptNode` (v0.86.0 `latex.ts:680-684`) — a display-mode script pair Unicode cannot
+    /// express, set above and below the baseline.
+    Script {
         lower: Option<String>,
         upper: Option<String>,
     },
@@ -975,6 +1012,29 @@ fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
                         baseline,
                     });
                 }
+                LayoutNode::Script { lower, upper } => {
+                    // v0.86.0 `:795-807` — the upper rows, a blank baseline row the base sits on,
+                    // then the lower rows, all left-aligned.
+                    let upper = upper.as_deref().map(|u| render_layout(u, nodes));
+                    let lower = lower.as_deref().map(|l| render_layout(l, nodes));
+                    let width = upper
+                        .as_ref()
+                        .map_or(0, |u| u.width)
+                        .max(lower.as_ref().map_or(0, |l| l.width));
+                    let mut lines: Vec<String> = Vec::new();
+                    if let Some(u) = &upper {
+                        lines.extend(u.lines.iter().map(|l| pad_layout_line(l, width, false)));
+                    }
+                    lines.push(" ".repeat(width));
+                    if let Some(l) = &lower {
+                        lines.extend(l.lines.iter().map(|l| pad_layout_line(l, width, false)));
+                    }
+                    layouts.push(Layout {
+                        lines,
+                        width,
+                        baseline: upper.as_ref().map_or(0, |u| u.lines.len()),
+                    });
+                }
                 LayoutNode::Matrix {
                     lines: mlines,
                     baseline,
@@ -1051,6 +1111,8 @@ struct Parser<'a> {
     position: usize,
     supported: bool,
     stack_fractions: bool,
+    /// `scriptDepth` (v0.86.0 `latex.ts:845`) — how many script arguments the walk is inside.
+    script_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -1062,6 +1124,7 @@ impl<'a> Parser<'a> {
             position: 0,
             supported: true,
             stack_fractions: true,
+            script_depth: 0,
         }
     }
 
@@ -1120,8 +1183,7 @@ impl<'a> Parser<'a> {
             if character == '^' || character == '_' {
                 self.position += 1;
                 result = result.trim_end().to_string();
-                let arg = self.parse_required_argument(false);
-                let script = format_script(&arg, character == '_');
+                let script = self.parse_scripts(character == '_');
                 if result.ends_with(NAMED_OPERATOR_END) {
                     // The script goes INSIDE the operator sentinel so the spacing pass still sees
                     // the operator's boundary (`:857-861`).
@@ -1175,6 +1237,83 @@ impl<'a> Parser<'a> {
         result
     }
 
+    /// `parseScripts` (v0.86.0 `latex.ts:949-1005`) — the script after `^` / `_`, paired with an
+    /// immediately following opposite script. In display mode a script Unicode cannot express, or
+    /// one nested inside another script's argument, becomes a [`LayoutNode::Script`] instead of
+    /// the flat `^(…)` fallback, unless it holds a `/` or is multi-character lowercase text with no
+    /// layout inside it.
+    fn parse_scripts(&mut self, initial_sub: bool) -> String {
+        let mut sub: Option<String> = None;
+        let mut sup: Option<String> = None;
+        let mut order: Vec<bool> = Vec::new();
+        let mut parse = |parser: &mut Self, is_sub: bool| {
+            parser.script_depth += 1;
+            let value = parser.parse_required_argument(false);
+            parser.script_depth -= 1;
+            if is_sub {
+                sub = Some(value);
+            } else {
+                sup = Some(value);
+            }
+            order.push(is_sub);
+        };
+
+        parse(self, initial_sub);
+        let mut next_position = self.position;
+        while self.at(next_position).is_some_and(char::is_whitespace) {
+            next_position += 1;
+        }
+        let next_marker = self.at(next_position);
+        let opposite = if initial_sub { '^' } else { '_' };
+        if next_marker == Some(opposite) {
+            self.position = next_position + 1;
+            parse(self, !initial_sub);
+        }
+
+        let sub_unicode = sub.as_deref().and_then(|s| format_unicode_script(s, true));
+        let sup_unicode = sup.as_deref().and_then(|s| format_unicode_script(s, false));
+        // `value.includes("/") || (!value.includes(START) && Array.from(value).length > 1 &&
+        // !/[A-Z*∗]/.test(value))` — prose-like and fraction scripts stay flat (`:976-981`).
+        let can_use_layout = ![sub.as_deref(), sup.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|v| {
+                v.contains('/')
+                    || (!v.contains(LAYOUT_MARKER_START)
+                        && v.chars().count() > 1
+                        && !v
+                            .chars()
+                            .any(|c| c.is_ascii_uppercase() || c == '*' || c == '∗'))
+            });
+        let needs_layout = self.display
+            && can_use_layout
+            && (self.script_depth > 0
+                || (sub.is_some() && sub_unicode.is_none())
+                || (sup.is_some() && sup_unicode.is_none()));
+        if !needs_layout {
+            return order
+                .iter()
+                .map(|&is_sub| {
+                    let (unicode, value) = if is_sub {
+                        (&sub_unicode, &sub)
+                    } else {
+                        (&sup_unicode, &sup)
+                    };
+                    unicode.clone().unwrap_or_else(|| {
+                        format_script(value.as_deref().unwrap_or_default(), is_sub)
+                    })
+                })
+                .collect();
+        }
+
+        self.nodes.push(LayoutNode::Script {
+            lower: sub.as_deref().map(normalize_output),
+            upper: sup.as_deref().map(normalize_output),
+        });
+        let index = self.nodes.len() - 1;
+        format!("{LAYOUT_MARKER_START}{index}{LAYOUT_MARKER_END}")
+    }
+
     /// `parseWhitespace` (`latex.ts:905-910`) — a run of whitespace collapses to one space.
     fn parse_whitespace(&mut self) -> String {
         while self.cur().is_some_and(char::is_whitespace) {
@@ -1191,6 +1330,15 @@ impl<'a> Parser<'a> {
             return String::new();
         }
         let first = self.cur().unwrap_or('\0');
+        if first == '\n' || first == '\r' {
+            // A backslash before a line ending is a control space, as `\ ` is (v0.84.2; v0.86.0
+            // `:1023-1029`).
+            self.position += 1;
+            if first == '\r' && self.cur() == Some('\n') {
+                self.position += 1;
+            }
+            return " ".to_string();
+        }
         let command: String = if first.is_ascii_alphabetic() {
             let start = self.position;
             while self.cur().is_some_and(|c| c.is_ascii_alphabetic()) {
@@ -1210,6 +1358,13 @@ impl<'a> Parser<'a> {
         }
         if has(NEGATIVE_SPACING_COMMANDS, &command) {
             return NEGATIVE_SPACE.to_string();
+        }
+        if has(FONT_SWITCH_COMMANDS, &command) {
+            // The switch and the whitespace that ends its name both vanish (v0.86.0 `:1050-1055`).
+            while self.cur().is_some_and(char::is_whitespace) {
+                self.position += 1;
+            }
+            return String::new();
         }
         if has(IGNORED_COMMANDS, &command) {
             return String::new();
@@ -1460,9 +1615,10 @@ impl<'a> Parser<'a> {
         value
     }
 
-    /// `parseRequiredArgumentValue` (`latex.ts:1143-1160`).
+    /// `parseRequiredArgumentValue` (v0.86.0 `latex.ts:1260-1277`) — an argument may start on the
+    /// next line (v0.84.2).
     fn parse_required_argument_value(&mut self) -> String {
-        while self.cur().is_some_and(|c| c == ' ' || c == '\t') {
+        while self.cur().is_some_and(char::is_whitespace) {
             self.position += 1;
         }
         if self.position >= self.src.len() {
@@ -1596,43 +1752,7 @@ impl<'a> Parser<'a> {
         }
 
         if environment == "cases" || environment == "cases*" {
-            let rows: Vec<Vec<String>> = split_environment_rows(&body)
-                .into_iter()
-                .map(|row| {
-                    row.split('&')
-                        .map(|cell| self.render_nested(cell, false).trim().to_string())
-                        .collect::<Vec<String>>()
-                })
-                .filter(|row: &Vec<String>| row.iter().any(|c| !c.is_empty()))
-                .collect();
-            let count = rows.len();
-            return rows
-                .iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    let value = trim_trailing_comma(row.first().map_or("", String::as_str));
-                    let condition = row.get(1).map_or("", String::as_str);
-                    let delimiter = if index == 0 {
-                        '⎧'
-                    } else if index + 1 == count {
-                        '⎩'
-                    } else {
-                        '⎨'
-                    };
-                    let tail = if condition.is_empty() {
-                        String::new()
-                    } else {
-                        let prefix = if starts_with_condition_word(condition) {
-                            " "
-                        } else {
-                            " if "
-                        };
-                        format!("{prefix}{condition}")
-                    };
-                    format!("{delimiter} {value}{tail}")
-                })
-                .collect::<Vec<String>>()
-                .join("\n");
+            return self.render_cases(&body);
         }
 
         if matches!(
@@ -1656,6 +1776,82 @@ impl<'a> Parser<'a> {
 
         self.supported = false;
         body
+    }
+
+    /// `renderCases` (v0.86.0 `latex.ts:1393-1422`) — conditions start in one column, and a
+    /// multi-row block is a matrix layout whose baseline is its middle row, so it centres on the
+    /// left-hand side it defines. An even row count gains a bare `⎨` row to be that middle.
+    fn render_cases(&mut self, body: &str) -> String {
+        let rows: Vec<Vec<String>> = split_environment_rows(body)
+            .into_iter()
+            .map(|row| {
+                row.split('&')
+                    .map(|cell| self.render_nested(cell, false).trim().to_string())
+                    .collect::<Vec<String>>()
+            })
+            .filter(|row: &Vec<String>| row.iter().any(|c| !c.is_empty()))
+            .collect();
+        let value_width = rows
+            .iter()
+            .map(|row| visible_width(&trim_trailing_comma(row.first().map_or("", String::as_str))))
+            .max()
+            .unwrap_or(0);
+        let contents: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                let value = trim_trailing_comma(row.first().map_or("", String::as_str));
+                let condition = row.get(1).map_or("", String::as_str);
+                if condition.is_empty() {
+                    return value;
+                }
+                let prefix = if starts_with_condition_word(condition) {
+                    " "
+                } else {
+                    " if "
+                };
+                let pad = PROTECTED_SPACE
+                    .to_string()
+                    .repeat(value_width.saturating_sub(visible_width(&value)));
+                format!("{value}{pad}{prefix}{condition}")
+            })
+            .collect();
+        if contents.len() <= 1 {
+            return contents
+                .first()
+                .map(|content| format!("⎧ {content}"))
+                .unwrap_or_default();
+        }
+
+        let middle = contents.len() / 2;
+        let mut visual_rows: Vec<Option<&str>> =
+            contents.iter().map(|c| Some(c.as_str())).collect();
+        if contents.len().is_multiple_of(2) {
+            visual_rows.insert(middle, None);
+        }
+        let count = visual_rows.len();
+        let lines: Vec<String> = visual_rows
+            .iter()
+            .enumerate()
+            .map(|(index, content)| {
+                let delimiter = if index == 0 {
+                    '⎧'
+                } else if index + 1 == count {
+                    '⎩'
+                } else {
+                    '⎨'
+                };
+                match content {
+                    Some(content) => format!("{delimiter} {content}"),
+                    None => delimiter.to_string(),
+                }
+            })
+            .collect();
+        self.nodes.push(LayoutNode::Matrix {
+            lines,
+            baseline: middle,
+        });
+        let index = self.nodes.len() - 1;
+        format!("{LAYOUT_MARKER_START}{index}{LAYOUT_MARKER_END}")
     }
 
     /// `renderMatrix` (`latex.ts:1286-1336`).
@@ -1840,13 +2036,13 @@ fn strip_leading_brace_group(body: &str) -> String {
     body.to_string()
 }
 
-/// `value.replace(/,\s*$/, "")` (`latex.ts:1271`).
+/// `value.replace(/,\s*$/, "")` (v0.86.0 `latex.ts:1397`, `:1399`).
 fn trim_trailing_comma(value: &str) -> String {
     let trimmed = value.trim_end();
     trimmed.strip_suffix(',').unwrap_or(trimmed).to_string()
 }
 
-/// `/^(?:if|when|for|otherwise)\b/i` (`latex.ts:1274`).
+/// `/^(?:if|when|for|otherwise)\b/i` (v0.86.0 `latex.ts:1404`).
 fn starts_with_condition_word(condition: &str) -> bool {
     let lower = condition.to_ascii_lowercase();
     ["if", "when", "for", "otherwise"].iter().any(|w| {
@@ -2160,8 +2356,16 @@ pub(crate) fn render_token(token: &LatexToken, display: bool) -> String {
 mod tests {
     use super::render_latex;
 
-    /// Every `defineCases` pair from `pi/packages/tui/test/latex.test.ts` at v0.84.1, extracted
+    /// Every `defineCases` pair from `pi/packages/tui/test/latex.test.ts` at v0.86.0, extracted
     /// mechanically. These call `renderLatex(source)` with no options, i.e. inline mode.
+    /// The `|Ψ(x,t)|²` case's expectation: since v0.86.0 the `cases` block is a layout centred on
+    /// its left-hand side, so it is three rows with 97 columns of indent above and below.
+    const PSI_CASES: &str = concat!(
+        "                                                                                                 ⎧ Ψ^∗Ψ if 0 < x < L,\n",
+        "Ψ(x,t) = ∑ₙ₌₁^∞ cₙ √(2/L) sin((nπ x)/L)_(spatial eigenmode) exp(-(iℏ n²π²)/(2mL²)t), |Ψ(x,t)|² = ⎨\n",
+        "                                                                                                 ⎩ 0    otherwise.",
+    );
+
     const INLINE_CASES: &[(&str, &str)] = &[
         ("\\mathbb{C}^3 \\to \\mathbb{C}^3", "ℂ³ → ℂ³"),
         (
@@ -2213,7 +2417,10 @@ mod tests {
         ("\\ge 2", "≥ 2"),
         ("\\ge 3", "≥ 3"),
         ("1", "1"),
-        ("\\mathrm{diag}(-1/2,1,1)", "diag(-1/2,1,1)"),
+        (
+            "\\mathrm{diag}(-1/2,1,1),\\quad F_{\\rm intrinsic}(\\lambda)",
+            "diag(-1/2,1,1), F_intrinsic(λ)",
+        ),
         ("4+3xy", "4+3xy"),
         (
             "E \\approx \\frac{0.1\\ \\text{lux}}{100\\ \\text{lm/W}} = 0.001\\ \\text{W/m}^2",
@@ -2310,7 +2517,7 @@ mod tests {
         ),
         (
             "\\Psi(x,t)=\n\\sum_{n=1}^{\\infty}\n\\underbrace{\nc_n\n\\sqrt{\\frac{2}{L}}\n\\sin\\!\\left(\\frac{n\\pi x}{L}\\right)\n}_{\\text{spatial eigenmode}}\n\\exp\\!\\left(-\\frac{i\\hbar n^2\\pi^2}{2mL^2}t\\right),\n\\qquad\n|\\Psi(x,t)|^2\n=\n\\begin{cases}\n\\Psi^\\ast\\Psi, & 0<x<L,\\\\\n0, & \\text{otherwise}.\n\\end{cases}",
-            "Ψ(x,t) = ∑ₙ₌₁^∞ cₙ √(2/L) sin((nπ x)/L)_(spatial eigenmode) exp(-(iℏ n²π²)/(2mL²)t), |Ψ(x,t)|² = ⎧ Ψ^∗Ψ if 0 < x < L,\n⎩ 0 otherwise.",
+            PSI_CASES,
         ),
         (
             "x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}",
@@ -2383,7 +2590,7 @@ mod tests {
     }
 
     /// The `it(...)` assertions of `latex.test.ts` that `defineCases` does not cover — the
-    /// display-mode stacking cases and the two `undefined` groups.
+    /// display-mode stacking cases, the v0.84.2-v0.86.0 additions, and the two `undefined` groups.
     #[test]
     fn matches_pi_display_and_rejection_expectations() {
         let display: &[(&str, &str)] = &[
@@ -2402,6 +2609,7 @@ mod tests {
                 "    -b±√(b²-4ac)\nx = ────────────\n         2a",
             ),
             (r"\frac{x^2+1}{x-1}", "x²+1\n────\nx-1"),
+            ("\\frac{1}\n{2}", "1\n─\n2"),
             // "keeps nested display fractions linear"
             (
                 r"\frac{\frac{x^2+1}{x-1}-\frac{2x}{x+1}}{\frac{x}{x^2-1}}",
@@ -2415,9 +2623,23 @@ mod tests {
                 r"\frac{1+\frac{1}{1+\frac{1}{x}}}{1-\frac{1}{1-\frac{1}{x}}}",
                 "1+1/(1+1/x)\n───────────\n1-1/(1-1/x)",
             ),
-            // "keeps fractions linear in scripts and text-style fractions"
-            (r"e^{\frac{1}{2}}", "e^(1/2)"),
-            (r"\tfrac{1}{2}", "1/2"),
+            // "lays out unsupported and nested scripts while keeping script fractions linear"
+            (
+                r"\partial_tU_2(t,0)=Aj_*(1-t)^{-A-1}.\qquad x^{n^2}+x_{i_j}",
+                concat!(
+                    "                            2\n",
+                    "                    -A-1   n\n",
+                    "∂ₜU₂(t,0) = Aj (1-t)    . x  +x\n",
+                    "              *                i\n",
+                    "                                j",
+                ),
+            ),
+            (r"e^{\frac{1}{2}}+\tfrac{1}{2}", "e^(1/2)+1/2"),
+            // "treats a backslash followed by a line ending as control space"
+            (
+                "\\boxed{\n(1,1,1),\\ (1,1,2),\\ (1,2,5),\\ (1,5,13),\\ (2,5,29),\\\n(1,13,34),\\ (1,34,89)\n}.",
+                "[(1,1,1), (1,1,2), (1,2,5), (1,5,13), (2,5,29), (1,13,34), (1,34,89)].",
+            ),
             // "renders matrices with display delimiters"
             (
                 "A\\mathbf e_1=\\begin{pmatrix}\\pi\\\\0\\end{pmatrix},\\qquad A\\mathbf e_2=\\begin{pmatrix}0\\\\\\frac{1}{\\pi}\\end{pmatrix}.",
@@ -2444,11 +2666,40 @@ mod tests {
                 failures.push(format!("{source:?} → {got:?}, want \"x = y\""));
             }
         }
-        // "uses the middle brace for intermediate case rows"
-        let cases = r"\begin{cases}a & x<0 \\ b & x=0 \\ c & x>0\end{cases}";
-        let got = render_latex(cases, false);
-        if got.as_deref() != Some("⎧ a if x < 0\n⎨ b if x = 0\n⎩ c if x > 0") {
-            failures.push(format!("cases → {got:?}"));
+        let inline: &[(&str, &str)] = &[
+            // "centers even case rows around a middle brace" (inline upstream: no `{ display: true }`,
+            // latex.test.ts:457-462 @v0.86.0)
+            (
+                r"f(x) = \begin{cases} x^{2} & x \geq 0 \\ -x & x < 0 \end{cases}",
+                "       ⎧ x² if x ≥ 0\nf(x) = ⎨\n       ⎩ -x if x < 0",
+            ),
+            // "uses natural case conditions and aligns matrix columns"
+            (
+                r"f(x)=\begin{cases}a & x<0 \\ b & \text{if }x=0 \\ c & \text{otherwise}\end{cases}",
+                "       ⎧ a if x < 0\nf(x) = ⎨ b if x = 0\n       ⎩ c otherwise",
+            ),
+            // "renders relational algebra join operators"
+            (r"R\bowtie S,\quad R\Join S", "R ⋈ S, R ⋈ S"),
+            (r"R\ltimes S,\quad R\rtimes S", "R ⋉ S, R ⋊ S"),
+            (
+                r"R\leftouterjoin S,\quad R\rightouterjoin S,\quad R\fullouterjoin S",
+                "R ⟕ S, R ⟖ S, R ⟗ S",
+            ),
+            // "renders indexed roots and additional accents and wrappers"
+            (
+                r"\textnormal{hello}+\mbox{world}+\boldsymbol{x}+{\rm roman}+{\bf bold}+{\it italic}+{\sf sans}+{\tt mono}+{\cal calligraphic}+{\sl slanted}",
+                "hello+world+x+roman+bold+italic+sans+mono+calligraphic+slanted",
+            ),
+            // "treats a backslash followed by a line ending as control space"
+            ("a\\\r\nb", "a b"),
+        ];
+        for (source, expected) in inline {
+            match render_latex(source, false) {
+                Some(actual) if actual == *expected => {}
+                other => {
+                    failures.push(format!("{source:?}\n  want {expected:?}\n  got  {other:?}"))
+                }
+            }
         }
         // "returns undefined for unsupported commands" / "for malformed groups and environments"
         for source in [
@@ -2468,6 +2719,30 @@ mod tests {
             "{} divergences:\n{}",
             failures.len(),
             failures.join("\n")
+        );
+    }
+
+    /// The same layouts through the markdown renderer: a `$$…$$` block renders display-mode, one
+    /// row per layout row, and an inline span with a join symbol or a font switch is typeset
+    /// rather than falling back to its raw source.
+    #[test]
+    fn markdown_math_uses_the_v0_86_layouts_and_symbols() {
+        let theme = crate::UiTheme::dark();
+        let rows = |md: &str| -> Vec<String> {
+            crate::render_markdown(md, 80, &theme)
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+
+        assert_eq!(
+            rows("$$f(x) = \\begin{cases} x^{2} & x \\geq 0 \\\\ -x & x < 0 \\end{cases}$$\n"),
+            vec!["       ⎧ x² if x ≥ 0", "f(x) = ⎨", "       ⎩ -x if x < 0"],
+        );
+        assert_eq!(rows("$$x^{n^2}$$\n"), vec!["  2", " n", "x"]);
+        assert_eq!(
+            rows("Join $R \\bowtie S$ on ${\\bf k}$.\n"),
+            vec!["Join R ⋈ S on k."],
         );
     }
 }

@@ -162,7 +162,7 @@ pub struct InputEditor {
     view_width: usize,
     /// First **visual** line of the render window (`editor.ts:288` `scrollOffset`). The editor shows
     /// at most `maxVisibleLines` rows; anything above/below is scrolled out and announced by the
-    /// `─── ↑ N more ` / `─── ↓ N more ` rules ([`crate::editor::render::scroll_border`], `editor.ts:259-268`). Kept in range
+    /// centred ` ↑ N more ` / ` ↓ N more ` rules ([`crate::editor::render::scroll_border`], `editor.ts:276-293`). Kept in range
     /// and re-pointed at the caret every render (`editor.ts:507-516`) and reset to `0` whenever the
     /// buffer is replaced wholesale (`editor.ts:471`, `:449`).
     scroll_offset: usize,
