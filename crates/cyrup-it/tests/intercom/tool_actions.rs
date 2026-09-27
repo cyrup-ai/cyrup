@@ -57,6 +57,8 @@ fn session(id: &str, cwd: &str) -> SessionInfo {
         context_tokens: None,
         context_window: None,
         tmux_pane: None,
+        herdr_pane_id: None,
+        herdr_location: None,
         extra: Default::default(),
     }
 }

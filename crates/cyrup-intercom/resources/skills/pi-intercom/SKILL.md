@@ -10,6 +10,12 @@
 # ICOM-042, which ported the Herdr pane launcher. Upstream's `:26`, `:145-157`, `:228` and
 # `:241-248` are restored, with `Pi` -> `cyrup` under divergence 1's own rule.)
 #
+# (ICOM-065 carries in v0.14.0 `0ffe1d5`'s three edits — the `list` comment, the `list` table row and
+# the "Use list location instead of guessing" paragraph. One sentence of that paragraph is adapted:
+# upstream joins a pi session by its session file, which Herdr reports only for pi panes, so a cyrup
+# session is joined by its registered pane id and a moved pane reads `pane_missing` — the text says
+# that instead of naming a session identity cyrup does not register.)
+#
 # YAML comments are ignored by the front-matter parser, exactly as in
 # `cyrup-ext-subagents/resources/agents/researcher.md`.
 name: pi-intercom
@@ -84,7 +90,8 @@ Before sending, verify who's connected:
 
 ```typescript
 intercom({ action: "list" })
-// → Shows all connected sessions with names, cwd, models, and live status (`idle`, `thinking`, `tool:<name>`)
+// → Shows all connected sessions with names, cwd, models, live status, and
+//   current Herdr workspace/tab/pane (or explicit not-hosted/unavailable state)
 ```
 
 ### Pattern 3: Reply Naturally
@@ -253,7 +260,7 @@ new visible project panes should go through the supervisor.
 | `ask` | Blocks until reply (10 min default, configurable with `CYRUP_INTERCOM_ASK_TIMEOUT_MS`) | You need an answer to continue |
 | `reply` | Responds to the active or pending inbound ask | You were asked something and need to answer naturally |
 | `pending` | Lists unresolved inbound asks | You need to see who is waiting before replying |
-| `list` | Returns all sessions with live status | You need to discover targets or choose an idle peer |
+| `list` | Returns all sessions with live status and freshly resolved Herdr location | You need to discover targets or choose an idle peer |
 | `status` | Returns your connection state | Troubleshooting |
 
 ## Visible Peer Sessions
@@ -291,6 +298,10 @@ if (result.isError && result.content[0].text.includes("Already waiting")) {
 - **Explicit replies skip confirmation**: A caller-supplied `replyTo` skips the dialog
 
 ## Best Practices
+
+### Use list location instead of guessing
+
+For a Herdr-hosted session, `list` displays readable workspace and tab labels plus stable opaque IDs and a diagnostic pane ID. The workspace/tab values come from a fresh bounded Herdr snapshot for that list request, joined by the pane ID the session registered, so use them instead of inferring location from cwd or session name; a pane that has since moved reads as unavailable (`pane_missing`) rather than as its old place. `not under Herdr` means the session did not register a Herdr pane. `Herdr location unavailable` means it did register one, but the current snapshot failed or no longer contained that pane. Use `herdrLocation.paneId`, not the launch-time `herdrPaneId`, when current diagnostic pane metadata is needed. Do not use pane IDs as intercom addressing handles; target the session name or intercom session ID. If no connected session is Herdr-hosted, `list` does not call Herdr or add location lines.
 
 ### Use `ask` for blocking workflows
 

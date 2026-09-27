@@ -407,17 +407,48 @@ pub(super) fn format_session_list_row(
         .as_deref()
         .filter(|p| !p.trim().is_empty())
         .map_or_else(String::new, |p| format!(" · tmux {p}"));
+    // ICOM-065 — `const herdr = herdrLocation ? ` · ${herdrLocation}` : ""` (`v0.14.0
+    // index.ts:554-556`), OUTSIDE the model parentheses and before the tags. Empty when the roster
+    // carries no location, which is every roster without a Herdr-hosted session.
+    let herdr_location = crate::herdr_location::format_herdr_location(session);
+    let herdr = if herdr_location.is_empty() {
+        String::new()
+    } else {
+        format!(" · {herdr_location}")
+    };
     format!(
-        "• {} ({}) — {} ({}{}{}){}",
+        "• {} ({}) — {} ({}{}{}){}{}",
         name,
         id_prefix,
         session.cwd,
         session.model,
         format_context_usage(session),
         pane,
+        herdr,
         suffix
     )
 }
+
+/// The `intercom` tool's `description` — `v0.14.0 index.ts:2182-2199`, a template literal whose
+/// line breaks and column-aligned `→` are part of the text the model reads.
+const INTERCOM_DESCRIPTION: &str = r#"Send a message to another cyrup session running on this machine.
+Use this to communicate findings, request help, or coordinate work with other sessions.
+
+Target a session by name, full session ID, or the short id shown in parentheses
+by "list" (a leading prefix of the ID is enough). Prefer the short id when two
+sessions share a name. Re-list before reusing a session ID; skip if it resolves to self.
+
+Usage:
+  intercom({ action: "list" })                    → List active sessions
+  intercom({ action: "list-cwd" })                → List sessions in the current working directory
+  intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
+  intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
+  intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
+  intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
+  intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
+  intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
+  intercom({ action: "pending" })                                      → List unresolved inbound asks
+  intercom({ action: "status" })                  → Show connection status"#;
 
 /// `pub(crate)` so the bundled-skill check (`crate::resources`, ICOM-004) can assert that every
 /// action the shipped `SKILL.md` tells the model to call is actually advertised here — a skill that
@@ -426,10 +457,12 @@ pub(crate) fn parameters_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
+            // `v0.14.0 index.ts:2204-2215` + `:2219-2221` — `action`, `to`, `message` and `replyTo`
+            // descriptions verbatim (ICOM-070).
             "action": {
                 "type": "string",
                 "enum": ["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"],
-                "description": "The intercom action to perform."
+                "description": "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'"
             },
             // `v0.12.0 index.ts:1831-1833`.
             "cwd": {
@@ -445,8 +478,8 @@ pub(crate) fn parameters_schema() -> serde_json::Value {
                 "type": "boolean",
                 "description": "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true."
             },
-            "to": { "type": "string", "description": "Target session name or id (send/ask/reply). Optional for send/ask when 'cwd' is given." },
-            "message": { "type": "string", "description": "Message text (send/ask/reply)." },
+            "to": { "type": "string", "description": "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask." },
+            "message": { "type": "string", "description": "Message to send (for 'send', 'ask', or 'reply' action)" },
             "attachments": {
                 "type": "array",
                 "items": {
@@ -460,7 +493,7 @@ pub(crate) fn parameters_schema() -> serde_json::Value {
                     "required": ["type", "name", "content"]
                 }
             },
-            "replyTo": { "type": "string", "description": "The ask message id this replies to (reply)." },
+            "replyTo": { "type": "string", "description": "Message ID to reply to (for threading or responding to an 'ask')" },
             // `v0.10.1 index.ts:1822-1830`, descriptions verbatim.
             "messageId": { "type": "string", "description": "Message ID for actions that operate on an existing message, such as 'cancel'." },
             "supersedes": { "type": "string", "description": "Previous message ID this send/ask explicitly supersedes. Only works for the same sender and receiver." },
@@ -480,8 +513,15 @@ impl Tool for IntercomTool {
         &self.parameters
     }
 
+    /// `description` (`v0.14.0 index.ts:2182-2199`), verbatim except for the product name.
+    ///
+    /// ICOM-070. The targeting paragraph and the `Usage:` block are what tell the model that a
+    /// leading id prefix resolves, to prefer the short id when two peers share a name, and — v0.11.0
+    /// `006af91`, after agents reused dead ids — to re-list before reusing a session id. The one
+    /// substitution is [`INTERCOM_DESCRIPTION`]'s `another cyrup session` for upstream's `another pi
+    /// session`, the rule [`Self::prompt_snippet`] documents; `Herdr` is the vendor name and stays.
     fn description(&self) -> &str {
-        "Coordinate with other local agent sessions over the intercom broker: list/list-cwd/send/ask/reply/pending/status/cancel."
+        INTERCOM_DESCRIPTION
     }
 
     /// `label: "Intercom"` (`v0.10.1 index.ts:1781`).
@@ -581,6 +621,67 @@ mod tests {
             tool.prompt_guidelines().is_empty(),
             "`v0.10.1 index.ts:1779-1802` declares no promptGuidelines for `intercom`"
         );
+    }
+
+    /// ICOM-070 — the tool `description` and the four parameter descriptions that were cyrup
+    /// paraphrases, pinned against `v0.14.0 index.ts:2182-2221` with the port's one product-name
+    /// substitution (`another pi session` → `another cyrup session`). The paraphrase dropped the
+    /// prefix-targeting rule, the stale-id warning and the per-action call shapes.
+    #[test]
+    fn the_intercom_tool_description_and_parameter_descriptions_are_upstreams() {
+        let tool = IntercomTool::new(Arc::new(SharedIntercomState::new(
+            crate::config::IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        )));
+        let expected = [
+            "Send a message to another cyrup session running on this machine.",
+            "Use this to communicate findings, request help, or coordinate work with other sessions.",
+            "",
+            "Target a session by name, full session ID, or the short id shown in parentheses",
+            "by \"list\" (a leading prefix of the ID is enough). Prefer the short id when two",
+            "sessions share a name. Re-list before reusing a session ID; skip if it resolves to self.",
+            "",
+            "Usage:",
+            "  intercom({ action: \"list\" })                    → List active sessions",
+            "  intercom({ action: \"list-cwd\" })                → List sessions in the current working directory",
+            "  intercom({ action: \"list-cwd\", cwd: \"/path\" })  → List sessions in a specific directory",
+            "  intercom({ action: \"send\", to: \"name-or-id\", message: \"...\" })  → Send message",
+            "  intercom({ action: \"send\", cwd: \"/path\", openProjectPaneIfMissing: true, message: \"...\" }) → Open a visible Herdr project pane when needed, then send",
+            "  intercom({ action: \"ask\", to: \"name-or-id\", message: \"...\" })   → Ask and wait for reply",
+            "  intercom({ action: \"cancel\", messageId: \"...\" })                 → Request cancellation of a sent message",
+            "  intercom({ action: \"reply\", message: \"...\" })                      → Reply to the active/single pending ask",
+            "  intercom({ action: \"pending\" })                                      → List unresolved inbound asks",
+            "  intercom({ action: \"status\" })                  → Show connection status",
+        ]
+        .join("\n");
+        assert_eq!(tool.description(), expected, "`v0.14.0 index.ts:2182-2199`");
+
+        let schema = tool.parameters();
+        for (key, text) in [
+            (
+                "action",
+                "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'",
+            ),
+            (
+                "to",
+                "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+            ),
+            (
+                "message",
+                "Message to send (for 'send', 'ask', or 'reply' action)",
+            ),
+            (
+                "replyTo",
+                "Message ID to reply to (for threading or responding to an 'ask')",
+            ),
+        ] {
+            assert_eq!(
+                schema["properties"][key]["description"].as_str(),
+                Some(text),
+                "`{key}`'s description is upstream's (`v0.14.0 index.ts:2204-2221`)"
+            );
+        }
     }
 
     /// ICOM-017 — the tool's SCHEMA is what decides whether the model can reach the cancel path at
@@ -821,6 +922,8 @@ mod tests {
             last_activity: now_ms().into(),
             status: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_session_path: None,
             extra: Default::default(),
         };
         let client = Arc::new(
@@ -1021,6 +1124,8 @@ mod tests {
             context_tokens: None,
             context_window: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_location: None,
             extra: Default::default(),
         }
     }

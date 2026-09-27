@@ -7,22 +7,20 @@
 //! host flattens, and every branch upstream returns exactly one `Text`. This mirrors
 //! `cyrup-ext-subagents/src/extension.rs`, which took the same shape for `subagent`.
 //!
-//! **Three of upstream's inputs do not exist on this seam, and the branches that read them are
-//! therefore unreachable rather than unported.** cyrup's `render_call`/`render_result` receive the
-//! call/result payload and nothing else — no `theme`, no `{ isPartial }`, no
-//! `context.isError`/`context.expanded`. So:
+//! **Of upstream's four renderer inputs, the options bag arrives and the theme and `context` do
+//! not.** [`cyrup_ext::NativeExtension::render_result_under`] carries [`cyrup_ext::RenderOptions`]
+//! — `expanded` and `isPartial` — and the host re-invokes it whenever either moves
+//! (`cyrup_tui::App::refresh_extension_renders`), so both branches that read them are ported live.
+//! What is still absent:
 //!
 //! * every `theme.fg(...)` / `theme.bold(...)` wrapper degrades to its plain content (the same
 //!   carve-out `cyrup-ext-subagents` records for `subagent`, and the reason the ✓/✗/⚠ glyphs — which
 //!   are content, not colour — ARE ported: they are the only part of the status prefix that survives
 //!   a themeless render);
-//! * `isPartial` is never true here, so the `Intercom working...` / `Waiting for supervisor...`
-//!   placeholders (`:1758`, `:2317`) have no input to fire on;
 //! * `context.isError` is not observable, so `failed` reduces to
-//!   `details.error === true || details.delivered === false`, and `context.expanded` is not
-//!   observable either, so the `!context.expanded` message-id suffix is drawn unconditionally (the
-//!   collapsed tier, which is what a transcript row shows by default) and the `context.expanded`
-//!   `Reason:` line is not drawn at all.
+//!   `details.error === true || details.delivered === false`. Nothing is lost by it on these two
+//!   tools: an arm that fails returns a `ToolError`, whose result carries no `details` at all, so
+//!   neither the roster collapse nor the message-id suffix can fire on it either way.
 
 use serde_json::Value;
 
@@ -112,23 +110,58 @@ pub(crate) fn render_intercom_call(args: &Value) -> String {
     text
 }
 
-/// `renderResult` for `intercom` (`v0.10.1 index.ts:2316-2331`).
-pub(crate) fn render_intercom_result(result: &Value) -> String {
+/// `renderResult` for `intercom` (`v0.14.0 index.ts:2723-2744`).
+///
+/// ICOM-066 (`a0cc5a1`, #127): a `list` / `list-cwd` result carries `details.roster`, and while the
+/// row is collapsed it draws as one line — `N other sessions[ in <cwd>] (M connected)` — instead of
+/// the whole roster. Display only: the model still receives the full roster text.
+pub(crate) fn render_intercom_result(result: &Value, opts: &cyrup_ext::RenderOptions) -> String {
+    if opts.is_partial {
+        return "Intercom working...".to_string();
+    }
     let details = result.get("details").filter(|d| !d.is_null());
     let failed = failed(details);
     let mut text = String::from(if failed { "✗ " } else { "✓ " });
+    // `if (details?.roster && !failed && !context.expanded)` — "Collapsed rows are display-only; the
+    // model still receives the full roster text." `roster` is truthiness-tested upstream and then
+    // destructured, so an object is required and its fields are read as they are.
+    if let Some(roster) = details
+        .and_then(|d| d.get("roster"))
+        .filter(|r| r.is_object())
+        .filter(|_| !failed && !opts.expanded)
+    {
+        let peers = roster.get("peers").and_then(Value::as_u64).unwrap_or(0);
+        let total = roster.get("total").and_then(Value::as_u64).unwrap_or(0);
+        // `const where = rosterCwd ? ` in ${rosterCwd}` : ""` — JS-truthy, so `""` draws nothing.
+        let place = string_field(roster, "cwd")
+            .filter(|c| !c.is_empty())
+            .map_or_else(String::new, |c| format!(" in {c}"));
+        if peers == 0 {
+            text.push_str(&format!("no other sessions{place}"));
+        } else {
+            let plural = if peers == 1 { "" } else { "s" };
+            text.push_str(&format!("{peers} other session{plural}{place}"));
+        }
+        text.push_str(&format!(" ({total} connected)"));
+        return text;
+    }
     text.push_str(&first_text_content(result));
     // `if (details?.messageId && !context.expanded)` — a truthiness test, so an empty id is skipped.
-    // `context.expanded` is not observable here (see the module doc), so this draws the collapsed
-    // tier a transcript row shows by default.
     if let Some(message_id) = details
         .and_then(|d| string_field(d, "messageId"))
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty() && !opts.expanded)
     {
         text.push_str(&format!(
             " ({})",
             crate::identity::short_session_id(message_id)
         ));
+    }
+    // `if (details?.reason && context.expanded)`.
+    if let Some(reason) = details
+        .and_then(|d| string_field(d, "reason"))
+        .filter(|r| !r.is_empty() && opts.expanded)
+    {
+        text.push_str(&format!("\nReason: {reason}"));
     }
     text
 }
@@ -157,8 +190,14 @@ pub(crate) fn render_contact_supervisor_call(args: &Value) -> String {
     text
 }
 
-/// `renderResult` for `contact_supervisor` (`v0.10.1 index.ts:1757-1773`).
-pub(crate) fn render_contact_supervisor_result(result: &Value) -> String {
+/// `renderResult` for `contact_supervisor` (`v0.14.0 index.ts:2157-2175`).
+pub(crate) fn render_contact_supervisor_result(
+    result: &Value,
+    opts: &cyrup_ext::RenderOptions,
+) -> String {
+    if opts.is_partial {
+        return "Waiting for supervisor...".to_string();
+    }
     let details = result.get("details").filter(|d| !d.is_null());
     let failed = failed(details);
     // `typeof details?.structuredReplyParseError === "string"` — presence of the KEY as a string,
@@ -274,24 +313,109 @@ mod tests {
         );
     }
 
+    fn collapsed() -> cyrup_ext::RenderOptions {
+        cyrup_ext::RenderOptions::default()
+    }
+
+    fn expanded() -> cyrup_ext::RenderOptions {
+        cyrup_ext::RenderOptions {
+            expanded: true,
+            ..Default::default()
+        }
+    }
+
+    /// ICOM-066 — `a0cc5a1`'s own render case (`intercom.integration.test.ts:1797-1804` @v0.14.0):
+    /// collapsed, a roster is one line; expanded, it is the full text the model received.
     #[test]
-    fn intercom_result_marks_failure_and_prints_the_message_id_prefix() {
-        let ok = render_intercom_result(&json!({
-            "content": [{ "type": "text", "text": "Message sent to reviewer" }],
-            "details": { "messageId": "0192f3c1-9a10-7000-8000-aaaaaaaaaaaa", "delivered": true },
-        }));
-        assert_eq!(ok, "✓ Message sent to reviewer (0192f3c1)");
-        // `delivered: false` is the failure marker even with no `error` key.
-        let bad = render_intercom_result(&json!({
+    fn a_roster_result_collapses_to_one_line_and_expands_to_the_full_roster() {
+        let roster = json!({
+            "content": [{ "type": "text", "text": "**Current session:**\n• me\n\n**Other sessions (cwd: /repo):**\n• peer-a\n• peer-b" }],
+            "details": { "roster": { "peers": 2, "total": 3, "cwd": "/repo" } },
+        });
+        assert_eq!(
+            render_intercom_result(&roster, &collapsed()),
+            "✓ 2 other sessions in /repo (3 connected)"
+        );
+        let full = render_intercom_result(&roster, &expanded());
+        assert!(full.contains("peer-a\n• peer-b"), "{full}");
+
+        // `list` carries no `cwd`; one peer is singular; zero peers is `no other sessions`.
+        let one = json!({ "content": [], "details": { "roster": { "peers": 1, "total": 2 } } });
+        assert_eq!(
+            render_intercom_result(&one, &collapsed()),
+            "✓ 1 other session (2 connected)"
+        );
+        let none = json!({ "content": [], "details": { "roster": { "peers": 0, "total": 1, "cwd": "/x" } } });
+        assert_eq!(
+            render_intercom_result(&none, &collapsed()),
+            "✓ no other sessions in /x (1 connected)"
+        );
+        // A failed result never collapses (`!failed`).
+        let failed_roster = json!({
+            "content": [{ "type": "text", "text": "broken" }],
+            "details": { "error": true, "roster": { "peers": 1, "total": 2 } },
+        });
+        assert_eq!(
+            render_intercom_result(&failed_roster, &collapsed()),
+            "✗ broken"
+        );
+    }
+
+    /// `isPartial` and `context.expanded` on the non-roster arms (`v0.14.0 index.ts:2724-2743`,
+    /// `:2157-2160`): the placeholders while a call runs, the message-id suffix only collapsed, and
+    /// the `Reason:` line only expanded.
+    #[test]
+    fn partial_and_expanded_options_select_upstreams_branches() {
+        let partial = cyrup_ext::RenderOptions::default().partial(true);
+        assert_eq!(
+            render_intercom_result(&json!({}), &partial),
+            "Intercom working..."
+        );
+        assert_eq!(
+            render_contact_supervisor_result(&json!({}), &partial),
+            "Waiting for supervisor..."
+        );
+        let undelivered = json!({
             "content": [{ "type": "text", "text": "not delivered" }],
             "details": { "messageId": "0192f3c1-9a10", "delivered": false, "reason": "gone" },
-        }));
+        });
+        assert_eq!(
+            render_intercom_result(&undelivered, &collapsed()),
+            "✗ not delivered (0192f3c1)"
+        );
+        assert_eq!(
+            render_intercom_result(&undelivered, &expanded()),
+            "✗ not delivered\nReason: gone"
+        );
+    }
+
+    #[test]
+    fn intercom_result_marks_failure_and_prints_the_message_id_prefix() {
+        let ok = render_intercom_result(
+            &json!({
+                "content": [{ "type": "text", "text": "Message sent to reviewer" }],
+                "details": { "messageId": "0192f3c1-9a10-7000-8000-aaaaaaaaaaaa", "delivered": true },
+            }),
+            &collapsed(),
+        );
+        assert_eq!(ok, "✓ Message sent to reviewer (0192f3c1)");
+        // `delivered: false` is the failure marker even with no `error` key.
+        let bad = render_intercom_result(
+            &json!({
+                "content": [{ "type": "text", "text": "not delivered" }],
+                "details": { "messageId": "0192f3c1-9a10", "delivered": false, "reason": "gone" },
+            }),
+            &collapsed(),
+        );
         assert!(bad.starts_with("✗ "), "got {bad}");
         // No details at all: success marker, no id suffix.
-        let bare = render_intercom_result(&json!({
-            "content": [{ "type": "text", "text": "No unresolved inbound asks." }],
-            "details": {},
-        }));
+        let bare = render_intercom_result(
+            &json!({
+                "content": [{ "type": "text", "text": "No unresolved inbound asks." }],
+                "details": {},
+            }),
+            &collapsed(),
+        );
         assert_eq!(bare, "✓ No unresolved inbound asks.");
     }
 
@@ -312,19 +436,25 @@ mod tests {
             "contact_supervisor contact"
         );
 
-        let warn = render_contact_supervisor_result(&json!({
-            "content": [{ "type": "text", "text": "**Reply from supervisor:**\nok" }],
-            "details": { "structuredReplyParseError": "missing field `choice`" },
-        }));
+        let warn = render_contact_supervisor_result(
+            &json!({
+                "content": [{ "type": "text", "text": "**Reply from supervisor:**\nok" }],
+                "details": { "structuredReplyParseError": "missing field `choice`" },
+            }),
+            &collapsed(),
+        );
         assert_eq!(
             warn,
             "⚠ Reply from supervisor:\nok\nStructured reply parse issue: missing field `choice`"
         );
         // A failure outranks the parse warning (upstream's ternary tests `failed` first).
-        let bad = render_contact_supervisor_result(&json!({
-            "content": [{ "type": "text", "text": "nope" }],
-            "details": { "error": true, "structuredReplyParseError": "x" },
-        }));
+        let bad = render_contact_supervisor_result(
+            &json!({
+                "content": [{ "type": "text", "text": "nope" }],
+                "details": { "error": true, "structuredReplyParseError": "x" },
+            }),
+            &collapsed(),
+        );
         assert!(bad.starts_with("✗ "), "got {bad}");
     }
 }

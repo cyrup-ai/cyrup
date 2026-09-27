@@ -430,6 +430,8 @@ fn an_unscoped_register_frame_has_no_scope_key() {
             last_activity: 0u64.into(),
             status: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_session_path: None,
             extra: UnknownFields::default(),
         },
         session_id: Some("s1".to_string()),

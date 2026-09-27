@@ -41,6 +41,8 @@ fn session() -> SessionInfo {
         context_tokens: None,
         context_window: None,
         tmux_pane: None,
+        herdr_pane_id: None,
+        herdr_location: None,
         extra: Default::default(),
     }
 }
@@ -60,6 +62,8 @@ fn registration(cwd: &str) -> SessionRegistration {
         last_activity: 0u64.into(),
         status: None,
         tmux_pane: None,
+        herdr_pane_id: None,
+        herdr_session_path: None,
         extra: Default::default(),
     }
 }

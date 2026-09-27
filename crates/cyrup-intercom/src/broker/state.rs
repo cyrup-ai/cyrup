@@ -49,6 +49,10 @@ pub(super) struct ConnectedSession {
     /// `undefined` because every reader is either `!session.extensions?.length` (`:1277`) or
     /// `session.extensions ?? []` (`:1188`) — no branch upstream can tell the two apart.
     pub(super) extensions: Vec<crate::transport::protocol::ExtensionCapability>,
+    /// `herdrSessionPath` (`v0.14.0 broker/broker.ts:66-68`): "Stable Pi session identity used only
+    /// for live Herdr snapshot joins. This is a self-asserted local-client hint, not authenticated
+    /// location evidence." Kept HERE, never on [`Self::info`], so it is never returned in a roster.
+    pub(super) herdr_session_path: Option<String>,
 }
 
 /// A live connection's close handle, tracked so any handler can destroy it (takeover, eviction,
@@ -138,6 +142,10 @@ pub(super) struct BrokerState {
     pub(super) next_owner_order: u64,
     /// `extensionStateManager` (`v0.9.2 broker/broker.ts:227,232`).
     pub(super) extension_state: ExtensionStateManager,
+    /// ICOM-057 — `PENDING_ASKS_DIR` (`v0.14.0 broker/broker.ts:31`). `None` for every state not
+    /// built by [`super::run`] ([`Self::with_pending_ask_records`]), so a unit-test broker never
+    /// writes into the developer's own intercom directory.
+    pub(super) pending_ask_records: Option<super::pending_asks::PendingAskRecords>,
 }
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -172,6 +180,55 @@ impl BrokerState {
             // The socket/pipe answer, which is what every caller but [`run`] binds.
             trusted_local: cfg!(unix),
             endpoint_state_id: None,
+            pending_ask_records: None,
+        }
+    }
+
+    /// Attach the broker's on-disk pending-ask records (ICOM-057). Only [`super::run`] has the
+    /// intercom directory, and upstream's constructor is where they are opened and pruned
+    /// (`v0.14.0 broker/broker.ts:225-226`).
+    pub(super) fn with_pending_ask_records(
+        mut self,
+        records: super::pending_asks::PendingAskRecords,
+    ) -> Self {
+        self.pending_ask_records = Some(records);
+        self
+    }
+
+    /// `this.writePendingAskRecord(message, fromSession, target.info, brokerReceivedAt)`
+    /// (`v0.14.0 broker/broker.ts:709`), filed under the asker's scope.
+    ///
+    /// # Errors
+    /// The record could not be written; the caller fails the sending connection as upstream's throw
+    /// does (see `pending_asks`' module docs).
+    pub(super) fn write_pending_ask_record(
+        &self,
+        asker_key: &SessionKey,
+        message: &crate::transport::protocol::Message,
+        asker: &SessionInfo,
+        target: &SessionInfo,
+        created_at: u64,
+    ) -> std::io::Result<()> {
+        match &self.pending_ask_records {
+            Some(records) => records.write(
+                asker_key.scope.as_ref(),
+                &message.id,
+                &message.content.text,
+                asker,
+                target,
+                created_at,
+                self.ask_timeout_ms,
+            ),
+            None => Ok(()),
+        }
+    }
+
+    /// `this.removePendingAskRecord(messageId, scopeId)` (`v0.14.0 broker/broker.ts:1226-1234`) —
+    /// called wherever an ask edge is dropped. `scope` is the ASKER's (`edge.scopeId`,
+    /// `fromSession.scopeId`, `entry.fromScopeId`), because that is where the record was filed.
+    pub(super) fn remove_pending_ask_record(&self, scope: Option<&ScopeId>, message_id: &str) {
+        if let Some(records) = &self.pending_ask_records {
+            records.remove(scope, message_id);
         }
     }
 
@@ -279,10 +336,24 @@ impl BrokerState {
         }
     }
 
+    /// `pruneAskEdges(now)` (`v0.14.0 broker/broker.ts:1191-1199`): expire the on-disk records
+    /// first, then drop every timed-out edge together with its record.
     pub(super) fn prune_ask_edges(&mut self, now: u64) {
+        if let Some(records) = &self.pending_ask_records {
+            records.prune_logged(now);
+        }
         let timeout = self.ask_timeout_ms;
-        self.ask_edges
-            .retain(|_, edge| now.saturating_sub(edge.created_at) <= timeout);
+        let mut expired = Vec::new();
+        self.ask_edges.retain(|message_id, edge| {
+            let keep = now.saturating_sub(edge.created_at) <= timeout;
+            if !keep {
+                expired.push((edge.from.scope.clone(), message_id.clone()));
+            }
+            keep
+        });
+        for (scope, message_id) in expired {
+            self.remove_pending_ask_record(scope.as_ref(), &message_id);
+        }
     }
 
     /// `clearMessageReceiptRoutesForSession` (`v0.10.1 broker/broker.ts:979-985`).

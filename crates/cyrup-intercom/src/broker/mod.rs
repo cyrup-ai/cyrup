@@ -50,6 +50,7 @@ mod js;
 mod lifecycle;
 mod limits;
 mod mailbox;
+mod pending_asks;
 mod presence;
 mod receipts;
 mod send;

@@ -516,7 +516,6 @@ async fn connect_once(
     // `target::broker_connect_target` (`transport/spawn.rs:305,378`) and returns no target, so this
     // must re-resolve the SAME way or a session dials an endpoint no broker is listening on.
     let target = broker_connect_target(&params.agent_dir)?;
-    let registration = build_registration(state, params);
     // Register under THIS SESSION'S OWN id — pi `await nextClient.connect(buildRegistration(),
     // currentSessionId)` (`index.ts:833`), where `currentSessionId = ctx.sessionManager
     // .getSessionId()` (`index.ts:945`). The live `HostServices::session_id()` is cyrup's
@@ -549,34 +548,64 @@ async fn connect_once(
     //
     // — an explicitly configured stable id wins over the host's per-process one, so a restarted
     // worker keeps the address its peers already hold instead of orphaning every stored target.
-    let session_id = configured_stable_session_id(state)
-        .or_else(|| {
-            state
-                .host_services()
-                .and_then(|services| services.session_id())
-                .map(|id| id.trim().to_string())
-                .filter(|id| !id.is_empty())
-        })
-        .or_else(|| state.connect.last_session_id());
-    let client = Arc::new(IntercomClient::connect_target(&target, registration, session_id).await?);
-    if state.connect.shutting_down.load(Ordering::SeqCst)
-        || state.connect.generation.load(Ordering::SeqCst) != generation
-    {
-        // `Intercom runtime no longer active` (index.ts:837-840): never leave a registered client
-        // behind for a session that has moved on.
+    //
+    // ICOM-064 — and an extension's per-session claim wins over both: `currentIntercomSessionId =
+    // claimedIntercomSessionId ?? resolveConfiguredIntercomSessionId(…)` (`v0.14.0 index.ts:1653`).
+    //
+    // The loop runs at most twice: a claim can land (once per runtime) while this attempt is
+    // registering, and then the client just registered under the unclaimed id is dropped and the
+    // attempt registers again under the claim, before anything is published.
+    //
+    // The registration is rebuilt on each pass because its unnamed-session alias is derived from
+    // the same resolved id ([`presence_identity`]), so a pass under a claim advertises the claim's
+    // alias rather than the one computed before it landed.
+    let client = loop {
+        let registration = build_registration(state, params);
+        let session_id =
+            resolved_intercom_session_id(state).or_else(|| state.connect.last_session_id());
+        let client =
+            Arc::new(IntercomClient::connect_target(&target, registration, session_id).await?);
+        if state.connect.shutting_down.load(Ordering::SeqCst)
+            || state.connect.generation.load(Ordering::SeqCst) != generation
+        {
+            // `Intercom runtime no longer active` (index.ts:837-840): never leave a registered
+            // client behind for a session that has moved on.
+            client.disconnect();
+            return Err(IntercomError::Client(
+                "Intercom runtime no longer active".to_string(),
+            ));
+        }
+        if state.install_client_unless_claimed_elsewhere(&client) {
+            break client;
+        }
         client.disconnect();
-        return Err(IntercomError::Client(
-            "Intercom runtime no longer active".to_string(),
-        ));
-    }
+    };
     *state
         .connect
         .last_session_id
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = client.session_id();
-    state.set_client(Some(client.clone()));
     spawn_inbound_loop(state.clone(), client.clone());
     Ok(client)
+}
+
+/// ICOM-064 — a claim accepted after the startup connect had already registered under another id:
+/// drop that registration and register again, so the claimed id — not the host-assigned one — is
+/// what peers keep. The dropped client is unpublished FIRST, so its disconnect edge is a superseded
+/// connection's to [`handle_disconnect`] and arms no reconnect.
+pub fn reregister_under_claim(state: &Arc<SharedIntercomState>, stale: &Arc<IntercomClient>) {
+    match state.client() {
+        Some(live) if Arc::ptr_eq(&live, stale) => state.set_client(None),
+        _ => return,
+    }
+    stale.disconnect();
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = ensure_connected(&state, ConnectReason::Startup).await {
+            tracing::warn!(error = %e, "intercom: re-register under the claimed id failed; scheduling reconnect");
+            schedule_reconnect(&state);
+        }
+    });
 }
 
 /// The client `disconnected` handler (`index.ts:779-789`): fail any in-flight outbound ask, drop the
@@ -647,6 +676,17 @@ pub fn build_registration(
         // inside `buildRegistration`; `$TMUX_PANE` is immutable for the process lifetime, so every
         // rung produces the same value and a re-register never changes the peer's pane term.
         tmux_pane: crate::identity::current_tmux_pane(),
+        // `...(herdrPaneId ? { herdrPaneId } : {})` (`v0.14.0 index.ts:912,923`), read on every
+        // rung for the same reason `tmux_pane` is.
+        herdr_pane_id: crate::identity::current_herdr_pane(),
+        // [CYRUP-DELTA] upstream also sends `herdrSessionPath` = the session file whenever it sends
+        // a pane id (`:913,924`), and the broker joins on it FIRST — against a pane whose
+        // `agent_session` Herdr reports with `source: "herdr:pi"` (`herdr-location.ts:88-95`).
+        // Herdr reports that only for pi sessions, and nothing reports a cyrup session to Herdr, so
+        // sending the path would make every cyrup pane read `pane_missing`. Without it the broker
+        // takes upstream's older-client arm: a direct lookup of the registered pane id, which is
+        // current until the pane is moved and `unavailable/pane_missing` after.
+        herdr_session_path: None,
         extra: Default::default(),
     }
 }
@@ -663,6 +703,28 @@ pub fn configured_stable_session_id(state: &SharedIntercomState) -> Option<Strin
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .or_else(|| state.config.stable_id.clone())
+}
+
+/// `currentIntercomSessionId = claimedIntercomSessionId ?? resolveConfiguredIntercomSessionId(
+/// currentSessionId, config)` (`v0.14.0 index.ts:1653`): an extension's per-session claim
+/// (ICOM-064), else `CYRUP_INTERCOM_STABLE_ID` / `stableId`, else the live host's session id.
+/// `None` only when there is no live host to ask.
+///
+/// Upstream threads this one value into both the register call (`:1489`) and every
+/// `buildPresenceIdentity(pi, currentIntercomSessionId ?? …)` (`:910,956,1657`), so the id a
+/// session registers under and the id its unnamed-session alias is cut from are the same string.
+#[must_use]
+pub fn resolved_intercom_session_id(state: &SharedIntercomState) -> Option<String> {
+    state
+        .claimed_intercom_session_id()
+        .or_else(|| configured_stable_session_id(state))
+        .or_else(|| {
+            state
+                .host_services()
+                .and_then(|services| services.session_id())
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+        })
 }
 
 /// `buildPresenceIdentity(pi, sessionId).name` (`v0.10.1 index.ts:427-433`) — recomputed from the
@@ -709,8 +771,13 @@ pub fn presence_identity(
         };
     }
     if let Some(services) = state.host_services()
-        && let Some(id) = services.session_id().filter(|id| !id.is_empty())
+        && let Some(host_id) = services.session_id().filter(|id| !id.is_empty())
     {
+        // `buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId)`
+        // (`v0.14.0 index.ts:910,956,1657`): the fallback alias is cut from the id this session
+        // registers under — a claimed or configured stable id when there is one — not from the
+        // host's per-process id, so an unnamed claimed session advertises `subagent-chat-<claim>`.
+        let id = resolved_intercom_session_id(state).unwrap_or(host_id);
         let session_name = services.session_name();
         return PresenceIdentity {
             name: Some(presence_name(session_name.as_deref(), &id)),
@@ -892,5 +959,80 @@ mod tests {
         assert_eq!(state.connect.attempt(), 0);
         assert!(!state.connect.reconnect_armed());
         shutdown(&state);
+    }
+
+    struct Host(Option<&'static str>);
+
+    impl cyrup_ext::HostServices for Host {
+        fn session_id(&self) -> Option<String> {
+            Some("session-0123456789abcdef0123".to_string())
+        }
+        fn session_name(&self) -> Option<String> {
+            self.0.map(str::to_string)
+        }
+    }
+
+    /// `buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId)`
+    /// (`v0.14.0 index.ts:910,956,1657`): an unnamed session's alias is cut from the id it registers
+    /// under — the claim, else the configured stable id, else the host id — and a name still wins.
+    #[test]
+    fn the_unnamed_alias_is_cut_from_the_id_the_session_registers_under() {
+        let host_only = state();
+        host_only.set_host_services(Arc::new(Host(None)));
+        assert_eq!(
+            presence_identity(&host_only, None),
+            PresenceIdentity {
+                name: Some("subagent-chat-0123456789abcdef01".to_string()),
+                runtime_fallback_alias: true,
+            }
+        );
+
+        let stable = Arc::new(SharedIntercomState::new(
+            IntercomConfig {
+                stable_id: Some("stable-worker-7".to_string()),
+                ..IntercomConfig::default()
+            },
+            600_000,
+            std::path::PathBuf::from("/w"),
+        ));
+        stable.set_host_services(Arc::new(Host(None)));
+        assert_eq!(
+            presence_identity_name(&stable, None).as_deref(),
+            Some("subagent-chat-stable-worker-7")
+        );
+        assert_eq!(
+            resolved_intercom_session_id(&stable).as_deref(),
+            Some("stable-worker-7")
+        );
+
+        stable.open_identity_claim();
+        assert!(
+            stable
+                .accept_identity_claim(" claimed-worker-run1-1 ")
+                .is_none()
+        );
+        assert_eq!(
+            resolved_intercom_session_id(&stable).as_deref(),
+            Some("claimed-worker-run1-1")
+        );
+        assert_eq!(
+            presence_identity(&stable, None),
+            PresenceIdentity {
+                name: Some("subagent-chat-claimed-worker-run".to_string()),
+                runtime_fallback_alias: true,
+            }
+        );
+
+        let named = state();
+        named.set_host_services(Arc::new(Host(Some(" worker: fix auth "))));
+        named.open_identity_claim();
+        assert!(named.accept_identity_claim("claimed").is_none());
+        assert_eq!(
+            presence_identity(&named, None),
+            PresenceIdentity {
+                name: Some("worker: fix auth".to_string()),
+                runtime_fallback_alias: false,
+            }
+        );
     }
 }

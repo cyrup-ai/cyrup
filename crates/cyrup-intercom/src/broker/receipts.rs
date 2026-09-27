@@ -138,6 +138,8 @@ impl BrokerState {
                 .is_some_and(|edge| edge.from == current_key)
             {
                 self.ask_edges.remove(&message_id);
+                // ICOM-057 — `v0.14.0 broker/broker.ts:852`.
+                self.remove_pending_ask_record(current_key.scope.as_ref(), &message_id);
             }
             // `writeMessage(socket, { type: "delivered", messageId })` (`:829`) — BARE, and
             // deliberately so: `636f61e` rewrote every other `delivered` through
@@ -182,6 +184,8 @@ impl BrokerState {
             .is_some_and(|edge| edge.from == current_key)
         {
             self.ask_edges.remove(&message_id);
+            // ICOM-057 — `v0.14.0 broker/broker.ts:879`.
+            self.remove_pending_ask_record(current_key.scope.as_ref(), &message_id);
         }
         // ICOM-054 — `v0.13.0 broker/broker.ts:856`, AFTER the ask-edge removal here (upstream's
         // order differs between the two arms and is reproduced as written).

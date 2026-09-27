@@ -6,7 +6,7 @@ use std::sync::Arc;
 use cyrup_core::{ToolError, ToolResult};
 
 use crate::identity::short_session_id;
-use crate::tools::text_result;
+use crate::tools::detailed_result;
 use crate::transport::client::IntercomClient;
 use crate::transport::protocol::SessionInfo;
 
@@ -70,6 +70,14 @@ impl IntercomTool {
                     .join("\n")
             )
         };
-        Ok(text_result(format!("{current_section}\n\n{other_section}")))
+        // `details: { roster: { peers: otherSessions.length, total: sessions.length } }`
+        // (`v0.14.0 index.ts:2280`, ICOM-066) — what lets the renderer collapse the row to one line
+        // while the model still reads the full text above.
+        Ok(detailed_result(
+            format!("{current_section}\n\n{other_section}"),
+            serde_json::json!({
+                "roster": { "peers": other_sessions.len(), "total": sessions.len() }
+            }),
+        ))
     }
 }

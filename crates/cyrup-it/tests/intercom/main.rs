@@ -46,19 +46,31 @@ mod support;
 /// table of what was collapsed and what deliberately was not.
 mod common;
 
+// ICOM-061: `/alias` renames the session and pushes the name to peers without the name poll.
+mod alias_command;
 mod broker_extension_bus_miss_branches;
 mod broker_roundtrip;
 mod broker_runtime_claim;
 mod broker_startup_fail_fast;
 mod child_bridge_activation;
+// ICOM-067: the `cyrup-intercom-cli` scripting client (`cli.ts`), run as a subprocess against a
+// real broker and a real peer.
+mod cli_client;
 mod compose_send_leg;
 mod dismiss_incoming_ask;
+// ICOM-065: the broker-side Herdr location join, against a fake Herdr socket.
+mod herdr_location;
 mod human_surface;
+mod injected_receipt_after_injection;
 // Written here, not drained: the live-session proofs for ICOM-035 / ICOM-062 / ICOM-068 — the
 // production `IntercomExtension` inside a real `AgentSession`, against a real broker.
 mod inbound_live_session;
 mod intercom_command_transcript;
 mod intercom_id_command;
+// ICOM-066: `details.roster` and the collapsed one-line render.
+mod list_roster;
+// ICOM-057: the broker's `pending-asks/*.json` records — write, remove, prune.
+mod pending_ask_records;
 mod presence_context_usage;
 mod protocol_array_payload_rejection;
 mod protocol_explicit_null_rejection;
@@ -67,6 +79,8 @@ mod protocol_number_domain;
 mod reconnect;
 mod registers_under_session_id;
 mod session_info_context_fields;
+// ICOM-064: an extension claims the session's intercom id over the bus.
+mod session_identity_claim;
 mod shared_human_lock;
 mod tool_actions;
 

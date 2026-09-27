@@ -194,6 +194,8 @@ fn deliver_local_relay(state: &SharedIntercomState, text: String) -> Result<bool
         // A synthetic `subagent-result` relay sender has no terminal, so no pane —
         // the same reasoning as `runtime_fallback_alias: None` above.
         tmux_pane: None,
+        herdr_pane_id: None,
+        herdr_location: None,
         extra: Default::default(),
     };
     let message = Message {
@@ -463,6 +465,8 @@ mod tests {
             context_tokens: None,
             context_window: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_location: None,
             extra: Default::default(),
         };
         let msg = Message {
@@ -523,6 +527,8 @@ mod tests {
             context_tokens: None,
             context_window: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_location: None,
             extra: Default::default(),
         };
         let msg = Message {

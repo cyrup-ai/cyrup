@@ -31,6 +31,8 @@ pub mod cwd;
 pub mod error;
 pub mod extension;
 pub mod format_context;
+/// ICOM-065: the broker-side Herdr location join for `list`.
+pub mod herdr_location;
 pub mod identity;
 pub mod inbound;
 /// ICOM-056: the extension outbox and message provenance.

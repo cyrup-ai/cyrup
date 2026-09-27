@@ -61,6 +61,9 @@ pub const INTERCOM_COMMAND: &str = "intercom";
 /// `/intercom-id` to insert a stable handoff snippet for the current session into the editor");
 /// `git grep intercom-id v0.7.0` (cyrup's ported baseline) returns nothing.
 pub const INTERCOM_ID_COMMAND: &str = "intercom-id";
+/// The `/alias` session-alias command (ICOM-061; `v0.14.0 index.ts:2911-2914` —
+/// `pi.registerCommand("alias", { description, handler })`, added by `90e6ad4`, v0.13.0 #126).
+pub const ALIAS_COMMAND: &str = "alias";
 /// The width the `/intercom` session picker renders at (the session-list overlay's max width).
 const INTERCOM_OVERLAY_WIDTH: usize = crate::ui::session_list::SESSION_LIST_MAX_WIDTH;
 
@@ -360,6 +363,164 @@ impl IntercomExtension {
         Some(format!("Intercom contact target: {session_id}"))
     }
 
+    /// The `/alias` command body — pi `setIntercomAlias(args, ctx)` (`v0.14.0 index.ts:2779-2830`).
+    ///
+    /// `/alias <name>` renames the session (`pi.setSessionName(alias)`, `:2819`) and then pushes the
+    /// new identity to the broker at once (`syncPresenceIdentity(…)`, `:2828`), because — upstream's
+    /// own comment — "Pi's session_info_changed event updates the built-in UI, but it is not an
+    /// ExtensionAPI event", so without the push a peer would only see the rename on the next name-poll
+    /// tick. Bare `/alias` and `/alias menu` open an input dialog when there is a UI; without one,
+    /// bare `/alias` reports the current alias and `/alias menu` warns (`:2786-2796`).
+    ///
+    /// Output follows [`Self::notify_alias_command`]. `ui.input` is the blocking
+    /// `HostServices::input` bridge, so it is driven on a blocking thread exactly as the clarify
+    /// seam drives it (`seams.rs`).
+    async fn run_alias_command(&self, args: &str, ctx: &HostCtx) -> Option<String> {
+        // `const commandGeneration = runtimeGeneration; if (!getLiveContext(ctx, …)) return;`
+        let generation = self.state.connect.generation();
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        let services = self.state.host_services();
+        // `pi.getSessionName()?.trim()`, read where upstream reads it; blank is falsy.
+        let current_alias = || {
+            services
+                .as_ref()
+                .and_then(|s| s.session_name())
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+        };
+        let mut alias = args.trim().to_string();
+        let opens_alias_input = alias.is_empty() || alias.to_lowercase() == "menu";
+        if opens_alias_input {
+            if !ctx.has_ui {
+                let (message, kind) = if !alias.is_empty() {
+                    (
+                        "The alias menu requires an interactive UI; use /alias <name>.".to_string(),
+                        cyrup_ext::NotifyKind::Warning,
+                    )
+                } else if let Some(current) = current_alias() {
+                    (
+                        format!("Session alias: {current}"),
+                        cyrup_ext::NotifyKind::Info,
+                    )
+                } else {
+                    (
+                        "No session alias set. Use /alias <name>.".to_string(),
+                        cyrup_ext::NotifyKind::Info,
+                    )
+                };
+                return self.notify_alias_command(ctx, generation, message, kind);
+            }
+            // No bound backend has no dialog to open: the same "dismissed" outcome as the
+            // `HostServices::input` default, so the command ends silently.
+            let services = services.clone()?;
+            let placeholder = match current_alias() {
+                Some(current) => format!("Current alias: {current}"),
+                None => "Enter an alias".to_string(),
+            };
+            let entered = tokio::task::spawn_blocking(move || {
+                services.input(
+                    "Set session alias",
+                    Some(&placeholder),
+                    &cyrup_ext::DialogOptions::default(),
+                )
+            })
+            .await;
+            let entered = match entered {
+                Ok(entered) => entered,
+                Err(e) => {
+                    return self.notify_alias_command(
+                        ctx,
+                        generation,
+                        format!("Unable to set session alias: {e}"),
+                        cyrup_ext::NotifyKind::Error,
+                    );
+                }
+            };
+            // `if (entered === undefined) return;` — a dismissed dialog is not an error.
+            let entered = entered?;
+            alias = entered.trim().to_string();
+            if alias.is_empty() {
+                return self.notify_alias_command(
+                    ctx,
+                    generation,
+                    "Session alias cannot be empty.".to_string(),
+                    cyrup_ext::NotifyKind::Warning,
+                );
+            }
+        }
+
+        // The dialog may have outlived the runtime it was opened for.
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        // `pi.setSessionName(alias)` — always present upstream. A session with no bound backend
+        // has nothing to rename, which is upstream's `catch` arm rather than a claimed success.
+        let Some(services) = services else {
+            return self.notify_alias_command(
+                ctx,
+                generation,
+                "Unable to set session alias: no live session".to_string(),
+                cyrup_ext::NotifyKind::Error,
+            );
+        };
+        services.set_session_name(&alias);
+        // `pi.setSessionName` either renames or throws into the `catch` arm. cyrup's seam returns
+        // nothing, and the live backend drops a rename it cannot apply right now (its manager is
+        // taken with `try_lock`, so a turn holding it reads as "session busy"). Read the name back:
+        // a rename that did not land is upstream's error arm, not a success that pushes the old
+        // name to every peer.
+        if services.session_name().as_deref().map(str::trim) != Some(alias.as_str()) {
+            return self.notify_alias_command(
+                ctx,
+                generation,
+                "Unable to set session alias: the session did not accept the rename (it may be \
+                 busy); try again"
+                    .to_string(),
+                cyrup_ext::NotifyKind::Error,
+            );
+        }
+        self.sync_presence_identity();
+        self.notify_alias_command(
+            ctx,
+            generation,
+            format!("Session alias set: {alias}"),
+            cyrup_ext::NotifyKind::Info,
+        )
+    }
+
+    /// pi `notifyAliasCommand(ctx, message, level, generation)` (`v0.14.0 index.ts:799-809`): nothing
+    /// once the runtime has moved on; without a UI the text goes to the one channel a headless
+    /// session has (upstream `console.error`, "Keep alias guidance visible without injecting a
+    /// synthetic Pi message"); with one, a notification at `level`.
+    ///
+    /// cyrup's command RETURN STRING is both the headless channel and an Info notification (the
+    /// `Ok(None)` convention on [`NativeExtension::execute_command`], as in
+    /// [`Self::run_intercom_id_command`]), so a UI warning or error notifies itself at its own level
+    /// and returns nothing — returning it would show it at Info.
+    fn notify_alias_command(
+        &self,
+        ctx: &HostCtx,
+        generation: u64,
+        message: String,
+        kind: cyrup_ext::NotifyKind,
+    ) -> Option<String> {
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        if !ctx.has_ui || kind == cyrup_ext::NotifyKind::Info {
+            return Some(message);
+        }
+        match self.state.host_services() {
+            Some(services) => {
+                services.notify(&message, kind);
+                None
+            }
+            None => Some(message),
+        }
+    }
+
     /// The `/intercom` command body (pi `openIntercomOverlay`, `index.ts:1810-1874`, degraded to text
     /// per the port doc §4.3): list sessions over the live broker, then either render the session
     /// picker (no args) or resolve `<target>` + send `<message…>` via [`compose_send`].
@@ -582,6 +743,15 @@ impl NativeExtension for IntercomExtension {
                 completions: Vec::new(),
             },
         );
+        // `/alias` (`v0.14.0 index.ts:2911-2914`), description verbatim (`:2912`).
+        api.register_command(
+            ALIAS_COMMAND,
+            CommandDescriptor {
+                description: "Set the current session alias (usage: /alias <name> or /alias menu)"
+                    .to_string(),
+                completions: Vec::new(),
+            },
+        );
         // Lifecycle: connect/disconnect + presence sync (never blocks/mutates a tool call).
         api.subscribe(&[
             EventKind::SessionStart,
@@ -609,6 +779,8 @@ impl NativeExtension for IntercomExtension {
         // [`Self::on_bus_event`].
         api.subscribe_bus(crate::outbox::INTERCOM_EXTENSION_REGISTER_EVENT);
         api.subscribe_bus(crate::outbox::INTERCOM_OUTBOX_REQUEST_EVENT);
+        // ICOM-064: the answer to the `intercom:session-identity` request emitted at session start.
+        api.subscribe_bus(crate::identity::INTERCOM_SESSION_IDENTITY_CLAIM_EVENT);
         // `pi.events.emit(INTERCOM_EXTENSION_REGISTRY_READY_EVENT, { version: 1 })`
         // (`v0.12.0 index.ts:1700`) — UNCONDITIONAL, and immediately after the listeners so no
         // extension can ever observe "ready" before the request topic is live. This is the handshake
@@ -644,6 +816,16 @@ impl NativeExtension for IntercomExtension {
             crate::outbox::INTERCOM_EXTENSION_REGISTER_EVENT => {
                 crate::outbox::handle_extension_register(&self.state, payload);
             }
+            // ICOM-064 — `claim(stableId)` (`v0.14.0 index.ts:1648-1650`): a `{ version: 1,
+            // stableId }` claim; anything else is not a V1 claim and is ignored.
+            crate::identity::INTERCOM_SESSION_IDENTITY_CLAIM_EVENT => {
+                if payload.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+                    && let Some(stable_id) = payload.get("stableId").and_then(|v| v.as_str())
+                    && let Some(stale) = self.state.accept_identity_claim(stable_id)
+                {
+                    connect::reregister_under_claim(&self.state, &stale);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -666,12 +848,14 @@ impl NativeExtension for IntercomExtension {
             .set_project_pane_launcher(Arc::new(crate::project_pane::HerdrLauncher::from_env()));
     }
 
-    /// Dispatch this extension's two commands (command-tier).
+    /// Dispatch this extension's three commands (command-tier).
     ///
     /// - `/intercom` — no args → render the session picker; `<target> <message…>` → resolve the
     ///   target and send it over the broker (the port doc §4.3 degrade of pi's interactive overlay).
     /// - `/intercom-id` — insert this session's handoff snippet into the editor
     ///   ([`Self::run_intercom_id_command`], pi `v0.9.2 index.ts:2270-2289`).
+    /// - `/alias` — rename this session and push the new identity to peers at once
+    ///   ([`Self::run_alias_command`], pi `v0.14.0 index.ts:2779-2830`).
     async fn execute_command(
         &self,
         name: &str,
@@ -681,6 +865,9 @@ impl NativeExtension for IntercomExtension {
         ctx.require_command_tier()?;
         if name == INTERCOM_ID_COMMAND {
             return Ok(self.run_intercom_id_command(ctx).await);
+        }
+        if name == ALIAS_COMMAND {
+            return Ok(self.run_alias_command(args, ctx).await);
         }
         if name != INTERCOM_COMMAND {
             return Err(ExtError::Component(format!(
@@ -723,6 +910,18 @@ impl NativeExtension for IntercomExtension {
                 // rebuilds its registration from, clear the shutdown latch, bump the generation and
                 // reset the backoff ladder.
                 connect::begin_runtime(&self.state, self.connect_params(ctx.model()));
+                // ICOM-064 — `pi.events.emit(INTERCOM_SESSION_IDENTITY_EVENT, identityRequest)`
+                // (`v0.14.0 index.ts:1645-1652`), after the runtime reset and before the id is
+                // chosen. The claims come back on the claim topic ([`Self::on_bus_event`]) when the
+                // host drains the bus at the end of this dispatch; the connect below reads the
+                // claim when it registers, and a claim that loses that race re-registers it.
+                self.state.open_identity_claim();
+                if let Some(services) = self.state.host_services() {
+                    services.emit_event(
+                        crate::identity::INTERCOM_SESSION_IDENTITY_EVENT,
+                        &serde_json::json!({ "version": 1 }),
+                    );
+                }
                 // `startNamePoll()` (`v0.10.1 index.ts:1276`, inside `startSessionRuntime`): the
                 // third name-sync point. Cancelled in the `SessionShutdown` arm below.
                 self.state.start_name_poll();
@@ -753,6 +952,7 @@ impl NativeExtension for IntercomExtension {
                 // BEFORE the disconnect below, so the disconnect edge this triggers cannot arm a
                 // reconnect: a deliberate shutdown never reconnects.
                 connect::shutdown(&self.state);
+                self.state.close_identity_claim();
                 self.state.waiter.fail_pending("Session shutting down");
                 // `expireHeldInboundMessages("session shut down before injection")`
                 // (`v0.14.0 index.ts:1799`, ICOM-062) — before the disconnect below, so the
@@ -773,6 +973,8 @@ impl NativeExtension for IntercomExtension {
                 HookOutcome::Noop
             }
             HostEvent::AgentStart => {
+                // ICOM-064: the session's first run ends its identity-claim window.
+                self.state.close_identity_claim();
                 // `agentRunning = true; if (runtimeContext) flushHeldInboundMessages(runtimeContext,
                 // runtimeGeneration); activeTools.clear(); syncPresenceStatus()`
                 // (`v0.14.0 index.ts:1824-1832`). The flush is ICOM-062's `agent_start` edge: a
@@ -855,13 +1057,26 @@ impl NativeExtension for IntercomExtension {
                     .begin_turn(now_ms());
                 HookOutcome::Noop
             }
-            HostEvent::TurnEnd { .. } => {
+            HostEvent::TurnEnd { message, .. } => {
                 // `pi.on("turn_end") -> replyTracker.endTurn()` (`v0.10.1 index.ts:1416-1424`).
                 self.state
                     .tracker
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .end_turn();
+                // ICOM-063 — `busyDelivery: "human-first"` releases one held peer per turn
+                // boundary (`v0.14.0 index.ts:1814-1822`). This handler is awaited before the
+                // agent loop's next steering poll; upstream's `pi.sendMessage(…, {deliverAs:
+                // "steer"})` reaches `agent.steer` synchronously, so the peer rides this run.
+                // cyrup's steer goes through the live host's injection pump, a separate task this
+                // send has just woken, so yield once to let it hand the steer to the agent before
+                // the loop polls. That narrows the window; it does not close it: a steer that lands
+                // past both that poll and the post-run `has_queued_messages` check is appended with
+                // no turn (the pump's stranded-steer path). Closing it needs a synchronous steer on
+                // the host seam (`HostServices::inject_message_steer` while a run is active).
+                if crate::inbound::release_held_inbound_at_turn_end(&self.state, message) {
+                    tokio::task::yield_now().await;
+                }
                 HookOutcome::Noop
             }
             // ICOM-004 — hand cyrup's resource discovery the bundled skill
@@ -904,11 +1119,27 @@ impl NativeExtension for IntercomExtension {
         Some(serde_json::Value::String(text))
     }
 
-    /// `renderResult` for both tools (`v0.10.1 index.ts:2316-2331` and `:1757-1773`).
+    /// `renderResult` for both tools, under the default options (collapsed, not partial) — the
+    /// options-free form of [`Self::render_result_under`].
     fn render_result(&self, key: &str, result: &serde_json::Value) -> Option<serde_json::Value> {
+        self.render_result_under(key, result, &cyrup_ext::RenderOptions::default())
+    }
+
+    /// `renderResult(result, { isPartial }, theme, context)` for both tools (`v0.14.0
+    /// index.ts:2723-2744` and `:2157-2175`). Upstream branches on `isPartial` and
+    /// `context.expanded` — the latter is what collapses a `list` / `list-cwd` roster to one line
+    /// (ICOM-066) — so this is the hook the host re-invokes when either moves.
+    fn render_result_under(
+        &self,
+        key: &str,
+        result: &serde_json::Value,
+        opts: &cyrup_ext::RenderOptions,
+    ) -> Option<serde_json::Value> {
         let text = match key {
-            "intercom" => crate::tools::render::render_intercom_result(result),
-            "contact_supervisor" => crate::tools::render::render_contact_supervisor_result(result),
+            "intercom" => crate::tools::render::render_intercom_result(result, opts),
+            "contact_supervisor" => {
+                crate::tools::render::render_contact_supervisor_result(result, opts)
+            }
             _ => return None,
         };
         Some(serde_json::Value::String(text))
@@ -1419,6 +1650,8 @@ mod tests {
                 context_tokens: None,
                 context_window: None,
                 tmux_pane: None,
+                herdr_pane_id: None,
+                herdr_location: None,
                 extra: Default::default(),
             },
             message: crate::transport::protocol::Message {
@@ -1458,6 +1691,8 @@ mod tests {
                     context_tokens: None,
                     context_window: None,
                     tmux_pane: None,
+                    herdr_pane_id: None,
+                    herdr_location: None,
                     extra: Default::default(),
                 },
                 crate::transport::protocol::Message {

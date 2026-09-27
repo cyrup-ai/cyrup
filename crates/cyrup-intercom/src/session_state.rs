@@ -120,6 +120,15 @@ struct HeldInboundTimer {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// ICOM-064 — one runtime's session-identity claim window and its winner.
+#[derive(Debug, Default)]
+struct IdentityClaim {
+    /// Between `session_start` and the first `agent_start` / shutdown.
+    open: bool,
+    /// The first accepted claim, trimmed and non-empty.
+    claimed: Option<String>,
+}
+
 /// The shared, session-scoped intercom state.
 pub struct SharedIntercomState {
     client: Mutex<Option<Arc<IntercomClient>>>,
@@ -185,6 +194,9 @@ pub struct SharedIntercomState {
     /// `ensure_connected`/`schedule_reconnect` recover the broker connection after a drop instead of
     /// leaving [`Self::client`] empty for the rest of the session.
     pub connect: crate::connect::ConnectSupervisor,
+    /// ICOM-064 — `claimedIntercomSessionId` (`v0.14.0 index.ts:1645-1653`): the id another
+    /// extension claimed for THIS runtime over [`crate::identity::INTERCOM_SESSION_IDENTITY_EVENT`].
+    identity_claim: Mutex<IdentityClaim>,
     /// `seenInboundMessages` (`v0.10.1 index.ts:527`) — the inbound `(from.id, message.id)` dedupe
     /// set. Reachable in practice, not theoretically: the reconnect ladder re-registers the same
     /// session id, and ICOM-010's broker mailbox redelivers on that re-register, so a message
@@ -239,6 +251,7 @@ impl SharedIntercomState {
             last_presence_identity: Mutex::new(None),
             name_poll_task: Mutex::new(None),
             connect: crate::connect::ConnectSupervisor::default(),
+            identity_claim: Mutex::new(IdentityClaim::default()),
             seen_inbound_messages: Mutex::new(SeenInboundMessages::default()),
             latest_outbound_receipts: Mutex::new(HashMap::new()),
             extension_registrations: Mutex::new(HashMap::new()),
@@ -452,6 +465,15 @@ impl SharedIntercomState {
     pub fn is_idle(&self) -> bool {
         self.host_services()
             .is_none_or(|services| services.is_idle())
+    }
+
+    /// pi `ctx.hasPendingMessages()` — a human steer or follow-up waiting in the host's queues. The
+    /// `human-first` turn-boundary release (ICOM-063, `v0.14.0 index.ts:1819`) yields to it. With no
+    /// backend bound nothing can be pending (`HostServices::has_pending_messages`'s own default).
+    #[must_use]
+    pub fn has_pending_messages(&self) -> bool {
+        self.host_services()
+            .is_some_and(|services| services.has_pending_messages())
     }
 
     /// `activeTools.set(event.toolCallId, event.toolName)` (`v0.10.1 index.ts:1437`). Re-setting an
@@ -992,6 +1014,84 @@ impl SharedIntercomState {
         *self.client.lock().unwrap_or_else(|e| e.into_inner()) = client;
     }
 
+    /// ICOM-064 — open this runtime's claim window: `let claimedIntercomSessionId: string |
+    /// undefined;` (`v0.14.0 index.ts:1645`), a fresh slot per `session_start`, emptied here so a
+    /// previous runtime's claim never carries over.
+    pub fn open_identity_claim(&self) {
+        *self
+            .identity_claim
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = IdentityClaim {
+            open: true,
+            claimed: None,
+        };
+    }
+
+    /// ICOM-064 — close the claim window. Upstream's closes when the synchronous `emit` returns;
+    /// cyrup's bus delivers after the `session_start` dispatch instead (see
+    /// [`crate::identity::INTERCOM_SESSION_IDENTITY_CLAIM_EVENT`]), so it closes at the first
+    /// `agent_start` — nothing the session does before its first run can be missed — or at shutdown.
+    /// The claimed id itself is kept: reconnects of this runtime re-register under it.
+    pub fn close_identity_claim(&self) {
+        self.identity_claim
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open = false;
+    }
+
+    /// ICOM-064 — `claim(stableId)`: `claimedIntercomSessionId ??= (typeof stableId === "string" &&
+    /// stableId.trim()) || undefined` (`v0.14.0 index.ts:1649`). The first non-empty trimmed
+    /// claim of the runtime wins; a later one, a blank one or one after the window closed is ignored.
+    ///
+    /// Answers the client to re-register: one ALREADY registered under a different id when the claim
+    /// is accepted — the connect raced ahead of the bus delivery. `None` otherwise.
+    /// Accepting and reading the client happen under one lock, and
+    /// [`Self::install_client_unless_claimed_elsewhere`] takes the same lock, so every claim is seen
+    /// either by the connect that is installing a client or by this answer, never by neither.
+    pub fn accept_identity_claim(&self, stable_id: &str) -> Option<Arc<IntercomClient>> {
+        let claimed = stable_id.trim();
+        let mut claim = self
+            .identity_claim
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !claim.open || claim.claimed.is_some() || claimed.is_empty() {
+            return None;
+        }
+        claim.claimed = Some(claimed.to_string());
+        self.client()
+            .filter(|client| client.session_id().as_deref() != Some(claimed))
+    }
+
+    /// ICOM-064 — this runtime's claimed intercom id, which [`crate::connect`] offers ahead of
+    /// `CYRUP_INTERCOM_STABLE_ID` / `stableId` (`claimedIntercomSessionId ??
+    /// resolveConfiguredIntercomSessionId(…)`, `v0.14.0 index.ts:1653`).
+    #[must_use]
+    pub fn claimed_intercom_session_id(&self) -> Option<String> {
+        self.identity_claim
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .claimed
+            .clone()
+    }
+
+    /// Publish a freshly registered client unless a claim for a DIFFERENT id landed while it was
+    /// connecting (ICOM-064); `false` means the caller must drop it and register again under the
+    /// claim. See [`Self::accept_identity_claim`] for why this shares its lock.
+    #[must_use]
+    pub fn install_client_unless_claimed_elsewhere(&self, client: &Arc<IntercomClient>) -> bool {
+        let claim = self
+            .identity_claim
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(claimed) = &claim.claimed
+            && client.session_id().as_deref() != Some(claimed.as_str())
+        {
+            return false;
+        }
+        self.set_client(Some(client.clone()));
+        true
+    }
+
     /// The live client, if connected.
     #[must_use]
     pub fn client(&self) -> Option<Arc<IntercomClient>> {
@@ -1453,6 +1553,8 @@ mod tests {
                 context_tokens: None,
                 context_window: None,
                 tmux_pane: None,
+                herdr_pane_id: None,
+                herdr_location: None,
                 extra: Default::default(),
             };
             let message = crate::transport::protocol::Message {
@@ -1720,6 +1822,8 @@ mod tests {
                 last_activity: now_ms().into(),
                 status: None,
                 tmux_pane: None,
+                herdr_pane_id: None,
+                herdr_session_path: None,
                 extra: Default::default(),
             };
             let client = Arc::new(
@@ -1783,6 +1887,8 @@ mod tests {
                 context_tokens: None,
                 context_window: None,
                 tmux_pane: None,
+                herdr_pane_id: None,
+                herdr_location: None,
                 extra: Default::default(),
             };
             assert!(

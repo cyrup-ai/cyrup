@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::config::InboundTrigger;
+use crate::config::{BusyDelivery, InboundTrigger};
 use crate::reply_tracker::IntercomContext;
 use crate::session_state::SharedIntercomState;
 use crate::transport::client::{InboundEvent, IntercomClient, SendOptions};
@@ -172,7 +172,8 @@ pub const HELD_INBOUND_FLUSH_INTERVAL_MS: u64 = 100;
 ///
 /// ```text
 /// // Busy without an agent run cannot steer; manual compaction can discard an appended custom entry.
-/// if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || …human-first…)))
+/// if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning
+///     || (config.busyDelivery === "human-first" && liveContext.hasUI))))
 /// ```
 ///
 /// A session that is busy WITHOUT an agent run — a manual `/compact`, a `/tree` branch summary
@@ -180,10 +181,27 @@ pub const HELD_INBOUND_FLUSH_INTERVAL_MS: u64 = 100;
 /// continuation — has no run to steer into, and delivering with a turn would race the compaction.
 /// The rule is general, not compaction-specific: a busy NON-interactive session without a run holds
 /// too, instead of auto-replying. Anything already held keeps later messages behind it, so arrival
-/// order survives the hold. The `human-first` clause is `busyDelivery` (ICOM-063), not ported.
+/// order survives the hold.
+///
+/// `human_first_ui` is the opt-in clause (ICOM-063, `0ce2dcd`): `busyDelivery: "human-first"` on an
+/// interactive session holds a peer even while a run IS in flight, so it waits for
+/// [`release_held_inbound_at_turn_end`] instead of being steered at once. A non-interactive session
+/// never takes it — its busy behaviour is unchanged.
 #[must_use]
-pub fn should_hold_inbound(held: usize, is_idle: bool, agent_running: bool) -> bool {
-    held > 0 || (!is_idle && !agent_running)
+pub fn should_hold_inbound(
+    held: usize,
+    is_idle: bool,
+    agent_running: bool,
+    human_first_ui: bool,
+) -> bool {
+    held > 0 || (!is_idle && (!agent_running || human_first_ui))
+}
+
+/// `config.busyDelivery === "human-first" && ctx.hasUI` — the clause every `human-first` branch
+/// upstream opens with (`v0.14.0 index.ts:1278`, `:1337`, `:1816`).
+#[must_use]
+pub fn human_first_ui(state: &SharedIntercomState) -> bool {
+    state.config.busy_delivery == BusyDelivery::HumanFirst && state.has_ui()
 }
 
 /// `holdIncomingBrokerMessage(entry, ctx, generation)` (`v0.14.0 index.ts:1294-1301`): queue the
@@ -223,11 +241,42 @@ pub fn hold_incoming_broker_message(
     });
 }
 
-/// `flushHeldInboundMessages(ctx, generation)` (`v0.14.0 index.ts:1276-1289`, the non-`human-first`
-/// arm): deliver held messages, oldest first, for as long as the session is idle OR an agent run is
-/// in flight (a run can take a steer) and the runtime is still `generation`'s. Called by the 100 ms
-/// timer — which is how the idle edge after a compaction is observed — and on `agent_start`.
+/// `flushHeldInboundMessages(ctx, generation)` (`v0.14.0 index.ts:1276-1289`): deliver held
+/// messages, oldest first, for as long as the session is idle OR an agent run is in flight (a run
+/// can take a steer) and the runtime is still `generation`'s. Called by the 100 ms timer — which is
+/// how the idle edge after a compaction is observed — and on `agent_start`.
+///
+/// Under `busyDelivery: "human-first"` with a UI (ICOM-063) the flush releases at most ONE message,
+/// and only once the session is idle — through the normal delivery decision, so it takes the
+/// `inboundTrigger` policy. A run in flight is left alone: its peers go one per turn boundary
+/// ([`release_held_inbound_at_turn_end`]). README v0.14.0: "If the run ends first, the idle flush
+/// releases one via the normal `inboundTrigger` policy; remaining peers wait for later turns."
+///
+/// ```text
+/// if (config.busyDelivery === "human-first" && ctx.hasUI) {
+///   if (ctx.isIdle() && heldInboundMessages.length > 0) {
+///     deliverIncomingBrokerMessage(heldInboundMessages.shift()!, ctx, generation);
+///   }
+///   if (heldInboundMessages.length === 0) clearHeldInboundTimer();
+///   return;
+/// }
+/// ```
+///
+/// Neither arm clears the timer here: the timer retires itself once the queue is empty
+/// ([`SharedIntercomState::retire_held_inbound_timer`]), and aborting it from inside its own tick
+/// would cancel the tick mid-delivery.
 pub fn flush_held_inbound_messages(state: &Arc<SharedIntercomState>, generation: u64) {
+    if !crate::connect::is_live_at(state, generation) {
+        return;
+    }
+    if human_first_ui(state) {
+        if state.is_idle()
+            && let Some(entry) = state.pop_held_inbound()
+        {
+            deliver_incoming_broker_message(state, &entry.from, &entry.message, generation);
+        }
+        return;
+    }
     loop {
         if state.held_inbound_len() == 0
             || !(state.is_idle() || state.agent_running())
@@ -240,6 +289,64 @@ pub fn flush_held_inbound_messages(state: &Arc<SharedIntercomState>, generation:
         };
         deliver_incoming_broker_message(state, &entry.from, &entry.message, generation);
     }
+}
+
+/// The `human-first` half of `pi.on("turn_end")` (`v0.14.0 index.ts:1810-1823`, `0ce2dcd`): at a turn
+/// boundary of a run that can still take a steer, with no human message waiting in the host's
+/// queues, steer exactly ONE held peer into the run. Returns whether one was released.
+///
+/// ```text
+/// // Aborted/error turns cannot consume a steer; leave their peers for the idle trigger.
+/// if (config.busyDelivery === "human-first" && ctx.hasUI && event.message.role === "assistant"
+///   && event.message.stopReason !== "aborted" && event.message.stopReason !== "error"
+///   && heldInboundMessages.length > 0 && agentRunning
+///   && !ctx.isIdle() && !ctx.hasPendingMessages() && getLiveContext(ctx)) {
+///   sendIncomingBrokerMessage(heldInboundMessages.shift()!, "steer", runtimeGeneration);
+///   if (heldInboundMessages.length === 0) clearHeldInboundTimer();
+/// }
+/// ```
+///
+/// `!hasPendingMessages()` is what puts the human first: a steer or follow-up the user queued is
+/// answered before any held peer, and a peer waits as long as the user keeps typing. The turn's
+/// message is taken as its wire form (`role`, `stopReason`), which is what upstream reads; the
+/// cheap conditions are checked first so it is serialized only when a peer could be released.
+pub fn release_held_inbound_at_turn_end(
+    state: &Arc<SharedIntercomState>,
+    turn_message: &impl serde::Serialize,
+) -> bool {
+    if !human_first_ui(state) || state.held_inbound_len() == 0 || !state.agent_running() {
+        return false;
+    }
+    let Ok(turn_message) = serde_json::to_value(turn_message) else {
+        return false;
+    };
+    let role = turn_message.get("role").and_then(serde_json::Value::as_str);
+    let stop_reason = turn_message
+        .get("stopReason")
+        .and_then(serde_json::Value::as_str);
+    let generation = state.connect.generation();
+    if role != Some("assistant")
+        || matches!(stop_reason, Some("aborted" | "error"))
+        || state.is_idle()
+        || state.has_pending_messages()
+        || !crate::connect::is_live_at(state, generation)
+    {
+        return false;
+    }
+    let Some(entry) = state.pop_held_inbound() else {
+        return false;
+    };
+    send_incoming_message_at(
+        state,
+        &entry.from,
+        &entry.message,
+        InboundDelivery::Steer,
+        generation,
+    );
+    if state.held_inbound_len() == 0 {
+        state.clear_held_inbound_timer();
+    }
+    true
 }
 
 /// `deliverIncomingBrokerMessage(entry, ctx, generation)` (`v0.14.0 index.ts:1247-1275`): the
@@ -306,6 +413,7 @@ pub fn deliver_incoming_broker_message(
 /// pi.sendMessage({ customType: "intercom_message", content: …, display: true, details: deliveredEntry },
 ///   delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)
 ///     ? { triggerTurn: true } : { deliverAs: "steer" });
+/// emitMessageReceipt(injectedMessage.id, "injected");   // v0.14.0: AFTER the hand-off (ICOM-069)
 /// ```
 ///
 /// Three mechanisms live here, all load-bearing:
@@ -323,7 +431,8 @@ pub fn deliver_incoming_broker_message(
 /// message was written to the session tree HIDDEN for `inboundTrigger: "replies"`/`"never"`: it
 /// appeared live and then vanished from `--resume` and every transcript replay.
 ///
-/// Returns whether a live host was there to deliver through (`false` = headless/degraded).
+/// Returns whether the host took the message (`false` = headless/degraded, fenced, or the hand-off
+/// failed — in every one of those cases the sender is NOT told `injected`, ICOM-069).
 pub fn send_incoming_message(
     state: &SharedIntercomState,
     from: &SessionInfo,
@@ -361,10 +470,6 @@ pub fn send_incoming_message_at(
         return false;
     };
     let message = &stamp_injected_at(message);
-    // `emitMessageReceipt(injectedMessage.id, "injected")` (`v0.10.1 index.ts:881`) — emitted from
-    // the INJECTION site, after the liveness guard and before the content is built, so a delivery
-    // that the guard above dropped emits nothing.
-    state.emit_message_receipt(&message.id, MessageReceiptStatus::Injected, None);
     state
         .tracker
         .lock()
@@ -390,8 +495,14 @@ pub fn send_incoming_message_at(
     // delivery that does not trigger, so an idle `inboundTrigger: "never"` delivery is one too.
     let trigger_turn = delivery == InboundDelivery::Trigger
         && should_trigger_inbound_message(state.config.inbound_trigger, message);
-    deliver_card(services.as_ref(), &content, details.as_ref(), trigger_turn);
-    true
+    deliver_card(
+        state,
+        services.as_ref(),
+        message,
+        &content,
+        details.as_ref(),
+        trigger_turn,
+    )
 }
 
 /// [`send_incoming_message`] with an explicit trigger decision already made — the entry point the
@@ -407,10 +518,6 @@ pub fn trigger_turn_over_inbound(
         return false;
     };
     let message = &stamp_injected_at(message);
-    // `emitMessageReceipt(injectedMessage.id, "injected")` (`v0.10.1 index.ts:881`) — emitted from
-    // the INJECTION site, after the liveness guard and before the content is built, so a delivery
-    // that the guard above dropped emits nothing.
-    state.emit_message_receipt(&message.id, MessageReceiptStatus::Injected, None);
     state
         .tracker
         .lock()
@@ -423,19 +530,37 @@ pub fn trigger_turn_over_inbound(
     let card = build_inline_message(state, from, message);
     let content = card.content_markdown();
     let details = serde_json::to_value(&card).ok();
-    deliver_card(services.as_ref(), &content, details.as_ref(), trigger);
-    true
+    deliver_card(
+        state,
+        services.as_ref(),
+        message,
+        &content,
+        details.as_ref(),
+        trigger,
+    )
 }
 
 /// `pi.sendMessage({ customType: "intercom_message", content, display: true, details }, trigger ?
-/// { triggerTurn: true } : { deliverAs: "steer" })` (`v0.14.0 index.ts:1230-1238`) — the one place
-/// an inbound card is handed to the host.
+/// { triggerTurn: true } : { deliverAs: "steer" }); emitMessageReceipt(injectedMessage.id,
+/// "injected")` (`v0.14.0 index.ts:1230-1245`) — the one place an inbound card is handed to the host,
+/// and the one place the sender is told `injected`. Returns whether the host took it.
+///
+/// ICOM-069 — `17699ba` (v0.14.0) moved the receipt from before the hand-off to after it, so a
+/// hand-off that fails emits nothing and the sender's last known state stays what it was
+/// (`acknowledged`, or `queued` for a held message) — which is what an `ask` timeout then quotes.
+/// Upstream's failure is a synchronous throw out of `pi.sendMessage` (the extension runtime is
+/// stale, `loader.ts` `assertActive`); cyrup's is an `Err` from the host seam (no live session, the
+/// injection pump gone). `Ok` means the same thing upstream's normal return does: the host has the
+/// message. Its asynchronous fate is not waited on — upstream's `sendMessage` is fire-and-forget
+/// too (`agent-session.ts` `bindCore`: `this.sendCustomMessage(…).catch(…)`).
 fn deliver_card(
+    state: &SharedIntercomState,
     services: &dyn cyrup_ext::HostServices,
+    message: &Message,
     content: &str,
     details: Option<&serde_json::Value>,
     trigger_turn: bool,
-) {
+) -> bool {
     let delivered = if trigger_turn {
         services.inject_message(
             content,
@@ -447,8 +572,15 @@ fn deliver_card(
     } else {
         services.inject_message_steer(content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), true, details)
     };
-    if let Err(e) = delivered {
-        tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
+    match delivered {
+        Ok(()) => {
+            state.emit_message_receipt(&message.id, MessageReceiptStatus::Injected, None);
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
+            false
+        }
     }
 }
 
@@ -630,13 +762,14 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                     if !crate::connect::is_live_at(&state, message_generation) {
                         continue;
                     }
-                    // ICOM-062 — `if (heldInboundMessages.length > 0 || (!isIdle && !agentRunning))
-                    // holdIncomingBrokerMessage(…) else deliverIncomingBrokerMessage(…)`
-                    // (`v0.14.0 index.ts:1336-1341`).
+                    // ICOM-062 / ICOM-063 — `if (heldInboundMessages.length > 0 || (!isIdle &&
+                    // (!agentRunning || humanFirst && hasUI))) holdIncomingBrokerMessage(…) else
+                    // deliverIncomingBrokerMessage(…)` (`v0.14.0 index.ts:1336-1341`).
                     if should_hold_inbound(
                         state.held_inbound_len(),
                         state.is_idle(),
                         state.agent_running(),
+                        human_first_ui(&state),
                     ) {
                         hold_incoming_broker_message(&state, from, message, message_generation);
                     } else {
@@ -847,6 +980,8 @@ mod tests {
             context_tokens: None,
             context_window: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_location: None,
             extra: Default::default(),
         }
     }
@@ -1434,32 +1569,60 @@ mod tests {
         );
     }
 
-    /// ICOM-062 — upstream's hold rule (`v0.14.0 index.ts:1336-1341`, `human-first` clause aside),
-    /// as a truth table: held iff something is already held, or the session is busy WITHOUT an
-    /// agent run. Busy WITH a run steers; idle delivers.
+    /// ICOM-062 — upstream's hold rule (`v0.14.0 index.ts:1336-1341`) as a truth table: held iff
+    /// something is already held, or the session is busy WITHOUT an agent run. Busy WITH a run
+    /// steers; idle delivers.
     #[test]
     fn the_hold_rule_is_busy_without_an_agent_run_or_anything_already_held() {
-        // (held, is_idle, agent_running) → hold?
-        assert!(!should_hold_inbound(0, true, false), "idle: deliver");
+        // (held, is_idle, agent_running, human_first_ui) → hold?
+        assert!(!should_hold_inbound(0, true, false, false), "idle: deliver");
         assert!(
-            !should_hold_inbound(0, true, true),
+            !should_hold_inbound(0, true, true, false),
             "idle with a run flag: deliver"
         );
         assert!(
-            !should_hold_inbound(0, false, true),
+            !should_hold_inbound(0, false, true, false),
             "busy with a run: steer"
         );
         assert!(
-            should_hold_inbound(0, false, false),
+            should_hold_inbound(0, false, false, false),
             "busy without a run: hold"
         );
         assert!(
-            should_hold_inbound(1, true, false),
+            should_hold_inbound(1, true, false, false),
             "anything held keeps order: hold"
         );
         assert!(
-            should_hold_inbound(1, false, true),
+            should_hold_inbound(1, false, true, false),
             "anything held keeps order: hold"
+        );
+    }
+
+    /// ICOM-063 — the `human-first` clause (`v0.14.0 index.ts:1337`): an interactive session busy
+    /// WITH a run holds the peer instead of steering it; idle still delivers at once.
+    #[test]
+    fn human_first_holds_a_peer_while_a_run_is_in_flight() {
+        assert!(
+            should_hold_inbound(0, false, true, true),
+            "human-first, busy with a run: hold"
+        );
+        assert!(
+            !should_hold_inbound(0, true, false, true),
+            "human-first, idle: deliver"
+        );
+        assert!(
+            !should_hold_inbound(0, true, true, true),
+            "human-first, idle with a run flag: deliver"
+        );
+        let mut s = state(true);
+        s.config.busy_delivery = BusyDelivery::HumanFirst;
+        assert!(!human_first_ui(&s), "no UI: the clause never applies");
+        s.set_has_ui(true);
+        assert!(human_first_ui(&s));
+        s.config.busy_delivery = BusyDelivery::Steer;
+        assert!(
+            !human_first_ui(&s),
+            "the default policy never holds a run's peers"
         );
     }
 
@@ -1467,11 +1630,16 @@ mod tests {
     /// hold/flush state machine, whose whole point is a busy-to-idle transition.
     struct FlippableHost {
         idle: std::sync::atomic::AtomicBool,
+        /// `ctx.hasPendingMessages()` — a human steer/follow-up queued in the host.
+        pending: std::sync::atomic::AtomicBool,
         injected: std::sync::Mutex<Vec<InjectedCall>>,
     }
     impl cyrup_ext::HostServices for FlippableHost {
         fn is_idle(&self) -> bool {
             self.idle.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn has_pending_messages(&self) -> bool {
+            self.pending.load(std::sync::atomic::Ordering::SeqCst)
         }
         fn append_entry(
             &self,
@@ -1501,6 +1669,7 @@ mod tests {
     fn flippable(idle: bool) -> Arc<FlippableHost> {
         Arc::new(FlippableHost {
             idle: std::sync::atomic::AtomicBool::new(idle),
+            pending: std::sync::atomic::AtomicBool::new(false),
             injected: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -1621,5 +1790,125 @@ mod tests {
             host.injected.lock().unwrap().is_empty(),
             "an expired message is never injected"
         );
+    }
+
+    /// ICOM-063 — `busyDelivery: "human-first"`'s two release points in isolation
+    /// (`v0.14.0 index.ts:1276-1283`, `:1810-1822`): a run's peers are released ONE per turn
+    /// boundary, only as a steer, and only when every upstream condition holds; the `agent_start`
+    /// flush releases nothing while a run is in flight; the idle flush releases ONE with a turn.
+    /// The live-session proofs are `cyrup-it --test intercom
+    /// inbound_live_session::busy_delivery_human_first::`.
+    #[tokio::test]
+    async fn human_first_releases_one_held_peer_per_turn_boundary_under_upstreams_conditions() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let config = IntercomConfig {
+            busy_delivery: BusyDelivery::HumanFirst,
+            ..IntercomConfig::default()
+        };
+        let s = Arc::new(SharedIntercomState::new(
+            config,
+            600_000,
+            PathBuf::from("/w"),
+        ));
+        let host = flippable(false);
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+        crate::connect::begin_runtime(
+            &s,
+            crate::connect::ConnectParams {
+                agent_dir: dir.path().join("agent"),
+                metadata: None,
+                model: None,
+            },
+        );
+        let generation = s.connect.generation();
+        s.set_agent_running(true);
+        for id in ["m1", "m2", "m3"] {
+            hold_incoming_broker_message(&s, from(), msg(id, id), generation);
+        }
+
+        // `agent_start`: a run is in flight, so nothing is steered at once.
+        flush_held_inbound_messages(&s, generation);
+        assert!(host.injected.lock().unwrap().is_empty());
+
+        let turn = |role: &str, stop: &str| serde_json::json!({ "role": role, "stopReason": stop });
+        // "Aborted/error turns cannot consume a steer; leave their peers for the idle trigger."
+        assert!(!release_held_inbound_at_turn_end(
+            &s,
+            &turn("assistant", "aborted")
+        ));
+        assert!(!release_held_inbound_at_turn_end(
+            &s,
+            &turn("assistant", "error")
+        ));
+        assert!(!release_held_inbound_at_turn_end(&s, &turn("user", "stop")));
+        // A human message is waiting: it goes first.
+        host.pending.store(true, SeqCst);
+        assert!(!release_held_inbound_at_turn_end(
+            &s,
+            &turn("assistant", "stop")
+        ));
+        host.pending.store(false, SeqCst);
+        assert!(host.injected.lock().unwrap().is_empty());
+        assert_eq!(s.held_inbound_len(), 3);
+
+        // Every condition holds: exactly one peer, oldest first, as a steer.
+        assert!(release_held_inbound_at_turn_end(
+            &s,
+            &turn("assistant", "toolUse")
+        ));
+        let steered = host.injected.lock().unwrap().clone();
+        assert_eq!(steered.len(), 1);
+        assert!(steered[0].0.ends_with("m1"), "{steered:?}");
+        assert!(
+            !steered[0].3,
+            "a turn-boundary release is a steer, never a turn"
+        );
+        assert_eq!(s.held_inbound_len(), 2);
+
+        // Not while the extension has seen no `agent_start`, nor once the session is idle.
+        s.set_agent_running(false);
+        assert!(!release_held_inbound_at_turn_end(
+            &s,
+            &turn("assistant", "stop")
+        ));
+        host.idle.store(true, SeqCst);
+        s.set_agent_running(true);
+        assert!(!release_held_inbound_at_turn_end(
+            &s,
+            &turn("assistant", "stop")
+        ));
+        s.set_agent_running(false);
+
+        // The idle flush: ONE peer, through the normal delivery decision (a turn under `always`).
+        host.injected.lock().unwrap().clear();
+        flush_held_inbound_messages(&s, generation);
+        let triggered = host.injected.lock().unwrap().clone();
+        assert_eq!(triggered.len(), 1, "one peer per flush: {triggered:?}");
+        assert!(triggered[0].0.ends_with("m2") && triggered[0].3);
+        assert_eq!(s.held_inbound_len(), 1, "m3 waits for a later turn or tick");
+
+        // The default policy never releases at a turn boundary.
+        let steer = Arc::new(state(false));
+        steer.set_host_services(flippable(false));
+        steer.set_has_ui(true);
+        steer.set_agent_running(true);
+        crate::connect::begin_runtime(
+            &steer,
+            crate::connect::ConnectParams {
+                agent_dir: dir.path().join("agent2"),
+                metadata: None,
+                model: None,
+            },
+        );
+        steer.push_held_inbound(crate::session_state::HeldInbound {
+            from: from(),
+            message: msg("x", "x"),
+        });
+        assert!(!release_held_inbound_at_turn_end(
+            &steer,
+            &turn("assistant", "stop")
+        ));
     }
 }

@@ -53,6 +53,28 @@ pub const ENV_INTERCOM_STABLE_ID: &str = "CYRUP_INTERCOM_STABLE_ID";
 /// into today. Deliberately never read from `config.json` — that file is machine-global, so a scope
 /// stored there would apply to every session on the machine and erase the boundary it draws.
 pub const ENV_INTERCOM_SCOPE_ID: &str = "CYRUP_INTERCOM_SCOPE_ID";
+/// `INTERCOM_SESSION_IDENTITY_EVENT` (`v0.14.0 extension-api.ts:7`, `eae462a` #135): emitted on this
+/// session's extension bus at `session_start`, before the intercom id is chosen, so an extension that
+/// owns the session's routing address (a subagent launcher) can give it a fixed id per session while
+/// its name stays free for a human-readable label. The payload is `{ "version": 1 }`.
+///
+/// The first non-empty claim wins over [`ENV_INTERCOM_STABLE_ID`] and `stableId`
+/// (`v0.14.0 index.ts:1645-1653`), which are process- and machine-wide and so cannot tell two
+/// sessions of one process apart.
+pub const INTERCOM_SESSION_IDENTITY_EVENT: &str = "intercom:session-identity";
+/// The claim reply to [`INTERCOM_SESSION_IDENTITY_EVENT`]: `{ "version": 1, "stableId": "<id>" }`.
+///
+/// # [CYRUP-DELTA] — a reply topic stands in for `claim(stableId)`
+///
+/// Upstream's request carries a method (`IntercomSessionIdentityRequestV1 { version: 1;
+/// claim(stableId): void }`, `v0.14.0 extension-api.ts:17-20`) that a listener calls synchronously
+/// inside `pi.events.emit`. cyrup's bus carries JSON and delivers after the emitting dispatch
+/// (`cyrup_ext::bus::SharedBus::emit`), so a function cannot cross it and "synchronously" cannot
+/// mean "before `emit` returns". The claim is therefore a message on this topic, accepted until the
+/// session's first `agent_start` ([`crate::session_state::SharedIntercomState::close_identity_claim`]),
+/// and a claim that lands after the startup connect already registered re-registers under it —
+/// peers see the claimed id, never a lasting host-assigned one.
+pub const INTERCOM_SESSION_IDENTITY_CLAIM_EVENT: &str = "intercom:session-identity-claim";
 /// `HERDR_BIN` — NOT `CYRUP_HERDR_BIN`. Same rule as [`ENV_TMUX_PANE`]: the `CYRUP_` prefix applies
 /// to pi's OWN variables, and this one belongs to the Herdr vendor, read verbatim by upstream at
 /// `v0.12.0 project-agent.ts:68` (`options.bin ?? process.env.HERDR_BIN ?? "herdr"`). A user who has
@@ -132,6 +154,32 @@ pub fn current_tmux_pane_from(env: impl Fn(&str) -> Option<String>) -> Option<St
 #[must_use]
 pub fn current_tmux_pane() -> Option<String> {
     current_tmux_pane_from(|k| std::env::var(k).ok())
+}
+
+/// `currentHerdrPane()` (`v0.14.0 index.ts:522-529`, `0ffe1d5`):
+///
+/// ```text
+/// const pane = process.env.HERDR_PANE_ID?.trim();
+/// return pane ? pane : undefined;
+/// ```
+///
+/// Upstream's comment: "Herdr exports a launch-time pane alias to hosted processes. Its visible,
+/// workspace-qualified id can change when the pane moves … Workspace and tab ids are intentionally
+/// never registered." — the broker resolves those per `list` instead ([`crate::herdr_location`]).
+///
+/// `HERDR_PANE_ID` is Herdr's own variable ([`cyrup_herdr::env::HERDR_PANE_ID`]), not a `PI_*` one,
+/// so — like [`ENV_TMUX_PANE`] — it is read verbatim. Trimmed and blank-rejected at the producer.
+#[must_use]
+pub fn current_herdr_pane_from(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    env(cyrup_herdr::env::HERDR_PANE_ID)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// [`current_herdr_pane_from`] over the process environment.
+#[must_use]
+pub fn current_herdr_pane() -> Option<String> {
+    current_herdr_pane_from(|k| std::env::var(k).ok())
 }
 
 /// `getNamePollMs()` (`v0.10.1 index.ts:486-495`, 10 lines):
@@ -533,6 +581,26 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |k| map.get(k).cloned()
+    }
+
+    /// ICOM-065 — `currentHerdrPane()` (`v0.14.0 index.ts:526-529`): Herdr's own `HERDR_PANE_ID`,
+    /// trimmed, and absent when unset or blank.
+    #[test]
+    fn the_herdr_pane_is_herdrs_own_variable_trimmed() {
+        assert_eq!(
+            current_herdr_pane_from(env_of(&[("HERDR_PANE_ID", "  w5:p4 \n")])),
+            Some("w5:p4".to_string())
+        );
+        assert_eq!(
+            current_herdr_pane_from(env_of(&[("HERDR_PANE_ID", "   ")])),
+            None
+        );
+        assert_eq!(current_herdr_pane_from(env_of(&[])), None);
+        assert_eq!(
+            current_herdr_pane_from(env_of(&[("CYRUP_HERDR_PANE_ID", "w1:p1")])),
+            None,
+            "not renamed by the PI_* → CYRUP_* rule"
+        );
     }
 
     #[test]

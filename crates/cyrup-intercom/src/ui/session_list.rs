@@ -40,6 +40,30 @@ pub fn session_title(session: &SessionInfo, is_self: bool, same_cwd: bool) -> St
     format!("{name} ({}){suffix}", short_session_id(&session.id))
 }
 
+/// `herdrLocationText(session)` (`v0.14.0 ui/session-list.ts:36-42`, ICOM-065) — the overlay's own
+/// wording, which differs from the `list` row's ([`crate::herdr_location::format_herdr_location`]):
+/// no `Herdr ` prefix on a current location, no `pane ` before its id, and `Herdr unavailable
+/// (<reason>, pane <id>)`. `None` when the roster carries no location.
+#[must_use]
+pub fn herdr_location_text(session: &SessionInfo) -> Option<String> {
+    use crate::transport::protocol::HerdrLocation;
+    Some(match session.herdr_location.as_ref()? {
+        HerdrLocation::NotHosted => "not under Herdr".to_string(),
+        HerdrLocation::Unavailable {
+            pane_id, reason, ..
+        } => format!("Herdr unavailable ({}, pane {pane_id})", reason.as_str()),
+        HerdrLocation::Current {
+            workspace,
+            tab,
+            pane_id,
+            ..
+        } => format!(
+            "{} [{}] / {} [{}] / {pane_id}",
+            workspace.label, workspace.id, tab.label, tab.id
+        ),
+    })
+}
+
 /// What a keystroke did to the session-list overlay (pi `SessionListOverlay.handleInput`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionListAction {
@@ -177,6 +201,10 @@ impl SessionListOverlay {
             "  {}",
             theme.fg("dim", &path_line(&self.current_session))
         )));
+        // `session-list.ts:132-133`: one dim line under the path, only when there is a location.
+        if let Some(location) = herdr_location_text(&self.current_session) {
+            lines.push(row(&format!("  {}", theme.fg("dim", &location))));
+        }
         lines.push(row(""));
         lines.push(rule('├', '┤'));
         lines.push(row(&theme.bold(" Other Sessions")));
@@ -207,6 +235,10 @@ impl SessionListOverlay {
                 };
                 lines.push(row(&format!("{prefix}{title}")));
                 lines.push(row(&format!("  {}", theme.fg("dim", &path_line(session)))));
+                // `session-list.ts:158-159`.
+                if let Some(location) = herdr_location_text(session) {
+                    lines.push(row(&format!("  {}", theme.fg("dim", &location))));
+                }
                 if index < end - 1 {
                     lines.push(row(""));
                 }
@@ -264,6 +296,8 @@ mod tests {
             context_tokens: None,
             context_window: None,
             tmux_pane: None,
+            herdr_pane_id: None,
+            herdr_location: None,
             extra: Default::default(),
         }
     }
@@ -280,6 +314,61 @@ mod tests {
                 vec!["escape".to_string(), "ctrl+c".to_string()]
             }
         }
+    }
+
+    /// ICOM-065 — the overlay prints a location line under the path of each session that carries
+    /// one, in `herdrLocationText`'s wording (`v0.14.0 ui/session-list.ts:36-42`), and nothing for a
+    /// roster Herdr was never asked about.
+    #[test]
+    fn a_herdr_location_line_follows_the_path_line() {
+        use crate::transport::protocol::{HerdrLabelRef, HerdrLocation, HerdrUnavailableReason};
+        let mut me = session("session-12345678", "me");
+        me.herdr_location = Some(HerdrLocation::Current {
+            workspace: HerdrLabelRef {
+                id: "w5".into(),
+                label: "Platform".into(),
+            },
+            tab: HerdrLabelRef {
+                id: "w5:t2".into(),
+                label: "API".into(),
+            },
+            pane_id: "w5:p4".into(),
+            refreshed_at: 1u64.into(),
+        });
+        let mut gone = session("session-87654321", "gone");
+        gone.herdr_location = Some(HerdrLocation::Unavailable {
+            pane_id: "w1:p9".into(),
+            reason: HerdrUnavailableReason::PaneMissing,
+            detail: None,
+        });
+        let mut plain = session("session-11111111", "plain");
+        plain.herdr_location = Some(HerdrLocation::NotHosted);
+        let overlay = SessionListOverlay::new(me, vec![gone, plain]);
+        let text = overlay
+            .render(&PlainTheme, &MockKeybindings, 88)
+            .into_iter()
+            .map(|l| l.trim_matches('│').trim_end().to_string())
+            .collect::<Vec<_>>();
+        for expected in [
+            "  Platform [w5] / API [w5:t2] / w5:p4",
+            "  Herdr unavailable (pane_missing, pane w1:p9)",
+            "  not under Herdr",
+        ] {
+            let at = text.iter().position(|l| l == expected);
+            assert!(at.is_some(), "{expected:?} missing from {text:#?}");
+            assert!(
+                text[at.unwrap() - 1].contains("bsy-deepseek-v4-pro"),
+                "{expected:?} follows its path line: {text:#?}"
+            );
+        }
+        let bare = SessionListOverlay::new(session("a", "a"), vec![session("b", "b")]);
+        assert!(
+            !bare
+                .render(&PlainTheme, &MockKeybindings, 88)
+                .join("\n")
+                .contains("Herdr"),
+            "no location, no line"
+        );
     }
 
     // Port of test/overlay-width.test.ts:60-66.
