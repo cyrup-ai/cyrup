@@ -1913,3 +1913,87 @@ async fn prov011_a_tools_constrained_sampling_declaration_reaches_the_provider()
         "a tool that declares nothing keeps the field absent"
     );
 }
+
+// ----------------------------------------------------------------------------
+// AGENT-044 — `ToolError::details` is opt-in: a plain throwing tool still finalizes to pi's
+// `createErrorToolResult` shape (`details: {}`, `agent-loop.ts:863-868` @v0.87.1), and only a tool
+// that attaches a payload (bash's non-zero exit, `ACP-141`) persists one.
+// ----------------------------------------------------------------------------
+
+struct DetailedFailTool {
+    params: Value,
+}
+
+#[async_trait::async_trait]
+impl Tool for DetailedFailTool {
+    fn name(&self) -> &str {
+        "detailed"
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::new("Command exited with code 42").with_details(json!({ "exitCode": 42 })))
+    }
+}
+
+#[tokio::test]
+async fn agent044_tool_error_details_are_opt_in() {
+    let (_faux, sf) = faux_stream_fn(vec![
+        faux_assistant_message(
+            vec![
+                faux_tool_call("fail", json!({})),
+                faux_tool_call("detailed", json!({})),
+            ],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![
+            FailTool::new("fail"),
+            Arc::new(DetailedFailTool {
+                params: obj_schema(),
+            }),
+        ])
+        .build();
+    let recorder = Arc::new(EventRecorder::default());
+    agent.subscribe(recorder.clone());
+    agent.prompt("go").await.unwrap();
+    agent.wait_for_idle().await;
+
+    let persisted: Vec<(String, Value)> = recorder
+        .tool_result_messages()
+        .iter()
+        .map(|t| {
+            let wire = serde_json::to_value(t).unwrap();
+            (
+                wire["toolName"].as_str().unwrap_or_default().to_string(),
+                wire["details"].clone(),
+            )
+        })
+        .collect();
+    let details_of = |name: &str| {
+        persisted
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_else(|| panic!("no persisted result for {name}: {persisted:?}"))
+    };
+    assert_eq!(
+        details_of("fail"),
+        json!({}),
+        "a plain ToolError persists pi's empty object"
+    );
+    assert_eq!(
+        details_of("detailed"),
+        json!({ "exitCode": 42 }),
+        "an opted-in payload replaces the empty object"
+    );
+}

@@ -772,6 +772,13 @@ impl SessionBuilder {
         let cwd = cfg.cwd.clone();
         let cancel = RunCancel::new();
 
+        // Pi `DefaultResourceLoader.reload()` opens with `resetTimings("extensions")`
+        // (`core/resource-loader.ts:389` @v0.87.1), ahead of BOTH its pre-trust pass
+        // (`loadProjectTrustExtensions`) and the final load — the two passes this build runs at
+        // step 1 and step 4b/4c. Resetting here makes the `extensions` startup-timing rows this
+        // session's own load, whichever session the process built before it (AGENT-027).
+        cyrup_core::timings::reset_timings(cyrup_core::timings::TimingLabel::Extensions);
+
         // ---- 1. settings + trust (cyrup-config) ------------------------------------------------
         // Load global first (project untrusted) to read defaultProjectTrust, then decide trust.
         let mut settings = SettingsManager::load(self.settings_store.clone(), false);

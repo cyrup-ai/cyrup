@@ -27,17 +27,18 @@ impl RunCtx {
     /// `Error|Aborted` branch, which emitted `agent_end` carrying the WHOLE run accumulator and
     /// never reported `aborted`.
     pub(super) async fn stream_assistant(&mut self) -> Result<Arc<AssistantMessage>, RunFailure> {
-        // The running baseline. `prepare_next_turn` overrides are STICKY: a returned
-        // model/reasoning/context override is folded into the run's baseline (`self.model`,
-        // `self.thinking_level`, and the live `state.messages`) in `run_loop`, so it persists for
-        // ALL later turns in the run (Pi `config = {...config, model, reasoning}` /
-        // `currentContext = snapshot.context ?? currentContext`, agent-loop.ts:226-239). A
+        // The running baseline. `prepare_next_turn` / `prepare_request` overrides are STICKY: a
+        // returned model/reasoning/context override is folded into the run's baseline
+        // (`self.model`, `self.thinking_level`, and the loop's working `self.messages`) in
+        // `run_loop` BEFORE this call, so it applies to this request and persists for ALL later
+        // ones in the run (Pi `config = {...config, model, reasoning}` / `currentContext =
+        // update.context ?? currentContext`, agent-loop.ts:186-198, :228-237 @v0.87.1). A
         // non-reasoning model silently ignores the level (func-01 R-01-041).
         let model = self.model.clone();
         let effective_thinking = self.thinking_level;
         // Read the loop's OWN working copy (Pi `context.messages`, agent-loop.ts:283), NOT the live
-        // `state.messages` Arc — a `prepare_next_turn` context override or a mid-run external
-        // `set_messages` must not cross between the two.
+        // `state.messages` Arc — a `prepare_next_turn`/`prepare_request` context override or a
+        // mid-run external `set_messages` must not cross between the two.
         let base_messages = self.messages.clone();
 
         let transformed = match self

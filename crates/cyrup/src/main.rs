@@ -648,14 +648,6 @@ async fn run() -> anyhow::Result<i32> {
         // legacy `hooks/` directory has stopped loading one frame ahead of the paint that erases it.
         migrations::show_deprecation_warnings(&deprecation_warnings);
         let _signals = spawn_abort_on_signal(runtime.clone(), cancel.clone(), AppMode::Interactive);
-        // `PI_STARTUP_BENCHMARK` interactive run path (Pi main.ts:819-835): init the TUI, let stdin
-        // drain terminal query replies for ~150ms, stop, then print timings — never the event loop.
-        if timings::startup_benchmark_enabled() {
-            interactive::run_interactive_benchmark().await?;
-            timings::time("interactiveMode.init", timings::TimingLabel::Main);
-            timings::print_timings();
-            return Ok(0);
-        }
         // Pi `prepareInitialMessage(parsed, settingsManager.getImageAutoResize(), stdinContent)`
         // (main.ts:828-832): the `images.autoResize` setting decides whether an `@image.png`
         // positional is downsampled to 2000px or inlined at full resolution.
@@ -670,6 +662,16 @@ async fn run() -> anyhow::Result<i32> {
         timings::time("readPipedStdin", timings::TimingLabel::Main);
         let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images, piped_stdin).await?;
         timings::time("prepareInitialMessage", timings::TimingLabel::Main);
+        // `PI_STARTUP_BENCHMARK` interactive run path (Pi main.ts:950-958): init the TUI, let stdin
+        // drain terminal query replies for ~150ms, stop, then print timings — never the event loop.
+        // It comes after the `readPipedStdin` / `prepareInitialMessage` marks, as pi's does
+        // (main.ts:885/:888), so the benchmark table carries every `main` row (AGENT-027).
+        if timings::startup_benchmark_enabled() {
+            interactive::run_interactive_benchmark().await?;
+            timings::time("interactiveMode.init", timings::TimingLabel::Main);
+            timings::print_timings();
+            return Ok(0);
+        }
         // Pi prints immediately before entering the mode's own loop (`printTimings()` at
         // main.ts:899, after every `main` mark has been taken).
         timings::print_timings();

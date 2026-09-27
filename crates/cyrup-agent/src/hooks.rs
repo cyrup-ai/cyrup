@@ -17,8 +17,9 @@ use std::sync::Arc;
 /// A read-only view of the loop's live `AgentContext` (Pi `AgentContext`, types.ts:25-30): the
 /// active system prompt, the full transcript at the time of the hook, and the tools available to
 /// the model. Mirrors the `context` field Pi threads into `beforeToolCall`/`afterToolCall`/
-/// `shouldStopAfterTurn`/`prepareNextTurn` (types.ts:96,113,124). Borrowed (no clone) so a hook can
-/// inspect the system prompt / tools / messages without the runtime copying the transcript.
+/// `finishTurn`/`prepareNextTurn`/`prepareRequest` (`types.ts` `AgentTurnContext.context`,
+/// `PrepareRequestContext.context` @v0.87.1). Borrowed (no clone) so a hook can inspect the system
+/// prompt / tools / messages without the runtime copying the transcript.
 pub struct AgentContextView<'a> {
     pub system_prompt: &'a str,
     pub messages: &'a [Arc<AgentMessage>],
@@ -138,30 +139,73 @@ pub enum AfterOutcome {
     Failed(HookError),
 }
 
-/// Post-turn context for [`Hooks::prepare_next_turn`] and [`Hooks::should_stop_after_turn`] (Pi
-/// `ShouldStopAfterTurnContext` / `PrepareNextTurnContext`, types.ts:116-138).
+/// Completed-turn context for [`Hooks::finish_turn`] and [`Hooks::prepare_next_turn`] (Pi
+/// `AgentTurnContext` / `PrepareNextTurnContext extends AgentTurnContext`, `types.ts` @v0.87.1).
 pub struct PostTurn<'a> {
-    /// The new messages this run will return if it exits here (Pi `newMessages`, types.ts:137 —
-    /// cyrup's pre-existing field name).
+    /// The new messages this run will return if it exits here (Pi `newMessages` — cyrup's
+    /// pre-existing field name).
     pub messages: &'a [Arc<AgentMessage>],
+    /// How many turns this run has completed, this one included.
     pub turn_index: usize,
-    /// The assistant message that completed the turn (Pi `message`, types.ts:119).
+    /// The assistant message that completed the turn (Pi `message`).
     pub message: &'a AssistantMessage,
-    /// The tool-result messages passed to the preceding `turn_end` event (Pi `toolResults`,
-    /// types.ts:121).
+    /// The turn's tool-result messages — the ones its `turn_end` event carries (Pi `toolResults`).
     pub tool_results: &'a [ToolResultMessage],
-    /// The live agent context after the turn's messages were appended (Pi `context`, types.ts:124).
+    /// The live agent context after the turn's assistant message and tool results were appended
+    /// (Pi `context`).
     pub context: AgentContextView<'a>,
 }
 
+/// What [`Hooks::finish_turn`] decided (Pi `AgentTurnDecision`, `types.ts` @v0.87.1). Returning
+/// `None` from the hook is pi's `undefined`: normal scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnDecision {
+    /// Ensure one more provider request. A tool-result, steering or follow-up request satisfies it
+    /// and adds nothing; otherwise the loop makes one request on the current context.
+    Continue,
+    /// End the run right after this turn's `turn_end`, without polling the queues or preparing
+    /// another request.
+    End,
+}
+
+/// Per-request context for [`Hooks::prepare_request`] (Pi `PrepareRequestContext`, `types.ts`
+/// @v0.87.1): the runtime state the next provider request would use as things stand.
+pub struct PrepareRequestCtx<'a> {
+    /// The loop's working context, with this turn's pending messages already appended.
+    pub context: AgentContextView<'a>,
+    pub model: &'a ModelRef,
+    /// Pi `thinkingLevel: config.reasoning ?? "off"` — cyrup's level is never absent.
+    pub thinking_level: ModelThinkingLevel,
+}
+
+/// Replacement runtime state returned by [`Hooks::prepare_request`] (Pi `AgentRequestUpdate =
+/// Omit<AgentLoopTurnUpdate, "messages">`, `types.ts` @v0.87.1). Folded into the run baseline
+/// exactly like a [`TurnUpdate`], so each `Some(_)` field applies to this request AND every later
+/// one in the run. `tools`/`system_prompt` are the parts of pi's `context` cyrup carries as their
+/// own fields — see [`TurnUpdate::tools`].
+#[derive(Clone, Default)]
+pub struct RequestUpdate {
+    pub context: Option<Vec<Arc<AgentMessage>>>,
+    pub model: Option<ModelRef>,
+    pub thinking_level: Option<ModelThinkingLevel>,
+    pub tools: Option<Vec<Arc<dyn Tool>>>,
+    pub system_prompt: Option<String>,
+}
+
 /// Replacement runtime state returned by [`Hooks::prepare_next_turn`] (Pi `AgentLoopTurnUpdate`,
-/// types.ts:128-136). Each `Some(_)` field is folded into the run's running baseline and is STICKY:
-/// it persists as the default for EVERY later turn in the run (Pi `config = {...config, model,
-/// reasoning}` / `currentContext = snapshot.context ?? currentContext`, agent-loop.ts:226-239), not a
-/// one-shot. A `None` field keeps the current baseline. `context` replaces the working transcript.
+/// `types.ts` @v0.87.1). Each `Some(_)` field is folded into the run's running baseline and is
+/// STICKY: it persists as the default for EVERY later turn in the run (Pi `config = {...config,
+/// model, reasoning}` / `currentContext = snapshot.context ?? currentContext`, `agent-loop.ts:186-198`
+/// @v0.87.1), not a one-shot. A `None` field keeps the current baseline. `context` replaces the
+/// working transcript.
 #[derive(Clone, Default)]
 pub struct TurnUpdate {
     pub context: Option<Vec<Arc<AgentMessage>>>,
+    /// Messages to append before the next provider request, ahead of any queued steering or
+    /// follow-up, each with the normal `message_start`/`message_end` pair (Pi
+    /// `AgentLoopTurnUpdate.messages`, added v0.87.0; `agent-loop.ts:188`, `:209-214` @v0.87.1).
+    /// One-shot, unlike every other field: they are appended once, not folded into a baseline.
+    pub messages: Vec<AgentMessage>,
     pub model: Option<ModelRef>,
     pub thinking_level: Option<ModelThinkingLevel>,
     /// Replacement tool set for the rest of the run (Pi `AgentContext.tools`, carried inside the
@@ -182,21 +226,58 @@ pub struct TurnUpdate {
     pub system_prompt: Option<String>,
 }
 
+impl TurnUpdate {
+    /// Split into the baseline fold (the fields pi's `AgentRequestUpdate` shares with
+    /// `AgentLoopTurnUpdate`) and the one-shot messages to append.
+    pub(crate) fn into_parts(self) -> (RequestUpdate, Vec<AgentMessage>) {
+        let TurnUpdate {
+            context,
+            messages,
+            model,
+            thinking_level,
+            tools,
+            system_prompt,
+        } = self;
+        (
+            RequestUpdate {
+                context,
+                model,
+                thinking_level,
+                tools,
+                system_prompt,
+            },
+            messages,
+        )
+    }
+}
+
+fn tool_names(tools: Option<&Vec<Arc<dyn Tool>>>) -> Option<Vec<String>> {
+    tools.map(|ts| ts.iter().map(|t| t.name().to_string()).collect())
+}
+
 /// Hand-written because `Arc<dyn Tool>` is not `Debug` (`Tool: Send + Sync` only) — tools print as
 /// their names, which is the only part of them a diagnostic wants.
 impl std::fmt::Debug for TurnUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TurnUpdate")
             .field("context", &self.context)
+            .field("messages", &self.messages)
             .field("model", &self.model)
             .field("thinking_level", &self.thinking_level)
-            .field(
-                "tools",
-                &self
-                    .tools
-                    .as_ref()
-                    .map(|ts| ts.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()),
-            )
+            .field("tools", &tool_names(self.tools.as_ref()))
+            .field("system_prompt", &self.system_prompt)
+            .finish()
+    }
+}
+
+/// Same reason as [`TurnUpdate`]'s: tools print as their names.
+impl std::fmt::Debug for RequestUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestUpdate")
+            .field("context", &self.context)
+            .field("model", &self.model)
+            .field("thinking_level", &self.thinking_level)
+            .field("tools", &tool_names(self.tools.as_ref()))
             .field("system_prompt", &self.system_prompt)
             .finish()
     }
@@ -271,17 +352,42 @@ pub trait Hooks: Send + Sync {
         AfterOutcome::Keep
     }
 
-    /// After `turn_end`, before `should_stop_after_turn` (Pi `prepareNextTurn`, agent-loop.ts:226).
-    /// A returned [`TurnUpdate`] is STICKY: it becomes the new running baseline for all later turns.
+    /// After the tool batch and every tool-result `message_end`, immediately BEFORE `turn_end` (Pi
+    /// `finishTurn`, added v0.87.0 in place of `shouldStopAfterTurn`; awaited at
+    /// `agent-loop.ts:285` @v0.87.1). [`TurnDecision::End`] ends the run after `turn_end` without
+    /// polling the queues or preparing another request; [`TurnDecision::Continue`] ensures one more
+    /// provider request; `None` keeps normal scheduling.
+    ///
+    /// Also called on an errored or aborted assistant turn (`:251`), whose decision is ignored:
+    /// those remain hard exits. An `Err` is pi's bare-await throw — the run fails through
+    /// `handleRunFailure`.
+    ///
+    /// `_cancel` is the run's abort signal (pi passes `signal` as the second argument).
+    ///
+    /// Host/extension seam with no in-tree producer yet: `PolicyHooks` only forwards it, and pi's
+    /// producer — the coding-agent's actionable `turn_end`/`agent_before_settle` extension
+    /// boundaries (`_installAgentBoundaryHooks`, `agent-session.ts:675-684` @v0.87.1, EXT-078) —
+    /// is not ported.
+    async fn finish_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<Option<TurnDecision>, HookError> {
+        Ok(None)
+    }
+
+    /// After `turn_end`, only when the loop will run another turn, immediately before that turn's
+    /// `turn_start` (Pi `prepareNextTurn`, `agent-loop.ts:184-205` @v0.87.1 — moved there from
+    /// straight after `turn_end` in v0.84.2). A returned [`TurnUpdate`] is STICKY: it becomes the new
+    /// running baseline for all later turns; its [`TurnUpdate::messages`] are appended once.
     ///
     /// AGENT-024 — `_cancel` is the run's abort signal. pi's *loop*-level `prepareNextTurn`
     /// (`packages/agent/src/types.ts:229-231`) takes no signal, but the Agent-options layer above it
     /// binds one into the closure it hands the loop:
     /// `prepareNextTurn: async (context) => { if (this.prepareNextTurnWithContext) { return await
     /// this.prepareNextTurnWithContext(context, this.signal); } return await
-    /// this.prepareNextTurn?.(this.signal); }` (`packages/agent/src/agent.ts:463-471` @v0.84.1;
-    /// identical `this.signal` argument at v0.83.0, so this half is not drift). cyrup has no
-    /// separate options wrapper, so the run's token enters here — the loop passes
+    /// this.prepareNextTurn?.(this.signal); }` (`packages/agent/src/agent.ts:480-487` @v0.87.1).
+    /// cyrup has no separate options wrapper, so the run's token enters here — the loop passes
     /// `self.cancel.child()`, the same shape as `before_tool_call`/`after_tool_call`.
     async fn prepare_next_turn(
         &self,
@@ -291,18 +397,21 @@ pub trait Hooks: Send + Sync {
         Ok(None)
     }
 
-    /// After `turn_end` subscribers settle (func-02 R-02-032). `true` => emit `agent_end` & exit.
+    /// Immediately before EVERY provider request, including the run's first, after that turn's
+    /// pending messages were appended and emitted (Pi `prepareRequest`, added v0.87.0;
+    /// `agent-loop.ts:218-238` @v0.87.1). A returned [`RequestUpdate`] replaces the runtime values
+    /// for this and every later request in the run. It does not poll the queues: steering queued
+    /// while it runs waits for the next turn.
     ///
-    /// AGENT-024 — `_cancel` is the run's abort signal, bound the same way pi's Agent-options layer
-    /// binds it: `shouldStopAfterTurn: shouldStopAfterTurn ? async (context) => await
-    /// shouldStopAfterTurn(context, this.signal) : undefined` (`agent.ts:460-462` @v0.84.1, with the
-    /// `AgentOptions.shouldStopAfterTurn` field at `:108` and the public field at `:193-196`).
-    async fn should_stop_after_turn(
+    /// Host/extension seam with no in-tree producer yet: `PolicyHooks` only forwards it, and pi's
+    /// producer — the coding-agent's canonical-context request projection
+    /// (`_installAgentRequestProjection`, `agent-session.ts:608-632` @v0.87.1) — is not ported.
+    async fn prepare_request(
         &self,
-        _ctx: PostTurn<'_>,
+        _ctx: PrepareRequestCtx<'_>,
         _cancel: CancelToken,
-    ) -> Result<bool, HookError> {
-        Ok(false)
+    ) -> Result<Option<RequestUpdate>, HookError> {
+        Ok(None)
     }
 }
 

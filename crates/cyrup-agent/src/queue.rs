@@ -68,6 +68,15 @@ impl PendingQueue {
         self.items.is_empty()
     }
 
+    /// The batch the next [`Self::drain`] would return, without removing it: the single oldest
+    /// message, or all of them (Pi `PendingMessageQueue.peek`, `agent.ts:158-162` @v0.87.1).
+    pub fn peek(&self) -> Vec<AgentMessage> {
+        match self.mode {
+            QueueMode::OneAtATime => self.items.front().cloned().into_iter().collect(),
+            QueueMode::All => self.items.iter().cloned().collect(),
+        }
+    }
+
     /// Drain per the current mode: the single oldest message, or all of them (func-02 R-02-034/035).
     pub fn drain(&mut self) -> Vec<AgentMessage> {
         match self.mode {

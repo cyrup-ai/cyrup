@@ -46,8 +46,8 @@ pub struct AgentContext {
 }
 
 /// Per-run configuration for the low-level loop (Pi `AgentLoopConfig`, types.ts:140-282). The hook
-/// methods (`convertToLlm`/`transformContext`/`beforeToolCall`/`afterToolCall`/`prepareNextTurn`/
-/// `shouldStopAfterTurn`) live behind the [`Hooks`] seam; the steering/follow-up callbacks
+/// methods (`convertToLlm`/`transformContext`/`beforeToolCall`/`afterToolCall`/`finishTurn`/
+/// `prepareNextTurn`/`prepareRequest`) live behind the [`Hooks`] seam; the steering/follow-up callbacks
 /// (`getSteeringMessages`/`getFollowUpMessages`) are backed by the two [`PendingQueue`] handles.
 #[derive(Clone)]
 pub struct AgentLoopConfig {

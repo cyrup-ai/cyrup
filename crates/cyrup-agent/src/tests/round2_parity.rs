@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     AfterOutcome, AfterOverride, AfterToolCall, Agent, AgentContext, AgentEvent, AgentEventSink,
-    AgentLoopConfig, AgentMessage, HookError, Hooks, PostTurn, StreamFn, TurnUpdate, agent_loop,
-    agent_loop_continue, run_agent_loop, run_agent_loop_continue,
+    AgentLoopConfig, AgentMessage, HookError, Hooks, PostTurn, StreamFn, TurnDecision, TurnUpdate,
+    agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue,
 };
 use cyrup_core::{
     CancelToken, Content, EventStream, ModelRef, ModelThinkingLevel, RunCancel, StopReason,
@@ -228,15 +228,17 @@ async fn gap5_terminate_still_runs_post_turn_hooks_and_drains_follow_up() {
 // Gap #6 — uncontained run failure reports the REAL panic message (agent.ts:496-511).
 // ============================================================================
 
+/// Panics in `finish_turn`, the one turn hook that runs on every turn (a single-turn run never
+/// reaches `prepare_next_turn`, agent-loop.ts:184 @v0.87.1).
 struct ExplodingHook;
 
 #[async_trait::async_trait]
 impl Hooks for ExplodingHook {
-    async fn prepare_next_turn(
+    async fn finish_turn(
         &self,
         _ctx: PostTurn<'_>,
         _cancel: CancelToken,
-    ) -> Result<Option<TurnUpdate>, HookError> {
+    ) -> Result<Option<TurnDecision>, HookError> {
         panic!("kaboom: hook detonated");
     }
 }
@@ -278,16 +280,15 @@ async fn gap6_run_failure_surfaces_real_panic_message_and_error_stop_reason() {
 }
 
 // ============================================================================
-// AGENT-007 — a post-turn hook that RETURNS `Err` (Pi: throws) is a run FAILURE, not a quiet stop.
+// AGENT-007 — a turn hook that RETURNS `Err` (Pi: throws) is a run FAILURE, not a quiet stop.
 //
-// Pi awaits `prepareNextTurn` (agent-loop.ts:231) and `shouldStopAfterTurn` (agent-loop.ts:246-252)
-// bare — no try/catch — so a rejection escapes `runLoop` into `runWithLifecycle`'s catch
+// Pi awaits `prepareNextTurn` (agent-loop.ts:185 @v0.87.1) and `finishTurn` (`:285`) bare — no try/catch — so a rejection escapes `runLoop` into `runWithLifecycle`'s catch
 // (agent.ts:489-490) and reaches `handleRunFailure` (agent.ts:496-511), which emits a synthetic
 // errored assistant message through `message_start` → `message_end` → `turn_end` (empty
 // `toolResults`) → `agent_end` carrying `[failureMessage]`.
 // ============================================================================
 
-/// `prepare_next_turn` fails (Pi: throws) after the first turn completes.
+/// `prepare_next_turn` fails (Pi: throws) before the second turn starts.
 struct FailingPrepareHook;
 
 #[async_trait::async_trait]
@@ -301,17 +302,17 @@ impl Hooks for FailingPrepareHook {
     }
 }
 
-/// `should_stop_after_turn` fails (Pi: throws) after the first turn completes.
-struct FailingStopHook;
+/// `finish_turn` fails (Pi: throws) as the first turn completes.
+struct FailingFinishHook;
 
 #[async_trait::async_trait]
-impl Hooks for FailingStopHook {
-    async fn should_stop_after_turn(
+impl Hooks for FailingFinishHook {
+    async fn finish_turn(
         &self,
         _ctx: PostTurn<'_>,
         _cancel: CancelToken,
-    ) -> Result<bool, HookError> {
-        Err(HookError::new("stop check exploded"))
+    ) -> Result<Option<TurnDecision>, HookError> {
+        Err(HookError::new("finish turn exploded"))
     }
 }
 
@@ -327,6 +328,9 @@ async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
         .hooks(Arc::new(FailingPrepareHook))
         .build();
     agent.subscribe(rec.clone());
+    // `prepareNextTurn` runs only when the loop continues (agent-loop.ts:184 @v0.87.1): a queued
+    // follow-up is what makes it continue past the single scripted turn.
+    agent.follow_up(AgentMessage::user_text("more"));
 
     let new = agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -407,7 +411,7 @@ async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
 }
 
 #[tokio::test]
-async fn agent007_failing_should_stop_after_turn_emits_pis_full_failure_quartet() {
+async fn agent007_failing_finish_turn_emits_pis_full_failure_quartet() {
     let sf = faux_stream_fn(vec![faux_assistant_message(
         vec![faux_text("a1")],
         StopReason::Stop,
@@ -415,7 +419,7 @@ async fn agent007_failing_should_stop_after_turn_emits_pis_full_failure_quartet(
     .1;
     let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf)
-        .hooks(Arc::new(FailingStopHook))
+        .hooks(Arc::new(FailingFinishHook))
         .build();
     agent.subscribe(rec.clone());
 
@@ -433,14 +437,14 @@ async fn agent007_failing_should_stop_after_turn_emits_pis_full_failure_quartet(
     assert_eq!(
         tail,
         vec!["message_start", "message_end", "turn_end", "agent_end"],
-        "a failing should_stop_after_turn must close with Pi's failure quartet, got {names:?}"
+        "a failing finish_turn must close with Pi's failure quartet, got {names:?}"
     );
 
     let failure = last_assistant(&rec.snapshot());
     assert_eq!(failure.stop_reason, StopReason::Error);
     assert_eq!(
         failure.error_message.as_deref(),
-        Some("stop check exploded")
+        Some("finish turn exploded")
     );
 }
 

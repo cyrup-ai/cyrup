@@ -103,8 +103,9 @@ pub(crate) struct RunBaseline {
 /// This is cyrup's stand-in for the JS exception that unwinds out of `runLoop` into
 /// `runWithLifecycle`'s catch (`agent.ts:489-490`). Pi has exactly three producers of it inside the
 /// loop and all three are bare `await`s: `transformContext` / `convertToLlm`
-/// (`agent-loop.ts:288-295`, AGENT-025), the two post-turn hooks (`agent-loop.ts:231`, `:246-252`),
-/// and a throwing event listener (`agent.ts:573-575`, AGENT-033). The payload is the thrown value's
+/// (`agent-loop.ts:288-295`, AGENT-025), the turn hooks (`finishTurn`, `prepareNextTurn`,
+/// `prepareRequest` — `agent-loop.ts:185`, `:218`, `:251`, `:285` @v0.87.1), and a throwing event
+/// listener (`agent.ts:573-575`, AGENT-033). The payload is the thrown value's
 /// own text — `error instanceof Error ? error.message : String(error)` (`agent.ts:505`).
 struct RunFailure(String);
 
@@ -123,11 +124,11 @@ pub(crate) struct RunCtx {
     tool_execution: ToolExecution,
     session_id: Option<SessionId>,
     system_prompt: String,
-    /// Running model baseline; a `prepare_next_turn` model override updates it stickily
-    /// (Pi `config.model`, agent.ts:425 / agent-loop.ts:228-238).
+    /// Running model baseline; a `prepare_next_turn` / `prepare_request` model override updates it
+    /// stickily (Pi `config.model`, agent-loop.ts:189-198, :228-237 @v0.87.1).
     model: ModelRef,
-    /// Running thinking level; a `prepare_next_turn` `thinking_level` override updates it stickily
-    /// (Pi `config.reasoning`, agent.ts:426 / agent-loop.ts:228-238).
+    /// Running thinking level; a `prepare_next_turn` / `prepare_request` `thinking_level` override
+    /// updates it stickily (Pi `config.reasoning`, same sites).
     thinking_level: ModelThinkingLevel,
     /// Generation params + telemetry forwarded into `StreamOptions` (Pi `AgentLoopConfig`).
     gen_config: GenerationConfig,
@@ -260,9 +261,9 @@ impl RunCtx {
         Ok(())
     }
 
-    /// Pi `handleRunFailure` (agent.ts:496-511) reached from INSIDE the loop: the post-turn hooks
-    /// (`prepareNextTurn`, agent-loop.ts:231; `shouldStopAfterTurn`, agent-loop.ts:246-252) are
-    /// awaited with no try/catch, so a throw unwinds out of `runLoop` into `runWithLifecycle`'s
+    /// Pi `handleRunFailure` (agent.ts:496-511) reached from INSIDE the loop: the turn hooks
+    /// (`prepareNextTurn`, `prepareRequest`, `finishTurn`; agent-loop.ts:185, :218, :251, :285
+    /// @v0.87.1) are awaited with no try/catch, so a throw unwinds out of `runLoop` into `runWithLifecycle`'s
     /// catch (agent.ts:489-490) and is reported as a run FAILURE: one synthetic errored assistant
     /// message (empty text block, wall-clock timestamp, `stopReason` aborted-vs-error, the thrown
     /// `error.message`) followed by `message_start` → `message_end` → `turn_end` (with NO tool
@@ -337,7 +338,7 @@ impl RunCtx {
 
     /// Pi `runWithLifecycle` (`packages/agent/src/agent.ts:480-494` @v0.83.0): drive the loop and,
     /// on any thrown value, hand it to `handleRunFailure` (`:489-490`). Every in-loop failure
-    /// (`transformContext`/`convertToLlm`, the two post-turn hooks, a throwing listener) reaches
+    /// (`transformContext`/`convertToLlm`, the turn hooks, a throwing listener) reaches
     /// this one catch, which is why they all share [`RunFailure`].
     pub(crate) async fn run(&mut self, entry: RunEntry) -> Vec<AgentMessage> {
         // The only place the flag is set: a property of the entry, so it cannot disagree with it.
@@ -369,11 +370,11 @@ impl RunCtx {
                     self.messages.push(Arc::clone(&p));
                     self.new_messages.push(p);
                 }
-                self.run_loop(true).await
+                self.run_loop().await
             }
             RunEntry::Continue(_) => {
                 self.emit(AgentEvent::TurnStart).await?;
-                self.run_loop(true).await
+                self.run_loop().await
             }
         }
     }

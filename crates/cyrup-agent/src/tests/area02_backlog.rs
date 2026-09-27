@@ -1192,8 +1192,9 @@ async fn agent_s02_on_event_receives_the_runs_abort_signal() {
 //
 // pi binds it at the Agent-options layer: `prepareNextTurn: async (context) => { ... return await
 // this.prepareNextTurn?.(this.signal); }` (`agent.ts:463-471` @v0.84.1; the same `this.signal`
-// argument exists at v0.83.0) and `shouldStopAfterTurn: async (context) => await
-// shouldStopAfterTurn(context, this.signal)` (`:460-462`, v0.84.1 drift).
+// argument exists at v0.83.0). `finishTurn`, which replaced `shouldStopAfterTurn` in v0.87.0, gets
+// it from the loop itself: `config.finishTurn?.(lastCompletedTurn, signal)` (`agent-loop.ts:285`
+// @v0.87.1).
 // ===========================================================================
 
 #[derive(Default)]
@@ -1214,16 +1215,16 @@ impl Hooks for SignalWatchingPostTurn {
             .push(cancel.is_cancelled());
         Ok(None)
     }
-    async fn should_stop_after_turn(
+    async fn finish_turn(
         &self,
         _ctx: crate::PostTurn<'_>,
         cancel: CancelToken,
-    ) -> Result<bool, HookError> {
+    ) -> Result<Option<crate::TurnDecision>, HookError> {
         self.saw_cancelled
             .lock()
             .unwrap()
             .push(cancel.is_cancelled());
-        Ok(false)
+        Ok(None)
     }
 }
 

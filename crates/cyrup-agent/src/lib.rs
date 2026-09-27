@@ -25,7 +25,8 @@ pub use error::{AgentError, BusyEntry, ContinueSurface, HookError};
 pub use event::{AgentEvent, AgentMessage, AppRole, ToolResultMessage};
 pub use hooks::{
     AfterOutcome, AfterOverride, AfterToolCall, AgentContextView, BeforeOutcome, BeforeToolCall,
-    DefaultHooks, Hooks, PostTurn, TurnUpdate, default_convert_to_llm,
+    DefaultHooks, Hooks, PostTurn, PrepareRequestCtx, RequestUpdate, TurnDecision, TurnUpdate,
+    default_convert_to_llm,
 };
 pub use loop_fn::{
     AgentContext, AgentEventSink, AgentLoopConfig, AgentLoopStream, agent_loop,

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     Agent, AgentEvent, AgentMessage, EventSubscriber, HookError, Hooks, PostTurn, StreamFn,
-    TurnUpdate,
+    TurnDecision, TurnUpdate,
 };
 use cyrup_core::{
     CancelToken, Content, EventStream, Message, ModelRef, StopReason, TerminateHint, Tool,
@@ -76,12 +76,12 @@ impl Hooks for ContextOverrideHook {
             Ok(None)
         }
     }
-    async fn should_stop_after_turn(
+    async fn finish_turn(
         &self,
         ctx: PostTurn<'_>,
         _cancel: CancelToken,
-    ) -> Result<bool, HookError> {
-        Ok(ctx.turn_index >= 2)
+    ) -> Result<Option<TurnDecision>, HookError> {
+        Ok((ctx.turn_index >= 2).then_some(TurnDecision::End))
     }
 }
 

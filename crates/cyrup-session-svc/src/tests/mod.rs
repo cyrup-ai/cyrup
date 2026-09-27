@@ -54,6 +54,7 @@ mod session_list_dir;
 mod session_start_lifecycle;
 mod session_stats_shape;
 mod settings_resolve;
+mod startup_timings;
 mod summarization_retry_events;
 mod tool_usage_extension_seam;
 mod transport_setting;

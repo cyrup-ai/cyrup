@@ -1507,20 +1507,26 @@ struct LiveInner {
 }
 
 impl LiveExtension {
-    /// Load + instantiate a component and run its `init` export (R-08-001). After `init` returns,
-    /// the declared subscriptions are read back and the registered commands are flushed into the
-    /// registry. The `services` backend supplies interactive capabilities (default: deny-all).
+    /// Compile a component's bytes — the Cranelift pass, cyrup's counterpart of Pi's module import
+    /// (`loadExtensionModule`, `core/extensions/loader.ts:567` @v0.87.1). Kept apart from
+    /// [`Self::load`] so the host can take Pi's `${extensionPath} module import` timing mark
+    /// between the two (AGENT-027): compilation, not `init`, is where a large guest's load time goes.
+    pub fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component, ExtError> {
+        Component::from_binary(engine, bytes).map_err(|e| ExtError::Component(e.to_string()))
+    }
+
+    /// Instantiate a [compiled](Self::compile) component and run its `init` export (R-08-001). After
+    /// `init` returns, the declared subscriptions are read back and the registered commands are
+    /// flushed into the registry. The `services` backend supplies interactive capabilities (default:
+    /// deny-all).
     pub async fn load(
         engine: &Engine,
         id: ExtensionId,
-        bytes: &[u8],
+        component: &Component,
         limits: StoreLimits,
         guest: Arc<GuestState>,
         epoch_ticks: u64,
     ) -> Result<Self, ExtError> {
-        let component = Component::from_binary(engine, bytes)
-            .map_err(|e| ExtError::Component(e.to_string()))?;
-
         let mut linker = Linker::<HostState>::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|e| ExtError::Engine(e.to_string()))?;
@@ -1566,7 +1572,7 @@ impl LiveExtension {
 
         // init runs at command tier (load time): control ops would be legal here (R-08-008).
         guest.set_tier(CtxTier::Command);
-        let instance = bindings::Extension::instantiate_async(&mut store, &component, &linker)
+        let instance = bindings::Extension::instantiate_async(&mut store, component, &linker)
             .await
             .map_err(|e| map_wasm_error(&e))?;
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use cyrup_agent::{
     AfterOutcome, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, HookError, Hooks,
-    PostTurn, TurnUpdate,
+    PostTurn, PrepareRequestCtx, RequestUpdate, TurnDecision, TurnUpdate,
 };
 use cyrup_core::{CancelToken, Message, TerminateHint};
 use cyrup_tools::{PermissionPolicy, PolicyDecision};
@@ -297,12 +297,25 @@ impl Hooks for PolicyHooks {
         Ok(Some(update))
     }
 
-    async fn should_stop_after_turn(
+    /// pi's session wraps whatever `finishTurn` was already installed rather than replacing it
+    /// (`const previousFinishTurn = this.agent.finishTurn`, agent-session.ts:676-684 @v0.87.1), so
+    /// the inner seam's decision is passed through.
+    async fn finish_turn(
         &self,
         ctx: PostTurn<'_>,
         cancel: CancelToken,
-    ) -> Result<bool, HookError> {
-        self.inner.should_stop_after_turn(ctx, cancel).await
+    ) -> Result<Option<TurnDecision>, HookError> {
+        self.inner.finish_turn(ctx, cancel).await
+    }
+
+    /// Same wrap-don't-replace shape for `prepareRequest` (`const previousPrepareRequest =
+    /// this.agent.prepareRequest`, agent-session.ts:608-632 @v0.87.1).
+    async fn prepare_request(
+        &self,
+        ctx: PrepareRequestCtx<'_>,
+        cancel: CancelToken,
+    ) -> Result<Option<RequestUpdate>, HookError> {
+        self.inner.prepare_request(ctx, cancel).await
     }
 }
 
@@ -316,6 +329,94 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
     use cyrup_core::Content;
+
+    /// An extension-side seam that ends the run from `finish_turn` and raises the thinking level from
+    /// `prepare_request` — what the session's own wrapper must pass through, not swallow.
+    struct EndingInner;
+
+    #[async_trait::async_trait]
+    impl Hooks for EndingInner {
+        async fn finish_turn(
+            &self,
+            _ctx: PostTurn<'_>,
+            _cancel: CancelToken,
+        ) -> Result<Option<TurnDecision>, HookError> {
+            Ok(Some(TurnDecision::End))
+        }
+
+        async fn prepare_request(
+            &self,
+            _ctx: PrepareRequestCtx<'_>,
+            _cancel: CancelToken,
+        ) -> Result<Option<RequestUpdate>, HookError> {
+            Ok(Some(RequestUpdate {
+                thinking_level: Some(cyrup_core::ModelThinkingLevel::High),
+                ..RequestUpdate::default()
+            }))
+        }
+    }
+
+    /// Records the reasoning level of every provider request, then streams the faux response.
+    struct ReasoningLog {
+        inner: Arc<dyn cyrup_agent::StreamFn>,
+        seen: Arc<std::sync::Mutex<Vec<cyrup_core::ModelThinkingLevel>>>,
+    }
+
+    impl cyrup_agent::StreamFn for ReasoningLog {
+        fn stream(
+            &self,
+            model: &cyrup_core::ModelRef,
+            ctx: &cyrup_provider::Context,
+            opts: &cyrup_provider::StreamOptions,
+        ) -> cyrup_core::EventStream<cyrup_provider::StreamEvent> {
+            self.seen.lock().unwrap().push(opts.reasoning);
+            self.inner.stream(model, ctx, opts)
+        }
+    }
+
+    /// AGENT-038 — the session wrapper passes the inner seam's `finish_turn` decision and
+    /// `prepare_request` update through to the loop, as pi's session chains `previousFinishTurn` /
+    /// `previousPrepareRequest` (agent-session.ts:608-632, :675-684 @v0.87.1).
+    #[tokio::test]
+    async fn policy_hooks_pass_finish_turn_and_prepare_request_through() {
+        use cyrup_provider::faux::{
+            FauxProvider, faux_assistant_message, faux_text, faux_tool_call,
+        };
+        let faux = Arc::new(FauxProvider::new());
+        faux.set_responses(vec![
+            faux_assistant_message(
+                vec![faux_tool_call("missing", serde_json::json!({}))],
+                cyrup_core::StopReason::ToolUse,
+            ),
+            faux_assistant_message(vec![faux_text("unreached")], cyrup_core::StopReason::Stop),
+        ]);
+        let provider: Arc<dyn cyrup_provider::Provider> = faux;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sf: Arc<dyn cyrup_agent::StreamFn> = Arc::new(ReasoningLog {
+            inner: Arc::new(cyrup_agent::ProviderStreamFn::new(provider)),
+            seen: seen.clone(),
+        });
+        let hooks = Arc::new(PolicyHooks::new(
+            PermissionPolicy::new(),
+            Arc::new(EndingInner),
+            false,
+            false,
+            Arc::default(),
+        ));
+        let model = cyrup_core::ModelRef {
+            provider: "faux".into(),
+            api: Some("faux".into()),
+            model: "faux-1".into(),
+        };
+        let agent = cyrup_agent::Agent::builder(model, sf).hooks(hooks).build();
+        agent.prompt("go").await.unwrap().finished().await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![cyrup_core::ModelThinkingLevel::High],
+            "one request (the inner `End` beat the tool continuation), at the inner's level"
+        );
+    }
 
     #[test]
     fn filter_images_replaces_and_dedupes_placeholders() {
