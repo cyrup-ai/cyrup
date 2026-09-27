@@ -158,7 +158,9 @@ fn the_four_unbound_session_ids_route_to_their_commands_once_bound() {
 /// table must be upstream's, **in upstream's order** (`interactive-mode.ts:5827-5842` @v0.83.0) —
 /// `selectModel` after the cycle-models row, `toggleThinking` after `expandTools`, `copyMessage`
 /// after `externalEditor`. Order is asserted, not just presence: three rows appended at the end
-/// would satisfy a `contains` check and still not be pi's table.
+/// would satisfy a `contains` check and still not be pi's table. The `copyMessage` row reads
+/// `Copy selection or last assistant message` from v0.86.0 (`:6623` @v0.87.1; `Copy last assistant
+/// message` through v0.85.1), the selection-first behaviour `prefers_active_selection` ports.
 #[test]
 fn hotkeys_other_table_carries_the_three_restored_rows_in_upstream_order() {
     let app = new_app();
@@ -168,7 +170,7 @@ fn hotkeys_other_table_carries_the_three_restored_rows_in_upstream_order() {
     for (row, key_cell) in [
         ("| Open model selector |", "Ctrl+L"),
         ("| Toggle thinking block visibility |", "Ctrl+T"),
-        ("| Copy last assistant message |", "Ctrl+X"),
+        ("| Copy selection or last assistant message |", "Ctrl+X"),
     ] {
         assert!(other.contains(row), "missing row {row}:\n{other}");
         let line = other.lines().find(|l| l.contains(row)).unwrap();
@@ -201,11 +203,12 @@ fn hotkeys_other_table_carries_the_three_restored_rows_in_upstream_order() {
         "`:5836` then `:5837`"
     );
     assert!(
-        at("| Edit message in external editor |") < at("| Copy last assistant message |"),
+        at("| Edit message in external editor |")
+            < at("| Copy selection or last assistant message |"),
         "`:5837` then `:5838`"
     );
     assert!(
-        at("| Copy last assistant message |") < at("| Queue follow-up message |"),
+        at("| Copy selection or last assistant message |") < at("| Queue follow-up message |"),
         "`:5838` then `:5839`"
     );
 }

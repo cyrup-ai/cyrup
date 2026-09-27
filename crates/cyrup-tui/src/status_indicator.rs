@@ -7,7 +7,7 @@
 //!
 //! `Loader extends Text` and is constructed `super("", 1, 0)` (`loader.ts:35`) — **paddingX 1** — so
 //! `Text.render` emits `leftMargin + line + rightMargin` (`text.ts:70-76`). The rendered row is
-//! ` ⠋ Working... `, inset one column, not flush against the terminal edge.
+//! ` ⠋ Working `, inset one column, not flush against the terminal edge.
 //!
 //! ## States (`status-indicator.ts:7`)
 //! `working | retry | compaction | branchSummary`, plus idle — exactly one active at a time. Each
@@ -19,7 +19,7 @@
 //! defaultWorkingMessage` and appends NOTHING (`interactive-mode.ts:2074-2080`); the only place a
 //! working message ever gains a suffix is `resetExtensionUI` (`:2188-2191`), which spells it
 //! `(… to interrupt)` and fires on an extension reload, not on a turn. cyrup appended
-//! ` ({hint} to cancel)` to every kind, adding 18 columns to `Working...` for the whole duration of
+//! ` ({hint} to cancel)` to every kind, adding 18 columns to `Working` for the whole duration of
 //! every turn.
 //!
 //! ## Citation tags
@@ -52,7 +52,7 @@ pub const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 pub enum IndicatorKind {
     /// No active run — two blank lines (`IdleStatus`).
     Idle,
-    /// A turn is streaming — accent spinner + `Working…` (`interactive-mode.ts:1778`).
+    /// A turn is streaming — accent spinner + `Working` (`interactive-mode.ts:1778`).
     Working,
     /// Auto-retry in progress — warning spinner (`AutoRetryStart`).
     Retry,
@@ -165,14 +165,14 @@ pub struct StatusIndicator {
     /// Set only while a retry backoff is counting down; re-derives `message` per frame.
     retry: Option<RetryCountdown>,
     /// Pi `this.workingMessage` (`interactive-mode.ts:431`) — an extension's `setWorkingMessage`
-    /// override, `None` for `defaultWorkingMessage` (`"Working..."`, `:434`). Held ACROSS turns:
+    /// override, `None` for `defaultWorkingMessage` (`"Working"`, `:451` @v0.87.1). Held ACROSS turns:
     /// upstream seeds every new `WorkingStatusIndicator` from it (`:2102`, `:3118`), so an extension
     /// sets it once and every subsequent turn shows it, until it clears it or a session swap resets
     /// it.
     working_message: Option<String>,
     /// Pi `this.workingVisible` (`:432`), initialised `true`. `false` suppresses the working band
-    /// for the whole session — `agent_start` takes `clearStatusIndicator()` instead of showing the
-    /// loader (`:3114-3124`).
+    /// for the whole session — `turn_start` takes `clearStatusIndicator()` instead of showing the
+    /// loader (`:3307-3313` @v0.87.1).
     working_visible: bool,
     /// Pi `this.workingIndicatorOptions` (`:433`) — `None` is the built-in animated spinner.
     working_indicator: Option<WorkingIndicator>,
@@ -252,14 +252,14 @@ impl StatusIndicator {
         self.retry.map(|r| r.message_at(elapsed))
     }
 
-    /// Shortcut: enter the `Working…` state (`AgentStart`).
+    /// Shortcut: enter the `Working` state (`TurnStart`).
     ///
-    /// Pi's `agent_start` arm is a BRANCH on `workingVisible`, not an unconditional show:
-    /// `if (this.workingVisible) { showStatusIndicator(new WorkingStatusIndicator(ui,
-    /// this.workingMessage ?? this.defaultWorkingMessage, this.workingIndicatorOptions)) } else {
-    /// this.clearStatusIndicator() }` (`interactive-mode.ts:3114-3124`). Both halves are ported
-    /// here because this is the ONE funnel every cyrup caller uses — `AgentStart`, and the four
-    /// "back to working if still streaming" restores after a retry/compaction/branch-summary band.
+    /// Pi's `turn_start` arm is a BRANCH on `workingVisible`, not an unconditional show:
+    /// `if (this.workingVisible) { … showWorkingStatusIndicator() } else {
+    /// this.clearStatusIndicator() }` (`interactive-mode.ts:3307-3313` @v0.87.1; `agent_start`
+    /// until v0.84.4). Both halves are ported here because this is the ONE funnel every cyrup
+    /// caller uses — `TurnStart`, and the four "back to working if still streaming" restores after
+    /// a retry/compaction/branch-summary band.
     pub fn working(&mut self) {
         if !self.working_visible {
             // `clearStatusIndicator()` with NO kind argument — unfiltered, unlike the `"working"`
@@ -277,7 +277,7 @@ impl StatusIndicator {
     /// this.activeStatusIndicator.setMessage(message ?? this.defaultWorkingMessage)`.
     ///
     /// `None` is upstream's no-argument call: [`Self::default_message`] then supplies
-    /// `"Working..."`, which is what `?? this.defaultWorkingMessage` does there.
+    /// `"Working"`, which is what `?? this.defaultWorkingMessage` does there.
     pub fn set_working_message(&mut self, message: Option<String>) {
         self.working_message = message.clone();
         if self.kind == IndicatorKind::Working {
@@ -327,7 +327,7 @@ impl StatusIndicator {
     /// Pi `resetExtensionUI`'s working-indicator block (`interactive-mode.ts:2210-2218`), run on an
     /// extension reload / session swap: drop the message override, restore visibility to `true`,
     /// restore the default spinner — and, when the working band is LIVE, re-message it to
-    /// `"Working... ({interrupt} to interrupt)"` (`:2213-2217`).
+    /// `"Working ({interrupt} to interrupt)"` (`:2382` @v0.87.1).
     ///
     /// That suffix is upstream's, verbatim, and it is deliberately the odd one out: it says
     /// "to interrupt" where the retry / compaction / branch-summary constructors bake in
@@ -363,14 +363,15 @@ impl StatusIndicator {
 
     /// The default message for the active kind when none was supplied.
     ///
-    /// Verbatim from upstream, ASCII `...` and all: `"Working..."`
-    /// (`interactive-mode.ts:420 defaultWorkingMessage`), `"Retrying …s..."`
-    /// (`status-indicator.ts:47`), `"Compacting context..."` (`:81`), `"Summarizing branch..."`
-    /// (`:100`). cyrup spelled every one with U+2026, which is one column where pi draws three.
+    /// Verbatim from upstream: `"Working"` (`interactive-mode.ts:451 defaultWorkingMessage`
+    /// @v0.87.1 — `"Working..."` until v0.85.0, #8799), and, ASCII `...` and all,
+    /// `"Retrying …s..."` (`status-indicator.ts:47`), `"Compacting context..."` (`:81`),
+    /// `"Summarizing branch..."` (`:100`). cyrup spelled every one with U+2026, which is one column
+    /// where pi draws three.
     fn default_message(&self) -> &'static str {
         match self.kind {
             IndicatorKind::Idle => "",
-            IndicatorKind::Working => "Working...",
+            IndicatorKind::Working => "Working",
             IndicatorKind::Retry => "Retrying...",
             IndicatorKind::Compaction => "Compacting context...",
             IndicatorKind::BranchSummary => "Summarizing branch...",
@@ -429,7 +430,7 @@ impl StatusIndicator {
         //
         // The glyph itself is `updateDisplay`'s `const indicator = frame.length > 0 ? "${frame} " :
         // ""` (`loader.ts:86` @v0.84.2): an extension that passed `frames: []` gets NO glyph and NO
-        // trailing space, i.e. ` Working... ` flush against the one-column margin — not a blank
+        // trailing space, i.e. ` Working ` flush against the one-column margin — not a blank
         // column where a spinner used to be. A custom indicator is drawn UNSTYLED
         // (`renderIndicatorVerbatim`, `:85`) so the extension's own colouring survives; the built-in
         // keeps its accent/warning.

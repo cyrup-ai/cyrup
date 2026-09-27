@@ -111,6 +111,25 @@ fn known_no_image_terminals_and_conservative_default() {
     assert!(unknown_tc.true_color, "COLORTERM=truecolor → truecolor on");
 }
 
+/// TUI-098 — Pi v0.85.0 (#8828, `terminal-image.ts:113`) identifies Zed's integrated terminal as
+/// `{ images: null, trueColor: true, hyperlinks: true }`. Before the port it fell through to the
+/// conservative default: no OSC-8, and truecolor only with a `COLORTERM` hint — so the case below
+/// deliberately sets none. Driven through the override layer too, which is the path
+/// [`crate::detect_capabilities`] takes with the real environment.
+#[test]
+fn zed_is_identified_as_truecolor_and_hyperlink_capable() {
+    for tp in ["zed", "Zed"] {
+        let env = [("TERM_PROGRAM", tp), ("TERM", "xterm-256color")];
+        let caps = detect_capabilities_from(env_of(&env), false);
+        assert_eq!(caps.images, None, "{tp}: Zed has no inline image protocol");
+        assert!(caps.true_color, "{tp}: truecolor without a COLORTERM hint");
+        assert!(caps.hyperlinks, "{tp}: OSC-8 hyperlinks on");
+
+        let caps = crate::detect_capabilities_with_overrides(env_of(&env), || false);
+        assert!(caps.true_color && caps.hyperlinks && caps.images.is_none());
+    }
+}
+
 /// Pi v0.84.1 `tui/src/terminal-image.ts:124-129` — a Windows console that set no `WT_SESSION`
 /// (Windows Terminal hosting a `cmd.exe` launched straight from Win+R) still gets truecolor, and
 /// still does not get OSC-8. Added upstream in `fa07e7bd9`, after cyrup's v0.83.0 baseline.

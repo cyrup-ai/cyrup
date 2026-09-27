@@ -194,9 +194,15 @@ pub(super) fn ghost_span(hint: &str, available: usize, style: Style) -> Option<S
     Some(Span::styled(text, style))
 }
 
-/// One scroll-indicator rule, a 1:1 port of `createScrollBorder` (`editor.ts:259-268`):
+/// One scroll-indicator rule, a 1:1 port of `createScrollBorder` (`editor.ts:276-293` @v0.87.1):
 ///
 /// ```text
+/// const label = ` ${direction} ${hiddenLineCount} more `;
+/// const labelWidth = visibleWidth(label);
+/// if (labelWidth + 2 <= availableWidth) {
+///     const leftWidth = Math.floor((availableWidth - labelWidth) / 2);
+///     return "─".repeat(leftWidth) + label + "─".repeat(availableWidth - leftWidth - labelWidth);
+/// }
 /// const indicator = `─── ${direction} ${hiddenLineCount} more `;
 /// const remaining = availableWidth - visibleWidth(indicator);
 /// if (remaining >= 0) return indicator + "─".repeat(remaining);
@@ -204,7 +210,12 @@ pub(super) fn ghost_span(hint: &str, available: usize, style: Style) -> Option<S
 /// return sliceByColumn(indicator, 0, availableWidth - visibleWidth(ellipsis), true) + ellipsis;
 /// ```
 ///
-/// `direction` is `'↑'` (rows scrolled off the top) or `'↓'` (rows still below).
+/// `direction` is `'↑'` (rows scrolled off the top) or `'↓'` (rows still below). The centred branch
+/// is v0.85.0's; through v0.84.4 the left-anchored `─── ↑ N more ───…` was the wide path. Upstream
+/// kept that old branch after the centred one, but it cannot fire there: `indicator` is `label` plus
+/// three rule columns, so `remaining >= 0` implies `labelWidth + 2 <= availableWidth`, which the
+/// centred branch already took. It is not reproduced; the narrow fallback goes straight to the
+/// left-anchored slice-and-ellipsis.
 ///
 /// **The trailing `true` is `strict`, not a pad flag.** `sliceByColumn(line, startCol, length,
 /// strict = false)` (`utils.ts:1195-1197`) forwards to `sliceWithWidth`, whose `strict` drops a
@@ -225,15 +236,19 @@ pub(super) fn ghost_span(hint: &str, available: usize, style: Style) -> Option<S
 /// `─`s underneath.
 pub(super) fn scroll_border(direction: char, hidden: usize, width: u16) -> String {
     let avail = usize::from(width);
-    let indicator = format!("─── {direction} {hidden} more ");
-    let indicator_w = display_width(&indicator);
-    if avail >= indicator_w {
-        let mut out = indicator;
-        out.push_str(&"─".repeat(avail - indicator_w));
+    let label = format!(" {direction} {hidden} more ");
+    let label_w = display_width(&label);
+    if label_w + 2 <= avail {
+        let left = (avail - label_w) / 2;
+        let mut out = "─".repeat(left);
+        out.push_str(&label);
+        out.push_str(&"─".repeat(avail - left - label_w));
         return out;
     }
-    // Too narrow for the whole indicator: keep as many leading columns as fit, then `...` (itself
-    // truncated to the available width on a truly tiny terminal).
+    // Too narrow even for a rule cell each side: keep as many leading columns of the left-anchored
+    // indicator as fit, then `...` (itself truncated to the available width on a truly tiny
+    // terminal).
+    let indicator = format!("───{label}");
     let ellipsis: String = "...".chars().take(avail).collect();
     let budget = avail.saturating_sub(display_width(&ellipsis));
     let mut out = String::new();
@@ -390,9 +405,9 @@ impl Component for InputEditor {
         let para = Paragraph::new(lines).block(block).style(base);
         frame.render_widget(para, area);
         // E4's other half: the rules ANNOUNCE the hidden rows. `createScrollBorder`
-        // (`editor.ts:259-268`) replaces the plain `─`-repeat with `─── ↑ N more ───…` at the top
-        // when `scrollOffset > 0` (`:526-528`) and `─── ↓ N more ───…` at the bottom when content
-        // remains below (`:582-585`). The `Block` above already painted a plain rule on both edges;
+        // (`editor.ts:276-293` @v0.87.1) replaces the plain `─`-repeat with `───… ↑ N more ───…` at
+        // the top when `scrollOffset > 0` (`:509`) and `───… ↓ N more ───…` at the bottom when
+        // content remains below (`:514`). The `Block` above already painted a plain rule on both edges;
         // these overwrite it in place, which is byte-identical to pi choosing one string or the other
         // (both are exactly `width` columns).
         if self.scroll_offset > 0 && area.height >= 1 {

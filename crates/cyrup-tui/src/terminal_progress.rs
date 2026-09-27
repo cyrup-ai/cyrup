@@ -31,16 +31,18 @@
 //!
 //! | site | line (v0.83.0) | call |
 //! |---|---|---|
-//! | `case "agent_start"` | `:2865-2867` | `setProgress(true)` |
+//! | `case "turn_start"` | `:3303-3305` @v0.87.1 | `setProgress(true)` |
 //! | `case "agent_end"` | `:3057-3059` | `setProgress(false)` |
 //! | `case "compaction_start"` | `:3076-3078` | `setProgress(true)` |
 //! | `case "compaction_end"` | `:3090-3092` | `setProgress(false)` |
 //! | `stop()` | `:6041-6043` | `setProgress(false)` |
 //!
-//! Note what is NOT in that list: `agent_settled`, `turn_start`/`turn_end`, tool execution, and the
-//! auto-retry events. "Progress" here means *the agent is doing something the user is waiting on*,
-//! which begins at `agent_start` and ends at `agent_end` — a retry backoff sits inside that window
-//! and needs no separate signal.
+//! Note what is NOT in that list: `agent_settled`, `turn_end`, tool execution, and the auto-retry
+//! events. "Progress" here means *the agent is doing something the user is waiting on*, which
+//! begins at the run's first `turn_start` and ends at `agent_end` — a retry backoff sits inside
+//! that window and needs no separate signal. The raise was on `agent_start` until v0.84.4 (#8782)
+//! moved it to `turn_start`, so every turn re-raises it and a threshold compaction between two turns
+//! of one run (whose `compaction_end` clears it) does not leave the taskbar dark afterwards.
 //!
 //! # Version note
 //!
@@ -299,7 +301,7 @@ mod tests {
     }
 
     /// A transition is parked for the run loop to write, and draining it yields it exactly ONCE —
-    /// the property that keeps one `agent_start` from re-writing the active sequence on every frame.
+    /// the property that keeps one `turn_start` from re-writing the active sequence on every frame.
     #[test]
     fn a_transition_is_drained_exactly_once() {
         let mut p = TerminalProgress::with_enabled(true);
@@ -346,7 +348,7 @@ mod tests {
 
     /// Turning the row off mid-turn clears — the documented `[CYRUP-DELTA]` on
     /// [`TerminalProgress::set_enabled`]. Turning it off while idle writes nothing, and turning it
-    /// ON never writes on its own (Pi arms only from an `agent_start`/`compaction_start`).
+    /// ON never writes on its own (Pi arms only from a `turn_start`/`compaction_start`).
     #[test]
     fn disabling_the_setting_mid_turn_clears_but_enabling_never_arms() {
         let mut p = TerminalProgress::with_enabled(true);

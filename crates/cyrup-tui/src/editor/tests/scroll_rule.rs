@@ -10,17 +10,29 @@ use crate::editor::*;
 
 // ------------------------------------------------------------- createScrollBorder ------------
 
-/// The wide path (`editor.ts:262-263`): the indicator, then `─` to the requested width.
+/// The wide path (`editor.ts:279-281` @v0.87.1, v0.85.0 on): the label centred, `floor` of the
+/// spare columns as rule on the left and the rest on the right.
 #[test]
-fn the_scroll_rule_reads_as_an_indicator_padded_with_rule() {
-    let s = scroll_border('↑', 6, 20);
-    assert!(s.starts_with("─── ↑ 6 more "), "{s:?}");
-    assert_eq!(display_width(&s), 20, "{s:?}");
-    assert!(s.ends_with('─'), "the remainder is rule, not blank: {s:?}");
+fn the_scroll_rule_centres_its_label_when_it_fits() {
+    assert_eq!(
+        scroll_border('↑', 3, 40),
+        format!("{} ↑ 3 more {}", "─".repeat(15), "─".repeat(15))
+    );
+    assert_eq!(
+        scroll_border('↓', 3, 41),
+        format!("{} ↓ 3 more {}", "─".repeat(15), "─".repeat(16)),
+        "an odd spare column goes to the right"
+    );
+    assert_eq!(
+        scroll_border('↑', 6, 12),
+        "─ ↑ 6 more ─",
+        "one rule cell each side is still the centred form"
+    );
 }
 
-/// The narrow path (`editor.ts:265-267`): a strict slice of the indicator plus `...`, itself
-/// clipped on a terminal too narrow even for that.
+/// The narrow path (`editor.ts:288-291`): below `label + 2` columns, a strict slice of the
+/// left-anchored `─── ↑ N more ` plus `...`, itself clipped on a terminal too narrow even for
+/// that.
 #[test]
 fn a_terminal_too_narrow_for_the_indicator_gets_an_ellipsis() {
     assert_eq!(
@@ -29,6 +41,7 @@ fn a_terminal_too_narrow_for_the_indicator_gets_an_ellipsis() {
         "{:?}",
         scroll_border('↓', 5, 10)
     );
+    assert_eq!(scroll_border('↑', 6, 11), "─── ↑ 6 ...");
     assert_eq!(scroll_border('↓', 5, 2), "..");
     assert_eq!(scroll_border('↓', 5, 0), "");
 }

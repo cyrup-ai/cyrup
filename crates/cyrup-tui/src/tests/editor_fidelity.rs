@@ -79,7 +79,7 @@ fn rows(app: &App<TestBackend>) -> Vec<String> {
 
 /// Whether `row` is one of the editor's rules. A rule either repeats `─` across the full width
 /// (`editor.ts:530`, `:587`) **or** is a `createScrollBorder` indicator, which still opens with
-/// `─── ` (`:261`) — so "starts with `─`" covers both, where "is entirely `─`" would silently skip
+/// at least one `─` (`:279-281` @v0.87.1) — so "starts with `─`" covers both, where "is entirely `─`" would silently skip
 /// the scrolled case and hand the caller the wrong row.
 fn is_rule(row: &str) -> bool {
     row.starts_with('─')
@@ -248,7 +248,7 @@ fn the_editor_caps_at_thirty_percent_of_the_terminal_height() {
         // and only the scroll rule's own count can tell the two apart. 60 `Shift+Enter`s leave 61
         // layout lines with the caret on the last, so the rows hidden above are `61 - shown`.
         assert!(
-            r[top].starts_with(&format!("─── ↑ {} more ", 61 - want_text_rows)),
+            r[top].trim_matches('─') == format!(" ↑ {} more ", 61 - want_text_rows),
             "the top rule must report `61 - {want_text_rows}` hidden rows — a different number \
              means the editor drew a different count than the slot reserved:\n{}",
             r.join("\n")
@@ -278,9 +278,10 @@ fn a_short_buffer_stays_short_under_the_thirty_percent_cap() {
 
 /// **E4.** Overflow SCROLLS and the rules say by how much.
 ///
-/// `createScrollBorder("↑" | "↓", hiddenLineCount, width)` (`editor.ts:259-268`) replaces the plain
-/// `─`-repeat at the top when `scrollOffset > 0` (`:526-528`) and at the bottom when rows remain
-/// below (`:582-585`); `scrollOffset` is moved to keep the caret's layout line inside the window
+/// `createScrollBorder("↑" | "↓", hiddenLineCount, width)` (`editor.ts:276-293` @v0.87.1) replaces
+/// the plain `─`-repeat at the top when `scrollOffset > 0` (`:509`) and at the bottom when rows
+/// remain below (`:514`) — the label CENTRED in the rule since v0.85.0, `floor` columns of `─` on
+/// the left and the rest on the right; `scrollOffset` is moved to keep the caret's layout line inside the window
 /// before the slice (`:507-516`). cyrup drew a plain `Borders::TOP | BOTTOM` and a `Paragraph` with
 /// no `.scroll()`, so the surplus rows — the caret's included — were silently clipped.
 ///
@@ -300,10 +301,11 @@ fn overflow_scrolls_to_the_caret_and_the_rules_count_the_hidden_rows() {
     // above: the TOP rule carries `↑ 6 more`.
     let r = rows(&app);
     let top = editor_top_rule(&app);
-    assert!(
-        r[top].starts_with("─── ↑ 6 more "),
-        "top scroll rule (`:527`): {:?}",
-        r[top]
+    // 48 columns, a 10-column ` ↑ 6 more ` label: floor(38 / 2) = 19 rule cells each side.
+    assert_eq!(
+        r[top],
+        format!("{} ↑ 6 more {}", "─".repeat(19), "─".repeat(19)),
+        "top scroll rule, centred (`:279-281`)"
     );
     assert!(
         r[top].chars().all(|c| c != '↓'),
@@ -351,10 +353,10 @@ fn overflow_scrolls_to_the_caret_and_the_rules_count_the_hidden_rows() {
         "7 text rows between the rules: {:?}",
         &r[top..=bottom]
     );
-    assert!(
-        r[bottom].starts_with("─── ↓ 6 more "),
-        "bottom scroll rule (`:584`): {:?}",
-        r[bottom]
+    assert_eq!(
+        r[bottom],
+        format!("{} ↓ 6 more {}", "─".repeat(19), "─".repeat(19)),
+        "bottom scroll rule, centred (`:279-281`)"
     );
     assert!(
         caret_cell(&app).is_some(),
@@ -715,7 +717,7 @@ fn the_hardware_cursor_rides_the_scrolled_window_not_the_absolute_row() {
         "precondition: a 7-row window over 13 layout lines"
     );
     assert!(
-        rows(&app)[top].starts_with("─── ↑ "),
+        rows(&app)[top].contains(" ↑ "),
         "precondition: the window really scrolled"
     );
 
@@ -864,7 +866,7 @@ fn the_editor_caps_itself_at_thirty_percent_regardless_of_the_rect_it_is_given()
     );
     // And the rows it declined to draw are announced, not silently dropped.
     assert!(
-        row(0).starts_with("─── ↑ 23 more "),
+        row(0).trim_matches('─') == " ↑ 23 more ",
         "the top rule counts the hidden rows (`editor.ts:526-528`): {:?}",
         row(0)
     );

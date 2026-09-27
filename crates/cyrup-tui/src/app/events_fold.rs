@@ -29,20 +29,17 @@ impl<B: Backend> App<B> {
         // untouched — this is the same match, arm for arm and statement for statement, with the
         // single documented exception in `ToolExecutionStart` below.
         match ev {
+            // Pi `case "agent_start"` (`interactive-mode.ts:3294-3302` @v0.87.1) touches neither
+            // terminal progress nor the working band since v0.84.4 (#8782, commit `56700d42e`):
+            // both moved to `turn_start` below. cyrup's own `streaming` bit stays here.
             AgentSessionEvent::AgentStart => {
-                // Pi `case "agent_start"` (`interactive-mode.ts:2865-2867`): the FIRST statement of
-                // the arm, before the retry-handler restore and the working indicator, is
-                // `if (getShowTerminalProgress()) this.ui.terminal.setProgress(true)`. The OSC write
-                // is the run loop's (`flush_terminal_progress`), as for the OSC 0 title.
-                self.state.terminal_progress.set(true);
                 self.state.status.set_streaming(true);
-                self.state.indicator.working();
             }
             AgentSessionEvent::AgentEnd { .. } => {
                 // Pi `case "agent_end"` (`interactive-mode.ts:3057-3059`), again the arm's first
                 // statement: `setProgress(false)`. `agent_end` — not `agent_settled` — is where Pi
                 // clears, so a turn that goes on to auto-retry or run a queued continuation drops
-                // the indicator and the next `agent_start` puts it back.
+                // the indicator and the next run's first `turn_start` puts it back.
                 self.state.terminal_progress.set(false);
                 self.state.status.set_streaming(false);
                 self.state.indicator.idle();
@@ -66,7 +63,22 @@ impl<B: Backend> App<B> {
             // fold, which cannot `await` or return control to the caller — so this arm is a
             // deliberate no-op, NOT a missing case.
             AgentSessionEvent::AgentSettled => {}
-            AgentSessionEvent::TurnStart | AgentSessionEvent::TurnEnd { .. } => {}
+            // Pi `case "turn_start"` (`interactive-mode.ts:3302-3314` @v0.87.1): raise terminal
+            // progress on EVERY turn, not once per run, so a threshold compaction between a tool
+            // result and the next request — whose `compaction_end` clears it — does not leave the
+            // taskbar dark for the rest of the run ("Restore interactive progress when the same run
+            // resumes", #8782). The OSC write is the run loop's (`flush_terminal_progress`), as for
+            // the OSC 0 title. Then `if (workingVisible) { if (activeStatusIndicator?.kind !==
+            // "working") showWorkingStatusIndicator() } else clearStatusIndicator()`: a band that
+            // is already working keeps its phase and message; [`StatusIndicator::working`] is the
+            // visible/cleared branch.
+            AgentSessionEvent::TurnStart => {
+                self.state.terminal_progress.set(true);
+                if self.state.indicator.kind() != IndicatorKind::Working {
+                    self.state.indicator.working();
+                }
+            }
+            AgentSessionEvent::TurnEnd { .. } => {}
             // Pi `case "message_start"` (`interactive-mode.ts:3121-3143`): an `assistant` message
             // opens a fresh `AssistantMessageComponent` and files it in `this.streamingComponent`
             // (`:3130-3139`). cyrup's transcript already owns the streaming buffers, so the only
@@ -292,9 +304,9 @@ impl<B: Backend> App<B> {
             } => {
                 // Pi `case "compaction_end"` (`interactive-mode.ts:3090-3092`): clears
                 // unconditionally, even when this was an AUTO-compaction inside a still-streaming
-                // turn. Pi's own `agent_end` then re-clears; the visible effect is a brief gap in
-                // the taskbar pulse, and matching it is why `TerminalProgress::set` does not
-                // deduplicate repeated transitions.
+                // run. The run's next `turn_start` raises it again (or its `agent_end` re-clears);
+                // the visible effect is a brief gap in the taskbar pulse, and matching it is why
+                // `TerminalProgress::set` does not deduplicate repeated transitions.
                 self.state.terminal_progress.set(false);
                 // Back to working if the turn is still streaming, else idle.
                 if self.state.status.streaming {

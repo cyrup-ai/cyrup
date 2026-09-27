@@ -822,7 +822,14 @@ pub fn detect_capabilities_on_platform(
     if has("ITERM_SESSION_ID") || term_program == "iterm.app" {
         return identified(Some(ImageProtocol::Iterm2), true);
     }
-    if has("WT_SESSION") || term_program == "vscode" || term_program == "alacritty" {
+    // Pi v0.85.0 (#8828) adds Zed's integrated terminal to the `alacritty`/`vscode` arm
+    // (terminal-image.ts:113): truecolor and OSC-8, no inline images. `WT_SESSION` is its own arm
+    // upstream (`:109`) with the identical record, so folding it in here changes nothing.
+    if has("WT_SESSION")
+        || term_program == "vscode"
+        || term_program == "alacritty"
+        || term_program == "zed"
+    {
         return identified(None, true);
     }
     if terminal_emulator == "jetbrains-jediterm" {

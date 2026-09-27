@@ -31,7 +31,9 @@ use crate::{
 use cyrup_core::StopReason;
 use cyrup_provider::Provider;
 use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
-use cyrup_session_svc::{AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig};
+use cyrup_session_svc::{
+    AgentSession, AgentSessionEvent, CompactionReason, SessionBuilder, SessionConfig,
+};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
@@ -98,7 +100,7 @@ async fn cycle_terminal_progress_row(
 // ================================================================ the proof
 
 /// **The end-to-end.** The user turns "Terminal progress" on in `/settings`, then submits a prompt.
-/// The indicator must arm on the turn's `agent_start` and clear on its `agent_end`.
+/// The indicator must arm on the run's `turn_start` and clear on its `agent_end`.
 ///
 /// FAILS before the fix in two independent ways: there was no `terminal_progress` state for the
 /// `ApplySetting` arm to write, and no session-event arm ever recorded a transition — the whole
@@ -136,7 +138,7 @@ async fn settings_row_then_a_real_prompt_arms_and_clears_the_indicator() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (mut armed, mut kept, mut cleared) = (false, true, false);
             while let Some(ev) = events.next().await {
-                let is_start = matches!(ev, AgentSessionEvent::AgentStart);
+                let is_start = matches!(ev, AgentSessionEvent::TurnStart);
                 let is_end = matches!(ev, AgentSessionEvent::AgentEnd { .. });
                 app.ingest_session_event(&ev, &fx.session).await;
                 if is_start {
@@ -144,7 +146,7 @@ async fn settings_row_then_a_real_prompt_arms_and_clears_the_indicator() {
                     assert_eq!(
                         app.state_mut().terminal_progress.take_pending(),
                         Some(true),
-                        "agent_start must park the ACTIVE sequence for the run loop to write"
+                        "turn_start must park the ACTIVE sequence for the run loop to write"
                     );
                 } else if is_end {
                     cleared = !app.state().terminal_progress.is_active();
@@ -168,7 +170,7 @@ async fn settings_row_then_a_real_prompt_arms_and_clears_the_indicator() {
 
     assert!(
         armed_at_start,
-        "agent_start must light the indicator (interactive-mode.ts:2865-2867)"
+        "turn_start must light the indicator (interactive-mode.ts:3303-3305 @v0.87.1)"
     );
     assert!(
         kept_through_the_turn,
@@ -262,6 +264,53 @@ async fn a_compaction_is_its_own_progress_window() {
     );
 }
 
+/// TUI-116 — a threshold compaction BETWEEN two turns of one run clears the indicator on its
+/// `compaction_end` (`interactive-mode.ts:3090-3092`), and the run's next `turn_start` must light it
+/// again (`:3303-3305` @v0.87.1; moved off `agent_start` in v0.84.4, #8782 — "Restore interactive
+/// progress when the same run resumes"). The agent loop runs `prepare_next_turn` (where that
+/// compaction happens) and then emits `turn_start` (`cyrup-agent/src/agent/run/turn.rs`), so this is
+/// the order the fold sees.
+///
+/// FAILS before the fix: `TurnStart` was a no-op and only `agent_start` raised the indicator, so it
+/// stayed dark from the `compaction_end` to the end of the run.
+#[tokio::test]
+async fn a_mid_run_compaction_does_not_leave_the_indicator_dark_for_the_rest_of_the_run() {
+    let fx = fixture().await;
+    let mut app = app();
+    let on = cycle_terminal_progress_row(&mut app, &fx.session).await;
+    app.execute_command(on, &fx.session, None).await;
+
+    app.ingest_event(&AgentSessionEvent::AgentStart);
+    app.ingest_event(&AgentSessionEvent::TurnStart);
+    assert!(app.state().terminal_progress.is_active(), "fixture: lit");
+    app.ingest_event(&AgentSessionEvent::CompactionStart {
+        reason: CompactionReason::Threshold,
+    });
+    app.ingest_event(&AgentSessionEvent::CompactionEnd {
+        reason: CompactionReason::Threshold,
+        result: None,
+        aborted: false,
+        will_retry: false,
+        error_message: None,
+    });
+    assert!(
+        !app.state().terminal_progress.is_active(),
+        "fixture: `compaction_end` clears it even inside a streaming run"
+    );
+    app.state_mut().terminal_progress.take_pending();
+
+    app.ingest_event(&AgentSessionEvent::TurnStart);
+    assert!(
+        app.state().terminal_progress.is_active(),
+        "the resumed run's `turn_start` must light the indicator again"
+    );
+    assert_eq!(
+        app.state_mut().terminal_progress.take_pending(),
+        Some(true),
+        "…and park the ACTIVE sequence for the run loop to write"
+    );
+}
+
 /// Turning the row back OFF while a turn is running takes the taskbar down with it — the documented
 /// `[CYRUP-DELTA]`. Pi leaves it lit until process exit here, because its gate makes its own
 /// `agent_end` clear unreachable; clearing on the disabling edge is the same sequence sent sooner.
@@ -273,6 +322,7 @@ async fn turning_the_row_off_mid_turn_takes_the_indicator_down() {
     app.execute_command(on, &fx.session, None).await;
 
     app.ingest_event(&AgentSessionEvent::AgentStart);
+    app.ingest_event(&AgentSessionEvent::TurnStart);
     assert!(app.state().terminal_progress.is_active());
     app.state_mut().terminal_progress.take_pending();
 

@@ -42,6 +42,7 @@ mod autocomplete;
 mod bash_elapsed;
 mod bash_live_run;
 mod bash_overlay;
+mod builtin_collision;
 mod cell_size_query;
 mod chrome;
 mod clipboard;

@@ -86,8 +86,12 @@ impl InputEditor {
     /// `autocomplete.ts:101`).
     pub(super) fn update_autocomplete(&mut self) {
         let was_open = self.autocomplete.is_some();
+        // pi's `updateAutocomplete` re-asks with `force: this.autocompleteState === "force"`
+        // (`components/editor.ts:2468` @v0.86.0): an open popup keeps the mode it was opened in.
+        let force = self.autocomplete.as_ref().is_some_and(|ac| ac.forced);
         // `@`-mention search auto-pops the moment an `@` token forms (whole-tree fuzzy file search).
-        if let Some(ac) = self.compute_mention() {
+        if let Some(mut ac) = self.compute_mention() {
+            ac.forced = force;
             self.open_popup(ac);
             return;
         }
@@ -97,9 +101,13 @@ impl InputEditor {
             &self.lines_as_strings(),
             self.row,
             self.col,
-            false,
+            force,
             &self.cwd,
-        );
+        )
+        .map(|mut ac| {
+            ac.forced = force;
+            ac
+        });
         match computed {
             // BOTH slash contexts auto-open on every typed character: `isInSlashCommandContext`
             // (`components/editor.ts:2110-2112` @v0.84.3) is only
@@ -140,9 +148,21 @@ impl InputEditor {
 
     /// Trigger completion explicitly (Tab with no popup): force path completion, or slash completion
     /// while typing a `/name` (spec/tui/04 §5). A single forced match auto-applies (§3.7 item 10).
+    ///
+    /// Which of the two is pi's `handleTabCompletion` (`components/editor.ts:2263-2274` @v0.86.0):
+    /// a first-line `/name` with no space yet is an UNFORCED slash request
+    /// (`handleSlashCommandCompletion`), everything else a forced file request. The unforced one is
+    /// what keeps `/Users/dav<Tab>` from listing a directory — the slash branch answers it, and
+    /// answers nothing.
     pub(super) fn trigger_completion(&mut self) -> EditorOutcome {
+        let before = self.before_cursor();
+        let trimmed = before.trim_start();
+        // `isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")`, where
+        // `isSlashMenuAllowed()` is `cursorLine === 0` (`:2187-2201`).
+        let force = !(self.row == 0 && trimmed.starts_with('/') && !trimmed.contains(' '));
         // `@`-mention takes precedence on an explicit Tab too (whole-tree fuzzy file search).
-        if let Some(ac) = self.compute_mention() {
+        if let Some(mut ac) = self.compute_mention() {
+            ac.forced = force;
             self.open_popup(ac);
             return EditorOutcome::Edited;
         }
@@ -152,16 +172,25 @@ impl InputEditor {
             &self.lines_as_strings(),
             self.row,
             self.col,
-            true,
+            force,
             &self.cwd,
-        );
+        )
+        .map(|mut ac| {
+            ac.forced = force;
+            ac
+        });
         match computed {
             // Only a PATH popup auto-applies its single match: a one-item argument popup
             // (`/model gpt` narrowed to one model) must not silently insert without the user
-            // confirming, and a one-item command-name popup already behaves that way.
-            Some(ac) if ac.list.len() == 1 && ac.context == CompletionContext::Path => {
+            // confirming, and a one-item command-name popup already behaves that way. Forced
+            // only, as pi's `options.force && options.explicitTab` (`components/editor.ts:2390`).
+            Some(ac) if force && ac.list.len() == 1 && ac.context == CompletionContext::Path => {
                 self.open_popup(ac);
                 self.accept_completion();
+                // pi's auto-apply returns without ever setting a popup state
+                // (`components/editor.ts:2390-2408` @v0.86.0): leaving the forced popup here would
+                // re-ask the next typed character as a forced file request.
+                self.autocomplete = None;
                 EditorOutcome::Edited
             }
             Some(ac) => {
@@ -172,13 +201,19 @@ impl InputEditor {
         }
     }
 
-    /// Apply the selected popup item to the buffer (Tab/Enter accept). Leaves the popup state to the
-    /// caller (Tab keeps editing + recomputes; Enter on a slash item submits).
+    /// Apply the selected popup item to the buffer (Tab/Enter accept). Leaves the popup open to the
+    /// caller (Tab keeps editing + recomputes; Enter on a slash item submits), but drops its FORCED
+    /// state: pi cancels the popup after applying (`cancelAutocomplete()`, which nulls
+    /// `autocompleteState`, `components/editor.ts` @v0.86.0), so whatever is asked next is
+    /// unforced. Without this, the recompute after accepting a file from a Tab-opened list would
+    /// re-ask the empty trailing token with force and reopen a listing of the whole cwd.
     pub(super) fn accept_completion(&mut self) {
-        let Some(ac) = self.autocomplete.as_ref() else {
+        let lines = self.lines_as_strings();
+        let Some(ac) = self.autocomplete.as_mut() else {
             return;
         };
-        if let Some(applied) = ac.apply(&self.lines_as_strings(), self.row, self.col) {
+        ac.forced = false;
+        if let Some(applied) = ac.apply(&lines, self.row, self.col) {
             self.lines = applied.lines.iter().map(|s| s.chars().collect()).collect();
             if self.lines.is_empty() {
                 self.lines.push(Vec::new());

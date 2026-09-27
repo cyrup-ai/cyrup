@@ -172,6 +172,21 @@ impl AgentSession {
         false
     }
 
+    /// [`Self::slash_command_catalog`] in pi's exact `RpcSlashCommand` row shape, for the wires
+    /// that leave the process: the RPC `get_commands` response and a guest's `get-commands`
+    /// import. It drops the one cyrup-original key, `registeredName` (TUI-076), which only the
+    /// in-process TUI menu consumes — pi's RPC row carries `invocationName` alone
+    /// (`rpc-mode.ts:687` @v0.87.1), and so does `getCommands()` (`core/agent-session.ts`).
+    pub fn slash_command_catalog_wire(&self) -> Vec<serde_json::Value> {
+        let mut rows = self.slash_command_catalog();
+        for row in &mut rows {
+            if let Some(obj) = row.as_object_mut() {
+                obj.remove("registeredName");
+            }
+        }
+        rows
+    }
+
     /// The invocable slash commands a front-end can offer (Pi `get_commands`, rpc-mode.ts:653-683):
     /// registered extension commands (`source:"extension"`), prompt templates (`source:"prompt"`),
     /// and skills (`skill:<name>`, `source:"skill"`), each with a `name`/`description`/`source`/
@@ -255,6 +270,21 @@ impl AgentSession {
                     source_info.insert("baseDir".into(), serde_json::Value::from(dir));
                 }
                 let mut entry = serde_json::Map::new();
+                // TUI-076 — cyrup-original key. pi's interactive menu filters extension commands
+                // on the ORIGINAL name and only then maps to `invocationName`
+                // (`interactive-mode.ts:748-753` @v0.87.1), so two extensions both registering a
+                // builtin's name (`model:1`/`model:2`) drop out of it. pi's RPC row carries
+                // `invocationName` alone (`rpc-mode.ts:687`), but cyrup's TUI builds its menu from THIS
+                // catalog, so the original has to cross when it differs. Absent when the two agree,
+                // which keeps the common row identical to pi's; stripped again on every wire that
+                // leaves the process (`slash_command_catalog_wire`: RPC `get_commands`, the guest
+                // `get-commands` import).
+                if cmd.name != cmd.invocation_name {
+                    entry.insert(
+                        "registeredName".into(),
+                        serde_json::Value::from(cmd.name.clone()),
+                    );
+                }
                 entry.insert("name".into(), serde_json::Value::from(cmd.invocation_name));
                 // `RegisteredCommand.description?: string` (`core/extensions/types.ts:1163-1168`) —
                 // an undescribed command OMITS the key rather than sending `""`. cyrup's

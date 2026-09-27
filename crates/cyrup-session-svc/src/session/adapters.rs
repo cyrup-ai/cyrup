@@ -37,10 +37,11 @@ impl crate::host_services::SessionCatalog for SessionCatalogHandle {
     fn commands(&self) -> Vec<serde_json::Value> {
         // Pi `getCommands()` = `[...extensionCommands, ...templates, ...skills]`
         // (agent-session.ts:2332-2354 @v0.83.0), which is exactly what `slash_command_catalog`
-        // builds. A dropped session has no commands, which is the honest empty answer.
+        // builds — in pi's row shape (`_wire`: no cyrup-only `registeredName`). A dropped session
+        // has no commands, which is the honest empty answer.
         self.0
             .upgrade()
-            .map(|s| s.slash_command_catalog())
+            .map(|s| s.slash_command_catalog_wire())
             .unwrap_or_default()
     }
 

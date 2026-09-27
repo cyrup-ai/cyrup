@@ -54,7 +54,7 @@ impl<B: Backend> App<B> {
              | `{expand_tools}` | Toggle tool output expansion |\n\
              | `{toggle_thinking}` | Toggle thinking block visibility |\n\
              | `{external_editor}` | Edit message in external editor |\n\
-             | `{copy_message}` | Copy last assistant message |\n\
+             | `{copy_message}` | Copy selection or last assistant message |\n\
              | `{follow_up}` | Queue follow-up message |\n\
              | `{dequeue}` | Restore queued messages |\n\
              | `{paste_image}` | Paste image or text from clipboard |\n\
