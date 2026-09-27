@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     Agent, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall, HookError, Hooks, PostTurn,
-    StreamFn, TurnUpdate,
+    StreamFn, TurnDecision, TurnUpdate,
 };
 use cyrup_core::{
     CancelToken, Content, ModelRef, ModelThinkingLevel, StopReason, TerminateHint, Tool,
@@ -324,13 +324,13 @@ impl Hooks for BumpThinkingHook {
             Ok(None)
         }
     }
-    async fn should_stop_after_turn(
+    async fn finish_turn(
         &self,
         ctx: PostTurn<'_>,
         _cancel: CancelToken,
-    ) -> Result<bool, HookError> {
+    ) -> Result<Option<TurnDecision>, HookError> {
         // Stop after the second assistant turn.
-        Ok(ctx.turn_index >= 2)
+        Ok((ctx.turn_index >= 2).then_some(TurnDecision::End))
     }
 }
 

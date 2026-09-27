@@ -418,3 +418,149 @@ async fn prov047_the_proxy_transport_routes_through_the_configured_http_proxy() 
         "the proxied turn must stream end to end"
     );
 }
+
+// ----------------------------------------------------------------------------------------------
+// 5. AGENT-040 — a proxy stream that ends cleanly with no `done`/`error` frame.
+//
+// pi v0.85.0 `streamProxy` tracks `sawTerminalEvent` and, on a clean EOF without one, sets
+// `partial.stopReason = "error"` and `partial.errorMessage = "Connection closed by proxy server
+// before the response completed"`, then pushes `{ type: "error", reason: "error", error: partial }`
+// (proxy.ts:232-243 @v0.87.1). cyrup ended the stream silently, so the agent loop substituted a
+// fresh, EMPTY errored message with its own text and the streamed content was lost.
+// ----------------------------------------------------------------------------------------------
+
+const PROXY_CLOSED_EARLY: &str = "Connection closed by proxy server before the response completed";
+
+fn truncated_frames() -> Vec<String> {
+    vec![
+        r#"{"type":"start"}"#.to_string(),
+        r#"{"type":"text_start","contentIndex":0}"#.to_string(),
+        r#"{"type":"text_delta","contentIndex":0,"delta":"half an ans"}"#.to_string(),
+    ]
+}
+
+#[tokio::test]
+async fn agent040_clean_eof_without_terminal_frame_pushes_error_with_the_partial() {
+    use cyrup_provider::stream::ErrorReason;
+    use futures::StreamExt;
+
+    // Requires NO process-global `httpProxy` — see PROV-047's `PROXY_SETTING_GUARD` above.
+    let _serial = PROXY_SETTING_GUARD.lock().await;
+    let proxy_url = spawn_proxy_server(truncated_frames());
+    let opts = crate::ProxyStreamOptions {
+        auth_token: "test-token".into(),
+        proxy_url,
+        ..Default::default()
+    };
+    let mut stream = crate::stream_proxy(anthropic_model_ref(), Context::default(), opts);
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev);
+    }
+
+    let Some(StreamEvent::Error { reason, error }) = events.last() else {
+        panic!("a clean EOF with no terminal frame must end in an error event, got {events:?}");
+    };
+    assert_eq!(*reason, ErrorReason::Error);
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(error.error_message.as_deref(), Some(PROXY_CLOSED_EARLY));
+    assert!(
+        matches!(error.content.first(), Some(Content::Text { text, .. }) if text == "half an ans"),
+        "the error carries the partial streamed so far, got {:?}",
+        error.content
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Error { .. } | StreamEvent::Done { .. }))
+            .count(),
+        1,
+        "exactly one terminal event"
+    );
+}
+
+#[tokio::test]
+async fn agent040_live_turn_keeps_the_streamed_text_on_the_errored_message() {
+    // Requires NO process-global `httpProxy` — see PROV-047's `PROXY_SETTING_GUARD` above.
+    let _serial = PROXY_SETTING_GUARD.lock().await;
+    let proxy_url = spawn_proxy_server(truncated_frames());
+
+    let sf: Arc<dyn StreamFn> = Arc::new(ProxyStreamFn::new(proxy_url, "test-token"));
+    let agent = Agent::builder(anthropic_model_ref(), sf).build();
+    let handle = agent.prompt("ping the proxy").await.unwrap();
+    let new = handle.finished().await;
+    agent.wait_for_idle().await;
+
+    assert_eq!(new.len(), 2, "user + assistant");
+    let AgentMessage::Assistant(a) = &new[1] else {
+        panic!("expected an assistant message, got {:?}", new[1]);
+    };
+    assert_eq!(a.stop_reason, StopReason::Error);
+    assert_eq!(a.error_message.as_deref(), Some(PROXY_CLOSED_EARLY));
+    assert_eq!(assistant_text(&new[1]), "half an ans");
+}
+
+// ----------------------------------------------------------------------------------------------
+// 6. AGENT-037 — `toolcall_end` carries the server's authoritative `toolCall`.
+//
+// From v0.84.2 pi's union member is `{ type: "toolcall_end"; contentIndex; toolCall: ToolCall }`
+// and the handler runs `Object.assign(content, proxyEvent.toolCall)` before dropping `partialJson`
+// (proxy.ts:46, :368-371 @v0.87.1), so the server's parse wins over the client's accumulation.
+// cyrup dropped the field and emitted its own reconstruction.
+// ----------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn agent037_toolcall_end_tool_call_overrides_the_client_reconstruction() {
+    use futures::StreamExt;
+
+    // Requires NO process-global `httpProxy` — see PROV-047's `PROXY_SETTING_GUARD` above.
+    let _serial = PROXY_SETTING_GUARD.lock().await;
+    let usage = r#"{"input":5,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}}"#;
+    let frames = vec![
+        r#"{"type":"start"}"#.to_string(),
+        r#"{"type":"toolcall_start","contentIndex":0,"id":"call_1","toolName":"read"}"#
+            .to_string(),
+        r#"{"type":"toolcall_delta","contentIndex":0,"delta":"{\"path\":\"client.txt\"}"}"#
+            .to_string(),
+        r#"{"type":"toolcall_end","contentIndex":0,"toolCall":{"type":"toolCall","id":"call_1","name":"read","arguments":{"path":"server.txt","limit":5},"thoughtSignature":"sig"}}"#
+            .to_string(),
+        format!(r#"{{"type":"done","reason":"toolUse","usage":{usage}}}"#),
+    ];
+    let proxy_url = spawn_proxy_server(frames);
+    let opts = crate::ProxyStreamOptions {
+        auth_token: "test-token".into(),
+        proxy_url,
+        ..Default::default()
+    };
+    let mut stream = crate::stream_proxy(anthropic_model_ref(), Context::default(), opts);
+    let mut end = None;
+    let mut done = None;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            StreamEvent::ToolCallEnd { tool_call, .. } => end = Some(tool_call),
+            StreamEvent::Done { message, .. } => done = Some(message),
+            _ => {}
+        }
+    }
+
+    let tool_call = end.expect("toolcall_end is forwarded");
+    let expected = serde_json::json!({"path": "server.txt", "limit": 5});
+    assert_eq!(
+        serde_json::to_value(&tool_call.arguments).unwrap(),
+        expected,
+        "the server's toolCall wins over the accumulated deltas"
+    );
+    assert_eq!(tool_call.thought_signature.as_deref(), Some("sig"));
+    let message = done.expect("done is forwarded");
+    let Some(Content::ToolCall(settled)) = message.content.first() else {
+        panic!(
+            "expected the tool call in the final message, got {:?}",
+            message.content
+        );
+    };
+    assert_eq!(
+        serde_json::to_value(&settled.arguments).unwrap(),
+        expected,
+        "the correction lands on the partial, not only on the event"
+    );
+}

@@ -412,8 +412,17 @@ impl ExtensionHost {
         // the failing step are left in place — a native `init` builds its whole `InitApi` before any
         // of them run, so in practice `init` is the only failing step this can reach.)
         let result = self.load_native_body(ext, id.clone()).await;
-        if result.is_err() {
-            self.release_id(&id);
+        match &result {
+            // A native built-in is compiled in, so like Pi's inline factories
+            // (`loadExtensionFromFactory` → `initializeExtension`, `core/extensions/loader.ts:553`
+            // @v0.87.1) it has no module import to mark — only `${extensionPath} factory`, taken
+            // after `init` succeeds, and keyed by the id its load diagnostics are keyed by
+            // (AGENT-027).
+            Ok(()) => cyrup_core::timings::time(
+                &format!("{id} factory"),
+                cyrup_core::timings::TimingLabel::Extensions,
+            ),
+            Err(_) => self.release_id(&id),
         }
         result
     }
@@ -1973,6 +1982,28 @@ impl ExtensionHost {
         services: Arc<dyn crate::host::HostServices>,
         caps: &Capabilities,
     ) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
+        let timing_path = id.to_string();
+        self.load_wasm_timed(id, bytes, services, caps, &timing_path)
+            .await
+    }
+
+    /// [`Self::load_wasm_with_caps`], taking Pi's two per-extension startup-timing marks under
+    /// `timing_path` in the `extensions` namespace (AGENT-027): `${extensionPath} module import`
+    /// once the component has compiled (`core/extensions/loader.ts:568` @v0.87.1) and
+    /// `${extensionPath} factory` once `init` has run and its registrations are committed
+    /// (`:553`). Like Pi, a failed compile marks neither and a failed `init` marks only the import.
+    /// A discovered extension is labelled by its directory — the path cyrup loads it from and keys
+    /// its load diagnostics by — and a host-supplied one by its id.
+    #[cfg(feature = "wasm-host")]
+    async fn load_wasm_timed(
+        &self,
+        id: ExtensionId,
+        bytes: &[u8],
+        services: Arc<dyn crate::host::HostServices>,
+        caps: &Capabilities,
+        timing_path: &str,
+    ) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
+        use cyrup_core::timings::{TimingLabel, time};
         let wasm = self.wasm.as_ref().ok_or(ExtError::WasmHostDisabled)?;
         let fs_grants = caps.parse_fs_grants()?;
         self.reserve_id(&id)?;
@@ -2003,10 +2034,15 @@ impl ExtensionHost {
                     dispatcher: self.dispatcher.clone(),
                 })),
         );
+        let component = crate::host::LiveExtension::compile(wasm.engine(), bytes)?;
+        time(
+            &format!("{timing_path} module import"),
+            TimingLabel::Extensions,
+        );
         let ext = crate::host::LiveExtension::load(
             wasm.engine(),
             id.clone(),
-            bytes,
+            &component,
             crate::host::StoreLimits::default(),
             guest,
             Self::WASM_EPOCH_BUDGET_TICKS,
@@ -2023,6 +2059,7 @@ impl ExtensionHost {
         // one take exactly the same path — and so a descriptor is bound to its OWNING instance
         // rather than to whichever extension happened to load last.
         self.materialize_guest_tools()?;
+        time(&format!("{timing_path} factory"), TimingLabel::Extensions);
         Ok(ext)
     }
 
@@ -2157,8 +2194,14 @@ impl ExtensionHost {
             id.clone(),
             crate::ExtensionProvenance::local(disc.dir.to_string_lossy().into_owned()),
         )?;
-        self.load_wasm_with_caps(id.clone(), &bytes, services, &disc.manifest.capabilities)
-            .await?;
+        self.load_wasm_timed(
+            id.clone(),
+            &bytes,
+            services,
+            &disc.manifest.capabilities,
+            &disc.dir.to_string_lossy(),
+        )
+        .await?;
         Ok(id)
     }
 
@@ -2487,6 +2530,10 @@ impl ExtensionHost {
                 cancel,
             )
             .await;
+        // Pi's `reload()` opens with `resetTimings("extensions")` (`core/resource-loader.ts:389`
+        // @v0.87.1) — ahead of its `clearExtensionCache()`, which is this cache-bust — so the rows
+        // the fresh load marks below measure the reload, not whatever ran before it (AGENT-027).
+        cyrup_core::timings::reset_timings(cyrup_core::timings::TimingLabel::Extensions);
         // 2) cache-bust: drop dispatcher entries, registry tables, live instances, loaded ids.
         self.dispatcher.clear()?;
         self.registry.clear()?;

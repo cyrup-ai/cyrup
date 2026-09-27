@@ -18,6 +18,7 @@ pub mod keyed_lock;
 pub mod lazy_args;
 pub mod message;
 pub mod shared_str;
+pub mod timings;
 pub mod tool;
 
 pub use cancel::{CancelToken, RunCancel};

@@ -1,6 +1,6 @@
 //! Wire protocol — the bandwidth-reduced events the server emits (proxy.ts:36-57).
 
-use cyrup_core::Usage;
+use cyrup_core::{ToolCall, Usage};
 use cyrup_provider::stream::{DoneReason, ErrorReason};
 
 /// The server-sent proxy event (Pi `ProxyAssistantMessageEvent`, proxy.ts:36-57). The `partial`
@@ -40,8 +40,16 @@ pub enum ProxyAssistantMessageEvent {
     },
     #[serde(rename = "toolcall_delta")]
     ToolCallDelta { content_index: usize, delta: String },
+    /// AGENT-037 — pi's server sends its own final parse of the call as `toolCall` (proxy.ts:46
+    /// @v0.87.1, present from v0.84.2), which the client lays over its reconstruction. Optional
+    /// here so a frame from an older server that omits it still decodes; pi's
+    /// `Object.assign(content, undefined)` is likewise a no-op for such a frame.
     #[serde(rename = "toolcall_end")]
-    ToolCallEnd { content_index: usize },
+    ToolCallEnd {
+        content_index: usize,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        tool_call: Option<ToolCall>,
+    },
     /// Terminal: normal completion. `reason` ∈ {stop, length, toolUse} (Pi narrows `done.reason`,
     /// proxy.ts:49).
     #[serde(rename = "done")]

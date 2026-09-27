@@ -47,13 +47,22 @@ happens on that single task, so event order is deterministic; only tool `execute
 concurrently, on a `JoinSet`. The state lock is taken for the synchronous reducer only and is never
 held across a subscriber `await`.
 
-A turn proceeds: any queued steering messages are injected, then the assistant response is streamed
+A turn proceeds: every turn after the first opens with `prepare_next_turn`, whose overrides are
+sticky for the rest of the run and whose messages are injected ahead of the queue; if the earlier
+steering poll came back empty, steering is polled again after it, so a message queued during a long
+preparation reaches this turn. `turn_start` fires, then the prepared messages followed by any queued
+steering messages are emitted and appended. `prepare_request` runs before every provider request,
+including the first, and its overrides are sticky too. The assistant response is then streamed
 (`message_start` … `message_end`). If the reply carries tool calls they are executed as a batch —
 in parallel unless the run or any individual tool asks for `ExecMode::Sequential` — with each call
 going through preflight (locate, normalize arguments, validate against the schema, `before_tool_call`)
-and finalization (`after_tool_call`). `turn_end` then fires, followed by the two post-turn hooks:
-`prepare_next_turn`, whose overrides are sticky for the rest of the run, and `should_stop_after_turn`.
-Absent more tool calls or queued messages, the run closes with `agent_end`.
+and finalization (`after_tool_call`); a call whose turn to start comes after the run was aborted is
+settled as `Operation aborted` without executing. `finish_turn` then sees the finished turn and
+decides before `turn_end` fires: `End` closes the run with `agent_end` straight after `turn_end`,
+without polling the queues; `Continue` guarantees one more request, which a tool-result, steering or
+follow-up request satisfies, or else one context-only request. On an errored or aborted response
+`finish_turn` still runs but its decision is ignored and the run ends. Absent more tool calls,
+queued messages or a `Continue`, the run closes with `agent_end`.
 
 An assistant message truncated by the output token limit fails its whole tool batch rather than
 executing calls whose arguments may be incomplete.
@@ -81,7 +90,7 @@ Four seams cover everything a downstream crate implements:
 - **`StreamFn`** — the LLM boundary. Implement it to drive the loop from something other than a
   `cyrup_provider::Provider`; `ProviderStreamFn` and `ProxyStreamFn` are the two in-tree impls.
 - **`Hooks`** — the mutating seam. Intercept and rewrite tool calls and results, override the model
-  or context between turns, or stop a run early.
+  or context between turns or before each request, and end or continue a run from `finish_turn`.
 - **`EventSubscriber`** — notify-only observation of the ordered event stream. Registration returns
   a `Subscription`; dropping it does not detach, call `unsubscribe`.
 - **`Tool`** (from `cyrup-core`) — a callable the model can invoke, including its execution mode and

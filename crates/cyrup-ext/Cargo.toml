@@ -62,6 +62,10 @@ tokio-util = { workspace = true, features = ["io"], optional = true }
 # return a `Blocked` status. Lock-neutral: cyrup-provider is already a dependency and `faux` is a
 # pure-Rust in-crate feature that pulls no new crate.
 cyrup-provider = { workspace = true, features = ["faux"] }
+# `tests/startup_timings.rs` (AGENT-027) loads a hand-written WAT component through the real
+# discovered-file path, which compiles with `Component::from_binary` and so needs the binary form.
+# Adds no crate: `wat` 1.252.0 is already in the lockfile through wasmtime's own `wat` feature.
+wat = "1.252.0"
 
 # `tempfile` was here for `tests/build_tier1.rs`, which drives a REAL `cargo build --target
 # wasm32-wasip2` and must tie that build's ~213 MB artifact cache to a `TempDir` (it once wrote to a

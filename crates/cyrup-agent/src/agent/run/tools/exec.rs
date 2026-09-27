@@ -7,7 +7,9 @@ use crate::agent::message::update_value;
 use crate::agent::run::{RunCtx, RunFailure};
 use crate::agent::util::panic_message;
 use crate::event::{AgentEvent, AgentMessage};
-use cyrup_core::{AssistantMessage, ToolCall, ToolError, ToolUpdate, ToolUpdateSink};
+use cyrup_core::{
+    AssistantMessage, TerminateHint, ToolCall, ToolError, ToolUpdate, ToolUpdateSink,
+};
 use futures::future::FutureExt;
 use serde_json::Value;
 use std::future::{Future, poll_fn};
@@ -30,6 +32,13 @@ impl RunCtx {
     /// call #2's dialog is still open would let a tool run against state the user has not yet
     /// approved. Deferring the start is not serialization — once the whole batch is prepared the
     /// bodies are spawned together and run concurrently, exactly as `Promise.all` does.
+    ///
+    /// AGENT-042 — since pi v0.85.0 (`afda4d620`, "stop prepared tools after preflight abort") each
+    /// deferred closure opens with `if (signal?.aborted)` and settles its call as
+    /// `createErrorToolResult("Operation aborted")`, `isError: true`, emitting only
+    /// `tool_execution_end` — the tool is never executed and `afterToolCall` never runs
+    /// (`packages/agent/src/agent-loop.ts:617-625` @v0.87.1). A call prepared before an abort
+    /// landing in a later call's `before_tool_call` therefore does not run.
     pub(super) async fn execute_parallel(
         &self,
         assistant: &AssistantMessage,
@@ -73,9 +82,9 @@ impl RunCtx {
         }
 
         // Phase two — every call in the batch is prepared; start them all together
-        // (Pi `await Promise.all(finalizedCalls.map(…))`, agent-loop.ts:540-542). Calls
-        // deferred before an abort broke the loop are still started, exactly as Pi's
-        // already-pushed closures are.
+        // (Pi `await Promise.all(finalizedCalls.map(…))`, agent-loop.ts:643 @v0.87.1). Each
+        // call re-checks the run's signal when its turn to start comes, so calls deferred before
+        // an abort broke the loop settle as `Operation aborted` unexecuted (AGENT-042).
         let mut remaining = deferred.len();
         // The batch's start order. Each call releases the next as soon as its own body has been
         // driven to its first suspension point — which for `write`/`edit` is inside
@@ -95,6 +104,7 @@ impl RunCtx {
             let ftx = tx.clone();
             let cid = call_id;
             let child = self.cancel.child();
+            let run_signal = self.cancel.token();
             let (started_tx, started_rx) = oneshot::channel::<()>();
             let wait_turn = prev_started.replace(started_rx);
             joinset.spawn(async move {
@@ -110,6 +120,16 @@ impl RunCtx {
                 // than stall.
                 if let Some(turn) = wait_turn {
                     let _ = turn.await;
+                }
+
+                // AGENT-042 — pi's closure checks `signal?.aborted` FIRST, at the moment `map`
+                // invokes it (`agent-loop.ts:617-625` @v0.87.1): after every `beforeToolCall` has
+                // resolved and after the previous call reached its first suspension point. An
+                // aborted call is finalized without executing and without `afterToolCall`.
+                if run_signal.is_cancelled() {
+                    let _ = started_tx.send(());
+                    let _ = ftx.send(ToolRuntimeMsg::Aborted { source_index });
+                    return;
                 }
 
                 let mut body = std::pin::pin!(async move {
@@ -212,6 +232,24 @@ impl RunCtx {
                     self.emit(fin.end_event()).await?;
                     if let Some(slot) = finalized.get_mut(fin.source_index()) {
                         *slot = Some(fin);
+                    }
+                    remaining -= 1;
+                }
+                Some(ToolRuntimeMsg::Aborted { source_index }) => {
+                    // `createErrorToolResult("Operation aborted")` + `isError: true`, then
+                    // `emitToolExecutionEnd` — no `finalizeExecutedToolCall`, so no
+                    // `after_tool_call` (`agent-loop.ts:617-625` @v0.87.1).
+                    if let Some(call) = calls.get(source_index) {
+                        let fin = self.immediate_error(
+                            call,
+                            source_index,
+                            "Operation aborted",
+                            TerminateHint::Unspecified,
+                        );
+                        self.emit(fin.end_event()).await?;
+                        if let Some(slot) = finalized.get_mut(source_index) {
+                            *slot = Some(fin);
+                        }
                     }
                     remaining -= 1;
                 }

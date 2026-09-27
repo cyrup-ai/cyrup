@@ -412,7 +412,7 @@ transcript-backed mid-conversation system messages (`TranscriptContext`, `System
 session, scheduler, view, memory, collapse, jsonl) and the new `packages/durable` — growth on
 `DRIFT-040`'s scope, neither read; (3) extension surface: `turn_end` / `agent_before_settle` actionable
 boundaries, `context_with_system`, `cache_warming_decision`, `pi.on()` returning an unsubscribe,
-`ctx.modelRegistry.stream()`/`streamSimple()`, and `shouldStopAfterTurn` → `finishTurn` (area 06);
+`ctx.modelRegistry.stream()`/`streamSimple()`, and `shouldStopAfterTurn` → `finishTurn` (area 06; *2026-09-27: the agent-side hook is ported, area 02's `AGENT-038` closed — the extension boundary is still `EXT-078`*);
 (4) cost-aware prompt-cache warming with `/session` diagnostics; (5) `/bug` redacted diagnostic
 reports; (6) per-model `compaction.modelOverrides` (`reserveTokens`, `keepRecentTokens`); per-model
 `inputLimits.images.resize`; `compat.allowedFallbackModels` (the v0.84.3 fallback lead in area 01's

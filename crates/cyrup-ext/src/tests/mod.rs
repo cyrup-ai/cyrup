@@ -32,6 +32,7 @@ mod payload_and_seam_parity;
 mod project_trust_shortcircuit;
 mod provider;
 mod seam_liveness;
+mod startup_timings;
 mod terminal_keys;
 mod trust_gate_order;
 mod wasm_host;

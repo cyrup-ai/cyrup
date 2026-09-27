@@ -109,6 +109,9 @@ async fn run_proxy(
         }
     };
 
+    // AGENT-040 — pi's `sawTerminalEvent` (proxy.ts:190 @v0.87.1, set at `:199`): whether a
+    // `done`/`error` frame was forwarded, so a clean EOF without one can be told apart.
+    let mut saw_terminal = false;
     while let Some(frame) = frames.next().await {
         let frame = match frame {
             Ok(f) => f,
@@ -141,6 +144,9 @@ async fn run_proxy(
         };
         match builder.process(proxy_event) {
             Ok(Some(event)) => {
+                if matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. }) {
+                    saw_terminal = true;
+                }
                 if tx.send(event).await.is_err() {
                     // Consumer dropped (the agent stopped reading): nothing left to do.
                     return;
@@ -170,8 +176,28 @@ async fn run_proxy(
                 "Request aborted by user".to_string(),
             ))
             .await;
+    } else if !saw_terminal {
+        // AGENT-040 — a clean EOF with no `done`/`error` frame means the server dropped the
+        // response mid-stream; pi surfaces it as a terminal `error` carrying the partial streamed
+        // so far (proxy.ts:232-243 @v0.87.1) rather than leaving consumers without a result.
+        //
+        // Known divergence, open: pi splits on `\n` and flushes a trailing line with no newline
+        // before this check (`processLine(buffer)`, proxy.ts:225-230), so a server whose final
+        // `data: {"type":"done",…}` frame lacks the blank line (or any newline) still completes.
+        // cyrup reads frames through cyrup-provider's shared WHATWG SSE framer, which dispatches
+        // only on a blank line and drops an unterminated trailing event at EOF
+        // (`stream/framer.rs` EOF arm), so that server lands here with this message even though it
+        // did send `done`. Closing it means a proxy-only EOF flush in the framer (owned by
+        // cyrup-provider), not a change to this branch.
+        let _ = tx
+            .send(error_terminal(
+                &builder,
+                &cancel,
+                "Connection closed by proxy server before the response completed".to_string(),
+            ))
+            .await;
     }
-    // Clean end: the `done`/`error` event already carried the terminal (proxy.ts:213). Dropping `tx`
+    // Clean end: the `done`/`error` event already carried the terminal (proxy.ts:245). Dropping `tx`
     // ends the stream.
 }
 

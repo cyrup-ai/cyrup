@@ -279,4 +279,19 @@ impl Agent {
     pub fn has_queued_messages(&self) -> bool {
         !lock(&self.steering).is_empty() || !lock(&self.follow_up).is_empty()
     }
+
+    /// Preview the messages the loop would select for the next turn, without consuming them (Pi
+    /// `peekQueuedMessages`, `agent.ts:326-330` @v0.87.1, added v0.87.0): the steering queue's next
+    /// batch if it has one, else the follow-up queue's, each honouring its own [`QueueMode`].
+    ///
+    /// Host/extension API: pi's one caller is the coding-agent's boundary-context preview
+    /// (`agent-session.ts:787-789` `_getPendingBoundaryMessages`, behind the actionable
+    /// `turn_end`/`agent_before_settle` extension boundaries), which cyrup has not ported.
+    pub fn peek_queued_messages(&self) -> Vec<AgentMessage> {
+        let steering = lock(&self.steering).peek();
+        if !steering.is_empty() {
+            return steering;
+        }
+        lock(&self.follow_up).peek()
+    }
 }

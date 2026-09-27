@@ -33,6 +33,9 @@ enum ToolRuntimeMsg {
         tool_name: String,
         outcome: Result<ToolResult, ToolError>,
     },
+    /// A prepared call whose turn to start came after the run was aborted: it was never executed
+    /// and settles as `Operation aborted` without `after_tool_call` (AGENT-042, pi v0.85.0).
+    Aborted { source_index: usize },
 }
 
 /// One prepared-but-not-yet-started call — pi's `PreparedToolCall` (`agent-loop.ts:556-561`:

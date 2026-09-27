@@ -196,11 +196,26 @@ impl ProxyMessageBuilder {
                     partial: self.shared(),
                 }))
             }
-            ProxyAssistantMessageEvent::ToolCallEnd { content_index } => {
+            ProxyAssistantMessageEvent::ToolCallEnd {
+                content_index,
+                tool_call: authoritative,
+            } => {
                 // Drop the streaming-JSON side buffer (Pi `delete content.partialJson`, proxy.ts:339).
                 self.tool_json.remove(&content_index);
-                match self.partial.content.get(content_index) {
+                match self.partial.content.get_mut(content_index) {
                     Some(Content::ToolCall(tc)) => {
+                        // AGENT-037 — `Object.assign(content, proxyEvent.toolCall)` (proxy.ts:368
+                        // @v0.87.1): the server's parse replaces the client's reconstruction. Only
+                        // the keys the frame carries are assigned, so an absent `thoughtSignature`
+                        // leaves the slot's own, and a frame with no `toolCall` changes nothing.
+                        if let Some(server) = authoritative {
+                            tc.id = server.id;
+                            tc.name = server.name;
+                            tc.arguments = server.arguments;
+                            if server.thought_signature.is_some() {
+                                tc.thought_signature = server.thought_signature;
+                            }
+                        }
                         let tool_call = tc.clone();
                         Ok(Some(StreamEvent::ToolCallEnd {
                             content_index,

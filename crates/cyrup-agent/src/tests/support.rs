@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     AgentEvent, AgentMessage, EventSubscriber, HookError, Hooks, PostTurn, ProviderStreamFn,
-    StreamFn, ToolResultMessage, TurnUpdate,
+    StreamFn, ToolResultMessage, TurnDecision,
 };
 use cyrup_core::{
     AssistantMessage, CancelToken, Content, EventStream, Message, ModelRef, TerminateHint, Tool,
@@ -336,8 +336,9 @@ impl Tool for EchoTool {
 // Hooks that fail
 // ---------------------------------------------------------------------------
 
-/// A `prepare_next_turn` that panics with the given payload, for the synthetic-closing-sequence
-/// tests (Pi `handleRunFailure`, agent.ts:496-511).
+/// A `finish_turn` that panics with the given payload, for the synthetic-closing-sequence tests (Pi
+/// `handleRunFailure`, agent.ts:496-511). `finish_turn` because it is the turn hook that runs on
+/// every turn, a run's only one included (agent-loop.ts:251, :285 @v0.87.1).
 pub(super) struct PanicHook(&'static str);
 
 impl PanicHook {
@@ -348,11 +349,11 @@ impl PanicHook {
 
 #[async_trait::async_trait]
 impl Hooks for PanicHook {
-    async fn prepare_next_turn(
+    async fn finish_turn(
         &self,
         _ctx: PostTurn<'_>,
         _cancel: CancelToken,
-    ) -> Result<Option<TurnUpdate>, HookError> {
+    ) -> Result<Option<TurnDecision>, HookError> {
         panic!("{}", self.0);
     }
 }
