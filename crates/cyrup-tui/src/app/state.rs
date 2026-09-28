@@ -385,6 +385,35 @@ pub struct AppState {
     /// screen: `cancel()` fires it so a flow blocked on something other than a prompt (a callback
     /// server, a device-code poll) also unwinds. `None` whenever no login is in flight.
     pub(super) login_cancel: Option<CancelToken>,
+    /// **TUI-105.** Pi's `previousModel` — `const previousModel = this.session.model` captured at the
+    /// `/login` CALL SITE, before the dialog runs (`interactive-mode.ts:6004`, `:6135`), and passed
+    /// into `completeProviderAuthentication` (`:5883`).
+    ///
+    /// Captured at launch rather than read in the settle half on purpose: by the time the login
+    /// settles a concurrent `/model` may have set one, and pi's
+    /// `session.model === previousModel` guard (`:5961`) exists precisely to respect that.
+    ///
+    /// `[CYRUP-DELTA]` pi's `isUnknownModel(previousModel)` tests a sentinel `Model` of
+    /// `unknown/unknown/unknown` (`interactive-mode.ts:298-300`, built from `agent.ts:57-68`'s
+    /// `DEFAULT_MODEL`), because `session.model` upstream is never `undefined`. cyrup represents that
+    /// same "no model selected yet" state as `None` (`cyrup-session-svc/src/session/accessors.rs:33`,
+    /// whose doc names it as the credential-less first-run state), so `isUnknownModel` ports to
+    /// [`Option::is_none`] here.
+    ///
+    /// `pub(crate)` so `tests/login_flow.rs` can put the app in the first-run state: the test
+    /// fixture's faux provider always supplies a catalog, so `SessionBuilder` always resolves a
+    /// model (`cyrup-session-svc/src/builder.rs:2293-2318`) and a genuinely model-less session
+    /// cannot be built there.
+    pub(crate) login_previous_model: Option<cyrup_core::ModelRef>,
+    /// The `/login` generation the in-flight post-login catalog refresh belongs to — the same guard
+    /// [`Self::model_refresh_epoch`] provides for `/model`, and pi's
+    /// `this.session === session` half of `:5961`: a refresh settling 15 s after a SECOND login
+    /// started must not select a model on the first one's behalf.
+    pub(super) login_refresh_epoch: u64,
+    /// The post-login refresh's abort token — pi's `new AbortController()` +
+    /// `setTimeout(() => controller.abort(), 15_000)` (`interactive-mode.ts:5951-5952`), cleared by
+    /// its `finally { clearTimeout(timeout) }` (`:5973`).
+    pub(super) login_refresh_cancel: Option<CancelToken>,
     /// The `/model` picker generation the in-flight refresh belongs to (Pi's per-component `closed`
     /// flag, `model-selector.ts:74`). Bumped on every open; a settled [`crate::ModelRefreshMsg`]
     /// whose epoch is stale is DROPPED.
@@ -545,6 +574,9 @@ impl AppState {
             login_auth_type_options: None,
             pending_login_prompt: None,
             login_cancel: None,
+            login_previous_model: None,
+            login_refresh_epoch: 0,
+            login_refresh_cancel: None,
             model_refresh_epoch: 0,
             model_refresh_cancel: None,
             oauth_credential_providers: std::collections::BTreeSet::new(),

@@ -139,6 +139,11 @@ impl ApiImpl for MistralConversationsApi {
             url,
             headers,
             body: Some(body),
+            // PROV-084: `readMistralEvents` is a hand-rolled `body.getReader()` loop whose
+            // `if (done) break` (`mistral-conversations.ts:468` @v0.87.1) is followed by
+            // `if (buffer.trim()) { const event = parseMistralEvent(buffer); … yield event; }`
+            // (`:471-474`), so a stream cut after the last `data:` line still delivers it.
+            flush_at_eof: true,
         };
 
         let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {

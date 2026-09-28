@@ -4,6 +4,7 @@ use crate::api::content_cache::ContentCache;
 use crate::model::Model;
 use crate::usage::compute_cost;
 use crate::utils::provider_plumbing::now_millis;
+use base64::Engine as _;
 use cyrup_core::{
     ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId, Usage,
 };
@@ -24,6 +25,29 @@ pub(super) enum Block {
         index: i64,
         thinking: SharedStr,
         signature: String,
+        /// pi `thinkingBlock.redacted` (`bedrock-converse-stream.ts:663`): the reasoning arrived as
+        /// an opaque `redactedContent` blob (encrypted reasoning from a non-Anthropic model on
+        /// Bedrock) rather than as plain `text` + `signature`. PROV-097.
+        redacted: bool,
+        /// The decoded `redactedContent` bytes, concatenated in arrival order — pi's
+        /// `thinkingBlock.redactedChunks` (`:673-674`).
+        ///
+        /// `[CYRUP-DELTA]` pi buffers the chunks and runs `flushRedactedContent`
+        /// (`:678-690`) from `contentBlockStop` AND every terminal path, encoding
+        /// `bytesToBase64(redactedChunks)` into `thinkingSignature` and deleting the scratch field —
+        /// it must not reach a persisted message, because a `Uint8Array` serializes ten times the
+        /// size of its base64. cyrup has no such flush seam: `index`/`partial_json` are struct
+        /// fields the projection simply never emits, and there are a dozen `snapshot_owned` call
+        /// sites to hook. Instead [`project_block`] encodes on projection, which [`ContentCache`]
+        /// memoises per block (PERF-001), so it costs one encode per delta — the same order as pi's
+        /// one encode per block stop — and every snapshot, partial or terminal, carries a complete
+        /// payload rather than an empty one.
+        ///
+        /// **Decoded BYTES, not concatenated base64.** pi's `bytesToBase64` (`:1332-1344`) joins the
+        /// raw bytes of every chunk and encodes the result ONCE; concatenating each chunk's own
+        /// padded base64 would produce different bytes for any chunk whose length is not a multiple
+        /// of three.
+        redacted_chunks: Vec<u8>,
     },
     Tool {
         index: i64,
@@ -137,15 +161,25 @@ fn project_block(b: &Block) -> Content {
             Block::Thinking {
                 thinking,
                 signature,
+                redacted,
+                redacted_chunks,
                 ..
             } => Content::Thinking {
                 thinking: thinking.clone(),
-                thinking_signature: if signature.is_empty() {
+                // pi: "`thinkingSignature` holds either an Anthropic signature or an opaque
+                // redacted payload, never both" (`bedrock-converse-stream.ts:655-656`).
+                thinking_signature: if *redacted {
+                    if redacted_chunks.is_empty() {
+                        None
+                    } else {
+                        Some(base64::engine::general_purpose::STANDARD.encode(redacted_chunks))
+                    }
+                } else if signature.is_empty() {
                     None
                 } else {
                     Some(signature.clone())
                 },
-                redacted: false,
+                redacted: *redacted,
             },
             Block::Tool {
                 id,

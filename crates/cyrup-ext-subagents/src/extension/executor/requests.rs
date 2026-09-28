@@ -521,6 +521,17 @@ pub struct BackgroundStepsSpec {
     /// revive. Without it an `inherited` launch would be re-recorded as `configured` on its
     /// first revive, and a second revive would read a different origin than the first.
     pub model_origin: Option<crate::background::ModelOrigin>,
+    /// SUBA-119 — `modelResponseAliases: recoveryDescriptor ? recoveryDescriptor.modelResponseAliases
+    /// : foregroundContract?.modelResponseAliases` on the revived launch
+    /// (`subagent-executor.ts:2136` @v0.71.0).
+    ///
+    /// `None` from every ordinary producer, which takes the LIVE `config.json` value at
+    /// `spawn_background_steps`; `Some` only from
+    /// [`crate::extension::SubagentExecutor::control_resume`]'s terminal-revival arm, which hands
+    /// over the descriptor's launch-time map so a revived run enforces the declaration it was
+    /// authorized under. That is the promise the verification error itself makes: *"resumed native
+    /// runs retain their launch-time declaration."*
+    pub model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
 }
 
 /// G92: the three optional `status` VIEW selectors pi carries as separate params

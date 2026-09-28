@@ -458,3 +458,70 @@ fn the_command_input_carries_model_id_for_on_payload_then_leaves_the_body() {
     let (id, _) = split_command_input(replaced, &model);
     assert_eq!(id, "other.model");
 }
+
+/// PROV-097 — `onResponse` receives EVERY response header. pi `toProviderResponse` returns
+/// `{status, headers: {...response.headers}}` (`bedrock-converse-stream.ts:501-504` @v0.87.1),
+/// installed by `addResponseHeadersMiddleware` (`:510-525`) precisely because Bedrock's modeled
+/// `$metadata` keeps only a few of them and a gateway's own headers are otherwise lost. cyrup
+/// forwarded `x-amzn-requestid` alone. Translated from `packages/ai/test/bedrock-response-headers.test.ts`
+/// @v0.87.1.
+#[tokio::test]
+async fn prov097_on_response_receives_every_header() {
+    const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.amazon.eventstream\r\nx-amzn-requestid: req-1\r\nx-bifrost-provider: bedrock\r\nx-bifrost-resolved-model: claude-sonnet-4-5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let (url, _hits) = spawn_mock_sequence(&[OK]).await;
+
+    let seen: Arc<std::sync::Mutex<BTreeMap<String, String>>> = Arc::default();
+    let sink_map = seen.clone();
+    let mut model = sonnet_45();
+    model.base_url = url;
+    let opts = StreamOptions {
+        on_response: Some(Arc::new(
+            move |resp: crate::stream::ProviderResponse, _m| {
+                let map = sink_map.clone();
+                Box::pin(async move {
+                    if let Ok(mut guard) = map.lock() {
+                        *guard = resp.headers;
+                    }
+                })
+            },
+        )),
+        ..Default::default()
+    };
+    let auth = AuthResult {
+        auth: Default::default(),
+        env: Some(env_map(&[
+            ("AWS_BEDROCK_SKIP_AUTH", "1"),
+            ("AWS_REGION", "us-east-1"),
+        ])),
+        source: None,
+    };
+    let (sink, mut rx) = crate::api::channel(64);
+    let task = tokio::spawn(async move {
+        BedrockConverseStreamApi::new()
+            .run(
+                &model,
+                &user_ctx("hi"),
+                &auth,
+                &opts,
+                CancelToken::new(),
+                sink,
+            )
+            .await;
+    });
+    while rx.recv().await.is_some() {}
+    let _ = task.await;
+
+    let headers = seen.lock().expect("hook ran").clone();
+    assert_eq!(
+        headers.get("x-amzn-requestid").map(String::as_str),
+        Some("req-1")
+    );
+    assert_eq!(
+        headers.get("x-bifrost-provider").map(String::as_str),
+        Some("bedrock")
+    );
+    assert_eq!(
+        headers.get("x-bifrost-resolved-model").map(String::as_str),
+        Some("claude-sonnet-4-5")
+    );
+}

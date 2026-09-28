@@ -160,6 +160,42 @@ impl Agent {
         Ok(f(&mut st.messages))
     }
 
+    /// Append ONE finalized message to the live transcript, under the state lock, WITHOUT consulting
+    /// the run latch — the single write pi's `_refreshFinalizedContext()` performs
+    /// (`agent-session.ts:730-736` @v0.87.1, `this.agent.state.messages = projection.messages`) when
+    /// the only tree change since the transcript was last in step is the one entry just appended.
+    ///
+    /// Pi calls that re-seed from inside a live run: `_appendCustomMessage` ends with it
+    /// (`agent-session.ts:1979`) and the `turn_end` arm of `_handleAgentEvent` flushes through it
+    /// (`:965-973`), while `_isAgentRunActive` is still `true`. So this write has to be legal
+    /// mid-run, which is why it is a method of its own instead of a call to
+    /// [`Self::edit_transcript`].
+    ///
+    /// # Why this is safe while a run is active
+    ///
+    /// The latch [`Self::edit_transcript`] consults exists to stop CONCURRENT, ARBITRARY mutation
+    /// racing the run's own writes (ICOM-068: an edit landing after the run snapshotted put the
+    /// message into `state.messages` out of tree order). Neither hazard applies here:
+    ///
+    /// * **Not arbitrary.** This appends; it cannot truncate, reorder, replace or read back. The
+    ///   worst a caller can do is add a message at the tail — which is what the run's own reducer
+    ///   does on every `message_end`.
+    /// * **Not concurrent.** `state.messages` is written by exactly two parties: the reducer, and
+    ///   this method. Both take the same state lock, and the run's sole emission path reduces
+    ///   and then AWAITS each subscriber in order on the run task — so a caller reached from a run
+    ///   event (the `turn_end` flush) runs between two reductions on that one task, never beside
+    ///   one.
+    /// * **Order-preserving.** The run loop drives its turns from the private `.slice()` copy taken
+    ///   at `claim_and_snapshot` (pi `createContextSnapshot`, `agent.ts:457-461`), so this
+    ///   append cannot perturb the in-flight run at all; it is read by the NEXT snapshot
+    ///   (`continue_run`, or the next `prompt`), exactly as pi's assignment is.
+    ///
+    /// Callers that need the general, checked edit — anything that removes or rewrites history —
+    /// must keep using [`Self::edit_transcript`], which still refuses mid-run.
+    pub fn append_finalized_message(&self, message: AgentMessage) {
+        lock(&self.state).messages.push(message);
+    }
+
     /// Pop the trailing assistant message iff `pred` holds for it, returning it. The one operation
     /// both session retry predicates need — "any trailing assistant" and "a trailing
     /// `Error`/`Length` assistant" — expressed as a predicate rather than as two copies of the pop.

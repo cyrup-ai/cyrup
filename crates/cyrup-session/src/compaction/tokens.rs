@@ -9,7 +9,7 @@ use cyrup_core::{Content, EntryId, Message, StopReason, Usage};
 
 use crate::agent_message::AgentMessage;
 use crate::context::push_as_message;
-use crate::entry::Entry;
+use crate::entry::{Entry, KnownEntry};
 
 /// Images count as this many chars before the `/4` division (Pi parity).
 const ESTIMATED_IMAGE_CHARS: usize = 4800;
@@ -227,6 +227,77 @@ pub fn estimate_context_tokens_raw(messages: &[AgentMessage]) -> ContextUsageEst
         usage_tokens,
         trailing_tokens,
         last_usage_index,
+    }
+}
+
+/// Pi `estimateProjectedContextTokens` (`core/compaction/compaction.ts:248-283` @v0.87.1) — the
+/// estimate every shipped upstream reader of live context size goes through
+/// (`agent-session.ts:596`, `:758`, `:2708`, `:3893`, `compaction.ts:919` @v0.87.1).
+///
+/// [`estimate_context_tokens_raw`] anchors on the newest provider-reported assistant `usage` and
+/// only estimates the tail after it. That anchor is a reading of the context **as the provider saw
+/// it at the time of that response**, so it is only usable while nothing has since changed what the
+/// earlier context projects to. A `context_edit` (SESS-052) and a `compaction` both do exactly that:
+/// an edit can omit or shrink an entry that is *inside* the usage anchor's own accounting, and a
+/// compaction replaces a whole prefix with a summary. Upstream therefore DISCARDS the anchor when
+/// either entry appears LATER in the branch than the entry the anchor came from, and falls back to
+/// a pure chars/4 estimate of the whole projection.
+///
+/// Concretely, on the row's own scenario: pi's `_omitRecoveryAttempt` (`agent-session.ts:1015-1031`
+/// @v0.87.1) appends a `null` `context_edit` for an abandoned attempt, which by construction
+/// post-dates the usage-bearing assistant message it omits. Trusting the anchor there keeps the
+/// stale pre-edit reading, over-reports context and auto-compacts early.
+///
+/// `path` is the FULL branch (Pi `sessionManager.getBranch()` / `pathEntries`), not the
+/// compaction-admitted projection: the invalidation scan is over raw branch order, so a
+/// `context_edit` whose target was summarized away still counts as invalidating, exactly as
+/// upstream's `branchEntries.findIndex` / reverse walk does.
+///
+/// CYRUP-DELTA (mechanism, full parity): upstream's fallback re-sums
+/// `getCurrentSystemMessage(projection.messages)` plus every `message.role !== "system"`
+/// (`compaction.ts:277-282`), because pi carries the system prompt as an in-band transcript message.
+/// cyrup's [`AgentMessage`] union has no system arm at all — the system prompt is built out-of-band
+/// by `crate::prompt` and never becomes a session entry — so `currentSystem` is unconditionally
+/// absent and the `role !== "system"` filter excludes nothing. The remaining sum over every
+/// projected message is therefore byte-identical to upstream's, with no arm to port.
+pub fn estimate_projected_context_tokens(path: &[&Entry]) -> ContextUsageEstimate {
+    let tagged = crate::context::build_context_agent_messages_tagged(path);
+    let messages: Vec<AgentMessage> = tagged.iter().map(|(_, m)| m.clone()).collect();
+    let estimate = estimate_context_tokens_raw(&messages);
+
+    // Pi walks `projection.entries` accumulating `entry.messages.length` to find which entry owns
+    // `lastUsageIndex` (`compaction.ts:252-261`). The tagged projection already carries that
+    // ownership per message, so the walk is one index read and the two cannot drift.
+    if let Some(i) = estimate.last_usage_index
+        && let Some((usage_entry_id, _)) = tagged.get(i)
+    {
+        let usage_entry_index = path.iter().position(|e| &e.id() == usage_entry_id);
+        let latest_invalidating = path.iter().rposition(|e| {
+            matches!(
+                e,
+                Entry::Known(KnownEntry::ContextEdit { .. } | KnownEntry::Compaction { .. })
+            )
+        });
+        // Pi compares raw array indices with `-1` standing for "not found"
+        // (`compaction.ts:269-276`), and `usageEntryIndex > latestInvalidatingEntryIndex` KEEPS the
+        // anchor. With no invalidating entry that is `n > -1` ⇒ always keep; with an unlocatable
+        // usage entry it is `-1 > k` ⇒ never keep. `isize` reproduces both without a special case.
+        let usage_idx = usage_entry_index.map_or(-1_isize, |x| x as isize);
+        let invalid_idx = latest_invalidating.map_or(-1_isize, |x| x as isize);
+        if usage_idx > invalid_idx {
+            return estimate;
+        }
+    }
+
+    let tokens = messages
+        .iter()
+        .map(estimate_agent_message)
+        .fold(0u32, |a, b| a.saturating_add(b));
+    ContextUsageEstimate {
+        tokens,
+        usage_tokens: 0,
+        trailing_tokens: tokens,
+        last_usage_index: None,
     }
 }
 

@@ -336,6 +336,9 @@ impl SubagentExecutor {
                 capability_ceiling: None,
                 // …and only a revive carries a stored `modelOrigin`; a fresh launch derives it.
                 model_origin: None,
+                // SUBA-119: likewise, only a revive carries a launch-time alias map; a fresh launch
+                // takes the live `config.json` value inside `spawn_background_steps`.
+                model_response_aliases: None,
                 steps: vec![RunnerStep::SingleStep(step)],
                 mode: RunMode::Single,
                 session_file: fork_context.session_file_path,
@@ -486,6 +489,7 @@ impl SubagentExecutor {
             thinking_ceiling: requested_thinking_ceiling,
             capability_ceiling: requested_capability_ceiling,
             model_origin: stored_model_origin,
+            model_response_aliases: requested_model_response_aliases,
         } = spec;
         let cfg = self.config_snapshot().await;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before run-directory creation
@@ -789,6 +793,14 @@ impl SubagentExecutor {
             // fallible step between the claim and `Ok(run_id)` must roll the slot back explicitly,
             // and a `?` buried inside this struct literal cannot.
             model_scope,
+            // SUBA-119: the operator-declared `config.modelResponseAliases` in force at
+            // authorization time, baked in for the same reason `model_scope` above is — hop 2 has no
+            // `config.json` access, so this is the only channel by which a declared alias reaches a
+            // background child's model-verification check.
+            // A REVIVE overrides it with the descriptor's launch-time map
+            // (`subagent-executor.ts:2136`); every ordinary launch takes the live config value.
+            model_response_aliases: requested_model_response_aliases
+                .or_else(|| cfg.model_response_aliases.clone()),
             // Nested-route inheritance (pi `config.nestedRoute`/`config.nestedSelf`,
             // `async-execution.ts:727-731,989-993` @v0.34.0): carried verbatim so the detached runner (were it
             // ever to relay ITS OWN descendants further, a later unit's concern) inherits the SAME
@@ -3078,6 +3090,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
             let artifacts_dir = crate::artifacts::project_artifacts_dir(launch.cwd());
             let expected = RecoveryDescriptor {
                 fast: None,
+                model_response_aliases: None,
                 // SUBA-101: always recorded (pi `async-execution.ts:2024`); NARROW_MD declares
                 // none, so the parser default `false`.
                 inherit_global_context: Some(false),
@@ -3685,6 +3698,7 @@ mutationTools: apply_patch, notebook_edit\n",
                 .spawn_background_steps(
                     dir.path(),
                     BackgroundStepsSpec {
+                        model_response_aliases: None,
                         usage_budget: None,
                         turn_budget: None,
                         permission_rules: None,
@@ -3741,6 +3755,7 @@ mutationTools: apply_patch, notebook_edit\n",
             persona: ResolvedAgentPersona,
         ) -> BackgroundStepsSpec {
             BackgroundStepsSpec {
+                model_response_aliases: None,
                 usage_budget: None,
                 turn_budget: None,
                 permission_rules: None,

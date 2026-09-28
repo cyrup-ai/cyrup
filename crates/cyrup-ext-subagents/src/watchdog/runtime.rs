@@ -65,10 +65,10 @@ use super::scope::{WatchdogAutoFollowPromptLedger, WatchdogScopeArtifact};
 use super::settings::resolve_watchdog_config;
 use super::turn_delta::{WatchdogTurnDeltaInput, format_watchdog_turn_delta};
 use super::types::{
-    ResolvedWatchdogConfig, ThinkingSetting, WatchdogLspResult, WatchdogLspRuntimeSnapshot,
-    WatchdogLspStatus, WatchdogRuntimeStatus, WatchdogSettingsError, WatchdogSettingsResult,
-    WatchdogSettingsSource, WatchdogSeverity, WatchdogWarning, WatchdogWarningDetails,
-    WatchdogWarningSource, WatchdogWarningState,
+    ResolvedWatchdogConfig, ThinkingSetting, WatchdogImportance, WatchdogLspResult,
+    WatchdogLspRuntimeSnapshot, WatchdogLspStatus, WatchdogRuntimeStatus, WatchdogSettingsError,
+    WatchdogSettingsResult, WatchdogSettingsSource, WatchdogSeverity, WatchdogWarning,
+    WatchdogWarningDetails, WatchdogWarningSource, WatchdogWarningState,
 };
 use super::warning_format::{WatchdogWarningDetailsPatch, normalize_watchdog_warning_details};
 
@@ -286,6 +286,13 @@ pub enum WatchdogDelivery {
 pub type WatchdogWarningSink =
     Arc<dyn Fn(&WatchdogWarningDetails, Option<WatchdogDelivery>) + Send + Sync>;
 
+/// SUBA-120 / `displayUserWarning` (`runtime.ts:89`) — the USER-ONLY warning surface, where a
+/// `low`- or `medium`-importance finding goes. It takes no
+/// [`WatchdogWarningSendOptions`](WatchdogDelivery) counterpart: upstream's signature is
+/// `(warning: WatchdogWarningDetails) => void` with no second parameter, because a user-only finding
+/// is never steered into the parent model's turn — steering is exactly what makes a finding `high`.
+pub type WatchdogUserWarningSink = Arc<dyn Fn(&WatchdogWarningDetails) + Send + Sync>;
+
 /// `sendUserMessage` (`runtime.ts:84`) — used only for the auto-follow prompt. `Err` is upstream's
 /// rejected promise, which un-queues the prompt and records `lastError` (`:677-682`).
 pub type WatchdogUserMessageSink = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
@@ -392,8 +399,10 @@ pub struct MainWatchdogRuntimeOptions {
     pub review: Option<Arc<dyn WatchdogReview>>,
     /// A label for the review seam (`:174`).
     pub review_description: Option<String>,
-    /// Where a displayed warning goes (`:175`).
+    /// Where a displayed warning goes (`:175`) — SUBA-120: now only `high`-importance findings.
     pub display_warning: Option<WatchdogWarningSink>,
+    /// SUBA-120 — where a `low`/`medium`-importance finding goes instead (`runtime.ts:89`).
+    pub display_user_warning: Option<WatchdogUserWarningSink>,
     /// Where an auto-follow prompt goes (`:176`).
     pub send_user_message: Option<WatchdogUserMessageSink>,
     /// Review only when the repository changed (`:177`).
@@ -493,6 +502,7 @@ pub struct MainWatchdogRuntime {
     review_connected: bool,
     review_description: String,
     display_warning: Option<WatchdogWarningSink>,
+    display_user_warning: Option<WatchdogUserWarningSink>,
     send_user_message: Option<WatchdogUserMessageSink>,
     review_changes_only: bool,
     lsp_diagnostics: Arc<dyn WatchdogLspDiagnostics>,
@@ -602,6 +612,7 @@ impl MainWatchdogRuntime {
             review_connected,
             review_description,
             display_warning: options.display_warning,
+            display_user_warning: options.display_user_warning,
             send_user_message: options.send_user_message,
             review_changes_only: options.review_changes_only,
             lsp_diagnostics,
@@ -1451,10 +1462,26 @@ impl MainWatchdogRuntime {
             inner.displayed_warning_sequence += 1;
             details
         };
-        if let Some(sink) = &self.display_warning {
-            sink(&details, None);
-        }
+        self.route_warning(&details, None);
         true
+    }
+
+    /// SUBA-120 / `routeWarning(details, options)` (`runtime.ts:548-550`) — the whole routing rule,
+    /// verbatim: a `high`-importance finding goes to the parent-model sink, everything else
+    /// (`low`, `medium`) goes to the user-only sink. Both are optional, exactly as upstream's two
+    /// `?.` calls are.
+    ///
+    /// Every warning this runtime displays goes through here. Before SUBA-120 there was one sink and
+    /// every threshold-passing finding reached the parent model, so a `low` finding — which upstream
+    /// shows the user and nothing more — was steered into the parent's turn.
+    fn route_warning(&self, details: &WatchdogWarningDetails, delivery: Option<WatchdogDelivery>) {
+        if details.importance == WatchdogImportance::High {
+            if let Some(sink) = &self.display_warning {
+                sink(details, delivery);
+            }
+        } else if let Some(sink) = &self.display_user_warning {
+            sink(details);
+        }
     }
 
     /// `displayAcceptedReviewWarning(correction)` (`runtime.ts:631-641`).
@@ -1473,16 +1500,14 @@ impl MainWatchdogRuntime {
             inner.displayed_warning_sequence += 1;
             details
         };
-        if let Some(sink) = &self.display_warning {
-            sink(
-                &details,
-                if correction {
-                    Some(WatchdogDelivery::Steer)
-                } else {
-                    None
-                },
-            );
-        }
+        self.route_warning(
+            &details,
+            if correction {
+                Some(WatchdogDelivery::Steer)
+            } else {
+                None
+            },
+        );
     }
 
     /// `fail(message)` (`runtime.ts:828-834`).
@@ -2161,6 +2186,10 @@ mod tests {
     #[derive(Default)]
     struct Sinks {
         displayed: DisplayedWarnings,
+        /// SUBA-120 — everything `route_warning` sends to the USER-ONLY sink
+        /// (`displayUserWarning`, `runtime.ts:550`). Kept separate from `displayed` so a test can
+        /// assert not just that a finding was shown but WHICH surface it reached.
+        user_displayed: Arc<Mutex<Vec<WatchdogWarningDetails>>>,
         user_messages: Arc<Mutex<Vec<String>>>,
     }
 
@@ -2184,6 +2213,7 @@ mod tests {
 
     fn options_with(config: ResolvedWatchdogConfig, sinks: &Sinks) -> MainWatchdogRuntimeOptions {
         let displayed = Arc::clone(&sinks.displayed);
+        let user_displayed = Arc::clone(&sinks.user_displayed);
         let user_messages = Arc::clone(&sinks.user_messages);
         MainWatchdogRuntimeOptions {
             cwd: Some(PathBuf::from("/tmp")),
@@ -2195,6 +2225,12 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push((details.clone(), delivery));
+            })),
+            display_user_warning: Some(Arc::new(move |details: &WatchdogWarningDetails| {
+                user_displayed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(details.clone());
             })),
             send_user_message: Some(Arc::new(move |message: &str| {
                 user_messages
@@ -2209,9 +2245,13 @@ mod tests {
         }
     }
 
+    /// SUBA-120: `High` importance, so these two helpers keep routing to the PARENT-MODEL sink and
+    /// every pre-existing `sinks.displayed` assertion still tests what it was written to test. The
+    /// non-`high` path has its own tests below.
     fn blocker(summary: &str) -> WatchdogWarning {
         WatchdogWarning::new(
             WatchdogSeverity::Blocker,
+            WatchdogImportance::High,
             summary,
             "the evidence for it",
             "fix it before continuing",
@@ -2221,6 +2261,7 @@ mod tests {
     fn concern(summary: &str) -> WatchdogWarning {
         WatchdogWarning::new(
             WatchdogSeverity::Concern,
+            WatchdogImportance::High,
             summary,
             "the evidence for it",
             "consider fixing it",
@@ -2465,12 +2506,82 @@ mod tests {
         assert!(sinks.displayed.lock().unwrap().is_empty());
     }
 
+    // ---- SUBA-120: importance routing (`routeWarning`, `runtime.ts:548-550`) --------------------
+
+    /// SUBA-120 test (a). With BOTH sinks installed, a `high` finding reaches the parent-model sink
+    /// and a `low` finding reaches the user-only sink — and, the part that actually matters, the `low`
+    /// one NEVER reaches the parent-model sink (`routeWarning`, `runtime.ts:548-550`).
+    ///
+    /// Before this row there was ONE sink and every threshold-passing finding went to it, so a `low`
+    /// finding was delivered into the parent model's context exactly like a `high` one.
+    ///
+    /// The two importances are driven through SEPARATE runs rather than as two warnings of one review:
+    /// a review accepts at most one warning (`accept_warning` latches `active_review_warning`), so a
+    /// second finding in the same review is never displayed at all and would prove nothing about
+    /// routing.
+    #[tokio::test]
+    async fn a_high_finding_reaches_the_model_sink_and_a_low_finding_only_the_user_sink() {
+        async fn route(importance: WatchdogImportance) -> (usize, usize) {
+            let sinks = Sinks::default();
+            let mut review = ScriptedReview::new();
+            review.warnings = vec![WatchdogWarning::new(
+                WatchdogSeverity::Blocker,
+                importance,
+                "a finding worth routing",
+                "the evidence for it",
+                "fix it before continuing",
+            )];
+            let mut options = options_with(enabled_config(), &sinks);
+            options.review = Some(Arc::new(review));
+            let runtime = MainWatchdogRuntime::new(options);
+            runtime.handle_turn_end(&turn_end_event("work"), &cwd());
+            runtime.handle_agent_end(&cwd()).await;
+            let to_model = sinks.displayed.lock().unwrap().len();
+            let to_user = sinks.user_displayed.lock().unwrap().len();
+            (to_model, to_user)
+        }
+
+        assert_eq!(
+            route(WatchdogImportance::High).await,
+            (1, 0),
+            "a high finding goes to the parent model and NOT to the user-only surface"
+        );
+        assert_eq!(
+            route(WatchdogImportance::Low).await,
+            (0, 1),
+            "a low finding goes to the user-only surface and NEVER to the parent model"
+        );
+    }
+
+    /// A `medium` finding routes the same way a `low` one does — `routeWarning`'s rule is
+    /// `high` versus everything else, not a three-way split (`runtime.ts:549`).
+    #[tokio::test]
+    async fn a_medium_finding_routes_to_the_user_sink_like_a_low_one() {
+        let sinks = Sinks::default();
+        let mut review = ScriptedReview::new();
+        review.warnings = vec![WatchdogWarning::new(
+            WatchdogSeverity::Blocker,
+            WatchdogImportance::Medium,
+            "middling but real",
+            "the evidence for it",
+            "consider it",
+        )];
+        let mut options = options_with(enabled_config(), &sinks);
+        options.review = Some(Arc::new(review));
+        let runtime = MainWatchdogRuntime::new(options);
+        runtime.handle_turn_end(&turn_end_event("work"), &cwd());
+        runtime.handle_agent_end(&cwd()).await;
+        assert!(sinks.displayed.lock().unwrap().is_empty());
+        assert_eq!(sinks.user_displayed.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn the_emission_guard_suppresses_a_content_free_warning() {
         let sinks = Sinks::default();
         let mut review = ScriptedReview::new();
         review.warnings = vec![WatchdogWarning::new(
             WatchdogSeverity::Blocker,
+            WatchdogImportance::High,
             "LGTM",
             "looks good",
             "none",

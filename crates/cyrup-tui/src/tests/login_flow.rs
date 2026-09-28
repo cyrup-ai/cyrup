@@ -135,9 +135,20 @@ impl Provider for StubProvider {
 }
 
 fn stub_registry(auth: ProviderAuth) -> LoginProviderSource {
+    registry_for("stub", auth)
+}
+
+/// [`stub_registry`] under an arbitrary provider id — **TUI-105** needs one that appears in
+/// [`cyrup_config::default_model_per_provider`], which `"stub"` deliberately does not.
+///
+/// Only the LOGIN registry is substituted; the model catalog still comes from
+/// `cyrup_provider::all_providers()`, so a login under `"deepseek"` credentials the real deepseek
+/// provider and its real built-in models become available. Nothing here opens a socket: the strategy
+/// is still `ScriptedOauth`.
+fn registry_for(id: &'static str, auth: ProviderAuth) -> LoginProviderSource {
     Arc::new(move || {
         let provider: Arc<dyn Provider> = Arc::new(StubProvider {
-            id: ProviderId::from("stub"),
+            id: ProviderId::from(id),
             auth: auth.clone(),
             models: Vec::new(),
         });
@@ -247,7 +258,7 @@ async fn login_confirm_runs_the_flow_and_writes_a_credential() {
         matches!(msg, LoginUiMsg::Notify(_)),
         "expected the auth url"
     );
-    app.apply_login_msg(msg);
+    app.apply_login_msg(&fx.session, msg).await;
     let body = app.login_dialog_body().expect("dialog is open");
     assert!(body.contains("https://stub.invalid/authorize"), "{body}");
     assert!(body.contains("Approve, then paste the code"), "{body}");
@@ -258,7 +269,7 @@ async fn login_confirm_runs_the_flow_and_writes_a_credential() {
         matches!(msg, LoginUiMsg::Prompt { .. }),
         "expected a prompt"
     );
-    app.apply_login_msg(msg);
+    app.apply_login_msg(&fx.session, msg).await;
     let body = app.login_dialog_body().expect("dialog is open");
     assert!(body.contains("Paste the authorization code"), "{body}");
     // `showPrompt` appends — the auth URL is still on screen (`login-dialog.ts:152-153`).
@@ -283,7 +294,7 @@ async fn login_confirm_runs_the_flow_and_writes_a_credential() {
         }
         other => panic!("expected Finished, got {other:?}"),
     }
-    app.apply_login_msg(msg);
+    app.apply_login_msg(&fx.session, msg).await;
 
     // ---- THE ASSERTION THAT MATTERS: a credential reached the store.
     let stored = fx
@@ -399,8 +410,10 @@ async fn escape_cancels_the_login_silently_and_writes_nothing() {
         None,
     )
     .await;
-    app.apply_login_msg(next_msg(&mut rx).await); // auth url
-    app.apply_login_msg(next_msg(&mut rx).await); // prompt
+    app.apply_login_msg(&fx.session, next_msg(&mut rx).await)
+        .await; // auth url
+    app.apply_login_msg(&fx.session, next_msg(&mut rx).await)
+        .await; // prompt
 
     app.handle_input(&key(KeyCode::Esc));
     assert_eq!(app.active_selector_kind(), None, "Esc closes the dialog");
@@ -413,7 +426,7 @@ async fn escape_cancels_the_login_silently_and_writes_nothing() {
         }
         other => panic!("expected Finished, got {other:?}"),
     }
-    app.apply_login_msg(msg);
+    app.apply_login_msg(&fx.session, msg).await;
 
     let text = transcript_text(&app);
     assert!(
@@ -450,7 +463,7 @@ async fn a_failed_login_shows_the_banner_and_writes_nothing() {
     )
     .await;
     let msg = next_msg(&mut rx).await;
-    app.apply_login_msg(msg);
+    app.apply_login_msg(&fx.session, msg).await;
 
     let text = transcript_text(&app);
     assert!(
@@ -487,7 +500,7 @@ async fn api_key_login_prompts_persists_and_uses_the_api_key_wording() {
 
     let msg = next_msg(&mut rx).await;
     assert!(matches!(msg, LoginUiMsg::Prompt { .. }), "got {msg:?}");
-    app.apply_login_msg(msg);
+    app.apply_login_msg(&fx.session, msg).await;
     // `Enter ${method.name}` — `method.name` verbatim off the strategy, no reconstruction
     // (`ai/src/auth/helpers.ts:12-13`; `interactive-mode.ts:4880` carries `method` whole).
     let body = app.login_dialog_body().unwrap();
@@ -495,7 +508,8 @@ async fn api_key_login_prompts_persists_and_uses_the_api_key_wording() {
 
     type_text(&mut app, "sk-test-123");
     app.handle_input(&key(KeyCode::Enter));
-    app.apply_login_msg(next_msg(&mut rx).await);
+    app.apply_login_msg(&fx.session, next_msg(&mut rx).await)
+        .await;
 
     match fx
         .session
@@ -533,11 +547,14 @@ async fn logout_removes_the_stored_credential() {
         None,
     )
     .await;
-    app.apply_login_msg(next_msg(&mut rx).await); // auth url
-    app.apply_login_msg(next_msg(&mut rx).await); // prompt
+    app.apply_login_msg(&fx.session, next_msg(&mut rx).await)
+        .await; // auth url
+    app.apply_login_msg(&fx.session, next_msg(&mut rx).await)
+        .await; // prompt
     type_text(&mut app, "CODE7");
     app.handle_input(&key(KeyCode::Enter));
-    app.apply_login_msg(next_msg(&mut rx).await); // finished
+    app.apply_login_msg(&fx.session, next_msg(&mut rx).await)
+        .await; // finished
     assert!(
         fx.session
             .services()
@@ -659,4 +676,584 @@ async fn no_channel_means_no_orphaned_flow() {
     .await;
     assert_eq!(app.active_selector_kind(), None);
     assert!(transcript_text(&app).contains("login unavailable"));
+}
+
+// ================================================================ TUI-105
+
+// **TUI-105** — a completed login selects the provider's default model, recounts the available
+// providers, and refreshes that provider's catalog.
+
+/// A [`cyrup_session_svc::ProviderResolver`] backed by the built-in registry — the same source the
+/// real bin resolves against (`cyrup/src/session_launch.rs:177`), so the provider swap a default-model
+/// selection performs is the production one. Opens no socket: resolving a provider only constructs it.
+struct RegistryResolver;
+
+impl cyrup_session_svc::ProviderResolver for RegistryResolver {
+    fn resolve(&self, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
+        cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
+            credentials: None,
+            auth_context: None,
+            catalog_overlay: None,
+        })
+        .get_provider(provider_id)
+        .ok_or_else(|| format!("no built-in provider '{provider_id}'"))
+    }
+}
+
+/// A provider with NO models of its own, so `SessionBuilder` resolves no initial model and
+/// `session.model()` is `None` — pi's `isUnknownModel(previousModel)` state
+/// (`interactive-mode.ts:298-300`, the `unknown/unknown/unknown` sentinel from `agent.ts:57-68`),
+/// which cyrup spells as `None` (`cyrup-session-svc/src/session/accessors.rs:33`).
+///
+/// [`fixture`]'s faux provider always supplies `faux/faux-1`, so it can never produce this state.
+struct ModellessProvider(ProviderId);
+
+#[async_trait::async_trait]
+impl Provider for ModellessProvider {
+    fn id(&self) -> &ProviderId {
+        &self.0
+    }
+    fn models(&self) -> &[Model] {
+        &[]
+    }
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: &Context,
+        _options: &StreamOptions,
+    ) -> EventStream<StreamEvent> {
+        Box::pin(futures::stream::empty())
+    }
+}
+
+/// [`fixture`] on a session whose `model()` is `None` — the credential-less first run.
+async fn first_run_fixture() -> Fixture {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut config = SessionConfig::new(cwd, agent_dir.clone());
+    config.trust_override = Some(true);
+    let provider: Arc<dyn Provider> = Arc::new(ModellessProvider(ProviderId::from("none")));
+    let session = SessionBuilder::new(provider, config)
+        // `set_model_resolved` swaps the owning provider in place when the target belongs to another
+        // one (`cyrup-session-svc/src/session/model.rs:47`), which needs a resolver — the real bin
+        // wires the same built-in registry (`cyrup/src/session_launch.rs:177`).
+        .provider_resolver(Arc::new(RegistryResolver))
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        session.model(),
+        None,
+        "the whole point of this fixture is pi's isUnknownModel state"
+    );
+    Fixture {
+        _tmp: tmp,
+        agent_dir,
+        session: Arc::new(session),
+    }
+}
+
+/// The provider TUI-105's end-to-end tests log in to: one whose curated default
+/// (`cyrup-config/src/model/defaults.rs:8`) really is in its built-in catalog, so the selection has
+/// something to select.
+const DEFAULTED_PROVIDER: &str = "deepseek";
+const DEFAULTED_MODEL: &str = "deepseek-v4-pro";
+
+/// The provider TUI-105's DEFERRED tests log in to: one whose curated default is NOT in any built-in
+/// catalog, because it has none — `radius` ships zero embedded models
+/// (`cyrup_provider::all_providers()`) and its default is `"auto"`
+/// (`cyrup-config/src/model/defaults.rs:14`). That is pi's `deferSelection` condition exactly, and
+/// the state its comment names: "Dynamic catalogs may be empty until the first authenticated network
+/// refresh" (`interactive-mode.ts:5888`).
+const DYNAMIC_PROVIDER: &str = "radius";
+const DYNAMIC_MODEL: &str = "auto";
+
+/// Stand in for what a completed catalog refresh does — install the provider's freshly fetched models
+/// into the session's live overlay slot, which is the very mechanism
+/// `refresh_model_catalogs` uses (`cyrup-session-svc/src/session/model.rs:274-277`,
+/// `cyrup-provider/src/catalog_refresh.rs:71`). The fixture wires no catalog service, so there is
+/// nothing to fetch FROM; the installed result is the same either way.
+fn install_refreshed_catalog(session: &Arc<AgentSession>, provider: &str, ids: &[&str]) {
+    let models: Vec<Model> = ids.iter().map(|id| model_named(provider, id)).collect();
+    session
+        .services()
+        .catalog_overlay
+        .install(cyrup_provider::CatalogOverlay::from_entries([(
+            provider.to_string(),
+            models,
+        )]));
+}
+
+/// Make `provider` credentialed so its built-in models pass `has_configured_auth`
+/// (`cyrup-session-svc/src/session/model.rs:106`) and therefore appear in
+/// `available_model_catalog()` — pi's `getAvailableSnapshot()`.
+fn credential(session: &Arc<AgentSession>, provider: &str) {
+    session
+        .services()
+        .auth
+        .set_runtime_api_key(ProviderId::from(provider), "test-key".to_string());
+}
+
+/// Drive a whole OAuth login to its `Finished`, returning pi's `actionLabel` for the provider that
+/// was logged into (`interactive-mode.ts:5885`) so the assertions can build upstream's templates
+/// without hardcoding a display name.
+///
+/// The `Finished` is NOT applied here: the tests want to inspect or adjust state between the flow
+/// settling and `finish_login` running.
+async fn drive_login_to_finished(
+    app: &mut App<TestBackend>,
+    session: &Arc<AgentSession>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<LoginUiMsg>,
+    provider_id: &str,
+) -> (String, LoginUiMsg) {
+    app.execute_command(
+        AppCommand::LoginCommand(Some(provider_id.to_string())),
+        session,
+        None,
+    )
+    .await;
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::LoginDialog),
+        "`/login {provider_id}` must open the dialog"
+    );
+    app.apply_login_msg(session, next_msg(rx).await).await; // auth url
+    app.apply_login_msg(session, next_msg(rx).await).await; // prompt
+    type_text(app, "CODE42");
+    app.handle_input(&key(KeyCode::Enter));
+    let msg = next_msg(rx).await;
+    let action = match &msg {
+        LoginUiMsg::Finished(f) => {
+            assert!(f.result.is_ok(), "login failed: {:?}", f.result);
+            format!("Logged in to {}", f.provider_name)
+        }
+        other => panic!("expected Finished, got {other:?}"),
+    };
+    (action, msg)
+}
+
+/// **TUI-105**, the headline. Pi's `completeProviderAuthentication` selects the provider's curated
+/// default when the session had no model, and says so
+/// (`` `${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}` ``,
+/// `interactive-mode.ts:5898-5932`). cyrup's `finish_login` did nothing but push
+/// `` `${action}. Credentials saved to {path}` ``, so a first run ended a successful `/login` still
+/// unable to send a message until the user found `/model` on their own.
+///
+/// **Red without the change:** `session.model()` stays `None` and the status carries no `Selected`
+/// clause.
+#[tokio::test]
+async fn tui105_successful_login_selects_the_provider_default_model() {
+    let fx = first_run_fixture().await;
+    // The provider's catalog is already available, so `deferSelection` (`:5889-5895`) is false and
+    // the selection happens inline. The deferred route has its own test below.
+    credential(&fx.session, DEFAULTED_PROVIDER);
+    let mut app = app_with(registry_for(
+        DEFAULTED_PROVIDER,
+        ProviderAuth::with_oauth(Arc::new(ScriptedOauth)),
+    ));
+    let mut rx = app.install_login_channel();
+
+    let (action, msg) =
+        drive_login_to_finished(&mut app, &fx.session, &mut rx, DEFAULTED_PROVIDER).await;
+    app.apply_login_msg(&fx.session, msg).await;
+
+    let model = fx.session.model().expect("the login must select a model");
+    assert_eq!(model.provider.as_str(), DEFAULTED_PROVIDER);
+    assert_eq!(
+        model.model.as_str(),
+        DEFAULTED_MODEL,
+        "`defaultModelPerProvider[providerId]` (`interactive-mode.ts:5911`)"
+    );
+    let path = fx.agent_dir.join("auth.json").display().to_string();
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(&format!(
+            "{action}. Selected {DEFAULTED_MODEL}. Credentials saved to {path}"
+        )),
+        "`:5932` verbatim; got:\n{text}"
+    );
+}
+
+/// **TUI-105.** Pi's `isUnknownModel(previousModel)` gate (`interactive-mode.ts:5898`): a session
+/// that ALREADY has a model keeps it, and the status is the bare
+/// `` `${actionLabel}. Credentials saved to ${getAuthPath()}` `` (`:5937`) with no `Selected` clause.
+///
+/// Without this gate the fix would silently retarget a user who ran `/model` and then `/login`, which
+/// is a worse bug than the one it fixes — so this test is the one that stops it. [`fixture`]'s faux
+/// provider supplies `faux/faux-1`, which is exactly the "already chose a model" state.
+#[tokio::test]
+async fn tui105_login_does_not_override_an_existing_model() {
+    let fx = fixture().await;
+    let before = fx.session.model().expect("the faux fixture has a model");
+    credential(&fx.session, DEFAULTED_PROVIDER);
+    let mut app = app_with(registry_for(
+        DEFAULTED_PROVIDER,
+        ProviderAuth::with_oauth(Arc::new(ScriptedOauth)),
+    ));
+    let mut rx = app.install_login_channel();
+
+    let (action, msg) =
+        drive_login_to_finished(&mut app, &fx.session, &mut rx, DEFAULTED_PROVIDER).await;
+    app.apply_login_msg(&fx.session, msg).await;
+
+    assert_eq!(
+        fx.session.model(),
+        Some(before),
+        "`isUnknownModel(previousModel)` is false, so nothing is selected"
+    );
+    let path = fx.agent_dir.join("auth.json").display().to_string();
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(&format!("{action}. Credentials saved to {path}")),
+        "got:\n{text}"
+    );
+    assert!(
+        !text.contains("Selected"),
+        "a session that already had a model must not be retargeted:\n{text}"
+    );
+}
+
+/// **TUI-105.** Pi's `updateAvailableProviderCount` (`interactive-mode.ts:5092-5098`), called
+/// unconditionally at the end of `finishAuthentication` (`:5928`).
+///
+/// **Red without the change:** `StatusLine::set_provider_count` had exactly ONE production caller
+/// and it is at boot (`cyrup/src/interactive.rs:466-469`), so the footer's `(provider)` prefix gate
+/// (`status.rs:597`) could not move after startup — logging in to a second provider left the footer
+/// claiming one.
+#[tokio::test]
+async fn tui105_login_recounts_providers_from_the_auth_filtered_catalog() {
+    let fx = first_run_fixture().await;
+    credential(&fx.session, DEFAULTED_PROVIDER);
+    let mut app = app_with(registry_for(
+        DEFAULTED_PROVIDER,
+        ProviderAuth::with_oauth(Arc::new(ScriptedOauth)),
+    ));
+    let mut rx = app.install_login_channel();
+    app.status_mut().set_provider_count(1);
+
+    let (_action, msg) =
+        drive_login_to_finished(&mut app, &fx.session, &mut rx, DEFAULTED_PROVIDER).await;
+    app.apply_login_msg(&fx.session, msg).await;
+
+    // `new Set(getAvailableSnapshot().map(m => m.provider)).size` (`:5096-5097`).
+    let expected: std::collections::BTreeSet<String> = fx
+        .session
+        .available_model_catalog()
+        .iter()
+        .map(|m| m.provider.as_str().to_string())
+        .collect();
+    assert!(
+        expected.len() > 1,
+        "the credentialed provider must have widened the catalog: {expected:?}"
+    );
+    assert_eq!(app.state().status.provider_count, expected.len());
+
+    // `session.scopedModels.length > 0 ? scopedModels.map(s => s.model) : …` (`:5094-5095`) — the
+    // scoped set WINS when one is configured.
+    let one = fx
+        .session
+        .available_model_catalog()
+        .into_iter()
+        .find(|m| m.provider.as_str() == DEFAULTED_PROVIDER)
+        .expect("the credentialed provider has models");
+    fx.session
+        .set_scoped_models(vec![cyrup_session_svc::ScopedModel {
+            model: one,
+            thinking_level: None,
+        }]);
+    app.refresh_provider_count(&fx.session);
+    assert_eq!(
+        app.state().status.provider_count,
+        1,
+        "one scoped provider ⇒ one"
+    );
+}
+
+/// **TUI-105.** `deferSelection` (`interactive-mode.ts:5889-5895`), whose comment is "Dynamic
+/// catalogs may be empty until the first authenticated network refresh": the credential exists but
+/// the provider's models do not yet, so pi postpones the selection, says
+/// `` `… Refreshing model catalog…` `` (`:5948`), and runs `finishAuthentication` from the refresh
+/// continuation instead (`:5962`).
+///
+/// **Red without the change:** neither the deferred status string nor `LoginRefreshMsg` exists, and
+/// `finish_login` never selected a model on either route.
+#[tokio::test]
+async fn tui105_deferred_selection_reports_refreshing_then_selects() {
+    let fx = first_run_fixture().await;
+    let mut app = app_with(registry_for(
+        DYNAMIC_PROVIDER,
+        ProviderAuth::with_oauth(Arc::new(ScriptedOauth)),
+    ));
+    let mut rx = app.install_login_channel();
+    let mut refresh_rx = app.install_login_refresh_channel();
+
+    let (action, msg) =
+        drive_login_to_finished(&mut app, &fx.session, &mut rx, DYNAMIC_PROVIDER).await;
+    app.apply_login_msg(&fx.session, msg).await;
+
+    let path = fx.agent_dir.join("auth.json").display().to_string();
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(&format!(
+            "{action}. Credentials saved to {path}. Refreshing model catalog…"
+        )),
+        "`:5948` verbatim; got:\n{text}"
+    );
+    assert!(
+        !text.contains("Selected"),
+        "the selection is postponed until the refresh lands:\n{text}"
+    );
+    assert_eq!(fx.session.model(), None);
+
+    // The refresh lands, carrying the provider's account-specific catalog.
+    install_refreshed_catalog(&fx.session, DYNAMIC_PROVIDER, &[DYNAMIC_MODEL]);
+    let refresh = tokio::time::timeout(Duration::from_secs(5), refresh_rx.recv())
+        .await
+        .expect("the post-login refresh must settle")
+        .expect("the refresh channel stays open");
+    assert!(refresh.defer, "`deferSelection` travels on the message");
+    app.apply_login_refresh(&fx.session, refresh).await;
+
+    let model = fx
+        .session
+        .model()
+        .expect("the deferred selection must run from the refresh continuation");
+    assert_eq!(model.provider.as_str(), DYNAMIC_PROVIDER);
+    assert_eq!(model.model.as_str(), DYNAMIC_MODEL);
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(&format!(
+            "{action}. Selected {DYNAMIC_MODEL}. Credentials saved to {path}"
+        )),
+        "got:\n{text}"
+    );
+}
+
+/// **TUI-105.** Pi's `if (deferSelection && this.session === session && session.model === previousModel)`
+/// guard (`interactive-mode.ts:5960-5963`), comment included: "Do not replace a model or session
+/// selected while the refresh was running."
+///
+/// This is the one clause whose absence is a WRONG RESULT rather than a missing feature: a `/model`
+/// issued during the 15 s refresh window would be silently overwritten by the provider default. A fix
+/// without it passes the two tests above and is still broken, which is why this one exists.
+#[tokio::test]
+async fn tui105_a_stale_refresh_does_not_replace_a_model_chosen_meanwhile() {
+    let fx = first_run_fixture().await;
+    let mut app = app_with(registry_for(
+        DYNAMIC_PROVIDER,
+        ProviderAuth::with_oauth(Arc::new(ScriptedOauth)),
+    ));
+    let mut rx = app.install_login_channel();
+    let mut refresh_rx = app.install_login_refresh_channel();
+
+    let (_action, msg) =
+        drive_login_to_finished(&mut app, &fx.session, &mut rx, DYNAMIC_PROVIDER).await;
+    app.apply_login_msg(&fx.session, msg).await;
+    assert_eq!(fx.session.model(), None, "the selection was deferred");
+
+    // The user runs `/model` while the refresh is in flight and picks something else.
+    install_refreshed_catalog(
+        &fx.session,
+        DYNAMIC_PROVIDER,
+        &[DYNAMIC_MODEL, "something-else"],
+    );
+    let chosen = fx
+        .session
+        .available_model_catalog()
+        .into_iter()
+        .find(|m| m.provider.as_str() == DYNAMIC_PROVIDER && m.id.as_str() == "something-else")
+        .expect("the refreshed catalog has a second model");
+    fx.session.set_model_resolved(chosen).await.unwrap();
+
+    let refresh = tokio::time::timeout(Duration::from_secs(5), refresh_rx.recv())
+        .await
+        .expect("the post-login refresh must settle")
+        .expect("the refresh channel stays open");
+    assert!(refresh.defer);
+    app.apply_login_refresh(&fx.session, refresh).await;
+
+    assert_eq!(
+        fx.session
+            .model()
+            .expect("the user's choice stands")
+            .model
+            .as_str(),
+        "something-else",
+        "`session.model === previousModel` is false, so the deferred selection is abandoned"
+    );
+    assert!(
+        !transcript_text(&app).contains(&format!("Selected {DYNAMIC_MODEL}")),
+        "no selection status for a selection that did not happen"
+    );
+}
+
+/// **TUI-105.** `if (result.aborted) showWarning(...)` (`interactive-mode.ts:5956-5958`).
+///
+/// cyrup's coordinator splits pi's one `aborted` flag into `timed_out` (THIS caller's token fired)
+/// and `aborted` (the shared operation gave up) — `cyrup-provider/src/catalog_refresh.rs:90-95` —
+/// and both are upstream's, so both take this arm.
+#[tokio::test]
+async fn tui105_refresh_timeout_warns_and_keeps_cached_models() {
+    let fx = first_run_fixture().await;
+    credential(&fx.session, DEFAULTED_PROVIDER);
+    let mut app = app_with(registry_for(
+        DEFAULTED_PROVIDER,
+        ProviderAuth::with_oauth(Arc::new(ScriptedOauth)),
+    ));
+    let mut rx = app.install_login_channel();
+    let mut refresh_rx = app.install_login_refresh_channel();
+
+    let (action, msg) =
+        drive_login_to_finished(&mut app, &fx.session, &mut rx, DEFAULTED_PROVIDER).await;
+    app.apply_login_msg(&fx.session, msg).await;
+    // The catalog was already available, so this login selected inline and did NOT defer.
+    let selected = fx.session.model().expect("selected inline");
+
+    let mut refresh = tokio::time::timeout(Duration::from_secs(5), refresh_rx.recv())
+        .await
+        .expect("the post-login refresh must settle")
+        .expect("the refresh channel stays open");
+    assert!(!refresh.defer);
+    refresh.result.timed_out = true;
+    app.apply_login_refresh(&fx.session, refresh).await;
+
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(&format!(
+            "{action}, but its model catalog refresh timed out; using cached models."
+        )),
+        "`:5957` verbatim; got:\n{text}"
+    );
+    assert_eq!(
+        fx.session.model(),
+        Some(selected),
+        "a timed-out refresh leaves the already-selected model alone"
+    );
+}
+
+/// **TUI-105.** Pi's `selectionError` ladder (`interactive-mode.ts:5901-5923`), every rung and every
+/// message byte-for-byte, including the `radius` catalog-order fallback (`:5913-5915`).
+///
+/// Asserted on the pure decision rather than end to end because three of the four rungs need a
+/// catalog shape the offline fixture cannot produce — a provider that is credentialed, has models,
+/// and is missing its own curated default. That is the same reason `clipboard_write_plan` takes its
+/// platform as a parameter.
+///
+/// **Red without the change:** `default_model_selection` and `DefaultModelFailure` do not exist.
+#[test]
+fn tui105_login_reports_the_missing_default_by_name() {
+    use crate::app::login::{DefaultModelFailure, default_model_selection};
+
+    let action = "Logged in to Deepseek";
+
+    // Rung 2: `!hasDefaultModelProvider(providerId)` (`:5904-5905`). `"stub"` is absent from
+    // `default_model_per_provider`, which is why the other tests log in to `deepseek`.
+    assert_eq!(
+        default_model_selection("stub", &[]),
+        Err(DefaultModelFailure::NoDefaultConfigured)
+    );
+    assert_eq!(
+        DefaultModelFailure::NoDefaultConfigured.message(action, "stub"),
+        "Logged in to Deepseek, but no default model is configured for provider \"stub\". \
+         Use /model to select a model."
+    );
+
+    // Rung 3: `providerModels.length === 0` (`:5906-5907`).
+    assert_eq!(
+        default_model_selection(DEFAULTED_PROVIDER, &[]),
+        Err(DefaultModelFailure::NoModelsAvailable)
+    );
+    assert_eq!(
+        DefaultModelFailure::NoModelsAvailable.message(action, DEFAULTED_PROVIDER),
+        "Logged in to Deepseek, but no models are available for that provider. \
+         Use /model to select a model."
+    );
+
+    // Rung 4: the default is configured but absent from the catalog (`:5915-5916`).
+    let other = model_named(DEFAULTED_PROVIDER, "deepseek-v4-flash");
+    assert_eq!(
+        default_model_selection(DEFAULTED_PROVIDER, std::slice::from_ref(&other)),
+        Err(DefaultModelFailure::DefaultNotAvailable(DEFAULTED_MODEL))
+    );
+    assert_eq!(
+        DefaultModelFailure::DefaultNotAvailable(DEFAULTED_MODEL)
+            .message(action, DEFAULTED_PROVIDER),
+        "Logged in to Deepseek, but its default model \"deepseek-v4-pro\" is not available. \
+         Use /model to select a model."
+    );
+
+    // …and the hit, which is the whole point of the ladder.
+    let want = model_named(DEFAULTED_PROVIDER, DEFAULTED_MODEL);
+    assert_eq!(
+        default_model_selection(DEFAULTED_PROVIDER, &[other.clone(), want.clone()])
+            .unwrap()
+            .id
+            .as_str(),
+        DEFAULTED_MODEL
+    );
+
+    // `providerId === "radius" ? providerModels[0] : undefined` (`:5914`) — "Radius catalogs vary by
+    // account; prefer balanced, then use catalog order" (`:5912`). ONLY radius gets it.
+    let radius_first = model_named("radius", "some-account-model");
+    assert_eq!(
+        default_model_selection("radius", std::slice::from_ref(&radius_first))
+            .unwrap()
+            .id
+            .as_str(),
+        "some-account-model"
+    );
+
+    // Rung 5: `setModel` threw (`:5919-5923`).
+    assert_eq!(
+        DefaultModelFailure::SetModelFailed(
+            "no configured auth for deepseek/deepseek-v4-pro".into()
+        )
+        .message(action, DEFAULTED_PROVIDER),
+        "Logged in to Deepseek, but selecting its default model failed: \
+         no configured auth for deepseek/deepseek-v4-pro. Use /model to select a model."
+    );
+}
+
+/// A bare [`Model`] for the pure ladder test — only `provider` and `id` are read
+/// (`interactive-mode.ts:5900`, `:5913`).
+fn model_named(provider: &str, id: &str) -> Model {
+    // The faux provider's own model as a template — every other field is untouched and unread.
+    let mut model = FauxProvider::new().model().clone();
+    model.provider = ProviderId::from(provider);
+    model.id = cyrup_core::ModelId::from(id);
+    model
+}
+
+/// **TUI-105, the documentation half.** `begin_post_login_catalog_refresh`'s `CYRUP-DELTA` ends by
+/// naming what decides a deferred selection — the epoch guard and the previous model the refresh
+/// carries — and it wrote that second half as a bare ``[`LoginRefreshMsg::previous_model`]``. The
+/// type is `crate::login_dialog::LoginRefreshMsg` (`login_dialog.rs:623`) and `app::login` imports
+/// no such name, so the workspace's `rustdoc::broken_intra_doc_links` deny turned
+/// `cargo doc -p cyrup-tui --no-deps` into `error: unresolved link to
+/// `LoginRefreshMsg::previous_model`` / `error: could not document `cyrup-tui``: this row's own
+/// change stopped the crate's docs building.
+///
+/// Read out of the source because rustdoc, not the binary, is what consumes the link.
+///
+/// **Red without the change:** the bare spelling is back and the first assertion fires.
+#[test]
+fn tui105_the_deferred_selection_delta_resolves_its_link() {
+    const LOGIN_SRC: &str = include_str!("../app/login.rs");
+
+    assert!(
+        !LOGIN_SRC.contains("[`LoginRefreshMsg::"),
+        "app/login.rs links `LoginRefreshMsg` by a bare name it never imports; the type is \
+         `crate::login_dialog::LoginRefreshMsg`, and the workspace denies \
+         `rustdoc::broken_intra_doc_links`, so this one link makes \
+         `cargo doc -p cyrup-tui --no-deps` fail with `could not document `cyrup-tui``"
+    );
+    assert!(
+        LOGIN_SRC.contains("[`crate::login_dialog::LoginRefreshMsg::previous_model`]"),
+        "the `CYRUP-DELTA` on the WIDENED post-login refresh must still point at the field that \
+         makes the widening harmless — the previous model a late refresh compares against \
+         (`interactive-mode.ts:5960-5963`) — by its resolvable path"
+    );
 }

@@ -165,6 +165,8 @@ impl ApiImpl for AzureOpenAiResponsesApi {
             url,
             headers,
             body: Some(body),
+            // PROV-084: Azure reuses the openai-responses path — no residual flush.
+            flush_at_eof: false,
         };
 
         let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {

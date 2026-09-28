@@ -22,8 +22,7 @@ use serde_json::{Map, Value, json};
 /// * there is **no** `max_output_tokens` — Codex never sends one;
 /// * `include: ["reasoning.encrypted_content"]` is unconditional, not reasoning-gated;
 /// * `tool_choice` and `parallel_tool_calls` are always present;
-/// * `reasoning` is emitted purely from the requested effort, with no `model.reasoning` gate and no
-///   `off`-branch `{effort}`-only body.
+/// * the requested-effort branch has no `model.reasoning` gate (only the `off` branch does).
 ///
 /// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws: `convertResponsesTools` rejects a
 /// `strict: "require"` tool on a route without strict mode (`constrained-sampling.ts:91-95`
@@ -129,9 +128,11 @@ pub(super) fn build_request_body(
         );
     }
 
-    // `if (options?.reasoningEffort !== undefined)` (:582). cyrup's unified level is `off` exactly
-    // where pi's `streamSimple` leaves `reasoningEffort` undefined (:516-517), so `off` emits
-    // nothing at all — Codex has no `openai-responses`-style `{ effort }`-only off branch.
+    // `if (options?.reasoningEffort !== undefined) { ... } else if (model.reasoning &&
+    // model.thinkingLevelMap?.off !== null) { body.reasoning = { effort:
+    // model.thinkingLevelMap?.off ?? "none" }; }` (openai-codex-responses.ts:582-597 @v0.87.1).
+    // cyrup's unified `off` is exactly pi's undefined `reasoningEffort`, because `streamSimple`
+    // maps a clamped `"off"` to undefined (`:514-516`), so `off` lands in the `else if` arm.
     let clamped = clamp_thinking_level(model, opts.reasoning);
     if clamped != ModelThinkingLevel::Off {
         let key = thinking_level_key(clamped);
@@ -154,6 +155,27 @@ pub(super) fn build_request_body(
                 "reasoning".to_string(),
                 json!({ "effort": effort, "summary": summary }),
             );
+        }
+    } else if model.reasoning {
+        // `else if (model.reasoning && model.thinkingLevelMap?.off !== null)` (:596-597): an
+        // explicit `off: null` in the map suppresses the object entirely, an `off: <effort>`
+        // supplies the effort, and an absent `off` key falls back to `"none"`.
+        //
+        // `[CYRUP-DELTA]` — no `summary` key here. Upstream's `else if` writes `{ effort }`
+        // alone (`:597`), unlike the `if` branch at `:588-591`; do not "fix" this by adding one.
+        //
+        // The fallback string is upstream's `"none"`, NOT `thinking_level_key(Off)` (`"off"`,
+        // compat.rs:538) — `"off"` is only the map LOOKUP key, never the wire value.
+        let off_effort = match level_map_lookup(
+            model.thinking_level_map.as_ref(),
+            thinking_level_key(ModelThinkingLevel::Off),
+        ) {
+            Some(None) => None,
+            Some(Some(mapped)) => Some(mapped.clone()),
+            None => Some("none".to_string()),
+        };
+        if let Some(effort) = off_effort {
+            obj.insert("reasoning".to_string(), json!({ "effort": effort }));
         }
     }
 

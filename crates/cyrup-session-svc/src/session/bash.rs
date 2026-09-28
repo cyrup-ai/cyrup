@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 
 use cyrup_agent::{AgentMessage, AppRole};
 use cyrup_core::CancelToken;
-use cyrup_ext::{HostEvent, Reduced};
+use cyrup_ext::{ExtError, INVALID_USER_BASH_RESULT_MESSAGE, UserBashReduction};
 use cyrup_tools::ShellConfig;
 
 use crate::bash::{BashOptions, BashResult, bash_message_payload, run_bash};
@@ -57,8 +57,27 @@ enum UserBashOutcome {
     /// Pi `eventResult.operations` with no `result`: execute normally, but over this backend
     /// instead of `createLocalBashOperations` (`agent-session.ts:2782`'s `??`).
     Backend(std::sync::Arc<dyn cyrup_tools::ops::BashOperations>),
-    /// Pi `undefined` — nobody subscribed, nobody handled, or the winner supplied neither half.
+    /// Pi `undefined` — nobody subscribed and nobody handled. The command runs on the local shell.
+    ///
+    /// This arm is DELIBERATELY narrow, and that narrowness is EXT-077's fix: since coding-agent
+    /// 0.86.0 (*Breaking*, #9068) every other non-result outcome of `emitUserBash` leaves it by
+    /// `throw` and runs nothing at all. Anything reaching here must be upstream's literal
+    /// `undefined`.
     None,
+    /// Pi's `throw` out of `emitUserBash` (`extensions/runner.ts:1163-1167` and `:1177` @v0.87.1):
+    /// a contained handler FAULT (`EventKind::fails_closed` now covers `user_bash`), a handler
+    /// BLOCK, or a DEFINED-but-invalid `UserBashEventResult`. The command is aborted and NOT
+    /// executed, matching both upstream callers — `interactive-mode.ts:6740-6743`'s
+    /// `catch { return; }` ("The extension runner already reported the error. Do not fall back to
+    /// local execution.") and `rpc-mode.ts`'s catch-less `case "bash":`, whose throw becomes an
+    /// error response.
+    ///
+    /// The payload is the user-facing sentence, carried out as
+    /// [`cyrup_ext::ExtError::UserBashAborted`] so that `Display` is that sentence and the two
+    /// front-ends' existing `Err` arms render it: the TUI as a failed command with no exit code
+    /// (`cyrup-tui/src/app/bash_spawn.rs`), the RPC dispatcher as `RpcResponse::err("bash", …)` —
+    /// which is pi's RPC behaviour exactly.
+    Aborted(String),
 }
 
 impl AgentSession {
@@ -216,6 +235,13 @@ impl AgentSession {
                 self.execute_bash(command, options, on_chunk).await
             }
             UserBashOutcome::None => self.execute_bash(command, options, on_chunk).await,
+            // EXT-077. Pi ABORTS here — `emitUserBash` threw, and neither caller falls back to
+            // local execution. Returning `Err` rather than calling `execute_bash` is the whole
+            // point: an extension that routes `!` commands to a container, a remote box or a policy
+            // gate and then faults must not have the command re-run on the host behind its back.
+            UserBashOutcome::Aborted(message) => Err(SessionServiceError::Extension(
+                ExtError::UserBashAborted(message),
+            )),
         }
     }
 
@@ -225,16 +251,25 @@ impl AgentSession {
     /// interactive `!!` prefix, or the RPC command's `excludeFromContext ?? false`,
     /// `rpc-mode.ts:567`), and the session cwd (Pi `UserBashEvent`, `extensions/types.ts:813-821`).
     ///
-    /// Matches Pi's `emitUserBash` (`extensions/runner.ts:1005-1032` @v0.84.4) dispatch semantics:
-    /// the FIRST truthy handler result wins and short-circuits the remaining handlers, and a
-    /// handler that throws is caught and reported rather than being fatal — `dispatch_block_mutate`
-    /// returning `Reduced::Handled` is cyrup's equivalent of the former, and the dispatcher's
-    /// per-extension error isolation of the latter.
+    /// Matches Pi's `emitUserBash` (`extensions/runner.ts:1154-1183` @v0.87.1) dispatch semantics:
+    /// the FIRST handler that returns a DEFINED result wins and short-circuits the remaining
+    /// handlers, that result must satisfy `isUserBashEventResult`, and a handler that throws is
+    /// reported and RE-THROWN. Since coding-agent 0.86.0 (*Breaking*, #9068: "`user_bash` now fails
+    /// closed: errors or invalid defined results abort the command without invoking later handlers
+    /// or executing locally") only upstream's literal `undefined` falls through to local execution.
+    ///
+    /// **One reducer, not two (EXT-077).** All of that lives in
+    /// [`cyrup_ext::ExtensionHost::emit_user_bash_for`], which this function calls; it used to be
+    /// re-derived here from a raw [`cyrup_ext::Reduced`], which is how the fail-closed and the
+    /// `isUserBashEventResult` port could both exist in `cyrup-ext` and reach no user: a
+    /// `Reduced::Blocked` — exactly what `EventKind::fails_closed()` now produces for a faulting
+    /// `user_bash` handler — fell into this function's "not handled" arm and ran the command on the
+    /// host anyway.
     ///
     /// The `result` half deserializes straight out of the reduction payload. The `operations` half
     /// cannot — it is a callable, and ADR-0002 makes extension I/O values — so it is fetched back
-    /// from the extension that WON the reduction (`Reduced::Handled`'s `by`) via
-    /// [`cyrup_ext::ExtensionHost::user_bash_operations`], which is upstream's
+    /// from the extension that WON the reduction ([`cyrup_ext::UserBashReduction::Handled`]'s `by`)
+    /// via [`cyrup_ext::ExtensionHost::user_bash_operations`], which is upstream's
     /// `eventResult.operations` read (`rpc-mode.ts:581`) expressed over cyrup's value-typed seam.
     async fn emit_user_bash_event(
         &self,
@@ -251,32 +286,48 @@ impl AgentSession {
         }
         let cancel = self.session_cancel.child_token();
         let cwd = self.services.cwd.display().to_string();
-        let event = HostEvent::UserBash {
-            command: command.to_string(),
-            exclude_from_context,
-            cwd: cwd.clone(),
-        };
         let reduced = self
             .services
             .ext_host
-            .dispatcher()
-            .dispatch_block_mutate(event, &cancel)
+            .emit_user_bash_for(command, exclude_from_context, &cwd, &cancel)
             .await;
-        // Only a `Handled` outcome carries a `UserBashEventResult` at all; a block or a pass falls
-        // through to normal local execution.
-        let Reduced::Handled { value, by } = reduced else {
-            return UserBashOutcome::None;
+        let (value, by) = match reduced {
+            // Upstream's `undefined`: nobody handled it, so the local shell runs it.
+            UserBashReduction::Continue => return UserBashOutcome::None,
+            // A contained FAULT (`fails_closed`) or a handler's own block. `reason` is the
+            // dispatcher's `Extension failed, blocking execution: …` (pi
+            // `agent-session.ts:475-487`); it is `None` only for `ExtError::Cancelled` (EXT-029),
+            // where nothing should be synthesized out of the user's own Esc — the command is still
+            // aborted, because a cancelled guard has not cleared it.
+            UserBashReduction::Blocked { reason, .. } => {
+                return UserBashOutcome::Aborted(reason.unwrap_or_else(|| {
+                    "user_bash was cancelled before a handler decided; the command was not executed"
+                        .to_string()
+                }));
+            }
+            // Pi `throw new Error("Invalid user_bash handler result: …")` (`runner.ts:1163-1167`).
+            UserBashReduction::Invalid { .. } => {
+                return UserBashOutcome::Aborted(INVALID_USER_BASH_RESULT_MESSAGE.to_string());
+            }
+            UserBashReduction::Handled { value, by } => (value, by),
         };
         // Pi tests `eventResult?.result` FIRST and returns before it ever looks at `operations`
         // (`rpc-mode.ts:571-582`), so a result the handler supplied wins outright — which is why
-        // [`UserBashOutcome`] cannot hold both.
-        if let Some(result) = value
-            .0
-            .get("result")
-            .cloned()
-            .and_then(|r| serde_json::from_value::<BashResult>(r).ok())
-        {
-            return UserBashOutcome::Serviced(result);
+        // [`UserBashOutcome`] cannot hold both. `is_user_bash_event_result` has already established
+        // that EXACTLY ONE of the two keys is present, so this presence test is also the choice of
+        // half: a missing `result` means `operations`, never "neither".
+        if let Some(result) = value.get("result") {
+            return match serde_json::from_value::<BashResult>(result.clone()) {
+                Ok(result) => UserBashOutcome::Serviced(result),
+                // Unreachable through the predicate (it already checked `output`/`exitCode`/
+                // `cancelled`/`truncated`/`fullOutputPath`), and an ABORT rather than a fall-through
+                // if a future shape change ever reaches it: a `result` the extension meant to
+                // SERVICE the command with must never be downgraded into running that command on
+                // the host.
+                Err(e) => UserBashOutcome::Aborted(format!(
+                    "{INVALID_USER_BASH_RESULT_MESSAGE} (result did not decode: {e})"
+                )),
+            };
         }
         match self
             .services
@@ -284,7 +335,14 @@ impl AgentSession {
             .user_bash_operations(&by, command, exclude_from_context, &cwd)
         {
             Some(ops) => UserBashOutcome::Backend(ops),
-            None => UserBashOutcome::None,
+            // The other half of pi's `typeof operations.exec === "function"`
+            // (`runner.ts:145` @v0.87.1), deferred to this seam by
+            // `is_user_bash_event_result`'s ADR-0002 CYRUP-DELTA: a well-formed `{operations}`
+            // object whose owner declared no bash-operations backend has no callable `exec`, so
+            // `isUserBashEventResult` is FALSE upstream and `emitUserBash` throws. Aborting here is
+            // what makes that delta a mechanism difference at full parity instead of a second
+            // fail-open (EXT-077's "a non-callable `operations` is accepted rather than refused").
+            None => UserBashOutcome::Aborted(INVALID_USER_BASH_RESULT_MESSAGE.to_string()),
         }
     }
 

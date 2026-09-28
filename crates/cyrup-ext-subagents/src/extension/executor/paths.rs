@@ -958,6 +958,7 @@ mod tests {
             .spawn_background_steps(
                 dir.path(),
                 BackgroundStepsSpec {
+                    model_response_aliases: None,
                     // SUBA-021: unbudgeted on this path (see the field doc).
                     usage_budget: None,
                     turn_budget: None,

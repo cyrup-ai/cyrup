@@ -149,6 +149,28 @@ async fn process_event(
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
                     dec.response_id = Some(id.to_string());
                 }
+                // Server-side fallback / relabelling proxies (pi `:605-614` @v0.87.1). When the
+                // served model is not the one asked for, record it, and cost the turn with the
+                // compat entry's local rates if the model declares any for that
+                // (provider, model) pair. `usage_cost` stays `None` otherwise, which keeps
+                // `snapshot_owned` on `model.cost` exactly as before (PROV-090).
+                if let Some(response_model) = message
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|m| *m != model.id.as_str())
+                {
+                    dec.response_model = Some(response_model.to_string());
+                    dec.usage_cost = model
+                        .compat
+                        .as_ref()
+                        .and_then(|c| c.allowed_fallback_models.as_ref())
+                        .and_then(|fallbacks| {
+                            fallbacks
+                                .iter()
+                                .find(|f| f.provider == model.provider && f.model == response_model)
+                        })
+                        .map(|f| f.cost.clone());
+                }
                 if let Some(usage) = message.get("usage") {
                     apply_message_start_usage(&mut dec.usage, usage);
                 }

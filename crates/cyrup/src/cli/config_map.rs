@@ -267,7 +267,8 @@ impl Cli {
 /// `cwd` anchors a relative token, which is what Pi's bare `existsSync(input)`/`readFileSync(input)`
 /// does against `process.cwd()`; passing it explicitly keeps the function testable. Contents are
 /// decoded lossily to mirror Node's `readFileSync(path, "utf-8")` (which substitutes U+FFFD rather
-/// than failing), so a non-UTF-8 file is not silently turned back into its own path.
+/// than failing), so a non-UTF-8 file is not silently turned back into its own path. A leading UTF-8
+/// BOM is stripped from the contents, as pi's `stripBom(readFileSync(...))` does (`:61` @v0.87.1).
 pub fn resolve_prompt_input(
     cwd: &std::path::Path,
     input: &str,
@@ -288,7 +289,14 @@ pub fn resolve_prompt_input(
         return (input.to_string(), Vec::new());
     }
     match std::fs::read(&path) {
-        Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), Vec::new()),
+        Ok(bytes) => {
+            // CFG-087 — pi is `stripBom(readFileSync(input, "utf-8"))` (resource-loader.ts:61
+            // @v0.87.1). A BOM left in goes straight into the model's context: at the very front of
+            // it for `--system-prompt <file>`, and spliced into the middle for each
+            // `--append-system-prompt <file>` part, since the parts are joined verbatim.
+            let text = String::from_utf8_lossy(&bytes);
+            (cyrup_config::strip_bom(&text).to_string(), Vec::new())
+        }
         Err(e) => (
             input.to_string(),
             vec![Diagnostic::warning(format!(

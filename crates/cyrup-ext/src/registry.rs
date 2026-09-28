@@ -1165,6 +1165,157 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.autocomplete_providers.clone())
     }
 
+    /// Remove EVERY registration owned by `owner` and return how many entries were dropped.
+    ///
+    /// This is cyrup's port of pi's `discard` (`core/extensions/loader.ts:462-467` @v0.87.1):
+    /// `if (state !== "loading") return; state = "failed"; for (const unsubscribe of
+    /// loadingUnsubscribers) unsubscribe(); clearPending();`. Upstream needs no per-table sweep
+    /// because every registration an extension makes during its factory lands on that extension's
+    /// OWN object (`createExtension`, `loader.ts:525-538`: `tools`/`commands`/`flags`/`shortcuts`/
+    /// `messageRenderers`/`entryRenderers` maps), and `initializeExtension` (`:541-559`) throws
+    /// without ever handing that object to the runner — so the whole thing is garbage. The runtime
+    /// changes that DO reach shared state (`registerProvider` and friends) are queued through
+    /// `applyRuntimeChange` (`loader.ts:244-247`, `:421-433`) and `discard`'s `clearPending()` drops
+    /// them unapplied.
+    ///
+    /// cyrup's registry is FLAT and shared, and every `registration.*` import writes through it
+    /// immediately, so the equivalent of "the object is garbage" has to be spelled out. That makes
+    /// this function an enumeration hazard: it is correct only while it covers every owner-keyed
+    /// member of [`RegistryInner`], and a missed table fails SILENTLY — a dead extension's tool
+    /// keeps shadowing a live one, with nothing to observe but the wrong answer. **Any new
+    /// owner-keyed field added to [`RegistryInner`] must be handled here in the SAME commit.**
+    ///
+    /// Deliberately NOT purged: `flag_values` is keyed by flag name and holds CLI `--flag=value`
+    /// overrides captured by `apply_extension_flag_values` (pi's single `runtime.flagValues`,
+    /// `agent-session-services.ts:102-114`), which outlive any one extension and are not owned by
+    /// one; and `shortcut_diagnostics` is recomputed wholesale by every
+    /// [`Self::resolve_shortcuts`], so it is cleared rather than filtered.
+    ///
+    /// The caller is responsible for the two tables that do not live here: `SharedBus`
+    /// subscriptions ([`crate::bus::SharedBus::unsubscribe_all`], pi's `loadingUnsubscribers`) and
+    /// the host's reserved-id set (`ExtensionHost::release_id`).
+    pub fn purge_owner(&self, owner: &ExtensionId) -> Result<usize, ExtError> {
+        let mut g = self.lock_write()?;
+        let mut dropped = 0usize;
+
+        // --- tools (host `Arc<dyn Tool>`) ---
+        let names: Vec<String> = g
+            .tool_owner
+            .iter()
+            .filter(|(_, o)| *o == owner)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in &names {
+            g.tool_owner.remove(n);
+            g.tools.remove(n);
+            g.tool_order.retain(|t| t != n);
+            dropped += 1;
+        }
+
+        // --- guest tool descriptors ---
+        let names: Vec<String> = g
+            .guest_tools
+            .iter()
+            .filter(|(_, (o, _))| o == owner)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in &names {
+            g.guest_tools.remove(n);
+            g.guest_tool_order.retain(|t| t != n);
+            dropped += 1;
+        }
+
+        // --- commands (map + the load-order Vec that backs `name:N` disambiguation) ---
+        let names: Vec<String> = g
+            .commands
+            .iter()
+            .filter(|(_, (o, _))| o == owner)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in &names {
+            g.commands.remove(n);
+            dropped += 1;
+        }
+        let before = g.command_order.len();
+        g.command_order.retain(|(o, _, _)| o != owner);
+        dropped += before - g.command_order.len();
+
+        // --- shortcuts (map + registration order) ---
+        let keys: Vec<String> = g
+            .shortcuts
+            .iter()
+            .filter(|(_, (o, _))| o == owner)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &keys {
+            g.shortcuts.remove(k);
+            g.shortcut_order.retain(|s| s != k);
+            dropped += 1;
+        }
+        g.shortcut_diagnostics.clear();
+
+        // --- flags ---
+        let names: Vec<String> = g
+            .flag_owner
+            .iter()
+            .filter(|(_, o)| *o == owner)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in &names {
+            g.flag_owner.remove(n);
+            g.flags.remove(n);
+            dropped += 1;
+        }
+
+        // --- providers: the hub unregister is what makes the model registry drop the models this
+        // owner upserted at `register_provider` ("immediate upsert if the model registry is bound").
+        let ids: Vec<String> = g
+            .provider_owner
+            .iter()
+            .filter(|(_, o)| *o == owner)
+            .map(|(i, _)| i.clone())
+            .collect();
+        for id in &ids {
+            g.provider_owner.remove(id);
+            g.provider_hub.unregister(id);
+            dropped += 1;
+        }
+
+        // --- plain owner-keyed lists and maps ---
+        macro_rules! retain_not_owner {
+            ($field:ident, $pred:expr) => {{
+                let before = g.$field.len();
+                #[allow(clippy::redundant_closure_call)]
+                g.$field.retain($pred);
+                dropped += before - g.$field.len();
+            }};
+        }
+        retain_not_owner!(command_autocomplete, |(o, _): &(ExtensionId, String)| o
+            != owner);
+        retain_not_owner!(autocomplete_providers, |o: &ExtensionId| o != owner);
+        retain_not_owner!(markdown_transformers, |o: &ExtensionId| o != owner);
+        retain_not_owner!(bash_operations, |o: &ExtensionId| o != owner);
+        retain_not_owner!(terminal_input_subscribers, |o: &ExtensionId| o != owner);
+        retain_not_owner!(tool_renderer_owner, |_: &String, o: &mut ExtensionId| o
+            != owner);
+        retain_not_owner!(message_renderer_owner, |_: &String, o: &mut ExtensionId| o
+            != owner);
+        retain_not_owner!(entry_renderer_owner, |_: &String, o: &mut ExtensionId| o
+            != owner);
+        retain_not_owner!(
+            extension_provenance,
+            |o: &ExtensionId, _: &mut ExtensionProvenance| o != owner
+        );
+        retain_not_owner!(conflicts, |c: &ExtensionConflict| &c.path != owner);
+
+        drop(g);
+        // The descriptors this owner contributed are gone, so the materialized guest-tool set is
+        // stale. Without this the dirty flag would keep re-arming for a dead owner's descriptors
+        // (`ExtensionHost::refresh_tools`).
+        self.mark_tools_dirty();
+        Ok(dropped)
+    }
+
     pub fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
         let mut g = self.lock_write()?;
         g.provider_owner.remove(id);

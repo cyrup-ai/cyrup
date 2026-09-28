@@ -1154,14 +1154,20 @@ fn a_configured_path_that_resolves_to_nothing_produces_exactly_one_diagnostic_na
 // DRIFT-004 / SEAM-015 — `UserBashEventResult.operations` survives the reduction.
 // ---------------------------------------------------------------------------
 
-/// A `user_bash` handler that returns BOTH halves of pi's `UserBashEventResult`
-/// (`extensions/types.ts:1076-1082` @v0.83.0): an `operations` backend override AND a `result`.
-/// Upstream's two fields are independent — `rpc-mode.ts:566-579` short-circuits on `result` and
-/// otherwise threads `operations` into `executeBash` — so a reduction that carried only one of them
-/// would silently drop the other.
+/// A `user_bash` handler that returns a caller-supplied `UserBashEventResult`
+/// (`extensions/types.ts:1076-1082` @v0.83.0). Upstream's two fields are read INDEPENDENTLY by the
+/// callers — `rpc-mode.ts:570-582` @v0.87.1 short-circuits on `result` and otherwise threads
+/// `operations` into `executeBash` — so a reduction that dropped either key would silently lose it.
+///
+/// They are, however, MUTUALLY EXCLUSIVE in one returned value: `isUserBashEventResult`
+/// (`runner.ts:136-158` @v0.87.1) rejects `hasOperations === hasResult`, and since coding-agent
+/// 0.86.0 (*Breaking*, #9068) a defined-but-invalid result aborts the command. This fixture
+/// therefore takes the payload as a parameter and the test below drives BOTH pi-valid shapes, one
+/// per load, instead of a single both-keys value that upstream would reject (EXT-077).
 struct BashRedirect {
     id: ExtensionId,
     seen: Arc<Mutex<Vec<String>>>,
+    payload: Value,
 }
 
 #[async_trait::async_trait]
@@ -1184,10 +1190,7 @@ impl NativeExtension for BashRedirect {
                     .lock()
                     .unwrap()
                     .push(format!("{command}:{exclude_from_context}:{cwd}"));
-                HookOutcome::Handled(crate::HandledValue(json!({
-                    "operations": { "backend": "ssh", "remote": "build-box" },
-                    "result": { "output": "Linux build-box\n", "exitCode": 0 },
-                })))
+                HookOutcome::Handled(crate::HandledValue(self.payload.clone()))
             }
             _ => HookOutcome::Noop,
         }
@@ -1205,7 +1208,7 @@ impl NativeExtension for BashRedirect {
 ///  2. `cyrup-ext` carries a `handled` payload through `decode_outcome`
 ///     (`host/live.rs`: `HookOutcome::Handled(s)` -> `serde_json::from_str` VERBATIM, with no
 ///     per-event key filter — `decode_patch`'s per-kind shaping applies to `mutate` only) and out of
-///     [`ExtensionHost::emit_user_bash`] as the whole `UserBashReduction::Handled(Value)`.
+///     [`ExtensionHost::emit_user_bash`] as the whole `UserBashReduction::Handled`'s `value`.
 ///
 /// The drop used to be downstream of both, in `cyrup-session-svc`. It no longer is: `BashOptions`
 /// has an `operations` field and `execute_bash_with_user_event` fills it from the winning
@@ -1218,36 +1221,56 @@ impl NativeExtension for BashRedirect {
 /// `crate::tests::bash_operations_seam` and `cyrup-it/tests/ext/wasm_bash_operations.rs`). This
 /// test is still about the PAYLOAD: the key must survive the reduction whichever tier reads it.
 ///
-/// Presence before absence: the `result` half is asserted first, so a reduction that dropped the
+/// Presence before absence: the `result` shape is asserted first, so a reduction that dropped the
 /// whole payload could not pass by vacuously satisfying the `operations` check.
 #[tokio::test]
 async fn user_bash_reduction_carries_the_operations_half_not_only_the_result_half() {
-    let host = ExtensionHost::new(cfg());
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(BashRedirect {
-        id: "bash-redirect".into(),
-        seen: seen.clone(),
+    /// Drive one pi-valid payload through a fresh host and return the reduced value.
+    async fn reduce(payload: Value) -> Value {
+        let host = ExtensionHost::new(cfg());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        host.load_native(Arc::new(BashRedirect {
+            id: "bash-redirect".into(),
+            seen: seen.clone(),
+            payload,
+        }))
+        .await
+        .unwrap();
+
+        let reduced = host.emit_user_bash("uname -a", &CancelToken::new()).await;
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the handler must have been reached"
+        );
+
+        match reduced {
+            crate::UserBashReduction::Handled { value, .. } => value,
+            other => panic!("wrong arm: {other:?}"),
+        }
+    }
+
+    // Presence: the half cyrup already consumes. `cancelled`/`truncated` are required by
+    // `isUserBashEventResult` (`runner.ts:148-157` @v0.87.1).
+    let v = reduce(json!({
+        "result": {
+            "output": "Linux build-box\n",
+            "exitCode": 0,
+            "cancelled": false,
+            "truncated": false,
+        },
     }))
-    .await
-    .unwrap();
-
-    let cancel = CancelToken::new();
-    let reduced = host.emit_user_bash("uname -a", &cancel).await;
-
-    assert_eq!(
-        seen.lock().unwrap().len(),
-        1,
-        "the handler must have been reached"
-    );
-
-    let v = match reduced {
-        crate::UserBashReduction::Handled(v) => v,
-        other => panic!("wrong arm: {other:?}"),
-    };
-    // Presence: the half cyrup already consumes.
+    .await;
     assert_eq!(v["result"]["output"], json!("Linux build-box\n"));
     assert_eq!(v["result"]["exitCode"], json!(0));
+    assert!(
+        v.get("operations").is_none(),
+        "a result-only value gains no `operations` key at this boundary"
+    );
+
     // The half under test: pi `UserBashEventResult.operations` (`extensions/types.ts:1078-1080`).
+    let v = reduce(json!({ "operations": { "backend": "ssh", "remote": "build-box" } })).await;
     assert_eq!(
         v["operations"],
         json!({ "backend": "ssh", "remote": "build-box" }),

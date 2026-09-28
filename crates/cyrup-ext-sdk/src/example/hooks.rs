@@ -237,7 +237,13 @@ pub(super) fn install(api: &mut ExtensionApi) {
         if ev.command.contains("rm -rf") {
             Outcome::block("user_bash blocked by demo")
         } else if ev.command.starts_with("remote:") {
-            Outcome::handled(json!({ "operations": true }))
+            // The value behind the key must be an OBJECT: pi's `isUserBashEventResult` runs
+            // `typeof operations !== "object"` on it (`core/extensions/runner.ts:143-144`
+            // @v0.87.1), so `true` here is a DEFINED-but-invalid result and #9068 aborts the
+            // command instead of redirecting it. Upstream's own object holds the callable `exec`;
+            // cyrup's holds nothing, because the backend arrives through
+            // `register_bash_operations` instead (ADR-0002).
+            Outcome::handled(json!({ "operations": {} }))
         } else {
             Outcome::noop()
         }

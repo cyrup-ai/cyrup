@@ -551,6 +551,9 @@ mod tests {
         let dir = temp_dir();
         let acceptance = resolve(AcceptanceResolveInput {
             agent_name: "worker".into(),
+            // SUBA-108 — `acceptance.ts:88` @v0.71.0: the dynamic escalation (and so the REQUIRED
+            // review gate) fires for a DECLARED writer, not for a worker-shaped name or task.
+            acceptance_role: Some(super::super::AcceptanceRole::Writer),
             task: Some("Implement each dynamic item".into()),
             dynamic: true,
             explicit: cfg(AcceptanceConfig {
@@ -746,6 +749,9 @@ mod tests {
         // The same input WITHOUT the override, to prove the inferred gate is genuinely there.
         let inferred_only = resolve(AcceptanceResolveInput {
             agent_name: "worker".into(),
+            // SUBA-108 — `acceptance.ts:88` @v0.71.0: the dynamic escalation (and so the REQUIRED
+            // review gate) fires for a DECLARED writer, not for a worker-shaped name or task.
+            acceptance_role: Some(super::super::AcceptanceRole::Writer),
             task: Some("Implement each dynamic item".into()),
             dynamic: true,
             explicit: cfg(AcceptanceConfig {
@@ -765,6 +771,9 @@ mod tests {
 
         let overridden = resolve(AcceptanceResolveInput {
             agent_name: "worker".into(),
+            // SUBA-108 — `acceptance.ts:88` @v0.71.0: the dynamic escalation (and so the REQUIRED
+            // review gate) fires for a DECLARED writer, not for a worker-shaped name or task.
+            acceptance_role: Some(super::super::AcceptanceRole::Writer),
             task: Some("Implement each dynamic item".into()),
             dynamic: true,
             explicit: cfg(AcceptanceConfig {

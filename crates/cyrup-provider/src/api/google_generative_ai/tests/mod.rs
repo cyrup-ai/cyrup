@@ -62,6 +62,19 @@ fn model_with(id: &str, reasoning: bool) -> Model {
     }
 }
 
+/// A reasoning model carrying an explicit `thinkingLevelMap`, mirroring pi's own
+/// `googleModel(id, thinkingLevelMap)` fixture (`test/google-thinking-level-map.test.ts:14-27`
+/// @v0.87.1).
+fn model_with_map(id: &str, map: &[(&str, Option<&str>)]) -> Model {
+    let mut m = model_with(id, true);
+    m.thinking_level_map = Some(
+        map.iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(|s| s.to_string())))
+            .collect(),
+    );
+    m
+}
+
 fn user_ctx(text: &str) -> Context {
     Context {
         system_prompt: Some("be brief".to_string()),

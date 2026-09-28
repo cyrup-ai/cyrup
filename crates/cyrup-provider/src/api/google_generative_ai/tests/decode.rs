@@ -35,18 +35,17 @@ async fn a_finish_reason_is_recorded_raw_and_names_itself_in_the_error() {
     assert_eq!(message.raw_stop_reason.as_deref(), Some("STOP"));
 
     // MIRROR 2: pi does NOT unset `rawStopReason` when the tool-call override rewrites
-    // `stopReason` to `"toolUse"` (`:218-220`) — the raw word outlives the override.
-    let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{}}}]},\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n";
+    // `stopReason` to `"toolUse"` (google-generative-ai.ts:224-229 @v0.87.1) — the raw word
+    // outlives the override. The override only fires on a mapped `stop` (`:226`), so `STOP` is the
+    // frame that exercises it.
+    let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{}}}]},\"finishReason\":\"STOP\"}]}\n\n";
     let events = collect(raw.as_bytes().to_vec(), &m).await;
     let Some(StreamEvent::Done { message, .. }) = events.last() else {
         panic!("expected a done terminal, got {:?}", events.last());
     };
     assert_eq!(message.stop_reason, StopReason::ToolUse);
     assert_eq!(message.error_message, None);
-    assert_eq!(
-        message.raw_stop_reason.as_deref(),
-        Some("MALFORMED_FUNCTION_CALL")
-    );
+    assert_eq!(message.raw_stop_reason.as_deref(), Some("STOP"));
 
     // MIRROR 3: a truncated stream never delivered a finishReason, so there is nothing to record.
     let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n";
@@ -134,4 +133,42 @@ async fn synthesizes_tool_call_id_when_absent() {
         "got: {}",
         tool.id.as_str()
     );
+}
+
+/// The tool-call override is gated on the MAPPED reason being `stop`
+/// (`output.stopReason === "stop"`, google-generative-ai.ts:226 @v0.87.1). A non-STOP reason
+/// arriving alongside a tool call therefore survives, diagnostic intact.
+#[tokio::test]
+async fn a_non_stop_finish_reason_survives_a_tool_call() {
+    let m = model_with("gemini-2.5-pro", true);
+
+    // (i) MAX_TOKENS + a tool call stays `length` on a `done` terminal.
+    let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{}}}]},\"finishReason\":\"MAX_TOKENS\"}]}\n\n";
+    let events = collect(raw.as_bytes().to_vec(), &m).await;
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected a done terminal, got {:?}", events.last());
+    };
+    assert_eq!(message.stop_reason, StopReason::Length);
+    assert_eq!(message.raw_stop_reason.as_deref(), Some("MAX_TOKENS"));
+
+    // (ii) SAFETY + a tool call stays an ERROR terminal, and keeps its diagnostic — the override
+    // no longer nulls `error_message`.
+    let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{}}}]},\"finishReason\":\"SAFETY\"}]}\n\n";
+    let events = collect(raw.as_bytes().to_vec(), &m).await;
+    let Some(StreamEvent::Error { error, .. }) = events.last() else {
+        panic!("expected an error terminal, got {:?}", events.last());
+    };
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Provider stopped with: SAFETY")
+    );
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("SAFETY"));
+
+    // (iii) The half that must NOT change: STOP + a tool call is still `toolUse`.
+    let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{}}}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let events = collect(raw.as_bytes().to_vec(), &m).await;
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected a done terminal, got {:?}", events.last());
+    };
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
 }

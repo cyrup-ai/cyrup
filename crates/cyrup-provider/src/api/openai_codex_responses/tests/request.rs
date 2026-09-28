@@ -29,7 +29,11 @@ fn body_matches_upstream_shape() {
     assert!(body.get("temperature").is_none());
     assert!(body.get("service_tier").is_none());
     assert!(body.get("tools").is_none());
-    assert!(body.get("reasoning").is_none());
+    // No requested effort ⇒ pi's `reasoningEffort` is undefined (`:514-516`) and the
+    // `else if (model.reasoning && model.thinkingLevelMap?.off !== null)` arm
+    // (openai-codex-responses.ts:596-597 @v0.87.1) writes `{ effort: "none" }` — `{ effort }`
+    // alone, with no `summary`.
+    assert_eq!(body["reasoning"], json!({ "effort": "none" }));
 }
 
 #[test]
@@ -183,13 +187,60 @@ fn reasoning_effort_maps_and_null_suppresses() {
     let body = build_request_body(&model, &Context::default(), &so, &opts(), None).unwrap();
     assert_eq!(body["reasoning"]["effort"], json!("xhigh"));
 
-    // `off` leaves `reasoningEffort` undefined (:516-517) — no reasoning key, and NO
-    // `openai-responses`-style `{ effort: "none" }` off-branch.
+    // `off` leaves `reasoningEffort` undefined (`:514-516`), which lands in the `else if
+    // (model.reasoning && model.thinkingLevelMap?.off !== null)` arm at
+    // openai-codex-responses.ts:596-597 @v0.87.1. This map has no `off` key, so
+    // `model.thinkingLevelMap?.off ?? "none"` yields `"none"` — and that arm writes `{ effort }`
+    // ALONE, with no `summary` (unlike the `if` branch at `:588-591`).
     let so = StreamOptions {
         reasoning: ModelThinkingLevel::Off,
         ..Default::default()
     };
     let body = build_request_body(&model, &Context::default(), &so, &opts(), None).unwrap();
+    assert_eq!(body["reasoning"], json!({ "effort": "none" }));
+    assert!(body["reasoning"].get("summary").is_none());
+}
+
+/// The `off` arm's two guards (openai-codex-responses.ts:596-597 @v0.87.1): a mapped `off` supplies
+/// the effort, an `off: null` suppresses the object, and a non-reasoning model never reaches it.
+#[test]
+fn off_honours_a_mapped_off_and_a_null_off_suppresses() {
+    let off = StreamOptions {
+        reasoning: ModelThinkingLevel::Off,
+        ..Default::default()
+    };
+
+    // `off: "minimal"` ⇒ `{ effort: "minimal" }`. `off` is a SUPPORTED rung here
+    // (`Some(Some(_))` in `get_supported_thinking_levels`, collection.rs:823), so
+    // `clamp_thinking_level` leaves the request on `off` and the arm is reached.
+    let mut mapped = codex_model("gpt-5.5-codex");
+    mapped.thinking_level_map = Some(
+        [("off".to_string(), Some("minimal".to_string()))]
+            .into_iter()
+            .collect(),
+    );
+    let body = build_request_body(&mapped, &Context::default(), &off, &opts(), None).unwrap();
+    assert_eq!(body["reasoning"], json!({ "effort": "minimal" }));
+
+    // `off: null` ⇒ nothing at all. Reaching this guard needs care: `off: null` marks `off`
+    // UNSUPPORTED (collection.rs:822), so `clamp_thinking_level` re-targets the request to the
+    // nearest supported rung and `build_request_body` would take the `if` branch instead. Nulling
+    // EVERY rung leaves no supported level, so the clamp falls back to `off`
+    // (collection.rs:856-859) and the arm is reached with `off` present-and-null.
+    let mut nulled = codex_model("gpt-5.5-codex");
+    nulled.thinking_level_map = Some(
+        ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(|k| (k.to_string(), None))
+            .collect(),
+    );
+    let body = build_request_body(&nulled, &Context::default(), &off, &opts(), None).unwrap();
+    assert!(body.get("reasoning").is_none());
+
+    // `model.reasoning == false` gates the arm off entirely.
+    let mut plain = codex_model("gpt-5.5-codex");
+    plain.reasoning = false;
+    let body = build_request_body(&plain, &Context::default(), &off, &opts(), None).unwrap();
     assert!(body.get("reasoning").is_none());
 }
 

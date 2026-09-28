@@ -517,7 +517,12 @@ fn extension_details(agent: &AgentDefinition) -> Option<Value> {
     if let Some(names) = &agent.extensions {
         extensions.insert("names".into(), json!(names));
     }
-    if !agent.subagent_only_extensions.is_empty() {
+    if !agent
+        .subagent_only_extensions
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
         extensions.insert("subagentOnly".into(), json!(agent.subagent_only_extensions));
     }
     if !agent.skills.is_empty() {

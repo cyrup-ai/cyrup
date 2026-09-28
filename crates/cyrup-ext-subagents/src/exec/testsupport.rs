@@ -58,6 +58,10 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
 
 pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions {
     RunOptions {
+        // SUBA-119 — a test fixture's model is chosen for the run, not inherited from a parent
+        // session, so verification is ON and no aliases are declared.
+        model_override_from_parent: false,
+        model_response_aliases: None,
         parent_env_overrides: std::collections::BTreeMap::new(),
         machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and

@@ -224,6 +224,16 @@ impl EventSubscriber for SvcSubscriber {
         };
         self.fanout.emit(svc_ev).await;
 
+        // 2b. SEAM-127 — pi `_handleAgentEvent`'s `turn_end` arm (agent-session.ts:965-973
+        //     @v0.87.1): "A turn ends after its assistant message and every tool result has been
+        //     appended, so this is the first point in the run where a context-only custom message
+        //     can be inserted without landing between a tool call and its result. Flushing after
+        //     the extension and listener dispatch above also picks up messages that turn_end
+        //     handlers queued." Hence AFTER the fan-out, not before it.
+        if let (Some(s), AgentEvent::TurnEnd { .. }) = (&session, event) {
+            s.flush_pending_custom_messages().await;
+        }
+
         // 3. Terminate run-scoped subscriptions once the run settles — but ONLY on an unbound session.
         //    A bound session's post-run driver owns run termination (it may continue past this
         //    `agent_end` for a retry / compaction / queued continuation).

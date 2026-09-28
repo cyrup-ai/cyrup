@@ -104,6 +104,38 @@ fn create_image_block(mime_type: &str, data: &str) -> Result<Value, String> {
     Ok(json!({ "image": { "format": format, "source": { "bytes": encoded } } }))
 }
 
+/// pi `sanitizeBedrockDocument` (`bedrock-converse-stream.ts:921-934` @v0.87.1).
+///
+/// Bedrock's `DocumentType` rejects a zero-length object key, so a tool call whose arguments carry
+/// one fails the whole request rather than the one field. Recursive, and it drops ONLY empty keys:
+/// arrays are mapped, scalars are untouched, and every other key keeps its value verbatim.
+fn sanitize_bedrock_document(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_bedrock_document).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| !key.is_empty())
+                .map(|(key, nested)| (key.clone(), sanitize_bedrock_document(nested)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// pi `decodeRedactedContent` (`bedrock-converse-stream.ts:1323-1330` @v0.87.1). A persisted session
+/// carries the opaque payload as base64; a hand-edited or externally produced one can hold a
+/// signature that is not base64 at all, and pi drops that block rather than failing the request.
+///
+/// The canonical re-encode is the same normalisation [`create_image_block`] performs, for the same
+/// reason: upstream hands the SDK raw bytes and the REST binding re-encodes them.
+fn decode_redacted_content(signature: Option<&str>) -> Option<String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature?.trim())
+        .ok()
+        .filter(|b| !b.is_empty())?;
+    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 /// pi `convertToolResultContent` (`bedrock-converse-stream.ts:746-758`).
 fn convert_tool_result_content(content: &[Content]) -> Result<Vec<Value>, String> {
     let mut result = Vec::new();
@@ -184,15 +216,34 @@ pub(super) fn convert_messages(
                                 "toolUse": {
                                     "toolUseId": tc.id.as_str(),
                                     "name": tc.name,
-                                    "input": Value::Object((*tc.arguments).clone()),
+                                    // pi `sanitizeBedrockDocument(c.arguments)` (`:1008` @v0.87.1) —
+                                    // this is upstream's ONLY use of the sanitizer.
+                                    "input": sanitize_bedrock_document(&Value::Object(
+                                        (*tc.arguments).clone(),
+                                    )),
                                 }
                             }));
                         }
                         Content::Thinking {
                             thinking,
                             thinking_signature,
+                            redacted,
                             ..
                         } => {
+                            // pi `:1010-1019` @v0.87.1: encrypted reasoning is opaque, so the stored
+                            // payload is replayed as the `redactedContent` member instead of being
+                            // lowered to reasoning text (or degraded to plain text for want of a
+                            // signature). A payload that will not decode is dropped (PROV-097).
+                            if *redacted {
+                                if let Some(redacted_content) =
+                                    decode_redacted_content(thinking_signature.as_deref())
+                                {
+                                    blocks.push(json!({
+                                        "reasoningContent": { "redactedContent": redacted_content }
+                                    }));
+                                }
+                                continue;
+                            }
                             let thinking = sanitize_surrogates(thinking);
                             if thinking.trim().is_empty() {
                                 continue;

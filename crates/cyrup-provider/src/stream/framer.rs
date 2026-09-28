@@ -75,46 +75,86 @@ impl SseFramer {
             let line = std::str::from_utf8(self.buf.get(line_at..line_at + pos).unwrap_or(&[]))?;
 
             if line.is_empty() {
-                // Dispatch. Both buffers reset EVEN IF nothing is emitted (upstream's
-                // `core::mem::take(self)` in `EventBuilder::dispatch`).
-                let mut data = std::mem::take(&mut self.data);
-                let event = std::mem::take(&mut self.event);
-                if data.is_empty() {
-                    continue;
+                // Dispatch — the same three steps [`Self::flush`] runs, so the blank-line and
+                // the end-of-stream paths cannot drift apart.
+                match self.flush() {
+                    Some(frame) => return Ok(Some(frame)),
+                    None => continue,
                 }
-                if data.ends_with('\n') {
-                    data.pop();
-                }
-                return Ok(Some(SseFrame {
-                    event: if event.is_empty() {
-                        "message".to_string()
-                    } else {
-                        event
-                    },
-                    data,
-                }));
             }
-            if line.starts_with(':') {
-                continue; // comment
-            }
-            let (name, value) = match line.split_once(':') {
-                Some((n, v)) => (n, v.strip_prefix(' ').unwrap_or(v)),
-                None => (line, ""),
-            };
-            match name {
-                "event" => {
-                    self.event.clear();
-                    self.event.push_str(value);
-                }
-                "data" => {
-                    self.data.push_str(value);
-                    self.data.push('\n');
-                }
-                // `id:` and `retry:` are spec fields that `SseFrame` does not carry. Neither
-                // arms dispatch: only a blank line dispatches, and only non-empty data emits.
-                _ => {}
-            }
+            Self::consume_line(&mut self.event, &mut self.data, line);
         }
+    }
+
+    /// Apply one non-blank line to the event/data buffers (upstream's `decodeSseLine` past its
+    /// `line === ""` arm).
+    ///
+    /// CYRUP-DELTA: takes the two buffers rather than `&mut self`, because the caller's `line`
+    /// borrows `self.buf` and a `&mut self` receiver would conflict with it. Copying the line
+    /// into a `String` instead would put an allocation on every line of every stream, which is
+    /// exactly what this framer exists to avoid.
+    fn consume_line(event: &mut String, data: &mut String, line: &str) {
+        if line.starts_with(':') {
+            return; // comment
+        }
+        let (name, value) = match line.split_once(':') {
+            Some((n, v)) => (n, v.strip_prefix(' ').unwrap_or(v)),
+            None => (line, ""),
+        };
+        match name {
+            "event" => {
+                event.clear();
+                event.push_str(value);
+            }
+            "data" => {
+                data.push_str(value);
+                data.push('\n');
+            }
+            // `id:` and `retry:` are spec fields that `SseFrame` does not carry. Neither
+            // arms dispatch: only a blank line dispatches, and only non-empty data emits.
+            _ => {}
+        }
+    }
+
+    /// Dispatch whatever the event/data buffers hold. Both buffers reset EVEN IF nothing is
+    /// emitted (upstream's `core::mem::take(self)` in `EventBuilder::dispatch`).
+    ///
+    /// CYRUP-DELTA: gated on non-empty DATA, whereas pi's `flushSseEvent`
+    /// (`anthropic-messages.ts:340-353` @v0.87.1) also fires on an `event:`-only residual. It can:
+    /// its `ServerSentEvent` carries `raw`. [`SseFrame`] does not, and every cyrup decoder
+    /// dispatches on `data`, so an `event:`-only frame would be indistinguishable from noise.
+    pub(crate) fn flush(&mut self) -> Option<SseFrame> {
+        let mut data = std::mem::take(&mut self.data);
+        let event = std::mem::take(&mut self.event);
+        if data.is_empty() {
+            return None;
+        }
+        if data.ends_with('\n') {
+            data.pop();
+        }
+        Some(SseFrame {
+            event: if event.is_empty() {
+                "message".to_string()
+            } else {
+                event
+            },
+            data,
+        })
+    }
+
+    /// Terminate the stream: feed any UNTERMINATED residual line through the field parser, then
+    /// dispatch. This is upstream's `if (buffer.length > 0) decodeSseLine(buffer, state)` followed
+    /// by `flushSseEvent(state)` (`anthropic-messages.ts:454-464` @v0.87.1). Without the residual
+    /// step a stream cut mid-`data:` line still loses its payload.
+    pub(crate) fn flush_at_eof(&mut self) -> Result<Option<SseFrame>, std::str::Utf8Error> {
+        if self.start < self.buf.len() {
+            let line = std::str::from_utf8(self.buf.get(self.start..).unwrap_or(&[]))?;
+            // Non-empty by construction (no terminator remains), so pi's `line === ""` arm —
+            // which would dispatch — is unreachable here.
+            Self::consume_line(&mut self.event, &mut self.data, line);
+            self.start = self.buf.len();
+        }
+        Ok(self.flush())
     }
 }
 
@@ -128,6 +168,7 @@ pub(crate) enum FrameError<E> {
 /// cancel arm (see [`super::sse::open_sse`]).
 pub(crate) fn frame_bytes<S, B, E>(
     inner: S,
+    flush_at_eof: bool,
 ) -> impl futures::Stream<Item = Result<SseFrame, FrameError<E>>> + Send
 where
     S: futures::Stream<Item = Result<B, E>> + Send + 'static,
@@ -138,11 +179,13 @@ where
         inner: std::pin::Pin<Box<S>>,
         framer: SseFramer,
         done: bool,
+        flush_at_eof: bool,
     }
     let st = St {
         inner: Box::pin(inner),
         framer: SseFramer::default(),
         done: false,
+        flush_at_eof,
     };
     futures::stream::unfold(st, |mut st| async move {
         loop {
@@ -163,7 +206,22 @@ where
                     st.done = true;
                     return Some((Err(FrameError::Transport(e)), st));
                 }
-                // EOF. An unterminated trailing line is dropped, as upstream drops it.
+                // EOF. Two of pi's adapters terminate the residual frame here and the rest
+                // drop it, so the caller chooses:
+                //   * `anthropic-messages.ts` `flushSseEvent` (`:461-464` @v0.87.1), and
+                //   * `openai-codex-responses.ts` `if (done && buffer.trim()) buffer += "\n\n";`
+                //     (`:795` @v0.87.1, added in v0.85.0 / #9047)
+                // both flush; the OpenAI-SDK-backed paths have no equivalent and deliberately
+                // drop it. Setting `done` before yielding the flushed frame is what stops the
+                // unfold from polling the finished inner stream again.
+                None if st.flush_at_eof => {
+                    st.done = true;
+                    return match st.framer.flush_at_eof() {
+                        Ok(Some(frame)) => Some((Ok(frame), st)),
+                        Ok(None) => None,
+                        Err(e) => Some((Err(FrameError::Utf8(e)), st)),
+                    };
+                }
                 None => return None,
             }
         }

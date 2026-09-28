@@ -32,6 +32,7 @@ pub mod paths;
 pub mod policy;
 pub mod provider_compose;
 pub mod settings;
+pub mod text;
 pub mod trust;
 
 #[cfg(test)]
@@ -76,6 +77,7 @@ pub use settings::{
     Settings, SettingsManager, SettingsScope, SettingsStore, deep_merge, migrate_settings,
     parse_http_idle_timeout_ms,
 };
+pub use text::strip_bom;
 pub use trust::{
     AppMode, ExtensionTrust, ResourceKind, ResourceStage, TrustDecision, TrustEntry, TrustInputs,
     TrustOption, TrustOutcome, TrustStore, decide_trust, decide_trust_with_extension,

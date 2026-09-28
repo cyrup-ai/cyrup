@@ -868,10 +868,12 @@ fn the_demo_extension_declares_a_bash_backend_and_redirects_only_remote_commands
     );
     assert_eq!(
         redirected,
-        RawOutcome::Handled(json!({ "operations": true }).to_string()),
-        "a `remote:` command must be handled with the `operations` key and nothing else — a \
-         `result` would short-circuit execution before the backend is ever consulted \
-         (`modes/rpc/rpc-mode.ts:571-576`)"
+        RawOutcome::Handled(json!({ "operations": {} }).to_string()),
+        "a `remote:` command must be handled with the `operations` key, an OBJECT behind it, and \
+         nothing else — a `result` would short-circuit execution before the backend is ever \
+         consulted (`modes/rpc/rpc-mode.ts:571-576` @v0.87.1), and a non-object `operations` is a \
+         DEFINED-but-invalid result that #9068 aborts the command over \
+         (`core/extensions/runner.ts:143-144`, and `cyrup_ext::is_user_bash_event_result`)"
     );
     assert_eq!(
         api.dispatch(19, &["ls", "false", "/work"], &ctx),

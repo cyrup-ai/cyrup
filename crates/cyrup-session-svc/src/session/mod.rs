@@ -214,6 +214,12 @@ pub struct AgentSession {
     /// Messages staged to ride the NEXT prompt turn (Pi `_pendingNextTurnMessages`,
     /// agent-session.ts:1339); drained into the run by [`Self::assemble_run_messages`].
     pending_next_turn: Mutex<Vec<AgentMessage>>,
+    /// Custom messages deferred because a run was live and the caller passed `triggerTurn: false`
+    /// (Pi `_pendingCustomMessages`, agent-session.ts:350, pushed at `:1966` @v0.87.1). Appending
+    /// one mid-turn would place it between an assistant tool call and its result, which providers
+    /// that validate message order reject on replay — so it waits for a turn boundary and is
+    /// drained by [`Self::flush_pending_custom_messages`]. SEAM-127.
+    pending_custom_messages: Mutex<Vec<AgentMessage>>,
     /// Models available for `cycle_model` (Pi `_scopedModels`, agent-session.ts:870).
     scoped_models: Mutex<Vec<ScopedModel>>,
     /// Facade mirror of the agent's steering-queue mode (the agent exposes only a setter; Pi reads
@@ -243,6 +249,16 @@ pub struct AgentSession {
     /// Set once after an overflow auto-compaction so a second overflow does not loop (Pi
     /// `_overflowRecoveryAttempted`, agent-session.ts:1859).
     overflow_recovery_attempted: Mutex<bool>,
+    /// Latched by [`Self::abort`] while a run is active, so every post-run decision point can tell
+    /// an abort from a normal `agent_end` — Pi `_agentRunAbortRequested`
+    /// (`agent-session.ts:339` @v0.87.1), cleared where a run starts (`_runAgentPrompt` :1469) and
+    /// consulted by the continuation loop (:1473), `_handlePostAgentRun` (:1497,1504,1507,1522,1528)
+    /// and `_willRetryAfterAgentEnd` (:977).
+    ///
+    /// An `AtomicBool` rather than a `Mutex<bool>`: it is WRITTEN from a signal handler / RPC cancel
+    /// and READ from the driver task, so it must be lock-free on the writer side. `SeqCst`
+    /// throughout — the latch orders against the cancel-token stores in the same `abort()`.
+    agent_run_abort_requested: AtomicBool,
     // ---- immediate-bash seam (Pi agent-session.ts:2582-2684) ----
     proc: Arc<dyn ProcOps>,
     shell_path: Option<String>,
@@ -361,6 +377,7 @@ impl AgentSession {
             compaction_cancel: Mutex::new(None),
             branch_summary_cancel: Mutex::new(None),
             pending_next_turn: Mutex::new(Vec::new()),
+            pending_custom_messages: Mutex::new(Vec::new()),
             scoped_models: Mutex::new(Vec::new()),
             steering_mode: Mutex::new(steering_mode),
             follow_up_mode: Mutex::new(follow_up_mode),
@@ -375,6 +392,7 @@ impl AgentSession {
             auto_compaction_enabled_default: extras.auto_compaction_enabled,
             auto_compaction_cancel: Mutex::new(None),
             overflow_recovery_attempted: Mutex::new(false),
+            agent_run_abort_requested: AtomicBool::new(false),
             proc: extras.proc,
             shell_path: extras.shell_path,
             shell_command_prefix: extras.shell_command_prefix,
@@ -529,6 +547,21 @@ impl AgentSession {
     /// that does count it (SEAM-125).
     pub fn is_run_active(&self) -> bool {
         *self.driver_tx.borrow() || self.agent.is_running()
+    }
+
+    /// Whether an [`Self::abort`] landed during the current run — Pi `_agentRunAbortRequested`
+    /// (`agent-session.ts:339` @v0.87.1).
+    pub(crate) fn abort_requested(&self) -> bool {
+        self.agent_run_abort_requested.load(Ordering::SeqCst)
+    }
+
+    /// Set or clear the run-abort latch. Pi assigns the field directly at its two WRITE sites:
+    /// `abort()` (:2077) and the head of `_runAgentPrompt` (:1469, clearing it for the new run). Its
+    /// READ sites are the continuation loop (:1473), the `finally`'s `_finishCancelledRetry` guard
+    /// (:1484 — `settle_run`), the four checks inside `_handlePostAgentRun` (:1497/:1504/:1507/:1522)
+    /// and its tail (:1528), plus `_willRetryAfterAgentEnd` (:977). All are ported.
+    pub(crate) fn set_abort_requested(&self, v: bool) {
+        self.agent_run_abort_requested.store(v, Ordering::SeqCst);
     }
 
     /// Lock a `std::sync::Mutex` ignoring poisoning (no panic; arch-00 no-panic).

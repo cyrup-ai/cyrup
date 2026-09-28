@@ -278,7 +278,9 @@ fn normalize_newlines(value: &str) -> String {
 /// byte offset 3 (frontmatter.ts:13,17). `yaml_string = slice(4, endIndex)` and the body begins
 /// after the closing `\n---` (frontmatter.ts:23-24) — the close need not be its own line.
 pub(crate) fn split_front_matter(raw: &str) -> (Option<String>, String) {
-    let normalized = normalize_newlines(raw);
+    // Pi: `normalizeNewlines(stripBom(content))` (frontmatter.ts:11 @v0.87.1) — the BOM comes off
+    // BEFORE the fence test, so a BOM'd `---` block is still recognized as front-matter.
+    let normalized = normalize_newlines(cyrup_config::strip_bom(raw));
     // Pi: `if (!normalized.startsWith("---")) return { yamlString: null, body: normalized }`.
     if !normalized.starts_with("---") {
         return (None, normalized);
@@ -297,4 +299,23 @@ pub(crate) fn split_front_matter(raw: &str) -> (Option<String>, String) {
         .trim()
         .to_string();
     (Some(yaml), body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_front_matter;
+
+    /// CFG-087: pi's `extractFrontmatter` normalizes `stripBom(content)`, not `content`
+    /// (`utils/frontmatter.ts:11` @v0.87.1), so the BOM comes off BEFORE the `startsWith("---")`
+    /// fence test. Without the strip a BOM'd SKILL.md looks fence-less: the front matter is
+    /// returned as body text and every declared field (`name`, `description`) is lost.
+    #[test]
+    fn a_bom_does_not_hide_the_front_matter_fence() {
+        const DOC: &str = "---\nname: n\n---\nbody\n";
+        let plain = split_front_matter(DOC);
+        let bommed = split_front_matter(&format!("\u{feff}{DOC}"));
+        assert_eq!(bommed, plain);
+        assert_eq!(bommed.0.as_deref(), Some("name: n"));
+        assert_eq!(bommed.1, "body");
+    }
 }

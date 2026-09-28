@@ -7,8 +7,8 @@ use crate::agent_message::AgentMessage;
 use crate::compaction::cutpoint::find_cut_point;
 use crate::compaction::files::FileOps;
 use crate::compaction::settings::CompactionSettings;
-use crate::compaction::tokens::{TokenCache, estimate_context_tokens_raw};
-use crate::context::{build_context_agent_messages, raw_context_messages};
+use crate::compaction::tokens::{TokenCache, estimate_projected_context_tokens};
+use crate::context::raw_context_messages;
 use crate::entry::{Entry, KnownEntry};
 
 /// The prepared compaction (also the before-compact hook input).
@@ -164,13 +164,17 @@ pub fn prepare_compaction(
     }
 
     // tokens_before = estimated size of the ENTIRE pre-compaction context being reduced (Pi
-    // `estimateContextTokens(buildSessionContext(pathEntries).messages).tokens`, `compaction.ts:678`),
-    // NOT just the summarized slice — this is the number persisted in `CompactionEntry.tokensBefore`.
-    // Estimate over the RAW `AgentMessage` context (roles intact) so summary wrappers are not
-    // over-counted and `excludeFromContext` bash messages are still counted, matching Pi byte-for-byte.
+    // `estimateProjectedContextTokens(projection, pathEntries).tokens`, `compaction.ts:919`
+    // @v0.87.1), NOT just the summarized slice — this is the number persisted in
+    // `CompactionEntry.tokensBefore`. Estimate over the RAW `AgentMessage` context (roles intact) so
+    // summary wrappers are not over-counted and `excludeFromContext` bash messages are still
+    // counted, matching Pi byte-for-byte.
+    //
+    // SESS-052 — the PROJECTED estimate: a `context_edit` or `compaction` later in the branch than
+    // the usage anchor's entry discards the anchor, so a compaction that follows an edit records the
+    // size of the edited context it is actually reducing rather than a stale pre-edit reading.
     let refs: Vec<&Entry> = path.iter().collect();
-    let full_context = build_context_agent_messages(&refs);
-    let tokens_before = estimate_context_tokens_raw(&full_context).tokens;
+    let tokens_before = estimate_projected_context_tokens(&refs).tokens;
 
     Some(CompactionPreparation {
         first_kept_entry_id,

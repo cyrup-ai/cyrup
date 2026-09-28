@@ -512,6 +512,11 @@ impl<B: Backend> App<B> {
                         .push_status(format!("model error: {e}"));
                     return;
                 }
+                // **TUI-105.** `selectModel`'s `this.updateAvailableProviderCount()`
+                // (`interactive-mode.ts:5187`) — the same call the non-persisting confirm makes
+                // (`app/execute.rs`), because upstream's one `selectModel(model, persist)` serves
+                // both.
+                self.refresh_provider_count(session);
                 // `setDefaultModelAndProvider(provider, id)` writes BOTH keys together
                 // (`settings-manager.ts:737-744`); never one alone, or a relaunch resolves a model
                 // id against the wrong provider. The picker confirms a fully-qualified
@@ -979,14 +984,15 @@ impl<B: Backend> App<B> {
                     return;
                 };
                 let n = text.chars().count();
-                if crate::clipboard::copy_to_clipboard(&text).await {
-                    self.state
+                // Pi's `catch` reports the THROWN message (`interactive-mode.ts:6016-6018`), which
+                // names the missing helper (`clipboard.ts:124-137`) instead of the one generic
+                // string this arm used to print for every failure.
+                match crate::clipboard::copy_to_clipboard(&text).await {
+                    Ok(()) => self
+                        .state
                         .transcript
-                        .push_status(format!("copied selection ({n} chars)"));
-                } else {
-                    self.state
-                        .transcript
-                        .push_error("Failed to copy to clipboard");
+                        .push_status(format!("copied selection ({n} chars)")),
+                    Err(error) => self.state.transcript.push_error(error.message()),
                 }
             }
 
@@ -994,19 +1000,19 @@ impl<B: Backend> App<B> {
                 Some(text) => {
                     let n = text.chars().count();
                     // Pi's `handleCopyCommand` (interactive-mode.ts:6002-6019) wraps the write in a
-                    // `try`: success shows a status, a THROW shows `showError(...)`. Reporting
-                    // "copied" unconditionally is what let the old `#[cfg(not(unix))]` no-op tell a
-                    // Windows user their message was on the clipboard when nothing had been written.
-                    if crate::clipboard::copy_to_clipboard(&text).await {
-                        self.state
+                    // `try`: success shows a status, a THROW shows `showError(error.message)`.
+                    // Reporting "copied" unconditionally is what let the old `#[cfg(not(unix))]`
+                    // no-op tell a Windows user their message was on the clipboard when nothing had
+                    // been written.
+                    match crate::clipboard::copy_to_clipboard(&text).await {
+                        Ok(()) => self
+                            .state
                             .transcript
-                            .push_status(format!("copied last message ({n} chars)"));
-                    } else {
-                        // The message Pi throws when every branch failed (`clipboard.ts:171-173`),
-                        // surfaced through the same error channel as its `showError`.
-                        self.state
-                            .transcript
-                            .push_error("Failed to copy to clipboard");
+                            .push_status(format!("copied last message ({n} chars)")),
+                        // The message Pi throws for the branch that failed
+                        // (`clipboard.ts:124-137`), surfaced through the same error channel as its
+                        // `showError`.
+                        Err(error) => self.state.transcript.push_error(error.message()),
                     }
                 }
                 None => self
@@ -1024,16 +1030,14 @@ impl<B: Backend> App<B> {
             C::CopyEntry(entry_id) => {
                 match session.entry_copy_text(&entry_id.as_str().into()).await {
                     Some(text) => {
-                        if crate::clipboard::copy_to_clipboard(&text).await {
-                            self.state
+                        match crate::clipboard::copy_to_clipboard(&text).await {
+                            Ok(()) => self
+                                .state
                                 .transcript
-                                .push_status("Copied selected message to clipboard");
-                        } else {
-                            // The message pi throws when every clipboard branch failed
-                            // (`clipboard.ts:171-173`), reaching `showError` via the `catch`.
-                            self.state
-                                .transcript
-                                .push_error("Failed to copy to clipboard");
+                                .push_status("Copied selected message to clipboard"),
+                            // The message pi throws for the clipboard branch that failed
+                            // (`clipboard.ts:124-137`), reaching `showError` via the `catch`.
+                            Err(error) => self.state.transcript.push_error(error.message()),
                         }
                     }
                     None => self

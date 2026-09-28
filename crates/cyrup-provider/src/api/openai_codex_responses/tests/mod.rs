@@ -27,7 +27,8 @@ use crate::api::openai_responses::decode_stream;
 use crate::auth::AuthResult;
 use crate::context::Context;
 use crate::model::{Modality, Model, ModelCost};
-use crate::stream::sse::decode_sse_bytes;
+// PROV-084: the live Codex adapter sets `flush_at_eof`, so the replay path must too.
+use crate::stream::sse::decode_sse_bytes_flushing_at_eof;
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions, ToolChoice};
 use base64::Engine as _;
 use cyrup_core::{AssistantMessage, CancelToken, ModelThinkingLevel, SessionId, StopReason};

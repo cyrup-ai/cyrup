@@ -9,8 +9,13 @@ use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
 use crate::utils::json_parse::parse_streaming_json_object;
+use base64::Engine as _;
 use cyrup_core::{ApiId, SharedStr, ToolCall, ToolCallId};
 use serde_json::Value;
+
+/// pi `REDACTED_THINKING_PLACEHOLDER` (`bedrock-converse-stream.ts:123` @v0.87.1) — the visible
+/// stand-in for reasoning the provider returned encrypted.
+const REDACTED_THINKING_PLACEHOLDER: &str = "[Reasoning redacted]";
 
 /// Dispatch one decoded event-stream frame (pi's `for await (const item of response.stream!)` body,
 /// `bedrock-converse-stream.ts:257-289`).
@@ -220,6 +225,8 @@ async fn handle_content_block_delta(
                     index,
                     thinking: SharedStr::new(),
                     signature: String::new(),
+                    redacted: false,
+                    redacted_chunks: Vec::new(),
                 });
                 let content_index = dec.blocks.len().saturating_sub(1);
                 if !sink
@@ -255,12 +262,73 @@ async fn handle_content_block_delta(
                 return false;
             }
         }
-        // pi `:524-527`: the signature accumulates silently — no event is emitted for it.
+        // pi `:524-527`: the signature accumulates silently — no event is emitted for it. pi
+        // `:655-657` @v0.87.1 additionally suppresses it once the block is `redacted`: the field
+        // holds either an Anthropic signature or an opaque redacted payload, never both, and mixing
+        // them would corrupt whichever arrived first (PROV-097).
         if let Some(sig) = reasoning.get("signature").and_then(Value::as_str)
             && !sig.is_empty()
-            && let Some(Block::Thinking { signature, .. }) = dec.block_mut(position)
+            && let Some(Block::Thinking {
+                signature,
+                redacted: false,
+                ..
+            }) = dec.block_mut(position)
         {
             signature.push_str(sig);
+        }
+
+        // pi `:658-675` @v0.87.1 — encrypted reasoning from a non-Anthropic model on Bedrock (e.g.
+        // OpenAI GPT-5.6). The payload is opaque, so it is kept verbatim and replayed next turn the
+        // way the Anthropic path stores redacted thinking. The blob crosses cyrup's eventstream JSON
+        // as base64; it is decoded here so the projection can encode the JOINED bytes once, exactly
+        // as pi's `bytesToBase64` does (PROV-097).
+        if let Some(chunk) = reasoning
+            .get("redactedContent")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .and_then(|c| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(c)
+                    .ok()
+                    .filter(|b| !b.is_empty())
+            })
+        {
+            let first = matches!(
+                dec.blocks.get(position),
+                Some(Block::Thinking {
+                    redacted: false,
+                    ..
+                })
+            );
+            if first
+                && let Some(Block::Thinking {
+                    thinking,
+                    signature,
+                    redacted,
+                    ..
+                }) = dec.block_mut(position)
+            {
+                *redacted = true;
+                signature.clear();
+                thinking.push_str(REDACTED_THINKING_PLACEHOLDER);
+            }
+            if let Some(Block::Thinking {
+                redacted_chunks, ..
+            }) = dec.block_mut(position)
+            {
+                redacted_chunks.extend_from_slice(&chunk);
+            }
+            if first
+                && !sink
+                    .send(StreamEvent::ThinkingDelta {
+                        content_index: position,
+                        delta: REDACTED_THINKING_PLACEHOLDER.to_string(),
+                        partial: dec.snapshot(model, api),
+                    })
+                    .await
+            {
+                return false;
+            }
         }
     }
 

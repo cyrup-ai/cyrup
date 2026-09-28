@@ -235,11 +235,12 @@ impl Tool for EditTool {
         ]
     }
 
-    /// Pi `constrainedSampling: getExperimentalToolSampling()` (`core/tools/edit.ts:329`
-    /// @v0.84.2), declared on the same object literal as `renderShell: "self"` and
-    /// `prepareArguments`.
+    /// Pi `constrainedSampling: { type: "json_schema", strict: "prefer" }`
+    /// (`core/tools/edit.ts:156` @v0.87.1), declared on the same object literal as
+    /// `renderShell: "self"` and `prepareArguments`; unconditional since pi 0.86.0 dropped the
+    /// `PI_EXPERIMENTAL` gate.
     fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
-        cyrup_core::experimental_tool_sampling()
+        crate::tools::prefer_strict_tool_sampling()
     }
 
     async fn execute(
@@ -396,7 +397,8 @@ mod tests {
     use crate::lock::FileMutationLocks;
     use crate::ops::local::LocalFs;
     use cyrup_core::{
-        CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink,
+        CancelToken, ConstrainedSampling, ConstrainedSamplingConfig, Content, StrictSampling, Tool,
+        ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -743,21 +745,20 @@ mod tests {
             "ALPHA\n"
         );
     }
-    /// PROV-011 DoD 1/2 — the tool's opt-in tracks the experimental flag and nothing else.
-    ///
-    /// Flag-aware by construction: with the flag unset (the default `cargo test` environment) the
-    /// declaration must be ABSENT, and under `CYRUP_EXPERIMENTAL=1` it must
-    /// be pi's `{type:"json_schema", strict:"prefer"}`. Running the suite either way exercises the
-    /// matching branch, and the assertion also pins the tool to
-    /// `cyrup_core::experimental_tool_sampling` rather than to some private copy of the value.
+    /// TOOL-046 — the declaration is UNCONDITIONAL: pi 0.86.0 removed the `PI_EXPERIMENTAL` gate
+    /// and `core/tools/edit.ts:156` @v0.87.1 states the literal
+    /// `constrainedSampling: { type: "json_schema", strict: "prefer" }`. No env is read here,
+    /// because none is read upstream.
     #[test]
-    fn edit_declares_constrained_sampling_exactly_when_the_experimental_flag_is_on() {
+    fn edit_declares_strict_prefer_constrained_sampling_unconditionally() {
         let tool = tool(PathBuf::from("."));
-        let expected = cyrup_core::experimental_tool_sampling_from(|k| std::env::var(k).ok());
-        assert_eq!(tool.constrained_sampling(), expected);
         assert_eq!(
             tool.constrained_sampling(),
-            cyrup_core::experimental_tool_sampling()
+            Some(&ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictSampling::Prefer
+                }
+            ))
         );
     }
     // ---------------------------------------------------------------------------------------

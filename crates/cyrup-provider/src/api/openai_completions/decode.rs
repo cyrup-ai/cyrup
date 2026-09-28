@@ -2,10 +2,10 @@
 
 use super::blocks::{Block, Decoder};
 use super::deltas::{
-    encrypted_reasoning_detail_id, ensure_text_block, ensure_thinking_block, first_reasoning_delta,
-    process_tool_call_delta,
+    ensure_text_block, ensure_thinking_block, first_reasoning_delta, process_tool_call_delta,
 };
 use super::finalize::{build_final_message, map_stop_reason, parse_partial_json, parse_usage};
+use super::reasoning_details::{append_openai_reasoning_detail, is_openai_reasoning_detail};
 use crate::api::EventSink;
 use crate::api::compat::get_compat;
 use crate::error::ProviderError;
@@ -70,6 +70,17 @@ where
     // blocks (Pi `finishBlock` pushes `*_end` with `partial: output`, openai-completions.ts:214-246).
     let block_count = dec.blocks.len();
     for idx in 0..block_count {
+        // `applyStreamedReasoningDetails` (openai-completions.ts:329-333, called from `finishBlock`
+        // at `:440`): the merged details land in the thinking block's signature slot BEFORE the
+        // `thinking_end` event — pi mutates the same `output` object that event carries as
+        // `partial`, so the write must happen before the snapshot here too.
+        if matches!(dec.blocks.get(idx), Some(Block::Thinking { .. }))
+            && let Some(details) = dec.streamed_reasoning_details.clone()
+            && let Ok(serialized) = serde_json::to_string(&details)
+            && let Some(Block::Thinking { signature, .. }) = dec.block_mut(idx)
+        {
+            *signature = Some(serialized);
+        }
         let partial = dec.snapshot(model, api);
         let ev = match dec.blocks.get(idx) {
             Some(Block::Text(text)) => StreamEvent::TextEnd {
@@ -299,24 +310,25 @@ async fn process_chunk(
         }
     }
 
-    // 4. Encrypted reasoning details — attach as the thought signature of the matching tool call,
-    // or stash until that tool call appears (Pi `reasoning_details` handling, L422-435).
+    // 4. `reasoning_details` — EVERY valid detail is kept (text, summary and encrypted alike),
+    // anchored on the thinking block and merged in arrival order (Pi openai-completions.ts:664-675).
+    // They are replay metadata, so nothing is emitted as a delta: the merged array is serialized
+    // onto the thinking block's signature when that block is finalized.
     if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
         for detail in details {
-            if let Some(id) = encrypted_reasoning_detail_id(detail) {
-                let serialized = detail.to_string();
-                if let Some(&idx) = dec.tool_by_id.get(id) {
-                    if let Some(Block::Tool {
-                        thought_signature, ..
-                    }) = dec.block_mut(idx)
-                    {
-                        *thought_signature = Some(serialized);
-                    }
-                } else {
-                    dec.pending_reasoning_by_tool_id
-                        .insert(id.to_string(), serialized);
-                }
+            if !is_openai_reasoning_detail(detail) {
+                continue;
             }
+            if ensure_thinking_block(dec, "", model, api, sink)
+                .await
+                .is_none()
+            {
+                return false;
+            }
+            append_openai_reasoning_detail(
+                dec.streamed_reasoning_details.get_or_insert_with(Vec::new),
+                detail,
+            );
         }
     }
 

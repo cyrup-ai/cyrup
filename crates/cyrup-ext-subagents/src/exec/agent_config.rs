@@ -157,7 +157,7 @@ impl AgentConfig {
             exclude_tools: agent.exclude_tools.clone().unwrap_or_default(),
             allow_nested_subagents: agent.allow_nested_subagents,
             extensions: agent.extensions.clone(),
-            subagent_only_extensions: agent.subagent_only_extensions.clone(),
+            subagent_only_extensions: agent.subagent_only_extensions.clone().unwrap_or_default(),
             output: agent.output.clone(),
             inherit_project_context: agent.inherit_project_context,
             inherit_skills: agent.inherit_skills,
@@ -391,7 +391,7 @@ impl ResolvedAgentPersona {
             exclude_tools: agent.exclude_tools.clone().unwrap_or_default(),
             allow_nested_subagents: agent.allow_nested_subagents,
             extensions: agent.extensions.clone(),
-            subagent_only_extensions: agent.subagent_only_extensions.clone(),
+            subagent_only_extensions: agent.subagent_only_extensions.clone().unwrap_or_default(),
             output: agent.output.clone(),
             inherit_project_context: agent.inherit_project_context,
             inherit_skills: agent.inherit_skills,
@@ -591,6 +591,19 @@ pub struct RunOptions {
     /// its `model_override` is known to be in scope (or the scope is not armed). `None` = no
     /// policy configured.
     pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    /// SUBA-119 — pi's `options.modelOverrideFromParent` (`execution.ts:1836`): this run's model was
+    /// INHERITED from the parent session rather than chosen for it, so model verification is OFF (the
+    /// parent's own model is not a candidate this run selected, and the child reporting it is not a
+    /// mismatch to report). Derived once at the launch site by
+    /// [`crate::exec::fallback::model_override_is_from_parent`], beside the
+    /// `resolve_model_inheritance` call that makes the decision.
+    pub model_override_from_parent: bool,
+    /// SUBA-119 — pi's `options.modelResponseAliases` (`model-resolution.ts:18`): operator-declared
+    /// mappings from a launch candidate's BASE id to the raw response ids that legitimately identify
+    /// it. `None` and an empty map behave identically; a declared entry makes
+    /// [`crate::exec::model_verification::format_subagent_model_verification_error`] accept the
+    /// observed id instead of failing the run.
+    pub model_response_aliases: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// SUBA-078 — the effective `subagents.maxThinking` ceiling for this run (pi's
     /// `options.thinkingCeiling`, `runs/foreground/execution.ts:382`), already intersected with
     /// whatever this process itself inherited. `None` = no ceiling, so the bound is off.

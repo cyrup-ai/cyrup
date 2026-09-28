@@ -41,13 +41,48 @@ impl SessionManager {
         }
 
         // Re-chain the non-label entries linearly.
+        //
+        // Dropping a `Label` entry orphans any id that POINTED at it, so a retained
+        // `Compaction.first_kept_entry_id` naming a dropped label must be re-pointed at the next
+        // RETAINED entry — otherwise the id is off the forked path, `build_context_messages`'
+        // `e.id() == first_kept` test never matches, and everything the compaction deliberately
+        // kept vanishes from the fork's context. Pi:
+        //   const replacementByLabelId = new Map<string, string>();
+        //   const pendingLabelIds: string[] = [];
+        //   ...
+        //   firstKeptEntryId:
+        //       entry.firstKeptEntryId === entry.id
+        //           ? entry.id
+        //           : (replacementByLabelId.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId)
+        // (`session-manager.ts:1637-1657` @v0.87.1), including the `=== entry.id` self-reference
+        // guard. Labels still pending when the loop ends map to nothing — same as Pi, whose map is
+        // simply never consulted for them.
         let mut retained: Vec<Entry> = Vec::new();
         let mut prev: Option<EntryId> = None;
+        let mut pending_labels: Vec<EntryId> = Vec::new();
+        let mut replacement_by_label: std::collections::HashMap<EntryId, EntryId> =
+            std::collections::HashMap::new();
         for e in &path_entries {
             if matches!(e, Entry::Known(KnownEntry::Label { .. })) {
+                pending_labels.push(e.id());
                 continue;
             }
+            let this_id = e.id();
+            for l in pending_labels.drain(..) {
+                replacement_by_label.insert(l, this_id.clone());
+            }
             let mut cloned = e.clone();
+            if let Entry::Known(KnownEntry::Compaction {
+                base,
+                first_kept_entry_id,
+                ..
+            }) = &mut cloned
+                && let Some(fk) = first_kept_entry_id.as_ref()
+                && fk != &base.id
+                && let Some(replacement) = replacement_by_label.get(fk)
+            {
+                *first_kept_entry_id = Some(replacement.clone());
+            }
             if let Some(base) = cloned.base_mut() {
                 base.parent_id = prev.clone();
             }

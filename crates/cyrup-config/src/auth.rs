@@ -58,7 +58,7 @@ fn parse_auth(text: &str) -> Result<AuthFile, AuthError> {
     if text.trim().is_empty() {
         return Ok(AuthFile::new());
     }
-    serde_json::from_str(text).map_err(AuthError::Parse)
+    serde_json::from_str(crate::strip_bom(text)).map_err(AuthError::Parse)
 }
 
 /// File-backed credential store (arch-07 §3.5).
@@ -688,6 +688,20 @@ pub fn resolve_auth(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// CFG-087: pi strips a leading BOM before parsing `auth.json`
+    /// (`auth-storage.ts:216`, `:366`, `:501` @v0.87.1 -> `stripBom`, `utils/text.ts:7-9`).
+    #[test]
+    fn a_bom_does_not_change_how_auth_json_parses() {
+        const BODY: &str = r#"{"anthropic":{"type":"api_key","key":"k"}}"#;
+        let plain = parse_auth(BODY).expect("plain auth.json parses");
+        let bommed = parse_auth(&format!("\u{feff}{BODY}")).expect("BOM'd auth.json parses");
+        assert_eq!(bommed, plain);
+        assert_eq!(
+            bommed.get("anthropic").and_then(Credential::stored_api_key),
+            Some("k")
+        );
+    }
 
     /// The returned `TempDir` guard owns the directory's lifetime — callers MUST bind it
     /// (`let (s, _p, _dir) = store();`) or the tree is deleted before the test runs.

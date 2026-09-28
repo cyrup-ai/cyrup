@@ -1,14 +1,26 @@
-//! A read-only / research subagent must still get an acceptance contract — pi's `inferLevel` has
-//! no `"none"` branch.
+//! A research subagent that declares NO `acceptanceRole` must still get an acceptance contract;
+//! one that declares `acceptanceRole: read-only` must not.
 //!
-//! `pi-subagents:v0.34.0:src/runs/shared/acceptance.ts:69-125` `inferLevel` returns exactly four
-//! shapes and none of them is `none`: `reviewed` (`:88-96`), `checked` (`:98-105`), `attested` for
-//! a reviewer/oracle/scout/researcher/analyst agent or read-only task wording
-//! (`:107-116`), and `attested` as the final fallthrough (`:118-124`). `formatAcceptancePrompt`
-//! returns `""` only for `level === "none"` (`:305`), and `execution.ts:1037-1038` appends its
-//! result unconditionally, so essentially every child is told to end with a fenced
-//! `acceptance-report` block — and `evaluateAcceptance` (`:787-816`) then produces a real ledger:
-//! `attested` when the block is there, `rejected` when it is not.
+//! SUBA-108 — this module was written against `v0.34.0`, where `inferLevel` had no `"none"` branch
+//! at all and the level came from the agent NAME (`reviewer|oracle|scout|researcher|analyst`) and
+//! from task wording. Upstream `7c98a696` ("refactor: base acceptance inference on declared
+//! roles", #2356, v0.70.1) deleted every name and wording heuristic and added a `none` branch. At
+//! `pi-subagents:v0.71.0:src/runs/shared/acceptance.ts:81-122` the level comes from
+//! `input.acceptanceRole` alone:
+//!
+//! * `writer` + async/dynamic → `checked` with a required reviewer gate (`:88-100`);
+//! * `writer` → `checked` (`:101-108`);
+//! * `read-only` → **`none`** (`:109-117`) — no prompt, no gate;
+//! * no declared role → `attested`, "default lightweight attestation" (`:118-122`).
+//!
+//! So the statement this file pins is about the role, not the name: `researcher` is a name in no
+//! alternation and declares no role here, so it takes the final `attested` fallthrough. The
+//! ledger consequences are unchanged for that case — `formatAcceptancePrompt` returns `""` only
+//! for `level === "none"` (`:305`), `execution.ts:1037-1038` appends its result unconditionally,
+//! and `evaluateAcceptance` (`:787-816`) produces `attested` when the fenced block is there and
+//! `rejected` when it is not. What DID change is that a child which declares `read-only` now
+//! reaches the `none` branch, and [`a_declared_read_only_role_infers_no_contract_at_all`] pins
+//! that side.
 //!
 //! Before this change `AcceptanceContract::heuristic_default` classified with the enum-lattice
 //! `completion_guard::expects_implementation_mutation` instead and returned
@@ -45,6 +57,7 @@ use std::time::Duration;
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
+use cyrup_ext_subagents::exec::acceptance::model::AcceptanceRole;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
@@ -122,6 +135,10 @@ fn agent_config(name: &str) -> AgentConfig {
 /// through `AcceptanceContract::heuristic_default` — pi's `level: "auto"` (`acceptance.ts:127`).
 fn run_options(cwd: &Path) -> RunOptions {
     RunOptions {
+        // SUBA-119 — a fixture launch whose model comes from its own agent config, so
+        // native-child model verification is armed and no response-id alias is declared.
+        model_override_from_parent: false,
+        model_response_aliases: None,
         parent_env_overrides: std::collections::BTreeMap::new(),
         machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
@@ -209,15 +226,52 @@ async fn run_fixture(dir: &Path, agent: &str, task: &str, output: &str) -> Singl
     .expect("run_sync must not hang against a fast, well-behaved fixture child")
 }
 
-/// The contract itself, with no subprocess involved: pi's read-only-agent branch
-/// (`acceptance.ts:107-116`) infers `attested`, never a no-op.
+/// The contract itself, with no subprocess involved. The agent declares NO `acceptanceRole`, so
+/// `inferLevel` takes the final fallthrough (`acceptance.ts:118-122` @v0.71.0) and infers
+/// `attested` — a real contract, not a no-op. The agent's NAME is not consulted; the assertion
+/// holds for `worker` exactly as it does for `researcher`.
 #[test]
 fn a_research_agent_infers_a_real_contract_rather_than_none() {
-    let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the flake");
-    assert_eq!(contract.required_level, AcceptanceStatus::Attested);
-    assert!(
-        !contract.is_no_op(),
-        "pi's `inferLevel` has no `none` branch: {contract:?}"
+    for name in ["researcher", "worker", "explorer"] {
+        let contract = AcceptanceContract::heuristic_default(name, "Investigate the flake");
+        assert_eq!(
+            contract.required_level,
+            AcceptanceStatus::Attested,
+            "{name}"
+        );
+        assert!(
+            !contract.is_no_op(),
+            "an undeclared role takes the lightweight attestation default: {contract:?}"
+        );
+    }
+}
+
+/// SUBA-108 — the other side of the same rule, and the one v0.34.0 had no branch for: a DECLARED
+/// `acceptanceRole: read-only` infers `none` (`acceptance.ts:109-117` @v0.71.0), which is no
+/// acceptance prompt and no gate. The read-only branch names a findings criterion and two
+/// evidence kinds, and `resolveEffectiveAcceptance` discards both (`:521-522`), so the contract
+/// carries nothing either.
+///
+/// The control is the same agent name with no declared role: it stays `attested`. That is what
+/// makes this a statement about the ROLE rather than about `researcher` happening to be a name in
+/// no alternation.
+#[test]
+fn a_declared_read_only_role_infers_no_contract_at_all() {
+    let declared = AcceptanceContract::heuristic_default_for_role(
+        "researcher",
+        Some(AcceptanceRole::ReadOnly),
+        "Investigate the flake",
+    );
+    assert_eq!(declared.required_level, AcceptanceStatus::NotRequired);
+    assert!(declared.is_no_op(), "{declared:?}");
+    assert!(declared.criteria.is_empty(), "{:?}", declared.criteria);
+    assert!(declared.evidence.is_empty(), "{:?}", declared.evidence);
+
+    assert_eq!(
+        AcceptanceContract::heuristic_default_for_role("researcher", None, "Investigate the flake")
+            .required_level,
+        AcceptanceStatus::Attested,
+        "control: the same name with no declared role keeps the attestation default"
     );
 }
 

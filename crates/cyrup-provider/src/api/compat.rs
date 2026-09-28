@@ -8,8 +8,8 @@
 //! auto-detected from `provider` + `baseUrl` and then overridden by an explicit `model.compat`.
 //! This module reproduces that matrix verbatim (it is data, ported faithfully).
 
-use crate::model::{Model, ThinkingLevelMap};
-use cyrup_core::ModelThinkingLevel;
+use crate::model::{Model, ModelCost, ThinkingLevelMap};
+use cyrup_core::{ModelThinkingLevel, ProviderId};
 use serde_json::{Map, Value};
 
 /// Which request field carries the max-tokens cap.
@@ -279,6 +279,27 @@ pub struct OpenRouterRouting {
     pub preferred_max_latency: Option<OpenRouterPercentileCutoff>,
 }
 
+/// One model Anthropic will accept in `fallbacks` for server-side refusal fallback, with the local
+/// pricing metadata used to cost a response the fallback actually served (Pi
+/// `AnthropicAllowedFallbackModel`, `types.ts:318-322` @v0.87.1).
+///
+/// **Field names are the wire names**, and here they coincide with [`ModelCompat`]'s inherited
+/// `rename_all = "camelCase"` for `provider`/`model`/`cost` — all single words. `cost` reuses
+/// [`ModelCost`], the same type `Model::cost` carries, because that is exactly what pi substitutes:
+/// `usageModel = {...model, id: responseModel, cost: fallbackCost}`
+/// (`anthropic-messages.ts:613` @v0.87.1).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnthropicAllowedFallbackModel {
+    /// The provider the fallback response is attributed to. Matched against `model.provider` when
+    /// resolving the cost of a `message_start` whose `model` differs from the requested id.
+    pub provider: ProviderId,
+    /// The fallback model id, sent verbatim as `fallbacks[].model`.
+    pub model: String,
+    /// Local pricing for responses this fallback serves.
+    pub cost: ModelCost,
+}
+
 /// Per-model compatibility overrides — cyrup's **flat union** of every per-API compat shape.
 ///
 /// Pi types `Model<API>["compat"]` per wire API via the `Model<API>` generic, so the single `compat`
@@ -413,6 +434,15 @@ pub struct ModelCompat {
     /// `crate::api::anthropic_messages::default_supports_tool_references`. DRIFT-001.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_tool_references: Option<bool>,
+    /// Pi `allowedFallbackModels` (`types.ts:833-839` @v0.87.1): models Anthropic accepts in
+    /// `fallbacks` for server-side refusal fallback, with local pricing metadata for returned
+    /// fallback responses. When absent OR empty, callers must omit `fallbacks` — Anthropic rejects
+    /// the field for models with no permitted fallback targets — which is why the emitter at
+    /// `api::anthropic_messages::params` tests for a non-empty vec rather than for `Some`, and why
+    /// this is `Option<Vec<_>>` rather than a defaulted `Vec<_>`: `Some(vec![])` must round-trip as
+    /// the explicit empty array a user's `models.json` wrote. PROV-090.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub allowed_fallback_models: Option<Vec<AnthropicAllowedFallbackModel>>,
 
     // --- `openai-responses` subset (Pi `OpenAIResponsesCompat`, openai-responses.ts:57-63). Read
     // only by the openai-responses resolver. `supports_developer_role` and
@@ -603,6 +633,11 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         provider == "cloudflare-ai-gateway" || base_url.contains("gateway.ai.cloudflare.com");
     let is_nvidia = provider == "nvidia" || base_url.contains("integrate.api.nvidia.com");
     let is_ant_ling = provider == "ant-ling" || base_url.contains("api.ant-ling.com");
+    // pi lowercases the URL half here and declares this BEFORE `isNonStandard`
+    // (`openai-completions.ts:1603` @v0.87.1), so every downstream reader — `isNonStandard`,
+    // `useMaxTokens`, `requiresReasoningContentOnAssistantMessages` and `thinkingFormat` —
+    // inherits the case-insensitive match.
+    let is_deepseek = provider == "deepseek" || base_url.to_lowercase().contains("deepseek.com");
 
     let is_non_standard = is_nvidia
         || provider == "cerebras"
@@ -611,7 +646,7 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         || base_url.contains("api.x.ai")
         || is_together
         || base_url.contains("chutes.ai")
-        || base_url.contains("deepseek.com")
+        || is_deepseek
         || is_zai
         || is_moonshot
         || provider == "opencode"
@@ -621,14 +656,21 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         || is_ant_ling;
 
     // pi `useMaxTokens` — `openai-completions.ts:1427-1435` @**v0.83.0**, byte-identical at
-    // v0.84.1 apart from the line offset (`:1478-1485`).
+    // v0.84.1 apart from the line offset (`:1478-1485`); `:1621-1629` @v0.87.1.
     //
     // DRIFT-013: the trailing `|| isZai` was dropped in the port, so every Z.AI request carried
     // `max_completion_tokens`, which Z.AI ignores — an effectively uncapped completion. The item
     // classified this `upstream-drift`; it is **not-ported**. `git show
     // v0.83.0:packages/ai/src/api/openai-completions.ts` has `isZai` at `:1435`, inside the
     // ported baseline, so a rebase would never have swept it up.
+    //
+    // PROV-074: the `|| isDeepSeek` arm is the same failure family, one pin later. It landed
+    // upstream in **v0.84.2** (#7933, "send max_tokens to DeepSeek APIs") — `git show
+    // v0.84.1:packages/ai/src/api/openai-completions.ts` has no `isDeepSeek` in `useMaxTokens` —
+    // so the port shipped the pre-fix expression and DeepSeek received
+    // `max_completion_tokens`, which the DeepSeek API ignores.
     let use_max_tokens = base_url.contains("chutes.ai")
+        || is_deepseek
         || is_moonshot
         || is_cloudflare_ai_gateway
         || is_together
@@ -637,7 +679,6 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         || is_zai;
 
     let is_grok = provider == "xai" || base_url.contains("api.x.ai");
-    let is_deepseek = provider == "deepseek" || base_url.contains("deepseek.com");
     let is_openrouter_developer_role_model =
         is_openrouter && (id.starts_with("anthropic/") || id.starts_with("openai/"));
     let cache_control_format = if provider == "openrouter" && id.starts_with("anthropic/") {
@@ -968,6 +1009,48 @@ mod tests {
                 "{provider} @ {base_url} must send max_tokens"
             );
         }
+
+        // The negative half: a plain OpenAI model is untouched by the new term.
+        let c = detect_compat(&base_model("openai", "https://api.openai.com/v1", "gpt-5"));
+        assert_eq!(c.max_tokens_field, MaxTokensField::MaxCompletionTokens);
+    }
+
+    /// PROV-074. pi's `useMaxTokens` carries `|| isDeepSeek` in its SECOND slot
+    /// (`openai-completions.ts:1621-1629` @v0.87.1), added in v0.84.2 (#7933) — after the pin the
+    /// port was taken from, so DeepSeek shipped `max_completion_tokens`, which the DeepSeek API
+    /// ignores. Two further halves of the same upstream binding fail independently at HEAD: the
+    /// URL test is `baseUrl.toLowerCase().includes("deepseek.com")` (`:1603`), and `isNonStandard`
+    /// reads `isDeepSeek` rather than a raw URL test (`:1612`), so a DeepSeek-provider model on a
+    /// proxy base URL is non-standard too.
+    #[test]
+    fn prov074_deepseek_uses_max_tokens_through_every_detection_route() {
+        for (provider, base_url) in [
+            // the provider-id route
+            ("deepseek", "https://api.deepseek.com"),
+            // the base-URL route
+            ("custom", "https://api.deepseek.com/v1"),
+            // the case-insensitivity half — `MaxCompletionTokens` at HEAD purely for the
+            // missing `to_lowercase()`
+            ("custom", "https://API.DeepSeek.COM/v1"),
+        ] {
+            let c = detect_compat(&base_model(provider, base_url, "deepseek-v4-pro"));
+            assert_eq!(
+                c.max_tokens_field,
+                MaxTokensField::MaxTokens,
+                "{provider} @ {base_url} must send max_tokens"
+            );
+        }
+
+        // The lowercasing also reaches the two fields that already read `is_deepseek`.
+        let c = detect_compat(&base_model("custom", "https://API.DeepSeek.COM/v1", "x"));
+        assert!(c.requires_reasoning_content_on_assistant_messages);
+        assert_eq!(c.thinking_format, ThinkingFormat::Deepseek);
+
+        // The `is_non_standard` half: provider `deepseek` behind a proxy base URL is still
+        // non-standard, because pi's `isNonStandard` lists `isDeepSeek`, not the bare URL test.
+        let c = detect_compat(&base_model("deepseek", "https://my-proxy.example/v1", "x"));
+        assert!(!c.supports_store);
+        assert!(!c.supports_developer_role);
 
         // The negative half: a plain OpenAI model is untouched by the new term.
         let c = detect_compat(&base_model("openai", "https://api.openai.com/v1", "gpt-5"));

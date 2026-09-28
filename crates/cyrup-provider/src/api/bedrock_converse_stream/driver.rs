@@ -222,10 +222,22 @@ pub(super) async fn run_inner(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     if let Some(hook) = &opts.on_response {
-        let mut hdrs = BTreeMap::new();
-        if let Some(id) = &request_id {
-            hdrs.insert("x-amzn-requestid".to_string(), id.clone());
-        }
+        // pi `:501-504` @v0.87.1: `toProviderResponse` returns `{...response.headers}` — EVERY
+        // header, because Bedrock's modeled `$metadata` preserves only a few (requestId among them)
+        // and a gateway's own headers are otherwise lost before `onResponse` sees them. cyrup used
+        // to forward `x-amzn-requestid` alone; it is still here, as one of the whole set. Names are
+        // already lowercase in `reqwest`'s `HeaderMap`; a non-UTF-8 value is skipped, since
+        // `ProviderResponse::headers` is a string map (PROV-097).
+        let hdrs: BTreeMap<String, String> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+            })
+            .collect();
         hook(
             crate::stream::ProviderResponse {
                 status,

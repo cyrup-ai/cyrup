@@ -31,9 +31,8 @@
 //! this text is concatenated into markup and read back by a model, so the order is load-bearing.
 
 use super::types::{
-    SUBAGENT_WATCHDOG_WARNING_TYPE, WatchdogCategory, WatchdogConfidence, WatchdogSeverity,
-    WatchdogWarning, WatchdogWarningDetails, WatchdogWarningMessage, WatchdogWarningSource,
-    WatchdogWarningState,
+    SUBAGENT_WATCHDOG_WARNING_TYPE, WatchdogCategory, WatchdogSeverity, WatchdogWarning,
+    WatchdogWarningDetails, WatchdogWarningMessage, WatchdogWarningSource, WatchdogWarningState,
 };
 
 /// `Partial<WatchdogWarningDetails>` — the `extras` argument of
@@ -46,8 +45,6 @@ pub struct WatchdogWarningDetailsPatch {
     pub category: Option<WatchdogCategory>,
     /// Overrides `source` (and supplies the pre-`"main"` fallback).
     pub source: Option<WatchdogWarningSource>,
-    /// Overrides `confidence`.
-    pub confidence: Option<WatchdogConfidence>,
     /// Overrides `agent`.
     pub agent: Option<String>,
     /// Overrides `runId`.
@@ -123,7 +120,10 @@ pub fn normalize_watchdog_warning_details(
             .source
             .or(extras.source)
             .unwrap_or(WatchdogWarningSource::Main),
-        confidence: extras.confidence.or(warning.confidence),
+        // SUBA-120 — `importance` is a REQUIRED field on both records (`types.ts:47` @v0.71.0), so
+        // it copies straight across with no fallback; upstream's `...warning` spread carries it and
+        // its `Partial<WatchdogWarningDetails>` extras cannot supply one it does not have.
+        importance: warning.importance,
         agent: extras.agent.clone().or_else(|| warning.agent.clone()),
         run_id: extras.run_id.clone().or_else(|| warning.run_id.clone()),
         stale: extras.stale.or(warning.stale),
@@ -154,7 +154,7 @@ pub fn details_as_warning(details: &WatchdogWarningDetails) -> WatchdogWarning {
         evidence: details.evidence.clone(),
         recommended_action: details.recommended_action.clone(),
         category: Some(details.category),
-        confidence: details.confidence,
+        importance: details.importance,
         source: Some(details.source),
         agent: details.agent.clone(),
         run_id: details.run_id.clone(),
@@ -192,6 +192,13 @@ pub fn format_watchdog_warning_content_from_details(details: &WatchdogWarningDet
             "severity=\"{}\"",
             escape_xml_attribute(details.severity.as_str())
         ),
+        // SUBA-120 — `warning-format.ts:37` @v0.71.0 puts `importance` here, SECOND, as an
+        // ATTRIBUTE. The `confidence` field it replaced was rendered as an optional TAG below, so
+        // this is a position change as well as a rename.
+        format!(
+            "importance=\"{}\"",
+            escape_xml_attribute(details.importance.as_str())
+        ),
         format!(
             "category=\"{}\"",
             escape_xml_attribute(details.category.as_str())
@@ -218,10 +225,6 @@ pub fn format_watchdog_warning_content_from_details(details: &WatchdogWarningDet
     ];
     // `:43-50` — every optional tag, in upstream's order, dropped when the field is absent.
     let optional = [
-        tag(
-            "confidence",
-            details.confidence.map(|c| c.as_str().to_string()),
-        ),
         tag("agent", details.agent.clone()),
         tag("run_id", details.run_id.clone()),
         tag("state", details.state.map(|s| s.as_str().to_string())),
@@ -306,10 +309,12 @@ pub fn create_watchdog_warning_message_from_details(
 )]
 mod tests {
     use super::*;
+    use crate::watchdog::types::WatchdogImportance;
 
     fn warning() -> WatchdogWarning {
         WatchdogWarning::new(
             WatchdogSeverity::Concern,
+            WatchdogImportance::Medium,
             "summary <one>",
             "evidence & more",
             "do the thing",
@@ -391,17 +396,34 @@ mod tests {
     #[test]
     fn optional_tags_appear_in_upstream_order_and_absent_ones_are_dropped() {
         let mut w = warning();
-        w.confidence = Some(WatchdogConfidence::High);
         w.agent = Some("reviewer".into());
         w.stale = Some(false);
         let content = format_watchdog_warning_content(&w);
-        let confidence = content.find("<confidence>").unwrap();
         let agent = content.find("<agent>").unwrap();
         let stale = content.find("<stale>").unwrap();
-        assert!(confidence < agent && agent < stale, "{content}");
+        assert!(agent < stale, "{content}");
         assert!(!content.contains("<run_id>"), "{content}");
         // `stale: false` is stringified, not dropped.
         assert!(content.contains("<stale>false</stale>"), "{content}");
+    }
+
+    /// SUBA-120 test (c). `importance` is rendered as the SECOND ATTRIBUTE
+    /// (`warning-format.ts:36-37` @v0.71.0), not as the optional `<confidence>` CHILD TAG it
+    /// replaced, and `confidence` must appear nowhere in the rendered warning — a renderer or a
+    /// round-trip parser keyed on the old tag would silently read nothing.
+    #[test]
+    fn the_rendered_warning_carries_importance_as_an_attribute_and_no_confidence_anywhere() {
+        let mut w = warning();
+        w.importance = WatchdogImportance::Low;
+        let content = format_watchdog_warning_content(&w);
+        assert!(
+            content.contains(
+                r#"<subagent_watchdog severity="concern" importance="low" category="other""#
+            ),
+            "{content}"
+        );
+        assert!(!content.contains("confidence"), "{content}");
+        assert!(!content.contains("<importance>"), "{content}");
     }
 
     #[test]
@@ -446,7 +468,6 @@ mod tests {
             &WatchdogWarningDetailsPatch {
                 category: Some(details.category),
                 source: Some(details.source),
-                confidence: details.confidence,
                 agent: details.agent.clone(),
                 run_id: details.run_id.clone(),
                 stale: details.stale,

@@ -25,7 +25,8 @@
 )]
 
 use crate::clipboard::{
-    ClipboardEnv, ClipboardWrite, MAX_OSC52_ENCODED_LENGTH, clipboard_write_plan, osc52_sequence,
+    ClipboardEnv, ClipboardError, ClipboardWrite, MAX_OSC52_ENCODED_LENGTH, WslRoute,
+    clipboard_failure, clipboard_write_plan, headless, osc52_required, osc52_sequence, wsl_route,
 };
 
 /// A headless, non-remote desktop with no display server at all.
@@ -182,25 +183,307 @@ fn osc52_refuses_an_oversized_payload() {
     assert!(osc52_sequence(&ok).is_some());
 }
 
-/// `if (remote || !copied)` (`clipboard.ts:166`). The remote case is the non-obvious one: a
-/// successful LOCAL write over SSH put the text on the wrong machine's clipboard, so the escape —
-/// which the terminal emulator forwards to the machine the user is actually sitting at — is emitted
-/// anyway.
+/// `if (!osc52Emitted && (isRemoteSession(env) || (!copied && headless)))` (`clipboard.ts:120`).
+/// The remote case is the non-obvious one: a successful LOCAL write over SSH put the text on the
+/// wrong machine's clipboard, so the escape — which the terminal emulator forwards to the machine
+/// the user is actually sitting at — is emitted anyway.
+///
+/// **TUI-102.** These four assertions previously pinned `osc52_required(remote, copied)` =
+/// `remote || !copied`; they are migrated in place to the three-argument gate, and the two
+/// `(false, false)` rows now carry the `headless` conjunct that decides them.
 #[test]
 fn osc52_is_emitted_when_remote_even_after_a_local_success() {
     assert!(
-        crate::clipboard::osc52_required(true, true),
+        osc52_required(true, true, false),
         "remote + copied still emits"
     );
     assert!(
-        crate::clipboard::osc52_required(false, false),
-        "nothing worked locally"
+        osc52_required(false, false, true),
+        "nothing worked locally and there was no local route to begin with"
     );
-    assert!(crate::clipboard::osc52_required(true, false));
+    assert!(osc52_required(true, false, false));
     assert!(
-        !crate::clipboard::osc52_required(false, true),
+        !osc52_required(false, true, false),
         "local success, local session"
     );
+}
+
+/// **TUI-102**, the headline defect. `DISPLAY` is set and `xclip`/`xsel` are missing, so the plan
+/// produced two failing steps. The old gate was `remote || !copied`, which made `!copied` alone
+/// enough: the OSC 52 escape went out, `copied` was forced `true`, and `/copy` reported
+/// `copied selection (N chars)` over a clipboard nothing had been written to. Upstream refuses
+/// precisely this — "OSC 52 cannot be verified, so a desktop session with a display reports the
+/// failure instead (#9618)" (`clipboard.ts:115-117`).
+///
+/// **Red without the change:** `headless` does not exist (so the file does not compile), and
+/// `osc52_required(false, false)` returns `true`.
+#[test]
+fn tui102_desktop_display_failure_does_not_emit_osc52() {
+    let env = ClipboardEnv {
+        x11_display: true,
+        ..bare()
+    };
+    assert!(!headless("linux", &env));
+    assert!(
+        !osc52_required(false, false, headless("linux", &env)),
+        "a desktop session with a display must report the failure, not emit an unverifiable escape",
+    );
+}
+
+/// The other half of the same gate: with no display server at all the terminal IS the only clipboard
+/// route (containers, WSL without WSLg), so the escape must still go out (`clipboard.ts:116-117`).
+/// Guards against over-narrowing the fix into a blanket "never emit on a local failure".
+#[test]
+fn tui102_headless_linux_still_emits_osc52() {
+    let env = bare();
+    assert!(headless("linux", &env));
+    assert!(osc52_required(false, false, headless("linux", &env)));
+    // Each of pi's three conjuncts, removed in turn, takes the box off the headless path.
+    for env in [
+        ClipboardEnv {
+            x11_display: true,
+            ..bare()
+        },
+        ClipboardEnv {
+            wayland_display: true,
+            ..bare()
+        },
+        ClipboardEnv {
+            termux: true,
+            ..bare()
+        },
+    ] {
+        assert!(!headless("linux", &env), "{env:?}");
+    }
+    // `p === "linux"` is literal upstream (`clipboard.ts:118`).
+    for os in ["macos", "windows", "freebsd"] {
+        assert!(!headless(os, &bare()), "{os}");
+    }
+}
+
+/// The remote clause survives the fix. Included so the gate cannot be "corrected" by collapsing it
+/// to `!copied && headless` — over SSH the local write went to the wrong machine, and the box may
+/// well have a `DISPLAY` of its own (`clipboard.ts:117`).
+#[test]
+fn tui102_remote_emits_even_after_a_local_success() {
+    assert!(osc52_required(true, true, false));
+    let desktop = ClipboardEnv {
+        remote: true,
+        x11_display: true,
+        ..bare()
+    };
+    assert!(osc52_required(
+        desktop.remote,
+        true,
+        headless("linux", &desktop)
+    ));
+}
+
+/// **TUI-102.** Pi's throw ladder (`clipboard.ts:124-137`) in its exact precedence order, with every
+/// message byte-compared. The old code had one string, `"Failed to copy to clipboard"`, for all five
+/// outcomes, so a user with no `xclip` installed was told nothing about what to install.
+///
+/// **Red without the change:** `ClipboardError` does not exist, so this file does not compile.
+#[test]
+fn tui102_failure_messages_are_pi_verbatim() {
+    assert_eq!(
+        clipboard_failure("linux", &bare(), true),
+        ClipboardError::Oversized
+    );
+    assert_eq!(
+        ClipboardError::Oversized.message(),
+        "Clipboard unavailable: text exceeds the OSC 52 size limit"
+    );
+
+    // `oversized` is checked BEFORE the platform block (`clipboard.ts:125-126`), so it wins over a
+    // display server that would otherwise name a helper.
+    assert_eq!(
+        clipboard_failure(
+            "linux",
+            &ClipboardEnv {
+                x11_display: true,
+                ..bare()
+            },
+            true
+        ),
+        ClipboardError::Oversized,
+    );
+
+    // termux → Wayland → X11 (`clipboard.ts:127-135`): the first rung that matches wins, so a
+    // Termux box with a `DISPLAY` is still a Termux failure.
+    assert_eq!(
+        clipboard_failure(
+            "linux",
+            &ClipboardEnv {
+                termux: true,
+                x11_display: true,
+                ..bare()
+            },
+            false
+        ),
+        ClipboardError::Termux,
+    );
+    assert_eq!(
+        ClipboardError::Termux.message(),
+        "Clipboard unavailable: install the Termux:API app and `termux-api` package"
+    );
+    assert_eq!(
+        clipboard_failure(
+            "linux",
+            &ClipboardEnv {
+                wayland_display: true,
+                x11_display: true,
+                ..bare()
+            },
+            false
+        ),
+        ClipboardError::Wayland,
+    );
+    assert_eq!(
+        ClipboardError::Wayland.message(),
+        "Clipboard unavailable: install `wl-clipboard` (`wl-copy`) or check Wayland access"
+    );
+    assert_eq!(
+        clipboard_failure(
+            "linux",
+            &ClipboardEnv {
+                x11_display: true,
+                ..bare()
+            },
+            false
+        ),
+        ClipboardError::X11,
+    );
+    assert_eq!(
+        ClipboardError::X11.message(),
+        "Clipboard unavailable: install `xclip` or `xsel`, or check X11 access"
+    );
+
+    // The fallthrough (`clipboard.ts:137`): the whole platform block is `p === "linux"`, so macOS
+    // reaches the bare message even with a display set.
+    assert_eq!(
+        clipboard_failure("macos", &bare(), false),
+        ClipboardError::Unavailable
+    );
+    assert_eq!(
+        clipboard_failure(
+            "macos",
+            &ClipboardEnv {
+                x11_display: true,
+                ..bare()
+            },
+            false
+        ),
+        ClipboardError::Unavailable,
+    );
+    assert_eq!(
+        clipboard_failure("linux", &bare(), false),
+        ClipboardError::Unavailable
+    );
+    assert_eq!(
+        ClipboardError::Unavailable.message(),
+        "Clipboard unavailable"
+    );
+}
+
+/// `headless` reads `wayland_display`, NOT the wider `wayland_session` — pi tests
+/// `env.WAYLAND_DISPLAY` alone (`clipboard.ts:118`), so an `XDG_SESSION_TYPE=wayland` box with no
+/// socket IS headless upstream, and correctly so: [`clipboard_write_plan`] refuses to queue
+/// `wl-copy` for it (asserted just above), leaving the terminal as the only route.
+///
+/// Pinned as its own test because `wayland_session` is the field a reader reaches for by name, and
+/// using it here would suppress the escape on exactly the box that needs it.
+#[test]
+fn tui102_headless_ignores_a_wayland_session_with_no_socket() {
+    let env = ClipboardEnv {
+        wayland_session: true,
+        wayland_display: false,
+        ..bare()
+    };
+    assert!(
+        clipboard_write_plan("linux", &env).is_empty(),
+        "no local step exists"
+    );
+    assert!(
+        headless("linux", &env),
+        "a Wayland session with no WAYLAND_DISPLAY has no local clipboard route",
+    );
+    assert!(osc52_required(false, false, headless("linux", &env)));
+}
+
+/// **TUI-102.** `if (!copied && p === "linux" && isWSL(env))` and its two routes
+/// (`clipboard.ts:110-114`): Windows Terminal gets OSC 52, anything else goes through the PowerShell
+/// interop write. cyrup had ZERO WSL symbols — `rg -i wsl crates/cyrup-tui/src/clipboard.rs` was
+/// empty — so WSL-without-WSLg fell out of the ladder as a plain "Clipboard unavailable".
+///
+/// Spawning `powershell.exe` is not exercised here; the decision is. That is the same limit
+/// [`clipboard_write_plan`] already accepts for `pbcopy` and `clip`, and the reason both are pure
+/// functions over a parameterised `os`.
+///
+/// **Red without the change:** neither `wsl_route` nor `WslRoute` exists.
+#[test]
+fn tui102_wsl_without_wslg_routes_to_windows_interop() {
+    assert_eq!(
+        wsl_route(
+            "linux",
+            &ClipboardEnv {
+                wsl: true,
+                wt_session: true,
+                ..bare()
+            }
+        ),
+        Some(WslRoute::Osc52),
+        "`if (env.WT_SESSION) osc52Emitted = emitOsc52(text)` (clipboard.ts:112)",
+    );
+    assert_eq!(
+        wsl_route(
+            "linux",
+            &ClipboardEnv {
+                wsl: true,
+                wt_session: false,
+                ..bare()
+            }
+        ),
+        Some(WslRoute::PowerShell),
+        "`copied = osc52Emitted || copyViaWindowsClipboard(text)` (clipboard.ts:113)",
+    );
+    assert_eq!(
+        wsl_route("linux", &bare()),
+        None,
+        "an ordinary Linux box takes no interop route"
+    );
+    // `p === "linux"` is literal (`clipboard.ts:110`): a stray WSLENV on another platform is inert.
+    assert_eq!(
+        wsl_route(
+            "macos",
+            &ClipboardEnv {
+                wsl: true,
+                wt_session: true,
+                ..bare()
+            }
+        ),
+        None
+    );
+    assert_eq!(
+        wsl_route(
+            "windows",
+            &ClipboardEnv {
+                wsl: true,
+                ..bare()
+            }
+        ),
+        None
+    );
+
+    // WSL without WSLg has no display, so it is also headless — which is what makes the interop arm
+    // the only thing between it and a failure.
+    assert!(headless(
+        "linux",
+        &ClipboardEnv {
+            wsl: true,
+            ..bare()
+        }
+    ));
 }
 
 // ------------------------------------------------------------------ the READ side (DRIFT-045) --

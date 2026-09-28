@@ -17,6 +17,7 @@
     clippy::panic
 )]
 
+use cyrup_core::ModelId;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -573,4 +574,117 @@ fn runtime_source_outranks_project_in_name_resolution() {
             other => panic!("expected the runtime agent: {other:?}"),
         }
     }
+}
+
+// -------------------------------------------------------------------------------------------
+// 13. SUBA-121 — settings defaults and the narrowed override reach a runtime agent THROUGH
+//     `run_discovery` (`applyRuntimeAgentSettings`, `agents.ts:1619-1627` @v0.71.0)
+// -------------------------------------------------------------------------------------------
+
+/// SUBA-121, end to end. The unit coverage in `discovery::merge::tests` calls
+/// `apply_runtime_agent_settings` on a hand-built `Vec<AgentDefinition>`; nothing proved that
+/// `run_discovery` actually invokes it, and the whole point of this row is the WIRING — runtime
+/// agents are appended after `discover_and_merge` has already run `apply_overrides`, so the only
+/// thing that makes a `subagents.defaultModel` reach one is the extra pass at the call site.
+/// Deleting that pass leaves every unit test in `merge::tests` green.
+///
+/// Three settings and three outcomes, all read back off the DISCOVERED agent:
+///
+/// * `defaultModel` fills a runtime agent that declares no model, and stamps `model_source =
+///   SettingsDefault` (`applySubagentDefaultModel`, step 1);
+/// * `agentOverrides.<runtime-name>.thinking` reaches it (step 3, through the narrowing);
+/// * `defaultExtensions` does NOT — upstream's `applyRuntimeAgentSettings` runs only the model,
+///   thinking and narrowed-override passes, never `applySubagentDefaultExtensions`, so a runtime
+///   agent's extension surface stays extension-owned. That exclusion is as load-bearing as the
+///   two inclusions, so it is asserted in the same test.
+#[test]
+fn settings_defaults_and_narrowed_overrides_reach_a_runtime_agent_through_discovery() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let settings_path = base.path().join("settings.json");
+    std::fs::write(
+        &settings_path,
+        r#"{"subagents": {
+            "defaultModel": "p/m",
+            "defaultExtensions": ["must-not-reach-runtime"],
+            "agentOverrides": {"runtime-scout": {"thinking": "high", "tools": ["Read"]}}
+        }}"#,
+    )
+    .expect("write settings");
+
+    // A configured on-disk agent at the same scope, so the test also shows the runtime agent is
+    // not simply riding the normal merge path: this one goes through `discover_and_merge`.
+    write_agent(&user_agents_dir(base.path()), "disk-scout", &[]);
+
+    let registry = registry();
+    registry
+        .register(
+            "runtime-scout",
+            &RuntimeAgentDefinition::new("Runtime scout", "Scout at runtime."),
+        )
+        .expect("registers");
+
+    let mut cfg = cfg_with_registry(base.path(), &registry);
+    cfg.override_settings =
+        crate::discovery::load_layered_override_settings(&settings_path, None).expect("loads");
+
+    let result = discover_agents(&cfg, None).expect("discovers");
+    let agent = result
+        .agents
+        .iter()
+        .find(|a| a.name == "runtime-scout")
+        .expect("the runtime agent is discovered");
+    assert_eq!(agent.source, AgentSource::Runtime);
+    assert_eq!(
+        agent.model.as_ref().map(ModelId::as_str),
+        Some("p/m"),
+        "`subagents.defaultModel` must reach a model-less runtime agent"
+    );
+    assert_eq!(
+        agent.model_source,
+        Some(crate::discovery::types::AgentModelSourceInfo::SettingsDefault)
+    );
+    assert_eq!(
+        agent.thinking.as_deref(),
+        Some("high"),
+        "`agentOverrides.<runtime-name>.thinking` must reach it"
+    );
+    assert!(
+        !agent
+            .extensions
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e == "must-not-reach-runtime"),
+        "`defaultExtensions` is deliberately NOT part of `applyRuntimeAgentSettings`: {:?}",
+        agent.extensions
+    );
+    assert!(
+        !agent
+            .tools
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|t| matches!(t, crate::discovery::types::ToolRef::Builtin(n) if n == "Read")),
+        "the override narrowing keeps `tools` out: {:?}",
+        agent.tools
+    );
+
+    // Control: the on-disk agent gets `defaultModel` AND `defaultExtensions`, which is what the
+    // full `apply_overrides` pass does and what makes the runtime agent's narrower treatment a
+    // deliberate difference rather than a missing pass.
+    let disk = result
+        .agents
+        .iter()
+        .find(|a| a.name == "disk-scout")
+        .expect("the on-disk agent is discovered");
+    assert_eq!(disk.model.as_ref().map(ModelId::as_str), Some("p/m"));
+    assert!(
+        disk.extensions
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e == "must-not-reach-runtime"),
+        "control: an on-disk agent DOES take `defaultExtensions`: {:?}",
+        disk.extensions
+    );
 }

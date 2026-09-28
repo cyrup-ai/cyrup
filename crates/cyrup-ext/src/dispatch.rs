@@ -450,14 +450,18 @@ impl Dispatcher {
                 // always reported (arch-08 §8) and never crashes the host. What happens NEXT is
                 // per-kind (EXT-001):
                 //
-                // * fail CLOSED (`EventKind::fails_closed`, today `tool_call` only) — the fault
-                //   BLOCKS the action, matching Pi: `emitToolCall` (runner.ts:932-953) has no
+                // * fail CLOSED (`EventKind::fails_closed`, today `tool_call` and `user_bash`) — the
+                //   fault BLOCKS the action, matching Pi: `emitToolCall` (runner.ts:932-953) has no
                 //   try/catch, `agent-session.ts:475-487` re-throws `Extension failed, blocking
                 //   execution: …`, and `agent-loop.ts:616-662` turns that into an immediate error
-                //   result without executing the tool. Failing open here would let a trapped,
-                //   panicking, or timed-out permission gate ALLOW the call it was meant to deny.
-                //   Note this is a FAULT, not a decline: a handler that returns `Noop`/`Mutate`
-                //   (declined to block) still proceeds, exactly as before.
+                //   result without executing the tool. `emitUserBash` (runner.ts:1154-1183 @v0.87.1)
+                //   reports and then RE-THROWS (`throw err;`, :1177) since coding-agent 0.86.0
+                //   (*Breaking*, #9068), and neither of its callers falls back to local execution.
+                //   Failing open here would let a trapped, panicking, or timed-out permission gate
+                //   ALLOW the call it was meant to deny, or run a `!` command locally that an
+                //   extension was meant to redirect. Note this is a FAULT, not a decline: a handler
+                //   that returns `Noop`/`Mutate` (declined to block) still proceeds, exactly as
+                //   before.
                 //
                 // * fail OPEN (every other kind) — degrades to no-mutation and the chain continues,
                 //   matching the per-handler `catch { continue }` in each of Pi's other emitters.

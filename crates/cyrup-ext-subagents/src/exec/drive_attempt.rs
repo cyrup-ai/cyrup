@@ -47,6 +47,11 @@ pub(crate) struct DriveOutcome {
     /// force-terminated through the signal ladder and this diagnostic becomes the attempt's error,
     /// ahead of every other diagnosis.
     pub(crate) protocol_error: Option<crate::exec::child_protocol::ProtocolOutputLimit>,
+    /// SUBA-119 — the model-verification failure this attempt observed, if any: the child's assistant
+    /// `message_end` reported a model that is not the launch candidate and is not an accepted alias of
+    /// it. Folded onto the attempt's error by `attempt_runner`, the way upstream assigns
+    /// `result.error` at `execution.ts:1102`.
+    pub(crate) model_verification_error: Option<String>,
     /// The child's real exit status once confirmed gone, or a genuine `wait()`/read I/O fault.
     pub(crate) exit_status: std::io::Result<Option<std::process::ExitStatus>>,
     /// R-SA-037: the child's NDJSON stream showed a BLOCKING `contact_supervisor` supervisor-clarify
@@ -147,6 +152,24 @@ fn message_end_tool_calls(event: &SubagentEvent) -> Vec<&serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// SUBA-119 — the `model` an ASSISTANT `message_end` reports, when it carries a non-empty one. pi's
+/// `evt.message.model` under its `if (evt.message.model)` guard (`execution.ts:1096`), which in JS is
+/// falsy for both an absent field and an empty string.
+///
+/// The role check is upstream's too: `execution.ts:1096` sits inside the assistant-`message_end` arm,
+/// and `exec/child_transcript.rs:374` already reads this same field off an assistant message, so the
+/// wire is known to carry it.
+fn assistant_message_end_model(event: &SubagentEvent) -> Option<&str> {
+    if !is_assistant_message_end(event) {
+        return None;
+    }
+    let SubagentEvent::MessageEnd { message } = event else {
+        return None;
+    };
+    let model = message.get("model").and_then(serde_json::Value::as_str)?;
+    (!model.is_empty()).then_some(model)
+}
+
 /// SUBA-008 — pi's `hasToolCall` (`execution.ts:919`).
 fn message_end_has_tool_call(event: &SubagentEvent) -> bool {
     !message_end_tool_calls(event).is_empty()
@@ -205,6 +228,31 @@ struct DriveState {
     /// pi `watchdogTailTimer` (`:561`): armed while an armed child that has finished its turn is
     /// still reviewing; when it fires the review is declared stale and the drain starts.
     watchdog_tail_at: Option<tokio::time::Instant>,
+    /// SUBA-118 — pi `compactionStartedReceived` (`execution.ts:546,970`): a `compaction_start` has
+    /// been seen and not yet been cancelled. Cleared by `compaction_end{willRetry:true}` (`:971-974`)
+    /// and by `agent_start`/`auto_retry_start` (`:977-980`), because each of those means the child is
+    /// starting fresh rather than settling after a compaction.
+    compaction_started: bool,
+    /// SUBA-118 — pi `afterCompactionSettlement` (`execution.ts:547,996-999`): the child settled its
+    /// drain WHILE a compaction was outstanding.
+    ///
+    /// It deliberately stops HERE rather than riding out on [`DriveOutcome`] (upstream's
+    /// `result.afterCompactionSettlement`, `execution.ts:1418-1420`). The only consumer would be the
+    /// abort-recovery dispatch, which is unported for the reason recorded on
+    /// `crate::exec::fallback::AttemptNote`'s UNPORTED list; carrying it onto the outcome now would add
+    /// a field nothing reads. The fold itself is kept and tested because it is the half that CAN be
+    /// verified against upstream today, and it is what the dispatch will read when it lands.
+    ///
+    /// This is the marker
+    /// [`crate::exec::abort_recovery::plan_abort_recovery`] reads as `after_compaction_settlement`,
+    /// and it is what makes a terminal-drain cleanup signal non-authoritative
+    /// (`abort-recovery.ts:109`).
+    after_compaction_settlement: bool,
+    /// SUBA-119 — the first model-verification failure seen on this attempt, if any. Upstream's
+    /// `if (modelVerificationError && !result.error) result.error = modelVerificationError;`
+    /// (`execution.ts:1102`) never CLOBBERS an earlier error, and the `!result.error` half of that is
+    /// why this latches the FIRST one and ignores every later one.
+    model_verification_error: Option<String>,
 }
 
 /// Which of [`drive_attempt`]'s exit paths is settling the attempt — the ONLY thing that differs
@@ -247,6 +295,9 @@ impl DriveState {
             clean_terminal_stop: false,
             agent_settled: false,
             detached_seen: false,
+            compaction_started: false,
+            after_compaction_settlement: false,
+            model_verification_error: None,
             turn_budget: crate::exec::turn_budget::TurnBudgetTracker::new(
                 opts.turn_budget,
                 opts.enforce_hard_turn_limit,
@@ -266,6 +317,7 @@ impl DriveState {
             interrupted: matches!(reason, Settled::Interrupted),
             forced_termination: matches!(reason, Settled::ForcedDrain),
             clean_terminal_stop: self.clean_terminal_stop,
+            model_verification_error: self.model_verification_error.clone(),
             exit_status,
             detached: self.detached_seen,
             agent_settled: self.agent_settled,
@@ -417,6 +469,7 @@ async fn handle_child_line(
     control: &mut crate::exec::control::ControlMonitor,
     opts: &RunOptions,
     transcript: Option<&mut ChildTranscriptWriter>,
+    expected_model_for_verification: Option<&str>,
 ) -> LineAction {
     // NOTE: the raw NDJSON envelope deliberately does NOT enter `progress.recent_output` — pi
     // appends only EXTRACTED text, from an assistant `message_end`'s content and a finished tool
@@ -448,6 +501,31 @@ async fn handle_child_line(
     if matches!(event, crate::exec::ndjson::SubagentEvent::AgentSettled) {
         state.agent_settled = true;
     }
+    // SUBA-118 — pi's compaction-evidence fold (`execution.ts:970-980`), in upstream's order and
+    // BEFORE the lifecycle projection below, because the `agent_settled` arm reads
+    // `compaction_started` as it stands at that moment.
+    match &event {
+        // `:970`
+        crate::exec::ndjson::SubagentEvent::CompactionStart { .. } => {
+            state.compaction_started = true;
+        }
+        // `:971-974` — a compaction that will RETRY is not a settled compaction, so both markers
+        // clear. `aborted` alone does NOT clear them: upstream gates only on `willRetry === true`.
+        crate::exec::ndjson::SubagentEvent::CompactionEnd {
+            will_retry: true, ..
+        } => {
+            state.compaction_started = false;
+            state.after_compaction_settlement = false;
+        }
+        // `:977-980` — a child starting a fresh agent run, or backing off into an auto-retry, is not
+        // settling after a compaction.
+        crate::exec::ndjson::SubagentEvent::AgentStart
+        | crate::exec::ndjson::SubagentEvent::AutoRetryStart { .. } => {
+            state.compaction_started = false;
+            state.after_compaction_settlement = false;
+        }
+        _ => {}
+    }
     // pi `applyChildLifecycle(projectChildLifecycle(evt))` — run for EVERY event
     // (`execution.ts:844`), plus the terminal-stop form at `:947`. The three arms are:
     // `agent_end{willRetry:true}` DISARMS the window (the child is about to retry — force-killing
@@ -472,7 +550,16 @@ async fn handle_child_line(
             state.final_drain_at = None;
             state.watchdog_tail_at = None;
         }
-        crate::exec::child_protocol::ChildLifecycleAction::StartDrain => state.start_final_drain(),
+        crate::exec::child_protocol::ChildLifecycleAction::StartDrain => {
+            // SUBA-118 — pi `:996-999`: `if (evt.type === "agent_settled" && lifecycleAction ===
+            // "start-drain") afterCompactionSettlement = compactionStartedReceived;`. Both halves of
+            // that guard are load-bearing: it is an `agent_settled` that ACTUALLY starts the drain,
+            // not merely any `agent_settled` and not any other event that starts one.
+            if matches!(event, crate::exec::ndjson::SubagentEvent::AgentSettled) {
+                state.after_compaction_settlement = state.compaction_started;
+            }
+            state.start_final_drain();
+        }
         crate::exec::child_protocol::ChildLifecycleAction::None => {}
     }
     // R-SA-037 detach-trigger arm: a child's blocking `contact_supervisor` ask
@@ -533,6 +620,24 @@ async fn handle_child_line(
     // consumes the event by value (same reason the control fold above runs here).
     let assistant_turn = is_assistant_message_end(&event);
     let has_tool_call = message_end_has_tool_call(&event);
+    // SUBA-119 — pi `execution.ts:1096-1103`: inside `if (evt.message.model)`, gated on
+    // `expectedModelForVerification && !hasToolCall`, and assigned with `&& !result.error` so it never
+    // clobbers an earlier error. The `!hasToolCall` gate is upstream's: a message that is making a
+    // tool call is mid-turn, and a provider may report a different routing id on one of those without
+    // the run having actually changed model.
+    if let Some(expected) = expected_model_for_verification
+        && !has_tool_call
+        && state.model_verification_error.is_none()
+        && let Some(observed) = assistant_message_end_model(&event)
+    {
+        state.model_verification_error =
+            crate::exec::model_verification::format_subagent_model_verification_error(
+                expected,
+                observed,
+                &crate::extension::models::registry_available_models(),
+                opts.model_response_aliases.as_ref(),
+            );
+    }
     let terminal_structured_output_call =
         opts.structured_output_schema.is_some() && is_sole_structured_output_tool_call(&event);
     progress.record_event(event);
@@ -684,6 +789,19 @@ fn arm_post_exit_drain(state: &mut DriveState) {
 /// on every exit path (R-SA-067), so this function's own signature is shaped to always be able to
 /// hand `child` off to whichever exit path is taken, with no placeholder/`Default` value ever
 /// needed to satisfy a borrow.
+/// The two per-attempt facts [`drive_attempt`] needs beyond the child, the progress record and the
+/// run-wide [`RunOptions`]. Bundled rather than passed loose so the function stays within this
+/// workspace's argument bound (`clippy::too_many_arguments`).
+pub(crate) struct DriveAttemptInputs<'a> {
+    /// UW-3 — the child-watchdog config this attempt encoded into the child's env (pi `childWatchdog`,
+    /// `execution.ts:298-302`), or `None` when the child runs unarmed.
+    pub(crate) child_watchdog: Option<ChildWatchdogConfig>,
+    /// SUBA-119 — pi's `expectedModelForVerification` (`execution.ts:365`): the exact `--model` argv
+    /// this attempt launched with, or `None` when verification is off for this run
+    /// (`shared.verifyModel` false — no candidate, or the model came from the parent session).
+    pub(crate) expected_model_for_verification: Option<&'a str>,
+}
+
 pub(crate) async fn drive_attempt(
     mut child: SpawnedChild,
     progress: &mut AgentProgress,
@@ -691,8 +809,12 @@ pub(crate) async fn drive_attempt(
     deadline_sleep: Option<tokio::time::Sleep>,
     control: &mut crate::exec::control::ControlMonitor,
     mut transcript: Option<&mut ChildTranscriptWriter>,
-    child_watchdog: Option<ChildWatchdogConfig>,
+    inputs: DriveAttemptInputs<'_>,
 ) -> DriveOutcome {
+    let DriveAttemptInputs {
+        child_watchdog,
+        expected_model_for_verification,
+    } = inputs;
     tokio::pin!(deadline_sleep);
     let cancel = opts.cancel.clone();
     let interrupt = opts.interrupt.clone();
@@ -755,6 +877,7 @@ pub(crate) async fn drive_attempt(
                             control,
                             opts,
                             transcript.as_deref_mut(),
+                            expected_model_for_verification,
                         )
                         .await
                         {
@@ -899,6 +1022,7 @@ mod tests {
             &mut control,
             &opts,
             None,
+            None,
         )
         .await;
         assert!(matches!(action, LineAction::Continue));
@@ -919,6 +1043,7 @@ mod tests {
             &mut progress,
             &mut control,
             &opts,
+            None,
             None,
         )
         .await;
@@ -954,6 +1079,346 @@ mod tests {
         assert_eq!(
             state.fold_child_watchdog_line("{\"type\":\"turn_start\"}"),
             None
+        );
+    }
+
+    // ---- SUBA-119: model verification (`execution.ts:1096-1103` @v0.71.0) -----------------------
+
+    /// An assistant `message_end` NDJSON line reporting `model`, optionally with a `toolCall` part.
+    fn assistant_message_end(model: &str, tool_call: bool) -> String {
+        let mut content = vec![serde_json::json!({ "type": "text", "text": "done" })];
+        if tool_call {
+            content.push(serde_json::json!({ "type": "toolCall", "name": "bash", "id": "t1" }));
+        }
+        serde_json::json!({
+            "type": "message_end",
+            "message": { "role": "assistant", "model": model, "content": content },
+        })
+        .to_string()
+    }
+
+    /// Feed one line through `handle_child_line` with verification armed for `expected`, and report
+    /// whatever error was latched.
+    async fn verification_error_for(line: &str, expected: Option<&str>) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::exec::testsupport::base_opts(dir.path(), &["m"]);
+        let mut state = DriveState::new(&opts, None);
+        let mut progress = AgentProgress::default();
+        let mut control = crate::exec::control::ControlMonitor::new(
+            crate::exec::control::ResolvedControlConfig::default(),
+            "run-1".to_string(),
+            "worker".to_string(),
+            None,
+            None,
+            0,
+        );
+        handle_child_line(
+            line,
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+            expected,
+        )
+        .await;
+        state.model_verification_error
+    }
+
+    /// SUBA-119 test (b). A child whose assistant `message_end` reports a model that is not the launch
+    /// candidate latches the verification error. Nothing in this crate compared the two before.
+    ///
+    /// The models used are real entries of the credential-blind catalog
+    /// `crate::extension::models::registry_available_models` reads, because clause `:20` turns the
+    /// check off for an EMPTY registry and clause `:26` needs the expected id to be a known `fullId`.
+    #[tokio::test]
+    async fn a_child_reporting_a_different_model_latches_the_verification_error() {
+        let available = crate::extension::models::registry_available_models();
+        let expected = available
+            .first()
+            .map(|e| e.full_id().to_string())
+            .expect("the builtin catalog is not empty");
+        let observed = available
+            .iter()
+            .map(|e| e.full_id().to_string())
+            .find(|id| {
+                crate::exec::spawn_plan::split_known_thinking_suffix(id).0
+                    != crate::exec::spawn_plan::split_known_thinking_suffix(&expected).0
+                    && !id.ends_with(&format!(
+                        "/{}",
+                        crate::exec::spawn_plan::split_known_thinking_suffix(&expected).0
+                    ))
+            })
+            .expect("the catalog ships more than one distinct model");
+
+        let err = verification_error_for(
+            &assistant_message_end(&observed, false),
+            Some(expected.as_str()),
+        )
+        .await;
+        let err = err.expect("a reported model that is not the candidate must be an error");
+        assert!(
+            err.starts_with(
+                "model_verification_failed: native Pi child reported a different model"
+            ),
+            "{err}"
+        );
+        assert!(err.contains(&format!("Expected '{expected}'")), "{err}");
+        assert!(err.contains(&format!("observed '{observed}'")), "{err}");
+    }
+
+    /// SUBA-119 — the row's Verify sentence, second half: *"the same run with
+    /// `modelResponseAliases: {'prov/model': ['other/model']}` succeeds."* The SAME child stream
+    /// that latches the error above latches nothing once the observed id is declared under the
+    /// launch candidate, because `RunOptions::model_response_aliases` — now fed from `config.json`
+    /// — reaches the check.
+    #[tokio::test]
+    async fn a_declared_alias_on_the_run_options_clears_the_verification_error() {
+        let available = crate::extension::models::registry_available_models();
+        let expected = available
+            .first()
+            .map(|e| e.full_id().to_string())
+            .expect("the builtin catalog is not empty");
+        let observed = available
+            .iter()
+            .map(|e| e.full_id().to_string())
+            .find(|id| {
+                crate::exec::spawn_plan::split_known_thinking_suffix(id).0
+                    != crate::exec::spawn_plan::split_known_thinking_suffix(&expected).0
+                    && !id.ends_with(&format!(
+                        "/{}",
+                        crate::exec::spawn_plan::split_known_thinking_suffix(&expected).0
+                    ))
+            })
+            .expect("the catalog ships more than one distinct model");
+        let line = assistant_message_end(&observed, false);
+
+        // Premise: without the declaration this exact stream fails the run.
+        assert!(
+            verification_error_for(&line, Some(expected.as_str()))
+                .await
+                .is_some(),
+            "premise: the undeclared case must still be an error"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = crate::exec::testsupport::base_opts(dir.path(), &["m"]);
+        opts.model_response_aliases = Some(std::collections::BTreeMap::from([(
+            crate::exec::spawn_plan::split_known_thinking_suffix(&expected)
+                .0
+                .to_string(),
+            vec![observed.clone()],
+        )]));
+        let mut state = DriveState::new(&opts, None);
+        let mut progress = AgentProgress::default();
+        let mut control = crate::exec::control::ControlMonitor::new(
+            crate::exec::control::ResolvedControlConfig::default(),
+            "run-1".to_string(),
+            "worker".to_string(),
+            None,
+            None,
+            0,
+        );
+        handle_child_line(
+            &line,
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+            Some(expected.as_str()),
+        )
+        .await;
+        assert_eq!(
+            state.model_verification_error, None,
+            "a declared alias must clear the run failure"
+        );
+    }
+
+    /// SUBA-119 test (c). The same stream with a `toolCall` content part latches NOTHING — upstream's
+    /// `!hasToolCall` gate (`execution.ts:1099`). A message that is making a tool call is mid-turn.
+    #[tokio::test]
+    async fn a_message_end_carrying_a_tool_call_is_not_verified() {
+        let available = crate::extension::models::registry_available_models();
+        let expected = available
+            .first()
+            .map(|e| e.full_id().to_string())
+            .expect("catalog non-empty");
+        let observed = available
+            .iter()
+            .map(|e| e.full_id().to_string())
+            .find(|id| id != &expected)
+            .expect("more than one model");
+        assert_eq!(
+            verification_error_for(
+                &assistant_message_end(&observed, true),
+                Some(expected.as_str())
+            )
+            .await,
+            None,
+            "a tool-calling message is exempt from verification"
+        );
+    }
+
+    /// SUBA-119 test (d). Verification OFF (`expected_model_for_verification: None`, which is what a
+    /// parent-inherited launch produces via `!opts.model_override_from_parent` in `attempt_runner`)
+    /// latches nothing, however different the reported model is.
+    #[tokio::test]
+    async fn verification_off_never_latches_an_error() {
+        assert_eq!(
+            verification_error_for(&assistant_message_end("nothing/like-it", false), None).await,
+            None
+        );
+    }
+
+    /// The matching case: a child reporting the model it was launched with is silent.
+    #[tokio::test]
+    async fn a_child_reporting_the_launch_candidate_latches_nothing() {
+        let available = crate::extension::models::registry_available_models();
+        let expected = available
+            .first()
+            .map(|e| e.full_id().to_string())
+            .expect("catalog non-empty");
+        assert_eq!(
+            verification_error_for(
+                &assistant_message_end(&expected, false),
+                Some(expected.as_str())
+            )
+            .await,
+            None
+        );
+    }
+
+    /// A NON-assistant `message_end` is not verified, and neither is a message with no `model`:
+    /// upstream's check lives inside the assistant arm, under `if (evt.message.model)`
+    /// (`execution.ts:1096`).
+    #[tokio::test]
+    async fn a_user_message_end_and_a_model_less_one_are_both_exempt() {
+        let user = serde_json::json!({
+            "type": "message_end",
+            "message": { "role": "user", "model": "nothing/like-it", "content": [] },
+        })
+        .to_string();
+        assert_eq!(
+            verification_error_for(&user, Some("prov/model")).await,
+            None
+        );
+
+        let no_model = serde_json::json!({
+            "type": "message_end",
+            "message": { "role": "assistant", "content": [] },
+        })
+        .to_string();
+        assert_eq!(
+            verification_error_for(&no_model, Some("prov/model")).await,
+            None
+        );
+    }
+
+    // ---- SUBA-118: compaction evidence (`execution.ts:970-999` @v0.71.0) ------------------------
+
+    /// Feed a sequence of raw NDJSON lines through `handle_child_line` and report the two compaction
+    /// markers as they stand afterwards.
+    async fn compaction_markers_after(lines: &[String]) -> (bool, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::exec::testsupport::base_opts(dir.path(), &["m"]);
+        let mut state = DriveState::new(&opts, None);
+        let mut progress = AgentProgress::default();
+        let mut control = crate::exec::control::ControlMonitor::new(
+            crate::exec::control::ResolvedControlConfig::default(),
+            "run-1".to_string(),
+            "worker".to_string(),
+            None,
+            None,
+            0,
+        );
+        for line in lines {
+            handle_child_line(
+                line,
+                &mut state,
+                &mut progress,
+                &mut control,
+                &opts,
+                None,
+                None,
+            )
+            .await;
+        }
+        (state.compaction_started, state.after_compaction_settlement)
+    }
+
+    fn ev(value: serde_json::Value) -> String {
+        value.to_string()
+    }
+
+    /// SUBA-118 test (d). `compaction_start` then `agent_settled` marks the settlement; the same
+    /// sequence with an intervening `compaction_end{willRetry:true}` does NOT
+    /// (`execution.ts:970-974,996-999`).
+    ///
+    /// This is the distinction the whole abort-recovery exemption rests on: without it, a
+    /// terminal-drain cleanup signal would veto every compaction resume
+    /// (`abort-recovery.ts:109`).
+    #[tokio::test]
+    async fn a_compaction_that_will_retry_does_not_count_as_a_settled_compaction() {
+        let start = ev(serde_json::json!({ "type": "compaction_start", "reason": "context" }));
+        let settled = ev(serde_json::json!({ "type": "agent_settled" }));
+        let end_retry = ev(
+            serde_json::json!({ "type": "compaction_end", "reason": "context", "willRetry": true }),
+        );
+
+        assert_eq!(
+            compaction_markers_after(&[start.clone(), settled.clone()]).await,
+            (true, true),
+            "compaction_start then agent_settled marks the settlement"
+        );
+        assert_eq!(
+            compaction_markers_after(&[start.clone(), end_retry, settled.clone()]).await,
+            (false, false),
+            "a compaction that will retry clears both markers before the settlement"
+        );
+        // …and with no compaction at all, an `agent_settled` marks nothing.
+        assert_eq!(compaction_markers_after(&[settled]).await, (false, false));
+    }
+
+    /// `:977-980` — `agent_start` and `auto_retry_start` each clear BOTH markers: a child starting
+    /// fresh, or backing off into a retry, is not settling after a compaction.
+    #[tokio::test]
+    async fn a_fresh_agent_start_or_auto_retry_clears_the_compaction_markers() {
+        let start = ev(serde_json::json!({ "type": "compaction_start", "reason": "context" }));
+        let settled = ev(serde_json::json!({ "type": "agent_settled" }));
+
+        for clearing in [
+            ev(serde_json::json!({ "type": "agent_start" })),
+            ev(serde_json::json!({
+                "type": "auto_retry_start",
+                "attempt": 1,
+                "maxAttempts": 3,
+                "delayMs": 100,
+            })),
+        ] {
+            assert_eq!(
+                compaction_markers_after(&[start.clone(), settled.clone(), clearing.clone(),])
+                    .await,
+                (false, false),
+                "{clearing} must clear both markers"
+            );
+        }
+    }
+
+    /// `:971-974` gates on `willRetry === true` alone — a compaction that ENDED without retrying
+    /// leaves the marker standing, so the settlement that follows still counts.
+    #[tokio::test]
+    async fn a_compaction_end_without_will_retry_leaves_the_marker_standing() {
+        let start = ev(serde_json::json!({ "type": "compaction_start", "reason": "context" }));
+        let end = ev(serde_json::json!({
+            "type": "compaction_end",
+            "reason": "context",
+            "willRetry": false,
+        }));
+        let settled = ev(serde_json::json!({ "type": "agent_settled" }));
+        assert_eq!(
+            compaction_markers_after(&[start, end, settled]).await,
+            (true, true)
         );
     }
 }

@@ -116,6 +116,10 @@ fn fixture_spawn_command(script_path: &Path) -> SpawnCommand {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        // SUBA-119 — a fixture launch whose model comes from its own agent config, so
+        // native-child model verification is armed and no response-id alias is declared.
+        model_override_from_parent: false,
+        model_response_aliases: None,
         parent_env_overrides: std::collections::BTreeMap::new(),
         machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and

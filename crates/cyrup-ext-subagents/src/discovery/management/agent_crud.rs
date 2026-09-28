@@ -270,7 +270,8 @@ fn build_definition(
         allow_nested_subagents: None,
         extensions: fields.extensions.clone().unwrap_or(None),
         extensions_from_default: false,
-        subagent_only_extensions: fields.subagent_only_extensions.clone().unwrap_or_default(),
+        subagent_only_extensions: fields.subagent_only_extensions.clone(),
+        subagent_only_extensions_from_default: false,
         model: fields.model.clone().unwrap_or(None),
         fallback_models: fields.fallback_models.clone().unwrap_or_default(),
         thinking: fields.thinking.clone().unwrap_or(None),
@@ -371,7 +372,8 @@ fn merge_fields(
         subagent_only_extensions: fields
             .subagent_only_extensions
             .clone()
-            .unwrap_or_else(|| existing.subagent_only_extensions.clone()),
+            .or_else(|| existing.subagent_only_extensions.clone()),
+        subagent_only_extensions_from_default: existing.subagent_only_extensions_from_default,
         model: fields
             .model
             .clone()

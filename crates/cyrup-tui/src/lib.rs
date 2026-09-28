@@ -180,8 +180,8 @@ pub use keymap::{
     SelectKeymap, SessionAction, SessionKeymap, TreeAction, TreeKeymap,
 };
 pub use login_dialog::{
-    LoginDialog, LoginFinished, LoginLineKind, LoginUiMsg, TuiAuthInteraction, notify_auth_dialog,
-    show_auth_prompt,
+    LoginDialog, LoginFinished, LoginLineKind, LoginRefreshMsg, LoginUiMsg, TuiAuthInteraction,
+    notify_auth_dialog, show_auth_prompt,
 };
 pub use markdown::{
     render as render_markdown, render_with_hyperlink_support as render_markdown_with_hyperlinks,

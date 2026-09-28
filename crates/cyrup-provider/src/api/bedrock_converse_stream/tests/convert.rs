@@ -389,3 +389,111 @@ fn tool_config_shape_and_choice_mapping() {
     );
     assert!(body.get("toolConfig").is_none());
 }
+
+/// PROV-097 — `sanitizeBedrockDocument` over `toolUse.input` (pi `:921-934`, called at `:1008`
+/// @v0.87.1) and the `redactedContent` replay of an encrypted thinking block (pi `:1010-1019`).
+mod prov097_replay {
+    use super::*;
+    use base64::Engine as _;
+
+    /// The assistant's `model` must match the request's, or `transform_messages_with`
+    /// (`openai_completions::transform`, pi `transformMessages`) drops a redacted thinking block as
+    /// foreign history before the Bedrock converter ever sees it.
+    fn assistant(content: Vec<Content>) -> Message {
+        Message::Assistant(AssistantMessage {
+            content,
+            provider: "amazon-bedrock".into(),
+            model: sonnet_45().id.as_str().to_string(),
+            api: API_ID.into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            timestamp: 1,
+        })
+    }
+
+    fn assistant_blocks(content: Vec<Content>) -> Vec<Value> {
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User {
+                    content: vec![Content::text("hi")],
+                    timestamp: 0,
+                },
+                assistant(content),
+            ],
+            tools: Vec::new(),
+        };
+        let body = payload(
+            &sonnet_45(),
+            &ctx,
+            &StreamOptions::default(),
+            &BedrockOptions::default(),
+        );
+        messages_of(&body)
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .and_then(|m| m["content"].as_array())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// (i) Zero-length keys are dropped at EVERY depth, including inside arrays; every other key
+    /// survives untouched. Bedrock's `DocumentType` rejects an empty key, so replaying the
+    /// arguments verbatim failed the whole request.
+    #[test]
+    fn empty_object_keys_are_stripped_from_tool_use_input_at_every_depth() {
+        let args: Map<String, Value> = json!({
+            "": 1,
+            "ok": { "": 2, "keep": [ { "": 3, "deep": 4 } ] }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let blocks = assistant_blocks(vec![Content::ToolCall(ToolCall {
+            id: ToolCallId::from("t1"),
+            name: "tool".to_string(),
+            arguments: args.into(),
+            thought_signature: None,
+        })]);
+        assert_eq!(
+            blocks[0]["toolUse"]["input"],
+            json!({ "ok": { "keep": [ { "deep": 4 } ] } })
+        );
+    }
+
+    /// (ii) A redacted thinking block is replayed as `reasoningContent.redactedContent`, never as
+    /// `reasoningText` and never degraded to plain `text`.
+    #[test]
+    fn a_redacted_thinking_block_replays_as_redacted_content() {
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(b"opaque");
+        let blocks = assistant_blocks(vec![Content::Thinking {
+            thinking: "[Reasoning redacted]".into(),
+            thinking_signature: Some(payload_b64.clone()),
+            redacted: true,
+        }]);
+        assert_eq!(
+            blocks,
+            vec![json!({ "reasoningContent": { "redactedContent": payload_b64 } })]
+        );
+    }
+
+    /// The same block with no stored payload is DROPPED (pi's `if (redactedContent?.length)`), and
+    /// the assistant message therefore contributes nothing — not a `text` fallback.
+    #[test]
+    fn a_redacted_thinking_block_without_a_payload_is_dropped() {
+        for signature in [None, Some("not base64 at all !!".to_string())] {
+            let blocks = assistant_blocks(vec![Content::Thinking {
+                thinking: "[Reasoning redacted]".into(),
+                thinking_signature: signature.clone(),
+                redacted: true,
+            }]);
+            assert!(blocks.is_empty(), "signature {signature:?} gave {blocks:?}");
+        }
+    }
+}

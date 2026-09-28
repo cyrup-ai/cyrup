@@ -145,9 +145,11 @@ async fn decodes_multichunk_tool_call() {
 }
 
 #[tokio::test]
-async fn decodes_encrypted_reasoning_details_onto_tool_calls() {
-    // `call_a`: detail arrives AFTER the tool call (matched path).
-    // `call_b`: detail arrives BEFORE the tool call (pending path).
+async fn decodes_encrypted_reasoning_details_onto_the_thinking_block() {
+    // Every valid detail is anchored on the thinking block in ARRIVAL order and serialized onto its
+    // signature at finalization (Pi openai-completions.ts:664-675, :329-333). Tool calls no longer
+    // carry a per-call `thought_signature` — the correlation by `id` is gone upstream, so an
+    // encrypted detail whose tool call arrives later needs no stashing.
     let raw = concat!(
         "data: {\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"id\":\"call_b\",\"data\":\"BBB\"}]}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n",
@@ -157,24 +159,35 @@ async fn decodes_encrypted_reasoning_details_onto_tool_calls() {
         "data: [DONE]\n\n",
     );
     let events = collect_events(raw).await;
-    let sigs: std::collections::HashMap<String, Option<String>> = events
+    for e in &events {
+        if let StreamEvent::ToolCallEnd { tool_call, .. } = e {
+            assert_eq!(
+                tool_call.thought_signature,
+                None,
+                "{} must not carry a thought signature",
+                tool_call.id.as_str()
+            );
+        }
+    }
+    let sig = events
         .iter()
-        .filter_map(|e| match e {
-            StreamEvent::ToolCallEnd { tool_call, .. } => Some((
-                tool_call.id.as_str().to_string(),
-                tool_call.thought_signature.clone(),
-            )),
+        .find_map(|e| match e {
+            StreamEvent::Done { message, .. } => message.content.iter().find_map(|c| match c {
+                Content::Thinking {
+                    thinking_signature, ..
+                } => thinking_signature.clone(),
+                _ => None,
+            }),
             _ => None,
         })
-        .collect();
-    assert!(
-        sigs["call_a"]
-            .as_deref()
-            .unwrap()
-            .contains("reasoning.encrypted")
+        .expect("thinking block with a serialized reasoning_details signature");
+    assert_eq!(
+        serde_json::from_str::<Value>(&sig).unwrap(),
+        json!([
+            { "type": "reasoning.encrypted", "id": "call_b", "data": "BBB" },
+            { "type": "reasoning.encrypted", "id": "call_a", "data": "AAA" },
+        ])
     );
-    assert!(sigs["call_a"].as_deref().unwrap().contains("AAA"));
-    assert!(sigs["call_b"].as_deref().unwrap().contains("BBB"));
 }
 
 #[tokio::test]

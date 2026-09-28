@@ -37,6 +37,30 @@ pub(crate) struct AvailableModelEntry {
     full_id: String,
 }
 
+impl AvailableModelEntry {
+    /// The bare model id (`ModelInfo.id`).
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// `provider/id` (`ModelInfo.fullId`).
+    pub(crate) fn full_id(&self) -> &str {
+        &self.full_id
+    }
+
+    /// Build one directly. SUBA-119: the verification check's unit tests need a registry that does
+    /// NOT depend on which models the real provider catalog happens to ship, so the clauses can be
+    /// pinned individually.
+    #[cfg(test)]
+    pub(crate) fn new(provider: &str, id: &str) -> Self {
+        Self {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            full_id: format!("{provider}/{id}"),
+        }
+    }
+}
+
 /// pi's `ctx.modelRegistry.getAvailable()` (`profiles.ts:529`, `agent-management.ts:169`) — the
 /// model registry every model-facing subagents command consults — bound here to the REAL built-in
 /// provider registry, [`cyrup_provider::catalog::builtin_catalog`], i.e. every model every

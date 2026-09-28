@@ -1018,7 +1018,14 @@ impl NativeExtension for BashOpsSupplier {
 #[tokio::test]
 async fn execute_bash_with_user_event_fills_operations_from_the_winning_user_bash_handler() {
     let fx = fixture();
-    let ext = Arc::new(BashOpsSupplier::new(Some(serde_json::json!({}))));
+    // `{"operations": {…}}` is the `operations`-half `UserBashEventResult` — one of the two shapes
+    // `isUserBashEventResult` accepts (`extensions/runner.ts:136-158` @v0.87.1). This used to be a
+    // bare `{}`, which upstream REFUSES (`hasOperations === hasResult` with both false) and EXT-077
+    // now refuses here too; the object behind the key is the wire half, and the callable `exec` pi
+    // also requires of it is what `user_bash_operations` resolves below (ADR-0002).
+    let ext = Arc::new(BashOpsSupplier::new(Some(
+        serde_json::json!({"operations": {"kind": "recording"}}),
+    )));
     let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
         .with_native_extension(ext.clone())
         .build()
@@ -1125,16 +1132,31 @@ async fn a_user_bash_result_override_wins_over_the_same_handlers_operations_back
 /// `operations` off THAT object alone — a later extension's `operations` is unreachable because its
 /// handler was never called. `Reduced::Handled`'s `by` is what makes cyrup able to honour that.
 ///
-/// Here the first-loaded extension handles the event with a payload carrying no backend, so the
-/// second one's backend must not run even though it is loaded and subscribed.
+/// Here the first-loaded extension handles the event and supplies its OWN backend, so the second
+/// one's backend must not run even though it is loaded, subscribed and has one.
+///
+/// The winner used to hand back a bare `{}` and the assertion was "with no backend from the winner
+/// the command falls through to the local shell". EXT-077 retired that premise rather than the
+/// test: `{}` is not a valid `UserBashEventResult` (`hasOperations === hasResult`,
+/// `runner.ts:140` @v0.87.1), pi throws for it, and there is now NO pi-valid winning result that
+/// means "I won and I supply nothing" — `undefined` is how a handler declines, and declining is not
+/// winning. The subject (whose `operations` the host reads) is unchanged and is asserted more
+/// strongly: the winner's backend runs and the later extension is never even asked.
 #[tokio::test]
 async fn user_bash_operations_come_from_the_handler_that_won_not_a_later_extension() {
     let fx = fixture();
-    // `HandlingProbe` wins the reduction and supplies nothing (its `user_bash_operations` is the
-    // trait default); `loser` loads AFTER it and would supply a backend if it were ever asked.
-    let loser = Arc::new(BashOpsSupplier::new(Some(serde_json::json!({}))));
+    // `HandlingProbe` wins the reduction and supplies its own backend; `loser` loads AFTER it and
+    // would supply a different one if it were ever asked.
+    let winner = Arc::new(HandlingProbe {
+        ops: Arc::new(RecordingBashOps {
+            seen: Mutex::new(Vec::new()),
+        }),
+    });
+    let loser = Arc::new(BashOpsSupplier::new(Some(
+        serde_json::json!({"operations": {"kind": "recording"}}),
+    )));
     let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
-        .with_native_extension(Arc::new(HandlingProbe))
+        .with_native_extension(winner.clone())
         .with_native_extension(loser.clone())
         .build()
         .await
@@ -1151,7 +1173,7 @@ async fn user_bash_operations_come_from_the_handler_that_won_not_a_later_extensi
             None,
         )
         .await
-        .expect("the local shell succeeds");
+        .expect("the winning handler's backend succeeds");
 
     assert!(
         loser.ops_calls.lock().unwrap().is_empty(),
@@ -1161,17 +1183,27 @@ async fn user_bash_operations_come_from_the_handler_that_won_not_a_later_extensi
         loser.ops.seen.lock().unwrap().is_empty(),
         "…and must never execute the command"
     );
+    // PRESENCE — the WINNER's backend is the one the host resolved and ran.
+    let ran = winner.ops.seen.lock().unwrap().clone();
+    assert_eq!(
+        ran.len(),
+        1,
+        "the winning handler's own backend executed the command: {ran:?}"
+    );
+    assert_eq!(ran[0].0, "echo LOCAL_SHELL_RAN");
     assert!(
-        result.output.contains("LOCAL_SHELL_RAN"),
-        "with no backend from the winning handler the command falls through to the local shell \
-         (`options?.operations ?? createLocalBashOperations(...)`, agent-session.ts:2782): {:?}",
+        !result.output.contains("LOCAL_SHELL_RAN"),
+        "and the local shell is out of the picture: {:?}",
         result.output
     );
 }
 
-/// The first-loaded extension of the attribution test: subscribes to `user_bash`, handles it, and
-/// has no backend of its own (the [`NativeExtension::user_bash_operations`] trait default).
-struct HandlingProbe;
+/// The first-loaded extension of the attribution test: subscribes to `user_bash`, wins it with an
+/// `operations`-half [`cyrup_ext::is_user_bash_event_result`]-valid result, and supplies its own
+/// backend for the command.
+struct HandlingProbe {
+    ops: Arc<RecordingBashOps>,
+}
 #[async_trait::async_trait]
 impl NativeExtension for HandlingProbe {
     fn id(&self) -> ExtensionId {
@@ -1183,9 +1215,19 @@ impl NativeExtension for HandlingProbe {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         if matches!(ev, HostEvent::UserBash { .. }) {
-            return HookOutcome::Handled(cyrup_ext::HandledValue(serde_json::json!({})));
+            return HookOutcome::Handled(cyrup_ext::HandledValue(
+                serde_json::json!({"operations": {"kind": "recording"}}),
+            ));
         }
         HookOutcome::Noop
+    }
+    fn user_bash_operations(
+        &self,
+        _command: &str,
+        _exclude_from_context: bool,
+        _cwd: &str,
+    ) -> Option<Arc<dyn cyrup_tools::ops::BashOperations>> {
+        Some(self.ops.clone() as Arc<dyn cyrup_tools::ops::BashOperations>)
     }
 }
 
@@ -1207,7 +1249,12 @@ impl NativeExtension for HandlingProbe {
 #[tokio::test]
 async fn a_caller_supplied_operations_backend_is_not_clobbered_by_the_user_bash_handler() {
     let fx = fixture();
-    let ext = Arc::new(BashOpsSupplier::new(Some(serde_json::json!({}))));
+    // An `operations`-half result, for the reason given in
+    // `execute_bash_with_user_event_fills_operations_from_the_winning_user_bash_handler`: a bare
+    // `{}` is an invalid `UserBashEventResult` and now aborts the command (EXT-077).
+    let ext = Arc::new(BashOpsSupplier::new(Some(
+        serde_json::json!({"operations": {"kind": "recording"}}),
+    )));
     let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
         .with_native_extension(ext.clone())
         .build()

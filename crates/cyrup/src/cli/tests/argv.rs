@@ -156,11 +156,13 @@ fn lenient_args_feed_clap_without_a_hard_error() {
         (cli, diags)
     };
 
-    // Bad --mode: silently ignored ⇒ default text mode, no diagnostics.
+    // Bad --mode: SEAM-120 — an exit-1 error diagnostic (pi args.ts:104-108 @v0.87.1), and clap
+    // never sees the value it would reject with its own exit-2 text.
     let (cli, diags) = pipeline(&["--mode", "bogus", "hi"]);
     assert_eq!(cli.mode, None);
     assert_eq!(cli.positionals, vec!["hi".to_string()]);
-    assert!(diags.is_empty());
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].level, DiagnosticLevel::Error);
 
     // Bad --thinking: warns + continues, no thinking set.
     let (cli, diags) = pipeline(&["--thinking", "ultra", "go"]);
@@ -230,4 +232,142 @@ fn list_flags_trim_each_comma_split_segment_and_drop_empties() {
         vec![String::new()],
         "an empty --models value stays a single empty pattern, matching Pi's unfiltered split"
     );
+}
+
+/// The full pre-clap → clap pipeline with the diagnostics kept, for the rows below.
+fn pipeline_with_diags(args: &[&str]) -> (Cli, Vec<crate::diagnostics::Diagnostic>) {
+    let norm = normalize_short_aliases(args.iter().map(|s| s.to_string()));
+    let (lenient, diags) = crate::diagnostics::apply_arg_leniency(&norm);
+    let (clean, ext) = partition_extension_flags(&lenient);
+    let mut full = vec!["cyrup".to_string()];
+    full.extend(clean);
+    let mut cli = Cli::try_parse_from(full).expect("lenient argv parses under clap");
+    cli.extension_flags = ext;
+    cli.normalize_list_flags();
+    cli.restore_escaped_positionals();
+    (cli, diags)
+}
+
+/// SEAM-123 — pi args.ts:82-91 @v0.87.1: `--` ends option parsing, as the FIRST arm of pi's loop.
+/// RED twice over before the fix: `apply_arg_leniency`'s SEAM-104 arm errored `Unknown option: -
+/// Summarize these points`, and `partition_extension_flags` captured an extension flag named `""`
+/// (`strip_prefix("--")` on the bare token yields the empty string) which also swallowed the next
+/// token as its value.
+#[test]
+fn double_dash_ends_option_parsing() {
+    let (cli, diags) = pipeline_with_diags(&["-p", "--", "- Summarize these points"]);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(cli.print);
+    assert!(cli.extension_flags.is_empty(), "{:?}", cli.extension_flags);
+    assert_eq!(
+        cli.positionals,
+        vec!["- Summarize these points".to_string()]
+    );
+
+    // Everything after `--` is a message/file verbatim — a real flag spelling included.
+    let (cli, diags) = pipeline_with_diags(&["-p", "--", "@notes.md", "--model", "x"]);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(cli.model, None, "`--model` after `--` is not a flag");
+    assert!(cli.extension_flags.is_empty(), "{:?}", cli.extension_flags);
+    assert_eq!(
+        cli.positionals,
+        vec![
+            "@notes.md".to_string(),
+            "--model".to_string(),
+            "x".to_string()
+        ]
+    );
+
+    // The short-alias PRE-PASS honours `--` too. `normalize_short_aliases` runs over the whole
+    // argv in `main.rs` before anything else, so without its own `--` latch the tail arrived at
+    // clap already rewritten: `["-p","--","-nc","-na","-nt","hi"]` yielded positionals
+    // `["--no-context-files","--no-approve","--no-tools","hi"]` with NO diagnostic — a prompt
+    // beginning with a dash silently became different text, which is the exact case this row
+    // exists for. pi's `--` arm (args.ts:82-91 @v0.87.1) precedes and `break`s past every alias
+    // arm (args.ts:141-183), so its `messages` are `["-nc","-na","-nt","hi"]`.
+    let (cli, diags) = pipeline_with_diags(&["-p", "--", "-nc", "-na", "-nt", "hi"]);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(cli.print);
+    assert!(cli.extension_flags.is_empty(), "{:?}", cli.extension_flags);
+    assert!(
+        !cli.no_context_files && !cli.no_approve && !cli.no_tools,
+        "a post-`--` alias spelling must not set its flag"
+    );
+    assert_eq!(
+        cli.positionals,
+        vec![
+            "-nc".to_string(),
+            "-na".to_string(),
+            "-nt".to_string(),
+            "hi".to_string()
+        ]
+    );
+    // Presence before absence: the same aliases BEFORE `--` are still rewritten and still set
+    // their flags, and only the tail stays verbatim.
+    let (cli, diags) = pipeline_with_diags(&["-nc", "-nt", "-p", "--", "-na"]);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(cli.no_context_files && cli.no_tools);
+    assert!(
+        !cli.no_approve,
+        "the post-`--` `-na` is a message, not a flag"
+    );
+    assert_eq!(cli.positionals, vec!["-na".to_string()]);
+    // And the pre-pass alone, without the rest of the pipeline.
+    assert_eq!(
+        normalize_short_aliases(["cyrup", "-nc", "--", "-nc"].map(String::from)),
+        vec![
+            "cyrup".to_string(),
+            "--no-context-files".to_string(),
+            "--".to_string(),
+            "-nc".to_string()
+        ]
+    );
+
+    // Presence before absence: `--` still advertised in the help body (args.ts:275,329,355).
+    let help = crate::cli::render_help(&[]);
+    assert!(help.contains("[options] [--] [@files...] [messages...]"));
+    assert!(help.contains(
+        "  --                             End option parsing; treat remaining arguments as \
+         messages/files"
+    ));
+    assert!(help.contains("-p -- \"- Summarize these points\""));
+}
+
+/// SEAM-120 — pi args.ts:95-110 @v0.87.1. cyrup silently dropped an invalid `--mode` value AND
+/// consumed the following token unconditionally. pi does neither: a missing or `-`-leading value is
+/// an exit-1 error that consumes NOTHING, and a present-but-invalid value is a *different* exit-1
+/// error.
+#[test]
+fn bad_mode_is_an_error_not_a_silent_drop() {
+    use crate::diagnostics::DiagnosticLevel;
+
+    // (1) present but invalid → `Invalid mode "…"`, flag and value both withheld from clap.
+    let (cli, diags) = pipeline_with_diags(&["--mode", "bogus", "hi"]);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].level, DiagnosticLevel::Error);
+    assert_eq!(
+        diags[0].message,
+        "Invalid mode \"bogus\". Valid values: text, json, rpc"
+    );
+    assert_eq!(cli.mode, None);
+    assert_eq!(cli.positionals, vec!["hi".to_string()]);
+
+    // (2) next token is a flag → `--mode requires …`, and the flag is NOT consumed (pi does not
+    // `i++` on this branch), so `--model m` still reaches clap.
+    let (cli, diags) = pipeline_with_diags(&["--mode", "--model", "m", "hi"]);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].level, DiagnosticLevel::Error);
+    assert_eq!(diags[0].message, "--mode requires text, json, or rpc");
+    assert_eq!(cli.model.as_deref(), Some("m"));
+    assert_eq!(cli.positionals, vec!["hi".to_string()]);
+
+    // (3) trailing `--mode` with no value at all → the same error, never a clap exit-2.
+    let (_cli, diags) = pipeline_with_diags(&["--mode"]);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].message, "--mode requires text, json, or rpc");
+
+    // (4) CYRUP-DELTA: `acp` is cyrup's fifth mode and still parses with no diagnostic.
+    let (cli, diags) = pipeline_with_diags(&["--mode", "acp", "hi"]);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(cli.mode, Some(Mode::Acp));
 }

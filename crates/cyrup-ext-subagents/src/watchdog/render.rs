@@ -211,7 +211,7 @@ pub fn render_watchdog_warning_plain(
 )]
 mod tests {
     use super::*;
-    use crate::watchdog::types::{WatchdogCategory, WatchdogWarningSource};
+    use crate::watchdog::types::{WatchdogCategory, WatchdogImportance, WatchdogWarningSource};
 
     fn details() -> WatchdogWarningDetails {
         WatchdogWarningDetails {
@@ -221,7 +221,7 @@ mod tests {
             recommended_action: "do the thing".into(),
             category: WatchdogCategory::MissedConstraint,
             source: WatchdogWarningSource::Main,
-            confidence: None,
+            importance: WatchdogImportance::Medium,
             agent: None,
             run_id: None,
             stale: None,

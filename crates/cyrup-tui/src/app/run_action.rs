@@ -2,6 +2,8 @@ use super::*;
 
 use super::run::RunCtx;
 use super::run_arms::RunFlow;
+use crate::altscreen::COPY_ERROR_FLASH_DURATION;
+use std::time::Duration;
 
 impl App<InlineBackend<Stdout>> {
     /// The nested `AppAction` dispatch of the run loop's input arm (§7.2): the twelve-way match
@@ -29,9 +31,9 @@ impl App<InlineBackend<Stdout>> {
             // `renderer_mut` resolves to whichever renderer is live, so this is correct in both
             // modes without a branch here.
             AppAction::CopySelection(text) => {
-                let ok = crate::clipboard::copy_to_clipboard(&text).await;
-                let message = if ok { "Copied!" } else { "Copy failed" };
-                self.renderer_mut().flash(message, None);
+                let result = crate::clipboard::copy_to_clipboard(&text).await;
+                let (message, dwell) = copy_flash_for(&result);
+                self.renderer_mut().flash(message, dwell);
             }
             AppAction::Interrupt => {
                 ctx.session.abort();
@@ -391,5 +393,31 @@ impl App<InlineBackend<Stdout>> {
         }
         self.frames.request();
         Ok(RunFlow::Continue)
+    }
+}
+
+/// The flash a finished copy produces — pi's ternary pair (`tui-alt-screen.ts:1459-1462`):
+///
+/// ```ts
+/// this.flash(
+///   ok ? "Copied!" : typeof result === "string" ? result : "Copy failed",
+///   ok ? undefined : COPY_ERROR_FLASH_DURATION_MS,
+/// );
+/// ```
+///
+/// The `string` arm is the one cyrup was missing: upstream's `copySelection` returns the THROWN
+/// message (`tui-renderer.ts:37-44`), so a fullscreen copy failure names the missing helper and
+/// dwells for [`COPY_ERROR_FLASH_DURATION`]. cyrup flashed the constant `"Copy failed"` for the
+/// default one second — pi's `"Copy failed"` fallback is only reached when no message came back at
+/// all, which cannot happen here because [`crate::clipboard::ClipboardError`] always has one.
+///
+/// A free function rather than an inline `if` so the branch is assertable without a real clipboard:
+/// a CI host cannot produce either outcome from [`crate::clipboard::copy_to_clipboard`].
+pub(crate) fn copy_flash_for(
+    result: &Result<(), crate::clipboard::ClipboardError>,
+) -> (&'static str, Option<Duration>) {
+    match result {
+        Ok(()) => ("Copied!", None),
+        Err(error) => (error.message(), Some(COPY_ERROR_FLASH_DURATION)),
     }
 }

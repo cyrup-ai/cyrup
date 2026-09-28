@@ -10,7 +10,7 @@ use crate::utils::json_parse::parse_streaming_json_object;
 use cyrup_core::{ApiId, Content, ToolCall, ToolCallId};
 use serde_json::{Map, Value};
 
-/// Handle one streamed tool-call delta (Pi mistral-conversations.ts:418-464).
+/// Handle one streamed tool-call delta (Pi mistral-conversations.ts:685-731 @v0.87.1).
 pub(super) async fn process_tool_call(
     tool_call: &Value,
     dec: &mut Decoder,
@@ -23,7 +23,8 @@ pub(super) async fn process_tool_call(
         return false;
     }
 
-    let index = tool_call.get("index").and_then(Value::as_i64).unwrap_or(0);
+    let index_opt = tool_call.get("index").and_then(Value::as_i64);
+    let index = index_opt.unwrap_or(0);
     let provided_id = tool_call
         .get("id")
         .and_then(Value::as_str)
@@ -32,9 +33,21 @@ pub(super) async fn process_tool_call(
         Some(id) => id.to_string(),
         None => derive_mistral_tool_call_id(&format!("toolcall:{index}"), 0),
     };
-    let key = format!("{call_id}:{index}");
+    // Pi: `const key = toolCall.index ?? callId;` (mistral-conversations.ts:695 @v0.87.1). The
+    // index alone keys the block whenever it is PRESENT, so an id-less continuation chunk lands
+    // on the block the first chunk opened; the derived `callId` is only the fallback when the
+    // wire omits `index` entirely.
+    //
+    // CYRUP-DELTA: upstream's map is `Map<string | number, number>`, a heterogeneous key Rust's
+    // `HashMap<String, _>` cannot express. The `index:` prefix keeps the two key spaces disjoint
+    // so a provider-supplied call id that happens to look like a bare integer cannot collide
+    // with an index key.
+    let key = match index_opt {
+        Some(i) => format!("index:{i}"),
+        None => call_id.clone(),
+    };
 
-    // Open a new tool block on first sight of this key (Pi mistral-conversations.ts:439-450).
+    // Open a new tool block on first sight of this key (Pi mistral-conversations.ts:696-715).
     if !dec.tool_blocks_by_key.contains_key(&key) {
         let name = tool_call
             .get("function")

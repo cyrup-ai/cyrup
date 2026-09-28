@@ -55,7 +55,7 @@ use tokio::sync::{Mutex, oneshot};
 
 use super::runtime::WatchdogLspDiagnostics;
 use super::types::{
-    WatchdogCategory, WatchdogConfidence, WatchdogLspConfig, WatchdogLspDiagnostic,
+    WatchdogCategory, WatchdogImportance, WatchdogLspConfig, WatchdogLspDiagnostic,
     WatchdogLspDiagnosticSeverity, WatchdogLspResult, WatchdogLspStatus, WatchdogSeverity,
     WatchdogWarning, WatchdogWarningSource,
 };
@@ -530,7 +530,7 @@ pub fn watchdog_warning_from_lsp_diagnostics(
              change."
                 .to_string(),
         category: Some(WatchdogCategory::Correctness),
-        confidence: Some(WatchdogConfidence::High),
+        importance: WatchdogImportance::High,
         source: Some(WatchdogWarningSource::Lsp),
         agent: None,
         run_id: None,
@@ -1428,7 +1428,7 @@ mod tests {
         assert_eq!(warning.severity, WatchdogSeverity::Blocker);
         assert_eq!(warning.summary, "LSP found 1 error in changed file.");
         assert_eq!(warning.source, Some(WatchdogWarningSource::Lsp));
-        assert_eq!(warning.confidence, Some(WatchdogConfidence::High));
+        assert_eq!(warning.importance, WatchdogImportance::High);
         // The evidence carries EVERY actionable diagnostic, not just the counted ones.
         assert_eq!(warning.evidence.lines().count(), 2);
     }

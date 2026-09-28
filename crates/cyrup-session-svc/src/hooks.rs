@@ -272,11 +272,32 @@ impl Hooks for PolicyHooks {
         ctx: PostTurn<'_>,
         cancel: CancelToken,
     ) -> Result<Option<TurnUpdate>, HookError> {
+        // SEAM-126 — pi's `prepareNextTurnWithContext` override opens with
+        // `_compactBeforeNextAssistantResponse` (agent-session.ts:693-694 @v0.87.1), BEFORE the
+        // previous snapshot and before the system-prompt/tool refresh, so the threshold is checked at
+        // every turn boundary inside a run and not only after `agent_end`. Resolved first here for
+        // the same reason: the delegate below and the stamping after it must see the post-compaction
+        // state.
+        //
+        // CYRUP-DELTA: pi's no-compaction path still returns `{...context, messages:
+        // projection.messages}` (`:601`), reseeding the working transcript from the canonical
+        // projection on EVERY turn. That is a separate change — the canonical-projection work
+        // behind `prepareRequest` (`_installAgentRequestProjection`, `:608`), AGENT-038, explicitly
+        // out of scope here — so `context` is stamped ONLY when a compaction actually ran. Setting
+        // it unconditionally would start reseeding the loop's transcript on a path that has never
+        // done so.
+        let rebuilt = match self.session.get() {
+            Some(session) => session.compact_before_next_assistant_response().await,
+            None => None,
+        };
         let previous = self.inner.prepare_next_turn(ctx, cancel).await?;
         let Some(session) = self.session.get() else {
             return Ok(previous);
         };
         let mut update = previous.unwrap_or_default();
+        if let Some(messages) = rebuilt {
+            update.context = Some(messages.into_iter().map(std::sync::Arc::new).collect());
+        }
         update.tools = Some(session.next_turn_tools().await);
         // DRIFT-033 — pi's refresh assigns `context.systemPrompt` in the SAME object literal as
         // `context.tools` (agent-session.ts:534 vs `:535` @v0.83.0), so the prompt the model is sent

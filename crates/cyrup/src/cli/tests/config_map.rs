@@ -371,6 +371,46 @@ fn an_unreadable_prompt_file_warns_and_falls_back_to_the_literal() {
     );
 }
 
+/// CFG-087 — pi reads BOTH prompt-file tokens through `stripBom(readFileSync(input, "utf-8"))`
+/// (resource-loader.ts:61 @v0.87.1). Without the strip a Notepad-saved SYSTEM.md puts U+FEFF at
+/// character zero of the system prompt, and each `--append-system-prompt <file>` part splices one
+/// into the middle of it — the parts are joined verbatim, so the mark is not even at a boundary a
+/// provider might tolerate.
+///
+/// Asserted through the CLI mapper, not only through `resolve_prompt_input`, because the join is
+/// where the append case gets its second mark.
+#[test]
+fn a_bom_is_stripped_from_a_prompt_file_and_from_every_append_part() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("sys.md"), "\u{feff}You are terse.").unwrap();
+    std::fs::write(tmp.path().join("one.md"), "\u{feff}Cite sources.").unwrap();
+    std::fs::write(tmp.path().join("two.md"), "\u{feff}Stay calm.").unwrap();
+
+    let (text, diags) = resolve_prompt_input(tmp.path(), "sys.md", "system prompt");
+    assert_eq!(
+        text, "You are terse.",
+        "a BOM'd prompt file must not carry it"
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let cli = parse(&[
+        "--system-prompt",
+        "sys.md",
+        "--append-system-prompt",
+        "one.md",
+        "--append-system-prompt",
+        "two.md",
+    ]);
+    let (cfg, diags) = cli.to_session_config_with_diagnostics(&dirs_at(tmp.path()), AppMode::Print);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(cfg.system_prompt.as_deref(), Some("You are terse."));
+    assert_eq!(
+        cfg.append_system_prompt.as_deref(),
+        Some("Cite sources.\n\nStay calm."),
+        "no U+FEFF survives the join"
+    );
+}
+
 /// An empty `--system-prompt ""` must not be probed as a path (joining `""` onto the cwd would
 /// "exist" as the cwd itself and produce a bogus unreadable-file warning). Pi's
 /// `if (!input) return undefined` guard.

@@ -98,6 +98,9 @@ impl ApiImpl for CodexResponsesApi {
             url,
             headers,
             body: Some(body),
+            // pi: `if (done && buffer.trim()) buffer += "\n\n";`
+            // (`openai-codex-responses.ts:795` @v0.87.1, v0.85.0 / #9047).
+            flush_at_eof: true,
         };
 
         // Honor HTTP(S)_PROXY for the live client (pi `resolveHttpProxyUrlForTarget`).

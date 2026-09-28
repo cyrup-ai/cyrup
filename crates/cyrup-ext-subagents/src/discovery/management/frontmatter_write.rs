@@ -225,10 +225,11 @@ pub(crate) fn serialize_agent(
     if let Some(exts) = &def.extensions {
         lines.push(format!("extensions: {}", exts.join(", ")));
     }
-    if !def.subagent_only_extensions.is_empty() || preserve(&["subagentOnlyExtensions"]) {
+    let subagent_only_extensions = def.subagent_only_extensions.as_deref().unwrap_or_default();
+    if !subagent_only_extensions.is_empty() || preserve(&["subagentOnlyExtensions"]) {
         lines.push(format!(
             "subagentOnlyExtensions: {}",
-            def.subagent_only_extensions.join(", ")
+            subagent_only_extensions.join(", ")
         ));
     }
     // SUBA-102 — pi `const mutationToolsValue = joinComma(config.mutationTools); if

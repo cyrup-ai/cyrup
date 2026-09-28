@@ -268,6 +268,8 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -388,6 +390,8 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
 
     // The config carries the orchestrator's ABSOLUTE roots — the T0.4 fix.
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -540,6 +544,8 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -703,6 +709,8 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         "exit_code": 7
     });
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -853,6 +861,8 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -995,6 +1005,8 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
     // exactly the shape needed to race an interrupt against natural completion with nothing left
     // to legitimately pause.
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -1163,6 +1175,8 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -1308,6 +1322,8 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -1441,6 +1457,8 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -1590,6 +1608,8 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
         control: Option<cyrup_ext_subagents::exec::control::ResolvedControlConfig>,
     ) -> RunnerConfig {
         RunnerConfig {
+            // SUBA-119 — no operator-declared response-id alias for this fixture run.
+            model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,
             completion_owner_id: None,
@@ -1716,6 +1736,8 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
     step.skills = Some(Vec::new());
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -1850,6 +1872,8 @@ async fn the_runner_writes_no_artifacts_when_the_run_disabled_them() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -1927,6 +1951,8 @@ async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_
         "exit_code": 0
     });
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -2033,6 +2059,8 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -2283,6 +2311,8 @@ fn child_stop_chain_config(
     results_dir: &Path,
 ) -> RunnerConfig {
     RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -2684,6 +2714,8 @@ async fn a_child_scoped_stop_kills_one_fan_out_member_and_its_siblings_still_com
         .await
         .expect("mkdir run_dir");
     let config = RunnerConfig {
+        // SUBA-119 - no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         mode: RunMode::Parallel,
         steps: vec![RunnerStep::ParallelGroup(ParallelGroupSpec {
             steps: vec![
@@ -2916,6 +2948,8 @@ async fn a_worktree_fan_out_publishes_a_real_parallel_handoff_manifest() {
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         run_id: run_id.clone(),
@@ -3169,6 +3203,8 @@ async fn a_background_runs_status_and_result_carry_the_childs_runtime_acknowledg
         "exit_code": 0
     });
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,

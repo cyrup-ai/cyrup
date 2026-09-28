@@ -19,8 +19,14 @@ use super::argv::{ExtFlagValue, ExtensionFlag};
 pub fn render_help(extension_flags: &[ExtensionFlag]) -> String {
     const APP: &str = "cyrup";
     const CFG: &str = ".cyrup";
-    const ENV_AGENT_DIR: &str = "CYRUP_AGENT_DIR";
-    const ENV_SESSION_DIR: &str = "CYRUP_SESSION_DIR";
+    // CFG-068 — the directory rows name the SAME strings the readers use, taken from
+    // `cyrup_config::paths` rather than re-spelled here. A help row written as its own literal is a
+    // row that can drift away from the variable actually read, which is the failure this row was
+    // filed about in the other direction (`CYRUP_HOME` read everywhere, advertised nowhere).
+    const ENV_AGENT_DIR: &str = cyrup_config::paths::ENV_AGENT_DIR;
+    const ENV_CODING_AGENT_DIR: &str = cyrup_config::paths::ENV_CODING_AGENT_DIR;
+    const ENV_HOME: &str = cyrup_config::paths::ENV_HOME;
+    const ENV_SESSION_DIR: &str = cyrup_config::paths::ENV_SESSION_DIR;
     let ext_block = if extension_flags.is_empty() {
         String::new()
     } else {
@@ -41,7 +47,7 @@ pub fn render_help(extension_flags: &[ExtensionFlag]) -> String {
         "{APP} - AI coding assistant with read, bash, edit, write tools
 
 Usage:
-  {APP} [options] [@files...] [messages...]
+  {APP} [options] [--] [@files...] [messages...]
 
 Commands:
   {APP} install <source> [-l]     Install extension source and add to settings
@@ -98,6 +104,7 @@ Options:
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as CYRUP_OFFLINE=1)
+  --                             End option parsing; treat remaining arguments as messages/files
   --help, -h                     Show this help
   --version, -v                  Show version number
 
@@ -121,6 +128,9 @@ Examples:
 
   # Non-interactive mode (process and exit)
   {APP} -p \"List all .ts files in src/\"
+
+  # Prompt beginning with a dash
+  {APP} -p -- \"- Summarize these points\"
 
   # Multiple messages (interactive)
   {APP} \"Read package.json\" \"What dependencies do we have?\"
@@ -206,6 +216,8 @@ Environment Variables:
   AWS_BEARER_TOKEN_BEDROCK         - Bedrock API key (bearer token)
   AWS_REGION                       - AWS region for Amazon Bedrock (e.g., us-east-1)
   {ENV_AGENT_DIR:<32} - Config directory (default: ~/{CFG}/agent)
+  {ENV_CODING_AGENT_DIR:<32} - Config-dir fallback, intercom/subagent root (default: ~/{CFG})
+  {ENV_HOME:<32} - Home for subagent/intercom/permission paths, not config (default: $HOME)
   {ENV_SESSION_DIR:<32} - Session storage directory (overridden by --session-dir)
   CYRUP_PACKAGE_DIR                - Override package directory (for Nix/Guix store paths)
   CYRUP_OFFLINE                    - Disable startup network operations when set to 1/true/yes

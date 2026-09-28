@@ -266,6 +266,8 @@ pub fn register_child_watchdog(
     let resolved = child_resolved_config(&child_config);
     let resolver_config = resolved.clone();
     let display_config = child_config.clone();
+    let user_warning_config = child_config.clone();
+    let user_warning_services = Arc::clone(&services);
     let review_connected = review.is_some();
     let runtime = Arc::new(MainWatchdogRuntime::new(MainWatchdogRuntimeOptions {
         cwd: Some(cwd.to_path_buf()),
@@ -299,6 +301,19 @@ pub fn register_child_watchdog(
                 details_json.as_ref(),
                 false,
             );
+        })),
+        // SUBA-120 — `displayUserWarning` (`register-child.ts:89-93` @v0.71.0): the same
+        // `childWarningDetails` re-stamp as the sink above, then `pi.appendEntry` ONLY — never
+        // `pi.sendMessage`. A `low`/`medium` child finding is shown, not delivered.
+        display_user_warning: Some(Arc::new(move |details: &WatchdogWarningDetails| {
+            let Some(services) = user_warning_services() else {
+                return;
+            };
+            let child_details = child_warning_details(details, &user_warning_config);
+            let Ok(details_json) = serde_json::to_value(&child_details) else {
+                return;
+            };
+            let _ = services.append_entry(SUBAGENT_WATCHDOG_WARNING_TYPE, &details_json);
         })),
         // `:80-83` — no `sendUserMessage`: a child never auto-follows itself.
         send_user_message: None,
@@ -335,7 +350,7 @@ pub fn register_child_watchdog(
 )]
 mod tests {
     use super::super::types::{
-        ThinkingSetting, WatchdogCategory, WatchdogLspConfig, WatchdogSeverity,
+        ThinkingSetting, WatchdogCategory, WatchdogImportance, WatchdogLspConfig, WatchdogSeverity,
         WatchdogWarningState,
     };
     use super::*;
@@ -419,7 +434,7 @@ mod tests {
             recommended_action: "r".into(),
             category: WatchdogCategory::Other,
             source: WatchdogWarningSource::Main,
-            confidence: None,
+            importance: WatchdogImportance::Medium,
             agent: None,
             run_id: None,
             stale: None,
@@ -445,7 +460,7 @@ mod tests {
             recommended_action: "r".into(),
             category: WatchdogCategory::Correctness,
             source: WatchdogWarningSource::Lsp,
-            confidence: None,
+            importance: WatchdogImportance::Medium,
             agent: None,
             run_id: None,
             stale: None,

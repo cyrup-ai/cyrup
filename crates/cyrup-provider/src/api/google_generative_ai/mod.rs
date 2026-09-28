@@ -140,6 +140,8 @@ impl ApiImpl for GoogleGenerativeAiApi {
             url,
             headers,
             body: Some(body),
+            // PROV-084: pi frames Gemini with the SDK helper — no residual flush.
+            flush_at_eof: false,
         };
 
         let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {

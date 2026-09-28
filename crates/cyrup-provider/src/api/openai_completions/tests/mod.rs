@@ -11,6 +11,7 @@ mod decode;
 mod finalize;
 mod headers;
 mod params;
+mod reasoning_details;
 mod tools;
 mod transform;
 

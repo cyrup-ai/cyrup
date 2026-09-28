@@ -788,6 +788,7 @@ mod tests {
 
         // The executor built for THIS run, exactly as `run` builds it.
         let executor = ExecSingleStepExecutor {
+            model_response_aliases: None,
             writer_ledgers: None,
             lease_writer: None,
             spawn_command: None,

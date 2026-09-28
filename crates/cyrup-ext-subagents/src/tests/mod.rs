@@ -30,7 +30,6 @@ mod dynamic_group_acceptance_parity;
 mod herdr_shutdown_budget_integration;
 mod management_actions_integration;
 mod management_capabilities_integration;
-mod read_only_agent_name_alternation;
 mod rpc_bridge_integration;
 mod runtime_agent_registration_integration;
 mod spawn_temp_file_cleanup;

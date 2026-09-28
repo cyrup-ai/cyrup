@@ -45,6 +45,27 @@ impl<B: Backend> App<B> {
         rx
     }
 
+    /// **TUI-105.** Install the post-`/login` catalog-refresh channel and hand back its receiver.
+    ///
+    /// The sibling of [`Self::install_login_channel`], and separate from it because the refresh
+    /// outlives the login flow: pi's `.then` continuation runs up to 15 s after `loginProvider`
+    /// resolved (`interactive-mode.ts:5951-5973`), by which time the `LoginUiMsg` stream has already
+    /// delivered its `Finished`.
+    ///
+    /// `None` means no run loop is servicing the channel, and [`App::finish_login`] then skips the
+    /// spawn — the login still reports and still selects the provider default from the CACHED
+    /// catalog, which is the pre-TUI-105 behaviour plus the selection.
+    ///
+    /// `pub` for the same reason the two above it are: `tests/login_flow.rs` drives a whole refresh
+    /// without standing up a run loop.
+    pub fn install_login_refresh_channel(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::login_dialog::LoginRefreshMsg> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.login_refresh_tx = Some(tx);
+        rx
+    }
+
     /// Install the off-task `/model` catalog-refresh channel and hand back its receiver.
     ///
     /// [`App::run`] calls this once at startup, exactly like [`Self::install_login_channel`]. Without

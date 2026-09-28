@@ -22,7 +22,7 @@ use crate::{
     Entry, EntryBase, KnownEntry, NewSessionOpts, SessionHeader, SessionLayout, SessionManager,
     serialize_conversation,
 };
-use cyrup_core::{Content, EntryId, Message};
+use cyrup_core::{Content, EntryId, Message, StopReason};
 use serde_json::{Value, json};
 
 fn user(s: &str) -> Message {
@@ -1558,4 +1558,476 @@ fn sess015_resolvable_first_kept_index_still_keeps_the_tail_of_the_history() {
     assert!(joined.contains("OLD-TWO"), "{joined}");
     assert!(joined.contains("OLD-THREE"), "{joined}");
     assert!(joined.contains("NEW-ONE"), "{joined}");
+}
+
+// ------------------------------------------------ SESS-057 branched compaction first-kept ------
+
+/// `createBranchedSession` drops `Label` entries and re-chains the retained path, so a retained
+/// `Compaction.firstKeptEntryId` that NAMED a dropped label must be re-pointed at the next RETAINED
+/// entry. Pi keeps `replacementByLabelId`/`pendingLabelIds` for exactly this and clones the
+/// compaction as
+///   firstKeptEntryId: entry.firstKeptEntryId === entry.id
+///       ? entry.id
+///       : (replacementByLabelId.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId)
+/// (`session-manager.ts:1637-1657` @v0.87.1).
+///
+/// Without it the id is off the forked path, `build_context_messages`' `e.id() == first_kept` test
+/// never matches, `keeping` stays false, and everything the compaction deliberately KEPT is
+/// silently gone from the fork's model context.
+///
+/// Fixture: `u1 → a1 → L(label) → u2 → a2 → C(compaction, firstKeptEntryId = L)`, forked at `C`
+/// (the compaction must be ON the forked path for its `first_kept_entry_id` to matter at all).
+#[test]
+fn sess057_branched_compaction_first_kept_id_follows_a_dropped_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("2026-01-01T00-00-00-000Z_bbbbbbbb.jsonl");
+    let contents = concat!(
+        r#"{"type":"session","version":3,"id":"22222222-2222-7222-8222-222222222222","timestamp":"2026-01-01T00:00:00Z","cwd":"/proj/sess057"}"#,
+        "\n",
+        r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"first question"}],"timestamp":0}}"#,
+        "\n",
+        r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"first answer"}],"provider":"faux","model":"f","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}}"#,
+        "\n",
+        // The label entry sits ON the path and is the compaction's first-kept target.
+        r#"{"type":"label","id":"L","parentId":"a1","timestamp":"2026-01-01T00:00:03Z","targetId":"u1","label":"marked"}"#,
+        "\n",
+        r#"{"type":"message","id":"u2","parentId":"L","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":[{"type":"text","text":"second question"}],"timestamp":0}}"#,
+        "\n",
+        r#"{"type":"message","id":"a2","parentId":"u2","timestamp":"2026-01-01T00:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"second answer"}],"provider":"faux","model":"f","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}}"#,
+        "\n",
+        r#"{"type":"compaction","id":"C","parentId":"a2","timestamp":"2026-01-01T00:00:06Z","summary":"SUMMARY-057","firstKeptEntryId":"L","tokensBefore":99}"#,
+        "\n",
+    );
+    std::fs::write(&file, contents).unwrap();
+
+    let cwd = PathBuf::from("/proj/sess057");
+    let lay = SessionLayout::new(dir.path().to_path_buf(), cwd);
+    let mut m = SessionManager::open(&file).unwrap();
+    let cloned_path = m
+        .create_branched_session(&EntryId::from("C"), &lay)
+        .unwrap()
+        .expect("persisted branch returns a path");
+
+    // (a) The forked compaction's first-kept id is the next RETAINED entry after the dropped label.
+    let forked = SessionManager::open(&cloned_path).unwrap();
+    let first_kept = forked
+        .entries()
+        .iter()
+        .find_map(|e| match e {
+            Entry::Known(KnownEntry::Compaction {
+                first_kept_entry_id,
+                ..
+            }) => Some(first_kept_entry_id.clone()),
+            _ => None,
+        })
+        .expect("the forked file still carries the compaction entry");
+    assert_eq!(
+        first_kept,
+        Some(EntryId::from("u2")),
+        "first_kept_entry_id must follow the dropped label L to the next retained entry u2"
+    );
+
+    // (b) The user-visible consequence: the fork's context is the summary PLUS both kept entries.
+    let path: Vec<&Entry> = forked.branch_path(None);
+    let msgs = build_context_messages(&path);
+    let texts: Vec<String> = msgs
+        .iter()
+        .map(|msg| match msg {
+            Message::User { content, .. } => content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            Message::Assistant(a) => a
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            _ => String::new(),
+        })
+        .collect();
+    assert!(
+        texts.iter().any(|t| t.contains("SUMMARY-057")),
+        "the compaction summary must still be in context; got {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("second question")),
+        "u2 was KEPT by the compaction and must survive the fork; got {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("second answer")),
+        "a2 was KEPT by the compaction and must survive the fork; got {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("first question")),
+        "u1 is pre-first-kept and must stay summarized away; got {texts:?}"
+    );
+}
+
+// ------------------------------------------------- SESS-052 context_edit projection ------------
+
+/// Every text block of a projected message, flattened, so a projection can be asserted on.
+fn sess052_texts(msgs: &[Message]) -> Vec<String> {
+    msgs.iter()
+        .map(|msg| {
+            let content = match msg {
+                Message::User { content, .. } | Message::ToolResult { content, .. } => content,
+                Message::Assistant(a) => &a.content,
+            };
+            content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+fn sess052_open(dir: &std::path::Path, name: &str, body: &str) -> SessionManager {
+    let file = dir.join(name);
+    let header = concat!(
+        r#"{"type":"session","version":3,"id":"33333333-3333-7333-8333-333333333333","#,
+        r#""timestamp":"2026-01-01T00:00:00Z","cwd":"/proj/sess052"}"#,
+        "\n",
+    );
+    std::fs::write(&file, format!("{header}{body}")).unwrap();
+    SessionManager::open(&file).unwrap()
+}
+
+const SESS052_U1: &str = r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"U-ONE"}],"timestamp":0}}"#;
+const SESS052_A1: &str = r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"A-ONE-ORIGINAL"}],"provider":"faux","model":"f","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"error","timestamp":0}}"#;
+
+/// Pi `projectContextEntry` with `replacement === null` returns `[]` — the target is OMITTED from
+/// model context (`session-manager.ts:523` @v0.87.1). Pi writes exactly this on its DEFAULT path:
+/// `_omitRecoveryAttempt` appends `appendContextEdit(targetId, null)` for an abandoned assistant
+/// attempt and each of its tool results (`agent-session.ts:1015-1031` @v0.87.1).
+///
+/// Before this row `"context_edit"` was absent from `KNOWN_TYPES`, so the edit deserialised to
+/// `Entry::Unknown`, contributed nothing, AND the target projected unedited.
+#[test]
+fn sess052_a_null_replacement_omits_the_target_from_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{SESS052_U1}\n{SESS052_A1}\n{}\n{}\n",
+        r#"{"type":"context_edit","id":"E1","parentId":"a1","timestamp":"2026-01-01T00:00:03Z","targetId":"a1","replacement":null}"#,
+        r#"{"type":"message","id":"u2","parentId":"E1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":[{"type":"text","text":"U-TWO"}],"timestamp":0}}"#,
+    );
+    let m = sess052_open(dir.path(), "2026-01-01T00-00-00-000Z_cccccccc.jsonl", &body);
+    let path: Vec<&Entry> = m.branch_path(None);
+    let msgs = build_context_messages(&path);
+    let texts = sess052_texts(&msgs);
+
+    assert_eq!(
+        msgs.len(),
+        2,
+        "the omitted assistant attempt must not reach the model; got {texts:?}"
+    );
+    assert!(
+        msgs.iter().all(|m| matches!(m, Message::User { .. })),
+        "only the two user turns survive; got {texts:?}"
+    );
+    assert_eq!(texts, vec!["U-ONE".to_string(), "U-TWO".to_string()]);
+}
+
+/// A non-null replacement swaps ONLY the target's content. Pi wraps a STRING replacement as a single
+/// text block for the `assistant` and `toolResult` roles
+/// (`session-manager.ts:534-537` @v0.87.1); untargeted entries are untouched.
+#[test]
+fn sess052_string_replacement_wraps_as_a_text_block_on_an_assistant_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{SESS052_U1}\n{SESS052_A1}\n{}\n{}\n",
+        r#"{"type":"context_edit","id":"E1","parentId":"a1","timestamp":"2026-01-01T00:00:03Z","targetId":"a1","replacement":{"content":"REDACTED"}}"#,
+        r#"{"type":"message","id":"u2","parentId":"E1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":[{"type":"text","text":"U-TWO"}],"timestamp":0}}"#,
+    );
+    let m = sess052_open(dir.path(), "2026-01-01T00-00-00-000Z_dddddddd.jsonl", &body);
+    let path: Vec<&Entry> = m.branch_path(None);
+    let msgs = build_context_messages(&path);
+    let texts = sess052_texts(&msgs);
+
+    assert_eq!(
+        texts,
+        vec![
+            "U-ONE".to_string(),
+            "REDACTED".to_string(),
+            "U-TWO".to_string()
+        ],
+        "the assistant target projects the replacement, the user turns are untouched"
+    );
+    // The replacement is ONE text block, not a stringified array or a raw string.
+    let Some(Message::Assistant(a)) = msgs.get(1) else {
+        panic!("entry a1 must still project as an assistant message: {msgs:?}")
+    };
+    assert_eq!(
+        a.content.len(),
+        1,
+        "exactly one content block: {:?}",
+        a.content
+    );
+    assert!(
+        matches!(a.content.first(), Some(Content::Text { text, .. }) if text.as_ref() == "REDACTED"),
+        "the string replacement is wrapped as a text block: {:?}",
+        a.content
+    );
+    // Every other field of the target's message is left as the target wrote it.
+    assert_eq!(
+        a.stop_reason,
+        StopReason::Error,
+        "metadata is not rewritten"
+    );
+}
+
+/// Pi builds its edit map from the entries `buildContextEntries` ADMITTED
+/// (`session-manager.ts:551-554` @v0.87.1), so an edit that falls OUTSIDE the live compaction window
+/// applies to nothing — it cannot resurrect or alter a dropped entry. An admitted edit in the same
+/// file still applies, which is what makes this test red without the row.
+#[test]
+fn sess052_only_edits_inside_the_compaction_window_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{SESS052_U1}\n{SESS052_A1}\n{}\n{}\n{}\n{}\n",
+        // DROPPED: this edit sits before the compaction's first-kept entry, so it is not admitted.
+        r#"{"type":"context_edit","id":"E-OUT","parentId":"a1","timestamp":"2026-01-01T00:00:03Z","targetId":"u1","replacement":{"content":"HACKED"}}"#,
+        r#"{"type":"message","id":"u2","parentId":"E-OUT","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":[{"type":"text","text":"U-TWO"}],"timestamp":0}}"#,
+        r#"{"type":"compaction","id":"C","parentId":"u2","timestamp":"2026-01-01T00:00:05Z","summary":"SUMMARY-052","firstKeptEntryId":"u2","tokensBefore":42}"#,
+        // ADMITTED: after the compaction, targeting a KEPT entry.
+        r#"{"type":"context_edit","id":"E-IN","parentId":"C","timestamp":"2026-01-01T00:00:06Z","targetId":"u2","replacement":{"content":[{"type":"text","text":"U-TWO-EDITED"}]}}"#,
+    );
+    let m = sess052_open(dir.path(), "2026-01-01T00-00-00-000Z_eeeeeeee.jsonl", &body);
+    let path: Vec<&Entry> = m.branch_path(None);
+    let texts = sess052_texts(&build_context_messages(&path));
+
+    assert!(
+        !texts.iter().any(|t| t.contains("HACKED")),
+        "an edit outside the compaction window must apply to nothing; got {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("U-ONE")),
+        "the out-of-window edit must not resurrect its dropped target; got {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("SUMMARY-052")),
+        "the compaction summary is still the head of context; got {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t == "U-TWO-EDITED"),
+        "the ADMITTED edit on a kept entry applies; got {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t == "U-TWO"),
+        "the kept entry's original content is replaced, not appended; got {texts:?}"
+    );
+}
+
+// ------------------------------- SESS-052 context_edit invalidates the usage anchor -------------
+
+/// An assistant entry carrying a REAL provider `usage` reading, so the trigger estimate has an
+/// anchor to trust (or to discard). `total_tokens` is what `calculateContextTokens` reads first.
+fn sess052_anchor_assistant(id: &str, parent: &str, ts: &str, total: u32, text: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"type":"message","id":"{id}","parentId":"{parent}","timestamp":"{ts}","#,
+            r#""message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}],"#,
+            r#""provider":"faux","model":"f","usage":{{"input":{total},"output":0,"cacheRead":0,"#,
+            r#""cacheWrite":0,"totalTokens":{total},"cost":{{"input":0,"output":0,"cacheRead":0,"#,
+            r#""cacheWrite":0,"total":0}}}},"stopReason":"stop","timestamp":0}}}}"#,
+        ),
+        id = id,
+        parent = parent,
+        ts = ts,
+        total = total,
+        text = text,
+    )
+}
+
+/// Pi `estimateProjectedContextTokens` (`core/compaction/compaction.ts:248-283` @v0.87.1) DISCARDS
+/// the provider-usage anchor when a `context_edit` sits later in the branch than the entry the
+/// anchor came from, because the edit changed what that accounting covered.
+///
+/// The sharpest case, and the one this pins: the edit REPLACES the content of the very assistant
+/// entry whose `usage` is the anchor. The entry is still projected (so the bare
+/// [`estimate_context_tokens_raw`] still finds its 200000-token reading) but the content it now
+/// contributes is four characters. Trusting the anchor reports a 200000-token context for what is
+/// really a handful of tokens, which is the row's "over-reports context and can auto-compact early".
+#[test]
+fn sess052_a_later_context_edit_discards_the_provider_usage_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{SESS052_U1}\n{}\n{}\n{}\n",
+        sess052_anchor_assistant(
+            "a1",
+            "u1",
+            "2026-01-01T00:00:02Z",
+            200_000,
+            "A-HUGE-ANSWER-THE-PROVIDER-BILLED-FOR",
+        ),
+        r#"{"type":"context_edit","id":"E1","parentId":"a1","timestamp":"2026-01-01T00:00:03Z","targetId":"a1","replacement":{"content":"tiny"}}"#,
+        r#"{"type":"message","id":"u2","parentId":"E1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":[{"type":"text","text":"U-TWO"}],"timestamp":0}}"#,
+    );
+    let m = sess052_open(dir.path(), "2026-01-01T00-00-00-000Z_f0000001.jsonl", &body);
+    let path: Vec<&Entry> = m.branch_path(None);
+
+    // The anchor is still THERE to be found: the edit swapped content, not the message.
+    let raw = crate::compaction::tokens::estimate_context_tokens_raw(
+        &crate::context::build_context_agent_messages(&path),
+    );
+    assert_eq!(
+        raw.usage_tokens, 200_000,
+        "precondition: the bare raw estimate anchors on the edited entry's stale usage"
+    );
+
+    let projected = crate::compaction::tokens::estimate_projected_context_tokens(&path);
+    assert_eq!(
+        projected.usage_tokens, 0,
+        "an edit later in the branch than the anchor's entry discards the anchor \
+         (compaction.ts:269-276 @v0.87.1)"
+    );
+    assert_eq!(
+        projected.last_usage_index, None,
+        "the fallback reports no usage-backed anchor"
+    );
+    // The fallback is a pure chars/4 sum of the EDITED projection: "U-ONE" + "tiny" + "U-TWO".
+    let edited_sum: u32 = crate::context::build_context_agent_messages(&path)
+        .iter()
+        .map(estimate_agent_message)
+        .sum();
+    assert_eq!(projected.tokens, edited_sum);
+    assert_eq!(
+        projected.trailing_tokens, edited_sum,
+        "Pi returns the whole re-estimate as `trailingTokens` (compaction.ts:282)"
+    );
+    assert!(
+        projected.tokens < 100,
+        "the real edited context is a handful of tokens, not 200000; got {}",
+        projected.tokens
+    );
+}
+
+/// The comparison is DIRECTIONAL — `usageEntryIndex > latestInvalidatingEntryIndex`
+/// (`compaction.ts:276` @v0.87.1). An edit that PRE-dates the anchor's entry cannot have changed
+/// what the provider billed for, so the anchor is kept. Inverting the comparison, or treating any
+/// `context_edit` anywhere on the branch as invalidating, fails here.
+#[test]
+fn sess052_an_earlier_context_edit_keeps_the_provider_usage_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{SESS052_U1}\n{}\n{}\n",
+        // The edit lands BEFORE the usage-bearing assistant, targeting the first user turn.
+        r#"{"type":"context_edit","id":"E1","parentId":"u1","timestamp":"2026-01-01T00:00:02Z","targetId":"u1","replacement":{"content":"U-ONE-EDITED"}}"#,
+        sess052_anchor_assistant(
+            "a1",
+            "E1",
+            "2026-01-01T00:00:03Z",
+            200_000,
+            "AN-ANSWER-BILLED-AFTER-THE-EDIT",
+        ),
+    );
+    let m = sess052_open(dir.path(), "2026-01-01T00-00-00-000Z_f0000002.jsonl", &body);
+    let path: Vec<&Entry> = m.branch_path(None);
+
+    let projected = crate::compaction::tokens::estimate_projected_context_tokens(&path);
+    assert_eq!(
+        projected.usage_tokens, 200_000,
+        "the provider already saw the edited context, so its reading stands"
+    );
+    assert_eq!(projected.tokens, 200_000, "nothing trails the anchor");
+    assert_eq!(projected.last_usage_index, Some(1));
+}
+
+/// The trigger the row's Impact is about: `Compactor::should_compact` — Pi
+/// `shouldCompact(estimateProjectedContextTokens(projection, getBranch()).tokens, …)`
+/// (`agent-session.ts:594-600` @v0.87.1). With the stale anchor trusted, a 4-token context reads as
+/// 200000 and auto-compaction fires on a session that has nothing to compact.
+#[test]
+fn sess052_should_compact_does_not_fire_on_a_stale_pre_edit_usage_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{SESS052_U1}\n{}\n{}\n",
+        sess052_anchor_assistant(
+            "a1",
+            "u1",
+            "2026-01-01T00:00:02Z",
+            200_000,
+            "A-HUGE-ANSWER-THE-PROVIDER-BILLED-FOR",
+        ),
+        r#"{"type":"context_edit","id":"E1","parentId":"a1","timestamp":"2026-01-01T00:00:03Z","targetId":"a1","replacement":{"content":"tiny"}}"#,
+    );
+    let m = sess052_open(dir.path(), "2026-01-01T00-00-00-000Z_f0000003.jsonl", &body);
+    let path: Vec<Entry> = m.branch_path(None).into_iter().cloned().collect();
+
+    let compactor = crate::compaction::Compactor::new(NeverSummarizer, crate::compaction::NoHooks);
+    let settings = crate::compaction::CompactionSettings {
+        enabled: true,
+        reserve_tokens: 1_000,
+        keep_recent_tokens: 40,
+    };
+    assert!(
+        !compactor.should_compact(&path, 8_000, &settings),
+        "the edited context is far below the 8000-token window; only the discarded \
+         pre-edit anchor could push it over"
+    );
+}
+
+/// `CompactionEntry.tokensBefore` is the size of the context a compaction is reducing — Pi
+/// `estimateProjectedContextTokens(projection, pathEntries).tokens` (`compaction.ts:919` @v0.87.1).
+/// Persisting the stale pre-edit anchor writes a number that never described this context, and it is
+/// the number `/context`-style readers and the next compaction's accounting both read back.
+#[test]
+fn sess052_tokens_before_ignores_a_stale_pre_edit_usage_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{SESS052_U1}\n{}\n{}\n{}\n",
+        sess052_anchor_assistant(
+            "a1",
+            "u1",
+            "2026-01-01T00:00:02Z",
+            200_000,
+            "A-HUGE-ANSWER-THE-PROVIDER-BILLED-FOR",
+        ),
+        r#"{"type":"context_edit","id":"E1","parentId":"a1","timestamp":"2026-01-01T00:00:03Z","targetId":"a1","replacement":{"content":"tiny"}}"#,
+        r#"{"type":"message","id":"u2","parentId":"E1","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":[{"type":"text","text":"U-TWO"}],"timestamp":0}}"#,
+    );
+    let m = sess052_open(dir.path(), "2026-01-01T00-00-00-000Z_f0000004.jsonl", &body);
+    let path: Vec<Entry> = m.branch_path(None).into_iter().cloned().collect();
+    let cache = TokenCache::default();
+    let settings = crate::compaction::CompactionSettings {
+        enabled: true,
+        reserve_tokens: 10,
+        keep_recent_tokens: 1,
+    };
+    let prep = crate::compaction::prepare_compaction(&path, &cache, &settings)
+        .expect("there is history to compact");
+
+    let refs: Vec<&Entry> = path.iter().collect();
+    assert_eq!(
+        prep.tokens_before,
+        crate::compaction::tokens::estimate_projected_context_tokens(&refs).tokens,
+        "tokensBefore is the PROJECTED estimate"
+    );
+    assert!(
+        prep.tokens_before < 100,
+        "the 200000-token pre-edit anchor must not be persisted as tokensBefore; got {}",
+        prep.tokens_before
+    );
+}
+
+/// A [`Summarizer`] that must never be reached — these tests only exercise the trigger estimate.
+struct NeverSummarizer;
+
+impl crate::compaction::Summarizer for NeverSummarizer {
+    async fn complete(
+        &self,
+        _req: crate::compaction::SummarizationRequest<'_>,
+        _cancel: cyrup_core::CancelToken,
+    ) -> Result<cyrup_core::AssistantMessage, crate::compaction::CompactionError> {
+        panic!("no summarization is expected in a trigger-estimate test")
+    }
 }

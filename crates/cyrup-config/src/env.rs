@@ -101,7 +101,7 @@ impl EnvVars {
         // Resolved before the struct literal so the `path` closure's borrow of `home` ends before
         // `home` itself is moved into the field.
         let agent_dir = path(&crate::paths::ENV_AGENT_DIR_KEYS);
-        let session_dir = path(&["CYRUP_SESSION_DIR"]);
+        let session_dir = path(&[crate::paths::ENV_SESSION_DIR]);
         let package_dir = path(&["CYRUP_PACKAGE_DIR"]);
         Self {
             home,

@@ -67,6 +67,11 @@ struct ResolvedRunAgent {
     available_models: Vec<ModelId>,
     /// The model override that survived the fail-closed `modelScope` gate.
     effective_override: crate::exec::fallback::ModelOverride,
+    /// SUBA-119 — pi's `options.modelOverrideFromParent` (`execution.ts:1836`): resolved beside
+    /// `effective_override`, because that is the only point where the three inputs the decision reads
+    /// are all in hand, and because `ModelOverride::Explicit` cannot be told apart from a
+    /// parent-inherited model once it has been returned.
+    model_override_from_parent: bool,
     /// SUBA-088 — pi `currentProvider = parentModel?.provider` (`subagent-executor.ts:3648`
     /// @v0.64.0): the REMEMBERED parent model's provider, handed to `run_sync` as
     /// [`RunOptions::preferred_provider`] (pi's `preferredModelProvider: currentProvider`,
@@ -128,6 +133,13 @@ struct ForegroundRunOptionsInput<'a> {
     max_thinking: Option<String>,
     available_models: Vec<ModelId>,
     effective_override: crate::exec::fallback::ModelOverride,
+    /// SUBA-119 — pi's `options.modelOverrideFromParent` (`execution.ts:1836`).
+    model_override_from_parent: bool,
+    /// SUBA-119 — pi's `options.modelResponseAliases`, resolved from the same live
+    /// [`crate::registration::SubagentExtensionConfig`] snapshot as `spawn_command` and
+    /// `turn_budget` above (upstream: `deps.config.modelResponseAliases`,
+    /// `subagent-executor.ts:4029`).
+    model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
     preferred_provider: Option<ProviderId>,
     fork_context: ForkContext,
     deadline_at: Option<std::time::Instant>,
@@ -322,6 +334,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            model_override_from_parent,
             preferred_provider,
         } = self.resolve_run_agent(&req, &cfg, depth).await?;
         // SUBA-100 — pi `runSinglePath` (`subagent-executor.ts:3823-3827` @v0.68.0):
@@ -378,6 +391,8 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            model_override_from_parent,
+            model_response_aliases: cfg.model_response_aliases.clone(),
             preferred_provider,
             fork_context,
             deadline_at,
@@ -973,6 +988,15 @@ impl SubagentExecutor {
             model_scope.as_ref(),
         )
         .map_err(|violation| SubagentError::ModelOutOfScope(violation.message))?;
+        // SUBA-119 — the same three inputs the resolution above just consumed, read for pi's
+        // `modelOverrideFromParent` (`execution.ts:1836`). It must be computed HERE: once
+        // `resolve_model_inheritance` has returned `Explicit(model)`, a parent-inherited model and a
+        // caller-supplied one are the same value.
+        let model_override_from_parent = crate::exec::fallback::model_override_is_from_parent(
+            req.model_override.as_ref(),
+            agent_config.model.as_ref(),
+            parent_model.as_ref(),
+        );
         // SUBA-088 / pi `const currentProvider = parentModel?.provider` (`subagent-executor.ts:3648`
         // @v0.64.0), from the same remembered parent model the inheritance above used.
         let preferred_provider = parent_model.as_ref().and_then(provider_of);
@@ -988,6 +1012,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            model_override_from_parent,
             preferred_provider,
         })
     }
@@ -1141,6 +1166,8 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            model_override_from_parent,
+            model_response_aliases,
             preferred_provider,
             fork_context,
             deadline_at,
@@ -1156,6 +1183,14 @@ impl SubagentExecutor {
             workflow_steer,
         } = input;
         RunOptions {
+            model_override_from_parent,
+            // SUBA-119 — pi's `options.modelResponseAliases`, read from `config.json` exactly as
+            // upstream reads `deps.config.modelResponseAliases` at `subagent-executor.ts:4029` and
+            // threads it onto the single-run options at `:4093`. Validated at config load
+            // (`SubagentExtensionConfig::validate_model_response_aliases`), so what arrives here is
+            // already a well-formed map; `None` is the operator declaring nothing, which is every
+            // installation that has not hit a substituting router.
+            model_response_aliases,
             machine: None,
             // Fed from `SubagentExtensionConfig::env_overrides` by `run_foreground_impl`.
             parent_env_overrides: std::collections::BTreeMap::new(),
@@ -1908,7 +1943,8 @@ mod tests {
             tools: None,
             extensions: None,
             extensions_from_default: false,
-            subagent_only_extensions: Vec::new(),
+            subagent_only_extensions: None,
+            subagent_only_extensions_from_default: false,
             exclude_tools: None,
             allow_nested_subagents: None,
             model: model.map(ModelId::from),
@@ -2717,6 +2753,79 @@ mod detach_producer_tests {
         assert_eq!(
             runs.get(&run_id).expect("still remembered").children[0].status,
             "detached"
+        );
+    }
+    /// SUBA-119 — the FOREGROUND SINGLE path's half of the wiring, which is the one the row's
+    /// Verify sentence is about ("the same run with `modelResponseAliases: {'prov/model':
+    /// ['other/model']}` succeeds"). `build_foreground_run_options` hardcoded `None` here, so an
+    /// operator who followed the verification error's own remediation and declared the alias in
+    /// `config.json` got no change in behaviour at all.
+    ///
+    /// Asserted at the `RunOptions` seam because that is the value `handle_child_line` reads
+    /// (`opts.model_response_aliases`, `drive_attempt.rs`); a field set anywhere short of it is a
+    /// field the check never consults.
+    #[tokio::test]
+    async fn the_configured_response_alias_map_reaches_the_foreground_run_options() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let aliases: crate::exec::model_verification::ModelResponseAliases =
+            std::collections::BTreeMap::from([(
+                "prov/model".to_string(),
+                vec!["other/model".to_string()],
+            )]);
+
+        let built = |map: Option<crate::exec::model_verification::ModelResponseAliases>| {
+            let executor = SubagentExecutor::new();
+            let run_id = RunId::new();
+            let notifier = notifier_for(&executor, &run_id);
+            let control = crate::exec::control::ResolvedControlConfig::default();
+            let agent = crate::discovery::frontmatter::parse_agent_file(
+                "---\nname: scout\ndescription: d\n---\n\nBody.\n",
+                crate::discovery::types::AgentSource::User,
+                std::path::Path::new("/u/scout.md"),
+            )
+            .expect("the fixture persona parses");
+            executor
+                .build_foreground_run_options(ForegroundRunOptionsInput {
+                    overrides: SingleRunOverrides::default(),
+                    cwd: dir.path(),
+                    timeout_ms: None,
+                    cancel: CancelToken::new(),
+                    agent: &agent,
+                    turn_budget: None,
+                    permission_rules: None,
+                    spawn_command: None,
+                    model_scope: None,
+                    max_thinking: None,
+                    available_models: Vec::new(),
+                    effective_override: crate::exec::fallback::ModelOverride::Inherit,
+                    model_override_from_parent: false,
+                    model_response_aliases: map,
+                    preferred_provider: None,
+                    fork_context: ForkContext::fresh(),
+                    deadline_at: None,
+                    run_id: &run_id,
+                    resolved_control: &control,
+                    control_notifier: &notifier,
+                    output_path: None,
+                    output_mode: crate::discovery::types::OutputMode::Inline,
+                    session_dir: None,
+                    artifacts_enabled: false,
+                    include_transcript: false,
+                    art_dir: dir.path(),
+                    workflow_steer: None,
+                })
+                .model_response_aliases
+        };
+
+        assert_eq!(
+            built(Some(aliases.clone())),
+            Some(aliases),
+            "the declared map must reach the value `handle_child_line` reads"
+        );
+        assert_eq!(
+            built(None),
+            None,
+            "and an installation that declared nothing gets nothing invented for it"
         );
     }
 }

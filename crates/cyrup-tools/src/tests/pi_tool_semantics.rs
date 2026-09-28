@@ -902,3 +902,50 @@ fn truncation_details_carry_pis_content_field() {
         "the read side defaults; the write side never omits it"
     );
 }
+
+/// TOOL-046 — the strict-prefer constrained-sampling declaration, read off the BUILT-IN REGISTRY
+/// through `Arc<dyn Tool>`, which is the shape `cyrup-session-svc/src/builder.rs` hands the
+/// provider. Pi's change (CHANGELOG 0.86.0: *"Enabled strict-prefer JSON-schema sampling by default
+/// for built-in read, bash, powershell, edit, and write tools, without requiring PI_EXPERIMENTAL"*)
+/// names exactly five tools and excludes three, so this pins BOTH halves: the per-tool unit tests
+/// each see only their own vtable and could not catch a declaration stamped onto everything.
+///
+/// Upstream sources, all @v0.87.1: `core/tools/read.ts:80`, `bash.ts:243` (the shared
+/// `createShellToolDefinition`, hence `powershell`), `edit.ts:156`, `write.ts:57` carry the literal;
+/// `grep.ts`, `find.ts` and `ls.ts` have no `constrainedSampling` key at all.
+#[test]
+fn only_pis_five_tools_declare_strict_prefer_constrained_sampling() {
+    use cyrup_core::{ConstrainedSampling, ConstrainedSamplingConfig, StrictSampling};
+
+    let reg = crate::registry::ToolRegistry::with_builtins(
+        std::env::temp_dir(),
+        crate::ops::Backend::default(),
+        crate::ToolsOptions::default(),
+    );
+    let prefer = ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
+        strict: StrictSampling::Prefer,
+    });
+    let mut seen: Vec<String> = Vec::new();
+    for tool in reg.visible(&crate::registry::Availability::All) {
+        let name = tool.name();
+        seen.push(name.to_string());
+        match name {
+            "read" | "bash" | "powershell" | "edit" | "write" => assert_eq!(
+                tool.constrained_sampling(),
+                Some(&prefer),
+                "{name} must declare pi's strict-prefer JSON-schema sampling"
+            ),
+            "grep" | "find" | "ls" => assert_eq!(
+                tool.constrained_sampling(),
+                None,
+                "{name} carries no constrainedSampling key upstream"
+            ),
+            other => panic!("unexpected built-in {other}: extend this pin with its upstream state"),
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        8,
+        "all eight built-ins must be covered; got {seen:?}"
+    );
+}

@@ -1,29 +1,35 @@
-//! SUBA-082 — the DECLARED-role branch of `inferLevel`
-//! (`pi-subagents:v0.57.0:src/runs/shared/acceptance.ts:90-104`; `:92-108` @v0.64.0), a direct
-//! mirror of upstream's own case list, `test/unit/acceptance.test.ts:91-165` @v0.64.0 ("uses
-//! explicit agent roles for ambiguous tasks while preserving task-intent precedence").
+//! SUBA-108 — the DECLARED-role branch of `inferLevel` (`src/runs/shared/acceptance.ts:81-122`
+//! @v0.71.0). At this tag the declared role is the ONLY input: `inferLevel` reads nothing but
+//! `input.acceptanceRole` and the `async`/`dynamic`/`dynamicGroup` flags.
 //!
-//! What the role changes, and what it must NOT change:
+//! This file was filed as SUBA-082, against `:90-104` @v0.57.0, where the role interacted with a
+//! dozen name and wording heuristics. Upstream `7c98a696` ("refactor: remove inferred no-edit
+//! completion failures", #2356, v0.70.1) deleted all of them, and with them five of this module's
+//! seven tests — each of which pinned an interaction that no longer exists:
 //!
-//! - `readOnlyAgent` is `role === "read-only" || (role === undefined && /\b(?:reviewer|…)\b/)`
-//!   and `writeTask` gains `role === "writer" && !readOnlyTask` — so a declared role REPLACES the
-//!   agent-name guess (`explorer` + `read-only` → read-only branch; `reviewer` + `writer` → checked).
-//! - task-intent precedence is preserved: an implementation task on a `read-only` worker is still
-//!   `checked`, and `Review only; do not edit files` on a `writer` is still read-only.
-//! - with a role declared, `Patch src/auth.ts` counts as mutation (`rolePatchTask`) even though
-//!   the classifier alone calls it `unknown`.
-//! - a declared role that resolves read-only cancels the `dynamic`/`dynamicGroup` escalation
-//!   (`roleResolvesReadOnly`) and the risky-keyword escalation (`keywordRiskReadOnly`).
+//! * `a_declared_writer_role_replaces_the_reviewer_name_guess` — its control asserted that the
+//!   `reviewer` NAME takes the read-only branch. There is no name alternation any more.
+//! * `explicit_mutation_intent_wins_over_a_declared_read_only_role` and
+//!   `explicit_no_edit_wording_wins_over_a_declared_writer_role` — task wording no longer
+//!   overrides, or even reaches, the declared role. This is the deletion's whole point: CHANGELOG
+//!   0.70.1, *"Stop guessing whether task wording requires file edits."*
+//! * `a_declared_read_only_role_suppresses_the_risky_keyword_escalation` — the
+//!   `release|migration|security|…` pattern is gone, so there is no escalation to suppress.
+//! * `a_declared_read_only_role_cancels_the_dynamic_escalation` — its control asserted that a
+//!   NO-role dynamic run escalates. Dynamic now escalates only for a declared `writer`
+//!   (`acceptance.ts:88`), so `roleResolvesReadOnly` has no counterpart either.
 //!
-//! One deliberate difference from the v0.64.0 assertions: upstream's read-only branch resolves to
-//! level `none` there, this crate's to `attested`. That is v0.63.0's `0128385f` ("fix: omit
-//! inferred acceptance for read-only reviewers (#1799)"), a separate drift that also rewrites the
-//! NAME-classified branch and is not part of the acceptance-role row — see `infer_level`'s doc.
-//! Every case below therefore asserts the BRANCH (`checked` vs. the read-only branch's
-//! `review-findings` evidence and reason string), which is what the role decides on both tags.
+//! Those are deletions of tests for deleted behaviour, not suppressions. The property that
+//! REPLACES them — the inferred contract depends on the role/async/dynamic axes and on nothing
+//! else — is pinned directly, and more strongly than any of the five did, by
+//! `exec::acceptance::model::level`'s `inference_is_invariant_across_task_text_and_agent_name` and
+//! `exec::acceptance::lattice::contract`'s `the_inferred_contract_does_not_depend_on_the_agent_name`.
+//! The same deletion removed this crate's `tests/read_only_agent_name_alternation.rs` outright:
+//! that whole module existed to pin the `reviewer|oracle|scout|researcher|analyst` alternation.
 //!
-//! Everything here goes through `model::resolve_effective_acceptance`, the same function
-//! `AcceptanceContract::heuristic_default_for_role` calls on the live inference path.
+//! What survives here is the two statements that are still true: a declared `read-only` role takes
+//! the read-only branch where the bare agent name never would, and the enum-lattice entry points
+//! thread the role through to the contract unchanged.
 
 #![allow(
     clippy::unwrap_used,
@@ -51,25 +57,39 @@ fn infer(agent: &str, role: Option<AcceptanceRole>, task: &str) -> ResolvedAccep
     })
 }
 
-/// The read-only branch's own evidence set (`acceptance.ts:135-137` @v0.57.0) — the observable
-/// that separates it from BOTH `checked` and the default fallthrough.
+/// The read-only branch's observable at v0.71.0: level `none` (`acceptance.ts:110`) with
+/// criteria and evidence CLEARED on the way out (`:521-522`). The branch's own
+/// `[review-findings, residual-risks]` list — which `:135-137` @v0.57.0 did ship — never reaches
+/// the resolved config, because nothing shows a contract to a child that has no acceptance
+/// prompt. The reasons survive (`:520`), which is what still separates this branch from the
+/// `{ level: "none", reason }` deliberate disable.
+fn assert_read_only_branch(resolved: &ResolvedAcceptanceConfig, reason: &str, case: &str) {
+    assert_eq!(
+        resolved.level,
+        AcceptanceLevel::None,
+        "{case}: the read-only branch infers `none`"
+    );
+    assert!(
+        resolved.criteria.is_empty(),
+        "{case}: level `none` clears criteria, got {:?}",
+        resolved.criteria
+    );
+    assert!(
+        resolved.evidence.is_empty(),
+        "{case}: level `none` clears evidence, got {:?}",
+        resolved.evidence
+    );
+    assert_eq!(resolved.inferred_reason, vec![reason.to_string()], "{case}");
+}
+
+/// The read-only branch's own evidence set, as `inferLevel` names it before
+/// `resolveEffectiveAcceptance` discards it. It is observable only once `:505` has upgraded the
+/// level away from `none`, which is what [`a_caller_supplied_policy_reaches_a_read_only_child`]
+/// asserts.
 const READ_ONLY_BRANCH_EVIDENCE: [AcceptanceEvidenceKind; 2] = [
     AcceptanceEvidenceKind::ReviewFindings,
     AcceptanceEvidenceKind::ResidualRisks,
 ];
-
-fn assert_read_only_branch(resolved: &ResolvedAcceptanceConfig, reason: &str, case: &str) {
-    assert_ne!(
-        resolved.level,
-        AcceptanceLevel::Checked,
-        "{case}: must not be checked"
-    );
-    assert_eq!(
-        resolved.evidence, READ_ONLY_BRANCH_EVIDENCE,
-        "{case}: not the read-only branch"
-    );
-    assert_eq!(resolved.inferred_reason, vec![reason.to_string()], "{case}");
-}
 
 /// `explorer` is outside every name alternation, so on ambiguous wording it falls through to the
 /// default attestation — UNLESS it declares `read-only`, which takes the read-only branch with
@@ -109,191 +129,6 @@ fn a_declared_read_only_role_replaces_the_agent_name_guess() {
     );
 }
 
-/// `reviewer` + `writer`: the reviewer-name alternation is gated on `role === undefined`, and the
-/// `writer` arm of `writeTask` fires on any non-read-only task — with the role's own reason
-/// (`acceptance.ts:124` @v0.57.0: `"declared writer acceptance role"`, because `taskMayWrite` is
-/// false for this wording).
-#[test]
-fn a_declared_writer_role_replaces_the_reviewer_name_guess() {
-    let control = infer("reviewer", None, "Handle the authentication flow");
-    assert_read_only_branch(
-        &control,
-        "read-only/reviewer-style agent",
-        "control: reviewer name",
-    );
-
-    let writer = infer(
-        "reviewer",
-        Some(AcceptanceRole::Writer),
-        "Handle the authentication flow",
-    );
-    assert_eq!(writer.level, AcceptanceLevel::Checked);
-    assert_eq!(
-        writer.inferred_reason,
-        vec!["declared writer acceptance role".to_string()]
-    );
-
-    // With genuine mutation wording the reason is the ordinary one — the role is not what made
-    // the task write-capable.
-    let implementing = infer(
-        "reviewer",
-        Some(AcceptanceRole::Writer),
-        "Implement the fix",
-    );
-    assert_eq!(implementing.level, AcceptanceLevel::Checked);
-    assert_eq!(
-        implementing.inferred_reason,
-        vec!["write-capable worker/task".to_string()]
-    );
-
-    // `async` + a role-declared writer is the risky branch, exactly as for a name-classified
-    // worker (`acceptance.ts:106`).
-    let async_writer = resolve_effective_acceptance(&AcceptanceResolveInput {
-        agent_name: "reviewer".to_string(),
-        acceptance_role: Some(AcceptanceRole::Writer),
-        task: Some("Handle the authentication flow".to_string()),
-        is_async: true,
-        ..Default::default()
-    });
-    assert_eq!(async_writer.level, AcceptanceLevel::Checked);
-    assert_eq!(
-        async_writer.inferred_reason,
-        vec!["async write-capable or risky run".to_string()]
-    );
-}
-
-/// Task-intent precedence: explicit mutation wording beats a declared `read-only` role
-/// (`taskMayWrite` is computed on the `worker` grammar when a role is declared,
-/// `acceptance.ts:90,97`), including `Patch src/auth.ts`, which only `rolePatchTask` catches.
-#[test]
-fn explicit_mutation_intent_wins_over_a_declared_read_only_role() {
-    for task in [
-        "Implement the authentication fix",
-        "Create a fixture",
-        "Add coverage",
-        "Replace the dependency",
-        "Patch src/auth.ts",
-    ] {
-        let resolved = infer("worker", Some(AcceptanceRole::ReadOnly), task);
-        assert_eq!(resolved.level, AcceptanceLevel::Checked, "{task}");
-        assert_eq!(
-            resolved.inferred_reason,
-            vec!["write-capable worker/task".to_string()],
-            "{task}"
-        );
-    }
-    // The control for `rolePatchTask`: WITHOUT a role, `Patch src/auth.ts` is `unknown` to the
-    // classifier and a worker-named agent only reaches `checked` through the `\bworker\b` arm —
-    // so a name outside every alternation stays on the default fallthrough.
-    assert_eq!(
-        infer("explorer", None, "Patch src/auth.ts").inferred_reason,
-        vec!["default lightweight attestation".to_string()],
-        "control: `rolePatchTask` is gated on a declared role"
-    );
-    // Async + read-only role + patch wording: risky, because `writeTask` is true.
-    let async_patch = resolve_effective_acceptance(&AcceptanceResolveInput {
-        agent_name: "worker".to_string(),
-        acceptance_role: Some(AcceptanceRole::ReadOnly),
-        task: Some("Patch src/auth.ts".to_string()),
-        is_async: true,
-        ..Default::default()
-    });
-    assert_eq!(async_patch.level, AcceptanceLevel::Checked);
-}
-
-/// The mirror: explicit no-edit wording beats a declared `writer` role (`readOnlyTask` short-
-/// circuits `taskMayWrite` and gates the `writer` arm, `acceptance.ts:97,101`), on the single
-/// path and under a `dynamicGroup` escalation alike.
-#[test]
-fn explicit_no_edit_wording_wins_over_a_declared_writer_role() {
-    assert_read_only_branch(
-        &infer(
-            "worker",
-            Some(AcceptanceRole::Writer),
-            "Review only; do not edit files",
-        ),
-        "read-only task wording",
-        "worker + writer + review-only wording",
-    );
-    let dynamic_group = resolve_effective_acceptance(&AcceptanceResolveInput {
-        agent_name: "worker".to_string(),
-        acceptance_role: Some(AcceptanceRole::Writer),
-        task: Some("Review only; do not edit files".to_string()),
-        dynamic_group: true,
-        ..Default::default()
-    });
-    assert_ne!(
-        dynamic_group.level,
-        AcceptanceLevel::Checked,
-        "`roleResolvesReadOnly` cancels the dynamicGroup escalation for a declared role"
-    );
-}
-
-/// With a role declared, `keywordRiskReadOnly` is `inferredReadOnly` rather than the bare
-/// classifier verdict (`acceptance.ts:105`), so `security` in an explorer's read-only task no
-/// longer escalates; without a role the same wording on a worker still does (upstream's own
-/// "preserves risky keyword review inference when acceptance role metadata is omitted" case).
-#[test]
-fn a_declared_read_only_role_suppresses_the_risky_keyword_escalation() {
-    assert_read_only_branch(
-        &infer(
-            "explorer",
-            Some(AcceptanceRole::ReadOnly),
-            "Audit the security posture",
-        ),
-        "declared read-only acceptance role",
-        "explorer + read-only + security keyword",
-    );
-    for task in ["Inspect the security posture", "Read-only security audit"] {
-        let no_role = infer("worker", None, task);
-        assert_eq!(no_role.level, AcceptanceLevel::Checked, "{task}");
-        assert_eq!(
-            no_role.inferred_reason,
-            vec!["risky write-capable run".to_string()],
-            "{task}: the `undefined` branch keeps the keyword escalation"
-        );
-    }
-}
-
-/// `roleResolvesReadOnly` cancels the `dynamic` escalation (`acceptance.ts:107` @v0.57.0):
-/// `explorer` + `read-only` on `Explore each target` under dynamic fan-out is NOT risky.
-/// Without a role the very same input escalates to `checked` — the control that shows the
-/// guard is measuring the role and not the wording.
-#[test]
-fn a_declared_read_only_role_cancels_the_dynamic_escalation() {
-    let with_role = resolve_effective_acceptance(&AcceptanceResolveInput {
-        agent_name: "explorer".to_string(),
-        acceptance_role: Some(AcceptanceRole::ReadOnly),
-        task: Some("Explore each target".to_string()),
-        dynamic: true,
-        ..Default::default()
-    });
-    assert_read_only_branch(
-        &with_role,
-        "declared read-only acceptance role",
-        "explorer + read-only + dynamic",
-    );
-    let without_role = resolve_effective_acceptance(&AcceptanceResolveInput {
-        agent_name: "explorer".to_string(),
-        acceptance_role: None,
-        task: Some("Explore each target".to_string()),
-        dynamic: true,
-        ..Default::default()
-    });
-    assert_eq!(
-        without_role.level,
-        AcceptanceLevel::Checked,
-        "control: with no role the dynamic escalation fires (`roleResolvesReadOnly` is false)"
-    );
-    assert_eq!(
-        without_role.inferred_reason,
-        vec![
-            "risky write-capable run".to_string(),
-            "dynamic fanout context".to_string()
-        ]
-    );
-}
-
 /// The enum-lattice entry points carry the role through unchanged, and the two-argument forms
 /// are exactly the `None` role (the branch every pre-existing caller was on).
 #[test]
@@ -322,7 +157,9 @@ fn the_lattice_contract_entry_points_thread_the_role() {
             "Explore the authentication flow"
         )
         .required_level,
-        AcceptanceStatus::Attested
+        // SUBA-108 — `acceptance.ts:109-117` @v0.71.0: a declared read-only role infers `none`,
+        // which lowers to `NotRequired` (no acceptance prompt, no gate).
+        AcceptanceStatus::NotRequired
     );
     // The explicit-floor rule is untouched: an explicit `attested` still loses to a role-inferred
     // `checked` by rank.
@@ -337,4 +174,44 @@ fn the_lattice_contract_entry_points_thread_the_role() {
     );
     assert_eq!(effective.required_level, AcceptanceStatus::Checked);
     assert!(effective.explicit);
+}
+
+/// SUBA-108 — `acceptance.ts:505` @v0.71.0. A declared read-only agent infers `none`, and `none`
+/// is where the caller's own policy goes to die: `explicitLevel` is `auto` whenever the explicit
+/// input names no `level`, so the MAX escalation at `:507` never runs and the resolved level stays
+/// `none` — empty contract, `NotRequired` gate, criteria/evidence/verify/review discarded by
+/// `:521-522`. Upstream checks `explicitAcceptanceRequestsPolicy` first and upgrades to `attested`.
+#[test]
+fn a_caller_supplied_policy_reaches_a_read_only_child() {
+    let bare = infer("scout", Some(AcceptanceRole::ReadOnly), "Audit the flow");
+    assert_eq!(
+        bare.level,
+        AcceptanceLevel::None,
+        "premise: no policy asked"
+    );
+
+    let upgraded = resolve_effective_acceptance(&AcceptanceResolveInput {
+        explicit: Some(crate::exec::acceptance::model::AcceptanceInput::Config(
+            crate::exec::acceptance::model::AcceptanceConfig {
+                stop_rules: Some(vec!["do not edit".to_string()]),
+                ..Default::default()
+            },
+        )),
+        agent_name: "scout".to_string(),
+        acceptance_role: Some(AcceptanceRole::ReadOnly),
+        task: Some("Audit the flow".to_string()),
+        mode: None,
+        is_async: false,
+        dynamic: false,
+        dynamic_group: false,
+    });
+    assert_eq!(upgraded.level, AcceptanceLevel::Attested);
+    assert_eq!(upgraded.stop_rules, vec!["do not edit".to_string()]);
+    // `:509` compares against the UPGRADED level, so what survives is the read-only branch's own
+    // evidence list, not `requiredEvidenceForLevel("attested")`.
+    assert_eq!(upgraded.evidence, READ_ONLY_BRANCH_EVIDENCE);
+    assert!(
+        !upgraded.criteria.is_empty(),
+        "the level is no longer `none`, so `:521` no longer clears the criteria"
+    );
 }

@@ -1,5 +1,9 @@
 //! Message conversion (Pi `convertMessages`).
 
+use super::decode::REASONING_FIELDS;
+use super::reasoning_details::{
+    parse_legacy_encrypted_reasoning_detail, parse_openai_reasoning_details,
+};
 use super::tools::{convert_tools, tools_by_name};
 use super::transform::transform_messages;
 use crate::api::compat::{DeferredToolsMode, ResolvedCompat, sanitize_surrogates};
@@ -215,6 +219,40 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
         })
         .collect();
 
+    let tool_calls: Vec<&ToolCall> = am
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            Content::ToolCall(tc) => Some(tc),
+            _ => None,
+        })
+        .collect();
+
+    // The preserved `reasoning_details` array: the thinking block's own signature when it holds one
+    // (the current shape), else the legacy per-tool-call encrypted details
+    // (openai-completions.ts:1304-1312).
+    let signed_reasoning_details = am
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Thinking {
+                thinking_signature, ..
+            } => parse_openai_reasoning_details(thinking_signature.as_deref()),
+            _ => None,
+        })
+        .next();
+    let legacy_reasoning_details: Vec<Value> = tool_calls
+        .iter()
+        .filter_map(|tc| parse_legacy_encrypted_reasoning_detail(tc.thought_signature.as_deref()))
+        .collect();
+    let preserved_reasoning_details = signed_reasoning_details.or({
+        if legacy_reasoning_details.is_empty() {
+            None
+        } else {
+            Some(legacy_reasoning_details)
+        }
+    });
+
     if let Some(first) = thinking_blocks.first() {
         let first_thinking_sig = first.1;
         if compat.requires_thinking_as_text {
@@ -232,14 +270,21 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
             if !assistant_text.is_empty() {
                 content_val = json!(assistant_text);
             }
+            // `reasoning_details` is the structured alternative to a raw reasoning field: when
+            // details were preserved, NO raw field is sent (openai-completions.ts:1332-1333).
             // Replay reasoning under the original field name (llama.cpp server + gpt-oss).
             let mut signature = first_thinking_sig.clone();
             if model.provider.as_str() == "opencode-go" && signature.as_deref() == Some("reasoning")
             {
                 signature = Some("reasoning_content".to_string());
             }
-            if let Some(sig) = signature
+            if preserved_reasoning_details.is_none()
+                && let Some(sig) = signature
                 && !sig.is_empty()
+                // `isOpenAICompletionsReasoningField` (openai-completions.ts:272-274, gate at
+                // `:1338`). Load-bearing now that a thinking signature can be a JSON array of
+                // reasoning details rather than a field name.
+                && REASONING_FIELDS.contains(&sig.as_str())
             {
                 let joined = thinking_blocks
                     .iter()
@@ -253,18 +298,9 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
         content_val = json!(assistant_text);
     }
 
-    let tool_calls: Vec<&ToolCall> = am
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            Content::ToolCall(tc) => Some(tc),
-            _ => None,
-        })
-        .collect();
     let has_tool_calls = !tool_calls.is_empty();
     if has_tool_calls {
         let mut tc_values: Vec<Value> = Vec::new();
-        let mut reasoning_details: Vec<Value> = Vec::new();
         for tc in &tool_calls {
             tc_values.push(json!({
                 "id": tc.id.as_str(),
@@ -274,20 +310,14 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
                     "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
                 },
             }));
-            if let Some(sig) = &tc.thought_signature
-                && let Ok(parsed) = serde_json::from_str::<Value>(sig)
-                && !parsed.is_null()
-            {
-                reasoning_details.push(parsed);
-            }
         }
         obj.insert("tool_calls".to_string(), Value::Array(tc_values));
-        if !reasoning_details.is_empty() {
-            obj.insert(
-                "reasoning_details".to_string(),
-                Value::Array(reasoning_details),
-            );
-        }
+    }
+
+    // Emitted independently of `tool_calls` — a reasoning-only turn replays its details too
+    // (openai-completions.ts:1375-1377).
+    if let Some(details) = preserved_reasoning_details {
+        obj.insert("reasoning_details".to_string(), Value::Array(details));
     }
 
     if compat.requires_reasoning_content_on_assistant_messages

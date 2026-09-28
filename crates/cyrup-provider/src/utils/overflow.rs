@@ -3,7 +3,7 @@
 //! Classifies whether a failed (or silently-truncated) assistant turn was caused by the input
 //! exceeding the model's context window. Compaction depends on this signal. The provider-specific
 //! regex set, the non-overflow exclusions, and the three detection cases below are a faithful port
-//! of Pi `overflow.ts:37-161` (pi v0.83.0).
+//! of Pi `overflow.ts:37-62,64,136-149` (pi v0.87.1).
 
 use crate::utils::regexlite::Regex;
 use cyrup_core::{AssistantMessage, StopReason};
@@ -13,10 +13,10 @@ use std::sync::OnceLock;
 /// is the exact Pi source pattern, in Pi's order (the `/i` flag is implicit — [`Regex`] is always
 /// case-insensitive).
 const OVERFLOW_PATTERNS: &[&str] = &[
-    r"prompt is too long",                    // Anthropic token overflow
-    r"request_too_large",                     // Anthropic request byte-size overflow (HTTP 413)
+    r"prompt (?:is )?too long", // Anthropic and z.ai token overflow
+    r"request_too_large",       // Anthropic request byte-size overflow (HTTP 413)
     r"input is too long for requested model", // Amazon Bedrock
-    r"exceeds the context window",            // OpenAI (Completions & Responses API)
+    r"exceeds the context window", // OpenAI (Completions & Responses API)
     r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))", // OpenAI-compatible proxies (LiteLLM)
     r"input token count.*exceeds the maximum", // Google (Gemini)
     r"maximum prompt length is \d+",           // xAI (Grok)
@@ -37,8 +37,13 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     r"context[_ ]length[_ ]exceeded",      // Generic fallback
     r"too many tokens",                    // Generic fallback
     r"token limit exceeded",               // Generic fallback
-    r"^4(?:00|13)\s*(?:status code)?\s*\(no body\)", // Cerebras: 400/413 with no body
 ];
+
+/// Cerebras returns a bare 400/413 with no response body on context overflow. Kept OUT of
+/// [`OVERFLOW_PATTERNS`] and applied only when the message's provider is `cerebras`, because any
+/// other provider's bodyless 400/413 is an ordinary failure (Pi
+/// `CEREBRAS_BODYLESS_OVERFLOW_PATTERN`, overflow.ts:64, gated at overflow.ts:146).
+const CEREBRAS_BODYLESS_OVERFLOW_PATTERN: &str = r"^4(?:00|13)\s*(?:status code)?\s*\(no body\)";
 
 /// Patterns that mark an error as NON-overflow (e.g. throttling / rate-limit) even if it also
 /// matches an overflow pattern (Pi `NON_OVERFLOW_PATTERNS`, overflow.ts:70-74).
@@ -53,6 +58,11 @@ fn overflow_regexes() -> &'static [Regex] {
     CELL.get_or_init(|| OVERFLOW_PATTERNS.iter().map(|p| Regex::new(p)).collect())
 }
 
+fn cerebras_bodyless_regex() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| Regex::new(CEREBRAS_BODYLESS_OVERFLOW_PATTERN))
+}
+
 fn non_overflow_regexes() -> &'static [Regex] {
     static CELL: OnceLock<Vec<Regex>> = OnceLock::new();
     CELL.get_or_init(|| {
@@ -64,7 +74,7 @@ fn non_overflow_regexes() -> &'static [Regex] {
 }
 
 /// Check if an assistant message represents a context-overflow error (Pi `isContextOverflow`,
-/// overflow.ts:132-161).
+/// overflow.ts:136-149).
 ///
 /// Handles three cases, in order:
 /// 1. **Error-based** — `stopReason == error` with a message matching an overflow pattern (and not a
@@ -84,8 +94,17 @@ pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u6
         let is_non_overflow = non_overflow_regexes()
             .iter()
             .any(|p| p.is_match(error_message));
-        if !is_non_overflow && overflow_regexes().iter().any(|p| p.is_match(error_message)) {
-            return true;
+        if !is_non_overflow {
+            if overflow_regexes().iter().any(|p| p.is_match(error_message)) {
+                return true;
+            }
+            // Cerebras-only: a bodyless 400/413 means overflow for this provider alone
+            // (overflow.ts:146).
+            if message.provider.as_str() == "cerebras"
+                && cerebras_bodyless_regex().is_match(error_message)
+            {
+                return true;
+            }
         }
     }
 
@@ -127,6 +146,16 @@ pub fn overflow_patterns() -> &'static [&'static str] {
 mod tests {
     use super::*;
     use cyrup_core::{ProviderId, Usage};
+
+    fn err_from(provider: &str, message: &str) -> AssistantMessage {
+        AssistantMessage::errored(
+            ProviderId::from(provider),
+            "claude",
+            None,
+            StopReason::Error,
+            message,
+        )
+    }
 
     fn err(message: &str) -> AssistantMessage {
         AssistantMessage::errored(
@@ -177,8 +206,6 @@ mod tests {
             "Your request exceeded model token limit: 8192 (requested: 9000)", // Kimi
             "Prompt contains 9000 tokens ... too large for model with 8192 maximum context length", // Mistral
             "input is too long for requested model", // Bedrock
-            "400 (no body)",                         // Cerebras
-            "413 status code (no body)",             // Cerebras
         ];
         for c in cases {
             assert!(
@@ -186,6 +213,35 @@ mod tests {
                 "should detect overflow: {c}"
             );
         }
+        // Cerebras's bodyless 400/413 only counts for the cerebras provider (overflow.ts:64,146).
+        for c in ["400 (no body)", "413 status code (no body)"] {
+            assert!(
+                is_context_overflow(&err_from("cerebras", c), None),
+                "should detect overflow: {c}"
+            );
+        }
+    }
+
+    /// z.ai's `Prompt too long` (no `is`) is overflow, and the bodyless 400/413 pattern is gated on
+    /// the cerebras provider (Pi overflow.ts:38, :64, :141-148).
+    #[test]
+    fn zai_prompt_too_long_and_provider_gated_bodyless() {
+        assert!(is_context_overflow(
+            &err_from("zai", "{\"code\":\"1261\",\"message\":\"Prompt too long\"}"),
+            None
+        ));
+        assert!(is_context_overflow(
+            &err_from("cerebras", "400 (no body)"),
+            None
+        ));
+        assert!(!is_context_overflow(
+            &err_from("openai", "400 (no body)"),
+            None
+        ));
+        assert!(!is_context_overflow(
+            &err_from("openai", "413 status code (no body)"),
+            None
+        ));
     }
 
     /// Non-overflow errors are excluded even when they share overflow wording.

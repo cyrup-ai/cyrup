@@ -62,11 +62,21 @@ pub(super) async fn process_chunk(
         if let Some(err) = err {
             dec.error_message = Some(err);
         }
-        if dec.blocks.iter().any(|b| matches!(b, Content::ToolCall(_))) {
-            // A tool call present alongside a non-STOP reason is still a tool-use turn; clear the
-            // diagnostic with it so a successful turn never carries a stale error message.
+        // `if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop")`
+        // (google-generative-ai.ts:226 @v0.87.1; google-vertex.ts:234 is byte-identical). The
+        // `=== "stop"` half landed in v0.84.2 — at v0.84.1 (`:217-219`) the override was
+        // unconditional, which is the shape cyrup originally ported. A non-STOP reason therefore
+        // SURVIVES a tool call: a `SAFETY` turn stays an error, a `MAX_TOKENS` turn stays `length`.
+        //
+        // `[CYRUP-DELTA]` — pi has no `errorMessage` field to clear here: it rebuilds the terminal
+        // string from `output.rawStopReason` at throw time (`:277-281`), whereas cyrup bakes it in
+        // at map time in `stop_reason.rs::map_stop_reason`. Since the override now only fires on
+        // `Stop` (which carries no diagnostic), there is nothing to clear — so not clearing is what
+        // makes the two agree.
+        if matches!(stop, StopReason::Stop)
+            && dec.blocks.iter().any(|b| matches!(b, Content::ToolCall(_)))
+        {
             dec.stop_reason = Some(StopReason::ToolUse);
-            dec.error_message = None;
         }
     }
 

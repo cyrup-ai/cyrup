@@ -16,15 +16,32 @@ pub struct ExtensionFlag {
 /// Rewrite Pi's multi-character short flags (`-nt`/`-nbt`/`-xt`/`-ne`/`-ns`/`-np`/`-nc`/`-na`) to
 /// their long forms before clap parsing — clap's native shorts are single-character only, so these
 /// Pi aliases (args.ts:116-183) are normalized here so `cyrup -nt` is accepted exactly as Pi accepts
-/// it. Only exact whole-token matches are rewritten; longer combinations are left untouched.
+/// it. Only exact whole-token matches are rewritten; longer combinations are left untouched, and
+/// rewriting STOPS at a bare `--` so the end-of-options tail is passed through verbatim (SEAM-123).
 pub fn normalize_short_aliases<I, S>(args: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    args.into_iter()
-        .map(Into::into)
-        .map(|a| match a.as_str() {
+    let mut out: Vec<String> = Vec::new();
+    // SEAM-123 — this pass runs over the WHOLE argv (`main.rs` feeds it `std::env::args()`), so it
+    // is the first thing that can break pi's `--` contract. pi's `--` arm is the FIRST arm of
+    // `parseArgs` (args.ts:82-91 @v0.87.1) and `break`s out of the loop; its alias arms
+    // (`-nt`/`-nbt`/… at args.ts:141-183) sit *later* in the same `else if` chain and therefore
+    // never see a post-`--` token. Without this latch `cyrup -p -- -nc` delivered the message
+    // `--no-context-files`, i.e. silently different text, where pi delivers `-nc` verbatim.
+    let mut end_of_options = false;
+    for arg in args.into_iter().map(Into::into) {
+        if end_of_options {
+            out.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            end_of_options = true;
+            out.push(arg);
+            continue;
+        }
+        out.push(match arg.as_str() {
             "-nt" => "--no-tools".to_string(),
             "-nbt" => "--no-builtin-tools".to_string(),
             "-xt" => "--exclude-tools".to_string(),
@@ -33,9 +50,10 @@ where
             "-np" => "--no-prompt-templates".to_string(),
             "-nc" => "--no-context-files".to_string(),
             "-na" => "--no-approve".to_string(),
-            _ => a,
-        })
-        .collect()
+            _ => arg,
+        });
+    }
+    out
 }
 
 /// Partition `argv` (program name already stripped, short-aliases already normalized) into the args
@@ -50,6 +68,18 @@ pub fn partition_extension_flags(argv: &[String]) -> (Vec<String>, Vec<Extension
     let mut flags: Vec<ExtensionFlag> = Vec::new();
     let mut i = 0usize;
     while let Some(arg) = argv.get(i) {
+        // SEAM-123 — pi args.ts:82-91 @v0.87.1: `--` ENDS option parsing, and it is the first arm
+        // of pi's own loop (`if (arg === "--") { … break; }`). It must be first here too: without
+        // it, `arg.strip_prefix("--")` yields `""` for the bare token, `KNOWN_LONG_FLAGS` has no
+        // `""`, and the unknown-long-flag arm below captured an extension flag NAMED `""` that also
+        // swallowed the next token as its value. The tail is copied through verbatim — no `@`/`-`
+        // inspection, no flag capture — and clap's native `--` handling routes it into
+        // `Cli::positionals`, where `input.rs`'s `strip_prefix('@')` split reproduces pi's
+        // `fileArgs`/`messages` partition unchanged.
+        if arg == "--" {
+            clean.extend(argv.iter().skip(i).cloned());
+            break;
+        }
         let name_part = arg.split('=').next().unwrap_or(arg);
         if let Some(stripped) = arg.strip_prefix("--") {
             if KNOWN_LONG_FLAGS.contains(&name_part) {

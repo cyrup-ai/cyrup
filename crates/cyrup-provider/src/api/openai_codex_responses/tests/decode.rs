@@ -7,7 +7,7 @@ async fn drain(sse: &'static str, request_tier: Option<&str>) -> Vec<StreamEvent
     let api = ApiId::from(API_ID);
     let (sink, mut rx) = channel(64);
     let frames = map_codex_frames(
-        decode_sse_bytes(sse.as_bytes().to_vec()),
+        decode_sse_bytes_flushing_at_eof(sse.as_bytes().to_vec()),
         request_tier.map(str::to_string),
     );
     decode_stream(frames, &model, &api, &sink).await;
@@ -276,4 +276,27 @@ async fn a_stalled_header_phase_names_the_timeout_and_its_value() {
         error.error_message.as_deref(),
         Some("Codex SSE response headers timed out after 200ms")
     );
+}
+
+/// PROV-084's Codex mirror. pi terminates the residual frame with
+/// `if (done && buffer.trim()) buffer += "\\n\\n";` (`openai-codex-responses.ts:795` @v0.87.1,
+/// v0.85.0 / #9047), so a transcript cut right after the terminal event still completes the turn.
+#[tokio::test]
+async fn prov084_a_transcript_cut_after_the_terminal_event_still_completes() {
+    const CUT: &str = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_c1\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m1\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\n",
+        // No blank line after this one: the stream simply stops.
+        "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_c1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n",
+    );
+    let events = drain(CUT, None).await;
+    let last = events.last().expect("terminal");
+    assert!(
+        matches!(last, StreamEvent::Done { .. }),
+        "expected a done terminal, got {last:?}"
+    );
+    let msg = last.terminal_message().expect("terminal message");
+    assert_eq!(msg.stop_reason, StopReason::Stop);
+    assert_eq!(msg.usage.output, 5);
 }

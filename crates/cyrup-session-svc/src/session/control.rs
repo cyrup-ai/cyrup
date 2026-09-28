@@ -12,9 +12,32 @@ use cyrup_core::{EntryId, ModelId, ProviderId};
 use cyrup_ext::host::ControlOp;
 
 use crate::error::SessionServiceError;
+use crate::event::{InputSource, PromptOptions, StreamingBehavior, UserInput};
 
 use super::types::NavigateTreeOptions;
 use super::{AgentSession, now_ms};
+
+/// pi's `sendUserMessage` options bag — `options?: { deliverAs?: "steer" | "followUp";
+/// expandPromptTemplates?: boolean }` (`core/agent-session.ts:2008` @v0.87.1), the typed shape of
+/// [`ControlOp::SendUserMessage`]'s `opts` and the host counterpart of
+/// `cyrup-ext-sdk`'s `SendUserMessageOptions`.
+///
+/// `#[serde(default)]` on the container, not just the fields, so `null` / `{}` / a bag carrying only
+/// one key all parse — a guest that passes no options at all sends `Value::Null` over the WIT import
+/// (`cyrup-ext/src/host/live.rs::send_user_message`), and upstream's `options?.` reads that as
+/// "absent" rather than as an error. Unknown keys are ignored for the same reason: TypeScript's
+/// structural typing accepts them silently, so refusing them here would be cyrup inventing a
+/// failure pi does not have.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SendUserMessageOpts {
+    /// pi `options.deliverAs`, handed to `prompt` as `streamingBehavior` (`:2032`).
+    deliver_as: Option<StreamingBehavior>,
+    /// pi `options.expandPromptTemplates`, read as `?? false` (`:2031`) — **opt IN**. Its own doc
+    /// (`:2004`) says what it covers: "Whether to dispatch extension commands and expand skill
+    /// commands and prompt templates. Default: false."
+    expand_prompt_templates: Option<bool>,
+}
 
 /// Upper bound on a `ControlOp::WaitIdle` drained at the command tier (SEAM-003). Pi's
 /// `ctx.waitForIdle()` is a promise resolved by `_resolveIdleWaitIfIdle` and cannot wedge the
@@ -124,14 +147,61 @@ impl AgentSession {
             };
             let name = control_op_name(&op);
             let outcome = match op {
-                ControlOp::SendUserMessage { content, .. } => {
-                    // A guest `sendUserMessage` op re-enters the prompt path (`send_user_message` →
-                    // `prompt_accepted` → `prepare` → `try_execute_extension_command`), closing an
-                    // `async fn` cycle. Box this cold re-entry edge so the future stays finitely
-                    // sized (E0733) without adding indirection to the hot prompt path.
-                    Box::pin(self.send_user_message(content, None))
-                        .await
-                        .map(|_| ())
+                ControlOp::SendUserMessage { content, opts } => {
+                    // EXT-083 — the options bag is HONOURED here, not dropped. pi's
+                    // `sendUserMessage` is a thin wrapper over `prompt`:
+                    //
+                    // ```ts
+                    // await this.prompt(text, {
+                    //     expandPromptTemplates: options?.expandPromptTemplates ?? false,
+                    //     streamingBehavior: options?.deliverAs,
+                    //     images,
+                    //     source: "extension",
+                    // });
+                    // ```
+                    // (`core/agent-session.ts:2030-2035` @v0.87.1)
+                    //
+                    // so [`Self::prompt_with`] — cyrup's `prompt(text, options)` — is the call, and
+                    // both of pi's option reads land on it: `expand_prompt_templates` becomes
+                    // `UserInput::expand_templates`, `deliver_as` becomes
+                    // `PromptOptions::streaming_behavior`.
+                    //
+                    // NOT [`Self::send_user_message`], which is `sendUserMessage`'s name but not its
+                    // body: that helper defaults a missing behaviour to a STEER and queues through
+                    // the PUBLIC `steer`/`follow_up`. pi does neither — it throws "Agent is already
+                    // processing. Specify streamingBehavior…" for a missing behaviour while
+                    // streaming (`:1655-1659`, cyrup's
+                    // [`SessionServiceError::StreamingNeedsBehavior`]) and queues through the
+                    // PRIVATE `_queueSteer`/`_queueFollowUp` after `prepare` has already run the
+                    // `input` handlers and the expansion once (SEAM-121). The helper stays as it is
+                    // for its other caller, the ICOM injection pump.
+                    //
+                    // The `expand_templates: false` default is the whole behavioural point of the
+                    // row: `UserInput::text` sets it TRUE, so a relayed `"/deploy"` used to dispatch
+                    // a registered extension command (`run.rs`'s step 0) or expand a skill/template
+                    // before the model ever saw the text. Upstream a chat bridge, a macro or a
+                    // subagent summary that happens to start with `/` is sent AS TEXT unless the
+                    // guest asks otherwise.
+                    let opts: SendUserMessageOpts =
+                        serde_json::from_value(opts).unwrap_or_default();
+                    let input = UserInput {
+                        text: content,
+                        images: Vec::new(),
+                        source: InputSource::Sdk,
+                        expand_templates: opts.expand_prompt_templates.unwrap_or(false),
+                    };
+                    // A guest `sendUserMessage` op re-enters the prompt path (`prompt_with` →
+                    // `prepare` → `try_execute_extension_command`), closing an `async fn` cycle. Box
+                    // this cold re-entry edge so the future stays finitely sized (E0733) without
+                    // adding indirection to the hot prompt path.
+                    Box::pin(self.prompt_with(
+                        input,
+                        PromptOptions {
+                            streaming_behavior: opts.deliver_as,
+                        },
+                    ))
+                    .await
+                    .map(|_| ())
                 }
                 // Pi `ctx.compact(options)` (extensions/types.ts:344): `customInstructions`
                 // (types.ts:296-300) rides the op through to the summarizer — the same
@@ -251,14 +321,17 @@ impl AgentSession {
         // Pi's `triggerTurn` runs a fresh turn OVER the custom message when idle
         // (`_runAgentPrompt(appMessage)`); `deliverAs` takes precedence, exactly as in
         // `send_custom_message`/`inject_message`.
-        let trigger_turn = opts
-            .get("triggerTurn")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        // SEAM-127 — kept as the RAW `Option<bool>`: pi's `sendCustomMessage` tests
+        // `options?.triggerTurn !== false` in its streaming branch (agent-session.ts:1949
+        // @v0.87.1) and plain truthiness in the branch below it, so an ABSENT key and an explicit
+        // `false` are different inputs. `unwrap_or(false)` collapsed them, and the explicit
+        // `triggerTurn: false` then took the streaming steer arm — the one shape it exists to
+        // avoid.
+        let trigger_turn = opts.get("triggerTurn").and_then(Value::as_bool);
         // AGENT-030 — pi's `sendMessage` tests `this.isStreaming`, the session latch
         // `_isAgentRunActive` (agent-session.ts:900-901, :1477-1483): a trigger-turn message landing
         // in the post-`agent_end` gap steers the active loop rather than starting a second run.
-        if trigger_turn && deliver_as.is_none() && !self.is_run_active() {
+        if trigger_turn == Some(true) && deliver_as.is_none() && !self.is_run_active() {
             let msg = AgentMessage::Custom {
                 kind: custom_type,
                 payload: content,
@@ -275,8 +348,15 @@ impl AgentSession {
             };
             return self.spawn_run(vec![msg]).await;
         }
-        self.send_custom_message(&custom_type, content, display, details, deliver_as)
-            .await
+        self.send_custom_message(
+            &custom_type,
+            content,
+            display,
+            details,
+            deliver_as,
+            trigger_turn,
+        )
+        .await
     }
 
     /// Surface a control-op failure. SEAM-003's contract is that an op is either PERFORMED or

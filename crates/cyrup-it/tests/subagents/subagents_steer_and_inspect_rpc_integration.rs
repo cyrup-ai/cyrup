@@ -125,6 +125,8 @@ fn worker_step() -> RunnerStep {
 
 fn background_spec(run_id: RunId) -> BackgroundStepsSpec {
     BackgroundStepsSpec {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         steps: vec![worker_step()],
         mode: RunMode::Single,
         session_file: None,

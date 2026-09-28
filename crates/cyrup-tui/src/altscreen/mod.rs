@@ -76,7 +76,9 @@
 //! Two of its outcomes the dispatcher must finish itself, and neither is a gap in the unit:
 //! [`selection::PointerOutcome::Copy`] carries the text because
 //! [`crate::clipboard::copy_to_clipboard`] is `async` and the render path is not (§B-11 owns the
-//! `await` and the `Copied!` / `Copy failed` flash, `interactive-mode.ts:6106-6112`), and
+//! `await` and the flash — `Copied!` at the default dwell, or, since TUI-102, the thrown
+//! [`crate::clipboard::ClipboardError`] message held for [`COPY_ERROR_FLASH_DURATION`];
+//! `interactive-mode.ts:6106-6112`, `tui-alt-screen.ts:1456-1463`), and
 //! [`selection::PointerOutcome::Paste`] carries clipboard text because inserting it is the
 //! [`crate::AppState`] editor's, which no renderer here may hold (rule 2 below).
 //!
@@ -161,6 +163,7 @@
 mod document;
 mod exit;
 mod flash;
+pub(crate) use flash::COPY_ERROR_FLASH_DURATION;
 mod images;
 mod keys;
 mod out;

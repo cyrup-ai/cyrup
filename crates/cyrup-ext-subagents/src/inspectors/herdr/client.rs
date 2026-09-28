@@ -74,8 +74,8 @@ use std::time::Duration;
 
 use cyrup_herdr::schema::{
     OutputMatch, PaneAgentState, PaneInfo, PaneProcessInfo, PaneProcessInfoParams,
-    PaneReportAgentParams, PaneReportMetadataParams, PaneSendInputParams, PaneSplitParams,
-    PaneWaitForOutputParams, ReadSource, SplitDirection,
+    PaneReportAgentParams, PaneReportMetadataParams, PaneRightClickTarget, PaneSendInputParams,
+    PaneSplitParams, PaneWaitForOutputParams, ReadSource, SplitDirection,
 };
 use cyrup_herdr::{ApiErrorCode, EnvSource, HerdrError, HerdrPane, ProcessEnv};
 use serde_json::{Map, Value, json};
@@ -366,6 +366,15 @@ pub fn timeout_for(args: &[&str]) -> Duration {
 #[derive(Debug, Clone)]
 pub struct SocketHerdrClient {
     inner: cyrup_herdr::HerdrClient,
+    /// The pane this process runs in, which is the DEFAULT target of every pane operation that
+    /// takes one — `cyrup_herdr::HerdrClient` keeps only a socket path and a deadline
+    /// (`crates/cyrup-herdr/src/client.rs:108-142`), so the id has to be held here.
+    ///
+    /// A `String`, not an `Option`: [`HerdrPane`] has no constructor but
+    /// [`HerdrPane::discover`] and that gate rejects an empty `HERDR_PANE_ID`
+    /// (`crates/cyrup-herdr/src/env.rs:133-147`, `:171-173`), so this is always the real caller
+    /// pane.
+    caller_pane_id: String,
 }
 
 impl SocketHerdrClient {
@@ -374,6 +383,7 @@ impl SocketHerdrClient {
     pub fn for_pane(pane: &HerdrPane) -> Self {
         Self {
             inner: cyrup_herdr::HerdrClient::for_pane(pane),
+            caller_pane_id: pane.pane_id().to_owned(),
         }
     }
 
@@ -519,11 +529,13 @@ fn agent_state_from_wire(raw: &str) -> PaneAgentState {
 impl HerdrClient for SocketHerdrClient {
     async fn run(&self, args: &[&str]) -> Result<Value, HerdrErrorCode> {
         let client = self.inner.clone().with_timeout(timeout_for(args));
-        dispatch(&client, args).await.map_err(|error| {
-            let code = map_herdr_error(&error);
-            tracing::debug!(?code, argv = ?args, %error, "herdr operation failed");
-            code
-        })
+        dispatch(&client, &self.caller_pane_id, args)
+            .await
+            .map_err(|error| {
+                let code = map_herdr_error(&error);
+                tracing::debug!(?code, argv = ?args, %error, "herdr operation failed");
+                code
+            })
     }
 }
 
@@ -532,26 +544,28 @@ impl HerdrClient for SocketHerdrClient {
 /// An argv this adapter does not know is `invalid_request` shaped: herdr itself answers an unknown
 /// method that way (`tmp/herdr/src/api/server.rs:177-204`), and an adapter that silently answered
 /// `{}` would be the fabricated success `cyrup-herdr` refuses everywhere else.
-async fn dispatch(client: &cyrup_herdr::HerdrClient, args: &[&str]) -> Result<Value, HerdrError> {
+async fn dispatch(
+    client: &cyrup_herdr::HerdrClient,
+    caller_pane_id: &str,
+    args: &[&str],
+) -> Result<Value, HerdrError> {
     match args {
         // `herdr --version`. The socket's `ping` is strictly better than shelling out for it:
         // `tmp/herdr/src/api/server.rs:355-368` answers it without touching the app, so it stays
         // answerable while the UI is busy — which is exactly when an inspector is opened.
         ["--version"] => Ok(Value::String(client.ping().await?.version().to_owned())),
 
-        ["pane", "split", rest @ ..] => {
-            let mut params = PaneSplitParams::new(SplitDirection::Right);
-            params.cwd = flag_value(args, "--cwd").map(str::to_owned);
-            params.focus = rest.contains(&"--focus");
-            params.ratio = flag_value(args, "--ratio").and_then(|value| value.parse().ok());
-            params.env = env_pairs(args);
-            // `--current` means "split whichever pane herdr considers current", which is
-            // `PaneSplitParams`' own default (`target_pane_id: None`,
-            // `crates/cyrup-herdr/src/schema/panes.rs:66-78`) — so it needs no translation, and
-            // the flag's real force is upstream's: it is why `available()` gates on
-            // `HERDR_PANE_ID` (`tmp/herdr/src/cli/pane.rs:660-667`).
-            Ok(pane_info_json(&client.pane_split(params).await?))
-        }
+        // The target is parsed, not defaulted. herdr's own CLI starts `pane_id` at the CALLER's
+        // pane (`tmp/herdr/src/cli/pane.rs:636`) and `--current` sets it to exactly that
+        // (`:660-667`) — an omitted `target_pane_id` is a DIFFERENT thing: `handle_pane_split`
+        // then splits the focused pane of the active workspace
+        // (`tmp/herdr/src/app/api/panes.rs:34-47`), i.e. wherever the human happens to be
+        // looking, not the pane this process owns.
+        ["pane", "split", rest @ ..] => Ok(pane_info_json(
+            &client
+                .pane_split(split_params(caller_pane_id, rest)?)
+                .await?,
+        )),
 
         // `pane run` is `pane.send_input`, not a spawn: herdr TYPES the command into the pane's
         // shell and presses Enter (`tmp/herdr/src/cli/pane.rs:1046-1052`). An `Ok` here means the
@@ -664,13 +678,126 @@ async fn dispatch(client: &cyrup_herdr::HerdrClient, args: &[&str]) -> Result<Va
     }
 }
 
-/// `--env KEY=VALUE`, repeatable (`tmp/herdr/src/cli/pane.rs:711-719`).
-fn env_pairs(args: &[&str]) -> BTreeMap<String, String> {
-    flag_values(args, "--env")
-        .into_iter()
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect()
+/// A `pane.split` argv refusal, shaped the way herdr shapes a bad request
+/// (`tmp/herdr/src/api/server.rs:177-204`) and the way this adapter's unknown-argv arm already
+/// does.
+fn split_refusal(message: String) -> HerdrError {
+    HerdrError::Api {
+        method: "pane.split",
+        source: cyrup_herdr::ApiError {
+            code: ApiErrorCode::InvalidRequest,
+            message,
+        },
+    }
+}
+
+/// The value at `index`, or herdr's own "missing value for X" refusal
+/// (`tmp/herdr/src/cli/pane.rs:653-656` and every sibling arm).
+fn split_flag_value<'a>(rest: &[&'a str], index: usize, flag: &str) -> Result<&'a str, HerdrError> {
+    rest.get(index)
+        .copied()
+        .ok_or_else(|| split_refusal(format!("missing value for {flag}")))
+}
+
+/// `pane split` argv → [`PaneSplitParams`], as `parse_pane_split_args` parses it
+/// (`tmp/herdr/src/cli/pane.rs:630-740` @v0.9.1).
+///
+/// A single sequential pass, because that is what upstream is and the order is load-bearing:
+/// `--focus --no-focus` is last-wins (`:710-714`), and a positional pane id, `--pane` and
+/// `--current` all overwrite the same slot (`:645-667`). `target_pane_id` starts at the caller's
+/// pane (`:636`), `--direction` is mandatory (`:723-727`), and the id is NOT rewritten on the way
+/// through — `normalize_pane_id` is the identity (`tmp/herdr/src/cli.rs:869-871`).
+///
+/// `--right-click` is not accepted: nothing in this subtree sends it, and `right_click` stays at
+/// herdr's own default (`:643`), so an arm for it would be a flag the adapter advertises and no
+/// verb produces.
+fn split_params(caller_pane_id: &str, rest: &[&str]) -> Result<PaneSplitParams, HerdrError> {
+    let mut target_pane_id = Some(caller_pane_id.to_owned());
+    let mut direction = None;
+    let mut ratio = None;
+    let mut cwd = None;
+    let mut focus = false;
+    let mut env = BTreeMap::new();
+
+    let mut index = 0;
+    if let Some(positional) = rest.first().filter(|arg| !arg.starts_with("--")) {
+        target_pane_id = Some((*positional).to_owned());
+        index = 1;
+    }
+    while let Some(flag) = rest.get(index) {
+        match *flag {
+            "--pane" => {
+                target_pane_id = Some(split_flag_value(rest, index + 1, "--pane")?.to_owned());
+                index += 2;
+            }
+            // `--current` is the caller's pane, and the field's existence is the proof that
+            // upstream's `--current requires HERDR_PANE_ID` (`:660-667`) has already passed.
+            "--current" => {
+                target_pane_id = Some(caller_pane_id.to_owned());
+                index += 1;
+            }
+            "--direction" => {
+                let value = split_flag_value(rest, index + 1, "--direction")?;
+                direction = Some(match value {
+                    "right" => SplitDirection::Right,
+                    "down" => SplitDirection::Down,
+                    other => {
+                        return Err(split_refusal(format!(
+                            "invalid split direction: {other} (expected right or down)"
+                        )));
+                    }
+                });
+                index += 2;
+            }
+            "--ratio" => {
+                let value = split_flag_value(rest, index + 1, "--ratio")?;
+                let parsed = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|parsed| parsed.is_finite())
+                    .ok_or_else(|| split_refusal(format!("invalid ratio: {value}")))?;
+                ratio = Some(parsed);
+                index += 2;
+            }
+            "--cwd" => {
+                cwd = Some(split_flag_value(rest, index + 1, "--cwd")?.to_owned());
+                index += 2;
+            }
+            "--focus" => {
+                focus = true;
+                index += 1;
+            }
+            "--no-focus" => {
+                focus = false;
+                index += 1;
+            }
+            "--env" => {
+                let value = split_flag_value(rest, index + 1, "--env")?;
+                if let Some((key, value)) = value.split_once('=') {
+                    env.insert(key.to_owned(), value.to_owned());
+                }
+                index += 2;
+            }
+            other => return Err(split_refusal(format!("unknown option: {other}"))),
+        }
+    }
+
+    let Some(direction) = direction else {
+        return Err(split_refusal(
+            "usage: pane split [<pane_id>|--pane ID|--current] --direction right|down".to_owned(),
+        ));
+    };
+
+    Ok(PaneSplitParams {
+        workspace_id: None,
+        target_pane_id,
+        direction,
+        ratio,
+        cwd,
+        focus,
+        right_click: PaneRightClickTarget::Herdr,
+        env,
+    })
 }
 
 #[cfg(test)]
@@ -839,8 +966,8 @@ mod tests {
         );
     }
 
-    /// GUT `flag_values` to return only the first match and the two-env row goes red — a split
-    /// that silently drops the second `--env` is a pane missing half its environment.
+    /// GUT `flag_values` to return only the first match and the two-token row goes red — a
+    /// `report-metadata` that silently drops the second `--token` writes half a report.
     #[test]
     fn the_argv_helpers_read_repeated_flags() {
         let args = [
@@ -849,12 +976,75 @@ mod tests {
         assert_eq!(flag_value(&args, "--cwd"), Some("/w"));
         assert_eq!(flag_value(&args, "--nope"), None);
         assert_eq!(flag_values(&args, "--env"), vec!["A=1", "B=2"]);
-        let pairs = env_pairs(&args);
-        assert_eq!(pairs.get("A").map(String::as_str), Some("1"));
-        assert_eq!(pairs.get("B").map(String::as_str), Some("2"));
-        // A malformed pair is dropped, not sent: herdr answers `invalid_env` for one
-        // (`crates/cyrup-herdr/src/client.rs`'s `pane_split` doc).
-        assert!(env_pairs(&["--env", "NOEQUALS"]).is_empty());
+    }
+
+    /// `pane split` argv → params, against `parse_pane_split_args`
+    /// (`tmp/herdr/src/cli/pane.rs:630-740` @v0.9.1).
+    ///
+    /// GUT the `target_pane_id` initialiser back to `None` and the first two rows go red — that is
+    /// the defect this row fixes, and a `None` target splits whichever pane the HUMAN is focused
+    /// on (`tmp/herdr/src/app/api/panes.rs:34-47`) rather than the pane the inspector owns. GUT
+    /// the `--direction` parse back to a hard-coded `Right` and the `down` row goes red.
+    #[test]
+    fn pane_split_targets_the_callers_pane_and_honours_direction() {
+        let params = |rest: &[&str]| split_params("w1:p7", rest);
+        let ok = |rest: &[&str]| params(rest).unwrap();
+
+        // `--current` is the caller's pane, and so is an argv that names no pane at all
+        // (upstream `:636`).
+        let current = ok(&["--current", "--direction", "right", "--cwd", "/w"]);
+        assert_eq!(current.target_pane_id.as_deref(), Some("w1:p7"));
+        assert_eq!(current.direction, SplitDirection::Right);
+        assert_eq!(current.cwd.as_deref(), Some("/w"));
+
+        let implicit = ok(&["--direction", "down"]);
+        assert_eq!(implicit.target_pane_id.as_deref(), Some("w1:p7"));
+        assert_eq!(implicit.direction, SplitDirection::Down);
+
+        // A positional id and `--pane` both override it (upstream `:645-657`), unnormalised
+        // (`tmp/herdr/src/cli.rs:869-871`).
+        assert_eq!(
+            ok(&["w9:p2", "--direction", "right"])
+                .target_pane_id
+                .as_deref(),
+            Some("w9:p2")
+        );
+        assert_eq!(
+            ok(&["--pane", "w9:p2", "--direction", "right"])
+                .target_pane_id
+                .as_deref(),
+            Some("w9:p2")
+        );
+
+        // `--direction` is mandatory and closed (upstream `:723-727`, `:982-990`).
+        assert!(params(&["--current"]).is_err());
+        assert!(params(&["--direction", "sideways"]).is_err());
+        assert!(params(&["--direction"]).is_err());
+        assert!(params(&["--direction", "right", "--right-click", "pane"]).is_err());
+
+        // Sequential last-wins, which `rest.contains(&"--focus")` was not (upstream `:710-714`).
+        assert!(!ok(&["--direction", "right", "--focus", "--no-focus"]).focus);
+        assert!(ok(&["--direction", "right", "--no-focus", "--focus"]).focus);
+
+        // `--env` is repeatable, and a pair with no `=` is dropped rather than sent: herdr
+        // answers `invalid_env` for one (`tmp/herdr/src/app/api/env.rs:3-31`).
+        let env = ok(&[
+            "--direction",
+            "right",
+            "--env",
+            "A=1",
+            "--env",
+            "B=2",
+            "--env",
+            "NOEQUALS",
+            "--ratio",
+            "0.5",
+        ]);
+        assert_eq!(env.env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(env.env.get("B").map(String::as_str), Some("2"));
+        assert_eq!(env.env.len(), 2);
+        assert_eq!(env.ratio, Some(0.5));
+        assert!(params(&["--direction", "right", "--ratio", "inf"]).is_err());
     }
 
     /// The contract's own `from_wire_lossy` over herdr's REAL codes
@@ -893,6 +1083,86 @@ mod tests {
             map_herdr_error(&HerdrError::Closed { method: "pane.get" }),
             HerdrErrorCode::ValidationError
         );
+    }
+
+    /// The wire proof, through the only constructor production uses.
+    ///
+    /// `SocketHerdrClient::discover` is the real gate (`plugin.rs:94`, `routing.rs:1593` both
+    /// arrive here), so the caller pane the request carries is the one herdr injected. At HEAD
+    /// `target_pane_id` is absent from the line entirely (`skip_serializing_if`,
+    /// `crates/cyrup-herdr/src/schema/panes.rs:44-45`) and `direction` is always `"right"`, so
+    /// both assertions fail.
+    ///
+    /// `cyrup-herdr`'s own `FakeHerdr` is crate-private
+    /// (`crates/cyrup-herdr/src/tests/fake_server.rs`), hence the local listener — the same shape
+    /// `crate::placement::tests` uses.
+    #[tokio::test]
+    async fn the_pane_split_request_line_carries_the_callers_pane_id() {
+        use std::sync::Arc;
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let server = {
+            let lines = Arc::clone(&lines);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let lines = Arc::clone(&lines);
+                    tokio::spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        let mut line = String::new();
+                        if BufReader::new(read).read_line(&mut line).await.is_err() {
+                            return;
+                        }
+                        let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                            return;
+                        };
+                        lines.lock().unwrap().push(line);
+                        let answer = json!({"id": request["id"], "result": {
+                            "type": "pane_info",
+                            "pane": {"pane_id":"w1:p8","terminal_id":"t-w1:p8","workspace_id":"w1",
+                                "tab_id":"w1:t1","focused":true,"cwd":"/w","agent_status":"idle",
+                                "revision":1}}});
+                        let mut payload = serde_json::to_vec(&answer).unwrap();
+                        payload.push(b'\n');
+                        let _ = write.write_all(&payload).await;
+                        let _ = write.flush().await;
+                    });
+                }
+            })
+        };
+
+        let env = std::collections::HashMap::from([
+            ("HERDR_ENV".to_owned(), "1".to_owned()),
+            ("HERDR_PANE_ID".to_owned(), "w1:p7".to_owned()),
+            ("HERDR_SOCKET_PATH".to_owned(), socket.display().to_string()),
+        ]);
+        let client = SocketHerdrClient::discover(&env).unwrap();
+        client
+            .run(&[
+                "pane",
+                "split",
+                "--current",
+                "--direction",
+                "down",
+                "--cwd",
+                "/w",
+                "--no-focus",
+            ])
+            .await
+            .unwrap();
+        server.abort();
+
+        let recorded = lines.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        let request: Value = serde_json::from_str(&recorded[0]).unwrap();
+        assert_eq!(request["method"], "pane.split");
+        assert_eq!(request["params"]["target_pane_id"], "w1:p7");
+        assert_eq!(request["params"]["direction"], "down");
+        assert_eq!(request["params"]["focus"], false);
     }
 
     /// `SocketHerdrClient::discover` is the gate, and it is pi's gate. GUT it to

@@ -199,3 +199,123 @@ async fn no_runtime_keeps_the_single_session_flow() {
     assert!(app.scrollback_text().contains("starting new session"));
     assert_eq!(rt.generation().await, 0, "no runtime ⇒ no replacement");
 }
+
+/// **TUI-105 — the SESSION-REBIND leg of the provider recount.**
+///
+/// Upstream `rebindCurrentSession` ends with
+/// `await this.updateAvailableProviderCount(); this.updateEditorBorderColor(); this.updateTerminalTitle();`
+/// (`interactive-mode.ts:2040-2043` @v0.87.1). That function is the hook `setRebindSession` registers
+/// (`:573-574`), so the recount happens on EVERY `/reload`, `/new`, `/resume`, `/fork` and `/import` —
+/// not only on a login, a `/logout`, a `/model` or a `/scoped-models`.
+///
+/// The count is a property of the SWAPPED-IN session: `/resume` of a session recorded under a
+/// different agent dir reads a different `auth.json` (the reason the arm already re-reads the auth
+/// snapshot) and `/reload` re-reads `scopedModels` from rebuilt settings. So the arm is DRIVEN here
+/// rather than source-read: the two existing `session_swapped` tests
+/// (`tests/startup_resources_panel.rs`, `tests/theme_reapply_on_reload.rs`) assert its ordering out
+/// of `include_str!`, which cannot distinguish a recount of the new session's providers from a
+/// recount of the old one's.
+///
+/// The pre-swap count is seeded through `refresh_provider_count` against the OUTGOING session, whose
+/// scoped set pins it to one provider (`:5094-5095`, the scoped branch); the swapped-in session
+/// carries no scoped set, so its own count is the auth-filtered snapshot's
+/// (`getAvailableSnapshot()`, `:5096`) and the two differ.
+///
+/// **Red without the change:** `App::on_session_swapped` never called `refresh_provider_count`, so
+/// the footer's `provider_count > 1` gate (`status.rs:597`) — the one that decides whether the model
+/// is prefixed with `(provider)` — kept answering from the outgoing session's provider set for the
+/// rest of the process.
+#[tokio::test]
+async fn tui105_a_session_swap_recounts_providers_from_the_swapped_in_session() {
+    let fx = fixture();
+    let rt = runtime(&fx).await;
+    let mut app = inline_app();
+
+    let session0 = rt.session().await;
+    // Pin the OUTGOING session to a single provider through pi's scoped branch, so the pre-swap
+    // count is a real count of a real session and not a sentinel.
+    let one = session0
+        .available_model_catalog()
+        .into_iter()
+        .next()
+        .expect("the fixture session has a model catalog");
+    session0.set_scoped_models(vec![cyrup_session_svc::ScopedModel {
+        model: one,
+        thinking_level: None,
+    }]);
+    app.refresh_provider_count(&session0);
+    let before = app.state().status.provider_count;
+    assert_eq!(before, 1, "one scoped provider ⇒ one (`:5094-5095`)");
+
+    // Swap: `/new` installs a fresh session, which carries no scoped set.
+    app.execute_command(AppCommand::NewSession, &session0, Some(&rt))
+        .await;
+    let session1 = rt.session().await;
+    assert!(
+        session1.scoped_models().is_empty(),
+        "the swapped-in session must fall to the auth-filtered snapshot branch"
+    );
+    let expected: std::collections::BTreeSet<String> = session1
+        .available_model_catalog()
+        .iter()
+        .map(|m| m.provider.as_str().to_string())
+        .collect();
+    assert_ne!(
+        expected.len(),
+        before,
+        "the fixture must make the swap observable: the swapped-in session's provider set has to \
+         differ from the outgoing session's scoped one"
+    );
+
+    // Drive the run loop's `session_swapped` arm exactly as `App::run`'s `select!` does.
+    let mut events = session0.subscribe();
+    let mut ctx = run_ctx(session0, &rt);
+    app.on_session_swapped(&mut ctx, &mut events)
+        .await
+        .expect("the swap arm must not fail");
+
+    assert_eq!(
+        app.state().status.provider_count,
+        expected.len(),
+        "`rebindCurrentSession` recounts from the swapped-in session (`interactive-mode.ts:2042`); \
+         without that call the footer keeps the outgoing session's {before}"
+    );
+}
+
+/// `App::run`'s own backend. The `session_swapped` arm is `impl App<InlineBackend<Stdout>>`, so the
+/// arm cannot be driven through the `TestBackend` the rest of this file uses.
+fn inline_app() -> App<crate::InlineBackend<std::io::Stdout>> {
+    App::new(
+        crate::InlineBackend::with_anchor(std::io::stdout(), ratatui::layout::Position::ORIGIN),
+        UiTheme::dark(),
+    )
+    .unwrap()
+}
+
+/// The run loop's context, built exactly as `App::run` builds it: every field is a channel, a timer
+/// or a handle the arm under test needs live. Its receivers are dropped with the returned value's
+/// senders, which is fine — the arm only ever SENDS on them.
+fn run_ctx(
+    session: Arc<cyrup_session_svc::AgentSession>,
+    rt: &Arc<AgentSessionRuntime>,
+) -> crate::app::RunCtx {
+    let mut spinner = tokio::time::interval(Duration::from_millis(80));
+    spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    crate::app::RunCtx {
+        session,
+        runtime: Some(Arc::clone(rt)),
+        cancel: cyrup_core::CancelToken::new(),
+        gen_rx: Some(rt.watch_generation()),
+        spinner,
+        overlay_tick: None,
+        bash_rx: None,
+        package_update_rx: None,
+        ui_tx: tokio::sync::mpsc::unbounded_channel().0,
+        ui_effect_tx: tokio::sync::mpsc::unbounded_channel().0,
+        ext_error_tx: tokio::sync::mpsc::unbounded_channel().0,
+        commands_changed_tx: tokio::sync::mpsc::unbounded_channel().0,
+        overlay_tx: tokio::sync::mpsc::unbounded_channel().0,
+        theme_switch_tx: tokio::sync::mpsc::unbounded_channel().0,
+        shortcut_status_tx: tokio::sync::mpsc::unbounded_channel().0,
+    }
+}

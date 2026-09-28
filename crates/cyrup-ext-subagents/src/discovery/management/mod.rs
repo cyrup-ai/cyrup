@@ -68,7 +68,10 @@ mod capabilities;
 mod chain_crud;
 mod config_parse;
 mod frontmatter_write;
-mod handlers;
+// SUBA-123b: `pub(crate)` so `discovery::merge`'s tests can assert that `editable_base` does not
+// write a settings-supplied `subagentOnlyExtensions` back into an agent file — the guard the
+// `subagent_only_extensions_from_default` flag exists for. No new public surface.
+pub(crate) mod handlers;
 pub(crate) mod helpers;
 mod lookup;
 mod render;
@@ -335,6 +338,7 @@ mod tests {
         vec![crate::discovery::skills::AvailableSkill {
             name: "audit-trail".to_string(),
             description: Some("Trace every mutation.".to_string()),
+            disable_model_invocation: false,
         }]
     }
 
@@ -552,10 +556,12 @@ mod tests {
             crate::discovery::skills::AvailableSkill {
                 name: "audit-trail".to_string(),
                 description: Some("Trace every mutation.".to_string()),
+                disable_model_invocation: false,
             },
             crate::discovery::skills::AvailableSkill {
                 name: "deep-dive".to_string(),
                 description: None,
+                disable_model_invocation: false,
             },
         ];
         let mut req = mreq(None, None, None, None);

@@ -193,6 +193,14 @@ pub(crate) struct ExecSingleStepExecutor {
     /// through to its persona's own `model`/`fallback_models`, exactly as before this seam existed.
     /// Consumed by [`Self::run_single`] via [`crate::exec::fallback::resolve_model_inheritance`].
     pub(crate) inherited_session_model: Option<cyrup_core::ModelId>,
+    /// SUBA-119 — the operator-declared `config.modelResponseAliases` for this run, threaded onto
+    /// every dispatched step's [`crate::exec::RunOptions::model_response_aliases`] so the
+    /// native-child model-verification check has the same escape hatch here as on the foreground
+    /// single path. Reaches the detached runner through
+    /// [`RunnerConfig::model_response_aliases`](super::RunnerConfig::model_response_aliases); set on
+    /// a foreground chain/parallel walk through [`Self::with_model_response_aliases`].
+    pub(crate) model_response_aliases:
+        Option<crate::exec::model_verification::ModelResponseAliases>,
     /// SCOPE_19/A1 — the live PARENT session's reasoning level, the thinking half of
     /// [`Self::inherited_session_model`] and threaded by the same two routes: the one-shot
     /// [`RunnerConfig::inherited_session_thinking`](super::RunnerConfig::inherited_session_thinking)
@@ -294,6 +302,10 @@ struct StepAgentSetup {
     available_models: Vec<cyrup_core::ModelId>,
     /// The resolved override the candidate ladder puts first, past the SUBA-003 scope gate.
     model_override: crate::exec::fallback::ModelOverride,
+    /// SUBA-119 — pi's `options.modelOverrideFromParent` (`execution.ts:1836`), decided here rather
+    /// than downstream because `model_override` above cannot distinguish a caller-supplied model from
+    /// a parent-inherited one once it is an `Explicit`.
+    model_override_from_parent: bool,
     /// This step's own lowered acceptance contract (SUBA-N04), `None` when it declared none.
     acceptance: Option<crate::exec::acceptance::AcceptanceContract>,
 }
@@ -363,6 +375,11 @@ impl ExecSingleStepExecutor {
             orchestrator_intercom_target,
             run_id,
             inherited_session_model,
+            // SUBA-119: set separately via `with_model_response_aliases`, for the same reason
+            // `inherited_session_thinking` below is — the value comes from the live extension
+            // config, not from the single discovery pass this constructor's positional arguments
+            // all come from.
+            model_response_aliases: None,
             // Set separately via `with_inherited_session_thinking` — same rationale as `control`
             // below: the value is resolved by the caller's own plan phase
             // (`remembered_parent_thinking`), not by the single discovery pass the positional
@@ -406,6 +423,19 @@ impl ExecSingleStepExecutor {
             // reason upstream supplies `steerInboxDir` only from the background runner.
             run_dir: None,
         }
+    }
+
+    /// SUBA-119 — install the operator-declared `config.modelResponseAliases` for this walk (see
+    /// the field's doc). A builder step for the same reason
+    /// [`Self::with_inherited_session_thinking`] is one: the value comes from the live extension
+    /// config, not from the discovery pass [`Self::foreground`]'s positional arguments come from.
+    #[must_use]
+    pub(crate) fn with_model_response_aliases(
+        mut self,
+        aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
+    ) -> Self {
+        self.model_response_aliases = aliases;
+        self
     }
 
     /// SCOPE_19/A1 — install the live parent session's reasoning level for this walk's inheriting
@@ -588,6 +618,14 @@ impl ExecSingleStepExecutor {
             Ok(resolved) => resolved,
             Err(violation) => return Err(Box::new(StepResult::failure(violation.message))),
         };
+        // SUBA-119 — pi's `modelOverrideFromParent` (`execution.ts:1836`), over the same three inputs
+        // the resolution above just consumed. Model verification is OFF for a run whose model came
+        // from the parent session rather than being chosen for it.
+        let model_override_from_parent = crate::exec::fallback::model_override_is_from_parent(
+            step.model.as_ref(),
+            agent.model.as_ref(),
+            self.inherited_session_model.as_ref(),
+        );
 
         // SUBA-N04: lower THIS step's declared acceptance contract (pi `chain-execution.ts:400`
         // `acceptance: task.acceptance` for a parallel task / `:1335` `acceptance:
@@ -632,6 +670,7 @@ impl ExecSingleStepExecutor {
             agent,
             available_models,
             model_override,
+            model_override_from_parent,
             acceptance,
         })
     }
@@ -658,6 +697,10 @@ impl ExecSingleStepExecutor {
         ctx: &ChainRunContext,
         available_models: Vec<cyrup_core::ModelId>,
         model_override: crate::exec::fallback::ModelOverride,
+        // SUBA-119 — pi's `options.modelOverrideFromParent` (`execution.ts:1836`), decided by the
+        // caller beside its `resolve_model_inheritance` call because `ModelOverride::Explicit` cannot
+        // be told apart from a parent-inherited model once it has been returned.
+        model_override_from_parent: bool,
         acceptance: Option<crate::exec::acceptance::AcceptanceContract>,
     ) -> RunOptions {
         // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:1333,2002-2005,2069` @v0.34.0): clone the
@@ -763,6 +806,12 @@ impl ExecSingleStepExecutor {
             }
         });
         RunOptions {
+            model_override_from_parent,
+            // SUBA-119 — pi's `options.modelResponseAliases`, read from `config.json` parent-side
+            // and carried to this step through `RunnerConfig::model_response_aliases` (the detached
+            // runner has no config access of its own). Upstream threads the same value onto every
+            // async step at `async-execution.ts:1152`/`:1946`/`:2039`.
+            model_response_aliases: self.model_response_aliases.clone(),
             // The detached runner's own environment is its parent's hand-off: no overrides.
             parent_env_overrides: std::collections::BTreeMap::new(),
             // SUBA-100 — the launch-resolved placement the step carries (refused above when it
@@ -1069,6 +1118,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             agent,
             available_models,
             model_override,
+            model_override_from_parent,
             acceptance,
         } = match self.build_step_agent_config(step) {
             Ok(setup) => setup,
@@ -1108,8 +1158,14 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
         // token registered under a live index for the rest of the run.
         let _active = stop_slot.map(|(registry, index)| ActiveStopGuard { registry, index });
 
-        let opts =
-            self.build_step_run_options(step, ctx, available_models, model_override, acceptance);
+        let opts = self.build_step_run_options(
+            step,
+            ctx,
+            available_models,
+            model_override,
+            model_override_from_parent,
+            acceptance,
+        );
 
         let artifact_paths =
             self.write_step_input_artifact(step, resolved_task, ctx.step_slot.index());
@@ -1304,6 +1360,7 @@ mod tests {
             crate::background::session_lease::WriterUpdate,
         >();
         let executor = ExecSingleStepExecutor {
+            model_response_aliases: None,
             writer_ledgers: None,
             lease_writer: Some(lease_tx),
             // A binary that does not exist: `SpawnedChild::spawn` fails, so no `Launched` and no
@@ -1384,6 +1441,7 @@ mod tests {
         // The executor carries an EMPTY persona map — exactly the state that must NOT dispatch a
         // placeholder.
         let executor = ExecSingleStepExecutor {
+            model_response_aliases: None,
             writer_ledgers: None,
             lease_writer: None,
             spawn_command: None,
@@ -1595,6 +1653,7 @@ mod tests {
         artifact_config: crate::artifacts::ArtifactConfig,
     ) -> ExecSingleStepExecutor {
         ExecSingleStepExecutor {
+            model_response_aliases: None,
             writer_ledgers: None,
             lease_writer: None,
             spawn_command: None,
@@ -1624,6 +1683,72 @@ mod tests {
             include_progress: None,
             run_dir: None,
         }
+    }
+
+    /// SUBA-119 — the operator-declared `config.modelResponseAliases` must reach every dispatched
+    /// step's `RunOptions`, on BOTH shapes of this executor: the detached runner (through
+    /// `RunnerConfig::model_response_aliases`) and the foreground `/chain`//`/parallel` walk
+    /// (through `with_model_response_aliases`). Before this row both were hardcoded `None`, so the
+    /// verification error's own remediation — declare the alias in `config.json` — did nothing, and
+    /// the run kept failing.
+    ///
+    /// Pinned at the `RunOptions` seam because that is the value `handle_child_line` reads
+    /// (`opts.model_response_aliases`); anything short of it is a field nobody consults.
+    #[test]
+    fn the_declared_response_alias_map_reaches_every_dispatched_step() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let step = single_step("reviewer", "review the change");
+        let aliases: crate::exec::model_verification::ModelResponseAliases =
+            BTreeMap::from([("prov/model".to_string(), vec!["other/model".to_string()])]);
+
+        // The detached runner's shape, as `turn_loop` builds it from `RunnerConfig`.
+        let mut runner = runner_shaped(None, crate::artifacts::ArtifactConfig::default());
+        runner.model_response_aliases = Some(aliases.clone());
+        let opts = runner.build_step_run_options(
+            &step,
+            &step_test_ctx(dir.path()),
+            Vec::new(),
+            crate::exec::fallback::ModelOverride::Inherit,
+            false,
+            None,
+        );
+        assert_eq!(opts.model_response_aliases.as_ref(), Some(&aliases));
+
+        // The foreground `/chain`//`/parallel` walk's shape, through its builder.
+        let foreground = ExecSingleStepExecutor::foreground(
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            Arc::new(BTreeMap::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_model_response_aliases(Some(aliases.clone()));
+        let opts = foreground.build_step_run_options(
+            &step,
+            &step_test_ctx(dir.path()),
+            Vec::new(),
+            crate::exec::fallback::ModelOverride::Inherit,
+            false,
+            None,
+        );
+        assert_eq!(opts.model_response_aliases.as_ref(), Some(&aliases));
+
+        // And an executor that was given none carries none — the map is not invented.
+        let bare = runner_shaped(None, crate::artifacts::ArtifactConfig::default());
+        let opts = bare.build_step_run_options(
+            &step,
+            &step_test_ctx(dir.path()),
+            Vec::new(),
+            crate::exec::fallback::ModelOverride::Inherit,
+            false,
+            None,
+        );
+        assert_eq!(opts.model_response_aliases, None);
     }
 
     /// The transcript's `source` label follows which PROCESS built the executor, not which
@@ -1657,6 +1782,8 @@ mod tests {
             &step_test_ctx(dir.path()),
             Vec::new(),
             crate::exec::fallback::ModelOverride::Inherit,
+            // SUBA-119: not a parent-inherited model in this fixture.
+            false,
             None,
         );
         assert_eq!(
@@ -1680,6 +1807,8 @@ mod tests {
             &step_test_ctx(dir.path()),
             Vec::new(),
             crate::exec::fallback::ModelOverride::Inherit,
+            // SUBA-119: not a parent-inherited model in this fixture.
+            false,
             None,
         );
         assert_eq!(opts.transcript, Some(TranscriptSource::Async));
@@ -1698,6 +1827,8 @@ mod tests {
             &step_test_ctx(dir.path()),
             Vec::new(),
             crate::exec::fallback::ModelOverride::Inherit,
+            // SUBA-119: not a parent-inherited model in this fixture.
+            false,
             None,
         );
         assert_eq!(

@@ -102,29 +102,48 @@ mod tests {
 
     /// A contract that genuinely disables the gate (pi's `{ level: "none", reason: … }` /
     /// `false` shorthand, the only shapes `explicitAcceptanceCanDisable` accepts,
-    /// `acceptance.ts:167-174`) still appends nothing. The INFERRED contract no longer reaches
-    /// this state — `inferLevel` has no `none` branch — so the fixture is now an explicit one.
+    /// `acceptance.ts:167-174`) still appends nothing. SUBA-108: an INFERRED contract reaches this
+    /// state again — `acceptance.ts:109-117` @v0.71.0 gives a declared `read-only` role level
+    /// `none` — which the second fixture below now covers alongside the explicit one.
     #[test]
     fn a_gate_disabling_contract_leaves_task_text_unchanged() {
         let contract = AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![]);
         assert!(contract.is_no_op());
         let out = inject_acceptance_contract("Investigate the bug", &contract);
         assert_eq!(out, "Investigate the bug");
+
+        // SUBA-108 — and the INFERRED form of the same state: a declared read-only role.
+        let inferred = AcceptanceContract::heuristic_default_for_role(
+            "reviewer",
+            Some(crate::exec::acceptance::model::AcceptanceRole::ReadOnly),
+            "Investigate the bug",
+        );
+        assert!(inferred.is_no_op());
+        assert_eq!(
+            inject_acceptance_contract("Investigate the bug", &inferred),
+            "Investigate the bug"
+        );
     }
 
-    /// The converse, and the actual regression this pairs with: a research/read-only child DOES
-    /// get pi's `## Acceptance Contract` block, naming the criterion it will be judged on and the
-    /// evidence its `acceptance-report` must carry (`formatAcceptancePrompt`,
+    /// The converse, and the actual regression this pairs with: a child that declared NO role
+    /// still gets pi's `## Acceptance Contract` block, naming the criterion it will be judged on
+    /// and the evidence its `acceptance-report` must carry (`formatAcceptancePrompt`,
     /// `acceptance.ts:403-457`, appended at `execution.ts:1037-1038`).
+    ///
+    /// SUBA-108 — the criterion and evidence are the lightweight default pair, not the
+    /// findings/`review-findings` pair: `7c98a696` deleted the agent-name alternation that used to
+    /// route a `researcher`-named child to the read-only branch. The findings branch is now reached
+    /// only by DECLARING `read-only`, and that branch appends nothing at all — which is what
+    /// `a_gate_disabling_contract_leaves_task_text_unchanged` above now pins.
     #[test]
-    fn a_research_child_still_receives_the_acceptance_contract_block() {
+    fn a_child_with_no_declared_role_still_receives_the_acceptance_contract_block() {
         let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
         let out = inject_acceptance_contract("Investigate the bug", &contract);
         assert!(out.starts_with("Investigate the bug"));
         assert!(out.contains(ACCEPTANCE_CONTRACT_HEADING));
         assert!(out.contains("acceptance-report"));
-        assert!(out.contains("Return concrete findings with file paths and severity"));
-        assert!(out.contains("review-findings"));
+        assert!(out.contains("Return a concise result and residual risks when applicable"));
+        assert!(out.contains("manual-notes"));
     }
 
     #[test]

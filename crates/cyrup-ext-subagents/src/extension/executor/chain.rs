@@ -164,6 +164,11 @@ impl SubagentExecutor {
             // SAME remembered-value seam, so an inheriting step (no persona `thinking:`) reasons
             // at the parent session's level exactly as the foreground single-run path does.
             .with_inherited_session_thinking(self.remembered_parent_thinking())
+            // SUBA-119 (pi `modelResponseAliases: deps.config.modelResponseAliases` on the
+            // chain/parallel run options, `subagent-executor.ts:1367`/`:1749`): a foreground
+            // chain/parallel step's native child gets the same declared-alias escape from
+            // `model_verification_failed` the single path gets, out of the same config snapshot.
+            .with_model_response_aliases(cfg.model_response_aliases.clone())
             .with_control(Some(crate::exec::control::resolve_control_config(
                 cfg.control.as_ref(),
                 control_override.as_ref(),
@@ -461,6 +466,9 @@ impl SubagentExecutor {
                         thinking_ceiling: None,
                         capability_ceiling: None,
                         model_origin: None,
+                        // SUBA-119: only a single-run revive carries a launch-time alias map; this
+                        // fresh launch takes the live `config.json` value.
+                        model_response_aliases: None,
                         steps: graph,
                         mode,
                         session_file: first_session_file,

@@ -136,7 +136,11 @@ impl ImageMime {
                 None
             };
         }
-        if starts_with_ascii(buf, 0, b"GIF") {
+        // Both GIF version signatures IN FULL (`utils/mime.ts:13` @v0.87.1) — NOT the bare `GIF`
+        // prefix, which misclassified any text file starting with those three letters as an image
+        // and dropped it from `read` and `@file` input (pi #9755, fixed in 0.87.0). Do not
+        // "simplify" this back to a three-byte compare.
+        if starts_with_ascii(buf, 0, b"GIF87a") || starts_with_ascii(buf, 0, b"GIF89a") {
             return Some(ImageMime::Gif);
         }
         if starts_with_ascii(buf, 0, b"RIFF") && starts_with_ascii(buf, 8, b"WEBP") {

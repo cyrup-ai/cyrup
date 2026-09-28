@@ -318,50 +318,125 @@ fn copilot_enterprise_domain(cred: &Credential) -> Option<String> {
 // Model availability (Pi `github-copilot.ts:20-26` + `auth/oauth/github-copilot.ts:87-113`)
 // ---------------------------------------------------------------------------------------------
 
-/// Whether a `/models` entry is selectable (Pi `isSelectableCopilotModel`,
-/// `auth/oauth/github-copilot.ts:91-96`): `model_picker_enabled === true`, `policy.state !==
-/// "disabled"`, `capabilities.supports.tool_calls !== false`. Note the asymmetry — the picker flag
-/// must be exactly `true`, while the other two only exclude their explicit negative.
-fn is_selectable_copilot_model(item: &Map<String, Value>) -> bool {
-    let picker_enabled = item.get("model_picker_enabled") == Some(&Value::Bool(true));
-    let policy_disabled = item
-        .get("policy")
-        .and_then(Value::as_object)
-        .and_then(|p| p.get("state"))
-        .and_then(Value::as_str)
-        == Some("disabled");
-    let tool_calls_false = item
-        .get("capabilities")
-        .and_then(Value::as_object)
-        .and_then(|c| c.get("supports"))
-        .and_then(Value::as_object)
-        .and_then(|s| s.get("tool_calls"))
-        == Some(&Value::Bool(false));
-    picker_enabled && !policy_disabled && !tool_calls_false
+/// What one `/models` listing says about the account (Pi `parseGitHubCopilotModelCatalog`'s return,
+/// `auth/oauth/github-copilot.ts:93-132` @v0.87.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CopilotModelCatalog {
+    /// The ids the account may select — what lands in the credential's `availableModelIds`.
+    pub available_model_ids: Vec<String>,
+    /// The ids whose policy is `"unconfigured"` and which login should therefore POST a policy for.
+    /// Strictly a subset of the embedded catalog: posting a policy for a model cyrup cannot serve is
+    /// a wasted request.
+    pub policy_model_ids: Vec<String>,
 }
 
-/// Extract the selectable model ids from a Copilot `/models` body (Pi
-/// `parseAvailableCopilotModelIds`, `auth/oauth/github-copilot.ts:98-113`). A body whose `data` is
-/// not an array is the error `"Invalid Copilot models response"`, verbatim.
-pub fn parse_available_copilot_model_ids(raw: &Value) -> Result<Vec<String>, CopilotAuthError> {
+/// 1:1 port of Pi `parseGitHubCopilotModelCatalog` (`auth/oauth/github-copilot.ts:93-132`
+/// @v0.87.1). A body whose `data` is not an array is the error `"Invalid Copilot models response"`,
+/// verbatim.
+///
+/// Three rules, in upstream's order:
+///
+/// 1. A row with `capabilities.supports.tool_calls === false` is dropped outright, before anything
+///    else looks at it.
+/// 2. `availableModelIds` is the picker-enabled, non-`disabled` rows — except that when THAT set is
+///    empty and `allow_policy_fallback` is on, it becomes the `policyState === "enabled"` rows
+///    instead. Some Individual accounts return `model_picker_enabled: false` for every row despite
+///    explicit enabled policies, and the caller limits the fallback to that one endpoint so other
+///    account types keep strict picker semantics (`:170-172`).
+/// 3. `policyModelIds` is the `"unconfigured"` rows that are BOTH in the embedded catalog
+///    (upstream's `Object.hasOwn(GITHUB_COPILOT_MODELS, id)`) and either picker-enabled or covered
+///    by that same fallback.
+///
+/// PROV-098.
+pub fn parse_github_copilot_model_catalog(
+    raw: &Value,
+    allow_policy_fallback: bool,
+) -> Result<CopilotModelCatalog, CopilotAuthError> {
     let data = raw
         .as_object()
         .and_then(|o| o.get("data"))
         .and_then(Value::as_array)
         .ok_or_else(|| CopilotAuthError::new("Invalid Copilot models response"))?;
 
-    let mut ids = Vec::new();
-    for raw_item in data {
-        let Some(item) = raw_item.as_object() else {
-            continue; // `asRecord` → undefined, so `item?.id` is undefined and the row is skipped
-        };
-        if let Some(id) = item.get("id").and_then(Value::as_str)
-            && is_selectable_copilot_model(item)
-        {
-            ids.push(id.to_string());
-        }
+    /// Pi's `accountModels` row (`:105-117`).
+    struct AccountModel<'a> {
+        id: &'a str,
+        picker_enabled: bool,
+        policy_state: Option<&'a str>,
     }
-    Ok(ids)
+
+    let account_models: Vec<AccountModel<'_>> = data
+        .iter()
+        .filter_map(|raw_item| {
+            // `asRecord` → undefined makes `item?.id` undefined, so the row is skipped; likewise a
+            // non-string id (`typeof id !== "string"`).
+            let item = raw_item.as_object()?;
+            let id = item.get("id").and_then(Value::as_str)?;
+            // `:109-110`: `supports?.tool_calls === false` drops the row.
+            if tool_calls_explicitly_false(item) {
+                return None;
+            }
+            Some(AccountModel {
+                id,
+                picker_enabled: item.get("model_picker_enabled") == Some(&Value::Bool(true)),
+                policy_state: item
+                    .get("policy")
+                    .and_then(Value::as_object)
+                    .and_then(|p| p.get("state"))
+                    .and_then(Value::as_str),
+            })
+        })
+        .collect();
+
+    // `:119-121`
+    let picker_model_ids: Vec<String> = account_models
+        .iter()
+        .filter(|m| m.picker_enabled && m.policy_state != Some("disabled"))
+        .map(|m| m.id.to_string())
+        .collect();
+    // `:122`
+    let use_policy_fallback = allow_policy_fallback && picker_model_ids.is_empty();
+    // `:123-126`
+    let available_model_ids = if !use_policy_fallback {
+        picker_model_ids
+    } else {
+        account_models
+            .iter()
+            .filter(|m| m.policy_state == Some("enabled"))
+            .map(|m| m.id.to_string())
+            .collect()
+    };
+    // `:127-131`. `Object.hasOwn(GITHUB_COPILOT_MODELS, id)` is a membership test against the
+    // embedded catalog's ids; built once into a set rather than scanned per row.
+    let catalog: std::collections::HashSet<String> = github_copilot_models()
+        .into_iter()
+        .map(|m| m.id.as_str().to_string())
+        .collect();
+    let policy_model_ids = account_models
+        .iter()
+        .filter(|m| {
+            m.policy_state == Some("unconfigured")
+                && catalog.contains(m.id)
+                && (m.picker_enabled || use_policy_fallback)
+        })
+        .map(|m| m.id.to_string())
+        .collect();
+
+    Ok(CopilotModelCatalog {
+        available_model_ids,
+        policy_model_ids,
+    })
+}
+
+/// `capabilities.supports.tool_calls === false` — only an EXPLICIT `false` drops the row
+/// (Pi `:109-110`).
+fn tool_calls_explicitly_false(item: &Map<String, Value>) -> bool {
+    item.get("capabilities")
+        .and_then(Value::as_object)
+        .and_then(|c| c.get("supports"))
+        .and_then(Value::as_object)
+        .and_then(|s| s.get("tool_calls"))
+        == Some(&Value::Bool(false))
 }
 
 /// Restrict the catalog to what the credential says the account can select (Pi
@@ -584,14 +659,35 @@ impl GitHubCopilotOAuth {
         })
     }
 
-    /// List the account's selectable model ids (Pi `fetchAvailableGitHubCopilotModelIds`,
-    /// `auth/oauth/github-copilot.ts:115-125`).
+    /// Re-list the account's selectable model ids on refresh (Pi `fetchGitHubCopilotModels`,
+    /// `auth/oauth/github-copilot.ts:168-194` @v0.87.1, as `refreshGitHubCopilotToken` calls it at
+    /// `:354-367`).
+    ///
+    /// `allowPolicyFallback` is `baseUrl === "https://api.individual.githubcopilot.com"` (`:171`) on
+    /// THIS path too — refresh and login share one fetcher upstream and differ only in the retry
+    /// policy. Some Individual accounts report `model_picker_enabled: false` for every row despite
+    /// explicit enabled policies; limiting the fallback to that endpoint keeps strict picker
+    /// semantics everywhere else. It is derived from the REAL base url rather than
+    /// [`Self::models_origin`], which the tests override to loopback — the override changes where the
+    /// request goes, never which account type this is (the same derivation as
+    /// `auth::oauth::github_copilot::GitHubCopilotLogin::fetch_model_catalog`).
+    ///
+    /// Forcing the fallback off here used to reset `availableModelIds` from what login stored to
+    /// `[]` at the first token refresh for exactly those accounts (PROV-098).
+    ///
+    /// `[CYRUP-DELTA]` the rate-limit retry loop is not reused on this path. Upstream passes
+    /// `{maxRetries: 0, maxElapsedMs: 0}` (`:361`): `maxElapsedMs: 0` leaves the budget signal
+    /// unarmed (`:136-139`) and `retry === retryPolicy.maxRetries` holds on the very first iteration
+    /// (`:157`), so `fetchWithRateLimitRetry` returns the first response unconditionally — a plain
+    /// GET with the same 5s per-request timeout (`:150`) is byte-identical on the wire.
     async fn fetch_available_model_ids(
         &self,
         copilot_token: &str,
         enterprise_domain: Option<&str>,
     ) -> Result<Vec<String>, CopilotAuthError> {
         let base_url = self.models_origin(copilot_token, enterprise_domain);
+        let allow_policy_fallback = github_copilot_base_url(Some(copilot_token), enterprise_domain)
+            == GITHUB_COPILOT_BASE_URL;
         let url = format!("{base_url}/models");
 
         let mut headers: Vec<(&str, String)> = vec![
@@ -604,7 +700,8 @@ impl GitHubCopilotOAuth {
         let raw = self
             .fetch_json(&url, &headers, Some(MODELS_REQUEST_TIMEOUT))
             .await?;
-        parse_available_copilot_model_ids(&raw)
+        parse_github_copilot_model_catalog(&raw, allow_policy_fallback)
+            .map(|catalog| catalog.available_model_ids)
     }
 }
 
@@ -973,7 +1070,9 @@ mod tests {
             "not-an-object"
         ]));
         assert_eq!(
-            parse_available_copilot_model_ids(&raw).expect("parses"),
+            parse_github_copilot_model_catalog(&raw, false)
+                .expect("parses")
+                .available_model_ids,
             vec!["keep-minimal".to_string(), "keep-full".to_string()]
         );
     }
@@ -982,7 +1081,7 @@ mod tests {
     #[test]
     fn models_response_without_a_data_array_is_the_upstream_error() {
         for body in [json!({}), json!({ "data": {} }), json!([]), json!("nope")] {
-            let err = parse_available_copilot_model_ids(&body).expect_err("must reject");
+            let err = parse_github_copilot_model_catalog(&body, false).expect_err("must reject");
             assert_eq!(err.to_string(), "Invalid Copilot models response");
         }
     }
@@ -1236,6 +1335,82 @@ mod tests {
             !token_head
                 .to_ascii_lowercase()
                 .contains("x-github-api-version")
+        );
+    }
+
+    /// PROV-098, the REFRESH half of `allowPolicyFallback`. Upstream `refreshGitHubCopilotToken`
+    /// (`auth/oauth/github-copilot.ts:354-367` @v0.87.1) calls the SAME `fetchGitHubCopilotModels`
+    /// login does and so derives the flag from the base url (`:171`); it differs only in
+    /// `{maxRetries: 0, maxElapsedMs: 0}`.
+    ///
+    /// cyrup forced the fallback off here, so an Individual account whose every row reports
+    /// `model_picker_enabled: false` with `policy.state: "enabled"` — the exact shape the fallback
+    /// exists for — had the ids login stored wiped to `[]` by the first token refresh, and
+    /// `filter_github_copilot_models` then served zero models.
+    ///
+    /// MIRROR: the same body on an enterprise base url still yields nothing, because the fallback is
+    /// endpoint-scoped (`:170-172`) and no row's picker flag is set. That half passes either way and
+    /// is what keeps the fix from becoming "always fall back".
+    #[tokio::test]
+    async fn refresh_applies_the_policy_fallback_on_the_individual_endpoint_only() {
+        // Only ids in the embedded catalog are asserted, so the listing is the same shape login sees.
+        const MODELS: &str = r#"{"data":[
+            {"id":"gpt-5.4","model_picker_enabled":false,"policy":{"state":"enabled"}},
+            {"id":"claude-sonnet-4.5","model_picker_enabled":false,"policy":{"state":"enabled"}},
+            {"id":"unconfigured","model_picker_enabled":false,"policy":{"state":"unconfigured"}}
+        ]}"#;
+
+        // Individual: `proxy-ep=proxy.individual.githubcopilot.com` → the fallback endpoint.
+        let (origin, _) = spawn_github(
+            r#"{"token":"tid=t1;exp=99;proxy-ep=proxy.individual.githubcopilot.com;","expires_at":1800000000}"#,
+            MODELS,
+        )
+        .await;
+        let oauth = GitHubCopilotOAuth::new()
+            .with_auth_context(empty_env())
+            .with_origin_override(&origin, &origin);
+        let Credential::Oauth { ext, .. } = oauth
+            .refresh(&stored_github_token())
+            .await
+            .expect("refresh")
+        else {
+            panic!("refresh must yield an oauth credential");
+        };
+        assert_eq!(
+            ext.get(EXT_AVAILABLE_MODEL_IDS),
+            Some(&json!(["gpt-5.4", "claude-sonnet-4.5"])),
+            "the enabled policies stand in for the empty picker set"
+        );
+
+        // MIRROR — enterprise: no `proxy-ep` claim, so the credential's domain decides the base url
+        // (`https://copilot-api.company.ghe.com`) and strict picker semantics apply.
+        let (origin, _) = spawn_github(
+            r#"{"token":"tid=t1;exp=99;","expires_at":1800000000}"#,
+            MODELS,
+        )
+        .await;
+        let oauth = GitHubCopilotOAuth::new()
+            .with_auth_context(empty_env())
+            .with_origin_override(&origin, &origin);
+        let mut stored_ext = Map::new();
+        stored_ext.insert(
+            EXT_ENTERPRISE_URL.to_string(),
+            Value::String("company.ghe.com".to_string()),
+        );
+        let enterprise_cred = Credential::Oauth {
+            refresh: "gho_stored_github_token".to_string(),
+            access: "stale-copilot-token".to_string(),
+            expires: 0,
+            ext: stored_ext,
+        };
+        let Credential::Oauth { ext, .. } = oauth.refresh(&enterprise_cred).await.expect("refresh")
+        else {
+            panic!("refresh must yield an oauth credential");
+        };
+        assert_eq!(
+            ext.get(EXT_AVAILABLE_MODEL_IDS),
+            Some(&json!([])),
+            "the fallback is limited to api.individual.githubcopilot.com"
         );
     }
 

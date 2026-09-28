@@ -152,10 +152,11 @@ pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
     // cyrup flattens it to a `Vec` with no defined/empty distinction, and its own serializer only
     // writes the key when non-empty, so a round-tripped file's non-empty <=> pi's "defined": render
     // only when non-empty (documented minor divergence limited to the defined-but-empty edge).
-    if !a.subagent_only_extensions.is_empty() {
+    let subagent_only_extensions = a.subagent_only_extensions.as_deref().unwrap_or_default();
+    if !subagent_only_extensions.is_empty() {
         lines.push(format!(
             "Subagent-only extensions: {}",
-            a.subagent_only_extensions.join(", ")
+            subagent_only_extensions.join(", ")
         ));
     }
     // SUBA-102 — pi `if (agent.mutationTools !== undefined) lines.push(`Mutation tools: …`)`

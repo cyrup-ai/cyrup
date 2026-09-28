@@ -53,7 +53,7 @@ use super::settings::{
     get_watchdog_user_settings_path, write_user_watchdog_enabled, write_watchdog_model_settings,
 };
 use super::types::{
-    SUBAGENT_WATCHDOG_WARNING_TYPE, ThinkingSetting, WatchdogCategory, WatchdogConfidence,
+    SUBAGENT_WATCHDOG_WARNING_TYPE, ThinkingSetting, WatchdogCategory, WatchdogImportance,
     WatchdogRuntimeStatus, WatchdogSettingsSource, WatchdogSeverity, WatchdogWarning,
     WatchdogWarningDetails, WatchdogWarningSource, WatchdogWarningState,
 };
@@ -190,6 +190,7 @@ pub fn register_main_watchdog(
         )
     });
     let display_services = Arc::clone(&services);
+    let user_warning_services = Arc::clone(&services);
     let user_message_services = Arc::clone(&services);
     Arc::new(MainWatchdogRuntime::new(MainWatchdogRuntimeOptions {
         cwd: Some(cwd.to_path_buf()),
@@ -222,6 +223,20 @@ pub fn register_main_watchdog(
                 details_json.as_ref(),
                 delivery == Some(WatchdogDelivery::Steer),
             );
+        })),
+        // SUBA-120 — `displayUserWarning` (`register-main.ts:384` @v0.71.0):
+        // `pi.appendEntry(SUBAGENT_WATCHDOG_WARNING_TYPE, details)`. A `low`/`medium`-importance
+        // finding lands as a SESSION ENTRY the user reads and nothing more — no `inject_message`, so
+        // it never enters the parent model's context and never triggers a turn. That distinction is
+        // the entire point of the routing: `display_warning` above is the parent-model path.
+        display_user_warning: Some(Arc::new(move |details: &WatchdogWarningDetails| {
+            let Some(services) = user_warning_services() else {
+                return;
+            };
+            let Ok(details_json) = serde_json::to_value(details) else {
+                return;
+            };
+            let _ = services.append_entry(SUBAGENT_WATCHDOG_WARNING_TYPE, &details_json);
         })),
         send_user_message: Some(Arc::new(move |message: &str| {
             let services = user_message_services().ok_or_else(|| "no live session".to_string())?;
@@ -602,8 +617,25 @@ pub fn build_watchdog_status(
 // Command handling (`register-main.ts:155-375`)
 // =================================================================================================
 
-/// `parseTestCommand(input)` (`register-main.ts:155-159`) — `test concern|blocker <text>`.
-fn parse_test_command(input: &str) -> Option<(WatchdogSeverity, String)> {
+/// `parseTestCommand(input)` (`register-main.ts:157-161` @v0.71.0) —
+/// `test concern|blocker low|medium|high <text>`.
+///
+/// SUBA-120: `importance` is a MANDATORY third token. Upstream's regex is
+/// `/^test\s+(concern|blocker)\s+(low|medium|high)\s+([\s\S]+)$/`, so a bare
+/// `test blocker something` no longer parses at all — which is the point: the operator has to say
+/// which surface the manufactured finding should exercise, because that is what the command tests.
+///
+/// The trailing `\s+([\s\S]+)$` needs TWO characters after the importance token, not one: the
+/// separator class and the capture class both demand at least one character each, and `[\s\S]`
+/// matches whitespace too, so the regex backtracks and the capture can be a space. That is why
+/// this function rejects an empty remainder after consuming ONE separator character rather than
+/// accepting it and relying on the caller's empty-text check. The difference is observable: for
+/// the single input `test blocker high ` (exactly one trailing space) upstream does not match and
+/// falls through to the GENERAL usage error (`register-main.ts:372`), where returning `Some` with
+/// an empty text would produce the narrower `test`-specific one instead. Two or more trailing
+/// spaces do match upstream, captured as whitespace, and `.trim()` then empties them — so those
+/// DO reach the specific error, on both sides.
+fn parse_test_command(input: &str) -> Option<(WatchdogSeverity, WatchdogImportance, String)> {
     let rest = input.strip_prefix("test")?;
     let rest = rest.strip_prefix(|c: char| c.is_whitespace())?;
     let rest = rest.trim_start();
@@ -611,11 +643,28 @@ fn parse_test_command(input: &str) -> Option<(WatchdogSeverity, String)> {
         ("concern", WatchdogSeverity::Concern),
         ("blocker", WatchdogSeverity::Blocker),
     ] {
-        if let Some(tail) = rest.strip_prefix(token)
-            && let Some(text) = tail.strip_prefix(|c: char| c.is_whitespace())
-        {
-            return Some((severity, text.trim().to_string()));
+        let Some(tail) = rest.strip_prefix(token) else {
+            continue;
+        };
+        let Some(tail) = tail.strip_prefix(|c: char| c.is_whitespace()) else {
+            continue;
+        };
+        let tail = tail.trim_start();
+        for (itoken, importance) in [
+            ("low", WatchdogImportance::Low),
+            ("medium", WatchdogImportance::Medium),
+            ("high", WatchdogImportance::High),
+        ] {
+            if let Some(text) = tail.strip_prefix(itoken)
+                && let Some(text) = text.strip_prefix(|c: char| c.is_whitespace())
+                // `\s+([\s\S]+)$`: the capture needs a character of its own after the one this
+                // `strip_prefix` consumed for the separator.
+                && !text.is_empty()
+            {
+                return Some((severity, importance, text.trim().to_string()));
+            }
         }
+        return None;
     }
     None
 }
@@ -764,7 +813,11 @@ fn build_check_text(
 }
 
 /// `createTestWarning(severity, text)` (`register-main.ts:231-244`).
-fn create_test_warning(severity: WatchdogSeverity, text: &str) -> WatchdogWarning {
+fn create_test_warning(
+    severity: WatchdogSeverity,
+    importance: WatchdogImportance,
+    text: &str,
+) -> WatchdogWarning {
     WatchdogWarning {
         severity,
         summary: text.to_string(),
@@ -779,7 +832,10 @@ fn create_test_warning(severity: WatchdogSeverity, text: &str) -> WatchdogWarnin
                 .to_string()
         },
         category: Some(WatchdogCategory::Other),
-        confidence: Some(WatchdogConfidence::High),
+        // SUBA-120 — `register-main.ts:231` @v0.71.0 takes this from the command, so a
+        // `/subagents-watchdog test concern low …` exercises the USER-ONLY surface rather than always
+        // steering into the parent model's turn.
+        importance,
         source: Some(WatchdogWarningSource::Main),
         agent: None,
         run_id: None,
@@ -964,23 +1020,24 @@ pub fn handle_watchdog_command(
             },
         );
     }
-    if let Some((severity, test_text)) = parse_test_command(input) {
+    if let Some((severity, importance, test_text)) = parse_test_command(input) {
         if test_text.is_empty() {
             return (
                 WatchdogCommandOutcome::UsageError(
-                    "Usage: /subagents-watchdog test concern|blocker <text>".to_string(),
+                    "Usage: /subagents-watchdog test concern|blocker low|medium|high <text>"
+                        .to_string(),
                 ),
                 None,
             );
         }
-        let warning = create_test_warning(severity, &test_text);
+        let warning = create_test_warning(severity, importance, &test_text);
         let details = runtime.record_displayed_warning(&warning);
         // `:371` — the message is sent by the CALLER, which owns the delivery capability.
         return (WatchdogCommandOutcome::Text(String::new()), Some(details));
     }
     (
         WatchdogCommandOutcome::UsageError(format!(
-            "Usage: /subagents-watchdog [status|on|off|session on|session off|recommend-model|model recommended|model <provider/model[:thinking]>|model inherit|thinking {}|thinking inherit|session model recommended|check|test concern <text>|test blocker <text>]",
+            "Usage: /subagents-watchdog [status|on|off|session on|session off|recommend-model|model recommended|model <provider/model[:thinking]>|model inherit|thinking {}|thinking inherit|session model recommended|check|test concern|blocker low|medium|high <text>]",
             THINKING_LEVELS.join("|")
         )),
         None,
@@ -1070,8 +1127,12 @@ pub fn parse_watchdog_warning_content(content: &str) -> Option<WatchdogWarningDe
         summary: tag("summary")?,
         evidence: tag("evidence")?,
         recommended_action: tag("recommended_action")?,
+        // SUBA-120 — `importance` is a REQUIRED ATTRIBUTE on the rendered tag
+        // (`warning-format.ts:37` @v0.71.0), not the optional `<confidence>` CHILD TAG it replaced,
+        // so it is read with `attr` and with `?`: a rendered warning that carries no `importance`
+        // is not a warning this grammar can round-trip.
+        importance: WatchdogImportance::parse(&attr("importance")?)?,
         category: attr("category").and_then(|v| WatchdogCategory::parse(&v)),
-        confidence: tag("confidence").and_then(|v| WatchdogConfidence::parse(&v)),
         source: attr("source").and_then(|v| WatchdogWarningSource::parse(&v)),
         agent: tag("agent"),
         run_id: tag("run_id"),
@@ -1255,19 +1316,101 @@ mod tests {
         );
     }
 
+    /// SUBA-120 test (d). The grammar takes `importance` as a MANDATORY third token
+    /// (`register-main.ts:158` @v0.71.0), and `test blocker <text>` without one no longer parses —
+    /// the manufactured finding has to declare which surface it exercises.
     #[test]
     fn the_test_command_grammar_matches_upstreams_regex() {
         assert_eq!(
-            parse_test_command("test blocker something is wrong"),
-            Some((WatchdogSeverity::Blocker, "something is wrong".to_string()))
+            parse_test_command("test blocker high something is wrong"),
+            Some((
+                WatchdogSeverity::Blocker,
+                WatchdogImportance::High,
+                "something is wrong".to_string()
+            ))
         );
         assert_eq!(
-            parse_test_command("test concern  a  b "),
-            Some((WatchdogSeverity::Concern, "a  b".to_string()))
+            parse_test_command("test concern  low  a  b "),
+            Some((
+                WatchdogSeverity::Concern,
+                WatchdogImportance::Low,
+                "a  b".to_string()
+            ))
         );
+        assert_eq!(
+            parse_test_command("test concern medium x"),
+            Some((
+                WatchdogSeverity::Concern,
+                WatchdogImportance::Medium,
+                "x".to_string()
+            ))
+        );
+        // No importance token at all: upstream's regex requires one, so this is not a test command.
+        assert_eq!(parse_test_command("test blocker something is wrong"), None);
+        // An importance token with no text after it.
+        assert_eq!(parse_test_command("test blocker high"), None);
+        // An importance token that is not a member of the enum.
+        assert_eq!(parse_test_command("test blocker critical x"), None);
         assert_eq!(parse_test_command("test blocker"), None);
         assert_eq!(parse_test_command("test warning x"), None);
         assert_eq!(parse_test_command("status"), None);
+    }
+
+    /// SUBA-120 — the boundary of `\s+([\s\S]+)$`, which is TWO characters wide, not one.
+    ///
+    /// The capture class `[\s\S]` matches whitespace as well, so the regex backtracks: with two or
+    /// more trailing spaces the separator takes one and the capture takes the rest, the match
+    /// succeeds, and `.trim()` (`register-main.ts:160`) empties the captured text. With exactly ONE
+    /// trailing space there is nothing left for the capture and the regex does not match at all.
+    /// The two cases are therefore `Some(text: "")` and `None`, and the port must agree on which is
+    /// which — this is the case that decides whether the `test`-specific usage error
+    /// (`register-main.ts:343-345`) or the general one (`:372`) is the right answer for a given
+    /// input.
+    ///
+    /// Both sides' command handlers `args.trim()` first (`register-main.ts:249`,
+    /// [`handle_watchdog_command`]), so no slash-command input reaches this function with trailing
+    /// whitespace and the distinction is not observable there. It is still the function's contract,
+    /// and this port's own `parse_test_command` accepted a lone trailing space as a match before
+    /// SUBA-120's reconciliation — a `Some` where upstream returns `None`.
+    #[test]
+    fn exactly_one_trailing_space_is_not_a_test_command_but_two_are() {
+        assert_eq!(
+            parse_test_command("test blocker high "),
+            None,
+            "one trailing space leaves the `[\\s\\S]+` capture empty, so the regex fails"
+        );
+        assert_eq!(
+            parse_test_command("test blocker high  "),
+            Some((
+                WatchdogSeverity::Blocker,
+                WatchdogImportance::High,
+                String::new()
+            )),
+            "two trailing spaces DO match, capturing whitespace that `.trim()` then empties"
+        );
+        // The same boundary at the severity separator, where it has always held.
+        assert_eq!(parse_test_command("test blocker "), None);
+        assert_eq!(parse_test_command("test "), None);
+    }
+
+    /// SUBA-120 test (d), the routing half: a `low`-importance manual finding must not reach the
+    /// parent model. `create_test_warning` carries the command's importance through to
+    /// `display_recorded_warning`, which routes on it (`runtime.ts:548-550`).
+    #[test]
+    fn a_low_importance_test_warning_carries_low_through_to_the_warning() {
+        let (severity, importance, text) =
+            parse_test_command("test concern low just checking").expect("parses");
+        let warning = create_test_warning(severity, importance, &text);
+        assert_eq!(warning.importance, WatchdogImportance::Low);
+        assert_eq!(warning.severity, WatchdogSeverity::Concern);
+        assert_eq!(warning.summary, "just checking");
+
+        let (_, high, htext) =
+            parse_test_command("test blocker high really wrong").expect("parses");
+        assert_eq!(
+            create_test_warning(WatchdogSeverity::Blocker, high, &htext).importance,
+            WatchdogImportance::High
+        );
     }
 
     #[test]
@@ -1312,7 +1455,7 @@ mod tests {
     fn a_test_command_records_a_displayed_warning_for_the_caller_to_send() {
         let runtime = MainWatchdogRuntime::default();
         let (outcome, details) =
-            handle_watchdog_command(&runtime, "test blocker the renderer is broken", &ctx());
+            handle_watchdog_command(&runtime, "test blocker high the renderer is broken", &ctx());
         assert_eq!(outcome, WatchdogCommandOutcome::Text(String::new()));
         let details = details.expect("a warning to send");
         assert_eq!(details.severity, WatchdogSeverity::Blocker);
@@ -1355,8 +1498,12 @@ mod tests {
         // `parseTestCommand` DOES capture a whitespace-only tail (upstream's `([\s\S]+)` matches a
         // non-breaking space, and its `.trim()` then empties it) —
         assert_eq!(
-            parse_test_command("test blocker \u{a0}"),
-            Some((WatchdogSeverity::Blocker, String::new()))
+            parse_test_command("test blocker high \u{a0}"),
+            Some((
+                WatchdogSeverity::Blocker,
+                WatchdogImportance::High,
+                String::new()
+            ))
         );
         // — but `handleWatchdogCommand` trims its whole argument first (`:252`), and both JS
         // `String.trim()` and Rust's `str::trim` treat U+00A0 as whitespace, so no input reaches
@@ -1365,7 +1512,8 @@ mod tests {
         // reachable outcome is the general usage error, which
         // [`a_test_command_with_no_text_falls_through_to_the_general_usage_error`] pins.
         let runtime = MainWatchdogRuntime::default();
-        let (outcome, warning) = handle_watchdog_command(&runtime, "test blocker \u{a0}", &ctx());
+        let (outcome, warning) =
+            handle_watchdog_command(&runtime, "test blocker high \u{a0}", &ctx());
         assert!(warning.is_none());
         match outcome {
             WatchdogCommandOutcome::UsageError(message) => assert!(
@@ -1422,7 +1570,7 @@ mod tests {
             recommended_action: "add a down migration".to_string(),
             category: WatchdogCategory::UnsafeChange,
             source: WatchdogWarningSource::Child,
-            confidence: Some(WatchdogConfidence::High),
+            importance: WatchdogImportance::High,
             agent: Some("db-writer".to_string()),
             run_id: Some("run-7".to_string()),
             stale: Some(false),
@@ -1454,7 +1602,7 @@ mod tests {
         assert_eq!(parsed.recommended_action, original.recommended_action);
         assert_eq!(parsed.category, original.category);
         assert_eq!(parsed.source, original.source);
-        assert_eq!(parsed.confidence, original.confidence);
+        assert_eq!(parsed.importance, original.importance);
         assert_eq!(parsed.agent, original.agent);
         assert_eq!(parsed.run_id, original.run_id);
         assert_eq!(parsed.stale, original.stale);

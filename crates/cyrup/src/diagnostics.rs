@@ -69,6 +69,9 @@ const VALID_THINKING_LEVELS: [&str; 7] =
 /// adding it here produces exactly the failure ACP-002 hoisted the branch in `resolve_app_mode` to
 /// prevent, with no diagnostic anywhere. The two lists must move together.
 const VALID_MODES: [&str; 4] = ["text", "json", "rpc", "acp"];
+/// pi's `--mode`-with-no-usable-value error (args.ts:98 @v0.87.1), verbatim.
+const MODE_REQUIRES: &str = "--mode requires text, json, or rpc";
+
 /// Valid `--tui-mode` values (pi args.ts:182 @v0.84.1 — `mode === "regular" || mode === "fullscreen"`).
 const VALID_TUI_MODES: [&str; 2] = ["regular", "fullscreen"];
 /// pi's `--tui-mode`-with-no-usable-value error (args.ts:186 @v0.84.1), verbatim.
@@ -141,16 +144,57 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
     let mut assign_spans: [Vec<(usize, usize)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut i = 0usize;
     while let Some(arg) = argv.get(i) {
-        // `--mode <value>` (space form): keep when valid, silently drop both when invalid.
-        if arg == "--mode"
-            && let Some(value) = argv.get(i + 1)
-        {
-            if VALID_MODES.contains(&value.as_str()) {
-                clean.push(arg.clone());
-                clean.push(value.clone());
+        // SEAM-123 — pi args.ts:82-91 @v0.87.1: `--` ENDS option parsing, and it is the FIRST arm
+        // of pi's loop. Placed first here so neither the `--mode`/`--thinking`/`--tui-mode` arms nor
+        // the SEAM-104 unknown-single-dash arm can ever see a post-`--` token: `cyrup -p -- "-
+        // Summarize these points"` previously died on `Unknown option: - Summarize these points`.
+        // The SEAM-105 assign-span dedup below operates on the finished `clean`, so a family flag
+        // appearing only after `--` correctly records no span and is left verbatim.
+        if arg == "--" {
+            clean.extend(argv.iter().skip(i).cloned());
+            break;
+        }
+        // `--mode <value>` (space form) — pi args.ts:95-110 @v0.87.1, branch for branch:
+        //   * missing value, or a `-`-leading next token → error `--mode requires text, json, or
+        //     rpc`, and the value token is NOT consumed (pi `continue`s WITHOUT its `i++`), so a
+        //     following real flag still reaches clap
+        //   * present but not a valid mode → consume it (pi's `i++`) and error
+        //     `Invalid mode "<v>". Valid values: text, json, rpc`
+        //   * valid → keep flag + value for clap
+        // Both error branches withhold the flag from the cleaned argv: an error exits 1 in
+        // `main.rs`, and clap must never see a value it would reject with its own exit-2 text.
+        // SEAM-120 — cyrup previously dropped an invalid value SILENTLY and advanced by two
+        // unconditionally, so `--mode bogus` exited 0 in text mode and `--mode --model m` ate
+        // `--model` as the bad value and lost `m`.
+        //
+        // CYRUP-DELTA: [`VALID_MODES`] carries a fifth value `acp` that pi has no analogue for
+        // (args.ts:104 is a literal three-way comparison against text/json/rpc; pi encodes ACP in
+        // the identity of a separate binary — see the [`VALID_MODES`] doc above). The error text
+        // stays pi's literal three-name list rather than cyrup's real one: naming a fourth mode in
+        // an upstream message would be inventing upstream behaviour, and `--acp` is documented on
+        // its own row in `cli/help.rs`.
+        if arg == "--mode" {
+            match argv.get(i + 1) {
+                None => {
+                    diagnostics.push(Diagnostic::error(MODE_REQUIRES));
+                    i += 1;
+                }
+                Some(value) if value.starts_with('-') => {
+                    diagnostics.push(Diagnostic::error(MODE_REQUIRES));
+                    i += 1;
+                }
+                Some(value) if VALID_MODES.contains(&value.as_str()) => {
+                    clean.push(arg.clone());
+                    clean.push(value.clone());
+                    i += 2;
+                }
+                Some(value) => {
+                    diagnostics.push(Diagnostic::error(format!(
+                        "Invalid mode \"{value}\". Valid values: text, json, rpc"
+                    )));
+                    i += 2;
+                }
             }
-            // else: silently ignored (Pi args.ts:80-82) — drop the flag AND its value.
-            i += 2;
             continue;
         }
         // `--thinking <value>` (space form): keep when valid, warn + drop both when invalid.
@@ -429,15 +473,35 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    /// SEAM-120 — pi args.ts:95-110 @v0.87.1. An invalid `--mode` value is an exit-1 ERROR, not a
+    /// silent drop, and a missing / `-`-leading value consumes no token.
     #[test]
-    fn bad_mode_is_silently_dropped() {
-        // Pi args.ts:80-82: an invalid `--mode` value is silently ignored (no diagnostic).
+    fn bad_mode_is_an_error() {
         let (clean, diags) = apply_arg_leniency(&v(&["--mode", "bogus", "hi"]));
         assert_eq!(clean, v(&["hi"]));
-        assert!(diags.is_empty());
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].level, DiagnosticLevel::Error);
+        assert_eq!(
+            diags[0].message,
+            "Invalid mode \"bogus\". Valid values: text, json, rpc"
+        );
+        // A `-`-leading next token is NOT consumed (pi skips its `i++` on this branch).
+        let (clean, diags) = apply_arg_leniency(&v(&["--mode", "--model", "m", "hi"]));
+        assert_eq!(clean, v(&["--model", "m", "hi"]));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].message, MODE_REQUIRES);
+        // …as is a trailing `--mode` with no value at all.
+        let (clean, diags) = apply_arg_leniency(&v(&["--mode"]));
+        assert!(clean.is_empty(), "{clean:?}");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].message, MODE_REQUIRES);
         // A valid mode is preserved.
         let (clean, diags) = apply_arg_leniency(&v(&["--mode", "json"]));
         assert_eq!(clean, v(&["--mode", "json"]));
+        assert!(diags.is_empty());
+        // CYRUP-DELTA: cyrup's fifth mode survives the pass too.
+        let (clean, diags) = apply_arg_leniency(&v(&["--mode", "acp"]));
+        assert_eq!(clean, v(&["--mode", "acp"]));
         assert!(diags.is_empty());
     }
 
@@ -503,6 +567,13 @@ mod tests {
         // `--` still belongs to clap / the extension-flag capture, not to this arm.
         let (clean, diags) = apply_arg_leniency(&v(&["--"]));
         assert_eq!(clean, v(&["--"]));
+        assert!(diags.is_empty(), "{diags:?}");
+        // SEAM-123 — and `--` ENDS option parsing (pi args.ts:82-91 @v0.87.1): no later arm sees a
+        // post-`--` token, so neither `-x` nor `--mode bogus` is interpreted. RED before the fix:
+        // `-x` raised `Unknown option: -x` and `--mode bogus` was eaten by the `--mode` arm.
+        let tail = v(&["--", "-x", "--mode", "bogus"]);
+        let (clean, diags) = apply_arg_leniency(&tail);
+        assert_eq!(clean, tail);
         assert!(diags.is_empty(), "{diags:?}");
     }
 

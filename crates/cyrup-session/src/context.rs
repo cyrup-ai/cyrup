@@ -3,13 +3,16 @@
 //! standalone `build_session_context`-style message assembly (Pi `buildSessionContext`,
 //! `session-manager.ts:325-433`).
 
-use cyrup_core::{Content, EntryId, Message, ModelRef};
+use std::collections::HashMap;
+
+use cyrup_core::{AssistantMessage, Content, EntryId, Message, ModelRef};
+use serde_json::Value;
 
 use crate::agent_message::{
     AgentMessage, BranchSummaryMessage, CompactionSummaryMessage, CustomRoleMessage, MessageRole,
-    custom_to_message,
+    convert_to_llm, custom_to_message,
 };
-use crate::entry::{Entry, KnownEntry};
+use crate::entry::{ContextEditableContent, Entry, KnownEntry};
 
 /// Compaction-summary wrapper (Pi `COMPACTION_SUMMARY_PREFIX`/`SUFFIX`, `messages.ts:11-17`). The
 /// model conditions on this exact text, so it is byte-1:1 with Pi.
@@ -167,54 +170,16 @@ fn latest_compaction(path: &[&Entry]) -> Option<usize> {
 /// Used both by [`crate::manager::SessionManager::build_context`] and by compaction's
 /// `tokensBefore`/trigger estimation so they measure the same reconstructed context.
 pub fn build_context_messages(path: &[&Entry]) -> Vec<Message> {
-    let mut messages = Vec::new();
-    match latest_compaction(path).and_then(|i| path.get(i).copied().map(|e| (i, e))) {
-        Some((
-            cpos,
-            Entry::Known(KnownEntry::Compaction {
-                summary,
-                first_kept_entry_id,
-                tokens_before,
-                base,
-                ..
-            }),
-        )) => {
-            messages.push(compaction_summary_message(
-                summary,
-                *tokens_before,
-                parse_entry_ts(&base.timestamp),
-            ));
-            // `first_kept_entry_id == None` (an unresolvable v1 `firstKeptEntryIndex`) keeps
-            // NOTHING: Pi's `entry.id === compaction.firstKeptEntryId` never matches an absent
-            // id, so `foundFirstKept` stays false for the whole `0..compactionIdx` loop
-            // (`session-manager.ts:443-451`); the harness fork spells the same rule as a guard,
-            // `if (compaction.firstKeptEntryId)` (`agent/src/harness/session/session.ts:80`).
-            if let Some(before) = path.get(..cpos)
-                && let Some(first_kept) = first_kept_entry_id
-            {
-                let mut keeping = false;
-                for e in before {
-                    if &e.id() == first_kept {
-                        keeping = true;
-                    }
-                    if keeping {
-                        push_as_message(&mut messages, e);
-                    }
-                }
-            }
-            if let Some(after) = path.get(cpos + 1..) {
-                for e in after {
-                    push_as_message(&mut messages, e);
-                }
-            }
-        }
-        _ => {
-            for e in path {
-                push_as_message(&mut messages, e);
-            }
-        }
-    }
-    messages
+    // Pi builds the raw projection once and renders it: `buildSessionProjection(...)` then
+    // `convertToLlm(projection.messages)` (`session-manager.ts:543-566` @v0.87.1). cyrup did the
+    // compaction-window walk a SECOND time here with an LLM-rendering pusher, which duplicated the
+    // admission rule — and would have left this projection blind to `context_edit` entries while
+    // the raw one honoured them. Delegating makes the two physically the same walk:
+    // [`push_as_message`] is exactly `push_as_raw` followed by
+    // [`crate::agent_message::AgentMessage::push_llm`], and the governing compaction that this
+    // function used to push by hand is the same `compaction_summary_message(summary, tokens_before,
+    // ts)` that `build_context_entries`' head entry renders to.
+    convert_to_llm(&build_context_agent_messages(path))
 }
 
 /// Append the **raw `AgentMessage`** form of an entry — Pi `sessionEntryToContextMessages`
@@ -280,6 +245,123 @@ fn push_as_raw(out: &mut Vec<AgentMessage>, e: &Entry) {
             _ => {}
         }
     }
+}
+
+/// Apply one [`KnownEntry::ContextEdit`]'s replacement to the raw projection of its TARGET entry —
+/// Pi `projectContextEntry` (`session-manager.ts:519-540` @v0.87.1):
+///
+/// ```ts
+/// const messages = sessionEntryToContextMessages(entry);
+/// if (!edit) return messages;
+/// const replacement = edit.replacement;
+/// if (replacement === null) return [];
+/// return messages.map((message) => {
+///     if (message.role !== "user" && message.role !== "assistant" &&
+///         message.role !== "toolResult" && message.role !== "custom") return message;
+///     const content = (message.role === "assistant" || message.role === "toolResult") &&
+///         typeof replacement.content === "string"
+///         ? [{ type: "text" as const, text: replacement.content }]
+///         : replacement.content;
+///     return { ...message, content } as AgentMessage;
+/// });
+/// ```
+///
+/// Only the CONTENT is swapped; every other field of the target's message (timestamps, usage, stop
+/// reason, tool-call id, `customType`, `display`) is left exactly as the target wrote it. Roles
+/// outside the editable union (`bashExecution`, `branchSummary`, `compactionSummary`) pass through
+/// untouched.
+///
+/// CYRUP-DELTA vs Pi's `user` arm: Pi's `UserMessage["content"]` is `string | blocks[]`
+/// (`ai/src/types.ts:509-513` @v0.87.1) so a string replacement can sit there verbatim. cyrup's
+/// [`Message::User`] holds `Vec<Content>` and promotes the bare-string shorthand to a single text
+/// block at the wire boundary already (`de_user_content`, SESS-027), so the same promotion is done
+/// here. The `custom` arm keeps Pi's behaviour exactly, because cyrup mirrors custom content as raw
+/// JSON and a string stays a string.
+fn project_context_entry(out: &mut Vec<AgentMessage>, e: &Entry, edit: Option<&KnownEntry>) {
+    let Some(KnownEntry::ContextEdit { replacement, .. }) = edit else {
+        push_as_raw(out, e);
+        return;
+    };
+    // `replacement: null` OMITS the target from context entirely (Pi's `return []`).
+    let Some(r) = replacement else { return };
+
+    let blocks = |c: &ContextEditableContent| -> Vec<Content> {
+        match c {
+            ContextEditableContent::Text(t) => vec![Content::text(t.as_str())],
+            ContextEditableContent::Blocks(b) => b.clone(),
+        }
+    };
+
+    let mut projected = Vec::new();
+    push_as_raw(&mut projected, e);
+    for m in projected {
+        out.push(match m {
+            AgentMessage::Core(Message::User { timestamp, .. }) => {
+                AgentMessage::Core(Message::User {
+                    content: blocks(&r.content),
+                    timestamp,
+                })
+            }
+            AgentMessage::Core(Message::Assistant(a)) => {
+                AgentMessage::Core(Message::Assistant(AssistantMessage {
+                    content: blocks(&r.content),
+                    ..a
+                }))
+            }
+            AgentMessage::Core(Message::ToolResult {
+                tool_call_id,
+                tool_name,
+                is_error,
+                details,
+                usage,
+                added_tool_names,
+                timestamp,
+                ..
+            }) => AgentMessage::Core(Message::ToolResult {
+                tool_call_id,
+                tool_name,
+                content: blocks(&r.content),
+                is_error,
+                details,
+                usage,
+                added_tool_names,
+                timestamp,
+            }),
+            AgentMessage::Custom(c) => AgentMessage::Custom(CustomRoleMessage {
+                content: match &r.content {
+                    // Pi hands the `custom` role `replacement.content` AS-IS: a string stays a
+                    // string there, which cyrup's raw-JSON `content` represents natively.
+                    ContextEditableContent::Text(t) => Value::String(t.clone()),
+                    ContextEditableContent::Blocks(b) => {
+                        serde_json::to_value(b).unwrap_or(Value::Null)
+                    }
+                },
+                ..c
+            }),
+            // Roles outside Pi's editable union pass through unchanged.
+            other => other,
+        });
+    }
+}
+
+/// The in-range `context_edit` entries, keyed by the id they TARGET — Pi `buildSessionProjection`
+/// (`session-manager.ts:551-554` @v0.87.1):
+///
+/// ```ts
+/// const edits = new Map<string, ContextEditEntry>();
+/// for (const entry of contextEntries) { if (entry.type === "context_edit") edits.set(entry.targetId, entry); }
+/// ```
+///
+/// Built from the entries `build_context_entries` ADMITTED, so only edits inside the live compaction
+/// window apply; `Map.set` makes the LAST edit per target win.
+fn context_edits<'a>(admitted: &[&'a Entry]) -> HashMap<&'a EntryId, &'a KnownEntry> {
+    let mut edits: HashMap<&EntryId, &KnownEntry> = HashMap::new();
+    for e in admitted {
+        if let Entry::Known(k @ KnownEntry::ContextEdit { target_id, .. }) = e {
+            edits.insert(target_id, k);
+        }
+    }
+    edits
 }
 
 /// The raw-context projection of ONE entry — Pi `sessionEntryToContextMessages(entry)`
@@ -348,9 +430,11 @@ pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<AgentMessage> {
 /// [`build_context_agent_messages`] is this function with the ids dropped, so the two projections
 /// cannot drift.
 pub fn build_context_agent_messages_tagged(path: &[&Entry]) -> Vec<(EntryId, AgentMessage)> {
+    let admitted = build_context_entries(path);
+    let edits = context_edits(&admitted);
     let mut messages = Vec::new();
-    for e in build_context_entries(path) {
-        push_as_raw_tagged(&mut messages, e);
+    for e in &admitted {
+        push_as_raw_tagged(&mut messages, e, edits.get(&e.id()).copied());
     }
     messages
 }
@@ -416,9 +500,13 @@ pub fn build_context_entries<'a>(path: &[&'a Entry]) -> Vec<&'a Entry> {
 ///
 /// Delegates rather than duplicating the match, so a new projected entry kind can never be tagged
 /// in one projection and missing from the other.
-fn push_as_raw_tagged(out: &mut Vec<(EntryId, AgentMessage)>, e: &Entry) {
+fn push_as_raw_tagged(
+    out: &mut Vec<(EntryId, AgentMessage)>,
+    e: &Entry,
+    edit: Option<&KnownEntry>,
+) {
     let mut projected = Vec::new();
-    push_as_raw(&mut projected, e);
+    project_context_entry(&mut projected, e, edit);
     let id = e.id();
     out.extend(projected.into_iter().map(|m| (id.clone(), m)));
 }

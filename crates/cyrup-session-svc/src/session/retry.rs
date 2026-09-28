@@ -76,10 +76,22 @@ impl AgentSession {
         is_retryable_assistant_error(message)
     }
 
-    /// Whether the run that just ended will retry (Pi `_willRetryAfterAgentEnd`, agent-session.ts:561).
-    /// True iff auto-retry is enabled, the budget is not exhausted, and the last assistant message is
-    /// a retryable error.
+    /// Whether the run that just ended will retry (Pi `_willRetryAfterAgentEnd`,
+    /// `agent-session.ts:976-990` @v0.87.1). True iff no abort has been requested for this run,
+    /// auto-retry is enabled, the budget is not exhausted, and the last assistant message is a
+    /// retryable error.
     pub fn will_retry_after_agent_end(&self, messages: &[Arc<AgentMessage>]) -> bool {
+        // SESS-062 — pi's FIRST line is `if (this._agentRunAbortRequested) return false;`
+        // (`agent-session.ts:977` @v0.87.1), ahead of the settings and budget reads.
+        //
+        // This is a PROMISE about the future, not a classification of the error: it is the
+        // `willRetry` field of `agent_end` (`subscriber.rs:215`), which every front-end reads to
+        // decide whether to keep a "retrying…" affordance up instead of settling the turn. Once
+        // `abort()` has latched, `handle_post_agent_run` will refuse the retry, so answering `true`
+        // here promises a continuation that is never coming and strands the affordance.
+        if self.abort_requested() {
+            return false;
+        }
         if !self.auto_retry_enabled() || self.retry_attempt() >= self.retry_max_retries {
             return false;
         }

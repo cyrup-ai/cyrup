@@ -146,6 +146,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             child_watchdog,
             runtime_acknowledged_extensions_path,
             placed,
+            expected_model_for_verification,
         } = match self.prepare_attempt(model, attempt_notes).await {
             Ok(prepared) => prepared,
             Err(failure) => return *failure,
@@ -179,7 +180,10 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             deadline_sleep,
             &mut control,
             self.transcript.as_mut(),
-            child_watchdog,
+            crate::exec::drive_attempt::DriveAttemptInputs {
+                child_watchdog,
+                expected_model_for_verification: expected_model_for_verification.as_deref(),
+            },
         )
         .await;
 
@@ -403,6 +407,11 @@ struct PreparedAttempt {
     /// SUBA-100 — the placed run this attempt's relay drives, finished right after the drive
     /// loop so its fetched files are local before anything reads them. `None` for a local child.
     placed: Option<crate::placement::native::PlacedNativeRun>,
+    /// SUBA-119 — pi's `expectedModelForVerification` (`execution.ts:365`): the exact `--model` argv
+    /// this attempt launched with, or `None` when verification is off for the run
+    /// (`shared.verifyModel` false — `execution.ts:1836`'s
+    /// `Boolean(candidate) && !options.modelOverrideFromParent`).
+    expected_model_for_verification: Option<String>,
 }
 
 /// What [`SpawnedChildAttemptRunner::resolve_attempt_exit`] concluded about a settled attempt.
@@ -545,6 +554,12 @@ impl SpawnedChildAttemptRunner<'_> {
         // to write or delete the file itself — must not inherit the previous model attempt's
         // verdict. Without this, the model-fallback ladder could attribute attempt N's missing
         // tools to attempt N+1's startup crash.
+        // SUBA-119 — `verifyModel` (`execution.ts:1836`) then `expectedModelForVerification`
+        // (`:365`), off the plan so the compared value is exactly what went on the argv. A run whose
+        // model was inherited from the PARENT session never verifies: the parent's model is not a
+        // candidate this run chose, so the child reporting it is not a mismatch to report.
+        let expected_model_for_verification =
+            (!self.opts.model_override_from_parent).then(|| plan.model_arg.clone());
         let tool_diagnostic_path = plan.tool_diagnostic_path;
         let tool_surface = plan.tool_surface;
         let child_watchdog = plan.child_watchdog;
@@ -656,6 +671,7 @@ impl SpawnedChildAttemptRunner<'_> {
             child_watchdog,
             runtime_acknowledged_extensions_path,
             placed,
+            expected_model_for_verification,
         })
     }
 
@@ -1042,6 +1058,20 @@ fn diagnose_attempt_error(
     }
     if error.is_none() {
         error = spawn_error;
+    }
+    // (a.2) SUBA-119 — the model-verification failure, set DURING the stream
+    //     (`execution.ts:1102`: `if (modelVerificationError && !result.error) result.error =
+    //     modelVerificationError;`) and therefore part of upstream's `result.error` by the time the
+    //     close handler runs. That is what puts it ABOVE the tool diagnostic and the trailing
+    //     assistant error in `closeError = result.error ?? toolDiagnosticError ?? assistantError`
+    //     (`:1079`), and BELOW the turn-budget abort and the protocol failure, which also set
+    //     `result.error` mid-stream and whose own `!result.error` guards it must not displace.
+    //
+    //     Ranking it here rather than at the bottom is the point of the item: a child that silently
+    //     ran a different model than the parent selected also tends to produce perfectly ordinary
+    //     output, and letting its own trailing text become the run's error would hide the cause.
+    if error.is_none() {
+        error = outcome.model_verification_error.clone();
     }
     // (a.1) SUBA-045 — the child tool-availability diagnostic, in pi's exact rank: `closeError =
     //     result.error ?? toolDiagnosticError ?? assistantError` (`execution.ts:1079`). It sits

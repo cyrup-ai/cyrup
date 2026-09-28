@@ -184,6 +184,13 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
     let opts = RunOptions {
         parent_env_overrides: std::collections::BTreeMap::new(),
         machine: None,
+        // SUBA-119 — this fixture's model comes from its own agent config, not from the parent
+        // session, so native-child model verification is ARMED (pi
+        // `verifyModel = Boolean(candidate) && !options.modelOverrideFromParent`,
+        // `execution.ts:1836`) and no response-id alias is declared for it. Both are the values a
+        // stock installation launches with; the fixture asserts nothing about either.
+        model_override_from_parent: false,
+        model_response_aliases: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
         // nothing is recorded, which is this field's documented `None` behaviour.
         model_exclusions: None,

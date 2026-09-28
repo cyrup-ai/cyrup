@@ -40,6 +40,15 @@ use crate::text_width::{str_width, truncate_to_width};
 /// (`tui-alt-screen.ts:534-536`).
 pub(super) const DEFAULT_FLASH_DURATION: Duration = Duration::from_millis(1000);
 
+/// pi's `COPY_ERROR_FLASH_DURATION_MS` (`tui-alt-screen.ts:80`) — a **failed** copy flashes five
+/// times as long as a successful one, because its notice now names the missing helper
+/// (`clipboard.ts:125-137`) and one second is not long enough to read
+/// ``Clipboard unavailable: install `xclip` or `xsel`, or check X11 access``.
+///
+/// Spelled here beside the default rather than at the call site so both durations in the copy
+/// ternary (`tui-alt-screen.ts:1459-1462`) are one table.
+pub(crate) const COPY_ERROR_FLASH_DURATION: Duration = Duration::from_millis(5000);
+
 /// One queued notice — pi's `FlashEntry` (`components/alt-screen-flash.ts:6-10`), with the
 /// `NodeJS.Timeout` replaced by the deadline it would have fired at (see the module doc). Upstream's
 /// `id` field exists only so the timer callback can find its own entry to splice out; pruning by

@@ -61,13 +61,84 @@ pub enum InputReduction {
 pub enum UserBashReduction {
     /// No handler intercepted the `!`/`!!` command (proceed with the default bash execution).
     Continue,
-    /// A handler fully serviced it (Pi `{operations}`/`{result}`) — carried as the open-shaped value.
-    Handled(Value),
+    /// A handler fully serviced it (Pi `{operations}`/`{result}`) — carried as the open-shaped
+    /// value, validated by [`is_user_bash_event_result`], together with the extension that WON the
+    /// reduction.
+    ///
+    /// `by` is load-bearing and not diagnostic: the `operations` half of a
+    /// `UserBashEventResult` is a CALLABLE, which ADR-0002 forbids crossing the guest boundary, so
+    /// the host must ask that one extension for its backend
+    /// ([`ExtensionHost::user_bash_operations`]). Upstream reads `eventResult.operations` off the
+    /// same single winning result (`runner.ts:1168` @v0.87.1 returns it and stops), so dropping the
+    /// owner here is what forced `cyrup-session-svc` to re-derive the whole reduction itself and
+    /// left THIS one fail-closed (EXT-077).
+    Handled { value: Value, by: ExtensionId },
     /// A handler blocked the command (first block wins).
     Blocked {
         reason: Option<String>,
         by: ExtensionId,
     },
+    /// A handler returned a DEFINED value that is not a valid `UserBashEventResult`
+    /// ([`is_user_bash_event_result`] is false). Pi throws out of `emitUserBash` for this
+    /// (`runner.ts:1163-1167` @v0.87.1), and neither caller falls back to local execution, so this
+    /// is an ABORT and not a `Continue` (EXT-077).
+    Invalid { by: ExtensionId },
+}
+
+/// Pi's own `throw new Error(...)` text for a defined-but-invalid `user_bash` handler result
+/// (`packages/coding-agent/src/core/extensions/runner.ts:1163-1167` @v0.87.1), verbatim.
+///
+/// It is user-facing on both of upstream's callers — `modes/rpc/rpc-mode.ts`'s `case "bash":` has no
+/// `catch`, so the throw becomes the RPC `error` response a client renders — so cyrup surfaces the
+/// same sentence rather than a paraphrase. [`ExtError::UserBashAborted`] carries it out of the host
+/// with a `Display` of `{0}` and nothing else.
+pub const INVALID_USER_BASH_RESULT_MESSAGE: &str = "Invalid user_bash handler result: return \
+     undefined for local execution or exactly one valid { operations } or { result } object";
+
+/// Pi `isUserBashEventResult` (`packages/coding-agent/src/core/extensions/runner.ts:136-158`
+/// @v0.87.1), line for line: the value must be an object carrying EXACTLY ONE of `operations` /
+/// `result` (`hasOperations === hasResult` → false), `operations` must itself be an object, and a
+/// `result` must have a string `output`, a present `exitCode` that is null/absent-or-number, boolean
+/// `cancelled` and `truncated`, and an absent-or-string `fullOutputPath`.
+///
+/// CYRUP-DELTA: pi's `operations` branch finishes with `typeof operations.exec === "function"`
+/// (`runner.ts:145`). A callable cannot cross cyrup's guest boundary (ADR-0002), so the JSON side
+/// checks only that `operations` is an object; the "does it actually have an `exec`" half is resolved
+/// by [`ExtensionHost::user_bash_operations`], which looks the owning extension's declared
+/// bash-operations export up on the host. A guest whose `operations` object is well formed but which
+/// declared no such export therefore fails at that later seam rather than here — and it does FAIL:
+/// `cyrup-session-svc`'s `AgentSession::emit_user_bash_event` turns that seam's `None` into the same
+/// abort this predicate would have produced, carrying
+/// [`INVALID_USER_BASH_RESULT_MESSAGE`]. Full parity, different place.
+///
+/// CYRUP-DELTA: JS `undefined` and JSON `null` are not distinguishable once a guest value has been
+/// serialized, so an explicit `"exitCode": null` is accepted here exactly as pi accepts
+/// `exitCode: undefined` (`runner.ts:151`); `"exitCode"` being ABSENT is still a rejection, matching
+/// pi's `"exitCode" in resultRecord`.
+pub fn is_user_bash_event_result(v: &Value) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    let has_operations = obj.contains_key("operations");
+    let has_result = obj.contains_key("result");
+    if has_operations == has_result {
+        return false;
+    }
+    if has_operations {
+        return obj.get("operations").is_some_and(Value::is_object);
+    }
+    let Some(result) = obj.get("result").and_then(Value::as_object) else {
+        return false;
+    };
+    result.get("output").is_some_and(Value::is_string)
+        && result
+            .get("exitCode")
+            .is_some_and(|c| c.is_null() || c.is_number())
+        && result.get("cancelled").is_some_and(Value::is_boolean)
+        && result.get("truncated").is_some_and(Value::is_boolean)
+        && result
+            .get("fullOutputPath")
+            .is_none_or(|p| p.is_null() || p.is_string())
 }
 
 /// The reduced result of [`ExtensionHost::emit_session_before_compact`] (Pi
@@ -408,9 +479,15 @@ impl ExtensionHost {
         // `init()` returned `Err` stays in `loaded_ids()` — the startup listing reports it as
         // loaded, and a later legitimate load of the same id fails with a spurious `DuplicateId`.
         // Pi's `LoadExtensionsResult.extensions` only ever holds extensions that loaded; failures
-        // live in the sibling `errors` array. (Registrations already written to the registry before
-        // the failing step are left in place — a native `init` builds its whole `InitApi` before any
-        // of them run, so in practice `init` is the only failing step this can reach.)
+        // live in the sibling `errors` array.
+        //
+        // EXT-081: a failure past the reservation also UNDOES every registration this owner already
+        // wrote — pi's `discard` (`core/extensions/loader.ts:462-467` @v0.87.1), which unsubscribes
+        // the factory's event-bus subscriptions and drops the pending runtime changes while the
+        // extension's own tool/command/flag/shortcut maps die with the object
+        // `initializeExtension` never returns (`:541-559`). Reachable on this path through a
+        // registration step that fails after an earlier one succeeded, and through anything an
+        // `init`-spawned task pushed via the `LateRegistrar`.
         let result = self.load_native_body(ext, id.clone()).await;
         match &result {
             // A native built-in is compiled in, so like Pi's inline factories
@@ -422,9 +499,41 @@ impl ExtensionHost {
                 &format!("{id} factory"),
                 cyrup_core::timings::TimingLabel::Extensions,
             ),
-            Err(_) => self.release_id(&id),
+            // EXT-081: a guest whose `init` fails must also have its partial registrations
+            // discarded, not merely release its id — otherwise a failed load leaves the tool and
+            // command tables carrying entries no live extension backs.
+            Err(_) => {
+                self.discard_registrations(&id);
+                self.release_id(&id);
+            }
         }
         result
+    }
+
+    /// Undo everything a FAILED load wrote to shared state, in pi's `discard` order
+    /// (`core/extensions/loader.ts:462-467` @v0.87.1): the registry tables
+    /// ([`crate::ExtensionRegistry::purge_owner`]) and the shared event bus (upstream's
+    /// `for (const unsubscribe of loadingUnsubscribers) unsubscribe()`). The id reservation is
+    /// released by the caller, because a `DuplicateId` rejection must NOT release the reservation
+    /// that belongs to the extension already loaded.
+    ///
+    /// Infallible by design: the load is already returning its own error, and a poisoned registry
+    /// lock must not mask it. A purge failure is traced.
+    fn discard_registrations(&self, id: &ExtensionId) {
+        match self.registry.purge_owner(id) {
+            Ok(n) if n > 0 => tracing::debug!(
+                extension = %id,
+                dropped = n,
+                "discarded the registrations of a failed extension load (EXT-081)"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                extension = %id,
+                error = %e,
+                "could not discard the registrations of a failed extension load"
+            ),
+        }
+        self.bus.unsubscribe_all(id);
     }
 
     /// The body of [`Self::load_native_inner`], run under its id reservation.
@@ -1037,31 +1146,68 @@ impl ExtensionHost {
         }
     }
 
-    /// Dispatch `user_bash` (Pi `ExtensionRunner.emitUserBash`, runner.ts:885-912; gap-08 #5). The
-    /// FIRST handler that returns a result wins (Pi short-circuits): a block stops the command, a
-    /// `handled` result (operations/result) supplies the execution. Returns the reduced
-    /// [`UserBashReduction`].
-    pub async fn emit_user_bash(&self, command: &str, cancel: &CancelToken) -> UserBashReduction {
-        // `exclude_from_context` (the `!!` prefix) is decided by the submission parser at the caller
-        // (cross-crate), so it defaults to `false` here; `cwd` is the process working directory (Pi
-        // `UserBashEvent.cwd`, types.ts:789). The richer caller-supplied values flow once the
-        // submission pipeline threads them into this entry point.
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    /// Dispatch `user_bash` with the caller's own event fields — **the one reducer**, used by the
+    /// production `!`/`!!` and JSON-RPC `bash` path (`cyrup-session-svc`'s
+    /// `AgentSession::emit_user_bash_event`, `session/bash.rs`) and by
+    /// [`Self::emit_user_bash`] alike (Pi `ExtensionRunner.emitUserBash`, `runner.ts:1154-1183`
+    /// @v0.87.1).
+    ///
+    /// The FIRST handler that returns a defined result wins (pi short-circuits and `return`s it).
+    /// Since coding-agent 0.86.0 (*Breaking*, #9068) the three non-`Continue` outcomes are all
+    /// ABORTS — a fault, a handler block, and a defined-but-invalid result each leave
+    /// `emitUserBash` by `throw`, and NEITHER caller falls back to local execution
+    /// (`interactive-mode.ts:6740-6743`'s `catch { return; }` "The extension runner already reported
+    /// the error. Do not fall back to local execution."; `rpc-mode.ts`'s `case "bash":` has no catch
+    /// at all, so the throw becomes an error response). Only [`UserBashReduction::Continue`] —
+    /// upstream's `undefined` — runs the command locally.
+    ///
+    /// EXT-077 previously lived on the fact that this reduction had NO production caller:
+    /// `cyrup-session-svc` re-derived it from [`Reduced`] itself, validated nothing, and turned a
+    /// [`Reduced::Blocked`] into local execution. It now calls this function, so the fail-closed and
+    /// the predicate are one implementation with one set of proofs.
+    pub async fn emit_user_bash_for(
+        &self,
+        command: &str,
+        exclude_from_context: bool,
+        cwd: &str,
+        cancel: &CancelToken,
+    ) -> UserBashReduction {
         let ev = HostEvent::UserBash {
             command: command.to_string(),
-            exclude_from_context: false,
-            cwd,
+            exclude_from_context,
+            cwd: cwd.to_string(),
         };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
             Reduced::Blocked { reason, by, .. } => UserBashReduction::Blocked { reason, by },
+            // A DEFINED-but-invalid handler result is an abort, not a pass: pi throws it out of
+            // `emitUserBash` (`runner.ts:1163-1167` @v0.87.1) and both callers decline to execute
+            // locally.
             Reduced::Handled {
                 value: HandledValue(v),
-                ..
-            } => UserBashReduction::Handled(v),
+                by,
+            } => {
+                if is_user_bash_event_result(&v) {
+                    UserBashReduction::Handled { value: v, by }
+                } else {
+                    UserBashReduction::Invalid { by }
+                }
+            }
             Reduced::Pass(_) => UserBashReduction::Continue,
         }
+    }
+
+    /// [`Self::emit_user_bash_for`] for a caller that has neither of the submission's two extra
+    /// event fields to hand: `exclude_from_context` (the `!!` prefix, decided by the submission
+    /// parser) defaults to `false` and `cwd` is the process working directory (Pi
+    /// `UserBashEvent.cwd`, `extensions/types.ts:813-821`).
+    ///
+    /// This is a convenience over the reducer, NOT a second one — a session that has a real cwd and
+    /// a real `!!` flag (every production caller) calls [`Self::emit_user_bash_for`] directly.
+    pub async fn emit_user_bash(&self, command: &str, cancel: &CancelToken) -> UserBashReduction {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.emit_user_bash_for(command, false, &cwd, cancel).await
     }
 
     /// Resolve the per-call bash backend the extension `owner` supplied for a `user_bash` command
@@ -2003,10 +2149,52 @@ impl ExtensionHost {
         caps: &Capabilities,
         timing_path: &str,
     ) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
-        use cyrup_core::timings::{TimingLabel, time};
         let wasm = self.wasm.as_ref().ok_or(ExtError::WasmHostDisabled)?;
         let fs_grants = caps.parse_fs_grants()?;
+        // A DUPLICATE id is rejected before the reservation exists and must NOT release it.
         self.reserve_id(&id)?;
+        // EXT-081: every failure PAST the reservation is transactional — pi's `discard`
+        // (`core/extensions/loader.ts:462-467` @v0.87.1). A guest's `init` runs INSIDE
+        // `LiveExtension::load` and its `registration.*` imports write straight through to the
+        // shared `ExtensionRegistry`, so a trap or an `Err` returned after a handful of successful
+        // registrations used to leave a dead extension's tools, commands, shortcuts, flags and
+        // providers live, its bus subscriptions attached, and its id claimed. Structured as
+        // body + failure tail exactly like `load_native_inner`/`load_native_body` above, so the two
+        // load paths cannot drift.
+        let result = self
+            .load_wasm_body(
+                wasm,
+                id.clone(),
+                bytes,
+                services,
+                caps,
+                &fs_grants,
+                timing_path,
+            )
+            .await;
+        if result.is_err() {
+            self.discard_registrations(&id);
+            self.release_id(&id);
+        }
+        result
+    }
+
+    /// The body of [`Self::load_wasm_with_caps`], run under its id reservation (EXT-081).
+    #[cfg(feature = "wasm-host")]
+    #[allow(clippy::too_many_arguments)]
+    async fn load_wasm_body(
+        &self,
+        wasm: &crate::host_runtime::WasmRuntime,
+        id: ExtensionId,
+        bytes: &[u8],
+        services: Arc<dyn crate::host::HostServices>,
+        caps: &Capabilities,
+        fs_grants: &[crate::manifest::FsGrant],
+        // AGENT-027's timing key. EXT-081 moved this body out of `load_wasm_timed`, and the two
+        // `extensions`-namespace marks moved with it, so the key has to come along too.
+        timing_path: &str,
+    ) -> Result<Arc<crate::host::LiveExtension>, ExtError> {
+        use cyrup_core::timings::{TimingLabel, time};
         let guest = Arc::new(
             crate::host::GuestState::with_services(id.clone(), self.registry.clone(), services)
                 // Wire the guest onto the HOST-OWNED shared bus (not a fresh per-guest one) so its
@@ -2016,7 +2204,7 @@ impl ExtensionHost {
                 // EXT-054: the declared grant, seeded BEFORE `init` so the guest's very first call
                 // — `init` itself registers tools and can already reach `ui`/`exec` — runs under
                 // the restriction its manifest declared.
-                .with_capabilities(caps.clone(), &fs_grants, &self.config.cwd)
+                .with_capabilities(caps.clone(), fs_grants, &self.config.cwd)
                 // Pi `ctx.mode` / `ctx.hasUI` (extensions/types.ts:311,313) are host configuration,
                 // not session state: copy them in from the SAME [`HostConfig`] the native path
                 // hands to `HostCtx::event`/`::command` above, so a WASM guest's `ctx.mode()` and a
@@ -2051,7 +2239,7 @@ impl ExtensionHost {
         let ext = Arc::new(ext);
         self.dispatcher.add(ext.clone())?;
         if let Ok(mut g) = self.live.write() {
-            g.insert(id, ext.clone());
+            g.insert(id.clone(), ext.clone());
         }
         // Surface the guest's registered tools as executable handles in the active set: each runs
         // by dispatching `execute-tool` back into ITS OWN live instance (R-08-012/014/015). Done

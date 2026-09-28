@@ -23,6 +23,24 @@ pub(super) async fn process_block_start(
         None => return true,
     };
     match cb.get("type").and_then(Value::as_str) {
+        // Server-side fallback marker (pi `:627-632` @v0.87.1). Anthropic opens a `fallback` block
+        // to announce that another model is taking over. Before any content exists that is benign
+        // and the block is simply skipped (pi `continue`); once content has been emitted the
+        // fallback would silently splice two models' output together, so pi throws.
+        //
+        // `[CYRUP-DELTA]` pi's `throw` becomes the decoder's terminal-error route (`StopReason::Error`
+        // + `error_message`, drained by `driver.rs`'s post-event check) because `decode_stream`
+        // returns `()` and reports every protocol failure that way — the same route the missing
+        // `message_stop` protocol error already takes. The message text is pi's verbatim.
+        Some("fallback") => {
+            if !dec.blocks.is_empty() {
+                dec.error_message = Some(
+                    "Anthropic performed an unsupported mid-output model fallback".to_string(),
+                );
+                dec.stop_reason = Some(StopReason::Error);
+            }
+            true
+        }
         Some("text") => {
             // Seed from the payload Anthropic ships on the open event (Pi
             // `text: event.content_block.text ?? ""`, anthropic-messages.ts:591). Dropping it loses

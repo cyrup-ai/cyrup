@@ -1019,7 +1019,8 @@ fn to_agent_definition(
         allow_nested_subagents: definition.allow_nested_subagents,
         extensions: definition.extensions,
         extensions_from_default: false,
-        subagent_only_extensions: definition.subagent_only_extensions.unwrap_or_default(),
+        subagent_only_extensions: definition.subagent_only_extensions,
+        subagent_only_extensions_from_default: false,
         model: definition.model.as_deref().map(ModelId::from),
         fallback_models: definition
             .fallback_models
@@ -1253,7 +1254,13 @@ impl RuntimeAgentRegistration {
 /// on-disk tier regardless of the requested scope, so an agent hidden by scope precedence still
 /// blocks (`extension/index.ts:533-539`, tests `runtime-agent-registration.test.ts:331-366`
 /// @v0.64.0) — then APPEND the runtime agents after the discovered ones (`:428`). Runtime agents
-/// never take part in the four-tier precedence merge and never receive settings overrides.
+/// never take part in the four-tier precedence merge.
+///
+/// They DO, however, receive the model-tier subset of settings, applied separately by
+/// [`crate::discovery::merge::apply_runtime_agent_settings`] immediately after this function returns
+/// — pi `applyRuntimeAgentSettings` (`agents.ts:1619-1627` @v0.71.0). A previous revision of this
+/// comment claimed they "never receive settings overrides" full stop; that was true of this crate
+/// before SUBA-121 and was never true of upstream from v0.70.1 on.
 ///
 /// # Errors
 ///

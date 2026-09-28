@@ -201,7 +201,7 @@ async fn run_login(app: &mut App<TestBackend>, session: &Arc<AgentSession>, id: 
     );
     // `prompt(...)` → `dialog.showPrompt(message)` (`interactive-mode.ts:5331`).
     let msg = next_msg(&mut rx).await;
-    app.apply_login_msg(msg);
+    app.apply_login_msg(session, msg).await;
     for c in "CODE42".chars() {
         app.handle_input(&key(KeyCode::Char(c)));
     }
@@ -213,7 +213,7 @@ async fn run_login(app: &mut App<TestBackend>, session: &Arc<AgentSession>, id: 
         LoginUiMsg::Finished(f) => assert!(f.result.is_ok(), "login failed: {:?}", f.result),
         other => panic!("expected Finished, got {other:?}"),
     }
-    app.apply_login_msg(msg);
+    app.apply_login_msg(session, msg).await;
 }
 
 /// `model_changed` (`agent-session.ts` → `interactive-mode.ts:3068-3070`, which ends in
@@ -321,7 +321,7 @@ async fn api_key_login_to_a_subscription_capable_provider_does_not_light_the_mar
     )
     .await;
     let msg = next_msg(&mut rx).await;
-    app.apply_login_msg(msg);
+    app.apply_login_msg(&fx.session, msg).await;
     for c in "sk-test".chars() {
         app.handle_input(&key(KeyCode::Char(c)));
     }
@@ -334,7 +334,7 @@ async fn api_key_login_to_a_subscription_capable_provider_does_not_light_the_mar
         }
         other => panic!("expected Finished, got {other:?}"),
     }
-    app.apply_login_msg(msg);
+    app.apply_login_msg(&fx.session, msg).await;
 
     app.draw().unwrap();
     let t = buf_text(&app);

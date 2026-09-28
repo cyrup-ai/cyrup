@@ -22,6 +22,7 @@ mod event_kind_lockstep;
 mod ext_fail_closed;
 mod extension_flag_diagnostics;
 mod extension_name_conflicts;
+mod failed_load_is_transactional;
 mod loader;
 mod loader_direct_file;
 mod malformed_manifest;

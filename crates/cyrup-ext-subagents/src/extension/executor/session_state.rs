@@ -453,6 +453,7 @@ mod tests {
             allow: Some(vec!["anthropic/*".to_string()]),
         };
         let config = crate::background::runner_main::RunnerConfig {
+            model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
@@ -505,6 +506,7 @@ mod tests {
     /// A minimal `RunnerConfig`, mirroring the fixture above.
     fn minimal_runner_config() -> crate::background::runner_main::RunnerConfig {
         crate::background::runner_main::RunnerConfig {
+            model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,
             usage_budget: None,

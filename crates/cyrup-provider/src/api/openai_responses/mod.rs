@@ -147,6 +147,8 @@ impl ApiImpl for OpenAiResponsesApi {
             url,
             headers,
             body: Some(body),
+            // PROV-084: the OpenAI SDK path has no residual flush upstream.
+            flush_at_eof: false,
         };
 
         let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {
