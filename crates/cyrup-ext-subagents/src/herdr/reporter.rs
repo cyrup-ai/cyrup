@@ -433,15 +433,25 @@ async fn send_state(
     model: &Arc<Mutex<StateModel>>,
     report: &StateReport,
 ) {
-    let mut params = PaneReportAgentParams::new(pane_id, SOURCE, AGENT, report.state);
-    params.message.clone_from(&report.message);
-    params.seq = Some(seq.next());
-    if let Err(err) = client.report_agent(params).await {
+    let mut report = report.clone();
+    loop {
+        let mut params = PaneReportAgentParams::new(pane_id, SOURCE, AGENT, report.state);
+        params.message.clone_from(&report.message);
+        params.seq = Some(seq.next());
+        let Err(err) = client.report_agent(params).await else {
+            return;
+        };
         tracing::debug!(%err, state = ?report.state, "herdr: pane.report_agent did not land");
-        model
+        // `Some` only when an edge was swallowed behind this report while it was in flight
+        // (HERDR-004), and at most once per such edge, so a refusing herdr is not retried in a loop.
+        let retry = model
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .invalidate_last_report();
+        match retry {
+            Some(next) => report = next,
+            None => return,
+        }
     }
 }
 

@@ -11,7 +11,7 @@ Item kinds used by this area. They extend README's taxonomy for this area only:
 `client-bug` (the client or a consumer disagrees with herdr **at the pinned tag**), `protocol-drift`
 (herdr changed the API after the pin and the client does not follow), and `not-used` (an unused
 herdr API worth recording because a known cyrup need would use it). One `tooling` row uses README's
-own kind. Ids are `HERDR-NNN`. **Next free id: `HERDR-004`.**
+own kind. Ids are `HERDR-NNN`. **Next free id: `HERDR-005`.**
 
 > ### RE-MEASURE — 2026-09-24 — first measurement of this area
 >
@@ -114,6 +114,7 @@ preview tag and at HEAD. The binary client-shell protocol has not moved across t
 | ~~HERDR-001~~ | ~~medium~~ **CLOSED 2026-09-27** | client-bug | S | The inspector's socket adapter turns `pane split --current` into "split the focused pane of the active workspace". herdr's `--current` means the caller's own pane (`HERDR_PANE_ID`) — **CLOSED 2026-09-27**: `SocketHerdrClient` now carries the caller's pane id and the `pane split` arm targets it, honouring `--current`, `--pane <id>` and a positional id, and parsing `--direction` instead of hard-coding `Right` (`crates/cyrup-ext-subagents/src/inspectors/herdr/client.rs:707-793`). Verify: `cyrup-ext-subagents inspectors::herdr::client::tests::{the_pane_split_request_line_carries_the_callers_pane_id,pane_split_targets_the_callers_pane_and_honours_direction}`. |
 | HERDR-002 | low | tooling | S | The crate's pin "herdr v0.9.1 (`d59d060`)" names an untagged `main` commit that is not `v0.9.1`, and every `tmp/herdr/...:N` citation in the crate is at that commit |
 | HERDR-003 | low | client-bug | S | A stopped remote herdr is reported as "returned incomplete identity" rather than "stopped or incompatible", because `version`/`protocol` are `null` in herdr's `not_running` status JSON and are checked first |
+| ~~HERDR-004~~ | ~~low~~ **CLOSED 2026-09-28** | client-bug | S | **Filed and closed 2026-09-28** (on `claude/lows-next`): a refused `pane.report_agent` could strand the pane on stale state for up to 45 s. The de-duplicator recorded a report when it was handed to the reporter, not when herdr accepted it, so a same-state edge arriving while that report was in flight was swallowed; if the report then failed, nothing re-sent it until the refresh tick (`METADATA_REFRESH`, 45 s). Now `StateModel` notes a swallowed edge (`swallowed_since_handout`) and `invalidate_last_report` returns the report to send again at once, and `send_state` re-sends it — at most once per swallowed edge, so a refusing herdr is not retried in a loop. Found as an intermittent failure of `cyrup-it` `herdr_status_bridge_integration::a_rejected_report_never_disturbs_the_agent` under full parallel load (it fires the next edge once the fake server has received the report, before the bridge has read the refusal). Tests: `herdr::state::tests::an_edge_swallowed_behind_a_failed_report_is_re_sent_at_the_failure` (fails with the new branch gutted) and the updated `an_invalidated_report_is_sent_again`. |
 
 ---
 
@@ -218,6 +219,22 @@ before requiring `version`/`protocol`. Keep the socket-and-session check first.
 expects the "stopped or incompatible" sentence.
 
 ---
+
+## HERDR-004 — A refused state report is not re-sent for an edge swallowed while it was in flight
+
+> **Filed and CLOSED 2026-09-28** (on `claude/lows-next`).
+
+**Kind** client-bug · **Severity** low · **Effort** S · **Confidence** observed (intermittent `cyrup-it` failure under load; mechanism read in the code)
+
+**cyrup** — `crates/cyrup-ext-subagents/src/herdr/state.rs` `settle` recorded `last_reported` when a report was handed out; `reporter.rs` `send_state` called `invalidate_last_report` only after `report_agent` returned `Err`. An edge that settled to the same state in between was de-duplicated against a report herdr never accepted, and only the 45 s refresh tick (`reporter.rs` `METADATA_REFRESH`) re-sent it.
+
+**herdr / pi** — cyrup is its own lifecycle authority for the pane, so this reporter has no pi counterpart; pi-subagents' `herdr-status.ts` metadata lane does not de-duplicate at all and relies on the next transition or TTL refresh.
+
+**Impact** — a pane can show the wrong agent state for up to 45 s after herdr refuses or drops one report, whenever the edge that followed asked for the same state.
+
+**Fix (landed)** — `StateModel::swallowed_since_handout` is set when `settle` de-duplicates and cleared on every hand-out; `invalidate_last_report` now returns `Some(report)` when it was set, and `send_state` loops to send it. A failure with no swallowed edge behind it returns `None`, so retries stay bounded by edges.
+
+**Verify** — `herdr::state::tests::an_edge_swallowed_behind_a_failed_report_is_re_sent_at_the_failure`; `cyrup-it` `herdr_status_bridge_integration::a_rejected_report_never_disturbs_the_agent` is now deterministic.
 
 ## Conformance record: what was checked and found to agree with herdr `v0.9.1`
 

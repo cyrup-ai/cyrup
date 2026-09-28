@@ -139,6 +139,14 @@ pub struct StateModel {
     /// The last report handed out, for de-duplication. `None` means "herdr has not seen anything
     /// from us", which is also what [`Self::invalidate_last_report`] restores after a failed send.
     last_reported: Option<StateReport>,
+    /// Whether an edge was de-duplicated against `last_reported` since it was handed out.
+    ///
+    /// A report is recorded when it is handed to the reporter, not when herdr accepts it, so an
+    /// edge that lands while that report is still in flight is swallowed as "unchanged". If the
+    /// report then fails, that edge's retry would be lost until the refresh tick
+    /// ([`super::reporter::METADATA_REFRESH`], 45 s). [`Self::invalidate_last_report`] reads this
+    /// to re-send at once instead (HERDR-004).
+    swallowed_since_handout: bool,
 }
 
 impl StateModel {
@@ -350,8 +358,19 @@ impl StateModel {
     /// would strand the pane on stale state until the next genuine change. Separate from
     /// [`Self::resend`] because a failed send has no report to hand back — the caller is already
     /// holding the one that did not land.
-    pub fn invalidate_last_report(&mut self) {
+    ///
+    /// Returns the report to send again right now when an edge was swallowed while the failed one
+    /// was in flight: that edge asked for exactly this state, and waiting for the refresh tick
+    /// would leave the pane stale for up to [`super::reporter::METADATA_REFRESH`] (HERDR-004).
+    /// Otherwise `None`, and the next edge or the refresh tick retries, so a herdr that keeps
+    /// refusing is retried once per edge, never in a loop.
+    pub fn invalidate_last_report(&mut self) -> Option<StateReport> {
         self.last_reported = None;
+        if std::mem::take(&mut self.swallowed_since_handout) {
+            self.settle()
+        } else {
+            None
+        }
     }
 
     /// Recompute, de-duplicate, and record. `Some` exactly on a change of the `(state, message)`
@@ -360,9 +379,11 @@ impl StateModel {
     fn settle(&mut self) -> Option<StateReport> {
         let next = self.desired();
         if self.last_reported.as_ref() == Some(&next) {
+            self.swallowed_since_handout = true;
             return None;
         }
         self.last_reported = Some(next.clone());
+        self.swallowed_since_handout = false;
         Some(next)
     }
 }
@@ -651,14 +672,14 @@ mod tests {
     fn an_invalidated_report_is_sent_again() {
         let mut model = StateModel::new();
         let first = model.set_human_waiting(true).expect("first report");
-        assert_eq!(model.set_human_waiting(true), None, "de-duplicated");
 
         // Through the DE-DUPLICATOR, not through `resend`. `resend` clears `last_reported` on its
         // own way in, so it answers `Some` whether or not the invalidate happened — which is how
         // this test used to pass with `invalidate_last_report` gutted to a no-op. What the
         // invalidate actually buys is that an UNCHANGED edge after a failed send is sent again
-        // instead of being swallowed, and that is what the reporter depends on.
-        model.invalidate_last_report();
+        // instead of being swallowed, and that is what the reporter depends on. No edge arrived
+        // while `first` was in flight, so the failure itself re-sends nothing.
+        assert_eq!(model.invalidate_last_report(), None);
         assert_eq!(
             model.set_human_waiting(true),
             Some(first.clone()),
@@ -670,6 +691,35 @@ mod tests {
             "and once it HAS landed, the de-duplicator is back in force"
         );
         assert_eq!(model.resend(), Some(first));
+    }
+
+    /// HERDR-004: an edge that arrives while a report is in flight is de-duplicated against it.
+    /// When that report then fails, the swallowed edge's retry is owed at once — not at the next
+    /// edge, which may never come, nor at the 45 s refresh tick.
+    #[test]
+    fn an_edge_swallowed_behind_a_failed_report_is_re_sent_at_the_failure() {
+        let mut model = StateModel::new();
+        let in_flight = model.agent_start().expect("first report");
+        assert_eq!(
+            model.foreground_run_started(),
+            None,
+            "still `working`: swallowed while the first report is in flight"
+        );
+        assert_eq!(
+            model.invalidate_last_report(),
+            Some(in_flight.clone()),
+            "the failure re-sends what the swallowed edge asked for"
+        );
+        assert_eq!(
+            model.invalidate_last_report(),
+            None,
+            "a second failure with no edge behind it does not loop"
+        );
+        assert_eq!(
+            model.foreground_run_finished(),
+            Some(in_flight),
+            "and the next edge still reports, as before"
+        );
     }
 
     /// The TTL-refresh path re-emits even when nothing changed.
