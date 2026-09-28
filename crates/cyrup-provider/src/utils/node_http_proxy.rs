@@ -2,7 +2,9 @@
 //!
 //! Honors the standard `*_proxy` / `all_proxy` env vars (lower- and upper-case) with the
 //! provider-scoped [`ProviderEnv`] overlay winning over the ambient context, applies `no_proxy`
-//! matching (`*`, host, `host:port`, leading-`.`/`*` suffix), fills default ports per scheme, and
+//! matching (`*`; a bare host, which also exempts its subdomains; `host:port`; a `*.`/`.`/`*`
+//! prefix, which exempts the apex and its subdomains; and a bracketed or bare IPv6 host, compared
+//! bracket-free — node-http-proxy.ts:37-113 @v0.87.1), fills default ports per scheme, and
 //! rejects non-HTTP(S) (SOCKS/PAC) proxy URLs — exactly as Pi's resolver does
 //! (`resolveHttpProxyUrlForTarget`, node-http-proxy.ts:92).
 
@@ -77,7 +79,60 @@ async fn get_proxy_env(key: &str, ctx: &dyn AuthContext, env: Option<&ProviderEn
     String::new()
 }
 
-/// `shouldProxyHostname(hostname, port, env)` (node-http-proxy.ts:37-67): consult `no_proxy`.
+/// `stripBrackets(host)` (node-http-proxy.ts:37-39 @v0.87.1): unwrap a bracketed IPv6 literal.
+fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// `parseNoProxyEntry(entry)` (node-http-proxy.ts:41-72 @v0.87.1): trim, lower-case, then one of
+/// three shapes — a bracketed `[host]` with an optional `:port`; a bare string with more than one
+/// `:`, which is a portless IPv6 host; otherwise a single trailing `:port` split. `port == 0` means
+/// "no port qualifier", matching upstream's `Number.isNaN → 0` and its falsy-`0` guard later.
+fn parse_no_proxy_entry(entry: &str) -> Option<(String, u16)> {
+    let trimmed = entry.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // `if (trimmed.startsWith("["))` (:45-56).
+    if trimmed.starts_with('[')
+        && let Some(closing) = trimmed.find(']')
+    {
+        let host = trimmed[1..closing].to_string();
+        let rest = &trimmed[closing + 1..];
+        return match rest.strip_prefix(':') {
+            // `Number.parseInt` on a non-numeric rest is NaN → 0.
+            Some(p) => Some((host, p.parse::<u16>().unwrap_or(0))),
+            None => Some((host, 0)),
+        };
+    }
+
+    // `if (trimmed.includes(":") && trimmed.split(":").length > 2)` (:58-60): a bare IPv6 host such
+    // as `::1` has no port, and must NOT be split on its last colon.
+    if trimmed.matches(':').count() > 1 {
+        return Some((trimmed, 0));
+    }
+
+    // `colonIndex === trimmed.indexOf(":")` (:62-69): exactly one colon, so split a trailing port.
+    if let Some((host, port)) = trimmed.split_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return Some((host.to_string(), port));
+    }
+
+    Some((trimmed, 0))
+}
+
+/// `shouldProxyHostname(hostname, port, env)` (node-http-proxy.ts:74-113 @v0.87.1): consult
+/// `no_proxy`. An entry exempts the target when the normalised host EQUALS the entry's domain or is
+/// a subdomain of it (`endsWith(".{domain}")`, `:106-112`) — a bare `example.com` entry therefore
+/// covers `api.example.com` too, and `*.`/`.`/`*` prefixes are stripped so the apex is covered as
+/// well.
+///
+/// `[CYRUP-DELTA]` — upstream's `hostname.toLowerCase()` (`:82`) is near-inert here because
+/// `reqwest::Url::parse` already lower-cases a domain host; it is ported for fidelity, not effect.
 async fn should_proxy_hostname(
     hostname: &str,
     port: u16,
@@ -91,36 +146,32 @@ async fn should_proxy_hostname(
     if no_proxy == "*" {
         return false;
     }
+    let lowered = hostname.to_lowercase();
+    let normalized_target = strip_brackets(&lowered);
     // `.every(...)`: proxy iff EVERY no_proxy entry permits it.
     no_proxy
         .split(|c: char| c == ',' || c.is_whitespace())
-        .all(|proxy| {
-            if proxy.is_empty() {
+        .all(|entry| {
+            let Some((entry_host, entry_port)) = parse_no_proxy_entry(entry) else {
                 return true;
-            }
-            // `^(.+):(\d+)$` — split a trailing `:port`.
-            let (mut proxy_hostname, proxy_port) = match proxy.rsplit_once(':') {
-                Some((host, p))
-                    if !host.is_empty()
-                        && !p.is_empty()
-                        && p.bytes().all(|b| b.is_ascii_digit()) =>
-                {
-                    (host, p.parse::<u16>().unwrap_or(0))
-                }
-                _ => (proxy, 0u16),
             };
-            // A port-qualified entry that targets a different port never blocks (returns true → proxy).
-            if proxy_port != 0 && proxy_port != port {
+            // A port-qualified entry that targets a different port never blocks (`:91-93`).
+            if entry_port != 0 && entry_port != port {
                 return true;
             }
-            // `^[.*]` — entries NOT starting with `.` or `*` are exact-host matches.
-            if !proxy_hostname.starts_with('.') && !proxy_hostname.starts_with('*') {
-                return hostname != proxy_hostname;
+            // `*.` is TWO chars and must be stripped before the one-char `.`/`*` cases (`:96-100`);
+            // stripping only `*` would leave `.star.net` and lose the apex `star.net`.
+            let domain = strip_brackets(&entry_host);
+            let domain = match domain.strip_prefix("*.") {
+                Some(rest) => rest,
+                None => domain
+                    .strip_prefix('.')
+                    .unwrap_or_else(|| domain.strip_prefix('*').unwrap_or(domain)),
+            };
+            if domain.is_empty() {
+                return true;
             }
-            if let Some(stripped) = proxy_hostname.strip_prefix('*') {
-                proxy_hostname = stripped;
-            }
-            !hostname.ends_with(proxy_hostname)
+            normalized_target != domain && !normalized_target.ends_with(&format!(".{domain}"))
         })
 }
 
@@ -138,6 +189,9 @@ async fn get_proxy_for_url(
     let Some(hostname) = parsed.host_str() else {
         return String::new();
     };
+    // `stripBrackets(parsedUrl.hostname ...)` (:119): an IPv6 target and an IPv6 no_proxy entry
+    // must compare in the same bracket-free form.
+    let hostname = strip_brackets(hostname);
     if scheme.is_empty() || hostname.is_empty() {
         return String::new();
     }
@@ -304,6 +358,78 @@ mod tests {
                 .await
                 .expect("ok")
                 .is_some()
+        );
+    }
+
+    /// Translation of upstream `packages/ai/test/node-http-proxy.test.ts:77-103` @v0.87.1,
+    /// "handles subdomain wildcards, IPv6, and ports in NO_PROXY".
+    #[tokio::test]
+    async fn no_proxy_matches_subdomains_wildcards_ipv6_and_ports() {
+        let env = ctx([
+            ("https_proxy", "http://proxy:8080"),
+            (
+                "no_proxy",
+                "example.com, .wildcard.org, *.star.net, ::1, [2001:db8::1], 127.0.0.1:8080",
+            ),
+        ]);
+        for target in [
+            // A BARE entry exempts the apex AND its subdomains (`:106-112`).
+            "https://example.com",
+            "https://api.example.com",
+            // A leading `.` exempts the apex too, not just subdomains.
+            "https://wildcard.org",
+            "https://api.wildcard.org",
+            // `*.` is stripped as two chars, so the apex is exempt here as well.
+            "https://star.net",
+            "https://api.star.net",
+            // A bare IPv6 entry is portless (`:58-60`) and compares bracket-free (`:82`, `:119`).
+            "https://[::1]:80",
+            "https://[2001:db8::1]",
+            // A port-qualified entry blocks only its own port.
+            "https://127.0.0.1:8080",
+        ] {
+            assert!(
+                resolve_http_proxy_url_for_target(target, &env, None)
+                    .await
+                    .expect("ok")
+                    .is_none(),
+                "{target} should be exempt"
+            );
+        }
+        for target in [
+            // The guard that the subdomain test is `endsWith(".{domain}")` and not a bare
+            // `ends_with(domain)`: `notexample.com` is NOT under `example.com`.
+            "https://notexample.com",
+            "https://127.0.0.1:3000",
+        ] {
+            assert!(
+                resolve_http_proxy_url_for_target(target, &env, None)
+                    .await
+                    .expect("ok")
+                    .is_some(),
+                "{target} should be proxied"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_proxy_normalises_target_case() {
+        // Pins upstream's `hostname.toLowerCase()` (`:82`) on an APEX target, which the exact-host
+        // comparison already handled: this passes at HEAD too, because `reqwest::Url::parse`
+        // lower-cases a domain host before the matcher ever sees it. It is here to keep that
+        // invariant asserted (see the CYRUP-DELTA on `should_proxy_hostname`), NOT as proof of the
+        // subdomain fix above — `no_proxy_matches_subdomains_wildcards_ipv6_and_ports` is that
+        // proof. A subdomain target such as `API.Internal.Corp` would also fail at HEAD, but for
+        // the subdomain rule rather than for case, so it is deliberately not used here.
+        let env = ctx([
+            ("https_proxy", "http://proxy:8080"),
+            ("no_proxy", "internal.corp"),
+        ]);
+        assert!(
+            resolve_http_proxy_url_for_target("https://INTERNAL.CORP/", &env, None)
+                .await
+                .expect("ok")
+                .is_none()
         );
     }
 

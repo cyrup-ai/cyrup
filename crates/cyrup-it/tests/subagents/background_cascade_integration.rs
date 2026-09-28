@@ -204,6 +204,8 @@ async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -
     tokio::fs::create_dir_all(&run_paths.run_dir).await.unwrap();
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,

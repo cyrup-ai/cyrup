@@ -162,10 +162,15 @@ impl AgentSession {
     ) -> Result<PromptAccepted, SessionServiceError> {
         match self.prepare(input.into(), options).await? {
             Prepared::Handled => Ok(PromptAccepted::Handled),
-            Prepared::Queued(behavior, ui) => match behavior {
-                StreamingBehavior::FollowUp => self.follow_up(ui).await,
-                StreamingBehavior::Steer => self.steer(ui).await,
-            },
+            // SEAM-121 — pi's `prompt` calls the PRIVATE `_queueFollowUp`/`_queueSteer` here
+            // (agent-session.ts:1661-1663 @v0.87.1), never the public `followUp`/`steer`:
+            // `prepare` has already run the `input` handlers and the skill/template expansion, and
+            // the public entry points do both. Routing through them re-dispatched `input` for one
+            // submission and expanded the text a second time.
+            Prepared::Queued(behavior, ui) => Ok(match behavior {
+                StreamingBehavior::FollowUp => self.queue_follow_up(ui).await,
+                StreamingBehavior::Steer => self.queue_steer(ui).await,
+            }),
             Prepared::Run(messages) => {
                 self.spawn_run(messages).await?;
                 Ok(PromptAccepted::Started)
@@ -182,6 +187,12 @@ impl AgentSession {
         &self,
         messages: Vec<AgentMessage>,
     ) -> Result<(), SessionServiceError> {
+        // Clear the run-abort latch where the run STARTS — Pi does this once, at the head of
+        // `_runAgentPrompt` (`this._agentRunAbortRequested = false;`, `agent-session.ts:1469`
+        // @v0.87.1). cyrup has TWO run entry points where Pi has one ([`Self::spawn_run`] and
+        // [`Self::run_injection`]), so that single clear point is split across both; they are the
+        // same point, not two policies.
+        self.set_abort_requested(false);
         match self.handle.get() {
             Some(this) => {
                 // Flag the loop active BEFORE returning so an immediate `wait_for_idle` waits for the
@@ -239,6 +250,12 @@ impl AgentSession {
         &self,
         messages: Vec<AgentMessage>,
     ) -> Result<InjectionOffer, SessionServiceError> {
+        // Clear the run-abort latch where the run STARTS — Pi does this once, at the head of
+        // `_runAgentPrompt` (`this._agentRunAbortRequested = false;`, `agent-session.ts:1469`
+        // @v0.87.1). cyrup has TWO run entry points where Pi has one ([`Self::spawn_run`] and
+        // [`Self::run_injection`]), so that single clear point is split across both; they are the
+        // same point, not two policies.
+        self.set_abort_requested(false);
         let Some(this) = self.handle.get() else {
             // An unbound by-value session has no post-run driver; the run is still claimed here,
             // so the acceptance report stays truthful.
@@ -300,7 +317,10 @@ impl AgentSession {
             // focused drain (not the full `apply_pending_control`) because this future is spawned:
             // only SetModel/SetThinkingLevel can reach the queue from an event handler.
             self.apply_pending_agent_control().await;
-            while self.handle_post_agent_run().await {
+            // Pi's continuation loop is `while (!this._agentRunAbortRequested)`
+            // (`agent-session.ts:1473` @v0.87.1), so an abort landing DURING a `continue_run` also
+            // stops the loop — not only one that lands before the post-run step.
+            while !self.abort_requested() && self.handle_post_agent_run().await {
                 match self.agent.continue_run().await {
                     Ok(h) => {
                         let _ = h.finished().await;
@@ -322,13 +342,41 @@ impl AgentSession {
 
     /// Pi `_runAgentPrompt`'s `finally` (agent-session.ts:1063-1072), in its exact order.
     async fn settle_run(&self) {
-        // Pi `_runAgentPrompt`'s `finally` opens with `this._systemPromptOverride = undefined;`
+        // SESS-062 — pi's `finally` opens with `if (this._agentRunAbortRequested)
+        // this._finishCancelledRetry();` (`agent-session.ts:1484` @v0.87.1), AHEAD of the
+        // system-prompt reset, both flushes and `_emitAgentSettled()`.
+        //
+        // It is the only latch site that is reachable when the abort lands DURING a continuation,
+        // and therefore the one that actually closes the retry sequence. The loop above is
+        // `while !abort_requested() && handle_post_agent_run()`, so an abort arriving while
+        // `continue_run()` is awaited exits on the loop's OWN condition —
+        // `handle_post_agent_run` is never re-entered and none of its four
+        // `finish_cancelled_retry()` calls run.
+        //
+        // Without this, a retry that an abort cut short leaks `retry_attempt` permanently: neither
+        // side resets the counter at run START (pi zeroes `_retryAttempt` only at :960, :1519 and
+        // :3366; cyrup only in `prepare_retry`, `handle_post_agent_run` and
+        // `finish_cancelled_retry`). The leaked attempt survives into every later run until
+        // `retry_attempt() >= retry_max_retries` refuses auto-retry for the life of the session,
+        // and no `auto_retry_end` ever closes the "retrying" state a consumer opened on
+        // `auto_retry_start` / the `will_retry` field of `agent_end`.
+        //
+        // `finish_cancelled_retry` is a no-op when no retry is in flight, which is why pi guards
+        // only on the latch and not on the attempt count.
+        if self.abort_requested() {
+            self.finish_cancelled_retry().await;
+        }
+        // Pi `_runAgentPrompt`'s `finally` continues with `this._systemPromptOverride = undefined;`
         // (agent-session.ts:1069 @v0.83.0), BEFORE the bash flush and the settle emit — a
         // `before_agent_start` replacement is scoped to its own run and must not survive into the
         // next one (DRIFT-033).
         *Self::lock(&self.system_prompt_override) = None;
         // Pi `finally` (agent-session.ts:982-984): flush deferred bash messages from this turn.
         self.flush_pending_bash_messages().await;
+        // …and, immediately after it, the deferred custom messages — pi's `finally` calls the two
+        // back to back (agent-session.ts:1486-1487 @v0.87.1), so a `triggerTurn: false` message
+        // queued during a run that ends without reaching a `turn_end` is never stranded. SEAM-127.
+        self.flush_pending_custom_messages().await;
         // SEAM-005: the run has FULLY settled — the post-run loop above is done, so no retry,
         // compaction or queued continuation will follow. This is exactly Pi's `_emitAgentSettled()`
         // call site: the `finally` of `_runAgentPrompt` (agent-session.ts:1063-1072), AFTER
@@ -367,12 +415,31 @@ impl AgentSession {
     /// sequence, run a post-run threshold/overflow compaction, or continue for `agent_end`-queued
     /// messages. Returns `true` when the driver should `agent.continue()`.
     async fn handle_post_agent_run(&self) -> bool {
+        // Pi checks `_agentRunAbortRequested` FOUR times inside `_handlePostAgentRun`
+        // (`agent-session.ts:1497-1500,1504-1505,1507-1510,1522-1523` @v0.87.1) plus once more in
+        // its tail (:1528). Each one turns a decision that would have CONTINUED the run into a
+        // stop, and each closes a real window: an abort can land between `agent_end` and this
+        // function, during `prepare_retry`'s backoff, or during `check_compaction`'s summary call.
+        if self.abort_requested() {
+            self.finish_cancelled_retry().await;
+            return false;
+        }
         let Some(msg) = Self::lock(&self.last_assistant).take() else {
             return false;
         };
-        // Retryable transient error → backoff + continue (Pi :991-993).
+        // Retryable transient error → backoff + continue (Pi :991-993). The backoff is awaited
+        // inside `prepare_retry`, so an abort can land there: Pi re-reads the latch straight after
+        // (`if (this._agentRunAbortRequested) this._finishCancelledRetry(); return !latch;`, :1504).
         if self.is_retryable_error(&msg) && self.prepare_retry(&msg).await {
+            if self.abort_requested() {
+                self.finish_cancelled_retry().await;
+                return false;
+            }
             return true;
+        }
+        if self.abort_requested() {
+            self.finish_cancelled_retry().await;
+            return false;
         }
         // A terminal error with a spent / non-retryable budget closes the retry sequence (Pi :995-1003).
         if msg.stop_reason == cyrup_core::StopReason::Error && self.retry_attempt() > 0 {
@@ -384,12 +451,49 @@ impl AgentSession {
             })
             .await;
         }
-        // Threshold / overflow post-run compaction → continue (Pi :1005-1007).
-        if self.check_compaction(&msg, true).await.unwrap_or(false) {
-            return true;
+        if self.abort_requested() {
+            self.finish_cancelled_retry().await;
+            return false;
         }
-        // Messages queued by `agent_end` extension handlers need a continuation (Pi :1009-1012).
-        self.agent.has_queued_messages()
+        // Threshold / overflow post-run compaction → continue (Pi :1005-1007). The summary call is
+        // awaited inside, and `abort()` cancels it, so the latch is re-read on the way out
+        // (Pi `return !this._agentRunAbortRequested;`, :1522).
+        if self.check_compaction(&msg, true).await.unwrap_or(false) {
+            return !self.abort_requested();
+        }
+        // Messages queued by `agent_end` extension handlers need a continuation (Pi :1009-1012),
+        // unless the run was aborted (Pi :1528).
+        !self.abort_requested() && self.agent.has_queued_messages()
+    }
+
+    /// Close a retry sequence that an abort cut short — Pi `_finishCancelledRetry`
+    /// (`agent-session.ts:3363-3374` @v0.87.1):
+    ///
+    /// ```ts
+    /// private _finishCancelledRetry(): void {
+    ///     if (this._retryAttempt === 0) return;
+    ///     const attempt = this._retryAttempt;
+    ///     this._retryAttempt = 0;
+    ///     this._emit({ type: "auto_retry_end", success: false, attempt, finalError: "Retry cancelled" });
+    /// }
+    /// ```
+    ///
+    /// A no-op when no retry was in flight, which is why every abort path can call it
+    /// unconditionally.
+    async fn finish_cancelled_retry(&self) {
+        let attempt = {
+            let mut a = Self::lock(&self.retry_attempt);
+            if *a == 0 {
+                return;
+            }
+            std::mem::replace(&mut *a, 0)
+        };
+        self.fanout_emit(AgentSessionEvent::AutoRetryEnd {
+            success: false,
+            attempt,
+            final_error: Some("Retry cancelled".to_string()),
+        })
+        .await;
     }
 
     /// The persist+fan-out subscriber's `message_start` handler for a USER message (Pi
@@ -591,8 +695,11 @@ impl AgentSession {
         if input.expand_templates {
             input.text = self.expand_input_text(&input.text);
         }
-        // 2. Flush deferred bash messages so ordering is intact (agent-session.ts:1058).
+        // 2. Flush deferred bash AND custom messages so ordering is intact — pi's two adjacent
+        //    calls at the head of a new prompt (agent-session.ts:1670-1671 @v0.87.1, "Flush any
+        //    pending bash and custom messages before the new prompt"). SEAM-127.
         self.flush_pending_bash_messages().await;
+        self.flush_pending_custom_messages().await;
         // 3. Model + auth precheck. Pi validates the MODEL first —
         // `if (!this.model) { throw new Error(formatNoModelSelectedMessage()); }`
         // (agent-session.ts:1177-1180) — and only then the credential (`:1182-1195`). This is the
@@ -842,42 +949,93 @@ impl AgentSession {
         self.agent.wait_for_idle().await;
     }
 
-    /// Enqueue a steering message (delivered after the current tool batch, func-02 §9). Mirrors the
-    /// text into the facade queue + emits `queue_update` (Pi `_queueSteer`, agent-session.ts:1249).
+    /// Enqueue a steering message (delivered after the current tool batch, func-02 §9) — pi
+    /// `steer(text, images, options)`, agent-session.ts:1858-1862 @v0.87.1, one line onto
+    /// `_queueUserInput`. The caller's `UserInput::source` is pi's `options?.source ?? "interactive"`
+    /// (cyrup already carries the provenance on the input itself, so the RPC arm's `user_input`
+    /// helper supplies `InputSource::Rpc` with no extra parameter).
     pub async fn steer(
         &self,
         input: impl Into<UserInput>,
     ) -> Result<PromptAccepted, SessionServiceError> {
-        let mut ui = input.into();
-        // Pi agent-session.ts:1242-1252: error on an extension command, then expand skill/template
-        // BEFORE queueing — the queued text and the mirror must carry the expanded content.
-        if ui.expand_templates {
-            self.throw_if_extension_command(&ui.text)?;
-            ui.text = self.expand_input_text(&ui.text);
-        }
-        Self::lock(&self.steering_messages).push(ui.text.clone());
-        self.agent.steer(ui.into_agent_message());
-        self.emit_queue_update().await;
-        Ok(PromptAccepted::Queued(StreamingBehavior::Steer))
+        self.queue_user_input(input.into(), StreamingBehavior::Steer)
+            .await
     }
 
-    /// Enqueue a follow-up message (delivered after the agent goes idle, func-02 §9). Mirrors the
-    /// text into the facade queue + emits `queue_update` (Pi `_queueFollowUp`, agent-session.ts:1266).
+    /// Enqueue a follow-up message (delivered after the agent goes idle, func-02 §9) — pi
+    /// `followUp(text, images, options)`, agent-session.ts:1871-1875 @v0.87.1.
     pub async fn follow_up(
         &self,
         input: impl Into<UserInput>,
     ) -> Result<PromptAccepted, SessionServiceError> {
-        let mut ui = input.into();
-        // Pi agent-session.ts:1262-1272: error on an extension command, then expand skill/template
-        // BEFORE queueing.
+        self.queue_user_input(input.into(), StreamingBehavior::FollowUp)
+            .await
+    }
+
+    /// Pi's private `_queueUserInput` (agent-session.ts:1823-1848 @v0.87.1), step for step. Both
+    /// public queue entry points are one line onto this.
+    ///
+    /// SEAM-121 — `steer`/`follow_up` previously went straight from the extension-command check to
+    /// the expansion and the queue, skipping the `input` event entirely. Only `prepare` emitted it,
+    /// so a queued submission — every mid-run steer, every RPC `steer`/`followUp` frame, every
+    /// `sendUserMessage` landing on a live run — reached the transcript without an `on_input`
+    /// handler ever seeing it: no `transform` applied, no `handled` honoured, and the handler could
+    /// not observe the `rpc` source it is given upstream.
+    async fn queue_user_input(
+        &self,
+        mut ui: UserInput,
+        behavior: StreamingBehavior,
+    ) -> Result<PromptAccepted, SessionServiceError> {
+        // 1. pi :1829-1831 — the extension-command check is FIRST, ahead of the handlers.
         if ui.expand_templates {
             self.throw_if_extension_command(&ui.text)?;
+        }
+        // 2. pi :1833-1839 — `_runInputHandlers(text, images, source, this.isStreaming ? behavior :
+        //    undefined)`. `is_run_active()` is cyrup's documented analogue of `this.isStreaming`
+        //    (see the AGENT-030 note on [`Self::prepare`]), so the handler sees the queue selector
+        //    only while a run is live. `undefined` (i.e. `handled`) queues NOTHING and emits no
+        //    `queue_update`.
+        let handler_behavior = self.is_run_active().then_some(behavior);
+        if matches!(
+            self.emit_input_event(&mut ui, handler_behavior).await,
+            InputDisposition::Handled
+        ) {
+            return Ok(PromptAccepted::Handled);
+        }
+        // GAP-11, same reasoning as in [`Self::prepare`]: drain any control op an `on_input`
+        // handler just queued at this store-free point, so a `setModel`/`setThinkingLevel` from a
+        // handler that also steered takes effect rather than waiting for the next turn boundary.
+        self.apply_pending_agent_control().await;
+        // 3. pi :1840-1841 — expansion runs on the handler's OUTPUT, not on the raw text.
+        if ui.expand_templates {
             ui.text = self.expand_input_text(&ui.text);
         }
+        // 4. pi :1843-1847 — the private queue.
+        Ok(match behavior {
+            StreamingBehavior::Steer => self.queue_steer(ui).await,
+            StreamingBehavior::FollowUp => self.queue_follow_up(ui).await,
+        })
+    }
+
+    /// Pi's private `_queueSteer` (agent-session.ts:1879-1893 @v0.87.1): mirror the text into the
+    /// facade queue, hand the message to the agent, emit `queue_update`. Deliberately does NO
+    /// extension-command check, NO expansion and NO `input` dispatch — every caller has already run
+    /// whichever of those apply, and doing them here is what made one submission dispatch `input`
+    /// twice.
+    pub(super) async fn queue_steer(&self, ui: UserInput) -> PromptAccepted {
+        Self::lock(&self.steering_messages).push(ui.text.clone());
+        self.agent.steer(ui.into_agent_message());
+        self.emit_queue_update().await;
+        PromptAccepted::Queued(StreamingBehavior::Steer)
+    }
+
+    /// Pi's private `_queueFollowUp` (agent-session.ts:1896-1910 @v0.87.1). See
+    /// [`Self::queue_steer`].
+    pub(super) async fn queue_follow_up(&self, ui: UserInput) -> PromptAccepted {
         Self::lock(&self.follow_up_messages).push(ui.text.clone());
         self.agent.follow_up(ui.into_agent_message());
         self.emit_queue_update().await;
-        Ok(PromptAccepted::Queued(StreamingBehavior::FollowUp))
+        PromptAccepted::Queued(StreamingBehavior::FollowUp)
     }
 
     /// Error if `text` is a registered extension command (Pi `_throwIfExtensionCommand`,

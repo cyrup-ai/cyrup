@@ -32,19 +32,122 @@ fn thinking_level_for_gemini_3_pro() {
 
 #[test]
 fn disabled_thinking_when_reasoning_off() {
-    // Gemini 2.x reasoning model with reasoning off → thinkingBudget: 0.
+    // Gemini 2.x reasoning model with reasoning off → thinkingBudget: 0 (pi
+    // `getDisabledGoogleThinkingConfig` first arm, google-shared.ts:103; pinned upstream by
+    // "disables Gemini 2.5 thinking when reasoning is omitted").
     let m = model_with("gemini-2.5-flash", true);
     let body = build_body(&m, &user_ctx("x"), &StreamOptions::default());
     assert_eq!(
         body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
         0
     );
-    // Gemini 3 pro reasoning model with reasoning off → thinkingLevel: LOW.
-    let m3 = model_with("gemini-3-pro-preview", true);
+    // A level model whose catalog row STILL SUPPORTS `off` also disables with a zero budget
+    // (google-shared.ts:105-106) — an empty map keeps `off` supported.
+    let m3_off_ok = model_with("gemini-3-pro-preview", true);
+    let body = build_body(&m3_off_ok, &user_ctx("x"), &StreamOptions::default());
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"],
+        json!({ "thinkingBudget": 0 })
+    );
+    // A level model whose row marks `off` unsupported sends the lowest rung it still supports as a
+    // level (google-shared.ts:108-110).
+    let m3 = model_with_map(
+        "gemini-3-pro-preview",
+        &[("off", None), ("minimal", None), ("low", Some("LOW"))],
+    );
     let body = build_body(&m3, &user_ctx("x"), &StreamOptions::default());
     assert_eq!(
         body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
         "LOW"
+    );
+}
+
+/// `thinkingLevelMap` — not a hard-coded per-family table — decides what each pi rung sends (Pi
+/// `resolveGoogleThinkingLevel`, google-shared.ts:48-65). Each case below is one of pi's own
+/// `test/google-thinking-level-map.test.ts` cases @v0.87.1, kept separate so a regression names
+/// exactly which rung broke.
+///
+/// (1) native medium survives on a Gemini-3 Pro row that maps it ("preserves native medium effort
+/// for Gemini 3.1 Pro").
+#[test]
+fn mapped_medium_survives_on_gemini_3_pro() {
+    let m = model_with_map("gemini-3-pro-preview", &[("medium", Some("MEDIUM"))]);
+    let opts = StreamOptions {
+        reasoning: ModelThinkingLevel::Medium,
+        ..Default::default()
+    };
+    let tc =
+        build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"].clone();
+    assert_eq!(
+        tc,
+        json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" })
+    );
+}
+
+/// (2) an extended rung maps DOWN to a real Google level ("maps Google Generative AI xhigh to a
+/// supported level").
+#[test]
+fn mapped_xhigh_reaches_a_real_google_level() {
+    let m = model_with_map("gemini-3-pro-preview", &[("xhigh", Some("HIGH"))]);
+    let opts = StreamOptions {
+        reasoning: ModelThinkingLevel::Xhigh,
+        ..Default::default()
+    };
+    let tc =
+        build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"].clone();
+    assert_eq!(
+        tc,
+        json!({ "includeThoughts": true, "thinkingLevel": "HIGH" })
+    );
+}
+
+/// (3) the token-budget table is keyed on the RESOLVED level, not the requested rung ("honors
+/// uppercase provider values" + "uses mapped levels for token budgets").
+#[test]
+fn token_budget_is_keyed_on_the_resolved_level() {
+    let m = model_with_map("gemini-2.5-pro", &[("low", Some("HIGH"))]);
+    let opts = StreamOptions {
+        reasoning: ModelThinkingLevel::Low,
+        ..Default::default()
+    };
+    let tc =
+        build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"].clone();
+    assert_eq!(
+        tc,
+        json!({ "includeThoughts": true, "thinkingBudget": 32768 })
+    );
+}
+
+/// (4) reasoning omitted on a level row that bars `off`/`minimal` → the lowest supported rung
+/// ("uses the lowest supported level when reasoning is omitted", pi issue #9455).
+#[test]
+fn reasoning_off_uses_the_lowest_supported_level() {
+    let m = model_with_map(
+        "gemini-3-flash-preview",
+        &[("off", None), ("minimal", None), ("low", Some("LOW"))],
+    );
+    let tc = build_body(&m, &user_ctx("x"), &StreamOptions::default())["generationConfig"]
+        ["thinkingConfig"]
+        .clone();
+    assert_eq!(tc, json!({ "thinkingLevel": "LOW" }));
+}
+
+/// A mapping that names no Google level fails the turn before any HTTP, with pi's exact message
+/// (`[CYRUP-DELTA]` for google-shared.ts:61-63's throw).
+#[test]
+fn unmappable_thinking_level_fails_the_request() {
+    let m = model_with_map("gemini-3-pro-preview", &[("high", Some("ULTRA"))]);
+    let opts = StreamOptions {
+        reasoning: ModelThinkingLevel::High,
+        ..Default::default()
+    };
+    let err = build_params(&m, &user_ctx("think"), &opts).expect_err("ULTRA is not a Google level");
+    assert_eq!(
+        err,
+        GoogleParamsError::UnsupportedThinkingLevel(
+            "Unsupported Google thinking level mapping for google/gemini-3-pro-preview: high -> ULTRA"
+                .to_string()
+        )
     );
 }
 

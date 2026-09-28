@@ -315,6 +315,7 @@ mod tests {
             .expect("mkdir results_dir");
 
         let config = RunnerConfig {
+            model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,
             // SUBA-021: unbudgeted on this path (see the field doc).

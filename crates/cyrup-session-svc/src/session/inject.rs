@@ -77,6 +77,10 @@ impl AgentSession {
     /// agent-session.ts:1307-1338). `nextTurn` stages the message to ride the next prompt; `steer`/
     /// `followUp` queue onto the active run while streaming; otherwise the message is persisted and
     /// surfaced via `message_start`/`message_end`.
+    /// `trigger_turn` is pi's raw `options?.triggerTurn`, kept as an `Option<bool>` because pi's
+    /// branch 2 tests `!== false` and its branch 3 tests truthiness — an ABSENT key and an explicit
+    /// `false` take different branches, so collapsing them to one `bool` is what made a
+    /// `triggerTurn: false` message steer the live loop and be answered (SEAM-127).
     pub async fn send_custom_message(
         &self,
         custom_type: &str,
@@ -84,6 +88,7 @@ impl AgentSession {
         display: bool,
         details: Option<serde_json::Value>,
         deliver_as: Option<crate::event::DeliverAs>,
+        trigger_turn: Option<bool>,
     ) -> Result<(), SessionServiceError> {
         use crate::event::DeliverAs;
         let ts = now_ms();
@@ -108,16 +113,31 @@ impl AgentSession {
             // AGENT-030 — pi routes on `this.isStreaming`, the session latch `_isAgentRunActive`
             // (agent-session.ts:900-901, consulted at :1477): in the post-`agent_end` gap the
             // message queues onto the active loop instead of being appended between runs.
-            _ if self.is_run_active() => match deliver_as {
+            _ if self.is_run_active() && trigger_turn != Some(false) => match deliver_as {
                 Some(DeliverAs::FollowUp) => self.agent.follow_up(msg),
                 _ => self.agent.steer(msg),
             },
-            // ICOM-068 — pi's not-streaming, no-trigger arm is `_appendCustomMessage`: the tree
-            // append AND `_refreshFinalizedContext()`, which re-seeds `agent.state.messages` from the
-            // session projection (`agent-session.ts:1968-1982`, `:730-736` @v0.87.1), so the model
-            // sees the message on the next prompt. This arm used to do the tree append alone: the
-            // message was drawn and persisted and never sent to the model until a resume, fork or
-            // compaction re-seeded the transcript from the tree.
+            // pi branch 4 (agent-session.ts:1961-1966 @v0.87.1), reached when a run is live and
+            // `triggerTurn` is explicitly `false`. pi's own comment, verbatim in substance:
+            // "Appending now would put the message between an assistant tool call and its result,
+            // which providers that validate message order reject on replay. Defer to the end of the
+            // turn. Nothing is emitted yet: message events must not describe messages the session
+            // tree does not contain."
+            //
+            // This arm sits AFTER the `NextTurn` arm (pi's branch 1 likewise precedes every
+            // `triggerTurn` test) and BEFORE the not-streaming arm below, exactly as pi orders its
+            // branches 4 and 5. It is reachable for any other `deliver_as`: pi's branch 2 requires
+            // `triggerTurn !== false`, so `deliverAs: "steer"` with `triggerTurn: false` falls
+            // through to here and is DEFERRED, not queued. SEAM-127.
+            _ if self.is_run_active() => {
+                Self::lock(&self.pending_custom_messages).push(msg);
+            }
+            // ICOM-068 — pi's not-streaming, no-trigger arm (branch 5, `agent-session.ts:1967-1969`)
+            // is `_appendCustomMessage`: the tree append AND `_refreshFinalizedContext()`, which
+            // re-seeds `agent.state.messages` from the session projection (`:1972-1982`, `:730-736`
+            // @v0.87.1), so the model sees the message on the next prompt. This arm used to do the
+            // tree append alone: the message was drawn and persisted and never sent to the model
+            // until a resume, fork or compaction re-seeded the transcript from the tree.
             _ => {
                 match self
                     .append_no_turn_messages(vec![msg.clone()], &[], CompactionGate::Ignore)
@@ -125,12 +145,121 @@ impl AgentSession {
                 {
                     InjectionOffer::Taken => {}
                     // A run claimed the latch between the routing read above and the append's
-                    // critical section. It is streaming now, so this is pi's streaming arm.
+                    // critical section. It is streaming now, so re-route as pi routes a streaming
+                    // session — which is a TWO-way decision, not one: branch 2 steers only when
+                    // `triggerTurn !== false`, and an explicit `false` is branch 4's deferral
+                    // (SEAM-127). Steering it here would hand the model a message that asked for no
+                    // turn, and land it between a tool call and its result.
+                    InjectionOffer::AgentBusy if trigger_turn == Some(false) => {
+                        Self::lock(&self.pending_custom_messages).push(msg);
+                    }
                     InjectionOffer::AgentBusy => self.agent.steer(msg),
                 }
             }
         }
         Ok(())
+    }
+
+    /// Pi `_appendCustomMessage` (agent-session.ts:1972-1982 @v0.87.1), in pi's order: persist the
+    /// entry, re-seed the agent transcript from it, then emit `message_start` + `message_end`. The
+    /// body [`Self::flush_pending_custom_messages`] drains each deferred message through.
+    ///
+    /// ICOM-068 — the transcript half is not optional. Pi's `_appendCustomMessage` is ONE function
+    /// called from both its branch 5 and its `_flushPendingCustomMessages`, and it ends with
+    /// `_refreshFinalizedContext()` (`:1979`); without it a flushed message is drawn and persisted
+    /// and never sent to the model until a resume, fork or compaction re-seeds the transcript from
+    /// the tree. The tree append goes FIRST — pi's own order at `:1973-1980` — and the transcript
+    /// append that follows cannot fail, so the two can never disagree about a message that failed.
+    ///
+    /// CYRUP-DELTA (`agent-session.ts:1979`, mechanism at full parity): pi's
+    /// `_refreshFinalizedContext()` re-seeds `agent.state.messages` by assigning the WHOLE session
+    /// projection; cyrup pushes the one message through
+    /// [`cyrup_agent::Agent::append_finalized_message`]. Same resulting transcript: the entry
+    /// persisted two lines above is the only tree change since the transcript was last in step
+    /// (every other finalized message reaches both the tree and `state.messages` from the same
+    /// `message_end`), so "assign projection" and "push this message" differ only in cost.
+    ///
+    /// CYRUP-DELTA (`agent-session.ts:1968` vs `:1994`, mechanism at full parity): pi's two call
+    /// sites share this body; cyrup's immediate arm in [`Self::send_custom_message`] goes through
+    /// [`Self::append_no_turn_messages`] instead, because that arm also has to settle the injection
+    /// pump's steered messages and the run-latch race. Both arms perform pi's two halves — the tree
+    /// append and the transcript re-seed — and both emit the same pair of events.
+    ///
+    /// # Errors
+    ///
+    /// A tree append failure, before anything is written to the transcript or emitted.
+    async fn append_custom_message_now(
+        &self,
+        custom_type: &str,
+        content: serde_json::Value,
+        display: bool,
+        details: Option<serde_json::Value>,
+        msg: &AgentMessage,
+    ) -> Result<(), SessionServiceError> {
+        {
+            let mut manager = self.manager.lock().await;
+            manager.append_custom_message(custom_type, content, display, details)?;
+            // Under the manager lock, so no other writer can observe a tree that holds the entry
+            // while the transcript does not. Infallible and append-only — see the safety argument on
+            // [`cyrup_agent::Agent::append_finalized_message`] for why it is legal mid-run, which
+            // the `turn_end` call site requires.
+            self.agent.append_finalized_message(msg.clone());
+        }
+        self.fanout_emit(AgentSessionEvent::MessageStart {
+            message: msg.clone(),
+        })
+        .await;
+        self.fanout_emit(AgentSessionEvent::MessageEnd {
+            message: msg.clone(),
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Pi `_flushPendingCustomMessages` (agent-session.ts:1988-1996 @v0.87.1): drain the deferred
+    /// custom messages through `_appendCustomMessage`, in order. A no-op when the slot is empty.
+    ///
+    /// Called from every point pi calls it: the `turn_end` boundary (`:972` — "a turn ends after its
+    /// assistant message and every tool result has been appended, so this is the first point in the
+    /// run where a context-only custom message can be inserted without landing between a tool call
+    /// and its result"), the `finally` of the run alongside the bash flush (`:1486-1487`), and the
+    /// head of a new prompt (`:1670-1671`). The `turn_end` site is the one that normally delivers:
+    /// it runs on the run task, between two reductions, and appends and emits there — so a message
+    /// deferred during a run is displayed at the turn boundary that follows it, never held back to
+    /// the run's settle. The `finally` site is the backstop for a run that ends without reaching a
+    /// `turn_end`.
+    ///
+    /// The slot is taken up front, as pi takes `pending` into a local and clears the field, so a
+    /// `message_end` observer that defers a further message during this drain leaves it for the next
+    /// flush instead of extending this one.
+    ///
+    /// CYRUP-DELTA (call-site set only): pi ALSO flushes inside `_runBeforeSettleBoundary`
+    /// (`:1541`), which cyrup has no counterpart for — the `agent_before_settle` boundary is
+    /// unported (see the note on [`Self::abort`] in `session/queue.rs`). The `turn_end` and run-
+    /// `finally` sites bracket it on both sides, so nothing is stranded; the site arrives with the
+    /// boundary.
+    pub(crate) async fn flush_pending_custom_messages(&self) {
+        let pending = std::mem::take(&mut *Self::lock(&self.pending_custom_messages));
+        for msg in pending {
+            let AgentMessage::Custom {
+                kind,
+                payload,
+                details,
+                display,
+                ..
+            } = &msg
+            else {
+                continue;
+            };
+            let (kind, payload, details, display) =
+                (kind.clone(), payload.clone(), details.clone(), *display);
+            if let Err(e) = self
+                .append_custom_message_now(&kind, payload, display, details, &msg)
+                .await
+            {
+                tracing::warn!(error = %e, "deferred custom message could not be appended");
+            }
+        }
     }
 
     /// ICOM-035 — hand every no-turn custom injection in `inbox` to the live run's steering queue.

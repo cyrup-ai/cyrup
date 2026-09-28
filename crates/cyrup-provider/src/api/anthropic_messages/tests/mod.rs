@@ -30,7 +30,7 @@ use crate::auth::types::ModelAuth;
 use crate::auth::{AuthResult, ProviderEnv};
 use crate::context::{Context, ToolDef};
 use crate::model::{Modality, Model, ModelCost};
-use crate::stream::sse::decode_sse_bytes;
+use crate::stream::sse::{decode_sse_bytes, decode_sse_bytes_flushing_at_eof};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::utils::provider_plumbing::EnvSource;
 use cyrup_core::{
@@ -98,7 +98,8 @@ fn user_ctx(text: &str) -> Context {
 async fn collect(frames_bytes: Vec<u8>, m: &Model) -> Vec<StreamEvent> {
     let (sink, mut rx) = channel(64);
     let api = ApiId::from(API_ID);
-    let frames = decode_sse_bytes(frames_bytes);
+    // PROV-084: the live Anthropic adapter sets `flush_at_eof`, so the replay path must too.
+    let frames = decode_sse_bytes_flushing_at_eof(frames_bytes);
     let m2 = m.clone();
     let api2 = api.clone();
     let task = tokio::spawn(async move {

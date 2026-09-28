@@ -51,14 +51,22 @@ mod hotkeys;
 mod input;
 mod input_reader;
 mod layout;
-mod login;
+pub(crate) mod login;
 mod mode_switch;
 mod outcome;
 mod reload_trust;
 #[path = "render.rs"]
 mod render_impl;
 mod run;
-mod run_action;
+// TUI-105 — the run loop's own context, exported to the test tree ONLY. Before this the
+// `session_swapped` arm had no behavioural coverage at all: two existing tests
+// (`tests/startup_resources_panel.rs`, `tests/theme_reapply_on_reload.rs`) read its ORDER out of
+// `include_str!("../app/run_arms.rs")` precisely because "nothing in this crate constructs a
+// `RunCtx`". A source read cannot tell a recount of the swapped-in session's providers from a
+// recount of the outgoing one's, so the swap recount is proven by driving the arm instead.
+#[cfg(test)]
+pub(crate) use run::RunCtx;
+pub(crate) mod run_action;
 mod run_arms;
 mod selectors;
 mod session_bind;
@@ -316,6 +324,11 @@ pub struct App<B: Backend> {
     /// by construction (that is what `AuthInteraction` is for), so an unattended one cannot
     /// complete.
     login_tx: Option<tokio::sync::mpsc::UnboundedSender<LoginUiMsg>>,
+    /// **TUI-105.** Where a spawned post-login catalog refresh posts its settled outcome —
+    /// installed by [`App::install_login_refresh_channel`]. See that method for why it is a second
+    /// channel rather than a fourth [`LoginUiMsg`] variant.
+    login_refresh_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::login_dialog::LoginRefreshMsg>>,
     /// Where a spawned `/model` catalog refresh posts its settled outcome — installed by
     /// [`App::install_model_refresh_channel`], which [`App::run`] calls once at startup (the same
     /// shape as [`Self::login_tx`]).

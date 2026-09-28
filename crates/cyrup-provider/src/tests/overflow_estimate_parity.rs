@@ -1,4 +1,4 @@
-//! Parity regressions for `utils/overflow.rs` and `utils/estimate.rs` against pi v0.83.0
+//! Parity regressions for `utils/overflow.rs` and `utils/estimate.rs` against pi v0.87.1
 //! (`packages/ai/src/utils/{overflow,estimate}.ts`).
 //!
 //! Two ported-behaviour gaps are pinned here:
@@ -52,14 +52,16 @@ fn detects_ds4_and_dashscope_overflow_errors() {
     }
 }
 
-/// Guard the whole set, not just the two additions: Pi v0.83.0 `OVERFLOW_PATTERNS` has 25 entries
-/// (`overflow.ts:37-62`). A count assertion catches a future silent drop the same way.
+/// Guard the whole set, not just the two additions: Pi v0.87.1 `OVERFLOW_PATTERNS` has 24 entries
+/// (`overflow.ts:37-62`) — the Cerebras bodyless pattern lives outside the list, in
+/// `CEREBRAS_BODYLESS_OVERFLOW_PATTERN` (`overflow.ts:64`). A count assertion catches a future
+/// silent drop the same way.
 #[test]
 fn overflow_pattern_set_matches_pi_cardinality() {
     assert_eq!(
         overflow_patterns().len(),
-        25,
-        "pi v0.83.0 overflow.ts:37-62 defines 25 patterns; got {:?}",
+        24,
+        "pi v0.87.1 overflow.ts:37-62 defines 24 patterns; got {:?}",
         overflow_patterns()
     );
     // The two restored entries are present verbatim, in Pi's source form.

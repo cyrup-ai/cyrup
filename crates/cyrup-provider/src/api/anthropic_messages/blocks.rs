@@ -1,7 +1,7 @@
 //! Response decoding — in-progress block and decoder state.
 
 use crate::api::content_cache::ContentCache;
-use crate::model::Model;
+use crate::model::{Model, ModelCost};
 use crate::usage::apply_cost;
 use crate::utils::provider_plumbing::now_millis;
 use cyrup_core::{
@@ -52,6 +52,18 @@ pub(super) struct Decoder {
     cache: ContentCache,
     pub(super) usage: Usage,
     pub(super) response_id: Option<String>,
+    /// The model id the server actually served, when it differs from the one requested (pi
+    /// `output.responseModel = responseModel` when `event.message.model !== model.id`,
+    /// `anthropic-messages.ts:605-606` @v0.87.1). Set once, from `message_start`. PROV-090.
+    pub(super) response_model: Option<String>,
+    /// The rates [`Self::snapshot_owned`] costs with, when a server-side fallback served the turn
+    /// and the model's compat declares local pricing for it (pi
+    /// `usageModel = {...model, id: responseModel, cost: fallbackCost}`, `:613`). `None` — the only
+    /// value any pre-PROV-090 stream can reach — costs with `model.cost`, byte-identical to before.
+    ///
+    /// Resolved ONCE at `message_start` rather than re-searched per snapshot: `snapshot_owned` is on
+    /// the hot per-event path (PERF-001), and pi likewise resolves `usageModel` once.
+    pub(super) usage_cost: Option<ModelCost>,
     pub(super) stop_reason: Option<StopReason>,
     /// The provider's own `stop_reason` string, kept verbatim beside the narrowed [`StopReason`]
     /// (pi `output.rawStopReason = event.delta.stop_reason`,
@@ -127,13 +139,13 @@ impl Decoder {
     /// change what a subscriber observes (PERF-001).
     pub(super) fn snapshot_owned(&mut self, model: &Model, api: &ApiId) -> AssistantMessage {
         let mut usage = self.usage.clone();
-        apply_cost(&model.cost, &mut usage);
+        apply_cost(self.usage_cost.as_ref().unwrap_or(&model.cost), &mut usage);
         AssistantMessage {
             content: self.content(),
             provider: model.provider.clone(),
             model: model.id.as_str().to_string(),
             api: api.clone(),
-            response_model: None,
+            response_model: self.response_model.clone(),
             response_id: self.response_id.clone(),
             diagnostics: None,
             usage,

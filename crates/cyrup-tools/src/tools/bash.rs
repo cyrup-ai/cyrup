@@ -257,11 +257,12 @@ impl Tool for ShellTool {
         }
     }
 
-    /// Pi `constrainedSampling: getExperimentalToolSampling()` (`core/tools/bash.ts:354`
-    /// @v0.84.2). It sits on `createShellToolDefinition`, so upstream `powershell` carries the same
-    /// declaration from the same line — and so does cyrup's, this being the shared engine.
+    /// Pi `constrainedSampling: { type: "json_schema", strict: "prefer" }`
+    /// (`core/tools/bash.ts:243` @v0.87.1). It sits on `createShellToolDefinition`, so upstream
+    /// `powershell` carries the same declaration from the same line — and so does cyrup's, this
+    /// being the shared engine. Unconditional since pi 0.86.0 dropped the `PI_EXPERIMENTAL` gate.
     fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
-        cyrup_core::experimental_tool_sampling()
+        crate::tools::prefer_strict_tool_sampling()
     }
 
     async fn execute(
@@ -778,32 +779,31 @@ mod tests {
     use super::{BASH_CONFIG, ShellTool};
     use crate::config::BashOpts;
     use crate::ops::local::LocalProc;
-    use cyrup_core::Tool;
+    use cyrup_core::{ConstrainedSampling, ConstrainedSamplingConfig, StrictSampling, Tool};
     use std::path::PathBuf;
     use std::sync::Arc;
-    /// PROV-011 DoD 1/2 — the tool's opt-in tracks the experimental flag and nothing else.
-    ///
-    /// Flag-aware by construction: with the flag unset (the default `cargo test` environment) the
-    /// declaration must be ABSENT, and under `CYRUP_EXPERIMENTAL=1` it must be
-    /// pi's `{type:"json_schema", strict:"prefer"}`. Running the suite either way exercises the
-    /// matching branch, and the assertion also pins the tool to
-    /// `cyrup_core::experimental_tool_sampling` rather than to some private copy of the value.
+    /// TOOL-046 — the declaration is UNCONDITIONAL: pi 0.86.0 removed the `PI_EXPERIMENTAL` gate
+    /// and `core/tools/bash.ts:243` @v0.87.1 states the literal
+    /// `constrainedSampling: { type: "json_schema", strict: "prefer" }`. No env is read here,
+    /// because none is read upstream.
     ///
     /// The declaration sits on the SHARED engine, exactly as pi puts it on
-    /// `createShellToolDefinition` (`bash.ts:354`), so `powershell` inherits it from the same line.
+    /// `createShellToolDefinition` (`bash.ts:243`), so `powershell` inherits it from the same line.
     #[test]
-    fn the_shell_engine_declares_constrained_sampling_when_the_experimental_flag_is_on() {
+    fn the_shell_engine_declares_strict_prefer_constrained_sampling_unconditionally() {
         let tool = ShellTool::new(
             &BASH_CONFIG,
             Arc::new(LocalProc::new()),
             PathBuf::from("."),
             BashOpts::default(),
         );
-        let expected = cyrup_core::experimental_tool_sampling_from(|k| std::env::var(k).ok());
-        assert_eq!(tool.constrained_sampling(), expected);
         assert_eq!(
             tool.constrained_sampling(),
-            cyrup_core::experimental_tool_sampling()
+            Some(&ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictSampling::Prefer
+                }
+            ))
         );
     }
 }

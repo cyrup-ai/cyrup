@@ -1,7 +1,8 @@
 //! The RPC `bash` surface: a genuine backend failure that must not be fabricated into a success,
 //! `abort_bash` interrupting an in-flight command (the G1 concurrency property, whose only
 //! deterministic observable is the interrupted command's `cancelled:true`), and the DRIFT-004
-//! `user_bash` extension event with its full and partial result overrides.
+//! `user_bash` extension event with its `{result}` override, its `{operations}` backend and the
+//! #9068 fail-closed verdict for every other DEFINED shape.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -327,25 +328,38 @@ async fn rpc_bash_honors_a_user_bash_result_override() {
     );
 }
 
-/// DRIFT-004 (c): a PARTIAL `result` override must short-circuit too. Pi is TypeScript with no
-/// runtime type enforcement, so `emitUserBash` short-circuits on ANY truthy `result`
-/// (`runner.ts:955-981`) and `rpc-mode.ts:566-571` takes it unconditionally — an extension may
-/// legally return just `{output, exitCode}`.
+/// DRIFT-004 (c), RECONCILED AGAINST THE v0.87.1 PIN: a PARTIAL `result` override does not
+/// short-circuit — it ABORTS. This test used to assert the opposite, on the strength of the v0.84.4
+/// pin, where `emitUserBash` really was `if (handlerResult) { return handlerResult as
+/// UserBashEventResult; }` (`core/extensions/runner.ts:1005-1032` @v0.84.4, the return at
+/// `:1015-1017`) — no predicate at all, and a `catch` that only reported. That is the code the old
+/// doc's "Pi is TypeScript with no runtime type enforcement" reasoning described.
 ///
-/// A strict deserializer here would be a FAIL-OPEN, not a nicety: a sandbox or remote-exec
-/// extension returning that shape would yield `None`, the override would be dropped, and the
-/// command would fall through and run raw on the local shell — exactly what the extension existed
-/// to prevent. `BashResult` is therefore `#[serde(default)]` on every field.
+/// coding-agent 0.86.0 (*Breaking*, #9068: "`user_bash` now fails closed: errors or invalid defined
+/// results abort the command without invoking later handlers or executing locally") replaced it with
+/// `isUserBashEventResult` (`runner.ts:136-158` @v0.87.1) plus a `throw` (`runner.ts:1162-1166`),
+/// and that predicate requires a `result` to carry a string `output`, a PRESENT `exitCode`, and BOTH
+/// `cancelled` and `truncated` as booleans (`runner.ts:150-157`). `{output, exitCode}` satisfies two
+/// of those four, so upstream REJECTS it — and pins that very shape itself:
+/// `test/extensions-runner.test.ts:656` lists `["an incomplete result", '{ result: { output:
+/// "handled" } }']` among the results that must `rejects.toThrow("Invalid user_bash handler
+/// result")` (`:650-681`).
 ///
-/// The sibling test above supplies all four fields and so cannot catch this.
+/// The SAFETY property the old test existed to protect is unchanged and still asserted below: a
+/// sandbox or remote-exec extension's command must NEVER fall through onto the local shell. Pi's
+/// fail-closed is the stronger of the two ways to get that — the half-built result becomes a visible
+/// RPC `error` instead of being silently downgraded into a local run (EXT-077). `BashResult`'s
+/// `#[serde(default)]` fields stay as they are; they are no longer what decides the question,
+/// `cyrup_ext::is_user_bash_event_result` is, one layer above them.
 #[tokio::test]
-async fn rpc_bash_honors_a_partial_user_bash_result_override() {
+async fn rpc_bash_fails_closed_on_a_partial_user_bash_result_override() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let probe = Arc::new(RpcUserBashProbe {
         seen: seen.clone(),
-        // Only the two fields a sandbox extension would realistically know.
+        // Only the two fields a sandbox extension would realistically know — and NOT a valid
+        // `UserBashEventResult`, because `cancelled`/`truncated` are absent.
         override_result: Some(serde_json::json!({
             "output": "sandboxed-elsewhere",
             "exitCode": 0,
@@ -369,38 +383,51 @@ async fn rpc_bash_honors_a_partial_user_bash_result_override() {
     let lines = parse_lines(&out);
     assert!(
         !lines.iter().any(|l| type_of(l) == "bash_execution_update"),
-        "a partial override must short-circuit local execution just like a full one: {lines:?}"
+        "an aborted bash streams no execution deltas — nothing ran: {lines:?}"
     );
     let resp = lines
         .iter()
         .find(|l| l["command"] == "bash" && l["id"] == "b1")
         .expect("bash response");
     assert_eq!(
-        resp["data"]["output"], "sandboxed-elsewhere",
-        "partial override honored: {resp}"
+        resp["success"], false,
+        "an invalid override is an RPC error, not a success: {resp}"
     );
     assert!(
-        !resp["data"]["output"]
+        resp["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("locally-executed"),
-        "the command must NOT have reached the local shell: {resp}"
+            .contains(cyrup_ext::INVALID_USER_BASH_RESULT_MESSAGE),
+        "the abort carries pi's own `Invalid user_bash handler result: …` sentence: {resp}"
     );
-    // Omitted fields fall back to their defaults rather than voiding the whole override.
-    assert_eq!(
-        resp["data"]["cancelled"], false,
-        "omitted `cancelled` defaults: {resp}"
+    assert!(
+        resp["data"].is_null(),
+        "an aborted bash carries no data payload: {resp}"
     );
-    assert_eq!(
-        resp["data"]["truncated"], false,
-        "omitted `truncated` defaults: {resp}"
-    );
+
+    // The property the pre-#9068 version of this test was really defending: the command the
+    // extension meant to service elsewhere must not have run here instead.
+    for line in &lines {
+        for field in [&line["data"]["output"], &line["delta"]] {
+            assert!(
+                !field
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("locally-executed"),
+                "the command must NOT have reached the local shell: {lines:?}"
+            );
+        }
+    }
 
     let msgs = session.agent_messages().await;
     let msgs_json = serde_json::to_value(&msgs).expect("agent messages serialize");
     assert!(
-        msgs_json.to_string().contains("sandboxed-elsewhere"),
-        "the partial override is recorded into the transcript: {msgs_json}"
+        !msgs_json.to_string().contains("bashExecution"),
+        "an aborted bash is never recorded into transcript history: {msgs_json}"
+    );
+    assert!(
+        !msgs_json.to_string().contains("sandboxed-elsewhere"),
+        "a rejected override must not be recorded either: {msgs_json}"
     );
 }
 
@@ -408,12 +435,12 @@ async fn rpc_bash_honors_a_partial_user_bash_result_override() {
 // SEAM-015 — the JSON-RPC `bash` command must honour the `operations` backend the `user_bash`
 // handler supplied, not just its `result`.
 //
-// Pi `rpc-mode.ts:578-582` @v0.84.4: after the `result` short-circuit it calls
+// Pi `rpc-mode.ts:578-582` @v0.87.1: after the `result` short-circuit (`:571-576`) it calls
 // `session.executeBash(command.command, undefined, {excludeFromContext, id,
 // operations: eventResult?.operations})` — `operations` at `:581`, the sibling half of
-// `UserBashEventResult` (`core/extensions/types.ts:1139`). cyrup fills the same field one frame
-// lower, inside the shared `execute_bash_with_user_event` wrapper, so this arm's literal
-// `operations: None` is upstream's absent CALLER-supplied backend rather than a dropped
+// `UserBashEventResult` (`core/extensions/types.ts:1229-1239` @v0.87.1). cyrup fills the same
+// field one frame lower, inside the shared `execute_bash_with_user_event` wrapper, so this arm's
+// literal `operations: None` is upstream's absent CALLER-supplied backend rather than a dropped
 // extension-supplied one.
 // ----------------------------------------------------------------------------------------------
 
@@ -460,10 +487,23 @@ impl cyrup_ext::NativeExtension for RpcBashOpsSupplier {
         _ctx: &cyrup_ext::HostCtx,
     ) -> cyrup_ext::HookOutcome {
         if matches!(ev, cyrup_ext::HostEvent::UserBash { .. }) {
-            // Upstream: any truthy `UserBashEventResult` ends the handler loop and becomes THE
-            // result (`core/extensions/runner.ts:1005-1032`); one carrying only `operations` does
-            // not short-circuit execution, it redirects it.
-            return cyrup_ext::HookOutcome::Handled(cyrup_ext::HandledValue(serde_json::json!({})));
+            // The FIRST DEFINED `UserBashEventResult` ends the handler loop and becomes THE result
+            // (`core/extensions/runner.ts:1159-1168` @v0.87.1); one carrying only `operations` does
+            // not short-circuit execution, it redirects it (`rpc-mode.ts:578-582`).
+            //
+            // The `operations` KEY is load-bearing, not decoration: `isUserBashEventResult` demands
+            // EXACTLY ONE of `operations`/`result` and rejects a payload with NEITHER
+            // (`runner.ts:140-142`) — upstream pins the bare `{}` as fail-closed itself
+            // (`test/extensions-runner.test.ts:652`). Pi puts the callable `exec` behind that key;
+            // ADR-0002 forbids a callable crossing cyrup's value-typed seam, so the key carries an
+            // empty object and the backend itself arrives through `user_bash_operations` below. That
+            // split is the CYRUP-DELTA `cyrup_ext::is_user_bash_event_result` documents, and it is
+            // mechanism-only: an owner that declares NO backend is pi's `{ operations: {} }` with no
+            // callable `exec` (`test/extensions-runner.test.ts:654`) and aborts just the same,
+            // rather than falling through onto the local shell.
+            return cyrup_ext::HookOutcome::Handled(cyrup_ext::HandledValue(
+                serde_json::json!({ "operations": {} }),
+            ));
         }
         cyrup_ext::HookOutcome::Noop
     }
@@ -540,5 +580,292 @@ async fn rpc_bash_runs_on_an_extension_supplied_operations_backend() {
                 .unwrap_or_default()
                 .contains("ran-on-extension-backend")),
         "a redirected bash still streams its output over the same event: {lines:?}"
+    );
+}
+
+// ----------------------------------------------------------------------------------------------
+// The whole `user_bash` result contract, end to end over the wire (EXT-077 / coding-agent #9068).
+//
+// Pi decides it in two places and nothing else touches it:
+//
+//   * `emitUserBash` (`core/extensions/runner.ts:1154-1183` @v0.87.1) — `handlerResult ===
+//     undefined` CONTINUEs to the next handler (`:1160`) and, if every handler does that, the method
+//     returns `undefined` (`:1182`) and the command runs locally. Any other value is checked by
+//     `isUserBashEventResult` and, if it fails, becomes
+//     `throw new Error("Invalid user_bash handler result: …")` (`:1162-1166`) — reported to the error
+//     listeners with `event: "user_bash"` and RE-THROWN (`:1168-1178`), so no later handler runs and
+//     nothing executes.
+//   * `isUserBashEventResult` (`runner.ts:136-158`) — a non-null object carrying EXACTLY ONE of
+//     `operations` / `result` (`:140-142`, so both `{}` and `{operations, result}` are rejected);
+//     `operations` must be a non-null object with a CALLABLE `exec` (`:143-146`); a `result` must
+//     have a string `output`, a PRESENT `exitCode` that is `undefined`-or-number, and BOTH
+//     `cancelled` and `truncated` as booleans, with `fullOutputPath` absent-or-string (`:148-157`).
+//
+// Upstream pins both halves directly: the fail-closed table at
+// `test/extensions-runner.test.ts:650-681` (`{}`, `{operations: null}`, `{operations: {}}`,
+// `{result: null}`, `{result: {output}}`, and both keys at once) and the accept case at `:682-704`
+// (`{operations: {exec}}` returned as-is, `{result: {output, exitCode, cancelled, truncated}}`
+// resolved verbatim).
+//
+// `cyrup-ext` pins the PREDICATE unit-wise already
+// (`tests::ext_fail_closed::is_user_bash_event_result_matches_pis_predicate`). What is pinned HERE is
+// that the RPC `bash` front-end — the surface EXT-077's lane never ran, which is how two of these
+// rows regressed unnoticed — routes each verdict to the right place: invalid to an RPC `error` with
+// nothing executed and nothing recorded, a valid `{result}` to the override verbatim with nothing
+// executed, and a valid `{operations}` to the extension's own backend instead of the local shell.
+// ----------------------------------------------------------------------------------------------
+
+/// A native extension that answers every `user_bash` event with ONE payload, verbatim, and
+/// optionally declares [`SentinelBashOps`] as its backend — cyrup's stand-in for the callable
+/// `operations.exec` ADR-0002 keeps off the value seam.
+struct RawUserBashProbe {
+    payload: Value,
+    ops: Option<Arc<SentinelBashOps>>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for RawUserBashProbe {
+    fn id(&self) -> cyrup_core::ExtensionId {
+        cyrup_core::ExtensionId::from("raw-user-bash-probe")
+    }
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.subscribe(&[cyrup_ext::EventKind::UserBash]);
+        Ok(())
+    }
+    async fn on_event(
+        &self,
+        ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        if matches!(ev, cyrup_ext::HostEvent::UserBash { .. }) {
+            return cyrup_ext::HookOutcome::Handled(cyrup_ext::HandledValue(self.payload.clone()));
+        }
+        cyrup_ext::HookOutcome::Noop
+    }
+    fn user_bash_operations(
+        &self,
+        _command: &str,
+        _exclude_from_context: bool,
+        _cwd: &str,
+    ) -> Option<Arc<dyn cyrup_tools::ops::BashOperations>> {
+        self.ops
+            .clone()
+            .map(|o| o as Arc<dyn cyrup_tools::ops::BashOperations>)
+    }
+}
+
+/// One wire `bash` command, answered by a `user_bash` handler returning `payload` verbatim and
+/// declaring a backend only when `with_backend`. Returns the RPC lines, the commands the backend was
+/// handed, and the serialized transcript.
+async fn drive_raw_user_bash(
+    payload: Value,
+    with_backend: bool,
+) -> (Vec<Value>, Vec<String>, String) {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let ops = Arc::new(SentinelBashOps {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let ext: Arc<dyn cyrup_ext::NativeExtension> = Arc::new(RawUserBashProbe {
+        payload,
+        ops: if with_backend {
+            Some(ops.clone())
+        } else {
+            None
+        },
+    });
+    let runtime = build_runtime_with_ext(&fx, faux, ext).await;
+    let session = runtime.session().await;
+
+    let input = concat!(
+        r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#,
+        "\n"
+    );
+    let reader = Cursor::new(input.as_bytes().to_vec());
+    let mut out: Vec<u8> = Vec::new();
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
+
+    let msgs = session.agent_messages().await;
+    let transcript = serde_json::to_value(&msgs)
+        .expect("agent messages serialize")
+        .to_string();
+    let executed = ops.seen.lock().unwrap().clone();
+    (parse_lines(&out), executed, transcript)
+}
+
+/// Every shape pi's fail-closed table rejects becomes an RPC `error` carrying pi's own sentence, with
+/// the local shell never reached, the extension's backend never reached, and nothing recorded.
+///
+/// Two rows of this table are cyrup's ADR-0002 mechanism split rather than a literal JSON copy of
+/// upstream's: `{operations: {}}` with no declared backend is pi's `["operations without exec"]`
+/// (`test/extensions-runner.test.ts:654`) — the callable is missing, so it must abort — and
+/// `{operations: true}` is its `typeof operations !== "object"` reject (`runner.ts:143-144`).
+#[tokio::test]
+async fn rpc_bash_fails_closed_on_every_invalid_user_bash_result() {
+    let cases: Vec<(&str, Value, bool)> = vec![
+        // ("an empty object", extensions-runner.test.ts:652) — NEITHER key.
+        ("an empty object", serde_json::json!({}), false),
+        // ("null operations", :653)
+        (
+            "null operations",
+            serde_json::json!({"operations": null}),
+            false,
+        ),
+        // `typeof operations !== "object"` (runner.ts:143-144).
+        (
+            "non-object operations",
+            serde_json::json!({"operations": true}),
+            false,
+        ),
+        // ("operations without exec", :654) over cyrup's seam: well-formed key, NO backend declared.
+        (
+            "an operations key whose owner declared no backend",
+            serde_json::json!({"operations": {}}),
+            false,
+        ),
+        // ("a null result", :655)
+        ("a null result", serde_json::json!({"result": null}), false),
+        // ("an incomplete result", :656)
+        (
+            "an incomplete result",
+            serde_json::json!({"result": {"output": "handled"}}),
+            false,
+        ),
+        // The same, one field further along — still missing `cancelled`/`truncated`.
+        (
+            "a result with only output and exitCode",
+            serde_json::json!({"result": {"output": "handled", "exitCode": 0}}),
+            false,
+        ),
+        // ("operations and a result", :657-660) — EXCLUSIVE upstream, even with both halves valid,
+        // and even with a backend really declared behind the `operations` key.
+        (
+            "operations and a result",
+            serde_json::json!({
+                "operations": {},
+                "result": {
+                    "output": "handled", "exitCode": 0, "cancelled": false, "truncated": false,
+                },
+            }),
+            true,
+        ),
+    ];
+
+    for (what, payload, with_backend) in cases {
+        let (lines, executed, transcript) = drive_raw_user_bash(payload, with_backend).await;
+
+        let resp = lines
+            .iter()
+            .find(|l| l["command"] == "bash" && l["id"] == "b1")
+            .unwrap_or_else(|| panic!("bash response for {what}: {lines:?}"));
+        assert_eq!(
+            resp["success"], false,
+            "{what} must fail closed, not succeed: {resp}"
+        );
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(cyrup_ext::INVALID_USER_BASH_RESULT_MESSAGE),
+            "{what} must carry pi's own rejection sentence: {resp}"
+        );
+        assert!(
+            !lines.iter().any(|l| type_of(l) == "bash_execution_update"),
+            "{what} must not stream execution deltas: {lines:?}"
+        );
+        for line in &lines {
+            for field in [&line["data"]["output"], &line["delta"]] {
+                assert!(
+                    !field
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("locally-executed"),
+                    "{what} must not reach the local shell: {lines:?}"
+                );
+            }
+        }
+        assert!(
+            executed.is_empty(),
+            "{what} must not reach the extension's backend either: {executed:?}"
+        );
+        assert!(
+            !transcript.contains("bashExecution"),
+            "{what} must record nothing into transcript history: {transcript}"
+        );
+    }
+}
+
+/// The other side of the same predicate: the two shapes pi ACCEPTS
+/// (`test/extensions-runner.test.ts:682-704`) are honoured, each to its own destination — so the
+/// fail-closed above is a faithful port and not a blanket refusal.
+#[tokio::test]
+async fn rpc_bash_honors_both_valid_user_bash_result_shapes() {
+    // `{ result: { output, exitCode, cancelled, truncated } }` — `rpc-mode.ts:571-576` records it and
+    // answers with it; execution never happens.
+    let (lines, executed, transcript) = drive_raw_user_bash(
+        serde_json::json!({"result": {
+            "output": "handled-by-extension", "exitCode": 0, "cancelled": false, "truncated": false,
+        }}),
+        // A backend is declared and must still be IGNORED: pi tests `eventResult?.result` first and
+        // returns before it ever looks at `operations` (`rpc-mode.ts:571-576`).
+        true,
+    )
+    .await;
+    let resp = lines
+        .iter()
+        .find(|l| l["command"] == "bash" && l["id"] == "b1")
+        .expect("bash response for a valid result override");
+    assert_eq!(
+        resp["success"], true,
+        "a valid result override wins: {resp}"
+    );
+    assert_eq!(
+        resp["data"]["output"], "handled-by-extension",
+        "the override is returned verbatim: {resp}"
+    );
+    assert!(
+        executed.is_empty(),
+        "a `result` short-circuits before `operations` is ever read: {executed:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| type_of(l) == "bash_execution_update"),
+        "a serviced bash streams nothing: {lines:?}"
+    );
+    assert!(
+        transcript.contains("handled-by-extension"),
+        "the override is recorded (`recordBashResult`, rpc-mode.ts:572-575): {transcript}"
+    );
+
+    // `{ operations }` — `rpc-mode.ts:578-582` runs the command THROUGH it rather than instead of it.
+    let (lines, executed, _transcript) =
+        drive_raw_user_bash(serde_json::json!({"operations": {}}), true).await;
+    let resp = lines
+        .iter()
+        .find(|l| l["command"] == "bash" && l["id"] == "b1")
+        .expect("bash response for an operations override");
+    assert_eq!(
+        resp["success"], true,
+        "an operations override redirects rather than fails: {resp}"
+    );
+    assert_eq!(
+        executed,
+        vec!["echo locally-executed".to_string()],
+        "the extension's backend ran the command: {executed:?}"
+    );
+    assert!(
+        resp["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ran-on-extension-backend"),
+        "the response is the backend's output, not the local shell's: {resp}"
+    );
+    assert!(
+        !resp["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("locally-executed"),
+        "the local shell never ran it: {resp}"
     );
 }

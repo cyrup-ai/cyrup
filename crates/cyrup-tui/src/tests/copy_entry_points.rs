@@ -224,3 +224,130 @@ async fn no_altscreen_ctrl_x_copies_the_last_message() {
         "the inline path takes the last-message leg unconditionally: [{t}]"
     );
 }
+
+/// **TUI-102**, the fullscreen half. Upstream's `copySelection` returns the THROWN message
+/// (`tui-renderer.ts:37-44`) and `copyTextToClipboard` flashes it for `COPY_ERROR_FLASH_DURATION_MS`
+/// (`tui-alt-screen.ts:80`, `:1459-1462`):
+///
+/// ```ts
+/// this.flash(
+///   ok ? "Copied!" : typeof result === "string" ? result : "Copy failed",
+///   ok ? undefined : COPY_ERROR_FLASH_DURATION_MS,
+/// );
+/// ```
+///
+/// cyrup's `AppAction::CopySelection` arm mapped a `bool` to the constant `"Copy failed"` and passed
+/// `None`, so a fullscreen copy failure flashed a message that named nothing for the DEFAULT one
+/// second (`altscreen/flash.rs:41`) — long enough to notice and not to read.
+///
+/// The decision is asserted through `copy_flash_for` rather than by driving the arm, because a CI
+/// host cannot make a real `copy_to_clipboard` produce either outcome on demand — the same reason
+/// `clipboard_write_plan` is a pure function over a parameterised platform.
+///
+/// **Red without the change:** `copy_flash_for` and `ClipboardError` do not exist.
+#[test]
+fn tui102_copy_failure_flashes_pis_message_for_five_seconds() {
+    use crate::app::run_action::copy_flash_for;
+    use crate::clipboard::ClipboardError;
+    use std::time::Duration;
+
+    assert_eq!(
+        copy_flash_for(&Err(ClipboardError::X11)),
+        (
+            "Clipboard unavailable: install `xclip` or `xsel`, or check X11 access",
+            Some(Duration::from_millis(5000)),
+        ),
+        "`tui-alt-screen.ts:1459-1462` flashes the thrown message for COPY_ERROR_FLASH_DURATION_MS",
+    );
+    assert_eq!(
+        copy_flash_for(&Ok(())),
+        ("Copied!", None),
+        "`ok ? \"Copied!\" : …`, `ok ? undefined : …` — success takes the DEFAULT duration",
+    );
+    // Every rung of the ladder reaches the flash as its own message, not one generic string.
+    for error in [
+        ClipboardError::Oversized,
+        ClipboardError::Termux,
+        ClipboardError::Wayland,
+        ClipboardError::X11,
+        ClipboardError::Unavailable,
+    ] {
+        let (message, dwell) = copy_flash_for(&Err(error));
+        assert_eq!(message, error.message());
+        assert_ne!(message, "Copy failed", "pi's fallback is unreachable here");
+        assert_eq!(dwell, Some(Duration::from_millis(5000)));
+    }
+}
+
+/// **TUI-102, the documentation half.** The row replaced the constant `"Copy failed"` flash with
+/// pi's thrown [`crate::clipboard::ClipboardError`] message held for
+/// [`crate::altscreen::COPY_ERROR_FLASH_DURATION`] (`tui-alt-screen.ts:1456-1463` @v0.87.1), but
+/// three doc comments went on describing the REMOVED behaviour as current, and the doc comment that
+/// names the new decision function linked a path that does not exist.
+///
+/// Both halves are read out of the sources at compile time because neither is reachable from a
+/// running test: rustdoc, not the binary, is what consumes them.
+///
+/// * The link. `clipboard.rs` wrote ``[`crate::app::copy_flash_for`]``; the function is
+///   `crate::app::run_action::copy_flash_for` (`app/run_action.rs:416`) and `app/mod.rs` has no
+///   re-export, so the workspace's `rustdoc::broken_intra_doc_links` deny turned
+///   `cargo doc -p cyrup-tui --no-deps` into `error: unresolved link to
+///   `crate::app::copy_flash_for`` / `error: could not document `cyrup-tui``. The crate's docs did
+///   not build at all.
+/// * The three claims. `app/action.rs`, `altscreen/mod.rs` and `altscreen/selection.rs` each still
+///   promised a flash of ``Copied!`` or ``Copy failed`` — the exact string pi reaches only when NO
+///   message came back (`ok ? "Copied!" : typeof result === "string" ? result : "Copy failed"`),
+///   which cannot happen in cyrup because every `ClipboardError` has one.
+///
+/// **Red without the change:** the link assertion fails on `clipboard.rs`'s old spelling, and each
+/// of the three files fails its own pair of assertions.
+#[test]
+fn tui102_the_flash_docs_name_pis_message_and_resolve_their_link() {
+    // (`path`, source) — the doc sites the row's behaviour change invalidated.
+    const SITES: [(&str, &str); 3] = [
+        ("app/action.rs", include_str!("../app/action.rs")),
+        ("altscreen/mod.rs", include_str!("../altscreen/mod.rs")),
+        (
+            "altscreen/selection.rs",
+            include_str!("../altscreen/selection.rs"),
+        ),
+    ];
+
+    for (path, src) in SITES {
+        for stale in ["`Copied!` or `Copy failed`", "`Copied!` / `Copy failed`"] {
+            assert!(
+                !src.contains(stale),
+                "{path} still documents the flash as {stale}, which TUI-102 removed: a fullscreen \
+                 copy failure now flashes the thrown `ClipboardError` message for \
+                 `COPY_ERROR_FLASH_DURATION` (`tui-alt-screen.ts:1456-1463`), and pi's bare \
+                 \"Copy failed\" fallback is unreachable in cyrup because every error carries a \
+                 message"
+            );
+        }
+        assert!(
+            src.contains("ClipboardError"),
+            "{path} describes the copy flash, so it must name `ClipboardError` — the enum whose \
+             message the flash now carries"
+        );
+        assert!(
+            src.contains("COPY_ERROR_FLASH_DURATION"),
+            "{path} describes the copy flash, so it must name the 5 s dwell a FAILURE now takes \
+             (`COPY_ERROR_FLASH_DURATION_MS = 5000`, `tui-alt-screen.ts:80`)"
+        );
+    }
+
+    const CLIPBOARD_SRC: &str = include_str!("../clipboard.rs");
+    assert!(
+        !CLIPBOARD_SRC.contains("[`crate::app::copy_flash_for`]"),
+        "clipboard.rs links `crate::app::copy_flash_for`, which does not resolve: the function is \
+         `crate::app::run_action::copy_flash_for` and `app/mod.rs` re-exports nothing. The \
+         workspace denies `rustdoc::broken_intra_doc_links`, so this one link makes \
+         `cargo doc -p cyrup-tui --no-deps` fail with `could not document `cyrup-tui``"
+    );
+    assert!(
+        CLIPBOARD_SRC.contains("[`crate::app::run_action::copy_flash_for`]"),
+        "clipboard.rs must still point at the flash-duration decision by its resolvable path — the \
+         reason `ClipboardError` is an enum and not a `String` is that `copy_flash_for` never has \
+         to re-parse a message"
+    );
+}

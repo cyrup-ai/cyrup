@@ -99,7 +99,13 @@ pub fn find_turn_start(entries: &[Entry], idx: usize, start: usize) -> Option<us
 /// Walk backward from `end` accumulating each entry's RAW-CONTEXT estimate until
 /// `keep_recent_tokens` is reached, snap to the nearest valid cut point at or after that entry, then
 /// fold leading context-invisible entries into the kept region. Mirrors Pi `findCutPoint`
-/// (`coding-agent/src/core/compaction/compaction.ts:403-461`).
+/// (`coding-agent/src/core/compaction/compaction.ts:474-520` @v0.87.1).
+///
+/// The budget-crossing snap is Pi's
+/// `cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];`
+/// (`compaction.ts:498` @v0.87.1) — when trailing tool results exceed the keep budget by
+/// themselves there is no valid cut point at or after them, and the cut must land on the LAST
+/// valid point (the preceding assistant tool call), not fall back to the first message.
 ///
 /// Both the accumulation and the back-scan key off the SAME "is this entry context-visible?"
 /// predicate (`sessionEntryToContextMessages(entry).length > 0`), so `custom_message` and non-empty
@@ -146,8 +152,19 @@ pub fn find_cut_point(
         }
         acc = acc.saturating_add(est);
         if acc >= keep_recent_tokens {
-            // Snap to the closest valid cut point at or after this entry.
-            if let Some(&v) = valid.iter().find(|&&v| v >= i) {
+            // Snap to the closest valid cut point at or after this entry, falling back to the
+            // LAST valid point when none is at or after it — Pi:
+            //   cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
+            // (`coding-agent/src/core/compaction/compaction.ts:498` @v0.87.1), with Pi's comment:
+            // "If trailing tool results exceed the budget by themselves, keep their preceding
+            // assistant tool call instead of falling back to the first message." `valid` is proven
+            // non-empty by the early return above, so `valid.last()` always yields.
+            if let Some(v) = valid
+                .iter()
+                .copied()
+                .find(|&v| v >= i)
+                .or_else(|| valid.last().copied())
+            {
                 cut_idx = v;
             }
             break;

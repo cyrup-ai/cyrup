@@ -101,3 +101,133 @@ async fn decodes_text_thinking_and_tool_use_in_upstream_order() {
         other => panic!("expected a tool call, got {other:?}"),
     }
 }
+
+/// PROV-097 — encrypted reasoning (`reasoningContent.redactedContent`) from a non-Anthropic model on
+/// Bedrock. pi `bedrock-converse-stream.ts:652-675` + `:678-690` @v0.87.1. Translated from
+/// `packages/ai/test/bedrock-redacted-reasoning.test.ts` @v0.87.1.
+mod prov097_redacted_reasoning {
+    use super::*;
+    use base64::Engine as _;
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn thinking_of(events: &[StreamEvent]) -> Content {
+        let msg = events
+            .iter()
+            .find_map(StreamEvent::terminal_message)
+            .expect("terminal");
+        msg.content
+            .iter()
+            .find(|c| matches!(c, Content::Thinking { .. }))
+            .cloned()
+            .expect("a thinking block")
+    }
+
+    /// Two `redactedContent` chunks, no `text`/`signature`: the block exists, carries the
+    /// placeholder, is flagged `redacted`, and its signature is the base64 of the JOINED bytes.
+    /// The two chunks are 4 and 2 bytes, so neither is a multiple of three — concatenating their
+    /// own base64 strings would give the wrong answer, which is why the bytes are buffered.
+    #[tokio::test]
+    async fn redacted_content_becomes_one_placeholder_thinking_block() {
+        let first: &[u8] = b"abcd";
+        let second: &[u8] = b"ef";
+        let chunks = vec![
+            event("messageStart", "{\"role\":\"assistant\"}"),
+            event(
+                "contentBlockDelta",
+                &format!(
+                    "{{\"contentBlockIndex\":0,\"delta\":{{\"reasoningContent\":{{\"redactedContent\":\"{}\"}}}}}}",
+                    b64(first)
+                ),
+            ),
+            event(
+                "contentBlockDelta",
+                &format!(
+                    "{{\"contentBlockIndex\":0,\"delta\":{{\"reasoningContent\":{{\"redactedContent\":\"{}\"}}}}}}",
+                    b64(second)
+                ),
+            ),
+            event("contentBlockStop", "{\"contentBlockIndex\":0}"),
+            event("messageStop", "{\"stopReason\":\"end_turn\"}"),
+        ];
+        let events = collect(chunks, &sonnet_45()).await;
+
+        assert_eq!(
+            thinking_of(&events),
+            Content::Thinking {
+                thinking: "[Reasoning redacted]".into(),
+                thinking_signature: Some(b64(b"abcdef")),
+                redacted: true,
+            }
+        );
+        // Exactly ONE placeholder delta, from the FIRST chunk only (pi's `if (!redacted)` guard).
+        let placeholders: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ThinkingDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(placeholders, vec!["[Reasoning redacted]"]);
+    }
+
+    /// A `signature` arriving AFTER `redactedContent` is NOT appended: the field holds an Anthropic
+    /// signature or an opaque redacted payload, never both (pi `:655-657`).
+    #[tokio::test]
+    async fn a_signature_after_redacted_content_is_not_appended() {
+        let chunks = vec![
+            event("messageStart", "{\"role\":\"assistant\"}"),
+            event(
+                "contentBlockDelta",
+                &format!(
+                    "{{\"contentBlockIndex\":0,\"delta\":{{\"reasoningContent\":{{\"redactedContent\":\"{}\"}}}}}}",
+                    b64(b"opaque")
+                ),
+            ),
+            event(
+                "contentBlockDelta",
+                "{\"contentBlockIndex\":0,\"delta\":{\"reasoningContent\":{\"signature\":\"sig\"}}}",
+            ),
+            event("contentBlockStop", "{\"contentBlockIndex\":0}"),
+            event("messageStop", "{\"stopReason\":\"end_turn\"}"),
+        ];
+        let events = collect(chunks, &sonnet_45()).await;
+        let Content::Thinking {
+            thinking_signature, ..
+        } = thinking_of(&events)
+        else {
+            panic!("thinking");
+        };
+        assert_eq!(thinking_signature, Some(b64(b"opaque")));
+    }
+
+    /// Regression guard: the ordinary Anthropic-on-Bedrock path (`text` + `signature`) must stay
+    /// exactly as it was — `redacted: false` and the signature verbatim, not base64 of anything.
+    #[tokio::test]
+    async fn the_plain_text_and_signature_path_is_unchanged() {
+        let chunks = vec![
+            event("messageStart", "{\"role\":\"assistant\"}"),
+            event(
+                "contentBlockDelta",
+                "{\"contentBlockIndex\":0,\"delta\":{\"reasoningContent\":{\"text\":\"think\"}}}",
+            ),
+            event(
+                "contentBlockDelta",
+                "{\"contentBlockIndex\":0,\"delta\":{\"reasoningContent\":{\"signature\":\"sig\"}}}",
+            ),
+            event("contentBlockStop", "{\"contentBlockIndex\":0}"),
+            event("messageStop", "{\"stopReason\":\"end_turn\"}"),
+        ];
+        let events = collect(chunks, &sonnet_45()).await;
+        assert_eq!(
+            thinking_of(&events),
+            Content::Thinking {
+                thinking: "think".into(),
+                thinking_signature: Some("sig".to_string()),
+                redacted: false,
+            }
+        );
+    }
+}

@@ -557,6 +557,52 @@ pub struct CompactOptions {
     pub custom_instructions: Option<String>,
 }
 
+/// How a message a guest sends reaches a RUNNING agent — pi
+/// `sendUserMessage(content, {deliverAs})` (`core/agent-session.ts:2006-2035` @v0.87.1, the union at
+/// `:2008`), threaded on to `prompt` as `streamingBehavior` (`:2032`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeliverAs {
+    /// Redirect the run in flight.
+    Steer,
+    /// Queue the message for after the current run settles.
+    FollowUp,
+}
+
+/// Options for `sendUserMessage` (pi `core/agent-session.ts:2006-2009` @v0.87.1).
+///
+/// Both fields are `Option` because upstream reads them through `options?.` — an ABSENT key and a
+/// present one are different, and each absence has its own documented consequence (`:2029-2034`).
+/// Omitting the whole bag is legal and is what `Self::default()` serializes to.
+///
+/// [`Self::expand_prompt_templates`] defaults to FALSE upstream and its doc comment there is
+/// explicit about what that covers: "Whether to dispatch extension commands and expand skill
+/// commands and prompt templates. Default: false." So a guest that relays a literal `"/foo"` gets a
+/// user message reading `/foo` and NOT a dispatched extension command, unless it asks.
+///
+/// The host end of both fields is `cyrup-session-svc`'s `ControlOp::SendUserMessage` arm
+/// (`session/control.rs`), which decodes this exact shape and hands it to `prompt_with` the way pi
+/// hands it to `prompt`. Pinned by that crate's `ext_083_send_user_message_options` tests; until
+/// EXT-083 the bag was decoded nowhere and discarded one frame after this type built it.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendUserMessageOptions {
+    /// Delivery mode while the agent is streaming (pi `options.deliverAs`,
+    /// `agent-session.ts:2008`, passed on as `streamingBehavior` at `:2032`).
+    ///
+    /// `None` is upstream's absent key, which is NOT "the host decides": while the agent is
+    /// streaming pi refuses the message — "Agent is already processing. Specify streamingBehavior
+    /// ('steer' or 'followUp') to queue the message." (`:1655-1659`) — and when it is idle there is
+    /// no queue to pick, so the message simply starts a turn. Spell a variant whenever the message
+    /// may land mid-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_as: Option<DeliverAs>,
+    /// Dispatch extension commands and expand skill commands and prompt templates. `None` is
+    /// upstream's `?? false` (`agent-session.ts:2030`) — opt IN, not opt out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expand_prompt_templates: Option<bool>,
+}
+
 /// Options for `newSession` (Pi types.ts:346): an optional parent session + the `with_session`
 /// re-binding request (the `setup`/`withSession` closures map to the host re-binding flow).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

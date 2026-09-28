@@ -1028,8 +1028,10 @@ pub fn parse_agent_file_checked(
 
     let extensions = parse_frontmatter_list(parsed.get("extensions"));
 
-    let subagent_only_extensions =
-        parse_frontmatter_list(parsed.get("subagentOnlyExtensions")).unwrap_or_default();
+    // SUBA-123b: NO `unwrap_or_default()`. `parse_frontmatter_list` already distinguishes an absent
+    // key (`None`) from one declared empty (`Some(vec![])`), and collapsing the two made
+    // `subagents.defaultSubagentOnlyExtensions` unable to honour an explicit "none".
+    let subagent_only_extensions = parse_frontmatter_list(parsed.get("subagentOnlyExtensions"));
 
     let model = parsed.get("model").map(ModelId::from);
     let thinking = parsed.get("thinking").and_then(parse_thinking_value);
@@ -1374,6 +1376,7 @@ pub fn parse_agent_file_checked(
         extensions,
         extensions_from_default: false,
         subagent_only_extensions,
+        subagent_only_extensions_from_default: false,
         model,
         fallback_models,
         thinking,
@@ -2093,10 +2096,10 @@ mod tests {
             parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         assert_eq!(
             def.subagent_only_extensions,
-            vec![
+            Some(vec![
                 "./tools/child-search.ts".to_string(),
                 "/opt/pi/child-only.ts".to_string()
-            ]
+            ])
         );
     }
 

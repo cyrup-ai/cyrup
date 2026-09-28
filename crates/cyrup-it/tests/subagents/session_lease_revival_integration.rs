@@ -138,6 +138,8 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 
 fn base_config(run_id: RunId, steps: Vec<RunnerStep>, dir: &Path) -> RunnerConfig {
     RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,

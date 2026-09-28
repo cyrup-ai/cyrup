@@ -4,6 +4,15 @@
 
 use crate::model::Model;
 
+/// Whether this model uses Gemini's discrete `thinkingLevel` control instead of the token-based
+/// `thinkingBudget` control (Pi `usesGoogleThinkingLevel`, google-shared.ts:72-83 @v0.87.1). This
+/// selects only the WIRE FORMAT — which rungs are supported, and what each sends, comes from
+/// `model.thinking_level_map` (see `thinking::resolve_google_thinking_level`). Upstream's predicate
+/// is still id-based, and it is exactly the union of the three probes below.
+pub(super) fn uses_google_thinking_level(model: &Model) -> bool {
+    is_gemini3_pro(model) || is_gemini3_flash(model) || is_gemma4(model)
+}
+
 /// `/gemma-?4/` (Pi `isGemma4Model`, google-generative-ai.ts:404-406).
 pub(super) fn is_gemma4(model: &Model) -> bool {
     let id = model.id.as_str().to_lowercase();

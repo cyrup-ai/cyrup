@@ -47,7 +47,7 @@ impl Settings {
         // next `/config` write is REFUSED instead of rewriting the user's file from `{}`. pi has no
         // degraded path either: `JSON.parse` + `migrateSettings` (settings-manager.ts:389
         // @v0.83.0), and `persistScopedSettings` (`:585-593`) spreads whatever it parsed.
-        let mut obj: Map<String, Value> = serde_json::from_str(text)?;
+        let mut obj: Map<String, Value> = serde_json::from_str(crate::strip_bom(text))?;
         migrate_settings(&mut obj);
         Ok(Self { obj })
     }
@@ -208,5 +208,24 @@ impl Settings {
 pub(crate) fn strip_global_only(settings: &mut Settings) {
     for k in GLOBAL_ONLY_KEYS {
         settings.obj.remove(*k);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::Settings;
+
+    /// CFG-087: pi strips a leading BOM before `JSON.parse` at every read site
+    /// (`settings-manager.ts:424`, `:645` @v0.87.1 → `stripBom`, `utils/text.ts:7-9`).
+    #[test]
+    fn a_bom_does_not_change_how_a_settings_document_parses() {
+        let plain = Settings::parse(r#"{"model":"x"}"#).expect("plain document parses");
+        let bommed = Settings::parse("\u{feff}{\"model\":\"x\"}").expect("BOM'd document parses");
+        assert_eq!(bommed, plain);
+        assert_eq!(
+            bommed.as_map().get("model").and_then(|v| v.as_str()),
+            Some("x")
+        );
     }
 }

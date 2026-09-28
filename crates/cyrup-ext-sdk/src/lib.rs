@@ -79,10 +79,11 @@ pub use ctx::{
     Signal, ToolCall, Ui,
 };
 pub use descriptor::{
-    CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig,
+    CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig, DeliverAs,
     DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions, ForkPosition, GrammarVariants,
     ModelCost, ModelCostTier, NavigateOptions, NewSessionOptions, ProviderConfig,
-    ProviderModelConfig, RenderShell, StrictSampling, SwitchSessionOptions, ToolDescriptor,
+    ProviderModelConfig, RenderShell, SendUserMessageOptions, StrictSampling, SwitchSessionOptions,
+    ToolDescriptor,
 };
 pub use events::*;
 pub use provider::{
@@ -115,9 +116,10 @@ pub mod prelude {
     };
     pub use crate::descriptor::{
         CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig,
-        DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions, ForkPosition, GrammarVariants,
-        ModelCost, ModelCostTier, NavigateOptions, NewSessionOptions, ProviderConfig,
-        ProviderModelConfig, RenderShell, StrictSampling, SwitchSessionOptions, ToolDescriptor,
+        DeliverAs, DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions, ForkPosition,
+        GrammarVariants, ModelCost, ModelCostTier, NavigateOptions, NewSessionOptions,
+        ProviderConfig, ProviderModelConfig, RenderShell, SendUserMessageOptions, StrictSampling,
+        SwitchSessionOptions, ToolDescriptor,
     };
     pub use crate::events::*;
     pub use crate::provider::{

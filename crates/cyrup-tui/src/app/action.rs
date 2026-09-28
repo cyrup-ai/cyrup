@@ -20,7 +20,10 @@ pub enum AppAction {
     ///
     /// It rides an `AppAction` for the same reason [`Self::FollowUp`] and [`Self::Dequeue`] do:
     /// [`crate::clipboard::copy_to_clipboard`] is `async` and `App::handle_input` is not. The run
-    /// loop performs the write and flashes `Copied!` or `Copy failed` on the result (§B-11).
+    /// loop performs the write and flashes [`crate::app::run_action::copy_flash_for`]'s verdict on
+    /// the result (§B-11): `Copied!` at the default dwell, or — TUI-102 — the
+    /// [`crate::clipboard::ClipboardError`] message pi throws, held for
+    /// [`crate::altscreen::COPY_ERROR_FLASH_DURATION`] (`tui-alt-screen.ts:1456-1463`).
     CopySelection(String),
     /// The user requested an abort/interrupt of the in-flight run (Esc).
     Interrupt,

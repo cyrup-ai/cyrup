@@ -207,6 +207,20 @@ impl App<InlineBackend<Stdout>> {
         // …and the context segment, which is a property of the NEW branch's entries and its model's
         // window (`footer.ts:108-111`).
         self.refresh_context_usage(&ctx.session).await;
+        // TUI-105 — ...and the footer's available-provider count, for the same reason and from the
+        // same upstream statement: `rebindCurrentSession` ends with
+        // `await this.updateAvailableProviderCount();` (`interactive-mode.ts:2042`), immediately
+        // before `updateEditorBorderColor()` and `updateTerminalTitle()`. It is the hook
+        // `setRebindSession` registers (`:573-574`), so EVERY `/reload`, `/new`, `/resume`, `/fork`
+        // and `/import` recounts there.
+        //
+        // The count is a property of the SWAPPED-IN session's credentials and scoped set — a
+        // `/resume` of a session recorded under a different agent dir reads a different `auth.json`
+        // (the very reason `refresh_auth_snapshot` runs above), and `/reload` re-reads
+        // `scopedModels` from rebuilt settings. Without this the `provider_count > 1` gate
+        // (`status.rs:597`) that decides whether the footer prefixes the model with `(provider)`
+        // kept answering from the OUTGOING session's provider set for the rest of the process.
+        self.refresh_provider_count(&ctx.session);
         // The swapped-in session owns a fresh `LiveHostServices`; re-install the ui sink so a
         // post-swap guest dialog still reaches this loop (L4 review §2.1, same re-install this run
         // loop's `AppAction::Command` rebind mirrors from `crates/cyrup-modes/src/rpc.rs`'s
@@ -741,15 +755,33 @@ impl App<InlineBackend<Stdout>> {
         Ok(())
     }
 
-    pub(crate) fn on_login_msg(
+    pub(crate) async fn on_login_msg(
         &mut self,
+        ctx: &mut RunCtx,
         msg: crate::login_dialog::LoginUiMsg,
     ) -> Result<(), TuiError> {
         // The spawned `/login` flow wants something: a prompt rendered, progress shown,
         // or the whole login settled (Pi's `prompt`/`notify` callbacks +
         // the `try`/`catch` around `loginProvider`, `interactive-mode.ts:5367-5374`,
         // `:5285-5296`). Answers travel back over the one-shot the message carried.
-        self.apply_login_msg(msg);
+        //
+        // **TUI-105.** The settle half now needs the session — `completeProviderAuthentication`
+        // reads the catalog, sets the model and spawns the refresh (`interactive-mode.ts:5879-5973`) —
+        // so this arm takes `ctx` and awaits, the shape `on_tree_nav_msg` below already has.
+        self.apply_login_msg(&ctx.session, msg).await;
+        self.frames.request();
+        Ok(())
+    }
+
+    /// **TUI-105.** A spawned post-login catalog refresh settled — pi's `.then` continuation
+    /// (`interactive-mode.ts:5956-5971`): the warnings, the deferred selection under its
+    /// `session.model === previousModel` guard, then the provider count and the repaint.
+    pub(crate) async fn on_login_refresh_msg(
+        &mut self,
+        ctx: &mut RunCtx,
+        msg: crate::login_dialog::LoginRefreshMsg,
+    ) -> Result<(), TuiError> {
+        self.apply_login_refresh(&ctx.session, msg).await;
         self.frames.request();
         Ok(())
     }

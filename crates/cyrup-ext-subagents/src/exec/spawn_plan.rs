@@ -44,6 +44,12 @@ pub struct AttemptSpawnPlan {
     /// alongside the spec rather than re-derived from the overlay so the read side cannot drift
     /// from the write side.
     pub tool_diagnostic_path: Option<PathBuf>,
+    /// SUBA-119 — the EXACT model id this attempt put on the child's `--model` argv: pi's `modelArg`
+    /// (`execution.ts:363`), i.e. the candidate WITH its thinking suffix applied. It is upstream's
+    /// `expectedModelForVerification` (`:365`), the value the child's own reported model is compared
+    /// against, and it is returned here rather than re-derived by the caller precisely so the two can
+    /// never drift: verification must check what was actually launched.
+    pub model_arg: String,
     /// The tool surface this attempt actually launched the child with — the value behind its
     /// `--tools` CSV, carried beside [`Self::tool_diagnostic_path`] for the same stated reason:
     /// returned alongside the spec rather than re-derived from the overlay, so the read side
@@ -479,7 +485,7 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         "--mode".to_string(),
         "json".to_string(),
         "--model".to_string(),
-        model_arg,
+        model_arg.clone(),
     ];
 
     // The ONE resolution: the `tools` split, the ceiling's `read` refusal, the ceiling filter, the
@@ -623,6 +629,7 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     let cwd = opts.cwd.clone();
 
     Ok(AttemptSpawnPlan {
+        model_arg,
         spec: ChildSpawnSpec {
             command: SpawnCommand {
                 binary: command.binary,
@@ -2385,6 +2392,7 @@ mod tests {
 
         let injection = crate::discovery::skills::build_skill_injection(&[
             crate::discovery::skills::ResolvedSkill {
+                disable_model_invocation: false,
                 name: "fallback-skill".to_string(),
                 path: dir.path().join(".cyrup/skills/fallback-skill/SKILL.md"),
                 description: Some("Use fallback mode.".to_string()),

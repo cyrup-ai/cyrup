@@ -867,6 +867,7 @@ async fn prompt_injects_next_turn_after_user_and_expands_skill() {
             false,
             None,
             Some(crate::DeliverAs::NextTurn),
+            None,
         )
         .await
         .unwrap();

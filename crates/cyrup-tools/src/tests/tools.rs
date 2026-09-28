@@ -1881,13 +1881,46 @@ fn image_magic_detection() {
         Some(ImageMime::Jpeg)
     );
     assert_eq!(ImageMime::from_magic(&[0xff, 0xd8, 0xff, 0xf7]), None);
+    // TOOL-048 — both GIF signatures in full, and NOTHING that merely starts with "GIF"
+    // (`utils/mime.ts:13` @v0.87.1; pi #9755, CHANGELOG 0.87.0).
     assert_eq!(ImageMime::from_magic(b"GIF89a"), Some(ImageMime::Gif));
+    assert_eq!(ImageMime::from_magic(b"GIF87a"), Some(ImageMime::Gif));
+    assert_eq!(ImageMime::from_magic(b"GIFT list\n"), None);
+    assert_eq!(ImageMime::from_magic(b"GIFs I like\n"), None);
+    assert_eq!(ImageMime::from_magic(b"GIF"), None);
     let mut webp = Vec::from(*b"RIFF");
     webp.extend_from_slice(&[0, 0, 0, 0]);
     webp.extend_from_slice(b"WEBP");
     assert_eq!(ImageMime::from_magic(&webp), Some(ImageMime::Webp));
     // Plain text is not an image.
     assert_eq!(ImageMime::from_magic(b"hello world\n"), None);
+}
+
+/// TOOL-048 at the TOOL boundary — the half of the fix a model actually sees. A text file whose
+/// first three bytes are `GIF` used to sniff as `image/gif` (the loose `b"GIF"` prefix), get routed
+/// to `read`'s IMAGE branch, fail to decode, and come back as an image-failure note instead of the
+/// file's text. Upstream: `utils/mime.ts:13` @v0.87.1 / pi #9755 — *"Fixed text files beginning
+/// with GIF being misclassified as images and omitted from read and CLI @file input"*.
+#[tokio::test]
+async fn read_returns_the_text_of_a_file_that_merely_starts_with_gif() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("notes.txt"), "GIFs I like\n").unwrap();
+    let read = ReadTool::new(fs(), cwd, ReadOpts::default());
+    let r = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "notes.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first_text(&r),
+        "GIFs I like\n",
+        "a text file starting with GIF must take read's TEXT path verbatim"
+    );
 }
 
 /// TOOL-035 — Pi sniffs a fixed `IMAGE_TYPE_SNIFF_BYTES = 4100`-byte header (mime.ts:3, read at

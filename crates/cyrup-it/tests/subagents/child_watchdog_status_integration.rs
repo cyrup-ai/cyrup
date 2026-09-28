@@ -97,6 +97,10 @@ fn agent_config() -> AgentConfig {
 
 fn run_options(cwd: &Path) -> RunOptions {
     RunOptions {
+        // SUBA-119 — a fixture launch whose model comes from its own agent config, so
+        // native-child model verification is armed and no response-id alias is declared.
+        model_override_from_parent: false,
+        model_response_aliases: None,
         parent_env_overrides: std::collections::BTreeMap::new(),
         machine: None,
         model_exclusions: None,

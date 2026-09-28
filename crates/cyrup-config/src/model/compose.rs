@@ -177,7 +177,15 @@ pub(crate) fn apply_models_json(
     // Step 2: upsert each declared model (:191-197).
     for definition in &config.models {
         let existing = models.iter().position(|m| m.id.as_str() == definition.id);
-        let defaults = existing.map_or_else(|| models.first(), |i| models.get(i));
+        // `findModelDefaults(models, definition.id, definition.api ?? config.api)`
+        // (provider-composer.ts:239). The third argument is the DEFINITION's api first, then the
+        // provider block's — passing only the definition's reproduces half of CFG-092 whenever the
+        // wire api is declared at provider level.
+        let defaults = find_model_defaults(
+            &models,
+            &definition.id,
+            definition.api.as_deref().or(config.api.as_deref()),
+        );
         let model = model_from_json(provider_id, definition, config, defaults)?;
         match existing {
             Some(i) => {
@@ -196,6 +204,34 @@ pub(crate) fn apply_models_json(
         }
     }
     Ok(models)
+}
+
+/// Pi `findModelDefaults` (provider-composer.ts:198-205 @v0.87.1): which existing model a declared
+/// `models.json` entry inherits `api` / `baseUrl` from, as four rungs tried in order.
+///
+/// 1. the same `id` — an override of a built-in inherits from the built-in it replaces;
+/// 2. the same wire `api`, when the caller knows one — so an `anthropic-messages` entry cannot take
+///    an `openai-responses` model's endpoint;
+/// 3. the first `openai-completions` model — upstream's de-facto default wire api;
+/// 4. the first model at all.
+///
+/// New upstream at v0.85.0 (absent at v0.84.4): rungs 2 and 3 did not exist when the cyrup port was
+/// written, which is why CFG-092 is drift rather than a porting mistake.
+fn find_model_defaults<'a>(
+    models: &'a [Model],
+    model_id: &str,
+    api: Option<&str>,
+) -> Option<&'a Model> {
+    models
+        .iter()
+        .find(|m| m.id.as_str() == model_id)
+        .or_else(|| api.and_then(|api| models.iter().find(|m| m.api.as_str() == api)))
+        .or_else(|| {
+            models
+                .iter()
+                .find(|m| m.api.as_str() == "openai-completions")
+        })
+        .or_else(|| models.first())
 }
 
 /// Pi `modelFromJson` (provider-composer.ts:124-159): build one `Model` from a `models.json`
@@ -417,6 +453,95 @@ fn merge_compat(
 mod tests {
     use super::*;
     use crate::model::fixtures::{model, oai};
+
+    // ---- findModelDefaults rungs (CFG-092) ---------------------------------------------------
+
+    /// A built-in with an explicit wire api and endpoint.
+    fn wired(provider: &str, id: &str, api: &str, base_url: &str) -> Model {
+        let mut m = model(provider, id, id);
+        m.api = cyrup_provider::ApiId::from(api);
+        m.base_url = base_url.to_string();
+        m
+    }
+
+    fn composed(base: &[Model], json: &str) -> Vec<Model> {
+        let file: ModelFile = serde_json::from_str(json).unwrap();
+        let (out, errors) = file.compose(base);
+        assert!(errors.is_empty(), "{errors:?}");
+        out
+    }
+
+    fn by_id<'a>(models: &'a [Model], id: &str) -> &'a Model {
+        models
+            .iter()
+            .find(|m| m.id.as_str() == id)
+            .expect("composed model present")
+    }
+
+    #[test]
+    fn rung_2_a_declared_model_inherits_from_the_model_with_the_same_wire_api() {
+        // provider-composer.ts:201 @v0.87.1. Note the provider block declares NO baseUrl, so step 1
+        // leaves the built-ins' own endpoints in place and the two are still distinguishable.
+        let base = vec![
+            wired("acme", "a", "openai-responses", "https://x.example/v1"),
+            wired("acme", "b", "anthropic-messages", "https://y.example/v1"),
+        ];
+        let out = composed(
+            &base,
+            r#"{"providers":{"acme":{"models":[{"id":"c","api":"anthropic-messages"}]}}}"#,
+        );
+        assert_eq!(
+            by_id(&out, "c").base_url,
+            "https://y.example/v1",
+            "an anthropic-messages entry must not take an openai-responses model's endpoint"
+        );
+    }
+
+    #[test]
+    fn rung_2_reads_the_provider_blocks_api_when_the_definition_has_none() {
+        // pi passes `definition.api ?? config.api`, so a provider-level `api` selects the rung too.
+        let base = vec![
+            wired("acme", "a", "openai-responses", "https://x.example/v1"),
+            wired("acme", "b", "anthropic-messages", "https://y.example/v1"),
+        ];
+        let out = composed(
+            &base,
+            r#"{"providers":{"acme":{"api":"anthropic-messages","models":[{"id":"c"}]}}}"#,
+        );
+        assert_eq!(by_id(&out, "c").base_url, "https://y.example/v1");
+    }
+
+    #[test]
+    fn rung_3_falls_back_to_the_first_openai_completions_model_not_to_models_0() {
+        // provider-composer.ts:202. The openai-completions model sits at a NON-first index, so this
+        // cannot pass by accident through rung 4.
+        let base = vec![
+            wired("acme", "a", "openai-responses", "https://x.example/v1"),
+            wired("acme", "b", "openai-completions", "https://z.example/v1"),
+        ];
+        let out = composed(&base, r#"{"providers":{"acme":{"models":[{"id":"d"}]}}}"#);
+        let d = by_id(&out, "d");
+        assert_eq!(d.api.as_str(), "openai-completions");
+        assert_eq!(d.base_url, "https://z.example/v1");
+    }
+
+    #[test]
+    fn rung_1_same_id_still_beats_the_api_match() {
+        // The ordering guard: reordering the rungs to try `api` before `id` breaks exactly this.
+        let base = vec![
+            wired("acme", "a", "openai-responses", "https://x.example/v1"),
+            wired("acme", "b", "anthropic-messages", "https://y.example/v1"),
+        ];
+        let out = composed(
+            &base,
+            r#"{"providers":{"acme":{"models":[{"id":"b","api":"openai-responses"}]}}}"#,
+        );
+        assert_eq!(
+            by_id(&out, "b").base_url,
+            "https://y.example/v1",
+            "the same-id built-in wins over the same-api one"
+        );
+    }
 
     // ---- models.json composition (CFG-002) --------------------------------------------------
 

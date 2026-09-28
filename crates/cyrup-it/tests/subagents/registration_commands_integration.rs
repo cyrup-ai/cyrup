@@ -309,6 +309,10 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
             // G101 added these two; a profile declares neither.
             default_thinking: None,
             default_extensions: None,
+            // SUBA-123a/123b added these three; a profile declares none of them.
+            default_subagent_only_extensions: None,
+            agent_scan_dirs: None,
+            agent_exclude_dirs: None,
             disable_builtins: None,
             disable_thinking: None,
             // SUBA-003 added this field; a profile declares no model-scope policy of its own.
@@ -343,6 +347,10 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
             // G101 added these two; a profile declares neither.
             default_thinking: None,
             default_extensions: None,
+            // SUBA-123a/123b added these three; a profile declares none of them.
+            default_subagent_only_extensions: None,
+            agent_scan_dirs: None,
+            agent_exclude_dirs: None,
             disable_builtins: None,
             disable_thinking: None,
             // SUBA-003 added this field; a profile declares no model-scope policy of its own.

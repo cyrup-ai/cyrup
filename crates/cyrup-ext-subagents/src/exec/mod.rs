@@ -36,6 +36,7 @@
 //! soft, per-run interrupt) raced via `tokio::select!` against
 //! [`crate::spawn::SpawnedChild::terminate`]'s real SIGINT->SIGTERM->SIGKILL escalation ladder —
 //! this module never invents a second, competing cancellation mechanism.
+pub mod abort_recovery;
 
 pub mod acceptance;
 pub mod agent_refinements;
@@ -50,6 +51,7 @@ pub mod fallback;
 pub mod mcp_direct_tools;
 pub mod model_exclusions;
 pub mod model_scope;
+pub mod model_verification;
 pub mod mutation_evidence;
 pub mod ndjson;
 pub mod output;
@@ -2128,7 +2130,8 @@ pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinitio
         tools: agent.tools.clone(),
         extensions: None,
         extensions_from_default: false,
-        subagent_only_extensions: Vec::new(),
+        subagent_only_extensions: None,
+        subagent_only_extensions_from_default: false,
         exclude_tools: None,
         allow_nested_subagents: None,
         model: agent.model.clone(),
@@ -2369,7 +2372,10 @@ mod tests {
     #[test]
     fn run_sync_resolves_an_explicit_acceptance_level_as_a_floor_over_the_inferred_one() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let agent = sample_agent_config("m1", &[]);
+        let mut agent = sample_agent_config("m1", &[]);
+        // SUBA-108 — the inferred `checked` floor is the DECLARED writer role's
+        // (`acceptance.ts:101-108` @v0.71.0); the task wording no longer produces one.
+        agent.acceptance_role = Some(crate::exec::acceptance::model::AcceptanceRole::Writer);
         let mut opts = base_opts(dir.path(), &["m1"]);
 
         // A wire-lowered `acceptance: "attested"` (a floor, never a disable).
@@ -2404,9 +2410,12 @@ mod tests {
 
     /// `resolveEffectiveAcceptance({ …, acceptanceRole: agent.acceptanceRole, … })`
     /// (`runs/foreground/execution.ts:1834` @v0.64.0): the same agent name, task and (absent)
-    /// explicit policy resolve to a DIFFERENT floor once the agent config carries a role. A
-    /// `reviewer` that declares `writer` is a writer; a `worker` that declares `read-only` on
-    /// neutral wording is not.
+    /// explicit policy resolve to a DIFFERENT floor once the agent config carries a role.
+    ///
+    /// SUBA-108 — at v0.71.0 the role is the ONLY thing that decides, so the no-role control below
+    /// asserts the lightweight default rather than a name-derived verdict, and the declared
+    /// `read-only` floor is `NotRequired` (level `none`, `acceptance.ts:109-117`) rather than
+    /// `Attested`.
     #[test]
     fn run_sync_threads_the_agents_declared_acceptance_role_into_the_inferred_floor() {
         use crate::exec::acceptance::model::AcceptanceRole;
@@ -2422,7 +2431,7 @@ mod tests {
             resolve_run_acceptance(&opts, &reviewer, "Handle the authentication flow")
                 .required_level,
             AcceptanceStatus::Attested,
-            "control: the NAME alternation still decides when no role is declared"
+            "control: with no role declared, the lightweight default decides"
         );
         reviewer.acceptance_role = Some(AcceptanceRole::Writer);
         assert_eq!(
@@ -2437,14 +2446,18 @@ mod tests {
         assert_eq!(
             resolve_run_acceptance(&opts, &worker, "Explore the authentication flow")
                 .required_level,
-            AcceptanceStatus::Attested,
-            "a declared `read-only` role replaces the worker-name guess"
+            AcceptanceStatus::NotRequired,
+            "a declared `read-only` role infers level `none`: no prompt and no gate"
         );
+        // SUBA-108 — this assertion was the inverse before `7c98a696`: implementation WORDING used
+        // to override a declared read-only role. It no longer can, and that is the deletion's whole
+        // point (CHANGELOG 0.70.1, "Stop guessing whether task wording requires file edits"). The
+        // declared role wins whatever the task says.
         assert_eq!(
             resolve_run_acceptance(&opts, &worker, "Implement the authentication fix")
                 .required_level,
-            AcceptanceStatus::Checked,
-            "explicit task mutation intent still wins over a declared read-only role"
+            AcceptanceStatus::NotRequired,
+            "the declared read-only role wins over implementation task wording"
         );
     }
 

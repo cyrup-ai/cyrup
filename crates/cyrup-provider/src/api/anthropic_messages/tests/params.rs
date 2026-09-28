@@ -263,3 +263,76 @@ fn temperature_only_without_thinking_and_when_supported() {
     let body = build_body(&m, &user_ctx("x"), &opts);
     assert!(body.get("temperature").is_none());
 }
+
+/// PROV-090 — `fallbacks` is emitted from `compat.allowedFallbackModels`, and only when the list is
+/// non-empty (pi `anthropic-messages.ts:1199-1202` / `:202-204` @v0.87.1). The `server-side-fallback`
+/// beta rides along on the same predicate.
+#[test]
+fn prov090_allowed_fallback_models_emit_fallbacks_and_the_beta() {
+    use crate::api::compat::AnthropicAllowedFallbackModel;
+
+    let fallback = AnthropicAllowedFallbackModel {
+        provider: ProviderId::from("anthropic"),
+        model: "claude-opus-4-8".to_string(),
+        cost: ModelCost {
+            input: 3.0,
+            output: 5.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+            tiers: None,
+        },
+    };
+    let beta_of = |m: &Model| {
+        build_headers(
+            m,
+            &Context::default(),
+            &auth_with(Some("sk-ant-api03-xxx")),
+            &StreamOptions::default(),
+            false,
+        )
+        .get("anthropic-beta")
+        .and_then(|v| v.clone())
+        .unwrap_or_default()
+    };
+
+    // One entry → the field and the beta.
+    let with_one = Model {
+        compat: Some(ModelCompat {
+            allowed_fallback_models: Some(vec![fallback]),
+            ..Default::default()
+        }),
+        ..model()
+    };
+    let body = build_body(&with_one, &user_ctx("hi"), &StreamOptions::default());
+    assert_eq!(body["fallbacks"], json!([{ "model": "claude-opus-4-8" }]));
+    assert!(
+        beta_of(&with_one).contains(SERVER_SIDE_FALLBACK_BETA),
+        "beta header was {:?}",
+        beta_of(&with_one)
+    );
+
+    // Key absent → neither.
+    let without = model();
+    assert!(
+        build_body(&without, &user_ctx("hi"), &StreamOptions::default())
+            .get("fallbacks")
+            .is_none()
+    );
+    assert!(!beta_of(&without).contains(SERVER_SIDE_FALLBACK_BETA));
+
+    // Explicit EMPTY array → neither. Anthropic rejects `fallbacks` for a model with no permitted
+    // targets, so `Some(vec![])` must behave exactly like the absent key.
+    let empty = Model {
+        compat: Some(ModelCompat {
+            allowed_fallback_models: Some(Vec::new()),
+            ..Default::default()
+        }),
+        ..model()
+    };
+    assert!(
+        build_body(&empty, &user_ctx("hi"), &StreamOptions::default())
+            .get("fallbacks")
+            .is_none()
+    );
+    assert!(!beta_of(&empty).contains(SERVER_SIDE_FALLBACK_BETA));
+}

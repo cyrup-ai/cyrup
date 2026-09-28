@@ -33,7 +33,8 @@ use std::path::PathBuf;
 
 use super::types::{
     AgentDefinition, AgentModelSourceInfo, AgentOverrideConfig, AgentOverrideInfo, AgentSource,
-    LayeredOverrideSettings, OutputSpec, OverrideField, OverrideScope, ToolsOverrideField,
+    LayeredOverrideSettings, OutputSpec, OverrideField, OverrideScope, SubagentSettings,
+    ToolsOverrideField,
 };
 use crate::error::SubagentError;
 
@@ -197,6 +198,14 @@ pub fn apply_overrides(
     // BEFORE per-agent overrides, and all three fill-only-if-unset.
     apply_default_thinking(merged, resolve_default_thinking(settings).as_deref());
     apply_default_extensions(merged, resolve_default_extensions(settings).as_deref());
+    // SUBA-123b / pi `applySubagentDefaults` (`agents.ts:1412-1427` @v0.71.0): the
+    // subagent-only-extensions pass runs IMMEDIATELY AFTER the extensions pass and, like it, before
+    // any per-agent override — so an explicit `agentOverrides.<name>.subagentOnlyExtensions` still
+    // wins by overwriting what this filled in.
+    apply_default_subagent_only_extensions(
+        merged,
+        resolve_default_subagent_only_extensions(settings).as_deref(),
+    );
 
     // applyBuiltinOverrides header (agents.ts:792-798): resolve the bulk-disable / disableThinking
     // scope selection ONCE, up front, exactly as pi does before mapping over the builtin list.
@@ -241,7 +250,10 @@ pub fn apply_overrides(
             }
             // SUBA-084: a Runtime agent never enters this map at all (`mergeRuntimeAgents` appends
             // AFTER discovery's override application, `runtime-agent-registry.ts:428` @v0.64.0), so
-            // the arm exists only for totality and applies nothing.
+            // this arm applies nothing. It is NOT the case that runtime agents receive no settings
+            // at all: SUBA-121 / `applyRuntimeAgentSettings` (`agents.ts:1619-1627` @v0.71.0) runs
+            // the model-tier subset over them separately, once they have been appended — see
+            // [`apply_runtime_agent_settings`].
             AgentSource::Runtime => {}
         }
     }
@@ -296,18 +308,31 @@ fn apply_default_model(
         return;
     }
     for agent in merged.values_mut() {
-        if agent.model.is_some() && (agent.model_provider.is_some() || default_provider.is_none()) {
-            continue;
-        }
-        if agent.model.is_none()
-            && let Some(dm) = default_model
-        {
-            agent.model = Some(cyrup_core::ModelId::from(dm.to_string()));
-            agent.model_source = Some(AgentModelSourceInfo::SettingsDefault);
-        }
-        if let Some(dp) = default_provider {
-            agent.model_provider = Some(cyrup_core::ProviderId::from(dp));
-        }
+        apply_default_model_to_agent(agent, default_model, default_provider);
+    }
+}
+
+/// [`apply_default_model`]'s per-agent core, factored out so the runtime pass
+/// ([`apply_runtime_agent_settings`], SUBA-121) can run the identical rule over a SLICE of agents —
+/// runtime agents live in a `Vec` appended after the merge, never in the merge's `HashMap`. Upstream
+/// reuses one `applySubagentDefaultModel` over an `AgentConfig[]` for both paths
+/// (`agents.ts:1626`), so the rule must not be re-derived here.
+fn apply_default_model_to_agent(
+    agent: &mut AgentDefinition,
+    default_model: Option<&str>,
+    default_provider: Option<&str>,
+) {
+    if agent.model.is_some() && (agent.model_provider.is_some() || default_provider.is_none()) {
+        return;
+    }
+    if agent.model.is_none()
+        && let Some(dm) = default_model
+    {
+        agent.model = Some(cyrup_core::ModelId::from(dm.to_string()));
+        agent.model_source = Some(AgentModelSourceInfo::SettingsDefault);
+    }
+    if let Some(dp) = default_provider {
+        agent.model_provider = Some(cyrup_core::ProviderId::from(dp));
     }
 }
 
@@ -344,6 +369,101 @@ fn apply_default_thinking(
     }
 }
 
+/// SUBA-121 / pi `runtimeAgentOverrides` (`agents.ts:1596-1610` @v0.71.0): a NARROWED view of the
+/// layered settings whose per-agent override entries keep ONLY `model`, `defaultProvider`, `fast` and
+/// `thinking`. An entry that narrows to nothing is dropped outright (`:1609`'s
+/// `if (Object.keys(narrowed).length > 0)`), so it never records provenance for an override that
+/// applied nothing.
+///
+/// Everything outside `overrides` is carried through unchanged (`:1610`'s `{ ...settings, overrides }`)
+/// — the settings paths, the `default*` keys and the bulk-disable flags all stay, because the caller
+/// still resolves `defaultModel`/`defaultProvider`/`defaultThinking` off them.
+///
+/// Upstream's narrowing tests `override.X !== undefined`, which in cyrup's three-state
+/// [`OverrideField`] is [`OverrideField::is_present`] — an `ExplicitClear` is a statement about the
+/// field, exactly as a JSON `false` is not `undefined` in TypeScript, so it survives the narrowing.
+fn runtime_agent_overrides(settings: &LayeredOverrideSettings) -> LayeredOverrideSettings {
+    fn narrow(scope: &SubagentSettings) -> BTreeMap<String, AgentOverrideConfig> {
+        let mut out = BTreeMap::new();
+        for (name, delta) in &scope.overrides {
+            let narrowed = AgentOverrideConfig {
+                model: delta.model.clone(),
+                default_provider: delta.default_provider.clone(),
+                fast: delta.fast.clone(),
+                thinking: delta.thinking.clone(),
+                ..AgentOverrideConfig::default()
+            };
+            if !narrowed.is_empty() {
+                out.insert(name.clone(), narrowed);
+            }
+        }
+        out
+    }
+
+    let mut narrowed = settings.clone();
+    narrowed.user.overrides = narrow(&settings.user);
+    narrowed.project.overrides = narrow(&settings.project);
+    narrowed
+}
+
+/// SUBA-121 / pi `applyRuntimeAgentSettings` (`agents.ts:1619-1627` @v0.71.0, entered in `bbb30096`
+/// #2369 @v0.70.1): runtime-registered agents keep their extension-owned definition — prompt, tools,
+/// context, budgets and every other launch field — but follow the same MODEL-TIER settings as every
+/// other agent.
+///
+/// Before this existed, `run_discovery` appended runtime agents AFTER
+/// [`discover_and_merge`] had already run [`apply_overrides`], and nothing was applied to them
+/// afterward: a `subagents.defaultModel` never reached a runtime agent, and neither did
+/// `agentOverrides.<runtime-name>.model`/`.thinking`. The doc comments on
+/// [`merge_runtime_agents`](super::runtime_registry::merge_runtime_agents) and on
+/// [`apply_overrides`]'s `AgentSource::Runtime` arm both asserted that as intended behaviour; both
+/// were corrected alongside this function.
+///
+/// Upstream's order, reproduced exactly (`:1626-1627`):
+///
+/// 1. `applySubagentDefaultModel(agents, defaultModel, defaultProvider)` — fill-if-unset, so a
+///    runtime agent that DECLARES a `model` keeps its own. Upstream's doc comment at `:1611-1618`
+///    says this in so many words: *"A definition `model` still wins over `defaultModel`."*
+/// 2. `applySubagentDefaultThinking(…, defaultThinking)` — likewise fill-if-unset.
+/// 3. `applyCustomAgentOverrides(withDefaults, runtimeAgentOverrides(user),
+///    runtimeAgentOverrides(project), …)` — the per-agent pass, through the narrowing above, reusing
+///    [`apply_custom_agent`] so the cumulative user-then-project rule and the
+///    [`AgentOverrideInfo::field_scopes`] provenance it establishes are INHERITED rather than
+///    re-derived.
+///
+/// `defaultExtensions` is deliberately NOT applied. Upstream's runtime pass runs
+/// `applySubagentDefaultModel` and `applySubagentDefaultThinking` only (`agents.ts:1626`) — it never
+/// calls `applySubagentDefaultExtensions` — so a runtime agent's extension set stays entirely
+/// extension-owned. Adding [`apply_default_extensions`] here would invent behaviour pi does not have.
+pub fn apply_runtime_agent_settings(
+    agents: &mut [AgentDefinition],
+    settings: &LayeredOverrideSettings,
+) {
+    if agents.is_empty() {
+        return;
+    }
+    let default_provider = resolve_default_provider(settings);
+    let default_model = resolve_default_model(settings);
+    let default_thinking = resolve_default_thinking(settings);
+    let narrowed = runtime_agent_overrides(settings);
+
+    for agent in agents.iter_mut() {
+        if default_model.is_some() || default_provider.is_some() {
+            apply_default_model_to_agent(
+                agent,
+                default_model.as_deref(),
+                default_provider.as_deref(),
+            );
+        }
+        if let Some(dt) = default_thinking.as_deref()
+            && agent.thinking.is_none()
+        {
+            agent.thinking = Some(dt.to_string());
+        }
+        apply_custom_agent(agent, &narrowed);
+    }
+}
+
 /// pi `resolveSubagentDefaultExtensions` (`agents.ts:966-973`): project-wins-outright, same shape as
 /// [`resolve_default_thinking`].
 fn resolve_default_extensions(settings: &LayeredOverrideSettings) -> Option<Vec<String>> {
@@ -353,6 +473,42 @@ fn resolve_default_extensions(settings: &LayeredOverrideSettings) -> Option<Vec<
         return Some(de.clone());
     }
     settings.user.default_extensions.clone()
+}
+
+/// SUBA-123b / pi `resolveSubagentDefaultSubagentOnlyExtensions` (`agents.ts:1392-1399` @v0.71.0):
+/// the twin of [`resolve_default_extensions`] — the project scope wins outright, but ONLY when the
+/// project scope actually exists (upstream's `projectSettingsPath &&` guard).
+fn resolve_default_subagent_only_extensions(
+    settings: &LayeredOverrideSettings,
+) -> Option<Vec<String>> {
+    if settings.project_settings_path.is_some()
+        && let Some(list) = settings.project.default_subagent_only_extensions.as_ref()
+    {
+        return Some(list.clone());
+    }
+    settings.user.default_subagent_only_extensions.clone()
+}
+
+/// SUBA-123b / pi `applySubagentDefaultSubagentOnlyExtensions` (`agents.ts:1401-1410` @v0.71.0):
+/// fill every agent whose `subagent_only_extensions` is UNSET (`None`) from the resolved default,
+/// and stamp [`AgentDefinition::subagent_only_extensions_from_default`].
+///
+/// An agent that declared the key explicitly — INCLUDING an explicitly-empty list, which is
+/// `Some(vec![])` — keeps its own value, matching upstream's `agent.subagentOnlyExtensions !==
+/// undefined` guard. That case is the whole reason the field is an `Option`.
+fn apply_default_subagent_only_extensions(
+    merged: &mut HashMap<String, AgentDefinition>,
+    default_subagent_only_extensions: Option<&[String]>,
+) {
+    let Some(list) = default_subagent_only_extensions else {
+        return;
+    };
+    for agent in merged.values_mut() {
+        if agent.subagent_only_extensions.is_none() {
+            agent.subagent_only_extensions = Some(list.to_vec());
+            agent.subagent_only_extensions_from_default = true;
+        }
+    }
 }
 
 /// pi `applySubagentDefaultExtensions` (`agents.ts:975-984`): fill every agent whose `extensions` is
@@ -729,11 +885,14 @@ fn apply_builtin_override(
     apply_field_full_replace(&mut agent.extensions, &delta.extensions, None, |v| {
         Some(v.clone())
     });
+    // SUBA-123b: now an `Option`, so pi's `delete next.subagentOnlyExtensions` (`agents.ts:1283`)
+    // clears to `None` — "the agent said nothing" — exactly as the `extensions` clear above does,
+    // rather than to an empty list, which would mean "declared none".
     apply_field_full_replace(
         &mut agent.subagent_only_extensions,
         &delta.subagent_only_extensions,
-        Vec::new(),
-        |v| v.clone(),
+        None,
+        |v| Some(v.clone()),
     );
     apply_field_full_replace(
         &mut agent.completion_guard,
@@ -1093,7 +1252,8 @@ mod tests {
             tools: None,
             extensions: None,
             extensions_from_default: false,
-            subagent_only_extensions: Vec::new(),
+            subagent_only_extensions: None,
+            subagent_only_extensions_from_default: false,
             exclude_tools: None,
             allow_nested_subagents: None,
             model: None,
@@ -1748,7 +1908,7 @@ mod tests {
         );
         assert_eq!(
             updated.subagent_only_extensions,
-            vec!["./tools/child-only.ts".to_string()],
+            Some(vec!["./tools/child-only.ts".to_string()]),
             "the project-only key applies too"
         );
 
@@ -2258,7 +2418,7 @@ mod tests {
         );
         assert_eq!(
             updated.subagent_only_extensions,
-            vec!["./tools/child-review.ts".to_string()]
+            Some(vec!["./tools/child-review.ts".to_string()])
         );
         assert_eq!(updated.completion_guard, Some(false));
         // SUBA-081's five added fields, on the custom path.
@@ -3271,5 +3431,346 @@ mod tests {
         let updated = merged.get("reviewer").expect("present");
         assert_eq!(updated.exclude_tools, None);
         assert_eq!(updated.allow_nested_subagents, Some(false));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-121 — `applyRuntimeAgentSettings` (`agents.ts:1619-1627` @v0.71.0)
+    // ---------------------------------------------------------------------------------------
+
+    fn runtime_agent(name: &str) -> AgentDefinition {
+        agent(name, AgentSource::Runtime, "<runtime>")
+    }
+
+    /// (a) `subagents.defaultModel` reaches a runtime agent that declares no model of its own —
+    /// `applySubagentDefaultModel` at `agents.ts:1626`. Before SUBA-121 the runtime slice was
+    /// appended after `apply_overrides` and nothing was applied to it, so this stayed `None`.
+    #[test]
+    fn runtime_settings_fill_the_default_model_on_a_model_less_runtime_agent() {
+        let mut agents = vec![runtime_agent("rscout")];
+        let settings = user_scope(SubagentSettings {
+            default_model: Some("p/m".to_string()),
+            ..Default::default()
+        });
+        apply_runtime_agent_settings(&mut agents, &settings);
+        assert_eq!(agents[0].model.as_ref().map(|m| m.as_str()), Some("p/m"));
+        assert_eq!(
+            agents[0].model_source,
+            Some(AgentModelSourceInfo::SettingsDefault)
+        );
+    }
+
+    /// (b) …and a runtime agent that DOES declare a model keeps its own. Upstream's doc comment at
+    /// `agents.ts:1611-1618` states this outright: *"A definition `model` still wins over
+    /// `defaultModel`."*
+    #[test]
+    fn a_runtime_agent_that_declares_a_model_keeps_it_over_the_default() {
+        let mut agents = vec![runtime_agent("rscout")];
+        agents[0].model = Some(cyrup_core::ModelId::from("own/model".to_string()));
+        let settings = user_scope(SubagentSettings {
+            default_model: Some("p/m".to_string()),
+            ..Default::default()
+        });
+        apply_runtime_agent_settings(&mut agents, &settings);
+        assert_eq!(
+            agents[0].model.as_ref().map(|m| m.as_str()),
+            Some("own/model")
+        );
+    }
+
+    /// (c) `agentOverrides.<runtime-name>.thinking` reaches a runtime agent — one of the four fields
+    /// `runtimeAgentOverrides` (`agents.ts:1596-1610`) keeps.
+    #[test]
+    fn a_per_agent_thinking_override_reaches_a_runtime_agent() {
+        let mut agents = vec![runtime_agent("rscout")];
+        let settings = user_scope(settings_with_override(
+            "rscout",
+            AgentOverrideConfig {
+                thinking: OverrideField::Value("high".to_string()),
+                ..Default::default()
+            },
+        ));
+        apply_runtime_agent_settings(&mut agents, &settings);
+        assert_eq!(agents[0].thinking.as_deref(), Some("high"));
+    }
+
+    /// (d) The narrowing's other half, and the regression guard for (c): an override field OUTSIDE
+    /// `{model, defaultProvider, fast, thinking}` must NOT reach a runtime agent, because
+    /// `runtimeAgentOverrides` drops it before `applyCustomAgentOverrides` ever sees it
+    /// (`agents.ts:1596-1610`). Without the narrowing, (c)'s plumbing would carry `tools` through too.
+    #[test]
+    fn a_tools_override_does_not_reach_a_runtime_agent() {
+        let mut agents = vec![runtime_agent("rscout")];
+        let settings = user_scope(settings_with_override(
+            "rscout",
+            AgentOverrideConfig {
+                tools: ToolsOverrideField::Value(vec![ToolRef::from_tool_string("bash")]),
+                thinking: OverrideField::Value("high".to_string()),
+                ..Default::default()
+            },
+        ));
+        apply_runtime_agent_settings(&mut agents, &settings);
+        assert_eq!(
+            agents[0].tools, None,
+            "`tools` is extension-owned for a runtime agent"
+        );
+        assert_eq!(
+            agents[0].thinking.as_deref(),
+            Some("high"),
+            "the narrowing keeps the four model-tier fields"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-123b: `subagents.defaultSubagentOnlyExtensions`
+    // -----------------------------------------------------------------------------------------
+
+    /// pi `applySubagentDefaultSubagentOnlyExtensions` (`agents.ts:1401-1410` @v0.71.0): the default
+    /// fills ONLY an agent whose `subagentOnlyExtensions` is `undefined`, and the agent that declared
+    /// its own keeps it. The filled value is stamped as default-provenance.
+    ///
+    /// Gutted by: removing the `apply_default_subagent_only_extensions` call from `apply_overrides`
+    /// (neither agent gets anything), or dropping the `is_none()` guard (the declaring agent loses
+    /// `./own.ts`).
+    #[test]
+    fn default_subagent_only_extensions_fills_only_agents_that_declared_none() {
+        let mut merged = HashMap::new();
+        let mut declaring = agent("declaring", AgentSource::User, "/u/declaring.md");
+        declaring.subagent_only_extensions = Some(vec!["./own.ts".to_string()]);
+        merged.insert("declaring".to_string(), declaring);
+        merged.insert(
+            "silent".to_string(),
+            agent("silent", AgentSource::User, "/u/silent.md"),
+        );
+
+        let settings = user_scope(SubagentSettings {
+            default_subagent_only_extensions: Some(vec!["./from-settings.ts".to_string()]),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+
+        let silent = merged.get("silent").expect("present");
+        assert_eq!(
+            silent.subagent_only_extensions,
+            Some(vec!["./from-settings.ts".to_string()])
+        );
+        assert!(silent.subagent_only_extensions_from_default);
+        let declaring = merged.get("declaring").expect("present");
+        assert_eq!(
+            declaring.subagent_only_extensions,
+            Some(vec!["./own.ts".to_string()])
+        );
+        assert!(!declaring.subagent_only_extensions_from_default);
+    }
+
+    /// The case the old `Vec<String>` shape could not express: an agent file that declared
+    /// `subagentOnlyExtensions:` as an EMPTY list said "none", and upstream's
+    /// `agent.subagentOnlyExtensions !== undefined` guard leaves it alone (`agents.ts:1403`).
+    ///
+    /// Gutted by: collapsing the field back to a `Vec<String>` — an explicit `[]` then looks exactly
+    /// like an absent key and the settings default silently widens the child's extension surface.
+    #[test]
+    fn an_explicitly_empty_subagent_only_extensions_is_not_overwritten_by_the_default() {
+        let mut merged = HashMap::new();
+        let mut declared_empty = agent("quiet", AgentSource::User, "/u/quiet.md");
+        declared_empty.subagent_only_extensions = Some(Vec::new());
+        merged.insert("quiet".to_string(), declared_empty);
+
+        let settings = user_scope(SubagentSettings {
+            default_subagent_only_extensions: Some(vec!["./from-settings.ts".to_string()]),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+
+        let quiet = merged.get("quiet").expect("present");
+        assert_eq!(quiet.subagent_only_extensions, Some(Vec::new()));
+        assert!(!quiet.subagent_only_extensions_from_default);
+    }
+
+    /// `resolveSubagentDefaultSubagentOnlyExtensions` (`agents.ts:1392-1399`): project wins outright
+    /// over user, and only because the project scope exists.
+    #[test]
+    fn a_project_default_subagent_only_extensions_beats_the_user_one() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "silent".to_string(),
+            agent("silent", AgentSource::User, "/u/silent.md"),
+        );
+        let settings = two_scope(
+            SubagentSettings {
+                default_subagent_only_extensions: Some(vec!["./user.ts".to_string()]),
+                ..Default::default()
+            },
+            SubagentSettings {
+                default_subagent_only_extensions: Some(vec!["./project.ts".to_string()]),
+                ..Default::default()
+            },
+        );
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged
+                .get("silent")
+                .expect("present")
+                .subagent_only_extensions,
+            Some(vec!["./project.ts".to_string()])
+        );
+    }
+
+    /// SUBA-123b — the NEGATIVE branch of upstream's `projectSettingsPath &&` guard
+    /// (`agents.ts:1397` @v0.71.0). The project scope's VALUE is not enough: without a project
+    /// settings path there is no project scope to win, and the user value must stand.
+    ///
+    /// That is not a hypothetical shape. `load_layered_override_settings` is called with
+    /// `project_settings_path: None` whenever discovery runs outside a project root, and
+    /// [`LayeredOverrideSettings::project`] is then the all-default value — but a caller that
+    /// builds the struct directly (the management and doctor surfaces both do) can carry a project
+    /// value with no path, and a resolver that dropped the guard would hand it a project default
+    /// that upstream would never apply.
+    ///
+    /// Gutted by: deleting the `settings.project_settings_path.is_some() &&` clause from
+    /// `resolve_default_subagent_only_extensions` — the project list then wins here too.
+    #[test]
+    fn a_project_default_subagent_only_extensions_needs_a_project_settings_path() {
+        let pathless = LayeredOverrideSettings {
+            user: SubagentSettings {
+                default_subagent_only_extensions: Some(vec!["./user.ts".to_string()]),
+                ..Default::default()
+            },
+            project: SubagentSettings {
+                default_subagent_only_extensions: Some(vec!["./project.ts".to_string()]),
+                ..Default::default()
+            },
+            user_settings_path: PathBuf::from(USER_SETTINGS),
+            project_settings_path: None,
+        };
+        let mut merged = HashMap::new();
+        merged.insert(
+            "silent".to_string(),
+            agent("silent", AgentSource::User, "/u/silent.md"),
+        );
+        apply_overrides(&mut merged, &pathless).expect("apply succeeds");
+        assert_eq!(
+            merged
+                .get("silent")
+                .expect("present")
+                .subagent_only_extensions,
+            Some(vec!["./user.ts".to_string()]),
+            "with no project settings path the USER list is the resolved default"
+        );
+
+        // With a project value but no user value and still no path, there is no default at all —
+        // upstream falls through to `userSettings.defaultSubagentOnlyExtensions`, which is
+        // `undefined`, and `applySubagentDefaultSubagentOnlyExtensions` then returns early.
+        let project_only = LayeredOverrideSettings {
+            user: SubagentSettings::default(),
+            project: SubagentSettings {
+                default_subagent_only_extensions: Some(vec!["./project.ts".to_string()]),
+                ..Default::default()
+            },
+            user_settings_path: PathBuf::from(USER_SETTINGS),
+            project_settings_path: None,
+        };
+        let mut merged = HashMap::new();
+        merged.insert(
+            "silent".to_string(),
+            agent("silent", AgentSource::User, "/u/silent.md"),
+        );
+        apply_overrides(&mut merged, &project_only).expect("apply succeeds");
+        let agent = merged.get("silent").expect("present");
+        assert_eq!(agent.subagent_only_extensions, None);
+        assert!(!agent.subagent_only_extensions_from_default);
+    }
+
+    /// The provenance guard, and the reason the `from_default` flag exists: `editable_base`
+    /// (pi `editableAgentConfig`, `agent-management.ts:243`) must not hand a settings-supplied list
+    /// to the serializer, or the next management update BAKES it into the agent's `.md` file.
+    ///
+    /// Gutted by: removing the `subagent_only_extensions_from_default` clearing in `editable_base` —
+    /// the base comes back carrying `./from-settings.ts`, which the agent file never declared.
+    #[test]
+    fn a_default_supplied_subagent_only_extensions_is_not_written_back_by_editable_base() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "silent".to_string(),
+            agent("silent", AgentSource::User, "/u/silent.md"),
+        );
+        let settings = user_scope(SubagentSettings {
+            default_subagent_only_extensions: Some(vec!["./from-settings.ts".to_string()]),
+            ..Default::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+
+        let filled = merged.get("silent").expect("present");
+        assert_eq!(
+            filled.subagent_only_extensions,
+            Some(vec!["./from-settings.ts".to_string()]),
+            "precondition: the default did apply"
+        );
+        let base = crate::discovery::management::handlers::editable_base(filled);
+        assert_eq!(base.subagent_only_extensions, None);
+        assert!(!base.subagent_only_extensions_from_default);
+    }
+
+    /// (e) `subagents.defaultExtensions` must NOT reach a runtime agent: upstream's runtime pass calls
+    /// `applySubagentDefaultModel` and `applySubagentDefaultThinking` only (`agents.ts:1626`), never
+    /// `applySubagentDefaultExtensions`.
+    #[test]
+    fn the_default_extensions_setting_does_not_reach_a_runtime_agent() {
+        let mut agents = vec![runtime_agent("rscout")];
+        let settings = user_scope(SubagentSettings {
+            default_extensions: Some(vec!["./ext.ts".to_string()]),
+            ..Default::default()
+        });
+        apply_runtime_agent_settings(&mut agents, &settings);
+        assert_eq!(agents[0].extensions, None);
+        assert!(!agents[0].extensions_from_default);
+    }
+
+    /// An override entry that narrows to NOTHING is dropped rather than applied-and-recorded
+    /// (`agents.ts:1609`'s `if (Object.keys(narrowed).length > 0)`), so it leaves no `override_info`
+    /// provenance claiming a settings key touched this agent.
+    #[test]
+    fn an_override_entry_that_narrows_to_nothing_records_no_provenance() {
+        let mut agents = vec![runtime_agent("rscout")];
+        let settings = user_scope(settings_with_override(
+            "rscout",
+            AgentOverrideConfig {
+                tools: ToolsOverrideField::Value(vec![ToolRef::from_tool_string("bash")]),
+                ..Default::default()
+            },
+        ));
+        apply_runtime_agent_settings(&mut agents, &settings);
+        assert!(agents[0].override_info.is_none());
+    }
+
+    /// The per-agent pass runs through [`apply_custom_agent`], so the cumulative user-THEN-project
+    /// rule (`agents.ts:1545`'s *"project fields win without dropping user-only fields"*) is inherited
+    /// rather than re-derived: the project `model` wins while the user-only `thinking` survives.
+    #[test]
+    fn runtime_overrides_are_cumulative_user_then_project() {
+        let mut agents = vec![runtime_agent("rscout")];
+        let settings = two_scope(
+            settings_with_override(
+                "rscout",
+                AgentOverrideConfig {
+                    thinking: OverrideField::Value("low".to_string()),
+                    model: OverrideField::Value("user/m".to_string()),
+                    ..Default::default()
+                },
+            ),
+            settings_with_override(
+                "rscout",
+                AgentOverrideConfig {
+                    model: OverrideField::Value("proj/m".to_string()),
+                    ..Default::default()
+                },
+            ),
+        );
+        apply_runtime_agent_settings(&mut agents, &settings);
+        assert_eq!(agents[0].model.as_ref().map(|m| m.as_str()), Some("proj/m"));
+        assert_eq!(
+            agents[0].thinking.as_deref(),
+            Some("low"),
+            "the user-only field is not dropped by the project entry"
+        );
     }
 }

@@ -421,16 +421,243 @@ async fn ext001_declining_to_block_still_executes_the_tool() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn only_tool_call_fails_closed() {
+fn only_tool_call_and_user_bash_fail_closed() {
     for v in 0..EventKind::COUNT {
         let kind = EventKind::from_u8(v).expect("every discriminant below COUNT parses");
         assert_eq!(
             kind.fails_closed(),
-            kind == EventKind::ToolCall,
-            "{} fail-closed policy must match pi's runner.ts try/catch coverage",
+            matches!(kind, EventKind::ToolCall | EventKind::UserBash),
+            "{} fail-closed policy must match pi's runner.ts try/catch coverage — `emitToolCall` \
+             (runner.ts:932-953) has none, and `emitUserBash` (runner.ts:1154-1183 @v0.87.1) \
+             re-throws after reporting (coding-agent 0.86.0 *Breaking*, #9068)",
             kind.name()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// EXT-077 — a FAULTING `user_bash` handler must BLOCK the command (fail CLOSED).
+//
+// pi @v0.87.1: `emitUserBash` (runner.ts:1154-1183) catches each handler fault, reports it through
+// `emitError({event: "user_bash", …})`, and then `throw err;` (:1177). Neither caller falls back to
+// local execution — `interactive-mode.ts::handleBashCommand` has `catch { return; }` ("The extension
+// runner already reported the error. Do not fall back to local execution.") and `rpc-mode.ts`
+// `case "bash":` has no catch at all, so the throw becomes an error response. Before this fix a
+// panicking handler took `dispatch.rs`'s `continue`, the chain reached `Reduced::Pass`, and
+// `cyrup-session-svc` ran the command LOCALLY — the command an extension was meant to redirect.
+// ---------------------------------------------------------------------------
+
+struct PanickingBashHandler;
+
+#[async_trait::async_trait]
+impl NativeExtension for PanickingBashHandler {
+    fn id(&self) -> ExtensionId {
+        "panicking-bash".into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::UserBash]);
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        panic!("boom");
+    }
+}
+
+fn user_bash_event() -> HostEvent {
+    HostEvent::UserBash {
+        command: "uname -a".into(),
+        exclude_from_context: false,
+        cwd: "/tmp".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_faulting_user_bash_handler_blocks_the_command() {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(PanickingBashHandler))
+        .await
+        .unwrap();
+
+    let captured: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    host.add_error_listener(Arc::new(move |e: &ExtensionError| {
+        if let Ok(mut g) = sink.lock() {
+            g.push((e.extension.to_string(), e.event.to_string()));
+        }
+    }));
+
+    let reduced = host
+        .dispatcher()
+        .dispatch_block_mutate(user_bash_event(), &CancelToken::new())
+        .await;
+
+    match reduced {
+        Reduced::Blocked { reason, by, .. } => {
+            assert_eq!(by.to_string(), "panicking-bash");
+            let reason = reason.expect("a block reason");
+            assert!(
+                reason.contains("Extension failed, blocking execution"),
+                "pi's wording: {reason}"
+            );
+        }
+        other => panic!(
+            "EXT-077: a faulting user_bash handler must Block so the command is not executed \
+             locally, got {other:?}"
+        ),
+    }
+
+    // The report survives the fail-closed turn: pi calls `emitError` BEFORE it re-throws
+    // (runner.ts:1169-1177), and both front-ends rely on that report being the user-visible output.
+    let got = captured.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "the fault is still reported (R-08-036)");
+    assert_eq!(got[0].0, "panicking-bash");
+    assert_eq!(got[0].1, "user_bash");
+}
+
+/// The chain STOPS at the first faulting `user_bash` handler — pi's `throw` leaves the
+/// `snapshotEventHandlers` loop (runner.ts:1157-1180), so no later handler is invoked. This is the
+/// "without invoking later handlers" clause of coding-agent 0.86.0 #9068.
+#[tokio::test]
+async fn a_faulting_user_bash_handler_stops_the_chain() {
+    struct LaterHandler(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl NativeExtension for LaterHandler {
+        fn id(&self) -> ExtensionId {
+            "zz-later-bash".into()
+        }
+        async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+            api.subscribe(&[EventKind::UserBash]);
+            Ok(())
+        }
+        async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+            self.0.store(true, Ordering::SeqCst);
+            HookOutcome::Noop
+        }
+    }
+
+    let reached = Arc::new(AtomicBool::new(false));
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(PanickingBashHandler))
+        .await
+        .unwrap();
+    host.load_native(Arc::new(LaterHandler(reached.clone())))
+        .await
+        .unwrap();
+
+    let reduced = host
+        .dispatcher()
+        .dispatch_block_mutate(user_bash_event(), &CancelToken::new())
+        .await;
+
+    assert!(
+        matches!(reduced, Reduced::Blocked { .. }),
+        "got {reduced:?}"
+    );
+    assert!(
+        !reached.load(Ordering::SeqCst),
+        "EXT-077: a fault must not invoke later user_bash handlers (#9068)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// EXT-077 — `isUserBashEventResult` (runner.ts:136-158 @v0.87.1), ported.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn is_user_bash_event_result_matches_pis_predicate() {
+    use crate::is_user_bash_event_result as ok;
+
+    // Not an object at all (runner.ts:137).
+    for v in [json!(null), json!(1), json!("x"), json!([]), json!(true)] {
+        assert!(!ok(&v), "{v} is not an object");
+    }
+    // `hasOperations === hasResult` — neither, or both (runner.ts:140-142).
+    assert!(!ok(&json!({})), "neither key");
+    assert!(
+        !ok(&json!({
+            "operations": {},
+            "result": {"output": "", "exitCode": 0, "cancelled": false, "truncated": false},
+        })),
+        "both keys are EXCLUSIVE upstream"
+    );
+    // `operations` must be a non-null object (runner.ts:143-146).
+    assert!(ok(&json!({ "operations": {} })), "an operations object");
+    assert!(!ok(&json!({ "operations": null })), "null operations");
+    assert!(!ok(&json!({ "operations": 7 })), "non-object operations");
+
+    // The `result` shape (runner.ts:148-157).
+    let good = json!({"output": "hi", "exitCode": 0, "cancelled": false, "truncated": false});
+    assert!(ok(&json!({ "result": good })));
+    assert!(
+        ok(&json!({"result": {
+            "output": "hi", "exitCode": null, "cancelled": false, "truncated": false,
+            "fullOutputPath": "/tmp/o",
+        }})),
+        "exitCode may be null (pi: undefined) and fullOutputPath may be a string"
+    );
+    for bad in [
+        json!({"exitCode": 0, "cancelled": false, "truncated": false}),
+        json!({"output": 1, "exitCode": 0, "cancelled": false, "truncated": false}),
+        json!({"output": "hi", "cancelled": false, "truncated": false}),
+        json!({"output": "hi", "exitCode": "0", "cancelled": false, "truncated": false}),
+        json!({"output": "hi", "exitCode": 0, "truncated": false}),
+        json!({"output": "hi", "exitCode": 0, "cancelled": 1, "truncated": false}),
+        json!({"output": "hi", "exitCode": 0, "cancelled": false}),
+        json!({"output": "hi", "exitCode": 0, "cancelled": false, "truncated": false,
+               "fullOutputPath": 7}),
+        json!("not an object"),
+    ] {
+        assert!(!ok(&json!({ "result": bad.clone() })), "bad result: {bad}");
+    }
+}
+
+/// A handler that returns a DEFINED but invalid value is an ABORT upstream, not a pass-through:
+/// `emitUserBash` throws `Invalid user_bash handler result: …` (runner.ts:1163-1167 @v0.87.1).
+/// `emit_user_bash` must therefore surface it as `Invalid`, never as `Handled` or `Continue`.
+#[tokio::test]
+async fn an_invalid_user_bash_result_is_not_handled() {
+    struct BadResult(Value);
+    #[async_trait::async_trait]
+    impl NativeExtension for BadResult {
+        fn id(&self) -> ExtensionId {
+            "bad-bash-result".into()
+        }
+        async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+            api.subscribe(&[EventKind::UserBash]);
+            Ok(())
+        }
+        async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+            HookOutcome::Handled(crate::HandledValue(self.0.clone()))
+        }
+    }
+
+    // Exactly the shape pi rejects for `hasOperations === hasResult`.
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(BadResult(json!({"operations": {}, "result": {}}))))
+        .await
+        .unwrap();
+
+    match host.emit_user_bash("uname -a", &CancelToken::new()).await {
+        crate::UserBashReduction::Invalid { by } => assert_eq!(by.to_string(), "bad-bash-result"),
+        other => panic!(
+            "EXT-077: a defined-but-invalid user_bash result must abort, not proceed: {other:?}"
+        ),
+    }
+
+    // And the valid shape still reduces to `Handled`, so the guard is not a blanket reject.
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(BadResult(
+        json!({"operations": {"backend": "ssh"}}),
+    )))
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            host.emit_user_bash("uname -a", &CancelToken::new()).await,
+            crate::UserBashReduction::Handled { .. }
+        ),
+        "a pi-valid operations-only result still wins the reduction"
+    );
 }
 
 #[tokio::test]

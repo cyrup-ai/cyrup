@@ -385,6 +385,26 @@ fn dag_display(e: &cyrup_session::Entry) -> (SessionDagKind, String) {
             SessionDagKind::Other,
             format!("label {}", label.clone().unwrap_or_default()),
         ),
+        // Pi labels a `context_edit` node
+        //   `[context ${entry.replacement === null ? "omit" : "replace"}: ${entry.targetId}]`
+        // and classes it with the settings/bookkeeping entries hidden in the default tree view
+        // (`modes/interactive/components/tree-selector.ts:361,844` @v0.87.1) — hence
+        // `SessionDagKind::Other`, the same kind `label`/`custom`/`session_info` get here.
+        Entry::Known(KnownEntry::ContextEdit {
+            target_id,
+            replacement,
+            ..
+        }) => (
+            SessionDagKind::Other,
+            format!(
+                "[context {}: {target_id}]",
+                if replacement.is_none() {
+                    "omit"
+                } else {
+                    "replace"
+                }
+            ),
+        ),
         Entry::Unknown(_) => (SessionDagKind::Other, "(entry)".to_string()),
     }
 }

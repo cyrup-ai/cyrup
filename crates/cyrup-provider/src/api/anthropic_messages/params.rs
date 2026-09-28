@@ -245,6 +245,27 @@ pub(crate) fn build_params(
         obj.insert("tool_choice".to_string(), tool_choice_wire(tc));
     }
 
+    // fallbacks (Pi anthropic-messages.ts:1199-1202 @v0.87.1). Emitted ONLY when the compat list is
+    // non-empty — never `[]`, because Anthropic rejects the field for models with no permitted
+    // fallback targets (`types.ts:833-838`). Only the `model` key crosses the wire; the entry's
+    // `cost` is local pricing metadata used when decoding (PROV-090).
+    if let Some(fallbacks) = model
+        .compat
+        .as_ref()
+        .and_then(|c| c.allowed_fallback_models.as_ref())
+        .filter(|f| !f.is_empty())
+    {
+        obj.insert(
+            "fallbacks".to_string(),
+            Value::Array(
+                fallbacks
+                    .iter()
+                    .map(|f| json!({ "model": f.model }))
+                    .collect(),
+            ),
+        );
+    }
+
     Ok(Value::Object(obj))
 }
 

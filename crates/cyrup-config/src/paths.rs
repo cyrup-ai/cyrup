@@ -317,8 +317,12 @@ pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
 
 /// The root every cyrup path resolves against.
 ///
-/// Nothing in this workspace sets it outside tests, where it is the sandbox lever that keeps a
-/// run's artifacts out of the developer's real home.
+/// CFG-068: a shipped, operator-facing override, listed in `cyrup --help`'s
+/// `Environment Variables:` block and documented at `docs/guide/reference/environment.md:60-71`.
+/// It relocates only the home directory that subagents, intercom and the permission system derive
+/// their `~/.cyrup/...` paths from — it does NOT move configuration, which is what the two
+/// agent-dir variables below do. Tests also use it as a sandbox lever, but that is no longer its
+/// only caller.
 pub const ENV_HOME: &str = "CYRUP_HOME";
 
 /// The agent-directory override, in precedence order.
@@ -332,7 +336,22 @@ pub const ENV_HOME: &str = "CYRUP_HOME";
 /// binary's layout and left `cyrup-ext-subagents`' agent memory, run history, settings, prompts
 /// and sessions behind in the un-relocated tree (MCP-139 gap 1, "the agent-dir consolidation did
 /// not happen").
-pub const ENV_AGENT_DIR_KEYS: [&str; 2] = ["CYRUP_AGENT_DIR", ENV_CODING_AGENT_DIR];
+pub const ENV_AGENT_DIR_KEYS: [&str; 2] = [ENV_AGENT_DIR, ENV_CODING_AGENT_DIR];
+
+/// The short, operator-facing agent-dir spelling — the one `cyrup --help` advertises.
+///
+/// Named on its own (rather than living only as [`ENV_AGENT_DIR_KEYS`]'s first element) so the
+/// `--help` row and the reader can share ONE string: `ENV_AGENT_DIR_KEYS` is an array, and reading
+/// its first element from another crate needs an index the workspace lints deny. CFG-068 — the same
+/// reason [`ENV_HOME`] and [`ENV_SESSION_DIR`] are reachable by name.
+pub const ENV_AGENT_DIR: &str = "CYRUP_AGENT_DIR";
+
+/// The session-storage override, read here and overridden in turn by `--session-dir`
+/// (pi `main.ts:625-628` @v0.83.0 — `expandTildePath(envSessionDir)`).
+///
+/// Named for the same reason as [`ENV_AGENT_DIR`]: `cyrup --help` lists it, and a help row that is
+/// its own string literal is a row that can drift away from the variable actually read.
+pub const ENV_SESSION_DIR: &str = "CYRUP_SESSION_DIR";
 
 /// The sibling-port spelling of the agent-dir override, named on its own because two resolvers
 /// read it OUTSIDE the ladder above and must spell it identically:

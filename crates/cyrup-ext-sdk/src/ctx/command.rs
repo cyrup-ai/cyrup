@@ -211,7 +211,21 @@ impl CommandCtx {
         let o = serde_json::to_string(&opts).map_err(|e| format!("send_message opts: {e}"))?;
         control(Control::SendMessage(&m, &o))
     }
-    /// Queue a user-authored message with author-supplied options.
+    /// Queue a user-authored message with author-supplied options — pi
+    /// `ctx.sendUserMessage(content, options)` (`core/agent-session.ts:2006-2035` @v0.87.1, bound
+    /// onto the extension context at `:3057` and `:4006`).
+    ///
+    /// Spell `opts` with [`crate::SendUserMessageOptions`] to get pi's two fields under pi's own
+    /// names: `deliverAs` (`"steer"`/`"followUp"`) and `expandPromptTemplates`. The second one is
+    /// opt-IN upstream — `expandPromptTemplates: options?.expandPromptTemplates ?? false`
+    /// (`:2030`) — so a guest relaying a literal `"/foo"` sends a user message reading `/foo` and
+    /// does NOT dispatch the extension command unless it asks. `Value::Null` or an empty bag means
+    /// "no options", i.e. every one of pi's absent-key defaults.
+    ///
+    /// The host honours both fields at `cyrup-session-svc`'s `ControlOp::SendUserMessage` arm
+    /// (`session/control.rs`), which is where EXT-083's fix landed: the bag used to be parsed here,
+    /// carried over the WIT import, and then dropped by a `{ content, .. }` destructure, so every
+    /// relayed `/…` was dispatched as a command and every `deliverAs: "followUp"` became a steer.
     ///
     /// An `opts` encode failure is returned as `Err` rather than sending with an empty option bag.
     pub fn send_user_message(&self, content: &str, opts: impl Serialize) -> Result<(), String> {

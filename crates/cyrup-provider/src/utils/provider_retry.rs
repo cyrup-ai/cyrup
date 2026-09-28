@@ -228,7 +228,7 @@ fn now_ms() -> i64 {
 /// characters is tried and shortened until one parses. Header values are a handful of bytes, so the
 /// quadratic worst case is irrelevant, and every slice goes through `str::get` — no indexing, no
 /// panic on a char boundary.
-fn js_parse_float(value: &str) -> Option<f64> {
+pub(crate) fn js_parse_float(value: &str) -> Option<f64> {
     let text = value.trim_start();
     let mut end = text
         .char_indices()

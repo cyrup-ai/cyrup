@@ -15,6 +15,9 @@ pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Beta header tokens (Pi anthropic-messages.ts:167-168).
 pub(super) const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 pub(super) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+/// Pi `SERVER_SIDE_FALLBACK_BETA` (`anthropic-messages.ts:183` @v0.87.1) — sent whenever the model
+/// declares at least one `allowedFallbackModels` entry (PROV-090).
+pub(super) const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 
 /// Stealth-mode Claude Code identity (Pi anthropic-messages.ts:73).
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
@@ -46,6 +49,23 @@ fn should_use_fine_grained_beta(model: &Model, ctx: &Context) -> bool {
     !ctx.tools.is_empty() && !get_anthropic_compat(model).supports_eager_tool_input_streaming
 }
 
+/// `true` if the request should send the `server-side-fallback` beta (1:1 port of Pi
+/// `shouldUseServerSideFallbackBeta`, `anthropic-messages.ts:202-204` @v0.87.1:
+/// `(model.compat?.allowedFallbackModels?.length ?? 0) > 0`).
+///
+/// Read straight off `model.compat` rather than through
+/// [`get_anthropic_compat`](super::compat::get_anthropic_compat): pi's `getAnthropicCompat`
+/// (`:206-220`) does NOT resolve this key either — both of its readers (this predicate and
+/// `buildParams` `:1199-1201`) go to `model.compat` directly, because the value is a list with no
+/// default rather than a flag with one.
+pub(super) fn should_use_server_side_fallback_beta(model: &Model) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|c| c.allowed_fallback_models.as_ref())
+        .is_some_and(|f| !f.is_empty())
+}
+
 /// Build the request headers (1:1 port of Pi `createClient`, anthropic-messages.ts:813-899). The
 /// auth/model/opts header overlays layer last (a `None` value suppresses a default).
 pub(crate) fn build_headers(
@@ -67,6 +87,10 @@ pub(crate) fn build_headers(
     }
     if needs_interleaved {
         betas.push(INTERLEAVED_THINKING_BETA);
+    }
+    // Pi `:1027` — pushed after the interleaved-thinking beta, in pi's order (PROV-090).
+    if should_use_server_side_fallback_beta(model) {
+        betas.push(SERVER_SIDE_FALLBACK_BETA);
     }
 
     let mut headers = HeaderMap::new();

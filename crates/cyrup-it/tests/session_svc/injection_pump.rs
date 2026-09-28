@@ -252,6 +252,9 @@ async fn send_custom_message_while_idle_reaches_the_next_prompt() {
             true,
             None,
             None,
+            // SEAM-127 added pi's raw `options?.triggerTurn`: absent here, which is pi's own
+            // `sendCustomMessage(msg)` — the idle no-trigger arm this test is about.
+            None,
         )
         .await
         .unwrap();

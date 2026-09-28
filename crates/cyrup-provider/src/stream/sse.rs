@@ -156,6 +156,9 @@ pub struct SseRequest {
     /// Request headers. A `None` value suppresses a would-be default header (func-01 §4.1).
     pub headers: HeaderMap,
     pub body: Option<serde_json::Value>,
+    /// Terminate the residual SSE frame at EOF instead of dropping it (PROV-084). True only for
+    /// the two adapters pi flushes for — see [`crate::stream::framer::frame_bytes`].
+    pub flush_at_eof: bool,
 }
 
 impl SseRequest {
@@ -166,7 +169,15 @@ impl SseRequest {
             url: url.into(),
             headers: HeaderMap::new(),
             body: Some(body),
+            flush_at_eof: false,
         }
+    }
+
+    /// Opt this request into terminating a residual SSE frame at EOF (PROV-084).
+    #[must_use]
+    pub fn flush_at_eof(mut self) -> Self {
+        self.flush_at_eof = true;
+        self
     }
 
     #[must_use]
@@ -473,7 +484,7 @@ pub async fn open_sse(
         }
     };
 
-    let es: EsInner = Box::pin(frame_bytes(resp.bytes_stream()));
+    let es: EsInner = Box::pin(frame_bytes(resp.bytes_stream(), req.flush_at_eof));
     let state = SseState {
         es,
         cancel,
@@ -521,9 +532,27 @@ pub async fn open_sse(
 /// Decode raw SSE bytes into frames (no network) — useful for replaying recorded vendor fixtures
 /// (arch-01 §11). Errors during decode arrive as `Err` items.
 pub fn decode_sse_bytes(bytes: impl Into<Bytes>) -> FrameStream {
+    replay_sse_bytes(bytes, false)
+}
+
+/// [`decode_sse_bytes`] for the four adapters that terminate the residual frame at EOF
+/// (PROV-084) — Anthropic Messages, Codex Responses, Mistral Conversations and pi-messages, the
+/// four whose upstream counterparts are hand-rolled reader loops that flush `buffer` after the
+/// `done` break. Their fixture replays must match the live path they stand in for; every other
+/// adapter's fixtures (the OpenAI-SDK-backed paths) read through [`decode_sse_bytes`].
+///
+/// The flag here is a TEST-HARNESS constant, so a replay test alone cannot pin the live
+/// [`SseRequest::flush_at_eof`] each adapter sets; the two `prov084_the_live_run_path_*` tests
+/// (`api::mistral_conversations::tests::decode`, `api::pi_messages::tests`) drive `run()` over a
+/// loopback socket for that.
+pub fn decode_sse_bytes_flushing_at_eof(bytes: impl Into<Bytes>) -> FrameStream {
+    replay_sse_bytes(bytes, true)
+}
+
+fn replay_sse_bytes(bytes: impl Into<Bytes>, flush_at_eof: bool) -> FrameStream {
     let bytes = bytes.into();
     let byte_stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(bytes) });
-    Box::pin(frame_bytes(byte_stream).map(|r| {
+    Box::pin(frame_bytes(byte_stream, flush_at_eof).map(|r| {
         r.map_err(|e| match e {
             FrameError::Transport(io) => ProviderError::Decode(io.to_string()),
             FrameError::Utf8(inner) => ProviderError::Decode(format!("UTF8 error: {inner}")),
@@ -744,6 +773,7 @@ mod tests {
             url: url.to_string(),
             headers: HeaderMap::new(),
             body: None,
+            flush_at_eof: false,
         }
     }
 
@@ -1239,5 +1269,57 @@ mod tests {
         .expect("succeeds on retry");
         assert_eq!(*seen.lock().unwrap(), vec![200]);
         server.abort();
+    }
+
+    // ------------------------------------------------------------- PROV-084 (EOF flush) ----
+
+    /// PROV-084. pi's Anthropic framer ends with `flushSseEvent(state)`
+    /// (`anthropic-messages.ts:461-464` @v0.87.1) and its Codex framer with
+    /// `if (done && buffer.trim()) buffer += "\n\n";` (`openai-codex-responses.ts:795`
+    /// @v0.87.1), so a stream that ends without the terminating blank line still delivers its
+    /// last frame. cyrup dropped it, and the Anthropic driver then reported
+    /// "Anthropic stream ended before message_stop".
+    #[tokio::test]
+    async fn prov084_a_frame_with_no_terminating_blank_line_is_flushed_at_eof() {
+        let raw = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n";
+        let frames: Vec<SseFrame> = decode_sse_bytes_flushing_at_eof(raw.as_bytes().to_vec())
+            .map(|r| r.expect("frame"))
+            .collect()
+            .await;
+        assert_eq!(
+            frames.len(),
+            1,
+            "expected one flushed frame, got {frames:?}"
+        );
+        assert_eq!(frames[0].event, "message_stop");
+        assert_eq!(frames[0].data, "{\"type\":\"message_stop\"}");
+
+        // The residual line need not even be TERMINATED: pi feeds it through `decodeSseLine`
+        // before flushing (`anthropic-messages.ts:454-459`). Edit (2) alone would lose this.
+        let raw = "event: message_stop\ndata: {\"type\":\"message_stop\"}";
+        let frames: Vec<SseFrame> = decode_sse_bytes_flushing_at_eof(raw.as_bytes().to_vec())
+            .map(|r| r.expect("frame"))
+            .collect()
+            .await;
+        assert_eq!(
+            frames.len(),
+            1,
+            "expected one flushed frame, got {frames:?}"
+        );
+        assert_eq!(frames[0].event, "message_stop");
+        assert_eq!(frames[0].data, "{\"type\":\"message_stop\"}");
+    }
+
+    /// The gate: the OpenAI-SDK-backed adapters have no residual flush upstream, so plain
+    /// [`decode_sse_bytes`] must keep dropping it. This fails if the flush is ever made
+    /// unconditional.
+    #[tokio::test]
+    async fn prov084_the_non_flushing_replay_still_drops_the_residual_frame() {
+        let raw = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n";
+        let frames: Vec<SseFrame> = decode_sse_bytes(raw.as_bytes().to_vec())
+            .map(|r| r.expect("frame"))
+            .collect()
+            .await;
+        assert!(frames.is_empty(), "expected no frames, got {frames:?}");
     }
 }

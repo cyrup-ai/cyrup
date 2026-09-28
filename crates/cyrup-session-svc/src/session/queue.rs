@@ -94,7 +94,28 @@ impl AgentSession {
     /// must observe the run actually settle — teardown, compaction, the RPC `abort` verb — use
     /// [`Self::abort_and_settle`], which adds Pi's `await this.waitForIdle()` tail.
     pub fn abort(&self) {
+        // Pi `abort()` (`agent-session.ts:2075-2085` @v0.87.1), in this exact order:
+        //   if (this._isAgentRunActive) this._agentRunAbortRequested = true;
+        //   this.abortRetry(); this.abortCompaction(); this.abortBranchSummary();
+        //   if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
+        //   this.agent.abort(); await this.waitForIdle();
+        //
+        // SESS-062: cyrup reached only `abortRetry()` + `agent.abort()`. The compaction and
+        // branch-summary cancels were live but unreachable from here (only the TUI Escape path
+        // called them), and there was NO run-abort latch at all — so an abort landing after
+        // `agent_end` was a no-op (`agent.abort()` cancels a token no run holds) and
+        // `handle_post_agent_run` went on to retry / compact / continue regardless.
+        if self.is_run_active() {
+            self.set_abort_requested(true);
+        }
         self.abort_retry();
+        self.abort_compaction();
+        self.abort_branch_summary();
+        // CYRUP-DELTA: Pi's `if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;`
+        // (`agent-session.ts:2082` @v0.87.1) is NOT ported, because cyrup has no
+        // `agent_before_settle` boundary at all — `_runBeforeSettleBoundary`
+        // (`agent-session.ts:1531`) has no counterpart in `run.rs`, so there is no window the flag
+        // could describe. It arrives with that boundary (EXT-078), not here.
         self.agent.abort();
     }
 

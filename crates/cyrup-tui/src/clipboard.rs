@@ -32,7 +32,14 @@
 //!    `MOSH_CONNECTION`) *or* when nothing above worked (`clipboard.ts:166-169`) — remote included
 //!    even after a successful local write, because the local clipboard is the wrong machine's.
 //!
-//! Nothing worked → the caller reports Pi's `Failed to copy to clipboard` (`clipboard.ts:171-173`).
+//! 3b. On Linux under **WSL**, before the OSC 52 decision: Windows Terminal gets the escape
+//!    directly, and otherwise the text is written through Windows interop
+//!    ([`copy_via_windows_clipboard`], `clipboard.ts:110-114`) — WSL without WSLg has no Linux
+//!    display, so no step above it can have run.
+//!
+//! Nothing worked → [`copy_to_clipboard`] returns pi's throw ladder as a [`ClipboardError`], whose
+//! five messages name the missing helper instead of the single generic string this used to report
+//! (`clipboard.ts:124-137`).
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -68,8 +75,14 @@ pub(crate) struct ClipboardEnv {
     /// Pi `isWaylandSession` (`clipboard-image.ts:22-24`): `WAYLAND_DISPLAY` set **or**
     /// `XDG_SESSION_TYPE == "wayland"`.
     pub(crate) wayland_session: bool,
-    /// `process.env.DISPLAY` (`clipboard.ts:124`).
+    /// `process.env.DISPLAY` (`clipboard.ts:98`, `:133`).
     pub(crate) x11_display: bool,
+    /// Pi `isWSL` (`wsl.ts:4-15`): `WSL_DISTRO_NAME` | `WSLENV`, else `/microsoft|wsl/i` against
+    /// `/proc/version`. Selects the Windows-interop write chain (`clipboard.ts:110-114`).
+    pub(crate) wsl: bool,
+    /// `process.env.WT_SESSION` (`clipboard.ts:112`) — Windows Terminal, which supports OSC 52, so
+    /// the escape is preferred over the slower PowerShell round trip.
+    pub(crate) wt_session: bool,
 }
 
 impl ClipboardEnv {
@@ -85,6 +98,57 @@ impl ClipboardEnv {
             wayland_session: wayland_display
                 || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland"),
             x11_display: set("DISPLAY"),
+            // Pi `isWSL` verbatim (`wsl.ts:5-14`): the two env vars first, then the `/proc/version`
+            // sniff, and any read error is `false` (upstream's `catch`).
+            wsl: set("WSL_DISTRO_NAME")
+                || set("WSLENV")
+                || std::fs::read_to_string("/proc/version").is_ok_and(|release| {
+                    let release = release.to_ascii_lowercase();
+                    release.contains("microsoft") || release.contains("wsl")
+                }),
+            wt_session: set("WT_SESSION"),
+        }
+    }
+}
+
+/// The reason nothing reached a clipboard — pi's throw ladder (`clipboard.ts:124-137`), which
+/// `handleCopyCommand` turns into `showError(error.message)` and the fullscreen renderer flashes
+/// (`tui-renderer.ts:37-44`, `tui-alt-screen.ts:1456-1462`).
+///
+/// An enum rather than a `String` so the five messages are one table the tests can compare
+/// byte-for-byte, and so the flash duration decision ([`crate::app::run_action::copy_flash_for`])
+/// cannot be written against a message it had to re-parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardError {
+    /// `throw new Error("Clipboard unavailable: text exceeds the OSC 52 size limit")`
+    /// (`clipboard.ts:125`) — the escape was the only route left and the payload is past
+    /// [`MAX_OSC52_ENCODED_LENGTH`].
+    Oversized,
+    /// `clipboard.ts:128` — `TERMUX_VERSION` is set, so `termux-clipboard-set` was tried and is
+    /// missing or failed.
+    Termux,
+    /// `clipboard.ts:131` — `WAYLAND_DISPLAY` is set, so `wl-copy` was tried.
+    Wayland,
+    /// `clipboard.ts:134` — `DISPLAY` is set, so `xclip`/`xsel` were tried.
+    X11,
+    /// `clipboard.ts:137`, the fallthrough: a non-Linux platform, or a Linux box with no display
+    /// server env at all whose OSC 52 emit still did not copy.
+    Unavailable,
+}
+
+impl ClipboardError {
+    /// Pi's five throw strings, byte-for-byte (`clipboard.ts:125-137`).
+    pub(crate) fn message(&self) -> &'static str {
+        match self {
+            Self::Oversized => "Clipboard unavailable: text exceeds the OSC 52 size limit",
+            Self::Termux => {
+                "Clipboard unavailable: install the Termux:API app and `termux-api` package"
+            }
+            Self::Wayland => {
+                "Clipboard unavailable: install `wl-clipboard` (`wl-copy`) or check Wayland access"
+            }
+            Self::X11 => "Clipboard unavailable: install `xclip` or `xsel`, or check X11 access",
+            Self::Unavailable => "Clipboard unavailable",
         }
     }
 }
@@ -152,11 +216,79 @@ pub(crate) fn osc52_sequence(text: &str) -> Option<String> {
     Some(format!("\u{1b}]52;c;{encoded}\u{7}"))
 }
 
-/// Pi's `if (remote || !copied)` (`clipboard.ts:166`): the OSC 52 escape is emitted when nothing
-/// local worked **or** when the session is remote — in the remote case even after a successful local
-/// write, because the clipboard that was written belongs to the machine the user is not sitting at.
-pub(crate) fn osc52_required(remote: bool, copied: bool) -> bool {
-    remote || !copied
+/// Pi's `headless` (`clipboard.ts:118`): `p === "linux" && !DISPLAY && !WAYLAND_DISPLAY &&
+/// !TERMUX_VERSION` — no local clipboard route exists at all, so the terminal is the only one
+/// (containers, WSL without WSLg).
+///
+/// `[CYRUP-DELTA]` cyrup's [`ClipboardEnv`] carries both `wayland_display` and the wider
+/// `wayland_session` (`XDG_SESSION_TYPE == "wayland"` counts), and this reads the NARROWER one
+/// deliberately: upstream tests `env.WAYLAND_DISPLAY` only (`clipboard.ts:118`), so a Wayland
+/// session advertised with no socket to talk to *is* headless upstream — and it genuinely is, since
+/// `wl-copy` has nothing to connect to. Reading `wayland_session` here would make that box report a
+/// failure while suppressing the one route that still works.
+pub(crate) fn headless(os: &str, env: &ClipboardEnv) -> bool {
+    os == "linux" && !env.x11_display && !env.wayland_display && !env.termux
+}
+
+/// Pi's `if (!osc52Emitted && (isRemoteSession(env) || (!copied && headless)))`
+/// (`clipboard.ts:120`): the escape is emitted when the session is **remote** — even after a
+/// successful local write, because the clipboard that was written belongs to the machine the user is
+/// not sitting at — or when nothing local worked **and** there was no local route to begin with.
+///
+/// The `headless` conjunct is the correction this carries over the previous `remote || !copied`:
+/// "OSC 52 cannot be verified, so a desktop session with a display reports the failure instead
+/// (#9618)" (`clipboard.ts:115-117`). With `DISPLAY` set and `xclip`/`xsel` missing, the old gate
+/// emitted an unverifiable escape and returned success, so `/copy` said `copied selection (N chars)`
+/// over a clipboard nothing had been written to.
+pub(crate) fn osc52_required(remote: bool, copied: bool, headless: bool) -> bool {
+    remote || (!copied && headless)
+}
+
+/// Which Windows-interop route a WSL box takes — Pi `clipboard.ts:110-114`, extracted as a pure
+/// decision for the same reason [`clipboard_write_plan`] is one: neither arm can be exercised on a
+/// CI host, so the branch is asserted rather than compiled and hoped for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WslRoute {
+    /// `if (env.WT_SESSION) osc52Emitted = emitOsc52(text)` (`clipboard.ts:112`) — Windows Terminal
+    /// supports OSC 52, which beats the PowerShell round trip.
+    Osc52,
+    /// `copied = osc52Emitted || (await copyViaWindowsClipboard(text))` (`clipboard.ts:113`).
+    PowerShell,
+}
+
+/// `if (!copied && p === "linux" && isWSL(env))` (`clipboard.ts:110`) resolved to its route, or
+/// `None` when the arm does not apply. The `!copied` half stays at the call site, since it is
+/// execution state rather than environment.
+pub(crate) fn wsl_route(os: &str, env: &ClipboardEnv) -> Option<WslRoute> {
+    if os != "linux" || !env.wsl {
+        return None;
+    }
+    Some(if env.wt_session {
+        WslRoute::Osc52
+    } else {
+        WslRoute::PowerShell
+    })
+}
+
+/// Pi's throw ladder, in its exact precedence order (`clipboard.ts:124-137`): the oversized OSC 52
+/// payload first, then the Linux display-server env vars termux → Wayland → X11, then the bare
+/// fallthrough that also covers every non-Linux platform.
+pub(crate) fn clipboard_failure(os: &str, env: &ClipboardEnv, oversized: bool) -> ClipboardError {
+    if oversized {
+        return ClipboardError::Oversized;
+    }
+    if os == "linux" {
+        if env.termux {
+            return ClipboardError::Termux;
+        }
+        if env.wayland_display {
+            return ClipboardError::Wayland;
+        }
+        if env.x11_display {
+            return ClipboardError::X11;
+        }
+    }
+    ClipboardError::Unavailable
 }
 
 /// Run one step, returning whether it actually put the text on a clipboard.
@@ -205,32 +337,144 @@ async fn run_command(bin: &str, args: &[&str], text: &str) -> bool {
     )
 }
 
-/// Copy `text` to the system clipboard — Pi `copyToClipboard` (`clipboard.ts:73-174`).
+/// Pi's `runClipboardCommand("wslpath", …, { timeoutMs: 1000 })` (`clipboard.ts:33`) — a path
+/// translation, not a clipboard helper, hence its own much shorter bound.
+const WSLPATH_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Run `bin args` to completion under `timeout` and capture stdout — Pi's
+/// `runClipboardCommand(bin, args, { timeoutMs })` on the WSL path (`clipboard.ts:33`, `:38-40`),
+/// whose `undefined` return covers a spawn failure, a non-zero exit and the timeout alike.
 ///
-/// Returns whether the text reached a clipboard. Pi *throws* here and `handleCopyCommand` turns
-/// that into `showError(...)` (`interactive-mode.ts:6016-6018`); the caller in `App::execute_command`
-/// reports Pi's `Failed to copy to clipboard` on `false`. A silent `true` for a write that did
-/// nothing is the exact failure this function was rewritten to remove — do not reintroduce it by
-/// ignoring the return value.
-pub(crate) async fn copy_to_clipboard(text: &str) -> bool {
+/// `[CYRUP-DELTA]` this deliberately does NOT reuse the sync [`run_capture`] below, whose own
+/// `[CYRUP-DELTA]` records that its timeout stops *waiting* rather than killing the child. Here
+/// `kill_on_drop(true)` plus `tokio::time::timeout` dropping the future does kill it, matching
+/// Node's `killSignal`, so a wedged `powershell.exe` cannot be left behind holding a temp file.
+async fn run_capture_async(bin: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => String::from_utf8(out.stdout).ok(),
+        // A missing `wslpath`/`powershell.exe`, a non-zero exit, or the timeout — Pi's `catch`
+        // and its `undefined` (`clipboard.ts:42-43`).
+        _ => None,
+    }
+}
+
+/// Pi `copyViaWindowsClipboard` (`clipboard.ts:24-51`), doc comment included: WSL without WSLg has
+/// no Linux display, so the Windows clipboard is written through interop, and **PowerShell reads the
+/// text from a file** because `clip.exe` and PowerShell stdin decode piped bytes with the console
+/// code page, which mangles non-ASCII UTF-8.
+async fn copy_via_windows_clipboard(text: &str) -> bool {
+    // `join(tmpdir(), `pi-wsl-clip-${randomUUID()}.txt`)` (`clipboard.ts:30`). `[CYRUP-DELTA]` v7
+    // rather than pi's v4, matching the crate's other temp-file namer
+    // (`app/event_extract.rs:115`): uniqueness is all either side needs of it, and `create_new(true)`
+    // below is what actually refuses a collision.
+    let tmp = std::env::temp_dir().join(format!("cyrup-wsl-clip-{}.txt", uuid::Uuid::now_v7()));
+    let copied = copy_via_windows_clipboard_file(text, &tmp).await;
+    // Pi's `finally { try { unlinkSync(tmpFile) } catch {} }` (`clipboard.ts:44-50`) — the file may
+    // never have been created, and either way it must not survive the call.
+    let _ = std::fs::remove_file(&tmp);
+    copied
+}
+
+/// The body of [`copy_via_windows_clipboard`], split out only so the unlink can be a caller-side
+/// `finally` on **every** exit path rather than repeated at each `return false`.
+async fn copy_via_windows_clipboard_file(text: &str, tmp: &std::path::Path) -> bool {
+    // `writeFileSync(tmpFile, text, { encoding: "utf8", mode: 0o600 })` (`clipboard.ts:32`). The
+    // mode matters: the clipboard text is user content sitting in a world-readable directory.
+    {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let Ok(mut file) = opts.open(tmp) else {
+            return false;
+        };
+        if file.write_all(text.as_bytes()).is_err() || file.flush().is_err() {
+            return false;
+        }
+    }
+    let tmp_str = tmp.to_string_lossy().to_string();
+    // `?.toString("utf8").trim()`, then `if (!winPath) return false` (`clipboard.ts:33-36`).
+    let Some(winpath) = run_capture_async("wslpath", &["-w", &tmp_str], WSLPATH_TIMEOUT).await
+    else {
+        return false;
+    };
+    let winpath = winpath.trim();
+    if winpath.is_empty() {
+        return false;
+    }
+    // `winPath.replaceAll("'", "''")` (`clipboard.ts:37`) — PowerShell single-quote escaping.
+    let quoted = winpath.replace('\'', "''");
+    let script = format!(
+        "Set-Clipboard -Value ([System.IO.File]::ReadAllText('{quoted}', [System.Text.Encoding]::UTF8))"
+    );
+    run_capture_async(
+        "powershell.exe",
+        &["-NoProfile", "-Command", &script],
+        CLIPBOARD_COMMAND_TIMEOUT,
+    )
+    .await
+    .is_some()
+}
+
+/// Copy `text` to the system clipboard — Pi `copyToClipboard` (`clipboard.ts:74-138`).
+///
+/// `Err` carries Pi's throw (`clipboard.ts:124-137`), which `handleCopyCommand` turns into
+/// `showError(error.message)` (`interactive-mode.ts:6016-6018`) and the fullscreen renderer flashes
+/// for five seconds (`tui-renderer.ts:37-44`). A silent `Ok` for a write that did nothing is the
+/// exact failure this function was rewritten to remove — do not reintroduce it by ignoring the
+/// return value (`Result` is `#[must_use]`, so the compiler holds that line).
+pub(crate) async fn copy_to_clipboard(text: &str) -> Result<(), ClipboardError> {
+    let os = std::env::consts::OS;
     let env = ClipboardEnv::from_process();
     let mut copied = false;
-    for step in clipboard_write_plan(std::env::consts::OS, &env) {
+    for step in clipboard_write_plan(os, &env) {
         if run_step(step, text).await {
             copied = true;
             break;
         }
     }
-    // `if (remote || !copied) { copied ||= emitOsc52(text) }` (`clipboard.ts:166-169`). A remote
-    // session gets the escape even after a local success — the local clipboard belongs to the
-    // machine the user is *not* sitting at.
-    if osc52_required(env.remote, copied)
-        && let Some(seq) = osc52_sequence(text)
-    {
-        write_stdout(&seq);
-        copied = true;
+    // `if (!copied && p === "linux" && isWSL(env))` (`clipboard.ts:110-114`). Nothing above can have
+    // run on WSL without WSLg — there is no Linux display — so this is the first route that exists.
+    let mut osc52_emitted = false;
+    if !copied && let Some(route) = wsl_route(os, &env) {
+        if route == WslRoute::Osc52
+            && let Some(seq) = osc52_sequence(text)
+        {
+            write_stdout(&seq);
+            osc52_emitted = true;
+        }
+        // `copied = osc52Emitted || (await copyViaWindowsClipboard(text))` (`clipboard.ts:113`):
+        // the interop write is skipped only when the escape actually went out.
+        copied = osc52_emitted || copy_via_windows_clipboard(text).await;
     }
-    copied
+    // `if (!osc52Emitted && (isRemoteSession(env) || (!copied && headless)))`
+    // (`clipboard.ts:120-123`): `emitOsc52` returning false is Pi's `oversized = true`, which becomes
+    // the first rung of the throw ladder rather than a silent success.
+    let mut oversized = false;
+    if !osc52_emitted && osc52_required(env.remote, copied, headless(os, &env)) {
+        match osc52_sequence(text) {
+            Some(seq) => {
+                write_stdout(&seq);
+                copied = true;
+            }
+            None => oversized = true,
+        }
+    }
+    // `if (copied) return;` then the ladder (`clipboard.ts:124-137`).
+    if copied {
+        Ok(())
+    } else {
+        Err(clipboard_failure(os, &env, oversized))
+    }
 }
 
 // ------------------------------------------------------------------ the READ side (DRIFT-045) --

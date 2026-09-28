@@ -50,7 +50,7 @@ pub use summarize::{
 };
 pub use tokens::{
     ContextUsageEstimate, TokenCache, context_tokens_from_usage, estimate_context_tokens,
-    estimate_context_tokens_raw, estimate_tokens,
+    estimate_context_tokens_raw, estimate_projected_context_tokens, estimate_tokens,
 };
 
 /// Orchestrates compaction + branch summarization against a [`SessionManager`], wiring the pure
@@ -118,14 +118,18 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
             return false;
         }
         // Estimate over the RAW `AgentMessage` context — Pi passes
-        // `estimateContextTokens(buildSessionContext(pathEntries).messages)`
-        // (`compaction.ts:192-228,678`; `session-manager.ts:389-403`), whose `messages` keep the
-        // `bashExecution`/`branchSummary`/`compactionSummary`/`custom` roles intact. Estimating over
-        // the `convertToLlm`-rendered context instead would over-count summary wrappers and DROP
-        // `excludeFromContext` bash messages that Pi's raw context still counts.
+        // `estimateProjectedContextTokens(buildSessionProjection(), getBranch())`
+        // (`agent-session.ts:590-600` @v0.87.1; `session-manager.ts:389-403`), whose `messages` keep
+        // the `bashExecution`/`branchSummary`/`compactionSummary`/`custom` roles intact. Estimating
+        // over the `convertToLlm`-rendered context instead would over-count summary wrappers and
+        // DROP `excludeFromContext` bash messages that Pi's raw context still counts.
+        //
+        // SESS-052 — via [`estimate_projected_context_tokens`], not the bare
+        // [`estimate_context_tokens_raw`]: a `context_edit` or `compaction` later in the branch than
+        // the entry the provider-usage anchor came from invalidates that anchor, and upstream's
+        // trigger read goes through the projected estimate for exactly that reason.
         let refs: Vec<&Entry> = path.iter().collect();
-        let msgs = crate::context::build_context_agent_messages(&refs);
-        let est = estimate_context_tokens_raw(&msgs);
+        let est = estimate_projected_context_tokens(&refs);
         est.tokens > window.saturating_sub(s.reserve_tokens)
     }
 

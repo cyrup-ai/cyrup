@@ -8,6 +8,7 @@
 use cyrup_core::{EntryId, Message, ModelRef};
 
 use crate::agent_message::AgentMessage;
+use crate::compaction::tokens::{ContextUsageEstimate, estimate_projected_context_tokens};
 use crate::context::{SessionContext, build_context_agent_messages_tagged, build_context_messages};
 use crate::entry::{Entry, KnownEntry};
 
@@ -90,6 +91,22 @@ impl SessionManager {
             return Vec::new();
         }
         build_context_agent_messages_tagged(&path)
+    }
+
+    /// The live context estimate every compaction trigger must read — Pi
+    /// `estimateProjectedContextTokens(this.buildSessionProjection(), this.getBranch())`
+    /// (`agent-session.ts:594-600`, `:758`, `:2708`, `:3893` @v0.87.1).
+    ///
+    /// Exists so a service-layer trigger does not have to reassemble the `(projection, branch)` pair
+    /// itself: the branch path is borrowed state only the manager holds, and passing just the
+    /// projected messages — as the callers did before SESS-052 — structurally cannot apply the
+    /// edit/compaction invalidation rule, because the rule is a scan over BRANCH ENTRIES.
+    pub fn projected_context_estimate(&self) -> ContextUsageEstimate {
+        let path = self.branch_path(None);
+        if path.is_empty() {
+            return ContextUsageEstimate::default();
+        }
+        estimate_projected_context_tokens(&path)
     }
 
     /// The current branch's ENTRIES with compaction applied — Pi

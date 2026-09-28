@@ -196,6 +196,11 @@ impl ApiImpl for PiMessagesApi {
             url: url.clone(),
             headers,
             body: Some(body),
+            // PROV-084: `readPiMessagesEvents` is a hand-rolled `stream.getReader()` loop whose
+            // `if (done) { break; }` (`pi-messages.ts:297-299` @v0.87.1) is followed by
+            // `if (buffer.trim()) { const event = parsePiMessagesEvent(buffer); … yield event; }`
+            // (`:302-307`), so a stream cut after the last `data:` line still delivers it.
+            flush_at_eof: true,
         };
 
         // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
@@ -1022,7 +1027,7 @@ mod tests {
     use crate::auth::ProviderEnv;
     use crate::auth::types::ModelAuth;
     use crate::model::{Modality, ModelCost};
-    use crate::stream::sse::decode_sse_bytes;
+    use crate::stream::sse::decode_sse_bytes_flushing_at_eof;
     use crate::stream::{DoneReason, ErrorReason, ToolChoice};
     use cyrup_core::{Message, ModelThinkingLevel};
 
@@ -1234,7 +1239,8 @@ mod tests {
     async fn collect(raw: &str, m: &Model) -> Vec<StreamEvent> {
         let (sink, mut rx) = channel(64);
         let api = ApiId::from(API_ID);
-        let frames = decode_sse_bytes(raw.as_bytes().to_vec());
+        // PROV-084: the live pi-messages adapter sets `flush_at_eof`, so the replay path must too.
+        let frames = decode_sse_bytes_flushing_at_eof(raw.as_bytes().to_vec());
         let m2 = m.clone();
         let api2 = api.clone();
         let task = tokio::spawn(async move {
@@ -1348,6 +1354,40 @@ mod tests {
         assert_eq!(diags[0].r#type, "pi_messages_rewrite");
         assert_eq!(diags[0].details.as_ref().unwrap()["policyId"], "p1");
         assert_eq!(diags[0].details.as_ref().unwrap()["tokenCountChange"], -4);
+    }
+
+    /// PROV-084, pi-messages half: `readPiMessagesEvents` is a hand-rolled reader loop, not an
+    /// SDK helper, and it flushes the residual buffer after the `done` break —
+    /// `if (done) { break; }` (`pi-messages.ts:297-299` @v0.87.1) then
+    /// `if (buffer.trim()) { const event = parsePiMessagesEvent(buffer); if (event) yield event; }`
+    /// (`:302-307`). A transcript cut right after the terminal `done` frame's `data:` line, with
+    /// no blank line, therefore still completes upstream. cyrup had `flush_at_eof: false` here on
+    /// the false premise that this path reads through the SDK, so the `done` frame was dropped and
+    /// the turn ended on the truncation terminal instead.
+    #[tokio::test]
+    async fn prov084_a_transcript_cut_after_done_still_finishes() {
+        let raw = concat!(
+            "data: {\"type\":\"start\"}\n\n",
+            "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
+            "data: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"Hello\"}\n\n",
+            "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"Hello\"}\n\n",
+            // The stream ends HERE — no blank line after the last data line, and no `[DONE]`.
+            "data: {\"type\":\"done\",\"reason\":\"stop\",\"responseId\":\"resp_9\",\"usage\":{\"input\":3,\"output\":4,\"totalTokens\":7}}\n",
+        );
+        let events = collect(raw, &model()).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Error { .. })),
+            "no error terminal expected, got {events:?}"
+        );
+        let StreamEvent::Done { reason, message } = events.last().expect("a terminal") else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(*reason, DoneReason::Stop);
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.response_id.as_deref(), Some("resp_9"));
+        assert_eq!(message.content, vec![Content::text("Hello")]);
     }
 
     /// A backend `toolcall_delta` stream is re-parsed on EVERY delta, so `partial` shows the
@@ -1654,6 +1694,66 @@ mod tests {
         let diags = error.diagnostics.as_ref().expect("response diagnostic");
         assert_eq!(diags[0].r#type, "pi_messages_response_failure");
         assert_eq!(diags[0].details.as_ref().unwrap()["status"], 401);
+    }
+
+    /// PROV-084, pi-messages half, over the LIVE `run()` path — the one place the production
+    /// `SseRequest.flush_at_eof` (`pi_messages.rs:203`) is observable. `readPiMessagesEvents` is a
+    /// hand-rolled `stream.getReader()` loop whose `if (done) { break; }`
+    /// (`pi-messages.ts:297-299` @v0.87.1) is followed by
+    /// `if (buffer.trim()) { const event = parsePiMessagesEvent(buffer); if (event) yield event; }`
+    /// (`:302-307`), so a socket closed right after the terminal `done` frame's `data:` line — no
+    /// blank line, no `[DONE]` — still completes the turn upstream.
+    ///
+    /// The replay-path sibling (`prov084_a_transcript_cut_after_done_still_finishes`) pins the
+    /// decoder, but it reads through `decode_sse_bytes_flushing_at_eof`, whose flag is hard-coded in
+    /// the test harness: it stays green if the live gate regresses to `false`. This test is the one
+    /// that goes red.
+    #[tokio::test]
+    async fn prov084_the_live_run_path_flushes_a_reply_cut_after_done() {
+        let (base, _seen) = serve_once(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"type\":\"start\"}\n\n",
+                "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
+                "data: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"ok\"}\n\n",
+                "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"ok\"}\n\n",
+                // The response body ends HERE: one `\n` after the terminal frame, no blank line.
+                "data: {\"type\":\"done\",\"reason\":\"stop\",\"responseId\":\"resp_eof\",",
+                "\"usage\":{\"input\":3,\"output\":1,\"totalTokens\":4}}\n",
+            ),
+        )
+        .await;
+
+        let mut m = model();
+        m.base_url = base;
+        let (sink, mut rx) = channel(64);
+        PiMessagesApi::new()
+            .run(
+                &m,
+                &user_ctx("hi"),
+                &auth_with(Some("sk-live")),
+                &StreamOptions::default(),
+                CancelToken::new(),
+                sink,
+            )
+            .await;
+        let events = drain(&mut rx).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Error { .. })),
+            "no error terminal expected, got {events:?}"
+        );
+        let StreamEvent::Done { reason, message } = events.last().expect("a terminal") else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(*reason, DoneReason::Stop);
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.response_id.as_deref(), Some("resp_eof"));
+        assert_eq!(message.content, vec![Content::text("ok")]);
+        assert_eq!(message.usage.total_tokens, 4);
     }
 
     /// Pi `throw new Error(`No API key provided for provider "${model.provider}"`)`

@@ -185,6 +185,8 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -413,6 +415,8 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -508,6 +512,10 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        // SUBA-119 — a fixture launch whose model comes from its own agent config, so
+        // native-child model verification is armed and no response-id alias is declared.
+        model_override_from_parent: false,
+        model_response_aliases: None,
         parent_env_overrides: std::collections::BTreeMap::new(),
         machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
@@ -791,6 +799,8 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     // already blocked — the same terminal state a genuinely deep chain reaches once the T0.3
     // increment has walked the inherited depth up to the ceiling across successive spawns.
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,
@@ -1233,6 +1243,8 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
         .spawn_background_steps(
             dir.path(),
             BackgroundStepsSpec {
+                // SUBA-119 — no operator-declared response-id alias for this fixture run.
+                model_response_aliases: None,
                 turn_budget: None,
                 permission_rules: None,
                 // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a

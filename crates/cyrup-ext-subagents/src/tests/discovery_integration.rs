@@ -277,6 +277,7 @@ fn build_four_scope_fixture() -> FourScopeFixture {
     };
 
     let cfg = AgentDiscoveryConfig {
+        agent_exclusion_roots: Vec::new(),
         builtin_agents_dir: Some(builtin_dir),
         installed_packages: installed,
         trusted_project: true,

@@ -139,6 +139,14 @@ pub(crate) fn editable_base(target: &AgentDefinition) -> AgentDefinition {
         base.extensions = None;
         base.extensions_from_default = false;
     }
+    // SUBA-123b — the identical guard for `subagentOnlyExtensions`, whose settings default
+    // (`subagents.defaultSubagentOnlyExtensions`) is likewise not the agent's own data. Upstream
+    // reaches the same end through its `agentFrontmatterFields` side table
+    // (`agents.ts:1406-1407`), which never records a key the file did not declare.
+    if base.subagent_only_extensions_from_default {
+        base.subagent_only_extensions = None;
+        base.subagent_only_extensions_from_default = false;
+    }
     base
 }
 

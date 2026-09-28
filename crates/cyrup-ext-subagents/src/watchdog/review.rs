@@ -56,7 +56,7 @@ use super::runtime::{
     WatchdogWarningEmitter,
 };
 use super::types::{
-    ResolvedWatchdogConfig, ThinkingSetting, WatchdogCategory, WatchdogConfidence,
+    ResolvedWatchdogConfig, ThinkingSetting, WatchdogCategory, WatchdogImportance,
     WatchdogSeverity, WatchdogWarning, WatchdogWarningSource,
 };
 use crate::exec::split_known_thinking_suffix;
@@ -323,12 +323,20 @@ pub fn watchdog_warn_parameters_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "summary", "evidence", "recommendedAction"],
+        "required": ["severity", "importance", "summary", "evidence", "recommendedAction"],
         "properties": {
             "severity": {
                 "type": "string",
                 "enum": WatchdogSeverity::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                 "description": "concern for actionable risk, blocker for a likely wrong or unsafe outcome",
+            },
+            // SUBA-120 — `review.ts:30` @v0.71.0. REQUIRED, no default: upstream declares it as a
+            // plain (non-`Optional`) TypeBox property, so a call that omits it never reaches
+            // `toWatchdogWarning`. The description is upstream's verbatim, because it is prompt text.
+            "importance": {
+                "type": "string",
+                "enum": WatchdogImportance::ALL.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
+                "description": "low or medium for user-only visibility; high when the parent model must receive the finding",
             },
             "summary": { "type": "string", "description": "One concise sentence naming the issue." },
             "evidence": {
@@ -343,10 +351,6 @@ pub fn watchdog_warn_parameters_schema() -> Value {
                 "type": "string",
                 "enum": WatchdogCategory::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             },
-            "confidence": {
-                "type": "string",
-                "enum": WatchdogConfidence::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            },
         },
     })
 }
@@ -356,8 +360,8 @@ pub fn watchdog_warn_parameters_schema() -> Value {
 pub fn watchdog_warn_tool_description() -> String {
     [
         "Emit one actionable main-session watchdog warning.",
-        "Use only for medium/high confidence concerns or blockers that the parent should consider \
-         before accepting the work.",
+        "Set importance explicitly: low or medium for user-only visibility, high only when the \
+         parent model must receive the finding.",
         "Do not use for nits, praise, informational notes, or clean reviews.",
     ]
     .join(" ")
@@ -373,7 +377,14 @@ fn non_empty_string(value: Option<&str>, field: &str) -> Result<String, String> 
 }
 
 /// `toWatchdogWarning` (`review.ts:168-178`) — validate a `watchdog_warn` call's arguments into a
-/// warning. `category` defaults to `other`, `confidence` to `medium`, and `source` is always `main`.
+/// warning. `category` defaults to `other` and `source` is always `main`.
+///
+/// SUBA-120: `importance` has NO default. Upstream's `WatchdogWarnParams` (`review.ts:30`) declares
+/// it as a required TypeBox property, so a call omitting it is rejected by the schema before
+/// `toWatchdogWarning` runs. This function is the only validation gate on this side, so it must
+/// itself reject a missing `importance` rather than substitute one — the field it replaced
+/// (`confidence`) did silently default to `medium` here, which would route every unlabelled finding
+/// to the parent model.
 ///
 /// # Errors
 ///
@@ -387,19 +398,22 @@ pub fn to_watchdog_warning(params: &Value) -> Result<WatchdogWarning, String> {
         .and_then(Value::as_str)
         .and_then(WatchdogSeverity::parse)
         .ok_or_else(|| "watchdog_warn.severity must be concern or blocker.".to_string())?;
+    let importance = match object.get("importance").and_then(Value::as_str) {
+        None => {
+            return Err("watchdog_warn.importance must be low, medium, or high.".to_string());
+        }
+        Some(value) => WatchdogImportance::parse(value).ok_or_else(|| {
+            format!("watchdog_warn.importance '{value}' is not a known importance.")
+        })?,
+    };
     let category = match object.get("category").and_then(Value::as_str) {
         None => WatchdogCategory::Other,
         Some(value) => WatchdogCategory::parse(value)
             .ok_or_else(|| format!("watchdog_warn.category '{value}' is not a known category."))?,
     };
-    let confidence = match object.get("confidence").and_then(Value::as_str) {
-        None => WatchdogConfidence::Medium,
-        Some(value) => WatchdogConfidence::parse(value).ok_or_else(|| {
-            format!("watchdog_warn.confidence '{value}' is not a known confidence.")
-        })?,
-    };
     Ok(WatchdogWarning {
         severity,
+        importance,
         summary: non_empty_string(object.get("summary").and_then(Value::as_str), "summary")?,
         evidence: non_empty_string(object.get("evidence").and_then(Value::as_str), "evidence")?,
         recommended_action: non_empty_string(
@@ -407,7 +421,6 @@ pub fn to_watchdog_warning(params: &Value) -> Result<WatchdogWarning, String> {
             "recommendedAction",
         )?,
         category: Some(category),
-        confidence: Some(confidence),
         source: Some(WatchdogWarningSource::Main),
         agent: None,
         run_id: None,
@@ -545,12 +558,11 @@ pub fn build_watchdog_system_prompt(cwd: &str, has_scope: bool) -> String {
         "Emit warnings only by calling watchdog_warn. Freeform assistant text is ignored and must \
          not be used to report warnings."
             .to_string(),
-        "Emit only medium/high confidence actionable concerns or blockers: missed user constraints, \
-         correctness risks, test gaps that matter, unsafe changes, stale facts, loop risks, or scope \
-         drift."
+        "Emit only actionable concerns or blockers: missed user constraints, correctness risks, \
+         test gaps that matter, unsafe changes, stale facts, loop risks, or scope drift."
             .to_string(),
-        "Do not emit nits, style preferences, low-confidence guesses, informational notes, praise, \
-         or summaries."
+        "Do not emit nits, style preferences, unsupported guesses, informational notes, praise, or \
+         summaries."
             .to_string(),
         "If the turn is clean, call no tools and end normally.".to_string(),
         "Use severity='blocker' only when the issue should stop acceptance until addressed; \
@@ -1202,19 +1214,83 @@ mod tests {
     }
 
     #[test]
-    fn warn_parameters_default_category_and_confidence_and_always_source_main() {
+    fn warn_parameters_default_category_and_always_source_main() {
         let warning = to_watchdog_warning(&json!({
             "severity": "blocker",
+            "importance": "high",
             "summary": " s ",
             "evidence": " e ",
             "recommendedAction": " a ",
         }))
         .unwrap();
         assert_eq!(warning.severity, WatchdogSeverity::Blocker);
+        assert_eq!(warning.importance, WatchdogImportance::High);
         assert_eq!(warning.category, Some(WatchdogCategory::Other));
-        assert_eq!(warning.confidence, Some(WatchdogConfidence::Medium));
         assert_eq!(warning.source, Some(WatchdogWarningSource::Main));
         assert_eq!(warning.summary, "s", "fields are trimmed");
+    }
+
+    /// SUBA-120 test (b). `importance` is REQUIRED with NO default (`review.ts:30` declares it as a
+    /// plain, non-`Optional` TypeBox property). A call that omits it is a tool-call ERROR.
+    ///
+    /// The field it replaced, `confidence`, silently defaulted to `medium` here. Carrying that
+    /// default forward would have meant every unlabelled finding routes as non-`high`, i.e. the
+    /// parent model silently stops receiving findings the review meant for it — a default is the one
+    /// thing this field must not have.
+    #[test]
+    fn a_warn_call_omitting_importance_is_rejected_rather_than_defaulted() {
+        let err = to_watchdog_warning(&json!({
+            "severity": "blocker",
+            "summary": "s",
+            "evidence": "e",
+            "recommendedAction": "a",
+        }))
+        .expect_err("a missing importance is a tool-call error");
+        assert_eq!(
+            err,
+            "watchdog_warn.importance must be low, medium, or high."
+        );
+    }
+
+    /// …and an importance outside the enum is likewise rejected, not coerced.
+    #[test]
+    fn a_warn_call_with_an_unknown_importance_is_rejected() {
+        let err = to_watchdog_warning(&json!({
+            "severity": "blocker",
+            "importance": "critical",
+            "summary": "s",
+            "evidence": "e",
+            "recommendedAction": "a",
+        }))
+        .expect_err("an unknown importance is a tool-call error");
+        assert_eq!(
+            err,
+            "watchdog_warn.importance 'critical' is not a known importance."
+        );
+    }
+
+    /// The schema advertises `importance` as required, with upstream's verbatim description — that
+    /// text is prompt the review model reads, so a paraphrase is a behaviour change.
+    #[test]
+    fn the_warn_schema_requires_importance_and_carries_upstream_description() {
+        let schema = watchdog_warn_parameters_schema();
+        let required = schema["required"].as_array().expect("required array");
+        assert!(required.iter().any(|v| v == "importance"), "{schema}");
+        assert!(
+            !required.iter().any(|v| v == "confidence"),
+            "confidence is gone from the type entirely"
+        );
+        assert_eq!(
+            schema["properties"]["importance"]["description"],
+            json!(
+                "low or medium for user-only visibility; high when the parent model must receive the finding"
+            )
+        );
+        assert_eq!(
+            schema["properties"]["importance"]["enum"],
+            json!(["low", "medium", "high"])
+        );
+        assert!(schema["properties"].get("confidence").is_none(), "{schema}");
     }
 
     #[test]
@@ -1222,15 +1298,15 @@ mod tests {
         for (field, payload) in [
             (
                 "summary",
-                json!({ "severity": "concern", "summary": "  ", "evidence": "e", "recommendedAction": "a" }),
+                json!({ "severity": "concern", "importance": "high", "summary": "  ", "evidence": "e", "recommendedAction": "a" }),
             ),
             (
                 "evidence",
-                json!({ "severity": "concern", "summary": "s", "evidence": "", "recommendedAction": "a" }),
+                json!({ "severity": "concern", "importance": "high", "summary": "s", "evidence": "", "recommendedAction": "a" }),
             ),
             (
                 "recommendedAction",
-                json!({ "severity": "concern", "summary": "s", "evidence": "e", "recommendedAction": " " }),
+                json!({ "severity": "concern", "importance": "high", "summary": "s", "evidence": "e", "recommendedAction": " " }),
             ),
         ] {
             assert_eq!(
@@ -1320,7 +1396,8 @@ mod tests {
         assert!(watchdog_warn_tool_description().starts_with("Emit one actionable"));
         let schema = watchdog_warn_parameters_schema();
         assert_eq!(schema["additionalProperties"], json!(false));
-        assert_eq!(schema["required"].as_array().unwrap().len(), 4);
+        // SUBA-120: five, not four — `importance` (`review.ts:30`) is required.
+        assert_eq!(schema["required"].as_array().unwrap().len(), 5);
     }
 
     /// `:271-274` subtracts `watchdog_warn` from the tools the agent is GIVEN, while `:285` keeps
@@ -1437,6 +1514,7 @@ mod tests {
         let taken = tool
             .execute(&json!({
                 "severity": "blocker",
+                "importance": "high",
                 "summary": "s",
                 "evidence": "e",
                 "recommendedAction": "r",
@@ -1448,6 +1526,7 @@ mod tests {
         let refused = tool
             .execute(&json!({
                 "severity": "concern",
+                "importance": "high",
                 "summary": "s2",
                 "evidence": "e2",
                 "recommendedAction": "r2",
@@ -1460,12 +1539,12 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].source, Some(WatchdogWarningSource::Main));
-        assert_eq!(seen[0].confidence, Some(WatchdogConfidence::Medium));
+        assert_eq!(seen[0].importance, WatchdogImportance::High);
         assert_eq!(seen[0].category, Some(WatchdogCategory::Other));
 
         // A malformed call is an Err and must NOT reach the emitter.
         assert!(
-            tool.execute(&json!({ "severity": "blocker", "summary": "  " }))
+            tool.execute(&json!({ "severity": "blocker", "importance": "high", "summary": "  " }))
                 .is_err()
         );
         assert_eq!(seen.len(), 2);
@@ -1494,6 +1573,7 @@ mod tests {
                     .warn_tool
                     .execute(&json!({
                         "severity": "concern",
+                        "importance": "high",
                         "summary": "s",
                         "evidence": "e",
                         "recommendedAction": "r",

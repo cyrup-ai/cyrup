@@ -11,6 +11,7 @@ use cyrup_provider::is_context_overflow;
 use cyrup_session::compaction::{
     CompactionReason, CompactionSettings, Compactor, NoHooks, context_tokens_from_usage,
 };
+use cyrup_session::entry::{Entry, KnownEntry};
 
 use crate::compact::DynSummarizer;
 use crate::error::SessionServiceError;
@@ -112,7 +113,36 @@ impl AgentSession {
         // pre-compaction usage (stale, reflecting the old larger context) cannot falsely trigger.
         let settings = self.effective_compaction_settings();
         let direct_context_tokens = context_tokens_from_usage(&assistant.usage);
-        let context_tokens: u32 = if assistant.stop_reason == cyrup_core::StopReason::Error
+        // SESS-052 — pi tests for an admitted `context_edit` FIRST, ahead of both the direct-usage
+        // read and the error/zero fallback (`agent-session.ts:2703-2712` @v0.87.1):
+        //
+        // ```ts
+        // const hasContextEdits = projection.entries.some((e) => e.sourceEntry.type === "context_edit");
+        // if (hasContextEdits) contextTokens = estimateProjectedContextTokens(projection, branch).tokens;
+        // else if (stopReason === "error" || directContextTokens === 0) { … }
+        // else contextTokens = directContextTokens;
+        // ```
+        //
+        // The precedence is the point: `assistantMessage.usage` is a reading of the context the
+        // provider was sent, so once an edit has omitted or shrunk part of that context the reading
+        // over-reports it — and the assistant carrying it is healthy, so without this arm the
+        // error/zero fallback never runs either. pi's own `_omitRecoveryAttempt`
+        // (`agent-session.ts:1015-1031`) appends a `null` edit for every abandoned attempt, so this
+        // is the default path on any session that has recovered from a retry or an overflow, not an
+        // extension-only one. Reporting the stale pre-edit number auto-compacts early.
+        let has_context_edits = {
+            let mgr = self.manager.lock().await;
+            mgr.context_entries()
+                .iter()
+                .any(|e| matches!(e, Entry::Known(KnownEntry::ContextEdit { .. })))
+        };
+        let context_tokens: u32 = if has_context_edits {
+            self.manager
+                .lock()
+                .await
+                .projected_context_estimate()
+                .tokens
+        } else if assistant.stop_reason == cyrup_core::StopReason::Error
             || direct_context_tokens == 0
         {
             // SESS-028 — the estimate basis is the RAW `AgentMessage` transcript, not the
@@ -462,6 +492,70 @@ impl AgentSession {
     }
 
     /// The effective compaction settings with the live `enabled` toggle applied.
+    /// Pi `_compactBeforeNextAssistantResponse` (agent-session.ts:587-605 @v0.87.1), the threshold
+    /// check that runs at EVERY turn boundary inside a run rather than only after `agent_end`.
+    ///
+    /// SEAM-126 — [`Self::check_compaction`] is reached from `handle_post_agent_run` (after
+    /// `agent_end`) and from the pre-send path, so a run whose own tool results grow the context
+    /// past the threshold mid-loop kept driving turn after turn against a context nothing was
+    /// shrinking. pi added this in v0.84.4 (#8782) for exactly that case.
+    ///
+    /// Returns `Some(rebuilt context)` when a compaction ran, for the caller to stamp onto the
+    /// turn's `TurnUpdate::context`; `None` when nothing was needed.
+    ///
+    /// The estimate basis differs from `check_compaction`'s preferred path on purpose:
+    /// `check_compaction` reads the assistant turn's OWN reported `usage` first and only estimates
+    /// as a fallback, whereas this boundary has no fresh assistant message whose usage it could
+    /// read — so it always estimates, which is exactly what pi does here
+    /// (`estimateProjectedContextTokens`, no usage read, `:596`). The basis is the raw
+    /// `AgentMessage` transcript (SESS-028), the same projection pi estimates over.
+    pub(crate) async fn compact_before_next_assistant_response(
+        &self,
+    ) -> Option<Vec<cyrup_agent::AgentMessage>> {
+        // pi: `!model || model.contextWindow <= 0` → no compaction, and `getCompactionSettings`
+        // carries the enable flag (`:589-595`).
+        if !self.auto_compaction_enabled() {
+            return None;
+        }
+        let window = {
+            Self::lock(&self.compaction_model)
+                .as_ref()
+                .map_or(0, |m| m.context_window)
+        };
+        if window == 0 {
+            return None;
+        }
+        let settings = self.effective_compaction_settings();
+        // SESS-052 — pi reads `estimateProjectedContextTokens(projection, branch)` here
+        // (`agent-session.ts:596` @v0.87.1), which discards the provider-usage anchor when a
+        // `context_edit` or `compaction` post-dates the entry that anchor came from.
+        let estimate = self.manager.lock().await.projected_context_estimate();
+        // pi `shouldCompact`: contextTokens > contextWindow − reserveTokens
+        // (core/compaction/compaction.ts:289 @v0.87.1 — the file moved into a `compaction/`
+        // subdirectory since this row was filed).
+        let threshold = window.saturating_sub(u64::from(settings.reserve_tokens));
+        if u64::from(estimate.tokens) <= threshold {
+            return None;
+        }
+        match self
+            .run_auto_compaction(CompactionReason::Threshold, false)
+            .await
+        {
+            Ok(true) => Some(
+                self.raw_context_messages()
+                    .await
+                    .iter()
+                    .map(raw_message_to_agent)
+                    .collect(),
+            ),
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "turn-boundary auto-compaction failed");
+                None
+            }
+        }
+    }
+
     fn effective_compaction_settings(&self) -> CompactionSettings {
         CompactionSettings {
             enabled: self.auto_compaction_enabled(),

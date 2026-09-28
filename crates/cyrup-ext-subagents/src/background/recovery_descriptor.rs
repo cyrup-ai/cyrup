@@ -34,11 +34,11 @@
 //! # Fields cyrup cannot carry (omitted from the struct, deliberately)
 //!
 //! `mcpDirectTools`, `skillPath`, `intercomBridge`, `maxOutput`, `launchResolvedExtensions`,
-//! `modelResponseAliases`, `extensionBindings`, `requiredExtensions`, `agentContract`, `baseRef`:
-//! none of these has a cyrup concept on the async single path (see the `[AUG — descriptor]` field
-//! map for the per-field grep). `deny_unknown_fields` is safe because the writer and every reader
-//! of this file are in this crate. (`fast`, `mutationTools` and `inheritGlobalContext` left this
-//! list with SUBA-101/102/103 and are carried below.)
+//! `extensionBindings`, `requiredExtensions`, `agentContract`, `baseRef`: none of these has a cyrup
+//! concept on the async single path (see the `[AUG — descriptor]` field map for the per-field grep).
+//! `deny_unknown_fields` is safe because the writer and every reader of this file are in this crate.
+//! (`fast`, `mutationTools` and `inheritGlobalContext` left this list with SUBA-101/102/103, and
+//! `modelResponseAliases` left it with SUBA-119 — all four are carried below.)
 //!
 //! # `[CYRUP-DELTA]` — four cyrup-only run-level keys
 //!
@@ -431,6 +431,21 @@ pub struct RecoveryDescriptor {
     /// SUBA-N06 — the caller's `includeProgress`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_progress: Option<bool>,
+    /// SUBA-119 — pi `modelResponseAliases` (`async-resume.ts:326` in the reader's allowlist,
+    /// validated at `:347`, written by `async-execution.ts:2039`).
+    ///
+    /// This is upstream's own answer to the sentence the verification error ends with:
+    /// *"Configuration changes affect new independent native runs; resumed native runs retain their
+    /// launch-time declaration."* Without this field that promise is false — a resume would re-read
+    /// today's `config.json` (or, on cyrup's detached path, nothing at all) and a run launched under
+    /// a declared alias could fail `model_verification_failed` on revival. The revive prefers this
+    /// over the live config exactly as `subagent-executor.ts:2136` does
+    /// (`recoveryDescriptor ? recoveryDescriptor.modelResponseAliases : …`).
+    ///
+    /// Re-validated on read by [`Self::validate`] with upstream's descriptor-scoped label, so a
+    /// hand-edited descriptor cannot smuggle in a shape `config.json` would have refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
 }
 
 /// pi writes `tools` as a `string[]` (`"read"`, `"mcp:server.tool"`); [`ToolRef`]'s own derive
@@ -640,6 +655,12 @@ impl RecoveryDescriptor {
             usage_budget: config.usage_budget,
             permission_rules: config.permission_rules.clone(),
             include_progress: config.include_progress,
+            // SUBA-119 — pi `modelResponseAliases: ctx.modelResponseAliases`
+            // (`async-execution.ts:2039`): the alias map in force AT LAUNCH, so a revive enforces
+            // the declaration the run was authorized under rather than whatever `config.json` says
+            // at revival time. This is what makes the verification error's own promise — "resumed
+            // native runs retain their launch-time declaration" — true.
+            model_response_aliases: config.model_response_aliases.clone(),
         })
     }
 
@@ -741,6 +762,24 @@ impl RecoveryDescriptor {
         // uses, so a descriptor can never smuggle in an acceptance shape the tool would refuse.
         if let Some(acceptance) = &self.acceptance {
             crate::exec::acceptance::lower_acceptance_input(acceptance).map_err(invalid)?;
+        }
+        // SUBA-119 — pi `validateModelResponseAliases(parsed.modelResponseAliases, `async recovery
+        // descriptor '<path>' modelResponseAliases`)` (`async-resume.ts:347`): the SAME validator
+        // `config.json` load uses, so a hand-edited descriptor cannot carry a map the config
+        // surface would have refused. Serde has already narrowed the type, so only the KEY and
+        // per-entry rules can still fail here; they are the ones that matter, because a malformed
+        // key is a declaration that silently never matches.
+        if let Some(aliases) = &self.model_response_aliases {
+            let raw = serde_json::to_value(aliases).map_err(|error| {
+                invalid(format!(
+                    "modelResponseAliases is not representable: {error}"
+                ))
+            })?;
+            crate::exec::model_verification::validate_model_response_aliases(
+                Some(&raw),
+                "modelResponseAliases",
+            )
+            .map_err(invalid)?;
         }
         match (self.model_origin, self.model_override_from_parent) {
             (ModelOrigin::Inherited, Some(true)) => {}
@@ -1193,6 +1232,7 @@ mod tests {
 
     fn runner_config(step: SingleStepSpec, persona: ResolvedAgentPersona) -> RunnerConfig {
         RunnerConfig {
+            model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,
             run_id: RunId::from_token("run-launch".to_string()),
@@ -1962,5 +2002,74 @@ mod tests {
             "pi's `<project agents dir>/recovery-agent` fallback"
         );
         assert_eq!(fallback.system_prompt_body, "", "pi's `systemPrompt: \"\"`");
+    }
+    /// SUBA-119 — `modelResponseAliases` on the descriptor. The verification error ends with
+    /// *"Configuration changes affect new independent native runs; resumed native runs retain their
+    /// launch-time declaration"* — a promise that is false unless the alias map travels on the
+    /// descriptor. Without it a revive re-reads today's `config.json` (and on cyrup's detached path,
+    /// nothing at all), so a run launched under a declared alias could fail
+    /// `model_verification_failed` on revival with no way to escape it.
+    ///
+    /// Three halves, all upstream's: written from the launch config
+    /// (`async-execution.ts:2039`), round-tripped through the on-disk JSON under pi's own camelCase
+    /// key, and re-validated on read with the SAME validator `config.json` uses
+    /// (`async-resume.ts:347`), so a hand-edited descriptor cannot carry a shape the config surface
+    /// would have refused.
+    #[test]
+    fn the_descriptor_carries_the_launch_time_response_alias_map() {
+        let aliases: crate::exec::model_verification::ModelResponseAliases = BTreeMap::from([(
+            "anthropic/override".to_string(),
+            vec!["anthropic/override-2025".to_string()],
+        )]);
+        let mut config = runner_config(distinctive_step(), distinctive_persona());
+        config.model_response_aliases = Some(aliases.clone());
+
+        let written = RecoveryDescriptor::for_single_launch(&config, LaunchInputs::default())
+            .expect("a single native launch writes a descriptor");
+        assert_eq!(written.model_response_aliases.as_ref(), Some(&aliases));
+
+        // pi's own key name, and a clean round trip through the on-disk form.
+        let json = serde_json::to_value(&written).expect("serializes");
+        assert_eq!(
+            json.get("modelResponseAliases"),
+            Some(&serde_json::json!({ "anthropic/override": ["anthropic/override-2025"] }))
+        );
+        let read: RecoveryDescriptor = serde_json::from_value(json).expect("round-trips");
+        assert_eq!(read.model_response_aliases, Some(aliases));
+        read.validate(Path::new("/runs/r1/recovery-descriptor.json"))
+            .expect("a well-formed map validates");
+
+        // A launch that declared nothing writes nothing — the key is absent, not `null`, matching
+        // pi's `...(x ? { x } : {})` spread.
+        let bare = RecoveryDescriptor::for_single_launch(
+            &runner_config(distinctive_step(), distinctive_persona()),
+            LaunchInputs::default(),
+        )
+        .expect("descriptor");
+        assert_eq!(bare.model_response_aliases, None);
+        assert!(
+            serde_json::to_value(&bare)
+                .expect("serializes")
+                .get("modelResponseAliases")
+                .is_none()
+        );
+
+        // `async-resume.ts:347` — a malformed KEY is refused on read. serde has already narrowed the
+        // VALUE type, so the key rule is the one that can still fail, and it is the one that matters:
+        // a key that is not `provider/model` is a declaration that silently never matches.
+        let mut malformed = written;
+        malformed.model_response_aliases = Some(BTreeMap::from([(
+            "nomodel".to_string(),
+            vec!["anything".to_string()],
+        )]));
+        let err = malformed
+            .validate(Path::new("/runs/r1/recovery-descriptor.json"))
+            .expect_err("a non-provider/model key must be refused");
+        assert!(
+            err.to_string().contains(
+                "modelResponseAliases key \"nomodel\" must be a non-empty provider/model ID"
+            ),
+            "{err}"
+        );
     }
 }

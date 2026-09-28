@@ -339,6 +339,12 @@ impl<B: Backend> App<B> {
                 let cancel = CancelToken::new();
                 self.state.login_cancel = Some(cancel.clone());
                 let auth_type = option.auth_type;
+                // **TUI-105.** `const previousModel = this.session.model` (`:6004`, `:6135`) —
+                // captured HERE, at the call site, before the dialog runs. `finish_login` must not
+                // re-read it: a `/model` issued while the browser tab was open would then look like
+                // the state the login started in, and pi's `session.model === previousModel` guard
+                // (`:5961`) exists to respect exactly that.
+                self.state.login_previous_model = session.model();
                 let store = Arc::clone(&session.services().auth);
                 // `getAuthPath()` (`env.rs:236-238`): the path the success status names.
                 let auth_path = session.services().agent_dir.join("auth.json");
@@ -392,7 +398,7 @@ impl<B: Backend> App<B> {
     ///
     /// `pub` for the same reason as [`Self::apply_tree_nav_outcome`]: `tests/*.rs` drives the
     /// settle half without a live run loop.
-    pub fn apply_login_msg(&mut self, msg: LoginUiMsg) {
+    pub async fn apply_login_msg(&mut self, session: &Arc<AgentSession>, msg: LoginUiMsg) {
         match msg {
             LoginUiMsg::Notify(event) => {
                 if let Some(dialog) = self.login_dialog_mut() {
@@ -413,7 +419,7 @@ impl<B: Backend> App<B> {
                     let _ = stale.send(Err(OAuthError::Cancelled));
                 }
             }
-            LoginUiMsg::Finished(finished) => self.finish_login(*finished),
+            LoginUiMsg::Finished(finished) => self.finish_login(session, *finished).await,
         }
     }
 
@@ -422,7 +428,7 @@ impl<B: Backend> App<B> {
     /// success status (`completeProviderAuthentication`, `:5176-5227`) or the error banner — and
     /// NOTHING at all when the user cancelled, which is what `errorMsg !== "Login cancelled"`
     /// buys (`:5294`, `:5401`).
-    fn finish_login(&mut self, finished: LoginFinished) {
+    async fn finish_login(&mut self, session: &Arc<AgentSession>, finished: LoginFinished) {
         // `restoreEditor()` (`:5276-5281`).
         if self.active_selector_kind() == Some(SelectorKind::LoginDialog) {
             self.close_selector(true);
@@ -454,17 +460,52 @@ impl<B: Backend> App<B> {
                         .remove(&finished.provider_id);
                 }
                 self.refresh_subscription_marker();
-                // `actionLabel` (`:5183`) + `` `${actionLabel}. Credentials saved to ${getAuthPath()}` ``
-                // (`:5219`). `getAuthPath()` is `<agent_dir>/auth.json` (`env.rs:236`).
+                // `actionLabel` (`:5885`): `Logged in to {name}` | `Saved API key for {name}`.
                 let action = if finished.oauth {
                     format!("Logged in to {name}")
                 } else {
                     format!("Saved API key for {name}")
                 };
-                let path = finished.auth_path.display();
-                self.state
-                    .transcript
-                    .push_status(format!("{action}. Credentials saved to {path}"));
+                let provider_id = finished.provider_id.clone();
+                let auth_path = finished.auth_path.clone();
+                let previous_model = self.state.login_previous_model.clone();
+                // `deferSelection` (`:5889-5895`) — "Dynamic catalogs may be empty until the first
+                // authenticated network refresh" (`:5888`): the credential exists now, but the
+                // provider's models may only arrive with the refresh below, so selecting the default
+                // this instant would report it missing.
+                let default_id = cyrup_config::default_model_per_provider(&provider_id);
+                let defer = previous_model.is_none()
+                    && default_id.is_some()
+                    && !session.available_model_catalog().iter().any(|m| {
+                        m.provider.as_str() == provider_id && Some(m.id.as_str()) == default_id
+                    });
+                if defer {
+                    // `` `${actionLabel}. Credentials saved to ${getAuthPath()}. Refreshing model
+                    // catalog…` `` (`:5948`) — the ONLY line emitted on this path; the selection and
+                    // its status come from the refresh continuation.
+                    let path = auth_path.display();
+                    self.state.transcript.push_status(format!(
+                        "{action}. Credentials saved to {path}. Refreshing model catalog…"
+                    ));
+                } else {
+                    // `await finishAuthentication()` (`:5950`).
+                    self.finish_provider_authentication(
+                        session,
+                        &action,
+                        &provider_id,
+                        &auth_path,
+                        previous_model.is_none(),
+                    )
+                    .await;
+                }
+                self.begin_post_login_catalog_refresh(
+                    session,
+                    action,
+                    provider_id,
+                    auth_path,
+                    defer,
+                    previous_model,
+                );
             }
             // `if (errorMsg !== "Login cancelled")` (`:5294`, `:5401`) — a cancel is silent.
             Err(_) if finished.cancelled => {}
@@ -489,4 +530,303 @@ impl<B: Backend> App<B> {
             cancel.cancel();
         }
     }
+}
+
+impl<B: Backend> App<B> {
+    /// Recompute the footer's available-provider count — pi `updateAvailableProviderCount`
+    /// (`interactive-mode.ts:5092-5098`) verbatim: the SCOPED set when one is configured, otherwise
+    /// the auth-filtered snapshot, deduped by provider.
+    ///
+    /// Before TUI-105 `StatusLine::set_provider_count` had exactly one production caller, at boot
+    /// (`cyrup/src/interactive.rs:466-469`), so the `(provider)` prefix gate (`status.rs:597`) could
+    /// not change after startup: logging in to a second provider left the footer claiming one.
+    ///
+    /// `[CYRUP-DELTA]` that boot site still counts `session.model_catalog()` — the CURRENT provider's
+    /// own models — where this counts the auth-filtered `available_model_catalog()`, which is pi's
+    /// `getAvailableSnapshot()` (`interactive-mode.ts:5096`). So the first frame's count can be
+    /// narrower than every count after it. Not reconciled here: that line lives in the `cyrup` binary
+    /// crate, outside this change's crate, and the two readings agree from the first login, `/model`,
+    /// `/scoped-models` or `/logout` onwards.
+    pub(crate) fn refresh_provider_count(&mut self, session: &Arc<AgentSession>) {
+        let scoped = session.scoped_models();
+        // `session.scopedModels.length > 0 ? … : getAvailableSnapshot()` (`:5094-5096`).
+        let providers: std::collections::BTreeSet<String> = if scoped.is_empty() {
+            session
+                .available_model_catalog()
+                .iter()
+                .map(|m| m.provider.as_str().to_string())
+                .collect()
+        } else {
+            scoped
+                .iter()
+                .map(|s| s.model.provider.as_str().to_string())
+                .collect()
+        };
+        self.status_mut().set_provider_count(providers.len());
+    }
+
+    /// **TUI-105.** `finishAuthentication` (`interactive-mode.ts:5896-5945`): select the provider's
+    /// curated default model when the session had none, recount providers, then report.
+    ///
+    /// Returns the selected model id, which is what pi's `if (selectedModel)` (`:5931`) branches on.
+    ///
+    /// Called twice on the deferred path — once from [`Self::finish_login`] when the default is
+    /// already in the cached catalog, and once from [`Self::apply_login_refresh`] when it was not —
+    /// which is exactly upstream's closure being invoked from its two sites (`:5950`, `:5962`).
+    async fn finish_provider_authentication(
+        &mut self,
+        session: &Arc<AgentSession>,
+        action: &str,
+        provider_id: &str,
+        auth_path: &std::path::Path,
+        previous_model_was_unknown: bool,
+    ) -> Option<cyrup_core::ModelId> {
+        let mut selected: Option<cyrup_core::ModelId> = None;
+        let mut selection_error: Option<String> = None;
+        // `if (isUnknownModel(previousModel))` (`:5898`) — a session that ALREADY has a model keeps
+        // it. Without this gate the fix would clobber a model the user chose before logging in.
+        if previous_model_was_unknown {
+            // `getAvailableSnapshot().filter(model => model.provider === providerId)` (`:5899-5900`).
+            let provider_models: Vec<cyrup_provider::Model> = session
+                .available_model_catalog()
+                .into_iter()
+                .filter(|m| m.provider.as_str() == provider_id)
+                .collect();
+            match default_model_selection(provider_id, &provider_models) {
+                Ok(model) => {
+                    let id = model.id.clone();
+                    // `await this.session.setModel(selectedModel, { persist: true })` (`:5918`).
+                    match session.set_model_resolved(model).await {
+                        Ok(_) => selected = Some(id),
+                        // `catch` → `selectedModel = undefined` + the fourth message (`:5920-5923`).
+                        Err(e) => {
+                            selection_error = Some(
+                                DefaultModelFailure::SetModelFailed(e.to_string())
+                                    .message(action, provider_id),
+                            );
+                        }
+                    }
+                }
+                Err(failure) => selection_error = Some(failure.message(action, provider_id)),
+            }
+        }
+        // `await this.updateAvailableProviderCount(); this.footer.invalidate();` — unconditional, on
+        // both the selected and the errored paths (`:5928-5930`).
+        self.refresh_provider_count(session);
+        self.refresh_subscription_marker();
+        let path = auth_path.display();
+        match &selected {
+            // `` `${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}` ``
+            // (`:5932`).
+            Some(id) => {
+                let id = id.as_str();
+                self.state.transcript.push_status(format!(
+                    "{action}. Selected {id}. Credentials saved to {path}"
+                ));
+            }
+            // `` `${actionLabel}. Credentials saved to ${getAuthPath()}` `` + `showError(selectionError)`
+            // (`:5937-5941`).
+            None => {
+                self.state
+                    .transcript
+                    .push_status(format!("{action}. Credentials saved to {path}"));
+                if let Some(message) = selection_error {
+                    self.state.transcript.push_error(message);
+                }
+            }
+        }
+        selected
+    }
+
+    /// Spawn the post-login catalog refresh — pi's `AbortController` + 15 s `setTimeout` +
+    /// `session.modelRuntime.refresh(...)` tail (`interactive-mode.ts:5951-5973`).
+    ///
+    /// Shaped on [`Self::begin_model_catalog_refresh`] (`app/selectors.rs:348-389`) because it is the
+    /// same upstream pattern: one [`CancelToken`] serving as the deadline, the cancel and the
+    /// `clearTimeout`, and a worker task posting the settled result back to the run loop.
+    ///
+    /// `[CYRUP-DELTA]` pi scopes the refresh to `{ providers: [providerId] }` (`:5955`), spending its
+    /// whole 15 s budget on the one provider just authenticated. cyrup's
+    /// [`cyrup_session_svc::AgentSession::refresh_model_catalogs`]
+    /// (`cyrup-session-svc/src/session/model.rs:281`) resolves the credentialed provider list itself
+    /// and refreshes ALL of them, so this refresh is WIDER than upstream's: the budget is shared
+    /// across N providers, and a slow unrelated provider can eat it. Recorded rather than fixed
+    /// because the narrowing belongs in `cyrup-session-svc`, outside this change's crate; the
+    /// practical effect is a deferred selection that occasionally waits longer, never a wrong one —
+    /// the epoch guard and [`crate::login_dialog::LoginRefreshMsg::previous_model`] decide that.
+    fn begin_post_login_catalog_refresh(
+        &mut self,
+        session: &Arc<AgentSession>,
+        action: String,
+        provider_id: String,
+        auth_path: std::path::PathBuf,
+        defer: bool,
+        previous_model: Option<cyrup_core::ModelRef>,
+    ) {
+        let Some(tx) = self.login_refresh_tx.clone() else {
+            // No run loop servicing the channel (an embedder, a widget test): the login has already
+            // reported and, on the non-deferred path, already selected from the cached catalog.
+            return;
+        };
+        self.state.login_refresh_epoch = self.state.login_refresh_epoch.wrapping_add(1);
+        let epoch = self.state.login_refresh_epoch;
+        let cancel = CancelToken::new();
+        self.state.login_refresh_cancel = Some(cancel.clone());
+        // `setTimeout(() => controller.abort(), 15_000)` (`:5952`). The second arm is upstream's
+        // `finally { clearTimeout(timeout) }` (`:5973`): once the refresh settles this task exits
+        // instead of holding a timer for the full budget.
+        let deadline = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(crate::MODEL_REFRESH_TIMEOUT) => deadline.cancel(),
+                () = deadline.cancelled() => {}
+            }
+        });
+        let session = Arc::clone(session);
+        tokio::spawn(async move {
+            let result = session.refresh_model_catalogs(cancel.clone()).await;
+            cancel.cancel();
+            let _ = tx.send(crate::login_dialog::LoginRefreshMsg {
+                epoch,
+                provider_id,
+                action,
+                auth_path,
+                defer,
+                previous_model,
+                result,
+            });
+        });
+    }
+
+    /// A settled post-login catalog refresh — pi's `.then` continuation
+    /// (`interactive-mode.ts:5956-5971`), in upstream's exact order: the two warnings, the deferred
+    /// selection under its guard, then the count and the repaint.
+    ///
+    /// `pub` for the same reason [`Self::apply_login_msg`] is: `tests/login_flow.rs` drives the
+    /// settle half without a live run loop.
+    pub async fn apply_login_refresh(
+        &mut self,
+        session: &Arc<AgentSession>,
+        msg: crate::login_dialog::LoginRefreshMsg,
+    ) {
+        // pi's `this.session === session` identity check (`:5961`), expressed as the epoch guard
+        // `apply_model_refresh` already uses (`app/selectors.rs:406`): a refresh belonging to a login
+        // that has since been superseded must not select on the current one's behalf.
+        if msg.epoch != self.state.login_refresh_epoch {
+            return;
+        }
+        self.state.login_refresh_cancel = None;
+        let action = &msg.action;
+        if msg.result.aborted || msg.result.timed_out {
+            // `` `${actionLabel}, but its model catalog refresh timed out; using cached models.` ``
+            // (`:5957`). cyrup's coordinator distinguishes THIS caller's token firing (`timed_out`)
+            // from the shared operation aborting (`aborted`, `catalog_refresh.rs:90-95`); pi has only
+            // the one flag, and both are its `result.aborted`.
+            self.state.transcript.push_warning(format!(
+                "{action}, but its model catalog refresh timed out; using cached models."
+            ));
+        } else if !msg.result.errors.is_empty() {
+            // `` `${actionLabel}, but its model catalog could not be refreshed; using cached models.` ``
+            // (`:5959`).
+            self.state.transcript.push_warning(format!(
+                "{action}, but its model catalog could not be refreshed; using cached models."
+            ));
+        }
+        // "Do not replace a model or session selected while the refresh was running" (`:5960-5963`):
+        // a `/model` issued while the refresh was in flight WINS, which is why `previous_model` is the
+        // value captured before the login rather than a re-read.
+        if msg.defer && session.model() == msg.previous_model {
+            self.finish_provider_authentication(
+                session,
+                action,
+                &msg.provider_id,
+                &msg.auth_path,
+                msg.previous_model.is_none(),
+            )
+            .await;
+        }
+        // `this.updateAvailableProviderCount(); this.footer.invalidate(); this.ui.requestRender();`
+        // (`:5964-5966`) — unconditional, so a refresh that installed a new provider's catalog moves
+        // the footer even when no selection happened.
+        self.refresh_provider_count(session);
+        self.refresh_subscription_marker();
+        self.frames.request();
+    }
+}
+
+/// Why no default model could be selected after a login — pi's `selectionError` ladder
+/// (`interactive-mode.ts:5901-5923`), as a value so the four messages are one table the tests compare
+/// byte-for-byte and so each rung is reachable without a live provider catalog.
+///
+/// `[CYRUP-DELTA]` pi's FIRST rung, `providerId === "llama.cpp"` → `llamaCppPostLoginGuidance(...)`
+/// (`:5902-5903`, the helper at `:328-331`), is deliberately NOT ported: cyrup has no llama.cpp
+/// provider and no `/llama` command (`rg llama crates/cyrup-tui/src` is empty), so there is no
+/// reachable state for it, and porting it would advertise a command the product does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DefaultModelFailure {
+    /// `!hasDefaultModelProvider(providerId)` (`:5904-5905`) — cyrup's
+    /// [`cyrup_config::default_model_per_provider`] returning `None`
+    /// (`cyrup-config/src/model/defaults.rs:8`).
+    NoDefaultConfigured,
+    /// `providerModels.length === 0` (`:5906-5907`).
+    NoModelsAvailable,
+    /// The default id is configured but absent from the provider's catalog (`:5915-5916`).
+    DefaultNotAvailable(&'static str),
+    /// `setModel` threw (`:5919-5923`).
+    ///
+    /// `[CYRUP-DELTA]` pi's `setModel(selectedModel, { persist: true })` (`:5918`) maps to
+    /// [`cyrup_session_svc::AgentSession::set_model_resolved`]
+    /// (`cyrup-session-svc/src/session/model.rs:43`), which appends the `model_change` entry itself —
+    /// cyrup has no separate persist flag.
+    SetModelFailed(String),
+}
+
+impl DefaultModelFailure {
+    /// Pi's four `selectionError` templates, byte-for-byte (`interactive-mode.ts:5905`, `:5907`,
+    /// `:5916`, `:5922`). Every one of them ends in the same `Use /model to select a model.` nudge,
+    /// which is what makes the failure actionable rather than a dead end.
+    pub(crate) fn message(&self, action: &str, provider_id: &str) -> String {
+        match self {
+            Self::NoDefaultConfigured => format!(
+                "{action}, but no default model is configured for provider \"{provider_id}\". Use /model to select a model."
+            ),
+            Self::NoModelsAvailable => format!(
+                "{action}, but no models are available for that provider. Use /model to select a model."
+            ),
+            Self::DefaultNotAvailable(id) => format!(
+                "{action}, but its default model \"{id}\" is not available. Use /model to select a model."
+            ),
+            Self::SetModelFailed(error) => format!(
+                "{action}, but selecting its default model failed: {error}. Use /model to select a model."
+            ),
+        }
+    }
+}
+
+/// Pick the model a fresh login selects — pi's `selectedModel` expression (`:5913-5916`) with its
+/// two guard rungs (`:5904-5907`) folded in front.
+///
+/// The `radius` special case is upstream's, comment included: "Radius catalogs vary by account;
+/// prefer balanced, then use catalog order" (`:5912`), i.e. the default id first and the first
+/// catalog entry as that one provider's fallback.
+pub(crate) fn default_model_selection(
+    provider_id: &str,
+    provider_models: &[cyrup_provider::Model],
+) -> Result<cyrup_provider::Model, DefaultModelFailure> {
+    let Some(default_id) = cyrup_config::default_model_per_provider(provider_id) else {
+        return Err(DefaultModelFailure::NoDefaultConfigured);
+    };
+    if provider_models.is_empty() {
+        return Err(DefaultModelFailure::NoModelsAvailable);
+    }
+    provider_models
+        .iter()
+        .find(|m| m.id.as_str() == default_id)
+        .or_else(|| {
+            (provider_id == "radius")
+                .then(|| provider_models.first())
+                .flatten()
+        })
+        .cloned()
+        .ok_or(DefaultModelFailure::DefaultNotAvailable(default_id))
 }

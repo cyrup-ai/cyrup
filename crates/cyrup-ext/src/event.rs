@@ -174,8 +174,24 @@ impl EventKind {
     /// `tool_call` is cyrup's permission seam (R-08-010): `cyrup-permission-system` subscribes
     /// exactly this kind, so a handler that traps, panics, OOMs, or blows the invocation budget must
     /// DENY rather than silently allow the call it was meant to gate (EXT-001).
+    ///
+    /// `user_bash` JOINED it at coding-agent 0.86.0 (CHANGELOG *Breaking Changes*, #9068: "`user_bash`
+    /// now fails closed: errors or invalid defined results abort the command without invoking later
+    /// handlers or executing locally"). The doc paragraph above still describes `emitUserBash` as
+    /// catching-and-continuing, which was true at the pin that text was written against and is NO
+    /// LONGER true: `runner.ts:1154-1183` @v0.87.1 wraps each handler in a try/catch that reports via
+    /// `this.emitError({… event: "user_bash" …})` and then RE-THROWS (`throw err;`, `:1177`), so the
+    /// fault leaves the runner exactly as `emitToolCall`'s does. The same `throw` carries an invalid
+    /// handler result (`:1163-1167`).
+    ///
+    /// Both callers treat that throw as "abort, run nothing locally":
+    /// `modes/interactive/interactive-mode.ts::handleBashCommand` @v0.87.1 wraps the emit in
+    /// `try { … } catch { return; }` with the comment "The extension runner already reported the
+    /// error. Do not fall back to local execution.", and `modes/rpc/rpc-mode.ts` `case "bash":` has no
+    /// catch at all, so the throw becomes an error response. Do NOT restore the fail-open here: it
+    /// would silently execute a command the extension was meant to redirect (EXT-077).
     pub fn fails_closed(&self) -> bool {
-        matches!(self, EventKind::ToolCall)
+        matches!(self, EventKind::ToolCall | EventKind::UserBash)
     }
 
     /// Map a notify-only `cyrup_agent::AgentEvent` to its kind (mutating kinds come via `Hooks`).

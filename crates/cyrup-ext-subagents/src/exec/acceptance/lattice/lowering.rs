@@ -387,7 +387,13 @@ mod tests {
         );
 
         // And a run with no acceptance param at all still gets the inferred gate, unchanged.
-        let effective = AcceptanceContract::resolve_effective(None, "worker", "Implement the fix");
+        let effective = AcceptanceContract::resolve_effective_for_role(
+            None,
+            "worker",
+            // SUBA-108 — the inferred `checked` floor is the declared writer role's.
+            Some(crate::exec::acceptance::model::AcceptanceRole::Writer),
+            "Implement the fix",
+        );
         assert_eq!(effective.required_level, AcceptanceStatus::Checked);
         assert!(!effective.is_no_op(), "the gate must still be evaluated");
     }

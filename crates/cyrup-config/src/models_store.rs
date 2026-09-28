@@ -247,7 +247,7 @@ impl FileModelsStore {
         let Ok(text) = std::fs::read_to_string(&self.path) else {
             return OrderedObject::default();
         };
-        serde_json::from_str(&text).unwrap_or_default()
+        serde_json::from_str(crate::strip_bom(&text)).unwrap_or_default()
     }
 
     /// The snapshot, when the file has not moved since it was stamped — the same
@@ -411,6 +411,33 @@ mod tests {
             checked_at: Some(6),
             etag: Some(etag.to_string()),
         }
+    }
+
+    /// CFG-087, and the highest-value of the five: this read site is
+    /// `serde_json::from_str(..).unwrap_or_default()`, so at HEAD a BOM'd store file degrades
+    /// SILENTLY to an empty overlay — no error reaches anyone, the cache just looks cold forever.
+    /// pi strips the BOM first (`models-store.ts:63` @v0.87.1 -> `stripBom`, `utils/text.ts:7-9`).
+    #[tokio::test]
+    async fn a_bom_does_not_silently_empty_the_store_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_STORE_FILE_NAME);
+        {
+            let store = FileModelsStore::new(&path);
+            store.write("groq", entry("\"v1\""), None).await.unwrap();
+        }
+        // Prepend a UTF-8 BOM (EF BB BF, written as the `\u{feff}` char) to the file cyrup wrote.
+        let body = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("\u{feff}{body}")).unwrap();
+
+        // Assert on the ENTRY's presence, not on an error: at HEAD this returns Ok(None) from an
+        // empty map, so an `is_err()` assertion would not be RED.
+        let reopened = FileModelsStore::new(&path);
+        let got = reopened.read("groq", None).await.unwrap();
+        assert_eq!(
+            got.and_then(|e| e.etag).as_deref(),
+            Some("\"v1\""),
+            "a BOM'd store file must still yield its cached entry"
+        );
     }
 
     #[tokio::test]

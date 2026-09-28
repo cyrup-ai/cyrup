@@ -54,6 +54,22 @@ pub enum ExtError {
     /// Component instantiation/load failed.
     #[error("component load failed: {0}")]
     Component(String),
+    /// A `user_bash` emission ABORTED the user's `!`/`!!` (or JSON-RPC `bash`) command — pi's
+    /// `throw` out of `emitUserBash` since coding-agent 0.86.0 (*Breaking*, #9068:
+    /// "`user_bash` now fails closed: errors or invalid defined results abort the command without
+    /// invoking later handlers or executing locally"). Carried out of
+    /// `cyrup-session-svc`'s `execute_bash_with_user_event` so that NOTHING runs on the local shell
+    /// (EXT-077).
+    ///
+    /// `Display` is `{0}` and nothing else, because the string is already the user-facing sentence:
+    /// either the dispatcher's `Extension failed, blocking execution: …` (pi
+    /// `agent-session.ts:475-487`) or [`crate::INVALID_USER_BASH_RESULT_MESSAGE`] verbatim. The
+    /// enclosing `SessionServiceError::Extension` adds its own `extension host: ` prefix on the way
+    /// out, where pi's RPC `error` field carries the thrown message bare; that prefix is the only
+    /// difference from upstream on this path, and it names the layer the refusal came from rather
+    /// than changing what happened — the command is aborted and the reason is reported either way.
+    #[error("{0}")]
+    UserBashAborted(String),
     #[error("io: {0}")]
     Io(String),
     #[error(transparent)]

@@ -486,7 +486,18 @@ async fn resolve_repo_state(cwd: &Path) -> Result<RepoState, SubagentError> {
             .trim(),
     );
 
-    let status = run_git_checked(&toplevel, &["status", "--porcelain"]).await?;
+    // pi-subagents writes durable runtime state under its project artifact root by default;
+    // that state must not make managed isolation unusable for later runs
+    // (`runs/shared/worktree.ts:351` @v0.71.0, `["status", "--porcelain", "--",
+    // `:!${PROJECT_SUBAGENTS_RELATIVE_DIR}`]`). The pathspec is resolved against the TOPLEVEL
+    // while [`crate::artifacts::PROJECT_ARTIFACT_ROOT`] is `<cwd>`-relative; that is upstream's
+    // own shape (its pathspec is likewise toplevel-relative), so it is ported as-is.
+    let artifact_root_exclude = format!(":!{}", crate::artifacts::PROJECT_ARTIFACT_ROOT);
+    let status = run_git_checked(
+        &toplevel,
+        &["status", "--porcelain", "--", &artifact_root_exclude],
+    )
+    .await?;
     if !status.trim().is_empty() {
         return Err(SubagentError::WorktreeSetup(
             "worktree isolation requires a clean git working tree. Commit or stash changes first."
@@ -2169,6 +2180,47 @@ mod tests {
         // No worktree was created.
         let list = git(repo.path(), &["worktree", "list", "--porcelain"]);
         assert_eq!(list.matches("worktree ").count(), 1);
+    }
+
+    /// SUBA-117 — pi `probeWorktreeSource` excludes its own project artifact root from the
+    /// clean-tree probe (`runs/shared/worktree.ts:351` @v0.71.0). cyrup's root is
+    /// [`crate::artifacts::PROJECT_ARTIFACT_ROOT`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_worktrees_ignores_the_project_artifact_root() {
+        let repo = make_real_git_repo();
+        let state = repo
+            .path()
+            .join(crate::artifacts::PROJECT_ARTIFACT_ROOT)
+            .join("chain-runs")
+            .join("x");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("run.json"), "{}\n").unwrap();
+        resolve_repo_state(repo.path())
+            .await
+            .expect("durable runtime state under the artifact root must not block isolation");
+    }
+
+    /// Paired negative: the exclusion is a single pathspec, NOT a blanket
+    /// `--untracked-files=no`, so any other untracked path is still refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_worktrees_still_rejects_other_untracked_paths() {
+        let repo = make_real_git_repo();
+        std::fs::create_dir_all(repo.path().join(crate::artifacts::PROJECT_ARTIFACT_ROOT)).unwrap();
+        std::fs::write(
+            repo.path()
+                .join(crate::artifacts::PROJECT_ARTIFACT_ROOT)
+                .join("keep.json"),
+            "{}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("scratch.txt"), "untracked\n").unwrap();
+        match resolve_repo_state(repo.path()).await {
+            Err(SubagentError::WorktreeSetup(msg)) => {
+                assert!(msg.contains("clean git working tree"), "{msg}");
+            }
+            Err(other) => panic!("wrong variant: {other}"),
+            Ok(_) => panic!("an untracked file outside the artifact root is still dirty"),
+        }
     }
 
     // ---- cwd-conflict (allow-equal) ----

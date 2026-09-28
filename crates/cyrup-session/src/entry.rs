@@ -5,7 +5,7 @@
 //! `serde(tag=…)` + untagged-fallback shape is not expressible with `serde_derive`, so [`Entry`]
 //! hand-implements `Serialize`/`Deserialize` and delegates known variants to [`KnownEntry`].
 
-use cyrup_core::{EntryId, ModelId, ProviderId, Usage};
+use cyrup_core::{Content, EntryId, ModelId, ProviderId, Usage};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -169,6 +169,54 @@ pub enum KnownEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// An append-only edit to one EARLIER entry's contribution to model context — Pi
+    /// `ContextEditEntry` (`session-manager.ts:174-180` @v0.87.1).
+    ///
+    /// `replacement: null` OMITS the target from context entirely; a value replaces only its
+    /// content, leaving every other field of the target's message untouched. The edit entry itself
+    /// projects NO message (it is a known non-message kind, so
+    /// [`crate::context::push_as_raw`]'s catch-all skips it), and only edits admitted by
+    /// `build_context_entries` apply — an edit outside the live compaction window cannot resurrect
+    /// or alter anything.
+    ///
+    /// Pi writes these on the DEFAULT path, not only from extensions: `_omitRecoveryAttempt`
+    /// (`agent-session.ts:1015-1031` @v0.87.1) appends `appendContextEdit(targetId, null)` for an
+    /// abandoned assistant attempt and for each of its tool results.
+    ///
+    /// CYRUP-DELTA: cyrup never WRITES one — there is no `append_context_edit` counterpart to Pi
+    /// `appendContextEdit` (`session-manager.ts:1358-1395` @v0.87.1); that follows with EXT-078.
+    /// Reading and projecting them is what this variant is for, so a pi-written session no longer
+    /// degrades the edit to [`Entry::Unknown`] and silently projects the target UNEDITED. Because
+    /// cyrup only reads, the string→text-block normalisation Pi performs at WRITE time is done
+    /// defensively in the projection instead. See `session-manager.ts:174-180, 519-566 @v0.87.1`.
+    ContextEdit {
+        #[serde(flatten)]
+        base: EntryBase,
+        target_id: EntryId,
+        /// REQUIRED on the wire, with `null` as a meaningful value (omit the target from context) —
+        /// deliberately NOT `#[serde(default)]`: an absent key is not something Pi writes, and
+        /// conflating it with an explicit `null` would lose the omit signal.
+        replacement: Option<ContextEditReplacement>,
+    },
+}
+
+/// The `{ content }` payload of a non-omitting [`KnownEntry::ContextEdit`] — Pi
+/// `ContextEditEntry["replacement"]` (`session-manager.ts:177-179` @v0.87.1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextEditReplacement {
+    pub content: ContextEditableContent,
+}
+
+/// Content an append-only context edit may substitute without changing message metadata — Pi
+/// `ContextEditableContent` (`session-manager.ts:167-171` @v0.87.1), the union of the `user`,
+/// `assistant`, `toolResult` and `custom` message content types. On the wire that is a bare string
+/// or a block array, so this is `#[serde(untagged)]`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContextEditableContent {
+    Text(String),
+    Blocks(Vec<Content>),
 }
 
 /// The wire tags cyrup recognizes. Anything else → [`Entry::Unknown`].
@@ -182,6 +230,7 @@ const KNOWN_TYPES: &[&str] = &[
     "custom_message",
     "label",
     "session_info",
+    "context_edit",
 ];
 
 impl KnownEntry {
@@ -195,7 +244,8 @@ impl KnownEntry {
             | KnownEntry::Custom { base, .. }
             | KnownEntry::CustomMessage { base, .. }
             | KnownEntry::Label { base, .. }
-            | KnownEntry::SessionInfo { base, .. } => base,
+            | KnownEntry::SessionInfo { base, .. }
+            | KnownEntry::ContextEdit { base, .. } => base,
         }
     }
 
@@ -209,7 +259,8 @@ impl KnownEntry {
             | KnownEntry::Custom { base, .. }
             | KnownEntry::CustomMessage { base, .. }
             | KnownEntry::Label { base, .. }
-            | KnownEntry::SessionInfo { base, .. } => base,
+            | KnownEntry::SessionInfo { base, .. }
+            | KnownEntry::ContextEdit { base, .. } => base,
         }
     }
 }

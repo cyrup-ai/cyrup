@@ -199,7 +199,8 @@ pub use event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, 
 pub use extension::{ExtKind, Extension};
 pub use facade::{
     BeforeAgentStartReduction, CompactionReduction, ExtensionFlagOverride, ExtensionHost,
-    HostConfig, InputReduction, RenderOutcome, TreeReduction, UserBashReduction,
+    HostConfig, INVALID_USER_BASH_RESULT_MESSAGE, InputReduction, RenderOutcome, TreeReduction,
+    UserBashReduction, is_user_bash_event_result,
 };
 pub use hooks::ExtHooks;
 pub use loader::{

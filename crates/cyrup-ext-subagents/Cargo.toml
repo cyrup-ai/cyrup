@@ -149,7 +149,15 @@ tracing = "0.1.44"
 # already in this workspace's lockfile via `syntect`'s `default-fancy` — zero new transitive
 # crates. See the justifying comment on the `[workspace.dependencies]` entry.
 fancy-regex = { workspace = true }
-# VL-S13 (`exec/agent_refinements/proposal.rs` ONLY): the refinement proposal validator's blocked-
+# VL-S13 (`exec/agent_refinements/proposal.rs`) and SUBA-118 (`exec/abort_recovery.rs`) ONLY.
+#
+# SUBA-118 ports `abort-recovery.ts`'s three patterns (`:9-11`) — the provider-abort, abort-error and
+# tool-failure-prefix tests that decide whether a dead child may be resumed. All three are plain
+# regular expressions with no lookaround, so `regex` expresses them directly; and, exactly as in the
+# VL-S13 case below, upstream builds them WITHOUT the `u` flag, so every `\b` and `\w` is spelled
+# `(?-u:…)` to keep JavaScript's ASCII semantics rather than the Rust engine's Unicode default.
+#
+# VL-S13 (`exec/agent_refinements/proposal.rs`): the refinement proposal validator's blocked-
 # guidance pattern is a SECURITY control — the string that survives it is folded into the system
 # prompt of every subsequent spawn of that agent. It must reproduce JavaScript's ASCII `\b`
 # (`agent-refinements.ts:457` builds the RegExp without the `u` flag), which is spelled `(?-u:\b)`.

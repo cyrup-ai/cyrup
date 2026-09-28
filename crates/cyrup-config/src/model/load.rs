@@ -25,12 +25,20 @@ pub fn load_custom_models(path: &Path) -> Result<Vec<Model>, ConfigError> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let models: Vec<Model> = serde_json::from_str(&text)?;
+    // The BOM comes off BEFORE the parse, exactly as pi's `stripBom(content)` does inside
+    // `JSON.parse(stripJsonComments(stripBom(content)))` (model-config.ts:297 @v0.87.1). Left in,
+    // U+FEFF reaches `serde_json` as a leading non-value byte and the whole file is rejected.
+    let models: Vec<Model> = serde_json::from_str(crate::strip_bom(&text))?;
     Ok(models)
 }
 /// Strip `//` line comments and trailing commas from JSON, leaving string literals untouched — a
 /// 1:1 port of Pi's `stripJsonComments` (coding-agent/src/utils/json.ts), which every `models.json`
-/// read goes through (`JSON.parse(stripJsonComments(content))`, model-config.ts:257).
+/// read goes through (`JSON.parse(stripJsonComments(stripBom(content)))`, model-config.ts:297
+/// @v0.87.1).
+///
+/// It does NOT remove a BOM, and upstream does not ask it to: U+FEFF is not `char::is_whitespace`,
+/// so it reaches the default arm and is copied through verbatim. Callers strip the mark with
+/// [`crate::strip_bom`] BEFORE handing text here, which is the nesting order pi uses.
 ///
 /// Written as a single scanning pass rather than the two regex replaces, because Rust's `regex`
 /// crate has no backreference-free equivalent of the alternation trick and a scanner is exact.
@@ -87,9 +95,11 @@ fn strip_json_comments(input: &str) -> String {
 }
 
 /// Load a `models.json` provider-config file (Pi's `{ providers: {...} }` shape). A missing or
-/// empty file yields an empty [`ModelFile`]. JSONC `//` comments and trailing commas are stripped
-/// first, exactly as Pi does (model-config.ts:257). This is additive alongside
-/// [`load_custom_models`] (which reads the legacy flat `Vec<Model>` shape).
+/// empty file yields an empty [`ModelFile`]. A leading UTF-8 BOM is removed and then JSONC `//`
+/// comments and trailing commas are stripped, in that order, exactly as Pi does
+/// (`JSON.parse(stripJsonComments(stripBom(content)))`, model-config.ts:297 @v0.87.1 — the read
+/// site the BOM row CFG-087 named). This is additive alongside [`load_custom_models`] (which reads
+/// the legacy flat `Vec<Model>` shape).
 pub fn load_models_file(path: &Path) -> Result<ModelFile, ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -104,7 +114,7 @@ pub fn load_models_file(path: &Path) -> Result<ModelFile, ConfigError> {
     if text.trim().is_empty() {
         return Ok(ModelFile::default());
     }
-    let file: ModelFile = serde_json::from_str(&strip_json_comments(&text))?;
+    let file: ModelFile = serde_json::from_str(&strip_json_comments(crate::strip_bom(&text)))?;
     Ok(file)
 }
 /// Load `<agent_dir>/models.json` into a composed [`ModelFile`], turning EVERY failure mode into a
@@ -131,16 +141,21 @@ pub fn load_models_file_reporting(path: &Path) -> (ModelFile, Option<String>) {
     if text.trim().is_empty() {
         return (ModelFile::default(), None);
     }
-    // Tier 2 — JSON syntax (`JSON.parse(stripJsonComments(content))`, `:259-270`).
-    let value: serde_json::Value = match serde_json::from_str(&strip_json_comments(&text)) {
-        Ok(v) => v,
-        Err(e) => {
-            return empty(format!(
-                "Failed to parse models.json: {e}\n\nFile: {}",
-                path.display()
-            ));
-        }
-    };
+    // Tier 2 — JSON syntax (`JSON.parse(stripJsonComments(stripBom(content)))`, model-config.ts:297
+    // @v0.87.1). The BOM strip is INSIDE the comment strip, not around it: `strip_json_comments`
+    // preserves U+FEFF (it is not `char::is_whitespace`, so it falls through the scanner's default
+    // arm), and a surviving mark makes `serde_json` reject the file at line 1 column 1 — which is
+    // how a BOM'd models.json silently dropped every one of the user's providers (CFG-087).
+    let value: serde_json::Value =
+        match serde_json::from_str(&strip_json_comments(crate::strip_bom(&text))) {
+            Ok(v) => v,
+            Err(e) => {
+                return empty(format!(
+                    "Failed to parse models.json: {e}\n\nFile: {}",
+                    path.display()
+                ));
+            }
+        };
     // Tier 3 — schema (`validateModelsConfig.Check`, `:265-279`). EVERY failing field is reported,
     // by dotted key path, under a heading distinct from the syntax one.
     let schema_errors = validate_models_config(&value);
@@ -183,6 +198,64 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// CFG-087 — the models.json half. All three readers in this file handed the raw text to
+    /// `serde_json`, and `strip_json_comments` does NOT take the mark off (U+FEFF is not
+    /// `char::is_whitespace`, so it reaches the scanner's default arm and is copied through), so a
+    /// Notepad-saved models.json dropped EVERY provider the user declared. Upstream
+    /// model-config.ts:297 @v0.87.1 is `JSON.parse(stripJsonComments(stripBom(content)))` — the BOM
+    /// comes off first.
+    ///
+    /// The reporting loader is asserted on the PROVIDER MAP rather than only on the diagnostic,
+    /// because that is the observable the row's Impact names ("a BOM'd models.json drops the user's
+    /// providers") and because it is the loader whose contract is to swallow the error.
+    #[test]
+    fn a_bom_does_not_drop_the_declared_providers() {
+        let dir = crate::test_util::temp_dir();
+        const BODY: &str =
+            r#"{"providers":{"acme":{"baseUrl":"https://acme.test/v1","models":[{"id":"a1"}]}}}"#;
+
+        // Reporting loader (the startup path): an empty map plus
+        // `Failed to parse models.json: expected value at line 1 column 1` at HEAD.
+        let reporting = dir.join("reporting.json");
+        std::fs::write(&reporting, format!("\u{feff}{BODY}")).unwrap();
+        let (file, diagnostic) = load_models_file_reporting(&reporting);
+        assert_eq!(
+            diagnostic, None,
+            "a BOM must not be reported as a models.json syntax error"
+        );
+        assert_eq!(
+            file.providers["acme"].base_url.as_deref(),
+            Some("https://acme.test/v1"),
+            "a BOM'd models.json must still declare the user's providers"
+        );
+
+        // Strict loader (`load_models_file`).
+        let strict = dir.join("strict.json");
+        std::fs::write(&strict, format!("\u{feff}{BODY}")).unwrap();
+        let parsed = load_models_file(&strict).expect("a BOM'd models.json must parse");
+        assert_eq!(parsed.providers.len(), 1);
+
+        // Legacy flat `Vec<Model>` loader (`load_custom_models`).
+        let custom = dir.join("custom.json");
+        let models = vec![model("custom", "my-model", "My Model")];
+        let body = serde_json::to_string(&models).unwrap();
+        std::fs::write(&custom, format!("\u{feff}{body}")).unwrap();
+        let loaded = load_custom_models(&custom).expect("a BOM'd flat models.json must parse");
+        assert_eq!(loaded.first().unwrap().id.as_str(), "my-model");
+
+        // A BOM'd file with comments and trailing commas too: the two strips compose in pi's
+        // order, and neither one is doing the other's job.
+        let jsonc = dir.join("jsonc.json");
+        std::fs::write(
+            &jsonc,
+            "\u{feff}{\n  // note\n  \"providers\": { \"acme\": { \"models\": [{ \"id\": \"a1\" },] },  }\n}\n",
+        )
+        .unwrap();
+        let (file, diagnostic) = load_models_file_reporting(&jsonc);
+        assert_eq!(diagnostic, None);
+        assert_eq!(file.providers["acme"].models.len(), 1);
     }
 
     #[test]

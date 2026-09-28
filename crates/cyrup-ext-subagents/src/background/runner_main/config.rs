@@ -264,6 +264,18 @@ pub struct RunnerConfig {
     /// lets an older on-disk config still deserialize, leaving enforcement off for that run.
     #[serde(default)]
     pub model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    /// SUBA-119 — the operator-declared `config.modelResponseAliases` in force at authorization
+    /// time (pi `deps.config.modelResponseAliases`, threaded onto the async launch at
+    /// `subagent-executor.ts:2008` and onto each async step's run options at
+    /// `async-execution.ts:1152`/`:1946`/`:2039`).
+    ///
+    /// Carried for exactly the reason [`Self::model_scope`] is: hop 2 has no `config.json` access by
+    /// design, and without this field a background run whose child is served a substituted model
+    /// would fail with `model_verification_failed` even though the operator HAD declared the alias —
+    /// a foreground-only escape hatch, which is worse than none. `#[serde(default)]` (`None`) lets
+    /// an older on-disk config still deserialize, leaving the run on upstream's no-alias behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
     /// The inherited nested-event route (pi `config.nestedRoute`, `async-execution.ts:727,989` @v0.34.0) —
     /// resolved ONCE by the orchestrator from its own inherited env
     /// ([`crate::spawn::nested_events::resolve_inherited_nested_route_from_env`]) and carried here
@@ -569,6 +581,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
@@ -635,6 +648,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,
             // SUBA-021: unbudgeted on this path (see the field doc).

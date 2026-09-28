@@ -134,6 +134,10 @@ impl ApiImpl for AnthropicMessagesApi {
             url,
             headers,
             body: Some(body),
+            // pi's `iterateSseMessages` ends with `flushSseEvent(state)`
+            // (`anthropic-messages.ts:461` @v0.87.1), so a stream cut after the final
+            // `message_stop` frame still delivers it.
+            flush_at_eof: true,
         };
 
         let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {

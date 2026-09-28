@@ -553,6 +553,22 @@ mod tests {
         assert_eq!(map.get("xhigh"), None);
     }
 
+    /// PROV-074, the half that actually protects users: the shipped `deepseek.json` rows carry a
+    /// `compat` block with no `maxTokensField`, so the field each row resolves to is whatever
+    /// `detect_compat` produces. At HEAD that was `max_completion_tokens` for both rows.
+    #[test]
+    fn deepseek_catalog_rows_resolve_to_max_tokens() {
+        for m in DEEPSEEK.models().iter() {
+            let resolved = crate::api::compat::get_compat(m);
+            assert_eq!(
+                resolved.max_tokens_field,
+                crate::api::compat::MaxTokensField::MaxTokens,
+                "{} must cap with max_tokens",
+                m.id.as_str()
+            );
+        }
+    }
+
     #[test]
     fn catalog_drives_reasoning_encoding_via_compat() {
         // A cerebras model (openai thinking format, reasoning_effort supported) encodes

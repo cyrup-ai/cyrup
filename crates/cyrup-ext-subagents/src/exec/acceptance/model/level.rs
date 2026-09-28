@@ -1,8 +1,6 @@
 //! `requiredEvidenceForLevel` and level inference: what evidence a level demands, and how an
 //! `auto` request resolves to a concrete level (pi `acceptance.ts:55-302`).
 
-use crate::exec::completion_guard::{any_word_boundary, word_boundary_contains};
-
 use super::types::{
     AcceptanceConfig, AcceptanceEvidenceKind, AcceptanceInput, AcceptanceLevel,
     AcceptanceReviewGate, AcceptanceRole, CriterionInput, GateSeverity, ResolvedAcceptanceConfig,
@@ -53,9 +51,11 @@ pub enum SubagentRunMode {
 pub struct AcceptanceResolveInput {
     pub explicit: Option<AcceptanceInput>,
     pub agent_name: String,
-    /// SUBA-082 — pi `acceptanceRole?: AcceptanceRole` (`acceptance.ts:79` @v0.57.0, `:81`
-    /// @v0.64.0): the agent's DECLARED role. `None` is upstream's `undefined`, the branch on
-    /// which the agent-name alternations (`reviewer|oracle|…`, `worker`) are consulted at all.
+    /// SUBA-082 — pi `acceptanceRole?: AcceptanceRole` (`acceptance.ts:81` @v0.71.0): the
+    /// agent's DECLARED role, and after SUBA-108 the ONLY input [`infer_level`] reads. `None` is
+    /// upstream's `undefined` and now takes the final `attested` default (`:118-122`); the
+    /// agent-name alternations (`reviewer|oracle|…`, `worker`) that used to key off it were
+    /// deleted upstream by `7c98a696` (v0.70.1) and are gone from this port too.
     pub acceptance_role: Option<AcceptanceRole>,
     pub task: Option<String>,
     pub mode: Option<SubagentRunMode>,
@@ -72,298 +72,41 @@ struct InferredLevel {
     review: Option<ReviewSetting>,
 }
 
-/// `\b(?:do not|don't|must not)\s+patch\b` (`acceptance.ts:95` @v0.57.0) over the lowercased
-/// task — the negative guard on `rolePatchTask`.
-fn forbids_patch(task_lower: &str) -> bool {
-    let bytes = task_lower.as_bytes();
-    let mut i = 0usize;
-    while i <= bytes.len() {
-        if !task_lower.is_char_boundary(i) {
-            i += 1;
-            continue;
-        }
-        if boundary_before(task_lower, i)
-            && let Some(after_phrase) = ["do not", "don't", "must not"].iter().find_map(|phrase| {
-                task_lower
-                    .get(i..)
-                    .filter(|rest| rest.starts_with(phrase))
-                    .map(|_| i + phrase.len())
-            })
-            && let Some(after_ws) = skip_ws1(task_lower, after_phrase)
-            && task_lower
-                .get(after_ws..)
-                .is_some_and(|rest| rest.starts_with("patch"))
-            && boundary_after(task_lower, after_ws + "patch".len())
-        {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-/// `\bpatch\s+(?:(?:\.{0,2}[\\/])?(?:[\w.-]+[\\/])+[\w.-]+|[\w.-]+\.[a-z0-9]+\b|(?:the\s+)?parser\b)`
-/// (`acceptance.ts:96` @v0.57.0, `:98` @v0.64.0) over the lowercased, severity-compound-stripped
-/// task: `patch` followed by a PATH (`src/auth.ts`, `./x/y`, `/etc/hosts`), a FILENAME with an
-/// extension (`auth.ts`), or `(the) parser`. This is the one place a bare `patch <object>` reads
-/// as mutation intent — `classifyTaskMutationIntent` deliberately requires a recognizable object
-/// noun and classifies `Patch src/auth.ts` as `unknown` — and upstream enables it ONLY when a
-/// role is declared (`rolePatchTask`'s `input.acceptanceRole !== undefined` guard).
-fn has_role_patch_target(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i <= bytes.len() {
-        if !text.is_char_boundary(i) {
-            i += 1;
-            continue;
-        }
-        if boundary_before(text, i)
-            && text.get(i..).is_some_and(|rest| rest.starts_with("patch"))
-            && let Some(after_ws) = skip_ws1(text, i + "patch".len())
-            && text.get(after_ws..).is_some_and(role_patch_object_at)
-        {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-/// The three-way object alternation of [`has_role_patch_target`], tested at the start of `rest`.
-fn role_patch_object_at(rest: &str) -> bool {
-    // `(?:\.{0,2}[\\/])?(?:[\w.-]+[\\/])+[\w.-]+` — the dotted prefixes (`./`, `../`) are
-    // consumable by the segment group itself, so only a bare leading slash needs stripping.
-    let path_body = rest.strip_prefix(['/', '\\']).unwrap_or(rest);
-    let seg1 = path_body
-        .char_indices()
-        .find(|(_, c)| !is_path_segment_char(*c))
-        .map_or(path_body.len(), |(idx, _)| idx);
-    if seg1 > 0
-        && let Some(after_slash) = path_body
-            .get(seg1..)
-            .and_then(|tail| tail.strip_prefix(['/', '\\']))
-        && after_slash.chars().next().is_some_and(is_path_segment_char)
-    {
-        return true;
-    }
-    // `[\w.-]+\.[a-z0-9]+\b` — a `[\w.-]` run containing a dot followed by an `[a-z0-9]+` run
-    // that ends at a word boundary. Every dot in the run is a candidate split (backtracking).
-    let run_end = rest
-        .char_indices()
-        .find(|(_, c)| !is_path_segment_char(*c))
-        .map_or(rest.len(), |(idx, _)| idx);
-    let run = rest.get(..run_end).unwrap_or("");
-    for (dot_idx, _) in run.char_indices().filter(|(idx, c)| *c == '.' && *idx > 0) {
-        let ext_start = dot_idx + 1;
-        let ext_end = run
-            .get(ext_start..)
-            .map(|tail| {
-                tail.char_indices()
-                    .find(|(_, c)| !(c.is_ascii_lowercase() || c.is_ascii_digit()))
-                    .map_or(run.len(), |(idx, _)| ext_start + idx)
-            })
-            .unwrap_or(ext_start);
-        if ext_end > ext_start && boundary_after(run, ext_end) {
-            return true;
-        }
-    }
-    // `(?:the\s+)?parser\b`
-    let mut cursor = 0usize;
-    if rest.starts_with("the")
-        && let Some(after_ws) = skip_ws1(rest, "the".len())
-    {
-        cursor = after_ws;
-    }
-    rest.get(cursor..)
-        .is_some_and(|tail| tail.starts_with("parser"))
-        && boundary_after(rest, cursor + "parser".len())
-}
-
-/// `[\w.-]` — JavaScript `\w` (ASCII alphanumerics and `_`) plus `.` and `-`.
-fn is_path_segment_char(ch: char) -> bool {
-    crate::exec::completion_guard::is_word_char(ch) || ch == '.' || ch == '-'
-}
-
-/// `\s+` — the end offset after one-or-more whitespace characters at `i`, else `None`.
-fn skip_ws1(text: &str, i: usize) -> Option<usize> {
-    let mut end = i;
-    for ch in text.get(i..)?.chars() {
-        if ch.is_whitespace() {
-            end += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    (end > i).then_some(end)
-}
-
-/// `\b` immediately before byte offset `i`.
-fn boundary_before(text: &str, i: usize) -> bool {
-    text.get(..i)
-        .and_then(|s| s.chars().next_back())
-        .is_none_or(|c| !crate::exec::completion_guard::is_word_char(c))
-}
-
-/// `\b` immediately after byte offset `i`, for a pattern whose previous character is a word
-/// character.
-fn boundary_after(text: &str, i: usize) -> bool {
-    text.get(i..)
-        .and_then(|s| s.chars().next())
-        .is_none_or(|c| !crate::exec::completion_guard::is_word_char(c))
-}
-
-/// `inferLevel` (`acceptance.ts:77-147` @v0.43.0; the role-aware prologue at `:77-104` @v0.57.0,
-/// `:79-112` @v0.64.0) — regex-free word-boundary port (the classifier reuses
-/// `completion_guard`'s already-tested `word_boundary_contains`, exactly as the enum-lattice
-/// `heuristic_default` reuses `expects_implementation_mutation`).
+/// `inferLevel` (`acceptance.ts:81-122` @v0.71.0).
 ///
-/// SUBA-082: `input.acceptance_role` is pi's `acceptanceRole`, the PRIMARY classification input
-/// (upstream `3c635cc1`, "feat: add per-agent acceptance roles (#481)", in v0.35.0). Every
-/// `acceptanceRole === undefined` guard below is the branch this port carried alone before the
-/// role landed; each is now spelled out against `role.is_none()` so the two branches read
-/// side by side with upstream.
+/// SUBA-108 — upstream `7c98a696` ("refactor: remove inferred no-edit completion failures",
+/// #2356, v0.70.1) deleted every wording- and name-derived heuristic from this function. At
+/// v0.71.0 it reads **only** `input.acceptanceRole`: there is no agent-name alternation, no
+/// risky-keyword pattern, no `classifyTaskMutationIntent`, no `taskMayMutate` and no
+/// `stripSeverityCompounds` anywhere in `acceptance.ts`. `input.task`, `input.agentName` and
+/// `input.mode` remain in the signature and are NEVER READ; this port keeps them on
+/// [`AcceptanceResolveInput`] for the same reason, so the two signatures stay aligned.
 ///
-/// The body is the one shared by v0.57.0 (the row's tag) and v0.62.0. v0.63.0's `0128385f`
-/// ("fix: omit inferred acceptance for read-only reviewers (#1799)") then changed three lines
-/// in the SAME function — `readOnlyAgent` feeds `inferredReadOnly` (`:105` @v0.64.0), a new
-/// `dynamicResolvesReadOnly` guard on the `dynamic`/`dynamicGroup` escalations (`:107,110-111`),
-/// and the read-only branch's level flips from `attested` to `none` (`:137`). That commit is a
-/// separate drift from the acceptance-role row (it rewrites what a NAME-classified reviewer
-/// gets, role or no role, and interacts with this crate's always-attest lattice mapping in
-/// `AcceptanceContract::heuristic_default`) and is deliberately NOT folded in here.
+/// Consequence, and upstream's stated intent (CHANGELOG 0.70.1): *"Custom implementation agents
+/// must declare `acceptanceRole: writer` to receive writer acceptance defaults."* An agent with
+/// no declared role gets the lightweight attestation default regardless of its name or its task
+/// wording. cyrup's bundled `resources/agents/worker.md` therefore declares
+/// `acceptanceRole: writer`, matching `agents/worker.md` @v0.71.0 (added by the same commit).
+///
+/// The `read-only` branch returns `none`, i.e. no acceptance prompt at all
+/// (`formatAcceptancePrompt` returns `""` for `level === "none"`) and no gate.
 fn infer_level(input: &AcceptanceResolveInput) -> InferredLevel {
-    let agent = input.agent_name.to_lowercase();
-    let task = input.task.as_deref().unwrap_or("").to_lowercase();
-    let role = input.acceptance_role;
-    let mut reasons: Vec<String> = Vec::new();
-
-    // `const intent = classifyTaskMutationIntent(input.acceptanceRole ? "worker" :
-    // input.agentName, input.task ?? "")` (`acceptance.ts:90` @v0.57.0). Upstream's own comment:
-    // "Declared roles replace name heuristics, so use the full writer grammar to detect explicit
-    // mutation independently of the actual agent name." With no role declared the agent name is
-    // passed straight through, as before.
-    let intent = crate::exec::task_intent::classify_task_mutation_intent(
-        if role.is_some() {
-            "worker"
-        } else {
-            &input.agent_name
-        },
-        input.task.as_deref().unwrap_or(""),
-    );
-    // `const readOnlyTask = intent.kind === "read-only" || (intent.kind === "unknown" &&
-    // /\b(?:read[- ]only|review[- ]only|no edits|without edits|inspect|summari[sz]e)\b/.test(task))`
-    // (`acceptance.ts:91-92`). The keyword probe is a FALLBACK for `unknown` only, and its
-    // `do not edit`/`don't edit` entries moved into the classifier — a bare keyword scan
-    // cannot tell `Do not edit files.` (blanket, read-only) from `Do not edit unrelated files;
-    // implement the fix.` (scoped constraint on an implementation task), and used to call both
-    // read-only.
-    let read_only_task = intent == crate::exec::task_intent::TaskMutationIntent::ReadOnly
-        || (intent == crate::exec::task_intent::TaskMutationIntent::Unknown
-            && any_word_boundary(
-                &task,
-                &[
-                    "read only",
-                    "read-only",
-                    "review only",
-                    "review-only",
-                    "no edits",
-                    "without edits",
-                    "inspect",
-                    "summarise",
-                    "summarize",
-                ],
-            ));
-    // `const rolePatchTask = input.acceptanceRole !== undefined && intent.kind !== "read-only"
-    // && !/\b(?:do not|don't|must not)\s+patch\b/.test(task) && /\bpatch\s+(…)/.test(
-    // stripSeverityCompounds(task))` (`acceptance.ts:93-96` @v0.57.0): with a role declared,
-    // `Patch src/auth.ts` counts as mutation intent even though the classifier calls it `unknown`.
-    let role_patch_task = role.is_some()
-        && intent != crate::exec::task_intent::TaskMutationIntent::ReadOnly
-        && !forbids_patch(&task)
-        && has_role_patch_target(&crate::exec::task_intent::strip_severity_compounds(&task));
-    // `const taskMayWrite = readOnlyTask ? false : taskMayMutate(input.task ?? "") ||
-    // intent.kind === "implementation" || rolePatchTask` (`acceptance.ts:97`).
-    let task_may_write = !read_only_task
-        && (crate::exec::task_intent::task_may_mutate(input.task.as_deref().unwrap_or(""))
-            || intent == crate::exec::task_intent::TaskMutationIntent::Implementation
-            || role_patch_task);
-    // `const readOnlyAgent = input.acceptanceRole === "read-only" || (input.acceptanceRole ===
-    // undefined && /\b(?:reviewer|oracle|scout|researcher|analyst)\b/.test(agent))`
-    // (`acceptance.ts:98-99` @v0.57.0).
-    //
-    // Both edits to the alternation are VERSION LAG, not a port bug. At the ported baseline it
-    // read `reviewer|scout|context-builder|researcher|analyst` (`acceptance.ts:80` @ v0.34.0),
-    // which is exactly what this port originally carried — correctly. Upstream `83b9872`
-    // ("fix: remove stale bundled roles") then dropped `context-builder` and added `oracle` in
-    // the SAME edit; `git log -S` over this alternation returns that one commit and no other.
-    // Both halves are applied together here for the same reason they were made together.
-    let read_only_agent = role == Some(AcceptanceRole::ReadOnly)
-        || (role.is_none()
-            && any_word_boundary(
-                &agent,
-                &["reviewer", "oracle", "scout", "researcher", "analyst"],
-            ));
-    // `const writeTask = taskMayWrite || (input.acceptanceRole === "writer" && !readOnlyTask)
-    // || (input.acceptanceRole === undefined && /\bworker\b/.test(agent) && !readOnlyTask)`
-    // (`acceptance.ts:100-102`).
-    let write_task = task_may_write
-        || (role == Some(AcceptanceRole::Writer) && !read_only_task)
-        || (role.is_none() && word_boundary_contains(&agent, "worker") && !read_only_task);
-    // `const inferredReadOnly = readOnlyTask || (input.acceptanceRole === "read-only" &&
-    // !taskMayWrite)` (`acceptance.ts:103` @v0.57.0; v0.63.0's `#1799` widens this to
-    // `(readOnlyAgent || role === "read-only")` — not taken here, see the function doc).
-    let inferred_read_only =
-        read_only_task || (role == Some(AcceptanceRole::ReadOnly) && !task_may_write);
-    // `const roleResolvesReadOnly = input.acceptanceRole !== undefined && inferredReadOnly`
-    // (`acceptance.ts:104`): a DECLARED role that resolves read-only cancels the
-    // `dynamic`/`dynamicGroup` escalations below.
-    let role_resolves_read_only = role.is_some() && inferred_read_only;
-    // `const keywordRiskReadOnly = input.acceptanceRole === undefined ? intent.kind ===
-    // "read-only" : inferredReadOnly` (`acceptance.ts:105`).
-    let keyword_risk_read_only = if role.is_none() {
-        intent == crate::exec::task_intent::TaskMutationIntent::ReadOnly
-    } else {
-        inferred_read_only
-    };
-    // /\b(?:release|migration|migrate|security|data[- ]loss|destructive|post-review|fix pass)\b/
-    let risky_task = any_word_boundary(
-        &task,
-        &[
-            "release",
-            "migration",
-            "migrate",
-            "security",
-            "data loss",
-            "data-loss",
-            "destructive",
-            "post-review",
-            "fix pass",
-        ],
-    );
-    // `const risky = Boolean(input.async && writeTask) || (Boolean(input.dynamic) &&
-    // !roleResolvesReadOnly) || (Boolean(input.dynamicGroup) && !roleResolvesReadOnly) ||
-    // (!keywordRiskReadOnly && /…/.test(task))` (`acceptance.ts:106-109` @v0.57.0).
-    let risky = (input.is_async && write_task)
-        || (input.dynamic && !role_resolves_read_only)
-        || (input.dynamic_group && !role_resolves_read_only)
-        || (!keyword_risk_read_only && risky_task);
-
-    if risky {
-        reasons.push(
+    // `if (input.acceptanceRole === "writer" && (input.async || input.dynamic ||
+    // input.dynamicGroup))` (`acceptance.ts:88-100`).
+    if input.acceptance_role == Some(AcceptanceRole::Writer)
+        && (input.is_async || input.dynamic || input.dynamic_group)
+    {
+        let mut reasons = vec![
             if input.is_async {
-                "async write-capable or risky run"
+                "async declared writer"
             } else {
-                "risky write-capable run"
+                "dynamic declared writer"
             }
             .to_string(),
-        );
+        ];
         if input.dynamic || input.dynamic_group {
             reasons.push("dynamic fanout context".to_string());
         }
-        // `acceptance.ts:114-120` @v0.43.0 — the risky branch returns `level: "checked"` plus a
-        // REQUIRED review gate. Up to v0.34.0 it returned `level: "reviewed"`; v0.43.0 deleted
-        // that level entirely (see [`AcceptanceLevel`]), so the "an independent reviewer must
-        // sign this off" half of the escalation now lives ONLY in `review`, never in `level`.
         return InferredLevel {
             level: AcceptanceLevel::Checked,
             reasons,
@@ -383,20 +126,11 @@ fn infer_level(input: &AcceptanceResolveInput) -> InferredLevel {
             })),
         };
     }
-    if write_task && !read_only_task {
-        // `input.acceptanceRole === "writer" && !taskMayWrite ? "declared writer acceptance
-        // role" : "write-capable worker/task"` (`acceptance.ts:124` @v0.57.0, `:126` @v0.64.0).
-        reasons.push(
-            if role == Some(AcceptanceRole::Writer) && !task_may_write {
-                "declared writer acceptance role"
-            } else {
-                "write-capable worker/task"
-            }
-            .to_string(),
-        );
+    // `if (input.acceptanceRole === "writer")` (`acceptance.ts:101-108`).
+    if input.acceptance_role == Some(AcceptanceRole::Writer) {
         return InferredLevel {
             level: AcceptanceLevel::Checked,
-            reasons,
+            reasons: vec!["declared writer acceptance role".to_string()],
             criteria: vec![CriterionInput::Text(
                 "Implement the requested change without widening scope".to_string(),
             )],
@@ -404,23 +138,11 @@ fn infer_level(input: &AcceptanceResolveInput) -> InferredLevel {
             review: Option::None,
         };
     }
-    if read_only_agent || read_only_task {
-        // `input.acceptanceRole === "read-only" && !readOnlyTask ? "declared read-only
-        // acceptance role" : readOnlyAgent ? "read-only/reviewer-style agent" : "read-only task
-        // wording"` (`acceptance.ts:133` @v0.57.0, `:135` @v0.64.0).
-        reasons.push(
-            if role == Some(AcceptanceRole::ReadOnly) && !read_only_task {
-                "declared read-only acceptance role"
-            } else if read_only_agent {
-                "read-only/reviewer-style agent"
-            } else {
-                "read-only task wording"
-            }
-            .to_string(),
-        );
+    // `if (input.acceptanceRole === "read-only")` (`acceptance.ts:109-117`).
+    if input.acceptance_role == Some(AcceptanceRole::ReadOnly) {
         return InferredLevel {
-            level: AcceptanceLevel::Attested,
-            reasons,
+            level: AcceptanceLevel::None,
+            reasons: vec!["declared read-only acceptance role".to_string()],
             criteria: vec![CriterionInput::Text(
                 "Return concrete findings with file paths and severity when applicable".to_string(),
             )],
@@ -431,10 +153,10 @@ fn infer_level(input: &AcceptanceResolveInput) -> InferredLevel {
             review: Option::None,
         };
     }
-    reasons.push("default lightweight attestation".to_string());
+    // `acceptance.ts:118-122`.
     InferredLevel {
         level: AcceptanceLevel::Attested,
-        reasons,
+        reasons: vec!["default lightweight attestation".to_string()],
         criteria: vec![CriterionInput::Text(
             "Return a concise result and residual risks when applicable".to_string(),
         )],
@@ -478,6 +200,33 @@ fn explicit_acceptance_can_disable(explicit: &AcceptanceConfig) -> bool {
             .reason
             .as_deref()
             .is_some_and(|reason| !reason.trim().is_empty())
+}
+
+/// `explicitAcceptanceRequestsPolicy` (`acceptance.ts:243-245` @v0.71.0):
+/// `(explicit.level !== undefined && explicit.level !== "auto") || Object.keys(explicit).some((key) => key !== "level")`.
+///
+/// SUBA-108 — this predicate is what keeps a CALLER-SUPPLIED policy from being thrown away when
+/// the agent's declared role infers `none`. Upstream consults it at `acceptance.ts:505` and
+/// upgrades the inferred level to `attested`, so criteria/evidence/verify/review the caller asked
+/// for are still resolved and still enforced. It became reachable in cyrup the moment
+/// [`infer_level`]'s `read-only` branch started returning [`AcceptanceLevel::None`]; before that
+/// no inference produced `none` at all.
+///
+/// CYRUP-DELTA (mechanism, full parity) — upstream tests key PRESENCE with `Object.keys`; the
+/// Rust side tests `Option::is_some` on the same seven fields of [`AcceptanceConfig`], which is
+/// how a key's presence is already represented after normalization. The one input TS and Rust
+/// could disagree on is an explicit JSON `null` (`{"reason": null}`: a key upstream, `None`
+/// here), and that value is rejected earlier by acceptance-input validation, so it cannot reach
+/// this function.
+fn explicit_acceptance_requests_policy(explicit: &AcceptanceConfig) -> bool {
+    let level_requests = matches!(explicit.level, Some(level) if level != AcceptanceLevel::Auto);
+    let non_level_key_present = explicit.criteria.is_some()
+        || explicit.evidence.is_some()
+        || explicit.verify.is_some()
+        || explicit.review.is_some()
+        || explicit.stop_rules.is_some()
+        || explicit.reason.is_some();
+    level_requests || non_level_key_present
 }
 
 /// `normalizeCriteria` (acceptance.ts:330-342).
@@ -540,22 +289,41 @@ pub fn resolve_effective_acceptance(input: &AcceptanceResolveInput) -> ResolvedA
     let inferred = infer_level(input);
     let explicit_level = explicit.level.unwrap_or(AcceptanceLevel::Auto);
 
+    // `acceptance.ts:505` @v0.71.0: `const inferredLevel = inferred.level === "none" &&
+    // explicitAcceptanceRequestsPolicy(explicit) ? "attested" : inferred.level;`
+    //
+    // SUBA-108 — a declared `read-only` role infers `none`, and `none` ranks below every explicit
+    // level, so without this upgrade a caller-supplied policy that names no `level` (say
+    // `{ evidence: ["review-findings"] }`) resolves to `None`: no contract block, gate
+    // `NotRequired`, the caller's criteria/evidence/verify/review silently discarded. That is a
+    // fail-OPEN. Upstream upgrades to `attested` and enforces.
+    let inferred_level = if inferred.level == AcceptanceLevel::None
+        && explicit_acceptance_requests_policy(&explicit)
+    {
+        AcceptanceLevel::Attested
+    } else {
+        inferred.level
+    };
+
     let level = if explicit_acceptance_can_disable(&explicit) {
         AcceptanceLevel::None
     } else if explicit_level == AcceptanceLevel::Auto {
-        inferred.level
+        inferred_level
     } else {
         // MAX(explicit, inferred) by rank.
         let er = level_rank(explicit_level).unwrap_or(0);
-        let ir = level_rank(inferred.level).unwrap_or(0);
+        let ir = level_rank(inferred_level).unwrap_or(0);
         if er >= ir {
             explicit_level
         } else {
-            inferred.level
+            inferred_level
         }
     };
 
-    let base_evidence = if level == inferred.level {
+    // `acceptance.ts:509` compares against the UPGRADED `inferredLevel`, so an upgraded
+    // read-only agent keeps the read-only branch's own evidence list rather than
+    // `requiredEvidenceForLevel("attested")`.
+    let base_evidence = if level == inferred_level {
         inferred.evidence.clone()
     } else {
         required_evidence_for_level(level)
@@ -587,8 +355,22 @@ pub fn resolve_effective_acceptance(input: &AcceptanceResolveInput) -> ResolvedA
         level,
         explicit: input.explicit.is_some(),
         inferred_reason: inferred.reasons,
-        criteria,
-        evidence,
+        // `acceptance.ts:521-522` @v0.71.0: `criteria: level === "none" ? [] : criteria`,
+        // `evidence: level === "none" ? [] : evidence`.
+        //
+        // SUBA-108 — `formatAcceptancePrompt` emits nothing for `none`, so any criterion or
+        // evidence kind surviving here is a contract the child is never told about yet the
+        // ledger and `acceptance_requires_child_report` still count. Upstream clears both.
+        criteria: if level == AcceptanceLevel::None {
+            Vec::new()
+        } else {
+            criteria
+        },
+        evidence: if level == AcceptanceLevel::None {
+            Vec::new()
+        } else {
+            evidence
+        },
         verify: explicit.verify.clone().unwrap_or_default(),
         review,
         stop_rules: explicit.stop_rules.clone().unwrap_or_default(),
@@ -603,43 +385,35 @@ mod tests {
     use super::*;
     use crate::exec::acceptance::model::testsupport::resolve;
 
-    // ---- inferLevel / resolveEffectiveAcceptance ----
+    /// Everything `inferLevel` decides, as one comparable value — the whole observable surface of
+    /// the inference, so an invariance assertion over it cannot miss a field.
+    type InferredShape = (
+        AcceptanceLevel,
+        Vec<String>,
+        Vec<ResolvedAcceptanceGate>,
+        Vec<AcceptanceEvidenceKind>,
+        Option<ReviewSetting>,
+    );
 
+    // ---- inferLevel / resolveEffectiveAcceptance (`acceptance.ts:81-122` @v0.71.0) ----
+
+    /// SUBA-108 — the four role-only branches, each with its exact reasons/criteria/evidence
+    /// and review gate. `agent_name`, `task` and `mode` are set to values that the pre-v0.70.1
+    /// heuristics reacted to, so a regression that reintroduces any of them fails here.
     #[test]
-    fn infers_policies_for_reviewer_writer_async_and_dynamic() {
-        assert_eq!(
-            resolve(AcceptanceResolveInput {
-                agent_name: "reviewer".into(),
-                task: Some("Review-only. Do not edit.".into()),
-                mode: Some(SubagentRunMode::Single),
-                ..Default::default()
-            })
-            .level,
-            AcceptanceLevel::Attested
-        );
-        assert_eq!(
-            resolve(AcceptanceResolveInput {
-                agent_name: "worker".into(),
-                task: Some("Implement the fix".into()),
-                mode: Some(SubagentRunMode::Single),
-                ..Default::default()
-            })
-            .level,
-            AcceptanceLevel::Checked
-        );
-        // `acceptance.ts:111-121` @v0.43.0 — the risky branch resolves to `checked` (v0.34.0
-        // said `reviewed`, a level that no longer exists) and expresses "an independent
-        // reviewer must sign this off" through the REQUIRED review gate instead. Both halves
-        // are asserted, so a regression that drops the gate cannot hide behind the level.
-        let async_write = resolve(AcceptanceResolveInput {
-            agent_name: "worker".into(),
-            task: Some("Implement the fix".into()),
+    fn infers_policies_from_the_declared_role_alone() {
+        // `writer` + async → checked + REQUIRED reviewer gate (`:88-100`).
+        let async_writer = resolve(AcceptanceResolveInput {
+            agent_name: "reviewer".into(),
+            acceptance_role: Some(AcceptanceRole::Writer),
+            task: Some("Review-only. Do not edit.".into()),
             is_async: true,
             ..Default::default()
         });
-        assert_eq!(async_write.level, AcceptanceLevel::Checked);
+        assert_eq!(async_writer.level, AcceptanceLevel::Checked);
+        assert_eq!(async_writer.inferred_reason, vec!["async declared writer"]);
         assert_eq!(
-            async_write.review,
+            async_writer.review,
             Some(ReviewSetting::Gate(AcceptanceReviewGate {
                 agent: Some("reviewer".into()),
                 focus: None,
@@ -647,98 +421,252 @@ mod tests {
             }))
         );
         assert_eq!(
-            async_write.evidence,
+            async_writer.evidence,
             required_evidence_for_level(AcceptanceLevel::Checked)
         );
-        let dynamic = resolve(AcceptanceResolveInput {
-            agent_name: "worker".into(),
+
+        // `writer` + dynamic → the same, with the fanout reason appended (`:90`).
+        let dynamic_writer = resolve(AcceptanceResolveInput {
+            agent_name: "explorer".into(),
+            acceptance_role: Some(AcceptanceRole::Writer),
             task: Some("Fix each item".into()),
             mode: Some(SubagentRunMode::Chain),
             dynamic: true,
             ..Default::default()
         });
-        assert_eq!(dynamic.level, AcceptanceLevel::Checked);
+        assert_eq!(dynamic_writer.level, AcceptanceLevel::Checked);
         assert_eq!(
-            dynamic.review,
-            Some(ReviewSetting::Gate(AcceptanceReviewGate {
-                agent: Some("reviewer".into()),
-                focus: None,
-                required: Some(true),
-            }))
+            dynamic_writer.inferred_reason,
+            vec!["dynamic declared writer", "dynamic fanout context"]
         );
+
+        // plain `writer` → checked, ONE criterion, NO review gate (`:101-108`).
+        let writer = resolve(AcceptanceResolveInput {
+            agent_name: "reviewer".into(),
+            acceptance_role: Some(AcceptanceRole::Writer),
+            task: Some("Review only; do not edit".into()),
+            ..Default::default()
+        });
+        assert_eq!(writer.level, AcceptanceLevel::Checked);
+        assert_eq!(
+            writer.inferred_reason,
+            vec!["declared writer acceptance role"]
+        );
+        assert_eq!(writer.review, None);
+
+        // `read-only` → `none` (`:109-117`), NOT `attested`, even on implementation wording.
+        let read_only = resolve(AcceptanceResolveInput {
+            agent_name: "worker".into(),
+            acceptance_role: Some(AcceptanceRole::ReadOnly),
+            task: Some("Implement the fix".into()),
+            ..Default::default()
+        });
+        assert_eq!(read_only.level, AcceptanceLevel::None);
+        assert_eq!(
+            read_only.inferred_reason,
+            vec!["declared read-only acceptance role"]
+        );
+        // `acceptance.ts:521-522`: the `none` level ships NO criteria and NO evidence, even
+        // though `inferLevel`'s read-only branch names one criterion and two evidence kinds.
+        // The reasons survive (`:520` is `inferredReason: inferred.reasons`), which is how the
+        // ledger still records WHY the run was not gated.
+        assert!(read_only.criteria.is_empty(), "{:?}", read_only.criteria);
+        assert!(read_only.evidence.is_empty(), "{:?}", read_only.evidence);
+
+        // no role → the lightweight default (`:118-122`), whatever the name or task says.
+        let default = resolve(AcceptanceResolveInput {
+            agent_name: "worker".into(),
+            acceptance_role: None,
+            task: Some("Run the security migration release".into()),
+            ..Default::default()
+        });
+        assert_eq!(default.level, AcceptanceLevel::Attested);
+        assert_eq!(
+            default.inferred_reason,
+            vec!["default lightweight attestation"]
+        );
+        assert_eq!(default.review, None);
     }
 
-    // ---- SUBA-082: the regex-free `rolePatchTask` probes (`acceptance.ts:93-96` @v0.57.0) ----
-
-    /// `/\bpatch\s+(?:(?:\.{0,2}[\\/])?(?:[\w.-]+[\\/])+[\w.-]+|[\w.-]+\.[a-z0-9]+\b|(?:the\s+)?parser\b)/`
-    /// over lowercased text — each alternative, plus the objects it must NOT accept.
+    /// The property that the v0.71.0 rewrite is FOR: the result depends only on the
+    /// role/async/dynamic axes, and is byte-identical across the task-text and agent-name axes.
+    /// Before `7c98a696` eleven wording- and name-derived predicates fed this function; this
+    /// table fails in many rows at once if any of them comes back.
     #[test]
-    fn role_patch_target_matches_paths_filenames_and_the_parser_only() {
-        for text in [
-            "patch src/auth.ts",
-            "please patch ./x/y",
-            "patch ../lib/mod.rs and report",
-            "patch /etc/hosts",
-            "patch a/b",
-            "patch auth.ts",
-            "patch src.auth.ts",
-            "patch the parser",
-            "patch parser",
-            "patch  the   parser",
+    fn inference_is_invariant_across_task_text_and_agent_name() {
+        for role in [
+            Some(AcceptanceRole::Writer),
+            Some(AcceptanceRole::ReadOnly),
+            None,
         ] {
-            assert!(has_role_patch_target(text), "{text:?} must match");
-        }
-        for text in [
-            "patch it",
-            "patch x",
-            "patch /x",
-            "patch x_y.ts_z",
-            "patch",
-            "dispatch src/auth.ts",
-            "patch parsers",
-            "patch the parsers",
-            "patch .ts",
-        ] {
-            assert!(!has_role_patch_target(text), "{text:?} must not match");
+            for (is_async, dynamic) in [(false, false), (true, false), (false, true)] {
+                let mut baseline: Option<InferredShape> = None;
+                for task in [
+                    "Run the security migration release",
+                    "Review only; do not edit",
+                    "Implement the fix",
+                ] {
+                    for agent_name in ["reviewer", "worker"] {
+                        let got = resolve(AcceptanceResolveInput {
+                            agent_name: agent_name.into(),
+                            acceptance_role: role,
+                            task: Some(task.into()),
+                            is_async,
+                            dynamic,
+                            ..Default::default()
+                        });
+                        let shape = (
+                            got.level,
+                            got.inferred_reason.clone(),
+                            got.criteria.clone(),
+                            got.evidence.clone(),
+                            got.review.clone(),
+                        );
+                        match &baseline {
+                            None => baseline = Some(shape),
+                            Some(first) => assert_eq!(
+                                *first, shape,
+                                "role={role:?} async={is_async} dynamic={dynamic} \
+                                 task={task:?} agent={agent_name:?} diverged"
+                            ),
+                        }
+                    }
+                }
+            }
         }
     }
+    // ---- SUBA-108 defect 1: `acceptance.ts:505` — `none` + explicit policy -> `attested` ----
 
-    /// `/\b(?:do not|don't|must not)\s+patch\b/` — the negative guard.
+    /// `acceptance.ts:505` @v0.71.0:
+    /// `inferred.level === "none" && explicitAcceptanceRequestsPolicy(explicit) ? "attested"`.
+    ///
+    /// This is the fail-OPEN this row's `read-only -> none` branch made reachable. The caller
+    /// hands in a policy that names no `level` at all, so `explicitLevel` is `auto` and the MAX
+    /// escalation never runs; without the `:505` upgrade the resolved level is `None`, the
+    /// contract block is empty, the gate is `NotRequired` and every criterion, evidence kind,
+    /// verify command and review gate the caller asked for is discarded in silence.
     #[test]
-    fn forbids_patch_matches_the_three_prohibition_phrasings() {
-        assert!(forbids_patch("do not patch src/auth.ts"));
-        assert!(forbids_patch("review; don't patch anything"));
-        assert!(forbids_patch("you must not  patch the parser"));
-        assert!(!forbids_patch("do not patchwork"));
-        assert!(!forbids_patch("undo not patch"));
-        assert!(!forbids_patch("patch the parser"));
+    fn a_caller_supplied_policy_upgrades_a_read_only_none_to_attested() {
+        let resolved = resolve(AcceptanceResolveInput {
+            agent_name: "scout".into(),
+            acceptance_role: Some(AcceptanceRole::ReadOnly),
+            task: Some("Audit the parser".into()),
+            explicit: Some(AcceptanceInput::Config(AcceptanceConfig {
+                evidence: Some(vec![AcceptanceEvidenceKind::ReviewFindings]),
+                ..AcceptanceConfig::default()
+            })),
+            ..Default::default()
+        });
+        assert_eq!(
+            resolved.level,
+            AcceptanceLevel::Attested,
+            "an explicit policy with no `level` must still be enforced on a read-only agent"
+        );
+        // `:509` compares against the UPGRADED level, so the surviving evidence is the read-only
+        // branch's own list plus the caller's, de-duplicated — not
+        // `requiredEvidenceForLevel("attested")`.
+        assert_eq!(
+            resolved.evidence,
+            vec![
+                AcceptanceEvidenceKind::ReviewFindings,
+                AcceptanceEvidenceKind::ResidualRisks
+            ]
+        );
+        assert!(
+            !resolved.criteria.is_empty(),
+            "the upgraded level is not `none`, so `:521` no longer clears the criteria"
+        );
+        assert!(resolved.explicit);
     }
 
-    /// The severity-compound strip runs BEFORE the patch probe (`stripSeverityCompounds(task)`):
-    /// a "must-patch list" is an adjective, not an instruction to patch a list.
+    /// The four inputs `explicitAcceptanceRequestsPolicy` (`acceptance.ts:243-245`) distinguishes,
+    /// on the one role where the answer changes the resolved level.
+    ///
+    /// `auto`/absent asks for nothing, so `none` stands. Any non-`auto` level, and any non-`level`
+    /// key on its own, is a request for a policy. The `{ level: "none", reason }` case is the
+    /// exception that must NOT be upgraded: `explicitAcceptanceCanDisable` (`:239-241`) is checked
+    /// first and pins the level at `none` deliberately.
     #[test]
-    fn role_patch_task_ignores_severity_compounds_but_not_real_patch_objects() {
-        let resolved = |task: &str| {
-            resolve(AcceptanceResolveInput {
-                agent_name: "explorer".into(),
+    fn only_a_policy_bearing_explicit_input_upgrades_a_read_only_agent() {
+        let cases: Vec<(&str, Option<AcceptanceInput>, AcceptanceLevel)> = vec![
+            ("absent", None, AcceptanceLevel::None),
+            (
+                "level auto",
+                Some(AcceptanceInput::Level(AcceptanceLevel::Auto)),
+                AcceptanceLevel::None,
+            ),
+            (
+                "empty config",
+                Some(AcceptanceInput::Config(AcceptanceConfig::default())),
+                AcceptanceLevel::None,
+            ),
+            (
+                "non-level key only",
+                Some(AcceptanceInput::Config(AcceptanceConfig {
+                    stop_rules: Some(vec!["stop".into()]),
+                    ..AcceptanceConfig::default()
+                })),
+                AcceptanceLevel::Attested,
+            ),
+            (
+                "explicit attested",
+                Some(AcceptanceInput::Level(AcceptanceLevel::Attested)),
+                AcceptanceLevel::Attested,
+            ),
+            (
+                "explicit checked",
+                Some(AcceptanceInput::Level(AcceptanceLevel::Checked)),
+                AcceptanceLevel::Checked,
+            ),
+            (
+                "deliberate disable",
+                Some(AcceptanceInput::Config(AcceptanceConfig {
+                    level: Some(AcceptanceLevel::None),
+                    reason: Some("read-only audit".into()),
+                    ..AcceptanceConfig::default()
+                })),
+                AcceptanceLevel::None,
+            ),
+            (
+                "false shorthand",
+                Some(AcceptanceInput::Disabled),
+                AcceptanceLevel::None,
+            ),
+        ];
+        for (label, explicit, want) in cases {
+            let resolved = resolve(AcceptanceResolveInput {
+                agent_name: "scout".into(),
                 acceptance_role: Some(AcceptanceRole::ReadOnly),
-                task: Some(task.into()),
+                explicit,
                 ..Default::default()
-            })
-        };
-        assert_ne!(
-            resolved("Triage the must-patch src/auth.ts list").level,
-            AcceptanceLevel::Checked,
-            "`must-patch` is stripped before the probe sees `patch src/auth.ts`"
-        );
-        assert_eq!(
-            resolved("Patch src/auth.ts").level,
-            AcceptanceLevel::Checked
-        );
-        assert_ne!(
-            resolved("Do not patch src/auth.ts; explain the flow").level,
-            AcceptanceLevel::Checked,
-            "the prohibition guard wins"
-        );
+            });
+            assert_eq!(resolved.level, want, "case {label}");
+            if want == AcceptanceLevel::None {
+                assert!(resolved.criteria.is_empty(), "case {label}");
+                assert!(resolved.evidence.is_empty(), "case {label}");
+            }
+        }
+    }
+
+    /// The upgrade is scoped to an inferred `none`: a role that already infers a real level is
+    /// resolved by the MAX rule alone, so a non-`level` explicit key must not push a writer's
+    /// `checked` anywhere (in particular not DOWN to `attested`).
+    #[test]
+    fn the_none_upgrade_does_not_touch_a_role_that_already_infers_a_level() {
+        for (role, want) in [
+            (Some(AcceptanceRole::Writer), AcceptanceLevel::Checked),
+            (None, AcceptanceLevel::Attested),
+        ] {
+            let resolved = resolve(AcceptanceResolveInput {
+                agent_name: "worker".into(),
+                acceptance_role: role,
+                explicit: Some(AcceptanceInput::Config(AcceptanceConfig {
+                    stop_rules: Some(vec!["stop".into()]),
+                    ..AcceptanceConfig::default()
+                })),
+                ..Default::default()
+            });
+            assert_eq!(resolved.level, want, "role={role:?}");
+        }
     }
 }

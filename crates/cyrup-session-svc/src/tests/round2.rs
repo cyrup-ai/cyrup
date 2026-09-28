@@ -595,6 +595,7 @@ async fn send_custom_message_next_turn_rides_the_next_prompt() {
             false,
             None,
             Some(DeliverAs::NextTurn),
+            None,
         )
         .await
         .unwrap();

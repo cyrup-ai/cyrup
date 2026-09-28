@@ -227,3 +227,54 @@ fn tool_call_is_pi_shaped() {
         json!({ "toolCallId": "c", "toolName": "read", "input": { "path": "/x" } })
     );
 }
+
+// ---------------------------------------------------------------------------
+// EXT-083 — `sendUserMessage`'s options bag, upstream's field names.
+// ---------------------------------------------------------------------------
+
+/// pi `sendUserMessage(content, options?: { deliverAs?: "steer" | "followUp";
+/// expandPromptTemplates?: boolean })` (`core/agent-session.ts:2006-2009` @v0.87.1).
+///
+/// The names are the whole point: the host reads the bag as JSON, so a Rust-cased `deliver_as` or
+/// `expand_prompt_templates` would be silently ignored and the guest would get the defaults it
+/// thought it had overridden. `followUp` in particular must NOT serialize as `follow_up`.
+#[test]
+fn send_user_message_options_use_pis_field_names() {
+    use crate::{DeliverAs, SendUserMessageOptions};
+
+    assert_eq!(
+        serde_json::to_value(SendUserMessageOptions {
+            deliver_as: Some(DeliverAs::FollowUp),
+            expand_prompt_templates: Some(true),
+        })
+        .unwrap(),
+        json!({ "deliverAs": "followUp", "expandPromptTemplates": true }),
+    );
+    assert_eq!(
+        serde_json::to_value(SendUserMessageOptions {
+            deliver_as: Some(DeliverAs::Steer),
+            expand_prompt_templates: Some(false),
+        })
+        .unwrap(),
+        json!({ "deliverAs": "steer", "expandPromptTemplates": false }),
+    );
+
+    // "No opinion" must send an EMPTY bag, not `{"deliverAs": null, "expandPromptTemplates": null}`.
+    // pi distinguishes an absent option from a present one: `options?.expandPromptTemplates ?? false`
+    // (`:2030`) and `streamingBehavior: options?.deliverAs` (`:2032`) both read `undefined` as "the
+    // host decides", and an explicit JSON `null` is not that.
+    assert_eq!(
+        serde_json::to_value(SendUserMessageOptions::default()).unwrap(),
+        json!({}),
+    );
+
+    // And the bag round-trips from pi's own JSON, so a host-side parse of the same names agrees.
+    let back: SendUserMessageOptions =
+        serde_json::from_value(json!({ "deliverAs": "followUp" })).unwrap();
+    assert_eq!(back.deliver_as, Some(DeliverAs::FollowUp));
+    assert_eq!(
+        back.expand_prompt_templates, None,
+        "an absent `expandPromptTemplates` stays absent — the `?? false` is the HOST's, not a \
+         guest-side rewrite"
+    );
+}

@@ -504,10 +504,16 @@ impl<B: Backend> App<B> {
                 kind: SelectorKind::Model,
                 value,
             } => match session.set_model(&value).await {
-                Ok(_) => self
-                    .state
-                    .transcript
-                    .push_status(format!("model → {value}")),
+                Ok(_) => {
+                    // **TUI-105.** `selectModel`'s `this.updateAvailableProviderCount()`
+                    // (`interactive-mode.ts:5187`): switching provider can change how many the footer
+                    // has to distinguish between, which is what gates its `(provider)` prefix
+                    // (`status.rs:597`).
+                    self.refresh_provider_count(session);
+                    self.state
+                        .transcript
+                        .push_status(format!("model → {value}"));
+                }
                 Err(e) => self
                     .state
                     .transcript
@@ -560,6 +566,10 @@ impl<B: Backend> App<B> {
                     .collect();
                 let n = scoped.len();
                 session.set_scoped_models(scoped);
+                // **TUI-105.** `this.updateAvailableProviderCount()` (`interactive-mode.ts:5256`):
+                // a scoped set REPLACES the snapshot the count is taken from (`:5094-5095`), so the
+                // footer must be re-answered the moment the scope changes.
+                self.refresh_provider_count(session);
                 // GAP 4 — Pi's `Ctrl+S` here is `setEnabledModels(patterns)`
                 // (`interactive-mode.ts:5072`), a real settings write; cyrup applied the scope to
                 // the session only, which made the selector's own footer
@@ -630,6 +640,10 @@ impl<B: Backend> App<B> {
                             .oauth_credential_providers
                             .remove(option.id.as_str());
                         self.refresh_subscription_marker();
+                        // **TUI-105.** `await this.updateAvailableProviderCount()`
+                        // (`interactive-mode.ts:5855`), between the logout and its message: the
+                        // credential that made this provider's models available is gone.
+                        self.refresh_provider_count(session);
                         let name = &option.name;
                         // Pi's two verbatim messages (`:5157-5161`).
                         let message = if option.auth_type == AuthType::Oauth {

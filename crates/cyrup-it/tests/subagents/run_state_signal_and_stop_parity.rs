@@ -156,6 +156,10 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        // SUBA-119 — a fixture launch whose model comes from its own agent config, so
+        // native-child model verification is armed and no response-id alias is declared.
+        model_override_from_parent: false,
+        model_response_aliases: None,
         parent_env_overrides: std::collections::BTreeMap::new(),
         machine: None,
         // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
@@ -673,6 +677,8 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         .expect("mkdir run dir");
 
     let config = RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,

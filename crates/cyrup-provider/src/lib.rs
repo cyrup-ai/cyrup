@@ -164,7 +164,7 @@ pub use stream::sse::{
     DEFAULT_HTTP_IDLE_TIMEOUT_MS, OnRequest, OnResponse, SseFrame, SseRequest, build_client,
     build_client_for, build_client_for_target, build_client_with_proxy,
     configure_http_idle_timeout, configure_http_proxy, configured_http_proxy, decode_sse_bytes,
-    http_idle_timeout_ms, open_sse,
+    decode_sse_bytes_flushing_at_eof, http_idle_timeout_ms, open_sse,
 };
 pub use stream::{
     AssistantMessageEventSink, AssistantMessageEventStream, CacheRetention, OnPayload,

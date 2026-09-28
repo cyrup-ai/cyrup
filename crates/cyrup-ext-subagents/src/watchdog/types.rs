@@ -99,9 +99,59 @@ watchdog_str_enum! {
 }
 
 watchdog_str_enum! {
-    /// `WATCHDOG_WARNING_CONFIDENCES` (`types.ts:18-19`). Upstream deliberately omits `low` — the
-    /// review prompt forbids low-confidence warnings outright.
-    WatchdogConfidence { Medium => "medium", High => "high" }
+    /// SUBA-120 / `WATCHDOG_WARNING_IMPORTANCES` (`types.ts:18-19` @v0.71.0, entered in `52fc6b4b`
+    /// *"feat: route watchdog findings by importance"* @v0.68.0).
+    ///
+    /// This REPLACED the old `WATCHDOG_WARNING_CONFIDENCES` (`{medium, high}`), which upstream
+    /// deleted from the type entirely in the same commit. Importance is not a restatement of
+    /// confidence: it is the ROUTING decision. `low` and `medium` are user-only visibility; `high` is
+    /// what the parent model actually receives — see
+    /// [`MainWatchdogRuntime::route_warning`](super::runtime::MainWatchdogRuntime) for the rule
+    /// (`runtime.ts:548-550`).
+    ///
+    /// Unlike the confidence field it replaces, `importance` is REQUIRED on
+    /// [`WatchdogWarning`] — upstream's `WatchdogWarnParams` (`review.ts:30`) declares it as a
+    /// non-`Optional` TypeBox property with no default, so a `watchdog_warn` call that omits it is a
+    /// tool-call error rather than a silent `medium`.
+    ///
+    /// **The unported high-importance filters.** Upstream applies the `high` test at FOUR places.
+    /// [`route_warning`](super::runtime::MainWatchdogRuntime) ports one (`runtime.ts:548-550`); the
+    /// other three are unported, and SUBA-120 deliberately does not create a site for any of them:
+    ///
+    /// - `collectWatchdogFindings` inside `buildSubagentNotifyPayload`
+    ///   (`src/runs/background/notify.ts:716` @v0.71.0, spelled `if (warning.importance !== "high")
+    ///   continue;`) keeps only `high` findings, splitting them into `watchdogBlockers` and
+    ///   `watchdogConcerns` and appending the latter to the completion notice's `resultPreview`
+    ///   under `High-importance watchdog concerns:` (`:743`).
+    /// - `childWatchdogProgressForModel` (`src/watchdog/child-status.ts:223`) strips every
+    ///   non-`high` warning out of a child's `watchdog` progress before the parent model sees it.
+    /// - `withAggregatedToolUsage` (`src/runs/foreground/subagent-executor.ts:3021`) appends the
+    ///   surviving `high` findings to the subagent tool RESULT as a `High-importance watchdog
+    ///   findings:` text block.
+    ///
+    /// **What is missing here is the PROJECTION, not the filter.** All three read
+    /// `ChildWatchdogProgress.warnings` — the per-child list of findings a child's status events
+    /// carry up to its parent. cyrup's equivalent snapshot,
+    /// [`ChildWatchdogStateSnapshot`](super::child_status::ChildWatchdogStateSnapshot), has
+    /// `phase`, `seq`, `last_update`, `follow_up_pending`, `reason` and `timed_out` and no
+    /// `warnings` field at all, and `WatchdogWarning` has no consumer outside this `watchdog`
+    /// module. So there is no list to filter at any of the three sites, and adding the filter
+    /// without the field it filters would be dead code.
+    ///
+    /// Whoever ports the child-warning projection — into the completion notice
+    /// (`background/watch/`), into the child status fold (`watchdog/child_status.rs`) or into the
+    /// subagent tool result — MUST bring the `high` filter with it in the same change. Do not read
+    /// this note as "upstream has no filter there": it has one at each of the three lines above.
+    /// An earlier revision of this comment claimed `notify.ts` contained no importance filter,
+    /// which was wrong — `git grep 'importance === "high"'` misses `:716` because that site is
+    /// spelled `!== "high"`.
+    ///
+    /// CYRUP-DELTA: upstream's `warningMeetsThreshold` (`runtime.ts:543-545`) re-validates
+    /// `warning.importance` against the list with
+    /// `WATCHDOG_WARNING_IMPORTANCES.includes(warning.importance)`, because a TypeScript string can
+    /// carry a value outside the union at runtime. This enum makes that unrepresentable, so that
+    /// clause has no counterpart and the threshold check reduces to its severity half.
+    WatchdogImportance { Low => "low", Medium => "medium", High => "high" }
 }
 
 watchdog_str_enum! {
@@ -300,9 +350,10 @@ pub struct WatchdogWarning {
     /// Optional classification; normalizes to [`WatchdogCategory::Other`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<WatchdogCategory>,
-    /// Optional confidence; the review tool defaults it to `medium`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<WatchdogConfidence>,
+    /// SUBA-120 — how this finding is ROUTED (`types.ts:47` @v0.71.0). REQUIRED, with no default:
+    /// `low`/`medium` go to the user-only surface, `high` reaches the parent model
+    /// (`runtime.ts:548-550`). It replaces the deleted optional `confidence` field.
+    pub importance: WatchdogImportance,
     /// Which watchdog produced it; normalizes to [`WatchdogWarningSource::Main`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<WatchdogWarningSource>,
@@ -324,22 +375,25 @@ pub struct WatchdogWarning {
 }
 
 impl WatchdogWarning {
-    /// A minimal warning with only the four required fields set — the shape a `watchdog_warn` tool
-    /// call carries before normalization.
+    /// A minimal warning with only the required fields set — the shape a `watchdog_warn` tool call
+    /// carries before normalization. SUBA-120: `importance` joined that required set
+    /// (`review.ts:30` declares it non-`Optional` with no default), so it is a parameter here rather
+    /// than a `None` below.
     #[must_use]
     pub fn new(
         severity: WatchdogSeverity,
+        importance: WatchdogImportance,
         summary: impl Into<String>,
         evidence: impl Into<String>,
         recommended_action: impl Into<String>,
     ) -> Self {
         Self {
             severity,
+            importance,
             summary: summary.into(),
             evidence: evidence.into(),
             recommended_action: recommended_action.into(),
             category: None,
-            confidence: None,
             source: None,
             agent: None,
             run_id: None,
@@ -367,9 +421,8 @@ pub struct WatchdogWarningDetails {
     pub category: WatchdogCategory,
     /// Resolved (never absent, unlike the base record).
     pub source: WatchdogWarningSource,
-    /// See [`WatchdogWarning::confidence`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<WatchdogConfidence>,
+    /// See [`WatchdogWarning::importance`].
+    pub importance: WatchdogImportance,
     /// See [`WatchdogWarning::agent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -779,6 +832,7 @@ mod tests {
     fn warning_omits_absent_optionals_the_way_upstream_spreads_do() {
         let warning = WatchdogWarning::new(
             WatchdogSeverity::Concern,
+            WatchdogImportance::Medium,
             "summary",
             "evidence",
             "recommendedAction",
@@ -788,6 +842,7 @@ mod tests {
             json,
             serde_json::json!({
                 "severity": "concern",
+                "importance": "medium",
                 "summary": "summary",
                 "evidence": "evidence",
                 "recommendedAction": "recommendedAction",

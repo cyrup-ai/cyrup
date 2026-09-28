@@ -72,6 +72,36 @@ pub(crate) fn real_requested_model(requested: Option<&ModelId>) -> Option<&Model
     (!trimmed.is_empty() && trimmed != INHERIT_MODEL_SENTINEL).then_some(requested)
 }
 
+/// SUBA-119 — was the model this run will launch INHERITED FROM THE PARENT SESSION? pi's
+/// `options.modelOverrideFromParent`, the flag that turns model verification OFF
+/// (`execution.ts:1836`: `const verifyModel = Boolean(candidate) && !options.modelOverrideFromParent`).
+///
+/// [`resolve_model_inheritance`] returns [`ModelOverride::Explicit`] on BOTH a real caller override
+/// and a parent-session inheritance (its `None` arm at `:443`), so by the time a
+/// [`crate::exec::agent_config::RunOptions`] exists the two are indistinguishable — which is exactly
+/// the distinction upstream needs here. Rather than change that function's signature and every one of
+/// its callers, this is the same predicate over the same three inputs, evaluated beside it:
+/// the stage-1 request (`per_call_override ?? persona_model`) reduced to nothing real, and a live
+/// parent-session model to fall back to. That is the one branch that returns a parent model.
+///
+/// CYRUP-DELTA — this is NOT [`ModelOverride::Inherit`]. That variant means "the CALLER named no
+/// override", after which the ladder still seats the persona's own model, and upstream's `verifyModel`
+/// is TRUE in that case. Deriving verification from `ModelOverride::Inherit` would switch the check
+/// off for the commonest launch of all.
+///
+/// CYRUP-DELTA — [`crate::background::recovery_descriptor::ModelOrigin::Inherited`] is the same idea
+/// in the BACKGROUND descriptor path and is not reachable from the foreground launch path, which is
+/// why the predicate is re-derived here rather than read off an origin value.
+#[must_use]
+pub fn model_override_is_from_parent(
+    per_call_override: Option<&ModelId>,
+    persona_model: Option<&ModelId>,
+    inherited_session_model: Option<&ModelId>,
+) -> bool {
+    real_requested_model(per_call_override.or(persona_model)).is_none()
+        && inherited_session_model.is_some()
+}
+
 /// Distinguishes "the caller didn't specify a model override" from "explicitly use this model"
 /// (R-SA-041). Deliberately NOT `Option<ModelId>`: an `Option`-shaped API invites a caller to
 /// silently fall through to a global cross-session default model config when no override and no
@@ -1336,6 +1366,30 @@ pub enum AttemptNote {
     // UNPORTED upstream kinds, named here so the gap is greppable rather than invisible:
     //   AbortRecovery        — `subagent-runner.ts:1401` / `execution.ts:2029`
     //   ReadonlyContinuation — `execution.ts:2004`, added upstream in v0.66.0
+    //
+    // SUBA-118 — why `AbortRecovery` is still on this list although
+    // `crate::exec::abort_recovery::plan_abort_recovery` now exists, is a verbatim port of
+    // `abort-recovery.ts` @v0.71.0, and is fully tested rung by rung:
+    //
+    // The DECISION is ported; the DISPATCH is not, and cannot be wired at this call site without
+    // inventing behaviour pi does not have. Upstream calls `planAbortRecovery` at
+    // `execution.ts:1878`, INSIDE `runSinglePath`'s attempt loop, where `lastResult` already carries
+    // `structuredOutputFailed` and `acceptanceFailed` — because upstream evaluates structured output
+    // and acceptance inside that same loop. Two of the ladder's thirteen settle rungs
+    // (`abort-recovery.ts:112-113`) read exactly those two flags, and both exist to REFUSE a resume.
+    //
+    // In this crate they are not known yet at the equivalent point. `exec::run_sync`'s pipeline is
+    // ordered ladder (step 4) → structured output (step 5) → completion guard (step 6) → acceptance
+    // (step 7) — see the `run_sync` module doc — so `run_fallback_ladder` returns BEFORE either
+    // verdict exists. Calling the plan from inside the ladder would mean passing
+    // `structured_output_failed: false` and `acceptance_failed: false` unconditionally, which turns
+    // two refusal rungs into permanent no-ops and resumes children upstream settles.
+    //
+    // Closing this needs the acceptance/structured-output gates to move inside the ladder loop, i.e.
+    // a change to `run_sync`'s documented step order, which is a larger structural port than this
+    // note's row. The evidence half IS wired and carried:
+    // `DriveOutcome::after_compaction_settlement` (`execution.ts:970-999`) is folded per attempt and
+    // tested, so the input the ladder would need is already produced.
 }
 
 impl std::fmt::Display for AttemptNote {

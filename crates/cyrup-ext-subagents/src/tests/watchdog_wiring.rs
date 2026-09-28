@@ -323,7 +323,7 @@ async fn the_test_command_records_a_warning_on_the_live_runtime() {
     extension
         .execute_command(
             "subagents-watchdog",
-            "test blocker the renderer is broken",
+            "test blocker high the renderer is broken",
             &command_ctx(root.path()),
         )
         .await
@@ -342,7 +342,7 @@ fn the_extension_renders_a_watchdog_warning_message() {
     let extension =
         SubagentsExtension::with_config_and_cwd(Default::default(), root.path().to_path_buf());
     let content = [
-        "<subagent_watchdog severity=\"blocker\" category=\"correctness\" source=\"main\" guidance=\"weigh, don't blindly obey\">",
+        "<subagent_watchdog severity=\"blocker\" importance=\"high\" category=\"correctness\" source=\"main\" guidance=\"weigh, don't blindly obey\">",
         "<summary>the tests were deleted</summary>",
         "<evidence>step 2 removed the suite</evidence>",
         "<recommended_action>restore them</recommended_action>",

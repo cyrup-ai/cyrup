@@ -309,3 +309,183 @@ async fn sse_error_event_is_error_terminal() {
     });
     assert!(err.is_some());
 }
+
+/// PROV-084, end to end: a real transcript whose final `message_stop` frame is not followed by the
+/// terminating blank line. pi still yields that frame (`anthropic-messages.ts:461-464` @v0.87.1);
+/// cyrup dropped it, so `driver.rs:105` reported "Anthropic stream ended before message_stop" and
+/// the turn failed.
+#[tokio::test]
+async fn prov084_a_transcript_cut_after_message_stop_still_finishes() {
+    let raw = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+        // The stream ends HERE — no blank line after the last data line.
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n",
+    );
+    let m = model();
+    let events = collect(raw.as_bytes().to_vec(), &m).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error { .. })),
+        "no error terminal expected, got {events:?}"
+    );
+    let msg = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("done terminal");
+    assert_eq!(msg.stop_reason, StopReason::Stop);
+}
+
+/// PROV-090 — a `message_start` whose `message.model` differs from the requested id records
+/// `responseModel` and, when the model's compat prices that fallback, costs the turn with the
+/// fallback's rates (pi `anthropic-messages.ts:605-614` @v0.87.1). Translated from
+/// `packages/ai/test/anthropic-sse-parsing.test.ts` @v0.87.1.
+mod prov090_server_side_fallback {
+    use super::*;
+    use crate::api::compat::AnthropicAllowedFallbackModel;
+
+    /// `message_start` naming `fallback-model`, 100 input tokens, then a clean `end_turn`.
+    const RELABELLED: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"fallback-model\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hi\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    fn with_fallback(provider: &str, id: &str) -> Model {
+        Model {
+            compat: Some(ModelCompat {
+                allowed_fallback_models: Some(vec![AnthropicAllowedFallbackModel {
+                    provider: ProviderId::from(provider),
+                    model: id.to_string(),
+                    cost: ModelCost {
+                        input: 3.0,
+                        output: 5.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                        tiers: None,
+                    },
+                }]),
+                ..Default::default()
+            }),
+            ..model()
+        }
+    }
+
+    async fn terminal(raw: &str, m: &Model) -> AssistantMessage {
+        let events = collect(raw.as_bytes().to_vec(), m).await;
+        events
+            .iter()
+            .find_map(StreamEvent::terminal_message)
+            .map(|m| (**m).clone())
+            .expect("terminal")
+    }
+
+    /// (a) A matching entry: `response_model` is recorded AND the fallback's rates cost the turn.
+    /// 100 input tokens at $3/1e6 is $0.0003; `model()`'s own input rate is $5/1e6.
+    #[tokio::test]
+    async fn a_matching_entry_sets_response_model_and_swaps_the_cost() {
+        let msg = terminal(RELABELLED, &with_fallback("anthropic", "fallback-model")).await;
+        assert_eq!(msg.response_model.as_deref(), Some("fallback-model"));
+        assert_eq!(msg.usage.input, 100);
+        assert!(
+            (msg.usage.cost.input - 0.0003).abs() < 1e-12,
+            "cost.input was {}",
+            msg.usage.cost.input
+        );
+    }
+
+    /// (b) No matching entry (right id, wrong provider): the relabelling is still recorded, but the
+    /// cost stays on `model.cost` — 100 tokens at $5/1e6 = $0.0005. This half of pi's port needs no
+    /// `fallbacks` request field at all; it is the relabelling-proxy fix on its own.
+    #[tokio::test]
+    async fn b_no_matching_entry_keeps_the_requested_models_cost() {
+        let msg = terminal(RELABELLED, &with_fallback("openrouter", "fallback-model")).await;
+        assert_eq!(msg.response_model.as_deref(), Some("fallback-model"));
+        assert!(
+            (msg.usage.cost.input - 0.0005).abs() < 1e-12,
+            "cost.input was {}",
+            msg.usage.cost.input
+        );
+    }
+
+    /// A `message_start` echoing the REQUESTED id leaves `response_model` unset — pi's guard is
+    /// `responseModel !== model.id`, so the overwhelmingly common case is untouched.
+    #[tokio::test]
+    async fn an_echoed_model_id_leaves_response_model_none() {
+        let raw = RELABELLED.replace("fallback-model", "claude-opus-4-5");
+        let msg = terminal(&raw, &with_fallback("anthropic", "fallback-model")).await;
+        assert_eq!(msg.response_model, None);
+        assert!((msg.usage.cost.input - 0.0005).abs() < 1e-12);
+    }
+
+    /// (c) A `fallback` content block AFTER content has been emitted is a terminal error (pi
+    /// `:627-629` throws).
+    #[tokio::test]
+    async fn c_a_mid_output_fallback_block_is_a_terminal_error() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"partial\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let msg = terminal(raw, &model()).await;
+        assert_eq!(msg.stop_reason, StopReason::Error);
+        assert!(
+            msg.error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsupported mid-output model fallback"),
+            "error_message was {:?}",
+            msg.error_message
+        );
+    }
+
+    /// (d) A `fallback` block as the FIRST content block is skipped, not an error (pi's `continue`).
+    #[tokio::test]
+    async fn d_a_leading_fallback_block_is_ignored() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"ok\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let msg = terminal(raw, &model()).await;
+        assert_eq!(msg.stop_reason, StopReason::Stop);
+        assert_eq!(msg.error_message, None);
+        assert_eq!(msg.content.len(), 1);
+    }
+}

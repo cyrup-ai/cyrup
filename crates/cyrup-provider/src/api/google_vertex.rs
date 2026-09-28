@@ -201,6 +201,8 @@ impl ApiImpl for GoogleVertexApi {
             url,
             headers,
             body: Some(body),
+            // PROV-084: Vertex shares the Gemini framing — no residual flush.
+            flush_at_eof: false,
         };
 
         let client =
@@ -717,5 +719,36 @@ mod tests {
         };
         let body = build_params(&model, &ctx, &StreamOptions::default()).unwrap();
         assert!(body.get("contents").is_some(), "got: {body}");
+    }
+
+    /// The `thinkingLevelMap`-driven level resolution reaches Vertex through the shared
+    /// `build_params` too — pi runs its own thinking-level-map suite over BOTH adapters
+    /// (`test/google-thinking-level-map.test.ts:88-101` @v0.87.1, `it.each(googleAdapters)`).
+    #[test]
+    fn thinking_level_map_drives_the_vertex_level() {
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::User {
+                content: vec![Content::text("hi")],
+                timestamp: 0,
+            }],
+            tools: Vec::new(),
+        };
+        let mut model = vertex_model("gemini-3-pro-preview");
+        model.thinking_level_map = Some(
+            [("medium".to_string(), Some("MEDIUM".to_string()))]
+                .into_iter()
+                .collect(),
+        );
+        let opts = StreamOptions {
+            reasoning: cyrup_core::ModelThinkingLevel::Medium,
+            ..Default::default()
+        };
+        let body = build_params(&model, &ctx, &opts).unwrap();
+        assert_eq!(
+            body.get("generationConfig")
+                .and_then(|g| g.get("thinkingConfig")),
+            Some(&serde_json::json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" }))
+        );
     }
 }

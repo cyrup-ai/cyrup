@@ -125,10 +125,14 @@ impl AcpFailure {
             | E::MissingSessionCwd(_)
             | E::NoModelForSummarization
             | E::StreamingNeedsBehavior
-            | E::NavigateTreeWhileStreaming
-            | E::NavigateTreeWhileCompacting
             | E::ExtensionCommandNotQueueable(_)
             | E::NoActiveRun
+            // Added to `SessionServiceError` by TUI-104/SEAM-124 (the `/tree` navigation refusals).
+            // Declined for `AuthRequired` and for `InvalidParams`: the client sent a well-formed
+            // request and the remedy is to retry once the run or compaction finishes, not to send
+            // something else — the same reasoning as `NoActiveRun` directly above.
+            | E::NavigateTreeWhileStreaming
+            | E::NavigateTreeWhileCompacting
             | E::NothingToCompact
             | E::AlreadyCompacted
             | E::CompactionCancelled

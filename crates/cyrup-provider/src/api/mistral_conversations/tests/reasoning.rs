@@ -129,3 +129,19 @@ fn mistral_reasoning_effort_override_threads_to_payload() {
     let body = build_body(&m, &user_ctx("x"), &opts);
     assert_eq!(body["reasoningEffort"], "high");
 }
+
+/// The whole `mistral-medium-` family and `zai-glm-5-2` take `reasoningEffort`, not
+/// `promptMode` (Pi `usesReasoningEffort`, mistral-conversations.ts:898-905 @v0.87.1).
+#[test]
+fn medium_family_and_glm_use_reasoning_effort_not_prompt_mode() {
+    for id in ["mistral-medium-3.6", "mistral-medium-latest", "zai-glm-5-2"] {
+        let m = model_with(id, true);
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
+        let body = build_body(&m, &user_ctx("x"), &opts);
+        assert_eq!(body["reasoningEffort"], "high", "{id}");
+        assert!(body.get("promptMode").is_none(), "{id}");
+    }
+}

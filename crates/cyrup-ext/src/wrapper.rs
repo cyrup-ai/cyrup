@@ -133,11 +133,18 @@ impl Tool for RegisteredTool {
     /// missing delegation silently dropped EVERY declaration one frame after it was read. For a
     /// guest tool that was the whole opt-in path, dead on arrival:
     /// `WasmTool::constrained_sampling` (host/live.rs) lifted the declaration off the descriptor
-    /// and this wrapper discarded it. Since pi `7915cdac` @v0.84.2 it is also the path the four
-    /// coding built-ins depend on: `read`, `edit`, `write` and the shared `ShellTool` engine —
-    /// pi's `createShellToolDefinition`, so `powershell` inherits it — each return
-    /// [`cyrup_core::experimental_tool_sampling`], which is `Some` only under
-    /// `CYRUP_EXPERIMENTAL=1` and `None` otherwise.
+    /// and this wrapper discarded it. Since pi `7915cdac` @v0.84.2 it is also the path the coding
+    /// built-ins depend on: `read`, `edit`, `write` and the shared `ShellTool` engine — pi's
+    /// `createShellToolDefinition`, so `powershell` inherits it from the same line — each return
+    /// `cyrup_tools::tools::prefer_strict_tool_sampling`, i.e. pi's literal
+    /// `{ type: "json_schema", strict: "prefer" }` **unconditionally**, matching `core/tools/read.ts:80`,
+    /// `bash.ts:243`, `edit.ts:156` and `write.ts:57` @v0.87.1. TOOL-046: it used to be
+    /// `cyrup_core::experimental_tool_sampling`, `Some` only under `CYRUP_EXPERIMENTAL=1`, mirroring
+    /// pi's `getExperimentalToolSampling()`; CHANGELOG 0.86.0 dropped that gate and v0.87.1 has no
+    /// `getExperimentalToolSampling` anywhere in the repo. `grep`, `find` and `ls` declare nothing on
+    /// either side. Because those five reach the model ONLY through this delegation,
+    /// `tests::real_built_ins_carry_strict_prefer_through_the_wrapper_into_the_provider_request`
+    /// drives the real built-in registry through this wrapper and on into the provider request.
     fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
         self.inner.constrained_sampling()
     }
@@ -180,7 +187,12 @@ impl Tool for RegisteredTool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use cyrup_core::Content;
@@ -456,5 +468,172 @@ mod tests {
             w.prepare_arguments(args.clone()).await,
             serde_json::json!({"z": 1, "prepared": true})
         );
+    }
+    /// TOOL-046 — the REAL built-ins' strict-`prefer` declaration, carried through THIS wrapper and
+    /// on into the provider request.
+    ///
+    /// Why this test exists beside `cyrup-tools`' own registry pin: that pin reads
+    /// `constrained_sampling()` off `Arc<dyn Tool>` straight out of `ToolRegistry::with_builtins`,
+    /// one frame BEFORE this wrapper. Nothing the agent runs reaches a provider that way — every
+    /// built-in is re-wrapped here first ([`crate::ExtensionHost::active_tools`]; upstream
+    /// `wrapRegisteredTools(baseToolDefinitions…)`), and this is the one delegation the hand-written
+    /// list once missed, silently dropping every declaration. So the pin that matters runs the real
+    /// registry through `wrap_registered_tool` and then builds the request the way the agent loop
+    /// does — `cyrup_agent::agent::run::stream` maps each `Arc<dyn Tool>` to a
+    /// [`cyrup_provider::ToolDef`] whose `constrained_sampling` is `t.constrained_sampling().cloned()`
+    /// — and finally runs the two functions every adapter's `convertTools` calls on it
+    /// (`anthropic_messages::tools::convert_tools`, pi `anthropic-messages.ts:1337-1338` @v0.84.2).
+    ///
+    /// No environment is touched: the point of pi v0.86.0 is that the declaration no longer depends
+    /// on any flag, so a test that had to set one would be asserting the old behaviour.
+    ///
+    /// Upstream @v0.87.1: `core/tools/read.ts:80`, `bash.ts:243` (shared
+    /// `createShellToolDefinition`, hence `powershell`), `edit.ts:156`, `write.ts:57`; `grep.ts`,
+    /// `find.ts`, `ls.ts` carry no `constrainedSampling` key.
+    #[test]
+    fn real_built_ins_carry_strict_prefer_through_the_wrapper_into_the_provider_request() {
+        use cyrup_provider::utils::constrained_sampling::{
+            json_schema_tool_parameters, resolve_json_schema_strict_sampling,
+        };
+
+        let reg = cyrup_tools::registry::ToolRegistry::with_builtins(
+            std::env::temp_dir(),
+            cyrup_tools::ops::Backend::default(),
+            cyrup_tools::ToolsOptions::default(),
+        );
+        let built_ins = reg.visible(&cyrup_tools::registry::Availability::All);
+        assert_eq!(
+            built_ins.len(),
+            8,
+            "all eight built-ins must be covered; got {:?}",
+            built_ins
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let mut constrained: Vec<String> = Vec::new();
+        for inner in built_ins {
+            let name = inner.name().to_string();
+            // `ScriptedActive::new(vec![])` answers `None` — "no live agent attached" — so the
+            // wrapper is exercised purely as the declaration-carrying frame it is here.
+            let wrapped = wrap_registered_tool(Arc::clone(&inner), ScriptedActive::new(vec![]));
+
+            // Exactly `stream.rs`'s `.map`, i.e. the agent loop's hand-off to the provider.
+            let def = cyrup_provider::ToolDef {
+                name: wrapped.name().to_string(),
+                description: wrapped.description().to_string(),
+                parameters: wrapped.parameters().clone(),
+                constrained_sampling: wrapped.constrained_sampling().cloned(),
+            };
+
+            let strict = resolve_json_schema_strict_sampling(&def, true)
+                .expect("strict `prefer` never fails the request");
+            let params = json_schema_tool_parameters(&def, strict == Some(true))
+                .expect("the built-in schemas are all convertible");
+
+            match name.as_str() {
+                "read" | "bash" | "powershell" | "edit" | "write" => {
+                    constrained.push(name.clone());
+                    assert_eq!(
+                        strict,
+                        Some(true),
+                        "{name}: the provider request must be built with strict JSON-schema \
+                         sampling — pi declares it unconditionally since 0.86.0"
+                    );
+                    // The declaration is not decorative: it changes the serialized schema.
+                    assert_eq!(
+                        params.get("additionalProperties"),
+                        Some(&serde_json::Value::Bool(false)),
+                        "{name}: the strict conversion must reach the request body"
+                    );
+                    assert_ne!(
+                        params, def.parameters,
+                        "{name}: a request built with strict sampling sends the CONVERTED schema"
+                    );
+                }
+                "grep" | "find" | "ls" => {
+                    assert_eq!(
+                        strict, None,
+                        "{name} carries no constrainedSampling key upstream, so the request must \
+                         be unconstrained"
+                    );
+                    assert_eq!(
+                        params, def.parameters,
+                        "{name}: an unconstrained tool ships its raw schema"
+                    );
+                }
+                other => {
+                    panic!("unexpected built-in {other}: extend this pin with its upstream state")
+                }
+            }
+
+            // And the wrapper is the only reason any of the above is true.
+            assert_eq!(
+                wrapped.constrained_sampling(),
+                inner.constrained_sampling(),
+                "{name}: the wrapper must not alter the declaration"
+            );
+        }
+        assert_eq!(
+            constrained,
+            vec!["read", "bash", "powershell", "edit", "write"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "pi's CHANGELOG 0.86.0 names exactly these five, in registry order"
+        );
+    }
+    /// TOOL-046 — a source scan over the delegation's own doc block, the second half of the record
+    /// this row's first pass left contradicting the code.
+    ///
+    /// That block described what the four built-in bodies return, and it said they return
+    /// `cyrup_core::experimental_tool_sampling` — "`Some` only under `CYRUP_EXPERIMENTAL=1` and
+    /// `None` otherwise" — sitting on the very wrapper that carries the declaration to the agent,
+    /// while the bodies it described had been rewritten to declare it unconditionally. The
+    /// behavioural pin above proves the code; this proves the record, because an upstream-citing
+    /// comment in this repo IS the record.
+    ///
+    /// Positive assertions only, deliberately: the prose must be free to say in the past tense what
+    /// the gate used to do, so forbidding the old wording would punish the correction rather than
+    /// the staleness. What cannot be absent is the tag and the four lines the claim now rests on.
+    #[test]
+    fn the_constrained_sampling_delegation_doc_cites_v0_87_1() {
+        const SRC: &str = include_str!("wrapper.rs");
+        const OPENS: &str = "/// PROV-011 — upstream `wrapRegisteredTool` is a SPREAD";
+        const CLOSES: &str = "fn constrained_sampling(&self)";
+
+        let block = SRC
+            .split_once(OPENS)
+            .and_then(|(_, rest)| rest.split_once(CLOSES))
+            .map(|(doc, _)| doc)
+            .expect("the delegation's doc block must still open and close where this scan looks");
+        // Non-vacuity, both directions.
+        assert!(
+            block.contains("wrapToolDefinition"),
+            "the extracted slice is not the delegation's doc block: {block:?}"
+        );
+        assert!(
+            !block.contains("fn the_constrained_sampling_delegation_doc_cites_v0_87_1"),
+            "the slice over-ran into this test, so the assertions below would be vacuous"
+        );
+
+        for live in [
+            "v0.87.1",
+            "read.ts:80",
+            "bash.ts:243",
+            "edit.ts:156",
+            "write.ts:57",
+            // The substance of pi 0.86.0 / CHANGELOG: no flag gates the declaration any more.
+            "unconditional",
+        ] {
+            assert!(
+                block.contains(live),
+                "the doc must cite `{live}`: it describes what the built-in bodies return, and \
+                 since pi v0.86.0 that is the strict-`prefer` literal with no flag. Leaving a \
+                 v0.84.2 description here is how this comment came to state the opposite of the \
+                 code it sits on."
+            );
+        }
     }
 }

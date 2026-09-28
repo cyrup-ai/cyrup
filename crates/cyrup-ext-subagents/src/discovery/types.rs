@@ -855,6 +855,19 @@ impl From<OverrideOutputMode> for OutputMode {
 /// stays, with its census, as the place the NEXT upstream key goes until it is ported.
 pub const UNPORTED_OVERRIDE_KEYS: &[(&str, &str)] = &[];
 
+/// SUBA-123c — the top-level `subagents.*` twin of [`UNPORTED_OVERRIDE_KEYS`]: keys pi declares in a
+/// settings file's `subagents` block that this port has no reader for, each with the landing it is
+/// waiting on. Reported as a non-fatal warning by
+/// [`crate::discovery::subagent_settings_warnings`], never silently dropped.
+///
+/// `agentOverridesByProvider` (pi `agents.ts:1247`, selected by `selectProviderOverrides` at
+/// `:2933-2934` @v0.71.0) is the one entry: this port models [`SubagentSettings::overrides`] but has
+/// no per-provider override tier at all, so a pi-authored file using it silently lost every entry.
+pub const UNPORTED_SUBAGENTS_KEYS: &[(&str, &str)] = &[(
+    "agentOverridesByProvider",
+    "per-provider agent overrides (pi selectProviderOverrides)",
+)];
+
 impl AgentOverrideConfig {
     /// True iff every field in this delta is `Unset` — an override entry that, once parsed,
     /// turned out to say nothing (distinct from the entry being entirely absent from settings).
@@ -925,6 +938,40 @@ pub struct SubagentSettings {
     /// stored trimmed (`agents.ts:890-897`); a malformed value MUST abort discovery (R-SA-009).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_extensions: Option<Vec<String>>,
+    /// SUBA-123b — pi's `subagents.defaultSubagentOnlyExtensions` (`agents.ts:1218-1225`
+    /// @v0.71.0): a crate-wide CHILD-ONLY extension list filled into every agent whose own
+    /// `subagentOnlyExtensions` is unset (`applySubagentDefaultSubagentOnlyExtensions`,
+    /// `agents.ts:1401-1410`), which also stamps
+    /// [`AgentDefinition::subagent_only_extensions_from_default`]. Project scope wins outright
+    /// (`resolveSubagentDefaultSubagentOnlyExtensions`, `agents.ts:1392-1399`, gated on the project
+    /// scope existing). Validated as an array of NON-EMPTY strings and stored trimmed; a malformed
+    /// value MUST abort discovery (R-SA-009).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_subagent_only_extensions: Option<Vec<String>>,
+    /// SUBA-123a — pi's `subagents.agentScanDirs` (`agents.ts:1226-1233` @v0.71.0): EXTRA
+    /// agent-definition directories to walk, PREPENDED to this scope's ordinary agent directories
+    /// (`agents.ts:2651`/`:2950`). Each entry is home-expanded and may carry exactly ONE `*`, which
+    /// must be a whole path segment; the expansion lives in
+    /// [`crate::discovery::agent_dirs::settings_agent_scan_dirs`]. Validated as an array of
+    /// NON-EMPTY strings and stored trimmed; a malformed value MUST abort discovery (R-SA-009).
+    ///
+    /// Read PER SCOPE, never flattened: upstream feeds `userSettings.agentScanDirs` into the user
+    /// dir list and `projectSettings.agentScanDirs` into the project one (`agents.ts:2948-2949`),
+    /// so a project entry never displaces a user entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_scan_dirs: Option<Vec<String>>,
+    /// SUBA-123a — pi's `subagents.agentExcludeDirs` (`agents.ts:1234-1241` @v0.71.0): subtrees
+    /// removed from EVERY agent-definition walk — user dirs, project candidate dirs, package agent
+    /// dirs, and each individual file inside a walked directory (`agents.ts:1897`/`:1929`).
+    ///
+    /// Each entry resolves against the DIRECTORY OF THE SETTINGS FILE that declared it
+    /// (`agents.ts:2418`), which is why the resolved roots are built in
+    /// `SubagentExecutor::discovery_config_on_disk` — where both settings paths are still in hand —
+    /// rather than from a flattened [`SubagentSettings`]. The two scopes' lists UNION (upstream's
+    /// `flatMap` over both paths) instead of project-wins-outright. Validated as an array of
+    /// NON-EMPTY strings; a malformed value MUST abort discovery (R-SA-009).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_exclude_dirs: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_builtins: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1209,7 +1256,34 @@ pub struct AgentDefinition {
     pub extensions_from_default: bool,
     /// Child-only extension paths — visible to a spawned subagent even when not visible to the
     /// orchestrator itself.
-    pub subagent_only_extensions: Vec<String>,
+    ///
+    /// SUBA-123b: an [`Option`], mirroring [`Self::extensions`], because
+    /// `subagents.defaultSubagentOnlyExtensions` fills only an agent whose value is UNSET — pi's
+    /// guard is `agent.subagentOnlyExtensions !== undefined`
+    /// (`applySubagentDefaultSubagentOnlyExtensions`, `agents.ts:1403` @v0.71.0). A `Vec<String>`
+    /// could not express the difference between an agent file that declared
+    /// `subagentOnlyExtensions:` as an EMPTY list (an explicit "none", which the default must not
+    /// overwrite) and one that never mentioned the key.
+    pub subagent_only_extensions: Option<Vec<String>>,
+    /// True iff [`Self::subagent_only_extensions`] was filled in from
+    /// `subagents.defaultSubagentOnlyExtensions` rather than declared by the agent itself — the twin
+    /// of [`Self::extensions_from_default`], and load-bearing in the same one place
+    /// (`management::handlers::editable_base`), so a management update never BAKES a settings
+    /// default into the agent's `.md` file.
+    ///
+    /// CYRUP-DELTA (mechanism, full parity): upstream needs no such flag because
+    /// `editableAgentConfig` RE-READS the agent's file. It calls
+    /// `readAgentFrontmatterFields(agent.filePath)` (`agent-management.ts:245`, defined at `:330-337`
+    /// as `parseFrontmatter(fs.readFileSync(filePath))` keyed into a `Set`) for the general
+    /// declared-key test, and for the two extension lists specifically it calls
+    /// `withDeclaredExtensionPaths(…, agent.filePath)` (`:327`, defined at `:238-247`), which drops
+    /// the RESOLVED `extensions`/`subagentOnlyExtensions` off the config and puts back only what
+    /// the file's frontmatter literally contains. Neither path consults the
+    /// `agentFrontmatterFields` WeakMap that `applySubagentDefaultSubagentOnlyExtensions` maintains
+    /// at `agents.ts:1406-1407`; that table serves the merge passes, not the editor. cyrup does not
+    /// re-read the file at the editor, so the provenance rides on the definition instead, exactly as
+    /// `extensions_from_default` already does — same answer, one fewer file read.
+    pub subagent_only_extensions_from_default: bool,
     pub model: Option<ModelId>,
     /// SUBA-088 — pi `AgentConfig.modelProvider?: string` (`agents.ts:144` @v0.64.0): the provider
     /// this agent's BARE model ids (`model`/`fallbackModels` entries with no `provider/` prefix,
@@ -1744,7 +1818,8 @@ mod tests {
             allow_nested_subagents: None,
             extensions: None,
             extensions_from_default: false,
-            subagent_only_extensions: Vec::new(),
+            subagent_only_extensions: None,
+            subagent_only_extensions_from_default: false,
             model: None,
             fallback_models: Vec::new(),
             thinking: None,

@@ -112,8 +112,8 @@ impl TrustStore {
         if text.trim().is_empty() {
             return Ok(BTreeMap::new());
         }
-        let value: Value =
-            serde_json::from_str(&text).map_err(|e| ConfigError::Trust(format!("parse: {e}")))?;
+        let value: Value = serde_json::from_str(crate::strip_bom(&text))
+            .map_err(|e| ConfigError::Trust(format!("parse: {e}")))?;
         // Pi throws on a non-object top-level (trust-manager.ts:111-113).
         let obj = match value {
             Value::Object(o) => o,
@@ -528,6 +528,19 @@ mod tests {
     /// test (`let dir = tmp();`), never dropped into a temporary (`tmp().join(..)`).
     fn tmp() -> crate::test_util::TempDir {
         crate::test_util::temp_dir()
+    }
+
+    /// CFG-087: pi strips a leading BOM before parsing `trust.json`
+    /// (`trust-manager.ts:105` @v0.87.1 -> `stripBom`, `utils/text.ts:7-9`).
+    #[test]
+    fn a_bom_does_not_change_how_trust_json_parses() {
+        let dir = tmp();
+        let path = dir.join("trust.json");
+        std::fs::write(&path, "\u{feff}{\"/p\":true}").expect("write BOM'd trust.json");
+        let map = TrustStore::new(path)
+            .read_map()
+            .expect("BOM'd trust.json parses");
+        assert_eq!(map.get("/p"), Some(&Some(true)));
     }
 
     #[tokio::test]

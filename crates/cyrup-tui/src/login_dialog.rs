@@ -612,6 +612,33 @@ pub struct LoginFinished {
     pub auth_path: std::path::PathBuf,
 }
 
+/// **TUI-105.** A settled post-login model-catalog refresh, travelling from the spawned task back
+/// to the run loop — pi's `session.modelRuntime.refresh({providers:[providerId], signal}).then(...)`
+/// continuation (`interactive-mode.ts:5953-5971`).
+///
+/// Everything the `.then` closure reads off its enclosing scope travels on the message, because in
+/// cyrup that closure is a separate task: `actionLabel`, `providerId`, `getAuthPath()`,
+/// `deferSelection` and `previousModel`.
+#[derive(Debug)]
+pub struct LoginRefreshMsg {
+    /// The `/login` generation this refresh belongs to — pi's `this.session === session` identity
+    /// check (`interactive-mode.ts:5961`). A stale epoch is DROPPED.
+    pub epoch: u64,
+    /// `providerId` (`:5880`), for the deferred selection's catalog filter.
+    pub provider_id: String,
+    /// `actionLabel` (`:5885`) — every warning and status this refresh emits interpolates it.
+    pub action: String,
+    /// `getAuthPath()` (`:5954`), for the deferred selection's success status.
+    pub auth_path: std::path::PathBuf,
+    /// `deferSelection` (`:5889-5895`): whether the selection was postponed until this refresh
+    /// landed.
+    pub defer: bool,
+    /// `previousModel` (`:5883`), for pi's `session.model === previousModel` guard (`:5961`).
+    pub previous_model: Option<cyrup_core::ModelRef>,
+    /// The refresh outcome — pi's `result` (`:5956-5960`).
+    pub result: cyrup_provider::CatalogRefreshResult,
+}
+
 /// The TUI's [`AuthInteraction`] — pi's inline `{ signal, prompt, notify }` object
 /// (`loginProvider`, `interactive-mode.ts:5367-5374`).
 ///

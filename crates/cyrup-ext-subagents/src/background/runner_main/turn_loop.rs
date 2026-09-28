@@ -393,6 +393,11 @@ fn build_chain_context(
         // captured at plan time, carried through the one-shot config (this detached process has no
         // host-services backend of its own), so an inheriting step resolves the parent's model.
         inherited_session_model: config.inherited_session_model.clone(),
+        // SUBA-119: the operator-declared `config.modelResponseAliases`, carried the same way and
+        // for the same reason — this process has no `config.json` access, and without it a
+        // background child served a substituted model would fail `model_verification_failed` even
+        // though the alias WAS declared.
+        model_response_aliases: config.model_response_aliases.clone(),
         // SCOPE_19/A1: and the parent session's reasoning level, carried the same way and for the
         // same reason — this detached process cannot probe the parent's thinking level itself.
         inherited_session_thinking: config.inherited_session_thinking.clone(),

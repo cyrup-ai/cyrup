@@ -176,6 +176,83 @@ impl SubagentExecutor {
             &user_settings,
             project_settings.as_deref(),
         )?;
+        // SUBA-123a — pi `agentExclusionRoots(userSettingsPath, projectSettingsPath)`
+        // (`agents.ts:2416-2422`, applied at `:2650`/`:2943` @v0.71.0). Built HERE, and only here,
+        // because each `agentExcludeDirs` entry resolves against `path.dirname(settingsPath)` — the
+        // settings file that DECLARED it (`agents.ts:2418`) — and this is the last point at which
+        // both scopes' paths are still paired with their own parsed block. Both scopes' lists UNION
+        // (upstream's `flatMap` over both paths), unlike every scalar `subagents.*` key.
+        //
+        // CYRUP-DELTA: upstream re-reads each settings file from disk here
+        // (`readConfiguredAgentScanDirs`, `agents.ts:2392-2403`) with a bare `catch { return [] }`,
+        // so a malformed file yields no exclusions. This port reuses the already-parsed,
+        // already-validated blocks above instead, which means a malformed `agentExcludeDirs` ABORTS
+        // via `validate_agent_dir_lists` rather than silently disabling the exclusions the user
+        // asked for — R-SA-009's MUST-abort contract applied to a key upstream is lax about.
+        let user_excludes = cfg
+            .override_settings
+            .user
+            .agent_exclude_dirs
+            .clone()
+            .unwrap_or_default();
+        let project_excludes = cfg
+            .override_settings
+            .project
+            .agent_exclude_dirs
+            .clone()
+            .unwrap_or_default();
+        let mut exclusion_scopes: Vec<(&Path, &[String])> =
+            vec![(user_settings.as_path(), user_excludes.as_slice())];
+        if let Some(project_path) = project_settings.as_deref() {
+            exclusion_scopes.push((project_path, project_excludes.as_slice()));
+        }
+        cfg.agent_exclusion_roots =
+            crate::discovery::agent_dirs::agent_exclusion_roots(&exclusion_scopes);
+        // SUBA-123a — pi `settingsAgentScanDirs(userSettings.agentScanDirs ?? [], isExcluded)`
+        // (`agents.ts:2948-2949`), placed at upstream's exact position in each dir list:
+        // `[...extraUserAgentDirs(), ...userScanDirs.dirs, userDirOld, userDirNew]` (`:2950`) and
+        // `[...projectScanDirs.dirs, ...projectAgentDirs]` (`:2957`). So a scan dir outranks the
+        // `PI_SUBAGENT_EXTRA_AGENT_DIRS` extras `discovery_dirs_config` already prepended, and is
+        // outranked by the ordinary scope dirs under R-SA-002's last-directory-scanned-wins.
+        //
+        // Read PER SCOPE from the unflattened blocks, never from the layered view: a project
+        // `agentScanDirs` adds PROJECT roots and must not displace the user scan dirs.
+        let user_scan_dirs = crate::discovery::agent_dirs::settings_agent_scan_dirs(
+            cfg.override_settings
+                .user
+                .agent_scan_dirs
+                .as_deref()
+                .unwrap_or_default(),
+            &cfg.agent_exclusion_roots,
+        );
+        let project_scan_dirs = crate::discovery::agent_dirs::settings_agent_scan_dirs(
+            cfg.override_settings
+                .project
+                .agent_scan_dirs
+                .as_deref()
+                .unwrap_or_default(),
+            &cfg.agent_exclusion_roots,
+        );
+        if !user_scan_dirs.is_empty() {
+            // AFTER the extras, BEFORE the ordinary user dirs. The extras are the leading
+            // `roots.extra_agent_dirs().len()` entries, put there by `with_prepended_user_extras`.
+            let at = roots
+                .extra_agent_dirs()
+                .len()
+                .min(cfg.user_agent_dirs.len());
+            let tail = cfg.user_agent_dirs.split_off(at);
+            cfg.user_agent_dirs.extend(user_scan_dirs);
+            cfg.user_agent_dirs.extend(tail);
+        }
+        if !project_scan_dirs.is_empty() {
+            let ordinary = std::mem::take(&mut cfg.project_agent_dirs);
+            cfg.project_agent_dirs = project_scan_dirs;
+            cfg.project_agent_dirs.extend(ordinary);
+        }
+        // CYRUP-DELTA: upstream does NOT feed scan dirs into the CHAIN dir lists — `getUserChainDir`
+        // / `resolveNearestProjectChainDirs` are independent of `agentScanDirs`
+        // (`agents.ts:2644-2649`) — so `user_chain_dirs`/`project_chain_dirs` are deliberately left
+        // untouched here.
         Ok(cfg)
     }
 

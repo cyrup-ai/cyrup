@@ -521,6 +521,22 @@ pub struct SubagentExtensionConfig {
     /// whatever the agent's own frontmatter declares, or no policy at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<serde_json::Value>,
+    /// SUBA-119 — pi `ExtensionConfig.modelResponseAliases?: Record<string, string[]>`, read at
+    /// `subagent-executor.ts:1367`/`:1749`/`:2008`/`:3355`/`:4029` and handed to every run as
+    /// `options.modelResponseAliases`.
+    ///
+    /// Operator-declared mappings from a launch candidate's BASE `provider/model` id to the raw
+    /// response ids that legitimately identify it. This is the ONLY escape from
+    /// [`crate::exec::model_verification::format_subagent_model_verification_error`]'s hard run
+    /// failure, which is why it is a config key and not a run param: a router that substitutes a
+    /// model has to be declared once, not argued about per call.
+    ///
+    /// Validated at config load by [`Self::validate_model_response_aliases`] — upstream's
+    /// `validateModelResponseAliases(config.modelResponseAliases)` (`extension/config.ts:176`) —
+    /// so a malformed map is refused rather than dropped, because a dropped map means the run the
+    /// operator was trying to unblock keeps failing with the same error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
 }
 
 /// The `config.json` keys pi declares on `ExtensionConfig` at v0.68.0 (`shared/types.ts:2596-2690`)
@@ -528,12 +544,8 @@ pub struct SubagentExtensionConfig {
 /// [`SubagentExtensionConfig::config_warnings`] when set, rather than dropped by serde.
 ///
 /// Each is a real feature gap, not a decision that it is out of scope; the ledger carries them.
-pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 13] = [
+pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 12] = [
     ("forkContext", "pruned fork-context preparation"),
-    (
-        "modelResponseAliases",
-        "operator-declared model response-id aliases",
-    ),
     ("mainWindowRenderer", "main-chat renderer density controls"),
     ("orcaProgressTabs", "Orca observer tabs"),
     ("toolTimeoutMs", "a config-level per-tool-call timeout"),
@@ -626,6 +638,9 @@ impl Default for SubagentExtensionConfig {
             // SUBA-025 — pi's `mode === undefined => "full"` (`tool-description.ts:106`).
             tool_description_mode: None,
             permissions: None,
+            // SUBA-119 — no operator-declared response-id aliases, which is every installation
+            // that has not been served a substituted model.
+            model_response_aliases: None,
             // VL-S11 R3 — upstream's own default: `if (options.foregroundDetachShortcut)`
             // (`slash-commands.ts:1007`) registers NOTHING with the key absent. Opt-in, and
             // deliberately so; see the field's doc for why a default-on chord was rejected.
@@ -802,7 +817,28 @@ impl SubagentExtensionConfig {
         Self::validate_missions(raw)?;
         Self::validate_authority_policy(raw)?;
         Self::validate_artifact_config(raw)?;
+        // SUBA-119 — `validateModelResponseAliases(config.modelResponseAliases)`
+        // (`extension/config.ts:176`), which upstream runs AFTER `validateArtifactConfig` (`:173`),
+        // so a file with both problems reports the one pi would.
+        Self::validate_model_response_aliases(raw)?;
         Ok(())
+    }
+
+    /// SUBA-119 — pi `validateModelResponseAliases(config.modelResponseAliases)`
+    /// (`extension/config.ts:176` @v0.71.0), applied to the RAW config JSON for the same reason
+    /// [`Self::validate_missions`] is: serde alone would accept a wrong-shaped value by dropping
+    /// it, and a dropped alias map leaves the run the operator was unblocking failing with the
+    /// identical `model_verification_failed` error and no clue why the declaration had no effect.
+    ///
+    /// # Errors
+    ///
+    /// Upstream's own message, from
+    /// [`crate::exec::model_verification::validate_model_response_aliases`].
+    pub fn validate_model_response_aliases(raw: &serde_json::Value) -> Result<(), String> {
+        crate::exec::model_verification::validate_model_response_aliases(
+            raw.get("modelResponseAliases"),
+            "config.modelResponseAliases",
+        )
     }
 
     /// Non-fatal diagnostics for a raw `config.json` object: every key this port does not read.
@@ -1911,6 +1947,9 @@ mod tests {
             },
         );
         let settings = SubagentSettings {
+            default_subagent_only_extensions: None,
+            agent_scan_dirs: None,
+            agent_exclude_dirs: None,
             model_scope: None,
             overrides,
             default_model: Some("claude-sonnet".to_string()),
@@ -2246,6 +2285,79 @@ mod tests {
         assert_eq!(
             resolved.parallel_max_tasks.tier,
             ConfigTier::ExtensionConfig
+        );
+    }
+    // ---- SUBA-119: `config.modelResponseAliases` ----
+
+    /// SUBA-119 — the operator surface. `modelResponseAliases` is the ONLY escape from
+    /// `format_subagent_model_verification_error`'s hard run failure, and the failure text tells the
+    /// operator to declare it in `config.json`. Three things therefore have to hold at once, and
+    /// the row was refused because none of them did:
+    ///
+    /// 1. the key is PARSED into a typed map, so the declaration has somewhere to land;
+    /// 2. the key no longer censuses as UNPORTED — before this, following the error message's own
+    ///    instruction produced `'modelResponseAliases' is not supported by this port …; it has no
+    ///    effect` and the run kept failing;
+    /// 3. a malformed map is REFUSED at load (upstream's `validateModelResponseAliases`,
+    ///    `extension/config.ts:176`) rather than dropped, because a dropped map is indistinguishable
+    ///    from no declaration at all.
+    #[test]
+    fn the_model_response_aliases_key_is_parsed_censused_and_validated() {
+        let raw = serde_json::json!({
+            "modelResponseAliases": {
+                "prov/model": ["other/model", "third/model:high"],
+                "vendor/family/leaf": []
+            }
+        });
+
+        // (1) parsed.
+        let cfg: SubagentExtensionConfig =
+            serde_json::from_value(raw.clone()).expect("the key is typed");
+        let aliases = cfg
+            .model_response_aliases
+            .as_ref()
+            .expect("the declaration lands on the config");
+        assert_eq!(
+            aliases.get("prov/model").map(Vec::as_slice),
+            Some(&["other/model".to_string(), "third/model:high".to_string()][..])
+        );
+        assert_eq!(aliases.get("vendor/family/leaf").map(Vec::len), Some(0));
+
+        // (2) not censused as unported, and not as unknown either.
+        assert!(
+            SubagentExtensionConfig::config_warnings(&raw).is_empty(),
+            "{:?}",
+            SubagentExtensionConfig::config_warnings(&raw)
+        );
+        assert!(
+            !UNPORTED_CONFIG_KEYS
+                .iter()
+                .any(|(key, _)| *key == "modelResponseAliases"),
+            "a key with a reader must not be advertised as unported"
+        );
+
+        // (3) validated, with upstream's own message, through the aggregate the loader calls.
+        assert_eq!(SubagentExtensionConfig::validate_raw_config(&raw), Ok(()));
+        let bad = serde_json::json!({ "modelResponseAliases": { "nomodel": ["other/model"] } });
+        assert_eq!(
+            SubagentExtensionConfig::validate_raw_config(&bad),
+            Err(
+                "config.modelResponseAliases key \"nomodel\" must be a non-empty provider/model ID"
+                    .to_string()
+            )
+        );
+        let not_object = serde_json::json!({ "modelResponseAliases": ["prov/model"] });
+        assert_eq!(
+            SubagentExtensionConfig::validate_raw_config(&not_object),
+            Err("config.modelResponseAliases must be a JSON object".to_string())
+        );
+
+        // An absent key is the common case and must not warn or fail.
+        let quiet = serde_json::json!({});
+        assert_eq!(SubagentExtensionConfig::validate_raw_config(&quiet), Ok(()));
+        assert_eq!(
+            SubagentExtensionConfig::default().model_response_aliases,
+            None
         );
     }
 }

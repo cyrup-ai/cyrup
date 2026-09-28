@@ -3672,3 +3672,45 @@ fn check_summarization_response_pins_pi_s_acceptance_rules() {
         Err(CompactionError::Aborted)
     ));
 }
+
+#[test]
+fn sess061_trailing_tool_result_over_budget_cuts_at_the_last_valid_point() {
+    // Pi's budget-crossing snap is
+    //   cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
+    // (`coding-agent/src/core/compaction/compaction.ts:498` @v0.87.1), with Pi's own comment: "If
+    // trailing tool results exceed the budget by themselves, keep their preceding assistant tool
+    // call instead of falling back to the first message."
+    //
+    // A `tool_result` entry is never a valid cut point, so when the trailing tool result alone
+    // crosses `keep_recent_tokens` there is NO valid point at or after it. cyrup used to leave the
+    // `valid.first()` default in place and `break`, cutting at index 0 — i.e. compaction kept the
+    // whole history and summarised nothing.
+    let huge = "r".repeat(40_000); // 40_000 chars ⇒ 10_000 estimated tokens, alone over budget
+    let entries = vec![
+        msg_entry("e0", None, user("first turn")),
+        msg_entry("e1", Some("e0"), assistant("first answer")),
+        msg_entry("e2", Some("e1"), user("second turn")),
+        msg_entry("e3", Some("e2"), assistant_tool("read", "big.rs")),
+        msg_entry("e4", Some("e3"), tool_result("read", "big.rs", &huge)),
+    ];
+    let cache = TokenCache::default();
+    let keep_recent_tokens = 2_000;
+    assert!(
+        cache.estimate_raw_entry(&entries[4]) >= keep_recent_tokens,
+        "precondition: the trailing tool result must exceed the keep budget BY ITSELF"
+    );
+    for (i, e) in entries.iter().take(4).enumerate() {
+        assert!(
+            cache.estimate_raw_entry(e) < keep_recent_tokens,
+            "precondition: entry {i} must not cross the budget on its own"
+        );
+    }
+
+    let cut = find_cut_point(&entries, &cache, 0, entries.len(), keep_recent_tokens);
+
+    assert_eq!(
+        cut.first_kept_index, 3,
+        "must fall back to the LAST valid cut point — the assistant tool call at index 3 — not to \
+         the first message at index 0; got {cut:?}"
+    );
+}

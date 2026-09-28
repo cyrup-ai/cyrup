@@ -40,9 +40,11 @@ pub(super) struct Decoder {
     pub(super) thinking_idx: Option<usize>,
     pub(super) tool_by_stream: HashMap<i64, usize>,
     pub(super) tool_by_id: HashMap<String, usize>,
-    /// Encrypted reasoning details whose tool call hasn't been seen yet (Pi
-    /// `pendingReasoningDetailsByToolCallId`).
-    pub(super) pending_reasoning_by_tool_id: HashMap<String, String>,
+    /// The merged `reasoning_details` seen so far (Pi `streamedReasoningDetails`,
+    /// openai-completions.ts:328). Replay metadata, not a user-visible delta: it is serialized once
+    /// onto the thinking block's signature when that block is finalized
+    /// (`applyStreamedReasoningDetails`, openai-completions.ts:329-333).
+    pub(super) streamed_reasoning_details: Option<Vec<serde_json::Value>>,
     pub(super) usage: Option<Usage>,
     pub(super) response_id: Option<String>,
     pub(super) response_model: Option<String>,

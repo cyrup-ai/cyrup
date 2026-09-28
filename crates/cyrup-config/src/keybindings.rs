@@ -318,7 +318,7 @@ pub fn migrate_keybindings_config_file(agent_dir: &Path) {
         return;
     };
     // migrations.ts:162-165 — a non-object top level (including `null` and an array) is left alone.
-    let Ok(Value::Object(parsed)) = serde_json::from_str::<Value>(&text) else {
+    let Ok(Value::Object(parsed)) = serde_json::from_str::<Value>(crate::strip_bom(&text)) else {
         return;
     };
     let (config, migrated) = migrate_keybindings_config(&parsed);
@@ -354,6 +354,25 @@ mod tests {
 
     fn keys(config: &OrderedKeybindings) -> Vec<&str> {
         config.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// CFG-087: pi strips a leading BOM before parsing `keybindings.json`
+    /// (`keybindings.ts:363` @v0.87.1 -> `stripBom`, `utils/text.ts:7-9`). Without the strip the
+    /// `let Ok(Value::Object(..)) = .. else` in `migrate_keybindings_config_file` falls through and
+    /// the migration is silently skipped, leaving the legacy name on disk.
+    #[test]
+    fn a_bom_does_not_stop_the_keybindings_file_migration() {
+        let dir = crate::test_util::temp_dir();
+        let path = dir.join("keybindings.json");
+        let (legacy, modern) = KEYBINDING_NAME_MIGRATIONS[0];
+        std::fs::write(&path, format!("\u{feff}{{\"{legacy}\": \"ctrl+shift+9\"}}"))
+            .expect("write BOM'd keybindings.json");
+        migrate_keybindings_config_file(&dir);
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains(modern),
+            "expected the migrated name {modern:?} on disk, got {after:?}"
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@ use crate::paths::agent_dir;
 /// nested one under `.pi/`. cyrup keeps the FLAT spelling deliberately: the path is the
 /// on-disk location of every existing install's artifacts, and renaming it would strand
 /// them for no user-visible gain. `[CYRUP-DELTA, naming]`.
-const PROJECT_ARTIFACT_ROOT: &str = ".cyrup-subagents";
+pub(crate) const PROJECT_ARTIFACT_ROOT: &str = ".cyrup-subagents";
 /// The `artifacts` leaf under both the project root and the scoped temp root.
 const ARTIFACTS_SUBDIR: &str = "artifacts";
 /// The `chain-runs` leaf (pi `CHAIN_RUNS_DIR`'s leaf + `getProjectChainRunsDir`).

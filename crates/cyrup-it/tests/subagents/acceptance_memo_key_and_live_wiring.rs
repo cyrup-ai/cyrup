@@ -843,6 +843,8 @@ fn runner_config(
     step: SingleStepSpec,
 ) -> RunnerConfig {
     RunnerConfig {
+        // SUBA-119 — no operator-declared response-id alias for this fixture run.
+        model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,
         completion_owner_id: None,

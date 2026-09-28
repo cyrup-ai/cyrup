@@ -222,8 +222,11 @@ pub enum PointerOutcome {
     /// The report was ours and is fully dealt with.
     Handled,
     /// The report was ours and ended a selection: the caller writes this string with
-    /// [`crate::clipboard::copy_to_clipboard`] and flashes `Copied!` or `Copy failed` on the
-    /// result — pi's `copySelectionToClipboard` tail (`:1113-1117`).
+    /// [`crate::clipboard::copy_to_clipboard`] and flashes
+    /// [`crate::app::run_action::copy_flash_for`]'s verdict on the result — `Copied!` at the default
+    /// dwell, or, since TUI-102, the thrown [`crate::clipboard::ClipboardError`] message held for
+    /// [`super::COPY_ERROR_FLASH_DURATION`]. Pi's `copySelectionToClipboard` tail (`:1113-1117`)
+    /// with the `boolean | string` return v0.86.0 gave it (`:1456-1463`).
     Copy(String),
     /// An unmodified secondary-button press with clipboard text behind it: the caller inserts the
     /// string into the editor — pi's `onRightClickPaste()` (`:711`).

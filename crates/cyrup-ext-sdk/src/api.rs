@@ -591,7 +591,7 @@ where
 /// systems (for example SSH)"*), returned as `UserBashEventResult.operations`
 /// (`core/extensions/types.ts:1139`).
 ///
-/// Register one with [`ExtensionApi::register_bash_operations`] and return `{"operations": true}`
+/// Register one with [`ExtensionApi::register_bash_operations`] and return `{"operations": {}}`
 /// from a `user_bash` handler (see that method's doc for why BOTH halves are needed). The host then
 /// runs the extension's `!` command through [`Self::exec`] instead of the local shell — upstream's
 /// `options?.operations ?? createLocalBashOperations({ shellPath })`
@@ -874,8 +874,14 @@ impl ExtensionApi {
     ///
     /// * this call declares that the guest HAS a backend (it drives the
     ///   `registration.register-bash-operations` import at `init`);
-    /// * a `user_bash` handler returning [`Outcome::handled`] with `{"operations": true}` is what
-    ///   says *this particular command* should run through it — upstream's handler returns
+    /// * a `user_bash` handler returning [`Outcome::handled`] with `{"operations": {}}` is what
+    ///   says *this particular command* should run through it. The value must be an OBJECT and the
+    ///   payload must carry NO `result` key: pi's `isUserBashEventResult` demands exactly one of
+    ///   the two and `typeof operations === "object"` (`core/extensions/runner.ts:140-146`
+    ///   @v0.87.1), and since coding-agent 0.86.0 (#9068) anything else is a DEFINED-but-invalid
+    ///   result that ABORTS the command rather than redirecting it. The object is empty because
+    ///   upstream's holds a callable `exec` that ADR-0002 keeps off cyrup's value seam — this call
+    ///   is where the callable lives instead. Upstream's handler returns
     ///   `{ operations }` for exactly the commands it wants to redirect and `undefined` for the
     ///   rest (`examples/extensions/ssh.ts:203-206`), and a handler that returns a `result`
     ///   instead short-circuits execution entirely, so the backend is never consulted

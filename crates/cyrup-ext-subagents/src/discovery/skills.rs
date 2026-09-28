@@ -68,6 +68,14 @@ pub struct ResolvedSkill {
     pub name: String,
     pub path: PathBuf,
     pub description: Option<String>,
+    /// SUBA-125 — the skill's `disable-model-invocation` frontmatter flag
+    /// ([`cyrup_resources::skill::Skill::disable_model_invocation`]).
+    ///
+    /// A `true` here means the skill is USER-ONLY: it may be invoked explicitly, but it must never
+    /// be advertised to a model. [`build_skill_injection`] is the one place that acts on it (pi
+    /// `buildSkillInjection`, `skills.ts:717-722` @v0.71.0) — resolution itself is deliberately
+    /// unaffected, so a hidden skill still resolves and is NOT reported as `missing`.
+    pub disable_model_invocation: bool,
 }
 
 /// The outcome of resolving a list of skill names: the pointers that resolved, and the names that
@@ -85,6 +93,11 @@ pub struct SkillResolution {
 pub struct AvailableSkill {
     pub name: String,
     pub description: Option<String>,
+    /// SUBA-125 — as [`ResolvedSkill::disable_model_invocation`]. Consulted by
+    /// [`recommend_proactive_skill_subagents`], whose upstream filter carries the same test
+    /// (`proactive-skills.ts:146` @v0.71.0: `availableByName?.get(skill)?.disableModelInvocation
+    /// !== true`).
+    pub disable_model_invocation: bool,
 }
 
 /// The user/global roots skill discovery scans in addition to the per-run cwd. Resolved from env in
@@ -139,6 +152,10 @@ fn resolve_one(skills: &ResourceSet<Skill>, name: &str) -> Option<ResolvedSkill>
         name: skill.name.clone(),
         path: skill.skill_md.clone(),
         description: skill.front.description.clone(),
+        // SUBA-125: carried through resolution so `build_skill_injection` has something to filter
+        // on. Upstream's `resolveSkills` likewise projects the flag and does NOT act on it
+        // (`skills.ts:608-638` @v0.71.0) — a hidden skill resolves, and `missing` is untouched.
+        disable_model_invocation: skill.disable_model_invocation,
     })
 }
 
@@ -254,6 +271,7 @@ async fn discover_available_skills_in(
         .map(|skill| AvailableSkill {
             name: skill.name.clone(),
             description: skill.front.description.clone(),
+            disable_model_invocation: skill.disable_model_invocation,
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -271,6 +289,18 @@ async fn discover_available_skills_in(
 /// for an empty input (no block emitted).
 #[must_use]
 pub fn build_skill_injection(skills: &[ResolvedSkill]) -> String {
+    // SUBA-125 / pi `buildSkillInjection` (`skills.ts:717-722` @v0.71.0), whose own comment states
+    // that this is deliberately THE chokepoint every prompt-injection path funnels through: a
+    // caller that resolved a hidden skill BY NAME still cannot inject it, so the filter cannot be
+    // pushed up into resolution without opening a second path.
+    //
+    // The order here is load-bearing: the emptiness check runs AFTER the filter (upstream's
+    // `if (visibleSkills.length === 0) return ""`), because a request for one hidden skill must
+    // yield NO BLOCK rather than an empty `<available_skills>` element.
+    let skills: Vec<&ResolvedSkill> = skills
+        .iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .collect();
     if skills.is_empty() {
         return String::new();
     }
@@ -530,6 +560,15 @@ pub fn recommend_proactive_skill_subagents(
                 && available_by_name
                     .as_ref()
                     .is_none_or(|map| map.contains_key(skill.as_str()))
+                // SUBA-125 / pi `proactive-skills.ts:146` @v0.71.0:
+                // `availableByName?.get(skill)?.disableModelInvocation !== true`. A hidden skill is
+                // user-only and must never surface in a MODEL-FACING recommendation. Note the
+                // `!== true` shape: an unknown skill (no available row) is not excluded HERE — the
+                // clause above already decided that case.
+                && available_by_name
+                    .as_ref()
+                    .and_then(|map| map.get(skill.as_str()))
+                    .is_none_or(|entry| !entry.disable_model_invocation)
         })
         .map(|(skill, sources)| {
             let references = sources.len();
@@ -957,6 +996,7 @@ mod tests {
             name: "amp&skill".to_string(),
             path: PathBuf::from("/skills/amp&skill/SKILL.md"),
             description: Some("Use A & B <carefully>".to_string()),
+            disable_model_invocation: false,
         }];
         let injection = build_skill_injection(&skills);
         assert!(injection.contains("<name>amp&amp;skill</name>"));
@@ -985,6 +1025,7 @@ mod tests {
         AvailableSkill {
             name: name.to_string(),
             description: description.map(str::to_string),
+            disable_model_invocation: false,
         }
     }
 
@@ -1278,5 +1319,123 @@ mod tests {
             collected,
             vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
         );
+    }
+
+    // ============================================================================================
+    // SUBA-125 — `disable-model-invocation` is honored at every model-facing seam
+    // ============================================================================================
+
+    /// Write a project skill whose frontmatter carries `disable-model-invocation: true` — the
+    /// user-only marker (`cyrup_resources::skill::Skill::disable_model_invocation`).
+    fn make_hidden_project_skill(cwd: &Path, name: &str, description: &str) {
+        let skill_dir = cwd.join(".cyrup").join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\ndescription: {description}\ndisable-model-invocation: true\n---\n\nSecret body\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn resolved(name: &str, hidden: bool) -> ResolvedSkill {
+        ResolvedSkill {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            description: Some(format!("{name} description")),
+            disable_model_invocation: hidden,
+        }
+    }
+
+    /// pi `buildSkillInjection` (`skills.ts:717-719` @v0.71.0): the hidden skill is dropped from the
+    /// block even though the caller resolved it and handed it over.
+    ///
+    /// Gutted by: removing the `!skill.disable_model_invocation` filter — the hidden name appears in
+    /// the rendered block and the child is told about a user-only skill.
+    #[test]
+    fn build_skill_injection_omits_a_hidden_skill() {
+        let injection =
+            build_skill_injection(&[resolved("visible", false), resolved("hidden", true)]);
+        assert!(injection.contains("<name>visible</name>"), "{injection}");
+        assert!(
+            !injection.contains("hidden"),
+            "a user-only skill must not reach the child prompt: {injection}"
+        );
+    }
+
+    /// pi's `if (visibleSkills.length === 0) return ""` (`skills.ts:720`) — the emptiness check runs
+    /// AFTER the filter. This is the case a naive filter placement gets wrong: it emits the header
+    /// text and an empty `<available_skills>` element telling the child it has skills it does not.
+    ///
+    /// Gutted by: filtering inside the render loop instead of before the emptiness check.
+    #[test]
+    fn build_skill_injection_is_empty_when_every_resolved_skill_is_hidden() {
+        assert_eq!(
+            build_skill_injection(&[resolved("one", true), resolved("two", true)]),
+            ""
+        );
+    }
+
+    /// pi `proactive-skills.ts:146` @v0.71.0: a hidden skill is never proactively RECOMMENDED
+    /// either, so the second model-facing path is closed with the first. Driven off a real on-disk
+    /// `SKILL.md` so the flag is exercised end to end through `cyrup-resources`' frontmatter parse
+    /// and `discover_available_skills_in`'s projection.
+    ///
+    /// Gutted by: dropping the `disable_model_invocation` clause from the recommender's filter (the
+    /// hidden skill is recommended), or not projecting the flag in `discover_available_skills_in`
+    /// (same symptom, one layer down).
+    #[tokio::test]
+    async fn a_hidden_skill_is_not_proactively_recommended() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_project_skill(tmp.path(), "open-review", "Body.", "Open review skill.");
+        make_hidden_project_skill(tmp.path(), "secret-review", "Secret review skill.");
+        let available = discover_available_skills_in(tmp.path(), &isolated_dirs(tmp.path())).await;
+        assert!(
+            available.iter().any(|s| s.name == "secret-review"),
+            "control: the hidden skill IS discovered — it is only hidden from model-facing output"
+        );
+
+        let recommendations = recommend_proactive_skill_subagents(
+            &[
+                agent("reviewer", &[], false),
+                agent("one", &["open-review", "secret-review"], false),
+                agent("two", &["open-review", "secret-review"], false),
+            ],
+            &[],
+            Some(&available),
+            None,
+        );
+        let skills: Vec<&str> = recommendations.iter().map(|r| r.skill.as_str()).collect();
+        assert_eq!(skills, vec!["open-review"], "{recommendations:?}");
+    }
+
+    /// The row's verify clause, end to end over real files: an agent naming BOTH a hidden and a
+    /// visible skill resolves both (upstream's `resolveSkills` does not filter, and `missing` stays
+    /// empty — `skills.ts:608-638`), yet the child prompt block carries only the visible one.
+    ///
+    /// Gutted by: the same filter removal as the unit above — but this is the assertion that proves
+    /// the leak is closed at the PROMPT rather than only in a helper.
+    #[tokio::test]
+    async fn an_agent_naming_a_hidden_skill_launches_without_it_in_the_child_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_project_skill(tmp.path(), "shown", "Body.", "Shown skill.");
+        make_hidden_project_skill(tmp.path(), "unshown", "Unshown skill.");
+        let resolution = resolve_skills_in(
+            &["shown".to_string(), "unshown".to_string()],
+            tmp.path(),
+            &isolated_dirs(tmp.path()),
+        )
+        .await;
+        assert_eq!(
+            resolution.missing,
+            Vec::<String>::new(),
+            "upstream does NOT report a hidden skill as missing"
+        );
+        assert_eq!(resolution.resolved.len(), 2, "both resolve");
+
+        let injection = build_skill_injection(&resolution.resolved);
+        assert!(injection.contains("<name>shown</name>"), "{injection}");
+        assert!(!injection.contains("unshown"), "{injection}");
     }
 }

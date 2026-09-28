@@ -153,24 +153,6 @@ struct ProcessedFiles {
     images: Vec<Content>,
 }
 
-/// Sniff a supported image MIME type from the leading magic bytes (Pi
-/// `detectSupportedImageMimeTypeFromFile`, utils/mime.ts). Returns `None` for non-image content.
-fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.get(0..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        Some("image/webp")
-    } else if bytes.starts_with(b"BM") {
-        Some("image/bmp")
-    } else {
-        None
-    }
-}
-
 /// A processed-image result mirroring Pi `ProcessImageResult` (image-process.ts:11-20): the base64
 /// data, the (preserved-or-converted) MIME type, and the processing hint lines.
 struct ProcessedImage {
@@ -487,8 +469,16 @@ async fn process_file_args(
             .await
             .with_context(|| format!("Could not read file {}", abs.display()))?;
         let name = abs.display();
-        match detect_image_mime(&bytes) {
-            Some(mime) => match process_image(&bytes, mime, auto_resize) {
+        // SEAM-133 — the sniff is pi's `detectSupportedImageMimeTypeFromFile`
+        // (file-processor.ts:49 @v0.87.1), whose faithful port already lives in
+        // `cyrup_tools::ImageMime::from_file_head`: it applies pi's 4 100-byte sniff window to a
+        // buffer the caller already holds, rejects lossless JPEG (`FF D8 FF F7`) and animated PNG,
+        // requires a real IHDR, and structurally validates a BMP header. `input.rs` previously
+        // carried a second, laxer copy that called any `BM`-prefixed file a bitmap (so a text file
+        // beginning `BMW …` reached the model as an image-processing failure instead of its text)
+        // and claimed `FF D8 FF F7` as JPEG. There is now one copy of this predicate.
+        match cyrup_tools::ImageMime::from_file_head(&bytes) {
+            Some(mime) => match process_image(&bytes, mime.mime(), auto_resize) {
                 Ok(processed) => {
                     out.images.push(Content::Image {
                         data: processed.data,
@@ -515,8 +505,13 @@ async fn process_file_args(
                 )),
             },
             None => {
-                // Text file: wrap content in <file> tags with the absolute path.
-                let content = String::from_utf8_lossy(&bytes);
+                // Text file: wrap content in <file> tags with the absolute path. A `null` sniff
+                // means TEXT upstream too (file-processor.ts:75-77 @v0.87.1), and pi's read is
+                // `stripBom(await readFile(absolutePath, "utf-8"))` — so a UTF-8 BOM is removed
+                // before the content reaches the prompt rather than surviving as a U+FEFF inside
+                // the `<file>` body.
+                let body = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+                let content = String::from_utf8_lossy(body);
                 out.text
                     .push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
             }
@@ -751,17 +746,99 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detect_mime_recognizes_signatures() {
+    /// Build a PNG chunk: big-endian length, 4-byte type, payload, and a CRC placeholder (the
+    /// sniffer reads neither the CRC nor the payload).
+    fn png_chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend((payload.len() as u32).to_be_bytes());
+        out.extend(kind);
+        out.extend(payload);
+        out.extend([0u8; 4]);
+        out
+    }
+
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+    async fn inline_one(dir: &std::path::Path, path: &std::path::Path) -> ProcessedFiles {
+        process_file_args(&[path.to_string_lossy().into_owned()], dir, true)
+            .await
+            .expect("process")
+    }
+
+    /// SEAM-133 — the `@file` sniff is now the single faithful port in `cyrup-tools`
+    /// (`detectSupportedImageMimeTypeFromFile`, file-processor.ts:49 @v0.87.1), so a file pi calls
+    /// TEXT is inlined as text rather than shipped as a broken image.
+    #[tokio::test]
+    async fn non_images_pi_rejects_are_inlined_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (1) `BM` alone is not a bitmap: pi requires `isBmp` (mime.ts) — length >= 26, a sane
+        // pixel-data offset, a 12 or 40..=124 DIB header, one colour plane, a known bit depth.
+        let bmw = dir.path().join("f.txt");
+        std::fs::write(&bmw, "BMW service log").unwrap();
+        let out = inline_one(dir.path(), &bmw).await;
+        assert!(out.images.is_empty(), "{:?}", out.images);
         assert_eq!(
-            detect_image_mime(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            out.text,
+            format!(
+                "<file name=\"{}\">\nBMW service log\n</file>\n",
+                bmw.display()
+            )
+        );
+
+        // (2) an animated PNG (`acTL` before `IDAT`) — pi returns null for it (mime.ts:42-55).
+        let apng = dir.path().join("a.png");
+        let mut bytes = PNG_SIG.to_vec();
+        bytes.extend(png_chunk(b"IHDR", &[0u8; 13]));
+        bytes.extend(png_chunk(b"acTL", &[0u8; 8]));
+        bytes.extend(png_chunk(b"IDAT", &[0u8; 4]));
+        std::fs::write(&apng, &bytes).unwrap();
+        let out = inline_one(dir.path(), &apng).await;
+        assert!(out.images.is_empty(), "{:?}", out.images);
+        assert!(out.text.contains("<file name="), "{}", out.text);
+
+        // (3) lossless JPEG: `buffer[3] === 0xf7` → null (mime.ts).
+        let lossless = dir.path().join("l.jpg");
+        std::fs::write(&lossless, [0xff, 0xd8, 0xff, 0xf7, 0x00, 0x01]).unwrap();
+        let out = inline_one(dir.path(), &lossless).await;
+        assert!(out.images.is_empty(), "{:?}", out.images);
+        assert!(out.text.contains("<file name="), "{}", out.text);
+    }
+
+    /// SEAM-133 — pi's text branch reads `stripBom(readFile(path, "utf-8"))`
+    /// (file-processor.ts:77 @v0.87.1), so a UTF-8 BOM never reaches the prompt.
+    #[tokio::test]
+    async fn a_utf8_bom_is_stripped_from_an_inlined_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom.md");
+        std::fs::write(&path, b"\xef\xbb\xbfhello").unwrap();
+        let out = inline_one(dir.path(), &path).await;
+        assert!(out.images.is_empty());
+        assert!(
+            !out.text.contains('\u{feff}'),
+            "the BOM survived into the prompt: {:?}",
+            out.text
+        );
+        assert_eq!(
+            out.text,
+            format!("<file name=\"{}\">\nhello\n</file>\n", path.display())
+        );
+    }
+
+    /// Presence before absence: the change cannot pass by rejecting everything. A real minimal PNG
+    /// (signature + a length-13 IHDR) and a `GIF89a` file are still sniffed as images.
+    #[test]
+    fn real_image_headers_are_still_recognised() {
+        let mut png = PNG_SIG.to_vec();
+        png.extend(png_chunk(b"IHDR", &[0u8; 13]));
+        assert_eq!(
+            cyrup_tools::ImageMime::from_file_head(&png).map(cyrup_tools::ImageMime::mime),
             Some("image/png")
         );
         assert_eq!(
-            detect_image_mime(&[0xff, 0xd8, 0xff, 0x00]),
-            Some("image/jpeg")
+            cyrup_tools::ImageMime::from_file_head(b"GIF89a....").map(cyrup_tools::ImageMime::mime),
+            Some("image/gif")
         );
-        assert_eq!(detect_image_mime(b"GIF89a..."), Some("image/gif"));
-        assert_eq!(detect_image_mime(b"plain text"), None);
+        assert_eq!(cyrup_tools::ImageMime::from_file_head(b"plain text"), None);
     }
 }

@@ -290,11 +290,13 @@ impl AcceptanceContract {
         );
         Self {
             // `resolve_effective_acceptance` with no explicit input returns `inferred.level`
-            // verbatim, and `infer_level` only ever yields `attested`/`checked` (v0.43.0 removed
-            // the `reviewed` level; its risky branch now returns `checked` plus a required review
-            // gate, `acceptance.ts:114-120`) — the `Auto`/`None`/`Verified` arms below are
-            // unreachable and map to the nearest real level rather than reintroducing a silent
-            // no-op contract.
+            // verbatim. SUBA-108: since `acceptance.ts:109-117` @v0.71.0 a DECLARED read-only
+            // role infers `none`, so the `None` arm is reachable and must map to
+            // [`AcceptanceStatus::NotRequired`] — upstream's `none` means no acceptance prompt
+            // (`formatAcceptancePrompt` returns `""` for `level === "none"`) and no gate, which
+            // is exactly what `NotRequired`/[`Self::is_no_op`] expresses. The `Auto` arm stays
+            // unreachable (`resolve_effective_acceptance` never returns it) and keeps mapping to
+            // the nearest real level.
             required_level: match inferred.level {
                 crate::exec::acceptance::model::AcceptanceLevel::Verified => {
                     AcceptanceStatus::Verified
@@ -302,9 +304,11 @@ impl AcceptanceContract {
                 crate::exec::acceptance::model::AcceptanceLevel::Checked => {
                     AcceptanceStatus::Checked
                 }
+                crate::exec::acceptance::model::AcceptanceLevel::None => {
+                    AcceptanceStatus::NotRequired
+                }
                 crate::exec::acceptance::model::AcceptanceLevel::Attested
-                | crate::exec::acceptance::model::AcceptanceLevel::Auto
-                | crate::exec::acceptance::model::AcceptanceLevel::None => {
+                | crate::exec::acceptance::model::AcceptanceLevel::Auto => {
                     AcceptanceStatus::Attested
                 }
             },
@@ -509,98 +513,124 @@ mod tests {
     // AcceptanceContract construction
     // ---------------------------------------------------------------------------------------
 
+    /// SUBA-108 — since `acceptance.ts:101-108` @v0.71.0 the `checked` floor comes from the
+    /// DECLARED `writer` role, never from task wording or the agent's name.
     #[test]
-    fn heuristic_default_requires_checked_for_implementation_expecting_tasks() {
-        let contract = AcceptanceContract::heuristic_default("worker", "Implement the fix");
+    fn heuristic_default_requires_checked_for_a_declared_writer() {
+        let contract = AcceptanceContract::heuristic_default_for_role(
+            "worker",
+            Some(crate::exec::acceptance::model::AcceptanceRole::Writer),
+            "Implement the fix",
+        );
         assert_eq!(contract.required_level, AcceptanceStatus::Checked);
         assert!(!contract.explicit);
         assert!(contract.verify.is_empty());
+        // The same agent and task with NO declared role gets the lightweight default.
+        assert_eq!(
+            AcceptanceContract::heuristic_default("worker", "Implement the fix").required_level,
+            AcceptanceStatus::Attested
+        );
     }
 
-    /// pi `inferLevel`'s read-only branch (`acceptance.ts:107-116` @v0.34.0): read-only TASK
-    /// WORDING infers `attested` with the findings criterion and the review-findings evidence
-    /// pair — never `none`, which `inferLevel` has no branch for at all. (This test previously
-    /// asserted `NotRequired`/`is_no_op`, the divergence.)
+    /// SUBA-108 — `acceptance.ts:109-117` @v0.71.0: a DECLARED read-only role infers `none`,
+    /// which is no acceptance prompt and no gate (`formatAcceptancePrompt` returns `""` for
+    /// `level === "none"`). That is [`AcceptanceStatus::NotRequired`]/[`AcceptanceContract::is_no_op`].
+    /// This is the assertion that fails a port of `infer_level` that forgot to split the `None`
+    /// arm out of the `Attested` mapping.
+    ///
+    /// The criteria/evidence assertions are `acceptance.ts:521-522`
+    /// (`criteria: level === "none" ? [] : criteria`, same for `evidence`): the read-only branch
+    /// of `inferLevel` DOES name a findings criterion and two evidence kinds, and
+    /// `resolveEffectiveAcceptance` throws both away because nothing ever shows them to the
+    /// child. Keeping them would make `acceptance_requires_child_report` true for every declared
+    /// read-only child and put a criterion in the `not-required` ledger that upstream leaves
+    /// empty.
     #[test]
-    fn heuristic_default_attests_review_only_tasks_rather_than_disarming() {
+    fn heuristic_default_disarms_a_declared_read_only_role() {
+        let contract = AcceptanceContract::heuristic_default_for_role(
+            "reviewer",
+            Some(crate::exec::acceptance::model::AcceptanceRole::ReadOnly),
+            "anything",
+        );
+        assert_eq!(contract.required_level, AcceptanceStatus::NotRequired);
+        assert!(contract.is_no_op());
+        assert!(!contract.explicit);
+        assert!(
+            contract.criteria.is_empty(),
+            "level none clears criteria (acceptance.ts:521), got {:?}",
+            contract.criteria
+        );
+        assert!(
+            contract.evidence.is_empty(),
+            "level none clears evidence (acceptance.ts:522), got {:?}",
+            contract.evidence
+        );
+    }
+
+    /// Read-only TASK WORDING is no longer read at all: `7c98a696` deleted every wording
+    /// heuristic, so review-only phrasing with no declared role lands on the lightweight
+    /// default rather than on the findings-criterion branch.
+    #[test]
+    fn read_only_task_wording_without_a_role_gets_the_lightweight_default() {
         let contract =
             AcceptanceContract::heuristic_default("worker", "Review only: return findings");
         assert_eq!(contract.required_level, AcceptanceStatus::Attested);
-        assert!(!contract.is_no_op(), "there is always something to attest");
-        assert_eq!(contract.criteria.len(), 1);
+        assert!(!contract.is_no_op());
         assert_eq!(
             contract.criteria[0].must,
-            "Return concrete findings with file paths and severity when applicable"
+            "Return a concise result and residual risks when applicable"
         );
         assert_eq!(
             contract.evidence,
             vec![
-                crate::exec::acceptance::model::AcceptanceEvidenceKind::ReviewFindings,
+                crate::exec::acceptance::model::AcceptanceEvidenceKind::ManualNotes,
                 crate::exec::acceptance::model::AcceptanceEvidenceKind::ResidualRisks,
             ]
         );
     }
 
-    /// The read-only AGENT branch of the same tree — `reviewer|oracle|scout|researcher|analyst`
-    /// (`acceptance.ts:99` @ v0.43.0) — reached by agent name alone, with no read-only wording in
-    /// the task.
-    /// CROSS-CUTTING (batch 9): G97 made `advisor` an ALIAS of `oracle`, G99 put `oracle` (and not
-    /// `advisor`) into the read-only-agent alternation (`acceptance.ts:99` @v0.43.0), and G83 put
-    /// `advisor` into `isReviewerStyleAgent` (`task-intent.ts:138-140`). Three groups, one outcome: the
-    /// acceptance contract a caller gets must not depend on WHICH spelling of the same agent it
-    /// used.
-    ///
-    /// This is load-bearing rather than cosmetic. `advisor` is absent from the alternation, so it
-    /// reaches the same verdict as `oracle` only because two independent mechanisms agree —
-    /// name canonicalization at dispatch, and G83's reviewer-style classifier. If either is
-    /// narrowed, an `advisor` call silently starts running a STRICTER gate than the identical
-    /// `oracle` call, and no other test in the crate compares the two.
-    ///
-    /// `seer` is the control: an unrelated name genuinely does diverge on a write-shaped task, which
-    /// proves this test is comparing something that can differ rather than asserting a constant.
+    /// SUBA-108 — the test that used to live here (`an_alias_infers_the_same_acceptance_contract_
+    /// as_the_agent_it_names`) compared `advisor` against `oracle` and used `seer` as a control
+    /// that a write-shaped task DOES diverge by name. `7c98a696` deleted the
+    /// `reviewer|oracle|scout|researcher|analyst` alternation and every other name heuristic from
+    /// `inferLevel`, so the control can no longer hold and the property it guarded (alias and
+    /// name must agree) is now true by construction. What replaces it is the stronger statement:
+    /// the agent name is not an input at all.
     #[test]
-    fn an_alias_infers_the_same_acceptance_contract_as_the_agent_it_names() {
-        const TASKS: &[&str] = &[
+    fn the_inferred_contract_does_not_depend_on_the_agent_name() {
+        for task in [
             "Investigate the bug",
             "Implement the fix",
             "Update the parser and add a test",
             "Say hello",
-        ];
-
-        for task in TASKS {
-            let via_alias = AcceptanceContract::heuristic_default("advisor", task);
-            let via_name = AcceptanceContract::heuristic_default("oracle", task);
-            assert_eq!(
-                via_alias.required_level, via_name.required_level,
-                "`advisor` is an alias of `oracle`; the inferred contract for {task:?} must not \
-                 depend on which spelling was used"
-            );
+        ] {
+            for role in [
+                Some(crate::exec::acceptance::model::AcceptanceRole::Writer),
+                Some(crate::exec::acceptance::model::AcceptanceRole::ReadOnly),
+                None,
+            ] {
+                let baseline = AcceptanceContract::heuristic_default_for_role("seer", role, task);
+                for name in [
+                    "advisor",
+                    "oracle",
+                    "reviewer",
+                    "worker",
+                    "researcher",
+                    "analyst",
+                ] {
+                    let got = AcceptanceContract::heuristic_default_for_role(name, role, task);
+                    assert_eq!(
+                        (
+                            baseline.required_level,
+                            &baseline.criteria,
+                            &baseline.evidence
+                        ),
+                        (got.required_level, &got.criteria, &got.evidence),
+                        "name={name:?} role={role:?} task={task:?} changed the inferred contract"
+                    );
+                }
+            }
         }
-
-        // Control: the invariance above is a real agreement between two agent names, not an
-        // artifact of every name inferring the same thing.
-        let unrelated =
-            AcceptanceContract::heuristic_default("seer", "Update the parser and add a test");
-        let oracle =
-            AcceptanceContract::heuristic_default("oracle", "Update the parser and add a test");
-        assert_ne!(
-            unrelated.required_level, oracle.required_level,
-            "a write-shaped task must infer a stricter contract for a non-reviewer-style agent, \
-             otherwise this test proves nothing"
-        );
-    }
-
-    #[test]
-    fn heuristic_default_attests_a_research_agent_on_neutral_task_wording() {
-        let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
-        assert_eq!(contract.required_level, AcceptanceStatus::Attested);
-        assert_eq!(
-            contract.evidence,
-            vec![
-                crate::exec::acceptance::model::AcceptanceEvidenceKind::ReviewFindings,
-                crate::exec::acceptance::model::AcceptanceEvidenceKind::ResidualRisks,
-            ]
-        );
     }
 
     /// `inferLevel`'s final fallthrough (`acceptance.ts:118-124`): an agent and a task that match
@@ -650,19 +680,24 @@ mod tests {
     /// gated more weakly than the identical policy is under pi.
     #[test]
     fn an_explicit_level_below_the_inferred_one_is_raised_to_the_inferred_floor() {
-        let inferred = AcceptanceContract::heuristic_default("worker", "Implement the fix");
+        let inferred = AcceptanceContract::heuristic_default_for_role(
+            "worker",
+            Some(crate::exec::acceptance::model::AcceptanceRole::Writer),
+            "Implement the fix",
+        );
         assert_eq!(
             inferred.required_level,
             AcceptanceStatus::Checked,
             "premise"
         );
 
-        let effective = AcceptanceContract::resolve_effective(
+        let effective = AcceptanceContract::resolve_effective_for_role(
             Some(AcceptanceContract::explicit_floor(
                 AcceptanceStatus::Attested,
                 vec![],
             )),
             "worker",
+            Some(crate::exec::acceptance::model::AcceptanceRole::Writer),
             "Implement the fix",
         );
 
@@ -696,7 +731,14 @@ mod tests {
     /// `explicit == None` is pi's `explicitLevel === "auto"` branch: the inferred contract, whole.
     #[test]
     fn no_explicit_contract_yields_the_inferred_one() {
-        let effective = AcceptanceContract::resolve_effective(None, "worker", "Implement the fix");
+        // SUBA-108 — the `checked` floor now comes from the declared `writer` role
+        // (`acceptance.ts:101-108` @v0.71.0), not from the agent name or the task wording.
+        let effective = AcceptanceContract::resolve_effective_for_role(
+            None,
+            "worker",
+            Some(crate::exec::acceptance::model::AcceptanceRole::Writer),
+            "Implement the fix",
+        );
         assert_eq!(effective.required_level, AcceptanceStatus::Checked);
         assert!(
             !effective.explicit,
@@ -1211,13 +1253,38 @@ mod tests {
     /// gate, not silently drop to a weaker one.
     #[test]
     fn heuristic_inference_tops_out_at_checked_with_a_required_review_gate() {
-        let contract =
-            AcceptanceContract::heuristic_default("worker", "Prepare the security release");
-        assert_eq!(contract.required_level, AcceptanceStatus::Checked);
+        // At v0.71.0 the required review gate comes from `writer` + async/dynamic
+        // (`acceptance.ts:88-100`); the risky-keyword escalation it used to come from is gone.
+        // `heuristic_default_for_role` classifies on name + role + task alone (see its own
+        // `[CYRUP-DELTA]`), so the async axis is exercised on the model layer it delegates to.
+        let inferred = crate::exec::acceptance::model::resolve_effective_acceptance(
+            &crate::exec::acceptance::model::AcceptanceResolveInput {
+                explicit: None,
+                agent_name: "worker".to_string(),
+                acceptance_role: Some(crate::exec::acceptance::model::AcceptanceRole::Writer),
+                task: Some("Prepare the security release".to_string()),
+                mode: None,
+                is_async: true,
+                dynamic: false,
+                dynamic_group: false,
+            },
+        );
+        assert_eq!(
+            inferred.level,
+            crate::exec::acceptance::model::AcceptanceLevel::Checked
+        );
         assert!(matches!(
-            &contract.review,
+            &inferred.review,
             Some(crate::exec::acceptance::model::ReviewSetting::Gate(gate)) if gate.required == Some(true)
                 && gate.agent.as_deref() == Some("reviewer")
         ));
+        // And the non-async declared writer still tops out at `Checked` with no gate.
+        let plain = AcceptanceContract::heuristic_default_for_role(
+            "worker",
+            Some(crate::exec::acceptance::model::AcceptanceRole::Writer),
+            "Prepare the security release",
+        );
+        assert_eq!(plain.required_level, AcceptanceStatus::Checked);
+        assert!(plain.review.is_none());
     }
 }

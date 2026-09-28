@@ -174,6 +174,9 @@ impl App<InlineBackend<Stdout>> {
         // events and final outcome. Installed for the same reason `tree_nav_rx` is — the flow must
         // not run on this task, or no keystroke could ever answer its prompts.
         let mut login_rx = self.install_login_channel();
+        // **TUI-105.** The post-login catalog refresh's own channel: it settles up to 15 s after the
+        // `LoginUiMsg` stream delivered its `Finished` (`interactive-mode.ts:5951-5973`).
+        let mut login_refresh_rx = self.install_login_refresh_channel();
         // The `/model` catalog-refresh channel (XAI_4). Installed for the same reason `login_rx` is:
         // the refresh is a 15 s-bounded network round trip, so it must not run on this task — the
         // picker Pi renders BEFORE the refresh starts (`model-selector.ts:153-158`) would otherwise
@@ -432,7 +435,8 @@ impl App<InlineBackend<Stdout>> {
                 maybe_updates = package_updates => self.on_package_updates(&mut ctx, maybe_updates)?,
                 Some(warning) = tmux_warning_rx.recv() => self.on_tmux_warning(warning)?,
                 Some(theme) = theme_switch_rx.recv() => self.on_theme_switch(&mut ctx, theme).await?,
-                Some(msg) = login_rx.recv() => self.on_login_msg(msg)?,
+                Some(msg) = login_rx.recv() => self.on_login_msg(&mut ctx, msg).await?,
+                Some(msg) = login_refresh_rx.recv() => self.on_login_refresh_msg(&mut ctx, msg).await?,
                 Some(msg) = model_refresh_rx.recv() => self.on_model_refresh_msg(&mut ctx, msg)?,
                 Some(msg) = tree_nav_rx.recv() => self.on_tree_nav_msg(&mut ctx, msg).await?,
                 Some(msg) = share_rx.recv() => self.on_share_msg(msg)?,

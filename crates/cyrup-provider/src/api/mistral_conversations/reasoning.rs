@@ -35,16 +35,17 @@ pub(super) fn lower_reasoning(
 }
 
 /// `model.id` ∈ the explicit reasoning-effort set (Pi `usesReasoningEffort`,
-/// mistral-conversations.ts:621-623).
+/// mistral-conversations.ts:898-905 @v0.87.1). The whole `mistral-medium-` family matches by
+/// prefix, so no exact `mistral-medium-*` arm is needed.
 fn uses_reasoning_effort(model: &Model) -> bool {
     matches!(
         model.id.as_str(),
-        "mistral-small-2603" | "mistral-small-latest" | "mistral-medium-3.5"
-    )
+        "mistral-small-2603" | "mistral-small-latest" | "zai-glm-5-2"
+    ) || model.id.as_str().starts_with("mistral-medium-")
 }
 
 /// `model.reasoning && !usesReasoningEffort` (Pi `usesPromptModeReasoning`,
-/// mistral-conversations.ts:625-627).
+/// mistral-conversations.ts:907-908 @v0.87.1).
 fn uses_prompt_mode_reasoning(model: &Model) -> bool {
     model.reasoning && !uses_reasoning_effort(model)
 }

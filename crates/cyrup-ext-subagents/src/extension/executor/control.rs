@@ -590,6 +590,12 @@ impl SubagentExecutor {
                     // into `configured` on the first revive and make a second revive read a
                     // different origin than the first.
                     model_origin: Some(descriptor.model_origin),
+                    // SUBA-119 — pi `modelResponseAliases: recoveryDescriptor ?
+                    // recoveryDescriptor.modelResponseAliases : …` (`subagent-executor.ts:2136`):
+                    // the launch-time declaration, NOT today's `config.json`. A revive that re-read
+                    // the live config could fail a run the operator had already unblocked, and the
+                    // verification error's own last-but-one sentence promises it will not.
+                    model_response_aliases: descriptor.model_response_aliases.clone(),
                 },
             )
             .await?;

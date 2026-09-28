@@ -246,14 +246,30 @@ pub trait Tool: Send + Sync {
     /// Default `None` = the field is absent, which upstream is indistinguishable from `false`
     /// (`ConstrainedSampling::Disabled`), and is what a tool with no opinion keeps.
     ///
-    /// The four coding built-ins DO declare it as of pi `7915cdac` ("feat(ai): add strict tool
-    /// schema conversion", first tagged v0.84.2): `constrainedSampling:
-    /// getExperimentalToolSampling()` at `core/tools/read.ts:222`, `bash.ts:354` (the shared shell
-    /// definition, so upstream `powershell` inherits it from the same line), `edit.ts:329` and
-    /// `write.ts:200`, plus `server/create-harness.ts:34` for harness tools. `cyrup-tools` mirrors
-    /// that by returning [`crate::constrained_sampling::experimental_tool_sampling`]. An earlier
-    /// revision of this doc asserted the opposite; it was true at v0.83.0 and went stale at
-    /// v0.84.2.
+    /// Five coding built-ins DO declare it, and **unconditionally** as of pi v0.86.0 — CHANGELOG
+    /// 0.86.0: *"Enabled strict-prefer JSON-schema sampling by default for built-in `read`, `bash`,
+    /// `powershell`, `edit`, and `write` tools, without requiring `PI_EXPERIMENTAL`"*. Re-derived at
+    /// **v0.87.1** by `git grep -n constrainedSampling v0.87.1 -- packages/coding-agent/src`, which
+    /// returns the literal `constrainedSampling: { type: "json_schema", strict: "prefer" }` at
+    /// `core/tools/read.ts:80`, `bash.ts:243` (the shared `createShellToolDefinition`, so upstream
+    /// `powershell` inherits it from that one line), `edit.ts:156` and `write.ts:57` — and nothing
+    /// else outside the field declaration, the two `tool-definition-wrapper.ts` copies and
+    /// `experimental/micro/`. `grep`, `find` and `ls` carry no key on either side and keep this
+    /// default. `cyrup-tools` mirrors the five by returning
+    /// `cyrup_tools::tools::prefer_strict_tool_sampling` — a `static` strict-`prefer` value in that
+    /// crate, read off the built-in registry by
+    /// `cyrup_tools::tests::pi_tool_semantics::only_pis_five_tools_declare_strict_prefer_constrained_sampling`
+    /// and carried through `cyrup_ext::wrapper` into the provider request by that module's
+    /// `real_built_ins_carry_strict_prefer_through_the_wrapper_into_the_provider_request`.
+    ///
+    /// **The history, because this doc has gone stale twice.** At v0.83.0 no built-in declared the
+    /// field. pi `7915cdac` ("feat(ai): add strict tool schema conversion", first tagged v0.84.2)
+    /// added `constrainedSampling: getExperimentalToolSampling()` — flag-gated — to those same five
+    /// plus `server/create-harness.ts`. v0.86.0 removed the gate, and at v0.87.1
+    /// `getExperimentalToolSampling` is gone from the whole repo (`git grep -n
+    /// getExperimentalToolSampling v0.87.1` → no hits; `core/experimental.ts` exports only
+    /// `areExperimentalFeaturesEnabled`) and `server/create-harness.ts` no longer exists. So do not
+    /// carry this paragraph forward: re-derive it at the tag you are reading.
     fn constrained_sampling(&self) -> Option<&crate::ConstrainedSampling> {
         None
     }
@@ -502,5 +518,83 @@ mod terminate_hint_tests {
         assert!(!TerminateHint::Continue.requested());
         assert!(!TerminateHint::Unspecified.requested());
         assert_eq!(TerminateHint::default(), TerminateHint::Unspecified);
+    }
+}
+
+/// TOOL-046 — a source scan over [`Tool::constrained_sampling`]'s own doc block.
+///
+/// That doc is an upstream-citing comment, which this repo treats as the record of what pi does. It
+/// has now gone stale twice in the same way: written for v0.83.0 ("no built-in declares it"),
+/// corrected at v0.84.2 to the flag-gated `constrainedSampling: getExperimentalToolSampling()` with
+/// per-tool line citations and `server/create-harness.ts`, and left asserting exactly that after pi
+/// v0.86.0 made the declaration unconditional. By v0.87.1 every one of those citations is dead:
+/// `getExperimentalToolSampling` is gone from the whole repo and `server/create-harness.ts` no
+/// longer exists.
+///
+/// So the artifact under test is source text, and the pin is a scan — the same shape as
+/// `cyrup_tools`' `bash_prompt_guideline_deltas_are_tagged_cyrup_delta`. It reads only the doc block
+/// between that accessor's opening line and its signature, so this module's own prose (which must
+/// name the dead citations in order to forbid them) cannot make it pass or fail for the wrong
+/// reason.
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod constrained_sampling_doc_tests {
+    const SRC: &str = include_str!("tool.rs");
+
+    /// The `///` block documenting `fn constrained_sampling`, and nothing else in this file.
+    fn doc_block() -> &'static str {
+        const OPENS: &str = "/// Per-tool opt-in to provider-side constrained sampling";
+        const CLOSES: &str = "fn constrained_sampling(&self)";
+        let Some((_, after_open)) = SRC.split_once(OPENS) else {
+            panic!("`{OPENS}` no longer opens the doc block — retarget this scan");
+        };
+        let Some((block, _)) = after_open.split_once(CLOSES) else {
+            panic!("`{CLOSES}` no longer follows the doc block — retarget this scan");
+        };
+        block
+    }
+
+    #[test]
+    fn the_constrained_sampling_doc_cites_v0_87_1_and_not_the_dead_v0_84_2_lines() {
+        let block = doc_block();
+        // Non-vacuity: prove the slice really is that doc block, so an over- or under-read cannot
+        // pass the forbidden-string half by simply matching nothing.
+        assert!(
+            block.contains("PROV-011"),
+            "the extracted slice is not the constrained-sampling doc block: {block:?}"
+        );
+        assert!(
+            !block.contains("mod constrained_sampling_doc_tests"),
+            "the extracted slice over-ran into this test module, so the assertions below would be              vacuous"
+        );
+
+        // Only the LINE citations are forbidden: the prose legitimately names
+        // `getExperimentalToolSampling` and `server/create-harness.ts` in order to record that pi
+        // deleted both, and a blunt name scan could not tell that apart from a live claim.
+        for dead in ["read.ts:222", "bash.ts:354", "edit.ts:329", "write.ts:200"] {
+            assert!(
+                !block.contains(dead),
+                "`{dead}` is a v0.84.2 fact that is dead at v0.87.1 — pi v0.86.0 dropped the \
+                 `PI_EXPERIMENTAL` gate, and `getExperimentalToolSampling` and \
+                 `server/create-harness.ts` no longer exist upstream. Re-derive the citation at the \
+                 tag you read instead of carrying this one forward."
+            );
+        }
+
+        for live in [
+            "read.ts:80",
+            "bash.ts:243",
+            "edit.ts:156",
+            "write.ts:57",
+            "v0.87.1",
+            // The whole substance of pi 0.86.0: no flag gates the declaration any more.
+            "unconditional",
+        ] {
+            assert!(
+                block.contains(live),
+                "the doc must cite `{live}` — the tag and lines where pi actually declares \
+                 `constrainedSampling: {{ type: \"json_schema\", strict: \"prefer\" }}`"
+            );
+        }
     }
 }

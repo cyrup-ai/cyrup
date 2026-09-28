@@ -72,6 +72,7 @@
 //! exclusion to duplicate at the package/builtin tiers, because they route through the same walk
 //! function as User/Project.
 
+pub(crate) mod agent_dirs;
 pub mod agent_memory;
 pub mod chains;
 pub mod frontmatter;
@@ -466,7 +467,7 @@ pub fn resolve_user_chain_read_dirs(home: &Path) -> Vec<PathBuf> {
 }
 
 // -------------------------------------------------------------------------------------------
-// Alias-aware agent-name resolution (pi `resolveAgentName`, agents.ts:511-529)
+// Alias-aware agent-name resolution (pi `resolveAgentName`, agents.ts:706-731 @v0.71.0)
 // -------------------------------------------------------------------------------------------
 
 /// The outcome of an alias-aware name lookup — pi's `{ agent?, error? }` triple state
@@ -545,25 +546,34 @@ fn source_rank(source: AgentSource) -> u8 {
 }
 
 /// Resolve a requested agent name against a candidate list, honoring aliases — a direct port of pi's
-/// `resolveAgentName` (`agents.ts:511-529`).
+/// `resolveAgentName` (`agents.ts:706-731` @v0.71.0).
 ///
-/// The order is **name-first, aliases only as a fallback**, and each stage handles multiplicity the
-/// same way:
+/// Upstream runs **three ordered passes**, each with its own multiplicity handling and its own
+/// message. A later pass runs only when every earlier pass matched NOTHING:
 ///
 /// 1. Trim the request.
-/// 2. Match `name` OR `local_name` exactly. One hit wins. Several hits collapse via
+/// 2. Canonical pass — `name == raw` (`agents.ts:709-716`). One hit wins. Several hits collapse via
 ///    [`effective_agent_match`] when they are the same canonical agent at different tiers; otherwise
 ///    it is `Ambiguous agent name '<request>': <names…>`.
-/// 3. Only if stage 2 matched NOTHING, match against [`AgentDefinition::aliases`]. Same
-///    one/collapse/ambiguous handling, with the message `Ambiguous agent alias '<request>': <names…>`.
-/// 4. Nothing matched → [`AgentNameResolution::NotFound`].
+/// 3. Local-name pass — `local_name == raw` (`agents.ts:718-724`), only if pass 2 matched nothing.
+///    Same one/collapse/ambiguous shape, with the message
+///    `Ambiguous local agent name '<request>': <names…>`.
+/// 4. Alias pass — [`AgentDefinition::aliases`] contains `raw` (`agents.ts:726-731`), only if passes
+///    2 and 3 both matched nothing. Message `Ambiguous agent alias '<request>': <names…>`.
+/// 5. Nothing matched → [`AgentNameResolution::NotFound`].
 ///
-/// Stage 3 never runs when stage 2 found anything, so a real agent named `x` always beats another
-/// agent that merely lists `x` as an alias — aliases can never shadow a canonical name.
+/// Separating passes 2 and 3 is load-bearing (SUBA-122): a user agent named `scout` and a package
+/// agent `code-analysis.scout` whose `local_name` is `scout` are NOT ambiguous — the canonical pass
+/// matches exactly one and the local pass never runs. Folding them into a single filter, as this
+/// function did before, produced two matches with distinct canonical names, which
+/// [`effective_agent_match`] rejects, so the request failed as ambiguous.
+///
+/// The alias pass staying last is what makes a real agent named `x` always beat another agent that
+/// merely lists `x` as an alias — aliases can never shadow a canonical or local name.
 ///
 /// The ambiguity messages list the matches' `name`s **in candidate order** (pi's
-/// `exact.map(a => a.name).join(", ")` over the unsorted filter result), duplicates included, which
-/// is what upstream prints.
+/// `canonical.map(a => a.name).join(", ")` over the unsorted filter result), duplicates included,
+/// which is what upstream prints.
 #[must_use]
 pub fn resolve_agent_name<'a>(
     name: &str,
@@ -571,22 +581,35 @@ pub fn resolve_agent_name<'a>(
 ) -> AgentNameResolution<'a> {
     let raw = name.trim();
 
-    let exact: Vec<&AgentDefinition> = agents
-        .iter()
-        .filter(|a| a.name == raw || a.local_name == raw)
-        .collect();
-    if exact.len() == 1
-        && let Some(agent) = exact.first().copied()
+    let canonical: Vec<&AgentDefinition> = agents.iter().filter(|a| a.name == raw).collect();
+    if canonical.len() == 1
+        && let Some(agent) = canonical.first().copied()
     {
         return AgentNameResolution::Found(agent);
     }
-    if exact.len() > 1 {
-        if let Some(agent) = effective_agent_match(&exact) {
+    if canonical.len() > 1 {
+        if let Some(agent) = effective_agent_match(&canonical) {
             return AgentNameResolution::Found(agent);
         }
         return AgentNameResolution::Ambiguous(format!(
             "Ambiguous agent name '{name}': {}",
-            join_match_names(&exact)
+            join_match_names(&canonical)
+        ));
+    }
+
+    let local: Vec<&AgentDefinition> = agents.iter().filter(|a| a.local_name == raw).collect();
+    if local.len() == 1
+        && let Some(agent) = local.first().copied()
+    {
+        return AgentNameResolution::Found(agent);
+    }
+    if local.len() > 1 {
+        if let Some(agent) = effective_agent_match(&local) {
+            return AgentNameResolution::Found(agent);
+        }
+        return AgentNameResolution::Ambiguous(format!(
+            "Ambiguous local agent name '{name}': {}",
+            join_match_names(&local)
         ));
     }
 
@@ -799,9 +822,29 @@ pub struct AgentDiscoveryConfig {
     /// `slash/slash-commands.ts:120-130`, `agents/agent-management.ts:132-141`). Empty (the
     /// default) means no runtime agents and no extra work.
     pub runtime_agents: Vec<AgentDefinition>,
+    /// SUBA-123a — the resolved `subagents.agentExcludeDirs` roots from BOTH settings scopes (pi
+    /// `agentExclusionRoots`, `agents.ts:2416-2422`), each paired with its canonicalised form.
+    ///
+    /// Carried as RESOLVED roots rather than as the raw string list because each entry resolves
+    /// against the directory of the settings file that declared it (`agents.ts:2418`) — a fact only
+    /// the config builder (`SubagentExecutor::discovery_config_on_disk`) still knows, since
+    /// [`LayeredOverrideSettings`] flattens the two scopes for every other consumer. Empty (the
+    /// default) means no exclusions and no extra work: [`Self::is_excluded`] short-circuits.
+    pub(crate) agent_exclusion_roots: Vec<agent_dirs::ExclusionRoot>,
 }
 
 impl AgentDiscoveryConfig {
+    /// SUBA-123a — pi `agentExclusions(...)` applied to one candidate path (`agents.ts:2424-2431`).
+    ///
+    /// The ONE predicate every agent-definition walk consults, so the four upstream application
+    /// sites cannot drift apart: user dirs and project dirs (`agents.ts:2651-2655`), package agent
+    /// dirs (`:2659`/`:2964`), and each individual file inside a walked directory
+    /// (`inspectAgentDefinitionDirectory`, `:1897`/`:1929`).
+    #[must_use]
+    pub(crate) fn is_excluded(&self, path: &Path) -> bool {
+        agent_dirs::is_excluded(&self.agent_exclusion_roots, path)
+    }
+
     /// **Prepend** the resolved [`EXTRA_AGENT_DIRS_ENV_VAR`] entries — always
     /// [`crate::paths::Roots::extra_agent_dirs`], the crate's one resolution of that variable —
     /// *ahead of* `user_agent_dirs`, in the order the variable lists them, i.e. *before* any
@@ -848,13 +891,14 @@ pub fn parse_subagent_settings(
     validate_default_thinking(value)?;
     validate_default_provider(value)?;
     validate_default_extensions(value)?;
+    validate_agent_dir_lists(value)?;
     validate_override_default_providers(value)?;
     validate_override_suba096_keys(value)?;
     validate_override_context_and_mutation_keys(value)?;
     validate_override_machine_key(value)?;
     let mut settings: SubagentSettings = serde_json::from_value(value.clone())
         .map_err(|e| SubagentError::MalformedSettings(e.to_string()))?;
-    settings.warnings = override_key_warnings(value);
+    settings.warnings = subagent_settings_warnings(value);
     // pi `readSubagentSettings` (`agents.ts:874-881`): `defaultModel` must be a NON-EMPTY string;
     // an empty/whitespace-only value is malformed and MUST abort (R-SA-009). Stored trimmed so a
     // stray-whitespace value resolves to the same model everywhere it is consulted.
@@ -903,6 +947,23 @@ pub fn parse_subagent_settings(
     }
     if let Some(de) = settings.default_extensions.as_ref() {
         settings.default_extensions = Some(de.iter().map(|item| item.trim().to_string()).collect());
+    }
+    // SUBA-123b — `agents.ts:1224`: the same `.map(item => item.trim())` upstream applies to
+    // `defaultExtensions` just above, so the list this fills agents' `subagentOnlyExtensions` from
+    // names the same paths however the operator spaced them. A whitespace-ONLY entry cannot reach
+    // here: `validate_agent_dir_lists` rejects it first, as upstream's `!item.trim()` does.
+    if let Some(list) = settings.default_subagent_only_extensions.as_ref() {
+        settings.default_subagent_only_extensions =
+            Some(list.iter().map(|item| item.trim().to_string()).collect());
+    }
+    // SUBA-123a — same `.map(item => item.trim())` upstream applies to both dir lists
+    // (`agents.ts:1232,1240`), so a stray-whitespace entry resolves to the same directory
+    // everywhere it is consulted.
+    if let Some(dirs) = settings.agent_scan_dirs.as_ref() {
+        settings.agent_scan_dirs = Some(dirs.iter().map(|d| d.trim().to_string()).collect());
+    }
+    if let Some(dirs) = settings.agent_exclude_dirs.as_ref() {
+        settings.agent_exclude_dirs = Some(dirs.iter().map(|d| d.trim().to_string()).collect());
     }
     // pi `parseModelScopeConfig(subagentsObject.modelScope, { filePath })` (`agents.ts:731`):
     // `modelScope` is validated by its own parser (not serde's derive), so a malformed block
@@ -1170,12 +1231,60 @@ fn validate_override_context_and_mutation_keys(
     Ok(())
 }
 
-/// SUBA-096 — the non-fatal half of the override census: for every `agentOverrides.<name>`
-/// entry, one warning per key no reader consumes (see [`types::SubagentSettings::warnings`]).
+/// SUBA-096 / SUBA-123c — the non-fatal half of the settings census: one warning per key no reader
+/// consumes, at BOTH levels of the `subagents` block (see [`types::SubagentSettings::warnings`]).
 ///
-/// The known set is [`types::AgentOverrideConfig`]'s own serde field list plus `toolBudget`,
-/// which is `skip_deserializing` (populated by [`populate_override_tool_budgets`]) and so absent
-/// from that list while still read.
+/// Two passes:
+///
+/// 1. **Top level** (SUBA-123c). The known set is [`types::SubagentSettings`]'s own serde field list
+///    plus the keys this port reads from the raw object rather than through serde — `modelScope` and
+///    `maxThinking` (both `skip_deserializing`, populated by [`parse_subagent_settings`]) — plus the
+///    keys OTHER modules of this crate read off the same block: `projectRootResolution`
+///    ([`read_project_root_resolution`]-equivalent, this module), `machines`
+///    (`crate::placement::resolve`) and `watchdog` (`crate::watchdog::settings`). Upstream keys with
+///    no reader here are [`types::UNPORTED_SUBAGENTS_KEYS`].
+///
+///    This pass is the mechanism the row was filed for: before it, a top-level
+///    `subagents.<anything>` no reader consumes produced NO diagnostic at all, so a typo'd or
+///    unported key vanished — which is how `agentScanDirs`/`agentExcludeDirs`/
+///    `defaultSubagentOnlyExtensions` went unnoticed in the first place.
+///
+/// 2. **Per override entry** (SUBA-096). The known set is [`types::AgentOverrideConfig`]'s own serde
+///    field list plus `toolBudget`, which is `skip_deserializing` (populated by
+///    [`populate_override_tool_budgets`]) and so absent from that list while still read.
+///
+/// Neither pass is fatal: an unknown key is a diagnostic, not R-SA-009's abort, because a strict
+/// parse would take a whole settings file down over one stray key.
+fn subagent_settings_warnings(subagents: &serde_json::Value) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(top) = subagents.as_object() {
+        let mut known: Vec<&str> = key_census::struct_fields::<types::SubagentSettings>().to_vec();
+        known.extend([
+            // Populated from the raw value by `parse_subagent_settings`, not by serde.
+            "modelScope",
+            "maxThinking",
+            // Read by other modules off the same block.
+            "projectRootResolution",
+            "machines",
+            "watchdog",
+        ]);
+        let census = key_census::census(top, &known, types::UNPORTED_SUBAGENTS_KEYS);
+        for (key, landing) in &census.unported {
+            warnings.push(format!(
+                "subagents.{key} is not supported by this port ({landing}); it has no effect"
+            ));
+        }
+        for key in &census.unknown {
+            warnings.push(format!(
+                "subagents.{key} is not a subagent settings key (ignored)"
+            ));
+        }
+    }
+    warnings.extend(override_key_warnings(subagents));
+    warnings
+}
+
+/// [`subagent_settings_warnings`]' second pass — the per-`agentOverrides.<name>` census (SUBA-096).
 fn override_key_warnings(subagents: &serde_json::Value) -> Vec<String> {
     let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
         return Vec::new();
@@ -1220,6 +1329,40 @@ fn validate_default_extensions(subagents: &serde_json::Value) -> Result<(), Suba
     Err(SubagentError::MalformedSettings(
         "invalid 'defaultExtensions'; expected an array of non-empty strings".to_string(),
     ))
+}
+
+/// SUBA-123a — pi's `agentScanDirs`/`agentExcludeDirs` validation (`agents.ts:1226-1241`
+/// @v0.71.0), the exact twin of [`validate_default_extensions`]: each key, when present, MUST be
+/// an array of non-empty strings, and anything else ABORTS discovery (R-SA-009).
+///
+/// Run BEFORE serde for the reason [`parse_subagent_settings`] documents: serde's derived error
+/// for a wrong type names no field. Without this, `#[serde(default)]` on
+/// [`types::SubagentSettings`] silently swallowed a string or a number here and discovery ran with
+/// no extra roots and no exclusions at all — the failure mode the row was filed for.
+fn validate_agent_dir_lists(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    for key in [
+        "agentScanDirs",
+        "agentExcludeDirs",
+        // SUBA-123b — pi validates `defaultSubagentOnlyExtensions` with the identical
+        // array-of-non-empty-strings check and the identical message shape (`agents.ts:1218-1225`
+        // @v0.71.0), so it shares this loop rather than growing a third near-copy.
+        "defaultSubagentOnlyExtensions",
+    ] {
+        let Some(value) = subagents.get(key) else {
+            continue;
+        };
+        let ok = value.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .all(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))
+        });
+        if !ok {
+            return Err(SubagentError::MalformedSettings(format!(
+                "invalid '{key}'; expected an array of non-empty strings"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Read one on-disk `settings.json` file and extract its typed `subagents` block (pi
@@ -1343,6 +1486,19 @@ fn resolve_layered_subagent_settings(
         // (`agents.ts:946-973`) — project-wins-outright, exactly like `defaultModel`.
         default_thinking: project.default_thinking.or(user.default_thinking),
         default_extensions: project.default_extensions.or(user.default_extensions),
+        // SUBA-123a — `agentScanDirs` is read PER SCOPE by the dir-assembly step
+        // (`agents.ts:2948-2949` feeds each scope's own list into that scope's dir list), and
+        // `agentExcludeDirs` UNIONs both scopes at `agentExclusionRoots` (`agents.ts:2417`). This
+        // flattened view therefore has no directory consumer; it exists so the layered settings
+        // still SHOW what was configured (doctor/`list`) and follows the project-wins-outright rule
+        // every other key above uses rather than inventing a third precedence shape.
+        // SUBA-123b / pi `resolveSubagentDefaultSubagentOnlyExtensions` (`agents.ts:1392-1399`) —
+        // project-wins-outright, exactly like `defaultExtensions`.
+        default_subagent_only_extensions: project
+            .default_subagent_only_extensions
+            .or(user.default_subagent_only_extensions),
+        agent_scan_dirs: project.agent_scan_dirs.or(user.agent_scan_dirs),
+        agent_exclude_dirs: project.agent_exclude_dirs.or(user.agent_exclude_dirs),
         disable_builtins: project.disable_builtins.or(user.disable_builtins),
         disable_thinking: project.disable_thinking.or(user.disable_thinking),
         // pi `projectSettings.modelScope ?? userSettings.modelScope` (`agents.ts:1738`) — the same
@@ -1432,8 +1588,26 @@ impl AgentFileScan {
 /// Returned in scan order (which, per R-SA-004, is exactly the order that determines same-scope
 /// collision winners once handed to `merge::reduce_last_seen_wins`/`reduce_first_seen_wins`).
 pub(crate) fn walk_agent_dir_checked(root: &Path, source: AgentSource) -> AgentFileScan {
+    walk_agent_dir_checked_excluding(root, source, &[])
+}
+
+/// [`walk_agent_dir_checked`] with SUBA-123a's `subagents.agentExcludeDirs` roots applied.
+///
+/// The exclusion test runs at TWO depths, matching pi's `inspectAgentDefinitionDirectory`
+/// (`agents.ts:1897`, `:1929` @v0.71.0): the walk root itself (an excluded root yields an empty
+/// scan, exactly as an absent one does), and EVERY entry inside a walked directory. The second
+/// test is the load-bearing one — excluding only the roots would let an excluded subtree that
+/// happens to sit inside a non-excluded discovery root be walked anyway.
+pub(crate) fn walk_agent_dir_checked_excluding(
+    root: &Path,
+    source: AgentSource,
+    exclusions: &[agent_dirs::ExclusionRoot],
+) -> AgentFileScan {
     let mut out = AgentFileScan::default();
-    walk_agent_dir_into(root, root, source, &mut out);
+    if agent_dirs::is_excluded(exclusions, root) {
+        return out;
+    }
+    walk_agent_dir_into(root, root, source, exclusions, &mut out);
     out
 }
 
@@ -1444,7 +1618,13 @@ pub fn walk_agent_dir(root: &Path, source: AgentSource) -> Vec<AgentDefinition> 
     walk_agent_dir_checked(root, source).agents
 }
 
-fn walk_agent_dir_into(root: &Path, dir: &Path, source: AgentSource, out: &mut AgentFileScan) {
+fn walk_agent_dir_into(
+    root: &Path,
+    dir: &Path,
+    source: AgentSource,
+    exclusions: &[agent_dirs::ExclusionRoot],
+    out: &mut AgentFileScan,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1456,6 +1636,13 @@ fn walk_agent_dir_into(root: &Path, dir: &Path, source: AgentSource, out: &mut A
             continue;
         };
 
+        // SUBA-123a / pi `inspectAgentDefinitionDirectory` (`agents.ts:1929`): the exclusion test
+        // is per ENTRY, before the directory/file split, so an excluded subtree nested inside a
+        // non-excluded discovery root is skipped and an excluded individual `.md` file is too.
+        if agent_dirs::is_excluded(exclusions, &path) {
+            continue;
+        }
+
         if path.is_dir() {
             // R-SA-007: never descend into a directory segment reserved for skill bundling.
             if file_name == SKILLS_DIR_SEGMENT {
@@ -1466,7 +1653,7 @@ fn walk_agent_dir_into(root: &Path, dir: &Path, source: AgentSource, out: &mut A
             if should_prune_discovery_dir(root, &path, file_name) {
                 continue;
             }
-            walk_agent_dir_into(root, &path, source, out);
+            walk_agent_dir_into(root, &path, source, exclusions, out);
             continue;
         }
 
@@ -1494,10 +1681,17 @@ fn walk_agent_dir_into(root: &Path, dir: &Path, source: AgentSource, out: &mut A
 /// per-directory [`walk_agent_dir_checked`] results into one flat, scan-ordered scan — the shape
 /// `merge::reduce_last_seen_wins` expects for its own last-directory-scanned-wins reduction
 /// (R-SA-002).
-fn walk_agent_dirs(roots: &[PathBuf], source: AgentSource) -> AgentFileScan {
+fn walk_agent_dirs(
+    roots: &[PathBuf],
+    source: AgentSource,
+    exclusions: &[agent_dirs::ExclusionRoot],
+) -> AgentFileScan {
     let mut out = AgentFileScan::default();
     for root in roots {
-        out.extend(walk_agent_dir_checked(root, source));
+        // SUBA-123a — upstream filters the dir LIST before walking (`.filter((dir) =>
+        // !isExcluded(dir))`, `agents.ts:2651`/`:2655`) and `walk_agent_dir_checked_excluding`
+        // applies the identical test to its own root, so an excluded directory contributes nothing.
+        out.extend(walk_agent_dir_checked_excluding(root, source, exclusions));
     }
     out
 }
@@ -1518,7 +1712,12 @@ fn walk_agent_dirs(roots: &[PathBuf], source: AgentSource) -> AgentFileScan {
 /// crate's analog: a file entry is parsed directly; a directory entry is expanded via
 /// [`walk_agent_dir`] (R-SA-004/005/006/007 all apply uniformly to that expansion, since it is
 /// the exact same walk User/Project tiers use).
-fn expand_manifest_agent_entry(entry: &Path, source: AgentSource, out: &mut AgentFileScan) {
+fn expand_manifest_agent_entry(
+    entry: &Path,
+    source: AgentSource,
+    exclusions: &[agent_dirs::ExclusionRoot],
+    out: &mut AgentFileScan,
+) {
     if entry.is_file() {
         let Ok(content) = std::fs::read_to_string(entry) else {
             return;
@@ -1529,7 +1728,7 @@ fn expand_manifest_agent_entry(entry: &Path, source: AgentSource, out: &mut Agen
             Err(diagnostic) => out.diagnostics.push(diagnostic),
         }
     } else if entry.is_dir() {
-        out.extend(walk_agent_dir_checked(entry, source));
+        out.extend(walk_agent_dir_checked_excluding(entry, source, exclusions));
     }
     // A non-existent entry (dangling manifest declaration) is silently skipped — not this
     // function's place to surface a diagnostic (see `scan_package_agents`'s own doc for why
@@ -1590,7 +1789,18 @@ pub(crate) fn scan_package_agents_checked(cfg: &AgentDiscoveryConfig) -> AgentFi
             continue;
         };
         for agent_entry in &manifest.agents {
-            expand_manifest_agent_entry(agent_entry, AgentSource::Package, &mut out);
+            // SUBA-123a / pi `packageSubagentPaths.agents.filter((entry) => !isExcluded(entry.dir))`
+            // (`agents.ts:2659`, `:2964`): a package's own agent directory is excludable too, so a
+            // vendored package's agents can be removed from discovery without uninstalling it.
+            if cfg.is_excluded(agent_entry) {
+                continue;
+            }
+            expand_manifest_agent_entry(
+                agent_entry,
+                AgentSource::Package,
+                &cfg.agent_exclusion_roots,
+                &mut out,
+            );
         }
     }
     out
@@ -1676,7 +1886,7 @@ pub(crate) fn scan_builtin_agents_checked(cfg: &AgentDiscoveryConfig) -> AgentFi
     }
     let mut out = AgentFileScan::default();
     for agent_entry in &manifest.agents {
-        expand_manifest_agent_entry(agent_entry, AgentSource::Builtin, &mut out);
+        expand_manifest_agent_entry(agent_entry, AgentSource::Builtin, &[], &mut out);
     }
     out
 }
@@ -1768,7 +1978,11 @@ fn scan_agent_tiers_scoped(
     } = if scope == AgentReadScope::Project {
         AgentFileScan::default()
     } else {
-        walk_agent_dirs(&cfg.user_agent_dirs, AgentSource::User)
+        walk_agent_dirs(
+            &cfg.user_agent_dirs,
+            AgentSource::User,
+            &cfg.agent_exclusion_roots,
+        )
     };
     let AgentFileScan {
         agents: project,
@@ -1776,7 +1990,11 @@ fn scan_agent_tiers_scoped(
     } = if scope == AgentReadScope::User {
         AgentFileScan::default()
     } else {
-        walk_agent_dirs(&cfg.project_agent_dirs, AgentSource::Project)
+        walk_agent_dirs(
+            &cfg.project_agent_dirs,
+            AgentSource::Project,
+            &cfg.agent_exclusion_roots,
+        )
     };
     // pi `discoveryDiagnostics` (`agents.ts:2651-2662` @v0.64.0) concatenates builtin, then the
     // in-scope user/project tiers, then package; `buildAllDiscovery` (`:2705-2710`) goes
@@ -1842,7 +2060,20 @@ fn run_discovery(
         configured.extend(all.package);
         configured.extend(all.user);
         configured.extend(all.project);
+        let before_runtime = agents.len();
         runtime_registry::merge_runtime_agents(&cfg.runtime_agents, &mut agents, &configured)?;
+        // SUBA-121 — pi `applyRuntimeAgentSettings` (`agents.ts:1619-1627` @v0.71.0, entered in
+        // `bbb30096` #2369 @v0.70.1). `merge_runtime_agents` APPENDS, so everything from
+        // `before_runtime` on is exactly the runtime slice, and it has never been through
+        // `apply_overrides` (which ran inside `discover_and_merge` above, before these agents
+        // existed). Upstream runs the model-tier subset of settings over them right here:
+        // `subagents.defaultModel`/`defaultProvider`/`defaultThinking`, then the `model`,
+        // `defaultProvider`, `fast` and `thinking` fields of `agentOverrides.<name>`, user then
+        // project. Nothing else reaches a runtime agent — its prompt, tools, context and budgets stay
+        // extension-owned, and `defaultExtensions` is excluded (see `apply_runtime_agent_settings`).
+        if let Some(runtime_slice) = agents.get_mut(before_runtime..) {
+            merge::apply_runtime_agent_settings(runtime_slice, &cfg.override_settings);
+        }
     }
 
     let mut chain_scopes: Vec<(PathBuf, AgentSource)> = Vec::new();
@@ -3779,10 +4010,12 @@ mod tests {
         );
     }
 
-    /// The same rule on the NAME stage, with pi's distinct `Ambiguous agent name` wording
-    /// (`agents.ts:518`): a `localName` collision across two differently-qualified agents.
+    /// SUBA-122 test (c). The same rule on the LOCAL-NAME pass, which upstream gives its own wording
+    /// (`agents.ts:722`): a `localName` collision across two differently-qualified agents is
+    /// `Ambiguous local agent name`, NOT `Ambiguous agent name`. No code in this crate could produce
+    /// that message before the canonical and local passes were split.
     #[test]
-    fn two_distinct_agents_sharing_a_local_name_are_an_ambiguity_error() {
+    fn two_distinct_agents_sharing_a_local_name_are_a_local_ambiguity_error() {
         let agents = vec![
             parsed_agent(
                 AgentSource::Package,
@@ -3797,7 +4030,85 @@ mod tests {
         assert!(resolved.agent().is_none());
         assert_eq!(
             resolved.error(),
-            Some("Ambiguous agent name 'oracle': acme.oracle, other.oracle")
+            Some("Ambiguous local agent name 'oracle': acme.oracle, other.oracle")
+        );
+    }
+
+    /// SUBA-122 test (a) — the row's whole point. A user agent named `scout` and a package agent
+    /// `code-analysis.scout` whose `local_name` is also `scout` are not in conflict: upstream's
+    /// canonical pass (`agents.ts:709-716`) matches exactly one agent and the local-name pass
+    /// (`:718-724`) never runs. Folding the two passes into one `name == raw || local_name == raw`
+    /// filter, as this function used to, yielded two matches with DISTINCT canonical names, which
+    /// `effective_agent_match` refuses to collapse — so the request failed as ambiguous.
+    #[test]
+    fn a_canonical_name_beats_another_agents_local_name_of_the_same_string() {
+        let agents = vec![
+            parsed_agent(
+                AgentSource::Package,
+                "---\nname: scout\npackage: code-analysis\ndescription: d\n---\n\nBody\n",
+            ),
+            parsed_agent(
+                AgentSource::User,
+                "---\nname: scout\ndescription: d\n---\n\nBody\n",
+            ),
+        ];
+        let resolved = resolve_agent_name("scout", &agents);
+        assert_eq!(
+            resolved.error(),
+            None,
+            "the canonical pass matches exactly one agent, so this is not ambiguous"
+        );
+        assert_eq!(
+            resolved.agent().map(|a| a.source),
+            Some(AgentSource::User),
+            "the bare user agent owns the canonical name `scout`"
+        );
+    }
+
+    /// SUBA-122 test (b) — the local-name pass is still the fallback it always was. With ONLY the
+    /// qualified package agent present, nothing owns the canonical name `scout`, so pass 3 resolves
+    /// it by `local_name`. This guards the split against breaking the fallback.
+    #[test]
+    fn a_local_name_still_resolves_when_no_agent_owns_the_canonical_name() {
+        let agents = vec![parsed_agent(
+            AgentSource::Package,
+            "---\nname: scout\npackage: code-analysis\ndescription: d\n---\n\nBody\n",
+        )];
+        let resolved = resolve_agent_name("scout", &agents);
+        assert_eq!(
+            resolved.agent().map(|a| a.name.as_str()),
+            Some("code-analysis.scout")
+        );
+    }
+
+    /// SUBA-122 test (d), adjusted. The row asked for "two distinct canonical `scout` agents still
+    /// give `Ambiguous agent name`", but that message is UNREACHABLE — in both languages. The
+    /// canonical pass filters on `name == raw`, so every match carries the identical `name`, so
+    /// `effective_agent_match` (upstream `effectiveAgentMatch`, whose `distinctNames.length === 1`
+    /// test can never fail here) always collapses them by source rank and the error at
+    /// `agents.ts:713` is dead code. It is ported verbatim regardless; what is testable, and what
+    /// this asserts, is the collapse the canonical pass actually performs.
+    #[test]
+    fn several_agents_owning_one_canonical_name_collapse_by_source_rank() {
+        let agents = vec![
+            parsed_agent(
+                AgentSource::Builtin,
+                "---\nname: scout\ndescription: d\n---\n\nBody\n",
+            ),
+            parsed_agent(
+                AgentSource::Project,
+                "---\nname: scout\ndescription: d\n---\n\nBody\n",
+            ),
+            parsed_agent(
+                AgentSource::User,
+                "---\nname: scout\ndescription: d\n---\n\nBody\n",
+            ),
+        ];
+        let resolved = resolve_agent_name("scout", &agents);
+        assert_eq!(resolved.error(), None);
+        assert_eq!(
+            resolved.agent().map(|a| a.source),
+            Some(AgentSource::Project)
         );
     }
 
@@ -4343,5 +4654,457 @@ mod home_exclusion_tests {
             find_project_root_candidates(&loose),
             vec![home.path().to_path_buf()]
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_scan_and_exclude_dir_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+    use crate::extension::SubagentExecutor;
+    use crate::paths::Roots;
+
+    /// A hermetic home + project pair, wired the way `discovery_config_on_disk` expects: a home
+    /// holding `~/.cyrup/agents/` and a project root holding `<root>/.cyrup/agents/` (the `.cyrup`
+    /// dir is what makes the upward project search stop there).
+    struct Fixture {
+        home: tempfile::TempDir,
+        project: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(home.path().join(".cyrup").join("agents")).unwrap();
+            std::fs::create_dir_all(project.path().join(".cyrup").join("agents")).unwrap();
+            Self { home, project }
+        }
+
+        fn write_user_settings(&self, subagents: serde_json::Value) {
+            std::fs::write(
+                self.home
+                    .path()
+                    .join(".cyrup")
+                    .join("agents")
+                    .join("settings.json"),
+                serde_json::json!({ "subagents": subagents }).to_string(),
+            )
+            .unwrap();
+        }
+
+        fn write_project_settings(&self, subagents: serde_json::Value) {
+            std::fs::write(
+                self.project
+                    .path()
+                    .join(".cyrup")
+                    .join("agents")
+                    .join("settings.json"),
+                serde_json::json!({ "subagents": subagents }).to_string(),
+            )
+            .unwrap();
+        }
+
+        fn roots(&self) -> Roots {
+            Roots::sandboxed(self.home.path())
+        }
+
+        fn config(&self) -> Result<AgentDiscoveryConfig, SubagentError> {
+            SubagentExecutor::discovery_config_on_disk(self.project.path(), &self.roots())
+        }
+
+        fn discovered_names(&self) -> Vec<String> {
+            let cfg = self.config().expect("config builds");
+            discover_agents_all(&cfg)
+                .expect("discovery runs")
+                .agents
+                .into_iter()
+                .map(|a| a.name)
+                .collect()
+        }
+    }
+
+    fn write_agent(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\ndescription: agent {name}\n---\n\nBody\n"),
+        )
+        .unwrap();
+    }
+
+    /// SUBA-123a / pi `agentExclusions` (`agents.ts:2424-2431`) applied to a FILE inside a
+    /// non-excluded discovery root (`inspectAgentDefinitionDirectory`, `agents.ts:1929`): the
+    /// project's own `.cyrup/agents` dir is walked, but the `vendor/` subtree named by
+    /// `subagents.agentExcludeDirs` is not.
+    ///
+    /// The entry is written relative to the SETTINGS FILE's directory, which is upstream's base
+    /// (`agents.ts:2418`) — `<project>/.cyrup/agents` — so `"vendor"` names
+    /// `<project>/.cyrup/agents/vendor`.
+    ///
+    /// Gutted by: removing the per-entry `is_excluded` check in `walk_agent_dir_into` (the vendored
+    /// agent comes back), or resolving the entry against the project root instead of the settings
+    /// dir (the root never matches and nothing is excluded).
+    #[test]
+    fn agent_exclude_dirs_hides_an_agent_under_an_excluded_root() {
+        let fx = Fixture::new();
+        let agents = fx.project.path().join(".cyrup").join("agents");
+        write_agent(&agents, "kept");
+        write_agent(&agents.join("vendor"), "vendored");
+        fx.write_project_settings(serde_json::json!({ "agentExcludeDirs": ["vendor"] }));
+
+        let names = fx.discovered_names();
+        assert!(names.contains(&"kept".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"vendored".to_string()),
+            "the excluded subtree must not be walked: {names:?}"
+        );
+    }
+
+    /// The `real`-prefix arm of pi `agentExclusions` (`agents.ts:2429-2430`): the excluded root is
+    /// named by its real path, but the agent is REACHED through a symlink alias that sits inside a
+    /// perfectly ordinary discovery root. The written path is nowhere near the excluded root, so
+    /// only canonicalisation catches it.
+    ///
+    /// Gutted by: dropping the realpath arm of `agent_dirs::is_excluded` — the alias is walked and
+    /// the hidden agent comes back.
+    #[test]
+    #[cfg(unix)]
+    fn agent_exclude_dirs_hides_an_agent_reached_through_a_symlink_alias() {
+        let fx = Fixture::new();
+        let real = tempfile::tempdir().unwrap();
+        let hidden = real.path().join("hidden");
+        write_agent(&hidden, "aliased");
+        let agents = fx.project.path().join(".cyrup").join("agents");
+        write_agent(&agents, "kept");
+        std::os::unix::fs::symlink(&hidden, agents.join("alias")).unwrap();
+
+        // Control: without the exclusion the alias IS walked, so the assertion below says something.
+        fx.write_project_settings(serde_json::json!({}));
+        assert!(
+            fx.discovered_names().contains(&"aliased".to_string()),
+            "control: the symlinked agent is discoverable when nothing excludes it"
+        );
+
+        fx.write_project_settings(
+            serde_json::json!({ "agentExcludeDirs": [hidden.to_str().unwrap()] }),
+        );
+        let names = fx.discovered_names();
+        assert!(names.contains(&"kept".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"aliased".to_string()),
+            "the alias resolves into the excluded root: {names:?}"
+        );
+    }
+
+    /// SUBA-123a / pi `settingsAgentScanDirs` + `[...extraUserAgentDirs(), ...userScanDirs.dirs,
+    /// userDirOld, userDirNew]` (`agents.ts:2948,2950`): an agent reachable ONLY through a
+    /// configured scan dir is discovered, at User scope.
+    ///
+    /// Gutted by: not prepending the expanded scan dirs in `discovery_config_on_disk` (the agent is
+    /// absent), or not parsing `agentScanDirs` at all (same).
+    #[test]
+    fn agent_scan_dirs_adds_a_discovery_root() {
+        let fx = Fixture::new();
+        let extra = tempfile::tempdir().unwrap();
+        let root = extra.path().join("agents");
+        write_agent(&root, "scanned");
+        fx.write_user_settings(serde_json::json!({ "agentScanDirs": [root.to_str().unwrap()] }));
+
+        let names = fx.discovered_names();
+        assert!(
+            names.contains(&"scanned".to_string()),
+            "the configured scan dir must be walked: {names:?}"
+        );
+        let cfg = fx.config().unwrap();
+        let source = discover_agents_all(&cfg)
+            .unwrap()
+            .agents
+            .into_iter()
+            .find(|a| a.name == "scanned")
+            .map(|a| a.source)
+            .expect("the scanned agent is in the result");
+        assert_eq!(
+            source,
+            AgentSource::User,
+            "scan dirs are a USER-tier stream"
+        );
+    }
+
+    /// pi `expandAgentScanDirPattern` (`agents.ts:2433-2458`): exactly ONE `*`, and it must be a
+    /// WHOLE segment — `<base>/*/agents` expands over every child directory of `<base>`.
+    ///
+    /// Gutted by: treating the pattern literally (no directory named `*` exists, so nothing is
+    /// found).
+    #[test]
+    fn agent_scan_dirs_expands_one_wildcard_segment() {
+        let fx = Fixture::new();
+        let base = tempfile::tempdir().unwrap();
+        write_agent(&base.path().join("alpha").join("agents"), "from-alpha");
+        write_agent(&base.path().join("beta").join("agents"), "from-beta");
+        // A child with no `agents/` dir must simply contribute nothing, not a phantom root.
+        std::fs::create_dir_all(base.path().join("gamma")).unwrap();
+        let pattern = format!("{}/*/agents", base.path().to_str().unwrap());
+        fx.write_user_settings(serde_json::json!({ "agentScanDirs": [pattern] }));
+
+        let names = fx.discovered_names();
+        assert!(names.contains(&"from-alpha".to_string()), "{names:?}");
+        assert!(names.contains(&"from-beta".to_string()), "{names:?}");
+    }
+
+    /// The other half of `expandAgentScanDirPattern`'s wildcard rule (`agents.ts:2447`): more than
+    /// one `*`, or a `*` that is only PART of a segment, yields NOTHING. Pinned so the port cannot
+    /// over-deliver by reaching for a general glob library.
+    ///
+    /// Gutted by: dropping the `wildcards != 1` / `parts[i] != "*"` guard — both entries below then
+    /// resolve and the agents come back.
+    #[test]
+    fn a_two_wildcard_agent_scan_dir_entry_contributes_nothing() {
+        let fx = Fixture::new();
+        let base = tempfile::tempdir().unwrap();
+        write_agent(
+            &base.path().join("a").join("b").join("agents"),
+            "two-wildcards",
+        );
+        write_agent(
+            &base.path().join("partial").join("agents"),
+            "partial-segment",
+        );
+        let two = format!("{}/*/*/agents", base.path().to_str().unwrap());
+        let partial = format!("{}/part*/agents", base.path().to_str().unwrap());
+        fx.write_user_settings(serde_json::json!({ "agentScanDirs": [two, partial] }));
+
+        let names = fx.discovered_names();
+        assert!(!names.contains(&"two-wildcards".to_string()), "{names:?}");
+        assert!(!names.contains(&"partial-segment".to_string()), "{names:?}");
+    }
+
+    /// R-SA-009 / pi `agents.ts:1226-1233`: a non-array `agentScanDirs` is malformed and ABORTS
+    /// discovery. Before SUBA-123a serde's `#[serde(default)]` swallowed the key and the setting had
+    /// no effect at all — not even a warning.
+    ///
+    /// Gutted by: removing the `validate_agent_dir_lists` call from `parse_subagent_settings`.
+    #[test]
+    fn a_non_array_agent_scan_dirs_aborts_discovery_with_upstreams_text() {
+        let fx = Fixture::new();
+        fx.write_project_settings(serde_json::json!({ "agentScanDirs": "not-an-array" }));
+        let err = fx.config().expect_err("a non-array value must abort");
+        assert!(
+            err.to_string()
+                .contains("invalid 'agentScanDirs'; expected an array of non-empty strings"),
+            "{err}"
+        );
+
+        fx.write_project_settings(serde_json::json!({ "agentExcludeDirs": [""] }));
+        let err = fx.config().expect_err("an empty-string entry must abort");
+        assert!(
+            err.to_string()
+                .contains("invalid 'agentExcludeDirs'; expected an array of non-empty strings"),
+            "{err}"
+        );
+    }
+
+    /// SUBA-123b / R-SA-009 — the SETTINGS-READ half of `defaultSubagentOnlyExtensions`. The row's
+    /// Verify clause is "a bad value aborts discovery with upstream's text", and upstream validates
+    /// this key with the same array-of-non-empty-strings rule and the same message shape as the two
+    /// dir lists (`agents.ts:1218-1225` @v0.71.0). Before this the key rode
+    /// `#[serde(default)]` and a malformed value was silently discarded, which is the exact failure
+    /// mode SUBA-123 was filed for — so the validator entry is as load-bearing as the merge pass
+    /// that consumes the value, and it had no test.
+    ///
+    /// Every malformed shape upstream's `!Array.isArray(...) || some(item => typeof item !==
+    /// "string" || !item.trim())` rejects is covered: a non-array, a non-string element, an empty
+    /// string and a whitespace-only string.
+    ///
+    /// Gutted by: removing the `"defaultSubagentOnlyExtensions"` entry from
+    /// `validate_agent_dir_lists`' key list.
+    #[test]
+    fn a_malformed_default_subagent_only_extensions_aborts_discovery_with_upstreams_text() {
+        const WANT: &str =
+            "invalid 'defaultSubagentOnlyExtensions'; expected an array of non-empty strings";
+        for bad in [
+            serde_json::json!("not-an-array"),
+            serde_json::json!(7),
+            serde_json::json!({ "a": "b" }),
+            serde_json::json!([""]),
+            serde_json::json!(["   "]),
+            serde_json::json!(["./ok.ts", 7]),
+            serde_json::json!(["./ok.ts", null]),
+        ] {
+            let fx = Fixture::new();
+            fx.write_project_settings(serde_json::json!({
+                "defaultSubagentOnlyExtensions": bad.clone()
+            }));
+            let err = fx
+                .config()
+                .expect_err(&format!("{bad} must abort discovery"));
+            assert!(err.to_string().contains(WANT), "{bad}: {err}");
+
+            // The same malformed value at the USER scope aborts too — both scopes run through
+            // `read_subagent_settings_file`.
+            let fx = Fixture::new();
+            fx.write_user_settings(serde_json::json!({
+                "defaultSubagentOnlyExtensions": bad.clone()
+            }));
+            let err = fx
+                .config()
+                .expect_err(&format!("{bad} at user scope must abort discovery"));
+            assert!(err.to_string().contains(WANT), "{bad}: {err}");
+        }
+
+        // A well-formed value is accepted, so the assertions above are about the SHAPE and not
+        // about the key being rejected outright.
+        let fx = Fixture::new();
+        fx.write_project_settings(serde_json::json!({
+            "defaultSubagentOnlyExtensions": ["./ok.ts"]
+        }));
+        fx.config().expect("a valid list is accepted");
+    }
+
+    /// SUBA-123b — the trim (`agents.ts:1224`: `.map((item) => item.trim())`). Upstream stores the
+    /// TRIMMED entries, and the stored value is what `applySubagentDefaultSubagentOnlyExtensions`
+    /// copies onto every agent that declares no list of its own — so an untrimmed entry would reach
+    /// the child's extension resolver as a different path from the same text written without the
+    /// stray space. Note that a whitespace-ONLY entry never gets here: the validator above rejects
+    /// it, exactly as upstream's `!item.trim()` does.
+    ///
+    /// Gutted by: deleting the `default_subagent_only_extensions` trim block in
+    /// `parse_subagent_settings`.
+    #[test]
+    fn default_subagent_only_extensions_entries_are_stored_trimmed() {
+        let settings = parse_subagent_settings(Some(&serde_json::json!({
+            "defaultSubagentOnlyExtensions": ["  ./a.ts", "./b.ts\t", " ./c.ts "]
+        })))
+        .expect("valid list parses");
+        assert_eq!(
+            settings.default_subagent_only_extensions,
+            Some(vec![
+                "./a.ts".to_string(),
+                "./b.ts".to_string(),
+                "./c.ts".to_string()
+            ])
+        );
+    }
+
+    /// The POSITION of the scan dirs in the user list, which decides who wins a same-name collision
+    /// under R-SA-002's last-directory-scanned-wins: upstream orders them
+    /// `[...extraUserAgentDirs(), ...userScanDirs.dirs, userDirOld, userDirNew]`
+    /// (`agents.ts:2950`), so an extra dir loses to a scan dir, which loses to the user's own dirs.
+    ///
+    /// Gutted by: appending the scan dirs, or prepending them ahead of the extras — either way the
+    /// ordering assertion fails.
+    #[test]
+    fn a_scan_dir_sits_after_the_extras_and_before_the_ordinary_user_dirs() {
+        let fx = Fixture::new();
+        let extra = tempfile::tempdir().unwrap();
+        let scan = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(scan.path().join("agents")).unwrap();
+        let scan_dir = scan.path().join("agents");
+        fx.write_user_settings(
+            serde_json::json!({ "agentScanDirs": [scan_dir.to_str().unwrap()] }),
+        );
+        let roots = fx
+            .roots()
+            .with_extra_agent_dirs(vec![extra.path().to_path_buf()]);
+        let cfg = SubagentExecutor::discovery_config_on_disk(fx.project.path(), &roots).unwrap();
+
+        let extra_at = cfg
+            .user_agent_dirs
+            .iter()
+            .position(|d| d == extra.path())
+            .expect("extra dir present");
+        let scan_at = cfg
+            .user_agent_dirs
+            .iter()
+            .position(|d| d == &scan_dir)
+            .expect("scan dir present");
+        let ordinary_at = cfg
+            .user_agent_dirs
+            .iter()
+            .position(|d| d.starts_with(fx.home.path()))
+            .expect("an ordinary user dir present");
+        assert!(
+            extra_at < scan_at && scan_at < ordinary_at,
+            "{:?}",
+            cfg.user_agent_dirs
+        );
+    }
+}
+
+#[cfg(test)]
+mod subagent_settings_census_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    /// SUBA-123c — the mechanism the row asks for: a TOP-LEVEL `subagents.<key>` no reader consumes
+    /// is reported, so the next unported key warns instead of vanishing.
+    ///
+    /// Before this, `override_key_warnings` returned early unless `subagents.agentOverrides` was an
+    /// object and censused only the entries inside it, so `{"subagents":{"notAKey":1}}` produced
+    /// NOTHING — which is exactly how `agentScanDirs`, `agentExcludeDirs` and
+    /// `defaultSubagentOnlyExtensions` sat unported and unreported.
+    ///
+    /// Gutted by: removing the top-level census pass — `warnings` comes back empty.
+    #[test]
+    fn an_unknown_top_level_subagents_key_warns() {
+        let raw = serde_json::json!({ "notAKey": 1 });
+        let settings = parse_subagent_settings(Some(&raw)).expect("non-fatal");
+        assert_eq!(
+            settings.warnings,
+            vec!["subagents.notAKey is not a subagent settings key (ignored)".to_string()]
+        );
+    }
+
+    /// The other half: an upstream key this port declares UNPORTED is named as such, with its
+    /// landing, rather than being reported as a typo. `agentOverridesByProvider` is pi's per-provider
+    /// override tier (`agents.ts:1247`, `selectProviderOverrides` at `:2933`), which this port does
+    /// not model at all.
+    #[test]
+    fn an_unported_upstream_subagents_key_names_its_landing() {
+        let raw = serde_json::json!({ "agentOverridesByProvider": { "openai": {} } });
+        let settings = parse_subagent_settings(Some(&raw)).expect("non-fatal");
+        assert_eq!(settings.warnings.len(), 1, "{:?}", settings.warnings);
+        assert!(
+            settings.warnings[0]
+                .starts_with("subagents.agentOverridesByProvider is not supported by this port ("),
+            "{:?}",
+            settings.warnings
+        );
+        assert!(
+            settings.warnings[0].ends_with("); it has no effect"),
+            "{:?}",
+            settings.warnings
+        );
+    }
+
+    /// No false positives: every key this port really reads — including the three SUBA-123a/123b
+    /// added, the two `skip_deserializing` ones populated from the raw value, and the three read by
+    /// OTHER modules off the same block — must census clean.
+    ///
+    /// Gutted by: building the known set from `struct_fields` alone (the five non-serde keys are
+    /// reported as typos and every real settings file grows spurious warnings).
+    #[test]
+    fn a_ported_top_level_subagents_key_does_not_warn() {
+        let raw = serde_json::json!({
+            "defaultModel": "openai/gpt-5",
+            "defaultProvider": "openai",
+            "defaultThinking": "low",
+            "defaultExtensions": ["./a.ts"],
+            "defaultSubagentOnlyExtensions": ["./b.ts"],
+            "agentScanDirs": ["/tmp/agents"],
+            "agentExcludeDirs": ["/tmp/agents/vendor"],
+            "disableBuiltins": false,
+            "disableThinking": false,
+            "maxThinking": "high",
+            "modelScope": { "allow": ["openai/gpt-5"] },
+            "projectRootResolution": "nearest",
+            "machines": {},
+            "watchdog": { "enabled": true },
+            "agentOverrides": {}
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("all keys are read");
+        assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
     }
 }

@@ -356,9 +356,16 @@ impl WatchdogEmissionGuard {
 )]
 mod tests {
     use super::*;
+    use crate::watchdog::types::WatchdogImportance;
 
     fn warn(severity: WatchdogSeverity, summary: &str) -> WatchdogWarning {
-        WatchdogWarning::new(severity, summary, "evidence text", "do the thing")
+        WatchdogWarning::new(
+            severity,
+            WatchdogImportance::High,
+            summary,
+            "evidence text",
+            "do the thing",
+        )
     }
 
     #[test]
@@ -382,6 +389,7 @@ mod tests {
         let mut guard = WatchdogEmissionGuard::default();
         let decision = guard.evaluate(&WatchdogWarning::new(
             WatchdogSeverity::Concern,
+            WatchdogImportance::High,
             "LGTM",
             "evidence",
             "action",

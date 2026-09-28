@@ -8,23 +8,6 @@ use crate::stream::StreamEvent;
 use cyrup_core::{ApiId, SharedStr};
 use serde_json::Value;
 
-/// The id of a `reasoning.encrypted` detail (Pi `isEncryptedReasoningDetail`): requires
-/// `type == "reasoning.encrypted"` plus non-empty `id` and `data` strings.
-pub(super) fn encrypted_reasoning_detail_id(detail: &Value) -> Option<&str> {
-    if detail.get("type").and_then(Value::as_str) != Some("reasoning.encrypted") {
-        return None;
-    }
-    let id = detail
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
-    let _data = detail
-        .get("data")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
-    Some(id)
-}
-
 /// Ensure a text block exists, emitting `TextStart` on first appearance. Returns its index, or
 /// `None` if the consumer dropped the stream.
 pub(super) async fn ensure_text_block(
@@ -142,15 +125,11 @@ pub(super) async fn process_tool_call_delta(
         }
     };
 
-    // Attach any reasoning detail that arrived before this tool call (Pi
-    // `applyPendingReasoningDetail`).
-    let pending = id.and_then(|i| dec.pending_reasoning_by_tool_id.remove(i));
-
     if let Some(Block::Tool {
         id: bid,
         name: bname,
         args,
-        thought_signature,
+        ..
     }) = dec.block_mut(idx)
     {
         if let Some(i) = id
@@ -167,9 +146,6 @@ pub(super) async fn process_tool_call_delta(
             // O(delta): the append is amortised and no parse happens here at all — see
             // [`SharedStr`] and [`LazyArgs`](cyrup_core::LazyArgs) (PERF-001).
             args.push_str(args_fragment);
-        }
-        if let Some(sig) = pending {
-            *thought_signature = Some(sig);
         }
     }
     // Maintain the id index if the id only arrived now.
