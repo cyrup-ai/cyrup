@@ -263,6 +263,46 @@ pub fn tool_budget_blocked_message(
     )
 }
 
+/// SUBA-132 — pi `TOOL_BUDGET_BLOCKED_MESSAGE` (`tool-budget.ts:74` @v0.71.0): the whole of a
+/// [`tool_budget_blocked_message`], with its count, hard limit and tool name captured.
+static TOOL_BUDGET_BLOCKED_MESSAGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+            r"^Tool budget hard limit reached after (\d+) tool calls? \(hard (\d+)\)\. The '([^']+)' tool is blocked so you can finalize from the context you already have\.$",
+        )
+        .unwrap_or_else(|_| unreachable!("TOOL_BUDGET_BLOCKED_MESSAGE is a literal and always compiles"))
+    },
+);
+
+/// SUBA-132 — pi `isToolBudgetBlockedMessage` (`tool-budget.ts:76-94` @v0.71.0): a tool result
+/// counts as a budget block only when its ENTIRE (trimmed) text is the runtime's blocked message
+/// and the embedded hard limit and tool name belong to this run — an incidental occurrence of the
+/// phrase inside ordinary tool output is rejected.
+#[must_use]
+pub fn is_tool_budget_blocked_message(
+    budget: &ResolvedToolBudget,
+    result_text: &str,
+    blocked_tool: Option<&str>,
+) -> bool {
+    let Some(tool) = blocked_tool.map(str::trim).filter(|tool| !tool.is_empty()) else {
+        return false;
+    };
+    let Some(captures) = TOOL_BUDGET_BLOCKED_MESSAGE.captures(result_text.trim()) else {
+        return false;
+    };
+    let number = |index: usize| {
+        captures
+            .get(index)
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+    };
+    let (Some(blocked_tool_count), Some(hard)) = (number(1), number(2)) else {
+        return false;
+    };
+    hard == u64::from(budget.hard)
+        && blocked_tool_count > u64::from(budget.hard)
+        && captures.get(3).map(|m| m.as_str()) == Some(tool)
+}
+
 /// pi `encodeToolBudgetEnv` (`tool-budget.ts:70-72`): the resolved budget as JSON, or `None`.
 #[must_use]
 pub fn encode_tool_budget_env(budget: Option<&ResolvedToolBudget>) -> Option<String> {
@@ -548,5 +588,57 @@ mod tests {
             .expect("some");
         assert!(should_block_tool_for_budget(&budget, "read", 1));
         assert!(!should_block_tool_for_budget(&budget, "bash", 1));
+    }
+
+    /// SUBA-132 — pi `isToolBudgetBlockedMessage` (`tool-budget.ts:76-94` @v0.71.0): only the
+    /// runtime's own whole-message block for THIS budget and tool counts.
+    #[test]
+    fn only_this_runs_own_whole_blocked_message_is_a_budget_block() {
+        let budget = decode_tool_budget_env(Some("{\"hard\": 2}"), HardMinimum::One)
+            .expect("valid")
+            .expect("some");
+        let message = tool_budget_blocked_message(&budget, "read", 3);
+        assert!(is_tool_budget_blocked_message(
+            &budget,
+            &message,
+            Some("read")
+        ));
+        assert!(is_tool_budget_blocked_message(
+            &budget,
+            &format!("  {message}\n"),
+            Some(" read ")
+        ));
+        // Another tool's name, a missing name, another run's hard limit, a count within the limit,
+        // or the phrase embedded in ordinary output are all rejected.
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &message,
+            Some("grep")
+        ));
+        assert!(!is_tool_budget_blocked_message(&budget, &message, None));
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &message,
+            Some("  ")
+        ));
+        let other = decode_tool_budget_env(Some("{\"hard\": 5}"), HardMinimum::One)
+            .expect("valid")
+            .expect("some");
+        assert!(!is_tool_budget_blocked_message(
+            &other,
+            &message,
+            Some("read")
+        ));
+        let within = message.replace("after 3 tool calls", "after 2 tool calls");
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &within,
+            Some("read")
+        ));
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &format!("grep output: {message}"),
+            Some("read")
+        ));
     }
 }

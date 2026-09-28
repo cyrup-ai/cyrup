@@ -742,6 +742,42 @@ fn the_bundled_reviewer_lane_is_read_only() {
     );
 }
 
+/// SUBA-112 — `agents/worker.md` @v0.71.0 declares `defaultContext: fresh` (CHANGELOG 0.71.0:
+/// *"Packaged `worker` agents now start with fresh context instead of forking the parent's
+/// conversation"*, #2384) and `acceptanceRole: writer` (v0.70.1). A worker launched with no
+/// `context` argument therefore starts fresh even when a fork would be available.
+#[test]
+fn the_bundled_worker_starts_fresh_and_is_a_writer() {
+    let cfg = AgentDiscoveryConfig {
+        builtin_agents_dir: Some(bundled_resources_dir()),
+        ..AgentDiscoveryConfig::default()
+    };
+    let result = discover_agents_all(&cfg).expect("builtin-only discovery succeeds");
+    let worker = result
+        .agents
+        .iter()
+        .find(|a| a.name == "worker")
+        .expect("the bundled worker must be discoverable");
+
+    assert_eq!(
+        worker.default_context,
+        Some(crate::fork_context::ContextMode::Fresh)
+    );
+    assert_eq!(
+        worker.acceptance_role,
+        Some(crate::exec::acceptance::model::AcceptanceRole::Writer)
+    );
+    let effective = crate::fork_context::resolve_effective_context(
+        None,
+        &worker.name,
+        worker.default_context,
+        None,
+        true,
+    )
+    .expect("an implicit context always resolves");
+    assert_eq!(effective, crate::fork_context::ContextMode::Fresh);
+}
+
 #[test]
 fn all_six_bundled_builtin_personas_are_discovered_with_builtin_source() {
     let cfg = AgentDiscoveryConfig {

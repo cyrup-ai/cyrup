@@ -1526,7 +1526,7 @@ script's `carried_medium` list emptied. Everything else in the twenty-five rows 
 
 (1) `SEAM-115`: pi's footer occupancy is `estimateContextTokens` — `usage.totalTokens` preferred plus a
 trailing-messages estimate (`compaction.ts:202-230`, `:146-148` @v0.84.4); cyrup's
-`ContextUsage::from_last_assistant` is the four-field sum alone (low, area 08, unfiled). (2) `PROV-014`
+`ContextUsage::from_last_assistant` is the four-field sum alone (low, area 08, unfiled). *(Note 2026-09-28: the FOOTER path, `stats_context_usage`, now ports `getContextUsage` @v0.87.1 under `TUI-056`, closed on `claude/lows-next`; this lead's residual is the coarse `context_usage()` behind RPC `GetContextUsage` and `state_view`.)* (2) `PROV-014`
 review: `baseten` (`all.ts:95` @v0.84.4) is now the one unregistered v0.84.x built-in, with no row
 (area 01). *(Stale, corrected 2026-09-24: `baseten` IS registered at `ea23ca2` — `crates/cyrup-provider/src/providers/all.rs` lists it as a fleet provider with a dynamic catalog, under `DRIFT-009`.)* (3) `EXT-041`: `ReplayItem` has no custom-entry variant, so `cyrup-intercom`'s inbound card
 is lost on `/resume` (area 08 producer). (4) `TUI-068`: pi refuses to delete the CURRENT session from
@@ -2474,6 +2474,7 @@ plus these.
    Demonstrated concretely this pass: an injected double prefix left the **producer's** own unit test
    green and **only the rendered assertion caught it.** A string-level test on the producer side
    cannot see a renderer that re-prefixes, truncates or drops the line.
+   *(Note 2026-09-28: `TUI-062` is closed on `claude/lows-next` — the prefix is now built in one place, `TranscriptView::show_warning`, as in pi's `showWarning`; the lesson stands as history.)*
 8. **Assert presence before absence — twice, and both would have been vacuous tests.** (a) The first
    draft of the turn-budget system-prompt test asserted on the **argv**; `SUBA-030` had moved the
    persona off the command line into a spilled `0600` file, so it would have passed whatever the file

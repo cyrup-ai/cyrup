@@ -348,6 +348,30 @@ impl AgentSession {
         self.manager.lock().await.leaf_id().cloned()
     }
 
+    /// How many `compaction` entries the session file holds — pi's
+    /// `sessionManager.getEntries().filter((e) => e.type === "compaction").length`
+    /// (`interactive-mode.ts:4065-4066` @v0.87.1), the count `renderInitialMessages()` reports as
+    /// `Session compacted N times`.
+    ///
+    /// Counted over EVERY entry, not the current branch: `getEntries()` is the whole file minus the
+    /// header, so a compaction on an abandoned branch still counts, and a `branch_summary` never
+    /// does. That is why neither [`Self::replay_items`] (the branch projection) nor `session_dag`'s
+    /// `SessionDagKind::Compaction` (which folds `branch_summary` in) can answer it.
+    pub async fn compaction_count(&self) -> usize {
+        self.manager
+            .lock()
+            .await
+            .entries()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    cyrup_session::Entry::Known(cyrup_session::KnownEntry::Compaction { .. })
+                )
+            })
+            .count()
+    }
+
     /// The handle the `read` tool reads to decide whether the ACTIVE model accepts image input
     /// (pi `tools/read.ts`'s non-vision warning). Seeded from the resolved model at build and
     /// re-pushed by `apply_model_change`, so the warning tracks `/model` switches rather than the

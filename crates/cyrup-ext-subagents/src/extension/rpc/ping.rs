@@ -117,6 +117,9 @@ pub(crate) fn ping_data(executor: &SubagentExecutor, cwd: &Path) -> Value {
                 "lifecycleArtifactVersion":
                     crate::background::process_terminal::SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
             },
+            // `rpc.ts:460` @v0.71.0 — the `cost` method's report generation, paid for by
+            // [`crate::registration::cost::collect_subagent_cost`].
+            "cost": { "version": crate::registration::cost::SUBAGENT_COST_REPORT_VERSION },
         },
         "events": {
             "ready": SUBAGENT_RPC_READY_EVENT,

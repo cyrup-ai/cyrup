@@ -229,12 +229,11 @@ fn best_match_is_preselected() {
 #[test]
 fn autocomplete_popup_keys_are_configurable() {
     // Item #6 — the popup nav/accept/cancel keys are no longer hardcoded: a `keybindings.json` rebind
-    // (`tui.autocomplete.*`) takes effect. Rebind cancel from Esc to Ctrl+G, and accept to Ctrl+Y.
+    // of the ids pi's popup reads (`tui.select.cancel`, `tui.input.tab`) takes effect. Rebind cancel
+    // from Esc to Ctrl+G, and accept to Ctrl+Y.
     let mut ed = InputEditor::new();
-    ed.merge_keybindings_json(
-        r#"{ "tui.autocomplete.cancel": "ctrl+g", "tui.autocomplete.accept": "ctrl+y" }"#,
-    )
-    .unwrap();
+    ed.merge_keybindings_json(r#"{ "tui.select.cancel": "ctrl+g", "tui.input.tab": "ctrl+y" }"#)
+        .unwrap();
     type_str(&mut ed, "/sett");
     assert!(ed.autocomplete_open());
     // The rebound accept key applies the completion.

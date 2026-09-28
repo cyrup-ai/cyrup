@@ -537,6 +537,7 @@ impl SubagentsExtension {
                     // G98: `/run` parses no timeout token, so this is purely the agent's
                     // own `timeoutMs:` default — never an override of a call-site value.
                     timeout_ms: default_timeout_ms,
+                    checkpoint_before_deadline_ms: None,
                 })
                 .await?;
             Ok(format!("Background subagent run started: {run_id}"))
@@ -877,6 +878,7 @@ impl SubagentsExtension {
                     session_dir: None,
                     artifacts: None,
                     timeout_ms: None,
+                    checkpoint_before_deadline_ms: None,
                 })
                 .await?;
             return Ok(format!("Background subagent run started: {run_id}"));

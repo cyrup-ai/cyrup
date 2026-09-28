@@ -92,6 +92,9 @@ struct BusForwardingServices {
     /// document landed in, which is the whole subject of
     /// [`the_rpc_mode_machine_document_gets_its_own_slot_and_leaves_the_fleet_widget_alone`].
     widgets: Mutex<Vec<(String, Option<Vec<String>>)>>,
+    /// The live session branch `HostServices::branch` serves (pi `ctx.sessionManager.getBranch()`)
+    /// — what the RPC `cost` method walks.
+    branch: Mutex<Vec<Value>>,
 }
 
 impl cyrup_ext::host::HostServices for BusForwardingServices {
@@ -105,6 +108,10 @@ impl cyrup_ext::host::HostServices for BusForwardingServices {
 
     fn session_file(&self) -> Option<PathBuf> {
         Some(self.session_file.clone())
+    }
+
+    fn branch(&self) -> Value {
+        Value::Array(self.branch.lock().unwrap().clone())
     }
 
     fn set_widget(
@@ -239,6 +246,7 @@ impl Harness {
             bus: Arc::clone(host.bus()),
             session_file: home.path().join("session.jsonl"),
             widgets: Mutex::new(Vec::new()),
+            branch: Mutex::new(Vec::new()),
         });
         let extension = Arc::new(SubagentsExtension::with_mode(
             config.clone(),
@@ -493,7 +501,7 @@ async fn a_host_drives_ping_over_the_inter_extension_bus_and_gets_a_reply() {
     assert_eq!(reply["success"], json!(true));
 
     let data = &reply["data"];
-    // pi `SUBAGENT_RPC_METHODS` (`rpc.ts:34`) — eight, in upstream's order.
+    // pi `SUBAGENT_RPC_METHODS` (`rpc.ts:35` @v0.71.0) — nine, in upstream's order.
     assert_eq!(
         data["methods"],
         json!([
@@ -504,9 +512,13 @@ async fn a_host_drives_ping_over_the_inter_extension_bus_and_gets_a_reply() {
             "steer",
             "interrupt",
             "stop",
-            "resume"
+            "resume",
+            "cost"
         ])
     );
+    // SUBA-138 — pi `rpc.ts:460` @v0.71.0, paid for by the `cost` arm pinned in
+    // `rpc_cost_returns_the_versioned_report_over_the_live_branch`.
+    assert_eq!(data["capabilities"]["cost"], json!({ "version": 1 }));
     assert_eq!(
         data["events"]["replyPrefix"],
         json!(SUBAGENT_RPC_REPLY_EVENT_PREFIX)
@@ -561,6 +573,266 @@ async fn a_host_drives_ping_over_the_inter_extension_bus_and_gets_a_reply() {
         data["events"]["processTerminal"],
         json!("subagent:process-terminal"),
         "the process-terminal event topic must be advertised: {data}"
+    );
+}
+
+/// SUBA-138 — pi's RPC `cost` (`rpc.ts:770-776` @v0.71.0): the parent-plus-child accounting
+/// `/subagent-cost` renders, returned as the versioned `SubagentCostReport` over the LIVE session
+/// branch, and a non-object `params` refused with upstream's sentence.
+///
+/// GUT the `Cost` arm and `from_wire` refuses the method (`unsupported_method`); GUT the live-branch
+/// source and both totals read zero, because the per-cwd session directory under the sandbox is
+/// empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_cost_returns_the_versioned_report_over_the_live_branch() {
+    let harness = Harness::full().await;
+    let usage = |input: u64, output: u64, cost: f64| {
+        json!({
+            "input": input, "output": output, "cacheRead": 0, "cacheWrite": 0,
+            "totalTokens": input + output,
+            "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": cost },
+        })
+    };
+    *harness.services.branch.lock().unwrap() = vec![
+        json!({
+            "type": "message", "id": "a0000001", "parentId": null,
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {
+                "role": "assistant", "content": [{ "type": "text", "text": "ok" }],
+                "provider": "anthropic", "model": "claude-sonnet-4",
+                "usage": usage(200, 100, 0.02), "stopReason": "stop", "timestamp": 1,
+            },
+        }),
+        json!({
+            "type": "message", "id": "t0000001", "parentId": "a0000001",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "message": {
+                "role": "toolResult", "toolCallId": "call-1", "toolName": "subagent",
+                "content": [{ "type": "text", "text": "done" }],
+                "details": {
+                    "mode": "single",
+                    "results": [{ "agent": "worker", "turns": 2, "usage": usage(50, 25, 0.005) }],
+                },
+                "timestamp": 2,
+            },
+        }),
+    ];
+
+    let reply = harness.round_trip("pb8-cost-1", "cost", None).await;
+    assert_eq!(reply["success"], json!(true), "{reply}");
+    let data = &reply["data"];
+    assert_eq!(data["version"], json!(1), "{data}");
+    assert_eq!(data["parent"]["input"], json!(200));
+    assert_eq!(data["parent"]["turns"], json!(1));
+    assert_eq!(data["children"][0]["label"], json!("Child 1 (worker)"));
+    assert_eq!(data["children"][0]["usage"]["turns"], json!(2));
+    assert_eq!(data["childTotal"]["output"], json!(25));
+    assert_eq!(data["total"]["input"], json!(250));
+    assert_eq!(data["unresolvedAsyncChildren"], json!(0));
+
+    let refused = harness
+        .round_trip("pb8-cost-2", "cost", Some(json!("everything")))
+        .await;
+    assert_eq!(error_code(&refused), "invalid_params");
+    assert_eq!(
+        refused["error"]["message"],
+        json!("RPC cost params must be an object when provided."),
+        "{refused}"
+    );
+}
+
+/// SUBA-136 — the supervisor cards are REGISTERED: the host resolves a `subagent_supervisor_request`
+/// message and a `subagent_supervisor_reply` entry to this extension's live components (pi
+/// `extension/index.ts:651-658` @v0.71.0). GUT either registration and the host answers
+/// `RenderOutcome::None` — the raw message content, and no record of the reply at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_supervisor_request_and_reply_cards_are_registered_with_the_host() {
+    struct Plain;
+    impl cyrup_ext::RenderTheme for Plain {
+        fn fg(&self, _role: &str, text: &str) -> String {
+            text.to_string()
+        }
+        fn bold(&self, text: &str) -> String {
+            text.to_string()
+        }
+    }
+    let draw = |outcome: cyrup_ext::RenderOutcome| match outcome {
+        cyrup_ext::RenderOutcome::Live(component) => component.render(&cyrup_ext::RenderCtx {
+            width: 60,
+            expanded: false,
+            theme: &Plain,
+        }),
+        other => panic!("expected a live card, got {other:?}"),
+    };
+    let harness = Harness::full().await;
+    let opts = cyrup_ext::RenderOptions::default();
+
+    let request = draw(
+        harness
+            .host
+            .render_message_call_outcome(
+                "subagent_supervisor_request",
+                &json!({
+                    "role": "custom", "kind": "subagent_supervisor_request",
+                    "payload": "Subagent needs a supervisor decision.",
+                    "details": {
+                        "id": "req-1", "requestId": "req-1", "reason": "need_decision",
+                        "expectsReply": true, "runId": "run-1", "agent": "worker",
+                        "childIndex": 0, "requestBody": "Which branch?",
+                        "replyHint": "subagent_supervisor({ action: \"reply\", replyTo: \"req-1\", message: \"...\" })",
+                    },
+                }),
+                &opts,
+            )
+            .await,
+    );
+    assert!(
+        request[0].starts_with("╭ ⚠ Supervisor decision request "),
+        "{request:?}"
+    );
+    assert!(
+        request.iter().any(|row| row.starts_with("│Which branch?")),
+        "{request:?}"
+    );
+
+    let reply = draw(
+        harness
+            .host
+            .render_entry(
+                "subagent_supervisor_reply",
+                &json!({
+                    "type": "custom", "customType": "subagent_supervisor_reply",
+                    "data": {
+                        "requestId": "req-1", "reason": "need_decision", "runId": "run-1",
+                        "agent": "worker", "childIndex": 0, "message": "Use main.",
+                        "createdAt": 1,
+                    },
+                }),
+                &opts,
+            )
+            .await,
+    );
+    assert!(
+        reply[0].starts_with("╭ ↩ Supervisor reply to child "),
+        "{reply:?}"
+    );
+    assert!(
+        reply.iter().any(|row| row.starts_with("│Reply to: req-1")),
+        "{reply:?}"
+    );
+}
+
+/// SUBA-133 — the `<advertised_subagents>` catalog, end to end through the REAL registration:
+/// discovered at `SessionStart`, appended by the `before_agent_start` hook while `subagent` is
+/// selected, bounded by the session's capability ceiling, and refreshed by a successful management
+/// mutation (pi `extension/index.ts:533-541,821-829,1189-1192` @v0.71.0).
+///
+/// GUT the `SessionStart` refresh and the first prompt carries no catalog; GUT the ceiling and
+/// `denied` is listed; GUT the post-mutation refresh and `fresh` never appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advertised_agents_ride_the_parent_system_prompt() {
+    let ceiling = crate::exec::capability_ceiling::encode_capability_ceiling(Some(
+        &crate::exec::capability_ceiling::ResolvedCapabilityCeiling {
+            version: crate::exec::capability_ceiling::CAPABILITY_CEILING_VERSION,
+            allowed_tools: None,
+            allowed_agents: Some(vec!["fresh".into(), "scout".into(), "quiet".into()]),
+            deny_extensions: false,
+            sources: vec!["test".into()],
+        },
+    ))
+    .expect("a bounded ceiling encodes");
+    let harness = Harness::start_with(RegistrationMode::Full, |config| {
+        config.env_overrides.insert(
+            crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV.to_string(),
+            Some(ceiling),
+        );
+    })
+    .await;
+    let agents_dir = harness._home.path().join(".cyrup").join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    for (name, advertise) in [("scout", "true"), ("denied", "true"), ("quiet", "false")] {
+        std::fs::write(
+            agents_dir.join(format!("{name}.md")),
+            format!(
+                "---\nname: {name}\ndescription: The {name} <specialist>\nadvertise: {advertise}\n---\nBody.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    harness
+        .extension
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "test".to_string(),
+                previous_session_file: None,
+            },
+            &HostCtx::event(ExtMode::Tui, true, harness.cwd.clone()),
+        )
+        .await;
+
+    let prompt_with = |tools: Value| {
+        let host = Arc::clone(&harness.host);
+        async move {
+            host.emit_before_agent_start(
+                "hi",
+                Value::Null,
+                "You are cyrup.",
+                json!({ "selectedTools": tools }),
+                &CancelToken::new(),
+            )
+            .await
+            .and_then(|reduction| reduction.system_prompt)
+        }
+    };
+
+    let prompt = prompt_with(json!(["read", "subagent"]))
+        .await
+        .expect("the catalog rewrites the prompt");
+    assert!(
+        prompt.starts_with("You are cyrup.\n\n<advertised_subagents>\n"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(
+            "    <name>scout</name>\n    <description>The scout &lt;specialist&gt;</description>"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("<name>denied</name>"),
+        "outside the ceiling: {prompt}"
+    );
+    assert!(
+        !prompt.contains("<name>quiet</name>"),
+        "advertise: false: {prompt}"
+    );
+    assert!(
+        prompt_with(json!(["read"])).await.is_none(),
+        "without the subagent tool nothing is advertised"
+    );
+
+    crate::extension::testsupport::dispatch_tool(
+        &harness.extension.subagent_tool(),
+        json!({
+            "action": "create",
+            "config": {
+                "name": "fresh",
+                "description": "Just created",
+                "scope": "user",
+                "advertise": true,
+            },
+        }),
+    )
+    .await
+    .expect("the create lands");
+    let prompt = prompt_with(json!(["subagent"])).await.expect("rewritten");
+    assert!(prompt.contains("<name>fresh</name>"), "{prompt}");
+    assert!(
+        std::fs::read_to_string(agents_dir.join("fresh.md"))
+            .unwrap()
+            .contains("\nadvertise: true\n"),
+        "the serializer writes the opt-in"
     );
 }
 
@@ -882,7 +1154,8 @@ async fn the_bridge_announces_ready_on_session_start() {
             "steer",
             "interrupt",
             "stop",
-            "resume"
+            "resume",
+            "cost"
         ])
     );
     assert_eq!(ready["events"]["ready"], json!(SUBAGENT_RPC_READY_EVENT));

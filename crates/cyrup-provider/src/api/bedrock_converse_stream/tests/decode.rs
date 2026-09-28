@@ -102,6 +102,51 @@ async fn decodes_text_thinking_and_tool_use_in_upstream_order() {
     }
 }
 
+/// PROV-081 — pi #9457 (`bedrock-converse-stream.ts:712-715` @v0.87.1): the one-hour share of the
+/// cache writes is summed from `usage.cacheDetails[]` into `cache_write_1h`, so it is priced at 2x
+/// input instead of the five-minute `cacheWrite` rate. Without `cacheDetails` it stays unset.
+#[tokio::test]
+async fn one_hour_cache_writes_are_read_from_cache_details() {
+    let model = sonnet_45();
+    let events = collect(
+        vec![
+            event("messageStart", "{\"role\":\"assistant\"}"),
+            event(
+                "metadata",
+                "{\"usage\":{\"inputTokens\":10,\"outputTokens\":5,\"cacheWriteInputTokens\":1500,\"totalTokens\":1515,\"cacheDetails\":[{\"ttl\":\"1h\",\"inputTokens\":1000},{\"ttl\":\"5m\",\"inputTokens\":500}]}}",
+            ),
+            event("messageStop", "{\"stopReason\":\"end_turn\"}"),
+        ],
+        &model,
+    )
+    .await;
+    let StreamEvent::Done { message, .. } = events.last().unwrap() else {
+        panic!("expected a done terminal");
+    };
+    assert_eq!(message.usage.cache_write, 1500);
+    assert_eq!(message.usage.cache_write_1h, Some(1000));
+    // 500 short @ $3.75/1e6 + 1000 long @ 2 x $3/1e6.
+    let expected = (500.0 * 3.75 + 1000.0 * 3.0 * 2.0) / 1e6;
+    assert!((message.usage.cost.cache_write - expected).abs() < 1e-12);
+
+    let events = collect(
+        vec![
+            event("messageStart", "{\"role\":\"assistant\"}"),
+            event(
+                "metadata",
+                "{\"usage\":{\"inputTokens\":10,\"outputTokens\":5,\"cacheWriteInputTokens\":1500}}",
+            ),
+            event("messageStop", "{\"stopReason\":\"end_turn\"}"),
+        ],
+        &model,
+    )
+    .await;
+    let StreamEvent::Done { message, .. } = events.last().unwrap() else {
+        panic!("expected a done terminal");
+    };
+    assert_eq!(message.usage.cache_write_1h, None);
+}
+
 /// PROV-097 — encrypted reasoning (`reasoningContent.redactedContent`) from a non-Anthropic model on
 /// Bedrock. pi `bedrock-converse-stream.ts:652-675` + `:678-690` @v0.87.1. Translated from
 /// `packages/ai/test/bedrock-redacted-reasoning.test.ts` @v0.87.1.

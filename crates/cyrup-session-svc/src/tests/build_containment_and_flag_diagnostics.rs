@@ -476,3 +476,37 @@ async fn an_untrusted_project_extension_is_reported_but_never_fatal() {
         "an untrusted project must not exit 1; got {diags:?}"
     );
 }
+
+// ================================================================================ CFG-088 =======
+
+/// The session's own settings manager's load failure reaches `runtime.diagnostics` as a WARNING in
+/// pi's `collectSettingsDiagnostics` shape — `Invalid settings file <path>: <msg>`
+/// (`core/settings-diagnostics.ts:4-9` @v0.87.1, merged at `main.ts:782-785`) — so the bin can merge
+/// it with its startup manager's, deduplicate, and decide where it is shown. It is not fatal.
+#[tokio::test]
+async fn an_invalid_settings_file_is_a_runtime_warning_naming_the_file() {
+    let fx = fixture();
+    let global = fx.agent_dir.join("settings.json");
+    std::fs::write(&global, "{ not json").unwrap();
+    let store: Arc<dyn cyrup_config::SettingsStore> = Arc::new(
+        cyrup_config::FileSettingsStore::new(global.clone(), fx.cwd.join(".cyrup/settings.json")),
+    );
+    let runtime = AgentSessionRuntime::create(
+        Arc::new(SessionFactory::new(faux(), base_config(&fx)).settings_store(store)),
+        SessionTarget::New,
+    )
+    .await
+    .expect("a broken settings file degrades the scope, it does not fail the build");
+
+    let diags = runtime.diagnostics().await;
+    let prefix = format!("Invalid settings file {}: ", global.display());
+    let settings: Vec<_> = diags
+        .iter()
+        .filter(|d| d.source.as_deref() == Some("settings"))
+        .collect();
+    assert!(!settings.is_empty(), "{diags:?}");
+    for d in settings {
+        assert_eq!(d.severity, "warning");
+        assert!(d.message.starts_with(&prefix), "{}", d.message);
+    }
+}

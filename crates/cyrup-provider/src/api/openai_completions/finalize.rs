@@ -33,6 +33,7 @@ pub(super) fn build_final_message(dec: Decoder, model: &Model, api: &ApiId) -> A
         deferred: None,
         error_message: dec.error_message,
         raw_stop_reason: dec.raw_stop_reason,
+        end_turn: None,
         timestamp: now_millis(),
     }
 }
@@ -44,10 +45,15 @@ pub(super) fn parse_usage(raw: &Value, model: &Model) -> Usage {
     let prompt = u64_at(raw, "prompt_tokens");
     let completion = u64_at(raw, "completion_tokens");
     let details = raw.get("prompt_tokens_details");
+    // Providers disagree on where cache hits go (openai-completions.ts:1523-1530 @v0.87.1):
+    // OpenAI/OpenRouter use `prompt_tokens_details.cached_tokens`, DeepSeek uses
+    // `prompt_cache_hit_tokens`, and Kimi documents a top-level `usage.cached_tokens` on the final
+    // usage chunk.
     let cache_read = details
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64)
         .or_else(|| raw.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .or_else(|| raw.get("cached_tokens").and_then(Value::as_u64))
         .unwrap_or(0);
     let cache_write = details
         .and_then(|d| d.get("cache_write_tokens"))

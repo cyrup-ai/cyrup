@@ -75,7 +75,7 @@ impl BundledRoot {
         }
     }
 
-    /// The prompt ROOT contributed to `promptPaths` — a directory, never a file (FLUX_01 Fact 4):
+    /// The prompt ROOT contributed to `promptPaths` — a directory, never a file (port doc §0.4):
     /// `add_prompt_path` loads a file by BASENAME (losing the `flux/` namespace) and a directory
     /// through the recursive namespaced scanner.
     #[must_use]
@@ -83,7 +83,7 @@ impl BundledRoot {
         self.path().join("prompts")
     }
 
-    /// The bundled skill entry point contributed to `skillPaths` (FLUX_06) — a FILE:
+    /// The bundled skill entry point contributed to `skillPaths` (port doc §3.3) — a FILE:
     /// `add_skill_path` loads a `SKILL.md` path directly.
     #[must_use]
     pub fn skill_md(&self) -> PathBuf {

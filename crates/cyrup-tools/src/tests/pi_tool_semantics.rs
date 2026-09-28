@@ -258,7 +258,7 @@ impl FsOps for CancelOnWrite {
 /// ported v0.83.0 too (`:219`), so this is baseline debt rather than drift.
 ///
 /// cyrup checked only before the write, so a cancel landing during it produced
-/// `Successfully wrote N bytes` where pi reports an aborted tool error. Pi does NOT undo the
+/// `Successfully wrote to …` where pi reports an aborted tool error. Pi does NOT undo the
 /// write — the bytes stay on disk and only the RESULT is reported as aborted — which this pins on
 /// both halves. RED before; GREEN after.
 #[tokio::test]

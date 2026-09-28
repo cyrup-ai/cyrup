@@ -495,6 +495,7 @@ impl SubagentExecutor {
                         // used to REFUSE this combination outright, citing a pi precedent that does
                         // not exist; see the note at `route_single`'s background branch.
                         timeout_ms,
+                        checkpoint_before_deadline_ms: None,
                         // The `/chain`//`/parallel`//`/run-chain --bg` surface and the tool's CHAIN/
                         // PARALLEL modes expose no `share`/`artifacts` param — those are
                         // `subagent`-tool SINGLE-mode only, per pi's own schema.

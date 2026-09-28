@@ -49,10 +49,9 @@ fn header_set(headers: &mut HeaderMap, name: &str, value: Option<String>) {
 ///
 /// `originator: "pi"` and the `pi (...)` User-Agent are sent verbatim, NOT rebranded: the ChatGPT
 /// backend gates on this client identity, which makes it protocol, not branding — the same reason
-/// `anthropic-messages` sends `claude-cli/<version>` + `x-app: cli` unchanged. Node's
-/// `os.release()` (kernel version) has no `std` equivalent and no C dependency is being added for a
-/// User-Agent, so the platform triple is `(<os>; <arch>)`; upstream's own browser branch shortens it
-/// further, to `pi (browser)`.
+/// `anthropic-messages` sends `claude-cli/<version>` + `x-app: cli` unchanged. The platform tokens
+/// are Node's, built by [`crate::utils::user_agent::platform_user_agent`] — the same function the
+/// seven `cyrup (…)` adapters use.
 pub(super) fn build_sse_headers(
     model: &Model,
     auth: &AuthResult,
@@ -118,7 +117,7 @@ pub(super) fn build_sse_headers(
     headers
 }
 
-/// pi `` `pi (${_os.platform()} ${_os.release()}; ${_os.arch()})` `` (`:1594`).
+/// pi `headers.set("User-Agent", getPiUserAgent())` (`openai-codex-responses.ts:1626` @v0.87.1).
 fn codex_user_agent() -> String {
-    format!("pi ({}; {})", std::env::consts::OS, std::env::consts::ARCH)
+    crate::utils::user_agent::platform_user_agent("pi")
 }

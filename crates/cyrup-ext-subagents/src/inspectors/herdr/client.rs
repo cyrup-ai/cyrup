@@ -32,7 +32,8 @@
 //! (`actions.ts:103-107`, `project-panes.ts:577-579`), `pane run` (`actions.ts:111`,
 //! `project-panes.ts:585`), `pane close` (`actions.ts:113,149`,
 //! `project-panes.ts:587,608,654`), `tab focus` (`focus.ts:40`) and `workspace focus`
-//! (`focus.ts:44`). herdr v0.9.1 publishes 105 methods (`tmp/herdr/src/api/schema.rs:47-271`).
+//! (`focus.ts:44`). herdr publishes 105 methods at `d59d060` (`tmp/herdr/src/api/schema.rs:47-271`
+//! there) — 104 at the `v0.9.1` tag, which has no `pane.clear` (HERDR-002).
 //!
 //! This adapter translates **nine `pane …` argv forms plus `--version`**, which line up against
 //! pi's six like this:
@@ -64,7 +65,8 @@
 //! (`tmp/herdr/src/api/schema.rs:140,198,182,233`).
 //!
 //! **When they appeared is NOT asserted**, because nothing here can establish it: `tmp/herdr` is
-//! one commit (`d59d060`, v0.9.1) with 50 commits of history and no release tags, so "predates
+//! read here at `d59d060` — an untagged `main` commit, not the `v0.9.1` tag (HERDR-002) — in a
+//! clone that then had 50 commits of history and no release tags, so "predates
 //! 0.7.5" would be a claim with no grep behind it. The floor is kept because its refusal sentence
 //! is model-visible and is upstream's stated contract — not because this tree can show herdr
 //! imposes it, and not because it can show herdr does not.

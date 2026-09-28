@@ -110,9 +110,9 @@ pub struct PaneProcessInfoParams {
 /// **This is `herdr pane run`.** The CLI verb is not a separate method: it sends
 /// `pane.send_input { text, keys: ["Enter"] }` (`tmp/herdr/src/cli/pane.rs:1039-1052`). `text` and
 /// `keys` are both optional on the wire (`"required": ["pane_id"]`) and are encoded in that order
-/// by `encode_api_input` (`tmp/herdr/src/app/api/panes.rs:1846-1853`), so text-then-Enter is one
+/// by `encode_api_input` (`tmp/herdr/src/app/api/panes.rs:1830-1837`), so text-then-Enter is one
 /// call rather than two. An unknown key name is `invalid_key` and **nothing is written** —
-/// herdr encodes before it sends (`panes.rs:1852`).
+/// herdr encodes before it sends (`panes.rs:1836`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaneSendInputParams {
     /// The pane to write to.
@@ -186,7 +186,7 @@ impl PaneReadParams {
 ///
 /// `source` is the authority name — herdr keys its per-source agent authority on it and
 /// `pane.clear_agent_authority` releases it. `agent` is normalised by herdr
-/// (`normalize_reported_agent_label`, `tmp/herdr/src/app/api/panes.rs:1556`) and an unusable label
+/// (`normalize_reported_agent_label`, `tmp/herdr/src/app/api/panes.rs:1540`) and an unusable label
 /// is `invalid_agent`. `seq` is the monotonic ordering token that lets herdr drop a report that
 /// arrives after a newer one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -238,7 +238,7 @@ impl PaneReportAgentParams {
 ///
 /// Binds a pane to a resumable agent session without also asserting a state. herdr turns
 /// `agent_session_id`/`agent_session_path` into an `AgentSessionRef`
-/// (`session_ref_from_report`, `tmp/herdr/src/app/api/panes.rs:1586-1591`), which is what later
+/// (`session_ref_from_report`, `tmp/herdr/src/app/api/panes.rs:1570-1575`), which is what later
 /// surfaces as [`super::agents::AgentSessionInfo`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaneReportAgentSessionParams {
@@ -258,7 +258,7 @@ pub struct PaneReportAgentSessionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session_path: Option<String>,
     /// How the session was started, normalised by herdr
-    /// (`normalize_session_start_source`, `tmp/herdr/src/app/api/panes.rs:1598-1600`).
+    /// (`normalize_session_start_source`, `tmp/herdr/src/app/api/panes.rs:1582-1584`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_start_source: Option<String>,
 }
@@ -359,7 +359,7 @@ impl PaneReportMetadataParams {
 ///
 /// Drops the reporting authority a `source` holds over a pane, leaving the pane's own screen
 /// detection in charge again (`AppEvent::HookAuthorityCleared`,
-/// `tmp/herdr/src/app/api/panes.rs:1786-1790`). `source` is optional — absent clears whatever
+/// `tmp/herdr/src/app/api/panes.rs:1770-1774`). `source` is optional — absent clears whatever
 /// authority the pane currently has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaneClearAgentAuthorityParams {
@@ -387,7 +387,7 @@ impl PaneClearAgentAuthorityParams {
 /// `PaneReleaseAgentParams` (`tmp/herdr/src/api/schema/panes.rs:518-525`).
 ///
 /// The shutdown counterpart of [`PaneReportAgentParams`]: this named agent is no longer in this
-/// pane (`AppEvent::HookAgentReleased`, `tmp/herdr/src/app/api/panes.rs:1804-1810`). Unlike
+/// pane (`AppEvent::HookAgentReleased`, `tmp/herdr/src/app/api/panes.rs:1788-1794`). Unlike
 /// [`PaneClearAgentAuthorityParams`], `source` **and** `agent` are both required, so a release
 /// cannot silently retire another reporter's agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -422,7 +422,7 @@ impl PaneReleaseAgentParams {
 /// `PaneInfo` (`tmp/herdr/src/api/schema/panes.rs:527-561`) — herdr's pane record.
 ///
 /// Answered by `pane.get`, `pane.focus` and **`pane.split`** (all three encode
-/// `ResponseResult::PaneInfo`, `tmp/herdr/src/app/api/panes.rs:132,159-168,484-500`), and carried
+/// `ResponseResult::PaneInfo`, `tmp/herdr/src/app/api/panes.rs:132,159-168,468-484`), and carried
 /// in bulk by `pane.list`, `pane.current` and `session.snapshot`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PaneInfo {
@@ -488,7 +488,7 @@ pub struct PaneInfo {
     /// `tmp/herdr/src/app/creation.rs:354`), initialised to `0`
     /// (`tmp/herdr/src/terminal/state.rs:180`) and advanced at three production sites:
     /// `tmp/herdr/src/terminal/state.rs:235` (`wrapping_add(1)` on a stripped-title change),
-    /// `tmp/herdr/src/app/actions.rs:428` and `tmp/herdr/src/app/api/panes.rs:1749` (both
+    /// `tmp/herdr/src/app/actions.rs:428` and `tmp/herdr/src/app/api/panes.rs:1733` (both
     /// `saturating_add(1)`, on metadata-token expiry and patch). So a cache over `pane.get`,
     /// `pane.list`, `pane.current` or [`super::session::SessionSnapshot`] keys on **this** field.
     ///
@@ -512,7 +512,7 @@ pub struct PaneScrollInfo {
 /// `pane.process_info`.
 ///
 /// Every field but `pane_id` is best-effort: herdr fills them from `detect::foreground_job`
-/// (`tmp/herdr/src/app/api/panes.rs:536-538`), which is a platform probe that can legitimately
+/// (`tmp/herdr/src/app/api/panes.rs:520-522`), which is a platform probe that can legitimately
 /// see nothing. An empty `foreground_processes` is *"herdr could not tell"*, not *"the pane is
 /// idle"*.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -618,7 +618,7 @@ pub struct PaneLayoutSplit {
 ///
 /// **This type's `revision` is always `0`** at this pin — on every payload that carries a
 /// `PaneReadResult`, not only on the direct answer to `pane.read`. herdr hard-codes the literal in
-/// the single `pane.read` dispatch (`tmp/herdr/src/app/api/panes.rs:1540`) and every other
+/// the single `pane.read` dispatch (`tmp/herdr/src/app/api/panes.rs:1524`) and every other
 /// producer routes through it: `pane.wait_for_output` copies the field it just read
 /// (`let revision = read.revision;`, `tmp/herdr/src/api/wait.rs:98`), the `pane.output_matched`
 /// subscription builds its event from the same helper
@@ -634,7 +634,7 @@ pub struct PaneLayoutSplit {
 /// **That `0` is a fact about the read, not about the protocol.** herdr does publish a real
 /// ordering token, on the pane and agent records: [`PaneInfo::revision`], the terminal's own
 /// counter (`tmp/herdr/src/app/creation.rs:354`, bumped at `tmp/herdr/src/terminal/state.rs:235`,
-/// `tmp/herdr/src/app/actions.rs:428` and `tmp/herdr/src/app/api/panes.rs:1749`), and
+/// `tmp/herdr/src/app/actions.rs:428` and `tmp/herdr/src/app/api/panes.rs:1733`), and
 /// [`super::agents::AgentInfo::revision`], which is that same value copied across
 /// (`tmp/herdr/src/app/agents.rs:400`). A fleet cache keys on either.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

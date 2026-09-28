@@ -42,6 +42,11 @@ scrolling-regions = ["ratatui/scrolling-regions"]
 
 [dependencies]
 cyrup-core = { workspace = true }
+# Already a transitive dep (via cyrup-session-svc); direct so `/tree` can format a label's RFC3339
+# timestamp the way pi's `formatLabelTimestamp` does (`tree_selector::format_label_timestamp`).
+time = { workspace = true }
+# The local time zone `formatLabelTimestamp` reads its clock in (`tree_selector::local_offset_at`).
+chrono = { workspace = true }
 cyrup-session-svc = { workspace = true }
 cyrup-resources = { workspace = true }
 # Already a transitive dep (via cyrup-session-svc) and a dev-dep below; promoted to a direct dependency

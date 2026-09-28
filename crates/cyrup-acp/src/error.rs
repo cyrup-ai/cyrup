@@ -145,6 +145,9 @@ impl AcpFailure {
             | E::Session(_)
             | E::Compaction(_)
             | E::Config(_)
+            // `SESS-055`'s invalid `compaction.*` setting: a settings fault, never a credential
+            // one.
+            | E::CompactionSetting(_)
             | E::Resources(_)
             | E::Extension(_)
             | E::Context(_) => AcpFailure::Internal {

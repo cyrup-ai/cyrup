@@ -196,13 +196,29 @@ pub struct PostBuild<'a> {
     /// `false` for the interactive host, which launches modelless and shows the
     /// `modelFallbackMessage` as a banner instead (SEAM-075).
     pub require_model: bool,
+    /// The startup settings manager's diagnostics, merged with the runtime's at the checkpoint
+    /// (pi `startupSettingsDiagnostics`, main.ts:657, :896). CFG-088.
+    pub startup_diagnostics: &'a [crate::diagnostics::Diagnostic],
+    /// Whether this is the interactive host: its merged diagnostics are handed to the TUI rather
+    /// than printed (pi `appMode !== "interactive"`, main.ts:898).
+    pub interactive: bool,
+}
+
+/// A runtime that passed [`launch`]'s checkpoints.
+pub struct Launched {
+    pub runtime: Arc<AgentSessionRuntime>,
+    pub session: Arc<AgentSession>,
+    /// The merged startup diagnostics an interactive run shows in its transcript (pi
+    /// `InteractiveMode({ startupDiagnostics })`, main.ts:936); always empty for the other hosts,
+    /// which printed them. CFG-088.
+    pub notices: Vec<crate::diagnostics::Diagnostic>,
 }
 
 /// Create the runtime, run pi's post-creation diagnostics checkpoint, apply the post-build knobs,
 /// and apply the mode-gated modelless stop.
 ///
 /// [`ControlFlow::Break`] carries the exit code the caller must return; [`ControlFlow::Continue`]
-/// carries the live runtime + session.
+/// carries the live runtime + session (and an interactive run's startup notices).
 ///
 /// SEAM-033 — `create_unannounced` is pi's `createAgentSessionRuntime`
 /// (agent-session-runtime.ts:414-432), which never emits `session_start`; the HOST announces.
@@ -218,17 +234,18 @@ pub async fn launch(
     factory: Arc<SessionFactory>,
     target: SessionTarget,
     post: PostBuild<'_>,
-) -> anyhow::Result<ControlFlow<i32, (Arc<AgentSessionRuntime>, Arc<AgentSession>)>> {
+) -> anyhow::Result<ControlFlow<i32, Launched>> {
     timings::time("createRuntime", timings::TimingLabel::Main);
     let runtime = AgentSessionRuntime::create_unannounced(factory, target)
         .await
         .context("building agent session runtime")?;
     timings::time("createAgentSessionRuntime", timings::TimingLabel::Main);
 
-    // Pi main.ts:843-848 (SEAM-S01) — report the runtime's build diagnostics and exit 1 on any
-    // error (today: the extension-flag reconciliation errors and the extension LOAD failures).
-    // Same checkpoint, every mode.
-    if diagnostics::report_runtime(&runtime).await {
+    // Pi main.ts:895-904 (SEAM-S01, CFG-088) — report the merged startup + runtime diagnostics
+    // and exit 1 on any runtime error. Same checkpoint, every mode.
+    let report =
+        diagnostics::report_runtime(&runtime, post.startup_diagnostics, post.interactive).await;
+    if report.fatal {
         runtime.dispose().await;
         crate::output_guard::restore_stdout();
         return Ok(ControlFlow::Break(1));
@@ -255,7 +272,11 @@ pub async fn launch(
         diagnostics::no_models_available();
         return Ok(ControlFlow::Break(1));
     }
-    Ok(ControlFlow::Continue((runtime, session)))
+    Ok(ControlFlow::Continue(Launched {
+        runtime,
+        session,
+        notices: report.notices,
+    }))
 }
 
 /// Apply the per-run, post-build session knobs that have no `SessionConfig` slot: the trimmed

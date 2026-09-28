@@ -196,6 +196,8 @@ fn child_result(child_run_id: &str) -> SingleResult {
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
+        tool_budget_blocked: false,
+        session_name: None,
         usage_budget: None,
         error: None,
         saved_output_path: None,

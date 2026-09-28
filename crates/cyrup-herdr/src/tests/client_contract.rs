@@ -13,7 +13,7 @@ use crate::transport::DEFAULT_TIMEOUT;
 
 /// AUG §5.2's deadline row, and the reason it exists: **herdr imposes none**.
 /// `dispatch_to_app` is a `recv()` with a `None` timeout
-/// (`tmp/herdr/src/api/server.rs:911-913`), so a wedged UI never answers and never closes. 15 s
+/// (`tmp/herdr/src/api/server.rs:896-898`), so a wedged UI never answers and never closes. 15 s
 /// matches pi's own `SocketRpcClient` (`src/runs/shared/herdr-connection.ts:78` @v0.68.0) and is
 /// deliberately longer than herdr's 5 s `APP_RESPONSE_TIMEOUT` (`server.rs:29`), so a herdr that
 /// is merely slow gets to answer — including with its own `timeout` code.
@@ -34,7 +34,7 @@ fn the_default_request_deadline_is_fifteen_seconds() {
 }
 
 /// Constructing a client must touch nothing: herdr serves one request per connection
-/// (`tmp/herdr/src/api/server.rs:156-317`), so there is no connection worth holding, and
+/// (`tmp/herdr/src/api/server.rs:156-304`), so there is no connection worth holding, and
 /// [`HerdrClient::new`] is a path and a deadline (`tmp/herdr/src/api/client.rs:33-44` is the same
 /// shape).
 ///

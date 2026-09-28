@@ -363,6 +363,14 @@ pub struct RunnerConfig {
     /// `#[serde(default)]` (`None`) = no deadline, the pre-SUBA-N03 behaviour.
     #[serde(default)]
     pub deadline_at_ms: Option<u64>,
+    /// SUBA-128 — pi `config.checkpointBeforeDeadlineMs` (`subagent-runner.ts:210` @v0.71.0): with
+    /// a [`Self::deadline_at_ms`], the runner asks the running child this many milliseconds before
+    /// the deadline to finish its current tool call and hand off (`:3383-3406`).
+    ///
+    /// `#[serde(default)]` (`None`) = no checkpoint request, which is also what an older on-disk
+    /// config deserializes to.
+    #[serde(default)]
+    pub checkpoint_before_deadline_ms: Option<u64>,
     /// SUBA-N03 — pi `config.share` (`subagent-runner.ts` config, fed from `async-execution.ts:965`
     /// `share: shareEnabled`): the run's `share` opt-in, threaded onto every dispatched step's
     /// [`crate::exec::RunOptions::share`].
@@ -592,6 +600,7 @@ mod tests {
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
             deadline_at_ms: None,
+            checkpoint_before_deadline_ms: None,
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
@@ -659,6 +668,7 @@ mod tests {
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
             deadline_at_ms: None,
+            checkpoint_before_deadline_ms: None,
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),

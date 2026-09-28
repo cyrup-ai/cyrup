@@ -124,7 +124,7 @@ fn a_failed_extension_load_reports_and_exits_1_in_json_mode() {
 /// …and in rpc mode, which never renders a startup panel at all.
 #[test]
 fn a_failed_extension_load_reports_and_exits_1_in_rpc_mode() {
-    let (r, _tmp) = run(true, &["--rpc"]);
+    let (r, _tmp) = run(true, &["--mode", "rpc"]);
     assert_eq!(r.code, 1, "stderr was: {}", r.stderr);
     assert!(
         r.stderr.contains("Failed to load extension"),

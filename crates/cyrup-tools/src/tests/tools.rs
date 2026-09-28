@@ -574,7 +574,7 @@ async fn write_creates_dirs_and_holds_one_mutator_per_path() {
         )
         .await
         .unwrap();
-    assert!(first_text(&r).contains("Successfully wrote 5 bytes"));
+    assert_eq!(first_text(&r), "Successfully wrote to nested/deep/f.txt");
     assert_eq!(
         std::fs::read_to_string(cwd.join("nested/deep/f.txt")).unwrap(),
         "hello"
@@ -1798,9 +1798,11 @@ async fn read_offset_bound_counts_trailing_newline_line() {
     );
 }
 
-// gap #8 — write reports JS string length (UTF-16 units), not UTF-8 bytes (write.ts:222).
+// TOOL-049 — pi v0.85.0 dropped the count from write's result (write.ts:86 @v0.87.1): it was
+// `content.length`, UTF-16 code units mislabelled as bytes. Non-ASCII content is the case the old
+// text got wrong, so pin the exact string for it.
 #[tokio::test]
-async fn write_reports_utf16_length() {
+async fn write_result_carries_no_count() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
     let write = WriteTool::new(
@@ -1809,7 +1811,6 @@ async fn write_reports_utf16_length() {
         cwd.clone(),
         Default::default(),
     );
-    // "é𝄞" = 1 (é, 1 UTF-16 unit) + 1 (𝄞, astral, 2 UTF-16 units) = 3 UTF-16 units, 6 UTF-8 bytes.
     let r = write
         .execute(
             cid(),
@@ -1819,13 +1820,9 @@ async fn write_reports_utf16_length() {
         )
         .await
         .unwrap();
-    assert!(
-        first_text(&r).contains("Successfully wrote 3 bytes to u.txt"),
-        "got: {}",
-        first_text(&r)
-    );
+    assert_eq!(first_text(&r), "Successfully wrote to u.txt");
     // gap #6 — Pi declares `ToolDefinition<…, undefined>` and returns `details: undefined`
-    // (write.ts:223); cyrup must emit `None`, never a `{bytesWritten}` payload.
+    // (write.ts:87 @v0.87.1); cyrup must emit `None`, never a `{bytesWritten}` payload.
     assert!(
         r.details.is_none(),
         "write must emit no details: {:?}",

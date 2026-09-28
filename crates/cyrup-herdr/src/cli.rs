@@ -4,7 +4,7 @@
 //!
 //! herdr's own CLI is itself a socket client. `send_request` (`tmp/herdr/src/cli.rs:769-775`)
 //! resolves a socket, makes a `ping` connection for `ensure_server_protocol_compatible`
-//! (`:784-801`) and then a second connection for the verb — two connections per invocation, plus a
+//! (`:784-802`) and then a second connection for the verb — two connections per invocation, plus a
 //! process. Everything it can do on the wire, [`crate::HerdrClient`] can do in-process and
 //! cheaper.
 //!

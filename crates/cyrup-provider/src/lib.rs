@@ -188,7 +188,8 @@ pub use utils::overflow::{is_context_overflow, overflow_patterns};
 pub use utils::provider_retry::{DEFAULT_MAX_RETRY_DELAY_MS, ProviderRetry};
 pub use utils::refresh::RefreshDedup;
 pub use utils::retry::{
-    RetryObserver, RetryPolicy, is_retryable_assistant_error, retry_assistant_call,
+    DEFAULT_MAX_AGENT_RETRY_DELAY_MS, RetryObserver, RetryPolicy, is_retryable_assistant_error,
+    retry_assistant_call, retry_delay_ms,
 };
 pub use utils::simple_options::{
     SimpleStreamOptions, ThinkingBudgets, adjust_max_tokens_for_thinking, build_base_options,

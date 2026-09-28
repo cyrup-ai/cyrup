@@ -73,6 +73,7 @@ impl SubagentExecutor {
             thinking,
             turn_budget,
             usage_budget,
+            checkpoint_before_deadline_ms,
         } = request;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before agent discovery or
         // fork-context resolution below, and therefore also before `spawn_background_steps`' own
@@ -385,6 +386,11 @@ impl SubagentExecutor {
                 timeout_ms: Some(
                     timeout_ms.unwrap_or(crate::background::DEFAULT_ASYNC_CHILD_TIMEOUT_MS),
                 ),
+                // SUBA-128 — pi `checkpointBeforeDeadlineMs: data.params?.checkpointBeforeDeadlineMs
+                // ?? deps.config.checkpointBeforeDeadlineMs` (`subagent-executor.ts:3460` @v0.71.0),
+                // handed only to `executeAsyncSingle` — so only this path carries it.
+                checkpoint_before_deadline_ms: checkpoint_before_deadline_ms
+                    .or_else(|| cfg.checkpoint_before_deadline_ms()),
                 // SUBA-N03: `share` (pi `share: shareEnabled`, `async-execution.ts:965`).
                 share,
                 // SUBA-N03: pi's `artifactsDir: artifactConfig.enabled ? artifactsDir : undefined`
@@ -490,6 +496,7 @@ impl SubagentExecutor {
             capability_ceiling: requested_capability_ceiling,
             model_origin: stored_model_origin,
             model_response_aliases: requested_model_response_aliases,
+            checkpoint_before_deadline_ms,
         } = spec;
         let cfg = self.config_snapshot().await;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before run-directory creation
@@ -504,6 +511,14 @@ impl SubagentExecutor {
                 current: depth.current_depth,
                 max: depth.max_depth,
             });
+        }
+        // SUBA-135 — pi `spawnRunner`'s `preflightLaunchCwd(requestedCwd, cwd)`
+        // (`async-execution.ts:648-650` @v0.71.0): the runner's own cwd is refused by name before
+        // the async dir, the status file or the runner exist, so a bad cwd never yields a receipt.
+        if let Some(refusal) =
+            crate::exec::launch_cwd::preflight_launch_cwd(&cwd.display().to_string(), cwd)
+        {
+            return Err(SubagentError::Management(refusal));
         }
         // Launch-time refusal of `fast` for a foreign runner — pi `async-execution.ts:1012` (every
         // step of `buildAsyncRunnerSteps`) and `:1756` (`executeAsyncSingle`) @v0.68.0, both BEFORE
@@ -829,6 +844,7 @@ impl SubagentExecutor {
             // detached runner has neither) and carried verbatim.
             timeout_ms,
             deadline_at_ms,
+            checkpoint_before_deadline_ms,
             share,
             artifacts_dir,
             artifact_config,
@@ -945,12 +961,21 @@ impl SubagentExecutor {
             return Err(SubagentError::Spawn(error));
         }
 
-        let pid = match crate::background::spawn_detached::spawn_detached_runner_with_command(
+        // SUBA-141 — pi `proc.once("close", …)` (`async-execution.ts:759-770` @v0.71.0): this
+        // process also watches the runner and finalizes its proof from the exit it observes, so a
+        // runner that dies without reaching its own tail leaves its exit code and signal behind.
+        let pid = match crate::background::spawn_detached::spawn_detached_runner_observed(
             &resolved_command,
             &cfg_path,
             &run_paths.runner_stdout_log,
             &run_paths.runner_stderr_log,
             &env_overlay,
+            crate::background::spawn_detached::RunnerCloseObserver {
+                run_dir: run_paths.run_dir.clone(),
+                run_id: run_id.clone(),
+                process_instance_id: runner_process_instance_id.clone(),
+                lease_root: crate::background::session_leases_root_in(&cfg.roots),
+            },
         ) {
             Ok(pid) => pid,
             Err(error) => {
@@ -1241,6 +1266,213 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         }
     }
 
+    /// SUBA-135 — pi `preflightLaunchCwd` (`runs/shared/launch-cwd.ts:3-16` @v0.71.0), driven
+    /// through the REAL tool entry: a typo'd `cwd` is refused by name before anything is launched,
+    /// and an async launch leaves no run directory and no receipt behind.
+    mod launch_cwd_preflight {
+        use super::*;
+        use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
+        use crate::paths::Roots;
+        use crate::spawn::SpawnCommand;
+
+        const PERSONA: &str = "---\nname: helper\ndescription: H\n---\n\nbody\n";
+
+        fn entries(dir: &Path) -> Vec<PathBuf> {
+            match std::fs::read_dir(dir) {
+                Ok(read) => read.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+
+        pub(super) async fn tool_for(dir: &Path) -> crate::extension::tool::SubagentTool {
+            let agents = dir.join(".cyrup").join("agents");
+            std::fs::create_dir_all(&agents).expect("mkdir agents");
+            std::fs::write(agents.join("helper.md"), PERSONA).expect("write persona");
+            let executor = Arc::new(SubagentExecutor::new());
+            crate::extension::testsupport::arm_scoped_missions(&executor, dir).await;
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = Roots::sandboxed(dir);
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+            }
+            crate::extension::tool::SubagentTool::new(executor, dir.to_path_buf())
+        }
+
+        pub(super) async fn launch_text(
+            tool: &crate::extension::tool::SubagentTool,
+            params: serde_json::Value,
+        ) -> String {
+            match crate::extension::testsupport::dispatch_tool(tool, params).await {
+                Ok(result) => crate::extension::testsupport::tool_text(&result),
+                Err(error) => error.to_string(),
+            }
+        }
+
+        /// A SINGLE launch, foreground or async, names the resolved path and the typed spelling.
+        #[tokio::test]
+        async fn a_missing_single_launch_cwd_is_refused_before_launch_with_its_typed_spelling() {
+            for is_async in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let tool = tool_for(dir.path()).await;
+                let text = launch_text(
+                    &tool,
+                    serde_json::json!({"agent": "helper", "task": "t", "async": is_async, "cwd": "nope"}),
+                )
+                .await;
+                assert_eq!(
+                    text,
+                    format!(
+                        "Subagent launch aborted: cwd does not exist: {}\n(resolved from \"nope\")",
+                        dir.path().join("nope").display()
+                    ),
+                    "async={is_async}"
+                );
+                let roots = Roots::sandboxed(dir.path());
+                assert!(
+                    entries(&default_async_root_in(&roots, dir.path())).is_empty(),
+                    "async={is_async}: no run directory"
+                );
+                assert!(
+                    entries(&default_results_dir_in(&roots, dir.path())).is_empty(),
+                    "async={is_async}: no result"
+                );
+            }
+        }
+
+        /// A cwd that is a FILE is "not a directory", and a CHAIN call is refused the same way,
+        /// foreground or async, before any run exists — and before the mission binding could
+        /// create the directory it names (the tool entry's own note).
+        #[tokio::test]
+        async fn a_non_directory_cwd_is_refused_on_the_chain_paths_too() {
+            for is_async in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                std::fs::write(dir.path().join("afile"), "x").expect("write");
+                let tool = tool_for(dir.path()).await;
+                let text = launch_text(
+                    &tool,
+                    serde_json::json!({"chain": [{"agent": "helper", "task": "t"}], "async": is_async, "cwd": "afile"}),
+                )
+                .await;
+                assert!(
+                    text.contains(&format!(
+                        "Subagent launch aborted: cwd is not a directory: {}",
+                        dir.path().join("afile").display()
+                    )),
+                    "async={is_async}: {text}"
+                );
+                let roots = Roots::sandboxed(dir.path());
+                assert!(
+                    entries(&default_async_root_in(&roots, dir.path())).is_empty(),
+                    "async={is_async}: no run directory"
+                );
+            }
+        }
+    }
+
+    /// SUBA-128 — `checkpointBeforeDeadlineMs` (`extension/schemas.ts:363`, resolved at
+    /// `subagent-executor.ts:3460` @v0.71.0 as `params.checkpointBeforeDeadlineMs ??
+    /// config.checkpointBeforeDeadlineMs`) reaches the detached runner of an async SINGLE launch,
+    /// through the REAL tool entry.
+    mod checkpoint_before_deadline_launch {
+        use super::launch_cwd_preflight::{launch_text, tool_for};
+        use super::*;
+
+        fn runner_configs(root: &Path) -> Vec<crate::background::runner_main::RunnerConfig> {
+            let mut found = Vec::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(dir) = pending.pop() {
+                let Ok(read) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in read.filter_map(Result::ok) {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else if path
+                        .file_name()
+                        .is_some_and(|name| name == "runner-config.json")
+                    {
+                        let raw = std::fs::read_to_string(&path).expect("read config");
+                        found.push(serde_json::from_str(&raw).expect("runner config parses"));
+                    }
+                }
+            }
+            found
+        }
+
+        async fn launched_checkpoint(
+            config_default: Option<serde_json::Value>,
+            params: serde_json::Value,
+        ) -> (String, Vec<Option<u64>>) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let tool = tool_for(dir.path()).await;
+            tool.executor()
+                .config_cell()
+                .lock()
+                .await
+                .checkpoint_before_deadline_ms = config_default;
+            let text = launch_text(&tool, params).await;
+            let checkpoints = runner_configs(dir.path())
+                .into_iter()
+                .map(|config| config.checkpoint_before_deadline_ms)
+                .collect();
+            (text, checkpoints)
+        }
+
+        #[tokio::test]
+        async fn the_call_wins_the_config_default_fills_in_and_a_bad_value_is_refused() {
+            let (text, checkpoints) = launched_checkpoint(
+                Some(serde_json::json!(3_000)),
+                serde_json::json!({"agent": "helper", "task": "t", "async": true, "timeoutMs": 10_000, "checkpointBeforeDeadlineMs": 5_000}),
+            )
+            .await;
+            assert_eq!(checkpoints, vec![Some(5_000)], "{text}");
+
+            let (text, checkpoints) = launched_checkpoint(
+                Some(serde_json::json!(3_000)),
+                serde_json::json!({"agent": "helper", "task": "t", "async": true, "timeoutMs": 10_000}),
+            )
+            .await;
+            assert_eq!(checkpoints, vec![Some(3_000)], "{text}");
+
+            let (text, checkpoints) = launched_checkpoint(
+                None,
+                serde_json::json!({"agent": "helper", "task": "t", "async": true}),
+            )
+            .await;
+            assert_eq!(checkpoints, vec![None], "{text}");
+
+            let (text, checkpoints) = launched_checkpoint(
+                None,
+                serde_json::json!({"agent": "helper", "task": "t", "async": true, "checkpointBeforeDeadlineMs": 0}),
+            )
+            .await;
+            assert_eq!(
+                text,
+                "checkpointBeforeDeadlineMs must be a positive integer no larger than 2147483647."
+            );
+            assert!(checkpoints.is_empty(), "a refused launch writes no config");
+
+            // The schema bounds hold for every call shape, as pi's argument validation does,
+            // not only on the one launch that reads the value.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let tool = tool_for(dir.path()).await;
+            for params in [
+                serde_json::json!({"agent": "helper", "task": "t", "checkpointBeforeDeadlineMs": 0}),
+                serde_json::json!({"chain": [{"agent": "helper", "task": "t"}], "checkpointBeforeDeadlineMs": 2_147_483_648_u64}),
+            ] {
+                assert_eq!(
+                    launch_text(&tool, params.clone()).await,
+                    "checkpointBeforeDeadlineMs must be a positive integer no larger than 2147483647.",
+                    "{params}"
+                );
+            }
+        }
+    }
+
     /// The inherited capability ceiling (`CYRUP_SUBAGENT_CAPABILITY_CEILING_V1`, pi
     /// `resolveCurrentSubagentCapabilityCeiling`, `capability-ceiling.ts:168-170` @v0.68.0) is
     /// read through the extension's env seam on the async launch path, so a MALFORMED inherited
@@ -1411,6 +1643,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
             session_dir: None,
             artifacts: None,
             timeout_ms: None,
+            checkpoint_before_deadline_ms: None,
         }
     }
 
@@ -1449,6 +1682,41 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         crate::background::active_async_capacity::read_owner(slot)
             .await
             .expect("owner.json")
+    }
+
+    /// SUBA-135 — pi `spawnRunner`'s own `preflightLaunchCwd` (`async-execution.ts:648-650`
+    /// @v0.71.0): an async launch that did not come through the tool (the `/run` slash path, a
+    /// revive) is still refused by name before the async root, the run directory or the runner
+    /// exist.
+    #[tokio::test]
+    async fn an_async_launch_into_a_missing_cwd_is_refused_before_any_run_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = crate::paths::Roots::sandboxed(dir.path());
+            cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                binary: PathBuf::from("true"),
+                base_args: Vec::new(),
+            });
+        }
+        let missing = dir.path().join("gone");
+
+        let error = executor
+            .spawn_background(bare_background_request(&missing))
+            .await
+            .expect_err("a missing cwd must refuse the launch");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Subagent launch aborted: cwd does not exist: {}",
+                missing.display()
+            )
+        );
+        assert!(
+            !missing.exists(),
+            "the refused launch creates nothing there"
+        );
     }
 
     /// SCOPE_9 — **the leak test.** Between the claim and `Ok(run_id)` there are two fallible
@@ -1754,6 +2022,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                 session_dir: Some(session_root.display().to_string()),
                 artifacts: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -1889,6 +2158,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                 artifacts: None,
                 session_dir: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -1969,6 +2239,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                     session_dir: None,
                     artifacts,
                     timeout_ms: None,
+                    checkpoint_before_deadline_ms: None,
                 })
                 .await
                 .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -2062,6 +2333,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                 session_dir: None,
                 artifacts: None,
                 timeout_ms: Some(60_000),
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -2126,6 +2398,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                 session_dir: None,
                 artifacts: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect("spawn_background should succeed");
@@ -2189,6 +2462,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                 session_dir: None,
                 artifacts: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect("spawn_background should succeed")
@@ -2313,6 +2587,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                     session_dir: None,
                     artifacts: None,
                     timeout_ms: None,
+                    checkpoint_before_deadline_ms: None,
                 })
                 .await
                 .expect("spawn_background should succeed");
@@ -2410,6 +2685,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                 session_dir: None,
                 artifacts: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -2483,6 +2759,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                 session_dir: None,
                 artifacts: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -2571,6 +2848,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
                 session_dir: None,
                 artifacts: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
@@ -2961,6 +3239,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                     // dropped field (`None` / `default()`).
                     artifacts: Some(true),
                     timeout_ms: Some(60_000),
+                    checkpoint_before_deadline_ms: None,
                 })
                 .await
                 .expect("the launch succeeds and writes its descriptor");
@@ -3717,6 +3996,7 @@ mutationTools: apply_patch, notebook_edit\n",
                         include_progress: None,
                         run_id: run_id.clone(),
                         timeout_ms: None,
+                        checkpoint_before_deadline_ms: None,
                         share: None,
                         artifacts_dir: None,
                         artifact_config: ArtifactConfig::default(),
@@ -3795,6 +4075,7 @@ mutationTools: apply_patch, notebook_edit\n",
                 include_progress: None,
                 run_id,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
                 share: None,
                 artifacts_dir: None,
                 artifact_config: ArtifactConfig::default(),

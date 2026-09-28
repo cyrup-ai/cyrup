@@ -125,3 +125,16 @@ fn copilot_dynamic_headers_on_the_responses_route() {
     assert!(!plain.contains_key("X-Initiator"));
     assert!(!plain.contains_key("Openai-Intent"));
 }
+
+/// PROV-095 — pi `{ "User-Agent": getPiUserAgent(), ...model.headers }` (openai-responses.ts:248
+/// @v0.87.1, #8305): a default client User-Agent under every overlay.
+#[test]
+fn default_user_agent_sits_under_the_overlays() {
+    crate::utils::user_agent::assert_default_user_agent_under_overlays(|overlay| {
+        let opts = StreamOptions {
+            headers: overlay,
+            ..Default::default()
+        };
+        build_headers(&model(), &Context::default(), &auth(), &opts, "sk")
+    });
+}

@@ -261,13 +261,104 @@ fn explicit_prompt_cache_mode_only_on_opt_in_and_none_retention() {
         body.get("prompt_cache_key").is_none(),
         "retention none never writes a cache key"
     );
-    for r in [CacheRetention::Short, CacheRetention::Long] {
-        assert!(
-            build_params(&m, &ctx, &opts(r), None)
-                .get("prompt_cache_options")
-                .is_none()
-        );
-    }
+    assert!(
+        build_params(&m, &ctx, &opts(CacheRetention::Short), None)
+            .get("prompt_cache_options")
+            .is_none()
+    );
+}
+
+/// PROV-093 — pi `getPromptCacheRetention` / `getPromptCacheOptions` (`openai-responses.ts:83-100`
+/// @v0.87.1, v0.85.1), translated from the `"should use the supported long cache field for %s"`
+/// table in `test/cache-retention.test.ts` @v0.87.1: long retention on an explicit-mode (GPT-5.6+)
+/// model sends `prompt_cache_options: {ttl:"30m"}` and NO `prompt_cache_retention`, while a
+/// non-explicit model keeps `24h`. Red before the fix: cyrup sent `24h` to both and never a `ttl`.
+#[test]
+fn long_retention_picks_the_supported_cache_field() {
+    let ctx = user_ctx("hi");
+    let opts = StreamOptions {
+        cache_retention: Some(CacheRetention::Long),
+        session_id: Some("session-2".into()),
+        ..Default::default()
+    };
+
+    // `["gpt-4o-mini", "24h", undefined]`.
+    let body = build_params(&model(), &ctx, &opts, None);
+    assert_eq!(body["prompt_cache_key"], "session-2");
+    assert_eq!(body["prompt_cache_retention"], "24h");
+    assert!(body.get("prompt_cache_options").is_none());
+
+    // `["gpt-6-sol", undefined, { ttl: "30m" }]` — the explicit-mode family.
+    let mut explicit = model();
+    explicit.compat = Some(ModelCompat {
+        supports_explicit_prompt_cache_mode: Some(true),
+        ..Default::default()
+    });
+    let body = build_params(&explicit, &ctx, &opts, None);
+    assert_eq!(body["prompt_cache_key"], "session-2");
+    assert!(body.get("prompt_cache_retention").is_none(), "{body}");
+    assert_eq!(body["prompt_cache_options"], json!({ "ttl": "30m" }));
+
+    // `supportsLongCacheRetention: false` suppresses both long-cache fields.
+    explicit.compat = Some(ModelCompat {
+        supports_explicit_prompt_cache_mode: Some(true),
+        supports_long_cache_retention: Some(false),
+        ..Default::default()
+    });
+    let body = build_params(&explicit, &ctx, &opts, None);
+    assert!(body.get("prompt_cache_retention").is_none());
+    assert!(body.get("prompt_cache_options").is_none());
+}
+
+/// PROV-093 — pi `supportsMaxOutputTokens ?? true` gating `max_output_tokens`
+/// (`openai-responses.ts:79`, `:321` @v0.87.1, v0.85.0 #8941), translated from `"omits
+/// max_output_tokens when supportsMaxOutputTokens is false"` in
+/// `test/openai-responses-compat.test.ts` @v0.87.1.
+#[test]
+fn supports_max_output_tokens_false_omits_the_cap() {
+    let mut m = model();
+    let opts = StreamOptions {
+        max_tokens: Some(100),
+        ..Default::default()
+    };
+    assert_eq!(
+        build_params(&m, &user_ctx("hi"), &opts, None)["max_output_tokens"],
+        100
+    );
+    // The `models.json` spelling, since the key only ever reaches cyrup from there.
+    m.compat = Some(serde_json::from_value(json!({ "supportsMaxOutputTokens": false })).unwrap());
+    let body = build_params(&m, &user_ctx("hi"), &opts, None);
+    assert!(body.get("max_output_tokens").is_none(), "{body}");
+}
+
+/// PROV-094 — `if (options?.toolChoice !== undefined) params.tool_choice = options.toolChoice`
+/// (`openai-responses.ts:340-341` @v0.87.1; present since before v0.83.0). Translated from
+/// `"forwards required tool choice"` in `test/openai-responses-compat.test.ts` @v0.87.1, plus the
+/// unset and forced-function cases.
+#[test]
+fn tool_choice_reaches_the_responses_body() {
+    let m = model();
+    let ctx = user_ctx("hi");
+    let with = |tc: Option<ToolChoice>| {
+        build_params(
+            &m,
+            &ctx,
+            &StreamOptions {
+                tool_choice: tc,
+                ..Default::default()
+            },
+            None,
+        )
+    };
+    assert!(with(None).get("tool_choice").is_none());
+    assert_eq!(with(Some(ToolChoice::Required))["tool_choice"], "required");
+    assert_eq!(with(Some(ToolChoice::None))["tool_choice"], "none");
+    assert_eq!(
+        with(Some(ToolChoice::Function {
+            name: "ping".into()
+        }))["tool_choice"],
+        json!({ "type": "function", "name": "ping" })
+    );
 }
 
 /// PROV-045. Pi's first reasoning arm fires on `reasoningEffort || reasoningSummary`

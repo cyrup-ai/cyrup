@@ -1707,6 +1707,13 @@ pub(crate) fn detach_receipt(
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
+            tool_budget_blocked: false,
+            // SUBA-134 — the detached child keeps the name it was launched under.
+            session_name: crate::exec::child_session_name::derive_child_session_name(
+                Some(agent),
+                Some(task),
+                None,
+            ),
             model: None,
             attempted_models: Vec::new(),
             child_run_id: None,
@@ -1934,6 +1941,7 @@ mod tests {
         AgentDefinition {
             inherit_global_context: false,
             machine: None,
+            advertise: None,
             mutation_tools: None,
             name: "worker".to_string(),
             local_name: "worker".to_string(),

@@ -293,6 +293,8 @@ pub(super) async fn finish_run(
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
+            tool_budget_blocked: false,
+            session_name: None,
             agent: status
                 .steps
                 .first()
@@ -757,6 +759,7 @@ mod tests {
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
             deadline_at_ms: None,
+            checkpoint_before_deadline_ms: None,
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
@@ -857,6 +860,8 @@ mod tests {
                 turn_budget: None,
                 turn_budget_exceeded: false,
                 wrap_up_requested: false,
+                tool_budget_blocked: false,
+                session_name: None,
                 child_run_id: None,
                 agent: "researcher".to_string(),
                 task: "do the thing".to_string(),

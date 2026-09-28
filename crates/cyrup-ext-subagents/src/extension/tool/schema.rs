@@ -548,6 +548,9 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // and still cross-validates them (`resolve_foreground_timeout`).
     props.insert("timeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Optional run-level timeout in ms for foreground and async/background runs. Omitted: the agent's or configured default for foreground runs; async runs use the async default. Prefer this over maxRuntimeMs." }));
     props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "deprecated": true, "description": "Deprecated alias of timeoutMs; still accepted." }));
+    // SUBA-128 — pi `checkpointBeforeDeadlineMs` (`extension/schemas.ts:363` @v0.71.0), in
+    // upstream's position and with its own bounds and description.
+    props.insert("checkpointBeforeDeadlineMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "maximum": crate::registration::MAX_CHECKPOINT_BEFORE_DEADLINE_MS, "description": "Async single-agent runs only: the runner requests that the child checkpoint and stop this many ms before the run deadline (best-effort; the deadline kill still applies)." }));
     props.insert("agentScope".to_string(), serde_json::json!({ "type": "string", "description": "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" }));
     // SCOPE_19/B [CYRUP-DELTA] — upstream leaves `cwd` undescribed; a property with no description
     // makes a careful caller set it defensively. It is read by every execution mode.

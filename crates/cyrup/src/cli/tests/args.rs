@@ -94,3 +94,53 @@ fn model_flag_is_parsed_regardless_of_position() {
     );
     assert_eq!(after.positionals, vec!["Reply with pong".to_string()]);
 }
+
+/// SEAM-119 — `--use-theme <name>` (pi `cli/args.ts:190-197` @v0.87.1) is a real flag: it reaches
+/// `Cli::use_theme` through the whole `main.rs` pipeline instead of being captured as an unknown
+/// extension flag that swallows its value and exits 1 with `Unknown option: --use-theme`.
+#[test]
+fn use_theme_is_a_known_flag_carrying_its_name() {
+    let cli = parse_like_main(&["--use-theme", "light", "hello"]);
+    assert_eq!(cli.use_theme.as_deref(), Some("light"));
+    assert!(
+        cli.extension_flags.is_empty(),
+        "not captured as an extension flag: {:?}",
+        cli.extension_flags
+    );
+    assert_eq!(cli.positionals, vec!["hello".to_string()]);
+    // `name[/name]`: an auto pair is one value.
+    let pair = parse_like_main(&["--use-theme", "light/dark"]);
+    assert_eq!(pair.use_theme.as_deref(), Some("light/dark"));
+    // pi assigns `result.useTheme`, so the last occurrence stands.
+    let twice = parse_like_main(&["--use-theme", "light", "--use-theme", "dark"]);
+    assert_eq!(twice.use_theme.as_deref(), Some("dark"));
+    assert_eq!(parse_like_main(&[]).use_theme, None);
+}
+
+/// pi's one diagnostic for both unusable shapes — no next token, or a `-`-leading one — and in
+/// the second case the next token is NOT consumed, so `--use-theme --print` still sets `--print`.
+#[test]
+fn use_theme_without_a_name_is_pis_error_and_keeps_the_next_flag() {
+    let run = |args: &[&str]| {
+        let raw = normalize_short_aliases(args.iter().map(|s| s.to_string()));
+        crate::diagnostics::apply_arg_leniency(&raw)
+    };
+    let expected = vec![crate::Diagnostic::error(
+        "--use-theme requires a theme name",
+    )];
+
+    let (clean, diags) = run(&["--use-theme"]);
+    assert_eq!(diags, expected);
+    assert!(clean.is_empty(), "{clean:?}");
+
+    let (clean, diags) = run(&["--use-theme", "--print", "hi"]);
+    assert_eq!(diags, expected);
+    assert_eq!(clean, vec!["--print".to_string(), "hi".to_string()]);
+
+    let (_, diags) = run(&["--use-theme="]);
+    assert_eq!(diags, expected);
+
+    let (clean, diags) = run(&["--use-theme", "nord"]);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(clean, vec!["--use-theme".to_string(), "nord".to_string()]);
+}

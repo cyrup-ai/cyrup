@@ -26,7 +26,7 @@ pub(crate) struct RunCtx {
     pub(crate) shortcut_status_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
-impl App<InlineBackend<Stdout>> {
+impl App<InlineBackend<TuiStdout>> {
     /// The interactive event loop: `select!` over terminal input, the agent event stream, theme
     /// hot-reload, and cancellation (arch-10 §5). Renders with synchronized output. Submissions are
     /// routed to `session` (steer while streaming, else a fresh prompt; R-10-030).
@@ -231,7 +231,7 @@ impl App<InlineBackend<Stdout>> {
             if self.frames.due() {
                 let _frame = ArmGuard::enter("frame");
                 if self.frames.taken() {
-                    let _ = self.terminal.clear();
+                    self.reset_render_state();
                 }
                 self.draw_synchronized()?;
             }
@@ -464,7 +464,7 @@ impl App<InlineBackend<Stdout>> {
         // the loop without passing the top-of-body frame site again (PERF-005 §3.1).
         if self.frames.pending() {
             if self.frames.taken() {
-                let _ = self.terminal.clear();
+                self.reset_render_state();
             }
             let _ = self.draw_synchronized();
         }

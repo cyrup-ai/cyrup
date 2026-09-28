@@ -169,3 +169,40 @@ async fn a09_2_frontmatter_body_trimmed_and_crlf_normalized() {
     let t4 = PromptTemplate::load(&p4, ResourceScope::Cli, ResourceOrigin::Builtin).unwrap();
     assert_eq!(t4.body, "just text\nmore\n");
 }
+
+/// CFG-083 — a prompt template whose frontmatter YAML does not parse is DROPPED and reported as a
+/// prompt warning naming its path (pi `loadTemplateFromFile`, `core/prompt-templates.ts:118-125`
+/// @v0.87.1). A frontmatter that parses to a non-mapping is not a fault: pi keeps `parsed ?? {}`
+/// and its property reads find nothing, so the template loads with a body-derived description.
+#[tokio::test]
+async fn a_template_with_malformed_frontmatter_is_dropped_with_a_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        &root.join("global/prompts/bad.md"),
+        "---\ndescription: [unclosed\n---\nbody\n",
+    );
+    write(
+        &root.join("global/prompts/scalar.md"),
+        "---\njust a string\n---\nscalar body\n",
+    );
+    write(&root.join("global/prompts/good.md"), "good\n");
+
+    let report = run_discover(&cfg(root)).await;
+
+    assert!(!report.registry.prompts.contains("bad"));
+    assert!(report.registry.prompts.contains("good"));
+    let scalar = report
+        .registry
+        .prompts
+        .get_name("scalar")
+        .expect("a non-mapping frontmatter still loads");
+    assert_eq!(scalar.description, "scalar body");
+    let warnings: Vec<_> = report
+        .warnings
+        .iter()
+        .filter(|w| matches!(w.kind, crate::ResourceKind::Prompt))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", report.warnings);
+    assert!(warnings[0].path.ends_with("bad.md"));
+}

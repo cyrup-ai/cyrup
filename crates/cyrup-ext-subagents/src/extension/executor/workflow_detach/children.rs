@@ -297,11 +297,10 @@ pub(crate) fn workflow_result_children(
 
 /// One Arm-B child, built from its [`StepStatus`].
 ///
-/// Three upstream keys have no `SingleResult` home and are recorded here rather than dropped
+/// Two upstream keys have no `SingleResult` home and are recorded here rather than dropped
 /// silently (SCOPE_8 §W-7's "publish only the fields that exist", extended to this function):
 /// `workflowKey` — cyrup's keyed inventory is [`ResultFile::workflow_children`], which
-/// `plan_workflow_settlement` stamps from the same steps; `sessionName` — carried on the step and
-/// on the summary row, not on the result; `outputPathMapping` — carried on
+/// `plan_workflow_settlement` stamps from the same steps; `outputPathMapping` — carried on
 /// [`StepStatus::output_path_mapping`], which the driver stamps and which reaches the operator
 /// through [`crate::workflows::workflow_output_path_mapping_summary`].
 fn step_child(step: &StepStatus, output: &str) -> SingleResult {
@@ -339,6 +338,9 @@ fn step_child(step: &StepStatus, output: &str) -> SingleResult {
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
+        tool_budget_blocked: false,
+        // SUBA-134 — pi `sessionName: step.sessionName` onto the child result.
+        session_name: step.session_name.clone(),
         usage_budget: None,
         error: step.error.clone(),
         saved_output_path: None,

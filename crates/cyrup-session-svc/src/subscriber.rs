@@ -55,6 +55,30 @@ impl Fanout {
         Box::pin(ReceiverStream::new(rx))
     }
 
+    /// A run-scoped subscription that is NOT yet registered: the stream is handed out now and its
+    /// sender joins the run-scoped set only when [`Self::adopt_run`] is called. This is how a
+    /// `prompt` deferred past an `agent_settled` emit (SEAM-129) returns its stream at once without
+    /// the settling run's [`Self::end_run`] closing it; dropping the sender unadopted ends it.
+    pub(crate) fn detached_run(
+        &self,
+    ) -> (
+        mpsc::Sender<AgentSessionEvent>,
+        EventStream<AgentSessionEvent>,
+    ) {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        (tx, Box::pin(ReceiverStream::new(rx)))
+    }
+
+    /// Register a [`Self::detached_run`] sender as run-scoped.
+    pub(crate) fn adopt_run(&self, tx: mpsc::Sender<AgentSessionEvent>) {
+        lock(&self.run_scoped).push(tx);
+    }
+
+    /// Withdraw one adopted run-scoped sender (its stream ends once the caller drops `tx`).
+    pub(crate) fn release_run(&self, tx: &mpsc::Sender<AgentSessionEvent>) {
+        lock(&self.run_scoped).retain(|s| !s.same_channel(tx));
+    }
+
     /// Emit a facade-originated (session-level) event onto every live subscription (arch-11 §3.2).
     pub(crate) async fn emit_external(&self, ev: AgentSessionEvent) {
         self.emit(ev).await;

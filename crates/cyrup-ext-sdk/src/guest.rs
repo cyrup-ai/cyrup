@@ -1,7 +1,7 @@
 //! The wasm32 guest binding layer (arch-08 §4.1). Generates the `cyrup:ext` bindings with
 //! `wit-bindgen` (with `pub_export_macro` so a downstream author crate can call `export!`), then
 //! provides the routing free functions the [`crate::export_extension!`] macro wires the world's
-//! exports to: `init`, the 33 lifecycle hooks, `execute-tool`, `execute-command`/
+//! exports to: `init`, the 36 lifecycle hooks, `execute-tool`, `execute-command`/
 //! `get-argument-completions`, and `render-call`/`render-result`. Compiled ONLY for `wasm32`.
 //!
 //! The glue (the `Guest`/`events::Guest` impls + `export!`) is emitted by the macro — in THIS crate

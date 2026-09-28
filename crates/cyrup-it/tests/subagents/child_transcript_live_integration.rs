@@ -387,6 +387,7 @@ async fn prepare_background_run(
         usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: Some(art_dir.to_path_buf()),
         artifact_config,

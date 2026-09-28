@@ -16,7 +16,13 @@ use cyrup_core::{ApiId, AssistantMessage, StopReason, Usage};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Pi `output.endTurn` as `openai-codex-responses` writes it: `mapCodexEvents` sets it from the
+/// terminal `response.end_turn` on the very `output` object the shared `processResponsesStream`
+/// fills (`openai-codex-responses.ts:748-752` @v0.87.1). The shared Responses path itself never
+/// reads the key, so only the Codex adapter hands the decoder a cell (DRIFT-059).
+pub(crate) type EndTurnCell = Arc<OnceLock<bool>>;
 
 pub(super) struct RDecoder {
     pub(super) blocks: Vec<RBlock>,
@@ -38,6 +44,9 @@ pub(super) struct RDecoder {
     /// absence here was a PORT BUG at the ported baseline, not version lag.
     pub(super) raw_stop_reason: Option<String>,
     pub(super) saw_terminal: bool,
+    /// The Codex `end_turn` cell, read into every snapshot — `None` on the plain Responses and Azure
+    /// routes, which never record one.
+    end_turn: Option<EndTurnCell>,
 }
 
 impl Default for RDecoder {
@@ -55,6 +64,7 @@ impl Default for RDecoder {
             error_message: None,
             raw_stop_reason: None,
             saw_terminal: false,
+            end_turn: None,
         }
     }
 }
@@ -107,6 +117,7 @@ impl RDecoder {
             // snapshot too (v0.84.1 `openai-responses-shared.ts:566-573`).
             error_message: self.error_message.clone(),
             raw_stop_reason: self.raw_stop_reason.clone(),
+            end_turn: self.end_turn.as_ref().and_then(|cell| cell.get().copied()),
             timestamp: now_millis(),
         }
     }
@@ -120,14 +131,32 @@ impl RDecoder {
 }
 
 /// Drive the Responses SSE frame stream into ordered [`StreamEvent`]s (1:1 with Pi's stream loop).
-pub(crate) async fn decode_stream<S>(mut frames: S, model: &Model, api: &ApiId, sink: &EventSink)
+pub(crate) async fn decode_stream<S>(frames: S, model: &Model, api: &ApiId, sink: &EventSink)
 where
+    S: Stream<Item = Result<SseFrame, ProviderError>> + Unpin,
+{
+    decode_stream_with_end_turn(frames, model, api, sink, None).await;
+}
+
+/// [`decode_stream`] with the Codex `end_turn` cell: whatever the Codex event mapper records in it
+/// before yielding the terminal frame appears on every later snapshot, the terminal message
+/// included, exactly as pi's shared `output` object carries it (DRIFT-059).
+pub(crate) async fn decode_stream_with_end_turn<S>(
+    mut frames: S,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+    end_turn: Option<EndTurnCell>,
+) where
     S: Stream<Item = Result<SseFrame, ProviderError>> + Unpin,
 {
     let provider = model.provider.clone();
     let model_id = model.id.as_str().to_string();
 
-    let mut dec = RDecoder::default();
+    let mut dec = RDecoder {
+        end_turn,
+        ..RDecoder::default()
+    };
     if !sink
         .send(StreamEvent::Start {
             partial: dec.snapshot(model, api),

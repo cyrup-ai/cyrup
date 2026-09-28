@@ -84,7 +84,17 @@ struct CatalogSpec {
     /// provider's sub-record belongs in this catalog (`image-models.generated.ts`, PROV-065).
     /// `None` when it binds a flat `id -> Model` record, which is every `<p>.models.ts`.
     images_provider: Option<&'static str>,
+    /// `Some(rev)` when this catalog is read at its OWN pinned revision rather than `--rev`
+    /// (PROV-089). Only a module that is still a data literal after `a9f6a3159` can carry one:
+    /// `image-models.generated.ts` stayed tracked through `v0.87.1`, so its rows are recoverable
+    /// from a revision 29 tags newer than [`DEFAULT_REV`], where every `*.models.ts` is not.
+    rev: Option<&'static str>,
 }
+
+/// The revision `image-models.generated.ts` is read at (PROV-089): the ledger's pinned pi tag, and
+/// the last one that tracks the file — post-tag `a328aa89a` deletes it and moves the rows into the
+/// gitignored `providers/data/openrouter.json`, after which no revision can yield newer image rows.
+const IMAGES_REV: &str = "v0.87.1";
 
 /// The 34 embedded catalogs generated from the pinned revision, each bound to its upstream source
 /// module. [`LIVE_CATALOGS`] below carries the 35th — `xai` — whose rows are fetched live instead
@@ -95,10 +105,14 @@ struct CatalogSpec {
 /// This is 33 of pi's remaining 34 pinned-revision `*.models.ts` modules plus
 /// `openrouter-images.json`. The asymmetries are deliberate and all ledgered:
 ///
-/// * `together.models.ts` has **no** catalog file — cyrup hand-ports Together's 20 rows as Rust
+/// * `together.models.ts` has **no** catalog file — cyrup hand-ports Together's rows as Rust
 ///   literals in `providers/together.rs::together_models()`, so this generator cannot own them.
+///   That roster is 21 rows: the 20 `together.models.ts` declares at `b0c2a90e`, plus
+///   `moonshotai/Kimi-K3`, which pi's own served Together catalog carries and `b0c2a90e` predates
+///   (PROV-070).
 /// * `openrouter-images.json` has no `*.models.ts` counterpart (PROV-065); its rows are the
-///   `openrouter` sub-record of `packages/ai/src/image-models.generated.ts`.
+///   `openrouter` sub-record of `packages/ai/src/image-models.generated.ts`, read at
+///   [`IMAGES_REV`] rather than `--rev` (PROV-089).
 /// * `xai.models.ts` moved to [`LIVE_CATALOGS`] (XAI_1); see that table's doc comment.
 const CATALOGS: &[CatalogSpec] = &[
     spec("amazon-bedrock"),
@@ -130,6 +144,7 @@ const CATALOGS: &[CatalogSpec] = &[
         file: "openrouter-images",
         module: "image-models.generated.ts",
         images_provider: Some("openrouter"),
+        rev: Some(IMAGES_REV),
     },
     spec("openrouter"),
     spec("vercel-ai-gateway"),
@@ -166,6 +181,7 @@ const fn spec(name: &'static str) -> CatalogSpec {
         file: name,
         module: "",
         images_provider: None,
+        rev: None,
     }
 }
 
@@ -177,6 +193,11 @@ impl CatalogSpec {
         } else {
             self.module.to_string()
         }
+    }
+
+    /// The revision this catalog's rows are read at: its own pin, else the run's `--rev`.
+    fn rev<'a>(&'a self, run_rev: &'a str) -> &'a str {
+        self.rev.unwrap_or(run_rev)
     }
 }
 
@@ -679,9 +700,10 @@ fn run_gen_catalogs() -> Result<(), String> {
     if args.check {
         if differing.is_empty() {
             println!(
-                "gen-catalogs --check: all {} files match pi@{}",
+                "gen-catalogs --check: all {} files match pi@{}{}",
                 generated.len(),
-                args.rev
+                args.rev,
+                own_rev_summary(&args.rev)
             );
             return Ok(());
         }
@@ -695,17 +717,33 @@ fn run_gen_catalogs() -> Result<(), String> {
     }
 
     println!(
-        "gen-catalogs: wrote {} of {} files — {} from pi@{}, {} live",
+        "gen-catalogs: wrote {} of {} files — {} from pi@{}{}, {} live",
         differing.len(),
         generated.len(),
         CATALOGS.len(),
         args.rev,
+        own_rev_summary(&args.rev),
         LIVE_CATALOGS.len()
     );
     for name in &differing {
         println!("  updated {name}");
     }
     Ok(())
+}
+
+/// `" (openrouter-images at pi@v0.87.1)"` for every catalog read at its own pin, so a run's summary
+/// never names one revision for rows that came from two.
+fn own_rev_summary(run_rev: &str) -> String {
+    let pinned: Vec<String> = CATALOGS
+        .iter()
+        .filter(|c| c.rev.is_some())
+        .map(|c| format!("{} at pi@{}", c.file, c.rev(run_rev)))
+        .collect();
+    if pinned.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", pinned.join(", "))
+    }
 }
 
 // -------------------------------------------------------------------------- the provider roster --
@@ -908,7 +946,7 @@ fn generate_all(
     for spec in CATALOGS {
         let src = git_show(
             &args.pi,
-            &args.rev,
+            spec.rev(&args.rev),
             &format!("packages/ai/src/{}", spec.module_path()),
         )?;
         let rows = extract_rows(spec, &src)?;
@@ -1032,9 +1070,10 @@ fn manifest_json(
     )],
 ) -> Result<String, String> {
     let source = format!("pi@{}", args.rev);
-    let pinned_count = CATALOGS.len();
+    let own_rev_count = CATALOGS.iter().filter(|c| c.rev.is_some()).count();
+    let pinned_count = CATALOGS.len() - own_rev_count;
     let live_count = LIVE_CATALOGS.len();
-    let catalog_count = pinned_count + live_count; // D5 — must stay 35
+    let catalog_count = pinned_count + own_rev_count + live_count; // D5 — must stay 35
     let generated_at = if args.rev == DEFAULT_REV {
         DEFAULT_REV_TIMESTAMP.to_string()
     } else {
@@ -1073,7 +1112,11 @@ fn manifest_json(
          https://pi.dev/api/models/providers/xai on every run and carries its own \
          `fetchedAt`/`revision` under `catalogs` below, because pi's `xai.models.ts` has been a \
          re-export of gitignored data since a9f6a3159 and NO revision can yield newer rows \
-         (XAI_1). `catalogs` records the per-provider source so that split is machine-checkable \
+         (XAI_1). {own_rev_count} (openrouter-images) is read at its OWN pinned revision, \
+         pi@{IMAGES_REV}, named by its `catalogs` entry (PROV-089): image-models.generated.ts \
+         stayed a tracked data literal through that tag, so the b0c2a90e floor does not bind it, \
+         and the pi.dev overlay never serves image rows, so neither `generatedAt` nor any \
+         `fetchedAt` is a floor for it. `catalogs` records the per-provider source so that split is machine-checkable \
          rather than prose (PROV-060) — this is the split that map was built for. Per-provider \
          `fetchedAt` is the staleness floor for that provider's pi.dev overlay and takes \
          precedence over the global `generatedAt`; the global value remains the floor for every \
@@ -1108,7 +1151,10 @@ fn manifest_json(
         catalogs.push((
             spec.file.to_string(),
             Val::Obj(vec![
-                ("source".to_string(), Val::Str(source.clone())),
+                (
+                    "source".to_string(),
+                    Val::Str(format!("pi@{}", spec.rev(&args.rev))),
+                ),
                 (
                     "module".to_string(),
                     Val::Str(format!("packages/ai/src/{}", spec.module_path())),
@@ -1433,6 +1479,17 @@ mod tests {
             .find(|c| c.file == "openrouter-images")
             .unwrap();
         assert_eq!(img.module_path(), "image-models.generated.ts");
+        // PROV-089: the images module is read at its own pin, whatever `--rev` says, and every
+        // other catalog follows the run's revision.
+        assert_eq!(img.rev("b0c2a90e"), "v0.87.1");
+        assert_eq!(img.rev("some-other-rev"), "v0.87.1");
+        assert_eq!(zai.rev("b0c2a90e"), "b0c2a90e");
+        let own: Vec<&str> = CATALOGS
+            .iter()
+            .filter(|c| c.rev.is_some())
+            .map(|c| c.file)
+            .collect();
+        assert_eq!(own, vec!["openrouter-images"]);
 
         let xai = LIVE_CATALOGS.iter().find(|l| l.file == "xai").unwrap();
         assert_eq!(xai.module, "packages/ai/src/providers/xai.models.ts");

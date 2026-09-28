@@ -1325,6 +1325,11 @@ pub struct AgentDefinition {
     /// SUBA-100 — pi `machine?: string` (`agents.ts:56,180` @v0.68.0): the Herdr saved machine
     /// (id or label) this agent's child is placed on. `None` = run locally.
     pub machine: Option<String>,
+    /// SUBA-133 — pi `advertise?: boolean` (`agents.ts:140`, parsed `:2107-2111` @v0.71.0): the
+    /// author opted this file-defined agent into the `<advertised_subagents>` catalog the parent's
+    /// system prompt carries ([`crate::discovery::advertised::build_advertised_agent_prompt`]).
+    /// `None` when the key is absent, which advertises nothing — the catalog is opt-in.
+    pub advertise: Option<bool>,
     /// Skill-pointer names (not full content) proactively injected into this agent's assembled
     /// system prompt at spawn time (R-SA-017) — orthogonal to any on-demand skill-content loading
     /// the child performs for itself once running.
@@ -1801,6 +1806,7 @@ mod tests {
         AgentDefinition {
             inherit_global_context: false,
             machine: None,
+            advertise: None,
             mutation_tools: None,
             default_turn_budget: None,
             default_acceptance: None,

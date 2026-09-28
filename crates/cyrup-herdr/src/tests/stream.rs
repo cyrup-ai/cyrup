@@ -2,7 +2,7 @@
 //!
 //! Every test drives a real `UnixListener` through [`crate::HerdrClient::subscribe`] — the public
 //! entry point — so there is no mock between the assertion and the wire. The fake speaks
-//! `stream_subscriptions`' real shape (`tmp/herdr/src/api/server.rs:715-779`): one ack line, then
+//! `stream_subscriptions`' real shape (`tmp/herdr/src/api/server.rs:701-764`): one ack line, then
 //! pushed event lines on the same connection, with **no `id` field** on any of them.
 
 use std::time::Duration;
@@ -173,8 +173,8 @@ async fn the_subscription_ack_must_be_subscription_started() {
 
 #[tokio::test]
 async fn an_uncorrelated_invalid_request_fails_the_handshake() {
-    // The shape herdr writes when the line did not deserialise and it could not recover an id at
-    // all (`tmp/herdr/src/api/server.rs:180-201`). Requiring a matching id before treating an
+    // The shape herdr writes for every line that does not deserialise
+    // (`tmp/herdr/src/api/server.rs:179-191`). Requiring a matching id before treating an
     // error as fatal makes this shape invisible and the handshake waits out its deadline instead.
     let fake = FakeHerdr::start(Reply::Line(compact(
         r#"{"id":"","error":{"code":"invalid_request","message":"invalid request: unknown variant"}}"#,
@@ -497,7 +497,7 @@ async fn the_stream_recycles_itself_once_it_has_carried_its_byte_budget() {
 #[tokio::test]
 async fn a_refused_subscription_carries_herdrs_own_code_and_message() {
     // herdr refuses a subscription it cannot build — `ActiveSubscription::new` probes the pane and
-    // answers the failure with the request's own id (`tmp/herdr/src/api/server.rs:725-748`).
+    // answers the failure with the request's own id (`tmp/herdr/src/api/server.rs:711-733`).
     let fake = FakeHerdr::start_with(|request| {
         error_for(request, "pane_not_found", "pane w1:p9 not found")
     });

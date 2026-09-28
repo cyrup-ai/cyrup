@@ -1024,13 +1024,6 @@ impl OAuthAuth for GitHubCopilotLogin {
     }
 }
 
-/// An [`super::load::OAuthFlowFactory`]-shaped constructor for
-/// [`super::load::register_bundled_oauth_flow_loaders`] under
-/// [`super::load::OAuthFlowId::GithubCopilot`] (`load.ts:41-44`).
-pub fn github_copilot_oauth_flow() -> Result<Arc<dyn OAuthAuth>, OAuthError> {
-    Ok(Arc::new(GitHubCopilotLogin::new()) as Arc<dyn OAuthAuth>)
-}
-
 /// The provider id this flow's failures are attributed to.
 pub fn provider_id() -> &'static str {
     GITHUB_COPILOT_PROVIDER_ID
@@ -2107,15 +2100,6 @@ mod tests {
             "the proxy-ep claim drives the request endpoint (`:373-377`)"
         );
         assert!(auth.api_key.is_some());
-    }
-
-    /// The factory is registry-shaped (`load.ts:41-44`).
-    #[test]
-    fn factory_builds_the_flow() {
-        assert_eq!(
-            github_copilot_oauth_flow().unwrap().name(),
-            "GitHub Copilot"
-        );
     }
 }
 

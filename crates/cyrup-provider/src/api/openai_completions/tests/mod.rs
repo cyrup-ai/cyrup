@@ -107,6 +107,7 @@ fn ctx_with_tool_call_ids(ids: &[&str]) -> Context {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     })];
     for id in ids {

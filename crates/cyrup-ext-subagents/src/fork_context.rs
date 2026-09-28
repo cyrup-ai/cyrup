@@ -716,6 +716,7 @@ mod tests {
             deferred: None,
             error_message: None,
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: 0,
         })
     }
@@ -1157,6 +1158,7 @@ mod tests {
             deferred: None,
             error_message: None,
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: 0,
         })
     }

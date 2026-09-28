@@ -20,6 +20,7 @@ use crate::host::services::{
 use crate::host::store_state::HostState;
 use crate::native::{CtxTier, ExtMode};
 use crate::registry::{CommandDescriptor, ExecModeWire, ToolDescriptor};
+use crate::ui_prompt::UiPromptKind;
 use cyrup_core::{
     CancelToken, Content, ExtensionId, Message, TerminateHint, Tool, ToolCallId, ToolError,
     ToolResult, ToolUpdate, ToolUpdateSink,
@@ -146,10 +147,15 @@ impl bindings::cyrup::ext::registration::Host for HostState {
             }),
         };
         // A guest tool is dispatched back across the boundary; register it via the registry's
-        // descriptor table so the active-tool set can surface it (R-08-012/014).
-        let _ = guest
+        // descriptor table so the active-tool set can surface it (R-08-012/014). A refusal (pi's
+        // object-schema guard — an unparseable `parameters-json` arrives here as `null`) fails the
+        // load once `init` returns, where pi's `registerTool` throws out of the factory (EXT-082).
+        if let Err(e) = guest
             .registry
-            .register_guest_tool(guest.owner.clone(), desc);
+            .register_guest_tool(guest.owner.clone(), desc)
+        {
+            guest.note_registration_error(&e);
+        }
     }
 
     /// EXT-058 — pi `registerCommand(name, options)` writes STRAIGHT into the extension's live
@@ -194,12 +200,19 @@ impl bindings::cyrup::ext::registration::Host for HostState {
     async fn register_flag(&mut self, name: String, spec_json: String) {
         let Ok(guest) = guest_of(self) else { return };
         let spec: Value = serde_json::from_str(&spec_json).unwrap_or(Value::Null);
-        guest.set_flag(name.clone(), spec.clone());
         // Owner-attributed so Pi's first-wins flag rule (`getFlags`, runner.ts:473-483) and its
-        // `Flag "--x" conflicts with <owner>` diagnostic apply to a guest's `registerFlag`.
-        let _ = guest
-            .registry
-            .register_flag(guest.owner.clone(), name, spec);
+        // `Flag "--x" conflicts with <owner>` diagnostic apply to a guest's `registerFlag`. A
+        // default that does not match its `type` is refused BEFORE anything is stored, as pi's
+        // `registerFlag` throws before `extension.flags.set` (EXT-082).
+        if let Err(e) =
+            guest
+                .registry
+                .register_flag(guest.owner.clone(), name.clone(), spec.clone())
+        {
+            guest.note_registration_error(&e);
+            return;
+        }
+        guest.set_flag(name, spec);
     }
 
     async fn get_flag(&mut self, name: String) -> Option<String> {
@@ -289,6 +302,17 @@ impl bindings::cyrup::ext::registration::Host for HostState {
             }
         }
     }
+
+    /// EXT-080 — the remover pi's `on()` returns since v0.86.0 (`core/extensions/loader.ts:256-271`
+    /// @v0.87.1). An unknown kind is ignored, as `subscribe` ignores one.
+    async fn unsubscribe(&mut self, event_kinds: Vec<u8>) {
+        let Ok(guest) = guest_of(self) else { return };
+        for k in event_kinds {
+            if let Some(kind) = EventKind::from_u8(k) {
+                guest.remove_subscription(kind);
+            }
+        }
+    }
 }
 
 impl bindings::cyrup::ext::ui::Host for HostState {
@@ -335,6 +359,9 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         let Ok(guest) = ui_guest_of(self) else {
             return false;
         };
+        // EXT-075: pi wraps the whole call, so an already-dismissed dialog still opens and closes
+        // the prompt window (`wrapUIPromptContext`, `runner.ts:527-537` @v0.87.1).
+        let _prompt = guest.begin_ui_prompt(UiPromptKind::Confirm, Some(&prompt));
         // Programmatic dismiss (Pi `signal`): a dialog bound to an aborted signal returns cancelled.
         if guest.dialog_dismissed(&opts) {
             return false;
@@ -357,6 +384,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     ) -> Option<String> {
         let opts = DialogOptions::parse(&opts_json);
         let guest = ui_guest_of(self).ok()?;
+        let _prompt = guest.begin_ui_prompt(UiPromptKind::Input, Some(&prompt));
         if guest.dialog_dismissed(&opts) {
             return None;
         }
@@ -372,6 +400,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         opts_json: String,
     ) -> Option<String> {
         let guest = ui_guest_of(self).ok()?;
+        let _prompt = guest.begin_ui_prompt(UiPromptKind::Select, Some(&prompt));
         let options: Value = serde_json::from_str(&options_json).unwrap_or(Value::Null);
         let opts = DialogOptions::parse(&opts_json);
         if guest.dialog_dismissed(&opts) {
@@ -384,6 +413,7 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     }
     async fn editor(&mut self, title: String, initial: String) -> Option<String> {
         let guest = ui_guest_of(self).ok()?;
+        let _prompt = guest.begin_ui_prompt(UiPromptKind::Editor, Some(&title));
         // `ui.editor` blocks the same way (tears the TUI down and waits for `$EDITOR` to exit, an
         // equally human-paced wait) — the SAME epoch-budget exemption applies.
         let started = std::time::Instant::now();
@@ -471,6 +501,8 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     }
     async fn custom(&mut self, spec_json: String) -> Option<String> {
         let guest = ui_guest_of(self).ok()?;
+        // pi's `custom` wrap carries no title (`withUIPrompt("custom", undefined, …)`).
+        let _prompt = guest.begin_ui_prompt(UiPromptKind::Custom, None);
         let spec: Value = serde_json::from_str(&spec_json).unwrap_or(Value::Null);
         // Same epoch-budget forgiveness its siblings (`confirm`/`input`/`select`/`editor` above)
         // carry: a custom overlay is just as human-paced a wait once a real `HostServices` backend
@@ -1581,6 +1613,9 @@ impl LiveExtension {
             Ok(Err(msg)) => return Err(ExtError::Component(format!("init failed: {msg}"))),
             Err(e) => return Err(map_wasm_error(&e)),
         }
+        // EXT-082: a registration refused during `init` is pi's throwing factory — the load fails
+        // and the caller's failure tail (EXT-081) sweeps whatever `init` did register.
+        guest.finish_init_registrations()?;
 
         // EXT-058: command registrations declared during `init` already landed in the registry —
         // `registration::register-command` writes through like every sibling import, so there is
@@ -2509,6 +2544,10 @@ async fn invoke(
             let msgs = serde_json::to_string(messages).unwrap_or_else(|_| "[]".into());
             api.call_on_context(store, &msgs).await
         }
+        HostEvent::ContextWithSystem { messages } => {
+            let msgs = serde_json::to_string(messages).unwrap_or_else(|_| "[]".into());
+            api.call_on_context_with_system(store, &msgs).await
+        }
         HostEvent::MessageEnd { message } => {
             let m = serde_json::to_string(message).unwrap_or_else(|_| "null".into());
             api.call_on_message_end(store, &m).await
@@ -2605,6 +2644,14 @@ async fn invoke(
         }
         // agent_settled (Pi `_emitAgentSettled`, agent-session.ts:581-588): payload-free, notify-only.
         HostEvent::AgentSettled => api.call_on_agent_settled(store).await.and_then(|()| noop()),
+        HostEvent::UiPromptStart { kind, title } => api
+            .call_on_ui_prompt_start(store, kind, title.as_deref())
+            .await
+            .and_then(|()| noop()),
+        HostEvent::UiPromptEnd { kind, title } => api
+            .call_on_ui_prompt_end(store, kind, title.as_deref())
+            .await
+            .and_then(|()| noop()),
         HostEvent::TurnStart {
             turn_index,
             timestamp,
@@ -2812,7 +2859,8 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
                 terminate,
             })
         }
-        EventKind::Context => {
+        // `context_with_system` returns pi's same `ContextEventResult` (`types.ts:1382` @v0.87.1).
+        EventKind::Context | EventKind::ContextWithSystem => {
             let messages = serde_json::from_value(v).ok()?;
             Some(EventPatch::Context { messages })
         }

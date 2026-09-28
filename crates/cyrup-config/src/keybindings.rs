@@ -111,9 +111,10 @@ pub const KEYBINDING_NAME_MIGRATIONS: [(&str, &str); 59] = [
 ///
 /// `KEYBINDINGS` is `{ ...TUI_KEYBINDINGS, ...appIds }` (`keybindings.ts:64-65`), so the order is
 /// the 31 `tui.*` ids from `pi/packages/tui/src/keybindings.ts:55-131` @v0.83.0 followed by the
-/// 42 `app.*` ids from `keybindings.ts:66-207`. An id NOT in this list is an "extra" and is appended
-/// in sorted order (`keybindings.ts:320-325`).
-pub const KEYBINDING_IDS: [&str; 73] = [
+/// 42 `app.*` ids from `keybindings.ts:66-207`, plus `app.thinking.save` (v0.85.1, declared right
+/// after `app.thinking.cycle` at `core/keybindings.ts:100-107` @v0.87.1 — CFG-091). An id NOT in
+/// this list is an "extra" and is appended in sorted order (`keybindings.ts:320-325`).
+pub const KEYBINDING_IDS: [&str; 74] = [
     // `TUI_KEYBINDINGS` — pi/packages/tui/src/keybindings.ts:55-131 @v0.83.0
     "tui.editor.cursorUp",
     "tui.editor.cursorDown",
@@ -152,6 +153,7 @@ pub const KEYBINDING_IDS: [&str; 73] = [
     "app.exit",
     "app.suspend",
     "app.thinking.cycle",
+    "app.thinking.save",
     "app.model.cycleForward",
     "app.model.cycleBackward",
     "app.model.select",
@@ -407,9 +409,9 @@ mod tests {
 
     #[test]
     fn keybinding_ids_are_pis_declaration_order() {
-        assert_eq!(KEYBINDING_IDS.len(), 73, "31 tui.* + 42 app.*");
+        assert_eq!(KEYBINDING_IDS.len(), 74, "31 tui.* + 43 app.*");
         let unique: BTreeSet<&str> = KEYBINDING_IDS.iter().copied().collect();
-        assert_eq!(unique.len(), 73);
+        assert_eq!(unique.len(), 74);
         // `KEYBINDINGS = { ...TUI_KEYBINDINGS, ...app }` — every tui id precedes every app id.
         let first_app = KEYBINDING_IDS
             .iter()
@@ -433,6 +435,26 @@ mod tests {
         );
         assert_eq!(config[0].1, Value::String("ctrl+p".into()));
         assert_eq!(config[1].1, Value::String("ctrl+q".into()));
+    }
+
+    /// CFG-091 — `app.thinking.save` is a DECLARED id, so a migrated document writes it where pi's
+    /// `KEYBINDINGS` declares it (between `app.thinking.cycle` and `app.model.cycleForward`,
+    /// `core/keybindings.ts:100-111` @v0.87.1), not at the tail with the sorted extras.
+    #[test]
+    fn app_thinking_save_is_written_in_its_declared_position() {
+        let raw = parse(
+            r#"{"cycleModelForward":"ctrl+p","app.thinking.save":"ctrl+k","cycleThinkingLevel":"shift+tab"}"#,
+        );
+        let (config, migrated) = migrate_keybindings_config(&raw);
+        assert!(migrated);
+        assert_eq!(
+            keys(&config),
+            [
+                "app.thinking.cycle",
+                "app.thinking.save",
+                "app.model.cycleForward"
+            ]
+        );
     }
 
     #[test]

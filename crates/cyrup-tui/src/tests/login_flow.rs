@@ -1123,9 +1123,9 @@ async fn tui105_refresh_timeout_warns_and_keeps_cached_models() {
     let text = transcript_text(&app);
     assert!(
         text.contains(&format!(
-            "{action}, but its model catalog refresh timed out; using cached models."
+            "Warning: {action}, but its model catalog refresh timed out; using cached models."
         )),
-        "`:5957` verbatim; got:\n{text}"
+        "`:5956` verbatim, through `showWarning`'s prefix (TUI-062); got:\n{text}"
     );
     assert_eq!(
         fx.session.model(),

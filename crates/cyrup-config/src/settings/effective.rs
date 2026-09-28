@@ -8,8 +8,9 @@ use serde_json::Value;
 
 use super::layer::Settings;
 use super::types::{
-    BranchSummarySettings, CompactionSettings, DefaultProjectTrust, FullscreenExitOutput,
-    FullscreenScrollbar, MermaidRenderingMode, PackageSource, ProviderRetrySettings, RetrySettings,
+    BranchSummarySettings, CacheWarmingMode, CompactionSettings, DefaultProjectTrust,
+    FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, PackageSource,
+    ProviderRetrySettings, RetrySettings, TerminalCapabilityOverrides, TerminalImagesOverride,
     ThinkingBudgets, TuiMode, Warnings,
 };
 use crate::error::ConfigError;
@@ -244,18 +245,81 @@ impl EffectiveSettings {
             .unwrap_or(true)
     }
 
-    /// `compaction.reserveTokens` (default 16384; :768-770).
-    pub fn compaction_reserve_tokens(&self) -> i64 {
-        self.merged
-            .get_nested_i64(&["compaction", "reserveTokens"])
-            .unwrap_or(16384)
+    /// `compaction.reserveTokens` for `model` (`(provider, model_id)`), resolved through
+    /// `compaction.modelOverrides` — Pi `getCompactionReserveTokens(model?)`
+    /// (`settings-manager.ts:887-889` @v0.87.1). See [`Self::compaction_token_setting`].
+    pub fn compaction_reserve_tokens(
+        &self,
+        model: Option<(&str, &str)>,
+    ) -> Result<i64, ConfigError> {
+        self.compaction_token_setting(CompactionTokenField::ReserveTokens, model)
     }
 
-    /// `compaction.keepRecentTokens` (default 20000; :772-774).
-    pub fn compaction_keep_recent_tokens(&self) -> i64 {
-        self.merged
-            .get_nested_i64(&["compaction", "keepRecentTokens"])
-            .unwrap_or(20000)
+    /// `compaction.keepRecentTokens` for `model`, resolved through `compaction.modelOverrides` —
+    /// Pi `getCompactionKeepRecentTokens(model?)` (`settings-manager.ts:891-893` @v0.87.1).
+    pub fn compaction_keep_recent_tokens(
+        &self,
+        model: Option<(&str, &str)>,
+    ) -> Result<i64, ConfigError> {
+        self.compaction_token_setting(CompactionTokenField::KeepRecentTokens, model)
+    }
+
+    /// Pi `getCompactionTokenSetting(field, model?)` (`settings-manager.ts:859-885` @v0.87.1):
+    /// the exact-`"provider/modelId"` entry of `compaction.modelOverrides`, then the ordinary
+    /// `compaction.<field>`, then the built-in default (16384 / 20000, `:18-21`).
+    ///
+    /// Validation is pi's, in pi's order, and happens on READ exactly as pi throws from the getter:
+    /// the ordinary value is checked first even when an override would win, then the override
+    /// entry must be an object, then its field. Each accepted value is a non-negative
+    /// `Number.isSafeInteger`; the error text is pi's `Error` message verbatim, with the offending
+    /// value rendered by JS `String(value)`.
+    fn compaction_token_setting(
+        &self,
+        field: CompactionTokenField,
+        model: Option<(&str, &str)>,
+    ) -> Result<i64, ConfigError> {
+        let name = field.key();
+        let compaction = self.merged.get("compaction");
+        let ordinary = compaction.and_then(|c| c.as_object()?.get(name));
+        let ordinary = match ordinary {
+            None => None,
+            Some(v) => Some(non_negative_safe_integer(v).ok_or_else(|| {
+                ConfigError::InvalidCompactionSetting(format!(
+                    "Invalid compaction.{name} setting: {}. Expected a non-negative safe integer.",
+                    js_string(v)
+                ))
+            })?),
+        };
+
+        let model_key = model.map(|(provider, id)| format!("{provider}/{id}"));
+        let entry = model_key.as_deref().and_then(|key| {
+            compaction?
+                .as_object()?
+                .get("modelOverrides")?
+                .as_object()?
+                .get(key)
+        });
+        let key = model_key.as_deref().unwrap_or_default();
+        let override_value = match entry {
+            None => None,
+            Some(Value::Object(entry)) => match entry.get(name) {
+                None => None,
+                Some(v) => Some(non_negative_safe_integer(v).ok_or_else(|| {
+                    ConfigError::InvalidCompactionSetting(format!(
+                        "Invalid compaction.modelOverrides[\"{key}\"].{name} setting: {}. \
+                         Expected a non-negative safe integer.",
+                        js_string(v)
+                    ))
+                })?),
+            },
+            Some(other) => {
+                return Err(ConfigError::InvalidCompactionSetting(format!(
+                    "Invalid compaction.modelOverrides[\"{key}\"] setting: {}. Expected an object.",
+                    js_string(other)
+                )));
+            }
+        };
+        Ok(override_value.or(ordinary).unwrap_or(field.default()))
     }
 
     /// `branchSummary.reserveTokens` (default 16384; :784-789).
@@ -291,6 +355,14 @@ impl EffectiveSettings {
         self.merged
             .get_nested_i64(&["retry", "baseDelayMs"])
             .unwrap_or(2000)
+    }
+
+    /// `retry.maxAgentDelayMs` — the cap on each agent-level retry backoff (default 60000; Pi
+    /// `getRetrySettings().maxAgentDelayMs`, `settings-manager.ts:45`, `:937` @v0.87.1). CFG-081.
+    pub fn retry_max_agent_delay_ms(&self) -> i64 {
+        self.merged
+            .get_nested_i64(&["retry", "maxAgentDelayMs"])
+            .unwrap_or(60000)
     }
 
     /// `retry.provider.maxRetryDelayMs` (default 60000; :829-835).
@@ -413,6 +485,38 @@ impl EffectiveSettings {
         self.merged
             .get_nested_bool(&["terminal", "showTerminalProgress"])
             .unwrap_or(false)
+    }
+
+    /// `terminal.{images,trueColor,hyperlinks}` as capability overrides — Pi
+    /// `getTerminalCapabilityOverrides()` (`settings-manager.ts:1195-1203` @v0.87.1), read from the
+    /// merged view as pi reads `this.settings.terminal`. `images` overrides only for `"kitty"`,
+    /// `"iterm2"` or `false`; `trueColor`/`hyperlinks` only when a JSON boolean. Every other value,
+    /// `"auto"` included, leaves the field out so detection decides. CFG-090.
+    pub fn terminal_capability_overrides(&self) -> TerminalCapabilityOverrides {
+        let terminal = self.merged.get("terminal").and_then(Value::as_object);
+        let field = |key: &str| terminal.and_then(|t| t.get(key));
+        TerminalCapabilityOverrides {
+            images: match field("images") {
+                Some(Value::String(s)) if s == "kitty" => Some(TerminalImagesOverride::Kitty),
+                Some(Value::String(s)) if s == "iterm2" => Some(TerminalImagesOverride::Iterm2),
+                Some(Value::Bool(false)) => Some(TerminalImagesOverride::Disabled),
+                _ => None,
+            },
+            true_color: field("trueColor").and_then(Value::as_bool),
+            hyperlinks: field("hyperlinks").and_then(Value::as_bool),
+        }
+    }
+
+    /// `cacheWarming` — Pi `getCacheWarmingMode()` (`settings-manager.ts:954-958` @v0.87.1):
+    /// "Read from global settings only because warming costs money", validated against
+    /// `CACHE_WARMING_MODES`, else `"streaming"`. The key is in [`super::layer`]'s global-only
+    /// list, so a project or CLI value never reaches this merged view. CFG-093.
+    pub fn cache_warming_mode(&self) -> CacheWarmingMode {
+        match self.merged.get_str("cacheWarming").as_deref() {
+            Some("off") => CacheWarmingMode::Off,
+            Some("idle") => CacheWarmingMode::Idle,
+            _ => CacheWarmingMode::Streaming,
+        }
     }
 
     /// `images.autoResize` (default true; :1107-1109).
@@ -637,21 +741,28 @@ impl EffectiveSettings {
         }
     }
 
-    /// `getCompactionSettings` combined (Pi settings-manager.ts:776-782).
-    pub fn compaction_settings(&self) -> CompactionSettings {
-        CompactionSettings {
+    /// `getCompactionSettings(model?)` combined (Pi `settings-manager.ts:895-907` @v0.87.1): each
+    /// token budget resolved for `model` (`(provider, model_id)`) through
+    /// `compaction.modelOverrides`, then the ordinary setting, then the default. `Err` carries pi's
+    /// error for an invalid value — pi throws from this getter at every compaction call site.
+    pub fn compaction_settings(
+        &self,
+        model: Option<(&str, &str)>,
+    ) -> Result<CompactionSettings, ConfigError> {
+        Ok(CompactionSettings {
             enabled: self.compaction_enabled(),
-            reserve_tokens: self.compaction_reserve_tokens(),
-            keep_recent_tokens: self.compaction_keep_recent_tokens(),
-        }
+            reserve_tokens: self.compaction_reserve_tokens(model)?,
+            keep_recent_tokens: self.compaction_keep_recent_tokens(model)?,
+        })
     }
 
-    /// `getRetrySettings` combined (Pi settings-manager.ts:808-814).
+    /// `getRetrySettings` combined (Pi `settings-manager.ts:932-939` @v0.87.1).
     pub fn retry_settings(&self) -> RetrySettings {
         RetrySettings {
             enabled: self.retry_enabled(),
             max_retries: self.retry_max_retries(),
             base_delay_ms: self.retry_base_delay_ms(),
+            max_agent_delay_ms: self.retry_max_agent_delay_ms(),
         }
     }
 
@@ -751,4 +862,76 @@ pub fn parse_http_idle_timeout_ms(value: &Value) -> Option<u64> {
 /// better with it.
 fn expand_tilde(input: &str) -> String {
     crate::paths::normalize_path(input)
+}
+
+/// The two compaction token budgets pi resolves through `compaction.modelOverrides` (Pi
+/// `keyof CompactionModelOverride`, `settings-manager.ts:13-16` @v0.87.1).
+#[derive(Clone, Copy)]
+enum CompactionTokenField {
+    ReserveTokens,
+    KeepRecentTokens,
+}
+
+impl CompactionTokenField {
+    fn key(self) -> &'static str {
+        match self {
+            Self::ReserveTokens => "reserveTokens",
+            Self::KeepRecentTokens => "keepRecentTokens",
+        }
+    }
+
+    /// Pi `DEFAULT_COMPACTION_TOKEN_SETTINGS` (`settings-manager.ts:18-21` @v0.87.1).
+    fn default(self) -> i64 {
+        match self {
+            Self::ReserveTokens => 16384,
+            Self::KeepRecentTokens => 20000,
+        }
+    }
+}
+
+/// JS `Number.MAX_SAFE_INTEGER` (2^53 − 1).
+const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
+
+/// Pi's compaction-token acceptance test, `typeof v === "number" && Number.isSafeInteger(v) &&
+/// v >= 0` (`settings-manager.ts:865`, `:879` @v0.87.1). JSON `4096.0` is the JS number `4096`,
+/// so an integral float is accepted; `-0` is a safe integer that is not `< 0`, so it reads as `0`.
+fn non_negative_safe_integer(value: &Value) -> Option<i64> {
+    let n = value.as_number()?;
+    if let Some(i) = n.as_i64() {
+        return (0..=MAX_SAFE_INTEGER).contains(&i).then_some(i);
+    }
+    let f = n.as_f64()?;
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let accepted = (f.fract() == 0.0 && f.abs() <= MAX_SAFE_INTEGER as f64).then_some(f as i64);
+    accepted.filter(|i| *i >= 0)
+}
+
+/// JS `String(value)` over a parsed JSON value — how pi renders the offending value in its
+/// settings errors: a string is itself, an array joins its elements' strings with `,` (`null`
+/// elements are empty), any object is `[object Object]`, and a number is JS's shortest form (an
+/// integral value prints without a fraction).
+fn js_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|v| {
+                if v.is_null() {
+                    String::new()
+                } else {
+                    js_string(v)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".to_string(),
+        Value::Number(n) => match (n.as_i64(), n.as_f64()) {
+            (Some(i), _) => i.to_string(),
+            #[allow(clippy::cast_possible_truncation)]
+            (None, Some(f)) if f.fract() == 0.0 && f.abs() < 1e21 => format!("{}", f as i128),
+            _ => n.to_string(),
+        },
+    }
 }

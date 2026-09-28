@@ -55,20 +55,63 @@ pub struct ToolDescriptor {
 }
 
 impl ToolDescriptor {
-    /// Validate the descriptor at registration (R-ARCH-EXT-008): `name` non-empty and `parameters`
-    /// is a JSON object (a minimal JSON-Schema validity check; full schema validation is a follow-on).
+    /// Validate the descriptor at registration (R-ARCH-EXT-008): `name` non-empty. The
+    /// object-`parameters` rule is NOT here: it needs the registering extension for pi's message,
+    /// so [`ExtensionRegistry::register_guest_tool`] applies it through `require_object_schema`,
+    /// the same guard the native path goes through (EXT-082).
     pub fn validate(&self) -> Result<(), ExtError> {
         if self.name.trim().is_empty() {
             return Err(ExtError::Schema("tool name is empty".into()));
         }
-        if !self.parameters.is_object() {
-            return Err(ExtError::Schema(format!(
-                "tool `{}` parameters must be a JSON-Schema object",
-                self.name
-            )));
-        }
         Ok(())
     }
+}
+
+/// pi `registerTool`'s schema guard (`core/extensions/loader.ts:274-279` @v0.87.1, added at v0.86.0
+/// by #9300): a tool whose `parameters` is not a JSON object throws inside the factory, so the
+/// extension fails to load with an error naming both the tool and the extension. It applies to
+/// every tool an extension registers, native and guest alike, because upstream has one
+/// `registerTool` for both.
+fn require_object_schema(
+    owner: &ExtensionId,
+    name: &str,
+    parameters: &Value,
+) -> Result<(), ExtError> {
+    if parameters.is_object() {
+        return Ok(());
+    }
+    Err(ExtError::Registration(format!(
+        "Tool \"{name}\" registered by extension \"{owner}\" must define an object parameter schema."
+    )))
+}
+
+/// pi `registerFlag`'s default guard (`core/extensions/loader.ts:312-316` @v0.87.1, added at v0.84.3
+/// by `f47faf459`, #8123): `options.default !== undefined && typeof options.default !== options.type`
+/// throws `Invalid default for flag "<name>": expected <type>, got <typeof default>`.
+///
+/// A JSON `null` default is read as upstream's `undefined`: the wire has no `undefined`, the SDK's
+/// `FlagSpec` omits an absent default rather than sending `null`, and
+/// [`crate::host::GuestState::get_flag`] already treats a `null` default as "no default".
+fn require_typed_flag_default(name: &str, spec: &Value) -> Result<(), ExtError> {
+    let Some(default) = spec.get("default").filter(|d| !d.is_null()) else {
+        return Ok(());
+    };
+    let got = match default {
+        Value::Bool(_) => "boolean",
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Null | Value::Array(_) | Value::Object(_) => "object",
+    };
+    let expected = match spec.get("type") {
+        Some(Value::String(t)) => t.as_str(),
+        _ => "undefined",
+    };
+    if got == expected {
+        return Ok(());
+    }
+    Err(ExtError::Registration(format!(
+        "Invalid default for flag \"{name}\": expected {expected}, got {got}"
+    )))
 }
 
 /// Wire form of `ExecMode` (serde camelCase).
@@ -373,6 +416,7 @@ impl ExtensionRegistry {
         mark_dirty: bool,
     ) -> Result<(), ExtError> {
         let name = tool.name().to_string();
+        require_object_schema(&owner, &name, tool.parameters())?;
         let mut g = self.lock_write()?;
         if let Some(existing) = Self::tool_owner_in(&g, &name)
             && existing != owner
@@ -450,6 +494,7 @@ impl ExtensionRegistry {
         desc: ToolDescriptor,
     ) -> Result<(), ExtError> {
         desc.validate()?;
+        require_object_schema(&owner, &desc.name, &desc.parameters)?;
         let name = desc.name.clone();
         let mut g = self.lock_write()?;
         if let Some(existing) = Self::tool_owner_in(&g, &name)
@@ -1366,6 +1411,7 @@ impl ExtensionRegistry {
         spec: Value,
     ) -> Result<(), ExtError> {
         let name = name.into();
+        require_typed_flag_default(&name, &spec)?;
         let mut g = self.lock_write()?;
         if let Some(existing) = g.flag_owner.get(&name).cloned()
             && existing != owner
@@ -1442,17 +1488,6 @@ impl ExtensionRegistry {
             .iter()
             .map(|(name, (_, desc))| (name.clone(), desc.clone()))
             .collect())
-    }
-
-    /// Drop every registration (hot-reload cache-bust, R-08-005). The dispatcher is reset separately.
-    pub fn clear(&self) -> Result<(), ExtError> {
-        let mut g = self.lock_write()?;
-        *g = RegistryInner::default();
-        drop(g);
-        // A cleared registry has no tools to re-materialize; drop any pending refresh so the next
-        // `refresh_tools` after a reload does not walk an empty table (R-08-005).
-        self.take_tools_dirty();
-        Ok(())
     }
 
     pub fn provider_ids(&self) -> Result<Vec<String>, ExtError> {

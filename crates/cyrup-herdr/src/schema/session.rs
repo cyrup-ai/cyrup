@@ -23,10 +23,10 @@ use super::workspaces::WorkspaceInfo;
 /// [`crate::MAX_RESPONSE_BYTES`] is 4 MiB rather than herdr's own 1 MiB request bound.
 ///
 /// **Ordering against `events.subscribe` is structural, not advisory.** herdr serves one request
-/// per connection (`tmp/herdr/src/api/server.rs:156-317`), so a snapshot and a subscription cannot
+/// per connection (`tmp/herdr/src/api/server.rs:156-304`), so a snapshot and a subscription cannot
 /// share one; the subscription must be opened and acknowledged *first*, or events that fire while
 /// the snapshot is being built are lost
-/// (`tmp/herdr/docs/preview/website/src/content/docs/socket-api.mdx:118-130`). This crate's
+/// (`tmp/herdr/docs/next/website/src/content/docs/socket-api.mdx:118-130`). This crate's
 /// stream half owns that ordering; a caller reaching for [`crate::HerdrClient::session_snapshot`]
 /// alone is taking a point-in-time reading with no guarantee about what happens next.
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -225,6 +225,11 @@ pub async fn resolve_source(ctx: &dyn AuthContext, env: Option<&ProviderEnv>) ->
         return AdcSource::File(unix);
     }
 
+    // `[CYRUP-DELTA]` (CFG-070) — `APPDATA` appears nowhere in pi's source: `env-api-keys.ts:61`
+    // @v0.87.1 probes only the POSIX path, and the Windows half is `google-auth-library`'s own
+    // well-known search, reached through `@google/genai` (`api/google-vertex.ts:363-371`). cyrup
+    // links no Google auth library, so this is that search reimplemented on purpose; removing it
+    // would leave a Windows `gcloud auth application-default login` unseen where pi finds it.
     if let Some(appdata) = ctx.env("APPDATA").await.filter(|v| !v.is_empty()) {
         let windows = format!(
             "{}/{}",
@@ -686,6 +691,30 @@ mod tests {
                 "/home/dev/.config/gcloud/application_default_credentials.json".to_string()
             )
         );
+    }
+
+    /// CFG-070 — the library's Windows well-known file, `%APPDATA%\gcloud\...`, is found after the
+    /// POSIX one misses, and an empty `APPDATA` is not a directory.
+    #[tokio::test]
+    async fn falls_back_to_the_appdata_well_known_file() {
+        let ctx = FakeCtx::new()
+            .with_env("HOME", "C:/Users/dev")
+            .with_env("APPDATA", "C:\\Users\\dev\\AppData\\Roaming\\")
+            .with_file(
+                "C:\\Users\\dev\\AppData\\Roaming/gcloud/application_default_credentials.json",
+            );
+        assert_eq!(
+            resolve_source(&ctx, None).await,
+            AdcSource::File(
+                "C:\\Users\\dev\\AppData\\Roaming/gcloud/application_default_credentials.json"
+                    .to_string()
+            )
+        );
+        let empty = FakeCtx::new()
+            .with_env("HOME", "/home/dev")
+            .with_env("APPDATA", "")
+            .with_file("/gcloud/application_default_credentials.json");
+        assert_eq!(resolve_source(&empty, None).await, AdcSource::Metadata);
     }
 
     #[tokio::test]

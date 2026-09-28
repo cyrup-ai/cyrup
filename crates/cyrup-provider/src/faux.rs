@@ -961,6 +961,7 @@ pub fn faux_assistant_message_with(
         deferred: options.deferred.map(Box::new),
         error_message: options.error_message,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: options.timestamp.unwrap_or(0),
     }
 }
@@ -995,6 +996,7 @@ pub fn faux_deferred_message(model: &Model, handle: DeferredHandle) -> Assistant
         deferred: Some(Box::new(handle)),
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     }
 }

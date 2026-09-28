@@ -67,6 +67,13 @@ pub struct StartupDiagnostics {
     /// `process.exit(1)` (main.ts:843-848). Surfaced through
     /// [`crate::AgentSessionRuntime::diagnostics`] rather than the `[Extension issues]` panel.
     pub flags: Vec<String>,
+    /// The session's own settings manager's load/parse failures, rendered by
+    /// [`cyrup_config::ScopedError::diagnostic_message`] — Pi's
+    /// `collectSettingsDiagnostics(settingsManager)` in the runtime's diagnostics
+    /// (`main.ts:782-785` @v0.87.1), `type: "warning"`. Republished by
+    /// [`crate::AgentSessionRuntime::diagnostics`]; the bin merges them with its startup
+    /// manager's and deduplicates (CFG-088).
+    pub settings: Vec<String>,
 }
 
 impl StartupDiagnostics {
@@ -76,6 +83,7 @@ impl StartupDiagnostics {
             && self.extensions.is_empty()
             && self.models.is_empty()
             && self.flags.is_empty()
+            && self.settings.is_empty()
     }
 }
 

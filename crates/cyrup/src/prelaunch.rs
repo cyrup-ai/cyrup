@@ -74,7 +74,7 @@ pub async fn resolve_session(
     if let Some(issue) = resolution.missing_cwd {
         // SEAM-066/067: pi's `createStartupTui` resolves the theme AND installs the user's
         // keybindings before mounting any pre-launch selector (startup-ui.ts:78-83).
-        let theme = crate::startup_theme(dirs);
+        let theme = crate::startup_theme(dirs, cli.use_theme.as_deref());
         let (select_keymap, _) = crate::startup_keymaps(dirs);
         let body =
             crate::format_missing_session_cwd_prompt(&issue.session_cwd, &issue.fallback_cwd);
@@ -147,7 +147,7 @@ pub async fn resolve_startup_ui(
     // anything (startup-ui.ts:77-85); the two that reach these selectors are the resolved theme
     // (`initTheme(resolveThemeSetting(...))`, :79-80) and the user's keybindings
     // (`setKeybindings(KeybindingsManager.create())`, :81).
-    let theme = crate::startup_theme(dirs);
+    let theme = crate::startup_theme(dirs, cli.use_theme.as_deref());
     let keymaps = crate::startup_keymaps(dirs);
 
     // --resume (#1): mount the `SessionSelector` over the merged local+global session listing and
@@ -234,11 +234,17 @@ pub async fn resolve_startup_ui(
 /// pi supplies this callback only where it has a UI (`hasUI`, project-trust.ts:86-88), which is what
 /// the interactive-only wiring in `run` (`main.rs`) reproduces; every other host leaves it unset
 /// and the builder falls through to untrusted, exactly as pi's `if (!hasUI) return false;` does.
-pub fn trust_prompt_callback(dirs: &ConfigDirs) -> cyrup_session_svc::TrustPromptFn {
+///
+/// `use_theme` is `--use-theme` (SEAM-119): the trust prompt is a startup selector, and pi's
+/// override is applied to the startup settings before any of them mounts (`main.ts:666-668`).
+pub fn trust_prompt_callback(
+    dirs: &ConfigDirs,
+    use_theme: Option<&str>,
+) -> cyrup_session_svc::TrustPromptFn {
     let cwd = dirs.cwd.clone();
     let store = trust_store_for(dirs);
     // SEAM-066/067: the same two settings-derived inputs every other pre-launch selector takes.
-    let theme = crate::startup_theme(dirs);
+    let theme = crate::startup_theme(dirs, use_theme);
     let (keymap, _) = crate::startup_keymaps(dirs);
     Arc::new(move |options, saved| {
         let (theme, keymap, cwd, store) =

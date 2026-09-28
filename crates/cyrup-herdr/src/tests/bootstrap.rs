@@ -4,11 +4,11 @@
 //! herdr's rule, verbatim: *"To avoid a bootstrap gap, first open `events.subscribe` on another
 //! connection and wait for its acknowledgement. Buffer that stream while calling
 //! `session.snapshot`, install the snapshot, then apply the buffered events in order and continue
-//! streaming."* (`tmp/herdr/docs/preview/website/src/content/docs/socket-api.mdx:118-130`).
+//! streaming."* (`tmp/herdr/docs/next/website/src/content/docs/socket-api.mdx:118-130`).
 //!
 //! The reason it is mandatory rather than defensive is one line of herdr's source:
 //! `stream_subscriptions` takes `event_hub.current_sequence()` as its floor **before** it builds
-//! any subscription (`tmp/herdr/src/api/server.rs:723`), so an event that fires before the
+//! any subscription (`tmp/herdr/src/api/server.rs:709`), so an event that fires before the
 //! subscribe is accepted is never sent at all. There is no later correction and no replay.
 
 use std::sync::{Arc, Mutex};

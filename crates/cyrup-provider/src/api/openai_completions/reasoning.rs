@@ -10,12 +10,15 @@ use crate::stream::StreamOptions;
 use serde_json::{Map, Value, json};
 
 /// Apply the per-provider reasoning encoding (Pi `buildParams` reasoning chain, L594-668). Each
-/// branch is gated on `model.reasoning` and the resolved `thinking_format`.
+/// branch is gated on `model.reasoning` and the resolved `thinking_format`. `thinking_budget` is
+/// the clamped budget [`super::params::clamped_thinking_budget`] resolved, which a
+/// `{"$var": "thinking.budget"}` template value takes (PROV-100).
 pub(super) fn apply_reasoning(
     obj: &mut Map<String, Value>,
     model: &Model,
     opts: &StreamOptions,
     compat: &ResolvedCompat,
+    thinking_budget: Option<u64>,
 ) {
     if !model.reasoning {
         return;
@@ -57,9 +60,12 @@ pub(super) fn apply_reasoning(
             );
         }
         ThinkingFormat::ChatTemplate => {
-            if let Some(kwargs) =
-                build_chat_template_values(model, opts, &compat.chat_template_kwargs)
-            {
+            if let Some(kwargs) = build_chat_template_values(
+                model,
+                opts,
+                &compat.chat_template_kwargs,
+                thinking_budget,
+            ) {
                 obj.insert("chat_template_kwargs".to_string(), Value::Object(kwargs));
             }
         }
@@ -71,7 +77,8 @@ pub(super) fn apply_reasoning(
         // to `thinkingLevelMap.off` (`:899`), so Baseten is told "off" explicitly rather than being
         // left to its own default.
         ThinkingFormat::Baseten => {
-            if let Some(args) = build_chat_template_values(model, opts, &compat.chat_template_args)
+            if let Some(args) =
+                build_chat_template_values(model, opts, &compat.chat_template_args, thinking_budget)
             {
                 obj.insert("chat_template_args".to_string(), Value::Object(args));
             }
@@ -176,10 +183,13 @@ fn build_chat_template_values(
     model: &Model,
     opts: &StreamOptions,
     values: &Map<String, Value>,
+    thinking_budget: Option<u64>,
 ) -> Option<Map<String, Value>> {
     let mut kwargs = Map::new();
     for (key, value) in values {
-        if let Some(resolved) = resolve_chat_template_kwarg_value(model, opts, value) {
+        if let Some(resolved) =
+            resolve_chat_template_kwarg_value(model, opts, value, thinking_budget)
+        {
             kwargs.insert(key.clone(), resolved);
         }
     }
@@ -190,11 +200,13 @@ fn build_chat_template_values(
     }
 }
 
-/// Resolve one `ChatTemplateKwargValue` (Pi `resolveChatTemplateKwargValue`).
+/// Resolve one `ChatTemplateKwargValue` (Pi `resolveChatTemplateKwargValue`,
+/// `openai-completions.ts:1044-1066` @v0.87.1).
 fn resolve_chat_template_kwarg_value(
     model: &Model,
     opts: &StreamOptions,
     value: &Value,
+    thinking_budget: Option<u64>,
 ) -> Option<Value> {
     let obj = match value.as_object() {
         Some(o) => o,
@@ -209,6 +221,12 @@ fn resolve_chat_template_kwarg_value(
     }
     if obj.get("$var").and_then(Value::as_str) == Some("thinking.enabled") {
         return Some(json!(eff.is_some()));
+    }
+    // PROV-100 — `if (value.$var === "thinking.budget") return thinkingBudget;` (`:1061-1063`).
+    // Before this arm the budget variable fell through to the effort map below and was sent as an
+    // effort string where the template expects a token count.
+    if obj.get("$var").and_then(Value::as_str) == Some("thinking.budget") {
+        return thinking_budget.map(|b| json!(b));
     }
 
     let mapped = if eff.is_some() {

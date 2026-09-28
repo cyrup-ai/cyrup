@@ -689,6 +689,7 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),

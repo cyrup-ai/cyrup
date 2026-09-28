@@ -8,7 +8,10 @@ fn apply_overrides_deep_merges_onto_effective() {
     let store = Arc::new(InMemorySettingsStore::new());
     let mut mgr = SettingsManager::load(store.clone(), false);
     assert!(mgr.effective().compaction_enabled());
-    assert_eq!(mgr.effective().compaction_reserve_tokens(), 16384);
+    assert_eq!(
+        mgr.effective().compaction_reserve_tokens(None).unwrap(),
+        16384
+    );
 
     let overrides =
         Settings::parse(r#"{ "compaction": { "reserveTokens": 4096 }, "quietStartup": true }"#)
@@ -16,12 +19,18 @@ fn apply_overrides_deep_merges_onto_effective() {
     mgr.apply_overrides(&overrides);
     // nested merge preserves the sibling `enabled` default while overriding reserveTokens.
     assert!(mgr.effective().compaction_enabled());
-    assert_eq!(mgr.effective().compaction_reserve_tokens(), 4096);
+    assert_eq!(
+        mgr.effective().compaction_reserve_tokens(None).unwrap(),
+        4096
+    );
     assert!(mgr.effective().quiet_startup());
 
     // transient: a reload recomputes from the layers and drops the overrides.
     mgr.reload().unwrap();
-    assert_eq!(mgr.effective().compaction_reserve_tokens(), 16384);
+    assert_eq!(
+        mgr.effective().compaction_reserve_tokens(None).unwrap(),
+        16384
+    );
     assert!(!mgr.effective().quiet_startup());
 }
 

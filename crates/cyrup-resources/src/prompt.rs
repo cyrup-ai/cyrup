@@ -64,7 +64,11 @@ impl PromptTemplate {
         origin: ResourceOrigin,
     ) -> Result<PromptTemplate, ResourceError> {
         let raw = std::fs::read_to_string(path)?;
-        let (frontmatter, body) = parse_frontmatter(&raw);
+        let (frontmatter, body) =
+            parse_frontmatter(&raw).map_err(|reason| ResourceError::FrontMatter {
+                path: path.to_path_buf(),
+                reason,
+            })?;
 
         // Name = root-relative path, `.md` stripped from the leaf, components joined with
         // `/`. Both failure modes map to the same Manifest error the basename derivation
@@ -385,20 +389,30 @@ fn match_simple_form(
 // frontmatter parsing for prompt templates (utils/frontmatter.ts)
 // ---------------------------------------------------------------------------
 
+/// Frontmatter map as `parseFrontmatter` returns it.
+type Frontmatter = std::collections::BTreeMap<String, serde_yml::Value>;
+
 /// Parse the leading `---` YAML frontmatter block, returning `(frontmatter_map, body)`. Mirrors
 /// `parseFrontmatter` (utils/frontmatter.ts): no fence → empty map + whole content as body.
-fn parse_frontmatter(raw: &str) -> (std::collections::BTreeMap<String, serde_yml::Value>, String) {
+///
+/// CFG-083 — a YAML fault is an `Err` carrying the parser's message: pi's `parse` throws, and
+/// `loadTemplateFromFile` catches it separately, pushes `{type: "warning", message, path}` and
+/// returns no template (`core/prompt-templates.ts:118-125` @v0.87.1; at v0.83.0 the whole load sat
+/// in one `try … catch { return null }`, so the template was dropped at every tag). Every caller
+/// turns the `Err` into that warning.
+fn parse_frontmatter(raw: &str) -> Result<(Frontmatter, String), String> {
     let (yaml, body) = split_front_matter(raw);
     match yaml {
-        Some(front) => {
-            // Pi silently treats a YAML parse fault as `{}` (prompt-templates.ts:129-131).
-            let map =
-                serde_yml::from_str::<std::collections::BTreeMap<String, serde_yml::Value>>(&front)
-                    .unwrap_or_default();
-            (map, body)
-        }
+        // Only a SYNTAX fault is an error. A document that parses to something other than a
+        // mapping is not: pi keeps `parsed ?? {}` whatever it is, and its `typeof … === "string"`
+        // property reads then find nothing — the empty map here.
+        Some(front) => match serde_yml::from_str::<serde_yml::Value>(&front) {
+            Ok(serde_yml::Value::Mapping(map)) => Ok((map.into_iter().collect(), body)),
+            Ok(_) => Ok((Frontmatter::new(), body)),
+            Err(e) => Err(e.to_string()),
+        },
         // No fence → empty frontmatter + the normalized whole content (frontmatter.ts:14,19,33).
-        None => (std::collections::BTreeMap::new(), body),
+        None => Ok((Frontmatter::new(), body)),
     }
 }
 

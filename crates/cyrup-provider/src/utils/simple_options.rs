@@ -17,9 +17,9 @@ use cyrup_core::ThinkingLevel;
 const CONTEXT_SAFETY_TOKENS: i64 = 4096;
 /// Floor for a clamped `max_tokens` (Pi `MIN_MAX_TOKENS`, simple-options.ts:13).
 const MIN_MAX_TOKENS: i64 = 1;
-/// Minimum output tokens kept when a thinking budget would consume the whole window
-/// (Pi `minOutputTokens`, simple-options.ts:66).
-const MIN_OUTPUT_TOKENS: u64 = 1024;
+/// Tokens always left for the answer when a thinking budget shares the response ceiling (Pi
+/// `MIN_ANSWER_TOKENS`, `simple-options.ts:55` @v0.87.1).
+pub const MIN_ANSWER_TOKENS: u64 = 1024;
 
 /// Per-level thinking token budgets (Pi `ThinkingBudgets`, types.ts:88-94). A `None` field falls
 /// back to the built-in default for that level.
@@ -151,15 +151,14 @@ pub fn clamp_reasoning(effort: ThinkingLevel) -> ThinkingLevel {
 ///
 /// `base_max_tokens == None` means the caller set no explicit cap: use the model cap and fit
 /// thinking inside it. Otherwise `max_tokens = min(base + budget, model cap)`. If the resulting
-/// window cannot hold both, the thinking budget shrinks to leave [`MIN_OUTPUT_TOKENS`] of output.
+/// window cannot hold both, the thinking budget shrinks to leave [`MIN_ANSWER_TOKENS`] of output.
 pub fn adjust_max_tokens_for_thinking(
     base_max_tokens: Option<u64>,
     model_max_tokens: u64,
     reasoning_level: ThinkingLevel,
     custom_budgets: Option<&ThinkingBudgets>,
 ) -> (u64, u64) {
-    let level = clamp_reasoning(reasoning_level);
-    let mut thinking_budget = budget_for_level(level, custom_budgets);
+    let mut thinking_budget = thinking_budget_for_level(reasoning_level, custom_budgets);
 
     let max_tokens = match base_max_tokens {
         None => model_max_tokens,
@@ -167,14 +166,28 @@ pub fn adjust_max_tokens_for_thinking(
     };
 
     if max_tokens <= thinking_budget {
-        thinking_budget = max_tokens.saturating_sub(MIN_OUTPUT_TOKENS);
+        thinking_budget = clamp_thinking_budget_to_answer_room(thinking_budget, max_tokens);
     }
 
     (max_tokens, thinking_budget)
 }
 
+/// The token budget for a reasoning level (Pi `thinkingBudgetForLevel`, `simple-options.ts:68-72`
+/// @v0.87.1): the level is clamped first (`xhigh`/`max` → `high`), then a custom override wins over
+/// the default table.
+pub fn thinking_budget_for_level(level: ThinkingLevel, custom: Option<&ThinkingBudgets>) -> u64 {
+    budget_for_level(clamp_reasoning(level), custom)
+}
+
+/// Cap a thinking budget so at least [`MIN_ANSWER_TOKENS`] remain under a shared response ceiling
+/// (Pi `clampThinkingBudgetToAnswerRoom`, `simple-options.ts:75-77` @v0.87.1).
+pub fn clamp_thinking_budget_to_answer_room(thinking_budget: u64, ceiling: u64) -> u64 {
+    thinking_budget.min(ceiling.saturating_sub(MIN_ANSWER_TOKENS))
+}
+
 /// The token budget for a (already-clamped) on-level, applying any custom override over the Pi
-/// default (`minimal:1024, low:2048, medium:8192, high:16384`, simple-options.ts:58-64).
+/// default (`minimal:1024, low:2048, medium:8192, high:16384`, `DEFAULT_THINKING_BUDGETS`,
+/// simple-options.ts:57-62 @v0.87.1).
 fn budget_for_level(level: ThinkingLevel, custom: Option<&ThinkingBudgets>) -> u64 {
     let (default, override_val) = match level {
         ThinkingLevel::Minimal => (1024, custom.and_then(|c| c.minimal)),
@@ -333,12 +346,12 @@ mod tests {
 
     #[test]
     fn adjust_shrinks_budget_to_keep_output() {
-        // window <= budget → budget shrinks to leave MIN_OUTPUT_TOKENS of output.
+        // window <= budget → budget shrinks to leave MIN_ANSWER_TOKENS of output.
         let (max_tokens, budget) =
             adjust_max_tokens_for_thinking(Some(0), 16_384, ThinkingLevel::High, None);
         // base 0 + 16384 = 16384 == model cap; max_tokens == 16384 <= budget 16384 → shrink.
         assert_eq!(max_tokens, 16_384);
-        assert_eq!(budget, 16_384 - MIN_OUTPUT_TOKENS);
+        assert_eq!(budget, 16_384 - MIN_ANSWER_TOKENS);
     }
 
     #[test]

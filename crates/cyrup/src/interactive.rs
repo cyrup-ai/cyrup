@@ -8,6 +8,7 @@
 //!
 //! Pi's counterpart is `cli/interactive-mode.ts` plus the footer/theme helpers it pulls in.
 
+use std::io::Write as _;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -20,19 +21,46 @@ use cyrup_tui::{App, StdinTerminalProbe, ThemeController, UiTheme, crossterm_inp
 use crate::input::Inputs;
 use crate::run::initial_input;
 
-/// The startup migrated-credential warning line, or `None` when nothing was migrated — Pi
-/// `if (migratedProviders && migratedProviders.length > 0) { this.showWarning(`Migrated credentials
-/// to auth.json: ${migratedProviders.join(", ")}`); }` (interactive-mode.ts:874-876 @v0.83.0), with
-/// `showWarning`'s own `Warning: ` prefix (`:3885-3889`) folded in, because cyrup's `Entry::Warning`
-/// renders its text verbatim. Split out from the call site so the string is pinnable (CFG-051).
+/// The startup migrated-credential warning message, or `None` when nothing was migrated — the
+/// argument of Pi's `if (migratedProviders && migratedProviders.length > 0) {
+/// this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`); }`
+/// (`interactive-mode.ts:1140-1142` @v0.87.1). `showWarning`'s own `Warning: ` prefix is added
+/// where pi adds it, in `TranscriptView::show_warning` (TUI-062). Split out from the call site so
+/// the string is pinnable (CFG-051).
 fn migrated_credentials_warning(providers: &[String]) -> Option<String> {
     if providers.is_empty() {
         return None;
     }
     Some(format!(
-        "Warning: Migrated credentials to auth.json: {}",
+        "Migrated credentials to auth.json: {}",
         providers.join(", ")
     ))
+}
+
+/// Pi's startup-warning block up to the `modelFallbackMessage` line (`interactive-mode.ts:1130-1142`
+/// @v0.87.1), in pi's order: each startup diagnostic through `showError` / `showWarning` by its
+/// `type` (CFG-088), THEN the migrated-credential notice (CFG-051). Both go in the TRANSCRIPT, not
+/// on stderr, because that is the only place a user will still see them once the alternate screen
+/// is up.
+fn push_startup_warnings(
+    transcript: &mut cyrup_tui::TranscriptView,
+    diagnostics: &[crate::diagnostics::Diagnostic],
+    migrated_providers: &[String],
+) {
+    for diagnostic in diagnostics {
+        match diagnostic.level {
+            // Pi `showError` builds `Error: ${errorMessage}` itself (`:4463-4466`).
+            crate::diagnostics::DiagnosticLevel::Error => {
+                transcript.push_error(format!("Error: {}", diagnostic.message));
+            }
+            crate::diagnostics::DiagnosticLevel::Warning => {
+                transcript.show_warning(&diagnostic.message);
+            }
+        }
+    }
+    if let Some(line) = migrated_credentials_warning(migrated_providers) {
+        transcript.show_warning(line);
+    }
 }
 
 /// Write Pi's exit hint — `To resume this session: cyrup [--session-dir DIR] --session ID` — on the
@@ -113,13 +141,35 @@ pub async fn run_interactive(
     // @v0.84.4), computed at the composition root (`main.ts:701-704`) and handed in here exactly
     // as `migratedProviders` is: the session cwd when its trust was granted implicitly at boot.
     auto_trust_on_reload_cwd: Option<std::path::PathBuf>,
+    // SEAM-119 — `--use-theme`, pi's `InteractiveModeOptions.initialThemeSetting`
+    // (`main.ts:944` @v0.87.1), the in-memory theme setting the controller boots from and prefers
+    // over `settings.theme` for the rest of the run. Never persisted.
+    initial_theme_setting: Option<String>,
+    // CFG-088 — pi's `InteractiveModeOptions.startupDiagnostics` (`main.ts:936` @v0.87.1): the
+    // deduplicated startup + runtime diagnostics, shown in the transcript instead of on stderr.
+    startup_diagnostics: Vec<crate::diagnostics::Diagnostic>,
 ) -> anyhow::Result<()> {
     // Boot the render theme from `settings.theme` + the terminal background/color-depth (feature #4:
     // the `ThemeController`), instead of the hardwired dark boot the audit flagged (theme.rs #4). An
     // unset/`auto` setting resolves against the detected terminal polarity; every role is projected
     // into the detected `ColorMode` (feature #3) so 256-color terminals get indexed colors.
+    //
+    // CFG-090 — the `terminal.{images,trueColor,hyperlinks}` overrides go in first: pi applies them
+    // at startup (`main.ts:853` @v0.87.1) and again in the interactive constructor (`:566`), before
+    // any theme or capability read, so the colour depth the theme boots into and the capabilities
+    // `detect_image_support` publishes below both see them.
+    cyrup_tui::set_capability_overrides(cyrup_tui::CapabilityOverrides::from_settings(
+        session
+            .services()
+            .settings
+            .effective()
+            .terminal_capability_overrides(),
+    ));
     let theme_setting = session.services().settings.effective().theme_setting();
-    let mut controller = ThemeController::boot_from_env(theme_setting.as_deref());
+    let mut controller = ThemeController::boot_from_env_with_initial(
+        initial_theme_setting.as_deref(),
+        theme_setting.as_deref(),
+    );
     let mut app = App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
 
     // ADR-0005 §B-14 — select the renderer before anything paints. The flag wins when supplied,
@@ -228,11 +278,21 @@ pub async fn run_interactive(
         // everything else applied and these specific ids did not — the old code printed
         // "ignoring <path>" for that case too, which was false: the file had already been
         // half-applied in an iteration order the user cannot see.
+        // Printed through the TUI's guarded stderr: the terminal is live, and pi's dead-terminal
+        // handler covers `process.stderr` too (TUI-S02).
+        let mut stderr = cyrup_tui::terminal_stderr();
         match app.load_keybindings_json(&json) {
-            Err(e) => eprintln!("warning: ignoring {}: {e}", keybindings_path.display()),
+            Err(e) => {
+                let _ = writeln!(
+                    stderr,
+                    "warning: ignoring {}: {e}",
+                    keybindings_path.display()
+                );
+            }
             Ok(issues) => {
                 for issue in issues {
-                    eprintln!(
+                    let _ = writeln!(
+                        stderr,
                         "warning: {}: ignoring {}",
                         keybindings_path.display(),
                         issue
@@ -260,6 +320,14 @@ pub async fn run_interactive(
         .effective()
         .clear_on_shrink(&env_vars);
     app.set_reserve_status_rows(reserve);
+    // CFG-063 — pi's two render-debug instruments (`PI_TUI_DEBUG`, `PI_TUI_DEBUG_REDRAW`,
+    // `tui-main-screen.ts:321`, `:569` @v0.87.1) under their `CYRUP_` names, with the agent
+    // directory as the redraw log's home — pi hands the renderer `logDirectory: getAgentDir()`
+    // (`interactive-mode.ts:581`).
+    app.set_render_debug(cyrup_tui::RenderDebug::from_env(
+        |k| std::env::var(k).ok(),
+        Some(session.services().agent_dir.as_path()),
+    ));
 
     // Extension keyboard shortcuts (feature #10; Pi `registerShortcut`): source the registered
     // shortcut key-ids from the session's extension host so a matching press routes to the owning
@@ -312,24 +380,25 @@ pub async fn run_interactive(
     // runs from `init()`, ahead of `run()`'s startup-warning block) and before the replay.
     //
     // The `Warning: ` prefix belongs to pi's `showWarning` itself — `new Text(theme.fg("warning",
-    // `Warning: ${warningMessage}`), 1, 0)`, interactive-mode.ts:3885-3889 @v0.83.0 — and cyrup
-    // renders `Entry::Warning` verbatim, so every caller supplies it (app.rs:3626, :7821).
+    // `Warning: ${warningMessage}`), 1, 0)`, `interactive-mode.ts:4469-4473` @v0.87.1 — and is
+    // built in cyrup's one port of it, `TranscriptView::show_warning` (TUI-062).
 
-    // FIRST: the migrated-credential notice (`:874-876`). It tells the user their OAuth tokens and
-    // API keys were relocated out of `oauth.json`/`settings.json` into `auth.json` — a change that
-    // silently invalidates any backup or tooling pointing at the old files — and on stderr it lived
-    // exactly one frame before the paint that erased it. CFG-051.
-    if let Some(line) = migrated_credentials_warning(&migrated_providers) {
-        app.state_mut().transcript.push_warning(line);
-    }
+    // FIRST the startup diagnostics (CFG-088), THEN the migrated-credential notice. The latter
+    // tells the user their OAuth tokens and API keys were relocated out of
+    // `oauth.json`/`settings.json` into `auth.json` — a change that silently invalidates any backup
+    // or tooling pointing at the old files — and on stderr it lived exactly one frame before the
+    // paint that erased it (CFG-051).
+    push_startup_warnings(
+        &mut app.state_mut().transcript,
+        &startup_diagnostics,
+        &migrated_providers,
+    );
     // THEN the `modelFallbackMessage` warning (`:883-885`). Reading it is the whole point: on a
     // credential-less start it is `formatNoModelsAvailableMessage()`, i.e. "No models available.
     // Use /login …" (auth-guidance.ts:14-16), the instruction that turns a modelless launch
-    // (SEAM-075) into a working session. The `Warning: ` prefix was missing at this call site.
+    // (SEAM-075) into a working session.
     if let Some(msg) = runtime.model_fallback_message().await {
-        app.state_mut()
-            .transcript
-            .push_warning(format!("Warning: {msg}"));
+        app.state_mut().transcript.show_warning(msg);
     }
 
     let input_stream = crossterm_input_stream(cancel.clone());
@@ -413,7 +482,8 @@ fn build_theme_watcher(
     match ThemeWatcher::spawn(seed, path.clone(), cancel.clone()) {
         Ok(w) => Some(w),
         Err(e) => {
-            eprintln!(
+            let _ = writeln!(
+                cyrup_tui::terminal_stderr(),
                 "warning: theme hot-reload disabled for {}: {e}",
                 path.display()
             );
@@ -522,8 +592,8 @@ mod tests {
 
     /// CFG-051 — the notice that a user's OAuth tokens and API keys were relocated out of
     /// `oauth.json`/`settings.json` into `auth.json`. pi renders it INSIDE the running UI
-    /// (`this.showWarning(...)`, interactive-mode.ts:874-876 @v0.83.0, whose copy carries the
-    /// `Warning: ` prefix at `:3885-3889`); cyrup wrote it to stderr on the pre-TUI path, one frame
+    /// (`this.showWarning(...)`, `interactive-mode.ts:1140-1142` @v0.87.1, whose `Warning: ` prefix
+    /// `TranscriptView::show_warning` adds); cyrup wrote it to stderr on the pre-TUI path, one frame
     /// ahead of the paint that erased it. It is now a transcript entry beside the
     /// `modelFallbackMessage` warning, in pi's order (`:874` before `:884`).
     ///
@@ -533,13 +603,48 @@ mod tests {
         assert_eq!(migrated_credentials_warning(&[]), None);
         assert_eq!(
             migrated_credentials_warning(&["anthropic".to_string()]).as_deref(),
-            Some("Warning: Migrated credentials to auth.json: anthropic")
+            Some("Migrated credentials to auth.json: anthropic")
         );
         // `migratedProviders.join(", ")` — comma-space, and every provider named.
         assert_eq!(
             migrated_credentials_warning(&["anthropic".to_string(), "openai".to_string()])
                 .as_deref(),
-            Some("Warning: Migrated credentials to auth.json: anthropic, openai")
+            Some("Migrated credentials to auth.json: anthropic, openai")
+        );
+    }
+
+    /// CFG-088 — an interactive run's merged startup diagnostics land in the transcript, each
+    /// through pi's `showError` / `showWarning` (`interactive-mode.ts:1130-1138` @v0.87.1), and
+    /// AHEAD of the migrated-credential notice (`:1140-1142`).
+    #[test]
+    fn startup_diagnostics_head_the_transcript_warnings_in_pis_order() {
+        use crate::diagnostics::Diagnostic;
+        use cyrup_tui::Entry;
+        let mut transcript = cyrup_tui::TranscriptView::new();
+        super::push_startup_warnings(
+            &mut transcript,
+            &[
+                Diagnostic::warning("Invalid settings file /a/settings.json: bad"),
+                Diagnostic::error("boom"),
+            ],
+            &["anthropic".to_string()],
+        );
+        let lines: Vec<String> = transcript
+            .pending()
+            .iter()
+            .map(|e| match e {
+                Entry::Warning(t) => format!("warning|{t}"),
+                Entry::Error(t) => format!("error|{t}"),
+                other => panic!("unexpected entry {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "warning|Warning: Invalid settings file /a/settings.json: bad",
+                "error|Error: boom",
+                "warning|Warning: Migrated credentials to auth.json: anthropic",
+            ]
         );
     }
 

@@ -1,6 +1,6 @@
-//! Compat resolution (Pi getAnthropicCompat, anthropic-messages.ts:170-181)
+//! Compat resolution (Pi getAnthropicCompat, anthropic-messages.ts:206-220 @v0.87.1)
 
-use crate::api::compat::AnthropicMessagesCompat;
+use crate::api::compat::{AnthropicMessagesCompat, SessionAffinityFormat};
 use crate::model::Model;
 
 /// Resolved Anthropic compat (Pi `Required<Omit<AnthropicMessagesCompat,"forceAdaptiveThinking">>`).
@@ -8,6 +8,10 @@ pub(super) struct ResolvedAnthropicCompat {
     pub(super) supports_eager_tool_input_streaming: bool,
     pub(super) supports_long_cache_retention: bool,
     pub(super) send_session_affinity_headers: bool,
+    /// Pi `sessionAffinityFormat: model.compat?.sessionAffinityFormat ?? (isOpenRouter ?
+    /// "openrouter" : undefined)` (`anthropic-messages.ts:212` @v0.87.1). `Openrouter` sends
+    /// `x-session-id`; anything else (including unset) sends `x-session-affinity` (`:966-969`).
+    pub(super) session_affinity_format: Option<SessionAffinityFormat>,
     pub(super) supports_cache_control_on_tools: bool,
     pub(super) supports_temperature: bool,
     pub(super) allow_empty_signature: bool,
@@ -20,10 +24,13 @@ pub(super) struct ResolvedAnthropicCompat {
     pub(super) supports_tool_references: bool,
 }
 
-/// 1:1 port of Pi `getAnthropicCompat` (anthropic-messages.ts:170-181): every field defaults on,
-/// except `sendSessionAffinityHeaders`/`allowEmptySignature` which default off.
+/// 1:1 port of Pi `getAnthropicCompat` (`anthropic-messages.ts:206-220` @v0.87.1): every field
+/// defaults on, except `allowEmptySignature` which defaults off and the session-affinity pair,
+/// which default on for OpenRouter only (`bbb61e34a`, v0.86.0, #9102 — PROV-086).
 pub(super) fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
     let c: Option<&AnthropicMessagesCompat> = model.compat.as_ref();
+    let is_openrouter = model.provider.as_str() == "openrouter"
+        || model.base_url.as_str().contains("openrouter.ai");
     ResolvedAnthropicCompat {
         supports_eager_tool_input_streaming: c
             .and_then(|c| c.supports_eager_tool_input_streaming)
@@ -33,7 +40,10 @@ pub(super) fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
             .unwrap_or(true),
         send_session_affinity_headers: c
             .and_then(|c| c.send_session_affinity_headers)
-            .unwrap_or(false),
+            .unwrap_or(is_openrouter),
+        session_affinity_format: c
+            .and_then(|c| c.session_affinity_format)
+            .or(is_openrouter.then_some(SessionAffinityFormat::Openrouter)),
         supports_cache_control_on_tools: c
             .and_then(|c| c.supports_cache_control_on_tools)
             .unwrap_or(true),

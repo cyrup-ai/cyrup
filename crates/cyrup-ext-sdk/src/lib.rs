@@ -3,16 +3,17 @@
 //! Compiled to `wasm32-wasip2` (cdylib) it implements the `cyrup:ext` WIT world and emits a loadable
 //! COMPONENT; compiled for the host (rlib) the ergonomic layer (events, descriptors, outcomes,
 //! dispatch) is unit-testable. An author builds an [`ExtensionApi`] in a factory, subscribing to any
-//! of the 33 lifecycle events with typed `(event, &Ctx) -> Outcome` handlers and registering
+//! of the 36 lifecycle events with typed `(event, &Ctx) -> Outcome` handlers and registering
 //! tools/commands/shortcuts/flags/providers/renderers/autocomplete — the Rust analog of Pi's
 //! `ExtensionAPI` (extensions/types.ts:1128-1356).
 //!
 //! ## Modules
 //! - [`prelude`] — the author entry point: `use cyrup_ext_sdk::prelude::*;`.
 //! - [`api`] — [`ExtensionApi`], [`Outcome`], tool execution ([`ToolExec`]/[`ToolOutput`]).
-//! - [`events`] — the 30 typed event payloads + per-event result shapes (33 subscribable events;
-//!   30 payload structs, because some events share one — [`SessionLifecycleEvent`] serves both
-//!   `session_start` and `session_shutdown` — and `agent_start`/`agent_settled` carry none).
+//! - [`events`] — the 32 typed event payloads + per-event result shapes (36 subscribable events;
+//!   32 payload structs, because some events share one — [`SessionLifecycleEvent`] serves both
+//!   `session_start` and `session_shutdown`, [`UiPromptEvent`] both `ui_prompt_start` and
+//!   `ui_prompt_end` — and `agent_start`/`agent_settled` carry none).
 //! - [`ctx`] — [`Ctx`]/[`CommandCtx`]/[`Ui`]/[`Session`]/[`Models`] capability wrappers.
 //! - [`descriptor`] — tool/command/flag/provider descriptors.
 //! - [`tool_factory`] — [`define_tool`], plus the `bash`/`read`/`write` descriptor builders
@@ -68,7 +69,7 @@ pub use api::{
     ArgCompleter, BashOperations, CommandExec, ContentBlock, ExtensionApi,
     MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
     RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, RenderOptions,
-    ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
+    ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput, Unsubscribe,
 };
 pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
@@ -104,7 +105,7 @@ pub mod prelude {
         ArgCompleter, BashOperations, CommandExec, ContentBlock, ExtensionApi,
         MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
         RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, RenderOptions,
-        ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
+        ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput, Unsubscribe,
     };
     pub use crate::autocomplete::{
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,

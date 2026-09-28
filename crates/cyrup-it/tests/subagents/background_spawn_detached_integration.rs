@@ -592,6 +592,7 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -836,6 +837,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),

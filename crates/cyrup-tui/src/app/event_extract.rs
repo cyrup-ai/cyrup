@@ -105,18 +105,49 @@ pub(crate) fn line_text(line: &Line<'_>) -> String {
 /// headless/permission-denied session, a zero-area raster, …) — so a bare Ctrl+V never disrupts the
 /// editor and simply falls through to normal text handling.
 pub(crate) fn read_clipboard_image_to_temp() -> Option<std::path::PathBuf> {
+    read_clipboard_image_to_temp_with(
+        std::env::consts::OS,
+        &crate::clipboard::ClipboardEnv::from_process(),
+        read_native_clipboard_image,
+    )
+}
+
+/// [`read_clipboard_image_to_temp`] with the platform, the environment and the native read supplied
+/// — the two load gates of pi's `readClipboardImage` (`utils/clipboard-image.ts:207-235` @v0.87.1)
+/// applied BEFORE the native backend is touched (CFG-066):
+///
+/// * `if (env.TERMUX_VERSION) return null;` (`:214-216`) — Termux never reaches a clipboard reader.
+/// * `readClipboardImageViaNativeClipboard` reads `getNativeClipboard()?.getImage()` (`:200-205`),
+///   which is `undefined` — no backend constructed — off `darwin`/`win32` and on a Linux box without
+///   an X11 `DISPLAY` ([`crate::clipboard::native_clipboard_available`]).
+///
+/// `native` is only called when both gates pass, so a headless or Termux session never constructs
+/// an `arboard::Clipboard` at all.
+pub(crate) fn read_clipboard_image_to_temp_with(
+    os: &str,
+    env: &crate::clipboard::ClipboardEnv,
+    native: impl FnOnce() -> Option<image::RgbaImage>,
+) -> Option<std::path::PathBuf> {
+    if env.termux || !crate::clipboard::native_clipboard_available(os, env) {
+        return None;
+    }
+    let raster = native()?;
+    let path = std::env::temp_dir().join(format!("cyrup-clipboard-{}.png", uuid::Uuid::now_v7()));
+    raster
+        .save_with_format(&path, image::ImageFormat::Png)
+        .ok()?;
+    Some(path)
+}
+
+/// The native image read: `arboard`'s RGBA8 raster, rebuilt as an [`image::RgbaImage`].
+fn read_native_clipboard_image() -> Option<image::RgbaImage> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     let img = clipboard.get_image().ok()?;
     let width = u32::try_from(img.width).ok()?;
     let height = u32::try_from(img.height).ok()?;
     // `arboard::ImageData::bytes` is an RGBA8 raster; `from_raw` returns `None` if the buffer length
     // does not match `width * height * 4`, guarding a malformed clipboard payload without panicking.
-    let raster = image::RgbaImage::from_raw(width, height, img.bytes.into_owned())?;
-    let path = std::env::temp_dir().join(format!("cyrup-clipboard-{}.png", uuid::Uuid::now_v7()));
-    raster
-        .save_with_format(&path, image::ImageFormat::Png)
-        .ok()?;
-    Some(path)
+    image::RgbaImage::from_raw(width, height, img.bytes.into_owned())
 }
 
 /// The largest `edit` target that gets a synchronous pre-execution preview.

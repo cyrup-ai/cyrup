@@ -35,3 +35,18 @@ fn headers_use_bearer_and_affinity() {
         Some("sess-1")
     );
 }
+
+/// PROV-095 — pi `new Headers({ "User-Agent": getPiUserAgent(), … })` before both overrides
+/// (mistral-conversations.ts:337-345 @v0.87.1, #8305): a default client User-Agent under every
+/// overlay.
+#[test]
+fn default_user_agent_sits_under_the_overlays() {
+    let m = model_with("mistral-medium-2604", true);
+    crate::utils::user_agent::assert_default_user_agent_under_overlays(|overlay| {
+        let opts = StreamOptions {
+            headers: overlay,
+            ..Default::default()
+        };
+        build_headers(&m, &opts, "sk-mistral")
+    });
+}

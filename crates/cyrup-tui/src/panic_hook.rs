@@ -25,7 +25,7 @@
 //! rendering crate, or a re-panic on a poisoned mutex all land here, and none of them are reachable
 //! by auditing this workspace's own code.
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ratatui::crossterm::ExecutableCommand;
@@ -53,7 +53,7 @@ use ratatui::crossterm::terminal::{EndSynchronizedUpdate, disable_raw_mode};
 /// of everything else, because an exit taken mid-frame leaves the terminal buffering every write
 /// that follows, this function's own included. See the first statement below.
 pub fn restore_terminal_best_effort() {
-    let mut out = io::stdout();
+    let mut out = crate::dead_terminal::terminal_stdout();
     // Close the synchronized update FIRST, before this function writes anything else.
     // [`crate::App::draw_synchronized`] (`app/crossterm.rs:87-100`) brackets every frame in
     // `BeginSynchronizedUpdate` … `EndSynchronizedUpdate`, and both a hard exit through the TUI-092
@@ -98,6 +98,13 @@ pub fn install_panic_hook() {
     INSTALLS.fetch_add(1, Ordering::Relaxed);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // pi's `uncaughtCrash` (`interactive-mode.ts:4198-4210` @v0.87.1), in its order: unregister
+        // the dead-terminal handler, so a crash on a dead terminal still ends as a crash rather than
+        // as `emergencyTerminalExit`; kill the tracked detached bash groups, which would otherwise
+        // outlive the process; then restore. The drain holds its registry lock only to take the
+        // set, and nothing under that lock can panic, so it cannot be re-entered from here.
+        crate::dead_terminal::disarm();
+        cyrup_tools::kill_tracked_detached_children();
         restore_terminal_best_effort();
         previous(info);
     }));
@@ -208,6 +215,47 @@ mod tests {
             before + 1,
             "App::into_stdout must call install_panic_hook() before enable_raw_mode()"
         );
+        // TUI-S02 — and it registers the dead-terminal handler, pi's `registerSignalHandlers`
+        // (`interactive-mode.ts:4252-4261` @v0.87.1).
+        assert!(
+            crate::dead_terminal::is_armed(),
+            "App::into_stdout must arm the dead-terminal handler"
+        );
+        crate::dead_terminal::disarm();
+    }
+
+    /// pi's `uncaughtCrash` kills the tracked detached bash groups before it restores
+    /// (`interactive-mode.ts:4206-4208` @v0.87.1): a crash must not leave a `sleep` the bash tool
+    /// started running after the process is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_kills_the_tracked_detached_children() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        let _guard = lock_hook();
+        let _armed = crate::terminal_progress::lock_progress_armed();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        cyrup_tools::track_detached_child_pid(child.id());
+        std::panic::set_hook(Box::new(|_| {}));
+        install_panic_hook();
+        let result = std::panic::catch_unwind(|| panic!("boom"));
+        let _ = std::panic::take_hook();
+        assert!(result.is_err());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("the tracked detached child outlived the crash");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(9), "{status:?}");
     }
 
     /// Mirror of the terminal crossterm would grab: stdin when it is a TTY, else `/dev/tty`.

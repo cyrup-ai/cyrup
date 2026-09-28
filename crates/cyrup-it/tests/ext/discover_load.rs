@@ -1,9 +1,10 @@
-//! LIVE discover -> trust-gate -> load -> route-command -> reload, end-to-end (arch-08 §6.2/§6.5).
+//! LIVE discover -> trust-gate -> load -> route-command, end-to-end (arch-08 §6.2/§6.5).
 //! Builds the `cyrup-ext-sdk` demo COMPONENT, drops it into a temp project's
 //! `.cyrup/extensions/demo/` with an `extension.json`, and drives the facade orchestration: an
 //! untrusted project records an `Untrusted` error (R-08-002); a trusted project loads the component
-//! and routes a guest slash command across the boundary (R-08-016); `/reload` cache-busts and
-//! re-loads (R-08-005).
+//! and routes a guest slash command across the boundary (R-08-016). `/reload` is not driven here:
+//! it rebuilds the whole session (`SessionRuntime::reload` -> `SessionBuilder::build`), as pi's
+//! does, and the extension host has no in-place reload (EXT-025).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -38,7 +39,7 @@ fn temp_project(name: &str) -> PathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn discover_trust_load_command_reload() {
+async fn discover_trust_load_command() {
     let bytes = std::fs::read(fixture_component()).expect("read fixture component");
 
     // Lay out a project: <cwd>/.cyrup/extensions/demo/{extension.json, demo.wasm}.
@@ -129,18 +130,6 @@ async fn discover_trust_load_command_reload() {
         "non-deny backend recorded the command's control op with its instructions: {:?}",
         rec.control_ops()
     );
-
-    // 4) hot reload: cache-bust + re-load; the command still routes afterwards.
-    let reloaded = host
-        .reload(&roots, true, rec.clone(), &cancel)
-        .await
-        .expect("reload");
-    assert_eq!(reloaded.loaded.len(), 1, "reload re-loaded the extension");
-    let out2 = host
-        .run_command("greet", "team", &cancel)
-        .await
-        .expect("command runs post-reload");
-    assert_eq!(out2.as_deref(), Some("hello, team!"));
 
     let _ = std::fs::remove_dir_all(&cwd);
 }

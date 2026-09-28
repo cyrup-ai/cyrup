@@ -43,8 +43,7 @@ That is a whole task's worth of work deleted, which is why the series is **12 ta
 The old numbering maps `01→01`, `02–06→02–06`, `07–10→07–10`, `12→11`, `13→12`; the old `11`
 dissolved into the new `01`, where the resource contribution belongs.
 
-Three corrections to the parent spec were found while re-planning and are recorded in
-[FLUX_01](FLUX_01.md):
+Three corrections to the parent spec were found while re-planning:
 
 1. `NativeExtension`'s first method is **`fn id(&self) -> ExtensionId`**, not `fn name(&self) -> &str`.
 2. There are **three** `with_native_extension` seams in `main.rs` (one per `AppMode`), not one.
@@ -53,20 +52,25 @@ Three corrections to the parent spec were found while re-planning and are record
 
 ## The tasks
 
+The `FLUX_NN` numbers below are task labels. The per-task files are not in the tree: the thirteen
+originals (`git show adb3bba4:spec/flux/FLUX_NN.md`, numbered by the old plan — see the map above)
+were deleted by `67b73a05` when the crate landed, and the re-planned twelve were never committed.
+The crate is the record of what each task delivered.
+
 | # | Task | Deliverable |
 |---|------|-------------|
-| 01 | [Crate scaffold + wiring + bundled-resource contribution](FLUX_01.md) | `cyrup-flux` loads in all 3 modes; `flux/*` names register namespaced |
-| 02 | [Port `new.md` + `config.md`](FLUX_02.md) | state-bootstrap templates |
-| 03 | [Port `ask.md` + `split.md` + `aug.md`](FLUX_03.md) | planning triad |
-| 04 | [Port `exec.md` + `qa.md` + `tests.md`](FLUX_04.md) | execution triad |
-| 05 | [Port git/GitHub templates + `auto-pilot.md`](FLUX_05.md) | all 15 templates; pipeline A complete |
-| 06 | [The `flux` skill](FLUX_06.md) | `/skill:flux` loads the pipeline docs |
-| 07 | [`state.rs` + `/flux/status`](FLUX_07.md) | native status renderer |
-| 08 | [`/flux/cheatsheet` + `/flux/about`](FLUX_08.md) | remaining native renderers |
-| 09 | [`ctrl+f` status overlay](FLUX_09.md) | interactive themed panel |
-| 10 | [`ask_user_question` tool](FLUX_10.md) | agent-callable structured questions |
-| 11 | [FLUX-GAP sweep — restore structured questions](FLUX_11.md) | all 25 sites upgraded |
-| 12 | [Parallel-exec prompt alignment](FLUX_12.md) | multi-task mode matches `subagent` semantics |
+| 01 | Crate scaffold + wiring + bundled-resource contribution | `cyrup-flux` loads in all 3 modes; `flux/*` names register namespaced |
+| 02 | Port `new.md` + `config.md` | state-bootstrap templates |
+| 03 | Port `ask.md` + `split.md` + `aug.md` | planning triad |
+| 04 | Port `exec.md` + `qa.md` + `tests.md` | execution triad |
+| 05 | Port git/GitHub templates + `auto-pilot.md` | all 15 templates; pipeline A complete |
+| 06 | The `flux` skill | `/skill:flux` loads the pipeline docs |
+| 07 | `state.rs` + `/flux/status` | native status renderer |
+| 08 | `/flux/cheatsheet` + `/flux/about` | remaining native renderers |
+| 09 | `ctrl+f` status overlay | interactive themed panel |
+| 10 | `ask_user_question` tool | agent-callable structured questions |
+| 11 | FLUX-GAP sweep — restore structured questions | all 25 sites upgraded |
+| 12 | Parallel-exec prompt alignment | multi-task mode matches `subagent` semantics |
 
 ## Shared conventions
 
@@ -77,21 +81,23 @@ Three corrections to the parent spec were found while re-planning and are record
 - **No documentation work** beyond the content files a task explicitly creates.
 - Definitions of done are behavioural and minimal — one manual run-through, not a test suite.
 - Relative links resolve from this directory: `../flux.md` is the parent spec,
-  `../../crates/…` is the cyrup workspace, `../../tmp/code-puppy/…` is the vendored source.
+  `../../crates/…` is the cyrup workspace, `../../tmp/code_puppy_core_plugins/code_puppy_core_plugins/…`
+  is the ported source.
 
 ### Paths on this machine
 
 ```bash
 CY=/home/d0m17bw/workspace/cyrup                                 # the cyrup checkout
 RES=$CY/crates/cyrup-flux/resources                              # the one content home
-CP=$CY/tmp/code-puppy/flux_bootstrap/bundled/commands/flux       # vendored code-puppy source
+CP=$CY/tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/commands/flux  # ported source
 ```
 
 `$CY/tmp/` is gitignored (`cyrup/.gitignore`: `tmp/`) and holds clones of
-`mpfaffenberger/code_puppy_core_plugins` (as `code-puppy`, with `flux_bootstrap` and
-`customizable_commands` symlinked to the top level so every `../tmp/code-puppy/…` link in this
-spec resolves) and `mpfaffenberger/code_puppy` (as `code-puppy-core`), plus pi's
-`prompt-templates.ts`. FLUX_01 documents how to rebuild it if it is missing.
+`mpfaffenberger/code_puppy_core_plugins` (as `code_puppy_core_plugins`, ported at tag `v0.0.6`;
+the plugins live in its `code_puppy_core_plugins/` package, so every link in this spec carries
+that segment twice) and `mpfaffenberger/code_puppy` (as `code_puppy`, ported at tag `v0.0.720`),
+plus pi. Upstream claims are settled with `git -C $CY/tmp/<clone> show <tag>:<path>`, not with
+the working tree. `.claude/hooks/session-start.sh` clones every one of them if it is missing.
 
 ### The one verification command
 

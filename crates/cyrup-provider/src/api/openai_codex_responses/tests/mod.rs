@@ -23,7 +23,6 @@ use super::retry::*;
 use super::url::*;
 use super::*;
 use crate::api::channel;
-use crate::api::openai_responses::decode_stream;
 use crate::auth::AuthResult;
 use crate::context::Context;
 use crate::model::{Modality, Model, ModelCost};

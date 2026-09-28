@@ -1,6 +1,6 @@
 //! `ApiImpl`.
 
-use super::events::map_codex_frames;
+use super::events::decode_codex_stream;
 use super::headers::{build_sse_headers, extract_account_id};
 use super::options::OpenAiCodexResponsesOptions;
 use super::request::build_request_body;
@@ -11,7 +11,6 @@ use super::retry::{
 use super::terminals::{aborted_event, error_event, sleep_or_abort};
 use super::url::{codex_session_id, resolve_codex_url, resolved_base_url};
 use super::{CodexResponsesApi, DEFAULT_MAX_RETRIES, FrameStream};
-use crate::api::openai_responses::decode_stream;
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;
 use crate::context::Context;
@@ -284,7 +283,13 @@ impl ApiImpl for CodexResponsesApi {
 
         // pi hands the codex-mapped event iterator to the SHARED Responses decoder
         // (`processResponsesStream`, :664-669).
-        let mapped = map_codex_frames(frames, codex_opts.service_tier.clone());
-        decode_stream(mapped, model, &self.api, &sink).await;
+        decode_codex_stream(
+            frames,
+            codex_opts.service_tier.clone(),
+            model,
+            &self.api,
+            &sink,
+        )
+        .await;
     }
 }

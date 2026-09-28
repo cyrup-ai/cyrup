@@ -49,6 +49,9 @@ pub struct AgentFields {
     pub mutation_tools: Option<Option<Vec<String>>>,
     /// SUBA-100 — pi `config.machine`; `Some(None)` clears.
     pub machine: Option<Option<String>>,
+    /// SUBA-133 — pi `config.advertise` (`agent-management.ts:411-415` @v0.71.0); `Some(None)`
+    /// clears.
+    pub advertise: Option<Option<bool>>,
     pub skills: Option<Vec<String>>,
     pub default_reads: Option<Option<Vec<PathBuf>>>,
     pub default_progress: Option<Option<bool>>,
@@ -255,6 +258,8 @@ fn build_definition(
         inherit_global_context: fields.inherit_global_context.unwrap_or(false),
         // SUBA-100 — `config.machine`; absent means the agent runs locally.
         machine: fields.machine.clone().unwrap_or(None),
+        // SUBA-133 — `config.advertise`; absent means not advertised.
+        advertise: fields.advertise.unwrap_or(None),
         // SUBA-102 — pi `config.mutationTools` (`:514-518`); absent means none declared.
         mutation_tools: fields.mutation_tools.clone().unwrap_or(None),
         name: runtime_name,
@@ -342,6 +347,9 @@ fn merge_fields(
             .machine
             .clone()
             .unwrap_or_else(|| existing.machine.clone()),
+        // SUBA-133 — `Some(None)` is pi's `delete target.advertise`; an unstated key keeps the
+        // base's value (the `editableAgentConfig` spread).
+        advertise: fields.advertise.unwrap_or(existing.advertise),
         // SUBA-102 — `Some(None)` is pi's `delete target.mutationTools`; an unstated key keeps the
         // base's list (`editableAgentConfig`, `:318`).
         mutation_tools: fields

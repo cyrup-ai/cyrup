@@ -137,6 +137,7 @@ fn background_spec(run_id: RunId) -> BackgroundStepsSpec {
         include_progress: None,
         run_id,
         timeout_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),

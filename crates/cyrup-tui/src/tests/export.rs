@@ -87,17 +87,21 @@ fn both_tui_export_sites_pass_the_live_session_state() {
         ("/export", include_str!("../app/execute_session.rs")),
         ("/share", include_str!("../app/execute_misc.rs")),
     ] {
-        let call = src
-            .find("session_jsonl_to_html_with_theme(")
-            .unwrap_or_else(|| panic!("{label} must still render through the shared renderer"));
-        let args = src
-            .get(call..(call + 220).min(src.len()))
-            .unwrap_or_default();
         assert!(
-            args.contains("session.export_state()"),
-            "{label} must pass `session.export_state()` — without the leaf the exported document \
-             walks the branch the user abandoned (DRIFT-041), and without the agent state it drops \
-             the System Prompt and Available Tools sections (DRIFT-054)"
+            src.contains("session.export_html_document()"),
+            "{label} must render through `AgentSession::export_html_document`"
         );
     }
+    // That one document builder is where the live state is threaded in.
+    let svc = include_str!("../../../cyrup-session-svc/src/session/transcript.rs");
+    let body = svc
+        .find("pub async fn export_html_document(")
+        .and_then(|at| svc.get(at..(at + 700).min(svc.len())))
+        .unwrap_or_default();
+    assert!(
+        body.contains("session_jsonl_to_html_with_theme(") && body.contains("self.export_state()"),
+        "the HTML document must pass `export_state()` — without the leaf the exported document \
+         walks the branch the user abandoned (DRIFT-041), and without the agent state it drops \
+         the System Prompt and Available Tools sections (DRIFT-054)"
+    );
 }

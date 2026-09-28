@@ -47,9 +47,8 @@ pub mod update_check;
 mod tests;
 
 pub use cli::{
-    Cli, ExtFlagValue, ExtensionFlag, Mode, OutputFormat, ThinkingArg, TuiMode,
-    normalize_short_aliases, partition_extension_flags, render_help, resolve_app_mode,
-    should_take_over_stdout,
+    Cli, ExtFlagValue, ExtensionFlag, Mode, ThinkingArg, TuiMode, normalize_short_aliases,
+    partition_extension_flags, render_help, resolve_app_mode, should_take_over_stdout,
 };
 pub use credential_print::{
     AuthCheckResult, CredentialPrintCommand, CredentialPrintError, CredentialPrintKind,

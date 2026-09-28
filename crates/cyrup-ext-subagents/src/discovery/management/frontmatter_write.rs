@@ -57,6 +57,19 @@ pub(crate) fn serialize_agent(
         lines.push(format!("package: {pkg}"));
     }
     lines.push(format!("description: {}", def.description));
+    // SUBA-133 — `agent-serializer.ts:67` @v0.71.0: `if (config.advertise === true ||
+    // preserve("advertise")) lines.push(\`advertise: ${config.advertise === true ? "true" :
+    // "false"}\`)`. An explicit `advertise: false` survives an update; a create writes only `true`.
+    if def.advertise == Some(true) || preserve(&["advertise"]) {
+        lines.push(format!(
+            "advertise: {}",
+            if def.advertise == Some(true) {
+                "true"
+            } else {
+                "false"
+            }
+        ));
+    }
     // aliases (`agent-serializer.ts:59-60` @ v0.43.0):
     // `if (aliasesValue || preserve("alias", "aliases")) lines.push(`aliases: ${aliasesValue ?? ""}`)`.
     // Both spellings are `KNOWN_FIELDS`, so this line is what stops a management rewrite from
@@ -465,6 +478,11 @@ pub(crate) fn preserved_frontmatter_fields(
     }
     if fields.description.is_some() {
         set.remove("description");
+    }
+    // SUBA-133 — pi `if (hasKey(cfg, "advertise")) changed("advertise")` (`agent-management.ts:348`
+    // @v0.71.0): a stated `advertise` is re-serialized from the new value, so a cleared one goes.
+    if fields.advertise.is_some() {
+        set.remove("advertise");
     }
     // pi `agent-management.ts:287` @ v0.43.0: `if (hasKey(cfg, "aliases")) changed("alias", "aliases")`
     // — an update that sets `aliases` un-preserves BOTH spellings so the new value is serialized.

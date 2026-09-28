@@ -52,15 +52,41 @@ impl AgentSession {
         Ok(())
     }
 
-    /// Export the current session tree as JSONL (Pi `exportToJsonl`, agent-session.ts:3052). With a
-    /// `path` the bytes are written there; otherwise the JSONL text is returned.
+    /// The HTML export document for this session, unwritten — what [`Self::export_to_html`] writes,
+    /// for a caller that picks its own destination (`/export` and the `/share` gist upload).
+    ///
+    /// Rendered over the WHOLE session tree ([`cyrup_session::SessionManager::export_jsonl`]), not
+    /// the branch [`Self::export_to_jsonl`] writes: pi's `exportToHtml` hands `exportSessionToHtml`
+    /// the full session manager so the page's tree sidebar can show every branch, and `/share`'s
+    /// gist arm uploads that page (`session-share.ts:71-72` @v0.87.1) while its Radius arm uploads
+    /// the linearised branch (`:51`).
+    pub async fn export_html_document(&self) -> Result<String, SessionServiceError> {
+        let jsonl = {
+            let guard = self.manager.lock().await;
+            let mut buf: Vec<u8> = Vec::new();
+            guard.export_jsonl(&mut buf)?;
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        Ok(crate::export::session_jsonl_to_html_with_theme(
+            &jsonl,
+            &self.export_theme(),
+            &self.export_state().await,
+        ))
+    }
+
+    /// Export the CURRENT BRANCH as a linear JSONL session under a fresh header (Pi
+    /// `exportToJsonl` → `exportSessionToJsonl` → `serializeSessionBranch`,
+    /// `agent-session.ts:3934-3935`, `core/session-export.ts:9-29` @v0.87.1; see
+    /// [`cyrup_session::SessionManager::export_branch_jsonl`]). Feeds `/export <file>.jsonl`,
+    /// `/share` and RPC `export_jsonl` (SESS-058, DRIFT-055). With a `path` the bytes are written
+    /// there; otherwise the JSONL text is returned.
     pub async fn export_to_jsonl(
         &self,
         path: Option<&Path>,
     ) -> Result<Option<String>, SessionServiceError> {
         let guard = self.manager.lock().await;
         let mut buf: Vec<u8> = Vec::new();
-        guard.export_jsonl(&mut buf)?;
+        guard.export_branch_jsonl(&mut buf)?;
         drop(guard);
         let text = String::from_utf8_lossy(&buf).into_owned();
         match path {
@@ -175,17 +201,7 @@ impl AgentSession {
         &self,
         path: Option<&Path>,
     ) -> Result<std::path::PathBuf, SessionServiceError> {
-        let jsonl = {
-            let guard = self.manager.lock().await;
-            let mut buf: Vec<u8> = Vec::new();
-            guard.export_jsonl(&mut buf)?;
-            String::from_utf8_lossy(&buf).into_owned()
-        };
-        let html = crate::export::session_jsonl_to_html_with_theme(
-            &jsonl,
-            &self.export_theme(),
-            &self.export_state().await,
-        );
+        let html = self.export_html_document().await?;
         let out = match path {
             Some(p) => p.to_path_buf(),
             None => {
@@ -291,10 +307,6 @@ fn flatten_dag_node(
 ) {
     let id = node.entry.id();
     let (kind, label) = dag_display(&node.entry);
-    let label = match &node.label {
-        Some(l) => format!("[{l}] {label}"),
-        None => label,
-    };
     out.push(SessionDagNode {
         entry_id: id.clone(),
         parent_id,
@@ -303,7 +315,8 @@ fn flatten_dag_node(
         kind,
         foldable: !node.children.is_empty(),
         is_leaf: leaf == Some(&id),
-        has_label: node.label.is_some(),
+        user_label: node.label.clone(),
+        label_timestamp: node.label_timestamp.clone(),
         timestamp: node
             .entry
             .base()
@@ -372,30 +385,30 @@ fn dag_display(e: &cyrup_session::Entry) -> (SessionDagKind, String) {
             clip(format!("branch summary: {}", normalize(summary))),
         ),
         Entry::Known(KnownEntry::SessionInfo { name, .. }) => (
-            SessionDagKind::Other,
+            SessionDagKind::Settings,
             format!("title: {}", name.clone().unwrap_or_default()),
         ),
         Entry::Known(KnownEntry::CustomMessage { custom_type, .. }) => {
             (SessionDagKind::Other, format!("[{custom_type}]"))
         }
         Entry::Known(KnownEntry::Custom { custom_type, .. }) => {
-            (SessionDagKind::Other, format!("custom {custom_type}"))
+            (SessionDagKind::Settings, format!("custom {custom_type}"))
         }
         Entry::Known(KnownEntry::Label { label, .. }) => (
-            SessionDagKind::Other,
+            SessionDagKind::Settings,
             format!("label {}", label.clone().unwrap_or_default()),
         ),
         // Pi labels a `context_edit` node
         //   `[context ${entry.replacement === null ? "omit" : "replace"}: ${entry.targetId}]`
         // and classes it with the settings/bookkeeping entries hidden in the default tree view
         // (`modes/interactive/components/tree-selector.ts:361,844` @v0.87.1) — hence
-        // `SessionDagKind::Other`, the same kind `label`/`custom`/`session_info` get here.
+        // `SessionDagKind::Settings`, the same kind `label`/`custom`/`session_info` get here.
         Entry::Known(KnownEntry::ContextEdit {
             target_id,
             replacement,
             ..
         }) => (
-            SessionDagKind::Other,
+            SessionDagKind::Settings,
             format!(
                 "[context {}: {target_id}]",
                 if replacement.is_none() {
@@ -405,6 +418,12 @@ fn dag_display(e: &cyrup_session::Entry) -> (SessionDagKind, String) {
                 }
             ),
         ),
+        // pi v0.86+'s cache-warm `usage` entry (SESS-051) still loads as `Entry::Unknown`; it is
+        // classed apart so the `/tree` filter can drop it in every mode, as pi's
+        // `if (entry.type === "usage") return false;` does (`tree-selector.ts:341` @v0.87.1).
+        Entry::Unknown(v) if v.get("type").and_then(serde_json::Value::as_str) == Some("usage") => {
+            (SessionDagKind::Usage, "(entry)".to_string())
+        }
         Entry::Unknown(_) => (SessionDagKind::Other, "(entry)".to_string()),
     }
 }

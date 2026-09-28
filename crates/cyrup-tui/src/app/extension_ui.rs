@@ -363,11 +363,8 @@ impl<B: Backend> App<B> {
                         .transcript
                         .push_error(format!("Error: {message}"));
                 }
-                NotifyKind::Warning => {
-                    self.state
-                        .transcript
-                        .push_warning(format!("Warning: {message}"));
-                }
+                // Pi `showWarning(message)` (`interactive-mode.ts:2851` @v0.87.1).
+                NotifyKind::Warning => self.state.transcript.show_warning(message),
                 NotifyKind::Info => self.state.transcript.push_status(message),
             },
             UiEffect::SetStatus { key, text } => {

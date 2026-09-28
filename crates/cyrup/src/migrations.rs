@@ -115,12 +115,11 @@ fn migrate_auth_to_auth_json(agent_dir: &Path) -> Vec<String> {
         // `auth.json` carries OAuth access/refresh tokens and plaintext API keys, so it MUST be
         // owner-only — Pi writes it with `{ mode: 0o600 }` (migrations.ts:69) and creates its dir
         // 0700 (auth-storage.ts:55). A plain `fs::write` uses the ambient umask, which leaves the
-        // credentials group- or world-readable on a permissive umask. `write_atomic(secret=true)` is
-        // the same writer [`cyrup_config::AuthStore::save`] uses, so the migrated file lands with
-        // exactly the mode the store would have given it. This branch only ever CREATES the file —
-        // the fn returned early above when `auth.json` already existed — so no pre-existing file's
-        // permissions are read, relaxed, or otherwise touched.
-        let _ = cyrup_config::lock::write_atomic(&auth_path, serialized.as_bytes(), true);
+        // credentials group- or world-readable on a permissive umask. `write_in_place_secret` is
+        // the same writer [`cyrup_config::AuthStore`] uses (CFG-089), so the migrated file lands
+        // with exactly the mode the store would have given it. This branch only ever CREATES the
+        // file — the fn returned early above when `auth.json` already existed.
+        let _ = cyrup_config::lock::write_in_place_secret(&auth_path, serialized.as_bytes());
     }
     providers
 }

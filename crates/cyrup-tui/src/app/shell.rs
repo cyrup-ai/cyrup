@@ -54,6 +54,9 @@ impl<B: Backend> App<B> {
             compact_tx: None,
             queue_drain_tx: None,
             lifecycle_tx: None,
+            render_debug: render_debug::RenderDebug::default(),
+            last_frame_size: render_debug::NO_FRAME,
+            debug_previous_lines: Vec::new(),
         })
     }
 
@@ -166,15 +169,16 @@ impl<B: Backend> App<B> {
     /// the concatenation. Order does not matter to the only consumer — EXT-039's gate inverts it
     /// key-first and lets the RESERVED id win any tie (`extensions/runner.ts:104-106`).
     ///
-    /// [`crate::keymap::AutocompleteKeymap`] is deliberately absent: upstream has no
-    /// `tui.autocomplete.*` family at all (the popup reuses `tui.select.*` and `tui.input.tab` —
-    /// see [`crate::keymap::AutocompleteAction::from_id`]), so every id it could contribute is
+    /// [`crate::keymap::AutocompleteKeymap`] is deliberately absent: the popup has no ids of its
+    /// own (it reuses `tui.select.*` and `tui.input.tab` — see
+    /// [`crate::keymap::AutocompleteAction::from_id`]), so every id it could contribute is
     /// already contributed by the select and editor maps, and adding it would only duplicate rows.
     pub fn effective_keybindings(&self) -> Vec<(String, Vec<String>)> {
         let mut out = self.state.keymap.effective_config();
         out.extend(self.state.select_keymap.effective_config());
         out.extend(self.state.tree_keymap.effective_config());
         out.extend(self.state.session_keymap.effective_config());
+        out.extend(self.state.thinking_keymap.effective_config());
         out.extend(self.state.models_keymap.effective_config());
         out.extend(self.state.editor.keymap_ref().effective_config());
         out.extend(self.alt_keymap.effective_config());
@@ -207,6 +211,14 @@ impl<B: Backend> App<B> {
         self.state.editor.set_autocomplete_max_visible(n);
     }
 
+    /// CFG-063 — install the render-debug instruments (`CYRUP_TUI_DEBUG`,
+    /// `CYRUP_TUI_DEBUG_REDRAW`). The composition root resolves them with
+    /// [`RenderDebug::from_env`] against the agent directory, pi's `logDirectory: getAgentDir()`
+    /// (`interactive-mode.ts:581` @v0.87.1).
+    pub fn set_render_debug(&mut self, debug: RenderDebug) {
+        self.render_debug = debug;
+    }
+
     /// Whether the idle 2-row status band is reserved (kept present) to avoid an editor/footer reflow
     /// when a spinner appears (item #9). Plumbed from Pi's `terminal.clearOnShrink` setting
     /// (interactive-mode.ts:1638-1642: an idle status container is cleared only when clearOnShrink is
@@ -217,7 +229,7 @@ impl<B: Backend> App<B> {
 
     /// Load a user `keybindings.json` document and merge it into every live keymap (R-10-018; Pi
     /// `KeybindingsManager.create`, keybindings.ts:348-352). Each map's `merge_json` applies only the
-    /// ids in its own namespace (`app.*` / `editor.*` / `tui.select.*` / `app.tree.*`) and ignores the
+    /// ids in its own namespace (`app.*` / `tui.editor.*` / `tui.select.*` / `app.tree.*`) and ignores the
     /// rest, so one document configures the global, editor, selector and tree maps in a single pass.
     /// A malformed DOCUMENT (unparseable JSON, or a non-object top level) is surfaced as a typed
     /// error and nothing is applied — Pi's `loadRawConfig` returning `undefined`
@@ -239,6 +251,7 @@ impl<B: Backend> App<B> {
         issues.extend(self.state.select_keymap.merge_json(json)?);
         issues.extend(self.state.tree_keymap.merge_json(json)?);
         issues.extend(self.state.session_keymap.merge_json(json)?);
+        issues.extend(self.state.thinking_keymap.merge_json(json)?);
         issues.extend(self.state.models_keymap.merge_json(json)?);
         issues.extend(self.state.editor.merge_keybindings_json(json)?);
         Ok(issues)
@@ -277,6 +290,7 @@ impl<B: Backend> App<B> {
         self.state.select_keymap = crate::keymap::SelectKeymap::default();
         self.state.tree_keymap = crate::keymap::TreeKeymap::default();
         self.state.session_keymap = crate::keymap::SessionKeymap::default();
+        self.state.thinking_keymap = crate::keymap::ThinkingKeymap::default();
         self.state.models_keymap = crate::keymap::ModelsKeymap::default();
         self.state.editor.reset_keybindings_to_defaults();
         self.load_keybindings_json(&json)
@@ -454,8 +468,9 @@ impl<B: Backend> App<B> {
     /// them. Called by the binary at startup; tests keep the half-block default (the inline path still
     /// renders to `TestBackend`).
     pub fn detect_image_support(&mut self) {
-        let caps = crate::image::detect_capabilities();
-        self.state.capabilities = caps;
+        // CFG-090 — Pi's `getCapabilities()` detects UNDER the settings overrides
+        // (`terminal-image.ts:160-169` @v0.87.1), which the launcher set first (`main.ts:853`).
+        let caps = crate::image::detect_capabilities_with_settings_overrides();
         // Seed the process-wide OSC-8 answer the markdown renderer reads (Pi's cached
         // `getCapabilities()`, terminal-image.ts:138-143) so the link gate at `markdown.ts:692`
         // sees the same detection this call already paid for.
@@ -479,6 +494,47 @@ impl<B: Backend> App<B> {
         } else {
             None
         };
+        self.publish_capabilities(caps, cell_size);
+    }
+
+    /// Re-apply `terminal.{images,trueColor,hyperlinks}` from the (re)loaded settings — Pi
+    /// `applyRuntimeSettings()`'s `setCapabilityOverrides(this.settingsManager
+    /// .getTerminalCapabilityOverrides())` (`interactive-mode.ts:1992-1993` @v0.87.1), run on every
+    /// session rebind and `/reload`. An unchanged set is a no-op; a changed one drops the cache
+    /// (pi `:175-186`), and because cyrup derives the image renderer and the transcript's image and
+    /// OSC-8 gates from the capabilities once rather than per paint, they are re-derived here. The
+    /// font cell is not re-queried — pi measures it once at TUI start (`tui.ts:679-686`) — so a
+    /// cell measured earlier is kept. CFG-090.
+    pub fn apply_terminal_capability_overrides(
+        &mut self,
+        overrides: cyrup_config::settings::TerminalCapabilityOverrides,
+    ) {
+        if !crate::image::set_capability_overrides(
+            crate::image::CapabilityOverrides::from_settings(overrides),
+        ) {
+            return;
+        }
+        let caps = crate::image::detect_capabilities_with_settings_overrides();
+        crate::image::set_capabilities(caps);
+        let cell_size = self
+            .state
+            .image_renderer
+            .is_graphical()
+            .then(|| self.state.image_renderer.cell_pixels());
+        self.publish_capabilities(caps, cell_size);
+        // pi's next `createTheme` reads `getCapabilities().trueColor` (`theme.ts:529` @v0.87.1);
+        // the controller carries the mode every later theme application projects through.
+        let color_mode = ColorMode::from_true_color(caps.true_color);
+        self.state.color_mode = color_mode;
+        if let Some(controller) = self.state.theme_controller.as_mut() {
+            controller.set_color_mode(color_mode);
+        }
+    }
+
+    /// Publish resolved capabilities to every consumer that derives from them once: the app's
+    /// record, the image renderer, and the transcript's image and OSC-8 gates.
+    fn publish_capabilities(&mut self, caps: TerminalCapabilities, cell_size: Option<(u16, u16)>) {
+        self.state.capabilities = caps;
         self.state.image_renderer =
             ImageRenderer::from_capabilities_with_cell_size(caps, cell_size);
         // TUI-N01 / TUI-036 — publish the capability where the two consumers can reach it: the

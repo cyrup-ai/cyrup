@@ -139,7 +139,7 @@ pub struct InputEditor {
     /// 3–20; item #6). Plumbed from `settings.autocompleteMaxVisible` by the binary; applied to every
     /// opened popup's [`crate::SelectList`].
     autocomplete_max_visible: u16,
-    /// The configurable autocomplete-popup key table (item #6; `tui.autocomplete.*`). The popup's
+    /// The configurable autocomplete-popup key table (item #6; `tui.select.*` + `tui.input.tab`). The popup's
     /// navigate/accept/cancel keys are no longer hardcoded — a `keybindings.json` rebind flows through.
     autocomplete_keymap: crate::keymap::AutocompleteKeymap,
     cwd: PathBuf,

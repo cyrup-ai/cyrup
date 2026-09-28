@@ -103,7 +103,20 @@ pub(crate) fn apply_agent_config(
 ) -> Result<(), String> {
     use serde_json::Value;
 
-    // pi `agent-management.ts:411-421` @ v0.43.0 — the FIRST branch of `applyAgentConfig`:
+    // SUBA-133 — pi `agent-management.ts:411-415` @v0.71.0, now the FIRST branch of
+    // `applyAgentConfig`: `""` deletes, a boolean sets, anything else refuses.
+    if let Some(v) = cfg.get("advertise") {
+        fields.advertise = Some(match v {
+            Value::String(s) if s.is_empty() => None,
+            Value::Bool(b) => Some(*b),
+            _ => {
+                return Err(
+                    "config.advertise must be a boolean or empty string when provided.".to_string(),
+                );
+            }
+        });
+    }
+    // pi `agent-management.ts:411-421` @ v0.43.0 — the next branch of `applyAgentConfig`:
     //
     //   if (cfg.aliases === false || cfg.aliases === "") target.aliases = undefined;
     //   else if (typeof cfg.aliases === "string") { parseCsv(...).filter(a => a !== target.name) }

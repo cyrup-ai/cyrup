@@ -464,6 +464,7 @@ mod tests {
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
             deadline_at_ms: None,
+            checkpoint_before_deadline_ms: None,
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
@@ -514,6 +515,7 @@ mod tests {
             permission_rules: None,
             timeout_ms: None,
             deadline_at_ms: None,
+            checkpoint_before_deadline_ms: None,
             share: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),

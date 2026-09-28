@@ -79,6 +79,24 @@ impl AgentSession {
                 return Err(err);
             }
         };
+        // Pi reads `getCompactionSettings(model)` next (`agent-session.ts:2419` @v0.87.1), inside
+        // the same `try`, so an invalid budget (SESS-055) ends in the same
+        // `"Compaction failed: …"` `compaction_end` as the model check above.
+        let settings = match self.compaction_settings_for_model() {
+            Ok(settings) => settings,
+            Err(err) => {
+                cancel_slot.clear();
+                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    reason,
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(format!("Compaction failed: {err}")),
+                })
+                .await;
+                return Err(err);
+            }
+        };
         // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" })`
         // (agent-session.ts:1859).
         let (retry_observer, retry_rx) =
@@ -97,7 +115,6 @@ impl AgentSession {
         // gate before it reaches the request.
         let compactor =
             Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
-        let settings = self.compaction_settings.clone();
 
         // Compute the REAL preparation BEFORE the extension hook (Pi computes `prepareCompaction`
         // then fires `session_before_compact` against it, agent-session.ts:1663-1693; L4 gap #5).

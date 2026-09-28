@@ -51,7 +51,7 @@ fn select_and_editor_maps_merge_their_own_ids_only() {
     let doc = r#"{
         "app.interrupt": "ctrl+g",
         "tui.select.confirm": "ctrl+y",
-        "editor.submit": ["ctrl+m"]
+        "tui.input.submit": ["ctrl+m"]
     }"#;
 
     let mut sk = SelectKeymap::default();
@@ -105,10 +105,6 @@ fn editor_keymap_merges_tui_input_copy() {
     );
     assert_eq!(
         EditorAction::from_id("tui.input.copy"),
-        Some(EditorAction::PassThrough)
-    );
-    assert_eq!(
-        EditorAction::from_id("copy"),
         Some(EditorAction::PassThrough)
     );
 }
@@ -203,7 +199,12 @@ fn hotkey_cells_match_pis_key_text_for_shift_tab_and_the_page_keys() {
         KeyCode::PageDown
     );
     assert_eq!(crate::chrome::format_key_text("pageUp", true), "PageUp");
-    assert_eq!(km.keys_label(Action::PageUp).as_deref(), Some("pageUp"));
+    assert_eq!(
+        crate::EditorKeymap::default()
+            .keys_label(EditorAction::PageUp)
+            .as_deref(),
+        Some("pageUp/ctrl+pageUp")
+    );
 }
 
 #[test]
@@ -358,33 +359,261 @@ fn pis_canonical_editor_and_input_ids_resolve() {
 }
 
 /// pi's LEGACY bare names — the keys `KEYBINDING_NAME_MIGRATIONS` maps
-/// (`core/keybindings.ts:209-269`) — are what a pi user's older `keybindings.json` carries, and pi
-/// migrates them forward on every load (`migrateKeybindingsConfig`, `:289-309`).
+/// (`core/keybindings.ts:240-300` @v0.87.1) — are what a pi user's older `keybindings.json` carries.
+/// They reach the editor map through the rename every `merge_json` applies first, exactly as pi's
+/// `loadFromFile` migrates before `rebuild()` — never as ids of their own.
 #[test]
-fn pis_legacy_bare_names_resolve_too() {
+fn pis_legacy_bare_names_resolve_through_the_migration() {
+    let mut ek = EditorKeymap::default();
+    let issues = ek
+        .merge_json(r#"{ "cursorUp": "alt+k", "newLine": "ctrl+j" }"#)
+        .unwrap();
+    assert!(issues.is_empty(), "{issues:?}");
     assert_eq!(
-        EditorAction::from_id("cursorUp"),
+        ek.action_for(&key(KeyCode::Char('k'), KeyModifiers::ALT)),
         Some(EditorAction::CursorUp)
     );
-    assert_eq!(EditorAction::from_id("pageUp"), Some(EditorAction::PageUp));
     assert_eq!(
-        EditorAction::from_id("newLine"),
+        ek.action_for(&key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
         Some(EditorAction::NewLine)
     );
+    assert_eq!(EditorAction::from_id("cursorUp"), None);
 }
 
-/// The shipped-cyrup `editor.*` spellings stay accepted, so a config written against cyrup's own
-/// released id list does not break — the same do-not-break-a-shipped-config promise pi's migration
-/// table makes.
+/// Every id pi v0.87.1 defines: the 47 `TUI_KEYBINDINGS` ids (`packages/tui/src/keybindings.ts`)
+/// and the 43 `AppKeybindings` ids (`coding-agent/src/core/keybindings.ts:14-57`).
+const PI_IDS: [&str; 90] = [
+    "tui.editor.cursorUp",
+    "tui.editor.cursorDown",
+    "tui.editor.cursorLeft",
+    "tui.editor.cursorRight",
+    "tui.editor.cursorWordLeft",
+    "tui.editor.cursorWordRight",
+    "tui.editor.cursorLineStart",
+    "tui.editor.cursorLineEnd",
+    "tui.editor.jumpForward",
+    "tui.editor.jumpBackward",
+    "tui.editor.pageUp",
+    "tui.editor.pageDown",
+    "tui.editor.historyPrevious",
+    "tui.editor.historyNext",
+    "tui.editor.deleteCharBackward",
+    "tui.editor.deleteCharForward",
+    "tui.editor.deleteWordBackward",
+    "tui.editor.deleteWordForward",
+    "tui.editor.deleteToLineStart",
+    "tui.editor.deleteToLineEnd",
+    "tui.editor.yank",
+    "tui.editor.yankPop",
+    "tui.editor.undo",
+    "tui.input.newLine",
+    "tui.input.submit",
+    "tui.input.tab",
+    "tui.input.copy",
+    "tui.select.up",
+    "tui.select.down",
+    "tui.select.pageUp",
+    "tui.select.pageDown",
+    "tui.select.confirm",
+    "tui.select.cancel",
+    "tui.altScreen.pageUp",
+    "tui.altScreen.pageDown",
+    "tui.altScreen.halfPageUp",
+    "tui.altScreen.halfPageDown",
+    "tui.altScreen.lineUp",
+    "tui.altScreen.lineDown",
+    "tui.altScreen.previousPrompt",
+    "tui.altScreen.nextPrompt",
+    "tui.altScreen.top",
+    "tui.altScreen.bottom",
+    "tui.altScreen.search",
+    "tui.altScreen.searchNext",
+    "tui.altScreen.searchPrevious",
+    "tui.altScreen.searchClose",
+    "app.interrupt",
+    "app.clear",
+    "app.exit",
+    "app.suspend",
+    "app.thinking.cycle",
+    "app.thinking.save",
+    "app.model.cycleForward",
+    "app.model.cycleBackward",
+    "app.model.select",
+    "app.tools.expand",
+    "app.thinking.toggle",
+    "app.session.toggleNamedFilter",
+    "app.editor.external",
+    "app.message.copy",
+    "app.message.followUp",
+    "app.message.dequeue",
+    "app.clipboard.pasteImage",
+    "app.session.new",
+    "app.session.tree",
+    "app.session.fork",
+    "app.session.resume",
+    "app.tree.foldOrUp",
+    "app.tree.unfoldOrDown",
+    "app.tree.editLabel",
+    "app.tree.toggleLabelTimestamp",
+    "app.session.togglePath",
+    "app.session.toggleSort",
+    "app.session.rename",
+    "app.session.delete",
+    "app.session.deleteNoninvasive",
+    "app.models.save",
+    "app.models.enableAll",
+    "app.models.clearAll",
+    "app.models.toggleProvider",
+    "app.models.reorderUp",
+    "app.models.reorderDown",
+    "app.tree.filter.default",
+    "app.tree.filter.noTools",
+    "app.tree.filter.userOnly",
+    "app.tree.filter.labeledOnly",
+    "app.tree.filter.all",
+    "app.tree.filter.cycleForward",
+    "app.tree.filter.cycleBackward",
+];
+
+/// **TUI-065 / TUI-066.** The ids cyrup used to accept on top of pi's: the bare `editor.*`
+/// namespace (24), `tui.autocomplete.*` (5) and `app.pageUp` / `app.pageDown`. pi defines none of
+/// them, so its `rebuild()` skips every one (`packages/tui/src/keybindings.ts` `if (!(keybinding in
+/// this.definitions)) continue`). Loaded through the production path they now change nothing and
+/// raise no issue — the same outcome as any other id pi does not know.
 #[test]
-fn cyrups_shipped_editor_ids_stay_accepted_as_aliases() {
-    assert_eq!(
-        EditorAction::from_id("editor.cursorLeft"),
-        Some(EditorAction::CursorLeft)
+fn cyrups_former_invented_ids_are_inert_like_any_unknown_id() {
+    let invented = [
+        "editor.cursorLeft",
+        "editor.cursorRight",
+        "editor.cursorUp",
+        "editor.cursorDown",
+        "editor.cursorWordLeft",
+        "editor.cursorWordRight",
+        "editor.cursorLineStart",
+        "editor.cursorLineEnd",
+        "editor.deleteCharBackward",
+        "editor.deleteCharForward",
+        "editor.deleteWordBackward",
+        "editor.deleteWordForward",
+        "editor.deleteToLineStart",
+        "editor.deleteToLineEnd",
+        "editor.yank",
+        "editor.yankPop",
+        "editor.undo",
+        "editor.jumpForward",
+        "editor.jumpBackward",
+        "editor.pageUp",
+        "editor.pageDown",
+        "editor.newLine",
+        "editor.submit",
+        "editor.tab",
+        "tui.autocomplete.previous",
+        "tui.autocomplete.next",
+        "tui.autocomplete.accept",
+        "tui.autocomplete.acceptSubmit",
+        "tui.autocomplete.cancel",
+        "app.pageUp",
+        "app.pageDown",
+    ];
+    let doc = format!(
+        "{{{}}}",
+        invented
+            .iter()
+            .map(|id| format!("\"{id}\": \"f5\""))
+            .collect::<Vec<_>>()
+            .join(",")
     );
+    let mut app = crate::App::new(
+        ratatui::backend::TestBackend::new(80, 24),
+        crate::UiTheme::dark(),
+    )
+    .unwrap();
+    let before = app.effective_keybindings();
+    let issues = app.load_keybindings_json(&doc).unwrap();
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(app.effective_keybindings(), before);
+    let mut ed = crate::InputEditor::new();
+    ed.merge_keybindings_json(&doc).unwrap();
     assert_eq!(
-        EditorAction::from_id("editor.submit"),
-        Some(EditorAction::Submit)
+        ed.keymap_ref()
+            .action_for(&key(KeyCode::F(5), KeyModifiers::NONE)),
+        None
+    );
+    // The autocomplete popup is not in `effective_keybindings`, so drive it: a former
+    // `tui.autocomplete.accept` rebind must not make F5 accept the open completion.
+    let mut ed = crate::InputEditor::new();
+    ed.merge_keybindings_json(r#"{ "tui.autocomplete.accept": "f5" }"#)
+        .unwrap();
+    for c in "/sett".chars() {
+        ed.handle_key(&key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert!(ed.autocomplete_open());
+    ed.handle_key(&key(KeyCode::F(5), KeyModifiers::NONE));
+    assert_eq!(ed.text(), "/sett");
+}
+
+/// **TUI-065 / TUI-066 `Verify`.** Every id the live keymaps publish is one of pi's — so no cyrup-only
+/// id can reach `/hotkeys`' source or EXT-039's extension-conflict gate, and the census of invented
+/// ids is empty rather than tracked.
+#[test]
+fn every_published_binding_id_is_a_pi_id() {
+    let app = crate::App::new(
+        ratatui::backend::TestBackend::new(80, 24),
+        crate::UiTheme::dark(),
+    )
+    .unwrap();
+    for (id, _) in app.effective_keybindings() {
+        assert!(PI_IDS.contains(&id.as_str()), "{id} is not a pi v0.87.1 id");
+    }
+}
+
+/// **TUI-066.** The key-spec words pi's `KeyId` has no name for are not key specs: `ModifierName`
+/// is exactly `ctrl | shift | alt | super` (`keys.ts:142` @v0.87.1) and `SpecialKey` has no
+/// `backtab`, `del`, `ins`, `pgup` or `pgdn` (`:109-139`). A `SUPER` key labels as `super`, the
+/// word pi's own id uses, so the label reads back.
+#[test]
+fn key_specs_use_only_pis_words() {
+    for spec in [
+        "control+c",
+        "option+b",
+        "meta+b",
+        "cmd+k",
+        "command+k",
+        "backtab",
+        "del",
+        "ins",
+        "pgup",
+        "pgdn",
+    ] {
+        assert!(Key::parse(spec).is_err(), "{spec} must not parse");
+    }
+    let super_k = Key::parse("super+k").unwrap();
+    assert_eq!(super_k.label(), "super+k");
+    assert_eq!(Key::parse(&super_k.label()).unwrap(), super_k);
+}
+
+/// pi's `shift+tab` matches every report of the key — legacy `CSI Z`, Kitty `CSI 9;2u` and
+/// modifyOtherKeys (`keys.ts:862-868` @v0.87.1). crossterm hands cyrup `BackTab` (with or without
+/// `SHIFT`) or `Tab`+`SHIFT` for those, and one `shift+tab` spec — the only way to write the key now
+/// that `backtab` is not a spec word — matches all three, while plain `tab` matches none of them.
+#[test]
+fn a_shift_tab_spec_matches_every_backtab_report() {
+    let shift_tab = Key::parse("shift+tab").unwrap();
+    let tab = Key::parse("tab").unwrap();
+    for ev in [
+        key(KeyCode::BackTab, KeyModifiers::NONE),
+        key(KeyCode::BackTab, KeyModifiers::SHIFT),
+        key(KeyCode::Tab, KeyModifiers::SHIFT),
+    ] {
+        assert!(shift_tab.matches(&ev), "{ev:?}");
+        assert!(!tab.matches(&ev), "{ev:?}");
+    }
+    let mut km = Keymap::default();
+    km.merge_json(r#"{ "app.thinking.cycle": "shift+tab" }"#)
+        .unwrap();
+    assert_eq!(
+        km.action_for(&key(KeyCode::BackTab, KeyModifiers::NONE)),
+        Some(Action::ThinkingCycle)
     );
 }
 
@@ -428,10 +657,9 @@ fn the_autocomplete_popup_resolves_through_pis_select_ids() {
         AutocompleteAction::from_id("tui.select.cancel"),
         Some(AutocompleteAction::Cancel)
     );
-    // The invented spellings stay as aliases.
     assert_eq!(
         AutocompleteAction::from_id("tui.autocomplete.previous"),
-        Some(AutocompleteAction::Previous)
+        None
     );
 }
 

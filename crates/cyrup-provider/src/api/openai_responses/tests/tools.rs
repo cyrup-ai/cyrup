@@ -98,6 +98,7 @@ fn assistant_tool_call(id: &str, name: &str) -> Message {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 2,
     })
 }
@@ -412,6 +413,7 @@ fn the_search_call_id_hashes_the_full_tool_call_id_and_comma_joined_names() {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 2,
     });
     ctx.messages[2] = marked_tool_result("call_1|fc_item_1", &["late_tool", "later_tool"]);

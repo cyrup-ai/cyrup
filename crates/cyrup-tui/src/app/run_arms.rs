@@ -10,7 +10,7 @@ pub(crate) enum RunFlow {
     ReturnOk,
 }
 
-impl App<InlineBackend<Stdout>> {
+impl App<InlineBackend<TuiStdout>> {
     /// The boot-time UI seed (§7.2): the `/` menu registry, every persisted setting's
     /// first-frame application, the window title, the auth/context snapshots and the
     /// project-trust banner — moved verbatim from `App::run`'s setup. The session-swap
@@ -137,6 +137,8 @@ impl App<InlineBackend<Stdout>> {
         // skipped entirely when `raw_context_messages()` is empty — and a fresh session in an
         // untrusted project is precisely the case that most needs the banner.
         self.render_project_trust_warning_if_needed(session);
+        // TUI-003 — …and `renderInitialMessages()`'s last statement, the compaction count.
+        self.render_compaction_count_if_needed(session).await;
     }
 
     /// Bind the UI to the runtime's currently-installed session — pi's awaited `rebindSession`
@@ -244,6 +246,17 @@ impl App<InlineBackend<Stdout>> {
             Arc::clone(&ctx.session.services().resources),
             ctx.theme_switch_tx.clone(),
         );
+        // CFG-090 — pi's `rebindCurrentSession` runs `applyRuntimeSettings()` (`interactive-mode.ts
+        // :2025` @v0.87.1), whose first line re-applies the `terminal.*` capability overrides
+        // (`:1993`), BEFORE the theme is re-applied (`:578`), so a changed `trueColor` reaches the
+        // theme projection below.
+        self.apply_terminal_capability_overrides(
+            ctx.session
+                .services()
+                .settings
+                .effective()
+                .terminal_capability_overrides(),
+        );
         // TUI-004 — ...and, immediately after that re-registration and in upstream's order, the
         // RENDER theme itself. pi pairs `setRegisteredThemes(...)` with
         // `await this.themeController.applyFromSettings()` at both call sites — the
@@ -258,10 +271,8 @@ impl App<InlineBackend<Stdout>> {
         // Reads the setting from the SWAPPED-IN session, which is pi's
         // `settingsManager.getThemeSetting()` (`theme-controller.ts:59`): `/reload` rebuilds the
         // session, so this view is the freshly re-read one. pi prefers its in-memory
-        // `currentThemeSetting` over the manager; cyrup has no such shadow because every theme
-        // change here — the `/settings → theme` confirm arm and an extension's `setTheme` alike —
-        // persists through `AppCommand::ApplySetting` unconditionally (see `on_theme_switch`), so
-        // the persisted value IS what upstream would be holding in memory.
+        // `currentThemeSetting` over the manager, and so does the controller: it holds the same
+        // shadow, seeded by `--use-theme` and replaced by every in-app switch (SEAM-119).
         self.reapply_theme_from_settings(
             ctx.session
                 .services()
@@ -404,6 +415,8 @@ impl App<InlineBackend<Stdout>> {
         // in a DIFFERENT project swaps the cwd and the trust decision with it, so the banner's
         // answer changes on the swap.
         self.render_project_trust_warning_if_needed(&ctx.session);
+        // TUI-003 — `renderInitialMessages()` then reports the swapped-in session's compactions.
+        self.render_compaction_count_if_needed(&ctx.session).await;
         // pi's re-entrancy guard, `interactive-mode.ts:1977-1979`
         // (`if (this.session !== session) return;`): a newer session landed while we awaited above,
         // so abandon this rebind without painting it — the `session_swapped` arm will fire again for
@@ -421,14 +434,14 @@ impl App<InlineBackend<Stdout>> {
         // TUI-092 — surface an arm that blew [`ARM_BUDGET`] on the previous iteration. Recorded
         // by [`ArmGuard`]'s `Drop` (which cannot draw: it runs inside the arm, on a raw-mode
         // terminal the frame owns) and drained HERE, on the first healthy iteration after it,
-        // so the diagnostic reaches the user as an ordinary transcript line. `push_warning`
+        // so the diagnostic reaches the user as an ordinary transcript line. `show_warning`
         // queues into `TranscriptView::pending`; every arm below ends in `draw_synchronized`,
         // which paints it.
         if let Ok(mut over) = OVER_BUDGET_ARM.lock()
             && let Some(arm) = over.take()
         {
-            self.state.transcript.push_warning(format!(
-                "Warning: run-loop arm `{arm}` exceeded its {ARM_BUDGET:?} budget"
+            self.state.transcript.show_warning(format!(
+                "run-loop arm `{arm}` exceeded its {ARM_BUDGET:?} budget"
             ));
         }
     }
@@ -702,12 +715,8 @@ impl App<InlineBackend<Stdout>> {
     }
 
     pub(crate) fn on_tmux_warning(&mut self, warning: &'static str) -> Result<(), TuiError> {
-        // Pi `:866-868` — `showWarning`, whose copy is `Warning: {message}`
-        // (`interactive-mode.ts:3885-3889`), the same framing the extension `notify`
-        // path uses in `apply_ui_effect`.
-        self.state
-            .transcript
-            .push_warning(format!("Warning: {warning}"));
+        // Pi `this.showWarning(warning)` (`interactive-mode.ts:1114-1118` @v0.87.1).
+        self.state.transcript.show_warning(warning);
         self.frames.request();
         Ok(())
     }

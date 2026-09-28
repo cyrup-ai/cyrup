@@ -36,6 +36,10 @@ pub struct AppState {
     /// handed to each opened [`SessionSelector`], so a JSON rebind of sort/named/delete/path/rename
     /// reaches BOTH the handler and the header's hint rows (`session-selector.ts:171-179`).
     pub session_keymap: SessionKeymap,
+    /// The `/thinking` picker's table (`app.thinking.save`, `core/keybindings.ts:104-107`
+    /// @v0.87.1) handed to each opened [`crate::ThinkingSelector`], so a JSON rebind of the persist
+    /// key reaches both its handler and its footer (`thinking-selector.ts:97`, `:131`).
+    pub thinking_keymap: ThinkingKeymap,
     /// The `/scoped-models` bespoke binding table (`app.models.*`, `core/keybindings.ts:150-175`)
     /// handed to each opened [`CheckboxSelector`], so a JSON rebind of reorder/all/clear/provider/
     /// save reaches both the handler and the footer row (`scoped-models-selector.ts:199-204`).
@@ -435,6 +439,13 @@ pub struct AppState {
     /// settled `/login` or `/logout` (each of which ends in `footer.invalidate()`,
     /// `interactive-mode.ts:5449`, `:5475`). See [`App::refresh_auth_snapshot`].
     pub(super) oauth_credential_providers: std::collections::BTreeSet<String>,
+    /// EXT-051 — each extension-registered provider that declares an `oauth` block, with that
+    /// block's `isSubscription` (pi `ExtensionOAuthConfig.isSubscription`,
+    /// `core/extensions/types.ts:1669` @v0.87.1, carried onto the provider's `auth.oauth` by
+    /// `adaptOAuth`, `core/provider-composer.ts:276-279`). The second conjunct of the footer's
+    /// `isUsingSubscription` for a provider the built-in registry does not know. Refreshed with
+    /// [`Self::oauth_credential_providers`] by [`App::refresh_auth_snapshot`].
+    pub(super) extension_oauth_subscription: std::collections::BTreeMap<String, bool>,
     /// Tool names the live session knows a DEFINITION for, each with that definition's
     /// `renderShell` — Pi's `getToolDefinition(name)` registry (`agent-session.ts:806`, built over
     /// the builtins plus every registered/custom tool), which `ToolExecutionComponent` reads twice:
@@ -492,6 +503,7 @@ impl AppState {
             select_keymap: SelectKeymap::default(),
             tree_keymap: TreeKeymap::default(),
             session_keymap: SessionKeymap::default(),
+            thinking_keymap: ThinkingKeymap::default(),
             models_keymap: ModelsKeymap::default(),
             commands: CommandRegistry::new(),
             selector: None,
@@ -580,6 +592,7 @@ impl AppState {
             model_refresh_epoch: 0,
             model_refresh_cancel: None,
             oauth_credential_providers: std::collections::BTreeSet::new(),
+            extension_oauth_subscription: std::collections::BTreeMap::new(),
             known_tool_definitions: std::collections::HashMap::new(),
             extension_completion_query: None,
         }

@@ -3,6 +3,7 @@
 use super::claude_code::is_github_copilot;
 use super::compat::{force_adaptive_thinking, get_anthropic_compat};
 use crate::HeaderMap;
+use crate::api::compat::SessionAffinityFormat;
 use crate::auth::AuthResult;
 use crate::context::Context;
 use crate::model::Model;
@@ -19,8 +20,9 @@ pub(super) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05
 /// declares at least one `allowedFallbackModels` entry (PROV-090).
 pub(super) const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 
-/// Stealth-mode Claude Code identity (Pi anthropic-messages.ts:73).
-const CLAUDE_CODE_VERSION: &str = "2.1.75";
+/// Stealth-mode Claude Code identity (Pi `claudeCodeVersion`, `anthropic-messages.ts:87` @v0.87.1;
+/// `2.1.75` through v0.84.4, `2.1.251` from v0.85.0, `2.1.280` from v0.87.1).
+pub(super) const CLAUDE_CODE_VERSION: &str = "2.1.280";
 
 /// Resolve the `POST` target: an auth base-url override wins over `model.base_url`. The endpoint is
 /// `{base}/v1/messages`.
@@ -144,17 +146,22 @@ pub(crate) fn build_headers(
         if !betas.is_empty() {
             headers.insert("anthropic-beta".to_string(), Some(betas.join(",")));
         }
-        // Session-affinity header when caching is enabled and the compat flag is set.
+        // Session-affinity header when caching is enabled and the compat flag is set; the header
+        // name follows `sessionAffinityFormat` (pi `:964-969` @v0.87.1).
         let cache =
             resolve_cache_retention(opts.cache_retention, EnvSource::new(auth.env.as_ref()));
+        let compat = get_anthropic_compat(model);
         if cache != CacheRetention::None
-            && get_anthropic_compat(model).send_session_affinity_headers
+            && compat.send_session_affinity_headers
             && let Some(sid) = &opts.session_id
         {
-            headers.insert(
-                "x-session-affinity".to_string(),
-                Some(sid.as_str().to_string()),
-            );
+            let header =
+                if compat.session_affinity_format == Some(SessionAffinityFormat::Openrouter) {
+                    "x-session-id"
+                } else {
+                    "x-session-affinity"
+                };
+            headers.insert(header.to_string(), Some(sid.as_str().to_string()));
         }
     }
 
@@ -182,5 +189,9 @@ pub(crate) fn build_headers(
             headers.insert(name.clone(), value.clone());
         }
     }
+    // PROV-095: `mergeClientHeaders` puts `{ "User-Agent": getPiUserAgent() }` under every other
+    // source (anthropic-messages.ts:294-296 @v0.87.1), so the OAuth branch's `claude-cli/…`
+    // user-agent and any caller value win over it.
+    crate::utils::user_agent::insert_default_user_agent(&mut headers);
     headers
 }

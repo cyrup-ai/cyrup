@@ -167,42 +167,94 @@ impl SubagentExecutor {
         .dir()
     }
 
-    /// `/subagent-cost` (R-SA-140; pi `buildSubagentCostReport`, slash-commands.ts:377-416): walk
-    /// this session's TRANSCRIPT (not a background status file) and report the parent's own
-    /// assistant-message usage plus a per-child breakdown of every subagent `toolResult` recorded in
-    /// the branch — so foreground subagent usage (which never mints a background run) is visible.
-    /// Reads the newest on-disk session for `cwd` (pi walks the live `ctx.sessionManager`; cyrup has
-    /// no live manager threaded into this extension, so the faithful analog is the same on-disk read
-    /// [`Self::fork_resolver`]/`run_doctor` already use). Delegates the actual walk + rendering to
-    /// [`crate::registration::cost::build_subagent_cost_report`].
+    /// `/subagent-cost` (R-SA-140; pi `formatSubagentCostReport(collectSubagentCost(ctx, state))`,
+    /// `slash/subagent-cost.ts` @v0.71.0): the text rendering of [`Self::collect_cost_report`].
     pub async fn run_cost_report(&self, cwd: &Path) -> String {
-        self.cost_report_from_sessions_dir(&Self::sessions_dir(cwd))
-            .await
+        match self.collect_cost_report(cwd).await {
+            Ok(report) => crate::registration::cost::format_subagent_cost_report(&report),
+            Err(message) => message,
+        }
     }
 
-    /// The testable core of [`Self::run_cost_report`]: given a resolved session-storage directory,
-    /// open its newest `.jsonl` transcript READ-ONLY (never creating one) and render the cost report
-    /// over its branch. An absent/empty session directory renders the well-formed empty-state report
-    /// rather than an error.
-    async fn cost_report_from_sessions_dir(&self, sessions_dir: &Path) -> String {
+    /// The accounting behind both `/subagent-cost` and the RPC `cost` method (pi
+    /// `collectSubagentCost`, `subagent-cost.ts:145-240` @v0.71.0): the parent's own usage plus
+    /// every child recorded in this session's TRANSCRIPT, then async workflow children resolved
+    /// through their receipts and artifact metadata.
+    ///
+    /// The branch is the live session's (pi `ctx.sessionManager.getBranch()`) whenever a session
+    /// backend is attached. Without one — a host that never bound a session — the newest on-disk
+    /// session for `cwd` is read instead, the same read [`Self::fork_resolver`]/`run_doctor` use.
+    ///
+    /// # Errors
+    ///
+    /// The rendered sentence when that on-disk fallback cannot scan the session directory or open
+    /// the session it found. The live branch cannot fail.
+    pub async fn collect_cost_report(
+        &self,
+        cwd: &Path,
+    ) -> Result<crate::registration::cost::SubagentCostReport, String> {
+        let services = self.host_services();
+        let session_file = services.as_ref().and_then(|s| s.session_file());
+        let branch: Vec<cyrup_session::Entry> =
+            match services.as_ref().filter(|s| s.session_id().is_some()) {
+                Some(services) => match services.branch() {
+                    serde_json::Value::Array(entries) => entries
+                        .into_iter()
+                        .filter_map(|entry| serde_json::from_value(entry).ok())
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                None => {
+                    self.branch_from_sessions_dir(&Self::sessions_dir(cwd))
+                        .await?
+                }
+            };
+        let cfg = self.config_snapshot().await;
+        let inherited =
+            crate::spawn::nested_events::resolve_inherited_nested_route_from_env(|key| {
+                std::env::var(key).ok()
+            });
+        let async_root = crate::extension::executor::paths::resolve_background_storage_roots(
+            cwd,
+            inherited.as_ref(),
+            &cfg.roots,
+        )
+        .map(|(async_root, _)| async_root)
+        .map_err(|err| format!("subagent-cost: could not resolve the async run root: {err}"))?;
+        Ok(crate::registration::cost::collect_subagent_cost(
+            branch.iter(),
+            &crate::registration::cost::SubagentCostSources {
+                session_file: session_file.as_deref(),
+                cwd,
+                base_cwd: cwd,
+                artifact_dir_preference: cfg.artifact_dir_preference(),
+                async_root: &async_root,
+            },
+        )
+        .await)
+    }
+
+    /// The no-session fallback of [`Self::collect_cost_report`]: open the newest `.jsonl` transcript
+    /// under a resolved session-storage directory READ-ONLY (never creating one) and return its
+    /// branch. An absent/empty session directory is an empty branch, not an error.
+    async fn branch_from_sessions_dir(
+        &self,
+        sessions_dir: &Path,
+    ) -> Result<Vec<cyrup_session::Entry>, String> {
         let _ = self; // no executor state needed; a method purely for call-site symmetry/testability.
         match crate::registration::cost::find_latest_session_file_by_mtime(sessions_dir).await {
             Ok(Some(path)) => match cyrup_session::SessionManager::open(&path) {
-                Ok(manager) => {
-                    crate::registration::cost::build_subagent_cost_report(manager.branch_path(None))
-                }
-                Err(err) => format!(
+                Ok(manager) => Ok(manager.branch_path(None).into_iter().cloned().collect()),
+                Err(err) => Err(format!(
                     "subagent-cost: could not open session {}: {err}",
                     path.display()
-                ),
+                )),
             },
-            Ok(None) => crate::registration::cost::build_subagent_cost_report(std::iter::empty::<
-                &cyrup_session::Entry,
-            >()),
-            Err(err) => format!(
+            Ok(None) => Ok(Vec::new()),
+            Err(err) => Err(format!(
                 "subagent-cost: could not scan session directory {}: {err}",
                 sessions_dir.display()
-            ),
+            )),
         }
     }
 
@@ -409,9 +461,9 @@ mod tests {
     use super::*;
 
     // ---------------------------------------------------------------------------------------
-    // `/subagent-cost` walks the SESSION TRANSCRIPT (pi `buildSubagentCostReport`,
-    // slash-commands.ts:377-416), not a background status file: this drives the REAL production
-    // command path (`SubagentExecutor::run_cost_report` -> `cost_report_from_sessions_dir`) end to
+    // `/subagent-cost` walks the SESSION TRANSCRIPT (pi `collectSubagentCost`,
+    // `slash/subagent-cost.ts` @v0.71.0), not a background status file: this drives the REAL
+    // production command path (`SubagentExecutor::run_cost_report` -> `collect_cost_report`) end to
     // end over a real on-disk session (created + appended via `cyrup_session::SessionManager`,
     // reloaded via `SessionManager::open`), proving the command sums the parent's own assistant
     // usage plus every subagent child's usage from the transcript. (The recursive nested-run
@@ -481,8 +533,33 @@ mod tests {
             .append_message(tool_result)
             .expect("append tool result");
 
+        // The no-session fallback reads that transcript back off disk...
         let executor = SubagentExecutor::new();
-        let report = executor.cost_report_from_sessions_dir(&layout.dir()).await;
+        let on_disk = executor
+            .branch_from_sessions_dir(&layout.dir())
+            .await
+            .expect("the newest session opens");
+        assert_eq!(on_disk.len(), 3, "user + assistant + tool result");
+
+        // ...and a live session serves the same branch through `HostServices::branch` (pi
+        // `ctx.sessionManager.getBranch()`), which is what `/subagent-cost` walks whenever a session
+        // is attached. GUT the live arm and this renders the (empty) per-cwd session directory.
+        struct LiveBranch(Vec<serde_json::Value>);
+        impl cyrup_ext::host::HostServices for LiveBranch {
+            fn session_id(&self) -> Option<String> {
+                Some("cost-session".to_string())
+            }
+            fn branch(&self) -> serde_json::Value {
+                serde_json::Value::Array(self.0.clone())
+            }
+        }
+        executor.set_host_services(std::sync::Arc::new(LiveBranch(
+            on_disk
+                .iter()
+                .map(|entry| serde_json::to_value(entry).expect("entry serializes"))
+                .collect(),
+        )));
+        let report = executor.run_cost_report(&cwd).await;
 
         assert!(report.starts_with("Subagent cost\n"), "{report}");
         assert!(

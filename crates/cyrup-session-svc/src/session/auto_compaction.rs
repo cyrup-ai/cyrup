@@ -48,7 +48,11 @@ impl AgentSession {
         assistant: &AssistantMessage,
         skip_aborted: bool,
     ) -> Result<bool, SessionServiceError> {
-        if !self.auto_compaction_enabled() {
+        // Pi's first statement is `const settings = this.settingsManager.getCompactionSettings(
+        // this.model)` (`agent-session.ts:2604` @v0.87.1), ahead of the enable check — so an
+        // invalid budget throws here even while auto-compaction is off (SESS-055).
+        let settings = self.effective_compaction_settings()?;
+        if !settings.enabled {
             return Ok(false);
         }
         if skip_aborted && assistant.stop_reason == cyrup_core::StopReason::Aborted {
@@ -111,7 +115,6 @@ impl AgentSession {
         // assistant turn's OWN reported usage; only for an error / all-zero-usage message fall back to
         // estimating from the live context, with a post-compaction-usage verification so a kept
         // pre-compaction usage (stale, reflecting the old larger context) cannot falsely trigger.
-        let settings = self.effective_compaction_settings();
         let direct_context_tokens = context_tokens_from_usage(&assistant.usage);
         // SESS-052 — pi tests for an admitted `context_edit` FIRST, ahead of both the direct-usage
         // read and the error/zero fallback (`agent-session.ts:2703-2712` @v0.87.1):
@@ -220,6 +223,10 @@ impl AgentSession {
         reason: CompactionReason,
         will_retry: bool,
     ) -> Result<bool, SessionServiceError> {
+        // Pi reads `getCompactionSettings(model)` BEFORE its `try` (`agent-session.ts:2749`
+        // @v0.87.1), so an invalid budget escapes to the caller with no `compaction_start` /
+        // `compaction_end` pair (SESS-055).
+        let settings = self.effective_compaction_settings()?;
         // Pi's FIRST statement inside the try is `if (!this.model) { return false; }`
         // (agent-session.ts:2052-2054) — before `_emit({type:"compaction_start"})` (`:2072`) and
         // before `started = true`, so a modelless session emits NEITHER `compaction_start` nor
@@ -256,7 +263,6 @@ impl AgentSession {
         // gate before it reaches the request.
         let compactor =
             Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
-        let settings = self.effective_compaction_settings();
 
         // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY preparation.
         let (prep, branch_entries) = {
@@ -486,12 +492,16 @@ impl AgentSession {
                     error_message,
                 })
                 .await;
-                if aborted { Ok(false) } else { Err(e.into()) }
+                // Pi's `catch` ends in `return false` for an abort and a failure alike
+                // (`agent-session.ts:2873-2896` @v0.87.1): a failed summary is reported through
+                // `compaction_end.errorMessage` and never thrown, so neither the pre-prompt check
+                // (which would refuse the prompt) nor the post-run check (which would stop the
+                // loop) sees it. The settings read above is the only throw (SESS-055).
+                Ok(false)
             }
         }
     }
 
-    /// The effective compaction settings with the live `enabled` toggle applied.
     /// Pi `_compactBeforeNextAssistantResponse` (agent-session.ts:587-605 @v0.87.1), the threshold
     /// check that runs at EVERY turn boundary inside a run rather than only after `agent_end`.
     ///
@@ -511,11 +521,14 @@ impl AgentSession {
     /// `AgentMessage` transcript (SESS-028), the same projection pi estimates over.
     pub(crate) async fn compact_before_next_assistant_response(
         &self,
-    ) -> Option<Vec<cyrup_agent::AgentMessage>> {
-        // pi: `!model || model.contextWindow <= 0` → no compaction, and `getCompactionSettings`
-        // carries the enable flag (`:589-595`).
-        if !self.auto_compaction_enabled() {
-            return None;
+    ) -> Result<Option<Vec<cyrup_agent::AgentMessage>>, SessionServiceError> {
+        // pi: `getCompactionSettings(model)` first — it THROWS on an invalid budget, which fails
+        // the run through the agent's `handleRunFailure` (SESS-055) — then `!model ||
+        // model.contextWindow <= 0` → no compaction, and the settings carry the enable flag
+        // (`:588-595`).
+        let settings = self.effective_compaction_settings()?;
+        if !settings.enabled {
+            return Ok(None);
         }
         let window = {
             Self::lock(&self.compaction_model)
@@ -523,9 +536,8 @@ impl AgentSession {
                 .map_or(0, |m| m.context_window)
         };
         if window == 0 {
-            return None;
+            return Ok(None);
         }
-        let settings = self.effective_compaction_settings();
         // SESS-052 — pi reads `estimateProjectedContextTokens(projection, branch)` here
         // (`agent-session.ts:596` @v0.87.1), which discards the provider-usage anchor when a
         // `context_edit` or `compaction` post-dates the entry that anchor came from.
@@ -535,32 +547,56 @@ impl AgentSession {
         // subdirectory since this row was filed).
         let threshold = window.saturating_sub(u64::from(settings.reserve_tokens));
         if u64::from(estimate.tokens) <= threshold {
-            return None;
+            return Ok(None);
         }
-        match self
+        // `await this._runAutoCompaction("threshold", false)` (`:602`): a failed summary is its own
+        // `return false`, so the only thing that can escape it is the settings throw — which, like
+        // the one above, fails the run.
+        if !self
             .run_auto_compaction(CompactionReason::Threshold, false)
-            .await
+            .await?
         {
-            Ok(true) => Some(
-                self.raw_context_messages()
-                    .await
-                    .iter()
-                    .map(raw_message_to_agent)
-                    .collect(),
-            ),
-            Ok(false) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, "turn-boundary auto-compaction failed");
-                None
-            }
+            return Ok(None);
         }
+        Ok(Some(
+            self.raw_context_messages()
+                .await
+                .iter()
+                .map(raw_message_to_agent)
+                .collect(),
+        ))
     }
 
-    fn effective_compaction_settings(&self) -> CompactionSettings {
-        CompactionSettings {
+    /// The auto-compaction settings for the ACTIVE model: the enable flag is the runtime toggle
+    /// (else `compaction.enabled`), the budgets are [`Self::compaction_settings_for_model`].
+    fn effective_compaction_settings(&self) -> Result<CompactionSettings, SessionServiceError> {
+        Ok(CompactionSettings {
             enabled: self.auto_compaction_enabled(),
-            reserve_tokens: self.compaction_settings.reserve_tokens,
-            keep_recent_tokens: self.compaction_settings.keep_recent_tokens,
-        }
+            ..self.compaction_settings_for_model()?
+        })
+    }
+
+    /// Pi `settingsManager.getCompactionSettings(this.model)` (`settings-manager.ts:895-907`
+    /// @v0.87.1), read fresh at every compaction call site as pi does: `reserveTokens` and
+    /// `keepRecentTokens` resolve through `compaction.modelOverrides["provider/modelId"]` for the
+    /// session's current model, then the ordinary setting, then the default (SESS-055). An invalid
+    /// value is pi's thrown `Error`, as [`SessionServiceError::CompactionSetting`].
+    pub(crate) fn compaction_settings_for_model(
+        &self,
+    ) -> Result<CompactionSettings, SessionServiceError> {
+        let model = Self::lock(&self.compaction_model).clone();
+        let key = model.as_ref().map(|m| (m.provider.as_str(), m.id.as_str()));
+        let resolved = self
+            .services
+            .settings
+            .effective()
+            .compaction_settings(key)
+            .map_err(SessionServiceError::CompactionSetting)?;
+        let to_u32 = |v: i64| u32::try_from(v.max(0)).unwrap_or(u32::MAX);
+        Ok(CompactionSettings {
+            enabled: resolved.enabled,
+            reserve_tokens: to_u32(resolved.reserve_tokens),
+            keep_recent_tokens: to_u32(resolved.keep_recent_tokens),
+        })
     }
 }

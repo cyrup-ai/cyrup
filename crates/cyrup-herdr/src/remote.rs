@@ -158,8 +158,18 @@ pub struct RemoteEndpoint {
     pub protocol: u64,
 }
 
-/// `parseHerdrEndpoint(value, expectedSession)` (`herdr-connection.ts:49-60`), against the JSON
-/// `herdr status server --json` prints (`tmp/herdr/src/cli/status.rs:262-275`).
+/// `parseHerdrEndpoint(value, expectedSession)` (`herdr-connection.ts:50-60` @v0.68.0), against
+/// the JSON `herdr status server --json` prints (`server_status_json`,
+/// `git -C tmp/herdr show v0.9.1:src/cli/status.rs`, `:309-353`).
+///
+/// **`[CYRUP-DELTA]` — liveness is judged before identity.** pi requires `version` (a string) and
+/// `protocol` (a number) in the same check as `socket`, before it looks at `running`. herdr's
+/// `NotRunning` arm writes `"version": null, "protocol": null` (`status.rs:340-352`), so on pi a
+/// machine whose herdr server is simply stopped — the common case — reports *incomplete identity*
+/// and points the operator at a malformed answer instead of a stopped server. Here the socket and
+/// session are checked first, exactly as pi does, then `running`/`compatible`/
+/// `endpoint_compatible`, and only a server that claims to be running and compatible must carry a
+/// version and protocol. Every sentence is pi's; only a stopped server's answer changes.
 ///
 /// # Errors
 /// pi's sentence for each refusal.
@@ -167,6 +177,8 @@ pub fn parse_endpoint(
     value: &str,
     expected_session: Option<&str>,
 ) -> Result<RemoteEndpoint, RemoteError> {
+    let incomplete =
+        || RemoteError("Remote Herdr endpoint discovery returned incomplete identity.".to_string());
     let parsed: serde_json::Value = serde_json::from_str(value).map_err(|_| {
         RemoteError("Remote Herdr endpoint discovery returned malformed JSON.".to_string())
     })?;
@@ -175,19 +187,11 @@ pub fn parse_endpoint(
             "Remote Herdr endpoint discovery returned no endpoint.".to_string(),
         ));
     };
-    let socket = p.get("socket").and_then(serde_json::Value::as_str);
-    let version = p.get("version").and_then(serde_json::Value::as_str);
-    let protocol = p.get("protocol").and_then(serde_json::Value::as_f64);
-    let (Some(socket), Some(version), Some(protocol)) = (socket, version, protocol) else {
-        return Err(RemoteError(
-            "Remote Herdr endpoint discovery returned incomplete identity.".to_string(),
-        ));
-    };
-    if !socket.starts_with('/') {
-        return Err(RemoteError(
-            "Remote Herdr endpoint discovery returned incomplete identity.".to_string(),
-        ));
-    }
+    let socket = p
+        .get("socket")
+        .and_then(serde_json::Value::as_str)
+        .filter(|socket| socket.starts_with('/'))
+        .ok_or_else(incomplete)?;
     let session = canonical_session(p.get("session").and_then(serde_json::Value::as_str));
     let expected = canonical_session(expected_session);
     if expected != session {
@@ -206,6 +210,14 @@ pub fn parse_endpoint(
             "The selected remote Herdr session is stopped or incompatible.".to_string(),
         ));
     }
+    let version = p
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(incomplete)?;
+    let protocol = p
+        .get("protocol")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(incomplete)?;
     // `protocol` is a JSON number upstream (`typeof p.protocol !== "number"`); herdr writes a u32.
     let protocol = if protocol.is_finite() && protocol >= 0.0 {
         // Truncation is the intent: herdr never writes a fraction here.
@@ -213,9 +225,7 @@ pub fn parse_endpoint(
         let whole = protocol as u64;
         whole
     } else {
-        return Err(RemoteError(
-            "Remote Herdr endpoint discovery returned incomplete identity.".to_string(),
-        ));
+        return Err(incomplete());
     };
     Ok(RemoteEndpoint {
         socket: socket.to_string(),

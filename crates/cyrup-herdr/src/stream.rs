@@ -3,18 +3,18 @@
 //! ## Why this is not [`crate::transport::request`]
 //!
 //! Every other method on this socket is one line out and one line back, because
-//! `handle_connection_with_stop` has no read loop (`tmp/herdr/src/api/server.rs:156-317`).
+//! `handle_connection_with_stop` has no read loop (`tmp/herdr/src/api/server.rs:156-304`).
 //! `events.subscribe` is the exception it dispatches to `stream_subscriptions` for
-//! (`:229-250` → `:715-779`), and that function writes an acknowledgement and then **keeps
+//! (`:216-237` → `:701-764`), and that function writes an acknowledgement and then **keeps
 //! writing**:
 //!
-//! - line 1 is `{"id":"<your id>","result":{"type":"subscription_started"}}` (`:747-756`);
+//! - line 1 is `{"id":"<your id>","result":{"type":"subscription_started"}}` (`:732-741`);
 //! - every later line is an event with **no `id` field at all** —
 //!   `tmp/herdr/src/api/subscriptions.rs:249-266` emits a bare `serde_json::Value`.
 //!
 //! herdr polls its subscriptions and flushes on a 100 ms tick (`CONNECTION_POLL_INTERVAL`,
-//! `server.rs:28`, consumed at `:777`), so worst-case event latency is 100 ms and
-//! `should_stop_connection` (`:812-821`) is the liveness check on the same tick.
+//! `server.rs:28`, consumed at `:762`), so worst-case event latency is 100 ms and
+//! `should_stop_connection` (`:797-806`) is the liveness check on the same tick.
 //!
 //! ## Draining is not optional
 //!
@@ -31,7 +31,7 @@
 //! *"Lifecycle subscriptions start when the request is accepted and do not replay events retained
 //! before that point."* (`socket-api.mdx:817-819`), and the source agrees:
 //! `stream_subscriptions` takes `event_hub.current_sequence()` as its floor **before** it builds
-//! any subscription (`server.rs:723`). So the window between a snapshot and a later subscribe is
+//! any subscription (`server.rs:709`). So the window between a snapshot and a later subscribe is
 //! not a latency problem — those events are never sent. [`crate::HerdrClient::bootstrap`] exists
 //! so that window cannot be opened.
 
@@ -68,7 +68,7 @@ pub const MAX_STREAM_BYTES: u64 = 128 * 1024 * 1024;
 /// or [`crate::HerdrClient::subscribe`] (on its own, for a consumer that keeps no cache).
 ///
 /// Dropping it closes the connection, which is how herdr learns to stop
-/// (`should_stop_connection`, `tmp/herdr/src/api/server.rs:812-821`).
+/// (`should_stop_connection`, `tmp/herdr/src/api/server.rs:797-806`).
 ///
 /// **Every error is terminal.** [`Self::next`] yields at most one `Err` and then `None` for ever:
 /// a malformed line, an unexpected error envelope, a byte bound or a closed socket all mean this
@@ -174,7 +174,7 @@ impl HerdrEvents {
         let line = line.trim_end_matches(['\r', '\n']);
 
         // An error envelope after the acknowledgement. herdr's own stream loop writes only events
-        // once it has acked (`tmp/herdr/src/api/server.rs:762-778`), so this is a herdr that has
+        // once it has acked (`tmp/herdr/src/api/server.rs:747-763`), so this is a herdr that has
         // changed or a socket that is not the one this client thinks it is — either way the
         // subscription's state is unknown. pi ends the stream on it too
         // (`src/runs/shared/herdr-connection.ts:100` @v0.68.0, the post-ack `record.error` arm).

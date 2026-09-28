@@ -51,6 +51,7 @@ pub(super) fn empty_assistant(model: &ModelRef) -> AssistantMessage {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     }
 }

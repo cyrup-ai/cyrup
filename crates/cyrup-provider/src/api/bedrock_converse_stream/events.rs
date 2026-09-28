@@ -382,7 +382,7 @@ async fn handle_content_block_stop(
     sink.send(event).await
 }
 
-/// pi `handleMetadata` (`bedrock-converse-stream.ts:532-545`).
+/// pi `handleMetadata` (`bedrock-converse-stream.ts:701-719` @v0.87.1).
 fn handle_metadata(payload: &Value, dec: &mut Decoder) {
     let Some(usage) = payload.get("usage") else {
         return;
@@ -392,6 +392,19 @@ fn handle_metadata(payload: &Value, dec: &mut Decoder) {
     dec.usage.output = n("outputTokens");
     dec.usage.cache_read = n("cacheReadInputTokens");
     dec.usage.cache_write = n("cacheWriteInputTokens");
+    // pi `:712-715` @v0.87.1 (#9457): the one-hour share of the cache writes, summed from
+    // `cacheDetails[]`, so `calculateCost` prices it at the one-hour rate. Absent `cacheDetails`
+    // leaves it unset (pi's `?.reduce` yields `undefined`).
+    dec.usage.cache_write_1h = usage
+        .get("cacheDetails")
+        .and_then(Value::as_array)
+        .map(|details| {
+            details
+                .iter()
+                .filter(|d| d.get("ttl").and_then(Value::as_str) == Some("1h"))
+                .map(|d| d.get("inputTokens").and_then(Value::as_u64).unwrap_or(0))
+                .fold(0u64, u64::saturating_add)
+        });
     let total = n("totalTokens");
     dec.usage.total_tokens = if total == 0 {
         dec.usage.input.saturating_add(dec.usage.output)

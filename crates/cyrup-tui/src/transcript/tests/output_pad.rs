@@ -244,7 +244,8 @@ fn l2_live_streaming_partial_wraps_inside_its_own_padding() {
 /// produced row (`:70-76`).
 ///
 /// `assistant-message.ts:180`/`:189`/`:193` construct them as `new Text(theme.fg("error", …),
-/// this.outputPad, 0)`; `interactive-mode.ts:3956-3960` does the same in the warning colour.
+/// this.outputPad, 0)`; `showWarning` (`interactive-mode.ts:4469-4473` @v0.87.1) does the same in
+/// the warning colour with a paddingX of `1` — equal to `outputPad` at the `1` used here.
 /// cyrup pushed ONE unwrapped logical line and `pad_lines`'d it, i.e. the L2 defect again.
 #[test]
 fn error_and_warning_rows_wrap_inside_the_output_pad() {
@@ -262,6 +263,43 @@ fn error_and_warning_rows_wrap_inside_the_output_pad() {
         assert!(
             rows[1].spans.iter().any(|s| s.style.fg.is_some()),
             "colour lost: {rows:?}"
+        );
+    }
+}
+
+/// **TUI-062** — pi builds every warning row this entry ports as `new Text(theme.fg("warning", …),
+/// 1, 0)` — `showWarning` (`interactive-mode.ts:4471` @v0.87.1), the trust banner, the cost notices
+/// — a literal paddingX of `1`, while `showError` passes `this.outputPad` (`:4465`). So with
+/// `outputPad` at `0` or `3` a warning still sits one column in and an error moves with the setting.
+#[test]
+fn a_warning_keeps_padding_one_while_an_error_follows_output_pad() {
+    let theme = UiTheme::dark();
+    let indent = |row: &Line<'static>| line_text(row).chars().take_while(|c| *c == ' ').count();
+    for pad in [0usize, 3] {
+        let warning = entry_lines(
+            &Entry::Warning("Warning: careful".into()),
+            &theme,
+            80,
+            pad,
+            ImageOpts::default(),
+        );
+        assert_eq!(line_text(&warning[0]), "", "leading Spacer(1)");
+        assert_eq!(
+            indent(&warning[1]),
+            1,
+            "warning at outputPad={pad}: {warning:?}"
+        );
+        let error = entry_lines(
+            &Entry::Error("Error: broken".into()),
+            &theme,
+            80,
+            pad,
+            ImageOpts::default(),
+        );
+        assert_eq!(
+            indent(&error[1]),
+            pad,
+            "error at outputPad={pad}: {error:?}"
         );
     }
 }

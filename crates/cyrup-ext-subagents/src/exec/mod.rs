@@ -42,12 +42,14 @@ pub mod acceptance;
 pub mod agent_refinements;
 pub mod capability_ceiling;
 pub mod child_protocol;
+pub mod child_session_name;
 /// The live `_transcript.jsonl` writer fed from the parsed child-event stream (pi
 /// `shared/child-transcript.ts`).
 pub mod child_transcript;
 pub mod completion_guard;
 pub mod control;
 pub mod fallback;
+pub mod launch_cwd;
 pub mod mcp_direct_tools;
 pub mod model_exclusions;
 pub mod model_scope;
@@ -332,8 +334,35 @@ fn resolve_run_acceptance(
 /// / `RunOptions::clarify = None`), the drive loop still marks the attempt detached but the `AskLock`
 /// degrades to its no-live-channel fallback rather than blocking.
 pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> SingleResult {
+    // SUBA-134 — every result names the child session it came from (pi `sessionName:
+    // childSessionName` on the success and every early-failure result, `execution.ts:464,503,1505`
+    // @v0.71.0): the launcher-assigned name when there is one, else the derivation the child itself
+    // was given ([`crate::exec::attempt_runner`] hands it the same value).
+    let mut result = run_sync_unnamed(agent, task, opts).await;
+    if result.session_name.is_none() {
+        result.session_name = crate::exec::child_session_name::resolve_child_session_name(
+            &agent.name,
+            task,
+            &opts.child_env,
+        );
+    }
+    result
+}
+
+/// [`run_sync`] without the result's session name.
+async fn run_sync_unnamed(agent: &AgentConfig, task: &str, opts: &RunOptions) -> SingleResult {
     if let Some(failure) = depth_guard_failure(agent, task) {
         return failure;
+    }
+    // SUBA-135 — pi `preflightLaunchCwd` at the head of the run (`execution.ts:1604` @v0.71.0; the
+    // runner's per-step `subagent-runner.ts:1061`): a missing or non-directory cwd is refused by
+    // name before anything is prepared or spawned. `run_sync` is handed the resolved cwd only, so
+    // it is its own requested spelling here; the typed spelling is named where it is still known
+    // (the SINGLE-mode dispatch and the async launch).
+    if let Some(refusal) =
+        crate::exec::launch_cwd::preflight_launch_cwd(&opts.cwd.display().to_string(), &opts.cwd)
+    {
+        return pre_spawn_failure(agent, task, refusal);
     }
 
     // Step 1 (R-SA-025): fail fast before any subprocess spawns — INCLUDING a foreign one. This
@@ -693,6 +722,41 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         None
     };
 
+    let (progress, mut control) = winning_attempt_state(last_attempt);
+
+    let mut gates = GateState {
+        exit_code,
+        error,
+        detached,
+        interrupted,
+        timed_out,
+    };
+    // SUBA-127 — read ahead of the output handoff, as upstream does (`execution.ts:1449-1471`
+    // precedes `resolveSingleOutput` at `:1541`; the runner's read precedes `:1375`): a rejected
+    // structured value fails the run before its prose can be persisted as the step's output.
+    let (structured_output, structured_acceptance_report) =
+        gates.apply_structured_output(structured_runtime.as_ref(), opts, &progress.all_events);
+    // SUBA-126 — pi `if (!fullOutput.trim() && result.structuredOutput !== undefined) fullOutput =
+    // JSON.stringify(result.structuredOutput, null, 2)` (`execution.ts:1515` @v0.71.0; the runner's
+    // `outputForPersistence`, `subagent-runner.ts:1373-1374`): a child that answered only through
+    // `structured_output` delivers, saves, and chains the value itself. Acceptance still reads the
+    // child's own prose (`acceptanceOutput`, `:1513`), which is blank here. "Blank" is measured
+    // after `stripAcceptanceReport`, as upstream measures `fullOutput`: prose that is nothing but
+    // an acceptance-report block delivers the value too.
+    let acceptance_prose = final_output.clone();
+    let structured_substituted = structured_output.is_some()
+        && final_output.as_deref().is_none_or(|text| {
+            crate::exec::acceptance::model::strip_acceptance_report(text)
+                .trim()
+                .is_empty()
+        });
+    let final_output = match structured_output.as_ref() {
+        Some(value) if structured_substituted => {
+            serde_json::to_string_pretty(value).ok().or(final_output)
+        }
+        _ => final_output,
+    };
+
     let final_output = apply_terminal_preamble(
         final_output,
         timed_out,
@@ -707,30 +771,23 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
 
     let (final_output, full_output_for_reference, saved_output_path) = resolve_saved_output(
         opts,
-        exit_code,
+        gates.exit_code,
         final_output,
         setup.output_snapshot,
-        &mut error,
+        &mut gates.error,
     );
 
-    let (progress, mut control) = winning_attempt_state(last_attempt);
-
-    let mut gates = GateState {
-        exit_code,
-        error,
-        detached,
-        interrupted,
-        timed_out,
-    };
-    let (structured_output, structured_acceptance_report) =
-        gates.apply_structured_output(structured_runtime.as_ref(), opts);
     let guard_result = gates.apply_completion_guard(agent, task, &progress, &mut control);
     let acceptance_ledger = gates
         .apply_acceptance(
             &contract,
             &progress,
             opts,
-            final_output.as_deref(),
+            if structured_substituted {
+                acceptance_prose.as_deref()
+            } else {
+                final_output.as_deref()
+            },
             guard_result,
             &structured_acceptance_report,
         )
@@ -738,6 +795,21 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     let GateState {
         exit_code, error, ..
     } = gates;
+
+    // SUBA-132 — pi `result.toolBudgetBlocked` (`execution.ts:1144-1156` @v0.71.0): a tool result
+    // that is this budget's own hard-block message, matched by the result event's own tool name.
+    let tool_budget_blocked = agent.tool_budget.as_ref().is_some_and(|budget| {
+        progress.tool_end_events.iter().any(|event| match event {
+            crate::exec::ndjson::SubagentEvent::ToolExecutionEnd {
+                tool_name, result, ..
+            } => crate::exec::tool_budget::is_tool_budget_blocked_message(
+                budget,
+                &crate::exec::output::extract_tool_result_text(result).unwrap_or_default(),
+                Some(tool_name),
+            ),
+            _ => false,
+        })
+    });
 
     // pi `execution.ts:2036-2040`: the explicit session FILE wins when it exists or the child
     // demonstrably produced messages; otherwise a share-enabled run's `--session-dir` is scanned
@@ -806,6 +878,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         turn_budget: turn_budget_tracker.state(),
         turn_budget_exceeded: turn_budget_tracker.exceeded(),
         wrap_up_requested: turn_budget_tracker.wrap_up_requested(),
+        tool_budget_blocked,
+        session_name: None,
         agent: agent.name.clone(),
         task: task.to_string(),
         exit_code,
@@ -1148,6 +1222,8 @@ pub(crate) fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) 
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
+        tool_budget_blocked: false,
+        session_name: None,
         agent: agent.name.clone(),
         task: task.to_string(),
         exit_code: 1,
@@ -1597,12 +1673,21 @@ impl GateState {
         });
     }
 
-    /// Step 5 (R-SA-030): structured-output extraction + parent-side JSON-Schema re-validation.
-    /// Only evaluated on an otherwise-clean run (mirrors the completion-guard/acceptance gate's own
-    /// "don't re-diagnose an already-failed attempt" discipline in the two gates that follow) — a run that already
-    /// failed for another reason (non-zero exit, timeout, detach, interrupt) must not additionally
-    /// be re-labeled by a structured-output check that never had a fair chance to run against a
-    /// clean transcript.
+    /// Step 5 (R-SA-030): structured-output extraction + parent-side JSON-Schema re-validation,
+    /// in the shape of pi's runner (`subagent-runner.ts:1245-1270` @v0.71.0, SUBA-127):
+    ///
+    /// - The capture is READ whenever the child invoked `structured_output`
+    ///   ([`crate::exec::structured::structured_output_tool_invoked`] over the winning attempt's
+    ///   events), whatever else happened — so a valid value produced before a provider error or a
+    ///   deadline is kept as evidence on the failed result.
+    /// - An error is REPORTED only on an otherwise-clean run: a run that already failed (non-zero
+    ///   exit, timeout) must not be re-labeled by a check that never had a fair chance. An invoked
+    ///   call that captured nothing is a rejected call, reported with pi's bounded rejection summary
+    ///   ([`crate::exec::structured::format_structured_output_rejection_error`]) — never as the
+    ///   missing-call error, which misdirects the fix; the missing-call error is for a child that
+    ///   never invoked the tool at all.
+    /// - A detached or interrupted run is not read: its child is still live or paused (upstream
+    ///   returns before this read on both paths, `execution.ts:612-631,1420-1435`).
     ///
     /// SUBA-105 — beside the value, the child's `acceptanceReport` (pi `readStructuredOutput
     /// AcceptanceReport`, `structured-output.ts:185-196`, read at `subagent-runner.ts:1286-1288`
@@ -1613,11 +1698,12 @@ impl GateState {
         &mut self,
         structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
         opts: &RunOptions,
+        events: &[crate::exec::ndjson::SubagentEvent],
     ) -> (
         Option<serde_json::Value>,
         crate::exec::structured::StructuredAcceptanceReport,
     ) {
-        let value = self.apply_structured_output_value(structured_runtime, opts);
+        let value = self.apply_structured_output_value(structured_runtime, opts, events);
         let report = match (value.as_ref(), structured_runtime) {
             (Some(_), Some(runtime)) => {
                 crate::exec::structured::read_structured_output_acceptance_report(runtime)
@@ -1631,59 +1717,62 @@ impl GateState {
         &mut self,
         structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
         opts: &RunOptions,
+        events: &[crate::exec::ndjson::SubagentEvent],
     ) -> Option<serde_json::Value> {
-        if self.gate().is_clean() {
-            // SUBA-S01: read the FILE the child's `structured_output` tool wrote (pi
-            // `readStructuredOutput`, `structured-output.ts:156-173`). The capture file is the ONLY
-            // channel — pi has no other, and neither does this port any more.
-            //
-            // The `None` arm used to fall back to `resolve_structured_output`, a cyrup-original scan
-            // that accepted the newest fenced ```json block in the child's prose. That is exactly what
-            // the "EVEN WHEN prose was produced" rule below says must NOT satisfy a declared schema,
-            // and it was not merely lenient: a coincidental fence could VALIDATE against the caller's
-            // schema and become the run's structured result, silently feeding a wrong answer into a
-            // chain's output bindings. A schema that was declared but whose capture runtime could not
-            // be created is therefore `Missing` — no file, no value — which is the same hard failure
-            // upstream produces when the child never called the tool.
-            let structured_outcome = match structured_runtime {
-                Some(runtime) => match crate::exec::structured::read_structured_output(runtime) {
+        if self.detached || self.interrupted {
+            return None;
+        }
+        // SUBA-S01: read the FILE the child's `structured_output` tool wrote (pi
+        // `readStructuredOutput`, `structured-output.ts:388-405` @v0.71.0). The capture file is
+        // the ONLY channel — a fenced ```json block in prose never satisfies a declared schema,
+        // since a coincidental fence could validate and silently become the run's structured
+        // result. A schema that was declared but whose capture runtime could not be created is
+        // therefore `Missing` — no file, no value.
+        let invoked = crate::exec::structured::structured_output_tool_invoked(events);
+        let structured_outcome = match structured_runtime {
+            Some(runtime) if invoked => {
+                match crate::exec::structured::read_structured_output(runtime) {
                     Ok(value) => StructuredOutcome::Valid(value),
+                    // pi `structured.error === MISSING_STRUCTURED_OUTPUT_CALL_ERROR ?
+                    // formatStructuredOutputRejectionError(run.messages) : structured.error`.
                     Err(message)
                         if message == crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR =>
                     {
-                        StructuredOutcome::Missing
+                        StructuredOutcome::Invalid(
+                            crate::exec::structured::format_structured_output_rejection_error(
+                                events,
+                            ),
+                        )
                     }
                     Err(message) => StructuredOutcome::Invalid(message),
-                },
-                None if opts.structured_output_schema.is_some() => StructuredOutcome::Missing,
-                None => StructuredOutcome::NotRequested,
-            };
-            match structured_outcome {
-                StructuredOutcome::NotRequested => None,
-                StructuredOutcome::Valid(value) => Some(value),
-                StructuredOutcome::Missing => {
-                    // pi `readStructuredOutput` (structured-output.ts:156-173, execution.ts:1212-1216): a
-                    // declared `outputSchema` with no captured `structured_output` value is a HARD
-                    // failure — EVEN WHEN the child produced prose. pi runs its structured-output check
-                    // on every clean exit and fails on the missing value unconditionally; prose is never
-                    // an exemption. (An empty-prose + missing-structured attempt never reaches here: the
-                    // per-attempt cold-start gate already failed it retryably via `structured_output_absent`,
-                    // so a clean gate at this point implies prose WAS produced — exactly the "even with
-                    // prose" case this must still reject.)
+                }
+            }
+            Some(_) => StructuredOutcome::Missing,
+            None if opts.structured_output_schema.is_some() => StructuredOutcome::Missing,
+            None => StructuredOutcome::NotRequested,
+        };
+        let clean = self.gate().is_clean();
+        match structured_outcome {
+            StructuredOutcome::NotRequested => None,
+            StructuredOutcome::Valid(value) => Some(value),
+            // pi's rule: a declared `outputSchema` with no `structured_output` call is a HARD
+            // failure — EVEN WHEN the child produced prose.
+            StructuredOutcome::Missing => {
+                if clean {
                     self.exit_code = 1;
                     self.push_error(
                         crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR.to_string(),
                     );
-                    None
                 }
-                StructuredOutcome::Invalid(message) => {
+                None
+            }
+            StructuredOutcome::Invalid(message) => {
+                if clean {
                     self.exit_code = 1;
                     self.push_error(message);
-                    None
                 }
+                None
             }
-        } else {
-            None
         }
     }
 
@@ -2113,6 +2202,7 @@ pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinitio
     AgentDefinition {
         inherit_global_context: false,
         machine: None,
+        advertise: None,
         // SUBA-102 — pi `evaluateCompletionMutationGuard({ …, mutationTools })`
         // (`completion-guard.ts:246` @v0.68.0): the agent's extra mutating tool names.
         mutation_tools: agent.mutation_tools.clone(),

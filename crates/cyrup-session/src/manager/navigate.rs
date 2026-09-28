@@ -28,6 +28,11 @@ impl SessionManager {
 
     /// Move the leaf to `to`, then append a `BranchSummary` capturing the abandoned branch
     /// (R-04-024). The abandoned branch is never touched.
+    ///
+    /// `from_id` is the PRE-navigation leaf — the branch being summarized — or `"root"` when there
+    /// was none: pi captures `const fromId = this.leafId ?? "root"` BEFORE `this.leafId =
+    /// branchFromId` (`session-manager.ts:1603-1604` @v0.87.1; v0.84.3 `d711bd5f0` reversed the
+    /// earlier rule that recorded the destination, SESS-063).
     pub fn branch_with_summary(
         &mut self,
         to: Option<&EntryId>,
@@ -36,11 +41,11 @@ impl SessionManager {
         usage: Option<Usage>,
         from_hook: bool,
     ) -> Result<EntryId, SessionError> {
+        let from_id = self.leaf.clone().unwrap_or_else(|| EntryId::from("root"));
         match to {
             Some(id) => self.branch(id)?,
             None => self.reset_leaf(),
         }
-        let from_id = to.cloned().unwrap_or_else(|| EntryId::from("root"));
         self.push_entry(Entry::known(KnownEntry::BranchSummary {
             base: self.make_base(),
             from_id,

@@ -243,3 +243,24 @@ fn a_rebind_moves_the_restored_hotkeys_cells() {
         "the replaced default must be gone: {line}"
     );
 }
+
+/// **TUI-071.** `app.suspend` on native Windows only reports that it cannot suspend — pi
+/// `handleCtrlZ` (`interactive-mode.ts:4278-4282` @v0.87.1) — and never reaches the run loop's
+/// teardown; everywhere else it is the run loop's `Suspend`.
+#[test]
+fn suspend_on_native_windows_reports_instead_of_suspending() {
+    use crate::KeybindingPlatform as P;
+    let mut app = new_app();
+    let win = P::detect("windows", |_| None);
+    assert_eq!(app.suspend_action(win), AppAction::Redraw);
+    assert_eq!(
+        statuses(&app),
+        ["Suspend to background is not supported on Windows"]
+    );
+    let mut app = new_app();
+    assert_eq!(
+        app.suspend_action(P::detect("linux", |_| None)),
+        AppAction::Suspend
+    );
+    assert!(statuses(&app).is_empty());
+}

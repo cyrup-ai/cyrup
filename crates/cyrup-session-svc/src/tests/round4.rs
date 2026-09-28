@@ -154,15 +154,10 @@ async fn new_session_with_records_parent_session() {
         .unwrap();
     assert!(!result.cancelled);
 
-    // The new session's JSONL header carries `parentSession`.
+    // The new session's stored header carries `parentSession`. (The stored header, not the JSONL
+    // EXPORT: that writes a fresh header without it, as pi's `serializeSessionBranch` does.)
     let session = runtime.session().await;
-    let jsonl = session
-        .export_to_jsonl(None)
-        .await
-        .unwrap()
-        .expect("jsonl text");
-    let header_line = jsonl.lines().next().expect("header line");
-    let header: serde_json::Value = serde_json::from_str(header_line).unwrap();
+    let header = serde_json::to_value(session.session_header().await).unwrap();
     assert_eq!(
         header["parentSession"].as_str(),
         Some(parent_file.as_str()),

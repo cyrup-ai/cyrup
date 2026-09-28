@@ -9,7 +9,7 @@
 //!    [`ApiErrorCode::Other`] and a herdr upgrade that invents a code is a value, not a parse
 //!    failure.
 //! 2. **herdr's own `message` is reproduced verbatim, never a synthesised sentence.** herdr's own
-//!    Rust client does exactly this (`tmp/herdr/src/api/client.rs:164`,
+//!    Rust client does exactly this (`tmp/herdr/src/api/client.rs:137`,
 //!    `Self::ErrorResponse(response) => write!(f, "{}", response.error.message)`).
 //! 3. **"unavailable" is not one thing.** pi's `HerdrErrorCode` (`src/inspectors/herdr/client.ts:3-9`
 //!    @v0.68.0) folds a ~60-code space onto five names, and `normalizeCode` (`:35-41`) sends
@@ -70,7 +70,7 @@ pub enum Unavailable {
 // crate ships nothing it cannot reach:
 //
 //   * `ProtocolMismatch` — herdr's CLI refuses ANY protocol difference before every verb
-//     (`tmp/herdr/src/cli.rs:786-801` → `cli/protocol_guard.rs:16-43`, error code
+//     (`tmp/herdr/src/cli.rs:787-802` → `cli/protocol_guard.rs:16-43`, error code
 //     `protocol_mismatch`) and that code is CLI-only: `tmp/herdr/src/api/server.rs` never produces
 //     it, so a socket client only ever meets it as text on a shelled-out herdr's stderr — where
 //     `HerdrCli` already reports it, as [`ApiErrorCode::Other`] carrying that exact spelling, with
@@ -96,7 +96,7 @@ pub enum Unavailable {
 pub enum ApiErrorCode {
     /// The request did not deserialise into herdr's `Request` — **including an unknown method
     /// name**, because `Method` is a tagged enum and an unknown tag is a serde error
-    /// (`tmp/herdr/src/api/server.rs:177-204`; `tmp/herdr/src/api/schema/tests.rs:420-424` asserts
+    /// (`tmp/herdr/src/api/server.rs:177-191`; `tmp/herdr/src/api/schema/tests.rs:420-424` asserts
     /// the `"unknown variant"` text). This is therefore the code that means *this herdr build does
     /// not have that method*, which is why [`HerdrError::is_unsupported_method`] keys on it.
     InvalidRequest,
@@ -127,14 +127,14 @@ pub enum ApiErrorCode {
     /// `pane.report_agent` named an agent herdr does not know.
     InvalidAgent,
     /// `pane.send_input` named a key herdr cannot encode
-    /// (`tmp/herdr/src/app/api/panes.rs:1852`). **Nothing was written**: herdr encodes the whole
+    /// (`tmp/herdr/src/app/api/panes.rs:1836`). **Nothing was written**: herdr encodes the whole
     /// input before it sends any of it, so this is a clean refusal, not a partial write.
     InvalidKey,
     /// `pane.split` was given an `env` entry with an empty key, an `=` in a key, or a NUL in
     /// either half (`tmp/herdr/src/app/api/env.rs:3-31`).
     InvalidEnv,
     /// `pane.close` would have closed a whole worktree group, and herdr wants the user to say so
-    /// explicitly (`tmp/herdr/src/app/api/panes.rs:1880-1886`). The pane is **still open**.
+    /// explicitly (`tmp/herdr/src/app/api/panes.rs:1864-1870`). The pane is **still open**.
     ConfirmationRequired,
     /// `pane.wait_for_output` was given a `regex` pattern that does not compile
     /// (`tmp/herdr/src/api/wait.rs:38-48`). Refused before the first read, so it fails at once
@@ -164,16 +164,16 @@ pub enum ApiErrorCode {
     UiBusy,
     /// A read raced a redraw.
     StaleContent,
-    /// `tmp/herdr/src/app/api/agents.rs:96` and `tmp/herdr/src/api/server.rs:842` — herdr's own
+    /// `tmp/herdr/src/app/api/agents.rs:96` and `tmp/herdr/src/api/server.rs:827` — herdr's own
     /// 5 s `APP_RESPONSE_TIMEOUT` elapsed. Distinct from [`HerdrError::Timeout`], which is *this*
     /// client's deadline elapsing with no line at all.
     Timeout,
-    /// The server is shutting down (`tmp/herdr/src/api/server.rs:390`).
+    /// The server is shutting down (`tmp/herdr/src/api/server.rs:377`).
     ServerUnavailable,
-    /// `tmp/herdr/src/api/server.rs:373` — `client_shell.surface.set` is refused on the raw socket
+    /// `tmp/herdr/src/api/server.rs:360` — `client_shell.surface.set` is refused on the raw socket
     /// by construction. It can never be ported; it is absent, not deferred.
     ConnectionLocalOnly,
-    /// herdr failed internally (`tmp/herdr/src/api/server.rs:365`).
+    /// herdr failed internally (`tmp/herdr/src/api/server.rs:352`).
     InternalError,
     /// Any code this client does not name — a newer herdr, or one of the 30-odd codes no cyrup
     /// consumer reaches. Carries the wire spelling unchanged.
@@ -273,7 +273,7 @@ impl std::fmt::Display for ApiErrorCode {
 
 /// An `{"id":…,"error":{"code":…,"message":…}}` envelope, decoded.
 ///
-/// `message` is herdr's own text, byte for byte (`tmp/herdr/src/api/client.rs:164` does the same).
+/// `message` is herdr's own text, byte for byte (`tmp/herdr/src/api/client.rs:137` does the same).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message} ({code})")]
 pub struct ApiError {
@@ -302,7 +302,7 @@ pub enum HerdrError {
     /// The answer's `id` was not the `id` that was sent.
     ///
     /// The connection is dropped rather than the payload accepted: one request per connection
-    /// (`tmp/herdr/src/api/server.rs:156-317`) means a mismatched id cannot be a pipelining
+    /// (`tmp/herdr/src/api/server.rs:156-304`) means a mismatched id cannot be a pipelining
     /// artefact, so it is either a confused server or a crossed socket, and either way the payload
     /// describes something other than what was asked. pi drops it too
     /// (`src/runs/shared/herdr-connection.ts:86` @v0.68.0).
@@ -323,7 +323,7 @@ pub enum HerdrError {
     },
     /// This client's deadline elapsed with no complete line.
     ///
-    /// There is no herdr-side deadline on a plain dispatch — `tmp/herdr/src/api/server.rs:911-913`
+    /// There is no herdr-side deadline on a plain dispatch — `tmp/herdr/src/api/server.rs:896-898`
     /// is a `recv()` with `None` timeout — so without this the call would hang forever.
     #[error("herdr did not answer {method} within {timeout:?}")]
     Timeout {
@@ -354,7 +354,7 @@ pub enum HerdrError {
     /// [`crate::schema::ResponseResult::Unrecognised`].
     ///
     /// **This is never silently upgraded to a success.** herdr's own client does the same
-    /// (`tmp/herdr/src/api/client.rs:119`, `ApiClientError::UnexpectedResult`).
+    /// (`tmp/herdr/src/api/client.rs:92`, `ApiClientError::UnexpectedResult`).
     #[error("herdr answered {method} with {got}, which is not a {want}")]
     UnexpectedResult {
         /// The wire method name.
@@ -377,13 +377,13 @@ impl HerdrError {
     /// herdr's stability rule is per-method, not per-version: *"Other missing methods disable only
     /// those actions and show a client-local notice; they do not disconnect the UI … JSON API
     /// clients should ignore unknown fields and handle unsupported methods as normal errors."*
-    /// (`tmp/herdr/docs/preview/website/src/content/docs/socket-api.mdx:951-959`). An unknown
+    /// (`tmp/herdr/docs/next/website/src/content/docs/socket-api.mdx:951-959`). An unknown
     /// method name fails `Request` deserialisation and comes back as `invalid_request`
-    /// (`tmp/herdr/src/api/server.rs:177-201`), so that one code is the whole signal herdr gives.
+    /// (`tmp/herdr/src/api/server.rs:177-188`), so that one code is the whole signal herdr gives.
     ///
     /// **It is not a narrower signal than that, and this accessor does not pretend otherwise.**
     /// The `invalid_request` arm is the `Err` branch of `serde_json::from_str::<Request>(line)`
-    /// (`server.rs:177-201`), and `Method` is adjacently tagged with `content = "params"`, so
+    /// (`server.rs:177-188`), and `Method` is adjacently tagged with `content = "params"`, so
     /// params are deserialised inside that same call. An unknown method tag, a missing required
     /// params field, a wrong JSON type and an enum value this herdr build does not know all
     /// produce the identical code. So `true` means *this build will not accept this request as

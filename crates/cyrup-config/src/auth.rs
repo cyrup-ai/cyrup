@@ -339,7 +339,7 @@ impl AuthStore {
         let mut text =
             serde_json::to_string_pretty(&Value::Object(obj)).map_err(AuthError::Parse)?;
         text.push('\n');
-        crate::lock::write_atomic(&self.path, text.as_bytes(), true)?;
+        crate::lock::write_in_place_secret(&self.path, text.as_bytes())?;
 
         drop(flock);
         // Pi assigns the just-written document onto `this.data` inside `modify`
@@ -889,6 +889,33 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700);
+    }
+
+    /// CFG-089 — a credential write leaves an administrator-set mode alone (Pi applies `0o600`
+    /// only when `writeFileSync` creates the file, `auth-storage.ts:24-25` @v0.87.1) and rewrites
+    /// the same inode rather than renaming a fresh one over it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_keeps_an_existing_files_mode_and_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (s, path, _dir) = store();
+        let provider = ProviderId::from("x");
+        s.modify(&provider, |_| async { Ok(Some(Credential::api_key("k1"))) })
+            .await
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        s.modify(&provider, |_| async { Ok(Some(Credential::api_key("k2"))) })
+            .await
+            .unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(meta.ino(), inode);
+        assert_eq!(
+            s.read(&provider).await.unwrap().unwrap().stored_api_key(),
+            Some("k2")
+        );
     }
 
     #[test]

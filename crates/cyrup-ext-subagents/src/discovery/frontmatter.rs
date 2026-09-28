@@ -162,6 +162,9 @@ const KNOWN_FIELDS: &[&str] = &[
     // parsed `agents.ts:2168` @v0.68.0). Until it was typed here, a `machine:` line round-tripped
     // into `extra_fields` and the agent ran locally. Emitted by `management::serialize_agent`.
     "machine",
+    // SUBA-133 — the advertised-catalog opt-in (`agent-serializer.ts:9`, parsed `agents.ts:2107`
+    // @v0.71.0). Emitted by `management::serialize_agent`.
+    "advertise",
 ];
 
 /// True iff `key` is one of the crate's first-class typed frontmatter fields (pi's `KNOWN_FIELDS`,
@@ -1353,6 +1356,20 @@ pub fn parse_agent_file_checked(
         Err(message) => return Err(fail(message)),
     };
 
+    // SUBA-133 — pi `agents.ts:2107-2111` @v0.71.0: exactly `true` or `false`, else THROW — here
+    // the same per-file skip + warn as every other malformed frontmatter value above. Upstream
+    // names the LOCAL name in this sentence, not the package-qualified one.
+    let advertise = match parsed.get("advertise") {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(_) => {
+            return Err(fail(format!(
+                "Agent '{local_name}' has invalid advertise frontmatter; expected true or false."
+            )));
+        }
+    };
+
     let present_fields: HashSet<String> = parsed.keys().map(str::to_string).collect();
     let extra_fields: BTreeMap<String, String> = parsed
         .fields
@@ -1364,6 +1381,7 @@ pub fn parse_agent_file_checked(
     Ok(Some(AgentDefinition {
         inherit_global_context,
         machine,
+        advertise,
         mutation_tools,
         name: runtime_name,
         local_name,
@@ -1949,6 +1967,40 @@ mod tests {
         .expect("parses");
         assert!(!bare.inherit_global_context, "absent defaults to false");
         assert_eq!(bare.mutation_tools, None, "an empty list is no list");
+    }
+
+    /// SUBA-133 — `advertise` is typed (never `extra_fields`) and strictly `true`/`false`
+    /// (`agents.ts:2107-2111` @v0.71.0); anything else refuses the file with upstream's sentence,
+    /// naming the LOCAL name.
+    #[test]
+    fn advertise_is_a_strict_boolean_frontmatter_field() {
+        for (raw, expected) in [("true", Some(true)), ("false", Some(false))] {
+            let content =
+                format!("---\nname: scout\ndescription: D\nadvertise: {raw}\n---\n\nBody\n");
+            let def =
+                parse_agent_file(&content, AgentSource::User, Path::new("/s.md")).expect("parses");
+            assert_eq!(def.advertise, expected);
+            assert!(!def.extra_fields.contains_key("advertise"));
+        }
+        let absent = parse_agent_file(
+            "---\nname: scout\ndescription: D\n---\n\nBody\n",
+            AgentSource::User,
+            Path::new("/s.md"),
+        )
+        .expect("parses");
+        assert_eq!(absent.advertise, None);
+        let refused = parse_agent_file_checked(
+            "---\nname: scout\npackage: acme\ndescription: D\nadvertise: yes\n---\n\nBody\n",
+            AgentSource::User,
+            Path::new("/s.md"),
+        )
+        .expect_err("a non-boolean advertise refuses the file");
+        assert!(
+            format!("{refused:?}").contains(
+                "Agent 'scout' has invalid advertise frontmatter; expected true or false."
+            ),
+            "{refused:?}"
+        );
     }
 
     // -----------------------------------------------------------------------------------------

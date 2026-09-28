@@ -125,6 +125,7 @@ fn signed_block_ctx(provider: &str, model: &str, content: Vec<Content>) -> Conte
                 deferred: None,
                 error_message: None,
                 raw_stop_reason: None,
+                end_turn: None,
                 timestamp: 1,
             }),
         ],

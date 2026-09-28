@@ -133,12 +133,32 @@ impl<B: Backend> App<B> {
         {
             return;
         }
-        // No `Warning: ` prefix: pi's trust banner is a RAW `Text` in the warning colour (`:3505`),
-        // not a `showWarning` call, so — unlike `interactive-mode.ts:3884-3888`'s
-        // `Warning: ${warningMessage}` — there is no prefix to carry (TUI-062).
+        // No `Warning: ` prefix: pi's trust banner is a RAW `Text` in the warning colour
+        // (`interactive-mode.ts:4078-4090` @v0.87.1), not a `showWarning` call, so it goes through
+        // `push_warning` rather than `show_warning` (TUI-062).
         self.state
             .transcript
             .push_warning(PROJECT_UNTRUSTED_WARNING);
+    }
+
+    /// The tail of pi's `renderInitialMessages()` (`interactive-mode.ts:4064-4070` @v0.87.1): once
+    /// the replay and the trust banner are down, `Session compacted 1 time` / `N times` when the
+    /// session file holds any `compaction` entry. Runs on every path that re-renders the initial
+    /// messages — the boot bind and the session swap — right after
+    /// [`Self::render_project_trust_warning_if_needed`], and like it is UNconditional on the
+    /// replay: a session compacted down to nothing still says so.
+    pub async fn render_compaction_count_if_needed(&mut self, session: &Arc<AgentSession>) {
+        let count = session.compaction_count().await;
+        if count > 0 {
+            let times = if count == 1 {
+                "1 time".to_string()
+            } else {
+                format!("{count} times")
+            };
+            self.state
+                .transcript
+                .push_status(format!("Session compacted {times}"));
+        }
     }
 
     /// Reload [`AppState::known_tool_definitions`] from the bound session's tool registry — Pi's

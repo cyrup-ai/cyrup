@@ -18,6 +18,7 @@ fn assistant_text_replay_carries_message_item() {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     };
     ctx.messages.push(Message::Assistant(am));

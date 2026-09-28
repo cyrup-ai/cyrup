@@ -822,6 +822,7 @@ mod tests {
         AgentDefinition {
             inherit_global_context: false,
             machine: None,
+            advertise: None,
             mutation_tools: None,
             default_turn_budget: None,
             default_acceptance: None,

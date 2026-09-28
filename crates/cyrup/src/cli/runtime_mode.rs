@@ -1,7 +1,7 @@
 use cyrup_config::AppMode;
 
 use super::args::Cli;
-use super::enums::{Mode, OutputFormat};
+use super::enums::Mode;
 
 /// Resolve the runtime mode (R-11-001 / arch-11 §6.1). Explicit mode flags win; otherwise a
 /// non-TTY stdin or stdout forces PRINT, and a full TTY pair selects the interactive front-end.
@@ -16,13 +16,13 @@ pub fn resolve_app_mode(cli: &Cli, stdin_tty: bool, stdout_tty: bool) -> AppMode
     if cli.acp || cli.mode == Some(Mode::Acp) {
         return AppMode::Acp;
     }
-    if cli.rpc || cli.mode == Some(Mode::Rpc) {
+    if cli.mode == Some(Mode::Rpc) {
         return AppMode::Rpc;
     }
-    if cli.json || cli.mode == Some(Mode::Json) || cli.output_format == Some(OutputFormat::Json) {
+    if cli.mode == Some(Mode::Json) {
         return AppMode::Json;
     }
-    if cli.print || cli.output_format == Some(OutputFormat::Text) {
+    if cli.print {
         return AppMode::Print;
     }
     if !stdin_tty || !stdout_tty {

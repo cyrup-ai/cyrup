@@ -16,10 +16,10 @@ These are active whenever no picker, dialog or overlay owns the keyboard.
 | `Ctrl+D` | Quit — only when the editor is empty. Otherwise it forward-deletes. |
 | `Ctrl+C` | Clear the editor. A second press within 500 ms quits, empty or not. |
 | `Esc` | Interrupt. Context-dependent — see below. |
-| `Ctrl+Z` | Suspend cyrup to the background. |
+| `Ctrl+Z` | Suspend cyrup to the background. No default on native Windows, which has no job control; bound there by hand, it only reports that suspend is not supported. |
 | `Ctrl+O` | Expand or collapse tool and bash output. |
 | `Ctrl+G` | Open the editor buffer in your external editor. |
-| `PageUp` / `PageDown` | Scroll the active region by ten lines. Goes to the editor when the buffer spans more than one visual line. |
+| `PageUp` / `PageDown` | Scroll the active region by ten lines while the buffer is a single visual line; otherwise page the caret. These are the editor's `tui.editor.pageUp` / `tui.editor.pageDown` keys, so rebinding those moves both. |
 | `Shift+Tab` | Cycle the thinking level on the current model. |
 | `Ctrl+P` | Next model in the cycling set. |
 | `Ctrl+Shift+P` | Previous model. |
@@ -28,10 +28,16 @@ These are active whenever no picker, dialog or overlay owns the keyboard.
 | `Ctrl+X` | Copy the last assistant message to the clipboard — the same action as `/copy`. |
 | `Alt+Enter` | Queue the buffer as a follow-up message. No-op on an empty buffer. |
 | `Alt+Up` | Pull queued messages back into the editor. |
-| `Ctrl+V` / `Alt+V` | Paste an image from the clipboard as a file path. Falls through to ordinary text paste when the clipboard holds no image. |
+| `Ctrl+V` (`Alt+V` on Windows and WSL) | Paste an image from the clipboard as a file path. Falls through to ordinary text paste when the clipboard holds no image. |
 
 `Ctrl+T` toggles thinking-block *visibility*; `Shift+Tab` changes the thinking *level* on the model.
 They are separate bindings for separate things.
+
+**Under WSL** (`WSL_DISTRO_NAME` or `WSL_INTEROP` set) the defaults Windows Terminal reserves move,
+exactly as upstream's do: `Alt+P` is the previous model, `Ctrl+Q` queues a follow-up, `Alt+Q` pulls
+queued messages back, `Alt+V` pastes an image, the editor's undo is `Alt+Z`, and the fullscreen
+prompt jumps are the bare `Ctrl+Up` / `Ctrl+Down`. Native Windows gets the same set, except that
+undo is `Ctrl+Z` there because suspend leaves it free.
 
 Four more actions are bindable but ship with **no default key**, matching upstream: `app.session.new`,
 `app.session.tree`, `app.session.fork` and `app.session.resume`. Name them in
@@ -114,6 +120,10 @@ cancels the jump.
 stock iTerm2, gnome-terminal and xterm. Nothing binds `Ctrl+\` by default; it is there for your own
 bindings.
 
+The raw `0x08` byte such a terminal sends is **Ctrl+Backspace** in Windows Terminal (`WT_SESSION` set
+and no `SSH_CONNECTION`, `SSH_CLIENT` or `SSH_TTY`) and **Backspace** everywhere else. A `ctrl+h`
+binding matches it either way. `Esc` followed by that byte is **Alt+Backspace** on every terminal.
+
 ## Autocomplete popup
 
 | Key | Effect |
@@ -154,8 +164,8 @@ Individual pickers add keys on top.
 
 | Key | Effect |
 |---|---|
-| `Alt+Left` / `Ctrl+Left` | Fold, or move up |
-| `Alt+Right` / `Ctrl+Right` | Unfold, or move down |
+| `Ctrl+Left` / `Alt+Left` | Fold, or move up (`Alt+Left` first on macOS) |
+| `Ctrl+Right` / `Alt+Right` | Unfold, or move down (`Alt+Right` first on macOS) |
 | `Shift+L` | Edit the row's label inline |
 | `Shift+T` | Toggle the label-timestamp column |
 | `Ctrl+D` | Filter: default |
@@ -181,6 +191,16 @@ label editor is open it captures every key.
 | `Ctrl+S` | Save to settings and close |
 | `Ctrl+C` | Clear the search box; cancels only when it is empty |
 | `Esc` | Cancel |
+
+### /thinking
+
+| Key | Effect |
+|---|---|
+| `Up` / `Down` | Move |
+| `Enter` | Set the level for this session |
+| `Ctrl+S` | Set the level and save it as the default — `app.thinking.save` |
+| `Esc` / `Ctrl+C` | Cancel |
+| any printable character | Fuzzy-search the levels |
 
 ### /model
 
@@ -319,10 +339,10 @@ a top level that is not an object, discards the whole document.
 
 A key spec is modifiers and a key joined with `+`, and is case-insensitive.
 
-- **Modifiers:** `ctrl` (`control`), `shift`, `alt` (`option`, `meta`), `super` (`cmd`, `command`).
-- **Named keys:** `enter` (`return`), `tab`, `backtab`, `esc` (`escape`), `space`, `up`, `down`,
-  `left`, `right`, `home`, `end`, `backspace`, `delete` (`del`), `insert` (`ins`), `pageup`
-  (`pgup`, `pageUp`), `pagedown` (`pgdn`, `pageDown`), and `f1` through `f12`.
+- **Modifiers:** `ctrl`, `shift`, `alt`, `super`.
+- **Named keys:** `enter` (`return`), `tab`, `esc` (`escape`), `space`, `up`, `down`, `left`,
+  `right`, `home`, `end`, `backspace`, `delete`, `insert`, `pageUp`, `pageDown`, and `f1` through
+  `f12`. `shift+tab` matches Shift+Tab however the terminal reports it.
 - **Anything else must be a single character.** `ctrl+shift+p` is valid; `ctrl+q1` is not.
 
 `clear` is deliberately unsupported — the terminal backend has no counterpart for it, so there is
@@ -338,19 +358,18 @@ label.
 
 ### Binding ids
 
-There are 73 ids in four namespaces:
+There are 74 ids in four namespaces:
 
 | Namespace | Covers |
 |---|---|
 | `tui.editor.*` | Editor motion, deletion, kill ring, char-jump, undo, history |
 | `tui.input.*` | `newLine`, `submit`, `tab`, `copy` |
 | `tui.select.*` | The shared picker keys — up, down, page up, page down, confirm, cancel |
-| `app.*` | Interrupt, clear, exit, suspend, thinking level and thinking-block visibility, model cycling and the model selector, tool output, external editor, message queueing, copy-last-message, clipboard, and the session, tree and scoped-model pickers |
+| `app.*` | Interrupt, clear, exit, suspend, thinking level (cycle and the `/thinking` picker's save-as-default) and thinking-block visibility, model cycling and the model selector, tool output, external editor, message queueing, copy-last-message, clipboard, and the session, tree and scoped-model pickers |
 
-Older spellings still work: bare legacy names such as `cursorUp`, `submit` and `interrupt`, the
-`editor.*` prefix, `app.pageUp` and `app.pageDown`, and `tui.autocomplete.*`. The autocomplete popup
-also honours `tui.select.up`, `tui.select.down`, `tui.select.confirm`, `tui.select.cancel` and
-`tui.input.tab`.
+Older spellings still work: bare legacy names such as `cursorUp`, `submit` and `interrupt` are
+renamed to their current ids. The autocomplete popup has no ids of its own; it honours
+`tui.select.up`, `tui.select.down`, `tui.select.confirm`, `tui.select.cancel` and `tui.input.tab`.
 
 Legacy ids are renamed as the file is read, and the file is rewritten once at startup so ids appear
 in declaration order, with unrecognised ids sorted and appended at the end. A file with nothing to

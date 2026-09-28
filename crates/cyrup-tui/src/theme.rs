@@ -56,20 +56,35 @@ impl ColorMode {
     /// `getCapabilities().trueColor`
     /// (`coding-agent/src/modes/interactive/theme/theme.ts:630`), and `getCapabilities` is the
     /// override-layered accessor (`tui/src/terminal-image.ts:164-172`).
+    ///
+    /// CFG-090 — a `terminal.trueColor` settings override
+    /// ([`crate::image::set_capability_overrides`]) is spread over that, as pi's `getCapabilities()`
+    /// spreads `capabilityOverrides` over `detectCapabilities()` (`terminal-image.ts:160-169`
+    /// @v0.87.1).
     pub fn detect() -> ColorMode {
-        ColorMode::detect_from(|k| std::env::var(k).ok())
+        match crate::image::capability_overrides().true_color {
+            Some(true_color) => ColorMode::from_true_color(true_color),
+            None => ColorMode::detect_from(|k| std::env::var(k).ok()),
+        }
+    }
+
+    /// Pi `getCapabilities().trueColor ? "truecolor" : "256color"` (`theme.ts:529` @v0.87.1).
+    pub fn from_true_color(true_color: bool) -> ColorMode {
+        if true_color {
+            ColorMode::TrueColor
+        } else {
+            ColorMode::Ansi256
+        }
     }
 
     /// The pure core of [`ColorMode::detect`], parameterised over an environment lookup so both
     /// arms are deterministically testable (same shape as `detect_capabilities_from`).
     pub fn detect_from(env: impl Fn(&str) -> Option<String>) -> ColorMode {
-        if crate::image::detect_capabilities_with_overrides(env, || false).true_color {
-            ColorMode::TrueColor
-        } else {
-            // Pi `createTheme` falls back to `"256color"` when truecolor is unavailable
-            // (v0.84.1 theme.ts:611). There is no lower rung upstream.
-            ColorMode::Ansi256
-        }
+        // Pi `createTheme` falls back to `"256color"` when truecolor is unavailable
+        // (v0.84.1 theme.ts:611). There is no lower rung upstream.
+        ColorMode::from_true_color(
+            crate::image::detect_capabilities_with_overrides(env, || false).true_color,
+        )
     }
 
     /// Project one `ratatui::Color` into this mode. Only `Color::Rgb` is transformed (named/indexed
@@ -1511,6 +1526,12 @@ pub struct ThemeController {
     /// `settingsManager.setTheme(detection.theme)` + `flush()`, `theme-controller.ts:57-61`). Only
     /// ever set when the user has no explicit setting.
     persist: Option<String>,
+    /// Pi `currentThemeSetting` (`theme-controller.ts:23` @v0.87.1): the in-memory theme setting
+    /// that shadows `settings.theme` in `applyFromSettings` (`:57`). Seeded from
+    /// `--use-theme` (`initialThemeSetting`, `:42`) and replaced by every user theme switch
+    /// (`setThemeName` `:88-94`, `setThemeSetting` `:96-99`), so a one-run override survives
+    /// `/reload` without ever being written to settings. SEAM-119.
+    current_setting: Option<String>,
 }
 
 impl ThemeController {
@@ -1534,7 +1555,27 @@ impl ThemeController {
             theme_setting: theme_setting.map(str::to_string),
             auto_sync: parse_auto_theme_setting(theme_setting).is_some(),
             persist: None,
+            current_setting: None,
         }
+    }
+
+    /// Pi's constructor with an `initialThemeSetting` (`theme-controller.ts:40-47` @v0.87.1): the
+    /// boot theme resolves from `initialThemeSetting ?? settings.theme`, and the initial setting
+    /// is kept as the in-memory shadow later re-resolutions prefer. `--use-theme` is the only
+    /// source of one (`main.ts:944`). SEAM-119.
+    pub fn boot_with_initial(
+        initial_setting: Option<&str>,
+        theme_setting: Option<&str>,
+        color_mode: ColorMode,
+        terminal_theme: TerminalTheme,
+    ) -> Self {
+        let mut controller = ThemeController::boot(
+            initial_setting.or(theme_setting),
+            color_mode,
+            terminal_theme,
+        );
+        controller.current_setting = initial_setting.map(str::to_string);
+        controller
     }
 
     /// Boot with the color mode + terminal polarity detected from the environment (the binary path).
@@ -1544,6 +1585,20 @@ impl ThemeController {
     /// [`Self::sync_with_terminal`] once raw mode is on to complete it.
     pub fn boot_from_env(theme_setting: Option<&str>) -> Self {
         ThemeController::boot(theme_setting, ColorMode::detect(), TerminalTheme::detect())
+    }
+
+    /// [`Self::boot_with_initial`] with the color mode + terminal polarity detected from the
+    /// environment, as [`Self::boot_from_env`] detects them.
+    pub fn boot_from_env_with_initial(
+        initial_setting: Option<&str>,
+        theme_setting: Option<&str>,
+    ) -> Self {
+        ThemeController::boot_with_initial(
+            initial_setting,
+            theme_setting,
+            ColorMode::detect(),
+            TerminalTheme::detect(),
+        )
     }
 
     /// Re-run Pi's `applyFromSettings` (`theme-controller.ts:37-63`) now that the terminal can be
@@ -1625,6 +1680,11 @@ impl ThemeController {
     /// ([`crate::App::reapply_theme_from_settings`]), matching Pi's unconditional
     /// `applyThemeName` → `setTheme(name)` re-read (`:126-135`).
     pub fn apply_from_settings(&mut self, setting: Option<&str>) -> String {
+        // `const themeSetting = this.currentThemeSetting ?? settingsManager.getThemeSetting()`
+        // (`theme-controller.ts:57` @v0.87.1) — a `--use-theme` or an in-app switch shadows the
+        // re-read settings value (SEAM-119).
+        let shadowed = self.current_setting.clone();
+        let setting = shadowed.as_deref().or(setting);
         self.theme_setting = setting.map(str::to_string);
         let resolved = if let Some((light, dark)) = parse_auto_theme_setting(setting) {
             self.auto_sync = true;
@@ -1680,6 +1740,12 @@ impl ThemeController {
         &self.active_name
     }
 
+    /// Re-point the mode later theme applications project through, after a `terminal.trueColor`
+    /// override changed the detected colour depth (CFG-090).
+    pub(crate) fn set_color_mode(&mut self, color_mode: ColorMode) {
+        self.color_mode = color_mode;
+    }
+
     /// The color mode the controller projects into (test/inspection).
     pub fn color_mode(&self) -> ColorMode {
         self.color_mode
@@ -1700,6 +1766,19 @@ impl ThemeController {
     /// than the one that failed. The generation bumps for the same reason every other apply does.
     pub fn fall_back_to_dark(&mut self) -> UiTheme {
         self.set_theme_name(DARK_THEME_NAME)
+    }
+
+    /// Record a user theme switch as the in-memory setting — pi's `this.currentThemeSetting =
+    /// themeName` in `setThemeName` and `= themeSetting` in `setThemeSetting`
+    /// (`theme-controller.ts:88-99` @v0.87.1), which both of pi's switch paths (the `/settings`
+    /// theme confirm and an extension's `ctx.ui.setTheme`) run. SEAM-119.
+    pub fn set_current_setting(&mut self, setting: impl Into<String>) {
+        self.current_setting = Some(setting.into());
+    }
+
+    /// The in-memory setting that shadows `settings.theme`, if any (test/inspection).
+    pub fn current_setting(&self) -> Option<&str> {
+        self.current_setting.as_deref()
     }
 
     /// Switch the active theme by name (Pi `setThemeName`, `theme-controller.ts:62-65`), bumping the

@@ -149,7 +149,8 @@ pub fn drain_stdin_before_exit() -> usize {
     // an empty stack a no-op, and keeping `restore` total (it is also the panic-path teardown) is
     // worth more than eliding the duplicate.
     use ratatui::crossterm::ExecutableCommand;
-    let _ = std::io::stdout().execute(ratatui::crossterm::event::PopKeyboardEnhancementFlags);
+    let _ = crate::dead_terminal::terminal_stdout()
+        .execute(ratatui::crossterm::event::PopKeyboardEnhancementFlags);
     drain_input(&mut StdinDrain, DRAIN_MAX, DRAIN_IDLE)
 }
 

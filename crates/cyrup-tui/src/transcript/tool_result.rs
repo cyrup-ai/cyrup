@@ -130,9 +130,35 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// `formatDuration` (bash.ts:197-199): `{s}.{tenths}s`.
+/// `formatDuration` (renderers/bash.ts:32-42 @v0.87.1, pi #9628 in v0.86.0): under a minute it is
+/// `seconds.toFixed(1)` + `s`; from one minute it is whole seconds (`Math.floor`) as `Xm Ys`, and
+/// from one hour `Xh Ym Zs`.
 pub(super) fn format_duration(ms: u64) -> String {
-    format!("{:.1}s", ms as f64 / 1000.0)
+    let seconds = ms as f64 / 1000.0;
+    if seconds < 60.0 {
+        return format!("{}s", to_fixed_1(seconds));
+    }
+    let total_seconds = ms / 1000;
+    let minutes = total_seconds / 60;
+    let remainder = total_seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {remainder}s");
+    }
+    format!("{}h {}m {remainder}s", minutes / 60, minutes % 60)
+}
+
+/// `Number.prototype.toFixed(1)` for a non-negative double. Both it and Rust's `{:.1}` round the
+/// EXACT binary value, and they disagree only on an exact tie: ECMA-262 takes the larger candidate,
+/// Rust the even one (`0.25` is `"0.3"` in JS, `"0.2"` in Rust). A one-decimal tie is `(2k+1)/20`,
+/// which a double holds exactly only when it is an odd number of quarters, so that is the one case
+/// rounded up by hand.
+fn to_fixed_1(x: f64) -> String {
+    let quarters = x * 4.0;
+    if quarters.fract() == 0.0 && quarters % 2.0 == 1.0 {
+        let tenths = (x * 10.0).ceil() as u64;
+        return format!("{}.{}", tenths / 10, tenths % 10);
+    }
+    format!("{x:.1}")
 }
 
 /// read `renderResult` truncation footer (read.ts:190-199).

@@ -99,13 +99,25 @@ pub fn flat_total(steps: &[RunnerStep]) -> usize {
 /// is deliberately not taken here.
 #[must_use]
 pub fn pending_step_statuses_for(step: &RunnerStep) -> Vec<StepStatus> {
+    // SUBA-134 — pi declares each status step with its child's `sessionName`
+    // (`subagent-runner.ts:1913-1917` @v0.71.0), so a status reader can label a child before it
+    // settles; the child runs under the same derivation.
+    let named = |agent: &str, task: &str| {
+        let mut status = StepStatus::pending(agent);
+        status.session_name = crate::exec::child_session_name::derive_child_session_name(
+            Some(agent),
+            Some(task),
+            None,
+        );
+        status
+    };
     match step {
-        RunnerStep::SingleStep(spec) => vec![StepStatus::pending(spec.agent.clone())],
+        RunnerStep::SingleStep(spec) => vec![named(&spec.agent, &spec.task)],
         RunnerStep::ImportAsyncRoot(spec) => vec![StepStatus::pending(spec.agent.clone())],
         RunnerStep::ParallelGroup(group) => group
             .steps
             .iter()
-            .map(|task| StepStatus::pending(task.agent.clone()))
+            .map(|task| named(&task.agent, &task.task))
             .collect(),
         RunnerStep::DynamicGroup(dynamic) => {
             vec![StepStatus::pending(format!(
@@ -280,6 +292,7 @@ mod tests {
             permission_rules: None,
             timeout_ms: None,
             deadline_at_ms: None,
+            checkpoint_before_deadline_ms: None,
             share: None,
             artifacts_dir,
             artifact_config,

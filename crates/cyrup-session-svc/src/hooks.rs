@@ -287,7 +287,10 @@ impl Hooks for PolicyHooks {
         // it unconditionally would start reseeding the loop's transcript on a path that has never
         // done so.
         let rebuilt = match self.session.get() {
-            Some(session) => session.compact_before_next_assistant_response().await,
+            Some(session) => session
+                .compact_before_next_assistant_response()
+                .await
+                .map_err(|e| HookError::new(e.to_string()))?,
             None => None,
         };
         let previous = self.inner.prepare_next_turn(ctx, cancel).await?;

@@ -1,8 +1,8 @@
 //! The interactive status overlay behind [`crate::extension::STATUS_OVERLAY_SHORTCUT`]
 //! (`ctrl+alt+f`; FLUX-004 retired `ctrl+f`) — the cyrup-native restoration of Wibey's
 //! `ui-mode: flux-status` panel (port doc §3.4.3). `/flux/status` ([`crate::render_status`],
-//! FLUX_07) owns the plain-text channel; this module owns real COLOUR, which can only exist
-//! inside an overlay because the TUI strips ANSI from externally supplied text
+//! port doc §3.4.2) owns the plain-text channel; this module owns real COLOUR, which can only
+//! exist inside an overlay because the TUI strips ANSI from externally supplied text
 //! (`crates/cyrup-tui/src/ansi.rs`). The overlay draws styled [`OverlaySpan`]s the host paints
 //! natively, so nothing is stripped.
 //!
@@ -35,7 +35,7 @@ fn sev_col_width(sev: &str) -> usize {
     }
 }
 
-/// The status colour palette (port doc table, FLUX_09 SUBTASK 1), mapped from
+/// The status colour palette (the overlay of port doc §3.4.3), mapped from
 /// `flux_status.py`'s ANSI codes onto the 16-colour [`OverlayColor`] enum: the two 256-colour
 /// values collapse (`ORANGE` -> `Yellow`, `TEAL` -> `Cyan`).
 fn status_style(status: &str) -> (Option<&'static str>, Option<OverlayColor>) {

@@ -30,11 +30,15 @@ mod manifest_cache;
 mod native_ctx_state;
 mod native_dispatch;
 mod payload_and_seam_parity;
+mod post_baseline_events;
 mod project_trust_shortcircuit;
 mod provider;
+mod registration_validation;
 mod seam_liveness;
 mod startup_timings;
 mod terminal_keys;
 mod trust_gate_order;
 mod wasm_host;
+#[cfg(feature = "wasm-host")]
+mod wat_guest;
 mod wit_world_sync;

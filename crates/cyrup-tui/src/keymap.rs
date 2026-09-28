@@ -26,7 +26,7 @@ use crate::error::TuiError;
 /// `c @ b'\x1C'..=b'\x1F' => KeyCode::Char((c - 0x1C + b'4') as char) + CONTROL`
 /// (`src/event/sys/unix/parse.rs:110-113`) — so `0x1F` arrives as `Ctrl+7` and `0x1D` as `Ctrl+5`,
 /// matching neither `ctrl+-` nor `ctrl+]`. cyrup bound only the CSI-u spellings, so on Terminal.app,
-/// iTerm2's default profile, gnome-terminal and plain xterm `editor.undo` did not exist at all
+/// iTerm2's default profile, gnome-terminal and plain xterm `tui.editor.undo` did not exist at all
 /// (TUI-053) and char-jump-forward was equally dead. `0x1E` is omitted because pi maps no chord to
 /// it.
 ///
@@ -48,6 +48,98 @@ fn normalize_legacy_control_byte(ev: &KeyEvent) -> Option<KeyEvent> {
         _ => return None,
     };
     Some(KeyEvent::new(KeyCode::Char(decoded), ev.modifiers))
+}
+
+/// Pi `isWindowsTerminalSession()` (`tui/src/keys.ts:715-719` @v0.87.1), verbatim over an env
+/// lookup:
+///
+/// ```ts
+/// Boolean(process.env.WT_SESSION) && !process.env.SSH_CONNECTION && !process.env.SSH_CLIENT && !process.env.SSH_TTY
+/// ```
+///
+/// JS truthiness, so a variable set to the empty string counts as unset. The three SSH negations
+/// are all load-bearing: `WT_SESSION` is inherited into an ssh session opened FROM Windows Terminal,
+/// where the remote terminal is no longer WT's and raw `0x08` means plain Backspace again (CFG-064).
+pub(crate) fn is_windows_terminal_session(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    let set = |k: &str| lookup(k).is_some_and(|v| !v.is_empty());
+    set("WT_SESSION") && !set("SSH_CONNECTION") && !set("SSH_CLIENT") && !set("SSH_TTY")
+}
+
+/// The live process's [`is_windows_terminal_session`], read once. pi re-reads `process.env` per key,
+/// but nothing in a running process changes these four variables.
+fn windows_terminal_session() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = WINDOWS_TERMINAL_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static DETECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DETECTED.get_or_init(|| is_windows_terminal_session(|k| std::env::var_os(k)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test stand-in for the four env variables, so a test can take either side of
+    /// [`windows_terminal_session`] without mutating the process environment.
+    static WINDOWS_TERMINAL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force [`windows_terminal_session`] for the current test thread.
+#[cfg(test)]
+pub(crate) fn force_windows_terminal_session(value: bool) {
+    WINDOWS_TERMINAL_OVERRIDE.with(|c| c.set(Some(value)));
+}
+
+/// A legacy raw `0x08` (BS) byte as crossterm reports it — see [`legacy_raw_backspace`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawBackspace {
+    /// `0x08` alone, which crossterm reports as `Ctrl+H`.
+    Bare,
+    /// `ESC 0x08`, which crossterm reports as `Ctrl+Alt+H`.
+    EscPrefixed,
+}
+
+/// Whether `ev` is what crossterm makes of a legacy raw `0x08` (BS) byte, alone or ESC-prefixed.
+///
+/// crossterm 0.29.0 decodes the whole C0 range arithmetically — `c @ b'\x01'..=b'\x1A' =>
+/// Char((c - 0x1 + b'a') as char) + CONTROL` (`src/event/sys/unix/parse.rs:106-109`) — so `0x08`
+/// arrives as `Ctrl+H`, the same shape [`normalize_legacy_control_byte`] rewrites for `0x1C..=0x1F`,
+/// and an ESC prefix adds `ALT` to whatever the rest decodes to (`:78-87`), so `ESC 0x08` arrives
+/// as `Ctrl+Alt+H`. Gated on the negotiated protocol for the same reason: under the kitty protocol
+/// a real Ctrl+H is `CSI 104;5u` and a real Ctrl+Backspace is `CSI 127;5u`, so a `Ctrl+H` event
+/// there was never a raw BS byte.
+fn legacy_raw_backspace(ev: &KeyEvent) -> Option<RawBackspace> {
+    if ev.code != KeyCode::Char('h')
+        || crate::keyboard_protocol::current() == crate::keyboard_protocol::KeyboardProtocol::Kitty
+    {
+        return None;
+    }
+    let mods = ev.modifiers & SUPPORTED_MODS;
+    if mods == KeyModifiers::CONTROL {
+        Some(RawBackspace::Bare)
+    } else if mods == KeyModifiers::CONTROL | KeyModifiers::ALT {
+        Some(RawBackspace::EscPrefixed)
+    } else {
+        None
+    }
+}
+
+/// Pi `matchesRawBackspace(data, expectedModifier)` for `data === "\x08"`
+/// (`tui/src/keys.ts:730-734` @v0.87.1): the byte is Ctrl+Backspace on Windows Terminal and plain
+/// Backspace everywhere else. It is consulted by BOTH the `backspace` and the `ctrl+backspace` key
+/// checks (`:945-958`), and pi's `parseKey` names the byte the same way (`:1287`,
+/// `isWindowsTerminalSession() ? "ctrl+backspace" : "backspace"`).
+///
+/// This is an alias, not a rewrite: pi's `rawCtrlChar("h")` still matches the same byte for a
+/// `ctrl+h` binding (`:1167`), and [`Key::matches`] keeps that comparison too.
+fn matches_raw_backspace(expected: KeyModifiers) -> bool {
+    if windows_terminal_session() {
+        expected == KeyModifiers::CONTROL
+    } else {
+        expected.is_empty()
+    }
 }
 
 /// One `keybindings.json` entry the merge could not use, named so the caller can report it.
@@ -191,10 +283,6 @@ pub enum Action {
     Clear,
     /// Suspend to the background (Ctrl+Z, SIGTSTP) — `app.suspend`.
     Suspend,
-    /// Scroll the transcript up a page — `app.pageUp`.
-    PageUp,
-    /// Scroll the transcript down a page — `app.pageDown`.
-    PageDown,
     /// Toggle expansion of the focused tool/bash block (Ctrl+O) — `app.tools.expand`.
     ToolsExpand,
     /// Open the editor buffer in `$VISUAL`/`$EDITOR` (Ctrl+G) — `app.editor.external`
@@ -220,7 +308,7 @@ pub enum Action {
     /// prepends their text (joined by blank lines) to the current editor buffer; shows a
     /// `No queued messages to restore` status when nothing is queued.
     Dequeue,
-    /// Paste a system-clipboard image (Ctrl+V; Windows: Alt+V) — `app.clipboard.pasteImage`
+    /// Paste a system-clipboard image (Ctrl+V; Windows and WSL: Alt+V) — `app.clipboard.pasteImage`
     /// (`handleClipboardImagePaste`, interactive-mode.ts:2537-2557; `core/keybindings.ts:106-109`).
     /// Reads the clipboard image via `arboard`, writes it to a `cyrup-clipboard-<uuid>.png` temp file,
     /// and inserts its PATH as text at the editor cursor (Pi's `insertTextAtCursor(filePath)`,
@@ -270,8 +358,6 @@ impl Action {
             "app.interrupt" => Some(Action::Interrupt),
             "app.clear" => Some(Action::Clear),
             "app.suspend" => Some(Action::Suspend),
-            "app.pageUp" => Some(Action::PageUp),
-            "app.pageDown" => Some(Action::PageDown),
             "app.tools.expand" => Some(Action::ToolsExpand),
             "app.editor.external" => Some(Action::ExternalEditor),
             "app.thinking.cycle" => Some(Action::ThinkingCycle),
@@ -301,25 +387,12 @@ impl Action {
     /// key that collides with a RESERVED id (`extensions/runner.ts:544-586` @v0.84.4). Without an
     /// id per action cyrup could not name the built-in the extension collides with, so it could
     /// neither refuse nor warn.
-    ///
-    /// **[CYRUP-DELTA]** two of the ids below are cyrup's own — `app.pageUp` and `app.pageDown` are
-    /// not in upstream's `AppKeybindings`, which lists every `app.*` id at
-    /// `core/keybindings.ts:14-57` @v0.84.4 and has no page-scroll entry (pi's page ids are all in
-    /// the tui namespace: `tui.editor.pageUp` / `tui.select.pageUp` / `tui.altScreen.pageUp`,
-    /// `packages/tui/src/keybindings.ts:21-22`, `:40-41`, `:45-46`). [`Action::from_id`] already
-    /// records the invention as TUI-028; this is the same delta seen from the gate side. Both are bound
-    /// by default in cyrup's global keymap, so they enter `effective_keybindings()` and an
-    /// extension registering `pageup` earns a `[Extension issues]` warning ("is built-in shortcut
-    /// for app.pageUp … Using `<ext>`") that pi would never emit. Neither is reserved, so the key is
-    /// still handed to the extension: the delta is one extra warning, not a routing change.
     pub fn id(self) -> &'static str {
         match self {
             Action::Quit => "app.exit",
             Action::Interrupt => "app.interrupt",
             Action::Clear => "app.clear",
             Action::Suspend => "app.suspend",
-            Action::PageUp => "app.pageUp",
-            Action::PageDown => "app.pageDown",
             Action::ToolsExpand => "app.tools.expand",
             Action::ExternalEditor => "app.editor.external",
             Action::ThinkingCycle => "app.thinking.cycle",
@@ -404,82 +477,45 @@ pub enum EditorAction {
 impl EditorAction {
     /// Resolve an editor binding id to an [`EditorAction`]. `None` for ids outside the editor map.
     ///
-    /// **TUI-028.** The canonical spellings are pi's `tui.editor.*` / `tui.input.*`
-    /// (`packages/tui/src/keybindings.ts:9-32` @v0.83.0 — already the spelling at the ported
-    /// baseline). cyrup shipped a bare `editor.*` namespace that matches **neither** pi's current
-    /// ids nor pi's legacy ones, so all 24 bindings written from either era of pi's documentation
-    /// were silently inert — `merge_json` ignores an id it does not recognise, with no error and no
-    /// diagnostic.
-    ///
-    /// The `editor.*` spellings are kept as accepted ALIASES rather than deleted, the way pi keeps
-    /// its own legacy names working through `KEYBINDING_NAME_MIGRATIONS`
-    /// (`coding-agent/src/core/keybindings.ts:209-269`, applied by `migrateKeybindingsConfig` at
-    /// `:289-309`): a `keybindings.json` written against shipped cyrup must not break. pi's legacy
-    /// BARE names (`cursorUp`, `pageUp`, `newLine`, …) are accepted here too, since those are what
-    /// its migration table maps and a pi user's old file carries them.
+    /// Exactly pi's `tui.editor.*` / `tui.input.*` ids (`packages/tui/src/keybindings.ts:9-36`
+    /// @v0.87.1), the only names pi's `KeybindingsManager` defines. pi's legacy bare names
+    /// (`cursorUp`, `pageUp`, `newLine`, `copy`, …) never reach this function: every `merge_json`
+    /// reads its document through [`keybindings_object`], which applies pi's
+    /// `KEYBINDING_NAME_MIGRATIONS` first (`coding-agent/src/core/keybindings.ts:240-300`), exactly
+    /// as pi's `loadFromFile` migrates before `rebuild()` sees an id. cyrup's own `editor.*`
+    /// spelling is not accepted (TUI-066): pi defines no such id, so it is inert there too.
     pub fn from_id(id: &str) -> Option<EditorAction> {
         use EditorAction as E;
         Some(match id {
-            // Canonical (`keybindings.ts:9-29`).
-            "tui.editor.cursorLeft" | "editor.cursorLeft" | "cursorLeft" => E::CursorLeft,
-            "tui.editor.cursorRight" | "editor.cursorRight" | "cursorRight" => E::CursorRight,
-            "tui.editor.cursorUp" | "editor.cursorUp" | "cursorUp" => E::CursorUp,
-            "tui.editor.cursorDown" | "editor.cursorDown" | "cursorDown" => E::CursorDown,
-            "tui.editor.cursorWordLeft" | "editor.cursorWordLeft" | "cursorWordLeft" => {
-                E::CursorWordLeft
-            }
-            "tui.editor.cursorWordRight" | "editor.cursorWordRight" | "cursorWordRight" => {
-                E::CursorWordRight
-            }
-            "tui.editor.cursorLineStart" | "editor.cursorLineStart" | "cursorLineStart" => {
-                E::CursorLineStart
-            }
-            "tui.editor.cursorLineEnd" | "editor.cursorLineEnd" | "cursorLineEnd" => {
-                E::CursorLineEnd
-            }
-            "tui.editor.deleteCharBackward"
-            | "editor.deleteCharBackward"
-            | "deleteCharBackward" => E::DeleteCharBackward,
-            "tui.editor.deleteCharForward" | "editor.deleteCharForward" | "deleteCharForward" => {
-                E::DeleteCharForward
-            }
-            "tui.editor.deleteWordBackward"
-            | "editor.deleteWordBackward"
-            | "deleteWordBackward" => E::DeleteWordBackward,
-            "tui.editor.deleteWordForward" | "editor.deleteWordForward" | "deleteWordForward" => {
-                E::DeleteWordForward
-            }
-            "tui.editor.deleteToLineStart" | "editor.deleteToLineStart" | "deleteToLineStart" => {
-                E::DeleteToLineStart
-            }
-            "tui.editor.deleteToLineEnd" | "editor.deleteToLineEnd" | "deleteToLineEnd" => {
-                E::DeleteToLineEnd
-            }
-            "tui.editor.yank" | "editor.yank" | "yank" => E::Yank,
-            "tui.editor.yankPop" | "editor.yankPop" | "yankPop" => E::YankPop,
-            "tui.editor.undo" | "editor.undo" | "undo" => E::Undo,
-            "tui.editor.jumpForward" | "editor.jumpForward" | "jumpForward" => E::JumpForward,
-            "tui.editor.jumpBackward" | "editor.jumpBackward" | "jumpBackward" => E::JumpBackward,
-            // TUI-028 — `app.pageUp`/`app.pageDown` were cyrup inventions; upstream has neither.
-            // Paging inside the editor buffer is `tui.editor.pageUp`/`pageDown`
-            // (`keybindings.ts:19-20`). The `app.*` spellings stay as aliases for the same reason
-            // the `editor.*` ones do.
-            "tui.editor.pageUp" | "editor.pageUp" | "pageUp" => E::PageUp,
-            "tui.editor.pageDown" | "editor.pageDown" | "pageDown" => E::PageDown,
-            // TUI-035 (`keybindings.ts:11-12`, `:68-75` @v0.84.1) — no cyrup predecessor, so no
-            // alias to carry.
+            "tui.editor.cursorLeft" => E::CursorLeft,
+            "tui.editor.cursorRight" => E::CursorRight,
+            "tui.editor.cursorUp" => E::CursorUp,
+            "tui.editor.cursorDown" => E::CursorDown,
+            "tui.editor.cursorWordLeft" => E::CursorWordLeft,
+            "tui.editor.cursorWordRight" => E::CursorWordRight,
+            "tui.editor.cursorLineStart" => E::CursorLineStart,
+            "tui.editor.cursorLineEnd" => E::CursorLineEnd,
+            "tui.editor.deleteCharBackward" => E::DeleteCharBackward,
+            "tui.editor.deleteCharForward" => E::DeleteCharForward,
+            "tui.editor.deleteWordBackward" => E::DeleteWordBackward,
+            "tui.editor.deleteWordForward" => E::DeleteWordForward,
+            "tui.editor.deleteToLineStart" => E::DeleteToLineStart,
+            "tui.editor.deleteToLineEnd" => E::DeleteToLineEnd,
+            "tui.editor.yank" => E::Yank,
+            "tui.editor.yankPop" => E::YankPop,
+            "tui.editor.undo" => E::Undo,
+            "tui.editor.jumpForward" => E::JumpForward,
+            "tui.editor.jumpBackward" => E::JumpBackward,
+            "tui.editor.pageUp" => E::PageUp,
+            "tui.editor.pageDown" => E::PageDown,
+            // TUI-035 (`keybindings.ts:11-12`, `:68-75` @v0.84.1).
             "tui.editor.historyPrevious" => E::HistoryPrevious,
             "tui.editor.historyNext" => E::HistoryNext,
-            // `tui.input.*` (`keybindings.ts:30-33`).
-            "tui.input.newLine" | "editor.newLine" | "newLine" => E::NewLine,
-            "tui.input.submit" | "editor.submit" | "submit" => E::Submit,
-            "tui.input.tab" | "editor.tab" | "tab" => E::Tab,
-            // TUI-067 (`tui/src/keybindings.ts:36`). The legacy BARE spelling is pi's own `copy`
-            // (`coding-agent/src/core/keybindings.ts:260`, mirrored in cyrup's migration table at
-            // `cyrup-config/src/keybindings.rs:70`), which is why it is carried here the way
-            // `newLine`/`submit`/`tab` carry theirs. There is no `editor.copy` alias: cyrup never
-            // shipped a spelling for this id, because it had no destination at all until now.
-            "tui.input.copy" | "copy" => E::PassThrough,
+            "tui.input.newLine" => E::NewLine,
+            "tui.input.submit" => E::Submit,
+            "tui.input.tab" => E::Tab,
+            // TUI-067 (`tui/src/keybindings.ts:36`).
+            "tui.input.copy" => E::PassThrough,
             _ => return None,
         })
     }
@@ -594,6 +630,18 @@ fn normalize_shifted_letter(code: KeyCode, mods: KeyModifiers) -> KeyCode {
     code
 }
 
+/// crossterm reports Shift+Tab as [`KeyCode::BackTab`] — with or without a `SHIFT` flag for the
+/// legacy `CSI Z`, and for the Kitty `CSI 9;2u` form too — where pi's key id is `shift+tab`, whose
+/// `matchesKey` arm accepts `"\x1b[Z"`, the Kitty sequence and modifyOtherKeys alike
+/// (`keys.ts:862-876` @v0.87.1). Folding `BackTab` into `Tab`+`SHIFT` on both sides of a comparison
+/// is what lets the one `shift+tab` spec match every report of the key.
+fn fold_backtab(code: KeyCode, mods: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    match code {
+        KeyCode::BackTab => (KeyCode::Tab, mods | KeyModifiers::SHIFT),
+        other => (other, mods),
+    }
+}
+
 /// A parsed key spec: a base code plus modifiers (R-10-023).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -628,13 +676,12 @@ impl Key {
                 continue;
             }
             match token.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" => mods |= KeyModifiers::CONTROL,
+                "ctrl" => mods |= KeyModifiers::CONTROL,
                 "shift" => mods |= KeyModifiers::SHIFT,
-                "alt" | "option" | "meta" => mods |= KeyModifiers::ALT,
-                "super" | "cmd" | "command" => mods |= KeyModifiers::SUPER,
+                "alt" => mods |= KeyModifiers::ALT,
+                "super" => mods |= KeyModifiers::SUPER,
                 "enter" | "return" => code = Some(KeyCode::Enter),
                 "tab" => code = Some(KeyCode::Tab),
-                "backtab" => code = Some(KeyCode::BackTab),
                 "esc" | "escape" => code = Some(KeyCode::Esc),
                 "space" => code = Some(KeyCode::Char(' ')),
                 "up" => code = Some(KeyCode::Up),
@@ -644,12 +691,12 @@ impl Key {
                 "home" => code = Some(KeyCode::Home),
                 "end" => code = Some(KeyCode::End),
                 "backspace" => code = Some(KeyCode::Backspace),
-                "delete" | "del" => code = Some(KeyCode::Delete),
-                // Upstream `KeyId` spells these `pageUp`/`pageDown` (`tui/src/keys.ts:122-123`);
-                // `label()` emits that same camelCase spelling and every token here is lowercased
-                // before matching, so both spellings parse and the label round-trips.
-                "pageup" | "pgup" => code = Some(KeyCode::PageUp),
-                "pagedown" | "pgdn" => code = Some(KeyCode::PageDown),
+                "delete" => code = Some(KeyCode::Delete),
+                // Upstream `KeyId` spells these `pageUp`/`pageDown` (`tui/src/keys.ts:122-123`) and
+                // `parseKeyId` lowercases before matching (`:791`); `label()` emits the camelCase
+                // spelling, so the label round-trips.
+                "pageup" => code = Some(KeyCode::PageUp),
+                "pagedown" => code = Some(KeyCode::PageDown),
                 // `insert` and `f1`…`f12` are `SpecialKey`s upstream (`tui/src/keys.ts:118`,
                 // `:128-139` @v0.83.0), with real sequence tables (`:380`, `:456-476`) and real
                 // `matchesKey` arms (`:1128-1139`). cyrup had neither, so the multi-character token
@@ -671,7 +718,7 @@ impl Key {
                 // The literal token is reported, not `s`, so `"ctrl+clear"` also reads
                 // `unsupported key "clear"` rather than blaming the whole spec.
                 "clear" => return Err(TuiError::UnsupportedKey("clear".to_string())),
-                "insert" | "ins" => code = Some(KeyCode::Insert),
+                "insert" => code = Some(KeyCode::Insert),
                 other
                     if other.strip_prefix('f').is_some_and(|d| {
                         !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
@@ -708,13 +755,29 @@ impl Key {
     ///    with `shift` held, an ASCII `A..=Z` normalizes to its lowercase codepoint, so a `shift+a`
     ///    binding matches a terminal that reports `Char('A')` + `SHIFT` (the Kitty/disambiguate path
     ///    this TUI enables), and vice-versa.
+    ///
+    /// And three aliases: a `backspace` or `ctrl+backspace` spec also matches the `Ctrl+H` crossterm
+    /// makes of a legacy raw `0x08`, on the side pi's Windows Terminal heuristic picks
+    /// ([`matches_raw_backspace`]); an `alt+backspace` spec matches the `Ctrl+Alt+H` it makes of
+    /// `ESC 0x08`; and crossterm's `BackTab` is `shift+tab` ([`fold_backtab`]).
     pub fn matches(&self, ev: &KeyEvent) -> bool {
-        let ev_mods = ev.modifiers & SUPPORTED_MODS;
-        let self_mods = self.mods & SUPPORTED_MODS;
+        let (ev_code, ev_mods) = fold_backtab(ev.code, ev.modifiers & SUPPORTED_MODS);
+        let (self_code, self_mods) = fold_backtab(self.code, self.mods & SUPPORTED_MODS);
+        // CFG-064 — a `backspace` / `ctrl+backspace` spec against a legacy raw `0x08` byte is
+        // decided by the Windows Terminal heuristic, not by the Ctrl+H crossterm reports for it;
+        // `ESC 0x08` is `alt+backspace` on every terminal (`if (data === "\x1b\x7f" || data ===
+        // "\x1b\b") return true;`, `keys.ts:936-938` @v0.87.1, and `parseKey`, `:1291`).
+        if self.code == KeyCode::Backspace {
+            match legacy_raw_backspace(ev) {
+                Some(RawBackspace::Bare) => return matches_raw_backspace(self_mods),
+                Some(RawBackspace::EscPrefixed) => return self_mods == KeyModifiers::ALT,
+                None => {}
+            }
+        }
         if ev_mods != self_mods {
             return false;
         }
-        normalize_shifted_letter(ev.code, ev_mods) == normalize_shifted_letter(self.code, self_mods)
+        normalize_shifted_letter(ev_code, ev_mods) == normalize_shifted_letter(self_code, self_mods)
     }
 
     /// A short human label for the key (`esc`, `ctrl+c`, `shift+tab`) — the inverse of [`Key::parse`],
@@ -733,14 +796,13 @@ impl Key {
         // the doubled form: `app.thinking.cycle` declares the single key `"shift+tab"`
         // (`coding-agent/src/core/keybindings.ts:73-76` @v0.83.0) and `formatKeys` prints
         // `getKeys(id)` verbatim (`keybinding-hints.ts:29-40`), so `/hotkeys` reads `Shift+Tab`.
-        // Without this guard the `BackTab`+SHIFT binding at [`Keymap::default`] labelled itself
-        // `shift+shift+tab`, which is not a chord any terminal reports and which [`Key::parse`]
-        // reads back as plain `Tab`+SHIFT — a label that does not round-trip.
+        // Without this guard a `BackTab`+SHIFT key (the shape crossterm reports for `CSI Z`)
+        // labelled itself `shift+shift+tab`, which is not a chord any terminal reports.
         if self.mods.contains(KeyModifiers::SHIFT) && self.code != KeyCode::BackTab {
             s.push_str("shift+");
         }
         if self.mods.contains(KeyModifiers::SUPER) {
-            s.push_str("cmd+");
+            s.push_str("super+");
         }
         let base = match self.code {
             KeyCode::Char(' ') => "space".to_string(),
@@ -782,9 +844,53 @@ impl Key {
     }
 }
 
-/// A configurable binding table (R-10-018). Pi defaults (`core/keybindings.ts:63-202`): Ctrl+D →
-/// exit (`app.exit`), Ctrl+C → clear (`app.clear`), Esc → interrupt, Ctrl+Z → suspend, Ctrl+O →
-/// expand, PgUp/PgDn → page.
+/// The two platform facts upstream's default table branches on (`core/keybindings.ts:62-160`
+/// @v0.87.1), resolved once per process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeybindingPlatform {
+    /// `process.platform === "win32"`.
+    pub win32: bool,
+    /// `process.platform === "darwin"` — only `app.tree.foldOrUp`/`unfoldOrDown`'s key ORDER reads
+    /// it (`core/keybindings.ts:150-157` @v0.87.1).
+    pub darwin: bool,
+    /// pi `useWindowsKeybindings()` — see [`KeybindingPlatform::detect`].
+    pub windows_keybindings: bool,
+}
+
+impl KeybindingPlatform {
+    /// pi `useWindowsKeybindings(platform, env)` (`core/keybindings.ts:62-67` @v0.87.1, v0.84.4):
+    ///
+    /// ```ts
+    /// return platform === "win32" || (platform === "linux" && Boolean(env.WSL_DISTRO_NAME || env.WSL_INTEROP));
+    /// ```
+    ///
+    /// `os` is a [`std::env::consts::OS`] value and `lookup` an env read, so the WSL arm is
+    /// asserted from any host. WSL counts as Windows because the Windows Terminal hosting it
+    /// reserves the Linux chords pi moved off (#8372: "avoid terminal-reserved shortcuts for …
+    /// model cycling, editor undo, fullscreen transcript navigation and search") — CFG-091.
+    pub fn detect(os: &str, lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+        let set = |k: &str| lookup(k).is_some_and(|v| !v.is_empty());
+        let win32 = os == "windows";
+        Self {
+            win32,
+            darwin: os == "macos",
+            windows_keybindings: win32
+                || (os == "linux" && (set("WSL_DISTRO_NAME") || set("WSL_INTEROP"))),
+        }
+    }
+
+    /// This process's platform — pi's module-level `const windowsKeybindings =
+    /// useWindowsKeybindings()` (`:73`), evaluated once.
+    pub fn current() -> Self {
+        static CURRENT: std::sync::OnceLock<KeybindingPlatform> = std::sync::OnceLock::new();
+        *CURRENT.get_or_init(|| Self::detect(std::env::consts::OS, |k| std::env::var_os(k)))
+    }
+}
+
+/// A configurable binding table (R-10-018). Pi defaults (`core/keybindings.ts:94-147` @v0.87.1):
+/// Ctrl+D → exit (`app.exit`), Ctrl+C → clear (`app.clear`), Esc → interrupt, Ctrl+Z → suspend
+/// (none on native Windows), Ctrl+O → expand. Paging is not here: pi's only page ids are the
+/// editor's `tui.editor.pageUp`/`pageDown` (TUI-065).
 #[derive(Clone, Debug)]
 pub struct Keymap {
     bindings: Vec<(Key, Action)>,
@@ -792,28 +898,31 @@ pub struct Keymap {
 
 impl Default for Keymap {
     fn default() -> Self {
-        Keymap {
+        Keymap::for_platform(KeybindingPlatform::current())
+    }
+}
+
+impl Keymap {
+    /// Upstream's `app.*` defaults for `platform` (`core/keybindings.ts:94-147` @v0.87.1). Three of
+    /// them carry a `windowsKeybindings` arm (CFG-091): `app.model.cycleBackward`
+    /// (`alt+p` / `shift+ctrl+p`), `app.message.followUp` (`ctrl+q` / `alt+enter`) and
+    /// `app.message.dequeue` (`alt+q` / `alt+up`).
+    ///
+    /// Two more branch on the platform (TUI-071): `app.suspend` is unbound on `win32` (`:96-99`), and
+    /// `app.clipboard.pasteImage` is `alt+v` under `windowsKeybindings`, else `ctrl+v` (`:142-145`) —
+    /// one key, never both.
+    pub fn for_platform(platform: KeybindingPlatform) -> Self {
+        let windows = platform.windows_keybindings;
+        let mut km = Keymap {
             bindings: vec![
                 (Key::ctrl('d'), Action::Quit),
                 (Key::ctrl('c'), Action::Clear),
                 (Key::plain(KeyCode::Esc), Action::Interrupt),
-                (Key::ctrl('z'), Action::Suspend),
                 (Key::ctrl('o'), Action::ToolsExpand),
                 (Key::ctrl('g'), Action::ExternalEditor),
-                (Key::plain(KeyCode::PageUp), Action::PageUp),
-                (Key::plain(KeyCode::PageDown), Action::PageDown),
-                // `app.thinking.cycle` (`core/keybindings.ts:72-75`, default `shift+tab`). A terminal
-                // reports Shift+Tab three ways depending on the keyboard protocol: the legacy `CSI Z`
-                // `BackTab` (with or without a SHIFT flag) and — under this TUI's Kitty
-                // DISAMBIGUATE mode — `Tab`+SHIFT. Bind all three so the cycle fires regardless.
-                (Key::plain(KeyCode::BackTab), Action::ThinkingCycle),
-                (
-                    Key {
-                        code: KeyCode::BackTab,
-                        mods: KeyModifiers::SHIFT,
-                    },
-                    Action::ThinkingCycle,
-                ),
+                // `app.thinking.cycle` (`core/keybindings.ts:100-103` @v0.87.1, default
+                // `shift+tab`) — one key, which [`Key::matches`] also matches against crossterm's
+                // `BackTab` reports ([`fold_backtab`]).
                 (
                     Key {
                         code: KeyCode::Tab,
@@ -821,40 +930,59 @@ impl Default for Keymap {
                     },
                     Action::ThinkingCycle,
                 ),
-                // `app.model.cycleForward` / `cycleBackward` (`core/keybindings.ts:76-83`).
+                // `app.model.cycleForward` / `cycleBackward` (`core/keybindings.ts:108-115`
+                // @v0.87.1): `windowsKeybindings ? "alt+p" : "shift+ctrl+p"`.
                 (Key::ctrl('p'), Action::ModelCycleForward),
                 (
-                    Key {
-                        code: KeyCode::Char('p'),
-                        mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                    if windows {
+                        Key {
+                            code: KeyCode::Char('p'),
+                            mods: KeyModifiers::ALT,
+                        }
+                    } else {
+                        Key {
+                            code: KeyCode::Char('p'),
+                            mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                        }
                     },
                     Action::ModelCycleBackward,
                 ),
-                // `app.message.followUp` (`core/keybindings.ts:98-101`, default `alt+enter`).
+                // `app.message.followUp` (`:134-137`): `windowsKeybindings ? "ctrl+q" : "alt+enter"`.
                 (
-                    Key {
-                        code: KeyCode::Enter,
-                        mods: KeyModifiers::ALT,
+                    if windows {
+                        Key::ctrl('q')
+                    } else {
+                        Key {
+                            code: KeyCode::Enter,
+                            mods: KeyModifiers::ALT,
+                        }
                     },
                     Action::FollowUp,
                 ),
-                // `app.message.dequeue` (`core/keybindings.ts:102-105`, default `alt+up`).
+                // `app.message.dequeue` (`:138-141`): `windowsKeybindings ? "alt+q" : "alt+up"`.
                 (
-                    Key {
-                        code: KeyCode::Up,
-                        mods: KeyModifiers::ALT,
+                    if windows {
+                        Key {
+                            code: KeyCode::Char('q'),
+                            mods: KeyModifiers::ALT,
+                        }
+                    } else {
+                        Key {
+                            code: KeyCode::Up,
+                            mods: KeyModifiers::ALT,
+                        }
                     },
                     Action::Dequeue,
                 ),
-                // `app.clipboard.pasteImage` (`core/keybindings.ts:106-109`): `ctrl+v` everywhere,
-                // `alt+v` on Windows. Bind both so muscle memory works on either platform (the read is
-                // gated on an image actually being present, so a bare Ctrl+V still falls through to the
-                // editor as before).
-                (Key::ctrl('v'), Action::ClipboardPasteImage),
+                // `app.clipboard.pasteImage` (`:142-145`): `windowsKeybindings ? "alt+v" : "ctrl+v"`.
                 (
-                    Key {
-                        code: KeyCode::Char('v'),
-                        mods: KeyModifiers::ALT,
+                    if windows {
+                        Key {
+                            code: KeyCode::Char('v'),
+                            mods: KeyModifiers::ALT,
+                        }
+                    } else {
+                        Key::ctrl('v')
                     },
                     Action::ClipboardPasteImage,
                 ),
@@ -869,11 +997,15 @@ impl Default for Keymap {
                 // unbound. They are NOT listed here on purpose: inventing a default cyrup would be
                 // a divergence, and `keys_label` returning `None` is upstream's `keys.length === 0`.
             ],
+        };
+        // `app.suspend` (`:96-99`): `process.platform === "win32" ? [] : "ctrl+z"` — Windows has no
+        // job control to suspend into.
+        if !platform.win32 {
+            km.bindings.push((Key::ctrl('z'), Action::Suspend));
         }
+        km
     }
-}
 
-impl Keymap {
     /// An empty keymap (all keys fall through to the editor).
     pub fn empty() -> Self {
         Keymap {
@@ -1114,46 +1246,37 @@ impl SelectKeymap {
     }
 }
 
-/// The configurable autocomplete-popup actions (item #6; `tui.autocomplete.*`). Pi's autocomplete
-/// dropdown navigation was matched inline; cyrup routes it through this table so a `keybindings.json`
-/// rebind of the popup keys takes effect (consistent with the `tui.select.*` pattern). Defaults:
-/// `↑`/`↓` navigate, `Tab` accepts + keeps editing, `Enter` accepts (submitting for a slash item),
-/// `Esc` dismisses.
+/// The autocomplete-popup actions, resolved through the ids pi's popup reads: `tui.select.up` /
+/// `down` / `confirm` / `cancel` and `tui.input.tab` (`packages/tui/src/components/editor.ts`
+/// autocomplete branch). A separate table rather than [`SelectKeymap`] because the popup lives
+/// inside the editor and the two are rebuilt independently, but it owns no id of its own — a
+/// rebind of `tui.select.up` moves selector highlights and the popup together, as upstream.
+/// Defaults: `↑`/`↓` navigate, `Tab` accepts + keeps editing, `Enter` accepts (submitting for a
+/// slash item), `Esc` dismisses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AutocompleteAction {
-    /// Move the highlight up one row — `tui.autocomplete.previous`.
+    /// Move the highlight up one row — `tui.select.up`.
     Previous,
-    /// Move the highlight down one row — `tui.autocomplete.next`.
+    /// Move the highlight down one row — `tui.select.down`.
     Next,
-    /// Accept the highlighted item and keep editing — `tui.autocomplete.accept` (`Tab`).
+    /// Accept the highlighted item and keep editing — `tui.input.tab` (`Tab`).
     Accept,
-    /// Accept the highlighted item, submitting for a slash item — `tui.autocomplete.acceptSubmit` (`Enter`).
+    /// Accept the highlighted item, submitting for a slash item — `tui.select.confirm` (`Enter`).
     AcceptSubmit,
-    /// Dismiss the popup — `tui.autocomplete.cancel` (`Esc`).
+    /// Dismiss the popup — `tui.select.cancel` (`Esc`).
     Cancel,
 }
 
 impl AutocompleteAction {
-    /// Resolve a popup binding id.
-    ///
-    /// **TUI-028.** Upstream has no `tui.autocomplete.*` family at all: the popup reuses
-    /// `tui.select.up` / `tui.select.down` / `tui.select.confirm` / `tui.select.cancel` and
-    /// `tui.input.tab` (`packages/tui/src/components/editor.ts:664-712` @v0.83.0). cyrup routed the
-    /// popup through an invented map, so rebinding `tui.select.up` moved selector highlights but
-    /// NOT the popup — one user-visible action needing two different config keys.
-    ///
-    /// pi's ids are now accepted here, so a config written against pi's documentation moves both.
-    /// The `tui.autocomplete.*` spellings are kept as aliases for the same
-    /// do-not-break-a-shipped-config reason the `editor.*` ones are.
+    /// Resolve a popup binding id — pi's ids only. cyrup's former `tui.autocomplete.*` family is not
+    /// accepted (TUI-066): upstream defines no such id, so a config naming one is inert there too.
     pub fn from_id(id: &str) -> Option<AutocompleteAction> {
         match id {
-            "tui.select.up" | "tui.autocomplete.previous" => Some(AutocompleteAction::Previous),
-            "tui.select.down" | "tui.autocomplete.next" => Some(AutocompleteAction::Next),
-            "tui.input.tab" | "tui.autocomplete.accept" => Some(AutocompleteAction::Accept),
-            "tui.select.confirm" | "tui.autocomplete.acceptSubmit" => {
-                Some(AutocompleteAction::AcceptSubmit)
-            }
-            "tui.select.cancel" | "tui.autocomplete.cancel" => Some(AutocompleteAction::Cancel),
+            "tui.select.up" => Some(AutocompleteAction::Previous),
+            "tui.select.down" => Some(AutocompleteAction::Next),
+            "tui.input.tab" => Some(AutocompleteAction::Accept),
+            "tui.select.confirm" => Some(AutocompleteAction::AcceptSubmit),
+            "tui.select.cancel" => Some(AutocompleteAction::Cancel),
             _ => None,
         }
     }
@@ -1210,7 +1333,8 @@ impl AutocompleteKeymap {
         }
     }
 
-    /// Merge a JSON keybindings document, applying only the `tui.autocomplete.*` ids (item #6).
+    /// Merge a JSON keybindings document, applying only the ids [`AutocompleteAction::from_id`]
+    /// resolves.
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
         merge_entries(json, AutocompleteAction::from_id, |action, keys| {
             self.set_action(action, keys)
@@ -1406,6 +1530,94 @@ impl SessionAction {
     }
 }
 
+/// The `/thinking` picker's own action (`thinking-selector.ts:130-135` @v0.87.1). Like
+/// [`SessionAction`] it binds only inside its selector, on top of the shared `tui.select.*`
+/// navigation, so it lives in its own table rather than in the global [`Keymap`] — whose
+/// [`Keymap::set_action`] takes a rebound key away from every other global action, which a
+/// selector-scoped id must never do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ThinkingAction {
+    /// Persist the highlighted level as the default — `app.thinking.save` (`ctrl+s`,
+    /// `core/keybindings.ts:104-107` @v0.87.1, new at v0.85.1): `if (kb.matches(keyData,
+    /// "app.thinking.save") && this.onSelectAsDefault)` (`thinking-selector.ts:131`). CFG-091.
+    Save,
+}
+
+impl ThinkingAction {
+    /// Resolve an `app.thinking.save` binding id.
+    pub fn from_id(id: &str) -> Option<ThinkingAction> {
+        match id {
+            "app.thinking.save" => Some(ThinkingAction::Save),
+            _ => None,
+        }
+    }
+
+    /// The canonical id — the inverse of [`ThinkingAction::from_id`], so this table joins the
+    /// `KeybindingsConfig` EXT-039's gate is resolved against.
+    pub fn id(self) -> &'static str {
+        match self {
+            ThinkingAction::Save => "app.thinking.save",
+        }
+    }
+}
+
+/// The configurable `/thinking` picker binding table. Default is upstream's verbatim:
+/// `"app.thinking.save": { defaultKeys: "ctrl+s" }` (`core/keybindings.ts:104-107` @v0.87.1).
+#[derive(Clone, Debug)]
+pub struct ThinkingKeymap {
+    bindings: Vec<(Key, ThinkingAction)>,
+}
+
+impl Default for ThinkingKeymap {
+    fn default() -> Self {
+        ThinkingKeymap {
+            bindings: vec![(Key::ctrl('s'), ThinkingAction::Save)],
+        }
+    }
+}
+
+impl ThinkingKeymap {
+    /// Resolve the picker action for an event, if any (R-10-018).
+    pub fn action_for(&self, ev: &KeyEvent) -> Option<ThinkingAction> {
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// **All** keys bound to `action`, joined with `/` — pi's `keyText("app.thinking.save")`
+    /// (`keybinding-hints.ts:34-36`). `None` when unbound.
+    pub fn keys_label(&self, action: ThinkingAction) -> Option<String> {
+        join_key_labels(
+            self.bindings
+                .iter()
+                .filter(|(_, a)| *a == action)
+                .map(|(k, _)| k),
+        )
+    }
+
+    /// Rebind `action` to exactly `keys`.
+    pub fn set_action(&mut self, action: ThinkingAction, keys: Vec<Key>) {
+        self.bindings.retain(|(_, a)| *a != action);
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document, applying only `app.thinking.save`.
+    pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        merge_entries(json, ThinkingAction::from_id, |action, keys| {
+            self.set_action(action, keys)
+        })
+    }
+
+    /// This map's contribution to upstream's `KeybindingsConfig` (pi
+    /// `KeybindingsManager.getEffectiveConfig()`), joined with its siblings by
+    /// [`crate::App::effective_keybindings`]; see [`effective_config`].
+    pub fn effective_config(&self) -> Vec<(String, Vec<String>)> {
+        effective_config(&self.bindings, ThinkingAction::id)
+    }
+}
+
 /// The configurable `/resume` binding table. Defaults are upstream's verbatim
 /// (`core/keybindings.ts:91-94` Ctrl+N, `:135-150` Ctrl+P / Ctrl+S / Ctrl+R / Ctrl+D, and
 /// `:177-180` @v0.84.4 `ctrl+backspace` for `deleteNoninvasive`).
@@ -1569,8 +1781,9 @@ impl TreeAction {
 /// The configurable `/tree` binding table (spec/tui/05 §6.1).
 ///
 /// **TUI-027.** The defaults are pi's, read at `v0.83.0`
-/// `packages/coding-agent/src/core/keybindings.ts:119-134` (`app.tree.foldOrUp` =
-/// `["alt+left","ctrl+left"]`, `app.tree.unfoldOrDown` = `["alt+right","ctrl+right"]`,
+/// `packages/coding-agent/src/core/keybindings.ts:119-134` (`app.tree.foldOrUp` = alt+left and
+/// ctrl+left, `app.tree.unfoldOrDown` = alt+right and ctrl+right, in the platform order
+/// [`TreeKeymap::for_platform`] documents,
 /// `app.tree.editLabel` = `shift+l`, `app.tree.toggleLabelTimestamp` = `shift+t`) and `:179-206`
 /// (the seven `app.tree.filter.*` ids on ctrl+d / ctrl+t / ctrl+u / ctrl+l / ctrl+a, ctrl+o and
 /// shift+ctrl+o). cyrup previously bound the four non-filter actions to the bare characters
@@ -1584,29 +1797,44 @@ pub struct TreeKeymap {
 
 impl Default for TreeKeymap {
     fn default() -> Self {
+        TreeKeymap::for_platform(KeybindingPlatform::current())
+    }
+}
+
+impl TreeKeymap {
+    /// Upstream's `/tree` defaults for `platform`. `app.tree.foldOrUp` / `unfoldOrDown` bind the same
+    /// two keys everywhere but in a platform ORDER (`core/keybindings.ts:150-157` @v0.87.1):
+    /// `process.platform === "darwin" ? ["alt+left", "ctrl+left"] : ["ctrl+left", "alt+left"]` — the
+    /// first key is the one every hint and `/hotkeys` row names first (TUI-071).
+    pub fn for_platform(platform: KeybindingPlatform) -> Self {
         use TreeAction as T;
         let ctrl = |c: char| Key {
             code: KeyCode::Char(c),
-            mods: KeyModifiers::CONTROL,
-        };
-        let alt_code = |code: KeyCode| Key {
-            code,
-            mods: KeyModifiers::ALT,
-        };
-        let ctrl_code = |code: KeyCode| Key {
-            code,
             mods: KeyModifiers::CONTROL,
         };
         let shift = |c: char| Key {
             code: KeyCode::Char(c),
             mods: KeyModifiers::SHIFT,
         };
+        let (first_mod, second_mod) = if platform.darwin {
+            (KeyModifiers::ALT, KeyModifiers::CONTROL)
+        } else {
+            (KeyModifiers::CONTROL, KeyModifiers::ALT)
+        };
+        let first = |code: KeyCode| Key {
+            code,
+            mods: first_mod,
+        };
+        let second = |code: KeyCode| Key {
+            code,
+            mods: second_mod,
+        };
         TreeKeymap {
             bindings: vec![
-                (alt_code(KeyCode::Left), T::FoldOrUp),
-                (ctrl_code(KeyCode::Left), T::FoldOrUp),
-                (alt_code(KeyCode::Right), T::UnfoldOrDown),
-                (ctrl_code(KeyCode::Right), T::UnfoldOrDown),
+                (first(KeyCode::Left), T::FoldOrUp),
+                (second(KeyCode::Left), T::FoldOrUp),
+                (first(KeyCode::Right), T::UnfoldOrDown),
+                (second(KeyCode::Right), T::UnfoldOrDown),
                 (shift('l'), T::EditLabel),
                 (shift('t'), T::ToggleLabelTimestamp),
                 (ctrl('d'), T::FilterDefault),
@@ -1704,6 +1932,16 @@ pub struct EditorKeymap {
 
 impl Default for EditorKeymap {
     fn default() -> Self {
+        EditorKeymap::for_platform(KeybindingPlatform::current())
+    }
+}
+
+impl EditorKeymap {
+    /// Upstream's `tui.*` editor defaults for `platform`. One of them has platform arms:
+    /// `tui.editor.undo` is `process.platform === "win32" ? "ctrl+z" : windowsKeybindings ? "alt+z"
+    /// : "ctrl+-"` (`core/keybindings.ts:77-80` @v0.87.1) — `alt+z` under WSL (CFG-091), `ctrl+z`
+    /// on native Windows, where `app.suspend` leaves that chord free (`:96-99`, TUI-071).
+    pub fn for_platform(platform: KeybindingPlatform) -> Self {
         use EditorAction as E;
         use KeyCode::{
             Backspace, Char, Delete, Down, End, Enter, Home, Left, PageDown, PageUp, Right, Tab, Up,
@@ -1773,7 +2011,16 @@ impl Default for EditorKeymap {
                 (ctrl('k'), E::DeleteToLineEnd),
                 (ctrl('y'), E::Yank),
                 (alt('y'), E::YankPop),
-                (ctrl('-'), E::Undo),
+                (
+                    if platform.win32 {
+                        ctrl('z')
+                    } else if platform.windows_keybindings {
+                        alt('z')
+                    } else {
+                        ctrl('-')
+                    },
+                    E::Undo,
+                ),
                 // Char-jump (`:111-114`, Kitty-gated).
                 (ctrl(']'), E::JumpForward),
                 (
@@ -1797,9 +2044,7 @@ impl Default for EditorKeymap {
             ],
         }
     }
-}
 
-impl EditorKeymap {
     /// An empty editor keymap.
     pub fn empty() -> Self {
         EditorKeymap {
@@ -1816,7 +2061,7 @@ impl EditorKeymap {
     /// Resolve the editor action for an event, if any.
     ///
     /// The event is first put through [`normalize_legacy_control_byte`], pi's `keys.ts:1275-1281`
-    /// decoding of the `0x1C..=0x1F` control bytes — without it `editor.undo` is unreachable on any
+    /// decoding of the `0x1C..=0x1F` control bytes — without it `tui.editor.undo` is unreachable on any
     /// terminal that does not speak the kitty keyboard protocol (TUI-053).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<EditorAction> {
         let normalized = normalize_legacy_control_byte(ev);
@@ -1874,7 +2119,8 @@ impl EditorKeymap {
         }
     }
 
-    /// Merge a JSON keybindings document, applying only the `editor.*` ids (spec/tui/03 §6.1).
+    /// Merge a JSON keybindings document, applying only the `tui.editor.*` / `tui.input.*` ids
+    /// [`EditorAction::from_id`] resolves (spec/tui/03 §6.1).
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
         merge_entries(json, EditorAction::from_id, |action, keys| {
             self.set_action(action, keys)
@@ -1901,8 +2147,7 @@ impl EditorKeymap {
 ///
 /// # Why this is a map of its own
 /// The four unmodified defaults (`pageUp`, `pageDown`, `home`, `end`) are already bound elsewhere:
-/// `pageUp`/`pageDown` to [`EditorAction::PageUp`]/[`EditorAction::PageDown`] and to the global
-/// [`Action::PageUp`]/[`Action::PageDown`], `home`/`end` to
+/// `pageUp`/`pageDown` to [`EditorAction::PageUp`]/[`EditorAction::PageDown`], `home`/`end` to
 /// [`EditorAction::CursorLineStart`]/[`EditorAction::CursorLineEnd`]. Upstream's comment at
 /// `keybindings.ts:159` — "These intentionally shadow the unmodified editor bindings in fullscreen
 /// mode" — is exactly that collision, declared deliberate. Keeping the family in a separate table
@@ -2057,6 +2302,17 @@ impl Default for AltScreenKeymap {
     /// [`EditorKeymap::default`] makes for `ctrl+home`/`ctrl+end`. Neither chord is bound by any
     /// other cyrup map, so nothing is taken away from the editor to add them.
     fn default() -> Self {
+        AltScreenKeymap::for_platform(KeybindingPlatform::current())
+    }
+}
+
+impl AltScreenKeymap {
+    /// The alternate-screen defaults for `platform`. `tui.altScreen.previousPrompt` / `nextPrompt`
+    /// are `windowsKeybindings ? "ctrl+up" : ["ctrl+shift+up", "ctrl+up"]` (and the `down` twin)
+    /// at `core/keybindings.ts:81-88` @v0.87.1 — the bare chord alone under WSL (CFG-091).
+    /// `tui.altScreen.search`'s arm (`:89-92`) has no id here: [`AltScreenAction::from_id`] does
+    /// not resolve the search ids.
+    pub fn for_platform(platform: KeybindingPlatform) -> Self {
         use AltScreenAction as A;
         let ctrl_shift = |code: KeyCode| Key {
             code,
@@ -2066,22 +2322,23 @@ impl Default for AltScreenKeymap {
             code,
             mods: KeyModifiers::CONTROL,
         };
-        AltScreenKeymap {
-            bindings: vec![
-                (Key::plain(KeyCode::PageUp), A::PageUp),
-                (Key::plain(KeyCode::PageDown), A::PageDown),
-                (ctrl_shift(KeyCode::Up), A::PreviousPrompt),
-                (ctrl_code(KeyCode::Up), A::PreviousPrompt),
-                (ctrl_shift(KeyCode::Down), A::NextPrompt),
-                (ctrl_code(KeyCode::Down), A::NextPrompt),
-                (Key::plain(KeyCode::Home), A::Top),
-                (Key::plain(KeyCode::End), A::Bottom),
-            ],
+        let mut bindings = vec![
+            (Key::plain(KeyCode::PageUp), A::PageUp),
+            (Key::plain(KeyCode::PageDown), A::PageDown),
+        ];
+        if !platform.windows_keybindings {
+            bindings.push((ctrl_shift(KeyCode::Up), A::PreviousPrompt));
         }
+        bindings.push((ctrl_code(KeyCode::Up), A::PreviousPrompt));
+        if !platform.windows_keybindings {
+            bindings.push((ctrl_shift(KeyCode::Down), A::NextPrompt));
+        }
+        bindings.push((ctrl_code(KeyCode::Down), A::NextPrompt));
+        bindings.push((Key::plain(KeyCode::Home), A::Top));
+        bindings.push((Key::plain(KeyCode::End), A::Bottom));
+        AltScreenKeymap { bindings }
     }
-}
 
-impl AltScreenKeymap {
     /// Resolve the viewport action for an event **unconditionally**, ignoring which renderer is
     /// live (R-10-018).
     ///

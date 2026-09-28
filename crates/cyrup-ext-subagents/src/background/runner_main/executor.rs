@@ -1238,6 +1238,7 @@ fn build_step_result(
         runtime_acknowledged_extensions,
         native_machine,
         execution,
+        tool_budget_blocked,
         ..
     } = result;
     let mut step_result = if exit_code == 0 {
@@ -1295,6 +1296,9 @@ fn build_step_result(
     // @v0.68.0) and `execution` (`:928`) on the step's result. Same trailing-`..` caveat as above.
     step_result.native_machine = native_machine;
     step_result.execution = execution;
+    // SUBA-132 — pi's runner keeps `toolBudgetBlocked` on the step's result (`subagent-runner.ts:1077`,
+    // published at `:1592`). Same trailing-`..` caveat as above.
+    step_result.tool_budget_blocked = tool_budget_blocked;
     // SUBA-N05: carry the events this step's control monitor raised out of `run_sync` so
     // `step_result_to_single_result` can put them on the terminal `ResultFile`. Without this
     // hop the whole async control path is inert: the thresholds are honoured, the events are
@@ -1538,6 +1542,33 @@ mod tests {
         // child-scoped stop against this index is `stop_failed` rather than a cancel of a token
         // nothing is listening to.
         assert!(!registry.cancel_active(2));
+    }
+
+    /// SUBA-132 — an async child's tool-budget block crosses the `StepResult` waist onto its
+    /// terminal `SingleResult`, which is what a detached workflow settles from
+    /// (`workflow_detach::children`/`receipt`): `budget_exhausted`, not an ordinary outcome.
+    #[test]
+    fn tool_budget_blocked_survives_the_step_result_waist_and_settles_budget_exhausted() {
+        let step = crate::spawn::chain_graph::RunnerStep::SingleStep(single_step(
+            "coder",
+            "read everything",
+        ));
+        let mut single = super::super::settle::stopped_single_result(&step);
+        single.stopped = false;
+        single.tool_budget_blocked = true;
+
+        let step_result = build_step_result("coder", single, None);
+        assert!(step_result.tool_budget_blocked);
+        let terminal = super::super::settle::step_result_to_single_result(&step, &step_result);
+        assert!(terminal.tool_budget_blocked);
+        assert_eq!(
+            crate::workflows::workflow_terminal_outcome_for_result(
+                crate::workflows::WorkflowBudgetSignals::from_single_result(&terminal)
+            ),
+            Some(crate::workflows::WorkflowTerminalOutcome::Partial {
+                reason: crate::workflows::WorkflowTerminalOutcomeReason::BudgetExhausted,
+            })
+        );
     }
 
     /// SUBA-3c — the recovery summary survives the whole async waist:

@@ -184,23 +184,24 @@ Use this EXACT format:
 Keep each section concise. Preserve exact file paths, function names, and error messages.";
 
 /// Prompt for the turn-prefix half of a split-turn compaction (R-05-006). Byte-1:1 with Pi
-/// `TURN_PREFIX_SUMMARIZATION_PROMPT` (`compaction.ts:737-750`).
-pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str =
-    "This is the PREFIX of a turn that was too large \
-to keep. The SUFFIX (recent work) is retained.
+/// `TURN_PREFIX_SUMMARIZATION_PROMPT` (`compaction.ts:964-977` @v0.87.1 — rewritten in v0.87.1,
+/// #9908, because a model refused the earlier "PREFIX of a turn" wording).
+pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "The messages above are earlier context from an \
+ongoing conversation. Later messages are stored separately and do not need to be reconstructed.
 
-Summarize the prefix to provide context for the retained suffix:
+Create a concise checkpoint of the user's request and the progress shown above. This checkpoint \
+will be placed before the later messages so the conversation can continue with the necessary context.
 
 ## Original Request
-[What did the user ask for in this turn?]
+[What did the user ask for?]
 
-## Early Progress
-- [Key decisions and work done in the prefix]
+## Progress So Far
+- [Key decisions and work completed in these messages]
 
-## Context for Suffix
-- [Information needed to understand the retained recent work]
+## Context Needed to Continue
+- [Information from these messages needed to understand the later work]
 
-Be concise. Focus on what's needed to understand the kept suffix.";
+Only summarize information explicitly present above. Do not infer or recreate later messages.";
 
 /// One summarization call's result: the summary text plus the token spend that produced it — Pi's
 /// `{ text, usage }` (`generateSummaryWithUsage` / `generateTurnPrefixSummary`,
@@ -483,8 +484,11 @@ pub async fn generate_turn_prefix_summary<S: Summarizer>(
     cancel: CancelToken,
 ) -> Result<SummaryOutput, CompactionError> {
     let transcript = serialize_conversation(&convert_to_llm(msgs));
+    // Pi v0.87.1 frames the turn prefix with `# Conversation` / `# Instructions` headings rather
+    // than the `<conversation>` tags the history and branch summaries keep
+    // (`compaction.ts:1118` @v0.87.1).
     let prompt = format!(
-        "<conversation>\n{transcript}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
+        "# Conversation\n{transcript}\n\n# Instructions\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
     );
     let req = SummarizationRequest {
         system_prompt: SUMMARIZATION_SYSTEM_PROMPT,

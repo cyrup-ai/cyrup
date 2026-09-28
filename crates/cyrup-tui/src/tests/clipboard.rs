@@ -508,8 +508,13 @@ fn wayland() -> ClipboardEnv {
 /// workspace — so this test did not compile.
 #[test]
 fn the_wayland_read_branch_is_gated_on_pis_three_way_conjunction() {
+    // A Wayland session that ALSO runs XWayland: `wl-paste`, then the X11 native backend.
+    let wayland_with_xwayland = ClipboardEnv {
+        x11_display: true,
+        ..wayland()
+    };
     assert_eq!(
-        clipboard_read_plan("linux", &wayland()),
+        clipboard_read_plan("linux", &wayland_with_xwayland),
         vec![ClipboardRead::WlPaste, ClipboardRead::Native],
         "`platform() === \"linux\" && isWaylandSession() && WAYLAND_DISPLAY` (clipboard.ts:53)",
     );
@@ -525,6 +530,7 @@ fn the_wayland_read_branch_is_gated_on_pis_three_way_conjunction() {
     );
     let session_but_no_socket = ClipboardEnv {
         wayland_session: true,
+        x11_display: true,
         ..ClipboardEnv::default()
     };
     assert_eq!(
@@ -532,7 +538,7 @@ fn the_wayland_read_branch_is_gated_on_pis_three_way_conjunction() {
         vec![ClipboardRead::Native],
         "a Wayland session with no WAYLAND_DISPLAY has no socket for wl-paste",
     );
-    for os in ["macos", "windows", "freebsd"] {
+    for os in ["macos", "windows"] {
         assert_eq!(
             clipboard_read_plan(os, &wayland()),
             vec![ClipboardRead::Native],
@@ -541,21 +547,143 @@ fn the_wayland_read_branch_is_gated_on_pis_three_way_conjunction() {
     }
 }
 
-/// The READ gate is deliberately NARROWER than the write side's `[CYRUP-DELTA]`, which widened
-/// pi's `p !== "linux"` to "macOS or Windows" so the BSDs would not take a silently-failing native
-/// write. There is no such hazard on a read: a failed read yields no text, which is exactly what a
-/// missing helper yields, so the literal port is also the safe one. Stated as a test so the two
-/// gates are not "made consistent" by a later reader.
+/// **CFG-066.** The native read is `getNativeClipboard()?.getText()` (`clipboard.ts:62-66`
+/// @v0.87.1), and `getNativeClipboard()` loads no helper on Linux without an X11 `DISPLAY` — so a
+/// Wayland-only box, a headless container and Termux all skip the native step — and none at all off
+/// `darwin`/`win32` (`tui/src/native-platform.ts:53-63`).
+///
+/// **Red before the fix:** the plan pushed `ClipboardRead::Native` unconditionally, so every one of
+/// these environments constructed an `arboard::Clipboard`.
 #[test]
-fn the_read_gate_and_the_write_gate_are_allowed_to_disagree_on_freebsd() {
+fn the_native_text_read_is_behind_pis_get_native_clipboard_gate() {
     assert_eq!(
-        clipboard_read_plan("freebsd", &wayland()),
-        vec![ClipboardRead::Native]
+        clipboard_read_plan("linux", &wayland()),
+        vec![ClipboardRead::WlPaste],
+        "Wayland without DISPLAY: the X11-only native helper is not loaded",
     );
     assert!(
-        !clipboard_write_plan("freebsd", &wayland()).contains(&ClipboardWrite::Native),
-        "the write side excludes freebsd from the native step; the read side does not",
+        clipboard_read_plan("linux", &bare()).is_empty(),
+        "headless Linux"
     );
+    let termux = ClipboardEnv {
+        termux: true,
+        ..ClipboardEnv::default()
+    };
+    assert!(clipboard_read_plan("linux", &termux).is_empty(), "Termux");
+    assert!(
+        clipboard_read_plan("freebsd", &wayland()).is_empty(),
+        "no native helper exists off darwin/win32",
+    );
+}
+
+/// The read gate and the write gate now say the same thing about the BSDs, and they say it for the
+/// same reason: upstream's `getNativePlatformHelper()` answers `undefined` off `darwin`/`win32`
+/// (`native-platform.ts:53-56` @v0.87.1). The write side used to reach that result through a
+/// `[CYRUP-DELTA]`; at v0.87.1 it is plain parity, through [`native_clipboard_available`].
+#[test]
+fn freebsd_has_no_native_clipboard_on_either_side() {
+    assert!(!clipboard_read_plan("freebsd", &wayland()).contains(&ClipboardRead::Native));
+    assert!(!clipboard_write_plan("freebsd", &wayland()).contains(&ClipboardWrite::Native));
+    for os in ["macos", "windows"] {
+        assert!(clipboard_write_plan(os, &bare()).contains(&ClipboardWrite::Native));
+    }
+    assert!(
+        !clipboard_write_plan("linux", &x11_only()).contains(&ClipboardWrite::Native),
+        "`if (p !== \"linux\")` still keeps Linux on the ownership-retaining CLI tools",
+    );
+}
+
+/// An X11 desktop (`DISPLAY` only).
+fn x11_only() -> ClipboardEnv {
+    ClipboardEnv {
+        x11_display: true,
+        ..ClipboardEnv::default()
+    }
+}
+
+/// **CFG-066.** Pi's image read opens with `if (env.TERMUX_VERSION) return null;`
+/// (`clipboard-image.ts:214-216` @v0.87.1) and reaches the native backend only through
+/// `getNativeClipboard()` (`:200-205`). Driven through the production reader with the native read
+/// replaced by a recorder, so "was the backend constructed?" is observed rather than inferred.
+///
+/// **Red before the fix:** `read_clipboard_image_to_temp` called `arboard::Clipboard::new()` first
+/// thing, on every platform and in every environment.
+#[test]
+fn the_image_read_never_touches_the_native_backend_under_termux_or_without_a_display() {
+    use crate::app::read_clipboard_image_to_temp_with;
+    use std::cell::Cell;
+
+    let refused = [
+        (
+            "linux",
+            ClipboardEnv {
+                termux: true,
+                // Even with a display: the Termux gate is first and unconditional.
+                x11_display: true,
+                ..ClipboardEnv::default()
+            },
+        ),
+        ("linux", bare()),
+        ("linux", wayland()),
+        ("freebsd", x11_only()),
+    ];
+    for (os, env) in refused {
+        let constructed = Cell::new(false);
+        let path = read_clipboard_image_to_temp_with(os, &env, || {
+            constructed.set(true);
+            None
+        });
+        assert_eq!(path, None, "{os} {env:?}");
+        assert!(
+            !constructed.get(),
+            "{os} {env:?}: no native backend may be constructed"
+        );
+    }
+
+    for (os, env) in [
+        ("linux", x11_only()),
+        ("macos", bare()),
+        ("windows", bare()),
+    ] {
+        let constructed = Cell::new(false);
+        let path = read_clipboard_image_to_temp_with(os, &env, || {
+            constructed.set(true);
+            Some(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([0, 0, 0, 255]),
+            ))
+        });
+        assert!(
+            constructed.get(),
+            "{os}: the native backend is the image source here"
+        );
+        let path = path.expect("a raster is materialised to a PNG temp file");
+        assert!(path.is_file());
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// **CFG-066**, the caller's half of the `Verify`: with the backend refused, Ctrl+V DEGRADES to the
+/// text read instead of erroring — pi's `handleClipboardPaste` falls through to `readClipboardText`
+/// when `readClipboardImage` answers `null` (`interactive-mode.ts:2870-2892`).
+#[test]
+fn a_refused_native_backend_degrades_the_paste_to_text() {
+    use crate::UiTheme;
+    use crate::app::{App, read_clipboard_image_to_temp_with};
+    use ratatui::backend::TestBackend;
+
+    let termux = ClipboardEnv {
+        termux: true,
+        ..ClipboardEnv::default()
+    };
+    let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+    let pasted = app.paste_from_clipboard(
+        || read_clipboard_image_to_temp_with("linux", &termux, || panic!("backend constructed")),
+        || Some("typed on the phone".to_string()),
+    );
+    assert!(pasted);
+    assert_eq!(app.state().editor.text(), "typed on the phone");
 }
 
 mod clipboard_paste_tests {

@@ -97,8 +97,9 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     // the move is an import re-signing in the fails-to-LINK direction), the renderer
     // display-options batch to `@0.9` (EXT-006: `render-call`/`render-result` gained `opts-json`)
     // and the guest bash-backend batch to `@0.10` (DRIFT-004: the NEW `bash-operations-exec`
-    // export, plus the `host-bash` imports its `onData`/`signal` halves travel over), on the
-    // strength of
+    // export, plus the `host-bash` imports its `onData`/`signal` halves travel over), and the
+    // post-baseline event batch to `@0.11` (EXT-075/EXT-079: the NEW `on-ui-prompt-start`,
+    // `on-ui-prompt-end` and `on-context-with-system` exports), on the strength of
     // host `bindgen!` accepting the new shapes and
     // `cargo check -p cyrup-ext-sdk --target wasm32-wasip2` expanding `export_extension!` cleanly
     // — i.e. host and guest agreeing at the TYPE level, in two separate compilations that never
@@ -112,7 +113,7 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     // instantiated the bytes the PRODUCTION Tier-1 loop returns until this assertion.
     // ---------------------------------------------------------------------------------------
     assert_eq!(
-        HOST_WORLD, "cyrup:ext@0.10",
+        HOST_WORLD, "cyrup:ext@0.11",
         "the world this artifact is being linked against"
     );
 

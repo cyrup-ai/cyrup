@@ -777,6 +777,7 @@ pub(super) async fn run_import_async_root(
 
     let step_result = StepResult {
         execution: None,
+        tool_budget_blocked: false,
         native_machine: None,
         runtime_acknowledged_extensions: None,
         success: imported.success,

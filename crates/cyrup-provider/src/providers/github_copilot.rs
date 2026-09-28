@@ -146,10 +146,10 @@ pub fn github_copilot_models() -> Vec<Model> {
 /// `[CYRUP-DELTA]` pi wraps this in `lazyOAuth({ name, load: loadGitHubCopilotOAuth })`
 /// (`github-copilot.ts:16`) so a bundler cannot follow a *variable* dynamic `import()` into
 /// Node-only flow code (`auth/oauth/load.ts:9-12`). Rust links statically: the flow module is in
-/// the binary either way, there is no import to defer, and `auth/oauth/load.rs`'s own note records
-/// that the bundled-registration path is the only path here. Naming the flow directly is the same
-/// object pi's `load` resolves to, minus an indirection that in Rust can only *fail* — an
-/// unregistered loader yields `FlowUnavailable` where pi would always resolve.
+/// the binary either way and there is no import to defer — the same position pi's standalone Bun
+/// binary is in, whose bundled loader is the constant `githubCopilot: () => githubCopilotOAuth`
+/// (`bun-oauth.ts:16` @v0.87.1). Naming the flow directly is that same object; see
+/// [`super::builtin_oauth`] for why `load.ts` itself is not ported.
 pub fn github_copilot_auth() -> ProviderAuth {
     ProviderAuth {
         api_key: Some(env_key("GitHub Copilot token", [COPILOT_GITHUB_TOKEN_ENV])),

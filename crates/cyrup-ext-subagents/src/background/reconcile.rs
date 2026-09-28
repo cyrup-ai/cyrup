@@ -392,19 +392,25 @@ pub async fn reconcile(
         });
     }
 
+    // pi `reconcileAsyncRun`'s two failure sentences (`stale-run-reconciler.ts:434-444` @v0.71.0):
+    // a dead pid is `buildFailedRepair`'s base message, naming the runner's recorded exit when
+    // one was observed (SUBA-141, `:231-238`); a pid that is alive — or whose liveness cannot be
+    // confirmed, which upstream treats the same — but has gone stale is its own sentence.
     let reason = match liveness {
-        Liveness::Dead => "tracked pid is no longer running (zero-signal probe: no such process)",
-        Liveness::Alive => {
-            "tracked pid appears alive but has not reported progress past the long-staleness \
-             threshold; OS pid reuse makes indefinite trust unsound"
-        }
-        Liveness::Unknown => {
-            "tracked pid liveness could not be confirmed (permission-denied-class probe failure) \
-             and has not reported progress past the long-staleness threshold"
-        }
+        Liveness::Dead => format!(
+            "Async runner process {pid} {} before writing a result. Marked run failed by \
+             stale-run reconciliation.",
+            runner_exit_text(paths, &status).await
+        ),
+        Liveness::Alive | Liveness::Unknown => format!(
+            "Async runner process {pid} still has a live PID, but status has not updated for \
+             {}ms. Marked run failed by stale-run reconciliation because PID ownership cannot \
+             be verified.",
+            (crate::time::epoch_millis(now) - status.last_update).max(0)
+        ),
     };
 
-    synthesize_failure(paths, &mut status, reason).await
+    synthesize_failure(paths, &mut status, &reason).await
 }
 
 /// Convenience wrapper over [`reconcile`] using the real wall clock and the real
@@ -496,6 +502,7 @@ fn stamp_reconciled_process_terminal(status: &mut RunStatus, reason: ProcessTerm
         base: ProcessTerminalBase::new(status.run_id.clone(), instance),
         reason,
         diagnostic: None,
+        instances: Vec::new(),
     });
 }
 
@@ -654,6 +661,58 @@ fn is_stale(last_update_epoch_ms: i64, now: SystemTime, stale_after: Duration) -
     elapsed >= stale_after
 }
 
+/// SUBA-141 — pi `buildFailedRepair`'s exit phrase (`stale-run-reconciler.ts:231-237` @v0.71.0):
+/// the runner's own recorded exit — off `process-terminal.json`, else the status overlay — when
+/// the proof is `observed` or `unknown` and carries a runner instance matching its own runner id;
+/// `exited or disappeared` otherwise.
+async fn runner_exit_text(paths: &RunPaths, status: &RunStatus) -> String {
+    use crate::background::process_terminal::{
+        ProcessInstanceExit, ProcessTerminal, ProofExpectation, read_process_terminal,
+    };
+
+    let run_dir = crate::background::RunDir::for_existing(&paths.run_dir);
+    let terminal = read_process_terminal(
+        &run_dir,
+        ProofExpectation {
+            run_id: Some(&status.run_id),
+            runner_process_instance_id: None,
+        },
+    )
+    .await
+    .or_else(|| status.process_terminal.clone());
+    let instances = match &terminal {
+        Some(
+            ProcessTerminal::Observed { instances, .. }
+            | ProcessTerminal::Unknown { instances, .. },
+        ) => instances.as_slice(),
+        _ => &[],
+    };
+    let runner_exit = terminal.as_ref().and_then(|terminal| {
+        instances.iter().find_map(|instance| match instance {
+            ProcessInstanceExit::Runner {
+                process_instance_id,
+                exit_code,
+                signal,
+                ..
+            } if process_instance_id == terminal.runner_process_instance_id() => {
+                Some((exit_code, signal))
+            }
+            _ => None,
+        })
+    });
+    match runner_exit {
+        Some((exit_code, signal)) => format!(
+            "exited with code {}{}",
+            exit_code.map_or_else(|| "none".to_string(), |code| code.to_string()),
+            signal
+                .as_deref()
+                .map(|signal| format!(" (signal {signal})"))
+                .unwrap_or_default()
+        ),
+        None => "exited or disappeared".to_string(),
+    }
+}
+
 /// Step 4's failure-synthesis action (R-SA-092): mark every non-terminal step `Failed`, advance the
 /// overall run state to `Failed`, write the repaired `status.json`, then write a freshly synthesized
 /// [`ResultFile`] — in that order, mirroring R-SA-077's own "status before result" write ordering
@@ -671,6 +730,18 @@ async fn synthesize_failure(
 ) -> std::io::Result<ReconcileOutcome> {
     let now = SystemTime::now();
     let now_ms = crate::time::epoch_millis(now);
+
+    // pi `buildFailedRepair` (`stale-run-reconciler.ts:239-240` @v0.71.0): the message, then the
+    // runner's stderr tail under its own header when there is one. Built BEFORE the steps are
+    // repaired because upstream's step error is this whole message (`error: step.error ??
+    // message`, `:250`), tail included.
+    let stderr_tail = read_stderr_tail(&paths.runner_stderr_log).await;
+    let mut diagnostic = reason.to_string();
+    if let Some(tail) = stderr_tail {
+        diagnostic.push_str("\n\nRunner stderr tail:\n");
+        diagnostic.push_str(&tail);
+    }
+    let reason = diagnostic.as_str();
 
     for step in &mut status.steps {
         if !step.status.is_terminal() {
@@ -723,14 +794,7 @@ async fn synthesize_failure(
         );
     }
 
-    let stderr_tail = read_stderr_tail(&paths.runner_stderr_log).await;
-    let mut diagnostic = format!("subagent run reconciled as stale/dead: {reason}");
-    if let Some(tail) = stderr_tail.filter(|tail| !tail.is_empty()) {
-        diagnostic.push_str("\n\n--- runner stderr (tail) ---\n");
-        diagnostic.push_str(&tail);
-    }
-
-    let synthesized_results = synthesize_step_results(status, &diagnostic);
+    let synthesized_results = synthesize_step_results(status, reason);
 
     let result = ResultFile {
         id: status.run_id.clone(),
@@ -826,6 +890,8 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
+            tool_budget_blocked: false,
+            session_name: None,
             agent: step.agent.clone(),
             task: String::new(),
             exit_code: -1,
@@ -906,6 +972,8 @@ pub(crate) fn placeholder_result(
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
+        tool_budget_blocked: false,
+        session_name: None,
         agent: agent.to_string(),
         task: String::new(),
         exit_code: -1,
@@ -966,17 +1034,37 @@ async fn read_optional_json<T: serde::de::DeserializeOwned>(
 }
 
 /// Best-effort read of a bounded tail of the runner's captured stderr log, for the diagnostic
-/// context R-SA-092 asks a synthesized failure to include. Returns `None` (never an error) if the
-/// log is missing or unreadable — diagnostics enrichment must never block failure synthesis itself.
+/// context R-SA-092 asks a synthesized failure to include — pi `readRunnerStartupDiagnostics`
+/// (`stale-run-reconciler.ts:53-74` @v0.71.0): the last 64 KiB, trimmed, its last 30 lines, and
+/// at most the last 4 000 characters of those. Returns `None` (never an error) if the log is
+/// missing, empty or unreadable — diagnostics enrichment must never block failure synthesis.
 async fn read_stderr_tail(path: &Path) -> Option<String> {
-    /// Cap on how much of the stderr log is retained in a synthesized diagnostic — "bounded tail",
-    /// not the whole (potentially unbounded) log.
-    const STDERR_TAIL_CAP_BYTES: usize = 4096;
+    const MAX_BYTES: usize = 64 * 1024;
+    const MAX_LINES: usize = 30;
+    const MAX_CHARS: usize = 4000;
 
     let bytes = tokio::fs::read(path).await.ok()?;
-    let start = bytes.len().saturating_sub(STDERR_TAIL_CAP_BYTES);
-    let tail_bytes = bytes.get(start..)?;
-    Some(String::from_utf8_lossy(tail_bytes).into_owned())
+    let start = bytes.len().saturating_sub(MAX_BYTES);
+    let content = String::from_utf8_lossy(bytes.get(start..)?)
+        .trim()
+        .to_string();
+    if content.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = content
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let tail = lines
+        .get(lines.len().saturating_sub(MAX_LINES)..)
+        .unwrap_or_default()
+        .join("\n");
+    let length = tail.chars().count();
+    if length > MAX_CHARS {
+        let kept: String = tail.chars().skip(length - MAX_CHARS).collect();
+        return Some(format!("{kept}\n[stderr tail truncated]"));
+    }
+    Some(tail)
 }
 
 /// Best-effort recovery of a [`crate::background::RunId`] from a [`RunPaths`]' own status-file
@@ -1551,6 +1639,158 @@ mod tests {
         assert!(
             !reread_result.results.is_empty(),
             "a synthesized diagnostic result must be present"
+        );
+    }
+
+    /// SUBA-141 end to end (pi `2e280687`/#2427): a runner that dies of a signal before writing a
+    /// result is reported with the exit the LAUNCHING process observed.
+    ///
+    /// The runner here is a real detached process launched through the production
+    /// `spawn_detached_runner_observed` — a shell that `SIGKILL`s itself, which is what an OOM
+    /// kill leaves: no tail, no proof of its own. The launcher's close observer finalizes the
+    /// `pending` sidecar into an `unknown` proof carrying the runner instance, and the dead-pid
+    /// repair names it.
+    ///
+    /// GUT the observer (drop the child) and the sidecar stays `pending`, so the first wait times
+    /// out; GUT `with_runner_exit` and the message says `exited or disappeared`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runner_killed_by_a_signal_reconciles_with_its_exit_code_and_signal() {
+        use crate::background::process_terminal::{
+            ProcessTerminal, ProofExpectation, RunnerProcessInstanceId,
+            initialize_process_terminal, read_process_terminal,
+        };
+        use crate::background::spawn_detached::{
+            RunnerCloseObserver, spawn_detached_runner_observed,
+        };
+
+        let (dir, paths) = temp_paths();
+        let run_id = run_id_from_paths(&paths);
+        let run_dir = crate::background::RunDir::for_existing(&paths.run_dir);
+        let instance = RunnerProcessInstanceId::new();
+        initialize_process_terminal(&run_dir, &run_id, &instance)
+            .await
+            .expect("the launch's pending proof");
+
+        let pid = spawn_detached_runner_observed(
+            &crate::spawn::SpawnCommand {
+                binary: std::path::PathBuf::from("/bin/sh"),
+                base_args: vec!["-c".to_string(), "kill -KILL $$".to_string()],
+            },
+            &paths.run_dir.join("runner-config.json"),
+            &paths.runner_stdout_log,
+            &paths.runner_stderr_log,
+            &std::collections::BTreeMap::new(),
+            RunnerCloseObserver {
+                run_dir: paths.run_dir.clone(),
+                run_id: run_id.clone(),
+                process_instance_id: instance.clone(),
+                lease_root: dir.path().join("leases"),
+            },
+        )
+        .expect("the runner starts");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let proof = loop {
+            match read_process_terminal(&run_dir, ProofExpectation::new(&run_id, &instance)).await {
+                Some(proof @ ProcessTerminal::Unknown { .. }) => break proof,
+                _ if std::time::Instant::now() > deadline => {
+                    panic!("the launcher never recorded the runner's close")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let ProcessTerminal::Unknown { instances, .. } = &proof else {
+            unreachable!("matched above")
+        };
+        assert_eq!(instances.len(), 1, "{proof:?}");
+
+        let mut status = running_status(
+            run_id.clone(),
+            pid,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
+        status.session_id = crate::identity::SessionId::parse("test-session");
+        crate::background::atomic::write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
+
+        let outcome = reconcile(
+            &paths,
+            None,
+            SystemTime::now(),
+            check_pid_liveness,
+            DEFAULT_SPAWN_GRACE,
+            DEFAULT_STALE_AFTER,
+        )
+        .await
+        .expect("reconcile succeeds");
+        assert_eq!(outcome.action, ReconcileAction::SynthesizedFailure);
+        let error = outcome.status.steps[0].error.clone().unwrap_or_default();
+        assert_eq!(
+            error,
+            format!(
+                "Async runner process {pid} exited with code none (signal SIGKILL) before \
+                 writing a result. Marked run failed by stale-run reconciliation."
+            )
+        );
+    }
+
+    /// pi `buildFailedRepair`'s fallback phrase: with no recorded runner exit — the sidecar still
+    /// `pending`, as a runner nobody observed leaves it — the repair says the runner `exited or
+    /// disappeared`, and the stderr tail follows under upstream's header.
+    #[tokio::test]
+    async fn an_unobserved_dead_runner_exited_or_disappeared_with_its_stderr_tail() {
+        let (_dir, paths) = temp_paths();
+        let run_id = run_id_from_paths(&paths);
+        let dead_pid = spawn_and_reap_dead_pid();
+        let mut status = running_status(
+            run_id,
+            dead_pid,
+            crate::time::epoch_millis(SystemTime::now()),
+        );
+        status.session_id = crate::identity::SessionId::parse("test-session");
+        crate::background::atomic::write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
+        std::fs::write(&paths.runner_stderr_log, "boot\npanicked at runner\n\n").unwrap();
+
+        let outcome = reconcile(
+            &paths,
+            None,
+            SystemTime::now(),
+            check_pid_liveness,
+            DEFAULT_SPAWN_GRACE,
+            DEFAULT_STALE_AFTER,
+        )
+        .await
+        .expect("reconcile succeeds");
+        let reason = format!(
+            "Async runner process {dead_pid} exited or disappeared before writing a result. \
+             Marked run failed by stale-run reconciliation."
+        );
+        // pi `error: step.error ?? message` (`:250`): the whole message, tail included.
+        let message = format!("{reason}\n\nRunner stderr tail:\nboot\npanicked at runner");
+        assert_eq!(
+            outcome.status.steps[0].error.as_deref(),
+            Some(message.as_str())
+        );
+        let result: ResultFile = serde_json::from_slice(
+            &tokio::fs::read(crate::background::result_index::owned_payload_path(
+                &paths.results_dir,
+                &crate::identity::SessionId::parse("test-session").expect("non-empty"),
+                &run_id_from_paths(&paths),
+            ))
+            .await
+            .expect("ResultFile exists"),
+        )
+        .expect("valid JSON");
+        let diagnostic = serde_json::to_string(&result.results).unwrap();
+        assert!(
+            diagnostic.contains(&format!(
+                "{reason}\\n\\nRunner stderr tail:\\nboot\\npanicked at runner"
+            )),
+            "{diagnostic}"
         );
     }
 

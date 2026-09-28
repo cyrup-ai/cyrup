@@ -153,6 +153,30 @@ impl ClipboardError {
     }
 }
 
+/// Whether the native clipboard backend (`arboard`) may be constructed at all — pi
+/// `getNativeClipboard()` (`tui/src/native-platform.ts:58-63` @v0.87.1), the load gate every
+/// native read and write goes through:
+///
+/// ```ts
+/// if (process.platform !== "linux") return getNativePlatformHelper(); // darwin | win32, else undefined
+/// if (!process.env.DISPLAY) return undefined;
+/// return loadNativePlatformHelper("linux", "-x11");
+/// ```
+///
+/// CFG-066. This is the v0.87.1 form of the `hasDisplay` / `TERMUX_VERSION` gate pi used to keep
+/// in `clipboard-native.ts`: Linux needs an X11 `DISPLAY` (Termux and a headless box have none, and
+/// `WAYLAND_DISPLAY` alone no longer counts — the helper is X11-only, as is `arboard` built without
+/// its `wayland-data-control` feature), and a platform with no native helper (the BSDs) never
+/// constructs one. Upstream's `arch` check (`x64`/`arm64`) guards which prebuilt `.node` exists;
+/// `arboard` is compiled for the host, so it has no counterpart.
+pub(crate) fn native_clipboard_available(os: &str, env: &ClipboardEnv) -> bool {
+    match os {
+        "linux" => env.x11_display,
+        "macos" | "windows" => true,
+        _ => false,
+    }
+}
+
 /// The ordered write chain for `os` (an [`std::env::consts::OS`] value) under `env` — Pi
 /// `copyToClipboard`'s branch structure with the execution stripped out.
 ///
@@ -160,18 +184,16 @@ impl ClipboardError {
 /// the defect this replaced was precisely a target-gated arm nobody could see.
 pub(crate) fn clipboard_write_plan(os: &str, env: &ClipboardEnv) -> Vec<ClipboardWrite> {
     let mut steps: Vec<ClipboardWrite> = Vec::new();
-    // `if (clipboard && p !== "linux")` (`clipboard.ts:88`) — the native write goes first, Windows
-    // very much included (the platform whose arm used to be an empty function body).
+    // `if (p !== "linux") { const clipboard = getNativeClipboard(); if (clipboard?.setText) … }`
+    // (`coding-agent/src/utils/clipboard.ts:80-90` @v0.87.1) — the native write goes first,
+    // Windows very much included (the platform whose arm used to be an empty function body).
     //
-    // [CYRUP-DELTA] the condition is `is macOS or Windows`, not Pi's `p !== "linux"`
-    // (`copyToClipboard`, `clipboard.ts:88`). Pi's exclusion exists because its native backend is
-    // X11-based and does not retain selection ownership after the call resolves, so the write
-    // reports success and copies nothing (`clipboard.ts:82-87`). `arboard` has that same X11/Wayland
-    // backend, and it serves EVERY unix except macOS — FreeBSD/OpenBSD included — so porting the
-    // string comparison literally would reintroduce, on the BSDs, exactly the silent success this
-    // module was rewritten to remove. Naming the two platforms with a genuinely persistent native
-    // clipboard (NSPasteboard, `clipboard-win`) states the upstream INTENT instead of its proxy.
-    if matches!(os, "macos" | "windows") {
+    // This used to be a `[CYRUP-DELTA]` narrowing pi's `p !== "linux"` to "macOS or Windows" so the
+    // BSDs would not take arboard's non-persistent X11 write. At v0.87.1 upstream says the same
+    // thing itself: `getNativePlatformHelper()` answers `undefined` off `darwin`/`win32`
+    // (`tui/src/native-platform.ts:53-56`), so `p !== "linux"` plus the helper's existence is
+    // exactly these two platforms — [`native_clipboard_available`] is that helper gate.
+    if os != "linux" && native_clipboard_available(os, env) {
         steps.push(ClipboardWrite::Native);
     }
     match os {
@@ -503,12 +525,18 @@ pub(crate) enum ClipboardRead {
 /// *narrower* platform test than the write side's `[CYRUP-DELTA]`, and deliberately so: a failed
 /// read degrades to "no text", never to the silent false success that justified widening the write
 /// arm off `p !== "linux"`.
+///
+/// The native step is behind [`native_clipboard_available`] — upstream's
+/// `getNativeClipboard()?.getText()` (`clipboard.ts:62-66` @v0.87.1), whose optional chain skips the
+/// read outright when the helper is not loaded (CFG-066).
 pub(crate) fn clipboard_read_plan(os: &str, env: &ClipboardEnv) -> Vec<ClipboardRead> {
     let mut steps = Vec::new();
     if os == "linux" && env.wayland_session && env.wayland_display {
         steps.push(ClipboardRead::WlPaste);
     }
-    steps.push(ClipboardRead::Native);
+    if native_clipboard_available(os, env) {
+        steps.push(ClipboardRead::Native);
+    }
     steps
 }
 
@@ -607,7 +635,7 @@ pub(crate) fn read_clipboard_text() -> Option<String> {
 /// sequence until the next frame, and the terminal is the consumer, not the ratatui buffer.
 fn write_stdout(seq: &str) {
     use std::io::Write as _;
-    let mut out = std::io::stdout();
+    let mut out = crate::dead_terminal::terminal_stdout();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
 }

@@ -160,10 +160,13 @@ impl SystemPromptBuilder {
         let t = self.tmpl;
         let mut out = String::with_capacity(2048);
 
-        // Pi gates the skills section on `read` being in the effective set: `hasRead` for the
-        // default body (`system-prompt.ts:101,155`) and `!selectedTools || selectedTools
-        // .includes("read")` for the custom-prompt branch (`:64-65`) — the same predicate.
-        let read_available = is_selected(inp.selected_tools.as_ref(), "read");
+        // SESS-059 — Pi gates the skills section on a tool that can READ a skill file being in the
+        // effective set, `read` first, then `bash`: `const skillFileReadTool = (["read", "bash"]
+        // as const).find((tool) => tools.includes(tool))` (`system-prompt.ts:46` @v0.85.0,
+        // #8552), shared by the custom-prompt branch (`:66`) and the default body (`:161`).
+        let skill_file_read_tool = ["read", "bash"]
+            .into_iter()
+            .find(|tool| is_selected(inp.selected_tools.as_ref(), tool));
 
         if let Some(custom) = &inp.custom_prompt {
             // ── FULL REPLACEMENT (R-06-003) ──
@@ -183,9 +186,9 @@ impl SystemPromptBuilder {
         }
         // 6. project context files (already trust-gated + ordered)
         emit_context_files(&mut out, t, &inp.context_files);
-        // 7. skills (only if read available — R-06-010)
-        if read_available {
-            emit_skills_section(&mut out, &inp.skills);
+        // 7. skills (only if `read` or `bash` can load them — R-06-010, SESS-059)
+        if let Some(tool) = skill_file_read_tool {
+            emit_skills_section(&mut out, &inp.skills, tool);
         }
         // 8. footer
         emit_footer(&mut out, inp);

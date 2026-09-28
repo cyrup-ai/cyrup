@@ -264,3 +264,33 @@ fn shared_credentials_files_are_read_for_a_configured_profile() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&dir);
 }
+
+/// CFG-070 — `AWS_CONFIG_FILE` relocates the config file, and a profile found only there is read
+/// from its `[profile <name>]` section, as the SDK's shared-file step does.
+#[test]
+fn aws_config_file_relocates_the_profile_section() {
+    let dir = std::env::temp_dir().join(format!("cyrup-bedrock-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config");
+    std::fs::write(
+        &path,
+        "[profile ops]\naws_access_key_id = OPSKEY\naws_secret_access_key = opssecret\n",
+    )
+    .unwrap();
+
+    let ambient = env_map(&[
+        ("AWS_CONFIG_FILE", path.to_string_lossy().as_ref()),
+        (
+            "AWS_SHARED_CREDENTIALS_FILE",
+            dir.join("missing").to_string_lossy().as_ref(),
+        ),
+    ]);
+    let env = env_source(None, &ambient);
+    assert_eq!(
+        shared_profile_credentials("ops", &env).map(|c| c.access_key_id),
+        Some("OPSKEY".to_string())
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
+}

@@ -165,6 +165,8 @@ mod tests {
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
+            tool_budget_blocked: false,
+            session_name: None,
             child_run_id: None,
             agent: "researcher".to_string(),
             task: "look into the thing".to_string(),

@@ -5,10 +5,11 @@
 //! and the spawned post-run driver loop that owns retry / auto-compaction / queued continuations.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use cyrup_agent::AgentMessage;
 use cyrup_core::{AssistantMessage, Content, EventStream, Message};
-use cyrup_ext::{HostEvent, InputEventSource, InputStreamingBehavior, Reduced};
+use cyrup_ext::{HostEvent, InputEventSource, InputReduction, InputStreamingBehavior};
 
 use crate::error::SessionServiceError;
 use crate::event::{
@@ -35,6 +36,26 @@ pub(crate) enum InjectionOffer {
     /// Another run owns the latch. Nothing was consumed and nothing was persisted twice; the
     /// caller still owns the batch.
     AgentBusy,
+}
+
+/// A submission made while `agent_settled` was being emitted — one entry of pi's
+/// `_deferredSettledActions` (`agent-session.ts:379` @v0.87.1). Pi pushes a closure; cyrup names
+/// the three closures pi pushes.
+pub(crate) enum DeferredSettled {
+    /// `prompt(text, options)` (`:1607-1609`) reached through [`AgentSession::prompt_run`]. The
+    /// caller already holds the returned run-scoped stream; its sender rides here and is adopted
+    /// when the deferred prompt runs.
+    PromptRun {
+        input: UserInput,
+        stream: tokio::sync::mpsc::Sender<AgentSessionEvent>,
+    },
+    /// `prompt(text, options)` reached through [`AgentSession::prompt_with`].
+    Prompt {
+        input: UserInput,
+        options: PromptOptions,
+    },
+    /// `sendMessage(…, {triggerTurn: true})`'s `_runAgentPrompt(appMessage)` (`:1956-1958`).
+    Run(Vec<AgentMessage>),
 }
 
 /// The disposition of the `input` extension event (Pi `InputEventResult.action`, runner.ts:1100).
@@ -118,6 +139,17 @@ impl AgentSession {
         &self,
         input: impl Into<UserInput>,
     ) -> Result<(PromptAccepted, EventStream<AgentSessionEvent>), SessionServiceError> {
+        // SEAM-129 — pi `prompt()` opens with `if (this._isEmittingAgentSettled) {
+        // this._deferredSettledActions.push(…); return; }` (`agent-session.ts:1607-1609` @v0.87.1):
+        // a prompt made from an `agent_settled` handler runs right after the emit, not refused.
+        if self.is_emitting_settled() {
+            let (tx, stream) = self.fanout.detached_run();
+            self.defer_settled(DeferredSettled::PromptRun {
+                input: input.into(),
+                stream: tx,
+            });
+            return Ok((PromptAccepted::Started, stream));
+        }
         // AGENT-030: the session-level run latch, not the agent's per-run streaming flag — pi's
         // `prompt()` consults `this.isStreaming`, which IS `_isAgentRunActive`
         // (agent-session.ts:876-877 / :1159 @v0.83.0). See [`Self::is_run_active`].
@@ -160,6 +192,14 @@ impl AgentSession {
         input: impl Into<UserInput>,
         options: PromptOptions,
     ) -> Result<PromptAccepted, SessionServiceError> {
+        // SEAM-129 — the same deferral as [`Self::prompt_run`] (`agent-session.ts:1607-1609`).
+        if self.is_emitting_settled() {
+            self.defer_settled(DeferredSettled::Prompt {
+                input: input.into(),
+                options,
+            });
+            return Ok(PromptAccepted::Started);
+        }
         match self.prepare(input.into(), options).await? {
             Prepared::Handled => Ok(PromptAccepted::Handled),
             // SEAM-121 — pi's `prompt` calls the PRIVATE `_queueFollowUp`/`_queueSteer` here
@@ -197,7 +237,7 @@ impl AgentSession {
             Some(this) => {
                 // Flag the loop active BEFORE returning so an immediate `wait_for_idle` waits for the
                 // WHOLE loop, not just the first `agent_end`.
-                let _ = self.driver_tx.send(true);
+                self.claim_run_latch();
                 tokio::spawn(async move { this.drive_run(messages).await });
                 Ok(())
             }
@@ -263,7 +303,7 @@ impl AgentSession {
         };
         // Flag the loop active BEFORE the claim, for the same reason `spawn_run` does: an
         // immediate `wait_for_idle` must wait for the WHOLE loop, not just the first `agent_end`.
-        let _ = self.driver_tx.send(true);
+        self.claim_run_latch();
         match this.agent.prompt(messages).await {
             Ok(handle) => {
                 tokio::spawn(async move { this.drive_accepted_run(handle).await });
@@ -381,15 +421,123 @@ impl AgentSession {
         // compaction or queued continuation will follow. This is exactly Pi's `_emitAgentSettled()`
         // call site: the `finally` of `_runAgentPrompt` (agent-session.ts:1063-1072), AFTER
         // `_flushPendingBashMessages()` and BEFORE the idle wait resolves.
+        //
+        // SEAM-129 — `_emitAgentSettled` (`agent-session.ts:870-891` @v0.87.1) clears
+        // `_isAgentRunActive` FIRST and emits under `_isEmittingAgentSettled`, so a handler that
+        // submits a prompt is neither refused nor raced: the submission is deferred and run right
+        // after the emit, before the idle wait resolves.
+        self.run_released.store(true, Ordering::SeqCst);
+        self.emitting_settled.store(true, Ordering::SeqCst);
         self.emit_agent_settled().await;
         // Terminate the run-scoped subscriptions returned by `prompt` now the whole loop has
         // settled. Ordered AFTER the settle emit so a run-scoped subscriber (what `prompt` hands
-        // back) actually observes `agent_settled` as its last event.
+        // back) actually observes `agent_settled` as its last event — and BEFORE the emitting flag
+        // drops, so a prompt that lands in between cannot register a stream this then closes.
         self.fanout.end_run();
-        // Pi's `_resolveIdleWaitIfIdle()` runs in `_emitAgentSettled`'s own `finally` — i.e. the
+        self.emitting_settled.store(false, Ordering::SeqCst);
+        let deferred = std::mem::take(&mut *Self::lock(&self.deferred_settled));
+        if self.run_deferred_settled(deferred).await {
+            // A deferred submission started the next run, which now owns the latch and drops it
+            // from its own settle.
+            return;
+        }
+        // Pi's `_resolveIdleWaitIfIdle()` runs after the emit and the deferred actions — i.e. the
         // idle wait releases only after the event has been delivered. `driver_tx` is cyrup's idle
-        // latch, so it drops last.
-        let _ = self.driver_tx.send(false);
+        // latch, so it drops last, and only if no run has claimed it since it was released.
+        self.driver_tx.send_if_modified(|active| {
+            let release = self.run_released.swap(false, Ordering::SeqCst);
+            if release {
+                *active = false;
+            }
+            release
+        });
+    }
+
+    /// Mark a run as owning the session: `driver_tx` up and the SEAM-129 release cleared, in one
+    /// step under the watch's lock so a settling run's tail cannot interleave between them.
+    fn claim_run_latch(&self) {
+        self.driver_tx.send_modify(|active| {
+            self.run_released.store(false, Ordering::SeqCst);
+            *active = true;
+        });
+    }
+
+    /// Pi `_isEmittingAgentSettled` (`agent-session.ts:378` @v0.87.1).
+    pub(crate) fn is_emitting_settled(&self) -> bool {
+        self.emitting_settled.load(Ordering::SeqCst)
+    }
+
+    /// Pi `this._deferredSettledActions.push(…)`.
+    pub(crate) fn defer_settled(&self, action: DeferredSettled) {
+        Self::lock(&self.deferred_settled).push(action);
+    }
+
+    /// Pi `for (const action of deferred) await action();` (`agent-session.ts:881-887` @v0.87.1).
+    /// Pi's `await this.prompt(…)` resolves only once that run has settled, so each later action
+    /// waits for the run the previous one started. Returns whether the LAST action left a run
+    /// owning the latch. A failed action ends the loop, as pi's throw leaves its `for`: the actions
+    /// after it are dropped (a dropped [`DeferredSettled::PromptRun`] sender ends its caller's
+    /// stream). The failure is logged, because it has no caller left to return to — pi's rejects
+    /// the settling run's own `prompt()`, which cyrup's detached driver has already answered.
+    ///
+    /// Boxed as an explicitly `Send` future: an action starts a run through [`Self::spawn_run`],
+    /// whose spawned driver ends in [`Self::settle_run`], which awaits this — an `async fn` cycle
+    /// the compiler cannot prove `Send` through opaque types.
+    fn run_deferred_settled(
+        &self,
+        deferred: Vec<DeferredSettled>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(self.run_deferred_settled_inner(deferred))
+    }
+
+    async fn run_deferred_settled_inner(&self, deferred: Vec<DeferredSettled>) -> bool {
+        let mut started = false;
+        for action in deferred {
+            if started {
+                self.wait_for_run_settled().await;
+            }
+            let outcome = match action {
+                DeferredSettled::PromptRun { input, stream } => {
+                    self.run_deferred_prompt(input, stream).await
+                }
+                DeferredSettled::Prompt { input, options } => {
+                    Box::pin(self.prompt_with(input, options))
+                        .await
+                        .map(|accepted| matches!(accepted, PromptAccepted::Started))
+                }
+                DeferredSettled::Run(messages) => self.spawn_run(messages).await.map(|()| true),
+            };
+            match outcome {
+                Ok(action_started) => started = action_started,
+                Err(e) => {
+                    tracing::warn!(error = %e, "a submission deferred past agent_settled failed");
+                    return false;
+                }
+            }
+        }
+        started
+    }
+
+    /// [`Self::prompt_run`]'s body for a deferred submission whose stream was handed out already:
+    /// the sender joins the run-scoped set exactly where `prompt_run` subscribes, and is withdrawn
+    /// again when no run follows, which ends the caller's stream.
+    async fn run_deferred_prompt(
+        &self,
+        input: UserInput,
+        stream: tokio::sync::mpsc::Sender<AgentSessionEvent>,
+    ) -> Result<bool, SessionServiceError> {
+        if self.is_run_active() {
+            return Err(SessionServiceError::StreamingNeedsBehavior);
+        }
+        self.fanout.adopt_run(stream.clone());
+        let prepared = Box::pin(self.prepare(input, PromptOptions::default())).await;
+        match prepared {
+            Ok(Prepared::Run(messages)) => self.spawn_run(messages).await.map(|()| true),
+            other => {
+                self.fanout.release_run(&stream);
+                other.map(|_| false)
+            }
+        }
     }
 
     /// Emit `agent_settled` (Pi `_emitAgentSettled`, agent-session.ts:581-588) — to the EXTENSION
@@ -458,8 +606,19 @@ impl AgentSession {
         // Threshold / overflow post-run compaction → continue (Pi :1005-1007). The summary call is
         // awaited inside, and `abort()` cancels it, so the latch is re-read on the way out
         // (Pi `return !this._agentRunAbortRequested;`, :1522).
-        if self.check_compaction(&msg, true).await.unwrap_or(false) {
-            return !self.abort_requested();
+        match self.check_compaction(&msg, true).await {
+            Ok(true) => return !self.abort_requested(),
+            Ok(false) => {}
+            // SESS-055 — the one throw `_checkCompaction` has is `getCompactionSettings(model)`
+            // (`agent-session.ts:2604` @v0.87.1). It leaves `_runAgentPrompt`'s `while` for the
+            // `finally`, so the run settles with NO continuation, even for messages an `agent_end`
+            // handler queued. pi's `prompt()` then rejects with it; this driver runs detached from
+            // the prompt caller, so the log is where the error goes, and the next prompt's
+            // pre-send check refuses with the same message.
+            Err(e) => {
+                tracing::warn!(error = %e, "post-run compaction check failed");
+                return false;
+            }
         }
         // Messages queued by `agent_end` extension handlers need a continuation (Pi :1009-1012),
         // unless the run was aborted (Pi :1528).
@@ -655,29 +814,31 @@ impl AgentSession {
         // Deliver the `source` (Pi `InputEvent.source`, agent-session.ts:1021) + the in-flight
         // `streamingBehavior` (`undefined` when idle, :1022) so a handler can branch on
         // interactive-vs-queued / steer-vs-follow-up before deciding (#13c).
-        let event = HostEvent::Input {
-            text: ui.text.clone(),
-            images: ui.images.clone(),
-            source: input_event_source(ui.source),
-            streaming_behavior: streaming_behavior.map(input_streaming_behavior),
-        };
+        //
+        // EXT-025: the ONE `input` emitter is the extension host's, as pi's is the runner's
+        // `emitInput` (`core/extensions/runner.ts` @v0.87.1) — this used to be a second, inline copy
+        // of the same reduction.
         let reduced = self
             .services
             .ext_host
-            .dispatcher()
-            .dispatch_block_mutate(event, &cancel)
+            .emit_input(
+                &ui.text,
+                ui.images.clone(),
+                input_event_source(ui.source),
+                streaming_behavior.map(input_streaming_behavior),
+                &cancel,
+            )
             .await;
         match reduced {
-            Reduced::Handled { .. } | Reduced::Blocked { .. } => InputDisposition::Handled,
-            // Apply any `transform` the handler chain folded into the event (Pi
-            // agent-session.ts:1029-1032: `currentText`/`currentImages` adopt the result).
-            Reduced::Pass(ev) => {
-                if let HostEvent::Input { text, images, .. } = *ev {
-                    ui.text = text;
-                    ui.images = images;
-                }
+            InputReduction::Handled | InputReduction::Blocked { .. } => InputDisposition::Handled,
+            // Apply the `transform` the handler chain folded (Pi agent-session.ts:1029-1032:
+            // `currentText`/`currentImages` adopt the result).
+            InputReduction::Transform { text, images } => {
+                ui.text = text;
+                ui.images = images;
                 InputDisposition::Continue
             }
+            InputReduction::Continue => InputDisposition::Continue,
         }
     }
 
@@ -737,9 +898,10 @@ impl AgentSession {
             }
         }
         // 4. Pre-send compaction check on the last assistant turn (agent-session.ts:1080-1083).
-        if self.auto_compaction_enabled()
-            && let Some(last) = self.last_assistant_message().await
-        {
+        // Pi calls `_checkCompaction` whenever there is a last assistant, with no enable gate of its
+        // own (`agent-session.ts:1695-1698` @v0.87.1): the enable check lives inside, AFTER the
+        // settings read that refuses an invalid compaction budget (SESS-055).
+        if let Some(last) = self.last_assistant_message().await {
             let _ = self.check_compaction(&last, false).await?;
         }
         // 5. Assemble (before_agent_start hook + ordering).
@@ -839,19 +1001,20 @@ impl AgentSession {
             return messages;
         }
 
-        let event = HostEvent::BeforeAgentStart {
-            prompt: user_text,
-            images: serde_json::to_value(&images).unwrap_or(serde_json::Value::Null),
-            system_prompt: base.clone(),
-            options: serde_json::Value::Null,
-            injected: Vec::new(),
-        };
+        // EXT-025: the ONE `before_agent_start` emitter is the extension host's (pi's runner
+        // `emitBeforeAgentStart`); it answers `None` for an unchanged prompt with nothing injected
+        // and for a blocked/handled chain alike, both of which keep the base below.
         let cancel = self.session_cancel.child_token();
         let reduced = self
             .services
             .ext_host
-            .dispatcher()
-            .dispatch_block_mutate(event, &cancel)
+            .emit_before_agent_start(
+                &user_text,
+                serde_json::to_value(&images).unwrap_or(serde_json::Value::Null),
+                &base,
+                serde_json::Value::Null,
+                &cancel,
+            )
             .await;
 
         let mut messages = vec![user_msg];
@@ -870,12 +1033,10 @@ impl AgentSession {
             let (tools, _rebuilt_prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
             self.agent.set_tools(tools).await;
         }
-        if let Reduced::Pass(ev) = reduced
-            && let HostEvent::BeforeAgentStart {
-                system_prompt,
-                injected,
-                ..
-            } = *ev
+        if let Some(cyrup_ext::BeforeAgentStartReduction {
+            system_prompt,
+            injected,
+        }) = reduced
         {
             // Apply the (possibly handler-replaced / sanitized) system prompt; reset to base
             // otherwise. Pi's two branches are `if (result?.systemPrompt !== undefined) {
@@ -889,19 +1050,24 @@ impl AgentSession {
             // CYRUP-DELTA on the discriminator only: pi distinguishes "handler returned no prompt"
             // (`undefined`) from "handler returned one"; cyrup's `HostEvent::BeforeAgentStart`
             // carries the prompt as a mutated-in-place `String`, so a handler that returns the base
-            // verbatim is indistinguishable from one that returns nothing. Equality with `base` is
-            // therefore read as "no override", which agrees with pi on the resulting prompt for
-            // every input and differs only in which slot holds the identical text.
-            if system_prompt == base {
-                *Self::lock(&self.system_prompt_override) = None;
-                self.agent.set_system_prompt(base.clone()).await;
-            } else {
-                *Self::lock(&self.system_prompt_override) = Some(system_prompt.clone());
-                self.agent.set_system_prompt(system_prompt).await;
+            // verbatim is indistinguishable from one that returns nothing. The reduction reports a
+            // prompt only when it differs from `base`, so an unchanged one is read as "no override",
+            // which agrees with pi on the resulting prompt for every input and differs only in
+            // which slot holds the identical text.
+            match system_prompt {
+                Some(system_prompt) => {
+                    *Self::lock(&self.system_prompt_override) = Some(system_prompt.clone());
+                    self.agent.set_system_prompt(system_prompt).await;
+                }
+                None => {
+                    *Self::lock(&self.system_prompt_override) = None;
+                    self.agent.set_system_prompt(base.clone()).await;
+                }
             }
             messages.extend(injected.iter().map(core_message_to_agent));
         } else {
-            // Blocked/Handled (no Pi analogue here): keep the base prompt, no injection.
+            // Nothing changed, or the chain was blocked/handled (no Pi analogue here): keep the
+            // base prompt, no injection.
             *Self::lock(&self.system_prompt_override) = None;
             self.agent.set_system_prompt(base.clone()).await;
         }

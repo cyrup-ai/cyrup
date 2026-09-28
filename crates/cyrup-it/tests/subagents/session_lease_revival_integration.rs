@@ -146,6 +146,7 @@ fn base_config(run_id: RunId, steps: Vec<RunnerStep>, dir: &Path) -> RunnerConfi
         usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),

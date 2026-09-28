@@ -130,3 +130,52 @@ async fn session_dag_flattens_a_real_multi_branch_session() {
     // Pre-order: the first node is a root (depth 0).
     assert_eq!(dag[0].depth, 0, "pre-order flatten must start at a root");
 }
+
+/// SESS-S05 — the DAG carries pi's `SessionTreeNode.label` and `.labelTimestamp`
+/// (`session-manager.ts:163-165` @v0.87.1) as their own fields, set through the same live
+/// `set_label` path `/tree`'s label editor persists through; the row text no longer has the label
+/// baked in, so the TUI can compose pi's `[label] <time> content` itself.
+#[tokio::test]
+async fn session_dag_carries_the_label_and_when_it_was_set() {
+    use cyrup_ext::host::HostServices as _;
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("answer")],
+        StopReason::Stop,
+    )]);
+    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(&fx))
+        .build()
+        .await
+        .expect("build session");
+    let _ = session.prompt("port the editor").await.expect("prompt");
+    session.wait_for_idle().await;
+    let user_id = session.user_messages_for_forking().await[0]
+        .entry_id
+        .clone();
+    session
+        .services()
+        .host_services
+        .set_label(user_id.as_str(), Some("checkpoint"));
+
+    let dag = session.session_dag().await;
+    let node = dag
+        .iter()
+        .find(|n| n.entry_id == user_id)
+        .expect("the labelled user message is in the DAG");
+    assert_eq!(node.user_label.as_deref(), Some("checkpoint"));
+    let stamped = node.label_timestamp.as_deref().expect("labelTimestamp");
+    time::OffsetDateTime::parse(stamped, &time::format_description::well_known::Rfc3339)
+        .expect("an RFC3339 label timestamp");
+    assert!(
+        node.label.starts_with("user: "),
+        "the row text is the entry alone, not `[label] …`: {}",
+        node.label
+    );
+    assert!(
+        dag.iter()
+            .filter(|n| n.entry_id != user_id)
+            .all(|n| n.user_label.is_none() && n.label_timestamp.is_none()),
+        "{dag:#?}"
+    );
+}

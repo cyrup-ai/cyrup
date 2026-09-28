@@ -584,6 +584,107 @@ async fn route_child_stop_requests(
     }
 }
 
+// =================================================================================================
+// SUBA-128 — the pre-deadline checkpoint request
+// =================================================================================================
+
+/// pi's `source: "deadline-checkpoint"` (`subagent-runner.ts:3401` @v0.71.0): the steer-request
+/// source the runner stamps on its own checkpoint request.
+pub(super) const DEADLINE_CHECKPOINT_SOURCE: &str = "deadline-checkpoint";
+
+/// The shortest delay upstream arms the checkpoint timer for (`checkpointDelayMs >= 1_000`,
+/// `subagent-runner.ts:3388`): a checkpoint that would fire within a second of launch is skipped.
+const MIN_DEADLINE_CHECKPOINT_DELAY_MS: u64 = 1_000;
+
+/// pi's checkpoint delay (`subagent-runner.ts:3384-3388` @v0.71.0): `remainingMs -
+/// checkpointBeforeDeadlineMs`, armed only for a positive checkpoint and a delay of at least a
+/// second.
+pub(super) fn deadline_checkpoint_delay_ms(
+    remaining_ms: u64,
+    checkpoint_before_deadline_ms: Option<u64>,
+) -> Option<u64> {
+    let checkpoint = checkpoint_before_deadline_ms.filter(|ms| *ms > 0)?;
+    remaining_ms
+        .checked_sub(checkpoint)
+        .filter(|delay| *delay >= MIN_DEADLINE_CHECKPOINT_DELAY_MS)
+}
+
+/// pi's checkpoint steer text (`subagent-runner.ts:3402` @v0.71.0), verbatim; `seconds` is
+/// `Math.round(Math.max(0, deadlineAt - now) / 1000)`.
+pub(super) fn deadline_checkpoint_message(seconds: u64) -> String {
+    format!(
+        "Deadline checkpoint from the runner: this run is killed in about {seconds} seconds. Finish the current tool call only, then stop and reply with a handoff: changed files, build/test state, remaining work, and commit/PR state. Do not start new work."
+    )
+}
+
+/// SUBA-128 — pi's `checkpointTimer` (`subagent-runner.ts:3379-3406` @v0.71.0): with a deadline and
+/// a `checkpointBeforeDeadlineMs`, wait until that long before the deadline and — unless the run
+/// already timed out, stopped or was interrupted, or no child is running — ask the running
+/// children to finish the current tool call and hand off.
+///
+/// Upstream routes the request "like any external steer so its lifecycle records the receipt"
+/// (`:3382`); this task does the same by writing it into the run's own steer queue, so
+/// [`route_steer_requests`] hands it to every running child and records
+/// `subagent.steer.requested` exactly as it does for `action: "steer"`. `None` when no timer is
+/// armed.
+pub(super) fn spawn_deadline_checkpoint(
+    run_paths: RunPaths,
+    flags: &ControlFlags,
+    shared_status: SharedStatus,
+    deadline_at_ms: Option<u64>,
+    checkpoint_before_deadline_ms: Option<u64>,
+) -> Option<ControlWatcherHandle> {
+    let deadline_at_ms = deadline_at_ms?;
+    let now = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
+    let delay_ms = deadline_checkpoint_delay_ms(
+        deadline_at_ms.saturating_sub(now),
+        checkpoint_before_deadline_ms,
+    )?;
+    let ended = [
+        Arc::clone(&flags.timed_out),
+        Arc::clone(&flags.stopped),
+        Arc::clone(&flags.interrupted),
+    ];
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if ended
+            .iter()
+            .any(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return;
+        }
+        let running = lock_status(&shared_status)
+            .steps
+            .iter()
+            .any(|step| step.status == StepState::Running);
+        if !running {
+            return;
+        }
+        let now = crate::time::now_epoch_millis();
+        let remaining_ms = deadline_at_ms.saturating_sub(u64::try_from(now).unwrap_or(0));
+        let request = control::SteerRequest {
+            kind: "steer".to_string(),
+            id: format!("{DEADLINE_CHECKPOINT_SOURCE}-{now}"),
+            ts: now,
+            message: deadline_checkpoint_message(remaining_ms.saturating_add(500) / 1_000),
+            // pi `mode: "steer"`, which the wire writes as absent.
+            mode: None,
+            target_index: None,
+            source: Some(DEADLINE_CHECKPOINT_SOURCE.to_string()),
+        };
+        if let Err(error) = control::write_steer_request_to_dir(
+            &control::steer_requests_dir(&run_paths.run_dir),
+            &request,
+        )
+        .await
+        {
+            // Best-effort, as upstream's own is: the deadline kill still applies.
+            tracing::warn!(%error, "the deadline checkpoint request could not be queued");
+        }
+    });
+    Some(ControlWatcherHandle { handle })
+}
+
 /// RAII wrapper aborting the spawned control-inbox watcher task on drop, so a caller ([`run`](super::run))
 /// never needs to remember to clean it up explicitly — the watcher's only useful lifetime is the
 /// duration of [`run`](super::run)'s own step loop.
@@ -1043,5 +1144,121 @@ mod tests {
             .collect();
         assert_eq!(messages, vec!["first".to_string(), "second".to_string()]);
         assert_eq!(lock_status(&shared).steps[0].telemetry.steer_count, Some(2));
+    }
+
+    /// SUBA-128 — pi's `checkpointDelayMs` (`subagent-runner.ts:3384-3388` @v0.71.0): armed only
+    /// for a positive checkpoint whose delay is at least a second.
+    #[test]
+    fn the_checkpoint_delay_is_the_remaining_time_less_the_checkpoint_and_at_least_a_second() {
+        assert_eq!(
+            deadline_checkpoint_delay_ms(10_000, Some(5_000)),
+            Some(5_000)
+        );
+        assert_eq!(
+            deadline_checkpoint_delay_ms(10_000, Some(9_000)),
+            Some(1_000)
+        );
+        assert_eq!(deadline_checkpoint_delay_ms(10_000, Some(9_001)), None);
+        assert_eq!(deadline_checkpoint_delay_ms(10_000, Some(20_000)), None);
+        assert_eq!(deadline_checkpoint_delay_ms(10_000, Some(0)), None);
+        assert_eq!(deadline_checkpoint_delay_ms(10_000, None), None);
+        assert_eq!(
+            deadline_checkpoint_message(5),
+            "Deadline checkpoint from the runner: this run is killed in about 5 seconds. Finish the current tool call only, then stop and reply with a handoff: changed files, build/test state, remaining work, and commit/PR state. Do not start new work."
+        );
+    }
+
+    /// SUBA-128 — the armed timer queues pi's `deadline-checkpoint` steer about `checkpoint` before
+    /// the deadline, and the steer router hands it to the running child like any external steer,
+    /// recording `subagent.steer.requested` with its source.
+    #[tokio::test]
+    async fn the_deadline_checkpoint_reaches_the_running_child_before_the_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a", "b"], &[1]);
+        let (flags, _cancel) = init_control_flags(&paths).await;
+        let now = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
+        let _timer = spawn_deadline_checkpoint(
+            paths.clone(),
+            &flags,
+            Arc::clone(&shared),
+            Some(now + 3_200),
+            Some(2_000),
+        )
+        .expect("a deadline and a checkpoint arm the timer");
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            control::consume_steer_requests(&paths.run_dir)
+                .await
+                .is_empty(),
+            "nothing is requested before the checkpoint"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+        let mut events = RunEventLog::create(&paths.events).await.ok();
+        let mut pending = Vec::new();
+        route_steer_requests(&paths, &shared, &mut events, &mut pending).await;
+        let inbox = control::step_steer_inbox_dir(&paths.run_dir, 1);
+        let files: Vec<_> = std::fs::read_dir(&inbox)
+            .expect("the running child's inbox")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1);
+        let request: control::SteerRequest =
+            serde_json::from_str(&std::fs::read_to_string(files[0].path()).expect("read"))
+                .expect("parse");
+        assert_eq!(request.source.as_deref(), Some(DEADLINE_CHECKPOINT_SOURCE));
+        assert!(
+            request.id.starts_with("deadline-checkpoint-"),
+            "{}",
+            request.id
+        );
+        assert_eq!(request.message, deadline_checkpoint_message(2));
+        let log = std::fs::read_to_string(&paths.events).expect("events.jsonl");
+        assert!(
+            log.lines()
+                .any(|line| line.contains("subagent.steer.requested")
+                    && line.contains(DEADLINE_CHECKPOINT_SOURCE)),
+            "{log}"
+        );
+    }
+
+    /// SUBA-128 — pi's `if (timedOut || stopped || interrupted) return;` and "no running step"
+    /// guards: a run that already ended, or has no child running, is not steered.
+    #[tokio::test]
+    async fn an_ended_or_idle_run_gets_no_deadline_checkpoint() {
+        for (running, stop) in [(&[1usize][..], true), (&[][..], false)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (paths, shared) = steer_fixture(dir.path(), &["a", "b"], running);
+            let (flags, _cancel) = init_control_flags(&paths).await;
+            if stop {
+                flags
+                    .stopped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let now = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
+            let _timer = spawn_deadline_checkpoint(
+                paths.clone(),
+                &flags,
+                Arc::clone(&shared),
+                Some(now + 1_100),
+                Some(50),
+            )
+            .expect("armed");
+            tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+            assert!(
+                control::consume_steer_requests(&paths.run_dir)
+                    .await
+                    .is_empty(),
+                "stopped={stop}, running={running:?}"
+            );
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (paths, shared) = steer_fixture(dir.path(), &["a"], &[0]);
+        let (flags, _cancel) = init_control_flags(&paths).await;
+        assert!(
+            spawn_deadline_checkpoint(paths, &flags, shared, None, Some(5_000)).is_none(),
+            "no deadline, no timer"
+        );
     }
 }

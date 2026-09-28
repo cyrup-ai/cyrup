@@ -71,7 +71,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cyrup_agent::{Agent, AgentMessage};
 use cyrup_core::{AssistantMessage, CancelToken, EventStream, ModelRef, SessionId};
-use cyrup_session::compaction::{BranchSummarySettings, CompactionSettings};
+use cyrup_session::compaction::BranchSummarySettings;
 use cyrup_session::manager::SessionManager;
 use cyrup_tools::ProcOps;
 use tokio::sync::Mutex as AsyncMutex;
@@ -93,12 +93,13 @@ use adapters::{SessionActivityHandle, SessionCatalogHandle};
 /// keep the constructor signature bounded.
 pub(crate) struct SessionExtras {
     pub telemetry_enabled: bool,
-    pub compaction_settings: CompactionSettings,
     pub branch_summary_settings: BranchSummarySettings,
     pub auto_compaction_enabled: bool,
     pub auto_retry_enabled: bool,
     pub retry_max_retries: u32,
     pub retry_base_delay_ms: u64,
+    /// `retry.maxAgentDelayMs` (Pi `getRetrySettings().maxAgentDelayMs`, default 60 000).
+    pub retry_max_agent_delay_ms: u64,
     pub proc: Arc<dyn ProcOps>,
     /// `shellPath` setting (Pi `getShellPath`, settings-manager.ts:864-865); resolved fresh on
     /// every immediate-bash call (see [`AgentSession::execute_bash`]), never baked in at build time.
@@ -181,7 +182,6 @@ pub struct AgentSession {
     /// turn-boundary refresh re-push a system prompt WITHOUT undoing a handler's mid-run
     /// sanitization, which is why cyrup's single-slot version could not push one at all (DRIFT-033).
     system_prompt_override: Mutex<Option<String>>,
-    compaction_settings: CompactionSettings,
     branch_summary_settings: BranchSummarySettings,
     /// Long-lived token handed to the extension subscriber (distinct from per-run cancellation).
     session_cancel: CancelToken,
@@ -240,6 +240,7 @@ pub struct AgentSession {
     retry_enabled_default: bool,
     retry_max_retries: u32,
     retry_base_delay_ms: u64,
+    retry_max_agent_delay_ms: u64,
     // ---- auto-compaction (Pi agent-session.ts:831,1811-1905,2078-2086) ----
     /// Runtime override of the settings `compaction.enabled` toggle (Pi `setAutoCompactionEnabled`).
     auto_compaction_override: Mutex<Option<bool>>,
@@ -308,6 +309,18 @@ pub struct AgentSession {
     /// A keep-alive receiver so `driver_tx.send` never fails for want of a live receiver (a watch
     /// `Sender` with zero receivers drops the sent value); `wait_for_idle` subscribes fresh ones.
     _driver_keepalive: tokio::sync::watch::Receiver<bool>,
+    /// `true` from the moment a settling run clears pi's `_isAgentRunActive` (the first statement of
+    /// `_emitAgentSettled`, `agent-session.ts:872` @v0.87.1) until `driver_tx` drops or a new run
+    /// starts. `driver_tx` is cyrup's run latch AND its idle latch; pi releases the first BEFORE the
+    /// `agent_settled` emit and the second only after the deferred settled actions (SEAM-129), so
+    /// [`Self::is_run_active`] reads `driver_tx` through this.
+    run_released: AtomicBool,
+    /// Pi `_isEmittingAgentSettled` (`agent-session.ts:378` @v0.87.1): set for the length of the
+    /// `agent_settled` emit, during which a prompt or a trigger-turn message is deferred.
+    emitting_settled: AtomicBool,
+    /// Pi `_deferredSettledActions` (`agent-session.ts:379`): submissions made while
+    /// [`Self::emitting_settled`] was set, run in order once the emit returns.
+    deferred_settled: Mutex<Vec<run::DeferredSettled>>,
     /// Bumped every time a compaction or branch-summary cancel slot is cleared — the idle edge of a
     /// compaction (SEAM-125). [`Self::is_idle`] counts a running compaction as busy (pi v0.85.1+
     /// `isIdle = !_isAgentRunActive && !isCompacting`), so [`Self::wait_for_idle`] needs something
@@ -365,7 +378,6 @@ impl AgentSession {
             compaction_model: Mutex::new(compaction_model),
             base_system_prompt: Mutex::new(base_system_prompt),
             system_prompt_override: Mutex::new(None),
-            compaction_settings: extras.compaction_settings,
             branch_summary_settings: extras.branch_summary_settings,
             session_cancel,
             session_id,
@@ -388,6 +400,7 @@ impl AgentSession {
             retry_enabled_default: extras.auto_retry_enabled,
             retry_max_retries: extras.retry_max_retries,
             retry_base_delay_ms: extras.retry_base_delay_ms,
+            retry_max_agent_delay_ms: extras.retry_max_agent_delay_ms,
             auto_compaction_override: Mutex::new(None),
             auto_compaction_enabled_default: extras.auto_compaction_enabled,
             auto_compaction_cancel: Mutex::new(None),
@@ -406,6 +419,9 @@ impl AgentSession {
             last_assistant: Mutex::new(None),
             driver_tx: driver_tx_init,
             _driver_keepalive: driver_keepalive,
+            run_released: AtomicBool::new(false),
+            emitting_settled: AtomicBool::new(false),
+            deferred_settled: Mutex::new(Vec::new()),
             compaction_settled: tokio::sync::watch::channel(0).0,
             runtime_actions: OnceLock::new(),
             shutdown_requested: AtomicBool::new(false),
@@ -545,8 +561,14 @@ impl AgentSession {
     /// directly and no driver loop exists. A running compaction is deliberately NOT part of it
     /// (pi's `isStreaming` is `_isAgentRunActive` alone) — see [`Self::is_idle`] for the predicate
     /// that does count it (SEAM-125).
+    ///
+    /// SEAM-129 — `driver_tx` stays `true` through the `agent_settled` emit and the deferred actions
+    /// after it, because it is also the idle latch; pi's run latch is already `false` there
+    /// (`_emitAgentSettled` clears it before emitting, `agent-session.ts:872` @v0.87.1), so the
+    /// released window reads as not active.
     pub fn is_run_active(&self) -> bool {
-        *self.driver_tx.borrow() || self.agent.is_running()
+        (*self.driver_tx.borrow() && !self.run_released.load(Ordering::SeqCst))
+            || self.agent.is_running()
     }
 
     /// Whether an [`Self::abort`] landed during the current run — Pi `_agentRunAbortRequested`

@@ -282,6 +282,7 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -404,6 +405,7 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -558,6 +560,7 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -723,6 +726,7 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -875,6 +879,7 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -1019,6 +1024,7 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -1189,6 +1195,7 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -1336,6 +1343,7 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -1471,6 +1479,7 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -1620,6 +1629,7 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
             usage_budget: None,
             timeout_ms: None,
             deadline_at_ms: None,
+            checkpoint_before_deadline_ms: None,
             share: None,
             artifacts_dir: None,
             artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -1749,6 +1759,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
         // The three fields under test, plus the timeout pair left at its default.
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: Some(true),
         artifacts_dir: Some(artifacts_dir.clone()),
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::foreground(),
@@ -1884,6 +1895,7 @@ async fn the_runner_writes_no_artifacts_when_the_run_disabled_them() {
         usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         // Both halves of pi's two-term gate say "off", which is exactly what an explicit
         // `artifacts: false` produces on the orchestrator side.
@@ -1965,6 +1977,7 @@ async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_
         // One hour in the PAST: `deadline_at_ms - now` underflows, and only a saturating
         // subtraction yields the correct "already expired" deadline.
         deadline_at_ms: Some(1),
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -2071,6 +2084,7 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -2321,6 +2335,7 @@ fn child_stop_chain_config(
         usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -2977,6 +2992,7 @@ async fn a_worktree_fan_out_publishes_a_real_parallel_handoff_manifest() {
         usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -3213,6 +3229,7 @@ async fn a_background_runs_status_and_result_carry_the_childs_runtime_acknowledg
         usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),

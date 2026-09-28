@@ -109,6 +109,18 @@ impl<B: Backend> App<B> {
                 .map(|(id, _)| id.as_str().to_string())
                 .collect();
         }
+        // EXT-051: an extension provider's `oauth.isSubscription` is pi's `auth.oauth.isSubscription`
+        // for that provider (`adaptOAuth`, `core/provider-composer.ts:276-279` @v0.87.1).
+        let registry = session.services().ext_host.registry();
+        self.state.extension_oauth_subscription = registry
+            .provider_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|id| {
+                let reg = registry.provider_registration(&id).ok().flatten()?;
+                reg.has_oauth().then(|| (id, reg.oauth_is_subscription()))
+            })
+            .collect();
         self.refresh_subscription_marker();
         // `available_model_catalog()` is auth-FILTERED (`cyrup-session-svc/src/session/model.rs:235-237`),
         // so a login or a logout changes which models `/model ` may offer. This is the seam every
@@ -167,10 +179,17 @@ impl<B: Backend> App<B> {
         if provider_id == KIMI_CODING_PROVIDER_ID {
             return true;
         }
-        self.state.oauth_credential_providers.contains(provider_id)
-            && self
+        // An extension provider's own `oauth` block answers for its id — pi's `registerProvider`
+        // hands the composed provider an `auth.oauth` adapted from it (`adaptOAuth`,
+        // `core/provider-composer.ts:276-279` @v0.87.1), so `models.getProvider(id)` reads the
+        // extension's `isSubscription` (EXT-051). Otherwise the built-in strategy's.
+        let subscription = match self.state.extension_oauth_subscription.get(provider_id) {
+            Some(is_subscription) => *is_subscription,
+            None => self
                 .provider_oauth_strategy(provider_id)
-                .is_some_and(|oauth| oauth.is_subscription())
+                .is_some_and(|oauth| oauth.is_subscription()),
+        };
+        self.state.oauth_credential_providers.contains(provider_id) && subscription
     }
 
     /// Recompute the footer's ` (sub)` marker for the currently-active provider. pi has no such
@@ -722,13 +741,13 @@ impl<B: Backend> App<B> {
             // (`:5957`). cyrup's coordinator distinguishes THIS caller's token firing (`timed_out`)
             // from the shared operation aborting (`aborted`, `catalog_refresh.rs:90-95`); pi has only
             // the one flag, and both are its `result.aborted`.
-            self.state.transcript.push_warning(format!(
+            self.state.transcript.show_warning(format!(
                 "{action}, but its model catalog refresh timed out; using cached models."
             ));
         } else if !msg.result.errors.is_empty() {
             // `` `${actionLabel}, but its model catalog could not be refreshed; using cached models.` ``
             // (`:5959`).
-            self.state.transcript.push_warning(format!(
+            self.state.transcript.show_warning(format!(
                 "{action}, but its model catalog could not be refreshed; using cached models."
             ));
         }

@@ -2,8 +2,8 @@
 //!
 //! ## One request per connection is not a choice
 //!
-//! herdr's `handle_connection_with_stop` (`tmp/herdr/src/api/server.rs:156-317`) reads **one** line
-//! via `read_initial_request_line` (`:168`, `:528-537`), dispatches it, writes one line (`:301`),
+//! herdr's `handle_connection_with_stop` (`tmp/herdr/src/api/server.rs:156-304`) reads **one** line
+//! via `read_initial_request_line` (`:168`, `:514-523`), dispatches it, writes one line (`:288`),
 //! and returns. There is no read loop. Every independent client agrees, which is how you know it is
 //! the contract and not an accident:
 //!
@@ -42,12 +42,12 @@ use crate::schema::{Request, ResponseResult, WireResponse};
 ///
 /// Checked here before a byte is written, so an over-long request fails with a
 /// [`HerdrError::TooLarge`] naming the bound instead of herdr closing the connection with
-/// `"api request line is too large"` (`server.rs:563-567`) and this client reporting a bare EOF.
+/// `"api request line is too large"` (`server.rs:549-553`) and this client reporting a bare EOF.
 ///
 /// **The bound is the JSON line, not the line plus its terminator** — herdr's is the same, and
 /// the parity is exact rather than approximate. `read_initial_request_line_with_limits`
 /// accumulates the request byte by byte and tests `bytes.len() > max_bytes` **only after pushing
-/// a non-newline byte** (`server.rs:556-568`); the `\n` branch above it breaks out before any
+/// a non-newline byte** (`server.rs:542-554`); the `\n` branch above it breaks out before any
 /// length check. So herdr accepts a JSON line of exactly `MAX_REQUEST_BYTES` and refuses at
 /// `MAX_REQUEST_BYTES + 1`, and [`write_line`] refuses at exactly the same place. Counting the
 /// newline here would make this client one byte stricter than the server and silently break a
@@ -74,7 +74,7 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// is merely slow answers rather than being cut off — herdr will report its own `timeout` code.
 ///
 /// It exists because **there is no herdr-side deadline on a plain dispatch**:
-/// `tmp/herdr/src/api/server.rs:911-913` is a `recv()` with `None` timeout. Without this deadline
+/// `tmp/herdr/src/api/server.rs:896-898` is a `recv()` with `None` timeout. Without this deadline
 /// a busy UI is a hang.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -199,7 +199,7 @@ impl AsyncWrite for LocalStream {
 /// Write one `\n`-terminated JSON line, bounded and deadlined.
 ///
 /// Framing: one JSON value per `\n`-terminated line, both directions
-/// (`tmp/herdr/src/api/client.rs:185-190` writes it, `tmp/herdr/src/api/server.rs:539-583` reads
+/// (`tmp/herdr/src/api/client.rs:158-163` writes it, `tmp/herdr/src/api/server.rs:525-569` reads
 /// it).
 ///
 /// # Errors
@@ -212,7 +212,7 @@ pub async fn write_line<W: AsyncWrite + Unpin>(
     line: &str,
 ) -> Result<()> {
     // `>` and not `>=`, and the newline is NOT counted: herdr's own check is
-    // `bytes.len() > max_bytes` over the bytes before the terminator (`server.rs:556-568`). See
+    // `bytes.len() > max_bytes` over the bytes before the terminator (`server.rs:542-554`). See
     // [`MAX_REQUEST_BYTES`].
     if line.len() > MAX_REQUEST_BYTES {
         return Err(HerdrError::TooLarge {
@@ -281,11 +281,17 @@ pub async fn read_line<R: AsyncRead + Unpin>(
 ///   mismatched id cannot be a pipelining artefact, so the payload describes something other than
 ///   what was asked — accepting it would hand a caller another pane's data as its own. pi drops it
 ///   too (`herdr-connection.ts:86`).
-/// - **An error envelope is fatal whatever its `id`**, including the empty one. herdr writes
-///   `{"id":"","error":{"code":"invalid_request",…}}` when the line did not deserialise and it
-///   could not recover a correlation id (`tmp/herdr/src/api/server.rs:180-201`). Requiring a
-///   matching id before treating an error as fatal would make that shape invisible, and the call
-///   would sit until its deadline instead of reporting what herdr actually said.
+/// - **An error envelope is fatal whatever its `id`**, including the empty one. At the pinned
+///   `v0.9.1`, herdr writes `{"id":"","error":{"code":"invalid_request",…}}` for **every** line
+///   that does not deserialise as a `Request` — an unknown method or a bad param included — and
+///   never echoes the id it was sent (`tmp/herdr/src/api/server.rs:179-191`); a failed
+///   `events.subscribe` setup answers with its internal probe's id, `<id>:sub:<n>:probe`
+///   (`tmp/herdr/src/api/subscriptions.rs:184-192`, `:210`, written unchanged at
+///   `server.rs:721-729`). herdr's `main` after that tag echoes the request's id in both cases
+///   (`241063f7`, *"preserve request ids in socket error responses"*). Both shapes end the call
+///   here, so neither build is misread: requiring a matching id before treating an error as fatal
+///   would make the `v0.9.1` shapes invisible, and the call would sit until its deadline instead
+///   of reporting what herdr actually said.
 pub async fn request(
     socket: &Path,
     request: &Request,

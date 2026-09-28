@@ -30,8 +30,8 @@
 //! 2. **Mode.** [`crate::keymap::AltScreenKeymap::action_in_mode`] resolves nothing at all under
 //!    [`TuiRenderMode::Regular`], so even a caller that routed an inline key through here would
 //!    move no viewport. That is why `pageUp` in an inline session still reaches
-//!    `tui.editor.pageUp` and cyrup's `app.pageUp` exactly as it did before this ADR — the two
-//!    tables are disjoint at resolution time, not merely at call-site discipline.
+//!    `tui.editor.pageUp` exactly as it did before this ADR — the two tables are disjoint at
+//!    resolution time, not merely at call-site discipline.
 //!
 //! # A release consumes but does not act
 //! Every one of upstream's arms is `if (!isRelease) …; return { consume: true }` (`:601-644`, over

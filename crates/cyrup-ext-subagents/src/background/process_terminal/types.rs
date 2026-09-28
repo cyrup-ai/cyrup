@@ -418,6 +418,11 @@ pub enum ProcessTerminal {
         reason: ProcessTerminalReason,
         /// The error sentence that produced the refusal, when there was one (`:712`).
         diagnostic: Option<String>,
+        /// SUBA-141 — the runner's own exit, when its close was observed even though the process
+        /// tree could not be verified (`shared/types.ts:709-710` @v0.71.0, `2e280687`/#2427).
+        /// Empty is upstream's absent key. It is what lets a stale-run repair say how the runner
+        /// died instead of only that it did.
+        instances: Vec<ProcessInstanceExit>,
     },
 }
 
@@ -511,8 +516,17 @@ impl From<ProcessTerminal> for RawProcessTerminal {
                 canonical_session.clone(),
             ),
             ProcessTerminal::Unknown {
-                reason, diagnostic, ..
-            } => (None, None, Some(*reason), diagnostic.clone(), None),
+                reason,
+                diagnostic,
+                instances,
+                ..
+            } => (
+                None,
+                (!instances.is_empty()).then(|| instances.clone()),
+                Some(*reason),
+                diagnostic.clone(),
+                None,
+            ),
         };
         let base = value.base();
         Self {
@@ -561,6 +575,7 @@ impl TryFrom<RawProcessTerminal> for ProcessTerminal {
                     .reason
                     .ok_or("unknown process-terminal proof is missing reason")?,
                 diagnostic: raw.diagnostic,
+                instances: raw.instances.unwrap_or_default(),
             },
         })
     }

@@ -199,6 +199,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -429,6 +430,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -813,6 +815,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
         deadline_at_ms: None,
+        checkpoint_before_deadline_ms: None,
         share: None,
         artifacts_dir: None,
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
@@ -1260,6 +1263,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
                 // carries none of the SINGLE-mode overrides.
                 run_id: cyrup_ext_subagents::background::RunId::new(),
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
                 share: None,
                 artifacts_dir: None,
                 artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),

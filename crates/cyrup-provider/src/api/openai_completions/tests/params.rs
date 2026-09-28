@@ -82,6 +82,7 @@ fn request_body_matches_openai_shape() {
                 deferred: None,
                 error_message: None,
                 raw_stop_reason: None,
+                end_turn: None,
                 timestamp: 0,
             }),
             Message::ToolResult {
@@ -401,5 +402,305 @@ fn baseten_omits_reasoning_effort_for_a_nulled_rung_and_without_effort_support()
     assert_eq!(
         body["chat_template_args"],
         json!({ "enable_thinking": true })
+    );
+}
+
+/// PROV-079 — pi #9797 (`openai-completions.ts:1261` @v0.87.1): an attachment sent with no prompt
+/// text carries only the image part, not a leading `{"type":"text","text":""}` that some
+/// OpenAI-compatible providers reject. Non-empty text parts are kept, in order.
+#[test]
+fn empty_text_parts_are_dropped_from_a_user_content_array() {
+    let mut m = model();
+    m.input = vec![Modality::Text, Modality::Image];
+    let image = Content::Image {
+        data: "aGk=".to_string(),
+        mime_type: "image/png".to_string(),
+    };
+    let ctx = Context {
+        system_prompt: None,
+        messages: vec![Message::User {
+            content: vec![Content::text(""), image.clone()],
+            timestamp: 0,
+        }],
+        tools: vec![],
+    };
+    let body = build_body(&m, &ctx, &StreamOptions::default());
+    assert_eq!(
+        body["messages"][0]["content"],
+        json!([{ "type": "image_url", "image_url": { "url": "data:image/png;base64,aGk=" } }]),
+        "{body}"
+    );
+
+    let ctx = Context {
+        system_prompt: None,
+        messages: vec![Message::User {
+            content: vec![Content::text("look"), Content::text(""), image],
+            timestamp: 0,
+        }],
+        tools: vec![],
+    };
+    let body = build_body(&m, &ctx, &StreamOptions::default());
+    let parts = body["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 2, "{body}");
+    assert_eq!(parts[0], json!({ "type": "text", "text": "look" }));
+    assert_eq!(parts[1]["type"], "image_url");
+}
+
+/// PROV-100 — `test/openai-completions-thinking-token-budget.test.ts` @v0.87.1, translated. A local
+/// vLLM GLM row (`maxTokens: 16384`) whose compat is `{thinkingFormat:"zai",
+/// supportsThinkingTokenBudget:true}` unless a case overrides it. `max_tokens` is what pi's
+/// `streamSimple` resolves (`options.maxTokens ?? model.maxTokens`, clamped to a context this
+/// window never reaches).
+mod prov100_thinking_token_budget {
+    use super::*;
+    use crate::api::compat::{ThinkingFormat, ThinkingTokenBudgetField};
+    use crate::utils::simple_options::ThinkingBudgets;
+
+    fn vllm_model(compat: Option<ModelCompat>) -> Model {
+        let mut m = model();
+        m.id = "zai-org/glm-5.2".into();
+        m.provider = "local-vllm".into();
+        m.base_url = "http://localhost:8000/v1".to_string();
+        m.context_window = 262_144;
+        m.max_tokens = 16_384;
+        m.compat = Some(compat.unwrap_or(ModelCompat {
+            thinking_format: Some(ThinkingFormat::Zai),
+            supports_thinking_token_budget: Some(true),
+            ..Default::default()
+        }));
+        m
+    }
+
+    fn capture(
+        m: &Model,
+        reasoning: ModelThinkingLevel,
+        budgets: Option<ThinkingBudgets>,
+        max_tokens: Option<u64>,
+    ) -> Value {
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::User {
+                content: vec![Content::text("Hi")],
+                timestamp: 0,
+            }],
+            tools: vec![],
+        };
+        build_body(
+            m,
+            &ctx,
+            &StreamOptions {
+                reasoning,
+                thinking_budgets: budgets,
+                max_tokens: Some(max_tokens.unwrap_or(m.max_tokens)),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn medium(n: u64) -> Option<ThinkingBudgets> {
+        Some(ThinkingBudgets {
+            medium: Some(n),
+            ..Default::default()
+        })
+    }
+
+    fn high(n: u64) -> Option<ThinkingBudgets> {
+        Some(ThinkingBudgets {
+            high: Some(n),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn sends_the_configured_budget_for_the_requested_level() {
+        let p = capture(
+            &vllm_model(None),
+            ModelThinkingLevel::Medium,
+            medium(4096),
+            None,
+        );
+        assert_eq!(p["thinking_token_budget"], 4096, "{p}");
+    }
+
+    #[test]
+    fn omits_the_budget_when_neither_the_field_nor_the_alias_is_set() {
+        let m = vllm_model(Some(ModelCompat {
+            thinking_format: Some(ThinkingFormat::Zai),
+            ..Default::default()
+        }));
+        let p = capture(&m, ModelThinkingLevel::Medium, medium(4096), None);
+        for field in [
+            "thinking_token_budget",
+            "thinking_budget",
+            "thinking_budget_tokens",
+        ] {
+            assert!(p.get(field).is_none(), "{field}: {p}");
+        }
+    }
+
+    #[test]
+    fn omits_the_budget_when_thinking_is_off() {
+        let p = capture(&vllm_model(None), ModelThinkingLevel::Off, high(8192), None);
+        assert!(p.get("thinking_token_budget").is_none(), "{p}");
+    }
+
+    #[test]
+    fn clamps_xhigh_and_max_to_the_high_budget() {
+        for level in [ModelThinkingLevel::Xhigh, ModelThinkingLevel::Max] {
+            let p = capture(&vllm_model(None), level, high(8192), None);
+            assert_eq!(p["thinking_token_budget"], 8192, "{level:?}: {p}");
+        }
+    }
+
+    #[test]
+    fn leaves_room_for_the_answer_when_the_budget_meets_the_response_ceiling() {
+        let p = capture(&vllm_model(None), ModelThinkingLevel::High, None, None);
+        assert_eq!(p["thinking_token_budget"], 16_384 - 1024, "{p}");
+    }
+
+    #[test]
+    fn uses_the_caller_max_tokens_as_the_ceiling_when_lower_than_the_model_cap() {
+        let p = capture(
+            &vllm_model(None),
+            ModelThinkingLevel::High,
+            high(8192),
+            Some(4096),
+        );
+        assert_eq!(p["thinking_token_budget"], 4096 - 1024, "{p}");
+    }
+
+    #[test]
+    fn sends_the_named_field_when_thinking_token_budget_field_is_set() {
+        for (field, name) in [
+            (ThinkingTokenBudgetField::ThinkingBudget, "thinking_budget"),
+            (
+                ThinkingTokenBudgetField::ThinkingBudgetTokens,
+                "thinking_budget_tokens",
+            ),
+        ] {
+            let m = vllm_model(Some(ModelCompat {
+                thinking_format: Some(ThinkingFormat::Qwen),
+                thinking_token_budget_field: Some(field),
+                ..Default::default()
+            }));
+            let p = capture(&m, ModelThinkingLevel::Medium, medium(4096), None);
+            assert_eq!(p[name], 4096, "{p}");
+            assert!(p.get("thinking_token_budget").is_none(), "{p}");
+        }
+    }
+
+    /// The two keys in their `models.json` spelling (pi's camelCase key, snake_case field values).
+    #[test]
+    fn both_keys_parse_from_their_models_json_form() {
+        for (compat, name) in [
+            (
+                json!({ "thinkingFormat": "qwen", "thinkingTokenBudgetField": "thinking_budget_tokens" }),
+                "thinking_budget_tokens",
+            ),
+            (
+                json!({ "thinkingFormat": "zai", "supportsThinkingTokenBudget": true }),
+                "thinking_token_budget",
+            ),
+        ] {
+            let m = vllm_model(Some(serde_json::from_value(compat).unwrap()));
+            let p = capture(&m, ModelThinkingLevel::Medium, medium(4096), None);
+            assert_eq!(p[name], 4096, "{p}");
+        }
+    }
+
+    #[test]
+    fn thinking_token_budget_field_wins_over_the_boolean_alias() {
+        let m = vllm_model(Some(ModelCompat {
+            thinking_format: Some(ThinkingFormat::Zai),
+            supports_thinking_token_budget: Some(true),
+            thinking_token_budget_field: Some(ThinkingTokenBudgetField::ThinkingBudget),
+            ..Default::default()
+        }));
+        let p = capture(&m, ModelThinkingLevel::Medium, medium(4096), None);
+        assert_eq!(p["thinking_budget"], 4096, "{p}");
+        assert!(p.get("thinking_token_budget").is_none(), "{p}");
+    }
+
+    /// The `$var` half: before PROV-100 cyrup resolved `thinking.budget` through the effort map
+    /// and sent `"high"` where the template expects a token count.
+    #[test]
+    fn puts_the_clamped_budget_in_chat_template_kwargs_for_thinking_budget() {
+        let template = || {
+            Some(ModelCompat {
+                thinking_format: Some(ThinkingFormat::ChatTemplate),
+                chat_template_kwargs: Some(
+                    json!({
+                        "enable_thinking": { "$var": "thinking.enabled" },
+                        "thinking_budget": { "$var": "thinking.budget" },
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+                ..Default::default()
+            })
+        };
+        let p = capture(
+            &vllm_model(template()),
+            ModelThinkingLevel::High,
+            None,
+            None,
+        );
+        assert_eq!(
+            p["chat_template_kwargs"],
+            json!({ "enable_thinking": true, "thinking_budget": 16_384 - 1024 })
+        );
+        assert!(p.get("thinking_token_budget").is_none(), "{p}");
+
+        // `"omits thinking.budget from chat_template_kwargs when thinking is off"`.
+        let p = capture(&vllm_model(template()), ModelThinkingLevel::Off, None, None);
+        assert_eq!(
+            p["chat_template_kwargs"],
+            json!({ "enable_thinking": false })
+        );
+    }
+
+    /// The same resolver feeds Baseten's `chat_template_args` (`openai-completions.ts:893`).
+    #[test]
+    fn baseten_chat_template_args_resolve_thinking_budget_too() {
+        let m = vllm_model(Some(ModelCompat {
+            thinking_format: Some(ThinkingFormat::Baseten),
+            chat_template_args: Some(
+                json!({ "budget": { "$var": "thinking.budget" } })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ..Default::default()
+        }));
+        let p = capture(&m, ModelThinkingLevel::Medium, medium(4096), None);
+        assert_eq!(p["chat_template_args"], json!({ "budget": 4096 }), "{p}");
+    }
+}
+
+/// PROV-100 — `test/openai-completions-vllm-priority.test.ts` @v0.87.1, translated:
+/// `compat.vllmPriority` is sent as the top-level `priority` request field
+/// (`openai-completions.ts:866-868`), and omitted when unset. Parsed from `models.json` form so the
+/// camelCase key is pinned too.
+#[test]
+fn vllm_priority_is_the_top_level_priority_field() {
+    let ctx = Context {
+        system_prompt: Some("sys".to_string()),
+        messages: vec![Message::User {
+            content: vec![Content::text("hi")],
+            timestamp: 0,
+        }],
+        tools: vec![],
+    };
+    let mut m = model();
+    m.compat = Some(serde_json::from_value(json!({ "vllmPriority": 10 })).unwrap());
+    assert_eq!(
+        build_body(&m, &ctx, &StreamOptions::default())["priority"],
+        10
+    );
+    assert!(
+        build_body(&model(), &ctx, &StreamOptions::default())
+            .get("priority")
+            .is_none()
     );
 }

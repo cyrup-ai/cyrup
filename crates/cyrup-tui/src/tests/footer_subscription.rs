@@ -431,3 +431,96 @@ async fn switching_to_a_non_subscription_provider_clears_the_marker() {
         "the marker must follow the ACTIVE provider (footer.ts:139-141):\n{t}"
     );
 }
+
+// ================================================================ EXT-051
+
+/// A native extension registering two OAuth providers: `ext-sub`, whose `oauth` block declares
+/// `isSubscription: true` (pi `ExtensionOAuthConfig.isSubscription`,
+/// `core/extensions/types.ts:1669` @v0.87.1), and `ext-metered`, whose block leaves it unset.
+struct OauthProviders;
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for OauthProviders {
+    fn id(&self) -> cyrup_core::ExtensionId {
+        cyrup_core::ExtensionId::from("oauth-providers")
+    }
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.register_provider(
+            "ext-sub",
+            serde_json::json!({"name": "Ext Sub", "models": [],
+                               "oauth": {"name": "Ext Sub", "isSubscription": true}}),
+        );
+        api.register_provider(
+            "ext-metered",
+            serde_json::json!({"name": "Ext Metered", "models": [],
+                               "oauth": {"name": "Ext Metered"}}),
+        );
+        Ok(())
+    }
+    async fn on_event(
+        &self,
+        _ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        cyrup_ext::HookOutcome::Noop
+    }
+}
+
+/// EXT-051 — pi's footer reads `isSubscription` off the provider's `auth.oauth`, which for an
+/// extension provider is adapted from its registration (`adaptOAuth`,
+/// `core/provider-composer.ts:276-279` @v0.87.1; `isUsingSubscription`, `model-runtime.ts:463-465`).
+/// An extension OAuth provider declaring it, used with a stored OAuth credential, prints
+/// `(sub)`; one leaving it unset, with the same credential, does not.
+///
+/// RED before this pass: `oauth_is_subscription` had no reader, and the predicate consulted only
+/// the built-in registry, where neither provider exists.
+#[tokio::test]
+async fn an_extension_oauth_provider_declaring_is_subscription_lights_the_marker() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut config = SessionConfig::new(cwd, agent_dir);
+    config.trust_override = Some(true);
+    config.no_extensions = true;
+    let session = Arc::new(
+        SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, config)
+            .with_native_extension(Arc::new(OauthProviders) as Arc<dyn cyrup_ext::NativeExtension>)
+            .build()
+            .await
+            .unwrap(),
+    );
+    for id in ["ext-sub", "ext-metered"] {
+        session
+            .services()
+            .auth
+            .modify(&ProviderId::from(id), |_| async {
+                Ok(Some(cyrup_config::auth::Credential::Oauth {
+                    refresh: "rt".into(),
+                    access: "at".into(),
+                    expires: 1_700_000_000_000,
+                    ext: serde_json::Map::new(),
+                }))
+            })
+            .await
+            .unwrap();
+    }
+
+    // The built-in registry knows neither id: only the extension registration can answer.
+    let mut app = app_with(Arc::new(Vec::new));
+    app.refresh_auth_snapshot(&session).await;
+
+    select_model(&mut app, "ext-sub", "m");
+    app.draw().unwrap();
+    let t = buf_text(&app);
+    assert!(t.contains("$0.000 (sub)"), "{t}");
+
+    select_model(&mut app, "ext-metered", "m");
+    app.draw().unwrap();
+    let t = buf_text(&app);
+    assert!(
+        !t.contains("(sub)"),
+        "an OAuth block without `isSubscription` is metered:\n{t}"
+    );
+}

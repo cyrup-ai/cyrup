@@ -13,6 +13,44 @@ Item kinds used by this area. They extend README's taxonomy for this area only:
 herdr API worth recording because a known cyrup need would use it). One `tooling` row uses README's
 own kind. Ids are `HERDR-NNN`. **Next free id: `HERDR-005`.**
 
+> ### CLOSURES 2026-09-28 — both remaining lows (`HERDR-002`, `HERDR-003`); no partials
+>
+> Landed on `claude/lows-next`, not yet committed. Each row and body section carries its evidence.
+> **The combined tree has not passed the gates.** The integration pass ran only
+> `cargo fmt --all -- --check`, which passed and changed no files. Clippy and `cargo nextest` were
+> not run on the combined diff, because `/` had 2.9 GB free, below the pass's 4 GB floor (`target/`
+> is 24 GB). Until they run, treat "green" as per-lane only. **Counted set after this pass
+> (`count_open_items.py`): 0 critical · 0 high · 0 medium · 0 low = 0 open, 4 closed** (was 0 medium ·
+> 2 low = 2 open, 2 closed). This area has no open rows. By row:
+>
+> - `HERDR-002` — the crate is pinned to the tag `v0.9.1` (`065ef9d6`), and every `tmp/herdr/...:N`
+>   citation is a line of `git show v0.9.1:<path>`. The census is 104 = 28 ported + 76 absent. This
+>   is a doc and citation change, so there is no red-first test.
+> - `HERDR-003` — a stopped remote herdr reads as "stopped or incompatible". This is a
+>   `[CYRUP-DELTA]` against pi's `parseHerdrEndpoint`, because herdr's `not_running` JSON has `null`
+>   `version`/`protocol`. The lane showed two tests red without the fix.
+>
+> **Ledger corrections.** (1) `git -C tmp/herdr rev-parse v0.9.1` returns the **annotated tag
+> object**, not `065ef9d6`. The commit is `v0.9.1^{commit}`. (2) At `v0.9.1`,
+> `docs/next/website/src/content/docs/socket-api.mdx` is the release documentation, and it is byte
+> for byte `d59d0603`'s `docs/preview/` copy (`git diff` of the two blobs is empty). The tag's own
+> `docs/preview/` copy is older. The re-measure's "`socket-api.mdx` @v0.9.1" means the `docs/next/`
+> copy. (3) `tmp/herdr` has moved since the 2026-09-24 re-measure. It is a shallow clone (one
+> graft; `git rev-list --count d59d0603` = 50) whose HEAD is now `fff6c820`
+> (`preview-2026-09-21-0ff0f27e2226-39-gfff6c820`), and it carries 90 tags, 57 of them `v*`, back
+> to `v0.7.5`. The pins table below records the clone as it was on 2026-09-24. Every citation in
+> this file is at a tag or a named commit, so none moves. (4) The JSON Schema count of 103 holds
+> at the tag: `pane.graphics.stream` is `schemars(skip)` (`v0.9.1:src/api/schema.rs:207`), one fewer
+> than the 104 methods.
+>
+> **Left, outside this area.** The other `@ d59d060` anchors in `cyrup-ext-subagents`
+> (`herdr/mod.rs`, `herdr/reporter.rs`, `inspectors/herdr/actions.rs`,
+> `inspectors/shell_command.rs`) and `cyrup-it` `herdr_status_bridge_integration.rs` name the
+> commit correctly and resolve as written, so they were left alone.
+> `inspectors/herdr/{client,focus}.rs` still argue that "no release tags" means it cannot be
+> established when a method appeared. Now that `tmp/herdr` has release tags back to `v0.7.5`, that
+> could be settled. It is a SUBA-side claim, and this pass did not change it.
+
 > ### RE-MEASURE — 2026-09-24 — first measurement of this area
 >
 > **Pins:** cyrup **`ea23ca2`**. herdr cloned fresh into `tmp/herdr` from
@@ -112,8 +150,8 @@ preview tag and at HEAD. The binary client-shell protocol has not moved across t
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | ~~HERDR-001~~ | ~~medium~~ **CLOSED 2026-09-27** | client-bug | S | The inspector's socket adapter turns `pane split --current` into "split the focused pane of the active workspace". herdr's `--current` means the caller's own pane (`HERDR_PANE_ID`) — **CLOSED 2026-09-27**: `SocketHerdrClient` now carries the caller's pane id and the `pane split` arm targets it, honouring `--current`, `--pane <id>` and a positional id, and parsing `--direction` instead of hard-coding `Right` (`crates/cyrup-ext-subagents/src/inspectors/herdr/client.rs:707-793`). Verify: `cyrup-ext-subagents inspectors::herdr::client::tests::{the_pane_split_request_line_carries_the_callers_pane_id,pane_split_targets_the_callers_pane_and_honours_direction}`. |
-| HERDR-002 | low | tooling | S | The crate's pin "herdr v0.9.1 (`d59d060`)" names an untagged `main` commit that is not `v0.9.1`, and every `tmp/herdr/...:N` citation in the crate is at that commit |
-| HERDR-003 | low | client-bug | S | A stopped remote herdr is reported as "returned incomplete identity" rather than "stopped or incompatible", because `version`/`protocol` are `null` in herdr's `not_running` status JSON and are checked first |
+| ~~HERDR-002~~ | ~~low~~ **CLOSED 2026-09-28** | tooling | S | **CLOSED 2026-09-28** (on `claude/lows-next`): the crate is now pinned to the tag, herdr **`v0.9.1` (`065ef9d6`)**: `crates/cyrup-herdr/Cargo.toml:3` and the `lib.rs` crate doc (`:3-15`), which says every `tmp/herdr/<path>:N` citation is a line of `git -C tmp/herdr show v0.9.1:<path>`, a bare `socket-api.mdx:N` is the tag's `docs/next/` copy, and `d59d0603` was the first-written commit and differs on API paths in exactly two ways. The census is re-anchored to the tag: 104 methods (`lib.rs:81`), 28 ported + 76 absent (`:84`, `:94`), and the not-ported table's rows add to 76 (2+4+14+4+22+2+27+1; `clear` is gone from the geometry row). `transport.rs::request`'s doc (`transport.rs:284-294`) now states both error-id shapes: `v0.9.1` writes id `""` for every undeserialisable line (`server.rs:179-191`) and the probe id `<id>:sub:<n>:probe` for a failed subscribe setup (`subscriptions.rs:184-192`, `:210`), while `241063f7` on `main` echoes the request id. The remap was checked mechanically: all 334 full-path citations were paired HEAD-to-working and resolve at `v0.9.1` to the text `d59d0603` had (for ranges spanning `d59d0603`-only code, the start and end lines are the same function boundaries), and 134 bare `file.rs:N` remaps were checked the same way. The verifier also relabelled three places outside the crate that called `d59d060` "v0.9.1": `cyrup-ext-subagents/src/inspectors/herdr/{client,focus}.rs` module docs and `cyrup-ext-subagents/Cargo.toml:61`. Doc and citation change only, so there is no red-first test; Verify is the row's own: `git -C tmp/herdr show v0.9.1:src/api/schema.rs \| grep -c '#\[serde(rename = "'` = 104 = the crate's census. Original: The crate's pin "herdr v0.9.1 (`d59d060`)" names an untagged `main` commit that is not `v0.9.1`, and every `tmp/herdr/...:N` citation in the crate is at that commit |
+| ~~HERDR-003~~ | ~~low~~ **CLOSED 2026-09-28** | client-bug | S | **CLOSED 2026-09-28** (on `claude/lows-next`), as a deliberate divergence from pi: `crates/cyrup-herdr/src/remote.rs::parse_endpoint` now checks the absolute `socket` (`remote.rs:190-194`), then session identity (`:195-203`), then `running`/`compatible`/`endpoint_compatible` (`:204-212`), and only then requires a string `version` and numeric `protocol` (`:213-229`). A machine whose herdr server is stopped now gets "The selected remote Herdr session is stopped or incompatible." instead of "returned incomplete identity". The `[CYRUP-DELTA]` doc (`remote.rs:165-172`) names the dependency: herdr `v0.9.1`'s `NotRunning` arm writes `version: null, protocol: null` (`git -C tmp/herdr show v0.9.1:src/cli/status.rs`, `:340-352`), while pi-subagents' `parseHerdrEndpoint` checks `version`/`protocol` alongside `socket`, before `running`. Its check order is the same at `v0.68.0` and at the pinned `v0.71.0` (the file is identical; the function is at `:50-60`). Every refusal sentence is still pi's. Tests (the lane showed them red without the fix): `cyrup-herdr tests::machine_remote::remote::a_stopped_server_reads_as_stopped_not_as_incomplete_identity` (`machine_remote.rs:237`; it also pins that the socket and session checks still come first and that a running server without a version is still incomplete) and `…::discovery_of_a_stopped_remote_herdr_reports_it_stopped` (`:277`; `SshTransport::discover_endpoint` over an ssh stand-in whose `herdr status server --json` prints `v0.9.1`'s `not_running` JSON). Original: A stopped remote herdr is reported as "returned incomplete identity" rather than "stopped or incompatible", because `version`/`protocol` are `null` in herdr's `not_running` status JSON and are checked first |
 | ~~HERDR-004~~ | ~~low~~ **CLOSED 2026-09-28** | client-bug | S | **Filed and closed 2026-09-28** (on `claude/lows-next`): a refused `pane.report_agent` could strand the pane on stale state for up to 45 s. The de-duplicator recorded a report when it was handed to the reporter, not when herdr accepted it, so a same-state edge arriving while that report was in flight was swallowed; if the report then failed, nothing re-sent it until the refresh tick (`METADATA_REFRESH`, 45 s). Now `StateModel` notes a swallowed edge (`swallowed_since_handout`) and `invalidate_last_report` returns the report to send again at once, and `send_state` re-sends it — at most once per swallowed edge, so a refusing herdr is not retried in a loop. Found as an intermittent failure of `cyrup-it` `herdr_status_bridge_integration::a_rejected_report_never_disturbs_the_agent` under full parallel load (it fires the next edge once the fake server has received the report, before the bridge has read the refusal). Tests: `herdr::state::tests::an_edge_swallowed_behind_a_failed_report_is_re_sent_at_the_failure` (fails with the new branch gutted) and the updated `an_invalidated_report_is_sent_again`. |
 
 ---
@@ -160,6 +198,14 @@ line carries `"target_pane_id":"<HERDR_PANE_ID>"` for `--current`, and `"directi
 
 ## HERDR-002 — The crate is pinned to an untagged commit it calls `v0.9.1`
 
+> **CLOSED 2026-09-28** (on `claude/lows-next`). The pin is `v0.9.1` (`065ef9d6`) in
+> `Cargo.toml:3` and `lib.rs:3-15`. Every `tmp/herdr/<path>:N` citation is re-anchored to
+> `git show v0.9.1:<path>` (334 full-path and 134 bare citations checked mechanically). The census
+> is 104 = 28 + 76, and `transport.rs:284-294` states both error-id shapes. Evidence is in the
+> `## Open items` row. **Ledger correction:** `git rev-parse v0.9.1` returns the annotated tag
+> object; the commit is `v0.9.1^{commit}` = `065ef9d6`. See the closures block at the top for the
+> rest.
+
 **Kind** tooling · **Severity** low · **Effort** S · **Confidence** confirmed
 
 **cyrup**: `crates/cyrup-herdr/Cargo.toml` `description` ("herdr v0.9.1, d59d060") and the
@@ -192,6 +238,15 @@ preview tag). State the error-id difference in `transport.rs`'s doc, which today
 equals `git show <pinned-tag>:src/api/schema.rs | grep -c '#\[serde(rename = "'`.
 
 ## HERDR-003 — A stopped remote herdr reads as "incomplete identity"
+
+> **CLOSED 2026-09-28** (on `claude/lows-next`), as a `[CYRUP-DELTA]` against pi-subagents'
+> `parseHerdrEndpoint` (`v0.71.0:src/runs/shared/herdr-connection.ts:50-60`, identical to
+> `v0.68.0`). `parse_endpoint` judges liveness (`remote.rs:204-212`) before it requires
+> `version`/`protocol` (`:213-229`), because herdr `v0.9.1`'s `NotRunning` arm writes both as `null`
+> (`status.rs:340-352`). Tests: `tests::machine_remote::remote::{a_stopped_server_reads_as_stopped_not_as_incomplete_identity,discovery_of_a_stopped_remote_herdr_reports_it_stopped}`.
+> Not a gap: cyrup refuses a negative `protocol` as incomplete identity, while pi accepts any
+> number. herdr writes a `u32`, so the difference cannot arise. (The pi citation below says `:49-60`;
+> the function starts at `:50`.)
 
 **Kind** client-bug · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
 

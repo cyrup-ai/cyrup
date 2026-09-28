@@ -5,6 +5,7 @@
 //! through (R-SA-130). It holds no per-call state; every method takes what it needs as
 //! parameters.
 
+pub(crate) mod advertised;
 pub(crate) mod background;
 pub(crate) mod chain;
 pub(crate) mod control;
@@ -295,6 +296,9 @@ pub struct SubagentExecutor {
     /// One store per executor, shared by every concurrent run it drives — which is what makes a
     /// failure recorded by one run visible to the next one's ladder without a reload.
     model_exclusions: Arc<crate::exec::model_exclusions::ModelExclusionStore>,
+    /// SUBA-133 — the advertised-agent catalog (pi `advertisedAgents`/`advertisedContext`,
+    /// `extension/index.ts:533-541` @v0.71.0). See [`advertised`].
+    advertised_agents: std::sync::Mutex<advertised::AdvertisedAgents>,
 }
 
 impl Default for SubagentExecutor {
@@ -346,6 +350,7 @@ impl SubagentExecutor {
             model_exclusions: Arc::new(
                 crate::exec::model_exclusions::ModelExclusionStore::from_env(),
             ),
+            advertised_agents: std::sync::Mutex::new(advertised::AdvertisedAgents::default()),
         }
     }
 

@@ -131,7 +131,7 @@ impl InputEditor {
     }
 
     /// Merge a JSON keybindings document into the editor keymap **and** the autocomplete-popup keymap
-    /// (R-10-018; the `editor.*` + `tui.autocomplete.*` ids). Called by the binary at boot with the
+    /// (R-10-018; the `tui.editor.*` / `tui.input.*` / `tui.select.*` ids). Called by the binary at boot with the
     /// user's `keybindings.json` so custom editor + popup bindings take effect (item #6).
     /// CFG-038 — the two maps' rejected entries are CONCATENATED rather than short-circuited: the
     /// editor map returning an issue must not stop the autocomplete map from being applied.

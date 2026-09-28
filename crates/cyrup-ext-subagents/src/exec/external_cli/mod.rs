@@ -426,6 +426,8 @@ pub async fn run_external_cli(
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
+        tool_budget_blocked: false,
+        session_name: None,
         usage_budget: None,
         error,
         saved_output_path: saved_output_path.map(|path| path.display().to_string()),

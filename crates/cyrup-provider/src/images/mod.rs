@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = openrouter_image_models();
-        assert_eq!(models.len(), 35);
+        assert_eq!(models.len(), 55);
         assert!(models.iter().all(|m| m.api.as_str() == OPENROUTER_IMAGES));
         assert!(models.iter().all(|m| m.provider.as_str() == "openrouter"));
         assert!(
@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn catalog_accessors_match_pi() {
         assert_eq!(get_image_providers(), vec!["openrouter".to_string()]);
-        assert_eq!(get_image_models("openrouter").len(), 35);
+        assert_eq!(get_image_models("openrouter").len(), 55);
         assert!(get_image_model("openrouter", "openai/gpt-image-1").is_some());
         assert!(get_image_model("openrouter", "nope").is_none());
         assert!(get_image_model("nope", "x").is_none());
@@ -766,7 +766,7 @@ mod tests {
         models.set_provider(openrouter_provider_for_tests());
         assert_eq!(models.get_providers().len(), 1);
         assert!(models.get_provider("openrouter").is_some());
-        assert_eq!(models.get_models(Some("openrouter")).len(), 35);
+        assert_eq!(models.get_models(Some("openrouter")).len(), 55);
 
         let m = sample_model();
         let auth = models.get_auth(&m).await.expect("ok").expect("configured");

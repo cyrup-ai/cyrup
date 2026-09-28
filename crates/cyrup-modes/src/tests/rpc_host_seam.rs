@@ -267,12 +267,15 @@ async fn a_command_after_an_extension_session_swap_reaches_the_new_session() {
 // ---------------------------------------------------------------------------------------------
 
 /// A 10-minute first retry backoff — long enough that "the abort did not cancel it" is a hang, not
-/// a slow pass.
+/// a slow pass. `maxAgentDelayMs` is raised with it, or pi's 60 s default cap (CFG-081) would
+/// shorten the backoff to a minute.
 fn slow_retry_settings() -> cyrup_config::Settings {
     let mut cli = cyrup_config::Settings::new();
     cli.set_field(
         "retry",
-        serde_json::json!({"enabled": true, "maxRetries": 3, "baseDelayMs": 600_000}),
+        serde_json::json!({
+            "enabled": true, "maxRetries": 3, "baseDelayMs": 600_000, "maxAgentDelayMs": 600_000
+        }),
     )
     .unwrap();
     cli

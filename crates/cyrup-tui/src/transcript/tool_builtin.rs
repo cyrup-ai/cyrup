@@ -318,7 +318,8 @@ pub(super) fn render_bash_call(
 }
 
 /// `bash`/`powershell`'s `renderResult` — the output tail (collapsed = last 5 visual lines) +
-/// truncation notices + the `Took`/`Elapsed {d}s` footer (`bash.ts:249-317/430-479`).
+/// truncation notices + the `Took`/`Elapsed …` footer, its duration from [`format_duration`]
+/// (`bash.ts:249-317/430-479`).
 pub(super) fn render_bash_result(
     run: &ToolRun,
     expanded: bool,
