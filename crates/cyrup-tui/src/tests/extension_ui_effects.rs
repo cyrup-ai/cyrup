@@ -83,8 +83,8 @@ fn install_ui_sinks_delivers_all_eight_fire_and_forget_capabilities() {
         Some(&["a".to_string()]),
         cyrup_ext::host::services::WidgetPlacement::default(),
     );
-    svc.set_header("H");
-    svc.set_footer("F");
+    svc.set_header(Some("H"));
+    svc.set_footer(Some("F"));
     svc.set_title("cyrup — repo");
     svc.set_editor_text("typed", false);
     svc.set_tools_expanded(true);
@@ -110,10 +110,10 @@ fn install_ui_sinks_delivers_all_eight_fire_and_forget_capabilities() {
                 }),
             },
             UiEffect::SetHeader {
-                content: "H".into()
+                content: Some("H".into())
             },
             UiEffect::SetFooter {
-                content: "F".into()
+                content: Some("F".into())
             },
             UiEffect::SetTitle {
                 title: "cyrup — repo".into()
@@ -266,8 +266,8 @@ fn title_widget_header_footer_arrive_and_are_rendered() {
         Some(&["WIDGET-A".to_string(), "WIDGET-B".to_string()]),
         cyrup_ext::host::services::WidgetPlacement::default(),
     );
-    svc.set_header("HEADER-LINE");
-    svc.set_footer("FOOTER-LINE");
+    svc.set_header(Some("HEADER-LINE"));
+    svc.set_footer(Some("FOOTER-LINE"));
     drain(&mut app, &mut effect_rx);
 
     assert_eq!(
@@ -318,7 +318,7 @@ async fn an_extension_footer_swaps_the_built_in_one_out_and_back() {
     );
 
     app.apply_ui_effect(UiEffect::SetFooter {
-        content: "EXTFOOTER".to_string(),
+        content: Some("EXTFOOTER".to_string()),
     });
     let swapped = rendered(&mut app);
     assert!(
@@ -330,13 +330,35 @@ async fn an_extension_footer_swaps_the_built_in_one_out_and_back() {
         "the built-in must be swapped OUT:\n{swapped}"
     );
 
+    // EXT-064 — an EMPTY CUSTOM footer. This is `setFooter(() => <a component that renders
+    // nothing>)` upstream, and it must NOT bring the built-in back: pi restores the built-in only
+    // for the `undefined` factory (`modes/interactive/interactive-mode.ts:2442-2446` @v0.87.1),
+    // and a component that renders nothing is a perfectly ordinary custom footer.
+    //
+    // RED without the change: `UiEffect::SetFooter` carried a bare `String` and this arm read
+    // `(!content.is_empty()).then_some(content)`, so the empty string WAS the restore and
+    // `BUILTINMODEL` came back here. That collapse is what the row's `[CYRUP-DELTA]` used to
+    // document as acceptable; it is a lost state, so it is fixed rather than documented.
     app.apply_ui_effect(UiEffect::SetFooter {
-        content: String::new(),
+        content: Some(String::new()),
     });
+    let blanked = rendered(&mut app);
+    assert!(
+        !blanked.contains("BUILTINMODEL"),
+        "an EMPTY custom footer is still a CUSTOM footer — the built-in must stay swapped \
+         out:\n{blanked}"
+    );
+    assert!(
+        !blanked.contains("EXTFOOTER"),
+        "…and the previous custom text is gone:\n{blanked}"
+    );
+
+    // `None` IS pi's `undefined`, and it is the ONLY thing that restores the built-in.
+    app.apply_ui_effect(UiEffect::SetFooter { content: None });
     let restored = rendered(&mut app);
     assert!(
         restored.contains("BUILTINMODEL"),
-        "clearing restores the built-in:\n{restored}"
+        "clearing with `None` (pi's `setFooter(undefined)`) restores the built-in:\n{restored}"
     );
     assert!(
         !restored.contains("EXTFOOTER"),

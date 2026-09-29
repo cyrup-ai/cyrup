@@ -12,7 +12,8 @@ use super::types::{
 // --------------------------------------------------------------------------------------------
 
 /// `requiredEvidenceForLevel` (acceptance.ts:55-67).
-fn required_evidence_for_level(level: AcceptanceLevel) -> Vec<AcceptanceEvidenceKind> {
+#[must_use]
+pub fn required_evidence_for_level(level: AcceptanceLevel) -> Vec<AcceptanceEvidenceKind> {
     use AcceptanceEvidenceKind::*;
     match level {
         AcceptanceLevel::None | AcceptanceLevel::Auto => Vec::new(),
@@ -64,12 +65,22 @@ pub struct AcceptanceResolveInput {
     pub dynamic_group: bool,
 }
 
-struct InferredLevel {
-    level: AcceptanceLevel,
-    reasons: Vec<String>,
-    criteria: Vec<CriterionInput>,
-    evidence: Vec<AcceptanceEvidenceKind>,
-    review: Option<ReviewSetting>,
+/// The return of `inferLevel` (`acceptance.ts:88`), BEFORE `resolveEffectiveAcceptance` merges it
+/// with any explicit policy and before `:521-522` clears a `none` level's criteria and evidence.
+///
+/// SUBA-108 — public because `resolveEffectiveAcceptance` is not the only consumer upstream has:
+/// `acceptance.ts:504` binds `inferLevel(input)` and reads its `criteria`/`evidence`/`review` at
+/// `:512-517` for the merge. cyrup's lattice
+/// ([`crate::exec::acceptance::AcceptanceContract::resolve_effective_for_role`]) performs that same
+/// merge against a contract lowered from wire JSON, so it needs the same raw value rather than the
+/// already-resolved-and-possibly-cleared [`ResolvedAcceptanceConfig`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferredLevel {
+    pub level: AcceptanceLevel,
+    pub reasons: Vec<String>,
+    pub criteria: Vec<CriterionInput>,
+    pub evidence: Vec<AcceptanceEvidenceKind>,
+    pub review: Option<ReviewSetting>,
 }
 
 /// `inferLevel` (`acceptance.ts:81-122` @v0.71.0).
@@ -90,7 +101,8 @@ struct InferredLevel {
 ///
 /// The `read-only` branch returns `none`, i.e. no acceptance prompt at all
 /// (`formatAcceptancePrompt` returns `""` for `level === "none"`) and no gate.
-fn infer_level(input: &AcceptanceResolveInput) -> InferredLevel {
+#[must_use]
+pub fn infer_level(input: &AcceptanceResolveInput) -> InferredLevel {
     // `if (input.acceptanceRole === "writer" && (input.async || input.dynamic ||
     // input.dynamicGroup))` (`acceptance.ts:88-100`).
     if input.acceptance_role == Some(AcceptanceRole::Writer)
@@ -212,15 +224,27 @@ fn explicit_acceptance_can_disable(explicit: &AcceptanceConfig) -> bool {
 /// [`infer_level`]'s `read-only` branch started returning [`AcceptanceLevel::None`]; before that
 /// no inference produced `none` at all.
 ///
-/// CYRUP-DELTA (mechanism, full parity) — upstream tests key PRESENCE with `Object.keys`; the
-/// Rust side tests `Option::is_some` on the same seven fields of [`AcceptanceConfig`], which is
-/// how a key's presence is already represented after normalization. The one input TS and Rust
-/// could disagree on is an explicit JSON `null` (`{"reason": null}`: a key upstream, `None`
-/// here), and that value is rejected earlier by acceptance-input validation, so it cannot reach
-/// this function.
+/// CYRUP-DELTA (mechanism) — upstream tests key PRESENCE with `Object.keys`; the Rust side tests
+/// `Option::is_some` on the modeled non-`level` fields of [`AcceptanceConfig`], which is how a
+/// key's presence is already represented after normalization. The one input TS and Rust could
+/// disagree on is an explicit JSON `null` (`{"reason": null}`: a key upstream, `None` here), and
+/// that value is rejected earlier by acceptance-input validation, so it cannot reach this
+/// function.
+///
+/// This delta does NOT claim parity on the INPUT SET, and must not be read as doing so. Upstream's
+/// `AcceptanceConfig` (`shared/types.ts:1063-1074` @v0.71.0) has NINE keys:
+/// `level, report, preserveStagedIndex, criteria, evidence, verify, review, stopRules, reason`.
+/// SUBA-108 added `report`, which this predicate now reads. `preserveStagedIndex` is still
+/// MISSING: `ACCEPTANCE_CONFIG_KEYS` (`validate_input.rs:71-80`) omits it, so cyrup REFUSES a
+/// policy upstream accepts and carries onto its result (`acceptance.ts:497,519`), and this
+/// predicate can never see it. That is a separate, pre-existing behavioural divergence with its
+/// own fix — named here rather than papered over, and deliberately NOT recorded as a CYRUP-DELTA,
+/// because a refusal upstream does not make is a behavioural difference, not a mechanism one.
+/// (`ACCEPTANCE_VERIFY_KEYS` is likewise short of upstream's `output`/`schema` at `:56`.)
 fn explicit_acceptance_requests_policy(explicit: &AcceptanceConfig) -> bool {
     let level_requests = matches!(explicit.level, Some(level) if level != AcceptanceLevel::Auto);
-    let non_level_key_present = explicit.criteria.is_some()
+    let non_level_key_present = explicit.report.is_some()
+        || explicit.criteria.is_some()
         || explicit.evidence.is_some()
         || explicit.verify.is_some()
         || explicit.review.is_some()

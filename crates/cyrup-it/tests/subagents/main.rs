@@ -104,6 +104,7 @@ mod startup_retry_lifecycle_integration;
 // ---- exec: the synchronous run path, step chaining, parallelism, artifacts ----
 mod artifacts_run_integration;
 mod chain_step_child_detail_integration;
+mod completion_guard_retirement_integration;
 mod exec_run_sync_integration;
 mod tool_parallel_chain_integration;
 // SUBA-100 — Herdr saved-machine placement: fake ssh + fake herdr, real tool, real runner.

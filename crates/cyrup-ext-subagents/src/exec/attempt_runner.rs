@@ -60,6 +60,19 @@ pub(crate) struct SpawnedChildAttemptRunner<'a> {
     /// every earlier note in the one ring pi shows each note in exactly once (pi re-seeds a FRESH
     /// `recentOutput` per attempt, `execution.ts:542`, so it never faces the question).
     pub(crate) live_notes_emitted: usize,
+    /// SUBA-118 — pi's `recoveryPrompt` local (`execution.ts:1839`, seeded `= task` and reassigned
+    /// to `recovery.prompt` when [`crate::exec::abort_recovery::plan_abort_recovery`] answers
+    /// *resume*, `:1880`): the task text THIS attempt launches with. `None` is the ordinary case and
+    /// means [`Self::task`]; `Some` is set once, by [`AttemptRunner::apply_abort_recovery`], and from
+    /// then on every relaunch of the same candidate carries
+    /// [`crate::exec::abort_recovery::ABORT_RECOVERY_PROMPT`] instead — exactly as upstream's
+    /// reassignment persists for the second pass of its two-attempt loop.
+    ///
+    /// The retained session is what makes the substitution a RESUME rather than a fresh start: the
+    /// child is relaunched with the same `--session <file>` argv
+    /// (`crate::exec::agent_config::ForkContext::session_file_path`, `spawn_plan.rs:550`), so it
+    /// reloads the transcript it had built and is told to continue from it.
+    pub(crate) recovery_prompt: Option<&'static str>,
     /// The run's live `_transcript.jsonl` writer (pi `shared.transcriptWriter`,
     /// `execution.ts:1905`), or `None` when the run has no artifacts dir or
     /// [`RunOptions::transcript`] is `None`. ONE per run, shared across every fallback attempt so
@@ -126,6 +139,20 @@ pub(crate) struct AttemptRecord {
     /// settled, for the remote-failure hint (`decorateHerdrMachineResult`'s `stderrTail`). `None`
     /// for a local child.
     pub(crate) placed_stderr_tail: Option<String>,
+    /// SUBA-118 — `DriveOutcome::after_compaction_settlement` carried out per attempt (pi's
+    /// `AFTER_COMPACTION_SETTLEMENT` stamp, `execution.ts:1418-1420`), read by
+    /// [`AttemptRunner::plan_abort_recovery`]. `false` on every path that never reached the drive
+    /// loop, which is honest: no compaction can have settled in a child that never started.
+    pub(crate) after_compaction_settlement: bool,
+    /// SUBA-118 — `DriveOutcome::tool_budget_blocked` carried out per attempt (pi
+    /// `result.toolBudgetBlocked`, `execution.ts:1150`).
+    pub(crate) tool_budget_blocked: bool,
+    /// SUBA-118 — pi `result.structuredOutputFailed` (`execution.ts:1471`), computed at upstream's
+    /// own position in the per-attempt diagnosis: a declared schema whose capture file the child
+    /// never wrote, on an attempt that was otherwise CLEAN at that point. See
+    /// [`SpawnedChildAttemptRunner::resolve_attempt_exit`]'s step (d.1) for why the position is the
+    /// whole content of the field.
+    pub(crate) structured_output_failed: bool,
 }
 
 #[async_trait::async_trait]
@@ -183,6 +210,11 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             crate::exec::drive_attempt::DriveAttemptInputs {
                 child_watchdog,
                 expected_model_for_verification: expected_model_for_verification.as_deref(),
+                // SUBA-118 — the SAME budget the spawn plan encodes into the child's env
+                // (`spawn_plan.rs`'s `encode_tool_budget_env(self.agent.tool_budget)`), so the
+                // parent's recognition of the child's own hard-block message cannot be judging a
+                // different one.
+                tool_budget: self.agent.tool_budget.clone(),
             },
         )
         .await;
@@ -280,6 +312,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             error,
             success,
             error_is_placeholder,
+            structured_output_failed,
         } = self
             .resolve_attempt_exit(
                 error,
@@ -330,8 +363,79 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 runtime_acknowledged_extensions,
                 native_machine,
                 placed_stderr_tail,
+                // SUBA-118 — the three inputs the abort-recovery plan cannot derive from an
+                // `AttemptSignal`.
+                after_compaction_settlement: outcome.after_compaction_settlement,
+                tool_budget_blocked: outcome.tool_budget_blocked,
+                structured_output_failed,
             },
         )
+    }
+
+    /// SUBA-118 — pi `planAbortRecovery({...})` as its foreground call site composes the input
+    /// (`execution.ts:1878-1893`). Pure: it reads this attempt's own witnesses and the run's options,
+    /// performs one `exists` probe for the retained session, and answers *resume once* or *settle,
+    /// for this reason*.
+    ///
+    /// Every field below is upstream's, in upstream's order, with the two upstream passes as
+    /// CONSTANTS spelled out rather than silently omitted:
+    ///
+    /// * `usageBudgetExhausted: false` — upstream's foreground site passes the literal `false`
+    ///   (`:1885`); only the background runner consults a `ctx.usageBudgetExhausted?.()` callback
+    ///   (`subagent-runner.ts:1352`), and `run_sync` is the foreground.
+    /// * `acceptanceFailed: false` — upstream passes the literal `false` at BOTH sites (`:1887` and
+    ///   `subagent-runner.ts:1354`). There is no acceptance verdict at either one, so the rung
+    ///   (`abort-recovery.ts:113`) is a constant upstream too, not a hole this port left.
+    fn plan_abort_recovery(
+        &self,
+        attempt: &Self::Attempt,
+        signal: &AttemptSignal,
+        already_resumed: bool,
+    ) -> crate::exec::abort_recovery::AbortRecoveryPlan {
+        // Upstream's `messages` is its flat `SingleResult.messages`; this crate's equivalent is
+        // every `message_end` the child emitted, regardless of role — see
+        // `crate::exec::abort_recovery`'s own `CYRUP-DELTA` on the transcript shape.
+        let messages =
+            crate::exec::abort_recovery::message_end_values(&attempt.progress.message_end_events);
+        crate::exec::abort_recovery::plan_abort_recovery(
+            &crate::exec::abort_recovery::AbortRecoveryInput {
+                messages: &messages,
+                // `attemptResult.processSignal` (`:1881`).
+                process_signal: signal.startup.process_signal.as_deref(),
+                // `Boolean(options.sessionFile && existsSync(options.sessionFile))` (`:1882`).
+                session_available: self
+                    .opts
+                    .fork_context
+                    .session_file_path
+                    .as_ref()
+                    .is_some_and(|path| path.exists()),
+                already_resumed,
+                // `attemptResult.stopped || attemptResult.detached || Boolean(detachedReason) ||
+                // Boolean(options.workflowChildPermitLaunch) || options.signal?.aborted` (`:1884`) —
+                // cyrup's `RunOptions::cancel` IS `options.signal`, and `detached` is the one detach
+                // this ladder can observe (see `AttemptSignal::detached`).
+                stopped: signal.startup.stopped
+                    || signal.detached
+                    || self.opts.cancel.is_cancelled(),
+                // `attemptResult.interrupted || options.interruptSignal?.aborted` (`:1885`).
+                interrupted: attempt.interrupted || self.opts.interrupt.is_cancelled(),
+                timed_out: signal.timed_out,
+                tool_budget_exhausted: attempt.tool_budget_blocked,
+                usage_budget_exhausted: false,
+                structured_output_failed: attempt.structured_output_failed,
+                acceptance_failed: false,
+                // `attemptResult.progress?.currentTool` (`:1891`).
+                current_tool: attempt.progress.current_tool.as_deref(),
+                after_compaction_settlement: attempt.after_compaction_settlement,
+            },
+        )
+    }
+
+    /// SUBA-118 — pi `recoveryPrompt = recovery.prompt` (`execution.ts:1880`). Latches the recovery
+    /// prompt for every later launch of this candidate; the ladder only ever calls it once per
+    /// candidate, because the plan's own `already_resumed` rung refuses a second.
+    fn apply_abort_recovery(&mut self) {
+        self.recovery_prompt = Some(crate::exec::abort_recovery::ABORT_RECOVERY_PROMPT);
     }
 
     /// pi `waitForSubagentStartupRetry(delayMs, [options.signal, options.interruptSignal])`
@@ -426,6 +530,8 @@ struct AttemptDiagnosis {
     /// Whether `error` IS that placeholder — the startup-failure classifier has to be told, since
     /// pi keys "the child failed with nothing to say" on `error` being UNSET.
     error_is_placeholder: bool,
+    /// SUBA-118 — pi `result.structuredOutputFailed` (`execution.ts:1471`). See step (d.1).
+    structured_output_failed: bool,
 }
 
 impl SpawnedChildAttemptRunner<'_> {
@@ -497,7 +603,11 @@ impl SpawnedChildAttemptRunner<'_> {
 
         let task_text = build_task_text(
             self.agent,
-            self.task,
+            // SUBA-118 — pi passes its `recoveryPrompt` local, not `task`, as `runSingleAttempt`'s
+            // task argument (`execution.ts:1857`); it EQUALS `task` until a resume is granted and is
+            // the recovery prompt afterwards. `shared.originalTask` keeps the real task for the
+            // artifacts, which is what `self.task` still serves here on every other path.
+            self.recovery_prompt.unwrap_or(self.task),
             self.opts,
             self.contract,
             &self.skill_injection,
@@ -733,6 +843,37 @@ impl SpawnedChildAttemptRunner<'_> {
             exit_code = 1;
         }
 
+        // (d.1) SUBA-118 — pi `result.structuredOutputFailed = true` (`execution.ts:1471`), read by
+        //     the abort-recovery plan's structured-output rung (`abort-recovery.ts:112`).
+        //
+        //     THE POSITION IS THE WHOLE POINT. Upstream's structured-output block sits between the
+        //     `if (result.error && result.exitCode === 0)` normalization (`:1445-1447`, cyrup's (d)
+        //     above) and the `detectSubagentError`/empty-terminal block (`:1472-1493`, cyrup's (e)
+        //     and (f) below), and its `else if` arm fires ONLY when the attempt is still
+        //     `exitCode === 0 && !result.error` right there. Evaluating this AFTER (e)/(f) — or
+        //     reusing `run_sync`'s post-ladder step-5 verdict, which is computed on a settled
+        //     attempt — would make the flag a SUPERSET of upstream's and settle runs upstream
+        //     resumes: a child that compacted, aborted with an empty terminal message and left no
+        //     capture file reaches this point with an error already set, so upstream's flag is FALSE
+        //     for it, and that is the case the whole row exists to resume.
+        //
+        //     `structured_output_absent` is pi's `!existsSync(outputPath)` presence test, so this
+        //     asks the same question upstream's `!(structuredOutputToolInvoked && structured.called)`
+        //     does, against the same file. `structured_output_schema.is_some()` re-states upstream's
+        //     `if (options.structuredOutput)` guard, which that helper's `None => true` arm (written
+        //     for the empty-output gate's OTHER leg) does not carry.
+        //
+        //     This does NOT stamp an error or move the verdict: `run_sync`'s step 5 still owns the
+        //     diagnosis and its wording. The flag is per-attempt EVIDENCE, which is the only form
+        //     the ladder's decision point can read.
+        let structured_output_failed = exit_code == 0
+            && error.is_none()
+            && self.opts.structured_output_schema.is_some()
+            && structured_output_absent(
+                self.opts.structured_output_schema.as_ref(),
+                self.structured_runtime.as_ref(),
+            );
+
         // (e) `detectSubagentError` re-diagnosis of a still-clean zero exit — a trailing failed
         //     tool/bash call the agent did not speak past (pi `execution.ts:772-780`).
         if exit_code == 0
@@ -792,6 +933,7 @@ impl SpawnedChildAttemptRunner<'_> {
             error,
             success,
             error_is_placeholder,
+            structured_output_failed,
         }
     }
 }
@@ -932,6 +1074,12 @@ fn attempt_setup_failure(
             runtime_acknowledged_extensions: None,
             native_machine: None,
             placed_stderr_tail: None,
+            // SUBA-118 — nothing ran: no compaction settled, no tool was blocked, and no capture
+            // file could be missing on an attempt that never had a chance to write one. The plan
+            // refuses this attempt on `session_available`/`abort_candidate` anyway.
+            after_compaction_settlement: false,
+            tool_budget_blocked: false,
+            structured_output_failed: false,
         },
     )
 }
@@ -974,6 +1122,15 @@ fn interrupted_attempt(
             runtime_acknowledged_extensions: None,
             native_machine: None,
             placed_stderr_tail: None,
+            // SUBA-118 — both witnesses ride out of EVERY settle path (pi stamps them on the result
+            // before its own interrupt early-return, `execution.ts:1418-1420`/`:1150`). The plan
+            // refuses an interrupted attempt on its `interrupted` rung (`abort-recovery.ts:105`);
+            // carrying the evidence anyway is what keeps that refusal the reason it settles.
+            after_compaction_settlement: outcome.after_compaction_settlement,
+            tool_budget_blocked: outcome.tool_budget_blocked,
+            // pi returns from `runSingleAttempt` on an interrupt BEFORE its structured-output block
+            // runs at all (`:1391` vs `:1449`), so this attempt has no structured verdict.
+            structured_output_failed: false,
         },
     )
 }
@@ -994,7 +1151,15 @@ fn timed_out_attempt(
         AttemptSignal {
             success: false,
             exit_code: Some(raw_exit_code.unwrap_or(1)),
-            error: spawn_error.or_else(|| Some("subagent attempt timed out".to_string())),
+            // CFG-067 — pi's `terminateForToolTimeout` sets `result.error = message` at the moment
+            // the per-tool deadline fires (`execution.ts:1251`), i.e. strictly before any close
+            // handling, so it outranks both the spawn error and the generic timeout sentence — the
+            // same precedence a turn-budget abort's message has over the child's trailing apology.
+            error: outcome
+                .tool_timeout_error
+                .clone()
+                .or(spawn_error)
+                .or_else(|| Some("subagent attempt timed out".to_string())),
             usage: progress.usage.clone(),
             turns: u64::from(progress.turn_count()),
             timed_out: true,
@@ -1007,7 +1172,10 @@ fn timed_out_attempt(
             // (`execution.ts:1241`), but the state is still published.
             turn_budget: outcome.turn_budget.clone(),
             progress,
-            final_output,
+            // CFG-067 — `result.finalOutput = message` on the same line (`execution.ts:1252`): the
+            // operator reads WHY the run stopped where its answer would have been, rather than the
+            // half-sentence a child signalled mid-tool-call happens to have flushed.
+            final_output: outcome.tool_timeout_error.clone().or(final_output),
             interrupted: false,
             control,
             // As on the interrupt path: a child launched, so its surface is real.
@@ -1017,6 +1185,12 @@ fn timed_out_attempt(
             runtime_acknowledged_extensions: None,
             native_machine: None,
             placed_stderr_tail: None,
+            // SUBA-118 — as on the interrupt path: the evidence rides out, and the plan refuses a
+            // timed-out attempt on its own `timed_out` rung (`abort-recovery.ts:110`).
+            after_compaction_settlement: outcome.after_compaction_settlement,
+            tool_budget_blocked: outcome.tool_budget_blocked,
+            // The timeout early-return likewise precedes upstream's structured-output block.
+            structured_output_failed: false,
         },
     )
 }
@@ -1109,7 +1283,7 @@ fn build_startup_evidence(
         process_signal,
         // SUBA-102 — pi `isMutatingTool(event.toolName, toolArgs, input.mutationTools)`
         // (`run-child-session.ts:471` @v0.68.0): the agent's own mutating tools count too.
-        observed_mutation_attempt: crate::exec::completion_guard::has_mutation_tool_call(
+        observed_mutation_attempt: crate::exec::control::has_mutation_tool_call(
             &progress.all_events,
             mutation_tools,
         ),

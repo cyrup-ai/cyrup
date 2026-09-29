@@ -240,7 +240,11 @@ mod tests {
             ]
         );
         // Every key the struct reads is known — including the raw-held ones.
-        let quiet = serde_json::json!({"asyncWidget": false, "inlineToolDisplay": "summary", "fleetKeybindings": {}, "completionBatch": {}, "missions": {}});
+        // CFG-067: `toolTimeoutMs` is among them now. It used to be on `UNPORTED_CONFIG_KEYS`
+        // ("a config-level per-tool-call timeout"), i.e. the operator was TOLD it had no effect;
+        // the key is read for real now, so warning about it would be a lie. Killing mutation:
+        // leaving the entry on the unported list — this assertion then reports it again.
+        let quiet = serde_json::json!({"asyncWidget": false, "inlineToolDisplay": "summary", "fleetKeybindings": {}, "completionBatch": {}, "missions": {}, "toolTimeoutMs": 5000});
         assert!(SubagentExtensionConfig::config_warnings(&quiet).is_empty());
 
         let dir = tempfile::tempdir().expect("tempdir");

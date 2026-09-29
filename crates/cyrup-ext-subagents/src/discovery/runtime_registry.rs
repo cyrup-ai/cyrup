@@ -19,12 +19,14 @@
 //! the partition, the caps and every check are upstream's). [`RUNTIME_AGENT_REGISTRY_KEY`] is
 //! kept as a documented constant for traceability; nothing is keyed on it.
 //!
+//! # The second door
+//!
+//! SUBA-143 — a sibling extension that has only the bus, and no way to call the methods above,
+//! reaches this same registry through [`super::runtime_agent_events`], the port of pi's
+//! `src/agents/runtime-agent-events.ts` cross-extension event bridge.
+//!
 //! # What is NOT here (recorded, not silently dropped)
 //!
-//! - The v0.64.0-only cross-extension EVENT bridge (`src/agents/runtime-agent-events.ts`,
-//!   `registerAgentViaEvents` — synchronous `emit` with the handler mutating `request.result` in
-//!   place). cyrup's `SharedBus` queues emits and passes payloads by value, so that bridge needs a
-//!   request/response design of its own; it is a separate row.
 //! - Three `RuntimeAgentDefinition` fields have no [`AgentDefinition`] landing at HEAD
 //!   (`mcpDirectTools`, `skillPath`, `defaultToolTimeoutMs`; `inheritGlobalContext` and
 //!   `mutationTools` landed with SUBA-101/102). They are validated EXACTLY as upstream validates them (so a
@@ -76,6 +78,8 @@ const SUPPORTED_FIELDS: [&str; 36] = [
     "aliases",
     "tools",
     "excludeTools",
+    // SUBA-111.
+    "allowedAgents",
     "allowNestedSubagents",
     "mcpDirectTools",
     "model",
@@ -105,7 +109,6 @@ const SUPPORTED_FIELDS: [&str; 36] = [
     "defaultProgress",
     "interactive",
     "maxSubagentDepth",
-    "completionGuard",
     "toolBudget",
     "permissions",
 ];
@@ -121,10 +124,6 @@ const UNREPRESENTABLE_FIELDS: &[(&str, &str)] = &[
         "a standalone `mcp_direct_tools` list (cyrup only derives MCP direct tools from `mcp:`-prefixed `tools` entries)",
     ),
     ("skillPath", "a `skill_path` list"),
-    (
-        "defaultToolTimeoutMs",
-        "a `default_tool_timeout_ms` launch default",
-    ),
 ];
 
 // -------------------------------------------------------------------------------------------
@@ -169,6 +168,8 @@ pub struct RuntimeAgentDefinition {
     pub aliases: Option<Vec<String>>,
     pub tools: Option<Vec<String>>,
     pub exclude_tools: Option<Vec<String>>,
+    /// SUBA-111 — pi `allowedAgents`, already normalized by the shared ceiling validation.
+    pub allowed_agents: Option<Vec<String>>,
     pub allow_nested_subagents: Option<bool>,
     pub mcp_direct_tools: Option<Vec<String>>,
     pub model: Option<String>,
@@ -198,7 +199,6 @@ pub struct RuntimeAgentDefinition {
     pub default_progress: Option<bool>,
     pub interactive: Option<bool>,
     pub max_subagent_depth: Option<u64>,
-    pub completion_guard: Option<bool>,
     pub tool_budget: Option<Value>,
     pub permissions: Option<Value>,
 }
@@ -239,6 +239,7 @@ impl RuntimeAgentDefinition {
         put("aliases", string_list(&self.aliases));
         put("tools", string_list(&self.tools));
         put("excludeTools", string_list(&self.exclude_tools));
+        put("allowedAgents", string_list(&self.allowed_agents));
         put(
             "allowNestedSubagents",
             self.allow_nested_subagents.map(Value::Bool),
@@ -306,7 +307,6 @@ impl RuntimeAgentDefinition {
         put("defaultProgress", self.default_progress.map(Value::Bool));
         put("interactive", self.interactive.map(Value::Bool));
         put("maxSubagentDepth", self.max_subagent_depth.map(Value::from));
-        put("completionGuard", self.completion_guard.map(Value::Bool));
         put("toolBudget", self.tool_budget.clone());
         put("permissions", self.permissions.clone());
         Value::Object(object)
@@ -324,6 +324,19 @@ fn management_error(message: String) -> SubagentError {
 /// JS `String.prototype.length` counts UTF-16 code units, so the caps are measured the same way.
 fn js_length(value: &str) -> usize {
     value.encode_utf16().count()
+}
+
+/// `validateString(input.name, "Runtime agent name", MAX_AGENT_NAME_LENGTH)` (`:373`) over an
+/// UNTYPED wire value — the shape the SUBA-143 event bridge receives, where `name` may be absent
+/// or not a string at all. [`RuntimeAgentRegistry::register_value`] applies the identical check to
+/// its own `&str` argument, so a bridge that validates here and then registers is checked twice by
+/// the SAME function rather than twice by two that could drift.
+///
+/// # Errors
+///
+/// Upstream's `validateString` refusals, verbatim.
+pub(crate) fn validate_agent_name(value: Option<&Value>) -> Result<String, SubagentError> {
+    validate_string(value, "Runtime agent name", MAX_AGENT_NAME_LENGTH)
 }
 
 /// `validateString(value, field, maxLength)` (`:116-123`).
@@ -721,6 +734,24 @@ fn validate_definition(value: &Value) -> Result<ValidatedDefinition, SubagentErr
     let tools = validate_string_list(definition.get("tools"), &field("tools"))?;
     let exclude_tools =
         validate_string_list(definition.get("excludeTools"), &field("excludeTools"))?;
+    // SUBA-111 — the list grammar first, then the SHARED capability-ceiling validation, exactly as
+    // `agents.ts:2118-2119` layers `parseFrontmatterList` under
+    // `normalizeCapabilityCeilingAllowedAgents`.
+    let allowed_agents =
+        match validate_string_list(definition.get("allowedAgents"), &field("allowedAgents"))? {
+            None => None,
+            Some(entries) => Some(
+                crate::exec::capability_ceiling::normalize_capability_ceiling_allowed_agents(
+                    &serde_json::Value::Array(
+                        entries
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+                .map_err(management_error)?,
+            ),
+        };
     let allow_nested_subagents = validate_boolean(
         definition.get("allowNestedSubagents"),
         &field("allowNestedSubagents"),
@@ -773,8 +804,6 @@ fn validate_definition(value: &Value) -> Result<ValidatedDefinition, SubagentErr
         definition.get("maxSubagentDepth"),
         &field("maxSubagentDepth"),
     )?;
-    let completion_guard =
-        validate_boolean(definition.get("completionGuard"), &field("completionGuard"))?;
     let tool_budget = validate_tool_budget(definition.get("toolBudget"))?;
     let permission_rules = validate_permissions(definition.get("permissions"))?;
     let description = validate_string(
@@ -801,6 +830,7 @@ fn validate_definition(value: &Value) -> Result<ValidatedDefinition, SubagentErr
             aliases,
             tools,
             exclude_tools,
+            allowed_agents,
             allow_nested_subagents,
             mcp_direct_tools,
             model,
@@ -829,7 +859,6 @@ fn validate_definition(value: &Value) -> Result<ValidatedDefinition, SubagentErr
             default_progress,
             interactive,
             max_subagent_depth,
-            completion_guard,
             tool_budget: definition.get("toolBudget").cloned(),
             permissions: definition.get("permissions").cloned(),
         },
@@ -1016,6 +1045,7 @@ fn to_agent_definition(
         aliases,
         tools: definition.tools.as_deref().map(tool_refs),
         exclude_tools: definition.exclude_tools,
+        allowed_agents: definition.allowed_agents,
         allow_nested_subagents: definition.allow_nested_subagents,
         extensions: definition.extensions,
         extensions_from_default: false,
@@ -1045,12 +1075,16 @@ fn to_agent_definition(
             .map(|reads| reads.into_iter().map(PathBuf::from).collect()),
         default_progress: definition.default_progress,
         output,
-        completion_guard: definition.completion_guard,
         interactive: definition.interactive,
         max_subagent_depth,
         default_context: definition.default_context,
         default_async: definition.default_async,
         default_timeout_ms: definition.default_timeout_ms,
+        // CFG-067 — the registry always validated `defaultToolTimeoutMs` (`validate_positive_integer`
+        // above, pi `runtime-agent-registry.ts:231`) and then dropped it on the floor; it now lands
+        // on the definition, so a runtime-registered agent's per-tool deadline is the same second
+        // rung an agent-FILE's `toolTimeoutMs:` is.
+        default_tool_timeout_ms: definition.default_tool_timeout_ms,
         memory: None,
         tool_budget,
         default_turn_budget: None,

@@ -15,6 +15,7 @@
 //! SELECTABLE and STREAMABLE in the assembled run.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cyrup_ext::provider::{ModelRegistrySink, ProviderRegistration};
@@ -27,6 +28,17 @@ use cyrup_provider::{Model, Provider};
 pub struct GuestProviderRegistry {
     /// Realized providers keyed by provider id, in insertion order (BTreeMap for a stable catalog).
     providers: Mutex<BTreeMap<String, Arc<dyn Provider>>>,
+    /// Monotonic mutation counter — the CACHE KEY for the composed-registry snapshot
+    /// ([`crate::session::model_runtime::RegistrySnapshot`], CFG-020).
+    ///
+    /// The snapshot cannot key on this map by identity the way it keys on the installed provider
+    /// and the catalog overlay (both `Arc`s whose replacement IS the mutation): a guest
+    /// registration mutates this registry IN PLACE, behind the same `Arc` the session holds for its
+    /// whole life. A counter is the identity that in-place mutation does have. `upsert_provider`
+    /// and `remove_provider` — the `ModelRegistrySink` impl below, and the ONLY two writers of
+    /// `providers` — each bump it, so "the generation is unchanged" means "no guest catalog has
+    /// changed" with no way for a write to slip past.
+    generation: AtomicU64,
 }
 
 impl GuestProviderRegistry {
@@ -53,6 +65,16 @@ impl GuestProviderRegistry {
             .collect()
     }
 
+    /// The mutation generation — bumped by every `upsert_provider` / `remove_provider`.
+    ///
+    /// Read as a cache key, never as a count: a caller compares it with the value it last saw and
+    /// recomposes when it differs. `Relaxed` is the right ordering for exactly that use — the
+    /// recompose that follows a difference takes the registry's own `Mutex`, which is what
+    /// publishes the new catalogs.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
     /// The registered provider ids (diagnostics).
     pub fn ids(&self) -> Vec<String> {
         self.lock().keys().cloned().collect()
@@ -71,10 +93,12 @@ impl ModelRegistrySink for GuestProviderRegistry {
         // Full replacement for this provider id (Pi "replaces all models", model-registry.ts:919).
         let provider = reg.build_provider();
         self.lock().insert(reg.id.clone(), provider);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn remove_provider(&self, id: &str) {
         self.lock().remove(id);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 }
 

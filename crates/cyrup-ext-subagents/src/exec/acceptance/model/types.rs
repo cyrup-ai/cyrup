@@ -268,6 +268,19 @@ pub enum ReviewSetting {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AcceptanceConfig {
     pub level: Option<AcceptanceLevel>,
+    /// SUBA-108 — pi `report?: "on" | "off"` (`shared/types.ts:1065` @v0.71.0), the SECOND key of
+    /// upstream's `AcceptanceConfig` and the second entry of `ACCEPTANCE_CONFIG_KEYS`
+    /// (`acceptance.ts:54`). It is carried here for ONE reason: `explicitAcceptanceRequestsPolicy`
+    /// (`acceptance.ts:243-245`) is `Object.keys(explicit).some(key => key !== "level")`, so
+    /// `{ report: "on" }` and `{ report: "off" }` each make a policy "requested" and therefore
+    /// upgrade an inferred `none` to `attested` at `:505`. Without the field the Rust predicate
+    /// could not see the key at all and both shapes fell through to `none`.
+    ///
+    /// The MODE itself is still resolved off the raw policy by
+    /// [`super::resolve_acceptance_report_mode`], which is the only consumer that needs it;
+    /// `resolveEffectiveAcceptance` never reads `explicit.report` for anything but this presence
+    /// test, and `ResolvedAcceptanceConfig` has no `report` field upstream either.
+    pub report: Option<super::AcceptanceReportMode>,
     pub criteria: Option<Vec<CriterionInput>>,
     pub evidence: Option<Vec<AcceptanceEvidenceKind>>,
     pub verify: Option<Vec<AcceptanceVerifyCommand>>,

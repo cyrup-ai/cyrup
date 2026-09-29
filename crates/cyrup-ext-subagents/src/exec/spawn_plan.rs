@@ -12,9 +12,9 @@ use crate::discovery::types::SystemPromptMode;
 use crate::error::SubagentError;
 use crate::exec::acceptance::AcceptanceContract;
 use crate::exec::agent_config::{AgentConfig, RunOptions};
-use crate::exec::completion_guard_projection;
 use crate::exec::mcp_direct_tools;
 use crate::exec::output::{inject_output_path_system_prompt, inject_single_output_instruction};
+use crate::exec::output_capability_projection;
 use crate::spawn::depth::DepthEnvelope;
 use crate::spawn::{ChildSpawnSpec, SpawnCommand};
 
@@ -133,6 +133,19 @@ pub const PARENT_SESSION_ENV_VAR: &str = "CYRUP_SUBAGENT_PARENT_SESSION";
 /// still enforce). Set only by the spawn overlay in [`build_attempt_spawn_plan`], the ONLY non-test
 /// `env_overlay` construction site (covers foreground + background spawns). `pub` (P-5) so the
 /// permission companion reads it cross-crate.
+///
+/// **`[CYRUP-DELTA]` — CFG-074: cyrup-only, and it is the port mechanism that forces it.** There is
+/// no `PI_SUBAGENT_AGENT_NAME` at any `pi-subagents` tag (checked against the literal env-name set
+/// extracted from `src` at v0.71.0). It replaces an IN-PROCESS lookup, not another variable:
+/// upstream's `resolveAgentName` (`pi-permission-system/src/index.ts:2033-2047`) reads the live
+/// session's `active_agent` entry, which exists because pi's subagent runs inside the orchestrator's
+/// own process. cyrup's subagent is a separate OS process with no access to its parent's session, so
+/// the one fact that lookup returns has to cross the spawn boundary, and an env var on the overlay
+/// the spawn already writes is the boundary. The value is the same string upstream's lookup yields,
+/// and the permission layers it feeds (`agent` + `projectAgent`) enforce identically.
+///
+/// It is therefore visible in a cyrup child's environment where a pi child carries nothing, which is
+/// the cost of the delta and the reason it is recorded here rather than left implicit.
 pub const AGENT_NAME_ENV_VAR: &str = "CYRUP_SUBAGENT_AGENT_NAME";
 
 /// pi's `__none__` sentinel for [`MCP_DIRECT_TOOLS_ENV`] when no direct MCP tools are declared.
@@ -898,7 +911,7 @@ fn compose_persona(
     // task side uses, so a read-only agent is told the runtime will persist its final response
     // rather than being ordered to write a file it has no tool to write
     // (`single-output.ts:84-91`).
-    let output_capabilities = completion_guard_projection(agent);
+    let output_capabilities = output_capability_projection(agent);
     let persona_owned = inject_output_path_system_prompt(
         &persona_with_refinement,
         opts.output_path.as_deref(),
@@ -1358,8 +1371,41 @@ fn env_orchestration(
     // process, so a grandchild can be narrower than its parent and never wider. Absent ceiling =>
     // no var, so an unbounded run does not inherit a stale bound from the parent's environment (the
     // overlay only ever adds).
+    //
+    // SUBA-111 — what crosses the boundary is the intersection of the ceiling this run was
+    // ADMITTED by with the agent's OWN `allowedAgents:` declaration, turned into an agent-sourced
+    // ceiling. pi `child-launch.ts:185-187,211` @v0.71.0:
+    //
+    // ```text
+    // const agentCapabilityCeiling = input.descendantAllowedAgents === undefined ? undefined
+    //     : { version: 1, allowedAgents: [...input.descendantAllowedAgents],
+    //         denyExtensions: false, sources: [`agent:${input.childAgentName}`] };
+    // …
+    // toolPlan.capabilityCeiling = intersectSubagentCapabilityCeilings(toolPlan.capabilityCeiling,
+    //                                                                 agentCapabilityCeiling);
+    // ```
+    //
+    // It is deliberately NOT folded into `preflight_capability_ceiling`: that one tests the
+    // PARENT's inherited ceiling against THIS agent's name, and an agent naming only `reviewer`
+    // here would otherwise refuse to launch ITSELF. The bound is meant to bind one level deeper,
+    // and it does so because the refusal fires from the GRANDCHILD's own preflight, reading this
+    // env var. `intersect_capability_ceilings` can only narrow, so monotonicity is preserved for
+    // free.
+    let agent_ceiling = agent.allowed_agents.as_ref().map(|allowed| {
+        crate::exec::capability_ceiling::ResolvedCapabilityCeiling {
+            version: crate::exec::capability_ceiling::CAPABILITY_CEILING_VERSION,
+            allowed_tools: None,
+            allowed_agents: Some(allowed.clone()),
+            deny_extensions: false,
+            sources: vec![format!("agent:{}", agent.name)],
+        }
+    });
+    let descendant_ceiling = crate::exec::capability_ceiling::intersect_capability_ceilings(&[
+        capability_ceiling.cloned(),
+        agent_ceiling,
+    ]);
     if let Some(encoded) =
-        crate::exec::capability_ceiling::encode_capability_ceiling(capability_ceiling)
+        crate::exec::capability_ceiling::encode_capability_ceiling(descendant_ceiling.as_ref())
     {
         env_overlay.insert(
             crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV.to_string(),
@@ -1559,7 +1605,7 @@ pub(crate) fn build_task_text(
         contract,
         structured_acceptance_report,
     );
-    let capabilities = completion_guard_projection(agent);
+    let capabilities = output_capability_projection(agent);
     let with_output_path = inject_single_output_instruction(
         &with_acceptance,
         opts.output_path.as_deref(),
@@ -1695,6 +1741,239 @@ mod tests {
             .expect("present");
         assert_eq!(decoded.allowed_agents, Some(vec!["reviewer".to_string()]));
         assert_eq!(decoded.sources, vec!["org-policy".to_string()]);
+    }
+
+    /// SUBA-111 — an agent's OWN `allowedAgents:` declaration becomes an agent-sourced capability
+    /// ceiling on the CHILD it launches, so it binds that child's own descendants.
+    ///
+    /// pi `execution.ts:403` / `runner-child-launch.ts:53` pass `descendantAllowedAgents:
+    /// agent.allowedAgents`, and `child-launch.ts:185-187,211` @v0.71.0 build
+    /// `{ version: 1, allowedAgents: [...], denyExtensions: false, sources: ["agent:<name>"] }`
+    /// and INTERSECT it into the ceiling the child carries.
+    ///
+    /// Red before SUBA-111: `grep -rn allowedAgents crates/cyrup-ext-subagents/src/discovery` had
+    /// ZERO hits — the key round-tripped into `extra_fields`, `AgentConfig` had no field for it,
+    /// and `spawn_plan` encoded only the preflight-resolved ceiling. Every primitive on the
+    /// enforcement side already existed and was simply never fed.
+    #[test]
+    fn an_agents_own_allowed_agents_becomes_an_agent_sourced_ceiling_on_its_child() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        // Control: no declaration, no ceiling var at all.
+        let bare = sample_agent_config("m1", &[]);
+        let planned = build_attempt_spawn_plan(
+            &bare,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plans");
+        assert!(
+            !planned
+                .spec
+                .env_overlay
+                .contains_key(cc::CAPABILITY_CEILING_ENV),
+            "an agent declaring no `allowedAgents:` imposes no bound"
+        );
+
+        let mut bounded = sample_agent_config("m1", &[]);
+        bounded.allowed_agents = Some(vec!["reviewer".to_string()]);
+        let planned = build_attempt_spawn_plan(
+            &bounded,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("an agent naming other agents must still launch ITSELF");
+
+        let encoded = planned
+            .spec
+            .env_overlay
+            .get(cc::CAPABILITY_CEILING_ENV)
+            .expect("the agent-sourced ceiling crosses the process boundary");
+        let decoded = cc::decode_capability_ceiling(Some(encoded))
+            .expect("decodes")
+            .expect("present");
+        assert_eq!(decoded.allowed_agents, Some(vec!["reviewer".to_string()]));
+        assert_eq!(
+            decoded.sources,
+            vec![format!("agent:{}", bounded.name)],
+            "the refusal must be able to name WHICH agent imposed the bound"
+        );
+        assert!(!decoded.deny_extensions);
+
+        // And that encoded bound is exactly what refuses the GRANDCHILD: the child's own preflight
+        // reads this var back and `assert_agent_allowed` tests its target against it.
+        assert_eq!(
+            cc::assert_agent_allowed("worker", Some(&decoded)),
+            Err(format!(
+                "Capability ceiling from agent:{} does not allow agent 'worker'. Allowed agents: \
+                 reviewer.",
+                bounded.name
+            )),
+        );
+        assert_eq!(cc::assert_agent_allowed("reviewer", Some(&decoded)), Ok(()));
+    }
+
+    /// SUBA-111 — the agent-sourced axis composes with an inherited ceiling by INTERSECTION, never
+    /// by replacement (pi `intersectSubagentCapabilityCeilings(toolPlan.capabilityCeiling,
+    /// agentCapabilityCeiling)`, `child-launch.ts:211`). An agent cannot widen what it was itself
+    /// admitted under.
+    #[test]
+    fn an_agent_sourced_ceiling_can_only_narrow_the_inherited_one() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-agent-ceiling-intersection";
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "allowedAgents": ["reviewer", "planner"] }),
+        )
+        .expect("registers");
+
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.name = "reviewer".to_string();
+        // The agent asks for MORE than the org policy grants: `worker` is not in the inherited set.
+        agent.allowed_agents = Some(vec!["planner".to_string(), "worker".to_string()]);
+
+        let planned = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("`reviewer` is inside the org ceiling, so it plans");
+
+        let encoded = planned
+            .spec
+            .env_overlay
+            .get(cc::CAPABILITY_CEILING_ENV)
+            .expect("a ceiling crosses the boundary");
+        let decoded = cc::decode_capability_ceiling(Some(encoded))
+            .expect("decodes")
+            .expect("present");
+        assert_eq!(
+            decoded.allowed_agents,
+            Some(vec!["planner".to_string()]),
+            "only the INTERSECTION survives — `worker` was never the agent's to grant"
+        );
+        assert!(
+            decoded.sources.contains(&"org-policy".to_string())
+                && decoded.sources.contains(&"agent:reviewer".to_string()),
+            "both impositions must be named: {:?}",
+            decoded.sources
+        );
+    }
+
+    /// SUBA-111, the CLOSING LINK — the bound an agent declares in its own `allowedAgents:` is
+    /// enforced one level DOWN, by the grandchild's own preflight reading what this planner wrote
+    /// into [`cc::CAPABILITY_CEILING_ENV`].
+    ///
+    /// The two halves are proven as one composition rather than separately: the encoded value the
+    /// first plan produced is fed back in verbatim as the child process's inherited environment
+    /// (`RunOptions::parent_env_overrides`, which is what `preflight_capability_ceiling` reads
+    /// through `opts.parent_env_var`), exactly as `resolveCurrentSubagentCapabilityCeiling` reads
+    /// `process.env` in the re-exec'd child upstream. Nothing is hand-encoded here; if the encode
+    /// half regressed, the decode half would go with it.
+    ///
+    /// That is also why the agent-sourced ceiling must NOT be folded into
+    /// [`preflight_capability_ceiling`]: `reviewer` declaring `allowedAgents: planner` still plans
+    /// fine (it is not testing itself against its own bound), and the refusal fires only when its
+    /// CHILD tries to launch `worker`.
+    #[test]
+    fn a_declared_allowed_agents_bound_refuses_the_grandchild_from_the_childs_own_preflight() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = |agent: &AgentConfig, opts: &RunOptions| {
+            build_attempt_spawn_plan(
+                agent,
+                &ModelId::from("m1"),
+                "task",
+                opts,
+                depth,
+                dir.path(),
+                None,
+            )
+        };
+
+        let mut reviewer = sample_agent_config("m1", &[]);
+        reviewer.name = "reviewer".to_string();
+        reviewer.allowed_agents = Some(vec!["planner".to_string()]);
+        let launched =
+            plan(&reviewer, &opts).expect("an agent is never tested against its own bound");
+        let encoded = launched
+            .spec
+            .env_overlay
+            .get(cc::CAPABILITY_CEILING_ENV)
+            .expect("the declared bound crosses the process boundary")
+            .clone();
+
+        // Now BE the child: the inherited environment is what the parent just wrote.
+        let mut child_opts = base_opts(dir.path(), &["m1"]);
+        child_opts
+            .parent_env_overrides
+            .insert(cc::CAPABILITY_CEILING_ENV.to_string(), Some(encoded));
+
+        let mut worker = sample_agent_config("m1", &[]);
+        worker.name = "worker".to_string();
+        let Err(refusal) = plan(&worker, &child_opts) else {
+            panic!("`worker` is outside the declared bound and must be refused");
+        };
+        let SubagentError::CapabilityCeilingViolation(message) = refusal else {
+            panic!("the refusal must be a ceiling violation, got {refusal:?}");
+        };
+        assert_eq!(
+            message,
+            "Capability ceiling from agent:reviewer does not allow agent 'worker'. Allowed \
+             agents: planner.",
+            "upstream `capabilityCeilingAgentRestrictionMessage` verbatim, naming the agent source"
+        );
+
+        // The one name the bound DOES grant still launches, and the bound rides on unchanged.
+        let mut planner = sample_agent_config("m1", &[]);
+        planner.name = "planner".to_string();
+        let allowed = plan(&planner, &child_opts).expect("`planner` is inside the declared bound");
+        let decoded = cc::decode_capability_ceiling(
+            allowed
+                .spec
+                .env_overlay
+                .get(cc::CAPABILITY_CEILING_ENV)
+                .map(String::as_str),
+        )
+        .expect("decodes")
+        .expect("the inherited bound is re-encoded for the next level down");
+        assert_eq!(decoded.allowed_agents, Some(vec!["planner".to_string()]));
+        assert_eq!(decoded.sources, vec!["agent:reviewer".to_string()]);
     }
 
     /// SUBA-072 — a capability ceiling's `allowedTools` axis must actually gate what reaches the
@@ -2270,12 +2549,13 @@ mod tests {
             !text.contains("Runtime output path override:"),
             "the system-prompt-side header must NOT be used in the task text: {text:?}"
         );
-        // Every line the injector emits is one `strip_framework_instructions` removes, so the
-        // instruction contributes no write-intent signal back to the classifier.
-        assert!(
-            !crate::exec::task_intent::task_may_mutate(&text),
-            "the injected output instruction must be stripped before intent classification: {text:?}"
-        );
+        // SUBA-107 — this used to additionally assert
+        // `!crate::exec::task_intent::task_may_mutate(&text)`, i.e. that the framework-instruction
+        // stripper removed every line the injector emits before mutation-intent classification.
+        // `exec/task_intent.rs` is gone (upstream deleted `src/runs/shared/task-intent.ts` at
+        // v0.70.1 in `7c98a696`), and with no classifier left there is no classification for the
+        // injected text to contaminate. The two assertions above — the task-side header IS present
+        // and the system-prompt-side header is NOT — are the whole remaining contract.
     }
 
     /// G82 REGRESSION — upstream keys the output instruction on the PATH alone

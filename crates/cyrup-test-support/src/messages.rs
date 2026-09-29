@@ -26,6 +26,7 @@ pub fn assistant_msg(text: impl Into<SharedStr>) -> Message {
         api: ApiId::from("anthropic-messages"),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage {
             input: 1,
@@ -60,6 +61,7 @@ pub fn create_assistant_message(text: impl Into<SharedStr>) -> AgentMessage {
         api: ApiId::from("anthropic-messages"),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,

@@ -141,14 +141,23 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
         .collect()
 }
 
-/// Insert synthetic empty tool results for orphaned tool calls (Pi
-/// `transformMessages.insertSyntheticToolResults`).
-fn insert_synthetic_tool_results(
+/// Pi `closePendingToolCalls` (`transform-messages.ts:167-187` @v0.87.1): insert synthetic empty
+/// tool results for orphaned tool calls, then flush any HELD system message.
+///
+/// PROV-083a renamed this from `insert_synthetic_tool_results` to upstream's own name, because the
+/// function no longer only inserts results: `result.push(...heldSystemMessages)` (`:185`) sits
+/// OUTSIDE the `pendingToolCalls.length > 0` guard, so the flush runs on every call. See the
+/// `held_system_messages` docs at the second pass for why a system message is held at all.
+fn close_pending_tool_calls(
     result: &mut Vec<Message>,
     pending: &mut Vec<ToolCall>,
     existing: &mut HashSet<String>,
+    held_system_messages: &mut Vec<Message>,
 ) {
     if pending.is_empty() {
+        // Nothing to synthesize. The flush below is still upstream's, and is a no-op here: a system
+        // message is only ever held WHILE tool calls are pending.
+        result.append(held_system_messages);
         return;
     }
     for tc in pending.iter() {
@@ -167,6 +176,7 @@ fn insert_synthetic_tool_results(
     }
     pending.clear();
     existing.clear();
+    result.append(held_system_messages);
 }
 
 /// 1:1 port of Pi `transformMessages` (transform-messages.ts): downgrade images, drop/convert
@@ -204,7 +214,9 @@ pub(crate) fn transform_messages_with_source(
     let transformed: Vec<Message> = image_aware
         .iter()
         .map(|msg| match msg {
-            Message::User { .. } => msg.clone(),
+            // pi `:79-82` @v0.87.1: `if (msg.role === "system" || msg.role === "user") return msg;`
+            // — neither role carries a tool call or a cross-model thinking block to rewrite.
+            Message::System(_) | Message::User { .. } => msg.clone(),
             Message::ToolResult {
                 tool_call_id,
                 tool_name,
@@ -298,11 +310,21 @@ pub(crate) fn transform_messages_with_source(
     let mut result: Vec<Message> = Vec::new();
     let mut pending: Vec<ToolCall> = Vec::new();
     let mut existing: HashSet<String> = HashSet::new();
+    // pi `:164-166` @v0.87.1, verbatim: "System messages are transparent to tool-call accounting:
+    // one that lands between a tool call and its results is held back and emitted after the results
+    // (synthetic ones included), so it never causes a duplicate result for a call that is answered
+    // later." (PROV-083a)
+    let mut held_system_messages: Vec<Message> = Vec::new();
 
     for msg in transformed {
         match &msg {
             Message::Assistant(am) => {
-                insert_synthetic_tool_results(&mut result, &mut pending, &mut existing);
+                close_pending_tool_calls(
+                    &mut result,
+                    &mut pending,
+                    &mut existing,
+                    &mut held_system_messages,
+                );
                 if matches!(am.stop_reason, StopReason::Error | StopReason::Aborted) {
                     continue;
                 }
@@ -324,12 +346,31 @@ pub(crate) fn transform_messages_with_source(
                 existing.insert(tool_call_id.as_str().to_string());
                 result.push(msg);
             }
+            // pi `:216-221` @v0.87.1 — held back while tool calls are pending, so it lands AFTER
+            // their results (synthetic ones included) instead of splitting the call/result run.
+            Message::System(_) => {
+                if pending.is_empty() {
+                    result.push(msg);
+                } else {
+                    held_system_messages.push(msg);
+                }
+            }
             Message::User { .. } => {
-                insert_synthetic_tool_results(&mut result, &mut pending, &mut existing);
+                close_pending_tool_calls(
+                    &mut result,
+                    &mut pending,
+                    &mut existing,
+                    &mut held_system_messages,
+                );
                 result.push(msg);
             }
         }
     }
-    insert_synthetic_tool_results(&mut result, &mut pending, &mut existing);
+    close_pending_tool_calls(
+        &mut result,
+        &mut pending,
+        &mut existing,
+        &mut held_system_messages,
+    );
     result
 }

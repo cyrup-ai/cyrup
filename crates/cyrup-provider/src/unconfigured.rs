@@ -142,6 +142,7 @@ impl Provider for UnconfiguredProvider {
             api: ApiId::from(UNCONFIGURED_PROVIDER_ID),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Error,

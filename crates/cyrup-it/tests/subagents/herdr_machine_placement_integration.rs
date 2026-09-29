@@ -581,7 +581,7 @@ async fn the_detached_runner_runs_a_placed_step_on_the_machine() {
     let persona: cyrup_ext_subagents::exec::ResolvedAgentPersona = serde_json::from_value(json!({
         "name":"worker","model":"fixture-model","fallbackModels":[],"systemPromptMode":"replace",
         "systemPromptBody":"","subagentOnlyExtensions":[],"excludeTools":[],"inheritProjectContext":false,
-        "inheritSkills":true,"skills":[],"completionGuard":false
+        "inheritSkills":true,"skills":[]
     }))
     .unwrap_or_else(|error| panic!("minimal persona: {error}"));
     let config: RunnerConfig = serde_json::from_value(json!({

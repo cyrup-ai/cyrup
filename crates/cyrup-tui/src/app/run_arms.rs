@@ -471,12 +471,30 @@ impl App<InlineBackend<Stdout>> {
         Ok(())
     }
 
-    pub(crate) fn on_git_branch_poll(&mut self) -> Result<(), TuiError> {
+    pub(crate) async fn on_git_branch_poll(&mut self, ctx: &mut RunCtx) -> Result<(), TuiError> {
         // Pi repaints only when the branch actually CHANGED (`notifyBranchChange` fires
         // inside `if (this.cachedBranch !== nextBranch)`); an unchanged `stat` draws
         // nothing.
-        if self.poll_footer_git_branch() {
-            self.frames.request();
+        if !self.poll_footer_git_branch() {
+            return Ok(());
+        }
+        self.frames.request();
+        // EXT-064 — and notify every extension that subscribed to branch changes, from the same
+        // `if`, because upstream's `notifyBranchChange` calls its `branchChangeCallbacks` from
+        // exactly here (`core/footer-data-provider.ts:224-227` @v0.87.1):
+        //
+        // ```ts
+        // if (this.cachedBranch !== next) { this.cachedBranch = next; this.notifyBranchChange(); }
+        // ```
+        //
+        // A guest that set a custom footer has handed the host rendered TEXT, so unlike upstream's
+        // component it cannot re-read `getGitBranch()` on the repaint this arm just asked for; this
+        // is the push that lets it re-render. Gated on `has_branch_change_subscribers` so an
+        // extension-less session's poll arm costs exactly what it did before (one rwlock read) —
+        // upstream's own guard is the emptiness of the same callback set.
+        let ext_host = ctx.session.services().ext_host.clone();
+        if ext_host.has_branch_change_subscribers() {
+            ext_host.branch_change(self.state.git_branch.branch()).await;
         }
         Ok(())
     }

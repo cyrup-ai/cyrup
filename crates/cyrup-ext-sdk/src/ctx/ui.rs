@@ -7,6 +7,58 @@ use serde_json::Value;
 use crate::descriptor::DialogOptions;
 use crate::widget::WidgetPlacement;
 
+/// EXT-064 — pi's `ReadonlyFooterDataProvider` in its cyrup shape: the value upstream hands the
+/// `setFooter` factory as its third argument
+/// (`setFooter(factory: (tui, theme, footerData) => Component)`,
+/// `core/extensions/types.ts:183-187` @v0.87.1; bound at `modes/interactive/interactive-mode.ts:2440`).
+///
+/// cyrup's `set-footer` takes the RENDERED text once rather than a factory the draw path
+/// re-invokes, so there is no factory argument to carry this — the guest PULLS it instead, through
+/// [`Ui::footer_data`], and renders its footer from what it reads.
+///
+/// The field names are pi's own, so a guest ported from a TypeScript extension reads the same
+/// keys. Upstream's type is
+/// `Pick<FooterDataProvider, "getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange">`
+/// (`core/footer-data-provider.ts:385-388` @v0.87.1) — CITATION NOTE: that file is under `core/`,
+/// NOT `modes/interactive/`. Its fourth member, `onBranchChange(callback)` (`:140-143`), is a PUSH
+/// subscription and has no representation here: a callback cannot cross the component boundary as
+/// an import return, so it needs an event EXPORT and is filed as its own row.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct FooterData {
+    /// pi `getGitBranch(): string | null` (`core/footer-data-provider.ts:126-132` @v0.87.1), whose
+    /// doc reads *"null if not in repo, \"detached\" if detached HEAD"*.
+    ///
+    /// That TRI-STATE is preserved exactly: a branch NAME, the literal `"detached"` for a HEAD
+    /// that names a commit, or `None` outside a repo. `Some("detached")` is an ordinary string
+    /// value, not a sentinel this type collapses — the footer renders it differently from both a
+    /// branch and from nothing, which is the whole reason upstream distinguishes them.
+    #[serde(default, rename = "gitBranch")]
+    pub git_branch: Option<String>,
+    /// pi `getExtensionStatuses(): ReadonlyMap<string, string>`
+    /// (`core/footer-data-provider.ts:135-137` @v0.87.1) — the status segments OTHER extensions
+    /// set through [`Ui::set_status`], keyed by the key they passed.
+    ///
+    /// A [`std::collections::BTreeMap`], which puts the entries in KEY order — and that is
+    /// upstream's own render order, not a cyrup convenience: pi's footer does
+    /// `Array.from(extensionStatuses.entries()).sort(([a], [b]) => a.localeCompare(b))` before
+    /// joining them (`modes/interactive/components/footer.ts:237-240` @v0.87.1). CITATION NOTE:
+    /// that file is at `modes/interactive/components/footer.ts` at this pin — the bare `footer.ts`
+    /// cited elsewhere in the tree resolves nowhere.
+    ///
+    /// An entry whose text is EMPTY is present here, because upstream's provider stores it: only
+    /// `setStatus(key, undefined)` deletes a key (`core/footer-data-provider.ts:146-152`
+    /// @v0.87.1), and `getExtensionStatuses()` hands the empty string back. cyrup's own TUI footer
+    /// happens to drop empties when it renders, but that is the renderer's business — this is the
+    /// provider, and it answers what upstream's does.
+    #[serde(default, rename = "extensionStatuses")]
+    pub extension_statuses: std::collections::BTreeMap<String, String>,
+    /// pi `getAvailableProviderCount(): number` (`core/footer-data-provider.ts:160-162` @v0.87.1)
+    /// — the number of distinct providers with an available model, which upstream's footer uses to
+    /// decide whether to show the model selector hint.
+    #[serde(default, rename = "availableProviderCount")]
+    pub available_provider_count: u32,
+}
+
 /// Notification severity (Pi `notify(message, type?)`, `extensions/types.ts:142` @v0.83.0).
 /// [`NotifyKind::Info`] is Pi's default when the argument is omitted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -277,25 +329,86 @@ impl Ui {
         let _ = key;
     }
 
-    /// Set the chrome header line (Pi `setHeader`, `types.ts:190` @v0.83.0).
+    /// Set the chrome header line (Pi `setHeader(factory | undefined)`,
+    /// `core/extensions/types.ts:195-196` @v0.87.1).
+    ///
+    /// EXT-064 — `None` is upstream's `undefined`, "restore the built-in header"; `Some("")` is an
+    /// EMPTY CUSTOM header, which is a different state and used to be unreachable because the
+    /// empty string was what carried the restore. [`Self::clear_header`] is the named `None`.
     ///
     /// Like its two siblings [`Self::set_footer`] and [`Self::set_title`] this is
     /// fire-and-forget — the WIT import returns nothing, so a host-side failure is not observable
     /// here — and a no-op on the host (non-`wasm32`) target.
-    pub fn set_header(&self, content: &str) {
+    pub fn set_header(&self, content: Option<&str>) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::set_header(content);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = content;
     }
-    /// Set the chrome footer line (Pi `setFooter`, `types.ts:183` @v0.83.0); fire-and-forget, see
-    /// [`Self::set_header`].
-    pub fn set_footer(&self, content: &str) {
+    /// Restore the built-in header — upstream's `setHeader(undefined)`
+    /// (`modes/interactive/interactive-mode.ts:2481-2490` @v0.87.1).
+    pub fn clear_header(&self) {
+        self.set_header(None);
+    }
+    /// Set the chrome footer line (Pi `setFooter(factory | undefined)`,
+    /// `core/extensions/types.ts:183-193` @v0.87.1); fire-and-forget, see [`Self::set_header`] for
+    /// the `Option` mapping.
+    pub fn set_footer(&self, content: Option<&str>) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::set_footer(content);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = content;
     }
+    /// Restore the built-in footer — upstream's `setFooter(undefined)`
+    /// (`modes/interactive/interactive-mode.ts:2442-2446` @v0.87.1).
+    pub fn clear_footer(&self) {
+        self.set_footer(None);
+    }
+    /// Stop receiving git-branch-change notifications — the unsubscribe closure pi's
+    /// `onBranchChange(callback): () => void` RETURNS
+    /// (`core/footer-data-provider.ts:141-142` @v0.87.1). Idempotent, like upstream's
+    /// `Set.delete`. EXT-064.
+    ///
+    /// The callback itself stays registered ([`crate::api::ExtensionApi::on_branch_change`] is an
+    /// init-time factory call, since a closure cannot cross the component boundary); this takes
+    /// down the HOST-side subscription, which is what stops the `on-branch-change` export from
+    /// being invoked. Pair with [`Self::subscribe_branch_change`] to resume.
+    pub fn unsubscribe_branch_change(&self) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::unsubscribe_branch_change();
+    }
+    /// Resume git-branch-change notifications after [`Self::unsubscribe_branch_change`].
+    ///
+    /// `guest::init` already calls this once for an extension whose factory registered a callback,
+    /// so a guest that never unsubscribes never needs it.
+    pub fn subscribe_branch_change(&self) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::subscribe_branch_change();
+    }
+    /// EXT-064 — the footer's live data: the git branch, the status segments other extensions set,
+    /// and the available-provider count. pi's `ReadonlyFooterDataProvider`, the third argument its
+    /// `setFooter` factory receives (`interactive-mode.ts:2440` @v0.87.1); see [`FooterData`].
+    ///
+    /// `None` means the host has NO footer data provider attached, and that is upstream's own
+    /// answer outside the interactive TUI rather than a cyrup gap — pi constructs its one
+    /// `FooterDataProvider` at `interactive-mode.ts:611` and nowhere else, so in RPC, print and
+    /// json modes no extension footer factory is ever invoked. A guest should fall back to a
+    /// data-less footer there, exactly as an upstream extension's factory simply never runs.
+    ///
+    /// `None` is ALSO the answer when the host sent json this SDK could not deserialize. Those two
+    /// are not distinguished, and deliberately: both mean "render without footer data", and the
+    /// alternative — a `Some(FooterData::default())` for a parse failure — would claim "not in a
+    /// repo, no statuses, no providers" as fact.
+    pub fn footer_data(&self) -> Option<FooterData> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ui::footer_data()
+                .and_then(|json| serde_json::from_str(&json).ok());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        None
+    }
+
     /// Set the chrome title (Pi `setTitle`, `types.ts:193` @v0.83.0); fire-and-forget, see
     /// [`Self::set_header`].
     pub fn set_title(&self, title: &str) {

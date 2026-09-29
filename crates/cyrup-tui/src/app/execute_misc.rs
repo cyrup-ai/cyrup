@@ -191,105 +191,137 @@ impl<B: Backend> App<B> {
             ));
     }
 
-    /// Re-read the argument-completion sources pi's `createBaseAutocompleteProvider` closes over
-    /// (`interactive-mode.ts:685-736` @v0.84.3) and push them into the editor.
+    /// Install the argument-completion sources pi's `createBaseAutocompleteProvider` closes over
+    /// (`interactive-mode.ts:679-736` @v0.87.1) into the editor.
     ///
-    /// pi's closures read the session live on every keystroke;
-    /// [`crate::Autocomplete::compute`] is synchronous and holds no session, so cyrup takes a
-    /// SNAPSHOT at the four points where the underlying sets can actually change: boot
-    /// ([`Self::seed_session_ui`]), session swap, a credential change (the model catalog is
-    /// auth-filtered) and a `/scoped-models` save. It is a snapshot, not a subscription: a provider
-    /// or model that appears by some other path — a guest provider registered mid-session — is not
-    /// offered until the next refresh.
+    /// pi's three builtin completers read the session INSIDE the callback, so every keystroke is
+    /// answered from the session as it is at that instant. [`crate::Autocomplete::compute`] is
+    /// synchronous and holds no session, so the session is captured in a
+    /// [`crate::autocomplete::LiveSource::Live`] callback and read at completion time — the same
+    /// guarantee, by the same mechanism. Nothing is snapshotted here, so a set that changes by a
+    /// path nobody thought to hook — a guest provider an extension registers mid-session, a model
+    /// switch that shortens the thinking ladder — is offered on the very next keystroke.
     ///
-    /// Per-keystroke refreshing is deliberately NOT an option: `available_model_catalog()`
-    /// (`cyrup-session-svc/src/session/model.rs:235-237`) runs `has_configured_auth` per model.
+    /// Still called at boot ([`Self::seed_session_ui`]), on session swap, on a credential change and
+    /// on a `/scoped-models` save, because the callbacks capture ONE session `Arc` and a swap
+    /// replaces it — and because the `/thinking` PICKER keeps its own eager copy
+    /// (`self.state.available_thinking_levels`, pi's `:4792` read of the same session call).
+    ///
+    /// Reading live is affordable because CFG-020a made it so: `available_model_catalog()`
+    /// (`cyrup-session-svc/src/session/model.rs`) answers from the cached registry snapshot and
+    /// evaluates auth once per PROVIDER (~40 in-memory `has_auth` lookups), not once per model —
+    /// the per-model `has_configured_auth` that once made this impossible is gone. MEASURED, not
+    /// assumed: 903 µs per read over a 175-model catalog in an UNOPTIMISED test build
+    /// (`crate::tests::autocomplete_live::live_model_source_is_cheap_enough_per_keystroke`, which
+    /// prints the number under `--nocapture`), against a 16 ms frame. The completer is reached only
+    /// while a `/model`, `/login` or `/thinking` argument popup is actually open.
     pub(crate) fn refresh_argument_sources(&mut self, session: &Arc<AgentSession>) {
         // `scopedModels.length > 0 ? scopedModels.map(s => s.model) :
-        // modelRuntime.getAvailableSnapshot()` (`interactive-mode.ts:689-691`).
-        // `available_model_catalog()` is the same source the `/model` picker reads
-        // (`app/event_extract.rs:282`).
-        let scoped = session.scoped_models();
-        let models: Vec<crate::autocomplete::ModelArgument> = if scoped.is_empty() {
-            session
-                .available_model_catalog()
-                .iter()
-                .map(|m| crate::autocomplete::ModelArgument {
-                    id: m.id.to_string(),
-                    provider: m.provider.to_string(),
-                    name: m.name.clone(),
-                })
-                .collect()
-        } else {
-            scoped
-                .iter()
-                .map(|sm| crate::autocomplete::ModelArgument {
-                    id: sm.model.id.to_string(),
-                    provider: sm.model.provider.to_string(),
-                    name: sm.model.name.clone(),
-                })
-                .collect()
-        };
+        // modelRuntime.getAvailableSnapshot()` (`interactive-mode.ts:689-691`) — read per keystroke,
+        // as pi's closure does. `available_model_catalog()` is the same source the `/model` picker
+        // reads (`app/event_extract.rs:282`).
+        let model_session = Arc::clone(session);
+        let models = crate::autocomplete::LiveSource::live(move || {
+            let scoped = model_session.scoped_models();
+            if scoped.is_empty() {
+                model_session
+                    .available_model_catalog()
+                    .iter()
+                    .map(|m| crate::autocomplete::ModelArgument {
+                        id: m.id.to_string(),
+                        provider: m.provider.to_string(),
+                        name: m.name.clone(),
+                    })
+                    .collect()
+            } else {
+                scoped
+                    .iter()
+                    .map(|sm| crate::autocomplete::ModelArgument {
+                        id: sm.model.id.to_string(),
+                        provider: sm.model.provider.to_string(),
+                        name: sm.model.name.clone(),
+                    })
+                    .collect()
+            }
+        });
 
         // `getLoginProviderCompletionOptions(this.getLoginProviderOptions())`
-        // (`interactive-mode.ts:729`). The registry comes through the same seam
-        // [`Self::build_login_inputs`] and [`Self::provider_oauth_strategy`] use, so the offline
-        // test override ([`Self::set_login_provider_source`]) covers this path too. No auth-store
-        // read: the completion row uses only id / name / authTypes, never a status (`:730-734`).
-        let registry = match self.login_providers.as_deref() {
-            Some(source) => source(),
-            None => cyrup_provider::all_providers(),
-        };
-        let mut login_providers: Vec<crate::autocomplete::LoginProviderArgument> = registry
-            .iter()
-            .filter_map(|p| {
-                // A provider with no auth strategy contributes no row (`:4948`/`:4957` both test a
-                // member of `provider.auth`), exactly as `build_login_inputs` filters.
-                let auth = p.provider_auth()?;
-                // The push order IS `AUTH_TYPE_ORDER` — oauth 0, api_key 1
-                // (`interactive-mode.ts:286`), which is what the merge step sorts by.
-                let mut auth_types = Vec::with_capacity(2);
-                if auth.oauth.is_some() {
-                    auth_types.push(AuthType::Oauth);
-                }
-                if auth.api_key.is_some() {
-                    auth_types.push(AuthType::ApiKey);
-                }
-                let id = p.id().as_str().to_string();
-                Some(crate::autocomplete::LoginProviderArgument {
-                    name: crate::provider_display_name(&id),
-                    id,
-                    auth_types,
+        // (`interactive-mode.ts:729`), likewise per keystroke. The registry comes through the same
+        // seam [`Self::build_login_inputs`] and [`Self::provider_oauth_strategy`] use, so the
+        // offline test override ([`Self::set_login_provider_source`]) covers this path too. No
+        // auth-store read: the completion row uses only id / name / authTypes, never a status
+        // (`:730-734`). The SEAM itself is captured rather than re-read — it is installed once,
+        // before boot, and is `None` in every non-test build — while the registry it returns is
+        // read per keystroke, which is the half pi's `getLoginProviderOptions()` call makes live.
+        let login_source = self.login_providers.clone();
+        let login_providers = crate::autocomplete::LiveSource::live(move || {
+            let registry = match login_source.as_deref() {
+                Some(source) => source(),
+                None => cyrup_provider::all_providers(),
+            };
+            let mut login_providers: Vec<crate::autocomplete::LoginProviderArgument> = registry
+                .iter()
+                .filter_map(|p| {
+                    // A provider with no auth strategy contributes no row (`:4948`/`:4957` both test a
+                    // member of `provider.auth`), exactly as `build_login_inputs` filters.
+                    let auth = p.provider_auth()?;
+                    // The push order IS `AUTH_TYPE_ORDER` — oauth 0, api_key 1
+                    // (`interactive-mode.ts:286`), which is what the merge step sorts by.
+                    let mut auth_types = Vec::with_capacity(2);
+                    if auth.oauth.is_some() {
+                        auth_types.push(AuthType::Oauth);
+                    }
+                    if auth.api_key.is_some() {
+                        auth_types.push(AuthType::ApiKey);
+                    }
+                    let id = p.id().as_str().to_string();
+                    Some(crate::autocomplete::LoginProviderArgument {
+                        name: crate::provider_display_name(&id),
+                        id,
+                        auth_types,
+                    })
                 })
-            })
-            .collect();
-        // `sort((a, b) => a.name.localeCompare(b.name))` (`interactive-mode.ts:317`). DEVIATION:
-        // cyrup-tui carries no collator (`cyrup_config::login::sort_by_name` uses `feruca`, which
-        // is not a dependency here), so this is the lowercased-name-then-id ordering
-        // `auth_select::provider_rows` (`:115`) already uses for the very same provider list —
-        // identical for the ASCII ids every provider actually has.
-        login_providers.sort_by(|a, b| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then_with(|| a.id.cmp(&b.id))
+                .collect();
+            // `sort((a, b) => a.name.localeCompare(b.name))` (`interactive-mode.ts:317`). DEVIATION:
+            // cyrup-tui carries no collator (`cyrup_config::login::sort_by_name` uses `feruca`, which
+            // is not a dependency here), so this is the lowercased-name-then-id ordering
+            // `auth_select::provider_rows` (`:115`) already uses for the very same provider list —
+            // identical for the ASCII ids every provider actually has.
+            login_providers.sort_by(|a, b| {
+                a.name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase())
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            login_providers
         });
 
         // `session.getAvailableThinkingLevels()` (`core/agent-session.ts:1816-1819`): the current
         // model's ladder, or the full `THINKING_LEVEL_OPTIONS` when no model is selected. pi reads
         // it from the session at BOTH consumers — the `/thinking` completer
-        // (`interactive-mode.ts:715`) and the picker (`:4792`) — so this one call feeds both here
-        // too, instead of the completer re-deriving it from the catalog and drifting from what the
-        // picker offers.
-        let thinking_levels: Vec<String> = session
+        // (`interactive-mode.ts:715`) and the picker (`:4792`). The completer reads it live here
+        // too, so a `/model` switch to a non-reasoning model narrows the `/thinking` popup on the
+        // next keystroke rather than on the next refresh.
+        let thinking_session = Arc::clone(session);
+        let thinking_levels = crate::autocomplete::LiveSource::live(move || {
+            thinking_session
+                .available_thinking_levels()
+                .into_iter()
+                .map(|l| thinking_level_str(l).to_string())
+                .collect()
+        });
+        // The PICKER's copy is eager and stays so — it is rendered from `state`, not from a
+        // completer callback, and the other two writers of this field (`execute.rs:242`,
+        // `execute_misc.rs:612`) already refresh it on model change.
+        self.state.available_thinking_levels = session
             .available_thinking_levels()
             .into_iter()
             .map(|l| thinking_level_str(l).to_string())
             .collect();
-        self.state.available_thinking_levels = thinking_levels.clone();
 
-        // `extension_completions` is NOT part of this snapshot — it is fetched per keystroke by
-        // [`Self::refresh_extension_completions`] and carried across by `set_argument_sources`.
+        // `extension_completions` is NOT one of these callbacks — the guest call is `async`, so it
+        // is fetched per keystroke by [`Self::refresh_extension_completions`] and carried across by
+        // `set_argument_sources`.
         self.state
             .editor
             .set_argument_sources(crate::autocomplete::ArgumentSources {

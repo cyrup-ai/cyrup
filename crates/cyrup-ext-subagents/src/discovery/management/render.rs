@@ -197,8 +197,10 @@ pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
     if let Some(depth) = a.max_subagent_depth {
         lines.push(format!("Max subagent depth: {depth}"));
     }
-    if a.completion_guard == Some(false) {
-        lines.push("Completion guard: false".to_string());
+    // SUBA-111 — a declared delegation bound is a capability the reader must be able to SEE; it
+    // is the one axis of the agent-sourced capability ceiling an agent file can set.
+    if let Some(allowed) = a.allowed_agents.as_ref() {
+        lines.push(format!("Allowed agents: {}", allowed.join(", ")));
     }
     if !a.system_prompt_body.trim().is_empty() {
         lines.push(String::new());

@@ -119,7 +119,7 @@ const GOOGLE_VERTEX_CATALOG_JSON: &str = include_str!("catalog/google-vertex.jso
 /// The full Vertex catalog (1:1 with pi `GOOGLE_VERTEX_MODELS`). A parse failure yields an empty
 /// catalog (surfaced loudly by the count test) rather than a panic (NO-PANIC policy).
 pub fn google_vertex_models() -> Vec<Model> {
-    serde_json::from_str(GOOGLE_VERTEX_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(GOOGLE_VERTEX_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The Vertex [`ProviderAuth`] (pi `auth: { apiKey: vertexAuth }`, `google-vertex.ts:93`).
@@ -453,12 +453,13 @@ mod tests {
 
     // ------------------------------------------------------------------ catalog
 
-    /// pi `GOOGLE_VERTEX_MODELS` at `b0c2a90e`: 10 models, all on the `google-vertex` wire api and
-    /// all on the `{location}` base-URL template.
+    /// pi `GOOGLE_VERTEX_MODELS`, live since PROV-071: 14 models, all on the `google-vertex` wire
+    /// api and all on the `{location}` base-URL template. 10 while the catalog was frozen at
+    /// `b0c2a90e`.
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = google_vertex_models();
-        assert_eq!(models.len(), 10);
+        assert_eq!(models.len(), 14);
         assert!(
             models
                 .iter()
@@ -474,7 +475,19 @@ mod tests {
         assert!(models.iter().all(|m| m.reasoning));
         assert!(models.iter().all(|m| m.supports_image_input()));
         assert!(models.iter().all(|m| m.context_window == 1_048_576));
-        assert!(models.iter().all(|m| m.max_tokens == 65_536));
+        // 65 536 on thirteen of the fourteen; `gemini-2.5-flash-lite` reports 65 535. models.dev's
+        // `limit.output` is the source (`generate-models.ts:1651` @v0.87.1 — `source.limit?.output
+        // || 4096`), so the off-by-one is upstream's datum, not a rounding here. Asserted as the
+        // exact split rather than relaxed to a range, which would stop noticing a row that lost
+        // its window entirely.
+        assert_eq!(
+            models
+                .iter()
+                .filter(|m| m.max_tokens != 65_536)
+                .map(|m| (m.id.as_str(), m.max_tokens))
+                .collect::<Vec<_>>(),
+            vec![("gemini-2.5-flash-lite", 65_535)]
+        );
 
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
@@ -488,6 +501,10 @@ mod tests {
                 "gemini-3.1-pro-preview",
                 "gemini-3.1-pro-preview-customtools",
                 "gemini-3.5-flash",
+                "gemini-3.5-flash-lite",
+                "gemini-3.6-flash",
+                "gemini-3.7-flash",
+                "gemini-3.8-flash",
                 "gemini-flash-latest",
                 "gemini-flash-lite-latest",
             ]
@@ -524,32 +541,43 @@ mod tests {
 
         let pro = by_id("gemini-3.1-pro-preview");
         let map = pro.thinking_level_map.as_ref().expect("thinkingLevelMap");
+        // The VALUES are what goes on the wire as Vertex's `thinkingLevel`, and they moved with
+        // the data: `LOW`/`HIGH` with a null `medium` at `b0c2a90e`, lowercase `low`/`medium`/`high`
+        // now. `getGoogleThinkingLevelMap` (`packages/ai/scripts/generate-models.ts:1011-1020`
+        // @v0.87.1) returns `getEffortThinkingLevelMap(reasoning_options)` for a Gemini row and
+        // only falls back to its own hardcoded `{minimal: "MINIMAL", high: "HIGH"}` for Gemma-4, so
+        // these are models.dev's `reasoning_options` verbatim — a data move upstream, not a case
+        // convention cyrup chose.
         assert_eq!(map.get("off"), Some(&None));
         assert_eq!(map.get("minimal"), Some(&None));
-        assert_eq!(map.get("low"), Some(&Some("LOW".to_string())));
-        assert_eq!(map.get("medium"), Some(&None));
-        assert_eq!(map.get("high"), Some(&Some("HIGH".to_string())));
-        assert_eq!(map.len(), 5);
+        assert_eq!(map.get("low"), Some(&Some("low".to_string())));
+        assert_eq!(map.get("medium"), Some(&Some("medium".to_string())));
+        assert_eq!(map.get("high"), Some(&Some("high".to_string())));
+        assert_eq!(map.get("xhigh"), Some(&None));
+        assert_eq!(map.get("max"), Some(&None));
+        assert_eq!(map.len(), 7);
         assert_eq!(pro.cost.input, 2.0);
         assert_eq!(pro.cost.output, 12.0);
         assert_eq!(pro.cost.cache_read, 0.2);
         assert_eq!(pro.cost.cache_write, 0.0);
 
-        // `off: null` only.
+        // The flash rows differ from the pro ones in exactly one rung: `minimal` is supported.
         let flash3 = by_id("gemini-3-flash-preview");
         let map = flash3
             .thinking_level_map
             .as_ref()
             .expect("thinkingLevelMap");
         assert_eq!(map.get("off"), Some(&None));
-        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("minimal"), Some(&Some("minimal".to_string())));
+        assert_eq!(map.get("high"), Some(&Some("high".to_string())));
+        assert_eq!(map.len(), 7);
 
         // MIRROR: the 2.5 rows have no map.
         assert!(by_id("gemini-2.5-flash").thinking_level_map.is_none());
         assert!(by_id("gemini-2.5-pro").thinking_level_map.is_none());
     }
 
-    /// `gemini-2.5-pro` verbatim from `google-vertex.models.ts` @`b0c2a90e`.
+    /// `gemini-2.5-pro` verbatim from `google-vertex.models.ts`.
     #[test]
     fn gemini_2_5_pro_matches_the_upstream_row() {
         let models = google_vertex_models();
@@ -576,7 +604,7 @@ mod tests {
         let provider = google_vertex_provider();
         assert_eq!(provider.id().as_str(), "google-vertex");
         assert_eq!(provider.name(), "Google Vertex AI");
-        assert_eq!(provider.models().len(), 10);
+        assert_eq!(provider.models().len(), 14);
         let auth = provider.provider_auth().expect("vertex declares auth");
         // pi wires `auth: { apiKey: vertexAuth }` — an api-key strategy, no OAuth
         // (`google-vertex.ts:93`).

@@ -3,8 +3,6 @@
 
 use std::path::Path;
 
-use crate::exec::completion_guard::CompletionMutationGuardResult;
-
 use super::contract::{AcceptanceContract, ReviewerResult};
 use super::report_source::{
     AcceptanceFileOutput, select_acceptance_report_source, self_report_floor,
@@ -55,10 +53,11 @@ impl CleanCompletionGate {
 ///    at least [`AcceptanceStatus::Claimed`]; if the extracted JSON additionally carries at least
 ///    one of [`crate::exec::output::ACCEPTANCE_REPORT_COMPANION_KEYS`], the floor rises to
 ///    [`AcceptanceStatus::Attested`] (still self-report, richer self-report).
-/// 3. If `contract.required_level >= Checked`, a structural/evidence check runs:
-///    `completion_guard.triggered == false` (i.e. the completion-mutation guard did NOT fire) is
-///    the evidence this module consults — an orchestrator-observed fact, not a child assertion —
-///    and raising the achieved level to [`AcceptanceStatus::Checked`] when it holds.
+/// 3. If `contract.required_level >= Checked`, upstream's own structural/evidence check runs
+///    (`acceptance.ts:1297-1321`): every declared criterion must appear in the child's report as
+///    `satisfied`, every declared evidence kind must be present in it, and `no-staged-files`
+///    additionally shells out to a REAL `git status --short`. Any failed runtime check caps the
+///    achieved level below [`AcceptanceStatus::Checked`].
 /// 4. If `contract.required_level >= Verified`, [`crate::exec::acceptance::lattice::verify::run_verify_commands`] is ACTUALLY invoked
 ///    against every declared command; achieving [`AcceptanceStatus::Verified`] requires that **no**
 ///    result [`rejects`](crate::exec::acceptance::model::AcceptanceVerifyResult::rejects) — a single failing (or timed-out)
@@ -96,7 +95,6 @@ pub async fn evaluate_acceptance(
     contract: &AcceptanceContract,
     gate: CleanCompletionGate,
     final_output: Option<&str>,
-    completion_guard: CompletionMutationGuardResult,
     verify_cwd: &Path,
     // G80 — pi's `artifactsDir`/`runId` pair (`acceptance.ts:1226-1227`), threaded down to
     // `runMemoizedVerifyCommand`. `None` (every caller with no artifacts root configured, and
@@ -116,7 +114,6 @@ pub async fn evaluate_acceptance(
         contract,
         gate,
         final_output,
-        completion_guard,
         verify_cwd,
         memo,
         file_output,
@@ -146,7 +143,6 @@ pub async fn evaluate_acceptance_with_cancel(
     contract: &AcceptanceContract,
     gate: CleanCompletionGate,
     final_output: Option<&str>,
-    completion_guard: CompletionMutationGuardResult,
     verify_cwd: &Path,
     memo: Option<crate::exec::acceptance::model::VerifyMemoContext<'_>>,
     file_output: Option<AcceptanceFileOutput<'_>>,
@@ -156,7 +152,6 @@ pub async fn evaluate_acceptance_with_cancel(
         contract,
         gate,
         final_output,
-        completion_guard,
         verify_cwd,
         memo,
         file_output,
@@ -192,7 +187,6 @@ pub async fn evaluate_acceptance_with_structured_report(
     contract: &AcceptanceContract,
     gate: CleanCompletionGate,
     final_output: Option<&str>,
-    completion_guard: CompletionMutationGuardResult,
     verify_cwd: &Path,
     memo: Option<crate::exec::acceptance::model::VerifyMemoContext<'_>>,
     file_output: Option<AcceptanceFileOutput<'_>>,
@@ -239,20 +233,14 @@ pub async fn evaluate_acceptance_with_structured_report(
     let mut detail: Vec<String> = Vec::new();
     if contract.required_level >= AcceptanceStatus::Checked {
         let mut checked = true;
-        if completion_guard.triggered {
-            detail.push(
-                "checked: completion-mutation guard triggered (implementation was expected but \
-                 no mutating tool call was observed)"
-                    .to_string(),
-            );
-            checked = false;
-        }
-        // pi's own `rank >= checked` rung (`evaluateAcceptance`, `acceptance.ts:1297-1321`): every
+        // pi's `rank >= checked` rung (`evaluateAcceptance`, `acceptance.ts:1297-1321`): every
         // declared criterion must appear in the child's report as `satisfied`, every declared
         // evidence kind must be present in it, and `no-staged-files` additionally shells out to a
-        // REAL `git status --short`. ANY failed runtime check rejects. Runs alongside — not instead
-        // of — the completion-mutation guard above, which is this crate's own extra orchestrator-
-        // observed signal (R-SA-034) and has no upstream counterpart on this rung.
+        // REAL `git status --short`. ANY failed runtime check rejects.
+        //
+        // SUBA-107: this rung used to ALSO cap on `completion_guard.triggered`, a cyrup-only term
+        // its own comment admitted had no upstream counterpart. The guard it read was deleted
+        // upstream at v0.70.1 (`7c98a696`), so the rung is now upstream's alone.
         let failures = declared_structural_failures(contract, report_source, verify_cwd).await;
         if !failures.is_empty() {
             detail.extend(failures);
@@ -422,7 +410,6 @@ mod tests {
 
     use super::*;
     use crate::exec::acceptance::lattice::testsupport::clean_gate;
-    use crate::exec::acceptance::lattice::testsupport::no_guard_trigger;
     use crate::exec::acceptance::lattice::testsupport::passed;
     use crate::exec::acceptance::lattice::testsupport::vc;
 
@@ -435,7 +422,6 @@ mod tests {
             &contract,
             clean_gate(),
             Some("I fixed the bug.\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```"),
-            no_guard_trigger(),
             dir.path(),
             None,
             None,
@@ -468,7 +454,6 @@ mod tests {
                 "I ran the tests and they passed.\n```acceptance-report\n\
                  {\"criteriaSatisfied\": true, \"commandsRun\": [\"cargo test\"]}\n```",
             ),
-            no_guard_trigger(),
             dir.path(),
             None,
             None,
@@ -493,7 +478,6 @@ mod tests {
             &contract,
             clean_gate(),
             Some("Everything passed!\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```"),
-            no_guard_trigger(),
             dir.path(),
             None,
             None,
@@ -512,16 +496,8 @@ mod tests {
             AcceptanceStatus::Verified,
             vec![vc("exit 0"), vc("exit 1"), vc("exit 0")],
         );
-        let ledger = evaluate_acceptance(
-            &contract,
-            clean_gate(),
-            None,
-            no_guard_trigger(),
-            dir.path(),
-            None,
-            None,
-        )
-        .await;
+        let ledger =
+            evaluate_acceptance(&contract, clean_gate(), None, dir.path(), None, None).await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
         assert_eq!(ledger.verify_results.len(), 3);
     }
@@ -536,16 +512,7 @@ mod tests {
             interrupted: false,
             timed_out: false,
         };
-        let ledger = evaluate_acceptance(
-            &contract,
-            dirty_gate,
-            None,
-            no_guard_trigger(),
-            dir.path(),
-            None,
-            None,
-        )
-        .await;
+        let ledger = evaluate_acceptance(&contract, dirty_gate, None, dir.path(), None, None).await;
         assert_eq!(ledger.status, AcceptanceStatus::NotRequired);
         assert!(
             ledger.verify_results.is_empty(),
@@ -554,42 +521,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn checked_level_is_satisfied_by_a_non_triggered_completion_guard() {
+    /// SUBA-107 — formerly `checked_level_is_satisfied_by_a_non_triggered_completion_guard`. The
+    /// retired guard was the only thing this rung could fail on when nothing is declared; with it
+    /// gone, a contract that declares no criteria and no evidence reaches `Checked` outright,
+    /// which is `acceptance.ts:1297-1321`'s own behaviour (no runtime check to fail).
+    async fn checked_level_is_satisfied_when_no_structural_check_is_declared() {
         let dir = tempfile::tempdir().expect("tempdir");
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
-        let ledger = evaluate_acceptance(
-            &contract,
-            clean_gate(),
-            None,
-            no_guard_trigger(),
-            dir.path(),
-            None,
-            None,
-        )
-        .await;
+        let ledger =
+            evaluate_acceptance(&contract, clean_gate(), None, dir.path(), None, None).await;
         assert_eq!(ledger.status, AcceptanceStatus::Checked);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn checked_level_is_rejected_when_completion_guard_triggered() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
-        let triggered = CompletionMutationGuardResult {
-            expected_mutation: true,
-            attempted_mutation: false,
-            triggered: true,
-        };
-        let ledger = evaluate_acceptance(
-            &contract,
-            clean_gate(),
-            None,
-            triggered,
-            dir.path(),
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(ledger.status, AcceptanceStatus::Rejected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -601,16 +542,8 @@ mod tests {
                 detail: Some("looks good".to_string()),
             });
         assert_eq!(contract.required_level, AcceptanceStatus::Reviewed);
-        let ledger = evaluate_acceptance(
-            &contract,
-            clean_gate(),
-            None,
-            no_guard_trigger(),
-            dir.path(),
-            None,
-            None,
-        )
-        .await;
+        let ledger =
+            evaluate_acceptance(&contract, clean_gate(), None, dir.path(), None, None).await;
         assert_eq!(ledger.status, AcceptanceStatus::Reviewed);
     }
 
@@ -619,16 +552,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]);
         contract.required_level = AcceptanceStatus::Reviewed; // demand Reviewed but attach no result
-        let ledger = evaluate_acceptance(
-            &contract,
-            clean_gate(),
-            None,
-            no_guard_trigger(),
-            dir.path(),
-            None,
-            None,
-        )
-        .await;
+        let ledger =
+            evaluate_acceptance(&contract, clean_gate(), None, dir.path(), None, None).await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
     }
 
@@ -640,16 +565,8 @@ mod tests {
                 approved: false,
                 detail: Some("needs more work".to_string()),
             });
-        let ledger = evaluate_acceptance(
-            &contract,
-            clean_gate(),
-            None,
-            no_guard_trigger(),
-            dir.path(),
-            None,
-            None,
-        )
-        .await;
+        let ledger =
+            evaluate_acceptance(&contract, clean_gate(), None, dir.path(), None, None).await;
         assert_eq!(ledger.status, AcceptanceStatus::Rejected);
         assert!(ledger.detail.expect("detail").contains("needs more work"));
     }
@@ -698,7 +615,6 @@ mod tests {
             &contract,
             clean_gate(),
             Some(output),
-            no_guard_trigger(),
             dir.path(),
             None,
             None,

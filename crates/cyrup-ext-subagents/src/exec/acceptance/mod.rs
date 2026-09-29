@@ -17,9 +17,9 @@
 //!    its answer. This MUST run *before* [`crate::spawn::SpawnedChild::spawn`] — it is pure task-
 //!    text augmentation, not itself a spawn.
 //! 3. [`evaluate_acceptance`] (R-SA-032, DI-SA-5) — the gate itself. For `checked` and above,
-//!    structural/evidence checks run against the extracted output and observed transcript
-//!    (`exec/completion_guard.rs`'s already-computed [`crate::exec::completion_guard::CompletionMutationGuardResult`]
-//!    is one such piece of evidence this function consumes, never re-derives). For `verified`,
+//!    structural/evidence checks run against the extracted output (`acceptance.ts:1297-1321`:
+//!    declared criteria, declared evidence kinds, and a real `git status --short` for
+//!    `no-staged-files`). For `verified`,
 //!    [`run_verify_commands`] is invoked to ACTUALLY EXECUTE every declared `verify[]` command as
 //!    a real OS subprocess and observe its real exit code — **a child's own prose claim that a
 //!    command succeeded is never sufficient and is never even consulted here**; the whole point
@@ -35,8 +35,8 @@
 //!
 //! # Ordering this module does NOT own but MUST be called consistently with (R-SA-033)
 //!
-//! `structured-output validation (R-SA-030, exec/output.rs) -> completion-mutation guard
-//! (R-SA-034, exec/completion_guard.rs) -> acceptance-gate evaluation (this module, gated on
+//! `structured-output validation (R-SA-030, exec/output.rs) -> acceptance-gate evaluation (this
+//! module, gated on
 //! `exit_code == 0 && !detached && !interrupted && !timed_out`) -> result compaction (R-SA-043,
 //! a later phase)`. This module's [`evaluate_acceptance`] takes that same four-flag gate as an
 //! explicit, mandatory parameter — see that function's doc comment — precisely so a caller cannot

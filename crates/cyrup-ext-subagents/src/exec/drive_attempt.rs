@@ -72,6 +72,24 @@ pub(crate) struct DriveOutcome {
     /// `result.watchdog` (`execution.ts:563-567` @v0.43.0). `None` for an unarmed child and for an
     /// armed one that never reported.
     pub(crate) watchdog: Option<ChildWatchdogStateSnapshot>,
+    /// CFG-067 — a per-tool-call deadline expired and the child was signalled down for it (pi
+    /// `terminateForToolTimeout`, `execution.ts:1248-1263`). Upstream assigns the SAME string to
+    /// `result.error` and `result.finalOutput` and sets `result.timedOut`, so this rides out beside
+    /// [`Self::timed_out`] rather than replacing it.
+    pub(crate) tool_timeout_error: Option<String>,
+    /// SUBA-118 — pi `result.afterCompactionSettlement` (`execution.ts:1418-1420`, which stamps it
+    /// onto the attempt result under the `AFTER_COMPACTION_SETTLEMENT` symbol): the child settled
+    /// its drain WHILE a compaction was outstanding. Read by
+    /// [`crate::exec::attempt_runner::SpawnedChildAttemptRunner`]'s abort-recovery plan as
+    /// `after_compaction_settlement` (`abort-recovery.ts:81`), which is the marker that makes a
+    /// compaction-induced abort resumable at all and a terminal-drain cleanup signal
+    /// non-authoritative (`:109`).
+    pub(crate) after_compaction_settlement: bool,
+    /// SUBA-118 — pi `result.toolBudgetBlocked` (`execution.ts:1150`): a tool result this attempt
+    /// observed was the run's own hard-block message, so the child was stopped by its budget rather
+    /// than by anything resumable. Read by the abort-recovery plan's `tool_budget_exhausted` rung
+    /// (`abort-recovery.ts:111`).
+    pub(crate) tool_budget_blocked: bool,
 }
 
 /// The final-stop grace window (pi `FINAL_STOP_GRACE_MS`, `execution.ts:333`): once a terminal
@@ -236,18 +254,27 @@ struct DriveState {
     /// SUBA-118 — pi `afterCompactionSettlement` (`execution.ts:547,996-999`): the child settled its
     /// drain WHILE a compaction was outstanding.
     ///
-    /// It deliberately stops HERE rather than riding out on [`DriveOutcome`] (upstream's
-    /// `result.afterCompactionSettlement`, `execution.ts:1418-1420`). The only consumer would be the
-    /// abort-recovery dispatch, which is unported for the reason recorded on
-    /// `crate::exec::fallback::AttemptNote`'s UNPORTED list; carrying it onto the outcome now would add
-    /// a field nothing reads. The fold itself is kept and tested because it is the half that CAN be
-    /// verified against upstream today, and it is what the dispatch will read when it lands.
-    ///
-    /// This is the marker
-    /// [`crate::exec::abort_recovery::plan_abort_recovery`] reads as `after_compaction_settlement`,
-    /// and it is what makes a terminal-drain cleanup signal non-authoritative
-    /// (`abort-recovery.ts:109`).
+    /// It rides out on [`DriveOutcome::after_compaction_settlement`] (upstream's
+    /// `result.afterCompactionSettlement`, `execution.ts:1418-1420`), where the abort-recovery
+    /// dispatch reads it as
+    /// [`crate::exec::abort_recovery::AbortRecoveryInput::after_compaction_settlement`] — the marker
+    /// that makes a terminal-drain cleanup signal non-authoritative (`abort-recovery.ts:109`).
     after_compaction_settlement: bool,
+    /// SUBA-118 — pi `result.toolBudgetBlocked` (`execution.ts:1150`): latched the first time a tool
+    /// result this attempt observed is recognized as the run's OWN hard-block message
+    /// ([`crate::exec::tool_budget::is_tool_budget_blocked_message`]). Never cleared: upstream only
+    /// ever assigns `true`.
+    tool_budget_blocked: bool,
+    /// SUBA-118 — pi's `options.toolBudget` at the recognition site (`execution.ts:1149`). The budget
+    /// lives on [`crate::exec::agent_config::AgentConfig`] in this crate rather than on
+    /// [`RunOptions`], so it is handed in through [`DriveAttemptInputs`] instead of being read off
+    /// `opts` here. `None` (no budget declared) makes the recognition unreachable, exactly as
+    /// upstream's `options.toolBudget &&` guard does.
+    tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
+    /// CFG-067 — the per-tool-call deadlines armed for this attempt (pi's `activeToolTimeouts` /
+    /// `activeToolTimeoutKeysByName` / `toolTimeoutSequence` trio, `execution.ts:1218-1220`),
+    /// seeded with the run's already-resolved `toolTimeoutMs`.
+    tool_timeouts: crate::exec::tool_timeout::ToolTimeoutTracker,
     /// SUBA-119 — the first model-verification failure seen on this attempt, if any. Upstream's
     /// `if (modelVerificationError && !result.error) result.error = modelVerificationError;`
     /// (`execution.ts:1102`) never CLOBBERS an earlier error, and the `!result.error` half of that is
@@ -282,6 +309,10 @@ enum Settled {
     /// `forcedTerminationSignal`, so the clean-drain coercion to exit 0 cannot swallow a protocol
     /// failure. (It could not anyway — that coercion also requires no error, and this sets one.)
     ProtocolFailure,
+    /// CFG-067 — a per-tool-call deadline expired (pi `terminateForToolTimeout`,
+    /// `execution.ts:1248`). It sets `result.timedOut = true` exactly as the run-level timeout does,
+    /// which is why it shares [`DriveOutcome::timed_out`] rather than getting a flag of its own.
+    ToolTimeout,
 }
 
 impl DriveState {
@@ -297,7 +328,12 @@ impl DriveState {
             detached_seen: false,
             compaction_started: false,
             after_compaction_settlement: false,
+            tool_budget_blocked: false,
+            // Assigned by `drive_attempt` from `DriveAttemptInputs::tool_budget`; a state built for
+            // anything else drives a child that declared no budget.
+            tool_budget: None,
             model_verification_error: None,
+            tool_timeouts: crate::exec::tool_timeout::ToolTimeoutTracker::new(opts.tool_timeout_ms),
             turn_budget: crate::exec::turn_budget::TurnBudgetTracker::new(
                 opts.turn_budget,
                 opts.enforce_hard_turn_limit,
@@ -313,7 +349,10 @@ impl DriveState {
         exit_status: std::io::Result<Option<std::process::ExitStatus>>,
     ) -> DriveOutcome {
         DriveOutcome {
-            timed_out: matches!(reason, Settled::TimedOut),
+            // CFG-067 — pi's tool-timeout path sets the same `result.timedOut` the run-level
+            // timeout does (`execution.ts:1250` vs `:1199`), so the ladder stops on either.
+            timed_out: matches!(reason, Settled::TimedOut | Settled::ToolTimeout),
+            tool_timeout_error: None,
             interrupted: matches!(reason, Settled::Interrupted),
             forced_termination: matches!(reason, Settled::ForcedDrain),
             clean_terminal_stop: self.clean_terminal_stop,
@@ -324,6 +363,12 @@ impl DriveState {
             protocol_error: None,
             turn_budget: self.turn_budget.clone(),
             watchdog: self.watchdog_state.clone(),
+            // SUBA-118 — upstream stamps both onto the attempt result on EVERY way out of
+            // `runSingleAttempt` (`execution.ts:1418-1420` for the compaction marker, `:1150` for
+            // the budget latch), so they ride out of every settle path here too rather than only
+            // the ordinary one.
+            after_compaction_settlement: self.after_compaction_settlement,
+            tool_budget_blocked: self.tool_budget_blocked,
         }
     }
 
@@ -638,6 +683,59 @@ async fn handle_child_line(
                 opts.model_response_aliases.as_ref(),
             );
     }
+    // CFG-067 — pi's per-tool deadline arm/disarm, at upstream's own two moments: armed inside the
+    // `tool_execution_start` handler (`execution.ts:1035`) and cleared inside `tool_execution_end`
+    // (`:1053`). The terminal-stop `clearAllToolTimeouts()` (`:1116`) follows, because after the
+    // child's last assistant message no tool call of its can still be outstanding.
+    match &event {
+        crate::exec::ndjson::SubagentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            ..
+        } => {
+            state.tool_timeouts.arm(
+                Some(tool_call_id.as_str()),
+                tool_name,
+                tokio::time::Instant::now(),
+                run_remaining_ms(opts),
+            );
+        }
+        crate::exec::ndjson::SubagentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            ..
+        } => {
+            state
+                .tool_timeouts
+                .clear(Some(tool_call_id.as_str()), Some(tool_name));
+            // SUBA-118 — pi `execution.ts:1149-1156`: a tool RESULT that is this run's own
+            // hard-block message latches `result.toolBudgetBlocked`, which the abort-recovery plan
+            // reads to refuse a resume for a child its budget stopped (`abort-recovery.ts:111`).
+            //
+            // [CYRUP-DELTA] upstream reads the result text off the `message_end` for the toolResult
+            // message and has to guess the blocked tool's name from a single pending slot, with its
+            // own comment that the slot "can describe a different, overlapping call and serves only
+            // as a fallback" (`:1145-1148`). cyrup's wire carries the tool NAME and the RESULT on
+            // one `tool_execution_end` event, so the authoritative name is always available and the
+            // fallback has nothing to do — identical behaviour, no guess.
+            if !state.tool_budget_blocked
+                && let Some(budget) = state.tool_budget.clone()
+            {
+                let result_text = crate::tui::events::extract_event_text(result);
+                state.tool_budget_blocked =
+                    crate::exec::tool_budget::is_tool_budget_blocked_message(
+                        &budget,
+                        &result_text,
+                        Some(tool_name.as_str()),
+                    );
+            }
+        }
+        _ => {}
+    }
+    if terminal_stop {
+        state.tool_timeouts.clear_all();
+    }
     let terminal_structured_output_call =
         opts.structured_output_schema.is_some() && is_sole_structured_output_tool_call(&event);
     progress.record_event(event);
@@ -691,6 +789,43 @@ fn observe_turn_budget(
             }
             LineAction::TurnBudgetAbort(message)
         }
+    }
+}
+
+/// CFG-067 — pi's `runRemaining` term (`execution.ts:1268`):
+/// `attemptTimeout ? Math.max(0, attemptTimeout.remainingMs - elapsed) : undefined`. cyrup carries
+/// the run's deadline as an absolute instant rather than a budget plus a start time, so the
+/// subtraction upstream spells out is `saturating_duration_since` here — the same number, with the
+/// `Math.max(0, …)` clamp built in.
+fn run_remaining_ms(opts: &RunOptions) -> Option<u64> {
+    opts.deadline_at.map(|deadline| {
+        u64::try_from(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    })
+}
+
+/// CFG-067 — pi `terminateForToolTimeout` (`execution.ts:1248-1263`): the run is marked timed out,
+/// the message becomes BOTH `result.error` and `result.finalOutput`, and the child is aborted.
+///
+/// `[CYRUP-DELTA]` at full feature parity, the same one [`turn_budget_abort`] records: upstream
+/// arms a 4 s hard-finish timer and keeps reading the child in the meantime, while this crate's
+/// [`SpawnedChild::terminate`] consumes the child and walks the real SIGINT->SIGTERM->SIGKILL
+/// ladder. Both settle the attempt as timed out with the same message; the message is carried on
+/// the outcome precisely so the child's own late apology cannot displace it.
+async fn tool_timeout_abort(
+    child: SpawnedChild,
+    cancel: &CancelToken,
+    message: String,
+    state: &DriveState,
+) -> DriveOutcome {
+    let outcome = child.terminate(cancel).await;
+    DriveOutcome {
+        tool_timeout_error: Some(message),
+        ..state.outcome(Settled::ToolTimeout, outcome.map(|o| Some(o.status)))
     }
 }
 
@@ -800,6 +935,11 @@ pub(crate) struct DriveAttemptInputs<'a> {
     /// this attempt launched with, or `None` when verification is off for this run
     /// (`shared.verifyModel` false — no candidate, or the model came from the parent session).
     pub(crate) expected_model_for_verification: Option<&'a str>,
+    /// SUBA-118 — pi's `options.toolBudget` (`execution.ts:1149`), the budget whose OWN hard-block
+    /// message counts as `result.toolBudgetBlocked`. Comes from the agent's validated `toolBudget:`
+    /// ([`crate::exec::agent_config::AgentConfig::tool_budget`]), which is also what the spawn plan
+    /// encodes into the child's env, so parent and child are judging the same budget.
+    pub(crate) tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
 }
 
 pub(crate) async fn drive_attempt(
@@ -814,6 +954,7 @@ pub(crate) async fn drive_attempt(
     let DriveAttemptInputs {
         child_watchdog,
         expected_model_for_verification,
+        tool_budget,
     } = inputs;
     tokio::pin!(deadline_sleep);
     let cancel = opts.cancel.clone();
@@ -831,6 +972,7 @@ pub(crate) async fn drive_attempt(
     });
 
     let mut state = DriveState::new(opts, child_watchdog);
+    state.tool_budget = tool_budget;
 
     loop {
         let deadline_arm = async {
@@ -840,6 +982,7 @@ pub(crate) async fn drive_attempt(
             }
         };
         let final_drain_arm = pending_until(state.final_drain_at);
+        let tool_timeout_arm = pending_until(state.tool_timeouts.next_deadline());
         let watchdog_tail_arm = pending_until(state.watchdog_tail_at);
         let exit_drain_arm = pending_until(state.exit_drain_at);
 
@@ -866,6 +1009,14 @@ pub(crate) async fn drive_attempt(
                 // (R-SA-036/6.3.2) actually branches on to stop the ladder outright.
                 let outcome = child.terminate(&cancel).await;
                 return state.outcome(Settled::TimedOut, outcome.map(|o| Some(o.status)));
+            }
+            () = tool_timeout_arm => {
+                // CFG-067 — the earliest armed per-tool deadline came due. `expire` removes it
+                // first (upstream's `removeToolTimeoutKey(key)` ahead of the terminate) and hands
+                // back the message it was armed to raise.
+                if let Some(expiry) = state.tool_timeouts.expire(tokio::time::Instant::now()) {
+                    return tool_timeout_abort(child, &cancel, expiry.message, &state).await;
+                }
             }
             step = child.next_event_or_exit() => {
                 match step {
@@ -991,6 +1142,165 @@ mod tests {
             "followUpPending": false,
         })
         .to_string()
+    }
+
+    /// CFG-067 — the parent-side enforcement seam: a `tool_execution_start` ARMS the call's
+    /// deadline (pi `execution.ts:1035`) and its `tool_execution_end` CLEARS it (`:1053`).
+    ///
+    /// The run configures nothing, so `read` is armed off `DEFAULT_FAST_TOOL_TIMEOUT_TOOLS` alone
+    /// and `bash` is not armed at all — which is what makes "the fast builtins have a deadline even
+    /// unconfigured" a tested fact rather than a comment. Killing mutations: dropping either arm of
+    /// the fold, or arming on the wrong event.
+    #[tokio::test]
+    async fn a_tool_start_arms_its_deadline_and_its_end_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::exec::testsupport::base_opts(dir.path(), &["m"]);
+        let mut state = DriveState::new(&opts, None);
+        let mut progress = AgentProgress::default();
+        let mut control = crate::exec::control::ControlMonitor::disabled();
+
+        let start = |id: &str, tool: &str| {
+            serde_json::json!({
+                "type": "tool_execution_start", "toolCallId": id, "toolName": tool
+            })
+            .to_string()
+        };
+        let end = |id: &str, tool: &str| {
+            serde_json::json!({
+                "type": "tool_execution_end", "toolCallId": id, "toolName": tool
+            })
+            .to_string()
+        };
+
+        handle_child_line(
+            &start("c1", "bash"),
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            state.tool_timeouts.next_deadline().is_none(),
+            "an unconfigured non-fast tool gets no deadline"
+        );
+
+        handle_child_line(
+            &start("c2", "read"),
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            state.tool_timeouts.next_deadline().is_some(),
+            "a fast builtin is armed off the 5-minute default"
+        );
+
+        handle_child_line(
+            &end("c2", "read"),
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            state.tool_timeouts.next_deadline().is_none(),
+            "its own end clears it"
+        );
+    }
+
+    /// pi `clearAllToolTimeouts()` on the terminal assistant stop (`execution.ts:1116`): after the
+    /// child's last message no tool call of its can still be outstanding, so nothing may stay armed
+    /// to fire during the drain. Killing mutation: dropping the `if terminal_stop` clear — the
+    /// deadline survives the stop and can abort a child that already answered.
+    #[tokio::test]
+    async fn a_terminal_assistant_stop_clears_every_armed_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::exec::testsupport::base_opts(dir.path(), &["m"]);
+        let mut state = DriveState::new(&opts, None);
+        let mut progress = AgentProgress::default();
+        let mut control = crate::exec::control::ControlMonitor::disabled();
+
+        handle_child_line(
+            &serde_json::json!({
+                "type": "tool_execution_start", "toolCallId": "c1", "toolName": "read"
+            })
+            .to_string(),
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+            None,
+        )
+        .await;
+        assert!(state.tool_timeouts.next_deadline().is_some());
+
+        handle_child_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "role": "assistant", "stopReason": "stop", "content": [] }
+            })
+            .to_string(),
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+            None,
+        )
+        .await;
+        assert!(state.clean_terminal_stop, "the stop was observed");
+        assert!(
+            state.tool_timeouts.next_deadline().is_none(),
+            "and it disarmed every per-tool deadline"
+        );
+    }
+
+    /// The run's configured value reaches the tracker through [`RunOptions::tool_timeout_ms`], and
+    /// the expiry carries pi's verbatim sentence for the tool that actually overran. Killing
+    /// mutation: seeding the tracker with `None`, which silently restores the fast-tool defaults for
+    /// every tool and drops the operator's configured deadline on the floor.
+    #[tokio::test]
+    async fn the_runs_configured_deadline_reaches_the_tracker_and_names_the_overrunning_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::exec::RunOptions {
+            tool_timeout_ms: Some(25),
+            ..crate::exec::testsupport::base_opts(dir.path(), &["m"])
+        };
+        let mut state = DriveState::new(&opts, None);
+        let mut progress = AgentProgress::default();
+        let mut control = crate::exec::control::ControlMonitor::disabled();
+        handle_child_line(
+            &serde_json::json!({
+                "type": "tool_execution_start", "toolCallId": "c1", "toolName": "bash"
+            })
+            .to_string(),
+            &mut state,
+            &mut progress,
+            &mut control,
+            &opts,
+            None,
+            None,
+        )
+        .await;
+        let deadline = state
+            .tool_timeouts
+            .next_deadline()
+            .expect("the configured value arms even a non-fast tool");
+        assert_eq!(
+            state.tool_timeouts.expire(deadline).map(|e| e.message),
+            Some("Tool 'bash' exceeded its timeout of 25ms.".to_string())
+        );
     }
 
     /// U1 — a status line is NOT child activity: upstream returns before `lastActivityAt = now`

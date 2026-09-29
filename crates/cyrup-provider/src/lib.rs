@@ -77,7 +77,7 @@ pub use collection::{
 pub use config_provider::ConfigProvider;
 pub use context::{
     ConstrainedSampling, ConstrainedSamplingConfig, Context, GrammarVariants, StrictSampling,
-    ToolDef,
+    ToolDef, ToolReference,
 };
 pub use cyrup_core::ApiId;
 pub use env_api_keys::{
@@ -193,6 +193,20 @@ pub use utils::retry::{
 pub use utils::simple_options::{
     SimpleStreamOptions, ThinkingBudgets, adjust_max_tokens_for_thinking, build_base_options,
     clamp_max_tokens_to_context, clamp_reasoning,
+};
+/// PROV-083a — the transcript replay surface. `normalize_context` is the only constructor of a
+/// [`TranscriptContext`](utils::transcript::TranscriptContext), so the whole module is re-exported
+/// at the root beside `estimate` and `simple_options`, the other 1:1 `utils/*` ports.
+pub use utils::text::{
+    content_text, content_text_default, get_system_message_text, render_system_message_update,
+};
+pub use utils::transcript::{
+    TranscriptContext, TranscriptTools, as_system_message, collapse_system_messages,
+    create_initial_system_message, declarations_equal, get_current_system_message,
+    get_current_system_prompt, get_current_tools, get_declared_tools, get_initial_system_message,
+    get_tool_state_changes, has_non_additive_tool_changes, has_tool_redefinitions,
+    normalize_context, resolve_transcript, resolve_transcript_tools, to_tool_declaration,
+    without_initial_system_message,
 };
 pub use validate::{ToolValidationError, validate_named_tool_call, validate_tool_call};
 pub use wire::WireProvider;

@@ -93,6 +93,48 @@ pub trait ApiKeyAuth: Send + Sync {
         })
     }
 
+    /// `true` when this strategy implements [`ApiKeyAuth::check`] — the Rust stand-in for
+    /// upstream's `if (apiKey.check)` (`ai/src/auth/types.ts:180-186`, consulted at
+    /// `ai/src/models.ts:507`), since `check?` is an OPTIONAL member and a Rust trait default is
+    /// indistinguishable from an override at the call site.
+    ///
+    /// The distinction is load-bearing and is NOT the same as `check()` answering `Ok(None)`:
+    /// absent means *"Models checks availability by resolving auth"* (fall through to
+    /// [`ApiKeyAuth::resolve`]), whereas present-and-`None` means *"this provider is not
+    /// configured"* and stops there.
+    fn supports_check(&self) -> bool {
+        false
+    }
+
+    /// Optional side-effect-free availability check —
+    /// `check?(input): Promise<AuthCheck | undefined>` (`ai/src/auth/types.ts:180-186`).
+    ///
+    /// Upstream's doc comment: *"Optional side-effect-free availability check. Use this when
+    /// `resolve()` may execute commands or perform other request-time work. Missing means Models
+    /// checks availability by resolving auth."* [`crate::collection::Models::check_auth`] consults
+    /// it at pi's exact position (`ai/src/models.ts:504-517`): after the stored-OAuth branch and
+    /// after the "no api-key strategy" guard, and INSTEAD OF the resolution path — so a strategy
+    /// whose `resolve` shells out is asked a cheap question rather than made to do the work.
+    ///
+    /// `cred` is the stored credential and is `None` unless it is a [`Credential::ApiKey`], mirroring
+    /// `credential?.type === "api_key" ? credential : undefined` (`ai/src/models.ts:510`).
+    ///
+    /// An `Err` PROPAGATES out of `check_auth`/`get_available` exactly as upstream's
+    /// `ModelsError("auth", ...)` rethrow does (`ai/src/models.ts:514-516`); it is never folded into
+    /// "unconfigured".
+    ///
+    /// The default is a no-op that is never reached, because [`ApiKeyAuth::supports_check`] gates
+    /// the call — no built-in provider implements `check` upstream either, so every shipped strategy
+    /// keeps taking the resolution path. The seam exists for the same reason it exists upstream:
+    /// a third-party strategy whose `resolve` is expensive needs a cheap availability answer.
+    async fn check(
+        &self,
+        _ctx: &dyn AuthContext,
+        _cred: Option<&Credential>,
+    ) -> Result<Option<crate::collection::AuthCheck>, AuthError> {
+        Ok(None)
+    }
+
     /// Resolve request auth. `cred` is the explicit/stored credential (when present); a `None` `cred`
     /// means the resolver may consult ambient sources (env vars) via `ctx` (func-01 R-01-011/012).
     async fn resolve(

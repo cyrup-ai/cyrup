@@ -13,9 +13,13 @@
 //! here reified as [`ControlMonitor`] so `exec::drive_attempt` can drive it from one place instead
 //! of scattering a dozen closures through the NDJSON loop.
 //!
-//! `isMutatingBashCommand` is deliberately NOT re-ported here: [`crate::exec::completion_guard`]
-//! already owns the verbatim port of it (same upstream file), and this module reuses that one
-//! canonical implementation.
+//! SUBA-107 — `isMutatingBashCommand` and the mutating-tool-call transcript scan now live HERE,
+//! which is where upstream keeps them: `long-running-guard.ts:138` (`isMutatingBashCommand`) and
+//! `:155` (`isMutatingTool`) at v0.71.0. They used to sit in `exec/completion_guard.rs`, cyrup's
+//! port of `completion-guard.ts`, which upstream DELETED at v0.70.1 in `7c98a696` ("refactor:
+//! remove inferred no-edit completion failures (#2356)"). Nothing about the shell parsing changed
+//! in the move — it is the same verbatim port of `unquotedShellText`/`hasMutatingGitCommand`/
+//! `MUTATING_BASH_PATTERNS`, re-homed rather than reimplemented.
 //!
 //! # Where the notice half lands
 //!
@@ -32,7 +36,6 @@
 use std::collections::HashSet;
 
 use crate::background::ActivityState;
-use crate::exec::completion_guard::is_mutating_bash_command;
 use crate::exec::ndjson::SubagentEvent;
 use crate::registration::{ControlConfig, ControlEventType, ControlNotificationChannel};
 
@@ -298,8 +301,6 @@ pub fn parse_control_overrides(raw: &serde_json::Value) -> ControlConfig {
 pub enum ControlEventReason {
     /// No observed activity for longer than `needsAttentionAfterMs` (the default reason).
     Idle,
-    /// The completion-mutation guard tripped after the run settled.
-    CompletionGuard,
     /// The elapsed/turn/token long-running threshold tripped.
     ActiveLongRunning,
     /// Repeated mutating-tool failures escalated the run.
@@ -524,7 +525,6 @@ pub fn control_event_type_wire(event_type: ControlEventType) -> &'static str {
 pub fn control_event_reason_wire(reason: ControlEventReason) -> &'static str {
     match reason {
         ControlEventReason::Idle => "idle",
-        ControlEventReason::CompletionGuard => "completion_guard",
         ControlEventReason::ActiveLongRunning => "active_long_running",
         ControlEventReason::ToolFailures => "tool_failures",
         ControlEventReason::SupervisorRequest => "supervisor_request",
@@ -598,21 +598,6 @@ pub fn format_control_notice_message(
         Some(index) => format!(" step {}", index.saturating_add(1)),
         None => String::new(),
     };
-
-    if event.reason == Some(ControlEventReason::CompletionGuard) {
-        let mut lines = vec![
-            format!("Subagent failed: {}", event.agent),
-            format!("Run: {run_target}{step_suffix}"),
-            format!("Signal: {}", event.message),
-            "Next: read the output artifact or session from the subagent result, then retry with \
-             a more explicit implementation prompt or handle the fix directly."
-                .to_string(),
-        ];
-        if let Some(target) = child_intercom_target {
-            lines.push(format!("Run intercom target (may be inactive): {target}"));
-        }
-        return lines.join("\n");
-    }
 
     let nudge_message =
         "What are you blocked on? Reply with the smallest next step or ask for a decision.";
@@ -698,18 +683,13 @@ pub fn format_control_intercom_message(
     event: &ControlEvent,
     child_intercom_target: Option<&str>,
 ) -> String {
-    let completion_guard = event.reason == Some(ControlEventReason::CompletionGuard);
     let long_running = event.event_type == ControlEventType::ActiveLongRunning;
-    let status_label = if completion_guard {
-        "subagent failed"
-    } else if long_running {
+    let status_label = if long_running {
         "subagent active but long-running"
     } else {
         "subagent needs attention"
     };
-    let restatement = if completion_guard {
-        format!("{} failed in run {}.", event.agent, event.run_id)
-    } else if long_running {
+    let restatement = if long_running {
         format!(
             "{} is still active but long-running in run {}.",
             event.agent, event.run_id
@@ -804,7 +784,7 @@ pub fn resolve_current_path(tool_name: &str, args: &serde_json::Value) -> Option
 }
 
 /// The `/(?:>|>>|tee\s+)(\S+)/` capture from `resolveCurrentPath`'s bash branch, hand-rolled so the
-/// crate stays regex-free at this seam (the same choice `completion_guard` already made for the
+/// crate stays regex-free at this seam (the same choice the mutating-bash patterns below make for the
 /// mutating-bash patterns). Scans left to right for the first `>` or `tee` + whitespace, then takes
 /// the immediately following run of non-whitespace characters.
 fn first_redirect_target(command: &str) -> Option<String> {
@@ -843,6 +823,619 @@ fn first_redirect_target(command: &str) -> Option<String> {
             }
         }
         i += 1;
+    }
+    None
+}
+
+// =================================================================================================
+// SUBA-107 — the mutating-tool-call scan and the mutating-bash classifier, re-homed from
+// `exec/completion_guard.rs` (upstream `long-running-guard.ts:138,155` @v0.71.0)
+// =================================================================================================
+
+// -------------------------------------------------------------------------------------------
+// Word-boundary text matching primitives (regex-free port of the source's `\b...\b` patterns)
+// -------------------------------------------------------------------------------------------
+
+/// True if `ch` participates in a "word" for the purposes of a `\b` boundary test — mirrors
+/// JavaScript `RegExp`'s `\w` class closely enough for this module's fixed English-prose pattern
+/// set (`[A-Za-z0-9_]`). Every source pattern this module ports only ever brackets plain ASCII
+/// alphabetic phrases with `\b`, so this narrower definition (vs. full Unicode word-break rules)
+/// is faithful for this exact pattern set.
+pub(crate) fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+/// Case-insensitive `\bneedle\b` substring test: `needle` (already lowercase, may itself contain
+/// internal spaces, e.g. `"write to"`) must appear in `haystack_lower` (already lowercased) at a
+/// position where the character immediately before the match (if any) and the character
+/// immediately after the match (if any) are both non-word characters. This is the single building
+/// block every source `/\bphrase\b/i` pattern in this module reduces to.
+pub(crate) fn word_boundary_contains(haystack_lower: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack_lower.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = haystack_lower.get(start..).and_then(|s| s.find(needle)) {
+        let match_start = start + rel;
+        let match_end = match_start + needle_bytes.len();
+
+        let before_ok = haystack_lower[..match_start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c));
+        let after_ok = bytes.get(match_end).is_none()
+            || haystack_lower[match_end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_word_char(c));
+
+        if before_ok && after_ok {
+            return true;
+        }
+        // Advance by one byte past this occurrence's start to find the next (possibly
+        // overlapping) candidate — patterns here are short phrases, never used at a scale where
+        // this matters for performance.
+        start = match_start + 1;
+        if start > haystack_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// True if any of `needles` matches `haystack_lower` per [`word_boundary_contains`].
+pub(crate) fn any_word_boundary(haystack_lower: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| word_boundary_contains(haystack_lower, needle))
+}
+/// Source: `hasMutationToolCall(messages)` (`completion-guard.ts:69-84` @v0.43.0), re-scoped to this
+/// crate's dependency-free [`SubagentEvent`] transcript instead of a rich `Message[]` array (this
+/// crate has zero dependency on `cyrup-agent`'s message types, module docs above).
+///
+/// The source scans the assistant messages' `toolCall` **content parts** — the tool CALL, carrying
+/// its `arguments` — NOT the tool result. This crate's wire analogue of "an assistant emitted a
+/// tool call, with its requested arguments" is [`SubagentEvent::ToolExecutionStart`], which is the
+/// only event on the wire carrying the call's `args` (`ToolExecutionEnd` echoes only
+/// `result`/`is_error`, per `exec/ndjson.rs`'s wire-shape module doc). This function therefore
+/// scans `ToolExecutionStart` events, matching the source exactly: a call is counted from the
+/// moment it is REQUESTED, so a mutating call that started but never produced a
+/// `ToolExecutionEnd` (the child was killed mid-tool-call, or the tool never finished) STILL counts
+/// as an attempted mutation — precisely the "count never-completed calls" behavior the source's own
+/// message-part walk exhibits (a `toolCall` part is present in the assistant message regardless of
+/// whether a corresponding `toolResult` was ever appended).
+///
+/// Returns true on the first call [`crate::exec::control::is_mutating_tool`] classifies as
+/// mutating — the SAME predicate upstream's scan calls (`isMutatingTool(part.name, args,
+/// mutationTools)`, `completion-guard.ts:145` @v0.68.0): a name in the agent's own
+/// `mutation_tools` (SUBA-102), `edit`/`write`, a `cursor` edit/write activity, or a `bash` call
+/// whose `command` argument [`is_mutating_bash_command`] classifies as mutating.
+///
+/// This used to be a private copy of the classifier covering only `edit`/`write`/`bash`, so it
+/// could not see the agent's `mutationTools` at all and also missed upstream's `cursor` arm.
+#[must_use]
+pub fn has_mutation_tool_call(events: &[SubagentEvent], mutation_tools: Option<&[String]>) -> bool {
+    events.iter().any(|event| {
+        let SubagentEvent::ToolExecutionStart {
+            tool_name, args, ..
+        } = event
+        else {
+            return false;
+        };
+        crate::exec::control::is_mutating_tool(tool_name, args, mutation_tools)
+    })
+}
+
+/// Source: `isMutatingBashCommand` (`long-running-guard.ts:138-142` @v0.43.0). A bash command
+/// counts as mutating if it contains an unquoted file-redirection operator (`>`/`>>` not
+/// immediately preceded by `-` and not immediately followed by `&`/`|`/`;`/`(`/`)`, outside
+/// single/double quotes) OR invokes a mutating `git` subcommand ([`has_mutating_git_command`]) OR
+/// matches one of the fixed `MUTATING_BASH_PATTERNS`.
+///
+/// G84: the `has_mutating_git_command` term is the post-v0.34.0 upstream addition
+/// (`long-running-guard.ts:128-141`, absent at the ported baseline). Without it a subagent whose
+/// only write to the repo is `git add`/`git commit`/`git push` registers as having attempted NO
+/// mutation, which (a) makes [`has_mutation_tool_call`] return `false` and fires the completion
+/// guard's "no mutating tool call was observed" failure on a run that really did change the repo,
+/// and (b) leaves a repeatedly-failing `git push` out of the control loop's mutating-failure
+/// accounting ([`crate::exec::control`]'s `needs_attention` escalation), so the run never
+/// escalates.
+#[must_use]
+pub fn is_mutating_bash_command(command: &str) -> bool {
+    has_unquoted_file_redirection(command)
+        || has_mutating_git_command(command)
+        || matches_mutating_bash_pattern(command)
+}
+
+/// Source: `unquotedShellText` (`long-running-guard.ts:99-126`) — rewrite `command` so that every
+/// character that was inside single or double quotes becomes a `_` placeholder and the quote
+/// characters themselves are dropped. Segment splitting and the `git` prefix test in
+/// [`has_mutating_git_command`] then only ever see genuinely unquoted shell text, so
+/// `echo "git push"` cannot be mistaken for an actual push.
+///
+/// Ported branch-for-branch, including the backslash asymmetry: outside quotes a `\` and the
+/// character it escapes are both preserved verbatim; inside double quotes both become `_`; inside
+/// single quotes `\` is not an escape at all and simply becomes `_`.
+fn unquoted_shell_text(command: &str) -> String {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut result = String::with_capacity(command.len());
+    for ch in command.chars() {
+        if escaped {
+            result.push(if in_single || in_double { '_' } else { ch });
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            result.push(if in_double { '_' } else { ch });
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        result.push(if in_single || in_double { '_' } else { ch });
+    }
+    result
+}
+
+/// Source: the `unquoted.split(/(?:&&|\|\||[;|()\n])/)` in `hasMutatingGitCommand`
+/// (`long-running-guard.ts:130`). Splits on `&&`, `||`, `;`, `|`, `(`, `)` and `\n` — note a
+/// SINGLE `&` is deliberately not a separator (it is absent from the source's character class),
+/// and `||` falls out of the single-`|` case as two splits around an empty segment, which the
+/// caller's blank-segment skip discards exactly as the source's `if (!trimmed) continue` does.
+///
+/// Every separator is ASCII, and a multi-byte UTF-8 continuation byte is always `>= 0x80`, so
+/// byte-wise scanning can never land mid-character; the `get(..)` slices are still fallible-checked
+/// rather than indexed, per the crate's no-panic policy.
+fn split_shell_segments(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let sep_len = if bytes.get(i) == Some(&b'&') && bytes.get(i + 1) == Some(&b'&') {
+            2
+        } else if matches!(bytes.get(i), Some(&b';' | &b'|' | &b'(' | &b')' | &b'\n')) {
+            1
+        } else {
+            0
+        };
+        if sep_len == 0 {
+            i += 1;
+            continue;
+        }
+        out.push(text.get(start..i).unwrap_or(""));
+        i += sep_len;
+        start = i;
+    }
+    out.push(text.get(start..).unwrap_or(""));
+    out
+}
+
+/// Source: `hasMutatingGitCommand` (`long-running-guard.ts:128-136` @v0.43.0). True when any
+/// unquoted shell segment invokes `git add`, `git commit` or `git push`, allowing the same global
+/// options the source's regex allows in between. Segments that begin with `echo`/`printf` are
+/// skipped, matching the source's `/^(?:echo|printf)\b/` guard.
+fn has_mutating_git_command(command: &str) -> bool {
+    let unquoted = unquoted_shell_text(command);
+    for segment in split_shell_segments(&unquoted) {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // `/^(?:echo|printf)\b/`
+        if starts_with_word(trimmed, "echo") || starts_with_word(trimmed, "printf") {
+            continue;
+        }
+        if segment_invokes_mutating_git(trimmed) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `s` begins with the literal `word` followed by a regex word boundary (end-of-string or a
+/// non-word character) — the `^<word>\b` shape used by the two guards in
+/// [`has_mutating_git_command`].
+fn starts_with_word(s: &str, word: &str) -> bool {
+    s.strip_prefix(word)
+        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
+}
+
+/// One segment against the source's
+/// `^git\s+(?:(?:(?:-C|--git-dir|--work-tree)\s+\S+|(?:--git-dir|--work-tree)=\S+|--paginate)\s+)*(?:add|commit|push)\b`.
+///
+/// The `*` group and the verb alternation are disjoint (every option starts with `-`, no verb
+/// does), so the regex's backtracking is unnecessary here: the loop tests the verb first and
+/// otherwise consumes exactly one option group per iteration, bailing the moment neither matches.
+fn segment_invokes_mutating_git(segment: &str) -> bool {
+    let Some(after_git) = segment.strip_prefix("git") else {
+        return false;
+    };
+    // `git\s+` — at least one whitespace character must follow the literal `git`.
+    let mut cursor = after_git.trim_start_matches(char::is_whitespace);
+    if cursor == after_git {
+        return false;
+    }
+    loop {
+        // `(?:add|commit|push)\b`
+        for verb in ["add", "commit", "push"] {
+            if starts_with_word(cursor, verb) {
+                return true;
+            }
+        }
+        // `(?:--git-dir|--work-tree)=\S+`
+        let after_option = if let Some(tail) = cursor
+            .strip_prefix("--git-dir=")
+            .or_else(|| cursor.strip_prefix("--work-tree="))
+        {
+            let after_value = tail.trim_start_matches(|c: char| !c.is_whitespace());
+            // `\S+` needs at least one non-whitespace character.
+            if after_value == tail {
+                return false;
+            }
+            after_value
+        // `(?:-C|--git-dir|--work-tree)\s+\S+`
+        } else if let Some(tail) = cursor
+            .strip_prefix("--git-dir")
+            .or_else(|| cursor.strip_prefix("--work-tree"))
+            .or_else(|| cursor.strip_prefix("-C"))
+        {
+            let after_ws = tail.trim_start_matches(char::is_whitespace);
+            if after_ws == tail {
+                return false;
+            }
+            let after_value = after_ws.trim_start_matches(|c: char| !c.is_whitespace());
+            if after_value == after_ws {
+                return false;
+            }
+            after_value
+        // `--paginate`
+        } else if let Some(tail) = cursor.strip_prefix("--paginate") {
+            tail
+        } else {
+            return false;
+        };
+        // Each option group in the source's `*` is itself followed by `\s+`.
+        let next = after_option.trim_start_matches(char::is_whitespace);
+        if next == after_option {
+            return false;
+        }
+        cursor = next;
+    }
+}
+
+/// Source: `hasUnquotedFileRedirection` — a hand-rolled quote-aware scanner (already
+/// regex-free in the TypeScript source itself), ported verbatim character-by-character.
+fn has_unquoted_file_redirection(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0usize;
+    while let Some(&ch) = chars.get(i) {
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if in_single || in_double {
+            i += 1;
+            continue;
+        }
+        if ch != '>' {
+            i += 1;
+            continue;
+        }
+        if i > 0 && chars.get(i - 1) == Some(&'-') {
+            i += 1;
+            continue;
+        }
+        let is_double_redirect = chars.get(i + 1) == Some(&'>');
+        let mut cursor = i + usize::from(is_double_redirect) + 1;
+        while chars.get(cursor).is_some_and(|c| c.is_whitespace()) {
+            cursor += 1;
+        }
+        let Some(&target_start) = chars.get(cursor) else {
+            i += 1;
+            continue;
+        };
+        if matches!(target_start, '&' | '|' | ';' | '(' | ')') {
+            i += 1;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Source: `MUTATING_BASH_PATTERNS`, verbatim per-entry.
+fn matches_mutating_bash_pattern(command: &str) -> bool {
+    // `/(^|[;&|()\s])rm\s+/`, `mv`, `cp`, `mkdir`, `touch` — a shell-command-word occurrence of
+    // the verb (start-of-string or preceded by a shell separator/whitespace) followed by
+    // whitespace then at least one more character (`\s+` requires the verb not be the entire
+    // remainder of the string).
+    for verb in ["rm", "mv", "cp", "mkdir", "touch"] {
+        if command_word_followed_by_whitespace(command, verb) {
+            return true;
+        }
+    }
+    // `/(^|[;&|()\s])git\s+apply\b/`
+    if let Some(rest) = find_command_word(command, "git") {
+        let after_ws = rest.trim_start_matches(char::is_whitespace);
+        if after_ws != rest
+            && let Some(tail) = after_ws.strip_prefix("apply")
+            && tail.chars().next().is_none_or(|c| !is_word_char(c))
+        {
+            return true;
+        }
+    }
+    // `/(^|[;&|()\s])patch\s+/`
+    if command_word_followed_by_whitespace(command, "patch") {
+        return true;
+    }
+    // `/(^|[;&|()\s])sed\s+[^\n;&|]*\s-i\b/` — `sed`, whitespace, then any run of characters
+    // excluding `\n`/`;`/`&`/`|`, then whitespace then `-i` at a word boundary.
+    if command_word_then_flag(command, "sed", "-i") {
+        return true;
+    }
+    // `/(^|[;&|()\s])perl\s+[^\n;&|]*\s-pi\b/`
+    if command_word_then_flag(command, "perl", "-pi") {
+        return true;
+    }
+    // `/(^|[;&|()]|\n)\s*tee\s+[^|&;]+/` — `tee` (preceded by a shell separator/newline or
+    // string-start, optionally with whitespace in between) followed by whitespace then at least
+    // one non-`|`/`&`/`;` character.
+    if matches_tee_invocation(command) {
+        return true;
+    }
+    // `/\b(writeFile|writeFileSync|appendFile|appendFileSync)\b/`
+    if any_word_boundary(
+        command,
+        &["writefile", "writefilesync", "appendfile", "appendfilesync"],
+    ) {
+        // Case-sensitive in the source (no `/i` flag) — but these are camelCase Node.js API
+        // names that only ever appear in that exact casing in realistic command text; comparing
+        // case-sensitively against the ORIGINAL command (not lowercased) preserves source
+        // fidelity exactly, so this branch re-checks against `command` directly below instead of
+        // relying on the lowercase-only `any_word_boundary` helper.
+    }
+    for needle in ["writeFile", "writeFileSync", "appendFile", "appendFileSync"] {
+        if word_boundary_contains_case_sensitive(command, needle) {
+            return true;
+        }
+    }
+    // `/\bwrite_text\s*\(/`
+    if let Some(idx) = find_word_boundary_case_sensitive(command, "write_text") {
+        let rest = command.get(idx + "write_text".len()..).unwrap_or("");
+        let after_ws = rest.trim_start_matches(char::is_whitespace);
+        if after_ws.starts_with('(') {
+            return true;
+        }
+    }
+    // `/\bopen\s*\([^)]*,\s*["'][wa]/`
+    if matches_python_open_write_mode(command) {
+        return true;
+    }
+    false
+}
+
+/// True if `word` occurs in `command` at a position preceded by start-of-string or one of
+/// `;&|()` or whitespace, and is immediately followed by at least one whitespace character plus
+/// at least one more character after that whitespace run (the source's trailing `\s+` requiring
+/// non-empty content after the verb). Case-insensitive, matching the source's `/i` flag on every
+/// pattern this helper backs.
+fn command_word_followed_by_whitespace(command: &str, word: &str) -> bool {
+    let Some(rest) = find_command_word(command, word) else {
+        return false;
+    };
+    let after_ws = rest.trim_start_matches(char::is_whitespace);
+    after_ws != rest && !after_ws.is_empty()
+}
+
+/// Locates the first occurrence of `word` (case-insensitive) in `command` that is preceded by
+/// start-of-string or a shell separator/whitespace character (`;`, `&`, `|`, `(`, `)`, or any
+/// whitespace) — the source's `(^|[;&|()\s])` alternation — and returns the slice of `command`
+/// immediately following that occurrence, or `None` if no such occurrence exists.
+fn find_command_word<'a>(command: &'a str, word: &str) -> Option<&'a str> {
+    let lower = command.to_lowercase();
+    let word_lower = word.to_lowercase();
+    let mut start = 0usize;
+    while let Some(rel) = lower.get(start..).and_then(|s| s.find(&word_lower)) {
+        let match_start = start + rel;
+        let match_end = match_start + word_lower.len();
+        let preceded_ok = match_start == 0
+            || lower[..match_start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| matches!(c, ';' | '&' | '|' | '(' | ')') || c.is_whitespace());
+        if preceded_ok {
+            return command.get(match_end..);
+        }
+        start = match_start + 1;
+        if start > lower.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// Backs the `sed`/`perl` patterns: `word`, whitespace, then a run of characters excluding
+/// `\n`/`;`/`&`/`|`, then whitespace, then `flag` at a word boundary.
+fn command_word_then_flag(command: &str, word: &str, flag: &str) -> bool {
+    let Some(rest) = find_command_word(command, word) else {
+        return false;
+    };
+    let after_ws = rest.trim_start_matches(char::is_whitespace);
+    if after_ws == rest {
+        return false;
+    }
+    // `[^\n;&|]*` — consume as far as possible without crossing a newline/`;`/`&`/`|`, then look
+    // for `\s-flag\b` starting anywhere within that consumed span (the source's `.*\s-i\b` is
+    // itself greedy-then-backtrack, which reduces to "does `\s<flag>\b` occur anywhere before the
+    // first `\n`/`;`/`&`/`|`").
+    let scan_limit = after_ws
+        .find(['\n', ';', '&', '|'])
+        .unwrap_or(after_ws.len());
+    let Some(scan_region) = after_ws.get(..scan_limit) else {
+        return false;
+    };
+    let needle = format!(" {flag}");
+    let mut start = 0usize;
+    while let Some(rel) = scan_region.get(start..).and_then(|s| s.find(&needle)) {
+        let match_start = start + rel;
+        let flag_start = match_start + 1; // past the leading space
+        let flag_end = flag_start + flag.len();
+        let after_ok = scan_region
+            .get(flag_end..)
+            .and_then(|s| s.chars().next())
+            .is_none_or(|c| !is_word_char(c));
+        if after_ok {
+            return true;
+        }
+        start = match_start + 1;
+        if start > scan_region.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Backs `/(^|[;&|()]|\n)\s*tee\s+[^|&;]+/`.
+fn matches_tee_invocation(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    let mut start = 0usize;
+    while let Some(rel) = lower.get(start..).and_then(|s| s.find("tee")) {
+        let match_start = start + rel;
+        let match_end = match_start + 3;
+        // Preceded by start-of-string, `;`/`&`/`|`/`(`/`)`/`\n`, possibly with additional
+        // whitespace in between (`\s*` before `tee` in the source's own capture group ordering:
+        // the separator/newline is matched, THEN `\s*`, THEN `tee` — so whitespace may sit
+        // between the separator and `tee`, or `tee` may be at absolute start-of-string with only
+        // leading whitespace).
+        let prefix = &lower[..match_start];
+        let trimmed_prefix = prefix.trim_end_matches([' ', '\t']);
+        let preceded_ok = trimmed_prefix.is_empty()
+            || trimmed_prefix
+                .chars()
+                .next_back()
+                .is_some_and(|c| matches!(c, ';' | '&' | '|' | '(' | ')' | '\n'));
+        if preceded_ok {
+            let after_tee = &lower[match_end..];
+            let after_ws = after_tee.trim_start_matches([' ', '\t']);
+            let has_target = after_ws != after_tee
+                && after_ws
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !matches!(c, '|' | '&' | ';'));
+            if has_target {
+                return true;
+            }
+        }
+        start = match_start + 1;
+        if start > lower.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Backs `/\bopen\s*\([^)]*,\s*["'][wa]/` — Python-style `open(path, "w"...)`/`open(path, 'a'...)`.
+fn matches_python_open_write_mode(command: &str) -> bool {
+    let Some(idx) = find_word_boundary_case_sensitive_lower(command, "open") else {
+        return false;
+    };
+    let rest = command.get(idx + 4..).unwrap_or("");
+    let after_ws = rest.trim_start_matches(char::is_whitespace);
+    let Some(after_paren) = after_ws.strip_prefix('(') else {
+        return false;
+    };
+    let Some(comma_idx) = after_paren.find(',') else {
+        return false;
+    };
+    let Some(args_head) = after_paren.get(..comma_idx) else {
+        return false;
+    };
+    if args_head.contains(')') {
+        return false;
+    }
+    let after_comma = after_paren.get(comma_idx + 1..).unwrap_or("");
+    let after_comma_ws = after_comma.trim_start_matches(char::is_whitespace);
+    let mut chars = after_comma_ws.chars();
+    match chars.next() {
+        Some('"') | Some('\'') => {}
+        _ => return false,
+    }
+    matches!(chars.next(), Some('w') | Some('a'))
+}
+
+/// Case-sensitive `\bneedle\b` test (used only for the two source patterns that omit the `/i`
+/// flag: `writeFile`/... and `write_text`).
+fn word_boundary_contains_case_sensitive(haystack: &str, needle: &str) -> bool {
+    find_word_boundary_case_sensitive(haystack, needle).is_some()
+}
+
+fn find_word_boundary_case_sensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let mut start = 0usize;
+    while let Some(rel) = haystack.get(start..).and_then(|s| s.find(needle)) {
+        let match_start = start + rel;
+        let match_end = match_start + needle.len();
+        let before_ok = haystack[..match_start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c));
+        let after_ok = haystack[match_end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word_char(c));
+        if before_ok && after_ok {
+            return Some(match_start);
+        }
+        start = match_start + 1;
+        if start > haystack.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// `find_word_boundary_case_sensitive`, but case-insensitive (`open` in `/\bopen\s*\(/` DOES
+/// carry the `/i` flag in the source) — returns the byte offset of the match in the ORIGINAL
+/// (not-lowercased) `haystack` so callers can slice the real string afterward.
+fn find_word_boundary_case_sensitive_lower(haystack: &str, needle_lower: &str) -> Option<usize> {
+    let lower = haystack.to_lowercase();
+    let mut start = 0usize;
+    while let Some(rel) = lower.get(start..).and_then(|s| s.find(needle_lower)) {
+        let match_start = start + rel;
+        let match_end = match_start + needle_lower.len();
+        let before_ok = lower[..match_start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c));
+        let after_ok = lower[match_end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word_char(c));
+        if before_ok && after_ok {
+            return Some(match_start);
+        }
+        start = match_start + 1;
+        if start > lower.len() {
+            break;
+        }
     }
     None
 }
@@ -1440,33 +2033,6 @@ impl ControlMonitor {
             _ => {}
         }
     }
-
-    /// pi `execution.ts:1234-1247`: the completion-mutation guard's own `needs_attention` raise,
-    /// fired AFTER the attempt settles (and therefore after the drive loop is gone), sharing the
-    /// attempt's dedup set.
-    pub fn emit_completion_guard_notice(&mut self, now: i64, message: String) {
-        if !self.config.enabled {
-            return;
-        }
-        let event = build_control_event(
-            ActivityState::NeedsAttention,
-            ControlEventInput {
-                from: self.activity_state,
-                ts: now,
-                run_id: if self.run_id.is_empty() {
-                    self.agent.clone()
-                } else {
-                    self.run_id.clone()
-                },
-                agent: self.agent.clone(),
-                index: self.index,
-                message: Some(message),
-                reason: Some(ControlEventReason::CompletionGuard),
-                ..ControlEventInput::default()
-            },
-        );
-        self.emit_control_event(event);
-    }
 }
 
 /// The optional arguments `emitNeedsAttention` takes (`execution.ts:682-707`).
@@ -1682,15 +2248,6 @@ mod tests {
         let long_text = format_control_notice_message(&long, None);
         assert!(long_text.starts_with("Subagent active but long-running: scout\n"));
         assert!(!long_text.contains("Direct intercom target"));
-
-        let mut guard = sample_event(ControlEventType::NeedsAttention);
-        guard.reason = Some(ControlEventReason::CompletionGuard);
-        let guard_text = format_control_notice_message(&guard, None);
-        assert!(
-            guard_text.starts_with("Subagent failed: scout\n"),
-            "{guard_text}"
-        );
-        assert!(guard_text.contains("Next: read the output artifact"));
     }
 
     #[test]
@@ -2050,7 +2607,6 @@ mod tests {
             ..ResolvedControlConfig::default()
         });
         assert!(!m.update_activity_state(1_000_000));
-        m.emit_completion_guard_notice(1, "guard".to_string());
         assert!(m.events().is_empty());
     }
 
@@ -2077,16 +2633,12 @@ mod tests {
         );
         m.update_activity_state(600); // long-running first
         m.update_activity_state(2_000); // then idle -> needs_attention
-        m.emit_completion_guard_notice(3_000, "guard".to_string());
         let order = seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        assert_eq!(
-            order,
-            vec!["active_long_running", "needs_attention", "needs_attention"]
-        );
-        assert_eq!(m.events().len(), 3, "the sink and the record agree");
+        assert_eq!(order, vec!["active_long_running", "needs_attention"]);
+        assert_eq!(m.events().len(), 2, "the sink and the record agree");
     }
 
     #[test]

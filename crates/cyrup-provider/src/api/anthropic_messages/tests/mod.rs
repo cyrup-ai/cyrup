@@ -11,6 +11,8 @@ mod convert;
 mod decode;
 mod deferred_tools;
 mod headers;
+mod mid_convo;
+mod mid_convo_effort;
 mod params;
 mod perf001;
 mod tool_references;
@@ -103,7 +105,7 @@ async fn collect(frames_bytes: Vec<u8>, m: &Model) -> Vec<StreamEvent> {
     let m2 = m.clone();
     let api2 = api.clone();
     let task = tokio::spawn(async move {
-        decode_stream(frames, &m2, &api2, &sink, false, &[]).await;
+        decode_stream(frames, &m2, &api2, &sink, false, &[], None).await;
     });
     let mut events = Vec::new();
     while let Some(ev) = rx.recv().await {
@@ -140,6 +142,7 @@ fn tc_assistant(calls: &[(&str, &str)]) -> Message {
         api: API_ID.into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,

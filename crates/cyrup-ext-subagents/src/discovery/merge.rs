@@ -670,6 +670,8 @@ fn builtin_applied_keys(delta: &AgentOverrideConfig) -> BTreeSet<String> {
         ("skills", delta.skills.is_present()),
         ("tools", delta.tools.is_present()),
         ("excludeTools", delta.exclude_tools.is_present()),
+        // SUBA-111.
+        ("allowedAgents", delta.allowed_agents.is_present()),
         (
             "allowNestedSubagents",
             delta.allow_nested_subagents.is_present(),
@@ -679,7 +681,6 @@ fn builtin_applied_keys(delta: &AgentOverrideConfig) -> BTreeSet<String> {
             "subagentOnlyExtensions",
             delta.subagent_only_extensions.is_present(),
         ),
-        ("completionGuard", delta.completion_guard.is_present()),
         ("toolBudget", delta.tool_budget.is_present()),
         // SUBA-096.
         ("outputMode", delta.output_mode.is_some()),
@@ -862,6 +863,22 @@ fn apply_builtin_override(
     apply_field_full_replace(&mut agent.exclude_tools, &delta.exclude_tools, None, |v| {
         Some(v.clone())
     });
+    // SUBA-111 — pi `agents.ts:1140-1141` + the `delete next.allowedAgents` clear arm: a JSON
+    // `false` deletes the bound, any list replaces it wholesale.
+    //
+    // The list this applies is already NORMALIZED, and it is normalized where upstream normalizes
+    // it: `normalizeCapabilityCeilingAllowedAgents` runs at `:1141`, i.e. at PARSE time, so
+    // [`crate::discovery::parse_subagent_settings`] runs it over every `agentOverrides.<name>`
+    // entry and a malformed name refuses the settings file (R-SA-009) rather than reaching here.
+    // This arm therefore applies a trimmed, deduplicated, sorted, pattern-checked list — the same
+    // one the agent-file arm (`discovery/frontmatter.rs`) and the runtime-registry arm
+    // (`discovery/runtime_registry.rs`) produce.
+    apply_field_full_replace(
+        &mut agent.allowed_agents,
+        &delta.allowed_agents,
+        None,
+        |v| Some(v.clone()),
+    );
     apply_field_full_replace(
         &mut agent.allow_nested_subagents,
         &delta.allow_nested_subagents,
@@ -893,12 +910,6 @@ fn apply_builtin_override(
         &delta.subagent_only_extensions,
         None,
         |v| Some(v.clone()),
-    );
-    apply_field_full_replace(
-        &mut agent.completion_guard,
-        &delta.completion_guard,
-        None,
-        |v| Some(*v),
     );
     // pi `toolBudget`/`false` -> `delete next.toolBudget` (agents.ts:1285).
     apply_field_full_replace(&mut agent.tool_budget, &delta.tool_budget, None, |v| {
@@ -1056,6 +1067,10 @@ fn apply_field_full_replace<T, F>(
 /// both apply paths, exactly as pi shares the one function between `applyBuiltinOverride` and
 /// `applyCustomAgentOverride`. pi additionally deletes/repopulates `mcpDirectTools` alongside;
 /// this crate carries MCP direct tools inside the same list, so the one assignment covers both.
+/// The list arm's entries are already trimmed, with empty entries dropped, by
+/// [`crate::discovery::parse_subagent_settings`] — upstream's `parseToolsOverride` does the same
+/// at the same moment (`agents.ts:1132`), so `applyToolsOverride` (`agents.ts:1428`) likewise only
+/// ever splits an already-normalized list.
 fn apply_tools_override(
     target: &mut Option<Vec<super::types::ToolRef>>,
     delta: &ToolsOverrideField,
@@ -1235,6 +1250,7 @@ mod tests {
 
     fn agent(name: &str, source: AgentSource, file_path: &str) -> AgentDefinition {
         AgentDefinition {
+            default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,
             mutation_tools: None,
@@ -1255,6 +1271,7 @@ mod tests {
             subagent_only_extensions: None,
             subagent_only_extensions_from_default: false,
             exclude_tools: None,
+            allowed_agents: None,
             allow_nested_subagents: None,
             model: None,
             fallback_models: Vec::new(),
@@ -1266,7 +1283,6 @@ mod tests {
             default_reads: None,
             default_progress: None,
             output: None,
-            completion_guard: None,
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
@@ -1698,25 +1714,84 @@ mod tests {
             "reviewer",
             AgentSource::User,
             "/user/reviewer.md",
-            &["completionGuard"],
+            &["disabled"],
         );
-        a.completion_guard = Some(false);
+        a.disabled = Some(false);
         merged.insert("reviewer".to_string(), a);
 
         let settings = user_scope(settings_with_override(
             "reviewer",
             AgentOverrideConfig {
-                completion_guard: OverrideField::ExplicitClear,
+                disabled: OverrideField::ExplicitClear,
                 ..Default::default()
             },
         ));
 
         apply_overrides(&mut merged, &settings).expect("apply succeeds");
         let updated = merged.get("reviewer").expect("present");
-        assert_eq!(updated.completion_guard, None);
+        assert_eq!(updated.disabled, None);
         assert_eq!(
             updated.override_info.as_ref().expect("recorded").fields,
-            BTreeSet::from(["completionGuard".to_string()])
+            BTreeSet::from(["disabled".to_string()])
+        );
+    }
+
+    /// SUBA-111 — `agentOverrides.<name>.allowedAgents` sets a delegation bound, and a JSON
+    /// `false` CLEARS one declared in the agent file, restoring unrestricted delegation.
+    ///
+    /// pi `agents.ts:1140-1141` @v0.71.0:
+    /// `const allowedAgents = parseOverrideStringArrayOrFalse(input.allowedAgents, …);`
+    /// `if (allowedAgents !== undefined) override.allowedAgents = allowedAgents === false ? false
+    ///  : normalizeCapabilityCeilingAllowedAgents(allowedAgents);`
+    ///
+    /// Red before SUBA-111: `AgentOverrideConfig` had no such field, so
+    /// `agentOverrides.<name>.allowedAgents` was only an unknown-key warning from `key_census`.
+    #[test]
+    fn an_allowed_agents_override_sets_a_bound_and_a_json_false_clears_one() {
+        // Set.
+        let mut merged = HashMap::new();
+        merged.insert(
+            "reviewer".to_string(),
+            agent("reviewer", AgentSource::User, "/user/reviewer.md"),
+        );
+        let settings = user_scope(settings_with_override(
+            "reviewer",
+            AgentOverrideConfig {
+                allowed_agents: OverrideField::Value(vec!["planner".to_string()]),
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        let updated = merged.get("reviewer").expect("present");
+        assert_eq!(updated.allowed_agents, Some(vec!["planner".to_string()]));
+        assert_eq!(
+            updated.override_info.as_ref().expect("recorded").fields,
+            BTreeSet::from(["allowedAgents".to_string()]),
+            "recorded under pi's own on-disk key spelling"
+        );
+
+        // Clear: a JSON `false` restores unrestricted delegation.
+        let mut merged = HashMap::new();
+        let mut on_disk = agent_with_present(
+            "reviewer",
+            AgentSource::User,
+            "/user/reviewer.md",
+            &["allowedAgents"],
+        );
+        on_disk.allowed_agents = Some(vec!["planner".to_string()]);
+        merged.insert("reviewer".to_string(), on_disk);
+        let settings = user_scope(settings_with_override(
+            "reviewer",
+            AgentOverrideConfig {
+                allowed_agents: OverrideField::ExplicitClear,
+                ..Default::default()
+            },
+        ));
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+        assert_eq!(
+            merged.get("reviewer").expect("present").allowed_agents,
+            None,
+            "a JSON `false` is pi's `delete next.allowedAgents`"
         );
     }
 
@@ -1966,7 +2041,7 @@ mod tests {
                 "persona-reviewer",
                 AgentOverrideConfig {
                     model: OverrideField::Value("openai/gpt-5.4".to_string()),
-                    completion_guard: OverrideField::Value(true),
+                    disabled: OverrideField::Value(true),
                     ..Default::default()
                 },
             ),
@@ -1992,7 +2067,7 @@ mod tests {
             "a user-only key carries user alone"
         );
         assert_eq!(
-            info.field_scopes.get("completionGuard"),
+            info.field_scopes.get("disabled"),
             Some(&BTreeSet::from([OverrideScope::Project])),
             "a project-only key carries project alone"
         );
@@ -2009,8 +2084,8 @@ mod tests {
     /// wrong file.
     ///
     /// Also pins the KEY SPELLINGS, which are on-disk camelCase JSON keys (pi's
-    /// `BuiltinAgentOverrideConfig`, `agents.ts:80-111`) and not Rust field names — `completionGuard`,
-    /// never `completion_guard`. `subagents-admin.ts:117`'s `EditableOverrideField` compares against
+    /// `BuiltinAgentOverrideConfig`, `agents.ts:80-111`) and not Rust field names —
+    /// `subagentOnlyExtensions`, never `subagent_only_extensions`. `subagents-admin.ts:117`'s `EditableOverrideField` compares against
     /// these strings literally.
     #[test]
     fn override_fields_are_the_union_across_scopes_not_the_last_pass() {
@@ -2032,7 +2107,7 @@ mod tests {
                 "persona-reviewer",
                 AgentOverrideConfig {
                     model: OverrideField::Value("openai/gpt-5.4".to_string()),
-                    completion_guard: OverrideField::Value(true),
+                    disabled: OverrideField::Value(true),
                     ..Default::default()
                 },
             ),
@@ -2049,7 +2124,7 @@ mod tests {
         assert_eq!(
             info.fields,
             BTreeSet::from([
-                "completionGuard".to_string(),
+                "disabled".to_string(),
                 "model".to_string(),
                 "thinking".to_string(),
             ]),
@@ -2369,11 +2444,11 @@ mod tests {
                 skills: OverrideField::Value(vec!["tdd".to_string()]),
                 tools: ToolsOverrideField::Value(vec![ToolRef::Builtin("read".to_string())]),
                 exclude_tools: OverrideField::Value(vec!["bash".to_string()]),
+                allowed_agents: OverrideField::Unset,
                 allow_nested_subagents: OverrideField::Value(true),
                 subagent_only_extensions: OverrideField::Value(vec![
                     "./tools/child-review.ts".to_string(),
                 ]),
-                completion_guard: OverrideField::Value(false),
                 description: OverrideField::Value("overridden description".to_string()),
                 output: OverrideField::Value("./out/review.md".to_string()),
                 default_reads: OverrideField::Value(vec!["./AGENTS.md".to_string()]),
@@ -2420,7 +2495,6 @@ mod tests {
             updated.subagent_only_extensions,
             Some(vec!["./tools/child-review.ts".to_string()])
         );
-        assert_eq!(updated.completion_guard, Some(false));
         // SUBA-081's five added fields, on the custom path.
         assert_eq!(updated.description, "overridden description");
         // SUBA-096: `output` sets the path, `outputMode` the mode — both land in the one spec.
@@ -3362,6 +3436,7 @@ mod tests {
             "delegate",
             AgentOverrideConfig {
                 exclude_tools: OverrideField::Value(vec!["bash".to_string()]),
+                allowed_agents: OverrideField::Unset,
                 allow_nested_subagents: OverrideField::Value(true),
                 ..Default::default()
             },
@@ -3381,6 +3456,7 @@ mod tests {
             "delegate",
             AgentOverrideConfig {
                 exclude_tools: OverrideField::ExplicitClear,
+                allowed_agents: OverrideField::Unset,
                 ..Default::default()
             },
         ));
@@ -3406,6 +3482,7 @@ mod tests {
             "reviewer",
             AgentOverrideConfig {
                 exclude_tools: OverrideField::Value(vec!["bash".to_string()]),
+                allowed_agents: OverrideField::Unset,
                 allow_nested_subagents: OverrideField::Value(true),
                 ..Default::default()
             },
@@ -3423,6 +3500,7 @@ mod tests {
             "reviewer",
             AgentOverrideConfig {
                 exclude_tools: OverrideField::ExplicitClear,
+                allowed_agents: OverrideField::Unset,
                 allow_nested_subagents: OverrideField::Value(false),
                 ..Default::default()
             },

@@ -2,6 +2,7 @@
 
 use super::assistant::AssistantMessage;
 use super::content::{Content, de_tool_result_content, de_user_content};
+use super::system::SystemMessage;
 use super::usage::Usage;
 use crate::ToolCallId;
 
@@ -14,6 +15,11 @@ use crate::ToolCallId;
     rename_all_fields = "camelCase"
 )]
 pub enum Message {
+    /// The transcript's own system instructions and tool declarations at one point (Pi
+    /// `SystemMessage`, `packages/ai/src/types.ts:491-507` @v0.87.1, PROV-083a). A newtype arm so
+    /// [`SystemMessage`] owns the key order once, exactly as [`Message::Assistant`] does — see that
+    /// type's docs for the replay model.
+    System(SystemMessage),
     User {
         /// Pi `UserMessage.content: string | (TextContent | ImageContent)[]` (types.ts:379). On
         /// READ, a bare JSON string is accepted and promoted to a single text block; the array form
@@ -59,9 +65,9 @@ pub enum Message {
 
 impl serde::Serialize for Message {
     /// Manual serializer so the `role` discriminant appears EXACTLY ONCE and in Pi's field order.
-    /// `Assistant` delegates to [`AssistantMessage`]'s self-tagging serializer (which emits
-    /// `role:"assistant"` first, then Pi's order); `User`/`ToolResult` write their own `role` then
-    /// their fields. A derived internally-tagged `Serialize` would DOUBLE the `role` key for the
+    /// `System` and `Assistant` delegate to [`SystemMessage`]'s / [`AssistantMessage`]'s
+    /// self-tagging serializers (which emit their `role` first, then Pi's order); `User` and
+    /// `ToolResult` write their own `role` then their fields. A derived internally-tagged `Serialize` would DOUBLE the `role` key for the
     /// `Assistant` arm now that its struct self-tags. `Deserialize` stays derived (`tag = "role"`).
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -69,6 +75,8 @@ impl serde::Serialize for Message {
     {
         use serde::ser::SerializeStruct as _;
         match self {
+            // Self-tagging: emits `role:"system"` first, then pi's field order.
+            Message::System(m) => m.serialize(serializer),
             Message::User { content, timestamp } => {
                 let mut st = serializer.serialize_struct("Message", 3)?;
                 st.serialize_field("role", "user")?;

@@ -54,5 +54,6 @@ mod wasm_compaction_override;
 mod wasm_exec;
 mod wasm_http;
 mod wasm_proc;
+mod wasm_send_from_event;
 mod wasm_slash_command;
 mod wasm_ui_dialogs;

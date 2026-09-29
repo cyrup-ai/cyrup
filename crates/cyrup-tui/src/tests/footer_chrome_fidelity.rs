@@ -1305,7 +1305,7 @@ fn an_extension_footer_takes_exactly_the_rows_it_renders() {
     let is_rule = |r: &str| !r.is_empty() && r.chars().all(|c| c == '─');
 
     app.apply_ui_effect(cyrup_session_svc::UiEffect::SetFooter {
-        content: "EXTFOOT".to_string(),
+        content: Some("EXTFOOT".to_string()),
     });
     app.draw().unwrap();
     let rows = live_rows(&app);
@@ -1323,7 +1323,7 @@ fn an_extension_footer_takes_exactly_the_rows_it_renders() {
     );
 
     app.apply_ui_effect(cyrup_session_svc::UiEffect::SetFooter {
-        content: "F-ONE\nF-TWO\nF-THREE\nF-FOUR".to_string(),
+        content: Some("F-ONE\nF-TWO\nF-THREE\nF-FOUR".to_string()),
     });
     app.draw().unwrap();
     let rows = live_rows(&app);

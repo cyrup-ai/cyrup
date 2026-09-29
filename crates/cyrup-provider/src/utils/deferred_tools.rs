@@ -119,7 +119,12 @@ pub fn split_deferred_tools(
                     }
                 }
             }
-            Message::User { .. } => {}
+            // PROV-083a — this module reads the v0.85 `ToolResult.addedToolNames` deferred-load
+            // point, which a system message does not carry. Upstream's
+            // `packages/ai/src/utils/deferred-tools.ts` is DELETED at v0.87.1 and its job is taken
+            // over by `utils::transcript::resolve_transcript_tools`; PROV-083b retires this module
+            // together with the wire shapes it serves.
+            Message::System(_) | Message::User { .. } => {}
         }
     }
 
@@ -182,6 +187,7 @@ mod tests {
             api: "anthropic-messages".into(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,

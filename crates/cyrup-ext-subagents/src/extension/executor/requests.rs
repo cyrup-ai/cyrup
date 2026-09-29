@@ -54,6 +54,11 @@ pub struct SingleRunOverrides {
     pub output: Option<serde_json::Value>,
     /// pi `params.outputMode` (`schemas.ts:50-53`): `"inline"` (pi's own default) or `"file-only"`.
     pub output_mode: Option<String>,
+    /// CFG-067 — pi `params.toolTimeoutMs` (`extension/schemas.ts:364` @v0.71.0), the HIGHEST rung
+    /// of `resolveToolTimeoutMs` (`tool-timeout.ts:63`). Carried RAW so a malformed value reaches
+    /// upstream's own resolver message instead of failing the tool call's deserialization — see
+    /// `crate::extension::tool::params::SubagentParams::tool_timeout_ms`.
+    pub tool_timeout_ms: Option<serde_json::Value>,
     /// SUBA-096 — pi `params.fast` (`extension/schemas.ts:388` @v0.68.0), the call rung of
     /// `params.fast ?? a.fast`. `run_foreground_impl` folds the persona's own `fast` beneath it.
     pub fast: Option<bool>,
@@ -365,6 +370,10 @@ pub struct BackgroundSingleRequest<'a> {
     /// applies to "foreground and async/background runs", and `async-execution.ts:924,982-983` @v0.34.0 arms
     /// a real deadline from it.
     pub timeout_ms: Option<u64>,
+    /// CFG-067 — pi `toolTimeoutMs: params.toolTimeoutMs` on the async launch
+    /// (`subagent-executor.ts:4146`): the CALL rung, raw, for the same reason
+    /// [`BackgroundStepsSpec::tool_timeout_ms`] is.
+    pub tool_timeout_ms: Option<serde_json::Value>,
 }
 
 /// The already-resolved, plan-shaped inputs [`crate::extension::SubagentExecutor::spawn_background_steps`] takes from
@@ -377,6 +386,12 @@ pub struct BackgroundSingleRequest<'a> {
 /// depth / async-root / results-dir values read from the live `config_snapshot`) are filled in by
 /// `spawn_background_steps` itself and are deliberately NOT carried here.
 pub struct BackgroundStepsSpec {
+    /// CFG-067 — the CALL rung of `resolveToolTimeoutMs` (pi `params.toolTimeoutMs`, threaded onto
+    /// the async launch at `subagent-executor.ts:4146`), carried RAW. The config rung is stamped by
+    /// `spawn_background_steps` from the live snapshot it already takes; the agent and env rungs are
+    /// applied inside the runner, per step. See
+    /// [`crate::background::runner_main::RunnerConfig::tool_timeout`].
+    pub tool_timeout_ms: Option<serde_json::Value>,
     /// The already-resolved step graph to dispatch (`RunnerConfig::steps`).
     pub steps: Vec<RunnerStep>,
     /// How the detached runner drives that graph (`RunnerConfig::mode`).
@@ -525,13 +540,59 @@ pub struct BackgroundStepsSpec {
     /// : foregroundContract?.modelResponseAliases` on the revived launch
     /// (`subagent-executor.ts:2136` @v0.71.0).
     ///
-    /// `None` from every ordinary producer, which takes the LIVE `config.json` value at
-    /// `spawn_background_steps`; `Some` only from
-    /// [`crate::extension::SubagentExecutor::control_resume`]'s terminal-revival arm, which hands
-    /// over the descriptor's launch-time map so a revived run enforces the declaration it was
-    /// authorized under. That is the promise the verification error itself makes: *"resumed native
-    /// runs retain their launch-time declaration."*
-    pub model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
+    /// # The doc this replaces rationalised a hole, and the hole was real
+    ///
+    /// The original text, kept because it is the claim that turned out to be wrong: *"`None` from
+    /// every ordinary producer, which takes the LIVE `config.json` value at
+    /// `spawn_background_steps`; `Some` only from `control_resume`'s terminal-revival arm."*
+    ///
+    /// That is exactly the defect. With a single `Option`, *"an ordinary launch"* and *"a revive
+    /// whose retained contract declared nothing"* were both spelled `None`, so
+    /// `spawn_background_steps` could not tell them apart and fell back to the live config for
+    /// both. Upstream's `:2136` reads the live config on NEITHER branch, under its own comment at
+    /// `:2135`: *"Absence in the retained contract is meaningful; never acquire current aliases."*
+    /// Live config is read only by the ORDINARY-launch sites (`:1367`, `:1749`, `:2008`, `:3355`,
+    /// `:4029`). The concrete divergence: a router starts substituting, run A fails
+    /// `model_verification_failed`, the operator declares the alias in `config.json` and revives A
+    /// — pi still fails A, and cyrup used to pass it.
+    ///
+    /// [`RetainedModelResponseAliases`] is the type that can say *"retained contract, whose value
+    /// is this, possibly absent"*, which a bare `Option` cannot.
+    pub model_response_aliases: RetainedModelResponseAliases,
+}
+
+/// SUBA-119 — which of `subagent-executor.ts:2136`'s two worlds a [`BackgroundStepsSpec`] is in.
+///
+/// Upstream distinguishes them by WHICH CALL SITE builds the launch options, so its type system
+/// never has to: an ordinary launch passes `deps.config.modelResponseAliases`, and the revive at
+/// `:2136` passes the retained contract's value — including when that value is absent, which is
+/// the case the comment at `:2135` exists for. cyrup funnels both through one
+/// [`BackgroundStepsSpec`], so the distinction has to be carried rather than implied.
+///
+/// A named two-variant enum rather than `Option<Option<_>>` on purpose: every call site reads as
+/// the thing it means, and a producer cannot pick the wrong nesting by accident.
+///
+/// # A finding recorded here rather than papered over
+///
+/// Upstream's SECOND branch, `foregroundContract?.modelResponseAliases`, is
+/// `ForegroundHistoryChild.resumeContract` as populated by `rememberForegroundRun`
+/// (`subagent-executor.ts:762`, `:774`). cyrup has no counterpart:
+/// [`crate::extension::executor::foreground_history`]'s `record.rs:74-77` scopes pi's
+/// `resumeContract` out by name, and a workspace grep for `foreground_contract` returns nothing.
+/// So a cyrup FOREGROUND revive cannot carry launch-time aliases at all — a separate gap, in the
+/// foreground-resume-contract scope. The practical consequence for this type is that
+/// [`Self::Retained`] is reachable only from the ASYNC revive
+/// ([`crate::extension::SubagentExecutor::control_resume`]) today; that is a missing producer,
+/// not a reason to collapse the variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetainedModelResponseAliases {
+    /// An ORDINARY launch: take whatever `config.json` declares right now — upstream's
+    /// `deps.config.modelResponseAliases` (`:1367`, `:1749`, `:2008`, `:3355`, `:4029`).
+    Live,
+    /// A REVIVE: the retained contract's own value, and only that. `Retained(None)` is upstream's
+    /// meaningful absence — a run authorized before any alias was declared stays authorized under
+    /// no alias, however the live config has moved since.
+    Retained(Option<crate::exec::model_verification::ModelResponseAliases>),
 }
 
 /// G92: the three optional `status` VIEW selectors pi carries as separate params

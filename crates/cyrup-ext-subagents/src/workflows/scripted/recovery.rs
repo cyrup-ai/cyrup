@@ -39,8 +39,6 @@ use std::sync::LazyLock;
 use fancy_regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
-use crate::exec::task_intent::{TaskMutationIntent, classify_task_mutation_intent};
-
 /// Compile one upstream pattern with an EXPLICIT backtracking budget. 1,000,000 is
 /// `fancy-regex` 0.18's own default (`src/lib.rs:453`) — set here so the bound is a visible,
 /// deliberate choice rather than an inherited one; exceeding it fails closed at every call site.
@@ -498,14 +496,24 @@ pub fn is_acceptance_metadata_recovery(
         })
 }
 
-/// pi `isExplicitReadOnlyRecoveryReview` (`scripted-workflow.ts:1192-1276`): may this launch
-/// follow a rejected acceptance recovery? The nine-name conjunction (eleven `&&` terms, `:1264-
-/// 1274`) over the three scrubbed texts, in source order, ending in the ALREADY-PORTED
-/// [`classify_task_mutation_intent`] (`exec/task_intent.rs`; upstream imports it at `:7` and
-/// applies it at `:1274` — called here, never re-derived).
+/// pi `isExplicitReadOnlyRecoveryReview` (`scripted-workflow.ts:1374-1384` @v0.71.0): may this
+/// launch follow a rejected acceptance recovery? A TEN-term `&&` conjunction over the three
+/// scrubbed texts, in source order, ending at
+/// `!RECOVERY_REVIEW_DASH_LIVE_ACTION_PATTERN.test(taskDashLiveActionText)`.
+///
+/// SUBA-144: this used to carry an ELEVENTH term, cyrup's port of
+/// `classifyTaskMutationIntent(agent, task).kind === "read-only"`, ported from
+/// v0.70.0's `scripted-workflow.ts:1385`. `7c98a696` ("refactor: remove inferred no-edit
+/// completion failures (#2356)") deleted `src/runs/shared/task-intent.ts` and that term with it at
+/// v0.70.1, so at v0.71.0 the file has no such call and no such import. Keeping it made cyrup's
+/// barrier fail CLOSED on read-only review launches upstream permits — e.g. agent `review` with
+/// task `"Read-only: assess the saved analysis."`, which clears all ten surviving patterns but
+/// classified as `Unknown` rather than `ReadOnly` because the wording carries no read-only
+/// DELIVERABLE phrase. The ten patterns are what upstream now relies on; they still refuse a
+/// genuinely mutating task with a reviewer-shaped agent name.
 ///
 /// Any scrub failure (backtracking budget) fails CLOSED: the launch is treated as NOT an explicit
-/// read-only review, so the recovery barrier holds.
+/// read-only review, so the recovery barrier holds. That property is untouched by SUBA-144.
 #[must_use]
 pub fn is_explicit_read_only_recovery_review(params: &serde_json::Map<String, Value>) -> bool {
     let agent = params
@@ -541,7 +549,6 @@ pub fn is_explicit_read_only_recovery_review(params: &serde_json::Map<String, Va
         && !matches_or_fail_closed_true(&ANAPHORIC_MUTATION_PATTERN, &task_mutation_text)
         && !matches_or_fail_closed_true(&DESTRUCTIVE_COMMAND_PATTERN, &task_mutation_text)
         && !matches_or_fail_closed_true(&DASH_LIVE_ACTION_PATTERN, &task_dash_live_action_text)
-        && classify_task_mutation_intent(agent, task) == TaskMutationIntent::ReadOnly
 }
 
 /// pi `recoveryBarrierMessage` (`scripted-workflow.ts:1277-1279`), verbatim.
@@ -737,5 +744,54 @@ mod tests {
         assert!(is_acceptance_metadata_recovery(&child));
         child.ok = true;
         assert!(!is_acceptance_metadata_recovery(&child));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-144 — the retired eleventh conjunct
+    // ---------------------------------------------------------------------------------------
+
+    /// A launch that clears all TEN surviving upstream patterns must be permitted, even when the
+    /// deleted `classifyTaskMutationIntent` would not have called it read-only.
+    ///
+    /// `agent = "review"` matches upstream's `RECOVERY_REVIEW_REVIEWER_AGENT_PATTERN`
+    /// (`/\b(?:advisor|oracle|review|reviewer)\b/i`) but NOT the narrower
+    /// `isReviewerStyleAgent` (`/\b(?:advisor|reviewer|oracle)\b/i`) the retired classifier
+    /// consulted, and the task carries no read-only DELIVERABLE phrase — so the classifier
+    /// returned `Unknown`, and the eleventh term refused a launch upstream v0.71.0 admits.
+    #[test]
+    fn a_ten_term_clean_read_only_review_is_permitted_without_intent_classification() {
+        assert!(is_explicit_read_only_recovery_review(&params(
+            "review",
+            "Read-only: assess the saved analysis.",
+            true,
+        )));
+    }
+
+    /// The loosened barrier still holds where upstream's own ten patterns say it must: a
+    /// genuinely mutating task with a reviewer-shaped agent name is still refused, by
+    /// `RECOVERY_REVIEW_MUTATION_VERB_PATTERN` rather than by any intent classifier.
+    #[test]
+    fn a_mutating_task_with_a_reviewer_agent_name_is_still_refused() {
+        for task in [
+            "Read-only: assess the saved analysis, then edit the parser to match.",
+            "Read-only: rewrite the failing module.",
+            "Read-only: assess the analysis and delete the stale fixtures.",
+        ] {
+            assert!(
+                !is_explicit_read_only_recovery_review(&params("review", task, true)),
+                "upstream's ten surviving patterns must still refuse {task:?}"
+            );
+        }
+    }
+
+    /// The fail-closed-on-scrub-failure property SUBA-144 must not disturb: an unscrubbable task
+    /// is still refused.
+    #[test]
+    fn a_scrub_failure_still_fails_closed() {
+        // A pathological length that exhausts the scrub's backtracking budget.
+        let task = format!("Read-only: {}", "do not edit ".repeat(20_000));
+        assert!(!is_explicit_read_only_recovery_review(&params(
+            "review", &task, true
+        )));
     }
 }

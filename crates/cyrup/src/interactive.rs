@@ -433,6 +433,35 @@ async fn seed_footer<B: cyrup_tui::RebuildBackend>(
     runtime: &AgentSessionRuntime,
     session: &AgentSession,
 ) {
+    seed_model_footer(app, session);
+
+    // Location line (`cwd (branch) • name`, footer.ts:116-130).
+    app.status_mut().set_cwd(home_relative(runtime.cwd()));
+    // …and the `(branch)` half of it, which Pi reads from its `FooterDataProvider`
+    // (`footer.ts:117` → `footer-data-provider.ts` `getGitBranch()`). This is the sole production
+    // caller: before it existed `StatusLine::set_branch` had only test callers, so the segment could
+    // never appear in a real session. Constructed from the RUNTIME's cwd, the same value Pi passes
+    // (`new FooterDataProvider(sessionManager.getCwd())`), not the process cwd — a `--resume` of a
+    // session recorded elsewhere must show THAT tree's branch.
+    let cwd = runtime.cwd().to_path_buf();
+    app.set_footer_git_cwd(&cwd);
+
+    // Thinking level → footer suffix + editor rule color (spec/tui/03 §3.3, footer.ts:186-188).
+    let level = thinking_level_str(session.thinking_level().await);
+    app.status_mut().set_thinking_level(level);
+    app.editor_mut().set_thinking_level(level);
+}
+
+/// The model half of the footer seed: the model cell, the provider cell, the reasoning flag and the
+/// available-provider tally.
+///
+/// Split out of [`seed_footer`] so the boot tally is testable on its own: the rest of that function
+/// needs an [`AgentSessionRuntime`] (and so a whole `SessionFactory`) for the cwd, git branch and
+/// thinking level, while this half needs only the session.
+pub(crate) fn seed_model_footer<B: cyrup_tui::RebuildBackend>(
+    app: &mut App<B>,
+    session: &AgentSession,
+) {
     // pi's footer reads the OPTIONAL `state.model`: the model cell is
     // `state.model?.id || "no-model"` (footer.ts:169) and the `(provider)` prefix is gated on
     // `state.model` being present (footer.ts:192-193). A modelless session (SEAM-075) therefore
@@ -454,8 +483,10 @@ async fn seed_footer<B: cyrup_tui::RebuildBackend>(
     });
     status.set_provider(model.as_ref().map(|_| provider.clone()));
 
-    // Reasoning support + provider breadth from the resolved catalog (drives the ` • {level}` suffix
-    // and the `(provider)` prefix gate, footer.ts:184-199).
+    // Reasoning drives the ` • {level}` suffix (footer.ts:184-188). Read from
+    // `session.model_catalog()` — the INSTALLED provider's own catalog — deliberately: pi reads
+    // `state.model?.reasoning` (`footer.ts:185`), the flag of the session's own model, which belongs
+    // to the installed provider by construction. Only the TALLY below was reading the wrong list.
     let catalog = session.model_catalog();
     let reasoning = catalog
         .iter()
@@ -463,26 +494,14 @@ async fn seed_footer<B: cyrup_tui::RebuildBackend>(
         .map(|m| m.reasoning)
         .unwrap_or(false);
     status.set_reasoning(reasoning);
-    let mut providers: Vec<&str> = catalog.iter().map(|m| m.provider.as_str()).collect();
-    providers.sort_unstable();
-    providers.dedup();
-    status.set_provider_count(providers.len());
 
-    // Location line (`cwd (branch) • name`, footer.ts:116-130).
-    status.set_cwd(home_relative(runtime.cwd()));
-    // …and the `(branch)` half of it, which Pi reads from its `FooterDataProvider`
-    // (`footer.ts:117` → `footer-data-provider.ts` `getGitBranch()`). This is the sole production
-    // caller: before it existed `StatusLine::set_branch` had only test callers, so the segment could
-    // never appear in a real session. Constructed from the RUNTIME's cwd, the same value Pi passes
-    // (`new FooterDataProvider(sessionManager.getCwd())`), not the process cwd — a `--resume` of a
-    // session recorded elsewhere must show THAT tree's branch.
-    let cwd = runtime.cwd().to_path_buf();
-    app.set_footer_git_cwd(&cwd);
-
-    // Thinking level → footer suffix + editor rule color (spec/tui/03 §3.3, footer.ts:186-188).
-    let level = thinking_level_str(session.thinking_level().await);
-    app.status_mut().set_thinking_level(level);
-    app.editor_mut().set_thinking_level(level);
+    // The `(provider)` prefix gate (`footer.ts:192-193` → `status.rs:597`). Counted by the SAME
+    // function every later recount uses, which is pi's arrangement: `init()` reaches
+    // `updateAvailableProviderCount` (`interactive-mode.ts:5092-5099`) via `rebindCurrentSession`
+    // (`:1033` → `:2042`) and again at `:1051`. Before TUI-105 this was an open-coded tally over
+    // `session.model_catalog()`, the CURRENT provider's models only, so it was always 1 and the gate
+    // could never fire on the first frame however many providers were credentialed.
+    app.refresh_provider_count(session);
 }
 
 /// The lowercase footer/editor string for a [`cyrup_sdk::core::ModelThinkingLevel`] (matches the

@@ -32,9 +32,16 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         // for the other three and why they are blocked.
         "xai" => "grok-4.6",
         "groq" => "openai/gpt-oss-120b",
-        "cerebras" => "zai-glm-4.7",
-        "zai" => "glm-5.1",
-        "zai-coding-cn" => "glm-5.1",
+        // CHASED to v0.87.1 (`model-resolver.ts:37`). These three sat in the test's `DEFERRED`
+        // array because the id upstream had moved to was not in the embedded catalog — the
+        // catalog was frozen at `b0c2a90e` and `glm-5.3`/`gpt-oss-120b` post-date it. PROV-071's
+        // live refresh carries all three, so the block that deferred them is gone and NOT chasing
+        // them is now the defect: `zai-glm-4.7` and `glm-5.1` are retired upstream, so leaving
+        // them here drops three providers out of `first_default_or_first`'s scan entirely and
+        // launches the user on whatever sorts first.
+        "cerebras" => "gpt-oss-120b",
+        "zai" => "glm-5.3",
+        "zai-coding-cn" => "glm-5.3",
         "mistral" => "devstral-medium-latest",
         "minimax" => "MiniMax-M2.7",
         "minimax-cn" => "MiniMax-M2.7",
@@ -316,19 +323,38 @@ mod tests {
             ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
         ];
 
-        /// v0.85.1 rows cyrup has chased (`model-resolver.ts:35` @v0.85.1).
-        const CHASED: &[(&str, &str)] = &[("xai", "grok-4.6")];
-
-        /// v0.85.1 rows cyrup has NOT chased, and why. `cerebras` is chaseable but belongs to no
-        /// filed item; the two `glm-5.3` rows are BLOCKED — `catalog/zai.json` and
-        /// `catalog/zai-coding-cn.json` ship `glm-4.5-air, glm-4.7, glm-5-turbo, glm-5.1, glm-5.2,
-        /// glm-5v-turbo` and no `glm-5.3`, so naming it would drop both providers out of the scan
-        /// (XAI_5).
-        const DEFERRED: &[(&str, &str)] = &[
+        /// Rows cyrup has chased past v0.84.1, each with the tag it was chased to.
+        ///
+        /// `xai` was chased to v0.85.1 (`model-resolver.ts:35`). The other three were `DEFERRED`
+        /// until PROV-071: they are unchanged at v0.87.1 (`model-resolver.ts:37,38,39`), and the
+        /// only thing that had blocked them was that `catalog/cerebras.json`, `catalog/zai.json`
+        /// and `catalog/zai-coding-cn.json` were frozen at `b0c2a90e` and carried neither
+        /// `gpt-oss-120b` nor `glm-5.3`. The live refresh carries all three, and at the same time
+        /// RETIRED the ids cyrup was naming — `zai-glm-4.7` and `glm-5.1` are gone — so chasing
+        /// stopped being optional.
+        const CHASED: &[(&str, &str)] = &[
+            ("xai", "grok-4.6"),
             ("cerebras", "gpt-oss-120b"),
             ("zai", "glm-5.3"),
             ("zai-coding-cn", "glm-5.3"),
         ];
+
+        /// Rows where PI'S OWN curated default names an id pi's own catalog no longer serves.
+        ///
+        /// This is not a cyrup gap and must not be "fixed" into one. `defaultModelPerProvider`
+        /// @v0.87.1 (`model-resolver.ts:46,50`) still reads
+        /// `fireworks: "accounts/fireworks/models/kimi-k2p6"` and `"opencode-go": "kimi-k2.6"`,
+        /// while the catalogs pi generates and publishes for those two providers carry
+        /// `accounts/fireworks/models/kimi-k3` and no `kimi-k2.6` at all. pi therefore falls through
+        /// its own curated default for these providers exactly as cyrup does, and picking a
+        /// "better" successor here would be cyrup inventing upstream behaviour — the one thing the
+        /// table is not allowed to do. The rows are listed so the guard below can skip them BY
+        /// NAME, with this reason attached, rather than being weakened for everybody.
+        const STALE_UPSTREAM: &[(&str, &str)] = &[
+            ("fireworks", "accounts/fireworks/models/kimi-k2p6"),
+            ("opencode-go", "kimi-k2.6"),
+        ];
+        const DEFERRED: &[(&str, &str)] = &[];
 
         let expected: Vec<(&str, &str)> = PI
             .iter()
@@ -356,17 +382,57 @@ mod tests {
         }
 
         // THE GUARD. Every curated default must name a model the shipped catalog actually carries.
-        // Providers with no embedded rows are skipped: the four dynamic fleet members and `radius`
-        // get their catalogs at runtime, and `cyrup-provider`'s own
-        // `every_registered_provider_has_a_non_empty_catalog` already asserts which those are, so a
-        // silently-empty catalog cannot hide here.
+        // A provider with no embedded rows is skipped because it gets its catalog at runtime, and
+        // `cyrup-provider`'s own `every_registered_provider_has_a_non_empty_catalog` asserts exactly
+        // which providers those are, so a silently-empty catalog cannot hide behind the skip.
+        //
+        // DRIFT-009 shrank that skip from five providers to one. `baseten` and the three
+        // `qwen-token-plan*` providers used to have zero embedded rows, so four of the entries in
+        // `PI` above were checked for spelling and nothing else — `zai-org/GLM-5.2`, `qwen3.7-max`
+        // twice and `qwen3.8-max` could have named anything. Now that all four ship catalogs those
+        // four defaults are really resolved, and `radius` is the only provider left where this guard
+        // is vacuous. `MEANINGFUL_NOW` pins that gain: if one of the four regressed to an empty
+        // catalog the loop below would go quiet again and this assertion is what would notice.
+        const MEANINGFUL_NOW: &[&str] = &[
+            "baseten",
+            "qwen-token-plan",
+            "qwen-token-plan-cn",
+            "qwen-token-plan-individual",
+        ];
+        let mut checked: Vec<&str> = Vec::new();
         for provider in cyrup_provider::all_providers() {
             let id = provider.id().as_str();
             let Some(default_id) = default_model_per_provider(id) else {
                 continue;
             };
             if provider.models().is_empty() {
+                assert!(
+                    !MEANINGFUL_NOW.contains(&id),
+                    "{id} ships no embedded rows, so its curated default `{default_id}` is \
+                     unchecked again — DRIFT-009 embedded this catalog precisely so it would be"
+                );
                 continue;
+            }
+            if let Some((_, stale)) = STALE_UPSTREAM.iter().find(|(k, _)| *k == id) {
+                // The skip is itself asserted: it applies only while cyrup's value is still pi's.
+                // If somebody edits the table to a successor id, this fires instead of quietly
+                // letting the edit through as an upstream-faithful value.
+                assert_eq!(
+                    default_model_per_provider(id),
+                    Some(*stale),
+                    "{id} is listed as stale-upstream, so cyrup must carry pi's own value \
+                     verbatim; if you changed it, you changed behaviour pi does not have"
+                );
+                continue;
+            }
+            if MEANINGFUL_NOW.contains(&id) {
+                checked.push(
+                    MEANINGFUL_NOW
+                        .iter()
+                        .find(|m| **m == id)
+                        .copied()
+                        .expect("id"),
+                );
             }
             assert!(
                 provider
@@ -379,5 +445,10 @@ mod tests {
                  (pick its successor)."
             );
         }
+        checked.sort_unstable();
+        assert_eq!(
+            checked, MEANINGFUL_NOW,
+            "every DRIFT-009 provider must reach the guard above"
+        );
     }
 }

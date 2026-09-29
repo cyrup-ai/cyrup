@@ -92,6 +92,7 @@ fn assistant_tool_call(id: &str, name: &str) -> Message {
         api: "anthropic-messages".into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
@@ -216,13 +217,17 @@ fn loads_an_openai_responses_tool_through_client_tool_search() {
     // (4) The exact `tool_search_output` shape: same call id, and the definition carries
     // `defer_loading: true`.
     //
-    // PROV-034: there is **no `strict` key**. pi builds its function-tool literal without one
-    // and only then does `if (supportsStrictMode) functionTool.strict = constrainedStrict ??
-    // defaultStrict` (`openai-responses-shared.ts:365-378` @v0.83.0), and this api resolves
+    // PROV-034 / PROV-078: `strict` is present here, and it is present because the CATALOG says
+    // so. pi builds its function-tool literal without the key and only then does
+    // `if (supportsStrictMode) functionTool.strict = constrainedStrict ?? defaultStrict`
+    // (`openai-responses-shared.ts:365-378` @v0.83.0), with
     // `supportsStrictMode: model.compat?.supportsStrictMode ?? false` (`openai-responses.ts:72`).
-    // The embedded `gpt-5.4` row carries `compat: { supportsToolSearch: true }` and nothing
-    // else, so the flag is false and the key is absent — where cyrup used to hard-code
-    // `"strict": false` onto every tool of every request.
+    // While the catalog was frozen at `b0c2a90e` the `gpt-5.4` row carried
+    // `compat: { supportsToolSearch: true }` and nothing else, so the flag resolved false and the
+    // key was absent. PROV-078 made `supportsStrictMode` EXPLICIT metadata upstream and every
+    // `openai` row now declares `true`, so the key is emitted — as `false`, because this tool is
+    // not a constrained one. PROV-034's actual guarantee, that cyrup does not hard-code the key,
+    // is asserted below against a row with the flag cleared.
     assert_eq!(
         *out,
         json!({
@@ -240,6 +245,7 @@ fn loads_an_openai_responses_tool_through_client_tool_search() {
                     "required": ["value"],
                 },
                 "defer_loading": true,
+                "strict": false,
             }],
         })
     );
@@ -247,12 +253,28 @@ fn loads_an_openai_responses_tool_through_client_tool_search() {
     // literal above: `strict` must be missing on BOTH sides of the split — the searched-for
     // definition and the immediate `body.tools` prefix — because the same
     // `supportsStrictMode: false` governs both call sites.
+    assert_eq!(
+        body["tools"][0].get("strict"),
+        Some(&json!(false)),
+        "the immediate tool prefix carries the same `strict` the searched definition does — one \
+         `supportsStrictMode` governs both call sites"
+    );
+
+    // The negative half, and the one PROV-034 was really about: clear the catalog flag and the
+    // key must vanish from BOTH sides. Without this, a hard-coded `"strict": false` would satisfy
+    // every assertion above.
+    let mut unstrict = catalog_model("gpt-5.4");
+    if let Some(compat) = unstrict.compat.as_mut() {
+        compat.supports_strict_mode = None;
+    }
+    let plain = build_params(&unstrict, &ctx, &StreamOptions::default(), None);
+    let plain_items = plain["input"].as_array().unwrap();
     assert!(
-        out["tools"][0].get("strict").is_none(),
-        "supportsStrictMode is false for gpt-5.4, so pi emits no `strict` key at all"
+        plain_items[4]["tools"][0].get("strict").is_none(),
+        "with supportsStrictMode cleared, pi emits no `strict` key at all"
     );
     assert!(
-        body["tools"][0].get("strict").is_none(),
+        plain["tools"][0].get("strict").is_none(),
         "the immediate tool prefix must not carry `strict` either"
     );
 
@@ -406,6 +428,7 @@ fn the_search_call_id_hashes_the_full_tool_call_id_and_comma_joined_names() {
         api: API_ID.into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
@@ -487,7 +510,10 @@ fn tool_search_is_off_for_every_openai_responses_model_but_the_seven() {
     // cyrup carries the same data as `compat.supportsToolSearch` in
     // `providers/catalog/openai.json`. `openai-codex` contributes nothing — cyrup does not port
     // `openai-codex-responses`.
-    const ENABLED: [&str; 7] = [
+    // Ten since PROV-071's live refresh: `OPENAI_TOOL_SEARCH_MODEL_IDS` gained the GPT-6 trio.
+    // Seven while the catalog was frozen at `b0c2a90e`, which is why this constant was named for
+    // the count; the name is kept because the count is still the claim.
+    const ENABLED: [&str; 10] = [
         "gpt-5.4",
         "gpt-5.4-mini",
         "gpt-5.4-pro",
@@ -495,6 +521,9 @@ fn tool_search_is_off_for_every_openai_responses_model_but_the_seven() {
         "gpt-5.6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
+        "gpt-6-astra",
+        "gpt-6-luna",
+        "gpt-6-sol",
     ];
 
     let mut on: Vec<(String, String)> = Vec::new();

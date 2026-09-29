@@ -20,6 +20,7 @@
     clippy::indexing_slicing
 )]
 
+mod abort_recovery_integration;
 mod acceptance_policy_parity;
 mod acceptance_role_inference;
 mod bundled_resources_registration_integration;
@@ -31,6 +32,7 @@ mod herdr_shutdown_budget_integration;
 mod management_actions_integration;
 mod management_capabilities_integration;
 mod rpc_bridge_integration;
+mod runtime_agent_event_bridge_integration;
 mod runtime_agent_registration_integration;
 mod spawn_temp_file_cleanup;
 mod steer_delivery_integration;

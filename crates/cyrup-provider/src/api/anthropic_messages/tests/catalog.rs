@@ -65,17 +65,25 @@ fn default_supports_tool_references_parses_versions_like_pis_regex() {
 fn tool_references_default_off_across_every_embedded_catalog() {
     use crate::providers::all::all_providers;
 
-    const EXPECTED_ON: [&str; 10] = [
+    // The four new ids are the Claude models Anthropic shipped after `b0c2a90e`, which PROV-071's
+    // live refresh made visible. They widen the radius by arriving, not by any flag changing: the
+    // rule (`default_supports_tool_references`, DRIFT-001) is unchanged and still applies only to
+    // first-party Anthropic rows.
+    const EXPECTED_ON: [&str; 14] = [
         "claude-fable-5",
+        "claude-fable-5-1",
         "claude-opus-4-5",
         "claude-opus-4-5-20251101",
         "claude-opus-4-6",
         "claude-opus-4-7",
         "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-opus-5-5",
         "claude-sonnet-4-5",
         "claude-sonnet-4-5-20250929",
         "claude-sonnet-4-6",
         "claude-sonnet-5",
+        "claude-sonnet-5-5",
     ];
 
     let mut on: Vec<String> = Vec::new();
@@ -153,12 +161,18 @@ fn tool_search_is_confined_to_the_openai_responses_catalog() {
             // `supportsToolSearch` rows as `openai`, on the same `openai-responses` wire API —
             // the assertion is that tool-search stays confined to that API, not to one
             // provider, so a second responses-based provider legitimately widens this list.
-            "openai-codex/gpt-5.4",
-            "openai-codex/gpt-5.4-mini",
+            // `openai-codex/gpt-5.4` and `-mini` left this list because v0.86.0 REMOVED those two
+            // rows from Codex entirely (`packages/ai/CHANGELOG.md`), not because the flag moved;
+            // the GPT-6 trio joined it on both providers. Both facts arrived with PROV-071's live
+            // refresh, and the invariant this test exists for — tool search never reaches an
+            // `anthropic-messages` row — is asserted above and unaffected by either.
             "openai-codex/gpt-5.5",
             "openai-codex/gpt-5.6-luna",
             "openai-codex/gpt-5.6-sol",
             "openai-codex/gpt-5.6-terra",
+            "openai-codex/gpt-6-astra",
+            "openai-codex/gpt-6-luna",
+            "openai-codex/gpt-6-sol",
             "openai/gpt-5.4",
             "openai/gpt-5.4-mini",
             "openai/gpt-5.4-pro",
@@ -166,6 +180,9 @@ fn tool_search_is_confined_to_the_openai_responses_catalog() {
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "openai/gpt-6-astra",
+            "openai/gpt-6-luna",
+            "openai/gpt-6-sol",
         ],
         "the tool-search blast radius changed"
     );

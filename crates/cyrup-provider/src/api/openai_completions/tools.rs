@@ -13,7 +13,8 @@ pub(super) fn message_has_tool_use(msg: &Message) -> bool {
     match msg {
         Message::ToolResult { .. } => true,
         Message::Assistant(am) => am.content.iter().any(|c| matches!(c, Content::ToolCall(_))),
-        Message::User { .. } => false,
+        // A system message declares tools; it never CALLS one, and it is not a tool result.
+        Message::System(_) | Message::User { .. } => false,
     }
 }
 

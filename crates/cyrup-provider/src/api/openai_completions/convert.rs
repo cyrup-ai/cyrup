@@ -46,6 +46,14 @@ pub(crate) fn convert_messages(
         }
 
         match msg {
+            // PROV-083a — a `Message::System` carries the transcript's own prompt and tool
+            // state, not a turn to convert. Upstream this adapter reaches its message loop through
+            // `resolveTranscript` (`utils/transcript.ts:121`), which for a model without
+            // `supportsMidConvoSystemMessages` collapses every system message into the leading one
+            // the params builder already consumed — so no system message reaches this loop.
+            // PROV-083b wires that call and the in-place emission upstream does at
+            // `openai-completions.ts:1240-1252` for a model that accepts them.
+            Message::System(_) => {}
             Message::User { content, .. } => {
                 if content.is_empty() {
                     i += 1;

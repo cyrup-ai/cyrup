@@ -282,6 +282,7 @@ impl Harness {
 /// Extract the concatenated text of a message (Pi `getMessageText`, suite/harness.ts:34-49).
 pub fn message_text(message: &Message) -> String {
     let content: &[Content] = match message {
+        Message::System(m) => &m.content,
         Message::User { content, .. } => content,
         Message::Assistant(a) => &a.content,
         Message::ToolResult { content, .. } => content,

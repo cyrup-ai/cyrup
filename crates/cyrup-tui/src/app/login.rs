@@ -534,20 +534,21 @@ impl<B: Backend> App<B> {
 
 impl<B: Backend> App<B> {
     /// Recompute the footer's available-provider count — pi `updateAvailableProviderCount`
-    /// (`interactive-mode.ts:5092-5098`) verbatim: the SCOPED set when one is configured, otherwise
+    /// (`interactive-mode.ts:5092-5099`) verbatim: the SCOPED set when one is configured, otherwise
     /// the auth-filtered snapshot, deduped by provider.
     ///
-    /// Before TUI-105 `StatusLine::set_provider_count` had exactly one production caller, at boot
-    /// (`cyrup/src/interactive.rs:466-469`), so the `(provider)` prefix gate (`status.rs:597`) could
-    /// not change after startup: logging in to a second provider left the footer claiming one.
+    /// This is the SOLE producer of `StatusLine::set_provider_count`, which is what drives the
+    /// footer's `(provider)` prefix gate (`status.rs:597` ← `footer.ts:192-193`). Upstream is built
+    /// the same way: every recount in `interactive-mode.ts` — boot, the session rebind, the startup
+    /// refresh, each login/logout and each model change — goes through this one method, so boot is
+    /// not a second implementation but the same call. pi's `init()` reaches it twice, once via
+    /// `rebindCurrentSession` (`:1033` → its tail at `:2042`) and once explicitly at `:1051`;
+    /// cyrup's boot seed reaches it from `cyrup/src/interactive.rs::seed_model_footer`.
     ///
-    /// `[CYRUP-DELTA]` that boot site still counts `session.model_catalog()` — the CURRENT provider's
-    /// own models — where this counts the auth-filtered `available_model_catalog()`, which is pi's
-    /// `getAvailableSnapshot()` (`interactive-mode.ts:5096`). So the first frame's count can be
-    /// narrower than every count after it. Not reconciled here: that line lives in the `cyrup` binary
-    /// crate, outside this change's crate, and the two readings agree from the first login, `/model`,
-    /// `/scoped-models` or `/logout` onwards.
-    pub(crate) fn refresh_provider_count(&mut self, session: &Arc<AgentSession>) {
+    /// Takes `&AgentSession` rather than `&Arc<AgentSession>` so the boot seed — which holds a bare
+    /// `&AgentSession`, not the `Arc` — can call it; the in-app call sites pass their `Arc` unchanged
+    /// through deref coercion.
+    pub fn refresh_provider_count(&mut self, session: &AgentSession) {
         let scoped = session.scoped_models();
         // `session.scopedModels.length > 0 ? … : getAvailableSnapshot()` (`:5094-5096`).
         let providers: std::collections::BTreeSet<String> = if scoped.is_empty() {
@@ -645,15 +646,18 @@ impl<B: Backend> App<B> {
     /// same upstream pattern: one [`CancelToken`] serving as the deadline, the cancel and the
     /// `clearTimeout`, and a worker task posting the settled result back to the run loop.
     ///
-    /// `[CYRUP-DELTA]` pi scopes the refresh to `{ providers: [providerId] }` (`:5955`), spending its
-    /// whole 15 s budget on the one provider just authenticated. cyrup's
-    /// [`cyrup_session_svc::AgentSession::refresh_model_catalogs`]
-    /// (`cyrup-session-svc/src/session/model.rs:281`) resolves the credentialed provider list itself
-    /// and refreshes ALL of them, so this refresh is WIDER than upstream's: the budget is shared
-    /// across N providers, and a slow unrelated provider can eat it. Recorded rather than fixed
-    /// because the narrowing belongs in `cyrup-session-svc`, outside this change's crate; the
-    /// practical effect is a deferred selection that occasionally waits longer, never a wrong one —
-    /// the epoch guard and [`crate::login_dialog::LoginRefreshMsg::previous_model`] decide that.
+    /// SCOPED to the provider just authenticated, which is upstream's own shape: pi calls
+    /// `session.modelRuntime.refresh({ providers: [providerId], signal: controller.signal })`
+    /// DIRECTLY (`:5953`), under the `AbortController` (`:5950`) and 15 s `setTimeout` (`:5951`).
+    /// It deliberately does NOT route this through `refreshModelCatalogs`
+    /// (`modes/interactive/model-catalog-refresh.ts:46-51`), the shared coordinator it reserves for
+    /// WHOLE-catalog refreshes (`/model`, and `run()`'s startup refresh at `:1083`) — because a
+    /// coordinated call may JOIN an in-flight operation, and a joined operation's provider list wins,
+    /// which would discard this caller's scope outright. Hence
+    /// [`cyrup_session_svc::AgentSession::refresh_provider_catalog`] rather than its whole-catalog
+    /// neighbour `refresh_model_catalogs`: the whole 15 s budget is spent on the one provider, and a
+    /// slow unrelated provider cannot eat it. The fetch list drops `radius` inside that call, per the
+    /// fetch/overlay split `cyrup_provider::refresh_and_install` documents.
     fn begin_post_login_catalog_refresh(
         &mut self,
         session: &Arc<AgentSession>,
@@ -684,7 +688,9 @@ impl<B: Backend> App<B> {
         });
         let session = Arc::clone(session);
         tokio::spawn(async move {
-            let result = session.refresh_model_catalogs(cancel.clone()).await;
+            let result = session
+                .refresh_provider_catalog(cancel.clone(), &provider_id)
+                .await;
             cancel.cancel();
             let _ = tx.send(crate::login_dialog::LoginRefreshMsg {
                 epoch,

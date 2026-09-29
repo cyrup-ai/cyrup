@@ -369,7 +369,7 @@ impl SubagentExecutor {
     /// (name -> [`AgentDefinition`]) is done HERE — `extension.rs` is the ONE place with real
     /// discovery access (`crates/cyrup/src/subagent_runner_cmd.rs`'s hop-2 runner has none, which is
     /// exactly why `background/runner_main.rs`'s `ExecSingleStepExecutor` would otherwise synthesize a
-    /// placeholder `AgentConfig{system_prompt_body:"", model:"default", completion_guard:Some(false),
+    /// placeholder `AgentConfig{system_prompt_body:"", model:"default",
     /// …}`) — then each resolved definition is projected via
     /// [`crate::exec::resolve_step_agent_config`].
     ///

@@ -3,9 +3,26 @@
 use super::claude_code::to_claude_code_name;
 use super::convert::{ToolAnchors, convert_tool_result};
 use crate::api::compat::sanitize_surrogates;
-use cyrup_core::{AssistantMessage, Content, Message};
+use cyrup_core::{AssistantMessage, Content, Message, ProviderId};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// The `messages` array plus, for a managed-effort model, the effort each converted assistant turn
+/// was produced at (1:1 with Pi `ConvertedAnthropicMessages`, `anthropic-messages.ts:1221-1224`
+/// @v0.87.1). The key is the index INTO [`Self::messages`], not into the transcript — a turn that
+/// converts to no blocks is skipped by both sides, so the two indexings diverge. PROV-091.
+pub(crate) struct ConvertedMessages {
+    pub(crate) messages: Vec<Value>,
+    pub(crate) assistant_levels: HashMap<usize, String>,
+}
+
+/// Pi `isAnthropicEffort` (`anthropic-messages.ts:1430-1432` @v0.87.1). `minimal` is deliberately
+/// NOT an Anthropic effort: it is a cyrup/pi `ThinkingLevel` rung that `mapThinkingLevelToEffort`
+/// lowers to `low`, so a persisted `minimal` could only come from a foreign writer and must not be
+/// replayed as a marker.
+pub(super) fn is_anthropic_effort(value: Option<&str>) -> bool {
+    matches!(value, Some("low" | "medium" | "high" | "xhigh" | "max"))
+}
 
 /// Map cyrup [`Message`]s to Anthropic `messages` (1:1 port of Pi `convertMessages`,
 /// anthropic-messages.ts:1011-1182).
@@ -19,8 +36,10 @@ pub(crate) fn convert_messages(
     allow_empty_signature: bool,
     deferred_tool_names: &HashSet<String>,
     normalize_tool_name: &dyn Fn(&str) -> String,
-) -> Vec<Value> {
+    managed_provider: Option<&ProviderId>,
+) -> ConvertedMessages {
     let mut params: Vec<Value> = Vec::new();
+    let mut assistant_levels: HashMap<usize, String> = HashMap::new();
     // Declared once per request so a deferred tool is referenced exactly once (Pi :1125).
     let mut anchors = ToolAnchors {
         deferred_tool_names,
@@ -31,6 +50,14 @@ pub(crate) fn convert_messages(
     let mut i = 0;
     while let Some(msg) = transformed.get(i) {
         match msg {
+            // PROV-083a — a `Message::System` carries the transcript's own prompt and tool
+            // state, not a turn to convert. Upstream every adapter reaches its message loop
+            // through `collapseSystemMessages` / `withoutInitialSystemMessage`
+            // (`utils/transcript.ts:114`/`:57`), so the leading system message is consumed by the
+            // params builder and no later one survives; skipping is exactly what that collapsed
+            // transcript yields. PROV-083b wires each adapter's own `resolve_transcript` and, where
+            // the transport can express it, emits later system messages in place.
+            Message::System(_) => {}
             Message::User { content, .. } => {
                 if let Some(value) = build_user(content) {
                     params.push(value);
@@ -38,7 +65,19 @@ pub(crate) fn convert_messages(
             }
             Message::Assistant(am) => {
                 if let Some(value) = build_assistant(am, is_oauth, allow_empty_signature) {
+                    // Pi records `params.length` BEFORE the push and only for a turn that
+                    // converted to at least one block (`:1364-1378`), which is exactly the
+                    // `Some(_)` arm here.
+                    let message_index = params.len();
                     params.push(value);
+                    if let Some(managed) = managed_provider
+                        && am.api.as_str() == super::API_ID
+                        && am.provider == *managed
+                        && let Some(level) = am.provider_thinking_level.as_deref()
+                        && is_anthropic_effort(Some(level))
+                    {
+                        assistant_levels.insert(message_index, level.to_string());
+                    }
                 }
             }
             Message::ToolResult { .. } => {
@@ -83,7 +122,41 @@ pub(crate) fn convert_messages(
         apply_last_user_cache_control(&mut params, cc);
     }
 
-    params
+    ConvertedMessages {
+        messages: params,
+        assistant_levels,
+    }
+}
+
+/// Pi `insertThinkingLevelMessages` (`anthropic-messages.ts:1434-1448` @v0.87.1): emit each recorded
+/// turn's own `output_config` marker immediately BEFORE that turn, then one final marker carrying
+/// the effort this request runs at.
+///
+/// Runs AFTER [`convert_messages`] has applied `apply_last_user_cache_control`, matching pi's order
+/// (`:1341-1425` then `:1069`) — so the cache breakpoint stays on the last real user block and is
+/// never moved onto a marker. PROV-091.
+pub(super) fn insert_thinking_level_messages(
+    converted: ConvertedMessages,
+    active_effort: &str,
+) -> Vec<Value> {
+    let ConvertedMessages {
+        messages,
+        assistant_levels,
+    } = converted;
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    for (index, message) in messages.into_iter().enumerate() {
+        if let Some(historical) = assistant_levels.get(&index) {
+            out.push(effort_marker(historical));
+        }
+        out.push(message);
+    }
+    out.push(effort_marker(active_effort));
+    out
+}
+
+/// One `{role:"system",content:[],output_config:{effort}}` marker (Pi `:1441`, `:1446`).
+fn effort_marker(effort: &str) -> Value {
+    json!({ "role": "system", "content": [], "output_config": { "effort": effort } })
 }
 
 /// Build a `user` message; `None` when it has no non-empty content (Pi anthropic-messages.ts:1026-1063).

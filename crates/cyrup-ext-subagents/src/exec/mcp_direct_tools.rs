@@ -109,6 +109,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::error::SubagentError;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -328,8 +330,38 @@ where
 /// Optional `settings` block of an `mcp.json` (pi `McpConfig.settings`).
 #[derive(Clone, Debug, Default, Deserialize)]
 struct McpSettings {
-    #[serde(default, rename = "toolPrefix")]
+    /// `parseSettings:304` keeps this ONLY when it is one of the four known spellings and drops it
+    /// otherwise — which is why the deserialiser filters rather than storing the raw string. The
+    /// difference is invisible for a single source ([`get_tool_prefix`]'s catch-all and its `None`
+    /// arm both answer [`ToolPrefix::Server`]) and load-bearing once [`merge_configs`] folds two:
+    /// upstream's `{...base.settings, ...next.settings}` lets a VALID global `toolPrefix` survive a
+    /// project file that sets a bogus one, because the bogus one never became a key.
+    #[serde(
+        default,
+        rename = "toolPrefix",
+        deserialize_with = "settings_tool_prefix"
+    )]
     tool_prefix: Option<String>,
+    /// SUBA-124 — pi `parseSettings:309`: `agentPluginPaths` is stored **raw and unvalidated**
+    /// (`McpConfig["settings"]` types it `unknown`), because the only consumer,
+    /// [`crate::exec::mcp_config_sources::load_agent_plugin_mcp_servers`], does the filtering
+    /// itself: a non-array contributes nothing and a non-string member is skipped. Modelling it as
+    /// `Option<Vec<String>>` here would make a `["ok", 7]` value contribute NOTHING where upstream
+    /// still loads `ok`.
+    #[serde(default, rename = "agentPluginPaths")]
+    agent_plugin_paths: Option<Value>,
+}
+
+/// `parseSettings`' own `toolPrefix` clause (`:304`): one of the four literals, or absent.
+fn settings_tool_prefix<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Value::deserialize(deserializer)?;
+    Ok(raw
+        .as_str()
+        .filter(|value| parse_tool_prefix(value).is_some())
+        .map(str::to_string))
 }
 
 /// A merged view of every `mcp.json` source (pi `McpConfig`).
@@ -488,7 +520,11 @@ pub fn resolve_mcp_direct_tool_names_in(
     if mcp_direct_tools.is_empty() {
         return Vec::new();
     }
-    let config = load_mcp_config(cwd, dirs);
+    // SUBA-145: a malformed `subagents.projectRootResolution` aborts resolution rather than
+    // degrading to "nearest" — see [`load_mcp_config`].
+    let Ok(config) = load_mcp_config(cwd, dirs) else {
+        return Vec::new();
+    };
     let Some(cache) = load_metadata_cache(dirs) else {
         return Vec::new();
     };
@@ -511,21 +547,82 @@ fn load_metadata_cache(dirs: &McpDirs) -> Option<MetadataCache> {
     Some(parsed)
 }
 
-fn load_mcp_config(cwd: &Path, dirs: &McpDirs) -> McpConfig {
+/// pi `loadMcpConfig` (`mcp-direct-tool-allowlist.ts:243-262`).
+///
+/// SUBA-145 — the project-scoped sources are anchored on the **configured project root**, not on
+/// the raw `cwd`: upstream opens with `const projectRoot = findConfiguredProjectRoot(resolvedCwd)
+/// ?? resolvedCwd` (`:243-245`) and hands that, not `cwd`, to `getConfigPaths` (`:265-275`) and
+/// `expandImports`. Anchoring on `cwd` meant a child launched in a SUBDIRECTORY of its project
+/// missed both project-scoped `mcp.json` sources outright, so every `mcp:` selector naming a
+/// project-declared server resolved to nothing.
+///
+/// # Errors
+///
+/// [`crate::discovery::find_configured_project_root`]'s
+/// [`SubagentError::MalformedSettings`](crate::error::SubagentError::MalformedSettings) — a
+/// malformed `subagents.projectRootResolution` at a consulted root. Upstream lets
+/// `readProjectRootResolution` **throw** out of `findConfiguredProjectRoot` (`agents.ts:869-880`,
+/// the `throw new Error(...invalid 'projectRootResolution'...)` arm) and straight through
+/// `loadMcpConfig`; it must NOT silently degrade to "nearest", which would hand the child a
+/// different project's servers than the one its settings named.
+///
+/// SUBA-124 — also [`crate::exec::mcp_config_sources`]' `readJson` throw (`:428-441`), from a
+/// `settings.json`, `package.json`, `plugin.json` or plugin `mcp.json` that exists and is not valid
+/// JSON. Upstream does not catch it either; the caller turns it into an empty allowlist, which is
+/// the honest answer when the operator's own declaration cannot be read.
+fn load_mcp_config(cwd: &Path, dirs: &McpDirs) -> Result<McpConfig, SubagentError> {
+    // pi `findConfiguredProjectRoot(resolvedCwd) ?? resolvedCwd` — the plain arity, matching
+    // upstream's own import from `agents/agents.ts`.
+    let project_root =
+        crate::discovery::find_configured_project_root(cwd)?.unwrap_or_else(|| cwd.to_path_buf());
     let mut config = McpConfig::default();
-    for source_path in get_config_paths(cwd, dirs) {
+    for source_path in get_config_paths(&project_root, dirs) {
         let Some(loaded) = read_config(&source_path) else {
             continue;
         };
-        config = merge_configs(config, expand_imports(loaded, cwd, dirs));
+        config = merge_configs(config, expand_imports(loaded, &project_root, dirs));
     }
-    config
+
+    // SUBA-124 — pi `:253-262`, the two sources that are NOT `mcp.json` files. Without them a child
+    // granted `mcp:<plugin>__<server>` resolved to nothing at all, silently: the server exists at
+    // runtime (`cyrup_mcp::agent_plugin` loads it) and `resolve_direct_tool_names` simply skips a
+    // selection naming a server the config does not have.
+    let package_servers =
+        crate::exec::mcp_config_sources::load_package_mcp_servers(&project_root, dirs)?;
+    let plugin_servers = crate::exec::mcp_config_sources::load_agent_plugin_mcp_servers(
+        config
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.agent_plugin_paths.as_ref()),
+        &project_root,
+        dirs,
+    )?;
+    // `:255-257` — a package server whose normalized name a PLUGIN also claims is dropped outright
+    // rather than merged under it, so the plugin's definition cannot be partially shadowed.
+    let package_only: BTreeMap<String, ServerEntry> = package_servers
+        .into_iter()
+        .filter(|(name, _)| !plugin_servers.contains_key(name))
+        .collect();
+    // `:258-261` — precedence, innermost last: `mcp.json` beats plugin beats package.
+    Ok(merge_configs(
+        McpConfig {
+            mcp_servers: package_only,
+            ..McpConfig::default()
+        },
+        merge_configs(
+            McpConfig {
+                mcp_servers: plugin_servers,
+                ..McpConfig::default()
+            },
+            config,
+        ),
+    ))
 }
 
-fn get_config_paths(cwd: &Path, dirs: &McpDirs) -> Vec<PathBuf> {
+fn get_config_paths(project_root: &Path, dirs: &McpDirs) -> Vec<PathBuf> {
     let pi_global_path = dirs.agent_dir.join("mcp.json");
-    let project_path = cwd.join(".mcp.json");
-    let project_pi_path = cwd.join(".cyrup").join("mcp.json");
+    let project_path = project_root.join(".mcp.json");
+    let project_pi_path = project_root.join(".cyrup").join("mcp.json");
     let mut sources = Vec::new();
     if dirs.generic_global_config_path != pi_global_path {
         sources.push(dirs.generic_global_config_path.clone());
@@ -600,7 +697,20 @@ fn merge_configs(base: McpConfig, next: McpConfig) -> McpConfig {
             imports.push(kind);
         }
     }
-    let settings = next.settings.or(base.settings);
+    // pi `:319` — `settings: next.settings ? { ...base.settings, ...next.settings } : base.settings`.
+    // A SPREAD, not a replacement: a later source that sets only `agentPluginPaths` must not erase
+    // an earlier source's `toolPrefix`. This used to be `next.settings.or(base.settings)`, which is
+    // the same answer only while `McpSettings` has exactly one field — and SUBA-124 gives it a
+    // second, whose producer (the project `mcp.json`) is routinely a different file from the global
+    // one that sets the prefix.
+    let settings = match (base.settings, next.settings) {
+        (base, None) => base,
+        (None, Some(next)) => Some(next),
+        (Some(base), Some(next)) => Some(McpSettings {
+            tool_prefix: next.tool_prefix.or(base.tool_prefix),
+            agent_plugin_paths: next.agent_plugin_paths.or(base.agent_plugin_paths),
+        }),
+    };
     McpConfig {
         mcp_servers,
         imports,
@@ -608,13 +718,15 @@ fn merge_configs(base: McpConfig, next: McpConfig) -> McpConfig {
     }
 }
 
-fn expand_imports(config: McpConfig, cwd: &Path, dirs: &McpDirs) -> McpConfig {
+/// pi `expandImports(loaded, projectRoot)` — SUBA-145: the anchor a relative import (`vscode`'s
+/// `.vscode/mcp.json`) resolves against is the configured project root, not the raw cwd.
+fn expand_imports(config: McpConfig, project_root: &Path, dirs: &McpDirs) -> McpConfig {
     if config.imports.is_empty() {
         return config;
     }
     let mut imported_servers: BTreeMap<String, ServerEntry> = BTreeMap::new();
     for import_kind in &config.imports {
-        let Some(import_path) = resolve_import_path(*import_kind, cwd, &dirs.home) else {
+        let Some(import_path) = resolve_import_path(*import_kind, project_root, &dirs.home) else {
             continue;
         };
         let Ok(text) = std::fs::read_to_string(&import_path) else {
@@ -2242,6 +2354,486 @@ mod tests {
         );
     }
 
+    /// SUBA-145 — pi anchors the project-scoped sources on `findConfiguredProjectRoot(resolvedCwd)
+    /// ?? resolvedCwd` (`mcp-direct-tool-allowlist.ts:243-245`), NOT on the raw cwd. A child
+    /// launched below its project root must still see `<project>/.cyrup/mcp.json`.
+    #[test]
+    fn a_project_mcp_config_resolves_from_a_child_launched_in_a_subdirectory() {
+        let fixture = make_fixture();
+        // Writing the project-scoped source creates `<project>/.cyrup`, which is exactly the
+        // marker `find_project_root_candidates` walks for.
+        write_mcp_fixture(
+            &fixture,
+            "project-mcp",
+            Value::Null,
+            None,
+            vec!["inspect"],
+            vec![],
+            Some(fixture.project_dir.join(".cyrup").join("mcp.json")),
+            None,
+        );
+        let nested = fixture
+            .project_dir
+            .join("crates")
+            .join("deep")
+            .join("nested");
+        std::fs::create_dir_all(&nested).expect("nested cwd");
+
+        assert_eq!(
+            resolve_mcp_direct_tool_names_in(&["project-mcp".to_string()], &nested, &fixture.dirs),
+            vec!["project-mcp_inspect".to_string()]
+        );
+    }
+
+    /// SUBA-145's THIRD leg — `expandImports(loaded, projectRoot)` (`:249`). `get_config_paths` and
+    /// the import anchor are two separate uses of the same `projectRoot`, and the test above pins
+    /// only the first: the `vscode` import is the one `IMPORT_PATHS` entry that is RELATIVE
+    /// (`.vscode/mcp.json`), so it is the only one whose anchor is observable.
+    ///
+    /// Declared in the AGENT-GLOBAL source on purpose. That source is read whatever the anchor
+    /// resolves to, so the only thing this test can be measuring is where the relative import was
+    /// looked for — a cwd-anchored `expand_imports` searches `<project>/crates/deep/.vscode/mcp.json`
+    /// and finds nothing.
+    #[test]
+    fn a_relative_import_resolves_against_the_project_root_not_the_child_cwd() {
+        let fixture = make_fixture();
+        // The project-root marker, and nothing else: no project-scoped `mcp.json` is written, so
+        // `get_config_paths`' own anchor cannot be what makes this pass.
+        std::fs::create_dir_all(fixture.project_dir.join(".cyrup")).expect(".cyrup");
+        write_json(
+            &fixture.agent_dir.join("mcp.json"),
+            &serde_json::json!({ "imports": ["vscode"], "mcpServers": {} }),
+        );
+        let definition = serde_json::json!({ "command": "code-mcp", "args": ["--stdio"] });
+        write_json(
+            &fixture.project_dir.join(".vscode").join("mcp.json"),
+            &serde_json::json!({ "mcpServers": { "vscode-mcp": definition.clone() } }),
+        );
+        let entry: ServerEntry = serde_json::from_value(definition).expect("entry");
+        write_cache_for(&fixture, "vscode-mcp", &entry, &["open_file"]);
+
+        let nested = fixture.project_dir.join("crates").join("deep");
+        std::fs::create_dir_all(&nested).expect("nested cwd");
+        assert_eq!(
+            resolve_mcp_direct_tool_names_in(&["vscode-mcp".to_string()], &nested, &fixture.dirs),
+            vec!["vscode-mcp_open_file".to_string()]
+        );
+    }
+
+    /// The `Err` arm of the same anchor. pi lets `readProjectRootResolution`'s
+    /// `throw new Error("...invalid 'projectRootResolution'...")` (`agents.ts:869-880`) propagate
+    /// out of `findConfiguredProjectRoot` and through `loadMcpConfig`; it does NOT fall back to
+    /// the nearest root, which would resolve a different project's servers than the settings named.
+    #[test]
+    fn a_malformed_project_root_resolution_resolves_to_no_tools() {
+        let fixture = make_fixture();
+        write_mcp_fixture(
+            &fixture,
+            "project-mcp",
+            Value::Null,
+            None,
+            vec!["inspect"],
+            vec![],
+            Some(fixture.project_dir.join(".cyrup").join("mcp.json")),
+            None,
+        );
+        write_json(
+            &crate::discovery::project_settings_path(&fixture.project_dir),
+            &serde_json::json!({ "subagents": { "projectRootResolution": "bogus" } }),
+        );
+
+        // Resolution is driven from the project dir ITSELF, which is both the nearest project-root
+        // candidate (it holds `.cyrup`) and therefore the root whose malformed settings abort the
+        // walk. That is what makes this an `Err`-arm test and not a "nothing was found" test: every
+        // shape of fall-back-to-cwd — swallowing the `Err`, or never resolving a root at all —
+        // anchors on this same directory and DOES resolve `project-mcp` from its `.cyrup/mcp.json`.
+        assert!(
+            resolve_mcp_direct_tool_names_in(
+                &["project-mcp".to_string()],
+                &fixture.project_dir,
+                &fixture.dirs
+            )
+            .is_empty()
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-124 — the two sources `loadMcpConfig` merges BESIDE the `mcp.json` ladder
+    // (`mcp-direct-tool-allowlist.ts:253-262` @v0.71.0 over `mcp-config-sources.ts`)
+    // ---------------------------------------------------------------------------------------
+
+    const PLUGIN_SCHEMA_URL: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
+    const PLUGIN_MCP_SCHEMA_URL: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
+
+    /// Write `<plugin_root>/plugin.json` + `<plugin_root>/mcp.json` for a single stdio server.
+    fn write_plugin(plugin_root: &Path, plugin_name: &str, server_name: &str, server: Value) {
+        write_json(
+            &plugin_root.join("plugin.json"),
+            &serde_json::json!({ "$schema": PLUGIN_SCHEMA_URL, "name": plugin_name }),
+        );
+        write_json(
+            &plugin_root.join("mcp.json"),
+            &serde_json::json!({
+                "$schema": PLUGIN_MCP_SCHEMA_URL,
+                "mcpServers": { server_name: server },
+            }),
+        );
+    }
+
+    /// The [`ServerEntry`] `translatePluginStdioServer` (`mcp-config-sources.ts:313-344`) must
+    /// produce for a `{type:"stdio", command, args}` plugin server with no `env` and no `cwd`.
+    ///
+    /// Spelled out here rather than read back from the loader, because it is the SHAPE the cache's
+    /// `configHash` is computed over: if the translation drifts (a missing `${PLUGIN_ROOT}`
+    /// expansion, a `cwd` that is not the plugin root, an injected var left out) the digest moves
+    /// and every one of these tests stops resolving.
+    fn translated_plugin_entry(
+        fixture: &McpFixture,
+        plugin_root: &Path,
+        plugin_name: &str,
+        command: &str,
+        args: &[&str],
+    ) -> ServerEntry {
+        let root = plugin_root.to_string_lossy().into_owned();
+        let data = fixture
+            .agent_dir
+            .join("agent-plugin-data")
+            .join(plugin_name)
+            .to_string_lossy()
+            .into_owned();
+        ServerEntry {
+            command: Some(command.to_string()),
+            args: Some(
+                args.iter()
+                    .map(|arg| {
+                        arg.replace("${PLUGIN_ROOT}", &root)
+                            .replace("${PLUGIN_DATA}", &data)
+                    })
+                    .collect(),
+            ),
+            env: Some(BTreeMap::from([
+                ("PLUGIN_ROOT".to_string(), Value::String(root.clone())),
+                ("PLUGIN_DATA".to_string(), Value::String(data)),
+            ])),
+            cwd: Some(root),
+            ..ServerEntry::default()
+        }
+    }
+
+    /// `<agent_dir>/mcp-cache.json` with one entry, keyed by the NORMALIZED server name and hashed
+    /// over `entry` — the same two halves `write_mcp_fixture` writes, for a server that comes from
+    /// somewhere other than an `mcp.json`.
+    fn write_cache_for(
+        fixture: &McpFixture,
+        server_name: &str,
+        entry: &ServerEntry,
+        tools: &[&str],
+    ) {
+        let tools_json: Vec<Value> = tools
+            .iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect();
+        write_json(
+            &fixture.agent_dir.join("mcp-cache.json"),
+            &serde_json::json!({
+                "version": 1,
+                "servers": {
+                    server_name: {
+                        "configHash": compute_mcp_server_hash(entry).expect("hashable"),
+                        "cachedAt": crate::time::now_epoch_millis(),
+                        "tools": tools_json,
+                        "resources": [],
+                    }
+                }
+            }),
+        );
+    }
+
+    /// SUBA-124, the row's own Verify clause — *"a plugin at an `agentPluginPaths` entry with
+    /// `mcp.json` server `db`, and a metadata cache for `<plugin>__db`: `mcpDirectTools:
+    /// ["<plugin>__db"]` resolves its tools."*
+    ///
+    /// pi `:254` — `loadAgentPluginMcpServers(config.settings?.agentPluginPaths, projectRoot)`.
+    /// Before this row `load_mcp_config` read only the `mcp.json` ladder, so the server was absent
+    /// from the config and `resolve_direct_tool_names` skipped the selection with no warning.
+    #[test]
+    fn an_agent_plugin_server_resolves_its_direct_tools() {
+        let fixture = make_fixture();
+        let plugin_root = fixture.project_dir.join("plugins").join("acme");
+        write_plugin(
+            &plugin_root,
+            "acme",
+            "db",
+            serde_json::json!({
+                "type": "stdio",
+                "command": "dbserver",
+                "args": ["--root", "${PLUGIN_ROOT}"],
+            }),
+        );
+        // Writing the project-scoped `mcp.json` also creates `<project>/.cyrup`, which is the
+        // marker `find_configured_project_root` walks for — so the plugin path below resolves
+        // against the project root, as pi's `:254` anchors it.
+        write_json(
+            &fixture.project_dir.join(".cyrup").join("mcp.json"),
+            &serde_json::json!({
+                "settings": { "agentPluginPaths": ["plugins/acme"] },
+                "mcpServers": {},
+            }),
+        );
+        let expected = translated_plugin_entry(
+            &fixture,
+            &plugin_root,
+            "acme",
+            "dbserver",
+            &["--root", "${PLUGIN_ROOT}"],
+        );
+        write_cache_for(&fixture, "acme__db", &expected, &["query"]);
+
+        assert_eq!(
+            resolve(&fixture, &["acme__db"]),
+            vec!["acme__db_query".to_string()],
+            "a plugin-contributed server must be nameable by `mcpDirectTools`"
+        );
+    }
+
+    /// pi `:253` — `loadPackageMcpServers(projectRoot)`, over the project `settings.json`'s
+    /// `packages` (`getConfiguredPackageRoots:145-169`), each entry's `package.json` `pi.mcp`
+    /// config paths, and the `mcpServers` those declare under `` `${package}__${server}` ``.
+    ///
+    /// `@acme/tools` normalizes to `acme_tools` (`formatName:420` collapses each run of disallowed
+    /// characters to one `_` and then strips leading/trailing `_`/`-`), which is the name the
+    /// operator has to write in `mcpDirectTools` and the name the adapter's cache is keyed by.
+    #[test]
+    fn a_settings_package_server_resolves_its_direct_tools() {
+        let fixture = make_fixture();
+        let package_root = fixture.project_dir.join("vendor").join("pkg");
+        write_json(
+            &package_root.join("package.json"),
+            &serde_json::json!({ "name": "@acme/tools", "pi": { "mcp": "mcp.json" } }),
+        );
+        write_json(
+            &package_root.join("mcp.json"),
+            &serde_json::json!({
+                "mcpServers": { "db": { "command": "pkgserver", "args": ["--x"] } }
+            }),
+        );
+        // `<project>/.cyrup/settings.json` is upstream's `path.join(projectConfigDir,
+        // "settings.json")`, and its OWN directory is the base a relative entry resolves against.
+        write_json(
+            &fixture.project_dir.join(".cyrup").join("settings.json"),
+            &serde_json::json!({ "packages": ["../vendor/pkg"] }),
+        );
+        let entry: ServerEntry =
+            serde_json::from_value(serde_json::json!({ "command": "pkgserver", "args": ["--x"] }))
+                .expect("entry");
+        write_cache_for(&fixture, "acme_tools__db", &entry, &["query"]);
+
+        assert_eq!(
+            resolve(&fixture, &["acme_tools__db"]),
+            vec!["acme_tools__db_query".to_string()],
+            "a package-contributed server must be nameable by `mcpDirectTools`"
+        );
+    }
+
+    /// pi `:255-257` — `packageOnlyServers` filters OUT any package server whose normalized name a
+    /// plugin also claims, so the plugin's definition is the one that reaches the resolver whole.
+    /// The cache entry below is hashed over the PLUGIN's translated definition, so this passes only
+    /// if the plugin won: a package entry of the same name hashes differently and would be skipped
+    /// as cache-invalid.
+    #[test]
+    fn a_plugin_server_beats_a_package_server_of_the_same_normalized_name() {
+        let fixture = make_fixture();
+        let plugin_root = fixture.project_dir.join("plugins").join("acme");
+        write_plugin(
+            &plugin_root,
+            "acme",
+            "db",
+            serde_json::json!({ "type": "stdio", "command": "dbserver" }),
+        );
+        let package_root = fixture.project_dir.join("vendor").join("pkg");
+        write_json(
+            &package_root.join("package.json"),
+            &serde_json::json!({ "name": "acme", "pi": { "mcp": "mcp.json" } }),
+        );
+        write_json(
+            &package_root.join("mcp.json"),
+            &serde_json::json!({ "mcpServers": { "db": { "command": "package-loses" } } }),
+        );
+        write_json(
+            &fixture.project_dir.join(".cyrup").join("settings.json"),
+            &serde_json::json!({ "packages": ["../vendor/pkg"] }),
+        );
+        write_json(
+            &fixture.project_dir.join(".cyrup").join("mcp.json"),
+            &serde_json::json!({
+                "settings": { "agentPluginPaths": ["plugins/acme"] },
+                "mcpServers": {},
+            }),
+        );
+        let expected = translated_plugin_entry(&fixture, &plugin_root, "acme", "dbserver", &[]);
+        write_cache_for(&fixture, "acme__db", &expected, &["query"]);
+
+        assert_eq!(
+            resolve(&fixture, &["acme__db"]),
+            vec!["acme__db_query".to_string()],
+            "the plugin's definition must win, not the package's"
+        );
+    }
+
+    /// pi `:258-261` — the merge order, innermost last: an `mcp.json` entry beats a plugin one of
+    /// the same name. The cache is hashed over the `mcp.json` definition, which a plugin-wins
+    /// implementation would fail.
+    #[test]
+    fn an_mcp_json_server_beats_a_plugin_server_of_the_same_name() {
+        let fixture = make_fixture();
+        let plugin_root = fixture.project_dir.join("plugins").join("acme");
+        write_plugin(
+            &plugin_root,
+            "acme",
+            "db",
+            serde_json::json!({ "type": "stdio", "command": "plugin-loses" }),
+        );
+        write_json(
+            &fixture.project_dir.join(".cyrup").join("mcp.json"),
+            &serde_json::json!({
+                "settings": { "agentPluginPaths": ["plugins/acme"] },
+                "mcpServers": { "acme__db": { "command": "mcp-json-wins" } },
+            }),
+        );
+        let entry: ServerEntry =
+            serde_json::from_value(serde_json::json!({ "command": "mcp-json-wins" }))
+                .expect("entry");
+        write_cache_for(&fixture, "acme__db", &entry, &["query"]);
+
+        assert_eq!(
+            resolve(&fixture, &["acme__db"]),
+            vec!["acme__db_query".to_string()],
+            "`mcp.json` is `mergeConfigs`' outermost `next` and must win"
+        );
+    }
+
+    /// pi `:319` — `settings: next.settings ? { ...base.settings, ...next.settings } : base.settings`
+    /// is a SPREAD. The global `mcp.json` sets `toolPrefix: "none"`; the project one sets only
+    /// `agentPluginPaths`. Upstream keeps both, so the resolved tool name is the bare `query`.
+    ///
+    /// A `next.settings.or(base.settings)` replacement — which is what this port carried, and which
+    /// was indistinguishable from the spread while `McpSettings` had exactly ONE field — drops the
+    /// prefix and answers `acme__db_query` instead.
+    #[test]
+    fn a_project_settings_block_does_not_erase_a_global_tool_prefix() {
+        let fixture = make_fixture();
+        let plugin_root = fixture.project_dir.join("plugins").join("acme");
+        write_plugin(
+            &plugin_root,
+            "acme",
+            "db",
+            serde_json::json!({ "type": "stdio", "command": "dbserver" }),
+        );
+        write_json(
+            &fixture.agent_dir.join("mcp.json"),
+            &serde_json::json!({ "settings": { "toolPrefix": "none" }, "mcpServers": {} }),
+        );
+        write_json(
+            &fixture.project_dir.join(".cyrup").join("mcp.json"),
+            &serde_json::json!({
+                "settings": { "agentPluginPaths": ["plugins/acme"] },
+                "mcpServers": {},
+            }),
+        );
+        let expected = translated_plugin_entry(&fixture, &plugin_root, "acme", "dbserver", &[]);
+        write_cache_for(&fixture, "acme__db", &expected, &["query"]);
+
+        assert_eq!(
+            resolve(&fixture, &["acme__db"]),
+            vec!["query".to_string()],
+            "`toolPrefix: \"none\"` from the global source must survive the project's settings block"
+        );
+    }
+
+    /// `loadAgentPluginMcpServers:122,125` — `agentPluginPaths` is carried RAW (pi types it
+    /// `unknown` and `parseSettings:309` stores it unvalidated), so a non-string member is skipped
+    /// and the string members around it still load. Deserializing the key as `Option<Vec<String>>`
+    /// would make this whole list contribute nothing.
+    #[test]
+    fn a_non_string_agent_plugin_path_is_skipped_and_its_neighbours_still_load() {
+        let fixture = make_fixture();
+        let plugin_root = fixture.project_dir.join("plugins").join("acme");
+        write_plugin(
+            &plugin_root,
+            "acme",
+            "db",
+            serde_json::json!({ "type": "stdio", "command": "dbserver" }),
+        );
+        write_json(
+            &fixture.project_dir.join(".cyrup").join("mcp.json"),
+            &serde_json::json!({
+                "settings": { "agentPluginPaths": [7, "plugins/acme"] },
+                "mcpServers": {},
+            }),
+        );
+        let expected = translated_plugin_entry(&fixture, &plugin_root, "acme", "dbserver", &[]);
+        write_cache_for(&fixture, "acme__db", &expected, &["query"]);
+
+        assert_eq!(
+            resolve(&fixture, &["acme__db"]),
+            vec!["acme__db_query".to_string()]
+        );
+    }
+
+    /// `isValidPluginConfig:291-300` and `translatePluginStdioServer:318` — the two rejections a
+    /// looser port would let through: a `$schema` that is not the exact plugin-MCP URL, and a key
+    /// outside the per-transport allowlist (`url` on a `stdio` entry). Each must contribute NOTHING
+    /// rather than a partially-validated server, because the resolver hands the result straight to
+    /// the child's `--tools` allowlist.
+    #[test]
+    fn a_plugin_with_a_wrong_schema_or_an_unknown_field_contributes_nothing() {
+        for (manifest_schema, config_schema, server) in [
+            (
+                PLUGIN_SCHEMA_URL,
+                "https://agent-plugins.org/schemas/2.0.0/mcp.schema.json",
+                serde_json::json!({ "type": "stdio", "command": "dbserver" }),
+            ),
+            (
+                PLUGIN_SCHEMA_URL,
+                PLUGIN_MCP_SCHEMA_URL,
+                serde_json::json!({ "type": "stdio", "command": "dbserver", "url": "http://x" }),
+            ),
+            (
+                "https://agent-plugins.org/schemas/2.0.0/plugin.schema.json",
+                PLUGIN_MCP_SCHEMA_URL,
+                serde_json::json!({ "type": "stdio", "command": "dbserver" }),
+            ),
+        ] {
+            let fixture = make_fixture();
+            let plugin_root = fixture.project_dir.join("plugins").join("acme");
+            write_json(
+                &plugin_root.join("plugin.json"),
+                &serde_json::json!({ "$schema": manifest_schema, "name": "acme" }),
+            );
+            write_json(
+                &plugin_root.join("mcp.json"),
+                &serde_json::json!({
+                    "$schema": config_schema,
+                    "mcpServers": { "db": server },
+                }),
+            );
+            write_json(
+                &fixture.project_dir.join(".cyrup").join("mcp.json"),
+                &serde_json::json!({
+                    "settings": { "agentPluginPaths": ["plugins/acme"] },
+                    "mcpServers": {},
+                }),
+            );
+            let expected = translated_plugin_entry(&fixture, &plugin_root, "acme", "dbserver", &[]);
+            write_cache_for(&fixture, "acme__db", &expected, &["query"]);
+
+            assert!(
+                resolve(&fixture, &["acme__db"]).is_empty(),
+                "manifest {manifest_schema} / config {config_schema} must contribute no server"
+            );
+        }
+    }
+
     #[test]
     fn empty_selector_list_resolves_to_empty() {
         let fixture = make_fixture();
@@ -2279,6 +2871,103 @@ mod tests {
     use cyrup_mcp::dirs::{
         ResolvedIdentity, compute_server_hash, server_identity_pre_image as writer_pre_image,
     };
+
+    /// SUBA-124 conformance — the plugin translation this crate now carries and the one
+    /// `cyrup_mcp::agent_plugin` already carried must produce the SAME namespaced name and the same
+    /// `configHash` pre-image, or a plugin server resolves under a name the adapter never registers
+    /// (or hashes to a digest the adapter's cache entry never carries) and the child silently gets
+    /// no tools — which is the whole failure mode SUBA-124 is about.
+    ///
+    /// The two ports are independent on purpose: `cyrup-mcp` is a DEV-dependency here (resolving a
+    /// subagent's `mcp:` selectors must not drag the MCP adapter into a spawn), and the two files
+    /// they port are different upstream files — pi-subagents' `mcp-config-sources.ts` and the
+    /// adapter's `agent-plugin-loader.ts`. So nothing but a test can hold them together.
+    ///
+    /// The fixture exercises every field the translation SETS: a `./`-relative command resolved
+    /// inside the plugin root, `${PLUGIN_ROOT}`/`${PLUGIN_DATA}` expansion in `args` and `env`, the
+    /// two injected vars, and a `${PLUGIN_DATA}`-anchored `cwd`.
+    #[test]
+    fn the_plugin_translation_agrees_with_the_adapters_own_loader() {
+        let fixture = make_fixture();
+        let plugin_root = fixture.project_dir.join("plugins").join("acme");
+        std::fs::create_dir_all(plugin_root.join("bin")).expect("bin dir");
+        write_json(
+            &plugin_root.join("plugin.json"),
+            &serde_json::json!({
+                "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+                "name": "acme",
+            }),
+        );
+        write_json(
+            &plugin_root.join("mcp.json"),
+            &serde_json::json!({
+                "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+                "mcpServers": {
+                    "db": {
+                        "type": "stdio",
+                        "command": "./bin/serve",
+                        "args": ["--root", "${PLUGIN_ROOT}", "--state", "${PLUGIN_DATA}/db"],
+                        "env": { "STATE": "${PLUGIN_DATA}", "PLAIN": "p" },
+                        "cwd": "${PLUGIN_DATA}",
+                    }
+                },
+            }),
+        );
+
+        let paths = serde_json::json!(["plugins/acme"]);
+        let ours = crate::exec::mcp_config_sources::load_agent_plugin_mcp_servers(
+            Some(&paths),
+            &fixture.project_dir,
+            &fixture.dirs,
+        )
+        .expect("the fixture's JSON is valid");
+        let (theirs, skips) = cyrup_mcp::agent_plugin::load_agent_plugins_in(
+            &["plugins/acme".to_string()],
+            &cyrup_mcp::dirs::McpDirs::new(fixture.agent_dir.clone(), fixture.project_dir.clone()),
+        );
+        assert!(skips.is_empty(), "the adapter accepted nothing: {skips:?}");
+
+        let ours_names: Vec<&str> = ours.keys().map(String::as_str).collect();
+        let theirs_names: Vec<&str> = theirs.iter().map(|server| server.name.as_str()).collect();
+        assert_eq!(
+            ours_names, theirs_names,
+            "the two loaders must namespace a plugin server identically"
+        );
+
+        let our_entry = ours.values().next().expect("one server");
+        let their_server = theirs.first().expect("one server");
+        // Round-tripped through JSON because the two crates model the entry with different types on
+        // purpose — the on-disk `configHash` is the contract, not the struct.
+        let their_entry: ServerEntry = serde_json::from_value(
+            serde_json::to_value(&their_server.entry).expect("the writer's entry serializes"),
+        )
+        .expect("and deserializes as this reader's entry");
+        assert_eq!(
+            server_identity_pre_image(our_entry).expect("hashable"),
+            server_identity_pre_image(&their_entry).expect("hashable"),
+            "the translated definitions must hash identically"
+        );
+        // The translation is not vacuous: the `./` command was resolved into the plugin root and the
+        // placeholders were expanded, so a `configHash` over the RAW `mcp.json` entry would differ.
+        assert_eq!(
+            our_entry.command.as_deref(),
+            Some(
+                plugin_root
+                    .join("bin")
+                    .join("serve")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            our_entry
+                .env
+                .as_ref()
+                .and_then(|env| env.get("PLUGIN_ROOT"))
+                .and_then(Value::as_str),
+            Some(plugin_root.to_string_lossy().as_ref())
+        );
+    }
 
     /// All fifteen identity fields set at once, hashed by BOTH implementations (MCP-141/142), and
     /// pinned against upstream's own digest for the same definition — `socket` included.

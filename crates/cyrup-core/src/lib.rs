@@ -20,11 +20,12 @@ pub mod message;
 pub mod shared_str;
 pub mod timings;
 pub mod tool;
+pub mod tool_def;
 
 pub use cancel::{CancelToken, RunCancel};
 pub use constrained_sampling::{
     ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
-    experimental_tool_sampling, experimental_tool_sampling_from,
+    prefer_strict_tool_sampling,
 };
 pub use diagnostics::{
     AssistantMessageDiagnostic, DiagnosticCode, DiagnosticErrorInfo,
@@ -36,14 +37,16 @@ pub use event_stream::{Finalizing, FinalizingSink, FinalizingStream, finalizing_
 pub use keyed_lock::{Cancelled, KeyedAcquire, KeyedGuard, KeyedLockMap, KeyedLocks};
 pub use lazy_args::LazyArgs;
 pub use message::{
-    AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel, StopReason,
-    TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, UNRESOLVED_API, Usage,
+    AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel, Sections,
+    StopReason, SystemMessage, TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, UNRESOLVED_API,
+    Usage,
 };
 pub use shared_str::SharedStr;
 pub use tool::{
     ExecMode, TerminateHint, Tool, ToolError, ToolRenderKind, ToolResult, ToolUpdate,
     ToolUpdateSink,
 };
+pub use tool_def::{ToolDef, ToolReference};
 
 /// The single streaming primitive used across provider, agent, and tools (arch-00 §3.1).
 ///

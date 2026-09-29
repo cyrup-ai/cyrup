@@ -172,6 +172,39 @@ fn normalize_list(
     Ok(Some(seen.into_iter().collect()))
 }
 
+/// pi `normalizeCapabilityCeilingAllowedAgents(values)` (`capability-ceiling.ts:66-68` @v0.71.0):
+///
+/// ```text
+/// return normalizeCeiling({ allowedAgents: values } as SubagentCapabilityCeiling).allowedAgents!;
+/// ```
+///
+/// A one-line wrapper over the SHARED ceiling validation, on purpose: an `allowedAgents:` list
+/// declared in agent frontmatter or in an `agentOverrides` entry must be held to exactly the rules
+/// a wire ceiling is held to — array only, at most 256 entries, each a non-empty control-character-
+/// free string of at most 256 UTF-8 bytes trimmed, matching `^[A-Za-z0-9_.:-]+$`, at most 128 UTF-8
+/// bytes, de-duplicated and SORTED. Reusing [`normalize_list`] rather than re-deriving those rules
+/// is what keeps the two declaration sites from drifting apart, and it is why the error messages
+/// are byte-identical to a wire ceiling's.
+///
+/// SUBA-111 — this is the piece cyrup was missing. Every consumer of the `allowedAgents` axis
+/// ([`is_agent_allowed`], [`assert_agent_allowed`], [`intersect_capability_ceilings`],
+/// [`encode_capability_ceiling`]) already existed and worked; nothing PRODUCED the axis from an
+/// agent's own declaration, so `allowedAgents:` in an agent file round-tripped into
+/// `extra_fields` and bound nothing.
+///
+/// # Errors
+///
+/// Every message [`normalize_list`] raises, verbatim.
+pub fn normalize_capability_ceiling_allowed_agents(
+    values: &serde_json::Value,
+) -> Result<Vec<String>, String> {
+    let mut ceiling = serde_json::Map::new();
+    ceiling.insert("allowedAgents".to_string(), values.clone());
+    // `normalizeCeiling({ allowedAgents: values }).allowedAgents!` — the key is present by
+    // construction, so `normalize_list` cannot return `None` here.
+    Ok(normalize_list(&ceiling, "allowedAgents")?.unwrap_or_default())
+}
+
 /// pi `normalizeCeiling` (`capability-ceiling.ts:65-93`).
 ///
 /// # Errors

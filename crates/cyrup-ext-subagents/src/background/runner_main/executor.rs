@@ -169,6 +169,18 @@ pub(crate) struct ExecSingleStepExecutor {
     /// cloning the whole map per step. Mirrors pi's already-resolved `agents` list every child
     /// resolves against (`chain-execution.ts:1011`, `parallel-execution.test.ts:134-172`).
     pub(crate) resolved_agents: Arc<BTreeMap<String, ResolvedAgentPersona>>,
+    /// CFG-067 — the effective `toolTimeoutMs` for every agent this executor may dispatch, keyed by
+    /// the same [`crate::spawn::chain_graph::SingleStepSpec::agent`] string
+    /// [`Self::resolved_agents`] is keyed by.
+    ///
+    /// Resolved ONCE, where the refusal belongs: `resolve_tool_timeouts_by_agent` runs the full
+    /// four-rung ladder (call > this agent's own `toolTimeoutMs:` > `config.toolTimeoutMs` >
+    /// `CYRUP_SUBAGENT_TOOL_TIMEOUT_MS`) for every persona before any child is spawned, exactly as
+    /// upstream resolves per step at `async-execution.ts:1006-1012` and refuses the START when a
+    /// rung is malformed. Dispatch is therefore a pure lookup and cannot fail open: an agent absent
+    /// from this map has no configured deadline, which still leaves
+    /// [`crate::exec::tool_timeout::effective_tool_timeout_ms`]'s fast-tool defaults in force.
+    pub(crate) tool_timeouts: Arc<BTreeMap<String, Option<u64>>>,
     /// The launching orchestrator's own intercom presence target (pi
     /// `config.controlIntercomTarget` / `data.intercomBridge.orchestratorTarget`), threaded into
     /// every dispatched step's [`crate::exec::RunOptions::orchestrator_intercom_target`] so each
@@ -346,9 +358,18 @@ impl ExecSingleStepExecutor {
     /// step's `model:` override is policed by exactly the policy the single-run path enforces.
     ///
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "CFG-067 added the per-agent tool-timeout map; every argument is an independent \
+                  run-scoped fact the caller resolved, and bundling them into a struct would only \
+                  move the same list one line up"
+    )]
     pub(crate) fn foreground(
         depth: DepthEnvelope,
         resolved_agents: Arc<BTreeMap<String, ResolvedAgentPersona>>,
+        // CFG-067 — the per-agent effective `toolTimeoutMs`, resolved by the caller (which owns the
+        // config snapshot) exactly as `turn_loop` resolves it for the detached runner.
+        tool_timeouts: Arc<BTreeMap<String, Option<u64>>>,
         orchestrator_intercom_target: Option<String>,
         run_id: Option<RunId>,
         inherited_session_model: Option<cyrup_core::ModelId>,
@@ -366,6 +387,7 @@ impl ExecSingleStepExecutor {
             writer_ledgers: None,
             lease_writer: None,
             resolved_agents,
+            tool_timeouts,
             // A foreground executor has no control-inbox watcher, so this token is never cancelled;
             // foreground cancellation flows through `ChainRunContext::cancel`/`RunOptions::cancel`.
             interrupt_cancel: cyrup_core::CancelToken::new(),
@@ -806,6 +828,11 @@ impl ExecSingleStepExecutor {
             }
         });
         RunOptions {
+            // CFG-067 — the async/detached step's rung set is what the RUNNER was handed: the
+            // parent resolved `resolveToolTimeoutMs` before writing this step's config, exactly as
+            // upstream carries `task.toolTimeoutMs ?? config.toolTimeoutMs` onto each step
+            // (`subagent-runner.ts:3734`) and hands it to `runChildSession` (`:1216`).
+            tool_timeout_ms: self.tool_timeouts.get(&step.agent).copied().flatten(),
             model_override_from_parent,
             // SUBA-119 — pi's `options.modelResponseAliases`, read from `config.json` parent-side
             // and carried to this step through `RunnerConfig::model_response_aliases` (the detached
@@ -1360,6 +1387,7 @@ mod tests {
             crate::background::session_lease::WriterUpdate,
         >();
         let executor = ExecSingleStepExecutor {
+            tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
             lease_writer: Some(lease_tx),
@@ -1441,6 +1469,7 @@ mod tests {
         // The executor carries an EMPTY persona map — exactly the state that must NOT dispatch a
         // placeholder.
         let executor = ExecSingleStepExecutor {
+            tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
             lease_writer: None,
@@ -1653,6 +1682,7 @@ mod tests {
         artifact_config: crate::artifacts::ArtifactConfig,
     ) -> ExecSingleStepExecutor {
         ExecSingleStepExecutor {
+            tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
             lease_writer: None,
@@ -1721,6 +1751,7 @@ mod tests {
                 max_depth: 5,
             },
             Arc::new(BTreeMap::new()),
+            Arc::new(BTreeMap::new()),
             None,
             None,
             None,
@@ -1770,6 +1801,7 @@ mod tests {
                 current_depth: 0,
                 max_depth: 5,
             },
+            Arc::new(BTreeMap::new()),
             Arc::new(BTreeMap::new()),
             None,
             None,

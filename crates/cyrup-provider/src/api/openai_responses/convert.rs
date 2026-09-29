@@ -78,6 +78,14 @@ pub(crate) fn convert_responses_messages(
     let mut msg_index: i64 = 0;
     for msg in &transformed {
         match msg {
+            // PROV-083a — a `Message::System` carries the transcript's own prompt and tool
+            // state, not a turn to convert. Upstream this adapter reaches its message loop through
+            // `resolveTranscript` (`utils/transcript.ts:121`), which for a model without
+            // `supportsMidConvoSystemMessages` collapses every system message into the leading one
+            // the params builder already consumed — so no system message reaches this loop.
+            // PROV-083b wires that call and the in-place emission upstream does at
+            // `openai-responses.ts:119/:293` for a model that accepts them.
+            Message::System(_) => {}
             Message::User { content, .. } => {
                 let parts: Vec<Value> = content
                     .iter()

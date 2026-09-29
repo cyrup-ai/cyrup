@@ -34,6 +34,7 @@ fn assistant(s: &str) -> Message {
         api: "faux".into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
@@ -46,6 +47,7 @@ fn assistant(s: &str) -> Message {
 
 fn first_text(m: &Message) -> String {
     let blocks = match m {
+        Message::System(m) => &m.content,
         Message::User { content, .. } | Message::ToolResult { content, .. } => content,
         Message::Assistant(a) => &a.content,
     };

@@ -205,6 +205,12 @@ impl RunState {
                 | (RunState::Running, RunState::Partial)
                 | (RunState::Paused, RunState::Running)
                 | (RunState::Paused, RunState::Failed)
+                // SUBA-116 — pi `sealPausedRun` (`runs/foreground/async-stop-action.ts:88-97`
+                // @v0.71.0, introduced by `03b92ee7` / #2176) assigns `state: "stopped"` onto a
+                // status that is `paused`. That edge did not exist before v0.68.0, because a stop
+                // of a paused run was refused outright (`:41` @v0.64.0) and no other writer could
+                // produce it — which is why this table had only the two Paused edges above.
+                | (RunState::Paused, RunState::Stopped)
         )
     }
 
@@ -421,15 +427,26 @@ mod tests {
         assert_ne!(RunState::Stopped, RunState::Paused);
         assert_eq!(RunState::Stopped.rank(), RunState::Failed.rank());
 
-        // Reachable from exactly the two states pi's `stopAsyncRun` guard accepts
-        // (`async-stop-action.ts:41`: `state !== "running" && state !== "queued"` is the refusal).
+        // Reachable from exactly the three states pi's `stopAsyncRun` guard accepts
+        // (`async-stop-action.ts:120-121` @v0.71.0: `state !== "running" && state !== "queued" &&
+        // !pausedWholeRun` is the refusal).
         assert!(RunState::Running.can_transition_to(RunState::Stopped));
         assert!(RunState::Queued.can_transition_to(RunState::Stopped));
+        // SUBA-116 — this assertion used to read
+        // `assert!(!RunState::Paused.can_transition_to(RunState::Stopped), "a paused run is not
+        // stoppable upstream — `stopAsyncRun` answers `No running or queued async run was found`")`,
+        // and that was the correct reading of `:41` @v0.64.0. `03b92ee7` (#2176, shipped v0.68.0)
+        // added `pausedWholeRun` (`:120`) and `sealPausedRun` (`:31-101`), which assigns
+        // `state: "stopped"` onto a status that is `paused` (`:88-97`). The edge is now real, and
+        // `background::control::seal_paused_run` is its only producer.
         assert!(
-            !RunState::Paused.can_transition_to(RunState::Stopped),
-            "a paused run is not stoppable upstream — `stopAsyncRun` answers `No running or queued \
-             async run was found`"
+            RunState::Paused.can_transition_to(RunState::Stopped),
+            "a whole-run stop of a paused run seals it stopped (`async-stop-action.ts:88-97`)"
         );
+        // The two Paused edges that predate it are untouched, and a paused run still cannot
+        // complete or go back to queued (asserted above at the Paused block).
+        assert!(RunState::Paused.can_transition_to(RunState::Running));
+        assert!(RunState::Paused.can_transition_to(RunState::Failed));
 
         // A dead end: no outgoing transition at all, including to itself.
         for next in [

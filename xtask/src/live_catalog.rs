@@ -1,11 +1,13 @@
-//! The live-fetch half of `gen-catalogs` (XAI_1).
+//! The live-fetch half of `gen-catalogs` (XAI_1, generalized to every provider by PROV-071).
 //!
-//! `CATALOGS` in `main.rs` recovers 34 catalogs from a pinned pi revision with `git show`. That
-//! mechanism is DEAD for xai: pi's `xai.models.ts` is a two-line re-export of a gitignored,
-//! network-generated JSON file from `a9f6a3159` onward, so no revision carries the rows. pi
-//! publishes the already-shaped rows at `https://pi.dev/api/models/providers/xai` instead — the
-//! SAME endpoint `cyrup-provider/src/remote_catalog.rs` overlays at runtime — so this module takes
-//! them from there.
+//! `CATALOGS` in `main.rs` recovers rows from a pinned pi revision with `git show`. That mechanism
+//! is DEAD for every `packages/ai/src/providers/<p>.models.ts` pi ships: from `a9f6a3159`
+//! (`b0c2a90e`'s direct child) onward each one is a two-line re-export of a gitignored,
+//! network-generated JSON file, so no revision carries the rows and `b0c2a90e` is a permanent
+//! floor rather than a pin. pi publishes the already-shaped rows at
+//! `https://pi.dev/api/models/providers/<id>` instead — the SAME endpoint
+//! `cyrup-provider/src/remote_catalog.rs` overlays at runtime — so this module takes them from
+//! there, for all of them rather than only for `xai`.
 //!
 //! DEPENDENCY-FREE, like the rest of this crate (`xtask/Cargo.toml`): HTTP is `curl` shelled out
 //! exactly as `git_show` shells out `git`, and JSON is `tsdata`'s own order-preserving reader and
@@ -18,21 +20,46 @@ use crate::tsdata::{self, Val};
 use std::process::Command;
 
 /// One catalog whose rows are fetched live instead of recovered from the pinned revision.
+///
+/// **Everything but the ledger id is DERIVED from `file`**, and that is the point. The three
+/// fields this used to carry — `provider`, `url` and `module` — were each a hand-written copy of
+/// the same stem, and the test that guarded them (`drift_009s_four_modules_are_live_catalog_specs`)
+/// existed only because a spec pointing at a neighbour's endpoint would write one provider's rows
+/// into another's catalog file while `rows_from_body`'s provider check compared them against the
+/// same wrong spec and saw nothing. At five entries that was a test; at thirty-eight it would be a
+/// certainty. Deriving them makes the mismatch unspellable instead of merely detected.
 #[derive(Debug)]
 pub struct LiveCatalogSpec {
-    /// `providers/catalog/<file>.json`.
+    /// `providers/catalog/<file>.json`, the pi provider id, and the
+    /// `packages/ai/src/providers/<file>.models.ts` stem — one string, because upstream uses one.
     pub file: &'static str,
+    /// The gap-analysis item that authorised the live path for this catalog.
+    pub item: &'static str,
+}
+
+impl LiveCatalogSpec {
     /// The provider id every row must carry.
-    pub provider: &'static str,
+    pub fn provider(&self) -> &'static str {
+        self.file
+    }
+
     /// The endpoint that serves the rows, already shaped into cyrup's native `Model` JSON.
-    pub url: &'static str,
+    pub fn url(&self) -> String {
+        format!("{LIVE_CATALOG_ENDPOINT}{}", self.file)
+    }
+
     /// The upstream module the rows STILL originate from, kept for the manifest's `module` field:
     /// it is a re-export of gitignored data now, but it is what pi ships and what a future
     /// un-blocking would read.
-    pub module: &'static str,
-    /// The gap-analysis item that authorised the live path.
-    pub item: &'static str,
+    pub fn module(&self) -> String {
+        format!("packages/ai/src/providers/{}.models.ts", self.file)
+    }
 }
+
+/// The prefix every live catalog's URL is built from. Spelled once so a host change is one edit
+/// rather than thirty-eight, and so the manifest's `source` and the runtime overlay's endpoint
+/// (`cyrup-provider/src/remote_catalog.rs`) can be compared against a single constant.
+pub const LIVE_CATALOG_ENDPOINT: &str = "https://pi.dev/api/models/providers/";
 
 /// The response, reduced to what the generator needs.
 #[derive(Debug, Clone)]
@@ -52,15 +79,21 @@ pub struct Fetched {
 }
 
 /// What one live catalog contributed to this run.
+///
+/// `Fetched` carries ROWS, not a rendered body, because the signed-off divergences
+/// (`main.rs::DELTAS`) and the convergence assertions (`main.rs::CONVERGED`) have to run over the
+/// live rows exactly as they run over the pinned ones. Rendering here would have put the live half
+/// of the roster outside both guards — which is precisely how a generalization of this path loses
+/// twelve signed-off decisions without a diff.
 #[derive(Debug)]
 pub enum LiveOutcome {
-    /// Rows arrived: `body` is the file to write, `fetched_at`/`revision` are its provenance.
+    /// Rows arrived, validated and in upstream order; `fetched_at`/`revision` are their provenance.
     Fetched {
-        body: String,
+        rows: Vec<Val>,
         fetched_at: Option<String>,
         revision: Option<String>,
     },
-    /// The fetch could not happen. `xai.json` must be left exactly as it is and the previous
+    /// The fetch could not happen. `<file>.json` must be left exactly as it is and the previous
     /// manifest entry carried forward (D6). `why` is printed as a notice, never as an error.
     Skipped { why: String },
 }
@@ -118,30 +151,31 @@ fn header_value(dump: &str, name: &str) -> Option<String> {
 /// The rows of one live catalog, validated. HARD ERROR on anything unexpected (D3): the body
 /// arrived, so a shape we do not understand is a contract change, not an outage.
 pub fn rows_from_body(spec: &LiveCatalogSpec, body: &str) -> Result<Vec<Val>, String> {
-    let doc = tsdata::parse_json(body).map_err(|e| format!("{}: {e}", spec.url))?;
+    let url = spec.url();
+    let doc = tsdata::parse_json(body).map_err(|e| format!("{url}: {e}"))?;
     // The endpoint binds `id -> Model`, the same shape `remote_catalog::parse_catalog` accepts.
     let rows = tsdata::object_values(&doc)
-        .map_err(|e| format!("{}: expected an id-keyed object of models: {e}", spec.url))?;
+        .map_err(|e| format!("{url}: expected an id-keyed object of models: {e}"))?;
     if rows.is_empty() {
         return Err(format!(
-            "{}: returned zero rows — refusing to write an empty catalog over {}.json",
-            spec.url, spec.file
+            "{url}: returned zero rows — refusing to write an empty catalog over {}.json",
+            spec.file
         ));
     }
     for row in &rows {
         let id = row
             .get("id")
             .and_then(Val::as_str)
-            .ok_or_else(|| format!("{}: a row has no string `id`", spec.url))?;
+            .ok_or_else(|| format!("{url}: a row has no string `id`"))?;
         // `parse_catalog` FORCES `provider`; a build-time generator must instead refuse, because
         // `providers/fleet.rs` asserts every row is tagged with its own provider id and a silent
         // rewrite would hide an endpoint that started serving somebody else's rows.
         match row.get("provider").and_then(Val::as_str) {
-            Some(p) if p == spec.provider => {}
+            Some(p) if p == spec.provider() => {}
             other => {
                 return Err(format!(
-                    "{}: row `{id}` is tagged provider {other:?}, expected {:?}",
-                    spec.url, spec.provider
+                    "{url}: row `{id}` is tagged provider {other:?}, expected {:?}",
+                    spec.provider()
                 ));
             }
         }
@@ -184,32 +218,53 @@ pub fn http_date_to_iso8601(value: &str) -> Option<String> {
 /// needs determinism passes a closure over a fixture body. Nothing here touches the filesystem —
 /// the caller owns writing, so `--check` and `--diff` get the live rows for free.
 ///
-/// `CYRUP_XTASK_SKIP_LIVE=1` forces every spec to [`LiveOutcome::Skipped`] without invoking
-/// `fetch` at all — the escape hatch D3 promises a maintainer with no network.
+/// [`SKIP_LIVE_ENV`] forces every spec to [`LiveOutcome::Skipped`] without invoking `fetch` at all —
+/// the escape hatch D3 promises a maintainer with no network. The env read itself lives in
+/// [`skip_live_requested`] so that [`refresh_with`] below is drivable from a test: the workspace
+/// lints deny `std::env::set_var`, so a test that reached for the variable could not exist, and an
+/// untestable escape hatch is how an escape hatch stops working.
 pub fn refresh(
     specs: &'static [LiveCatalogSpec],
     fetch: &dyn Fn(&str) -> Result<Fetched, String>,
 ) -> Result<Vec<(&'static LiveCatalogSpec, LiveOutcome)>, String> {
-    let skip_all = std::env::var_os("CYRUP_XTASK_SKIP_LIVE").is_some();
+    refresh_with(specs, fetch, skip_live_requested())
+}
+
+/// The variable a maintainer with no network sets. Named once, because `main.rs`'s usage block and
+/// this module's doc comment both promise it and a rename that touched only one of them would leave
+/// the other lying.
+pub const SKIP_LIVE_ENV: &str = "CYRUP_XTASK_SKIP_LIVE";
+
+/// Whether [`SKIP_LIVE_ENV`] is set — presence, not value, exactly as before.
+pub fn skip_live_requested() -> bool {
+    std::env::var_os(SKIP_LIVE_ENV).is_some()
+}
+
+/// [`refresh`] with the skip decision passed in rather than read from the environment.
+pub fn refresh_with(
+    specs: &'static [LiveCatalogSpec],
+    fetch: &dyn Fn(&str) -> Result<Fetched, String>,
+    skip_all: bool,
+) -> Result<Vec<(&'static LiveCatalogSpec, LiveOutcome)>, String> {
     let mut out = Vec::new();
     for spec in specs {
         if skip_all {
             out.push((
                 spec,
                 LiveOutcome::Skipped {
-                    why: "CYRUP_XTASK_SKIP_LIVE is set".to_string(),
+                    why: format!("{SKIP_LIVE_ENV} is set"),
                 },
             ));
             continue;
         }
-        match fetch(spec.url) {
+        match fetch(&spec.url()) {
             Err(why) => out.push((spec, LiveOutcome::Skipped { why })),
             Ok(res) => {
                 let rows = rows_from_body(spec, &res.body)?; // hard error (D3)
                 out.push((
                     spec,
                     LiveOutcome::Fetched {
-                        body: render(rows),
+                        rows,
                         fetched_at: res.last_modified.as_deref().and_then(http_date_to_iso8601),
                         revision: res.revision,
                     },

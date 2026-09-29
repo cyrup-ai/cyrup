@@ -308,7 +308,12 @@ fn crate_root_doc_states_the_real_event_count() {
 /// `on_*` exports of `export_extension!` that carry NO event kind, and why. `on_terminal_input` is
 /// the guest half of pi's `onTerminalInput` handler — it is routed by `guest::on_terminal_input`
 /// and returns a `TerminalInputResult`, not by the kind-numbered `hook`/`notify` pair.
-const NON_KIND_EXPORTS: &[&str] = &["on_terminal_input"];
+/// `on_branch_change` (EXT-064) is the same shape: pi's `ReadonlyFooterDataProvider.onBranchChange`
+/// callback reaches the guest through its own `on-branch-change` export body
+/// (`guest::on_branch_change` -> `ExtensionApi::handle_branch_change`), which dispatches to the one
+/// registered callback directly rather than through `EventKind::from_u8`, so there is no
+/// discriminant for it to agree with.
+const NON_KIND_EXPORTS: &[&str] = &["on_terminal_input", "on_branch_change"];
 
 /// The `fn on_<name>` -> `api::kind::<CONST>` pairs that are NOT the SCREAMING_SNAKE of `<name>`.
 /// The exports are named after the events (`on_tool_execution_start`) and three of the consts are

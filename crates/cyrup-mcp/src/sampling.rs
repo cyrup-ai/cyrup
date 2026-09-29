@@ -290,6 +290,7 @@ fn convert_sampling_message(message: &SamplingMessage) -> Result<Message, ErrorD
             api: ApiId::from(SAMPLING_SYNTHETIC_API),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -446,7 +447,15 @@ async fn resolve_sampling_model(
     options: &SamplingOptions,
     preferences: Option<&ModelPreferences>,
 ) -> Result<Model, ErrorData> {
-    let available = options.models.get_available(None).await;
+    // `options.modelRegistry.getAvailable()` (`sampling-handler.ts:129`) reads pi's synchronous
+    // availability snapshot and cannot fail; cyrup's stand-in is the async
+    // `Models::get_available`, whose auth-check failures (a credential-store read, an
+    // `ApiKeyAuth::check` hook) surface here rather than being read as "nothing available".
+    let available = options
+        .models
+        .get_available(None)
+        .await
+        .map_err(|error| internal_msg(&error.to_string()))?;
     let hints: Vec<String> = preferences
         .and_then(|preferences| preferences.hints.as_ref())
         .map(|hints| hints.iter().filter_map(|hint| hint.name.clone()).collect())
@@ -594,6 +603,7 @@ mod tests {
             api: ApiId::from("test"),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason,

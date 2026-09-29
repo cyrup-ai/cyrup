@@ -47,8 +47,32 @@ pub(super) fn apply_reasoning(
                 }
             }
         }
+        // DRIFT-009c — `api/openai-completions.ts:886-893` @v0.87.1. TWO halves, and the second was
+        // a PORT OMISSION rather than drift: the upstream arm is identical at the ported baseline
+        // `v0.83.0`, at `v0.84.4` and at `v0.87.1`, so nothing upstream moved — cyrup only ever
+        // emitted the first half.
+        //
+        // The guard shape is deliberately NOT Baseten's below. Here `reasoning_effort` IS gated on
+        // `options.reasoningEffort` (`if (options?.reasoningEffort && compat.supportsReasoningEffort)`
+        // at `:888`), so with thinking off qwen is told `enable_thinking: false` and nothing more;
+        // Baseten's second half has no such guard and falls back to `thinkingLevelMap.off`.
+        //
+        // The lookup is `??`, not zai's `=== undefined` ternary: upstream writes
+        // `model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort` (`:889`), so
+        // an explicit `null` in the ladder falls back to the requested level instead of suppressing
+        // the key. [`mapped_effort_or`] is exactly that, which is why the zai arm above cannot share
+        // this line. The result is always a string, so upstream's `typeof effort === "string"` check
+        // can never fail here and needs no counterpart.
         ThinkingFormat::Qwen => {
             obj.insert("enable_thinking".to_string(), json!(eff.is_some()));
+            if let Some(e) = eff
+                && sre
+            {
+                obj.insert(
+                    "reasoning_effort".to_string(),
+                    json!(mapped_effort_or(map, level, e)),
+                );
+            }
         }
         ThinkingFormat::QwenChatTemplate => {
             obj.insert(

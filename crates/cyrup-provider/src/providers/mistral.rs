@@ -24,7 +24,7 @@ const MISTRAL_CATALOG_JSON: &str = include_str!("catalog/mistral.json");
 /// The full Mistral catalog (1:1 with Pi `MISTRAL_MODELS`). A parse failure yields an empty catalog
 /// (surfaced loudly by the catalog-count test) rather than a panic (NO-PANIC policy).
 pub fn mistral_models() -> Vec<Model> {
-    serde_json::from_str(MISTRAL_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(MISTRAL_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The Mistral [`ProviderAuth`]: `MISTRAL_API_KEY` (Pi `envApiKeyAuth`, env-api-keys.ts).
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = mistral_models();
-        assert_eq!(models.len(), 30);
+        assert_eq!(models.len(), 33);
         assert!(
             models
                 .iter()

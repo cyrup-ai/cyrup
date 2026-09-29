@@ -49,11 +49,11 @@ pub struct AgentProgress {
     pub recent_output: VecDeque<String>,
     /// Every `MessageEnd` event observed this attempt, in chronological (parse) order — the exact
     /// input [`crate::exec::output::extract_final_output`] (R-SA-029) needs, and what
-    /// [`crate::exec::completion_guard::has_mutation_tool_call`]/[`crate::exec::completion_guard::evaluate_completion_mutation_guard`]
+    /// [`crate::exec::control::has_mutation_tool_call`]
     /// (R-SA-034) scans alongside `tool_events` below.
     pub message_end_events: Vec<SubagentEvent>,
     /// Every `ToolExecutionEnd` event observed this attempt, in chronological order — feeds
-    /// [`crate::exec::completion_guard::has_mutation_tool_call`] (R-SA-034) and the summarized `tool_calls`
+    /// [`crate::exec::control::has_mutation_tool_call`] and the summarized `tool_calls`
     /// list [`crate::exec::SingleResult`] carries (R-SA-043).
     pub tool_end_events: Vec<SubagentEvent>,
     /// The full parsed transcript of every recognized event this attempt observed, in

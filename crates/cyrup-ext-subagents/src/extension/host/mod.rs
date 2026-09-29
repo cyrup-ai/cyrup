@@ -146,6 +146,15 @@ pub struct SubagentsExtension {
     /// Held on the extension for the same reason upstream holds it in the registration closure —
     /// `fleet-<n>` is only comparable across replies if the same map answers all of them.
     rpc_bridge: crate::extension::rpc::SubagentRpcBridge,
+    /// SUBA-143 — pi's `registerRuntimeAgentEventListener(pi)` (`extension/index.ts:894`, first
+    /// entry of `eventUnsubscribes`): the cross-extension door onto this session's runtime agent
+    /// registry, for a sibling extension that has the bus and nothing else.
+    ///
+    /// Held on the extension for the RPC bridge's reason — upstream's listener closes over its
+    /// own state for the life of the registration, and a `registrationId` is only redeemable if
+    /// the same bridge answers the disposal that the registration came from. Filled for BOTH
+    /// registration modes; only the [`RegistrationMode::Full`] arm subscribes it to a topic.
+    runtime_agent_bridge: crate::discovery::runtime_agent_events::RuntimeAgentEventBridge,
 }
 
 impl SubagentsExtension {
@@ -324,6 +333,8 @@ impl SubagentsExtension {
             fleet_status: Arc::new(std::sync::Mutex::new(fleet_status)),
             rpc_tool: std::sync::OnceLock::new(),
             rpc_bridge: crate::extension::rpc::SubagentRpcBridge::new(),
+            runtime_agent_bridge:
+                crate::discovery::runtime_agent_events::RuntimeAgentEventBridge::new(),
         }
     }
 
@@ -417,6 +428,17 @@ impl SubagentsExtension {
     #[must_use]
     pub fn executor(&self) -> &Arc<SubagentExecutor> {
         &self.executor
+    }
+
+    /// SUBA-143 — this extension's runtime-agent EVENT bridge (pi
+    /// `registerRuntimeAgentEventListener`'s closure state). Exposed so a test — and any caller
+    /// that drives `NativeExtension::on_bus_event` directly — can see which registration tokens
+    /// are outstanding without going back through the bus.
+    #[must_use]
+    pub fn runtime_agent_bridge(
+        &self,
+    ) -> &crate::discovery::runtime_agent_events::RuntimeAgentEventBridge {
+        &self.runtime_agent_bridge
     }
 
     /// SUBA-084 — pi's public `registerAgent` (`src/api/agents.ts:2` @v0.64.0, the re-export of

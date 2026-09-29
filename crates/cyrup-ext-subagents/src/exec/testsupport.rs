@@ -36,12 +36,12 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth: None,
         memory: None,
@@ -58,6 +58,7 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
 
 pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions {
     RunOptions {
+        tool_timeout_ms: None,
         // SUBA-119 — a test fixture's model is chosen for the run, not inherited from a parent
         // session, so verification is ON and no aliases are declared.
         model_override_from_parent: false,

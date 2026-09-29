@@ -13,6 +13,14 @@ pub(super) fn to_chat_messages(messages: &[Message], supports_images: bool) -> V
 
     for msg in messages {
         match msg {
+            // PROV-083a — a `Message::System` carries the transcript's own prompt and tool
+            // state, not a turn to convert. Upstream every adapter reaches its message loop through
+            // `collapseSystemMessages` / `withoutInitialSystemMessage`
+            // (`utils/transcript.ts:114`/`:57`), so the leading system message is consumed by the
+            // params builder and no later one survives; skipping is exactly what that collapsed
+            // transcript yields. PROV-083b wires each adapter's own `resolve_transcript` and, where
+            // the transport can express it, emits later system messages in place.
+            Message::System(_) => {}
             Message::User { content, .. } => {
                 let had_images = content.iter().any(|c| matches!(c, Content::Image { .. }));
                 let parts: Vec<Value> = content

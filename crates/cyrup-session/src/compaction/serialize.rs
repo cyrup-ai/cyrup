@@ -15,6 +15,11 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for m in messages {
         match m {
+            // pi's `serializeConversation` tests only `user`, `assistant` and `toolResult`
+            // (`compaction/utils.ts:109-148` @v0.87.1) — a system message contributes NO line. It is
+            // prompt state, not conversation, and the summarizer is given the prompt separately
+            // (PROV-083a).
+            Message::System(_) => {}
             Message::User { content, .. } => {
                 // Pi joins user text blocks with "" (no separator).
                 let body = join_text(content, "");

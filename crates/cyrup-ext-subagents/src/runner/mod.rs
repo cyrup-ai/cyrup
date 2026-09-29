@@ -180,8 +180,11 @@ pub fn runner_to_json_string(runner: &AgentRunnerConfig) -> String {
 ///
 /// Tag-to-tag: v0.57.0 listed FOURTEEN. `excludeTools`, `allowNestedSubagents` and `mutationTools`
 /// were added after this crate's stage-1 port, and each is a real Pi-only field an external profile
-/// must not be allowed to declare (cyrup ships the first two under SUBA-092).
-const PI_ONLY_FIELDS: [&str; 17] = [
+/// must not be allowed to declare (cyrup ships the first two under SUBA-092). SUBA-107 removed
+/// `completionGuard`: upstream deleted the setting outright at v0.70.1 (`7c98a696`), so it is now
+/// an ordinary unknown key rather than a Pi-only one, and refusing it by name would be a
+/// cyrup-only refusal.
+const PI_ONLY_FIELDS: [&str; 16] = [
     "tools",
     "excludeTools",
     "allowNestedSubagents",
@@ -192,7 +195,6 @@ const PI_ONLY_FIELDS: [&str; 17] = [
     "subagentOnlyExtensions",
     "mutationTools",
     "maxSubagentDepth",
-    "completionGuard",
     "skills",
     "skill",
     "skillPath",

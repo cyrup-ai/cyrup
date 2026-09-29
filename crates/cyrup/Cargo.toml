@@ -163,3 +163,9 @@ serde_json = { workspace = true }
 # the empty `AuthContext` the same test injects so an ambient `HTTP_PROXY` cannot reroute it.
 tokio = { workspace = true, features = ["net"] }
 async-trait = { workspace = true }
+# TUI-105: `src/tests/footer_provider_count.rs` renders the boot footer through `TestBackend` and
+# scrapes the buffer, so the `(provider)` prefix gate (`footer.ts:192-193`) is asserted as the user
+# sees it rather than as a count field. TEST-only, and lock-neutral: `cyrup-tui` — already a normal
+# dependency of this crate — pulls the same `ratatui`, and `impl RebuildBackend for TestBackend`
+# (`cyrup-tui/src/app/backend.rs:63`) is unconditional, so nothing new enters the binary's graph.
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }

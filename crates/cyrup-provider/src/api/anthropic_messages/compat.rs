@@ -46,6 +46,147 @@ pub(super) fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
     }
 }
 
+/// `getAnthropicCompat(model).supportsMidConvoSystemMessages` — the DECLARED value, else the runtime
+/// default (PROV-083a). This is the boolean the adapter hands to
+/// [`resolve_transcript`](crate::utils::transcript::resolve_transcript)
+/// (`anthropic-messages.ts:517` @v0.87.1: `resolveTranscript(context, compat.supportsMidConvoSystemMessages)`).
+///
+/// A free function rather than a [`ResolvedAnthropicCompat`] field because the block emitter that
+/// consumes it is PROV-083b; a field nothing reads yet would be dead code, and 083b folds both flags
+/// into the struct with the emitter that reads them. The resolution PRECEDENCE — declared over
+/// runtime default — is upstream's and is fixed here, not there.
+pub fn supports_mid_convo_system_messages(model: &Model) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|c| c.supports_mid_convo_system_messages)
+        .unwrap_or_else(|| default_supports_mid_convo_system_messages(model))
+}
+
+/// `getAnthropicCompat(model).supportsMidConvoToolChanges` — the DECLARED value, else the runtime
+/// default (PROV-083a). See [`supports_mid_convo_system_messages`] for why this is a free function.
+///
+/// Upstream never reads this flag alone: the `tool_addition`/`tool_removal` emitter is gated on the
+/// CONJUNCTION `supportsMidConvoSystemMessages && supportsMidConvoToolChanges`
+/// (`anthropic-messages.ts:1052-1053` @v0.87.1), which is what *"Requires
+/// `supportsMidConvoSystemMessages`"* (`types.ts:831`) means operationally.
+pub fn supports_mid_convo_tool_changes(model: &Model) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|c| c.supports_mid_convo_tool_changes)
+        .unwrap_or_else(|| default_supports_mid_convo_tool_changes(model))
+}
+
+/// `supportsAnthropicMidConvoSystemMessages` (`packages/ai/scripts/generate-models.ts:606-611`
+/// @v0.87.1), hand-rolled exactly as [`default_supports_tool_references`] hand-rolls DRIFT-001's
+/// regex, because cyrup carries no `regex` crate.
+///
+/// Upstream's two anchored alternatives, tested against the RAW model id (this predicate does NOT
+/// lowercase or strip a `~anthropic/` prefix — `supportsAnthropicMidConvoEffort` at `:598-604` does,
+/// and the difference is upstream's, not a transcription slip):
+///
+/// ```text
+/// ^claude-opus-(?:4[.-]8|5(?:[.-]5)?)(?:-\d{8})?$
+/// ^claude-(?:fable|mythos)-5(?:[.-]1)?(?:-\d{8})?$
+/// ```
+///
+/// So: Opus 4.8, Opus 5, Opus 5.5, Fable 5, Fable 5.1, Mythos 5, Mythos 5.1 — each with an optional
+/// 8-digit date suffix, each spelled with `.` or `-` between the major and minor. Everything else,
+/// including Opus 4.6/4.7 and every Sonnet and Haiku, is false.
+///
+/// Both patterns are fully ANCHORED and the only quantified group is `\d{8}`, so there is no
+/// backtracking to reproduce: each alternative is a fixed sequence of literal choices.
+fn supports_anthropic_mid_convo_system_messages(id: &str) -> bool {
+    /// `(?:-\d{8})?$` — the optional date suffix, then end of string.
+    fn date_suffix_then_end(rest: &str) -> bool {
+        if rest.is_empty() {
+            return true;
+        }
+        let Some(digits) = rest.strip_prefix('-') else {
+            return false;
+        };
+        digits.len() == 8 && digits.bytes().all(|b| b.is_ascii_digit())
+    }
+    /// `(?:[.-]<minor>)?` — the optional dot-or-dash minor, then the tail check.
+    fn optional_minor_then_end(rest: &str, minor: &str) -> bool {
+        for sep in ['.', '-'] {
+            let mut spelled = String::with_capacity(1 + minor.len());
+            spelled.push(sep);
+            spelled.push_str(minor);
+            if let Some(tail) = rest.strip_prefix(spelled.as_str())
+                && date_suffix_then_end(tail)
+            {
+                return true;
+            }
+        }
+        // The group did not participate.
+        date_suffix_then_end(rest)
+    }
+
+    // `^claude-opus-(?:4[.-]8|5(?:[.-]5)?)(?:-\d{8})?$`
+    if let Some(rest) = id.strip_prefix("claude-opus-") {
+        // `4[.-]8` — the minor is MANDATORY in this alternative, so a bare `claude-opus-4` is out.
+        for sep in ['.', '-'] {
+            let mut spelled = String::from("4");
+            spelled.push(sep);
+            spelled.push('8');
+            if let Some(tail) = rest.strip_prefix(spelled.as_str())
+                && date_suffix_then_end(tail)
+            {
+                return true;
+            }
+        }
+        // `5(?:[.-]5)?`
+        if let Some(tail) = rest.strip_prefix('5')
+            && optional_minor_then_end(tail, "5")
+        {
+            return true;
+        }
+    }
+
+    // `^claude-(?:fable|mythos)-5(?:[.-]1)?(?:-\d{8})?$`
+    if let Some(rest) = id.strip_prefix("claude-")
+        && let Some(rest) = ["fable-", "mythos-"]
+            .iter()
+            .find_map(|p| rest.strip_prefix(p))
+        && let Some(tail) = rest.strip_prefix('5')
+        && optional_minor_then_end(tail, "1")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Default for `supportsMidConvoSystemMessages` on the anthropic route (PROV-083a).
+///
+/// Upstream assigns the flag in `getAnthropicMessagesCompat`
+/// (`generate-models.ts:1208-1216` @v0.87.1) under two provider gates:
+///
+/// * `provider === "anthropic"` → both this flag and `supportsMidConvoToolChanges` (`:1208-1211`);
+/// * `provider === "opencode" || provider === "github-copilot"` → THIS FLAG ONLY (`:1212-1216`),
+///   because, in upstream's own words, those two *"forward mid-conversation system messages but
+///   reject `tool_addition`/`tool_removal` blocks, so tool changes stay top-level there."*
+///
+/// It lives as a RUNTIME predicate rather than as catalog data for the reason DRIFT-001 recorded for
+/// `supportsToolReferences`: not one of cyrup's 35 catalog files carries a `supportsMidConvo*` key,
+/// so with a constant `false` default the entire mid-conversation port would be unreachable code.
+pub fn default_supports_mid_convo_system_messages(model: &Model) -> bool {
+    matches!(
+        model.provider.as_str(),
+        "anthropic" | "opencode" | "github-copilot"
+    ) && supports_anthropic_mid_convo_system_messages(model.id.as_str())
+}
+
+/// Default for `supportsMidConvoToolChanges` on the anthropic route (PROV-083a) — the
+/// `provider === "anthropic"` half of `generate-models.ts:1208-1211`, which is the only gate that
+/// sets it. `opencode` and `github-copilot` reject the blocks, so they are absent here.
+pub fn default_supports_mid_convo_tool_changes(model: &Model) -> bool {
+    model.provider.as_str() == "anthropic"
+        && supports_anthropic_mid_convo_system_messages(model.id.as_str())
+}
+
 /// Default for `supportsToolReferences` (1:1 port of Pi `defaultSupportsToolReferences`,
 /// anthropic-messages.ts:193-199): first-party Anthropic models except Haiku (which rejects
 /// client-side `tool_reference` blocks) and models that predate tool search (Claude 3.x,
@@ -122,6 +263,26 @@ pub(super) fn force_adaptive_thinking(model: &Model) -> bool {
         .compat
         .as_ref()
         .and_then(|c| c.force_adaptive_thinking)
+        .unwrap_or(false)
+}
+
+/// `model.compat?.supportsMidConvoEffort === true` (Pi default false) — the model accepts per-turn
+/// `output_config` markers, so effort travels as one `{role:"system",content:[],output_config}`
+/// message per recorded turn rather than as a single request-level `output_config.effort`.
+///
+/// Read DIRECTLY off `model.compat`, NOT through [`get_anthropic_compat`], because pi's
+/// `getAnthropicCompat` (`anthropic-messages.ts:206-220` @v0.87.1) does not resolve it either: every
+/// upstream reader — the `providerThinkingLevel` seed (`:521`), the beta push (`:1028`), the
+/// `convertMessages` managed-provider argument (`:1061`), the `insertThinkingLevelMessages` gate
+/// (`:1069`), the temperature gate (`:1108`) and the managed thinking branch (`:1153`) — goes
+/// straight to `model.compat`, exactly as
+/// [`should_use_server_side_fallback_beta`](super::headers::should_use_server_side_fallback_beta)
+/// already documents for `allowedFallbackModels`. PROV-091.
+pub(super) fn supports_mid_convo_effort(model: &Model) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|c| c.supports_mid_convo_effort)
         .unwrap_or(false)
 }
 

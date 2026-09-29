@@ -22,10 +22,27 @@ use crate::exec::structured::MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR;
 use crate::exec::testsupport::{base_opts, sample_agent_config};
 
 /// The criterion every fixture gates on (upstream's own `proof`).
+/// SUBA-108 — upstream's own report for this scenario, verbatim
+/// (`test/integration/single-execution.part-2.test.ts:2013-2022` @v0.71.0, "workflow children with
+/// outputSchema can satisfy inherited checked acceptance").
+///
+/// It carries EVERY evidence kind, and it has to: `resolveEffectiveAcceptance` resolves a
+/// `{ level: "checked" }` policy that declares no `evidence` of its own against
+/// `requiredEvidenceForLevel("checked")` (`acceptance.ts:512`), i.e. `changed-files`,
+/// `tests-added`, `commands-run`, `residual-risks` and `no-staged-files`. This fixture used to
+/// carry only `criteriaSatisfied` + `residualRisks`, which passed solely because cyrup's
+/// `resolve_effective_for_role` combined LEVELS and dropped the inferred/required evidence set —
+/// the fail-open SUBA-108 closes. Upstream would have rejected the old fixture.
 fn proof_report() -> serde_json::Value {
     json!({
-        "criteriaSatisfied": [{ "id": "proof", "status": "satisfied", "evidence": "ok is true" }],
+        "criteriaSatisfied": [{ "id": "proof", "status": "satisfied", "evidence": "structured output returned ok true" }],
+        "changedFiles": ["none"],
+        "testsAddedOrUpdated": ["none"],
+        "commandsRun": [{ "command": "not run", "result": "not-run", "summary": "mock structured-output child" }],
+        "validationOutput": ["mock output validated"],
         "residualRisks": ["none"],
+        "noStagedFiles": true,
+        "diffSummary": "no file changes",
     })
 }
 

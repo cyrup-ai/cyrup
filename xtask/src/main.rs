@@ -2,7 +2,8 @@
 //! README "Build"):
 //!
 //! * `gen-catalogs` — regenerate `crates/cyrup-provider/src/providers/catalog/*.json` and
-//!   `catalog_manifest.json` from a pinned pi revision (PROV-018 / PROV-060). Documented below.
+//!   `catalog_manifest.json` from pi's published catalogs, plus one file from a pinned pi revision
+//!   (PROV-018 / PROV-060 / PROV-071). Documented below.
 //! * `feature-matrix` — type-check the feature combinations `cargo check --workspace
 //!   --all-targets` does not reach, and RUN the two suites the everyday gate skips (`cyrup-ext`
 //!   with `wasm-host` off, and the gated `cyrup-it` seam suite). See [`features`] for the matrix
@@ -13,23 +14,45 @@
 //!
 //! # `gen-catalogs`
 //!
-//! # Why a `git show` extractor and not pi's own generator
+//! # Where the rows come from, and why that changed twice
 //!
 //! PROV-018's original Fix said to run pi's `npm run generate-models`, because "the tree can no
-//! longer simply be read". That premise is FALSE and PROV-060 refutes it: pi gitignores
-//! `packages/ai/src/providers/data/` (`pi/.gitignore:11`) only from `a9f6a3159`
-//! (`feat(ai): separate generated model data (#6765)`) onward. At its direct parent `b0c2a90e` —
-//! precisely the revision `catalog_manifest.json` already names as its provenance floor — every
-//! `packages/ai/src/providers/<p>.models.ts` is still a full data literal. So the whole catalog is
-//! recoverable with `git show` plus [`tsdata`], with no `npm install`, no generator run and no
-//! network. This binary is that recipe, and `--check` is PROV-018's drift check.
+//! longer simply be read". PROV-060 refuted that: pi gitignores `packages/ai/src/providers/data/`
+//! (`pi/.gitignore:11`) only from `a9f6a3159` (`feat(ai): separate generated model data (#6765)`)
+//! onward, and at its direct parent `b0c2a90e` every `packages/ai/src/providers/<p>.models.ts` is
+//! still a full data literal. So the whole catalog was recoverable with `git show` plus [`tsdata`],
+//! with no `npm install`, no generator run and no network, and this binary became that recipe.
+//!
+//! **PROV-071 is the second correction, and it is the one that matters now.** `b0c2a90e` was never
+//! a chosen pin: it is the LAST revision that answers at all, and it has been the floor for every
+//! provider since 2026-07-17. Measured at `v0.87.1`, 41 of 41 `*.models.ts` are re-exports and
+//! `git ls-tree -r v0.87.1 packages/ai/src/providers/data` is empty, so `git show` recovers nothing
+//! newer for ANY provider at ANY revision. XAI_1 unfroze one catalog by fetching
+//! `https://pi.dev/api/models/providers/<id>` — the same endpoint the RUNTIME overlay reads — and
+//! DRIFT-009 four more. [`LIVE_CATALOGS`] now carries all 38 provider catalogs; [`CATALOGS`] holds
+//! the one file that is not a provider module (`openrouter-images`, PROV-065), for which no live
+//! endpoint exists.
+//!
+//! The refresh that closed PROV-071 moved 536 rows in, 204 out and 845 field values, across 27
+//! catalogs — two months of upstream data that the pinned path could not have reached.
+//!
+//! # The floor stays COMMITTED
+//!
+//! Live-fetched is not runtime-fetched. `providers/catalog/*.json` is `include_str!`-ed into the
+//! binary and reviewed as a diff; `gen-catalogs` is run by hand by a maintainer (there is no CI
+//! here, see README "Build"). The refresh-time path already exists and is
+//! `cyrup-provider/src/remote_catalog.rs`, hitting the same endpoint per configured provider. A
+//! second one here would duplicate it and still leave the committed floor frozen — and the floor is
+//! exactly what an offline or first-run user prices against, who by definition has no network.
 //!
 //! # What it is NOT allowed to do
 //!
-//! Regeneration must be **total and accounted for**: it rewrites every catalog from one revision,
-//! it refuses to run if any module is missing, and the only rows it is permitted to diverge from
-//! upstream on are the ones listed in [`DELTAS`] — each of which names the ledger item that
-//! authorised it. A generator with a silent skip is how catalog data goes missing without a diff.
+//! Regeneration must be **total and accounted for**: it rewrites every catalog from one source, it
+//! refuses to run if a module is missing, the only rows it may diverge from upstream on are the
+//! ones listed in [`DELTAS`], and every divergence upstream has since ADOPTED is re-checked through
+//! [`CONVERGED`] instead of being dropped. A generator with a silent skip is how catalog data goes
+//! missing without a diff — and a generalization that routed the live path around [`DELTAS`] is how
+//! twelve signed-off decisions would go missing the same way.
 //!
 //! # Usage
 //!
@@ -40,7 +63,10 @@
 //! ```
 //!
 //! * `--check` — generate in memory and compare byte-for-byte with what is on disk; exit 1 on any
-//!   difference. This is the drift check: point it at a newer pi and it fails.
+//!   difference. This is the drift check. It goes red when pi republishes a catalog, which is the
+//!   point: the committed floor is then behind upstream and somebody has to look. Offline, set
+//!   `CYRUP_XTASK_SKIP_LIVE` and it checks the pinned file alone rather than reporting 38 fake
+//!   differences.
 //! * `--diff` — print a **structural** (model-level and field-level) diff of on-disk vs generated
 //!   instead of writing anything. Whitespace-insensitive, so it reports only real data movement.
 //!   Its comparison is a port of pi's own `scripts/diff-model-catalog.mjs` (see [`canonicalize`]),
@@ -86,97 +112,121 @@ struct CatalogSpec {
     images_provider: Option<&'static str>,
 }
 
-/// The 34 embedded catalogs generated from the pinned revision, each bound to its upstream source
-/// module. [`LIVE_CATALOGS`] below carries the 35th — `xai` — whose rows are fetched live instead
-/// (XAI_1): pi's `xai.models.ts` became a re-export of gitignored, network-generated data at
-/// `a9f6a3159` (`b0c2a90e`'s direct child) and has stayed that way, so no revision this generator
-/// could pin would ever recover anything newer for it.
+/// The catalogs still recovered from the pinned revision with `git show` — **one**, and it is not
+/// a provider module.
 ///
-/// This is 33 of pi's remaining 34 pinned-revision `*.models.ts` modules plus
-/// `openrouter-images.json`. The asymmetries are deliberate and all ledgered:
+/// [`LIVE_CATALOGS`] below carries the other 38. PROV-071: pi's `*.models.ts` modules stopped
+/// being data literals at `a9f6a3159` (`b0c2a90e`'s direct child) and every one of them has been a
+/// re-export of gitignored, network-generated JSON ever since, so `git show` cannot recover
+/// anything newer for ANY provider at ANY revision. Pinning to `b0c2a90e` was never a choice about
+/// which revision to take; it was the last revision that answered at all, and it has been the
+/// floor for every provider — not just the four DRIFT-009 named — since 2026-07-17.
 ///
-/// * `together.models.ts` has **no** catalog file — cyrup hand-ports Together's 20 rows as Rust
-///   literals in `providers/together.rs::together_models()`, so this generator cannot own them.
-/// * `openrouter-images.json` has no `*.models.ts` counterpart (PROV-065); its rows are the
-///   `openrouter` sub-record of `packages/ai/src/image-models.generated.ts`.
-/// * `xai.models.ts` moved to [`LIVE_CATALOGS`] (XAI_1); see that table's doc comment.
-const CATALOGS: &[CatalogSpec] = &[
-    spec("amazon-bedrock"),
-    spec("ant-ling"),
-    spec("anthropic"),
-    spec("azure-openai-responses"),
-    spec("cerebras"),
-    spec("cloudflare-ai-gateway"),
-    spec("cloudflare-workers-ai"),
-    spec("deepseek"),
-    spec("fireworks"),
-    spec("github-copilot"),
-    spec("google-vertex"),
-    spec("google"),
-    spec("groq"),
-    spec("huggingface"),
-    spec("kimi-coding"),
-    spec("minimax-cn"),
-    spec("minimax"),
-    spec("mistral"),
-    spec("moonshotai-cn"),
-    spec("moonshotai"),
-    spec("nvidia"),
-    spec("openai-codex"),
-    spec("openai"),
-    spec("opencode-go"),
-    spec("opencode"),
-    CatalogSpec {
-        file: "openrouter-images",
-        module: "image-models.generated.ts",
-        images_provider: Some("openrouter"),
-    },
-    spec("openrouter"),
-    spec("vercel-ai-gateway"),
-    spec("xiaomi-token-plan-ams"),
-    spec("xiaomi-token-plan-cn"),
-    spec("xiaomi-token-plan-sgp"),
-    spec("xiaomi"),
-    spec("zai-coding-cn"),
-    spec("zai"),
-];
-
-/// Catalogs whose rows are fetched LIVE, because the pinned-revision path cannot reach them.
-///
-/// `CATALOGS` above is `git show` against `DEFAULT_REV`. For xai that mechanism is permanently
-/// dead: `xai.models.ts` is a two-line re-export of gitignored data from `a9f6a3159` (`b0c2a90e`'s
-/// direct child) onward, so the newest rows any revision can yield are already stale on the day the
-/// pin was taken. pi publishes the shaped rows at the URL below — the same endpoint the RUNTIME
-/// overlay reads (`cyrup-provider/src/remote_catalog.rs`) — so the embedded floor comes from there
-/// and the two mechanisms can no longer disagree.
-///
-/// This is the THIRD roster bucket, alongside `CATALOGS` and `UNPORTED`, and `account_for_roster`
-/// consults all three. The other 34 catalogs are affected by the same upstream change and are
-/// deliberately NOT here (XAI_5 is the ledger entry that defers them).
-const LIVE_CATALOGS: &[live_catalog::LiveCatalogSpec] = &[live_catalog::LiveCatalogSpec {
-    file: "xai",
-    provider: "xai",
-    url: "https://pi.dev/api/models/providers/xai",
-    module: "packages/ai/src/providers/xai.models.ts",
-    item: "XAI_1",
+/// `openrouter-images` is the exception because it is **not** a provider module: its rows are the
+/// `openrouter` sub-record of `packages/ai/src/image-models.generated.ts`, which is still a data
+/// literal in git, and `pi.dev/api/models/providers/openrouter-images` is a 404 — there is no live
+/// endpoint to move it to (PROV-065; PROV-089 tracks its own staleness, which is measurable
+/// against git precisely because this path still works for it).
+const CATALOGS: &[CatalogSpec] = &[CatalogSpec {
+    file: "openrouter-images",
+    module: "image-models.generated.ts",
+    images_provider: Some("openrouter"),
 }];
 
-const fn spec(name: &'static str) -> CatalogSpec {
-    CatalogSpec {
-        file: name,
-        module: "",
-        images_provider: None,
-    }
+/// Every catalog whose rows are fetched LIVE, because the pinned-revision path cannot reach them.
+///
+/// # This is now the whole provider roster, and that is PROV-071's closure
+///
+/// [`CATALOGS`] above is `git show` against `DEFAULT_REV`. For a provider module that mechanism is
+/// permanently dead, and it is dead for ALL of them for one reason: `<p>.models.ts` became a
+/// two-line re-export of gitignored data at `a9f6a3159` — `b0c2a90e`'s direct child — so the
+/// newest rows any revision can yield were already stale on the day the pin was taken. Measured at
+/// `v0.87.1`: 41 of 41 `packages/ai/src/providers/*.models.ts` are re-exports and
+/// `git ls-tree -r v0.87.1 packages/ai/src/providers/data` is empty.
+///
+/// XAI_1 unfroze one catalog this way and DRIFT-009 four more. PROV-071's whole content was that
+/// the remaining 33 were frozen for exactly the same reason and were being tracked rather than
+/// fixed; they are here now. pi publishes the shaped rows at the URL each spec derives — the same
+/// endpoint the RUNTIME overlay reads (`cyrup-provider/src/remote_catalog.rs`) — so the embedded
+/// floor and the runtime overlay come from one source and can no longer disagree.
+///
+/// # What this does NOT change
+///
+/// The floor is still a set of files committed to this repo, generated by a maintainer running
+/// `gen-catalogs` and reviewed as a diff. It is not fetched at build time and not fetched at
+/// runtime by this crate: `include_str!` needs a file, and the offline/first-run user this floor
+/// exists for has no network by definition. What changed is only WHERE a refresh reads from —
+/// `pi.dev` instead of a revision that cannot answer — and therefore that a refresh is now
+/// possible at all. The refresh-time path already exists and is `remote_catalog.rs`; a second one
+/// here would duplicate it and still leave the floor frozen.
+///
+/// # DELTAS and CONVERGED both run over these rows
+///
+/// A live catalog is not exempt from the signed-off divergences. [`generate_all`] applies
+/// [`DELTAS`] and checks [`CONVERGED`] for live rows exactly as it does for pinned ones, which is
+/// what turned the twelve `b0c2a90e`-era exceptions from silently-dropped into measured — see
+/// [`CONVERGED`].
+const LIVE_CATALOGS: &[live_catalog::LiveCatalogSpec] = &[
+    // PROV-071 — the 33 provider modules that used to be `git show` against `b0c2a90e`.
+    live("amazon-bedrock", "PROV-071"),
+    live("ant-ling", "PROV-071"),
+    live("anthropic", "PROV-071"),
+    live("azure-openai-responses", "PROV-071"),
+    live("cerebras", "PROV-071"),
+    live("cloudflare-ai-gateway", "PROV-071"),
+    live("cloudflare-workers-ai", "PROV-071"),
+    live("deepseek", "PROV-071"),
+    live("fireworks", "PROV-071"),
+    live("github-copilot", "PROV-071"),
+    live("google", "PROV-071"),
+    live("google-vertex", "PROV-071"),
+    live("groq", "PROV-071"),
+    live("huggingface", "PROV-071"),
+    live("kimi-coding", "PROV-071"),
+    live("minimax", "PROV-071"),
+    live("minimax-cn", "PROV-071"),
+    live("mistral", "PROV-071"),
+    live("moonshotai", "PROV-071"),
+    live("moonshotai-cn", "PROV-071"),
+    live("nvidia", "PROV-071"),
+    live("openai", "PROV-071"),
+    live("openai-codex", "PROV-071"),
+    live("opencode", "PROV-071"),
+    live("opencode-go", "PROV-071"),
+    live("openrouter", "PROV-071"),
+    live("vercel-ai-gateway", "PROV-071"),
+    live("xiaomi", "PROV-071"),
+    live("xiaomi-token-plan-ams", "PROV-071"),
+    live("xiaomi-token-plan-cn", "PROV-071"),
+    live("xiaomi-token-plan-sgp", "PROV-071"),
+    live("zai", "PROV-071"),
+    live("zai-coding-cn", "PROV-071"),
+    // DRIFT-009 — the four whose rows are in git at NO revision, live since that row landed.
+    live("baseten", "DRIFT-009"),
+    live("qwen-token-plan", "DRIFT-009"),
+    live("qwen-token-plan-cn", "DRIFT-009"),
+    live("qwen-token-plan-individual", "DRIFT-009"),
+    // XAI_1 — the first catalog to take this path, and the proof the other 37 could.
+    live("xai", "XAI_1"),
+];
+
+/// One [`LIVE_CATALOGS`] entry. Everything but the ledger id is derived from the stem
+/// (`live_catalog::LiveCatalogSpec`), so a thirty-eight-row table cannot hold a mismatched
+/// endpoint.
+const fn live(file: &'static str, item: &'static str) -> live_catalog::LiveCatalogSpec {
+    live_catalog::LiveCatalogSpec { file, item }
 }
 
 impl CatalogSpec {
     /// Path under `packages/ai/src/` of this catalog's source module.
+    ///
+    /// Spelled explicitly on every entry now. It used to default to
+    /// `providers/<file>.models.ts` for the 33 provider catalogs this table held; those are
+    /// [`LIVE_CATALOGS`] entries (PROV-071) and derive their own module path from their stem, so
+    /// the default branch here had no caller left and a default nothing exercises is a default
+    /// nobody can trust.
     fn module_path(&self) -> String {
-        if self.module.is_empty() {
-            format!("providers/{}.models.ts", self.file)
-        } else {
-            self.module.to_string()
-        }
+        self.module.to_string()
     }
 }
 
@@ -199,74 +249,79 @@ struct Unported {
     why: &'static str,
 }
 
-/// Why an upstream provider module has no embedded catalog. The distinction is load-bearing: a
-/// [`HandPorted`](UnportedReason::HandPorted) module is a deliberate placement of the same data
-/// elsewhere in the tree, a [`DataNotInGit`](UnportedReason::DataNotInGit) one is data this
-/// workspace cannot obtain at all — no extractor, no revision and no amount of effort will produce
-/// it, so it is an escalation rather than a task.
+/// Why an upstream provider module has no embedded catalog.
+///
+/// # `DataNotInGit` is gone, and its removal is the substance of DRIFT-009
+///
+/// There used to be a second variant for data this workspace "cannot obtain at all — no extractor,
+/// no revision and no amount of effort will produce it", held by DRIFT-009's four modules, and the
+/// `--roster` audit re-tested it by re-parsing each module at the audited revision. It is deleted
+/// rather than left empty because the category was WRONG, not merely unpopulated: the four modules
+/// still do not parse as data literals at `v0.87.1` and `providers/data/` is still absent from git,
+/// yet all four catalogs now generate — from `pi.dev/api/models/providers/<id>`, which serves the
+/// very artifact the gitignored JSON is built into. A category whose members were obtainable all
+/// along cannot be a category, and re-testing the git half of it would report "still blocked" about
+/// four catalogs sitting in the tree. The escalation the variant recorded is preserved on the ledger
+/// row beside its refutation; what replaces the audit here is [`LIVE_CATALOGS`] membership, which
+/// `account_for_roster` already checks, and `rows_from_body`, which HARD-ERRORS on a body whose
+/// shape it does not recognise.
 #[derive(Debug, PartialEq, Eq)]
 enum UnportedReason {
     /// cyrup carries the rows as Rust literals somewhere else, so this generator cannot own them.
     HandPorted,
-    /// The rows are in git at **no** upstream revision, so nothing can extract them.
-    DataNotInGit,
+    /// cyrup does not implement the provider at all, so there is nothing for a catalog to feed.
+    /// The absence is a PROVIDER gap owned by its own ledger item, not a catalog one — filing it
+    /// here is how the roster stays total without this generator pretending to fix it.
+    NoProvider,
+    /// cyrup implements the provider, but its catalog reaches it by a mechanism other than
+    /// `providers/catalog/*.json`, and closing the difference is owned elsewhere.
+    CatalogElsewhere,
 }
 
-/// The five upstream provider modules with no `providers/catalog/*.json`, as of pi `v0.84.4`.
+/// The upstream provider modules with no `providers/catalog/*.json`, as of pi `v0.87.1`.
 ///
-/// The four `DataNotInGit` entries are DRIFT-009's four-catalog shortfall, and the reason they are
-/// unobtainable is one fact: **all four providers postdate `b0c2a90e`**, the last revision at which
-/// a `*.models.ts` is a data literal (`baseten` `c1019d920` 2026-08-03, `qwen-token-plan` and
-/// `qwen-token-plan-cn` `bbb91fa8a` 2026-07-20, `qwen-token-plan-individual` `c03d78bdc`
-/// 2026-08-06; `a9f6a3159` gitignored `providers/data/` on 2026-07-17). At every revision that has
-/// them, the module is a two-line re-export of a JSON file that is in git nowhere, and the JSON is
-/// produced by `packages/ai/scripts/generate-models.ts` from a **network** fetch of models.dev
-/// (`v0.84.4 packages/ai/scripts/generate-models.ts:2334` reads `data[source]?.models`, `:1944`
-/// `processBasetenModels(data.baseten)`). Everything the generator hardcodes for them survives in
-/// git — `baseUrl`, `compat`, `thinkingFormat`, the thinking-level ladders and the Individual
-/// allowlist (`:290-334`, `:1259-1330`, `:2303-2380`) — but `cost`, `contextWindow`, `maxTokens`,
-/// `name`, `reasoning` and the input modalities are models.dev's, and only models.dev has them.
+/// [`CATALOGS`] and [`LIVE_CATALOGS`] are the positive halves of the roster and this is the
+/// negative half; `account_for_roster` requires the three together to account for every
+/// `*.models.ts` pi ships at the audited revision.
 ///
-/// **All four are REGISTERED providers (PROV-014, DRIFT-009), so this is a DATA shortfall and not
-/// a registration one.** Each is a `FleetCatalog::Dynamic` member of
-/// `crates/cyrup-provider/src/providers/fleet.rs` — auth resolves from its env var, requests
-/// stream, and the rows arrive through the pi.dev overlay or `models.json`. What is missing is the
-/// embedded FLOOR: an `--offline` run, and the window before the overlay's first fetch, sees no
-/// models for them. `--roster <rev>` below is the trigger that says when that can be fixed.
+/// DRIFT-009's four modules — `baseten` and the three `qwen-token-plan*` — used to be here under a
+/// `DataNotInGit` reason. They are now [`LIVE_CATALOGS`] entries; see that table's doc comment for
+/// why the block was a scope error rather than a data one, and the retired variant's doc above for
+/// why the category itself is gone.
+///
+/// `meta` and `radius` are new upstream at v0.86.0/v0.87.1 and were UNACCOUNTED FOR until this
+/// change: `gen-catalogs --roster v0.87.1` failed with "pi ships 2 provider module(s) this
+/// generator has never heard of". That failure is the audit working — it is the exact shape of the
+/// failure DRIFT-009 was filed for — and the fix is to name them and their owners, not to widen a
+/// positive table over providers cyrup does not have.
 const UNPORTED: &[Unported] = &[
+    Unported {
+        stem: "meta",
+        reason: UnportedReason::NoProvider,
+        item: "PROV-080",
+        why: "cyrup has no provider id `meta` at all (`providers/meta.ts` @v0.87.1 — base URL \
+              `https://api.meta.ai/v1`, `envApiKeyAuth(\"Meta Model API key\", [\"META_API_KEY\"])`, \
+              a Muse-subscription lazy OAuth, registered `all.ts:108`), so a catalog would have \
+              nothing to attach to; PROV-080 owns porting the provider and its catalog arrives in \
+              that change",
+    },
+    Unported {
+        stem: "radius",
+        reason: UnportedReason::CatalogElsewhere,
+        item: "PROV-014",
+        why: "cyrup's `providers/radius.rs` learns its rows from the gateway's own \
+              `GET /v1/config` and carries an EMPTY embedded catalog; pi gained a static \
+              `baselineModels` floor from `RADIUS_MODELS` at v0.86.0 (`providers/radius.ts:25-28` \
+              @v0.87.1, applied only when the gateway is the default one), which cyrup does not \
+              seed — PROV-014's residual piece (1) owns that, and it is provider wiring rather \
+              than a generator table",
+    },
     Unported {
         stem: "together",
         reason: UnportedReason::HandPorted,
         item: "PROV-060",
         why: "cyrup hand-ports Together's rows as Rust literals in \
               `providers/together.rs::together_models()`, so there is no JSON catalog to generate",
-    },
-    Unported {
-        stem: "baseten",
-        reason: UnportedReason::DataNotInGit,
-        item: "DRIFT-009",
-        why: "added at c1019d920, 17 days after the b0c2a90e extraction floor; the module has \
-              never been anything but a re-export of gitignored data/baseten.json",
-    },
-    Unported {
-        stem: "qwen-token-plan",
-        reason: UnportedReason::DataNotInGit,
-        item: "DRIFT-009",
-        why: "added at bbb91fa8a as a `values as { … }` type-only literal — the model IDS are in \
-              git there, the costs, context windows and maxTokens never were",
-    },
-    Unported {
-        stem: "qwen-token-plan-cn",
-        reason: UnportedReason::DataNotInGit,
-        item: "DRIFT-009",
-        why: "added at bbb91fa8a alongside qwen-token-plan and blocked identically",
-    },
-    Unported {
-        stem: "qwen-token-plan-individual",
-        reason: UnportedReason::DataNotInGit,
-        item: "DRIFT-009",
-        why: "added at c03d78bdc; a narrowed view of the same models.dev source, so it inherits \
-              the same block",
     },
 ];
 
@@ -293,6 +348,9 @@ struct Delta {
     why: &'static str,
 }
 
+// Constructed only by [`apply_deltas_from`]'s own tests while [`DELTAS`] is empty — see that
+// table's doc for why it is empty and why the machinery stays.
+#[cfg_attr(not(test), allow(dead_code))]
 enum DeltaAction {
     /// Delete the key upstream sets.
     Drop,
@@ -324,113 +382,226 @@ const WHY_GPT_56_PRICE_CUT: &str = "[CYRUP-DELTA] pi `OPENAI_GPT_56_STANDARD_COS
      would bill users 5x (Luna) and 1.25x (Terra) over the real rate. PROV-059 lists these six as \
      defects because sweep 9 measured only against b0c2a90e; they are preserved, not fixed.";
 
-const DELTAS: &[Delta] = &[
-    Delta {
+/// **Empty, and the emptiness is a measurement.** Every one of the twelve entries this table
+/// carried was a forward-port: a value pi's `scripts/generate-models.ts` hardcoded at the ported
+/// tag, pinned over the older value `b0c2a90e`'s generated data still held. Once [`LIVE_CATALOGS`]
+/// took over the provider roster (PROV-071) the rows arrive from `pi.dev` already current, so
+/// every pin became either a no-op or a reference to a model upstream has retired — and
+/// [`apply_deltas`]'s own guards said so, in twelve hard errors, rather than silently carrying
+/// them. Each one moved to [`CONVERGED`], where it is now ASSERTED instead of imposed.
+///
+/// The machinery stays because the next signed-off divergence is a `Delta`, not a patch to this
+/// comment; its unit tests construct their own entries and do not depend on this table being
+/// populated.
+const DELTAS: &[Delta] = &[];
+
+/// A divergence that [`DELTAS`] used to IMPOSE and that upstream has since ADOPTED (or retired the
+/// row for), checked on every run so the decision cannot regress unnoticed.
+///
+/// This table is the answer to the question a live-fetch generalization has to answer: what
+/// happens to the twelve signed-off exceptions when the data stops coming from `b0c2a90e`? Dropping
+/// them silently is how a deliberate decision is reverted without a diff — the exact failure
+/// [`DELTAS`]'s doc comment warns about. Keeping them as pins is worse: a pin whose value upstream
+/// already has is a no-op the generator refuses, and a pin that ever differs from live data would
+/// override current pricing with a two-month-old literal.
+///
+/// So each one is inverted. Instead of "write this value over upstream's", it is now "upstream
+/// must already carry this value" — the same guarantee, sourced rather than asserted, and it FAILS
+/// if upstream ever moves back. [`Expect::Retired`] covers the three whose model pi no longer
+/// ships: there is nothing left to pin, and the assertion becomes "still gone", so a
+/// re-introduction forces the original decision to be re-taken rather than silently re-inherited.
+struct Converged {
+    catalog: &'static str,
+    model: &'static str,
+    expect: Expect,
+    why: &'static str,
+}
+
+enum Expect {
+    /// The row must exist and `key` must equal this JSON literal.
+    Carries {
+        key: &'static str,
+        value: &'static str,
+    },
+    /// The row must NOT exist. `key` names what the retired exception acted on, so the failure
+    /// message can say what has to be re-decided if the row comes back.
+    Retired { key: &'static str },
+}
+
+const CONVERGED: &[Converged] = &[
+    Converged {
         catalog: "groq",
         model: "qwen/qwen3-32b",
-        key: "thinkingLevelMap",
-        action: DeltaAction::Drop,
-        why: "[CYRUP-DELTA] pi `GROQ_MODELS[\"qwen/qwen3-32b\"].thinkingLevelMap` @b0c2a90e. \
-              PROV-064: v0.84.1 retargeted the sole Groq thinking-level override from \
-              `qwen/qwen3-32b` (v0.83.0 `ai/scripts/generate-models.ts:837`) to `qwen/qwen3.6-27b` \
-              (v0.84.1 `:870`); cyrup adopted the newer behaviour and `providers/fleet.rs` \
-              `groq_qwen3_32b_no_longer_carries_the_retargeted_thinking_level_map` pins it.",
+        expect: Expect::Retired {
+            key: "thinkingLevelMap",
+        },
+        why: "PROV-064. The DELTA dropped `thinkingLevelMap` from this row because v0.84.1 \
+              retargeted Groq's sole thinking-level override from `qwen/qwen3-32b` \
+              (v0.83.0 `ai/scripts/generate-models.ts:837`) to `qwen/qwen3.6-27b` (v0.84.1 `:870`). \
+              pi.dev no longer serves `qwen/qwen3-32b` at all, so the override cannot be \
+              re-inherited; `providers/fleet.rs` \
+              `groq_qwen3_32b_no_longer_carries_the_retargeted_thinking_level_map` still pins the \
+              cyrup-side absence.",
     },
-    // ---- the three openai-codex contextWindows: b0c2a90e is simply WRONG for the ported tag ----
-    //
-    // PROV-059(d) claims cyrup understates these by 100k. It is REFUTED. `CODEX_GPT_56_CONTEXT` is
-    // `272000` at BOTH v0.83.0 (`ai/scripts/generate-models.ts:2352`) and v0.84.1 (`:2541`), and
-    // the comment one line above it at v0.83.0 says so in words: "GPT-5.6 follows Codex's 272k
-    // catalog limit (formerly 372k)". `372000` is the FORMER value, which is what b0c2a90e's
-    // generated data still held 13 days before the ported tag. Taking b0c2a90e here would inflate
-    // the window past the real limit and defer compaction past it.
-    Delta {
+    Converged {
         catalog: "openai-codex",
         model: "gpt-5.6-luna",
-        key: "contextWindow",
-        action: DeltaAction::Set("272000"),
+        expect: Expect::Carries {
+            key: "contextWindow",
+            value: "272000",
+        },
         why: WHY_CODEX_CONTEXT,
     },
-    Delta {
+    Converged {
         catalog: "openai-codex",
         model: "gpt-5.6-sol",
-        key: "contextWindow",
-        action: DeltaAction::Set("272000"),
+        expect: Expect::Carries {
+            key: "contextWindow",
+            value: "272000",
+        },
         why: WHY_CODEX_CONTEXT,
     },
-    Delta {
+    Converged {
         catalog: "openai-codex",
         model: "gpt-5.6-terra",
-        key: "contextWindow",
-        action: DeltaAction::Set("272000"),
+        expect: Expect::Carries {
+            key: "contextWindow",
+            value: "272000",
+        },
         why: WHY_CODEX_CONTEXT,
     },
-    // ---- the six GPT-5.6 cost rows: a signed-off v0.84.1 forward-port ----
-    Delta {
+    Converged {
         catalog: "openai-codex",
         model: "gpt-5.6-luna",
-        key: "cost",
-        action: DeltaAction::Set(GPT_56_LUNA_COST),
+        expect: Expect::Carries {
+            key: "cost",
+            value: GPT_56_LUNA_COST,
+        },
         why: WHY_GPT_56_PRICE_CUT,
     },
-    Delta {
+    Converged {
         catalog: "openai-codex",
         model: "gpt-5.6-terra",
-        key: "cost",
-        action: DeltaAction::Set(GPT_56_TERRA_COST),
+        expect: Expect::Carries {
+            key: "cost",
+            value: GPT_56_TERRA_COST,
+        },
         why: WHY_GPT_56_PRICE_CUT,
     },
-    Delta {
+    Converged {
         catalog: "openai",
         model: "gpt-5.6-luna",
-        key: "cost",
-        action: DeltaAction::Set(GPT_56_LUNA_COST),
+        expect: Expect::Carries {
+            key: "cost",
+            value: GPT_56_LUNA_COST,
+        },
         why: WHY_GPT_56_PRICE_CUT,
     },
-    Delta {
+    Converged {
         catalog: "openai",
         model: "gpt-5.6-terra",
-        key: "cost",
-        action: DeltaAction::Set(GPT_56_TERRA_COST),
+        expect: Expect::Carries {
+            key: "cost",
+            value: GPT_56_TERRA_COST,
+        },
         why: WHY_GPT_56_PRICE_CUT,
     },
-    Delta {
+    Converged {
         catalog: "azure-openai-responses",
         model: "gpt-5.6-luna",
-        key: "cost",
-        action: DeltaAction::Set(GPT_56_LUNA_COST_NO_TIERS),
+        expect: Expect::Carries {
+            key: "cost",
+            value: GPT_56_LUNA_COST_NO_TIERS,
+        },
         why: WHY_GPT_56_PRICE_CUT,
     },
-    Delta {
+    Converged {
         catalog: "azure-openai-responses",
         model: "gpt-5.6-terra",
-        key: "cost",
-        action: DeltaAction::Set(GPT_56_TERRA_COST_NO_TIERS),
+        expect: Expect::Carries {
+            key: "cost",
+            value: GPT_56_TERRA_COST_NO_TIERS,
+        },
         why: WHY_GPT_56_PRICE_CUT,
     },
-    // ---- the two Fireworks GLM openai-completions rows: DRIFT-052, a v0.84.0 forward-port ----
-    Delta {
+    Converged {
         catalog: "fireworks",
         model: "accounts/fireworks/models/glm-5p2",
-        key: "compat",
-        action: DeltaAction::Set(FIREWORKS_OPENAI_COMPAT),
+        expect: Expect::Retired { key: "compat" },
         why: WHY_FIREWORKS_GLM_COMPAT,
     },
-    Delta {
+    Converged {
         catalog: "fireworks",
         model: "accounts/fireworks/routers/glm-5p2-fast",
-        key: "compat",
-        action: DeltaAction::Set(FIREWORKS_OPENAI_COMPAT),
+        expect: Expect::Retired { key: "compat" },
         why: WHY_FIREWORKS_GLM_COMPAT,
     },
 ];
 
-/// pi's `openAICompat` for Fireworks (`ai/scripts/generate-models.ts:1239-1244` @v0.84.2), spelled
-/// in upstream's own key order so the pinned object diffs against the source declaration.
-const FIREWORKS_OPENAI_COMPAT: &str = r#"{"supportsStore":false,"supportsDeveloperRole":false,
-     "sendSessionAffinityHeaders":true,"supportsLongCacheRetention":false}"#;
+/// Check every [`CONVERGED`] entry for one catalog against the rows about to be written.
+///
+/// Runs for pinned and live catalogs alike, from [`generate_all`], immediately after
+/// [`apply_deltas`] — so an entry is checked against exactly the bytes that land on disk.
+fn check_converged(catalog: &str, rows: &[Val]) -> Result<(), String> {
+    check_converged_from(CONVERGED, catalog, rows)
+}
 
-/// DRIFT-052's rationale, shared by the two Fireworks GLM compat pins.
+/// [`check_converged`] over an explicit table, so the guard's own failure modes are testable
+/// without depending on what upstream happens to serve today.
+fn check_converged_from(
+    converged: &[Converged],
+    catalog: &str,
+    rows: &[Val],
+) -> Result<(), String> {
+    for entry in converged.iter().filter(|c| c.catalog == catalog) {
+        let row = rows
+            .iter()
+            .find(|r| r.get("id").and_then(Val::as_str) == Some(entry.model));
+        match (&entry.expect, row) {
+            (Expect::Retired { .. }, None) => {}
+            (Expect::Retired { key }, Some(_)) => {
+                return Err(format!(
+                    "{catalog}: `{}` is back upstream. A signed-off divergence acted on its `{key}` \
+                     and was retired because the row was gone; it must be re-decided now, not \
+                     silently re-inherited. ({})",
+                    entry.model, entry.why
+                ));
+            }
+            (Expect::Carries { key, .. }, None) => {
+                return Err(format!(
+                    "{catalog}: CONVERGED expects `{}` to carry `{key}`, but upstream no longer \
+                     ships the row — the convergence claim is stale and must be re-decided. ({})",
+                    entry.model, entry.why
+                ));
+            }
+            (Expect::Carries { key, value }, Some(row)) => {
+                let expected = tsdata::parse_json(value).map_err(|e| {
+                    format!("{catalog}: CONVERGED value for {}.{key} is not JSON: {e}", entry.model)
+                })?;
+                let actual = row.get(key).ok_or_else(|| {
+                    format!(
+                        "{catalog}: CONVERGED expects `{}` to carry `{key}`, but upstream does not \
+                         set it at all. ({})",
+                        entry.model, entry.why
+                    )
+                })?;
+                if canonicalize(actual, "") != canonicalize(&expected, "") {
+                    return Err(format!(
+                        "{catalog}: `{}`.{key} REGRESSED — upstream now serves {}, the signed-off \
+                         value is {}. ({})",
+                        entry.model,
+                        compact(actual),
+                        compact(&expected),
+                        entry.why
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// DRIFT-052's rationale, now attached to the two Fireworks GLM rows' CONVERGED entries.
 const WHY_FIREWORKS_GLM_COMPAT: &str = "[CYRUP-DELTA] DRIFT-052. pi `b9497c8c1` (\"fix(ai): correct Fireworks GLM prompt caching, \
      closes #7676\", first tag **v0.84.0**, still current at v0.84.2) moved the Fireworks GLM rows \
      off the inline `candidate.compat = { supportsStore: false, supportsDeveloperRole: false }` \
@@ -678,29 +849,45 @@ fn run_gen_catalogs() -> Result<(), String> {
 
     if args.check {
         if differing.is_empty() {
+            // `generated` holds only what this run could produce, so a skipped live fetch is
+            // reported as a smaller comparison rather than as a silent pass over 39 files.
+            let fetched = generated.len().saturating_sub(CATALOGS.len() + 1);
             println!(
-                "gen-catalogs --check: all {} files match pi@{}",
+                "gen-catalogs --check: all {} file(s) compared reproduce — {fetched} live from \
+                 {}<id>, {} from pi@{}{}",
                 generated.len(),
-                args.rev
+                live_catalog::LIVE_CATALOG_ENDPOINT,
+                CATALOGS.len(),
+                args.rev,
+                if fetched == LIVE_CATALOGS.len() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({} live catalog(s) NOT checked — their fetch was skipped)",
+                        LIVE_CATALOGS.len() - fetched
+                    )
+                }
             );
             return Ok(());
         }
         return Err(format!(
-            "{} file(s) differ from pi@{}: {}\nrun `cargo run -p xtask -- gen-catalogs` to refresh, \
-             and account for every change in docs/gap-analysis/01-cyrup-core-and-provider.md",
+            "{} file(s) do not reproduce: {}\nrun `cargo run -p xtask -- gen-catalogs` to refresh, \
+             and account for every change in docs/gap-analysis/01-cyrup-core-and-provider.md. A \
+             live catalog differs whenever pi.dev has republished since the last refresh, which is \
+             a real change to review, not noise.",
             differing.len(),
-            args.rev,
             differing.join(", ")
         ));
     }
 
     println!(
-        "gen-catalogs: wrote {} of {} files — {} from pi@{}, {} live",
+        "gen-catalogs: wrote {} of {} files — {} from pi@{}, {} live from {}<id>",
         differing.len(),
         generated.len(),
         CATALOGS.len(),
         args.rev,
-        LIVE_CATALOGS.len()
+        LIVE_CATALOGS.len(),
+        live_catalog::LIVE_CATALOG_ENDPOINT
     );
     for name in &differing {
         println!("  updated {name}");
@@ -821,10 +1008,10 @@ fn upstream_provider_stems(pi: &Path, rev: &str) -> Result<Vec<String>, String> 
 
 /// `gen-catalogs --roster <rev>`: audit the provider SET at `rev`, writing nothing.
 ///
-/// Beyond the accounting, this re-tests DRIFT-009's block rather than trusting the note above:
-/// every [`UnportedReason::DataNotInGit`] module is read at `rev` and must still fail to parse as a
-/// data literal. The day pi commits that data again — or reverts `a9f6a3159` — the block lifts and
-/// this fails, which is the only trigger the item can have while models.dev is its only source.
+/// It used to also re-parse every `DataNotInGit` module at `rev` to see whether DRIFT-009's block
+/// had lifted. That re-test went with the variant (DRIFT-009): the four modules are live-fetched
+/// now, so "does this still fail to parse as a data literal?" has no consequence — the answer is
+/// yes at `v0.87.1` and the catalogs generate regardless.
 fn run_roster(args: &Args, rev: &str) -> Result<(), String> {
     let stems = upstream_provider_stems(&args.pi, rev)?;
     if stems.is_empty() {
@@ -836,31 +1023,6 @@ fn run_roster(args: &Args, rev: &str) -> Result<(), String> {
     }
     let roster = account_for_roster(&stems)?;
 
-    let mut unblocked = Vec::new();
-    for u in roster
-        .unported_present
-        .iter()
-        .filter(|u| u.reason == UnportedReason::DataNotInGit)
-    {
-        let src = git_show(
-            &args.pi,
-            rev,
-            &format!("packages/ai/src/providers/{}.models.ts", u.stem),
-        )?;
-        if tsdata::parse_models_module(&src).is_ok() {
-            unblocked.push(u.stem);
-        }
-    }
-    if !unblocked.is_empty() {
-        return Err(format!(
-            "UNPORTED marks {} module(s) as data-not-in-git, but at {rev} they parse as data \
-             literals: {}. The block has LIFTED — move them into CATALOGS, regenerate, and close \
-             the owning ledger item.",
-            unblocked.len(),
-            unblocked.join(", ")
-        ));
-    }
-
     println!(
         "gen-catalogs --roster {rev}: {} provider module(s) upstream — {} embedded, {} \
          live-fetched, {} accounted for as unported",
@@ -870,12 +1032,13 @@ fn run_roster(args: &Args, rev: &str) -> Result<(), String> {
         roster.unported_present.len()
     );
     for l in &roster.live {
-        println!("  live-fetched {} — {} — {}", l.file, l.item, l.url);
+        println!("  live-fetched {} — {} — {}", l.file, l.item, l.url());
     }
     for u in &roster.unported_present {
         let reason = match u.reason {
             UnportedReason::HandPorted => "hand-ported",
-            UnportedReason::DataNotInGit => "data not in git (block re-tested at this revision)",
+            UnportedReason::NoProvider => "no such provider in cyrup",
+            UnportedReason::CatalogElsewhere => "catalog supplied elsewhere",
         };
         println!("  unported {} — {reason}, {} — {}", u.stem, u.item, u.why);
     }
@@ -912,14 +1075,17 @@ fn generate_all(
             &format!("packages/ai/src/{}", spec.module_path()),
         )?;
         let rows = extract_rows(spec, &src)?;
-        let rows = apply_deltas(spec, rows)?;
-        let mut body = Val::Arr(rows).to_json();
-        body.push('\n');
-        out.push((spec.file.to_string(), body));
+        let rows = apply_deltas(spec.file, rows)?;
+        check_converged(spec.file, &rows)?;
+        out.push((spec.file.to_string(), live_catalog::render(rows)));
     }
+    // The live half goes through the SAME two guards. Skipping them here is how a live-fetch
+    // generalization loses every signed-off decision without a diff (PROV-071).
     for (spec, outcome) in live {
-        if let live_catalog::LiveOutcome::Fetched { body, .. } = outcome {
-            out.push((spec.file.to_string(), body.clone()));
+        if let live_catalog::LiveOutcome::Fetched { rows, .. } = outcome {
+            let rows = apply_deltas(spec.file, rows.clone())?;
+            check_converged(spec.file, &rows)?;
+            out.push((spec.file.to_string(), live_catalog::render(rows)));
         }
     }
     out.push(("catalog_manifest".to_string(), manifest_json(args, live)?));
@@ -951,47 +1117,58 @@ fn extract_rows(spec: &CatalogSpec, src: &str) -> Result<Vec<Val>, String> {
 ///
 /// A stale exception is as dangerous as a missing one: it means somebody is holding a divergence
 /// open against a row upstream has already changed, and nobody would ever be told.
-fn apply_deltas(spec: &CatalogSpec, mut rows: Vec<Val>) -> Result<Vec<Val>, String> {
-    for delta in DELTAS.iter().filter(|d| d.catalog == spec.file) {
+fn apply_deltas(catalog: &str, rows: Vec<Val>) -> Result<Vec<Val>, String> {
+    apply_deltas_from(DELTAS, catalog, rows)
+}
+
+/// [`apply_deltas`] over an explicit table. [`DELTAS`] is empty today (every entry converged), so
+/// its guards would be untestable against the const — and an untestable guard is how the next
+/// signed-off divergence gets carried wrongly.
+fn apply_deltas_from(
+    deltas: &[Delta],
+    catalog: &str,
+    mut rows: Vec<Val>,
+) -> Result<Vec<Val>, String> {
+    for delta in deltas.iter().filter(|d| d.catalog == catalog) {
         let row = rows
             .iter_mut()
             .find(|r| r.get("id").and_then(Val::as_str) == Some(delta.model))
             .ok_or_else(|| {
                 format!(
-                    "{}: DELTAS names model `{}`, which pi@this revision no longer ships — \
-                     the exception is stale and must be re-decided, not carried. ({})",
-                    spec.file, delta.model, delta.why
+                    "{catalog}: DELTAS names model `{}`, which pi@this revision no longer ships \
+                     — the exception is stale and must be re-decided, not carried. ({})",
+                    delta.model, delta.why
                 )
             })?;
         match delta.action {
             DeltaAction::Drop => {
                 if !row.remove(delta.key) {
                     return Err(format!(
-                        "{}: DELTAS drops `{}` from `{}`, but upstream no longer sets it — the \
-                         exception is a no-op and must be deleted. ({})",
-                        spec.file, delta.key, delta.model, delta.why
+                        "{catalog}: DELTAS drops `{}` from `{}`, but upstream no longer sets it — \
+                         the exception is a no-op and must be deleted. ({})",
+                        delta.key, delta.model, delta.why
                     ));
                 }
             }
             DeltaAction::Set(json) => {
                 let pinned = tsdata::parse_json(json).map_err(|e| {
                     format!(
-                        "{}: DELTAS pin for {}.{} is not JSON: {e}",
-                        spec.file, delta.model, delta.key
+                        "{catalog}: DELTAS pin for {}.{} is not JSON: {e}",
+                        delta.model, delta.key
                     )
                 })?;
                 let upstream = row.get(delta.key).ok_or_else(|| {
                     format!(
-                        "{}: DELTAS pins `{}` on `{}`, but upstream does not set that key at all — \
-                         the pin would be an invention, not a divergence. ({})",
-                        spec.file, delta.key, delta.model, delta.why
+                        "{catalog}: DELTAS pins `{}` on `{}`, but upstream does not set that key \
+                         at all — the pin would be an invention, not a divergence. ({})",
+                        delta.key, delta.model, delta.why
                     )
                 })?;
                 if upstream == &pinned {
                     return Err(format!(
-                        "{}: DELTAS pins `{}` on `{}` to the value upstream already has — the \
-                         exception is a no-op and must be deleted. ({})",
-                        spec.file, delta.key, delta.model, delta.why
+                        "{catalog}: DELTAS pins `{}` on `{}` to the value upstream already has — \
+                         the exception is a no-op and must be deleted. ({})",
+                        delta.key, delta.model, delta.why
                     ));
                 }
                 row.set(delta.key, pinned);
@@ -1032,9 +1209,10 @@ fn manifest_json(
     )],
 ) -> Result<String, String> {
     let source = format!("pi@{}", args.rev);
+    let endpoint = live_catalog::LIVE_CATALOG_ENDPOINT;
     let pinned_count = CATALOGS.len();
     let live_count = LIVE_CATALOGS.len();
-    let catalog_count = pinned_count + live_count; // D5 — must stay 35
+    let catalog_count = pinned_count + live_count; // D5 — 39, one file per catalog on disk
     let generated_at = if args.rev == DEFAULT_REV {
         DEFAULT_REV_TIMESTAMP.to_string()
     } else {
@@ -1063,44 +1241,49 @@ fn manifest_json(
             .collect::<Vec<_>>()
             .join("; ")
     };
+    let delta_summary = if delta_summary.is_empty() {
+        "none; see CONVERGED".to_string()
+    } else {
+        delta_summary
+    };
 
     let note = format!(
         "Machine-readable counterpart of the provenance prose in src/tests/catalog_data.rs. All \
          {catalog_count} embedded catalogs under providers/catalog/*.json are generated by \
-         `cargo run -p xtask -- gen-catalogs`. {pinned_count} of them come from a SINGLE pinned pi \
-         revision — {source} ({generated_at}) — which is what top-level `generatedAt` and `source` \
-         describe. {live_count} (xai) is fetched LIVE from \
-         https://pi.dev/api/models/providers/xai on every run and carries its own \
-         `fetchedAt`/`revision` under `catalogs` below, because pi's `xai.models.ts` has been a \
-         re-export of gitignored data since a9f6a3159 and NO revision can yield newer rows \
-         (XAI_1). `catalogs` records the per-provider source so that split is machine-checkable \
-         rather than prose (PROV-060) — this is the split that map was built for. Per-provider \
-         `fetchedAt` is the staleness floor for that provider's pi.dev overlay and takes \
-         precedence over the global `generatedAt`; the global value remains the floor for every \
-         other catalog and must not be moved to follow a live fetch, or every other provider's \
-         valid persisted overlay would be discarded. Re-run `cargo run -p xtask -- gen-catalogs \
-         --check` to prove it. `generatedAt` is the staleness floor for the pi.dev overlay \
-         (DRIFT-007): a persisted remote catalog whose Last-Modified is not strictly newer than \
-         this is discarded whole, so upgrading cyrup can never leave a pre-upgrade overlay \
-         shadowing freshly refreshed embedded data. PROV-039: the value must be the LATEST \
-         extraction revision. IRREDUCIBLE RESIDUE (PROV-060), stated here and not only in the \
-         ledger: b0c2a90e is 13 days EARLIER than the ported tag v0.83.0 (2026-07-30). From \
-         a9f6a3159 (b0c2a90e's direct child) onward pi gitignores packages/ai/src/providers/data/ \
-         and every *.models.ts is a two-line re-export, so the catalog data for that 13-day window \
-         is not in git at any tag and is NOT measurable from a checkout. Any claim of catalog \
-         parity at v0.83.0 is a claim about b0c2a90e plus an unbounded delta. EXCEPTIONS: \
-         providers/together.rs hand-ports Together's rows as Rust literals and has no file here; \
-         and {delta_count} signed-off ROW divergences from {source} are carried by the \
-         generator's DELTAS table, which is the complete list — {delta_summary}. KNOWN \
-         INCOMPLETENESS in the GPT-5.6 price-cut forward-port, recorded so a reader does not \
-         mistake the current state for a decision: at v0.84.1 upstream applies \
-         OPENAI_GPT_56_STANDARD_COSTS to FOUR provider families — openai, the derived azure clone, \
-         openai-codex, and cloudflare-ai-gateway ('Cloudflare AI Gateway passes OpenAI usage through \
-         at OpenAI list prices', ai/scripts/generate-models.ts:2311-2315 @v0.84.1) — but cyrup \
-         forward-ported only the first three. cloudflare-ai-gateway's gpt-5.6-luna/terra rows \
-         therefore still carry b0c2a90e's PRE-cut rates, so the same model is priced 5x (Luna) / \
-         1.25x (Terra) higher on that route than on the other three. Completing or reverting the \
-         forward-port is an owner decision; it must move all four families together."
+         `cargo run -p xtask -- gen-catalogs`. {live_count} of them — every provider catalog — are \
+         fetched LIVE from {endpoint}<id>, the same endpoint the runtime overlay reads \
+         (cyrup-provider/src/remote_catalog.rs), and each carries its own fetchedAt/revision under \
+         `catalogs` below. {pinned_count} (openrouter-images) still comes from the pinned pi \
+         revision {source} ({generated_at}), which is what top-level `generatedAt` and `source` \
+         describe. PROV-071: the pinned path is DEAD for provider modules and always was — every \
+         packages/ai/src/providers/<p>.models.ts has been a re-export of gitignored, \
+         network-generated JSON since a9f6a3159 (b0c2a90e's direct child), so no revision can \
+         yield newer rows for any of them; b0c2a90e was never a chosen pin, only the last \
+         revision that answered. openrouter-images is not a provider module — its rows are the \
+         openrouter sub-record of packages/ai/src/image-models.generated.ts, still a data literal \
+         in git, and {endpoint}openrouter-images is a 404 (PROV-065; PROV-089 owns its \
+         staleness). `catalogs` records the per-provider source so the split is machine-checkable \
+         rather than prose (PROV-060). Per-provider `fetchedAt` is the staleness floor for that \
+         provider's pi.dev overlay and takes precedence over the global `generatedAt`; the global \
+         value remains the floor for any catalog without one and must not be moved to follow a \
+         live fetch. `generatedAt` is the staleness floor for the pi.dev overlay (DRIFT-007): a \
+         persisted remote catalog whose Last-Modified is not strictly newer than this is discarded \
+         whole, so upgrading cyrup can never leave a pre-upgrade overlay shadowing freshly \
+         refreshed embedded data. THIS IS STILL A COMMITTED FLOOR, NOT A RUNTIME FETCH: the files \
+         are include_str!-ed, a maintainer runs gen-catalogs and reviews the diff, and the \
+         offline or first-run user this floor exists for has no network by definition. \
+         EXCEPTIONS: providers/together.rs hand-ports Together's rows as Rust literals and has no \
+         file here (PROV-060); `meta` has no cyrup provider to attach a catalog to (PROV-080); \
+         `radius` learns its rows from its gateway and has no embedded floor, where pi gained one \
+         at v0.86.0 (PROV-014). SIGNED-OFF ROW DIVERGENCES: {delta_count} — {delta_summary}. Every \
+         one of the twelve this generator used to impose against b0c2a90e has CONVERGED: upstream \
+         now serves the pinned value itself, or retired the row, and the generator's CONVERGED \
+         table asserts that on every run instead of overwriting the data — so a regression is a \
+         hard error rather than a silent revert. The pre-cut GPT-5.6 prices, the 372k Codex \
+         context windows and the pre-#7676 Fireworks GLM compat block that made those exceptions \
+         necessary are gone with the b0c2a90e data that carried them, along with the \
+         cloudflare-ai-gateway asymmetry the previous note recorded as known incompleteness: that \
+         family's rows now arrive priced by upstream like the other three."
     );
 
     let mut catalogs: Vec<(String, Val)> = Vec::new();
@@ -1133,8 +1316,8 @@ fn manifest_json(
         catalogs.push((
             spec.file.to_string(),
             Val::Obj(vec![
-                ("source".to_string(), Val::Str(spec.url.to_string())),
-                ("module".to_string(), Val::Str(spec.module.to_string())), // D7
+                ("source".to_string(), Val::Str(spec.url())),
+                ("module".to_string(), Val::Str(spec.module())), // D7
                 ("fetchedAt".to_string(), fetched_at),
                 ("revision".to_string(), revision),
             ]),
@@ -1406,14 +1589,68 @@ mod tests {
     /// The roster must stay pinned to the file set it claims to own. `include_str!` cannot glob and
     /// this table cannot walk the tree at compile time, so the count is the guard that a new pi
     /// provider (or a new cyrup catalog) forces somebody to look here.
+    ///
+    /// DRIFT-009 widened the SPLIT without widening the total: the four ex-`UNPORTED` modules gained
+    /// catalog files (so the total went 35 -> 39) while `CATALOGS` stayed at 34, because all four
+    /// arrived through [`LIVE_CATALOGS`] rather than through `git show`. PROV-071 then moved the
+    /// remaining 33 provider catalogs across the same way, leaving `CATALOGS` with the ONE file
+    /// that is not a provider module. Both halves are asserted because the interesting failure is a
+    /// file moving between the tables, which a total alone cannot see.
     #[test]
-    fn the_catalog_roster_is_the_35_embedded_files() {
-        assert_eq!(CATALOGS.len(), 34, "xai moved to LIVE_CATALOGS (XAI_1)");
+    fn the_catalog_roster_is_the_39_embedded_files() {
+        assert_eq!(
+            CATALOGS.len(),
+            1,
+            "PROV-071 moved every provider catalog to LIVE_CATALOGS; `openrouter-images` is the \
+             only file left on the pinned path, because it is not a provider module"
+        );
+        assert_eq!(
+            LIVE_CATALOGS.len(),
+            38,
+            "every `packages/ai/src/providers/<p>.models.ts` pi ships except `together` (hand-\
+             ported), `meta` (no cyrup provider) and `radius` (catalog from its gateway)"
+        );
         assert_eq!(
             CATALOGS.len() + LIVE_CATALOGS.len(),
-            35,
-            "the roster is 35 total across the two tables"
+            39,
+            "the roster is 39 embedded catalog files across the two tables"
         );
+        // Every live spec derives its endpoint and module from its stem, so a mismatched pair is
+        // unspellable rather than merely detected — the reason `LiveCatalogSpec` collapsed three
+        // hand-written fields into one.
+        for l in LIVE_CATALOGS {
+            assert_eq!(l.provider(), l.file);
+            assert_eq!(
+                l.url(),
+                format!("https://pi.dev/api/models/providers/{}", l.file)
+            );
+            assert_eq!(
+                l.module(),
+                format!("packages/ai/src/providers/{}.models.ts", l.file)
+            );
+            assert!(!l.item.is_empty(), "{}: no ledger item", l.file);
+        }
+        // Every name is a real file on disk. This is what catches a table entry whose catalog was
+        // never generated — the failure mode DRIFT-009's four spent nine sweeps in.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/cyrup-provider/src/providers/catalog");
+        for name in CATALOGS
+            .iter()
+            .map(|c| c.file)
+            .chain(LIVE_CATALOGS.iter().map(|l| l.file))
+        {
+            let path = dir.join(format!("{name}.json"));
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(
+                body.trim_start().starts_with('['),
+                "{name}.json must be a JSON array of rows"
+            );
+            assert!(
+                body.len() > 2,
+                "{name}.json is an empty catalog — the table names a file nothing generated"
+            );
+        }
         let images: Vec<&str> = CATALOGS
             .iter()
             .filter(|c| c.images_provider.is_some())
@@ -1422,106 +1659,106 @@ mod tests {
         assert_eq!(images, vec!["openrouter-images"]);
     }
 
+    /// The pinned path's one remaining entry names a module that is NOT a provider module, and
+    /// that is the whole reason it is still on the pinned path (PROV-071).
     #[test]
-    fn module_paths_default_to_the_provider_models_module() {
-        // `xai` moved to `LIVE_CATALOGS` (XAI_1); `zai` is an arbitrary other `spec(..)` entry
-        // that still defaults its module path from its own file stem.
-        let zai = CATALOGS.iter().find(|c| c.file == "zai").unwrap();
-        assert_eq!(zai.module_path(), "providers/zai.models.ts");
+    fn the_pinned_catalog_is_the_images_record() {
         let img = CATALOGS
             .iter()
             .find(|c| c.file == "openrouter-images")
             .unwrap();
         assert_eq!(img.module_path(), "image-models.generated.ts");
+        assert_eq!(img.images_provider, Some("openrouter"));
+        // And nothing else is on it. A provider catalog that reappeared here would be silently
+        // frozen at `b0c2a90e` again, which is the state PROV-071 exists to have ended.
+        assert!(
+            CATALOGS.iter().all(|c| c.images_provider.is_some()),
+            "a provider module is back on the pinned path, where no revision can yield newer rows"
+        );
+    }
 
-        let xai = LIVE_CATALOGS.iter().find(|l| l.file == "xai").unwrap();
-        assert_eq!(xai.module, "packages/ai/src/providers/xai.models.ts");
+    /// The `Drop` and `Set` fixtures these guard tests run against.
+    ///
+    /// [`DELTAS`] is empty — every entry it carried has converged, see that table — so the guards
+    /// are exercised against a table declared here instead of against the const. That is not a
+    /// weaker test: `apply_deltas_from` is the function the generator calls with `DELTAS`, and the
+    /// next signed-off divergence will be a `Delta` of exactly this shape. A guard that could only
+    /// run while the table happened to be populated would have quietly stopped running the day it
+    /// emptied.
+    const FIXTURE_DELTAS: &[Delta] = &[
+        Delta {
+            catalog: "groq",
+            model: "qwen/qwen3-32b",
+            key: "thinkingLevelMap",
+            action: DeltaAction::Drop,
+            why: "fixture",
+        },
+        Delta {
+            catalog: "openai-codex",
+            model: "gpt-5.6-sol",
+            key: "contextWindow",
+            action: DeltaAction::Set("272000"),
+            why: "fixture",
+        },
+    ];
+
+    fn deltas(catalog: &str, rows: Vec<Val>) -> Result<Vec<Val>, String> {
+        apply_deltas_from(FIXTURE_DELTAS, catalog, rows)
     }
 
     /// A signed-off divergence that upstream has already dropped is a no-op nobody would be told
     /// about, so the generator must refuse rather than carry it.
     #[test]
     fn a_stale_delta_is_a_hard_error() {
-        let spec = spec("groq");
         let rows = vec![Val::Obj(vec![(
             "id".into(),
             Val::Str("qwen/qwen3-32b".into()),
         )])];
-        let err = apply_deltas(&spec, rows).unwrap_err();
+        let err = deltas("groq", rows).unwrap_err();
         assert!(err.contains("must be deleted"), "{err}");
 
-        let err = apply_deltas(&spec, Vec::new()).unwrap_err();
+        let err = deltas("groq", Vec::new()).unwrap_err();
         assert!(err.contains("stale and must be re-decided"), "{err}");
     }
 
     #[test]
     fn a_live_delta_removes_exactly_its_key() {
-        let spec = spec("groq");
         let rows = vec![Val::Obj(vec![
             ("id".into(), Val::Str("qwen/qwen3-32b".into())),
             ("thinkingLevelMap".into(), Val::Obj(vec![])),
             ("reasoning".into(), Val::Bool(true)),
         ])];
-        let out = apply_deltas(&spec, rows).unwrap();
+        let out = deltas("groq", rows).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].get("thinkingLevelMap").is_none());
         assert_eq!(out[0].get("reasoning"), Some(&Val::Bool(true)));
     }
 
-    /// The `openai-codex` fixture every `Set`-pin test needs: `apply_deltas` walks EVERY delta for
-    /// the catalog, and a delta whose model is absent from the rows is a hard "stale and must be
-    /// re-decided" error. `openai-codex` carries five (three `contextWindow` pins plus the luna and
-    /// terra `cost` pins), so a fixture holding only the row under test fails on the FIRST unrelated
-    /// delta and never reaches the assertion — which is exactly how these two tests were failing.
-    /// Every value here is `b0c2a90e`'s, so each pin is a real replacement rather than a no-op.
+    /// The `openai-codex` fixture every `Set`-pin test needs. Every value is `b0c2a90e`'s, so the
+    /// pin is a real replacement rather than a no-op.
     fn codex_rows() -> Vec<Val> {
-        let luna_cost = tsdata::parse_json(
-            r#"{"input":1,"output":6,"cacheRead":0.1,"cacheWrite":1.25,
-                "tiers":[{"inputTokensAbove":272000,"input":2,"output":9,"cacheRead":0.2,"cacheWrite":2.5}]}"#,
-        )
-        .expect("luna cost fixture parses");
-        let terra_cost = tsdata::parse_json(
-            r#"{"input":2.5,"output":15,"cacheRead":0.25,"cacheWrite":3.125,
-                "tiers":[{"inputTokensAbove":272000,"input":5,"output":22.5,"cacheRead":0.5,"cacheWrite":6.25}]}"#,
-        )
-        .expect("terra cost fixture parses");
-        vec![
-            Val::Obj(vec![
-                ("id".into(), Val::Str("gpt-5.6-luna".into())),
-                ("contextWindow".into(), Val::Num("372000".into())),
-                ("cost".into(), luna_cost),
-            ]),
-            Val::Obj(vec![
-                ("id".into(), Val::Str("gpt-5.6-terra".into())),
-                ("contextWindow".into(), Val::Num("372000".into())),
-                ("cost".into(), terra_cost),
-            ]),
-            Val::Obj(vec![
-                ("id".into(), Val::Str("gpt-5.6-sol".into())),
-                ("contextWindow".into(), Val::Num("372000".into())),
-                ("maxTokens".into(), Val::Num("128000".into())),
-            ]),
-        ]
+        vec![Val::Obj(vec![
+            ("id".into(), Val::Str("gpt-5.6-sol".into())),
+            ("contextWindow".into(), Val::Num("372000".into())),
+            ("maxTokens".into(), Val::Num("128000".into())),
+        ])]
     }
 
     /// The index of `gpt-5.6-sol` in [`codex_rows`] — the row these tests assert on.
-    const SOL: usize = 2;
+    const SOL: usize = 0;
 
     /// A `Set` pin replaces the value in place and keeps its declaration position, so the emitted
     /// row still diffs against upstream's key order.
     #[test]
     fn a_set_pin_replaces_in_place() {
-        let spec = spec("openai-codex");
-        let rows = codex_rows();
-        let out = apply_deltas(&spec, rows).unwrap();
-        let out = [out[SOL].clone()];
-        let Val::Obj(entries) = &out[0] else {
+        let out = deltas("openai-codex", codex_rows()).unwrap();
+        let Val::Obj(entries) = &out[SOL] else {
             panic!("object")
         };
         let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["id", "contextWindow", "maxTokens"]);
         assert_eq!(
-            out[0].get("contextWindow"),
+            out[SOL].get("contextWindow"),
             Some(&Val::Num("272000".into()))
         );
     }
@@ -1530,38 +1767,96 @@ mod tests {
     /// not set at all is an invention. Both must stop the generator rather than pass silently.
     #[test]
     fn a_no_op_or_inventing_pin_is_a_hard_error() {
-        let spec = spec("openai-codex");
-
-        // Upstream has ADOPTED the pinned value: the exception is now a no-op.
+        // Upstream has ADOPTED the pinned value: the exception is now a no-op. This is the guard
+        // that emptied `DELTAS` — nine of its twelve entries hit exactly this error the first time
+        // the generator ran against live rows.
         let mut already = codex_rows();
         already[SOL].set("contextWindow", Val::Num("272000".into()));
-        let err = apply_deltas(&spec, already).unwrap_err();
+        let err = deltas("openai-codex", already).unwrap_err();
         assert!(err.contains("value upstream already has"), "{err}");
 
         // Upstream does not set the key at all: pinning it would invent data rather than diverge.
-        let mut missing = codex_rows();
-        missing[SOL] = Val::Obj(vec![("id".into(), Val::Str("gpt-5.6-sol".into()))]);
-        let err = apply_deltas(&spec, missing).unwrap_err();
+        let missing = vec![Val::Obj(vec![(
+            "id".into(),
+            Val::Str("gpt-5.6-sol".into()),
+        )])];
+        let err = deltas("openai-codex", missing).unwrap_err();
         assert!(err.contains("would be an invention"), "{err}");
     }
 
     /// A delta naming a model the revision no longer ships must stop the generator — proved on the
-    /// `Set` family too, not just the `Drop` one, since `Set` is where the GPT-5.6 pins live.
+    /// `Set` family too, not just the `Drop` one. This is the OTHER error that emptied `DELTAS`:
+    /// the three remaining entries named rows upstream had retired.
     #[test]
     fn a_set_pin_naming_a_dropped_model_is_a_hard_error() {
-        let spec = spec("openai-codex");
-        let mut rows = codex_rows();
-        rows.remove(SOL);
-        let err = apply_deltas(&spec, rows).unwrap_err();
+        let err = deltas("openai-codex", Vec::new()).unwrap_err();
         assert!(err.contains("stale and must be re-decided"), "{err}");
         assert!(err.contains("gpt-5.6-sol"), "{err}");
     }
 
-    /// Every `packages/ai/src/providers/*.models.ts` pi ships at `v0.84.4`, from
-    /// `git -C tmp/pi ls-tree v0.84.4 --name-only packages/ai/src/providers/`. Hard-coded rather
+    /// PROV-071 — the twelve signed-off divergences did not vanish, they INVERTED: each is now a
+    /// [`Converged`] assertion over the rows the generator is about to write, and every one of them
+    /// runs against the catalogs actually on disk.
+    ///
+    /// This is the test that would have caught the failure the first attempt at this change made.
+    /// Moving the roster to `LIVE_CATALOGS` without routing `DELTAS`/`CONVERGED` through the live
+    /// path drops all twelve silently — no diff, no error, no red test — and the GPT-5.6 price
+    /// cut, the 272k Codex window and DRIFT-052's Fireworks compat block go back to being
+    /// unguarded.
+    #[test]
+    fn every_converged_divergence_still_holds_in_the_shipped_catalogs() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/cyrup-provider/src/providers/catalog");
+        let mut catalogs: BTreeMap<&str, Vec<Val>> = BTreeMap::new();
+        for entry in CONVERGED {
+            if catalogs.contains_key(entry.catalog) {
+                continue;
+            }
+            let path = dir.join(format!("{}.json", entry.catalog));
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let Val::Arr(rows) = tsdata::parse_json(&body).expect("catalog parses") else {
+                panic!("{}: not an array", path.display())
+            };
+            catalogs.insert(entry.catalog, rows);
+        }
+        assert_eq!(
+            catalogs.len(),
+            5,
+            "the twelve converged divergences span azure-openai-responses, fireworks, groq, \
+             openai and openai-codex"
+        );
+        for (catalog, rows) in &catalogs {
+            check_converged(catalog, rows)
+                .unwrap_or_else(|e| panic!("a signed-off divergence regressed: {e}"));
+        }
+
+        // And the table is TOTAL over what it claims: every entry names a catalog that exists, and
+        // the two kinds are both represented, so a future edit cannot quietly reduce it to one.
+        assert_eq!(CONVERGED.len(), 12);
+        assert_eq!(
+            CONVERGED
+                .iter()
+                .filter(|c| matches!(c.expect, Expect::Retired { .. }))
+                .count(),
+            3,
+            "groq's qwen/qwen3-32b and the two Fireworks glm-5p2 rows are retired upstream"
+        );
+        assert!(
+            CONVERGED.iter().all(|c| !c.why.is_empty()),
+            "every converged divergence must carry the reasoning that authorised it"
+        );
+    }
+
+    /// Every `packages/ai/src/providers/*.models.ts` pi ships at `v0.87.1`, from
+    /// `git -C tmp/pi ls-tree v0.87.1 --name-only packages/ai/src/providers/`. Hard-coded rather
     /// than shelled out for so the accounting is testable with no pi checkout — the checkout is
     /// `--roster`'s job, this is the decision's.
-    fn upstream_stems_at_v0_84_4() -> Vec<String> {
+    ///
+    /// It was `v0.84.4`'s 39 stems until PROV-071. The tag moved with the audit because two of the
+    /// three UNPORTED entries — `meta` and `radius` — do not EXIST at v0.84.4, so an accounting
+    /// pinned there could not exercise the rows that made the live `--roster v0.87.1` run fail.
+    fn upstream_stems_at_v0_87_1() -> Vec<String> {
         [
             "amazon-bedrock",
             "ant-ling",
@@ -1579,6 +1874,7 @@ mod tests {
             "groq",
             "huggingface",
             "kimi-coding",
+            "meta",
             "minimax-cn",
             "minimax",
             "mistral",
@@ -1593,6 +1889,7 @@ mod tests {
             "qwen-token-plan-cn",
             "qwen-token-plan-individual",
             "qwen-token-plan",
+            "radius",
             "together",
             "vercel-ai-gateway",
             "xai",
@@ -1608,37 +1905,45 @@ mod tests {
         .collect()
     }
 
-    /// DRIFT-009's shortfall, stated as an assertion instead of prose: pi ships 39 provider
-    /// modules at `v0.84.4`, cyrup embeds 34 of them, and the other five are named — one because
-    /// its rows live in Rust, four because their rows are in git at no revision.
+    /// PROV-071's shortfall, stated as an assertion instead of prose: pi ships 41 provider modules
+    /// at `v0.87.1`, and every one is accounted for by exactly one of the three tables.
+    ///
+    /// The shape of the accounting is what changed. DRIFT-009 made it 33 embedded + 5 live + 1
+    /// unported. It is now **0 embedded + 38 live + 3 unported**: every provider module is
+    /// live-fetched, because `git show` can recover none of them at any revision, and the three
+    /// left over are the ones cyrup does not embed a catalog for at all — `together` (rows are Rust
+    /// literals), `meta` (no cyrup provider) and `radius` (rows come from its gateway).
+    ///
+    /// `meta` and `radius` are the substance here, not bookkeeping: before this change
+    /// `gen-catalogs --roster v0.87.1` FAILED with "pi ships 2 provider module(s) this generator
+    /// has never heard of". That is the audit doing its job, and it had been failing unnoticed
+    /// because nobody had run it at a tag newer than the ones both providers post-date.
     #[test]
-    fn the_v0_84_4_provider_roster_is_fully_accounted_for() {
-        let stems = upstream_stems_at_v0_84_4();
-        assert_eq!(stems.len(), 39);
+    fn the_v0_87_1_provider_roster_is_fully_accounted_for() {
+        let stems = upstream_stems_at_v0_87_1();
+        assert_eq!(stems.len(), 41);
         let roster = account_for_roster(&stems).unwrap();
         assert_eq!(
             roster.embedded.len(),
-            33,
-            "xai moved to LIVE_CATALOGS (XAI_1)"
+            0,
+            "no provider module is on the pinned path any more (PROV-071)"
         );
-        assert_eq!(roster.live.len(), 1);
-        assert_eq!(roster.live[0].file, "xai");
+        assert_eq!(roster.live.len(), 38);
         assert!(roster.unported_absent.is_empty());
 
-        let mut blocked: Vec<&str> = roster
+        // Asserted as the whole unported set, in upstream stem order, with each one's owner: a
+        // provider quietly moving in or out of this list is the failure the audit exists for.
+        let unported: Vec<(&str, &str)> = roster
             .unported_present
             .iter()
-            .filter(|u| u.reason == UnportedReason::DataNotInGit)
-            .map(|u| u.stem)
+            .map(|u| (u.stem, u.item))
             .collect();
-        blocked.sort_unstable();
         assert_eq!(
-            blocked,
-            vec![
-                "baseten",
-                "qwen-token-plan",
-                "qwen-token-plan-cn",
-                "qwen-token-plan-individual"
+            unported,
+            [
+                ("meta", "PROV-080"),
+                ("radius", "PROV-014"),
+                ("together", "PROV-060"),
             ]
         );
         assert!(
@@ -1647,33 +1952,125 @@ mod tests {
                 .iter()
                 .all(|u| !u.why.is_empty() && !u.item.is_empty())
         );
+        // Each absence has its OWN reason; collapsing them onto one would hide that `meta` is a
+        // missing provider while `radius` is a present provider with another catalog source.
+        let reasons: Vec<&UnportedReason> =
+            roster.unported_present.iter().map(|u| &u.reason).collect();
+        assert_eq!(
+            reasons,
+            [
+                &UnportedReason::NoProvider,
+                &UnportedReason::CatalogElsewhere,
+                &UnportedReason::HandPorted,
+            ]
+        );
     }
 
-    /// The extraction floor predates all four blocked providers, which is *why* they are blocked —
-    /// so the floor must audit clean and say which entries it is too old to see.
+    /// DRIFT-009 — each of the four ex-`DataNotInGit` modules is a `LIVE_CATALOGS` entry pointing at
+    /// its OWN pi.dev endpoint, still citing the upstream module it originates from, and no longer
+    /// named anywhere in [`UNPORTED`].
+    ///
+    /// The url/provider/file agreement is the assertion that matters: `refresh` writes
+    /// `<file>.json` from whatever `<url>` answers, and `rows_from_body` validates the rows against
+    /// `provider` — so a copy-paste that left one spec pointing at a neighbour's endpoint would
+    /// write one provider's rows into another's catalog file, and the fetch-time provider check
+    /// would not notice because the tag it compares against came from the same wrong spec.
     #[test]
-    fn the_extraction_floor_is_accounted_for_and_predates_the_blocked_four() {
-        let stems: Vec<String> = upstream_stems_at_v0_84_4()
-            .into_iter()
-            .filter(|s| !s.starts_with("baseten") && !s.starts_with("qwen-token-plan"))
-            .collect();
-        assert_eq!(stems.len(), 35);
-        let roster = account_for_roster(&stems).unwrap();
+    fn drift_009s_four_modules_are_live_catalog_specs() {
+        for stem in [
+            "baseten",
+            "qwen-token-plan",
+            "qwen-token-plan-cn",
+            "qwen-token-plan-individual",
+        ] {
+            let spec = LIVE_CATALOGS
+                .iter()
+                .find(|l| l.file == stem)
+                .unwrap_or_else(|| panic!("{stem} must be a LIVE_CATALOGS entry (DRIFT-009)"));
+            assert_eq!(spec.provider(), stem, "{stem}: file and provider id agree");
+            assert_eq!(
+                spec.url(),
+                format!("https://pi.dev/api/models/providers/{stem}"),
+                "{stem} must fetch its OWN endpoint"
+            );
+            assert_eq!(
+                spec.module(),
+                format!("packages/ai/src/providers/{stem}.models.ts"),
+                "{stem} still originates from its upstream module, re-export or not"
+            );
+            assert_eq!(spec.item, "DRIFT-009");
+            assert!(
+                !UNPORTED.iter().any(|u| u.stem == stem),
+                "{stem} is live-fetched now and must not also be declared unported"
+            );
+        }
         assert_eq!(
-            roster.embedded.len(),
-            33,
-            "xai moved to LIVE_CATALOGS (XAI_1)"
+            LIVE_CATALOGS.len(),
+            38,
+            "the four, plus xai (XAI_1), plus the 33 PROV-071 moved across"
         );
-        assert_eq!(roster.live.len(), 1);
-        assert_eq!(roster.unported_present.len(), 1);
-        assert_eq!(roster.unported_absent.len(), 4);
+        assert_eq!(
+            LIVE_CATALOGS
+                .iter()
+                .filter(|l| l.item == "DRIFT-009")
+                .count(),
+            4,
+            "the four keep the ledger id that unblocked them, not PROV-071's"
+        );
+    }
+
+    /// `CYRUP_XTASK_SKIP_LIVE=1` must still degrade every live spec to `Skipped` — an offline
+    /// maintainer regenerating the 34 pinned catalogs is not blocked by the five live ones, and
+    /// DRIFT-009 multiplying those five by five did not change that.
+    ///
+    /// The `fetch` seam is passed a closure that PANICS, which is how "without invoking `fetch` at
+    /// all" is proven rather than asserted. The skip decision goes in through
+    /// [`live_catalog::refresh_with`] because the workspace lints deny `std::env::set_var`; the
+    /// variable's own name is pinned separately below, so the two halves together cover what
+    /// `refresh` does.
+    #[test]
+    fn skip_live_degrades_every_spec_without_fetching() {
+        let outcomes = live_catalog::refresh_with(
+            LIVE_CATALOGS,
+            &|url| {
+                panic!(
+                    "{} must short-circuit before any fetch, but {url} was hit",
+                    live_catalog::SKIP_LIVE_ENV
+                )
+            },
+            true,
+        )
+        .expect("skipping is never an error");
+        assert_eq!(outcomes.len(), LIVE_CATALOGS.len());
+        for (spec, outcome) in &outcomes {
+            match outcome {
+                live_catalog::LiveOutcome::Skipped { why } => {
+                    assert!(
+                        why.contains(live_catalog::SKIP_LIVE_ENV),
+                        "{}: the skip notice must name the variable that caused it, got {why}",
+                        spec.file
+                    );
+                }
+                live_catalog::LiveOutcome::Fetched { .. } => {
+                    panic!("{} was fetched despite skip_all", spec.file)
+                }
+            }
+        }
+
+        // The other half: `skip_all` really is what the environment decides, under the name the
+        // `gen-catalogs` usage block documents. Read-only, so no `set_var` is needed.
+        assert_eq!(live_catalog::SKIP_LIVE_ENV, "CYRUP_XTASK_SKIP_LIVE");
+        assert_eq!(
+            live_catalog::skip_live_requested(),
+            std::env::var_os("CYRUP_XTASK_SKIP_LIVE").is_some()
+        );
     }
 
     /// The failure this whole table exists to catch: pi adds a provider and nobody files a catalog
     /// for it. Silence here is how DRIFT-009 stayed four catalogs stale across nine sweeps.
     #[test]
     fn an_unaccounted_upstream_module_is_a_hard_error() {
-        let mut stems = upstream_stems_at_v0_84_4();
+        let mut stems = upstream_stems_at_v0_87_1();
         stems.push("brand-new-provider".to_string());
         let err = account_for_roster(&stems).unwrap_err();
         assert!(err.contains("brand-new-provider"), "{err}");
@@ -1683,7 +2080,7 @@ mod tests {
     /// The mirror failure: cyrup keeps embedding a catalog upstream has retired.
     #[test]
     fn an_embedded_catalog_pi_no_longer_ships_is_a_hard_error() {
-        let stems: Vec<String> = upstream_stems_at_v0_84_4()
+        let stems: Vec<String> = upstream_stems_at_v0_87_1()
             .into_iter()
             .filter(|s| s != "zai")
             .collect();
@@ -1694,6 +2091,28 @@ mod tests {
 
     /// A stem in more than one table would make the accounting ambiguous and hide whichever
     /// branch lost. Three tables now that `LIVE_CATALOGS` exists (XAI_1), so the check is pairwise.
+    ///
+    /// DRIFT-009 added the other half: EXACTLY ONE table, not at most one. A pairwise-disjointness
+    /// check passes for a stem that is in no table at all, which is precisely what a half-finished
+    /// move looks like — deleted from `UNPORTED`, not yet added to `LIVE_CATALOGS` — and
+    /// `account_for_roster` would then report it as a provider it has "never heard of" only when
+    /// somebody remembered to run `--roster`.
+    #[test]
+    fn every_upstream_stem_is_in_exactly_one_roster_table() {
+        for stem in upstream_stems_at_v0_87_1() {
+            let n = usize::from(
+                CATALOGS
+                    .iter()
+                    .any(|c| c.images_provider.is_none() && c.file == stem),
+            ) + usize::from(LIVE_CATALOGS.iter().any(|l| l.file == stem))
+                + usize::from(UNPORTED.iter().any(|u| u.stem == stem));
+            assert_eq!(
+                n, 1,
+                "{stem} is in {n} roster tables; every upstream module must be in exactly one"
+            );
+        }
+    }
+
     #[test]
     fn the_two_roster_tables_are_disjoint() {
         for u in UNPORTED {

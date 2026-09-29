@@ -76,6 +76,7 @@ fn request_body_matches_openai_shape() {
                 api: "openai-completions".into(),
                 response_model: None,
                 response_id: None,
+                provider_thinking_level: None,
                 diagnostics: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,
@@ -402,4 +403,158 @@ fn baseten_omits_reasoning_effort_for_a_nulled_rung_and_without_effort_support()
         body["chat_template_args"],
         json!({ "enable_thinking": true })
     );
+}
+
+// -------------------------------------------------------- DRIFT-009c: the qwen thinking format --
+
+/// `qwen-token-plan`'s `deepseek-v4-flash`, verbatim from
+/// `https://pi.dev/api/models/providers/qwen-token-plan` — the same live artifact
+/// `xtask gen-catalogs` now writes the embedded floor from (DRIFT-009) and the runtime overlay
+/// reads. All 49 rows across the three `qwen-token-plan*` providers carry
+/// `compat.thinkingFormat: "qwen"`; 28 of them pair it with `supportsReasoningEffort: true` and a
+/// `thinkingLevelMap`, and this is one of those 28.
+///
+/// Note the ladder: only `high` and `max` carry strings, every other rung is an explicit `null`.
+/// That is what makes this row able to tell qwen's `??` apart from zai's and Baseten's
+/// `=== undefined` ternary.
+fn qwen_token_plan_deepseek_v4_flash_row() -> &'static str {
+    r#"{
+        "id": "deepseek-v4-flash",
+        "name": "DeepSeek V4 Flash",
+        "api": "openai-completions",
+        "provider": "qwen-token-plan",
+        "baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+        "compat": {
+            "supportsStrictMode": true,
+            "thinkingFormat": "qwen",
+            "supportsDeveloperRole": false,
+            "supportsStore": false,
+            "supportsReasoningEffort": true
+        },
+        "thinkingLevelMap": {
+            "off": null, "minimal": null, "low": null, "medium": null,
+            "high": "high", "xhigh": null, "max": "max"
+        },
+        "reasoning": true,
+        "input": ["text"],
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 1000000,
+        "maxTokens": 384000
+    }"#
+}
+
+/// DRIFT-009c — `api/openai-completions.ts:886-893` @v0.87.1. The qwen arm has TWO halves and cyrup
+/// only ever emitted the first: `enable_thinking` went out, `reasoning_effort` did not.
+///
+/// This was a PORT OMISSION, not upstream drift — the arm reads identically at the ported baseline
+/// `v0.83.0`, at `v0.84.4` and at `v0.87.1`. Both halves are asserted together because a passing
+/// `enable_thinking` assertion is precisely what made the missing half invisible.
+#[test]
+fn qwen_sends_enable_thinking_and_a_mapped_reasoning_effort() {
+    let model: Model =
+        serde_json::from_str(qwen_token_plan_deepseek_v4_flash_row()).expect("catalog row parses");
+    let ctx = Context {
+        system_prompt: None,
+        messages: vec![],
+        tools: vec![],
+    };
+
+    let high = build_body(
+        &model,
+        &ctx,
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        },
+    );
+    assert_eq!(high["enable_thinking"], json!(true), "{high}");
+    assert_eq!(
+        high["reasoning_effort"], "high",
+        "map[high] = \"high\" (`:889`): {high}"
+    );
+
+    let maxed = build_body(
+        &model,
+        &ctx,
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::Max,
+            ..Default::default()
+        },
+    );
+    assert_eq!(maxed["reasoning_effort"], "max", "{maxed}");
+
+    // The `??` distinction. `map[low]` is an explicit `null`, so upstream's
+    // `map?.[effort] ?? options.reasoningEffort` (`:889`) falls back to the REQUESTED level — where
+    // zai's and Baseten's `mappedEffort === undefined ? … : mappedEffort` would keep the `null` and
+    // let the `typeof effort === "string"` guard drop the key entirely.
+    let low = build_body(
+        &model,
+        &ctx,
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::Low,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        low["reasoning_effort"], "low",
+        "a nulled rung falls back to the requested level under `??`, it does not suppress the key: \
+         {low}"
+    );
+    assert_eq!(low["enable_thinking"], json!(true), "{low}");
+}
+
+/// DRIFT-009c — the two guards the qwen arm does have, and the one it does not.
+///
+/// `reasoning_effort` is gated on BOTH `options.reasoningEffort` and `compat.supportsReasoningEffort`
+/// (`:888`). The first gate is the difference from the Baseten arm at `:897`, whose effort half is
+/// ungated and therefore sends `thinkingLevelMap.off` with thinking off — copying Baseten's shape
+/// here would send an effort qwen never asked for. `enable_thinking` itself is unconditional.
+///
+/// 21 of the 49 live `qwen-token-plan*` rows declare `supportsReasoningEffort: false` — including
+/// `qwen3.7-max`, which `cyrup-config`'s `default_model_per_provider` names as the default for two of
+/// the three providers — so the second case is the common one, not an edge.
+#[test]
+fn qwen_omits_reasoning_effort_with_thinking_off_and_without_effort_support() {
+    let model: Model =
+        serde_json::from_str(qwen_token_plan_deepseek_v4_flash_row()).expect("catalog row parses");
+    let ctx = Context {
+        system_prompt: None,
+        messages: vec![],
+        tools: vec![],
+    };
+
+    // Thinking OFF: `!!options?.reasoningEffort` is false and the effort half is skipped.
+    let off = build_body(&model, &ctx, &StreamOptions::default());
+    assert_eq!(
+        off["enable_thinking"],
+        json!(false),
+        "`enable_thinking` is unconditional (`:887`): {off}"
+    );
+    assert!(
+        off.get("reasoning_effort").is_none(),
+        "unlike Baseten (`:897`), the qwen effort half IS gated on `options.reasoningEffort` \
+         (`:888`) — nothing may be sent, least of all `thinkingLevelMap.off`: {off}"
+    );
+
+    // `supportsReasoningEffort: false` — the shape 21 of the 49 live rows ship.
+    let mut toggle_only = model.clone();
+    toggle_only
+        .compat
+        .as_mut()
+        .expect("compat")
+        .supports_reasoning_effort = Some(false);
+    let body = build_body(
+        &toggle_only,
+        &ctx,
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        body["enable_thinking"],
+        json!(true),
+        "the toggle survives without effort support: {body}"
+    );
+    assert!(body.get("reasoning_effort").is_none(), "{body}");
 }

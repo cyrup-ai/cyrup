@@ -163,6 +163,37 @@ where
     })
 }
 
+/// Deserialize `SystemMessage.content` accepting Pi's bare-string form OR a content array
+/// (Pi `content: string | TextContent[]`, `packages/ai/src/types.ts:493` @v0.87.1). A bare string
+/// becomes a single [`Content::Text`]; a JSON `null` or an absent key becomes `[]`, which is
+/// exactly pi's own normalization on load — `if (message.role === "system" && message.content ==
+/// null) return [{ ...message, content: "" }]`
+/// (`packages/coding-agent/src/core/session-manager.ts:444` @v0.87.1).
+///
+/// READ-TOLERANT like every sibling here (SESS-027): pi's per-role content unions are compile-time
+/// TypeScript and its session read path is a bare `JSON.parse`, so no block type is rejected.
+pub(super) fn de_system_content<'de, D>(deserializer: D) -> Result<Vec<Content>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StringOrArray {
+        Str(String),
+        Arr(Vec<Content>),
+    }
+    Ok(match Option::<StringOrArray>::deserialize(deserializer)? {
+        // `""` is pi's "no prompt text" (`createInitialSystemMessage` writes `systemPrompt ?? ""`,
+        // `utils/transcript.ts:19`) and normalizes to the empty block list, which the `System`
+        // serializer writes back out as `""` — a byte-exact round trip for pi's own bytes.
+        Some(StringOrArray::Str(s)) if s.is_empty() => Vec::new(),
+        Some(StringOrArray::Str(s)) => vec![Content::text(s)],
+        Some(StringOrArray::Arr(v)) => v,
+        None => Vec::new(),
+    })
+}
+
 /// Deserialize `ToolResultMessage.content` (Pi `content: (TextContent | ImageContent)[]`,
 /// `ai/src/types.ts:402`).
 ///

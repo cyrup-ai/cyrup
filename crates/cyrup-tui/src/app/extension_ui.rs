@@ -199,6 +199,13 @@ impl<B: Backend> App<B> {
         // every mode, including this one, and an extension that gates on editor focus would be
         // permanently inert.
         services.attach_editor_focus_mirror(self.state.editor_focus_mirror.clone());
+        // EXT-064 — the footer's data seam (SEAM-T03), attached here for the same reason the two
+        // editor mirrors are: `LiveHostServices::footer_data` otherwise keeps its trait default
+        // `None` in every mode, including this one, so an extension's custom footer would have
+        // nothing to render from. Attached ONLY here, and that is upstream's policy rather than an
+        // omission — pi constructs its one `FooterDataProvider` in `interactive-mode.ts:611`
+        // @v0.87.1 and in no other mode.
+        services.attach_footer_data_mirror(self.state.footer_data_mirror.clone());
         let access = Arc::new(crate::theme_access::TuiThemeAccess::new(
             resources,
             &self.state.theme.name,
@@ -236,6 +243,23 @@ impl<B: Backend> App<B> {
         if let Some(access) = self.state.theme_access.as_ref() {
             access.publish_active(&self.state.theme.name);
         }
+        // EXT-064 — the two frame-driven members of pi's `FooterDataProvider`. The third,
+        // `extensionStatuses`, is NOT published here: `LiveHostServices::set_status` writes it
+        // synchronously, as upstream's `setStatus` binding does (`interactive-mode.ts:2204`
+        // @v0.87.1), so a guest sees its own `set-status` without waiting for a frame.
+        //
+        // `git_branch` is whatever `App::poll_footer_git_branch` last resolved, carrying pi's
+        // tri-state unchanged — a branch name, `"detached"`, or `None` outside a repo
+        // (`core/footer-data-provider.ts:126-132`). `provider_count` is the unique-provider set
+        // `App::refresh_provider_count` computes, which is the same quantity pi feeds
+        // `setAvailableProviderCount` (`interactive-mode.ts:5098`).
+        self.state
+            .footer_data_mirror
+            .publish_git_branch(self.state.git_branch.branch());
+        let provider_count = u32::try_from(self.state.status.provider_count).unwrap_or(u32::MAX);
+        self.state
+            .footer_data_mirror
+            .publish_provider_count(provider_count);
     }
 
     /// Bind the INTERACTIVE-OVERLAY seam — Pi's `ctx.ui.custom(factory, { overlay: true, … })`
@@ -386,17 +410,19 @@ impl<B: Backend> App<B> {
             }
             UiEffect::SetToolsExpanded { expanded } => self.set_tools_expanded(expanded),
             UiEffect::SetTitle { title } => self.state.terminal_title = Some(title),
-            // TUI-033 — an EMPTY string is the clear. Pi's `setHeader(factory)` /
-            // `setFooter(factory)` restore the built-in when the factory is `undefined`
-            // (`interactive-mode.ts:2245-2254`, `:2273-2290`); cyrup's WIT signature is
-            // `set-header(content: string)` (`world.wit:272`), which has no `undefined`, so the
-            // empty string is the only value that can carry "restore the built-in".
-            UiEffect::SetHeader { content } => {
-                self.state.extension_header = (!content.is_empty()).then_some(content)
-            }
-            UiEffect::SetFooter { content } => {
-                self.state.extension_footer = (!content.is_empty()).then_some(content)
-            }
+            // EXT-064 (superseding TUI-033) — `None` is the clear, and it is upstream's own
+            // `undefined`: `setHeader`/`setFooter` restore the built-in chrome when the factory is
+            // `undefined` (`modes/interactive/interactive-mode.ts:2442-2446` and `:2481-2490`
+            // @v0.87.1). The WIT signature is now `set-header(content: option<string>)`, so the
+            // effect carries that distinction instead of overloading the empty string with it.
+            //
+            // The line these two replace was `(!content.is_empty()).then_some(content)`, which
+            // made `set-footer("")` a RESTORE — so a guest that wanted a blank custom footer got
+            // the built-in one back and had no other way to ask. `Some(String::new())` is now an
+            // empty custom footer, which is what a factory returning a component that renders
+            // nothing is upstream.
+            UiEffect::SetHeader { content } => self.state.extension_header = content,
+            UiEffect::SetFooter { content } => self.state.extension_footer = content,
             UiEffect::SetWidget { widget } => {
                 // Pi keys widgets and UPDATES IN PLACE: `removeExisting(this.extensionWidgetsAbove);
                 // removeExisting(this.extensionWidgetsBelow);` then `targetMap.set(key, component)`
@@ -507,6 +533,11 @@ impl<B: Backend> App<B> {
         self.state.extension_widgets.clear();
         self.state.extension_shortcuts.clear();
         self.state.status.extension_statuses.clear();
+        // EXT-064 — pi's `clearExtensionStatuses()`, which upstream calls from THIS same teardown
+        // (`interactive-mode.ts:2370` @v0.87.1). Cleared beside `StatusLine`'s copy so a dead
+        // extension's segment cannot survive in the provider a new session's extensions read from
+        // while being gone from the footer the user sees.
+        self.state.footer_data_mirror.clear_extension_statuses();
         // An extension dialog/editor overlay belongs to the outgoing host; leaving it up would
         // present a prompt whose reply channel is about to be dropped.
         self.state.overlays.clear();

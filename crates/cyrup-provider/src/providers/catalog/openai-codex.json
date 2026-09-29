@@ -6,10 +6,6 @@
 		"provider": "openai-codex",
 		"baseUrl": "https://chatgpt.com/backend-api",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"xhigh": "xhigh",
-			"minimal": "low"
-		},
 		"input": [
 			"text"
 		],
@@ -20,70 +16,15 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 128000
-	},
-	{
-		"id": "gpt-5.4",
-		"name": "GPT-5.4",
-		"api": "openai-codex-responses",
-		"provider": "openai-codex",
-		"baseUrl": "https://chatgpt.com/backend-api",
-		"compat": {
-			"supportsToolSearch": true
-		},
-		"reasoning": true,
+		"maxTokens": 128000,
 		"thinkingLevelMap": {
 			"xhigh": "xhigh",
 			"minimal": "low"
 		},
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 2.5,
-			"output": 15,
-			"cacheRead": 0.25,
-			"cacheWrite": 0,
-			"tiers": [
-				{
-					"inputTokensAbove": 272000,
-					"input": 5,
-					"output": 22.5,
-					"cacheRead": 0.5,
-					"cacheWrite": 0
-				}
-			]
-		},
-		"contextWindow": 272000,
-		"maxTokens": 128000
-	},
-	{
-		"id": "gpt-5.4-mini",
-		"name": "GPT-5.4 mini",
-		"api": "openai-codex-responses",
-		"provider": "openai-codex",
-		"baseUrl": "https://chatgpt.com/backend-api",
 		"compat": {
-			"supportsToolSearch": true
+			"supportsOpenAIGrammarTools": true
 		},
-		"reasoning": true,
-		"thinkingLevelMap": {
-			"xhigh": "xhigh",
-			"minimal": "low"
-		},
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 0.75,
-			"output": 4.5,
-			"cacheRead": 0.075,
-			"cacheWrite": 0
-		},
-		"contextWindow": 272000,
-		"maxTokens": 128000
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.5",
@@ -91,14 +32,7 @@
 		"api": "openai-codex-responses",
 		"provider": "openai-codex",
 		"baseUrl": "https://chatgpt.com/backend-api",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"xhigh": "xhigh",
-			"minimal": "low"
-		},
 		"input": [
 			"text",
 			"image"
@@ -119,7 +53,27 @@
 			]
 		},
 		"contextWindow": 272000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"minimal": "low"
+		},
+		"compat": {
+			"supportsOpenAIGrammarTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.6-luna",
@@ -127,15 +81,7 @@
 		"api": "openai-codex-responses",
 		"provider": "openai-codex",
 		"baseUrl": "https://chatgpt.com/backend-api",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"xhigh": "xhigh",
-			"max": "max",
-			"minimal": "low"
-		},
 		"input": [
 			"text",
 			"image"
@@ -156,7 +102,29 @@
 			]
 		},
 		"contextWindow": 272000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"max": "max",
+			"minimal": "low"
+		},
+		"compat": {
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.6-sol",
@@ -164,36 +132,50 @@
 		"api": "openai-codex-responses",
 		"provider": "openai-codex",
 		"baseUrl": "https://chatgpt.com/backend-api",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"xhigh": "xhigh",
-			"max": "max",
-			"minimal": "low"
-		},
 		"input": [
 			"text",
 			"image"
 		],
 		"cost": {
-			"input": 5,
-			"output": 30,
-			"cacheRead": 0.5,
-			"cacheWrite": 6.25,
+			"input": 4,
+			"output": 20,
+			"cacheRead": 0.4,
+			"cacheWrite": 5,
 			"tiers": [
 				{
 					"inputTokensAbove": 272000,
-					"input": 10,
-					"output": 45,
-					"cacheRead": 1,
-					"cacheWrite": 12.5
+					"input": 8,
+					"output": 30,
+					"cacheRead": 0.8,
+					"cacheWrite": 10
 				}
 			]
 		},
 		"contextWindow": 272000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"max": "max",
+			"minimal": "low"
+		},
+		"compat": {
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.6-terra",
@@ -201,15 +183,7 @@
 		"api": "openai-codex-responses",
 		"provider": "openai-codex",
 		"baseUrl": "https://chatgpt.com/backend-api",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"xhigh": "xhigh",
-			"max": "max",
-			"minimal": "low"
-		},
 		"input": [
 			"text",
 			"image"
@@ -230,6 +204,193 @@
 			]
 		},
 		"contextWindow": 272000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"max": "max",
+			"minimal": "low"
+		},
+		"compat": {
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gpt-6-astra",
+		"name": "GPT-6 Astra",
+		"api": "openai-codex-responses",
+		"provider": "openai-codex",
+		"baseUrl": "https://chatgpt.com/backend-api",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 10,
+			"output": 50,
+			"cacheRead": 1,
+			"cacheWrite": 12.5,
+			"tiers": [
+				{
+					"inputTokensAbove": 272000,
+					"input": 20,
+					"output": 75,
+					"cacheRead": 2,
+					"cacheWrite": 25
+				}
+			]
+		},
+		"contextWindow": 272000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": "low",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gpt-6-luna",
+		"name": "GPT-6 Luna",
+		"api": "openai-codex-responses",
+		"provider": "openai-codex",
+		"baseUrl": "https://chatgpt.com/backend-api",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 0.1,
+			"output": 0.5,
+			"cacheRead": 0.01,
+			"cacheWrite": 0.125,
+			"tiers": [
+				{
+					"inputTokensAbove": 272000,
+					"input": 0.2,
+					"output": 0.75,
+					"cacheRead": 0.02,
+					"cacheWrite": 0.25
+				}
+			]
+		},
+		"contextWindow": 272000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": "low",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gpt-6-sol",
+		"name": "GPT-6 Sol",
+		"api": "openai-codex-responses",
+		"provider": "openai-codex",
+		"baseUrl": "https://chatgpt.com/backend-api",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 2,
+			"output": 10,
+			"cacheRead": 0.2,
+			"cacheWrite": 2.5,
+			"tiers": [
+				{
+					"inputTokensAbove": 272000,
+					"input": 4,
+					"output": 15,
+					"cacheRead": 0.4,
+					"cacheWrite": 5
+				}
+			]
+		},
+		"contextWindow": 272000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": "low",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	}
 ]

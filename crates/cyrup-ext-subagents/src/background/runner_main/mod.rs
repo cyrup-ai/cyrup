@@ -115,6 +115,7 @@ mod tests {
     /// persona-map lookup and reach the spawn.
     pub(super) fn resolved_persona(name: &str) -> crate::exec::ResolvedAgentPersona {
         crate::exec::ResolvedAgentPersona {
+            default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,
             mutation_tools: None,
@@ -132,12 +133,12 @@ mod tests {
             extensions: None,
             subagent_only_extensions: Vec::new(),
             exclude_tools: Vec::new(),
+            allowed_agents: None,
             allow_nested_subagents: None,
             output: None,
             inherit_project_context: false,
             inherit_skills: true,
             skills: Vec::new(),
-            completion_guard: Some(false),
             max_subagent_depth: None,
             default_context: None,
             memory: None,
@@ -315,6 +316,7 @@ mod tests {
             .expect("mkdir results_dir");
 
         let config = RunnerConfig {
+            tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,

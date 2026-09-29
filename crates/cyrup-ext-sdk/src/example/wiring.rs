@@ -47,6 +47,19 @@ pub(super) fn install(api: &mut ExtensionApi) {
             ctx.notify(&format!("bus recv {topic}: {msg}"));
         },
     );
+    // EXT-087 — arm the `agent_settled` handler's one-shot `send_user_message`. See that handler
+    // in [`super::hooks`] for why it is armed rather than unconditional: this component is the
+    // shared fixture behind the whole `cyrup-it` suite.
+    api.register_command(
+        "armsend",
+        CommandDescriptor::new(
+            "Arm a one-shot `send_user_message` from the next `agent_settled` handler (demo).",
+        ),
+        |_args: &str, _ctx: &crate::CommandCtx| {
+            ARMED_SETTLE_SEND.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some("armed".to_string()))
+        },
+    );
     api.register_command(
         "buspub",
         CommandDescriptor::new(
@@ -58,4 +71,18 @@ pub(super) fn install(api: &mut ExtensionApi) {
             Ok(Some(format!("emitted demo:bus: {msg}")))
         },
     );
+}
+
+/// EXT-087 — the one-shot latch behind `/armsend`, read and cleared by the `agent_settled` handler
+/// in [`super::hooks`].
+///
+/// A plain static because the guest is single-threaded inside its component instance and the
+/// handler closures are `fn` pointers with no place to hang state; the surrounding SDK keeps its
+/// other guest-side registries (`LATE_TOOLS`) the same way.
+static ARMED_SETTLE_SEND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Take the `/armsend` latch, clearing it — so an armed send fires on the NEXT settle and only
+/// that one.
+pub(super) fn take_armed_settle_send() -> bool {
+    ARMED_SETTLE_SEND.swap(false, std::sync::atomic::Ordering::SeqCst)
 }

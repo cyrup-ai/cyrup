@@ -12,7 +12,9 @@ use crate::discovery::types::AgentReadScope;
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
 use crate::extension::executor::SubagentExecutor;
-use crate::extension::executor::requests::{BackgroundStepsSpec, GraphRunOutcome};
+use crate::extension::executor::requests::{
+    BackgroundStepsSpec, GraphRunOutcome, RetainedModelResponseAliases,
+};
 use crate::extension::host::slash_render::{
     apply_fork_contexts, first_step_task, plan_step_agent_names,
 };
@@ -31,6 +33,91 @@ impl SubagentExecutor {
     // synchronous shape — the SAME `walk_chain`/`ExecSingleStepExecutor` machinery
     // `background::runner_main`'s hop-2 detached runner drives, reused rather than reimplemented)
     // ---------------------------------------------------------------------------------------
+
+    /// SUBA-119 item 1(c) — the foreground `/chain`//`/parallel` walk's step executor,
+    /// extracted from [`Self::run_chain_foreground_with_control`] so the CONFIG-derived
+    /// fields it fills can be read by a test.
+    ///
+    /// It returns the CONCRETE `ExecSingleStepExecutor`, not `Arc<dyn SingleStepExecutor>`:
+    /// the caller widens it in one line. The extraction exists because this seam had no test
+    /// at all — `.with_model_response_aliases(cfg.model_response_aliases.clone())` could be
+    /// dropped outright and the whole suite stayed green, since the only test over that
+    /// concern (`background/runner_main/executor.rs`'s) hands the builder its own input by
+    /// hand and so cannot notice that nothing in production supplies it.
+    #[allow(clippy::too_many_arguments)]
+    fn build_foreground_step_executor(
+        &self,
+        cfg: &crate::registration::SubagentExtensionConfig,
+        depth: crate::spawn::depth::DepthEnvelope,
+        resolved_agents: BTreeMap<String, ResolvedAgentPersona>,
+        run_id: &RunId,
+        cwd: &Path,
+        control_override: Option<&crate::registration::ControlConfig>,
+        include_progress: Option<bool>,
+    ) -> Result<ExecSingleStepExecutor, SubagentError> {
+        // CFG-067 — pi's foreground chain/parallel steps take `configToolTimeoutMs` from the
+        // extension config (`subagent-executor.ts:7323`) and no call rung: `chain-execution.ts`
+        // threads no `toolTimeoutMs` of its own, so the ladder here is
+        // `this step's persona > config.toolTimeoutMs > CYRUP_SUBAGENT_TOOL_TIMEOUT_MS`. Resolved
+        // once, before any step runs, so a malformed rung refuses the walk.
+        let tool_timeouts = Arc::new(
+            crate::exec::tool_timeout::resolve_tool_timeouts_by_agent(
+                &crate::exec::tool_timeout::ToolTimeoutRungs {
+                    tool_timeout_ms: None,
+                    config_tool_timeout_ms: cfg.tool_timeout_ms.clone(),
+                },
+                resolved_agents
+                    .iter()
+                    .map(|(name, persona)| (name.as_str(), persona.default_tool_timeout_ms)),
+            )
+            .map_err(SubagentError::Management)?,
+        );
+        Ok(ExecSingleStepExecutor::foreground(
+            depth,
+            Arc::new(resolved_agents),
+            tool_timeouts,
+            self.orchestrator_intercom_target(),
+            Some(run_id.clone()),
+            // Session-model inheritance for foreground `/chain`//`/parallel` steps (pi's
+            // `data.parentModel`, read at `subagent-executor.ts:3165,3549` @v0.43.0 and fed by the
+            // same `requestParentModel`): an inheriting step (no persona `model:`, no per-step
+            // override) runs the parent's model, the SAME inheritance — through the SAME
+            // [`SubagentExecutor::remembered_parent_model`] memory — the foreground single-run path
+            // applies.
+            self.remembered_parent_model(),
+            // SUBA-003: the cwd's `subagents.modelScope` policy, so a foreground chain/parallel
+            // step's own `model:` is policed exactly as a single run's `model` is.
+            Self::resolve_model_scope(cwd, &cfg.roots)?,
+            // The extension config's in-process binary override, from the same snapshot this
+            // function already took. `None` for every ordinary configuration, which leaves each
+            // step resolving its command from the environment as before.
+            cfg.spawn_command.clone(),
+        )
+        // SUBA-N05 (pi `controlConfig: input.controlConfig` on every per-step `runSync`,
+        // `chain-execution.ts:322,491,733` @v0.34.0): the extension-level `subagents.control`
+        // block folded with this call's own override, so a foreground chain/parallel step's child
+        // stream is judged against the CONFIGURED attention thresholds instead of the hardcoded
+        // defaults this path used to fall back to.
+        // SCOPE_19/A1: session-thinking inheritance for foreground `/chain`//`/parallel`
+        // steps — the effort half of the `remembered_parent_model` argument above, through the
+        // SAME remembered-value seam, so an inheriting step (no persona `thinking:`) reasons
+        // at the parent session's level exactly as the foreground single-run path does.
+        .with_inherited_session_thinking(self.remembered_parent_thinking())
+        // SUBA-119 (pi `modelResponseAliases: deps.config.modelResponseAliases` on the
+        // chain/parallel run options, `subagent-executor.ts:1367`/`:1749`): a foreground
+        // chain/parallel step's native child gets the same declared-alias escape from
+        // `model_verification_failed` the single path gets, out of the same config snapshot.
+        .with_model_response_aliases(cfg.model_response_aliases.clone())
+        .with_control(Some(crate::exec::control::resolve_control_config(
+            cfg.control.as_ref(),
+            control_override,
+        )))
+        // SUBA-N06 (pi `chain-execution.ts:167`, gated on the same `includeProgress` the SINGLE
+        // path uses): each foreground chain/parallel step's own `SingleResult` carries its
+        // progress snapshot, which is where cyrup's [CYRUP-DELTA] on placement puts pi's
+        // `details.progress` array.
+        .with_include_progress(include_progress))
+    }
 
     /// Run an already-resolved [`RunnerStep`] list to completion in the foreground, synchronously
     /// (func-SA §5.1/§5.3; `/chain` and `/parallel`'s non-`--bg` shape). A bare `/parallel` call
@@ -133,52 +220,15 @@ impl SubagentExecutor {
         // `parallelHandoffPath(input.artifactsDir, input.runId)`), and two independently minted
         // ids would file a run's worktrees under a name nothing else in the run knows.
         let run_id = RunId::new();
-        let executor: Arc<dyn SingleStepExecutor> = Arc::new(
-            ExecSingleStepExecutor::foreground(
-                depth,
-                Arc::new(resolved_agents),
-                self.orchestrator_intercom_target(),
-                Some(run_id.clone()),
-                // Session-model inheritance for foreground `/chain`//`/parallel` steps (pi's
-                // `data.parentModel`, read at `subagent-executor.ts:3165,3549` @v0.43.0 and fed by the
-                // same `requestParentModel`): an inheriting step (no persona `model:`, no per-step
-                // override) runs the parent's model, the SAME inheritance — through the SAME
-                // [`SubagentExecutor::remembered_parent_model`] memory — the foreground single-run path
-                // applies.
-                self.remembered_parent_model(),
-                // SUBA-003: the cwd's `subagents.modelScope` policy, so a foreground chain/parallel
-                // step's own `model:` is policed exactly as a single run's `model` is.
-                Self::resolve_model_scope(cwd, &cfg.roots)?,
-                // The extension config's in-process binary override, from the same snapshot this
-                // function already took. `None` for every ordinary configuration, which leaves each
-                // step resolving its command from the environment as before.
-                cfg.spawn_command.clone(),
-            )
-            // SUBA-N05 (pi `controlConfig: input.controlConfig` on every per-step `runSync`,
-            // `chain-execution.ts:322,491,733` @v0.34.0): the extension-level `subagents.control`
-            // block folded with this call's own override, so a foreground chain/parallel step's child
-            // stream is judged against the CONFIGURED attention thresholds instead of the hardcoded
-            // defaults this path used to fall back to.
-            // SCOPE_19/A1: session-thinking inheritance for foreground `/chain`//`/parallel`
-            // steps — the effort half of the `remembered_parent_model` argument above, through the
-            // SAME remembered-value seam, so an inheriting step (no persona `thinking:`) reasons
-            // at the parent session's level exactly as the foreground single-run path does.
-            .with_inherited_session_thinking(self.remembered_parent_thinking())
-            // SUBA-119 (pi `modelResponseAliases: deps.config.modelResponseAliases` on the
-            // chain/parallel run options, `subagent-executor.ts:1367`/`:1749`): a foreground
-            // chain/parallel step's native child gets the same declared-alias escape from
-            // `model_verification_failed` the single path gets, out of the same config snapshot.
-            .with_model_response_aliases(cfg.model_response_aliases.clone())
-            .with_control(Some(crate::exec::control::resolve_control_config(
-                cfg.control.as_ref(),
-                control_override.as_ref(),
-            )))
-            // SUBA-N06 (pi `chain-execution.ts:167`, gated on the same `includeProgress` the SINGLE
-            // path uses): each foreground chain/parallel step's own `SingleResult` carries its
-            // progress snapshot, which is where cyrup's [CYRUP-DELTA] on placement puts pi's
-            // `details.progress` array.
-            .with_include_progress(include_progress),
-        );
+        let executor: Arc<dyn SingleStepExecutor> = Arc::new(self.build_foreground_step_executor(
+            &cfg,
+            depth,
+            resolved_agents,
+            &run_id,
+            cwd,
+            control_override.as_ref(),
+            include_progress,
+        )?);
         let global_limit =
             GlobalConcurrencyLimit::new(cfg.global_concurrency_limit.max(1) as usize);
         // R-SA-035/036 (pi `chain-execution.ts:606`): the chain-wide deadline is computed ONCE here,
@@ -451,6 +501,7 @@ impl SubagentExecutor {
                 .spawn_background_steps(
                     cwd,
                     BackgroundStepsSpec {
+                        tool_timeout_ms: None,
                         // SUBA-021: unbudgeted on this path (see the field doc).
                         usage_budget: None,
                         turn_budget: None,
@@ -468,7 +519,7 @@ impl SubagentExecutor {
                         model_origin: None,
                         // SUBA-119: only a single-run revive carries a launch-time alias map; this
                         // fresh launch takes the live `config.json` value.
-                        model_response_aliases: None,
+                        model_response_aliases: RetainedModelResponseAliases::Live,
                         steps: graph,
                         mode,
                         session_file: first_session_file,
@@ -663,6 +714,57 @@ mod tests {
         assert!(
             matches!(err, SubagentError::DepthExceeded { current: 0, max: 0 }),
             "got: {err:?}"
+        );
+    }
+
+    /// SUBA-119 item 1(c) — the foreground `/chain`//`/parallel` wiring seam.
+    ///
+    /// pi `subagent-executor.ts:1367`/`:1749` @v0.71.0 put `deps.config.modelResponseAliases` on
+    /// the chain and parallel run options, so a foreground chain step's native child gets the same
+    /// declared-alias escape from `model_verification_failed` the single path gets.
+    ///
+    /// This test sits AT the seam. The one test that previously covered the concern
+    /// (`background/runner_main/executor.rs::the_declared_response_alias_map_reaches_every_dispatched_step`)
+    /// calls `.with_model_response_aliases(aliases)` itself and then asserts the builder stored
+    /// what it was handed — true whether or not anything in production ever calls it. Dropping the
+    /// `.with_model_response_aliases(cfg.model_response_aliases.clone())` line from
+    /// `build_foreground_step_executor` left the whole suite green before this test existed.
+    #[tokio::test]
+    async fn a_foreground_chain_walk_carries_the_config_alias_map() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let aliases: crate::exec::model_verification::ModelResponseAliases =
+            std::collections::BTreeMap::from([(
+                "prov/model".to_string(),
+                vec!["router/substitute".to_string()],
+            )]);
+        let executor = SubagentExecutor::new();
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = crate::paths::Roots::sandboxed(dir.path());
+            cfg.model_response_aliases = Some(aliases.clone());
+        }
+        let cfg = executor.config_snapshot().await;
+
+        let built = executor
+            .build_foreground_step_executor(
+                &cfg,
+                crate::spawn::depth::DepthEnvelope {
+                    current_depth: 0,
+                    max_depth: 5,
+                },
+                std::collections::BTreeMap::new(),
+                &RunId::new(),
+                dir.path(),
+                None,
+                None,
+            )
+            .expect("the foreground executor builds");
+
+        assert_eq!(
+            built.model_response_aliases.as_ref(),
+            Some(&aliases),
+            "the foreground chain/parallel walk must carry `cfg.model_response_aliases` \
+             (`subagent-executor.ts:1367`/`:1749`)"
         );
     }
 }

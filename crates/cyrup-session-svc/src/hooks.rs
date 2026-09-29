@@ -39,6 +39,9 @@ pub(crate) fn coding_agent_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Mes
     let mut out = Vec::with_capacity(msgs.len());
     for m in msgs {
         match m.as_ref() {
+            // pi's `case "system"` — kept verbatim, first in the switch
+            // (`coding-agent/src/core/messages.ts:184-188` @v0.87.1), PROV-083a.
+            AgentMessage::System(s) => out.push(Message::System(s.clone())),
             AgentMessage::User { content, timestamp } => {
                 out.push(Message::User {
                     content: content.clone(),

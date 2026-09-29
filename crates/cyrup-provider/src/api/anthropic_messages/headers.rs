@@ -1,7 +1,7 @@
 //! Request encoding — endpoint resolution and request headers.
 
 use super::claude_code::is_github_copilot;
-use super::compat::{force_adaptive_thinking, get_anthropic_compat};
+use super::compat::{force_adaptive_thinking, get_anthropic_compat, supports_mid_convo_effort};
 use crate::HeaderMap;
 use crate::auth::AuthResult;
 use crate::context::Context;
@@ -18,6 +18,14 @@ pub(super) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05
 /// Pi `SERVER_SIDE_FALLBACK_BETA` (`anthropic-messages.ts:183` @v0.87.1) — sent whenever the model
 /// declares at least one `allowedFallbackModels` entry (PROV-090).
 pub(super) const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// Pi `MID_CONVERSATION_OUTPUT_CONFIG_BETA` (`anthropic-messages.ts:184` @v0.87.1) — the per-turn
+/// `{role:"system",content:[],output_config:{effort}}` markers (PROV-091).
+pub(super) const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str =
+    "mid-conversation-output-config-2026-07-01";
+/// Pi `THINKING_BINDING_CONTROLS_BETA` (`anthropic-messages.ts:185` @v0.87.1) — the
+/// `thinking.block_binding.prefix_mismatch_behavior` control the managed branch always sets
+/// (PROV-091). Pushed TOGETHER with [`MID_CONVERSATION_OUTPUT_CONFIG_BETA`], never alone.
+pub(super) const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 /// Stealth-mode Claude Code identity (Pi anthropic-messages.ts:73).
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
@@ -80,7 +88,15 @@ pub(crate) fn build_headers(
         .anthropic_options()
         .and_then(|o| o.interleaved_thinking)
         .unwrap_or(true);
-    let needs_interleaved = interleaved && !force_adaptive_thinking(model);
+    // Pi `:1019-1025` @v0.87.1, all four terms:
+    //   model.reasoning && options?.thinkingEnabled === true &&
+    //   (options.interleavedThinking ?? true) && model.compat?.forceAdaptiveThinking !== true
+    // cyrup's `ModelThinkingLevel::Off` IS pi's `thinkingEnabled: false` — there is no third state,
+    // so `opts.reasoning.is_on()` is an exact port of the second term. Before PROV-091 both the
+    // `model.reasoning` and the thinking-enabled terms were missing, so the beta shipped on every
+    // non-adaptive request, including reasoning-off ones that never used it.
+    let needs_interleaved =
+        model.reasoning && opts.reasoning.is_on() && interleaved && !force_adaptive_thinking(model);
     let mut betas: Vec<&str> = Vec::new();
     if should_use_fine_grained_beta(model, ctx) {
         betas.push(FINE_GRAINED_TOOL_STREAMING_BETA);
@@ -91,6 +107,11 @@ pub(crate) fn build_headers(
     // Pi `:1027` — pushed after the interleaved-thinking beta, in pi's order (PROV-090).
     if should_use_server_side_fallback_beta(model) {
         betas.push(SERVER_SIDE_FALLBACK_BETA);
+    }
+    // Pi `:1028-1030` — both, in this slot, gated on the same single flag (PROV-091).
+    if supports_mid_convo_effort(model) {
+        betas.push(MID_CONVERSATION_OUTPUT_CONFIG_BETA);
+        betas.push(THINKING_BINDING_CONTROLS_BETA);
     }
 
     let mut headers = HeaderMap::new();

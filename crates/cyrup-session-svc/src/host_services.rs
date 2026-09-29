@@ -9,6 +9,7 @@
 //! while the session's manager is async-locked. `LiveHostServices` therefore reads from a small
 //! sync snapshot the session pushes on model/state changes, plus the provider's (sync) model list.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -177,15 +178,22 @@ pub enum UiEffect {
     /// `lines: null` is pi's `content: undefined` and REMOVES the key's widget
     /// (`interactive-mode.ts:1935-1938`); it is never merely an empty list.
     SetWidget { widget: Value },
-    /// Pi `setHeader(factory)`, types.ts:184. Pi's RPC mode never delivers this over the wire at all
-    /// ("Custom header not supported in RPC mode - requires TUI access", rpc-mode.ts:209-211) because
-    /// Pi's version takes a TUI component FACTORY; cyrup's WIT `set-header(content: string)` is
-    /// plain data (world.wit:272), so it is still delivered on this in-process channel for a future
-    /// TUI-mode consumer even though the RPC mode does not forward it onward (see `rpc.rs`).
-    SetHeader { content: String },
-    /// Pi `setFooter(factory)`, types.ts:174-177; same RPC non-forwarding rationale as `SetHeader`
-    /// (rpc-mode.ts:213-215).
-    SetFooter { content: String },
+    /// Pi `setHeader(factory)`, `core/extensions/types.ts:195-196` @v0.87.1. Pi's RPC mode never
+    /// delivers this over the wire at all ("Custom header not supported in RPC mode - requires TUI
+    /// access", rpc-mode.ts:209-211) because Pi's version takes a TUI component FACTORY; cyrup's
+    /// WIT `set-header(content: option<string>)` is plain data, so it is still delivered on this
+    /// in-process channel for the TUI-mode consumer even though the RPC mode does not forward it
+    /// onward (see `rpc.rs`).
+    ///
+    /// EXT-064 — `content: None` is upstream's `undefined`, "restore the built-in header"
+    /// (`modes/interactive/interactive-mode.ts:2481-2490` @v0.87.1). `Some("")` is an EMPTY CUSTOM
+    /// header and is a DIFFERENT effect: the two were the same value while this carried a bare
+    /// `String` and the TUI read `(!content.is_empty()).then_some(content)`.
+    SetHeader { content: Option<String> },
+    /// Pi `setFooter(factory)`, `core/extensions/types.ts:183-193` @v0.87.1; same RPC
+    /// non-forwarding rationale as `SetHeader` (rpc-mode.ts:213-215), and the same EXT-064
+    /// `Option` mapping.
+    SetFooter { content: Option<String> },
     /// Pi `setTitle(title)`, types.ts:187; RPC wire `method:"setTitle"` (rpc-mode.ts:216-223).
     SetTitle { title: String },
     /// Pi `setEditorText(text)`/`pasteEditorText(text)`, types.ts:200-230; RPC wire
@@ -432,6 +440,133 @@ impl EditorTextMirror {
     /// The current extension-visible buffer text.
     pub fn text(&self) -> String {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// EXT-064 — the interactive footer's extension-visible data (SEAM-T03): pi's `FooterDataProvider`
+/// in the shape a cyrup guest can pull, backing [`HostServices::footer_data`].
+///
+/// **What upstream does.** pi constructs ONE `FooterDataProvider`
+/// (`modes/interactive/interactive-mode.ts:611` @v0.87.1) and hands a read-only view of it —
+/// `ReadonlyFooterDataProvider`, `core/footer-data-provider.ts:385-388` — to the `setFooter`
+/// factory as its third argument (`:2440`). An extension's custom footer renders FROM it; the
+/// shipped `examples/extensions/custom-footer.ts` reads `getGitBranch()` and
+/// `getExtensionStatuses()` and says in its own header comment that this is *"data not otherwise
+/// accessible"*. cyrup's `set-footer` takes the rendered text once rather than a factory (the
+/// `[CYRUP-DELTA]` above `set-footer` in `wit/world.wit`), so there is no factory argument to
+/// carry it and the guest PULLS the same values instead.
+///
+/// **Why a mirror and not a `ThemeAccess`-shaped trait.** All three members are pure reads with no
+/// action half, and — the load-bearing reason — the values live in the interactive `App`'s own
+/// state, which the run loop owns exclusively and no other thread may borrow. A trait object would
+/// therefore have had to hold shared cells anyway, so it would have been a second mechanism
+/// wrapping this one. [`EditorTextMirror`] and [`EditorFocusMirror`] are the in-tree precedent for
+/// exactly this: a pure interactive READ, published from the app's own frame path.
+///
+/// **Who writes it, and why the two writers differ.**
+/// 1. `git_branch` and `available_provider_count` are published by the interactive app once per
+///    frame, from the same `App::publish_extension_readbacks` choke point the editor mirrors use.
+///    Both already exist there (`App`'s `footer_data::FooterGitBranch`, which the run loop polls,
+///    and `StatusLine::provider_count`), and neither can change without a frame.
+/// 2. `extension_statuses` is written SYNCHRONOUSLY by [`HostServices::set_status`] — not on the
+///    frame path — because upstream's is: `ctx.ui.setStatus` is bound to
+///    `this.footerDataProvider.setExtensionStatus(key, text)` (`interactive-mode.ts:2204`), a
+///    plain map write that lands before the call returns. A guest that calls `set-status` and then
+///    `footer-data` inside one command must see its own write, and routing this through the
+///    per-frame [`UiEffect::SetStatus`] path alone would have made it see the PREVIOUS frame's map
+///    — a real behavioural difference from pi, not a mechanism one. The effect is still emitted:
+///    that is what repaints the built-in footer, and both writes happen at the same synchronous
+///    point, so the two cannot disagree.
+///
+/// Unattached (`None` on [`LiveHostServices`]) in every non-interactive mode, where
+/// [`HostServices::footer_data`] keeps its trait default `None`. That is upstream's own answer
+/// there rather than a cyrup gap: pi builds its `FooterDataProvider` in `interactive-mode.ts` and
+/// nowhere else, so in RPC, print and json modes no extension footer factory is ever invoked and
+/// no extension ever sees this value.
+#[derive(Clone, Debug, Default)]
+pub struct FooterDataMirror(Arc<Mutex<FooterDataCells>>);
+
+/// The three pollable members of pi's `ReadonlyFooterDataProvider`, behind [`FooterDataMirror`]'s
+/// one lock so a guest reading them never sees a torn pair.
+#[derive(Debug, Default)]
+struct FooterDataCells {
+    /// pi `getGitBranch(): string | null` (`core/footer-data-provider.ts:126-132` @v0.87.1):
+    /// *"null if not in repo, \"detached\" if detached HEAD"*. The tri-state is carried as-is —
+    /// `"detached"` is an ordinary `Some`, distinct from a branch name and from `None`.
+    git_branch: Option<String>,
+    /// pi `getExtensionStatuses(): ReadonlyMap<string, string>` (`:135-137`). Key-ordered, which
+    /// is upstream's RENDER order too (`components/footer.ts:237-240` sorts by `localeCompare`).
+    extension_statuses: BTreeMap<String, String>,
+    /// pi `getAvailableProviderCount(): number` (`:160-162`).
+    available_provider_count: u32,
+}
+
+impl FooterDataMirror {
+    /// A fresh mirror: no repo, no statuses, no providers. That is what a guest asking before the
+    /// first frame gets, and it is the honest answer — nothing has been resolved yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn cells(&self) -> std::sync::MutexGuard<'_, FooterDataCells> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Publish the resolved git branch — pi's `FooterDataProvider` keeping `cachedBranch` current
+    /// through its git watcher (`core/footer-data-provider.ts:52-118` @v0.87.1). The interactive
+    /// app calls this from its frame path with `FooterGitBranch::branch()`, whose own resolver
+    /// already produces upstream's three cases.
+    pub fn publish_git_branch(&self, branch: Option<&str>) {
+        self.cells().git_branch = branch.map(str::to_string);
+    }
+
+    /// Publish the available-provider count — pi's `setAvailableProviderCount`
+    /// (`core/footer-data-provider.ts:165-167` @v0.87.1), which upstream calls from its own login
+    /// flow (`interactive-mode.ts:5098`) off the same unique-provider set cyrup's
+    /// `App::refresh_provider_count` computes.
+    pub fn publish_provider_count(&self, count: u32) {
+        self.cells().available_provider_count = count;
+    }
+
+    /// pi `setExtensionStatus(key, text: string | undefined)`
+    /// (`core/footer-data-provider.ts:146-152` @v0.87.1): `None` DELETES the key, and any `Some`
+    /// — the empty string included — stores it. Upstream draws that line at `undefined` and
+    /// nowhere else, so an empty text is a present-but-blank segment here, exactly as it is in
+    /// `getExtensionStatuses()`. (cyrup's own `StatusLine` drops blanks when it RENDERS; that is
+    /// the renderer's rule, and this is the provider.)
+    pub fn set_extension_status(&self, key: &str, text: Option<&str>) {
+        let mut cells = self.cells();
+        match text {
+            Some(text) => {
+                cells
+                    .extension_statuses
+                    .insert(key.to_string(), text.to_string());
+            }
+            None => {
+                cells.extension_statuses.remove(key);
+            }
+        }
+    }
+
+    /// pi `clearExtensionStatuses()` (`core/footer-data-provider.ts:155-157` @v0.87.1), which
+    /// upstream calls when the extension set is torn down and rebuilt
+    /// (`interactive-mode.ts:2370`). cyrup's interactive app calls it from the same place it
+    /// clears `StatusLine`'s copy, so a `/reload` cannot leave a dead extension's segment behind
+    /// in one of the two and not the other.
+    pub fn clear_extension_statuses(&self) {
+        self.cells().extension_statuses.clear();
+    }
+
+    /// The whole provider as the json object [`HostServices::footer_data`] promises, under pi's
+    /// own field names. Taken under ONE lock, so the branch, the statuses and the count a guest
+    /// reads are all from the same instant.
+    pub fn snapshot_json(&self) -> Value {
+        let cells = self.cells();
+        json!({
+            "gitBranch": cells.git_branch,
+            "extensionStatuses": cells.extension_statuses,
+            "availableProviderCount": cells.available_provider_count,
+        })
     }
 }
 
@@ -774,6 +909,11 @@ pub struct LiveHostServices {
     /// default host — where all four theme methods answer pi's `noOpUIContext` values. See
     /// [`ThemeAccess`].
     theme_access: Mutex<Option<Arc<dyn ThemeAccess>>>,
+    /// EXT-064 — the interactive footer's extension-visible data (SEAM-T03), attached post-build
+    /// via [`Self::attach_footer_data_mirror`]. `None` in RPC and in headless (print/json) — and
+    /// on the default host — where [`HostServices::footer_data`] keeps its trait default `None`,
+    /// which is upstream's own answer there. See [`FooterDataMirror`].
+    footer_data_mirror: Mutex<Option<FooterDataMirror>>,
     /// The interactive editor's extension-visible buffer (SEAM-T02), attached post-build via
     /// [`Self::attach_editor_mirror`]. `None` outside the interactive TUI, where
     /// [`HostServices::editor_text`] keeps pi's headless `""`. See [`EditorTextMirror`].
@@ -829,6 +969,7 @@ impl LiveHostServices {
             activity: Mutex::new(None),
             catalog: Mutex::new(None),
             theme_access: Mutex::new(None),
+            footer_data_mirror: Mutex::new(None),
             editor_mirror: Mutex::new(None),
             editor_focus_mirror: Mutex::new(None),
             event_bus: Mutex::new(None),
@@ -938,6 +1079,16 @@ impl LiveHostServices {
     /// like the ui sinks: a replacement session brings a fresh `LiveHostServices`.
     pub fn attach_theme_access(&self, theme: Arc<dyn ThemeAccess>) {
         *Self::lock(&self.theme_access) = Some(theme);
+    }
+
+    /// EXT-064 — attach the interactive footer's data mirror (SEAM-T03), the source behind
+    /// [`HostServices::footer_data`]. Installed by the interactive TUI ONLY, because that is the
+    /// only mode pi has a `FooterDataProvider` in at all (`interactive-mode.ts:611` @v0.87.1);
+    /// leaving it unattached in RPC/print/json IS the upstream policy, not an omission — there an
+    /// extension's footer factory is never invoked and never sees this value. Must be re-run
+    /// against every swapped-in session, exactly like [`Self::attach_theme_access`].
+    pub fn attach_footer_data_mirror(&self, mirror: FooterDataMirror) {
+        *Self::lock(&self.footer_data_mirror) = Some(mirror);
     }
 
     /// Attach the interactive editor's extension-visible buffer mirror (SEAM-T02) — the source
@@ -1377,10 +1528,30 @@ impl HostServices for LiveHostServices {
     }
 
     fn set_status(&self, key: &str, text: Option<&str>) {
+        // EXT-064 — write the authoritative provider map FIRST, synchronously, because upstream
+        // does: `ctx.ui.setStatus` is bound to
+        // `this.footerDataProvider.setExtensionStatus(key, text)` followed by a render request
+        // (`modes/interactive/interactive-mode.ts:2203-2206` @v0.87.1), so the map is current
+        // before the call returns and a guest that calls `set-status` then `footer-data` in one
+        // command sees its own write. The effect below is the render request's analog — it repaints
+        // the built-in footer — and reaching the map only through it would have left `footer-data`
+        // answering from the PREVIOUS frame.
+        if let Some(mirror) = Self::lock(&self.footer_data_mirror).clone() {
+            mirror.set_extension_status(key, text);
+        }
         self.emit_ui_effect(UiEffect::SetStatus {
             key: key.to_string(),
             text: text.map(str::to_string),
         });
+    }
+
+    /// EXT-064 — pi's `ReadonlyFooterDataProvider` (`core/footer-data-provider.ts:385-388`
+    /// @v0.87.1) as the json object the WIT import promises. `None` when no mirror is attached,
+    /// i.e. in every mode but the interactive TUI — which is upstream's own answer, not a gap. See
+    /// [`FooterDataMirror`].
+    fn footer_data(&self) -> Option<String> {
+        let mirror = Self::lock(&self.footer_data_mirror).clone()?;
+        Some(mirror.snapshot_json().to_string())
     }
 
     fn set_widget(
@@ -1400,15 +1571,15 @@ impl HostServices for LiveHostServices {
         });
     }
 
-    fn set_header(&self, content: &str) {
+    fn set_header(&self, content: Option<&str>) {
         self.emit_ui_effect(UiEffect::SetHeader {
-            content: content.to_string(),
+            content: content.map(str::to_string),
         });
     }
 
-    fn set_footer(&self, content: &str) {
+    fn set_footer(&self, content: Option<&str>) {
         self.emit_ui_effect(UiEffect::SetFooter {
-            content: content.to_string(),
+            content: content.map(str::to_string),
         });
     }
 
@@ -2360,6 +2531,100 @@ mod tests {
             cyrup_tools::Backend::default().proc,
             std::env::temp_dir(),
         )
+    }
+
+    /// EXT-064 — `footer_data` answers `None` until a mirror is attached, and that `None` is
+    /// UPSTREAM'S OWN ANSWER for every mode but the interactive TUI, not a cyrup gap: pi builds its
+    /// one `FooterDataProvider` at `modes/interactive/interactive-mode.ts:611` @v0.87.1 and
+    /// nowhere else, so an extension's `setFooter` factory is never even invoked in RPC, print or
+    /// json mode.
+    ///
+    /// The second half is the one that matters: with a mirror attached, the whole
+    /// `ReadonlyFooterDataProvider` (`core/footer-data-provider.ts:385-388` @v0.87.1) comes back
+    /// under pi's own field names, and `gitBranch` carries upstream's TRI-STATE intact — the
+    /// literal `"detached"` is a value, distinct from a branch name and from `null`
+    /// (`:126-132`: *"null if not in repo, \"detached\" if detached HEAD"*).
+    #[test]
+    fn footer_data_is_none_until_a_mirror_is_attached() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+
+        assert!(
+            svc.footer_data().is_none(),
+            "unattached is pi's headless answer — there is no FooterDataProvider outside \
+             interactive mode"
+        );
+
+        let mirror = FooterDataMirror::new();
+        svc.attach_footer_data_mirror(mirror.clone());
+        mirror.publish_git_branch(Some("detached"));
+        mirror.publish_provider_count(3);
+
+        let data: Value = serde_json::from_str(&svc.footer_data().expect("attached")).unwrap();
+        assert_eq!(
+            data["gitBranch"],
+            json!("detached"),
+            "the detached-HEAD sentinel is a VALUE, not a collapsed None"
+        );
+        assert_eq!(data["availableProviderCount"], json!(3));
+        assert_eq!(data["extensionStatuses"], json!({}));
+
+        mirror.publish_git_branch(None);
+        let data: Value = serde_json::from_str(&svc.footer_data().expect("attached")).unwrap();
+        assert_eq!(
+            data["gitBranch"],
+            Value::Null,
+            "outside a repo the branch is null, and the provider is still attached"
+        );
+    }
+
+    /// EXT-064 — the coherence the row is actually about: a `set_status` is visible to the very
+    /// next `footer_data`, with NO frame in between.
+    ///
+    /// pi binds `ctx.ui.setStatus` straight to
+    /// `this.footerDataProvider.setExtensionStatus(key, text)` (`interactive-mode.ts:2204`
+    /// @v0.87.1) — a plain map write that lands before the call returns — so an extension's footer
+    /// factory sees its own segment immediately. Reaching the map only through the per-frame
+    /// `UiEffect::SetStatus` channel would have made `footer_data` answer from the PREVIOUS frame,
+    /// which is a behavioural difference from pi rather than a mechanism one. This test fails
+    /// against that wiring and passes against the synchronous one.
+    ///
+    /// It also pins where upstream draws the delete line: `setExtensionStatus`'s own body is
+    /// `if (text === undefined) { delete } else { set }` (`core/footer-data-provider.ts:146-152`),
+    /// so `None` removes a key and ANY `Some` — the empty string included — stores it. cyrup's
+    /// `StatusLine` drops blanks when it RENDERS; that is the renderer's rule, and this is the
+    /// provider.
+    #[test]
+    fn a_status_write_is_visible_to_the_very_next_footer_data_read() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+        svc.attach_footer_data_mirror(FooterDataMirror::new());
+
+        svc.set_status("alpha", Some("working"));
+        svc.set_status("zeta", Some("idle"));
+        let data: Value = serde_json::from_str(&svc.footer_data().expect("attached")).unwrap();
+        assert_eq!(
+            data["extensionStatuses"],
+            json!({"alpha": "working", "zeta": "idle"}),
+            "both segments are readable immediately, in key order — which is upstream's render \
+             order too (`components/footer.ts:237-240` sorts by localeCompare)"
+        );
+
+        svc.set_status("alpha", Some(""));
+        let data: Value = serde_json::from_str(&svc.footer_data().expect("attached")).unwrap();
+        assert_eq!(
+            data["extensionStatuses"]["alpha"],
+            json!(""),
+            "an EMPTY text is stored, not deleted — upstream deletes only on `undefined`"
+        );
+
+        svc.set_status("alpha", None);
+        let data: Value = serde_json::from_str(&svc.footer_data().expect("attached")).unwrap();
+        assert_eq!(
+            data["extensionStatuses"],
+            json!({"zeta": "idle"}),
+            "`None` is pi's `undefined` and deletes the key"
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ fn user(s: &str) -> Message {
 
 fn text_of(m: &Message) -> String {
     let blocks = match m {
+        Message::System(m) => &m.content,
         Message::User { content, .. } | Message::ToolResult { content, .. } => content,
         Message::Assistant(a) => &a.content,
     };
@@ -369,6 +370,7 @@ fn assistant_text(s: &str) -> cyrup_core::AssistantMessage {
         api: "faux".into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: cyrup_core::Usage::default(),
         stop_reason: cyrup_core::StopReason::Stop,
@@ -455,6 +457,7 @@ fn gap17_serialize_separators_json_args_and_skips_empty() {
         api: "faux".into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
@@ -868,6 +871,7 @@ fn m3_m4_branched_labels_keep_original_ts_and_global_scope() {
 
 fn ts_of(m: &Message) -> i64 {
     match m {
+        Message::System(m) => m.timestamp,
         Message::User { timestamp, .. } | Message::ToolResult { timestamp, .. } => *timestamp,
         Message::Assistant(a) => a.timestamp,
     }
@@ -988,6 +992,7 @@ fn asst_toolcall(name: &str, key: &str, path: &str) -> Message {
         api: "faux".into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
@@ -1379,6 +1384,7 @@ fn sess001_null_or_missing_content_is_normalized_to_empty_not_dropped() {
             "{label}: the turn must not vanish from context"
         );
         let content = match &msgs[0] {
+            Message::System(m) => m.content.clone(),
             Message::User { content, .. } | Message::ToolResult { content, .. } => content.clone(),
             Message::Assistant(a) => a.content.clone(),
         };
@@ -1676,6 +1682,7 @@ fn sess052_texts(msgs: &[Message]) -> Vec<String> {
     msgs.iter()
         .map(|msg| {
             let content = match msg {
+                Message::System(m) => &m.content,
                 Message::User { content, .. } | Message::ToolResult { content, .. } => content,
                 Message::Assistant(a) => &a.content,
             };
@@ -2030,4 +2037,84 @@ impl crate::compaction::Summarizer for NeverSummarizer {
     ) -> Result<cyrup_core::AssistantMessage, crate::compaction::CompactionError> {
         panic!("no summarization is expected in a trigger-estimate test")
     }
+}
+
+/// SESS-052, the FALLBACK arm of `estimateProjectedContextTokens` (`compaction.ts:277-282` @v0.87.1):
+///
+/// ```ts
+/// const currentSystem = getCurrentSystemMessage(projection.messages);
+/// let tokens = currentSystem ? estimateTokens(currentSystem) : 0;
+/// for (const message of projection.messages) {
+///     if (message.role !== "system") tokens += estimateTokens(message);
+/// }
+/// ```
+///
+/// Both arms were unported, behind a `CYRUP-DELTA` on
+/// [`crate::compaction::tokens::estimate_projected_context_tokens`] asserting they were no-ops in
+/// cyrup because "`AgentMessage` has no system arm" and a system prompt "never becomes a session
+/// entry". That held until PROV-083a added [`cyrup_core::Message`]'s `System` arm; with it, a pi
+/// ≥v0.86 `{"type":"message","message":{"role":"system",…}}` entry deserializes as a KNOWN message
+/// entry (not `Entry::Unknown`), [`crate::context::context_message_role`] returns `Some(System)` for
+/// it, and it is projected and counted — so both claims went false together and the two arms had to
+/// be ported. This test is therefore COUPLED to PROV-083a and is unpicked with it.
+///
+/// The fixture is the case the two arms exist FOR: two system entries where the second DELETES, with
+/// a `null`, a section the first added. pi replays them into one current system message — content
+/// joined `"\n\n"`, the deleted section gone — and charges that once. Summing per message charges
+/// both entries, deleted section and all.
+///
+/// The arithmetic, from pi's own `case "system"` (`compaction.ts:324-334`): the replayed content is
+/// `"base prompt" + "\n\n" + "extra instructions"` = 30 chars, `sections` is empty after the `null`
+/// delete, no `toolsAdded` ⇒ `ceil(30 / 4)` = 8. The per-message sum is 18 + 5 = 23, because it still
+/// pays for the 60-char section that is no longer part of the prompt.
+#[test]
+fn sess052_the_fallback_charges_the_replayed_system_message_once() {
+    let dir = tempfile::tempdir().unwrap();
+    // No usage-bearing assistant anywhere, so `estimate_projected_context_tokens` has no anchor to
+    // keep and takes the fallback unconditionally — the path under test.
+    let body = format!(
+        "{}\n{}\n",
+        concat!(
+            r#"{"type":"message","id":"s1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","#,
+            r#""message":{"role":"system","content":"base prompt","#,
+            r#""sections":{"env":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},"#,
+            r#""timestamp":0}}"#,
+        ),
+        concat!(
+            r#"{"type":"message","id":"s2","parentId":"s1","timestamp":"2026-01-01T00:00:02Z","#,
+            r#""message":{"role":"system","content":"extra instructions","#,
+            r#""sections":{"env":null},"timestamp":0}}"#,
+        ),
+    );
+    let m = sess052_open(dir.path(), "2026-01-01T00-00-00-000Z_f0000004.jsonl", &body);
+    let path: Vec<&Entry> = m.branch_path(None);
+
+    // The premise, pinned so a later change to entry loading cannot make this test vacuous: a pi
+    // system message entry really is KNOWN and really does project.
+    assert_eq!(path.len(), 2, "both system entries load: {path:?}");
+    assert!(
+        path.iter().all(|e| matches!(e, Entry::Known(_))),
+        "a pi `role:\"system\"` message entry loads as KNOWN, not Unknown"
+    );
+    assert_eq!(
+        crate::context::build_context_agent_messages(&path).len(),
+        2,
+        "and both are PROJECTED messages — the delta claimed they could not be"
+    );
+
+    let projected = crate::compaction::tokens::estimate_projected_context_tokens(&path);
+    assert_eq!(
+        projected.last_usage_index, None,
+        "no anchor: this must be the fallback arm"
+    );
+    assert_eq!(
+        projected.tokens, 8,
+        "pi charges the REPLAYED current system message once — ceil(30/4) = 8 — and excludes every \
+         `role === \"system\"` message from the loop. Summing per message instead gives 23, still \
+         paying for the 60-char section the second entry deleted."
+    );
+    assert_eq!(
+        projected.trailing_tokens, 8,
+        "the fallback reports its whole sum as trailing (`compaction.ts:282`)"
+    );
 }

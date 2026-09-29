@@ -330,6 +330,21 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         let Ok(guest) = ui_guest_of(self) else { return };
         let _ = guest.registry.unsubscribe_terminal_input(&guest.owner);
     }
+    /// EXT-064 — pi `ReadonlyFooterDataProvider.onBranchChange(callback)`
+    /// (`core/footer-data-provider.ts:139-143` @v0.87.1): records that this guest has a
+    /// branch-change callback; the callback itself is reached through the `on-branch-change`
+    /// EXPORT.
+    async fn subscribe_branch_change(&mut self) {
+        let Ok(guest) = ui_guest_of(self) else { return };
+        let _ = guest.registry.subscribe_branch_change(guest.owner.clone());
+    }
+    /// The unsubscribe function upstream's `onBranchChange` RETURNS
+    /// (`() => this.branchChangeCallbacks.delete(callback)`,
+    /// `core/footer-data-provider.ts:141-142` @v0.87.1). Idempotent.
+    async fn unsubscribe_branch_change(&mut self) {
+        let Ok(guest) = ui_guest_of(self) else { return };
+        let _ = guest.registry.unsubscribe_branch_change(&guest.owner);
+    }
     async fn confirm(&mut self, prompt: String, message: String, opts_json: String) -> bool {
         let opts = DialogOptions::parse(&opts_json);
         let Ok(guest) = ui_guest_of(self) else {
@@ -451,17 +466,42 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         let guest = ui_guest_of(self).ok()?;
         guest.services.theme_by_name(&name).map(|t| t.to_string())
     }
-    async fn set_header(&mut self, content: String) {
+    /// EXT-064 — pi `setHeader(factory: ((tui, theme) => Component) | undefined)`
+    /// (`core/extensions/types.ts:195-196` @v0.87.1), whose `undefined` restores the built-in header
+    /// (`modes/interactive/interactive-mode.ts:2481-2490`). `None` IS that `undefined`; `Some(s)`
+    /// is a custom header rendering `s`, and `Some("")` an empty custom one — a state the old
+    /// `content: string` signature could not express, because the empty string was the only value
+    /// left to carry "restore the built-in".
+    async fn set_header(&mut self, content: Option<String>) {
         if let Ok(guest) = ui_guest_of(self) {
-            guest.services.set_header(&content);
+            guest.services.set_header(content.as_deref());
             guest.set_header(content);
         }
     }
-    async fn set_footer(&mut self, content: String) {
+    /// EXT-064 — pi `setFooter(factory: ((tui, theme, footerData) => Component) | undefined)`
+    /// (`core/extensions/types.ts:183-193` @v0.87.1), restoring the built-in footer on `undefined`
+    /// (`modes/interactive/interactive-mode.ts:2442-2446`). See [`Self::set_header`] for the
+    /// `option<string>` mapping.
+    async fn set_footer(&mut self, content: Option<String>) {
         if let Ok(guest) = ui_guest_of(self) {
-            guest.services.set_footer(&content);
+            guest.services.set_footer(content.as_deref());
             guest.set_footer(content);
         }
+    }
+
+    /// EXT-064 — pi's `ReadonlyFooterDataProvider`, the third argument upstream hands the
+    /// `setFooter` factory (`interactive-mode.ts:2440` @v0.87.1). See
+    /// [`crate::host::HostServices::footer_data`] for the json shape and for why only three of
+    /// upstream's four members ride it.
+    ///
+    /// Reached through [`ui_guest_of`], NOT [`guest_of`]: this is a `ui.*` import, so the
+    /// manifest's `capabilities.ui` grant is what admits it, and a guest declaring `{"ui": false}`
+    /// is refused here exactly as it is for `set-footer` itself. That is the EXT-065 lesson —
+    /// a `ui` surface reached through the ungated accessor is a hole — and
+    /// `tests/manifest_capabilities.rs` pins it.
+    async fn footer_data(&mut self) -> Option<String> {
+        let guest = ui_guest_of(self).ok()?;
+        guest.services.footer_data()
     }
     async fn set_title(&mut self, title: String) {
         if let Ok(guest) = ui_guest_of(self) {
@@ -1288,26 +1328,60 @@ impl bindings::cyrup::ext::control::Host for HostState {
         guest.require_command_tier()?;
         guest.services.control(ControlOp::WaitIdle)
     }
+    /// EXT-087 — pi `ctx.sendMessage(message, options)`
+    /// (`core/extensions/loader.ts:351-354` @v0.87.1), whose whole body is
+    /// `assertActive(); runtime.sendMessage(...)`. NO tier check of any kind: it is callable from
+    /// every event handler upstream, and an `agent_settled` handler that queues the next message is
+    /// the shape the feature exists for.
+    ///
+    /// So no `require_command_tier()` here either — the GAP-11 exemption, extended from
+    /// `set-model`/`set-thinking-level` to the two send ops for the same reason. The op queues
+    /// unconditionally and is applied at the post-settle drain
+    /// (`cyrup-session-svc`'s `AgentSession::settle_run`), which is the store-free point where
+    /// every `LiveExtension.inner` guard is released.
+    ///
+    /// CITATION CORRECTION, recorded beside the original rather than in place of it: the row cites
+    /// `loader.ts:304-311 @v0.83.0`. At the pinned v0.87.1 the two methods are at `:351-358`; the
+    /// `:304-311` region there is other `assertActive()` call sites, so a pass re-deriving from the
+    /// row's line numbers at the new pin lands on the wrong methods and could wrongly conclude the
+    /// gate exists upstream.
     async fn send_message(
         &mut self,
         message_json: String,
         opts_json: String,
     ) -> Result<(), String> {
         let guest = guest_of(self)?;
-        guest.require_command_tier()?;
         let message: Value = serde_json::from_str(&message_json).unwrap_or(Value::Null);
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
         guest
             .services
             .control(ControlOp::SendMessage { message, opts })
     }
+    /// EXT-087 — pi `ctx.sendUserMessage(content, options)`
+    /// (`core/extensions/loader.ts:356-358` @v0.87.1), the twin of [`Self::send_message`] above and
+    /// ungated for the same reason; see that method's note for the citation correction.
+    ///
+    /// Upstream's v0.87.0 DEFERRAL is worth recording here, because cyrup gets it almost free and a
+    /// later pass could otherwise port a mechanism it does not need. pi added
+    /// `_isEmittingAgentSettled` (`core/agent-session.ts:378`) and `_deferredSettledActions`
+    /// (`:379`) precisely because `pi.sendUserMessage` reaches `this.prompt()` SYNCHRONOUSLY inside
+    /// the `agent_settled` dispatch, so it had to guard `prompt()`'s entry (`:1607-1608`) and push a
+    /// closure instead, then splice and await them once the emit's `finally` has cleared the flag
+    /// (`:873-885`). cyrup's send crosses a wasm import onto a QUEUE, so the queue IS the deferral —
+    /// what cyrup needs is the drain POINT, not the guard, and that is the post-settle drain in
+    /// `AgentSession::settle_run`. A second `_deferredSettledActions`-shaped queue would be
+    /// inventing a mechanism upstream only needs because JS is synchronous here.
+    ///
+    /// Note also `:1948-1952`: while STREAMING, upstream does not defer at all — it routes to
+    /// `agent.followUp()` or `agent.steer()` by `deliverAs`, which is the turn-boundary delivery
+    /// cyrup's `send_user_message` helper and ICOM injection pump already implement. The mid-run
+    /// case therefore needs no new mechanism; only the settled-dispatch case did.
     async fn send_user_message(
         &mut self,
         content: String,
         opts_json: String,
     ) -> Result<(), String> {
         let guest = guest_of(self)?;
-        guest.require_command_tier()?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
         guest
             .services
@@ -2000,6 +2074,24 @@ impl LiveExtension {
             })),
             Err(e) => Err(map_wasm_error(&e)),
         }
+    }
+
+    /// Tell this guest the git branch changed (EXT-064; pi
+    /// `ReadonlyFooterDataProvider.onBranchChange`'s callback, invoked from `notifyBranchChange`,
+    /// `core/footer-data-provider.ts:197-199` @v0.87.1). Runs at EVENT tier for the same reason
+    /// [`Self::on_terminal_input`] does: it is driven from the TUI's poll arm and must not be able
+    /// to hold the draw loop past the epoch budget.
+    #[cfg(feature = "wasm-host")]
+    pub async fn on_branch_change(&self, branch: Option<&str>) -> Result<(), ExtError> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Event);
+        let api = inner.instance.cyrup_ext_events();
+        api.call_on_branch_change(&mut inner.store, branch)
+            .await
+            .map_err(|e| map_wasm_error(&e))
     }
 
     /// Run the guest provider's `login(callbacks)` flow (Pi `oauth.login`, host gap #1). Runs at

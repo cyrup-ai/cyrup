@@ -40,6 +40,7 @@ pub(super) fn empty_assistant(model: &ModelRef) -> AssistantMessage {
             .unwrap_or_else(|| ApiId::from(UNRESOLVED_API)),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         // This message is only ever a PARTIAL — it seeds `partial` before the first `start` event

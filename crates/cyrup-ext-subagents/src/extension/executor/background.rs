@@ -10,7 +10,9 @@ use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::resolve_background_storage_roots;
-use crate::extension::executor::requests::{BackgroundSingleRequest, BackgroundStepsSpec};
+use crate::extension::executor::requests::{
+    BackgroundSingleRequest, BackgroundStepsSpec, RetainedModelResponseAliases,
+};
 use crate::extension::host::slash_render::plan_step_agent_names;
 use crate::extension::tool::task_items::{
     normalize_single_output_override, parse_tool_output_mode, resolve_effective_output_mode,
@@ -73,6 +75,7 @@ impl SubagentExecutor {
             thinking,
             turn_budget,
             usage_budget,
+            tool_timeout_ms,
         } = request;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before agent discovery or
         // fork-context resolution below, and therefore also before `spawn_background_steps`' own
@@ -293,6 +296,9 @@ impl SubagentExecutor {
         self.spawn_background_steps(
             cwd,
             BackgroundStepsSpec {
+                // CFG-067 — the call's own `toolTimeoutMs`, carried raw to the launch boundary,
+                // which stamps the config rung beside it (pi `subagent-executor.ts:4146-4147`).
+                tool_timeout_ms,
                 // SUBA-021 — the caller's validated `usageBudget`, carried to hop 2 (pi
                 // `spawnRunner({ …, usageBudget: params.usageBudget })`,
                 // `runs/background/async-execution.ts:1471`). ONE rung, unlike `turn_budget`
@@ -338,7 +344,7 @@ impl SubagentExecutor {
                 model_origin: None,
                 // SUBA-119: likewise, only a revive carries a launch-time alias map; a fresh launch
                 // takes the live `config.json` value inside `spawn_background_steps`.
-                model_response_aliases: None,
+                model_response_aliases: RetainedModelResponseAliases::Live,
                 steps: vec![RunnerStep::SingleStep(step)],
                 mode: RunMode::Single,
                 session_file: fork_context.session_file_path,
@@ -468,6 +474,7 @@ impl SubagentExecutor {
         spec: BackgroundStepsSpec,
     ) -> Result<RunId, SubagentError> {
         let BackgroundStepsSpec {
+            tool_timeout_ms,
             steps,
             mode,
             session_file,
@@ -799,8 +806,21 @@ impl SubagentExecutor {
             // background child's model-verification check.
             // A REVIVE overrides it with the descriptor's launch-time map
             // (`subagent-executor.ts:2136`); every ordinary launch takes the live config value.
-            model_response_aliases: requested_model_response_aliases
-                .or_else(|| cfg.model_response_aliases.clone()),
+            //
+            // # The comment above claimed a parity the `or_else` it described did not have
+            //
+            // Kept verbatim because the claim is what needed correcting. The code used to read
+            // `requested_model_response_aliases.or_else(|| cfg.model_response_aliases.clone())`
+            // over a single `Option`, so a revive whose retained contract declared NOTHING was
+            // indistinguishable from an ordinary launch and acquired the live map — which is the
+            // one thing `:2135` forbids by name: *"Absence in the retained contract is meaningful;
+            // never acquire current aliases."* An exhaustive match over
+            // `RetainedModelResponseAliases` removes the fallback from the revive branch, so the
+            // comment is now true.
+            model_response_aliases: match &requested_model_response_aliases {
+                RetainedModelResponseAliases::Live => cfg.model_response_aliases.clone(),
+                RetainedModelResponseAliases::Retained(retained) => retained.clone(),
+            },
             // Nested-route inheritance (pi `config.nestedRoute`/`config.nestedSelf`,
             // `async-execution.ts:727-731,989-993` @v0.34.0): carried verbatim so the detached runner (were it
             // ever to relay ITS OWN descendants further, a later unit's concern) inherits the SAME
@@ -832,7 +852,27 @@ impl SubagentExecutor {
             share,
             artifacts_dir,
             artifact_config,
+            // CFG-067 — the caller's raw `toolTimeoutMs` and the live `config.json` one, carried
+            // verbatim for the same reason as the five knobs above: hop 2 has neither the tool call
+            // nor the settings. Validated just below, before any directory or process exists.
+            tool_timeout: crate::exec::tool_timeout::ToolTimeoutRungs {
+                tool_timeout_ms,
+                config_tool_timeout_ms: cfg.tool_timeout_ms.clone(),
+            },
         };
+        // CFG-067 — pi refuses the async START when `resolveToolTimeoutMs` rejects the winning rung
+        // (`async-execution.ts:1012` throws `AsyncStartValidationError`), so the run is refused here,
+        // ahead of the recovery descriptor and the runner config. Resolved against EVERY persona the
+        // graph may dispatch, because each step's own `toolTimeoutMs:` frontmatter sits between the
+        // two rungs above and a run must not start if any of its steps cannot resolve.
+        crate::exec::tool_timeout::resolve_tool_timeouts_by_agent(
+            &runner_config.tool_timeout,
+            runner_config
+                .resolved_agents
+                .iter()
+                .map(|(name, persona)| (name.as_str(), persona.default_tool_timeout_ms)),
+        )
+        .map_err(SubagentError::Management)?;
 
         // pi `async-execution.ts:1993-2055` @v0.68.0: the RESOLVED launch contract, persisted as
         // `recovery-descriptor.json` BEFORE `runner-config.json` and before any process exists, so
@@ -1387,6 +1427,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
     /// assertions below are about the SLOT and not about step configuration.
     fn bare_background_request<'a>(cwd: &'a Path) -> BackgroundSingleRequest<'a> {
         BackgroundSingleRequest {
+            tool_timeout_ms: None,
             machine_cwd: None,
             machine: None,
             thinking: None,
@@ -1728,6 +1769,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -1864,6 +1906,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -1944,6 +1987,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         for artifacts in [None, Some(true), Some(false)] {
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
                     thinking: None,
@@ -2037,6 +2081,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         let before = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -2101,6 +2146,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         // and CPU until a human noticed and issued `interrupt`.
         let untimed = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -2164,6 +2210,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
 
         let request = |exec: Arc<SubagentExecutor>, root: std::path::PathBuf| async move {
             exec.spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -2288,6 +2335,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
 
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
                     thinking: None,
@@ -2385,6 +2433,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -2458,6 +2507,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         });
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -2540,6 +2590,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -2649,7 +2700,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         use std::collections::BTreeSet;
 
         /// The NARROW persona the round trip launches with. Every capability-shaped row (tools,
-        /// excludeTools, maxSubagentDepth, completionGuard, subagentOnlyExtensions, …) is TIGHTER
+        /// excludeTools, maxSubagentDepth, subagentOnlyExtensions, …) is TIGHTER
         /// than the wide rewrite below, so a revive that consults the file instead of the
         /// descriptor fails on every one of them. Every row is also NON-default for its type:
         /// `inheritProjectContext`/`inheritSkills` are `true` because the parser's default for a
@@ -2660,7 +2711,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
 model: fixture/persona-model\nthinking: low\nsystemPromptMode: replace\n\
 inheritProjectContext: true\ninheritSkills: true\ntools: read, grep\nexcludeTools: bash\n\
 allowNestedSubagents: true\nextensions: ext-a\nsubagentOnlyExtensions: ./child-only.ts\n\
-skills: alpha\nmaxSubagentDepth: 2\ncompletionGuard: false\n\
+skills: alpha\nmaxSubagentDepth: 2\n\
 toolBudget: {\"hard\": 7, \"soft\": 3}\nmemory: {scope: project, path: notes.md}\n---\n\
 Launch body.\n";
 
@@ -2672,7 +2723,7 @@ Launch body.\n";
 model: fixture/other-model\nthinking: medium\nsystemPromptMode: append\n\
 inheritProjectContext: false\ninheritSkills: false\ntools: read, grep, bash\n\
 allowNestedSubagents: false\nextensions: ext-z\nsubagentOnlyExtensions: ./other-child.ts\n\
-skills: zeta\nmaxSubagentDepth: 9\ncompletionGuard: true\ntoolBudget: {\"hard\": 99}\n\
+skills: zeta\nmaxSubagentDepth: 9\ntoolBudget: {\"hard\": 99}\n\
 memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
 
         /// Write `<cwd>/.cyrup/agents/<agent>.md` from one of the templates above.
@@ -2931,6 +2982,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
             });
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
                     structured_output_schema: Some(schema.clone()),
@@ -3109,6 +3161,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                 thinking_ceiling: None,
                 tools: narrow_tools(),
                 exclude_tools: vec!["bash".to_string()],
+                allowed_agents: None,
                 allow_nested_subagents: Some(true),
                 extensions: Some(vec!["ext-a".to_string()]),
                 subagent_only_extensions: vec!["./child-only.ts".to_string()],
@@ -3118,7 +3171,6 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
                 inherit_skills: true,
                 skills: vec!["beta".to_string()],
                 agent_file_path: written.agent_file_path.clone(),
-                completion_guard: Some(false),
                 memory: Some(launch_memory()),
                 output_path: written.output_path.clone(),
                 output_mode: OutputMode::FileOnly,
@@ -3217,8 +3269,6 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
             assert_eq!(persona.skills, vec!["beta".to_string()]);
             // row 28 — agentFilePath
             assert_eq!(persona.file_path, written.agent_file_path);
-            // row 29 — completionGuard (file now true)
-            assert_eq!(persona.completion_guard, Some(false));
             // row 30 — memory (file now user/other.md)
             assert_eq!(persona.memory, Some(launch_memory()));
             // row 31 — outputPath
@@ -3343,8 +3393,8 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
         #[tokio::test]
         async fn a_revived_run_replays_fast_global_context_and_mutation_tools() {
             let persona = NARROW_MD.replace(
-                "completionGuard: false\n",
-                "completionGuard: false\nfast: true\ninheritGlobalContext: true\n\
+                "maxSubagentDepth: 2\n",
+                "maxSubagentDepth: 2\nfast: true\ninheritGlobalContext: true\n\
 mutationTools: apply_patch, notebook_edit\n",
             );
             assert!(persona.contains("\nfast: true\n"), "fixture: {persona}");
@@ -3407,8 +3457,8 @@ mutationTools: apply_patch, notebook_edit\n",
             let launch = launch("descriptor-revive-machine", "worker").await;
             launch.settle(Some(launch.cwd().to_path_buf())).await;
             let placed = NARROW_MD.replace(
-                "completionGuard: false\n",
-                "completionGuard: false\nmachine: fake-box\n",
+                "maxSubagentDepth: 2\n",
+                "maxSubagentDepth: 2\nmachine: fake-box\n",
             );
             assert!(
                 placed.contains("\nmachine: fake-box\n"),
@@ -3464,10 +3514,8 @@ mutationTools: apply_patch, notebook_edit\n",
         /// the first revive is standard), or `current_agent_fast` projected as `None` (same).
         #[tokio::test]
         async fn a_revive_with_no_recorded_fast_takes_the_agents_current_fast() {
-            let fast_now = NARROW_MD.replace(
-                "completionGuard: false\n",
-                "completionGuard: false\nfast: true\n",
-            );
+            let fast_now =
+                NARROW_MD.replace("maxSubagentDepth: 2\n", "maxSubagentDepth: 2\nfast: true\n");
             assert!(fast_now.contains("\nfast: true\n"), "fixture: {fast_now}");
 
             let unset = launch("descriptor-fast-fallback", "worker").await;
@@ -3698,7 +3746,8 @@ mutationTools: apply_patch, notebook_edit\n",
                 .spawn_background_steps(
                     dir.path(),
                     BackgroundStepsSpec {
-                        model_response_aliases: None,
+                        tool_timeout_ms: None,
+                        model_response_aliases: RetainedModelResponseAliases::Live,
                         usage_budget: None,
                         turn_budget: None,
                         permission_rules: None,
@@ -3748,6 +3797,164 @@ mutationTools: apply_patch, notebook_edit\n",
             );
         }
 
+        /// SUBA-119 item 2, the row's own Verify clause — pi `subagent-executor.ts:2135-2136`
+        /// @v0.71.0:
+        ///
+        /// ```ts
+        /// // Absence in the retained contract is meaningful; never acquire current aliases.
+        /// modelResponseAliases: recoveryDescriptor ? recoveryDescriptor.modelResponseAliases : foregroundContract?.modelResponseAliases,
+        /// ```
+        ///
+        /// NEITHER branch reads `deps.config.modelResponseAliases`; live config is read only by
+        /// the ORDINARY-launch sites (`:1367`, `:1749`, `:2008`, `:3355`, `:4029`).
+        ///
+        /// THE SCENARIO this rules out: a router starts substituting, run A fails
+        /// `model_verification_failed`, the operator declares the alias in `config.json` and
+        /// revives A. pi still fails A — a new independent run is required — and before this row
+        /// cyrup passed it, because `requested.or_else(|| cfg.model_response_aliases.clone())`
+        /// could not tell "revive that declared nothing" from "ordinary launch". Closing it makes
+        /// the shipped verification error's own sentence — *"Configuration changes affect new
+        /// independent native runs; resumed native runs retain their launch-time declaration"* —
+        /// true for the first time.
+        #[tokio::test]
+        async fn a_revive_whose_descriptor_declared_no_alias_gets_none_even_when_the_live_config_declares_one()
+         {
+            let launch = launch("descriptor-alias-absent", "worker").await;
+            let path = launch.descriptor_path();
+            let descriptor = RecoveryDescriptor::read(&path)
+                .await
+                .expect("readable")
+                .expect("present");
+            assert_eq!(
+                descriptor.model_response_aliases, None,
+                "fixture: the run was authorized before any alias existed — nothing to rewrite, \
+                 which is exactly the case `:2135` calls meaningful absence"
+            );
+            launch.settle(Some(launch.cwd().to_path_buf())).await;
+
+            // The operator declares the alias AFTER the run was authorized.
+            {
+                let mut cfg = launch.executor.config_cell().lock().await;
+                cfg.model_response_aliases = Some(BTreeMap::from([(
+                    "fixture/persona-model".to_string(),
+                    vec!["router/substitute".to_string()],
+                )]));
+            }
+
+            let confirmation = launch.resume().await.expect("revives");
+            let revived_paths = launch.run_paths_under(launch.cwd(), &revived_id(&confirmation));
+            assert_eq!(
+                read_runner_config(&revived_paths.run_dir).model_response_aliases,
+                None,
+                "a revive must NEVER acquire the live config's aliases (`:2135-2136`)"
+            );
+        }
+
+        /// SUBA-119 item 2's companion. Without it the pair above could be satisfied by always
+        /// returning `None`, which would be a different bug with the same test result: here the
+        /// descriptor declares map A, the live config declares a DIFFERENT map B, and the revive
+        /// must carry A.
+        #[tokio::test]
+        async fn a_revive_whose_descriptor_declared_an_alias_keeps_that_one_not_the_live_one() {
+            let retained = BTreeMap::from([(
+                "fixture/persona-model".to_string(),
+                vec!["router/retained-A".to_string()],
+            )]);
+            let live = BTreeMap::from([(
+                "fixture/persona-model".to_string(),
+                vec!["router/live-B".to_string()],
+            )]);
+
+            let launch = launch("descriptor-alias-retained", "worker").await;
+            let path = launch.descriptor_path();
+            let mut descriptor = RecoveryDescriptor::read(&path)
+                .await
+                .expect("readable")
+                .expect("present");
+            descriptor.model_response_aliases = Some(retained.clone());
+            descriptor.write(&path).await.expect("rewrite");
+            launch.settle(Some(launch.cwd().to_path_buf())).await;
+            {
+                let mut cfg = launch.executor.config_cell().lock().await;
+                cfg.model_response_aliases = Some(live);
+            }
+
+            let confirmation = launch.resume().await.expect("revives");
+            let revived_paths = launch.run_paths_under(launch.cwd(), &revived_id(&confirmation));
+            assert_eq!(
+                read_runner_config(&revived_paths.run_dir).model_response_aliases,
+                Some(retained),
+                "the RETAINED contract's map, not today's"
+            );
+        }
+
+        /// SUBA-119 item 1(a) — the production wiring seam `background.rs`'s `Live` arm.
+        ///
+        /// The two tests that already covered this concern
+        /// (`background/runner_main/executor.rs`'s and `recovery_descriptor.rs`'s) each hand the
+        /// function under test its own input by hand, so neither could notice that nothing in
+        /// PRODUCTION supplies it. This one drives the real ordinary-launch path with the spec
+        /// declaring nothing (`RetainedModelResponseAliases::Live`) and asserts the declared
+        /// `config.json` map reaches both the one-shot `RunnerConfig` the detached hop-2 runner
+        /// reads and the descriptor the next revive reads.
+        #[tokio::test]
+        async fn a_declared_config_alias_reaches_the_background_runner_config() {
+            let aliases: crate::exec::model_verification::ModelResponseAliases =
+                BTreeMap::from([(
+                    "fixture/persona-model".to_string(),
+                    vec!["router/substitute".to_string()],
+                )]);
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_persona(dir.path(), "worker", NARROW_MD);
+            let executor = SubagentExecutor::new();
+            executor.set_host_services(Arc::new(FixedSessionHost("config-alias-live")));
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = Roots::sandboxed(dir.path());
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+                cfg.model_response_aliases = Some(aliases.clone());
+            }
+            let roots = Roots::sandboxed(dir.path());
+            let run_id = RunId::new();
+            let run_paths = RunPaths::for_run(
+                &default_async_root_in(&roots, dir.path()),
+                &default_results_dir_in(&roots, dir.path()),
+                &run_id,
+            );
+            let agent = executor
+                .resolve_agent(dir.path(), "worker", AgentReadScope::Both, &roots)
+                .expect("the persona resolves");
+            let persona = crate::exec::resolve_step_agent_config(&agent);
+            executor
+                .spawn_background_steps(
+                    dir.path(),
+                    process_terminal_launch_spec(run_id.clone(), persona),
+                )
+                .await
+                .expect("the launch succeeds");
+
+            assert_eq!(
+                read_runner_config(&run_paths.run_dir).model_response_aliases,
+                Some(aliases.clone()),
+                "an ordinary launch takes the LIVE config value (`:1367`/`:1749`/`:2008`)"
+            );
+            let descriptor = RecoveryDescriptor::read(
+                &RunDir::for_existing(&run_paths.run_dir).recovery_descriptor(),
+            )
+            .await
+            .expect("readable")
+            .expect("written per launch");
+            assert_eq!(
+                descriptor.model_response_aliases,
+                Some(aliases),
+                "and records it, so the NEXT revive retains this launch-time declaration"
+            );
+        }
+
         /// Builds the `BackgroundStepsSpec` this module's process-terminal tests launch with — a
         /// single step against the `worker` persona, nothing else set.
         fn process_terminal_launch_spec(
@@ -3755,7 +3962,8 @@ mutationTools: apply_patch, notebook_edit\n",
             persona: ResolvedAgentPersona,
         ) -> BackgroundStepsSpec {
             BackgroundStepsSpec {
-                model_response_aliases: None,
+                tool_timeout_ms: None,
+                model_response_aliases: RetainedModelResponseAliases::Live,
                 usage_budget: None,
                 turn_budget: None,
                 permission_rules: None,

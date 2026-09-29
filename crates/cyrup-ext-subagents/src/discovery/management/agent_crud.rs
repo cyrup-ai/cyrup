@@ -53,7 +53,6 @@ pub struct AgentFields {
     pub default_reads: Option<Option<Vec<PathBuf>>>,
     pub default_progress: Option<Option<bool>>,
     pub output: Option<Option<OutputSpec>>,
-    pub completion_guard: Option<Option<bool>>,
     pub interactive: Option<Option<bool>>,
     pub max_subagent_depth: Option<Option<u32>>,
     pub default_context: Option<Option<ContextMode>>,
@@ -267,6 +266,10 @@ fn build_definition(
         // handler accepts `config.excludeTools`, `agent-management.ts:487-497` @v0.64.0 — not
         // ported here), so a CREATED agent declares neither.
         exclude_tools: None,
+        // SUBA-111 — no management input creates an `allowedAgents` bound; a created agent
+        // declares none, matching `agent-management.ts`, which has no `allowedAgents` branch in
+        // `applyAgentConfig` either.
+        allowed_agents: None,
         allow_nested_subagents: None,
         extensions: fields.extensions.clone().unwrap_or(None),
         extensions_from_default: false,
@@ -284,7 +287,6 @@ fn build_definition(
         default_reads: fields.default_reads.clone().unwrap_or(None),
         default_progress: fields.default_progress.unwrap_or(None),
         output: fields.output.clone().unwrap_or(None),
-        completion_guard: fields.completion_guard.unwrap_or(None),
         interactive: fields.interactive.unwrap_or(None),
         max_subagent_depth: fields.max_subagent_depth.unwrap_or(None),
         default_context: fields.default_context.unwrap_or(None),
@@ -292,6 +294,9 @@ fn build_definition(
         // schemas have no `memory`/`toolBudget` key either); a created agent declares neither.
         default_async: None,
         default_timeout_ms: None,
+        // CFG-067 — same rule as `timeoutMs`: no management field exists for it, so a CREATED agent
+        // declares none.
+        default_tool_timeout_ms: None,
         memory: None,
         tool_budget: None,
         // SUBA-008: same rule as `toolBudget` — no management field exists for it, so a CREATED
@@ -363,6 +368,7 @@ fn merge_fields(
         // SUBA-092: preserved verbatim across an update so a management rewrite never strips an
         // author's exclusion list or nested-delegation grant (`agent-management.ts:321,323`).
         exclude_tools: existing.exclude_tools.clone(),
+        allowed_agents: existing.allowed_agents.clone(),
         allow_nested_subagents: existing.allow_nested_subagents,
         extensions: fields
             .extensions
@@ -406,7 +412,6 @@ fn merge_fields(
             .output
             .clone()
             .unwrap_or_else(|| existing.output.clone()),
-        completion_guard: fields.completion_guard.unwrap_or(existing.completion_guard),
         interactive: fields.interactive.unwrap_or(existing.interactive),
         max_subagent_depth: fields
             .max_subagent_depth
@@ -417,6 +422,8 @@ fn merge_fields(
         // or field-edited keeps both, exactly as pi's preserve-frontmatter update does.
         default_async: existing.default_async,
         default_timeout_ms: existing.default_timeout_ms,
+        // CFG-067 — an UPDATE never edits it but must not DROP it either.
+        default_tool_timeout_ms: existing.default_tool_timeout_ms,
         memory: existing.memory.clone(),
         tool_budget: existing.tool_budget.clone(),
         // SUBA-008: an UPDATE never edits it but must not DROP it either — see the note above.

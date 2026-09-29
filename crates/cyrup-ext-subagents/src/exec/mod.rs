@@ -15,8 +15,6 @@
 //!   (R-SA-024/025/029/031/042).
 //! - [`structured`] — structured-output extraction from the child's event stream + parent-side
 //!   JSON-Schema re-validation via the `jsonschema` crate (R-SA-030).
-//! - [`completion_guard`] — implementation-expecting classification + mutating-tool-call scan
-//!   (R-SA-034).
 //! - [`fallback`] — the model-fallback ladder-construction/retry-classification/usage-aggregation
 //!   algorithms (R-SA-035..041/044); this module supplies the `AttemptRunner` implementation that
 //!   actually spawns a real child OS process per attempt.
@@ -45,9 +43,11 @@ pub mod child_protocol;
 /// The live `_transcript.jsonl` writer fed from the parsed child-event stream (pi
 /// `shared/child-transcript.ts`).
 pub mod child_transcript;
-pub mod completion_guard;
 pub mod control;
 pub mod fallback;
+/// SUBA-124 — the two MCP-server sources `loadMcpConfig` merges beside the `mcp.json` ladder
+/// (settings `packages`, `settings.agentPluginPaths`). Upstream's own file split.
+mod mcp_config_sources;
 pub mod mcp_direct_tools;
 pub mod model_exclusions;
 pub mod model_scope;
@@ -63,7 +63,6 @@ pub mod refinement_evidence;
 pub mod result_summary;
 pub mod spawn_budget;
 pub mod structured;
-pub mod task_intent;
 /// SUBA-078 — the `subagents.maxThinking` reasoning-level ceiling.
 pub mod thinking_ceiling;
 pub mod tool_availability;
@@ -71,6 +70,9 @@ pub mod tool_budget;
 pub mod tool_call_summary;
 /// The resolved child tool surface + the pre-spawn task-claim gate.
 pub mod tool_surface;
+/// CFG-067 — the per-tool-call deadline subsystem (pi `runs/shared/tool-timeout.ts`) and the
+/// parent-side enforcement its consumers build on it.
+pub mod tool_timeout;
 pub mod turn_budget;
 pub mod usage_budget;
 
@@ -133,9 +135,6 @@ use crate::error::SubagentError;
 use crate::exec::acceptance::{
     AcceptanceContract, CleanCompletionGate, apply_post_hoc_correction,
     build_timed_out_acceptance_ledger,
-};
-use crate::exec::completion_guard::{
-    CompletionMutationGuardResult, evaluate_completion_mutation_guard,
 };
 use crate::exec::fallback::{AttemptSignal, run_fallback_ladder};
 use crate::exec::output::{
@@ -310,7 +309,9 @@ fn resolve_run_acceptance(
 ///    captured value that fails validation, or no captured value at all, forces `exit_code = 1`
 ///    with an error message — never silently downgraded, per R-SA-030's "MUST also fail the run"
 ///    text, and never satisfied by prose, per pi's "EVEN WHEN prose was produced" rule.
-/// 6. R-SA-034: completion-mutation guard, via [`completion_guard::evaluate_completion_mutation_guard`].
+/// 6. SUBA-107: NO completion-mutation guard. `pi-subagents` deleted
+///    `src/runs/shared/completion-guard.ts` at v0.70.1 (`7c98a696`), so a write-capable agent
+///    that finishes an implementation-worded task without editing anything is a SUCCESS.
 /// 7. R-SA-032: acceptance-gate evaluation, gated on `exit_code == 0 && !detached && !interrupted
 ///    && !timed_out` (R-SA-033's own gate condition), via [`acceptance::evaluate_acceptance`].
 /// 8. R-SA-033: post-hoc exit-code correction, via [`acceptance::apply_post_hoc_correction`].
@@ -713,7 +714,7 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         &mut error,
     );
 
-    let (progress, mut control) = winning_attempt_state(last_attempt);
+    let (progress, control) = winning_attempt_state(last_attempt);
 
     let mut gates = GateState {
         exit_code,
@@ -724,14 +725,12 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     };
     let (structured_output, structured_acceptance_report) =
         gates.apply_structured_output(structured_runtime.as_ref(), opts);
-    let guard_result = gates.apply_completion_guard(agent, task, &progress, &mut control);
     let acceptance_ledger = gates
         .apply_acceptance(
             &contract,
             &progress,
             opts,
             final_output.as_deref(),
-            guard_result,
             &structured_acceptance_report,
         )
         .await;
@@ -1016,6 +1015,9 @@ async fn drive_fallback_ladder<'a>(
         // upstream, which derives the flag from the RESOLVED list rather than the requested one.
         require_read_tool,
         live_notes_emitted: 0,
+        // SUBA-118 — pi `let recoveryPrompt = task` (`execution.ts:1839`): the ordinary task text
+        // until the abort-recovery plan grants a resume, which is the only thing that sets it.
+        recovery_prompt: None,
     };
     // SCOPE_3j: the ladder shell performs the cached-exclusion write for every attempt that reaches
     // the model-failure classification, so the store travels with the run rather than being read
@@ -1687,62 +1689,19 @@ impl GateState {
         }
     }
 
-    /// Step 6 (R-SA-034): completion-mutation guard — needs a real AgentDefinition-shaped view;
-    /// `evaluate_completion_mutation_guard` only reads `local_name`/`tools`/`completion_guard`, so
-    /// a minimal projection is built here rather than requiring `AgentConfig` to carry every other
-    /// `AgentDefinition` field this guard never touches.
-    ///
-    /// Returns the guard's verdict, which the acceptance gate below consumes as an acceptance
-    /// report source.
-    fn apply_completion_guard(
-        &mut self,
-        agent: &AgentConfig,
-        task: &str,
-        progress: &AgentProgress,
-        control: &mut crate::exec::control::ControlMonitor,
-    ) -> CompletionMutationGuardResult {
-        let guard_agent = completion_guard_projection(agent);
-        let guard_result =
-            evaluate_completion_mutation_guard(&guard_agent, task, &progress.all_events);
-
-        if self.gate().is_clean() && guard_result.triggered {
-            self.exit_code = 1;
-            self.push_error(
-                crate::exec::completion_guard::COMPLETION_GUARD_ERROR_MESSAGE.to_string(),
-            );
-            // pi `execution.ts:1234-1247`: the guard also raises a `needs_attention` control event with
-            // `reason: "completion_guard"` — the one raise that happens AFTER the child is gone, and
-            // the one the notice renderer formats as the "Subagent failed: <agent>" body rather than
-            // the steer/resume nudge. Shares the winning attempt's dedup set (`control` is that
-            // attempt's own monitor), exactly as the source's shared `emittedControlEventKeys` does.
-            control.emit_completion_guard_notice(
-                crate::time::now_epoch_millis(),
-                format!(
-                    "{} completed without making edits for an implementation task",
-                    agent.name
-                ),
-            );
-        }
-
-        guard_result
-    }
-
     /// Step 7 (R-SA-032) + Step 8 (R-SA-033), unless R-SA-037 bypasses both entirely.
     ///
-    /// The gate is re-derived HERE, after [`Self::apply_completion_guard`]'s correction, since
-    /// R-SA-033's own acceptance-gate condition must observe the POST-guard exit code (a run the
-    /// completion guard already failed must not additionally run acceptance evaluation against a
-    /// stale "exit_code == 0" snapshot).
+    /// The gate is re-derived HERE rather than reused from the caller, since R-SA-033's own
+    /// acceptance-gate condition must observe the exit code as the earlier gates left it.
     async fn apply_acceptance(
         &mut self,
         contract: &AcceptanceContract,
         progress: &AgentProgress,
         opts: &RunOptions,
         final_output: Option<&str>,
-        guard_result: CompletionMutationGuardResult,
         structured_report: &crate::exec::structured::StructuredAcceptanceReport,
     ) -> Option<acceptance::AcceptanceLedger> {
-        let post_guard_gate = self.gate();
+        let settled_gate = self.gate();
 
         if self.detached {
             None
@@ -1799,9 +1758,8 @@ impl GateState {
             // call replaces every prose source, and a required one that never came rejects.
             let ledger = acceptance::lattice::gate::evaluate_acceptance_with_structured_report(
                 contract,
-                post_guard_gate,
+                settled_gate,
                 final_output,
-                guard_result,
                 &opts.cwd,
                 memo,
                 file_output,
@@ -1813,7 +1771,7 @@ impl GateState {
             let correction = apply_post_hoc_correction(
                 &ledger,
                 contract.explicit,
-                post_guard_gate,
+                settled_gate,
                 self.error.as_deref(),
             );
             self.exit_code = correction.exit_code;
@@ -2104,17 +2062,20 @@ fn build_progress_snapshot(
 }
 
 /// Project an [`AgentConfig`] down to the minimal [`AgentDefinition`] shape
-/// [`evaluate_completion_mutation_guard`] actually reads (`local_name`, `tools`,
-/// `completion_guard`) — every other field is populated with an inert default since the guard
-/// never inspects them. Kept private and narrowly scoped rather than exposing a
-/// `From<&AgentConfig> for AgentDefinition` impl crate-wide, since a "mostly-fake"
-/// `AgentDefinition` is only ever valid for this one guard call, not as a general conversion.
-pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinition {
+/// [`crate::exec::output::has_output_write_capability`] actually reads (`tools`) — every other
+/// field is populated with an inert default since the predicate never inspects them. Kept private
+/// and narrowly scoped rather than exposing a `From<&AgentConfig> for AgentDefinition` impl
+/// crate-wide, since a "mostly-fake" `AgentDefinition` is only ever valid for this one capability
+/// question, not as a general conversion.
+///
+/// SUBA-107 renamed this from `completion_guard_projection`: it fed OUTPUT capability at every one
+/// of its live call sites, never the retired guard.
+pub(crate) fn output_capability_projection(agent: &AgentConfig) -> AgentDefinition {
     AgentDefinition {
         inherit_global_context: false,
         machine: None,
-        // SUBA-102 — pi `evaluateCompletionMutationGuard({ …, mutationTools })`
-        // (`completion-guard.ts:246` @v0.68.0): the agent's extra mutating tool names.
+        // SUBA-102 — the agent's extra mutating tool names, read by
+        // [`crate::exec::control::is_mutating_tool`] on the live control path.
         mutation_tools: agent.mutation_tools.clone(),
         default_turn_budget: None,
         default_acceptance: agent.default_acceptance.clone(),
@@ -2133,6 +2094,10 @@ pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinitio
         subagent_only_extensions: None,
         subagent_only_extensions_from_default: false,
         exclude_tools: None,
+        // SUBA-111 — the capability projection answers ONE question (output write capability), and
+        // the delegation bound is not part of it; the real value is read straight off `AgentConfig`
+        // at the encode site in `spawn_plan.rs`.
+        allowed_agents: None,
         allow_nested_subagents: None,
         model: agent.model.clone(),
         fallback_models: agent.fallback_models.clone(),
@@ -2144,12 +2109,12 @@ pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinitio
         default_reads: None,
         default_progress: None,
         output: agent.output.clone(),
-        completion_guard: agent.completion_guard,
         interactive: None,
         max_subagent_depth: agent.max_subagent_depth,
         default_context: None,
         default_async: None,
         default_timeout_ms: None,
+        default_tool_timeout_ms: None,
         memory: None,
         tool_budget: None,
         disabled: None,

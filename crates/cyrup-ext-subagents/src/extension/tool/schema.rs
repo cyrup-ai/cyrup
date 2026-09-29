@@ -548,6 +548,10 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // and still cross-validates them (`resolve_foreground_timeout`).
     props.insert("timeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Optional run-level timeout in ms for foreground and async/background runs. Omitted: the agent's or configured default for foreground runs; async runs use the async default. Prefer this over maxRuntimeMs." }));
     props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "deprecated": true, "description": "Deprecated alias of timeoutMs; still accepted." }));
+    // CFG-067 — pi `toolTimeoutMs` (`extension/schemas.ts:364` @v0.71.0), description verbatim. It
+    // is the PER-TOOL-CALL deadline, not the run's: `timeoutMs` above bounds the whole run, this
+    // bounds any single tool call the child makes, and the two are enforced independently.
+    props.insert("toolTimeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Per-tool deadline (ms); fast builtins default 5m." }));
     props.insert("agentScope".to_string(), serde_json::json!({ "type": "string", "description": "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" }));
     // SCOPE_19/B [CYRUP-DELTA] — upstream leaves `cwd` undescribed; a property with no description
     // makes a careful caller set it defensively. It is read by every execution mode.
@@ -859,6 +863,7 @@ mod tests {
             "async",
             "timeoutMs",
             "maxRuntimeMs",
+            "toolTimeoutMs",
             "agentScope",
             "cwd",
             "artifacts",

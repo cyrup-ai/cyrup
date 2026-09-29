@@ -171,6 +171,13 @@ fn push_registrations(api: &ExtensionApi) {
     if api.has_terminal_input_handler() {
         ui::subscribe_terminal_input();
     }
+    // EXT-064: declare (not send) the git-branch-change callback — the closure stays guest-side
+    // and the host reaches it through the `on-branch-change` export. Pi
+    // `ReadonlyFooterDataProvider.onBranchChange(callback)`, `core/footer-data-provider.ts:139-143`
+    // @v0.87.1.
+    if api.has_branch_change_handler() {
+        ui::subscribe_branch_change();
+    }
     for command in &api.autocomplete {
         registration::add_autocomplete(command);
     }
@@ -383,6 +390,18 @@ pub fn on_terminal_input(data: String) -> Option<crate::api::TerminalInputResult
             .as_ref()
             .and_then(|api| api.handle_terminal_input(&data))
     })
+}
+
+/// `on-branch-change` export body (EXT-064; pi `ReadonlyFooterDataProvider.onBranchChange`'s
+/// callback, invoked from `notifyBranchChange`, `core/footer-data-provider.ts:197-199` @v0.87.1).
+/// A no-op when this guest registered no callback, so an unexpected call is harmless.
+pub fn on_branch_change(branch: Option<String>) {
+    let ctx = crate::ctx::Ctx::new();
+    API.with(|c| {
+        if let Some(api) = c.borrow().as_ref() {
+            api.handle_branch_change(branch.as_deref(), &ctx);
+        }
+    });
 }
 
 /// `provider-login` export body (Pi `oauth.login`): returns the credentials JSON to persist.

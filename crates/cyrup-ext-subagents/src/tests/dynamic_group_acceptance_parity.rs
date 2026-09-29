@@ -154,11 +154,19 @@ async fn a_declared_group_gate_that_cannot_be_satisfied_fails_the_chain() {
 
 /// The same gate, but declaring a criterion the aggregate report DOES satisfy — the group passes
 /// and the chain continues, so the gate is a real evaluation rather than a blanket rejection.
+///
+/// SUBA-108 — the level is `attested`, not `checked`, and the difference is upstream's, not a
+/// convenience. `inferLevel` with no declared role takes the final fallthrough and returns
+/// `attested` with `["manual-notes", "residual-risks"]` (`acceptance.ts:118-122`), so
+/// `level === inferredLevel` at `:512` and the resolved evidence set is that inferred pair —
+/// both of which `aggregateAcceptanceReport` always carries (`manualNotes` at `:1211`,
+/// `residualRisks` at `:1205`). See
+/// [`a_checked_group_gate_requires_the_whole_checked_evidence_set`] for what `checked` costs.
 #[tokio::test]
 async fn a_declared_group_gate_the_aggregate_report_satisfies_lets_the_chain_through() {
     let results = walk(
         Some(serde_json::json!({
-            "level": "checked",
+            "level": "attested",
             "criteria": ["every dynamic child completed without blockers"]
         })),
         serde_json::json!([{ "id": "a" }, { "id": "b" }]),
@@ -171,6 +179,40 @@ async fn a_declared_group_gate_the_aggregate_report_satisfies_lets_the_chain_thr
         "a bare-string criterion normalizes to `criterion-1`, which the aggregate report reports \
          satisfied when every child succeeded: {:?}",
         results[0]
+    );
+}
+
+/// SUBA-108 — a `checked` group gate resolves its evidence set to
+/// `requiredEvidenceForLevel("checked")`, because the resolved level left the inferred `attested`
+/// behind (`acceptance.ts:512`). `aggregateAcceptanceReport` builds `commandsRun` by flat-mapping
+/// the CHILDREN's own reports (`:1203`), so children that filed none leave it empty — and an empty
+/// `commandsRun` is `"failed"`, not `"not-applicable"` (`reportEvidenceStatus`, `:1089`; contrast
+/// `changed-files`/`tests-added` at `:1083-1088`, which ARE not-applicable when empty).
+///
+/// This is the fail-open SUBA-108 closes at the group seam: before it,
+/// `resolve_effective_for_role` combined LEVELS only, so a `checked` group gate resolved to the
+/// DECLARED evidence set — empty — and gated on nothing but its criteria.
+#[tokio::test]
+async fn a_checked_group_gate_requires_the_whole_checked_evidence_set() {
+    let results = walk(
+        Some(serde_json::json!({
+            "level": "checked",
+            "criteria": ["every dynamic child completed without blockers"]
+        })),
+        serde_json::json!([{ "id": "a" }, { "id": "b" }]),
+    )
+    .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].success,
+        "children that filed no acceptance report cannot satisfy `commands-run`: {:?}",
+        results[0]
+    );
+    let error = results[0].error.clone().unwrap_or_default();
+    assert!(
+        error.contains("Acceptance rejected: commands-run evidence missing from child report."),
+        "expected pi's verbatim evidence-rejection message, got: {error}"
     );
 }
 

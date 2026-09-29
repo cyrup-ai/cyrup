@@ -46,11 +46,23 @@ fn groq_model_json(id: &str, context_window: u64) -> serde_json::Value {
 
 /// Write `<agent_dir>/models-store.json` the way a completed refresh would, with a `lastModified`
 /// strictly newer than the built-in catalog manifest so the staleness guard keeps it.
+///
+/// The floor is GROQ'S OWN, not the global `generatedAt`. Those were the same number while groq's
+/// catalog came from the pinned revision; since PROV-071 every provider catalog is live-fetched and
+/// carries its own `fetchedAt` in `catalog_manifest.json`, which is newer than the global value and
+/// is what `CatalogOverlay::apply` compares a persisted entry against for that provider. Seeding at
+/// `global + 1` made this fixture STALE against groq's real floor, so the overlay was discarded and
+/// the test failed — which is the staleness guard (DRIFT-007) working exactly as designed on an
+/// upgrade that moved the embedded data forward.
 async fn seed_store(agent_dir: &Path, models: Vec<serde_json::Value>) {
     let store = cyrup_config::models_store::FileModelsStore::new(
         agent_dir.join(cyrup_config::models_store::MODELS_STORE_FILE_NAME),
     );
-    let newer = cyrup_provider::builtin_model_data_generated_at().unwrap() + 1;
+    let newer = cyrup_provider::builtin_model_data_generated_at_by_provider()
+        .get("groq")
+        .copied()
+        .expect("groq has a per-provider staleness floor in catalog_manifest.json")
+        + 1;
     store
         .write(
             "groq",

@@ -5,15 +5,7 @@
 		"api": "anthropic-messages",
 		"provider": "anthropic",
 		"baseUrl": "https://api.anthropic.com",
-		"compat": {
-			"forceAdaptiveThinking": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null,
-			"xhigh": "xhigh",
-			"max": "max"
-		},
 		"input": [
 			"text",
 			"image"
@@ -25,7 +17,106 @@
 			"cacheWrite": 12.5
 		},
 		"contextWindow": 1000000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"compat": {
+			"supportsMidConvoSystemMessages": true,
+			"supportsMidConvoToolChanges": true,
+			"forceAdaptiveThinking": true,
+			"supportsStrictTools": true,
+			"allowedFallbackModels": [
+				{
+					"provider": "anthropic",
+					"model": "claude-opus-4-8",
+					"cost": {
+						"input": 5,
+						"output": 25,
+						"cacheRead": 0.5,
+						"cacheWrite": 6.25
+					}
+				},
+				{
+					"provider": "anthropic",
+					"model": "claude-opus-5",
+					"cost": {
+						"input": 5,
+						"output": 25,
+						"cacheRead": 0.5,
+						"cacheWrite": 6.25
+					}
+				}
+			]
+		},
+		"thinkingLevelMap": {
+			"off": null,
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "claude-fable-5-1",
+		"name": "Claude Fable 5.1",
+		"api": "anthropic-messages",
+		"provider": "anthropic",
+		"baseUrl": "https://api.anthropic.com",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 10,
+			"output": 50,
+			"cacheRead": 0.25,
+			"cacheWrite": 12.5
+		},
+		"contextWindow": 1000000,
+		"maxTokens": 128000,
+		"compat": {
+			"supportsMidConvoEffort": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsMidConvoToolChanges": true,
+			"forceAdaptiveThinking": true,
+			"supportsStrictTools": true
+		},
+		"thinkingLevelMap": {
+			"off": null,
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-haiku-4-5",
@@ -45,7 +136,27 @@
 			"cacheWrite": 1.25
 		},
 		"contextWindow": 200000,
-		"maxTokens": 64000
+		"maxTokens": 64000,
+		"compat": {
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 100,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-haiku-4-5-20251001",
@@ -65,47 +176,27 @@
 			"cacheWrite": 1.25
 		},
 		"contextWindow": 200000,
-		"maxTokens": 64000
-	},
-	{
-		"id": "claude-opus-4-1",
-		"name": "Claude Opus 4.1 (latest)",
-		"api": "anthropic-messages",
-		"provider": "anthropic",
-		"baseUrl": "https://api.anthropic.com",
-		"reasoning": true,
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 15,
-			"output": 75,
-			"cacheRead": 1.5,
-			"cacheWrite": 18.75
+		"maxTokens": 64000,
+		"compat": {
+			"supportsStrictTools": true
 		},
-		"contextWindow": 200000,
-		"maxTokens": 32000
-	},
-	{
-		"id": "claude-opus-4-1-20250805",
-		"name": "Claude Opus 4.1",
-		"api": "anthropic-messages",
-		"provider": "anthropic",
-		"baseUrl": "https://api.anthropic.com",
-		"reasoning": true,
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 15,
-			"output": 75,
-			"cacheRead": 1.5,
-			"cacheWrite": 18.75
+		"promptCache": {
+			"short": 300,
+			"long": 3600
 		},
-		"contextWindow": 200000,
-		"maxTokens": 32000
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 100,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-opus-4-5",
@@ -125,7 +216,27 @@
 			"cacheWrite": 6.25
 		},
 		"contextWindow": 200000,
-		"maxTokens": 64000
+		"maxTokens": 64000,
+		"compat": {
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 100,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-opus-4-5-20251101",
@@ -145,7 +256,27 @@
 			"cacheWrite": 6.25
 		},
 		"contextWindow": 200000,
-		"maxTokens": 64000
+		"maxTokens": 64000,
+		"compat": {
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 100,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-opus-4-6",
@@ -153,13 +284,7 @@
 		"api": "anthropic-messages",
 		"provider": "anthropic",
 		"baseUrl": "https://api.anthropic.com",
-		"compat": {
-			"forceAdaptiveThinking": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"max": "max"
-		},
 		"input": [
 			"text",
 			"image"
@@ -171,7 +296,31 @@
 			"cacheWrite": 6.25
 		},
 		"contextWindow": 1000000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"max": "max"
+		},
+		"compat": {
+			"forceAdaptiveThinking": true,
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-opus-4-7",
@@ -179,15 +328,7 @@
 		"api": "anthropic-messages",
 		"provider": "anthropic",
 		"baseUrl": "https://api.anthropic.com",
-		"compat": {
-			"forceAdaptiveThinking": true,
-			"supportsTemperature": false
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"xhigh": "xhigh",
-			"max": "max"
-		},
 		"input": [
 			"text",
 			"image"
@@ -199,7 +340,33 @@
 			"cacheWrite": 6.25
 		},
 		"contextWindow": 1000000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"forceAdaptiveThinking": true,
+			"supportsTemperature": false,
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-opus-4-8",
@@ -207,15 +374,7 @@
 		"api": "anthropic-messages",
 		"provider": "anthropic",
 		"baseUrl": "https://api.anthropic.com",
-		"compat": {
-			"forceAdaptiveThinking": true,
-			"supportsTemperature": false
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"xhigh": "xhigh",
-			"max": "max"
-		},
 		"input": [
 			"text",
 			"image"
@@ -227,7 +386,139 @@
 			"cacheWrite": 6.25
 		},
 		"contextWindow": 1000000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"compat": {
+			"supportsMidConvoSystemMessages": true,
+			"supportsMidConvoToolChanges": true,
+			"forceAdaptiveThinking": true,
+			"supportsTemperature": false,
+			"supportsStrictTools": true
+		},
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "claude-opus-5",
+		"name": "Claude Opus 5",
+		"api": "anthropic-messages",
+		"provider": "anthropic",
+		"baseUrl": "https://api.anthropic.com",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 5,
+			"output": 25,
+			"cacheRead": 0.5,
+			"cacheWrite": 6.25
+		},
+		"contextWindow": 1000000,
+		"maxTokens": 128000,
+		"compat": {
+			"supportsMidConvoEffort": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsMidConvoToolChanges": true,
+			"forceAdaptiveThinking": true,
+			"supportsTemperature": false,
+			"supportsStrictTools": true
+		},
+		"thinkingLevelMap": {
+			"off": null,
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "claude-opus-5-5",
+		"name": "Claude Opus 5.5",
+		"api": "anthropic-messages",
+		"provider": "anthropic",
+		"baseUrl": "https://api.anthropic.com",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 4,
+			"output": 20,
+			"cacheRead": 0.2,
+			"cacheWrite": 5
+		},
+		"contextWindow": 1000000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsMidConvoEffort": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsMidConvoToolChanges": true,
+			"forceAdaptiveThinking": true,
+			"supportsTemperature": false,
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-sonnet-4-5",
@@ -247,7 +538,27 @@
 			"cacheWrite": 3.75
 		},
 		"contextWindow": 1000000,
-		"maxTokens": 64000
+		"maxTokens": 64000,
+		"compat": {
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-sonnet-4-5-20250929",
@@ -267,7 +578,27 @@
 			"cacheWrite": 3.75
 		},
 		"contextWindow": 1000000,
-		"maxTokens": 64000
+		"maxTokens": 64000,
+		"compat": {
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-sonnet-4-6",
@@ -275,13 +606,7 @@
 		"api": "anthropic-messages",
 		"provider": "anthropic",
 		"baseUrl": "https://api.anthropic.com",
-		"compat": {
-			"forceAdaptiveThinking": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"max": "max"
-		},
 		"input": [
 			"text",
 			"image"
@@ -293,7 +618,31 @@
 			"cacheWrite": 3.75
 		},
 		"contextWindow": 1000000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"max": "max"
+		},
+		"compat": {
+			"forceAdaptiveThinking": true,
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "claude-sonnet-5",
@@ -301,14 +650,7 @@
 		"api": "anthropic-messages",
 		"provider": "anthropic",
 		"baseUrl": "https://api.anthropic.com",
-		"compat": {
-			"forceAdaptiveThinking": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"xhigh": "xhigh",
-			"max": "max"
-		},
 		"input": [
 			"text",
 			"image"
@@ -320,6 +662,85 @@
 			"cacheWrite": 2.5
 		},
 		"contextWindow": 1000000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"forceAdaptiveThinking": true,
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "claude-sonnet-5-5",
+		"name": "Claude Sonnet 5.5",
+		"api": "anthropic-messages",
+		"provider": "anthropic",
+		"baseUrl": "https://api.anthropic.com",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 2,
+			"output": 10,
+			"cacheRead": 0.2,
+			"cacheWrite": 2.5
+		},
+		"contextWindow": 1000000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsMidConvoEffort": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsMidConvoToolChanges": true,
+			"forceAdaptiveThinking": true,
+			"supportsTemperature": false,
+			"supportsStrictTools": true
+		},
+		"promptCache": {
+			"short": 300,
+			"long": 3600
+		},
+		"inputLimits": {
+			"maxRequestBytes": 33554432,
+			"images": {
+				"maxPerRequest": 600,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	}
 ]

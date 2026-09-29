@@ -80,6 +80,7 @@ pub mod key_census;
 pub mod management;
 pub mod merge;
 pub(crate) mod package_name;
+pub mod runtime_agent_events;
 pub mod runtime_registry;
 pub mod settings_write;
 pub mod skills;
@@ -95,7 +96,8 @@ use chains::{ChainScanResult, scan_chain_scopes};
 use management::{AgentVisibility, ChainVisibility};
 use types::{
     AgentDefinition, AgentDiscoveryDiagnostic, AgentReadScope, AgentSource, ChainDefinition,
-    ChainDiscoveryDiagnostic, LayeredOverrideSettings, OverrideField, SubagentSettings,
+    ChainDiscoveryDiagnostic, LayeredOverrideSettings, OverrideField, SubagentSettings, ToolRef,
+    ToolsOverrideField,
 };
 
 /// Directory segment reserved for skill bundling (R-SA-007), excluded from agent-file discovery
@@ -127,7 +129,7 @@ const AGENT_FILE_EXTENSION: &str = "md";
 /// Config-directory segment holding cyrup's per-scope agent/chain state (`.cyrup`, cyrup's analog
 /// of pi's `getConfigDirName()` = `.pi`, shared/utils.ts:16,91-92 @v0.43.0). A directory containing this
 /// segment marks a project root.
-const PROJECT_CONFIG_DIR_SEGMENT: &str = ".cyrup";
+pub(crate) const PROJECT_CONFIG_DIR_SEGMENT: &str = ".cyrup";
 
 /// Legacy top-level agents directory segment (pi's `.agents`), honored BOTH at a project root (a
 /// lower-precedence project agent read dir, `agents.ts:1687,1690` @v0.43.0 — pushed AHEAD of the
@@ -944,6 +946,44 @@ pub fn parse_subagent_settings(
                 delta.machine = OverrideField::Value(trimmed.to_string());
             }
         }
+        // MERGE-NORM / pi `agents.ts:1140-1141` @v0.71.0:
+        //
+        // ```ts
+        // const allowedAgents = parseOverrideStringArrayOrFalse(input.allowedAgents, …);
+        // if (allowedAgents !== undefined) override.allowedAgents =
+        //     allowedAgents === false ? false : normalizeCapabilityCeilingAllowedAgents(allowedAgents);
+        // ```
+        //
+        // Both halves, in upstream's order and at upstream's moment. The settings-override arm is
+        // an agent-sourced CAPABILITY CEILING, so it is held to exactly the rules the agent-file
+        // arm (`discovery/frontmatter.rs`) and the runtime-registry arm
+        // (`discovery/runtime_registry.rs`) already enforce: an entry with a space, a control
+        // character or an over-long name refuses the settings file here — R-SA-009 — instead of
+        // travelling verbatim to a consumer that can only silently fail to match it.
+        //
+        // The trim/drop-empties pass runs FIRST and is not decoration: upstream's
+        // `parseOverrideStringArrayOrFalse` drops an empty entry BEFORE the normalizer sees it, so
+        // `["", "reviewer"]` is `["reviewer"]` and not a refusal, while `[" rev iewer "]` still is
+        // one (trimming cannot rescue the interior space).
+        if let OverrideField::Value(names) = &delta.allowed_agents {
+            let entries = names
+                .iter()
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .map(|name| serde_json::Value::String(name.to_string()))
+                .collect::<Vec<_>>();
+            let normalized =
+                crate::exec::capability_ceiling::normalize_capability_ceiling_allowed_agents(
+                    &serde_json::Value::Array(entries),
+                )
+                .map_err(SubagentError::MalformedSettings)?;
+            delta.allowed_agents = OverrideField::Value(normalized);
+        }
+        // MERGE-NORM / pi `parseToolsOverride` -> `parseOverrideStringArrayOrFalse`
+        // (`agents.ts:970-978`, `:935-967`): the `tools` override's LIST arm is trimmed
+        // entry-by-entry and empty entries are dropped, before `applyToolsOverride`'s
+        // `splitToolList` ever classifies one.
+        normalize_tools_override_list(&mut delta.tools);
     }
     if let Some(de) = settings.default_extensions.as_ref() {
         settings.default_extensions = Some(de.iter().map(|item| item.trim().to_string()).collect());
@@ -998,6 +1038,54 @@ pub fn parse_subagent_settings(
     }
     populate_override_tool_budgets(&mut settings, value)?;
     Ok(settings)
+}
+
+/// pi `parseToolsOverride` (`agents.ts:970-978`) delegating to `parseOverrideStringArrayOrFalse`
+/// (`agents.ts:948-966`) for the LIST arm: every entry is `.trim()`ed and an entry that trims to
+/// empty is DROPPED, before the value is ever stored on the override and long before
+/// `applyToolsOverride`'s `splitToolList` classifies it.
+///
+/// [`ToolsOverrideField`]'s `Deserialize` classifies each entry as it reads it, so trimming the
+/// already-typed [`ToolRef`] in place would be wrong on the one shape that matters: `" mcp:x "`
+/// deserializes as [`ToolRef::Builtin`] (the untrimmed text does not start with `mcp:`), where
+/// upstream trims FIRST and therefore reaches `splitToolList` with `"mcp:x"` and yields an MCP
+/// direct tool. Each entry is rendered back to its raw settings spelling, trimmed, and
+/// re-classified through [`ToolRef::from_tool_string`] — which is exactly upstream's order.
+///
+/// `mcp:` alone is NOT an empty entry: upstream keeps it (the raw string is non-empty) and
+/// `slice(4)` leaves `""`, so the round-trip below preserves that `Mcp("")` rather than dropping
+/// it. Only [`ToolRef::ExtensionPath`] has no raw settings spelling — it is unreachable from the
+/// string form this override is written in and can only arrive through the adjacently-tagged map
+/// form — so it is trimmed in place rather than re-classified.
+fn normalize_tools_override_list(field: &mut ToolsOverrideField) {
+    let ToolsOverrideField::Value(entries) = field else {
+        return;
+    };
+    let mut normalized = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        match entry {
+            ToolRef::Builtin(name) => {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    normalized.push(ToolRef::from_tool_string(trimmed));
+                }
+            }
+            ToolRef::Mcp(name) => {
+                let raw = format!("mcp:{name}");
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    normalized.push(ToolRef::from_tool_string(trimmed));
+                }
+            }
+            ToolRef::ExtensionPath(name) => {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    normalized.push(ToolRef::ExtensionPath(trimmed.to_string()));
+                }
+            }
+        }
+    }
+    *field = ToolsOverrideField::Value(normalized);
 }
 
 /// pi `toolBudget?: ToolBudgetConfig | false` on a per-agent override entry (`agents.ts:102`,
@@ -2896,7 +2984,6 @@ mod tests {
                     "allowNestedSubagents": true,
                     "extensions": ["./ext/a.ts"],
                     "subagentOnlyExtensions": ["./ext/child.ts"],
-                    "completionGuard": false,
                     "toolBudget": { "hard": 20, "soft": 10, "block": "*" }
                 }
             }
@@ -5034,7 +5121,12 @@ mod agent_scan_and_exclude_dir_tests {
 
 #[cfg(test)]
 mod subagent_settings_census_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
 
@@ -5106,5 +5198,111 @@ mod subagent_settings_census_tests {
         });
         let settings = parse_subagent_settings(Some(&raw)).expect("all keys are read");
         assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MERGE-NORM — `agentOverrides.<name>.allowedAgents` / `.tools` are normalized at PARSE time,
+    // exactly where pi normalizes them (`agents.ts:1132`, `:1140-1141` @v0.71.0).
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn an_override_allowed_agents_list_is_normalized_at_parse_time() {
+        // pi: `parseOverrideStringArrayOrFalse` trims and drops empties, then
+        // `normalizeCapabilityCeilingAllowedAgents` dedups and sorts. All four transforms are
+        // observable in one list, and none of them happened before this change: the settings value
+        // travelled verbatim to the ceiling encoder.
+        let raw = serde_json::json!({
+            "agentOverrides": {
+                "scout": { "allowedAgents": ["reviewer", "  planner  ", "reviewer", "   ", ""] }
+            }
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("a valid override parses");
+        let delta = settings.overrides.get("scout").expect("scout override");
+        match &delta.allowed_agents {
+            OverrideField::Value(names) => assert_eq!(
+                names,
+                &vec!["planner".to_string(), "reviewer".to_string()],
+                "trimmed, empties dropped, deduplicated and sorted"
+            ),
+            other => panic!("expected a value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_override_allowed_agents_entry_outside_the_ceiling_grammar_refuses_the_settings_file() {
+        // The REFUSAL half. pi throws out of `parseBuiltinOverrideEntry`, which aborts the settings
+        // read; cyrup's equivalent is R-SA-009's `MalformedSettings`, carrying the ceiling's own
+        // verbatim message — the same one the agent-file arm (`frontmatter.rs`) already raises.
+        let raw = serde_json::json!({
+            "agentOverrides": { "scout": { "allowedAgents": ["rev iewer"] } }
+        });
+        let err = parse_subagent_settings(Some(&raw)).expect_err("an invalid name is refused");
+        match err {
+            SubagentError::MalformedSettings(message) => assert_eq!(
+                message,
+                "Invalid capability ceiling allowedAgents entry 'rev iewer'."
+            ),
+            other => panic!("expected MalformedSettings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_override_allowed_agents_false_still_clears_and_is_not_normalized() {
+        // pi's `allowedAgents === false ? false : normalize(...)` — the clear arm never reaches the
+        // normalizer, so the refusal added above must not swallow it.
+        let raw = serde_json::json!({
+            "agentOverrides": { "scout": { "allowedAgents": false } }
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("a clear parses");
+        let delta = settings.overrides.get("scout").expect("scout override");
+        assert!(matches!(delta.allowed_agents, OverrideField::ExplicitClear));
+    }
+
+    #[test]
+    fn an_override_tools_list_is_trimmed_before_it_is_classified() {
+        // pi `parseToolsOverride` -> `parseOverrideStringArrayOrFalse` (`agents.ts:970`, `:948`):
+        // trim each entry, drop the ones that trim to empty, THEN let `splitToolList` classify.
+        // `" mcp:srv.tool "` is the entry that proves the ORDER matters: classified before the
+        // trim it is a builtin named `" mcp:srv.tool "`, which matches no tool at all.
+        let raw = serde_json::json!({
+            "agentOverrides": {
+                "scout": { "tools": ["  read  ", "", "   ", " mcp:srv.tool ", "mcp:"] }
+            }
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("a valid tools override parses");
+        let delta = settings.overrides.get("scout").expect("scout override");
+        match &delta.tools {
+            ToolsOverrideField::Value(tools) => assert_eq!(
+                tools,
+                &vec![
+                    ToolRef::Builtin("read".to_string()),
+                    ToolRef::Mcp("srv.tool".to_string()),
+                    // `"mcp:"` is a NON-EMPTY raw entry upstream keeps; `slice(4)` leaves `""`.
+                    ToolRef::Mcp(String::new()),
+                ]
+            ),
+            other => panic!("expected a value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_tools_overrides_three_non_list_arms_survive_normalization() {
+        // `false` (the EMPTY allowlist) and `"inherit"` (no allowlist) are opposites, and `Unset`
+        // is neither — none of the three goes through the list normalization above.
+        for (json, expected) in [
+            (serde_json::json!(false), ToolsOverrideField::ExplicitClear),
+            (serde_json::json!("inherit"), ToolsOverrideField::Inherit),
+        ] {
+            let raw = serde_json::json!({
+                "agentOverrides": { "scout": { "tools": json } }
+            });
+            let settings = parse_subagent_settings(Some(&raw)).expect("parses");
+            let delta = settings.overrides.get("scout").expect("scout override");
+            assert_eq!(delta.tools, expected);
+        }
+        let raw = serde_json::json!({ "agentOverrides": { "scout": { "model": "m" } } });
+        let settings = parse_subagent_settings(Some(&raw)).expect("parses");
+        let delta = settings.overrides.get("scout").expect("scout override");
+        assert_eq!(delta.tools, ToolsOverrideField::Unset);
     }
 }

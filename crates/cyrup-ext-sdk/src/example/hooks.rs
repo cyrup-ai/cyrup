@@ -94,6 +94,38 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // text is what lets a host test prove the GUEST's handler ran across the WIT boundary.
     api.on_agent_settled(|ctx| {
         ctx.ui().notify("demo: agent settled");
+        // EXT-087 — a send from an EVENT handler, which upstream allows from every handler
+        // (`ctx.sendUserMessage` is `assertActive(); runtime.sendUserMessage(...)`,
+        // `core/extensions/loader.ts:356-358` @v0.87.1, with no tier check) and cyrup refused
+        // outright until this row: the host answered "deadlock guard: session-mutating control op
+        // from an event handler".
+        //
+        // ARMED by `/armsend`, and disarmed by the first firing, for two reasons. This component is
+        // the shared fixture behind the whole `cyrup-it` suite, so an unconditional send here would
+        // start an extra run under every other test in it. And an extension that sent on EVERY
+        // settle would loop forever — upstream too — so a one-shot latch is what a real one would
+        // use as well.
+        if super::wiring::take_armed_settle_send() {
+            match ctx.send_user_message("from the settled handler", serde_json::Value::Null) {
+                Ok(()) => ctx.ui().notify("demo: settled send queued"),
+                Err(e) => ctx.ui().notify(&format!("demo: settled send refused: {e}")),
+            }
+        }
+    });
+
+    // EXT-064 — the guest half of `ReadonlyFooterDataProvider.onBranchChange(callback)`
+    // (`core/footer-data-provider.ts:139-143` @v0.87.1). Upstream's custom footer is a COMPONENT
+    // the draw path re-renders, so a branch change repaints it with no extension code involved; a
+    // cyrup guest hands the host rendered TEXT, so it is told instead and re-renders itself. This
+    // handler does exactly what such an extension would: notify (so a host test can see the
+    // callback ran across the WIT boundary) and re-set the footer from the new branch.
+    //
+    // Unconditional, unlike the `/armsend` latch above: it fires only when the host actually
+    // reports a branch change, which no other test in the shared `cyrup-it` suite provokes.
+    api.on_branch_change(|branch: Option<&str>, ctx: &crate::Ctx| {
+        let shown = branch.unwrap_or("(no repo)");
+        ctx.ui().notify(&format!("demo: branch changed to {shown}"));
+        ctx.ui().set_footer(Some(&format!("branch: {shown}")));
     });
 
     // EXT-004: register a tool from a LIVE handler, after `init` — Pi's

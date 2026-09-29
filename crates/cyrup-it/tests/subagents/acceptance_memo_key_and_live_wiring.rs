@@ -780,6 +780,7 @@ async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
@@ -795,6 +796,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -802,7 +805,6 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
         memory: None,
@@ -843,6 +845,7 @@ fn runner_config(
     step: SingleStepSpec,
 ) -> RunnerConfig {
     RunnerConfig {
+        tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,
         runner_process_instance_id: None,

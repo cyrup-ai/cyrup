@@ -25,7 +25,6 @@ use crate::exec::acceptance::{
     AcceptanceStatus, CleanCompletionGate, evaluate_acceptance, inject_acceptance_contract,
     lower_acceptance_input,
 };
-use crate::exec::completion_guard::CompletionMutationGuardResult;
 
 /// The declared policy from the backlog item's own impact statement, plus a review gate and a stop
 /// rule so all four keys are exercised by one fixture.
@@ -49,15 +48,6 @@ fn clean_gate() -> CleanCompletionGate {
         detached: false,
         interrupted: false,
         timed_out: false,
-    }
-}
-
-/// The completion-mutation guard did NOT fire — pre-fix, this alone was enough to reach `Checked`.
-fn guard_did_not_fire() -> CompletionMutationGuardResult {
-    CompletionMutationGuardResult {
-        expected_mutation: true,
-        attempted_mutation: true,
-        triggered: false,
     }
 }
 
@@ -139,7 +129,6 @@ async fn a_child_report_missing_the_declared_criteria_and_evidence_is_rejected()
         &contract,
         clean_gate(),
         Some(BARE_REPORT),
-        guard_did_not_fire(),
         dir.path(),
         None,
         None,
@@ -187,7 +176,6 @@ async fn a_child_report_satisfying_the_declared_policy_reaches_checked() {
         &contract,
         clean_gate(),
         Some(report),
-        guard_did_not_fire(),
         dir.path(),
         None,
         None,
@@ -218,7 +206,6 @@ async fn a_criterion_reported_as_not_satisfied_is_rejected_with_pis_wording() {
         &contract,
         clean_gate(),
         Some(report),
-        guard_did_not_fire(),
         dir.path(),
         None,
         None,
@@ -256,7 +243,6 @@ async fn a_recommended_criterion_is_prompted_but_never_gates() {
         &contract,
         clean_gate(),
         Some("```acceptance-report\n{\"criteriaSatisfied\": []}\n```"),
-        guard_did_not_fire(),
         dir.path(),
         None,
         None,
@@ -304,16 +290,7 @@ async fn declared_no_staged_files_evidence_runs_a_real_git_status_and_rejects_a_
     // The child CLAIMS a clean index. The orchestrator's own `git status` says otherwise, and the
     // orchestrator wins (DI-SA-5).
     let report = "```acceptance-report\n{\"criteriaSatisfied\": [], \"noStagedFiles\": true}\n```";
-    let ledger = evaluate_acceptance(
-        &contract,
-        clean_gate(),
-        Some(report),
-        guard_did_not_fire(),
-        cwd,
-        None,
-        None,
-    )
-    .await;
+    let ledger = evaluate_acceptance(&contract, clean_gate(), Some(report), cwd, None, None).await;
 
     assert_eq!(
         ledger.status,

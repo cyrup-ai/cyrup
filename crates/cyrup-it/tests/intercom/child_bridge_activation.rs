@@ -114,7 +114,6 @@ fn base_agent_config(model: &str) -> AgentConfig {
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth: None,
         depth: DepthEnvelope {
@@ -129,12 +128,15 @@ fn base_agent_config(model: &str) -> AgentConfig {
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
         exclude_tools: Vec::new(), // SUBA-092: no exclusions (this literal predates the field)
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
     }
 }
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        tool_timeout_ms: None,
         // SUBA-119 — a fixture launch whose model comes from its own agent config, so
         // native-child model verification is armed and no response-id alias is declared.
         model_override_from_parent: false,

@@ -228,6 +228,25 @@ pub struct AbortRecoveryInput<'a> {
     pub after_compaction_settlement: bool,
 }
 
+/// The `message` payload of every `message_end` the child emitted, in order — the `messages` this
+/// module's `CYRUP-DELTA` describes, projected out of
+/// [`crate::exec::progress::AgentProgress::message_end_events`] once so
+/// [`plan_abort_recovery`] can walk plain JSON.
+///
+/// Every role is kept (`assistant`, `user`, `toolResult`): upstream's `SingleResult.messages` is
+/// likewise the flat, role-mixed list, and two of the ladder's rungs
+/// ([`has_useful_progress`], [`has_unresolved_tool_call`]) read the non-assistant entries.
+#[must_use]
+pub fn message_end_values(events: &[crate::exec::ndjson::SubagentEvent]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            crate::exec::ndjson::SubagentEvent::MessageEnd { message } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// `planAbortRecovery(input)` (`abort-recovery.ts:68-116`). The settle ladder, in upstream's exact
 /// order; see this module's header for the two orderings that are load-bearing.
 #[must_use]

@@ -1,4 +1,4 @@
-;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.10.0`
+;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.11.0`
 ;; `extension` world and whose `init` succeeds, so the host reaches its `${path} factory` timing mark.
 ;; It imports nothing and exports every `events` function plus `init`. Each export returns a
 ;; pointer to zeroed memory, which the canonical ABI reads as the first case / empty value
@@ -57,6 +57,7 @@
     (func (export "on-session-start") (param i32 i32 i32 i32 i32))
     (func (export "on-session-shutdown") (param i32 i32 i32 i32 i32))
     (func (export "on-session-info-changed") (param i32 i32 i32))
+    (func (export "on-branch-change") (param i32 i32 i32))
     (func (export "on-resources-discover") (param i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "on-project-trust") (param i32 i32) (result i32) i32.const 16)
     (func (export "on-session-before-switch") (param i32 i32 i32 i32 i32) (result i32) i32.const 16)
@@ -164,6 +165,8 @@
     (canon lift (core func $i "on-session-shutdown") (memory $mem) (realloc $realloc)))
   (func $on-session-info-changed (param "name" (option string))
     (canon lift (core func $i "on-session-info-changed") (memory $mem) (realloc $realloc)))
+  (func $on-branch-change (param "branch" (option string))
+    (canon lift (core func $i "on-branch-change") (memory $mem) (realloc $realloc)))
   (func $on-resources-discover (param "cwd" string) (param "reason" string) (result $hook-outcome)
     (canon lift (core func $i "on-resources-discover") (memory $mem) (realloc $realloc)))
   (func $on-project-trust (param "cwd" string) (result $hook-outcome)
@@ -225,6 +228,7 @@
     (export "on-session-start" (func $on-session-start))
     (export "on-session-shutdown" (func $on-session-shutdown))
     (export "on-session-info-changed" (func $on-session-info-changed))
+    (export "on-branch-change" (func $on-branch-change))
     (export "on-resources-discover" (func $on-resources-discover))
     (export "on-project-trust" (func $on-project-trust))
     (export "on-session-before-switch" (func $on-session-before-switch))
@@ -235,6 +239,6 @@
     (export "on-session-tree" (func $on-session-tree))
     (export "bus-deliver" (func $bus-deliver))
   )
-  (export "cyrup:ext/events@0.10.0" (instance $events))
+  (export "cyrup:ext/events@0.11.0" (instance $events))
   (export "init" (func $init))
 )

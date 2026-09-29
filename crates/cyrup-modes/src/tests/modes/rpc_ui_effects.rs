@@ -167,8 +167,8 @@ async fn rpc_header_footer_and_tools_expanded_effects_never_reach_the_wire() {
     let boot = read_json_line(&mut client_reader).await;
     assert_eq!(boot["command"], "get_state");
 
-    host_services.set_header("custom header");
-    host_services.set_footer("custom footer");
+    host_services.set_header(Some("custom header"));
+    host_services.set_footer(Some("custom footer"));
     host_services.set_tools_expanded(true);
 
     // SEAM-030 (b) — the 50 ms sleep that used to sit here is replaced by a POSITIVE

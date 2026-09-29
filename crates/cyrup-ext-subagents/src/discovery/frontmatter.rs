@@ -93,6 +93,9 @@ const KNOWN_FIELDS: &[&str] = &[
     // already there, `excludeTools` arrived with `b26da18e`). Same rule as every key above: known
     // here AND emitted by `management::serialize_agent`, or the first management rewrite deletes it.
     "excludeTools",
+    // SUBA-111 — pi `agents.ts:2118` @v0.71.0 (added at v0.70.0 by #2312). Until it was typed
+    // here it round-tripped into `extra_fields` and bound nothing at all.
+    "allowedAgents",
     "allowNestedSubagents",
     "model",
     "fallbackModels",
@@ -115,7 +118,6 @@ const KNOWN_FIELDS: &[&str] = &[
     "defaultProgress",
     "interactive",
     "maxSubagentDepth",
-    "completionGuard",
     // Both present in `KNOWN_FIELDS` at the ported v0.34.0 baseline
     // (`agent-serializer.ts:4-26` @ v0.34.0). Until they were parsed here, a `toolBudget:` or
     // `memory:` line in an agent file was demoted to `extra_fields` and did nothing at all.
@@ -126,6 +128,9 @@ const KNOWN_FIELDS: &[&str] = &[
     // omitted the corresponding parameter.
     "async",
     "timeoutMs",
+    // CFG-067 — `toolTimeoutMs` (`agent-serializer.ts:26` @v0.71.0). Known here AND emitted by
+    // `management::serialize_agent`, or the first management rewrite would drop it.
+    "toolTimeoutMs",
     // SUBA-082 — both in `KNOWN_FIELDS` at the row's tag (`agent-serializer.ts:24-25` @v0.57.0,
     // `:26-27` @v0.64.0). Parsed into `default_acceptance`/`acceptance_role`; until then both were
     // demoted to `extra_fields`, so `acceptanceRole: writer` on a `security-reviewer` silently
@@ -984,6 +989,38 @@ pub fn parse_agent_file_checked(
     // (`pi-args.ts:502`), which is where [`crate::exec::build_attempt_spawn_plan`] does them too.
     let exclude_tools = parse_frontmatter_list(parsed.get("excludeTools"));
 
+    // SUBA-111 `allowedAgents:` — pi `agents.ts:2118-2119` @v0.71.0:
+    //
+    // ```text
+    // const parsedAllowedAgents = parseFrontmatterList(frontmatter.allowedAgents);
+    // const allowedAgents = parsedAllowedAgents === undefined
+    //     ? undefined
+    //     : normalizeCapabilityCeilingAllowedAgents(parsedAllowedAgents);
+    // ```
+    //
+    // The list grammar is `tools:`'s (comma list or YAML block), and the normalizer is the SHARED
+    // capability-ceiling validation — so an entry with a space, a control character or an
+    // over-long name is refused here with the ceiling's own verbatim message rather than silently
+    // producing a bound nobody can satisfy. Upstream throws; this parser's equivalent is a
+    // per-file diagnostic that skips the agent, the same shape `toolBudget` failures take above.
+    let allowed_agents = match parse_frontmatter_list(parsed.get("allowedAgents")) {
+        None => None,
+        Some(entries) => {
+            let values = serde_json::Value::Array(
+                entries
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect::<Vec<_>>(),
+            );
+            match crate::exec::capability_ceiling::normalize_capability_ceiling_allowed_agents(
+                &values,
+            ) {
+                Ok(names) => Some(names),
+                Err(message) => return Err(fail(message)),
+            }
+        }
+    };
+
     let default_reads = parse_frontmatter_list(parsed.get("defaultReads"))
         .filter(|v| !v.is_empty())
         .map(|v| v.into_iter().map(PathBuf::from).collect::<Vec<_>>());
@@ -1041,7 +1078,6 @@ pub fn parse_agent_file_checked(
     let max_subagent_depth = parsed
         .get("maxSubagentDepth")
         .and_then(parse_max_subagent_depth);
-    let completion_guard = parse_bool_field(parsed.get("completionGuard"));
 
     // `toolBudget:` — pi `agents.ts:1163-1195` @ v0.34.0: a present, non-blank value is
     // `JSON.parse`d and must be a JSON OBJECT; `tool-budget.ts::validateToolBudgetConfig` then
@@ -1229,18 +1265,24 @@ pub fn parse_agent_file_checked(
         },
     };
 
-    // SUBA-086 `toolTimeoutMs:` — pi `agents.ts:2031-2038` @v0.64.0: `!Number.isInteger(parsed)
-    // || parsed <= 0 || parsed > 2_147_483_647` THROWS. Validated only: cyrup carries no
-    // per-agent tool-timeout default yet, so a VALID value keeps round-tripping through
-    // `extra_fields` exactly as before (the key is deliberately absent from `KNOWN_FIELDS` here —
-    // adding it without a typed field would drop it from the serializer's output).
-    if let Some(raw) = parsed.get("toolTimeoutMs")
-        && !matches!(raw.trim().parse::<u64>(), Ok(ms) if ms > 0 && ms <= 2_147_483_647)
-    {
-        return Err(fail(format!(
-            "Agent '{local_name}' has invalid toolTimeoutMs frontmatter; expected a positive integer no larger than 2147483647."
-        )));
-    }
+    // SUBA-086 / CFG-067 `toolTimeoutMs:` — pi `agents.ts:2163-2169` @v0.71.0:
+    // `!Number.isInteger(parsed) || parsed <= 0 || parsed > 2_147_483_647` THROWS, and the value
+    // that survives becomes `defaultToolTimeoutMs` (`:2258`). CFG-067 lands the second half: the
+    // key is now a typed [`AgentDefinition::default_tool_timeout_ms`] and a KNOWN field, so it is
+    // serialized from that field (pi `agent-serializer.ts:106`) instead of riding in
+    // `extra_fields`, and the second rung of `resolveToolTimeoutMs` finally has a value.
+    let default_tool_timeout_ms = match parsed.get("toolTimeoutMs") {
+        None => None,
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 && ms <= crate::exec::tool_timeout::MAX_TIMER_DELAY_MS => Some(ms),
+            _ => {
+                return Err(fail(format!(
+                    "Agent '{local_name}' has invalid toolTimeoutMs frontmatter; expected a positive integer no larger than {}.",
+                    crate::exec::tool_timeout::MAX_TIMER_DELAY_MS
+                )));
+            }
+        },
+    };
 
     // SUBA-086 `outputMode:` — pi `agents.ts:2041-2044` @v0.64.0: anything but the two literal
     // spellings `inline`/`file-only` THROWS. SUBA-096: the valid value is now CARRIED into
@@ -1372,6 +1414,7 @@ pub fn parse_agent_file_checked(
         aliases,
         tools,
         exclude_tools,
+        allowed_agents,
         allow_nested_subagents,
         extensions,
         extensions_from_default: false,
@@ -1387,12 +1430,12 @@ pub fn parse_agent_file_checked(
         default_reads,
         default_progress,
         output,
-        completion_guard,
         interactive,
         max_subagent_depth,
         default_context,
         default_async,
         default_timeout_ms,
+        default_tool_timeout_ms,
         memory,
         tool_budget,
         default_turn_budget,
@@ -1548,7 +1591,7 @@ mod tests {
 
     #[test]
     fn valid_full_frontmatter_parses_every_field() {
-        let content = "---\nname: scout\ndescription: Fast codebase recon\ntools: read, grep, find, ls, bash, write, intercom\nthinking: low\nsystemPromptMode: replace\ninheritProjectContext: true\ninheritSkills: false\noutput: context.md\ndefaultProgress: true\nmaxSubagentDepth: 2\ncompletionGuard: false\nfallbackModels: openai/gpt-5-mini, anthropic/claude-sonnet-4\ndefaultContext: fork\n---\n\nYou are a scouting subagent.\n";
+        let content = "---\nname: scout\ndescription: Fast codebase recon\ntools: read, grep, find, ls, bash, write, intercom\nthinking: low\nsystemPromptMode: replace\ninheritProjectContext: true\ninheritSkills: false\noutput: context.md\ndefaultProgress: true\nmaxSubagentDepth: 2\nfallbackModels: openai/gpt-5-mini, anthropic/claude-sonnet-4\ndefaultContext: fork\n---\n\nYou are a scouting subagent.\n";
         let def = parse_agent_file(content, AgentSource::Builtin, Path::new("/agents/scout.md"))
             .expect("valid frontmatter must parse");
 
@@ -1581,7 +1624,6 @@ mod tests {
         );
         assert_eq!(def.default_progress, Some(true));
         assert_eq!(def.max_subagent_depth, Some(2));
-        assert_eq!(def.completion_guard, Some(false));
         assert_eq!(
             def.fallback_models,
             vec![
@@ -2215,7 +2257,7 @@ mod tests {
 
     #[test]
     fn known_fields_never_leak_into_extra_fields() {
-        let content = "---\nname: worker\ndescription: Worker\nmodel: anthropic/claude-sonnet-4\nthinking: high\ncompletionGuard: true\n---\n\nBody\n";
+        let content = "---\nname: worker\ndescription: Worker\nmodel: anthropic/claude-sonnet-4\nthinking: high\nmaxSubagentDepth: 2\n---\n\nBody\n";
         let def =
             parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
         for key in KNOWN_FIELDS {
@@ -2715,6 +2757,106 @@ mod tests {
         );
     }
 
+    /// SUBA-111 — `allowedAgents:` parses onto the definition, is normalized by the SHARED
+    /// capability-ceiling validation, and is a `KNOWN_FIELDS` key so it is never demoted to
+    /// `extra_fields`.
+    ///
+    /// pi `agents.ts:2118-2119` @v0.71.0:
+    /// `const parsedAllowedAgents = parseFrontmatterList(frontmatter.allowedAgents);`
+    /// `const allowedAgents = parsedAllowedAgents === undefined ? undefined :
+    ///  normalizeCapabilityCeilingAllowedAgents(parsedAllowedAgents);`
+    ///
+    /// The normalizer DE-DUPLICATES and SORTS (`capability-ceiling.ts:85`, `[...new Set(...)]
+    /// .sort()`), and the sort is byte-wise, so `Worker` precedes `reviewer`.
+    ///
+    /// Red before SUBA-111: the key was absent from `KNOWN_FIELDS`, so it landed in
+    /// `extra_fields` and `AgentDefinition` had nowhere to put it.
+    #[test]
+    fn allowed_agents_frontmatter_parses_normalized_and_is_never_demoted() {
+        let content = "---\nname: worker\ndescription: W\nallowedAgents: reviewer, Worker, reviewer\n---\n\nbody\n";
+        let def =
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(
+            def.allowed_agents,
+            Some(vec!["Worker".to_string(), "reviewer".to_string()]),
+            "de-duplicated and byte-sorted by the shared ceiling normalizer"
+        );
+        assert!(
+            !def.extra_fields.contains_key("allowedAgents"),
+            "a KNOWN_FIELDS key must never be demoted to extra_fields; got {:?}",
+            def.extra_fields
+        );
+        assert!(def.present_fields.contains("allowedAgents"));
+
+        // Block-list syntax is the same grammar `tools:`/`excludeTools:` use.
+        let block = "---\nname: worker\ndescription: W\nallowedAgents:\n  - reviewer\n  - planner\n---\n\nbody\n";
+        let def =
+            parse_agent_file(block, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(
+            def.allowed_agents,
+            Some(vec!["planner".to_string(), "reviewer".to_string()])
+        );
+
+        // An absent key is upstream's `undefined`: no bound at all.
+        let none = "---\nname: worker\ndescription: W\n---\n\nbody\n";
+        assert_eq!(
+            parse_agent_file(none, AgentSource::Project, Path::new("/w.md"))
+                .expect("parses")
+                .allowed_agents,
+            None
+        );
+    }
+
+    /// SUBA-111 — an `allowedAgents:` entry the shared ceiling validation refuses takes the whole
+    /// agent file down with the ceiling's OWN verbatim message
+    /// (`capability-ceiling.ts:85-88`), rather than silently producing a bound nothing can satisfy.
+    #[test]
+    fn an_invalid_allowed_agents_entry_refuses_the_agent_file_with_the_ceilings_own_message() {
+        let content =
+            "---\nname: worker\ndescription: W\nallowedAgents: \"has space\"\n---\n\nbody\n";
+        let diagnostic =
+            parse_agent_file_checked(content, AgentSource::Project, Path::new("/w.md"))
+                .expect_err("an invalid ceiling entry must refuse the file");
+        assert_eq!(
+            diagnostic.error,
+            "Invalid capability ceiling allowedAgents entry 'has space'."
+        );
+    }
+
+    /// SUBA-107 — `completionGuard:` is no longer a known field. pi-subagents deleted the setting
+    /// at v0.70.1 (`7c98a696`); at v0.71.0 `completionGuard` has ZERO hits under `src/` and is
+    /// absent from `KNOWN_FIELDS`, so `agents.ts:2199-2201`'s own loop routes it to `extraFields`
+    /// like any other unrecognized key rather than throwing. cyrup must do the same: round-trip
+    /// it verbatim, type nothing, enforce nothing.
+    ///
+    /// This is the exact mirror of
+    /// [`Self::exclude_tools_and_allow_nested_subagents_parse_onto_the_definition_and_are_never_demoted`]'s
+    /// `extra_fields` assertion, inverted — that one pins a KNOWN key never landing there, this
+    /// one pins an UNKNOWN key always landing there.
+    #[test]
+    fn completion_guard_frontmatter_is_an_ordinary_unknown_key_round_tripped_into_extra_fields() {
+        for value in ["false", "true", "not-a-boolean"] {
+            let content = format!(
+                "---\nname: worker\ndescription: W\ncompletionGuard: {value}\n---\n\nbody\n"
+            );
+            let parsed = parse_agent_file(&content, AgentSource::Project, Path::new("/w.md"));
+            assert!(
+                parsed.is_some(),
+                "completionGuard: {value} must parse, never throw"
+            );
+            let Some(def) = parsed else { continue };
+            assert_eq!(
+                def.extra_fields.get("completionGuard").map(String::as_str),
+                Some(value),
+                "an unknown key round-trips verbatim into extra_fields"
+            );
+            assert!(
+                !KNOWN_FIELDS.contains(&"completionGuard"),
+                "completionGuard must not be a known field any more"
+            );
+        }
+    }
+
     /// SUBA-092 — `excludeTools:` (pi `agents.ts:1988` @v0.64.0, `parseFrontmatterList`) and
     /// `allowNestedSubagents:` (`agents.ts:2061-2066`, strictly `true`/`false`) parse onto the
     /// definition and, being `KNOWN_FIELDS` (`agent-serializer.ts:12-13`), are never demoted to
@@ -2865,8 +3007,12 @@ mod tests {
         }
     }
 
-    /// `toolTimeoutMs`/`outputMode`/`fast` are validated only: a VALID value is not (yet) carried
-    /// on the definition, so it must keep round-tripping through `extra_fields` as it did before.
+    /// CFG-067 — `toolTimeoutMs` is no longer validate-and-discard: a VALID value is TYPED onto
+    /// [`AgentDefinition::default_tool_timeout_ms`] (pi `agents.ts:2258` @v0.71.0) and therefore must
+    /// have LEFT `extra_fields`, exactly as `outputMode`/`fast` did when they were typed. Killing
+    /// mutation: dropping the key from `KNOWN_FIELDS` (it reappears in `extra_fields`), or dropping
+    /// the binding (the value is `None` and the agent runs with no per-tool deadline at all, which
+    /// is the whole defect this row closes).
     #[test]
     fn valid_tool_timeout_round_trips_and_output_mode_and_fast_are_typed() {
         let def = parse_agent_file_checked(
@@ -2876,10 +3022,8 @@ mod tests {
         )
         .expect("valid values are not diagnostics")
         .expect("the file parses");
-        assert_eq!(
-            def.extra_fields.get("toolTimeoutMs").map(String::as_str),
-            Some("5000")
-        );
+        assert_eq!(def.default_tool_timeout_ms, Some(5_000));
+        assert!(!def.extra_fields.contains_key("toolTimeoutMs"));
         // SUBA-096: typed, and no longer parked in `extra_fields` where nothing read them.
         // Mutation killed: dropping the fold of `outputMode` into `output.mode` (mode stays None),
         // or leaving either key out of `KNOWN_FIELDS` (it lands in `extra_fields` too).

@@ -1507,10 +1507,18 @@ async fn sess052_resume_and_run_one_turn(
     kinds(&stream.collect::<Vec<_>>().await)
 }
 
-/// SESS-052, the ESTIMATE half at the service layer. pi tests for an admitted `context_edit` FIRST,
-/// ahead of both the direct-usage read and the error/zero fallback
-/// (`agent-session.ts:2703-2712` @v0.87.1), and its turn-boundary trigger reads
-/// `estimateProjectedContextTokens(projection, branch)` unconditionally (`:596`).
+/// SESS-052, the ESTIMATE half at the service layer — specifically the PRE-SEND trigger. pi tests for
+/// an admitted `context_edit` FIRST, ahead of both the direct-usage read and the error/zero fallback
+/// (`agent-session.ts:2703-2712` @v0.87.1); this test pins cyrup's port of that precedence, the
+/// `has_context_edits` arm of [`SessionService::check_compaction`]
+/// (`crates/cyrup-session-svc/src/session/auto_compaction.rs:134-142`) reached from the pre-send call
+/// at `crates/cyrup-session-svc/src/session/run.rs:743`.
+///
+/// It does NOT reach the other trigger. pi's in-run turn boundary reads
+/// `estimateProjectedContextTokens(projection, branch)` unconditionally (`:596`), and cyrup's port of
+/// THAT site is pinned by
+/// [`sess052_the_in_run_turn_boundary_discards_an_edit_invalidated_usage_anchor`] below, which needs a
+/// tool loop and a no-usage provider to be red at all.
 ///
 /// Why the precedence matters: `assistantMessage.usage` is a reading of the context the PROVIDER was
 /// sent, INPUT tokens included. Once a `context_edit` later in the branch has omitted part of that
@@ -1529,7 +1537,7 @@ async fn sess052_a_resumed_context_edit_makes_the_trigger_re_estimate_instead_of
     let control_ks = sess052_resume_and_run_one_turn(&control_fx, control_file).await;
     assert!(
         sess052_compacted_before_the_run(&control_ks),
-        "LIVENESS: with no context_edit the ~10000-token usage anchor stands and the turn-boundary \
+        "LIVENESS: with no context_edit the ~10000-token usage anchor stands and the pre-send \
          trigger must fire, else phase 2 proves nothing: {control_ks:?}"
     );
 
@@ -1545,15 +1553,25 @@ async fn sess052_a_resumed_context_edit_makes_the_trigger_re_estimate_instead_of
     let edited_ks = sess052_resume_and_run_one_turn(&edited_fx, edited_file).await;
     assert!(
         !sess052_compacted_before_the_run(&edited_ks),
-        "an admitted context_edit must make the turn-boundary trigger DISCARD the now-meaningless \
+        "an admitted context_edit must make the PRE-SEND trigger DISCARD the now-meaningless \
          provider-usage anchor and re-estimate the EDITED projection (a handful of tokens, far under \
          the 2000-token threshold): {edited_ks:?}"
     );
 }
 
-/// Whether a compaction started at the TURN BOUNDARY — before the run's first `agent_start` — which
-/// is the site this test pins (`compact_before_next_assistant_response`, pi
-/// `estimateProjectedContextTokens` at `agent-session.ts:596` @v0.87.1).
+/// Whether a compaction started BEFORE the run's first `agent_start` — the window the PRE-SEND
+/// trigger lives in, and the only site this window can observe.
+///
+/// CORRECTION: this doc previously named `compact_before_next_assistant_response` / pi
+/// `agent-session.ts:596` as the site pinned here. That was wrong, and the mistake mattered — it made
+/// the `:596` call site look already covered. A pre-`agent_start` compaction cannot come from the
+/// in-run turn boundary, which by construction runs between turns INSIDE the run: it is
+/// [`SessionService::check_compaction`]'s `has_context_edits` arm (`auto_compaction.rs:134-142`)
+/// reached from step 4 of the pre-send path (`session/run.rs:743`), pi's `hasContextEdits` branch at
+/// `agent-session.ts:2703-2712` @v0.87.1. The `:596` boundary is pinned by
+/// [`sess052_the_in_run_turn_boundary_discards_an_edit_invalidated_usage_anchor`].
+///
+/// The window is still POSITIONAL rather than a plain `contains`, for the reason below.
 ///
 /// Deliberately NOT `ks.contains("compaction_start")`. A POST-run compaction still fires in phase 2,
 /// and for a reason that is a DIFFERENT, unported piece rather than a failure of this change: the
@@ -1569,4 +1587,241 @@ fn sess052_compacted_before_the_run(ks: &[&'static str]) -> bool {
     ks.iter()
         .take(first_start)
         .any(|k| *k == "compaction_start")
+}
+
+// ===================== SESS-052, the IN-RUN TURN-BOUNDARY trigger ==========================
+//
+// The test above pins the PRE-SEND arm. This one pins the other call site,
+// [`SessionService::compact_before_next_assistant_response`] — pi
+// `_compactBeforeNextAssistantResponse` (`agent-session.ts:587-605`, the
+// `estimateProjectedContextTokens(projection, branch)` read at `:596` @v0.87.1) — which is reached
+// through `prepare_next_turn` (`crates/cyrup-session-svc/src/hooks.rs:290`) and which
+// `crates/cyrup-agent/src/agent/run/turn.rs:40-42` only calls once `last_completed` is `Some`, i.e.
+// from turn 2 of a run onward. So the fixture needs a TOOL LOOP; a single-turn run never reaches it.
+//
+// Why no already-existing shape can be red at this site, and what unblocks it: the boundary always
+// sits AFTER the turn's own assistant, and `crates/cyrup-session-svc/src/subscriber.rs` appends that
+// assistant to the session tree synchronously on `message_end`. Its entry therefore POST-DATES any
+// pre-existing `context_edit`, so `estimate_projected_context_tokens`
+// (`crates/cyrup-session/src/compaction/tokens.rs:263-295`) KEEPS the anchor and the reverted and
+// current expressions agree — which is exactly why reverting the call site alone still leaves the
+// four tests above green. The discriminator is an in-run assistant carrying NO usage:
+// `estimate_context_tokens` only anchors on `tok > 0` (`tokens.rs:192-196`), so the newest VALID
+// anchor stays the pre-edit one from the resumed history, the edit post-dates it, and the two
+// expressions finally disagree. A zero-usage response is not artificial — pi's own
+// `directContextTokens === 0` arm exists for it (`agent-session.ts:2709` @v0.87.1).
+
+/// A tool whose only job is to give the run a SECOND turn, so the turn boundary is reached at all.
+/// The result is deliberately tiny: nothing about this test may depend on the tool's own size.
+struct Sess052Loop(serde_json::Value);
+
+#[async_trait::async_trait]
+impl cyrup_core::Tool for Sess052Loop {
+    fn name(&self) -> &str {
+        "sess052_loop"
+    }
+    fn parameters(&self) -> &serde_json::Value {
+        &self.0
+    }
+    async fn execute(
+        &self,
+        _call_id: cyrup_core::ToolCallId,
+        _params: serde_json::Value,
+        _cancel: cyrup_core::CancelToken,
+        _on_update: cyrup_core::ToolUpdateSink,
+    ) -> Result<cyrup_core::ToolResult, cyrup_core::ToolError> {
+        Ok(cyrup_core::ToolResult {
+            content: vec![cyrup_core::Content::text("looped")],
+            ..Default::default()
+        })
+    }
+}
+
+/// Call 1 is a `sess052_loop` tool call, every later call is plain text — and NONE of them carries
+/// usage.
+///
+/// [`FauxProvider`] cannot express this: `apply_usage_estimate` (`cyrup-provider/src/faux.rs:708`,
+/// `:726-733`) stamps `usage` computed from the serialized context onto every response, and
+/// [`faux_assistant_message`] itself seeds `output`/`total_tokens` from the content. So the message is
+/// zeroed here and streamed through the public [`faux_event_stream`], which is documented to stream
+/// the message AS-IS with no identity stamping and no usage estimate (`faux.rs:569-574`).
+///
+/// It keeps the inner [`FauxProvider`]'s id and model catalog rather than inventing its own: model
+/// resolution and the auth preflight at `session/run.rs:727-736` must behave exactly as they do for
+/// every other test in this file.
+struct NoUsageProvider {
+    inner: FauxProvider,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl NoUsageProvider {
+    fn new() -> Self {
+        Self {
+            inner: FauxProvider::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for NoUsageProvider {
+    fn id(&self) -> &cyrup_core::ProviderId {
+        self.inner.id()
+    }
+    fn models(&self) -> &[cyrup_provider::Model] {
+        self.inner.models()
+    }
+    fn stream(
+        &self,
+        model: &cyrup_provider::Model,
+        _context: &cyrup_provider::Context,
+        options: &cyrup_provider::StreamOptions,
+    ) -> cyrup_core::EventStream<cyrup_provider::StreamEvent> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut msg = if n == 0 {
+            faux_assistant_message(
+                vec![cyrup_provider::faux::faux_tool_call(
+                    "sess052_loop".to_string(),
+                    serde_json::json!({}),
+                )],
+                StopReason::ToolUse,
+            )
+        } else {
+            faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)
+        };
+        msg.provider = self.inner.id().clone();
+        msg.model = model.id.to_string();
+        // THE POINT OF THIS PROVIDER. `context_tokens_from_usage` of an all-zero `Usage` is 0, and
+        // `estimate_context_tokens` only anchors on `tok > 0` — so this assistant cannot become the
+        // newest valid usage anchor and the pre-edit one from the resumed history stays newest.
+        msg.usage = cyrup_core::Usage::default();
+        cyrup_provider::faux::faux_event_stream(
+            msg,
+            options,
+            cyrup_provider::faux::ChunkConfig::default(),
+        )
+    }
+}
+
+/// [`sess052_split_threshold_settings`] with the reserve pushed to `127999` — a threshold of ONE
+/// token, which any live context crosses. The ARMED control: it proves the turn-boundary hook can
+/// fire on this very fixture, so the main assertion's silence is a decision and not a dead hook.
+fn sess052_armed_threshold_settings() -> cyrup_config::Settings {
+    let mut cli = cyrup_config::Settings::new();
+    cli.set_field(
+        "compaction",
+        serde_json::json!({"enabled": true, "keepRecentTokens": 0, "reserveTokens": 127999}),
+    )
+    .unwrap();
+    cli.set_field("retry", serde_json::json!({"enabled": false}))
+        .unwrap();
+    cli
+}
+
+/// Resume `file` with [`NoUsageProvider`] and the loop tool under `settings`, run one prompt, and
+/// return the run's event kinds.
+async fn sess052_resume_and_run_a_tool_loop(
+    fx: &Fixture,
+    file: std::path::PathBuf,
+    settings: cyrup_config::Settings,
+) -> Vec<&'static str> {
+    let mut cfg = base_config(fx);
+    cfg.target = crate::SessionTarget::Resume(file);
+    cfg.no_extensions = true;
+    cfg.custom_tools = vec![Arc::new(Sess052Loop(
+        serde_json::json!({ "type": "object", "properties": {} }),
+    )) as Arc<dyn cyrup_core::Tool>];
+    let session = SessionBuilder::new(Arc::new(NoUsageProvider::new()) as Arc<dyn Provider>, cfg)
+        .cli_settings(settings)
+        .build()
+        .await
+        .expect("resume")
+        .into_shared();
+    session
+        .set_active_tools_by_name(&["sess052_loop".to_string()])
+        .await;
+    let stream = session.prompt("carry on").await.expect("resumed prompt");
+    session.wait_for_idle().await;
+    kinds(&stream.collect::<Vec<_>>().await)
+}
+
+/// Whether a compaction started at or after the run's first `agent_start` — the window the IN-RUN
+/// turn boundary lives in. Deliberately not [`sess052_compacted_before_the_run`], whose window is
+/// pre-`agent_start` by construction and therefore covers only the pre-send arm.
+fn sess052_compacted_inside_the_run(ks: &[&'static str]) -> bool {
+    let first_start = ks.iter().position(|k| *k == "agent_start").unwrap_or(0);
+    ks.iter()
+        .skip(first_start)
+        .any(|k| *k == "compaction_start")
+}
+
+/// How many `turn_start`/`turn_end` pairs the run drove at or after `agent_start`. Two or more means
+/// `prepare_next_turn` — and so the boundary under test — was actually reached.
+fn sess052_turns_in_the_run(ks: &[&'static str]) -> usize {
+    let first_start = ks.iter().position(|k| *k == "agent_start").unwrap_or(0);
+    ks.iter()
+        .skip(first_start)
+        .filter(|k| **k == "turn_end")
+        .count()
+}
+
+/// SESS-052 at the IN-RUN TURN BOUNDARY — `compact_before_next_assistant_response`, pi
+/// `_compactBeforeNextAssistantResponse`'s `estimateProjectedContextTokens(projection, branch)` read
+/// (`agent-session.ts:596` @v0.87.1). The sibling test above pins the PRE-SEND arm
+/// (`check_compaction`'s `has_context_edits` branch, pi `agent-session.ts:2703-2712`); this pins the
+/// other site, which no existing test reached.
+///
+/// A resumed pi-written history whose big user turn has been OMITTED by a `context_edit`, driven
+/// through a tool loop by a provider that reports no usage. At the turn-2 boundary the newest valid
+/// usage anchor is still the PRE-EDIT assistant from the resumed history, the edit post-dates its
+/// entry, so upstream throws the anchor away and re-estimates the EDITED projection — a few dozen
+/// tokens, far under the 2000-token threshold — and nothing compacts. Trusting the anchor instead
+/// reports the stale ~20000 and compacts a session with nothing left to compact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sess052_the_in_run_turn_boundary_discards_an_edit_invalidated_usage_anchor() {
+    let (fx, file) = sess052_seed_a_big_history().await;
+    let target = sess052_append_omitting_context_edit(&file);
+    assert!(
+        !target.is_empty(),
+        "the edit must target a real entry, else the projection has nothing to invalidate"
+    );
+    let ks =
+        sess052_resume_and_run_a_tool_loop(&fx, file.clone(), sess052_split_threshold_settings())
+            .await;
+
+    // (a) The boundary was REACHED. `prepare_next_turn` only fires from turn 2, so without a second
+    //     turn this test would be vacuous no matter what it asserted next.
+    assert!(
+        sess052_turns_in_the_run(&ks) >= 2,
+        "the tool loop must drive at least two turns, or `prepare_next_turn` — and with it the \
+         boundary under test — is never reached: {ks:?}"
+    );
+
+    // (b) The pinning assertion.
+    assert!(
+        !sess052_compacted_inside_the_run(&ks),
+        "the turn-boundary trigger must DISCARD the usage anchor the resumed `context_edit` \
+         invalidated and re-estimate the EDITED projection (a few dozen tokens, far under the \
+         2000-token threshold) — not report the stale pre-edit ~20000: {ks:?}"
+    );
+
+    // (c) The ARMED control, on the same fixture: with the threshold at one token the boundary MUST
+    //     fire, so (b)'s silence cannot be a dead hook or a run that never got there.
+    let (armed_fx, armed_file) = sess052_seed_a_big_history().await;
+    let armed_target = sess052_append_omitting_context_edit(&armed_file);
+    assert!(
+        !armed_target.is_empty(),
+        "the armed control needs the same edit"
+    );
+    let armed_ks = sess052_resume_and_run_a_tool_loop(
+        &armed_fx,
+        armed_file,
+        sess052_armed_threshold_settings(),
+    )
+    .await;
+    assert!(
+        sess052_compacted_inside_the_run(&armed_ks),
+        "ARMED CONTROL: at a one-token threshold the in-run turn boundary must compact on this very \
+         fixture, else (b) proves only that the hook is dead: {armed_ks:?}"
+    );
 }

@@ -328,6 +328,11 @@ fn dag_display(e: &cyrup_session::Entry) -> (SessionDagKind, String) {
     };
     match e {
         Entry::Known(KnownEntry::Message { message, .. }) => match message {
+            // PROV-083a — `getEntryDisplayText` tests `user`, `assistant`, `toolResult` and
+            // `bashExecution` by name and falls through to `result = theme.fg("dim", `[${role}]`)`
+            // for every other role (`tree-selector.ts:811-813` @v0.87.1), so a system message's
+            // label is its bare role, NOT its prompt text.
+            SessMsg::Core(Message::System(_)) => (SessionDagKind::Message, "[system]".to_string()),
             SessMsg::Core(Message::User { content, .. }) => (
                 SessionDagKind::Message,
                 clip(format!("user: {}", normalize(&join_text(content)))),
@@ -470,6 +475,10 @@ fn dag_copy_text(e: &cyrup_session::Entry) -> Option<String> {
     let text: Option<String> = match e {
         Entry::Known(KnownEntry::Message { message, .. }) => match message {
             SessMsg::BashExecution(b) => Some(b.command.clone()),
+            // PROV-083a — the copy path's second branch is `else if ("content" in entry.message)`
+            // (`tree-selector.ts:912-917` @v0.87.1), and a `SystemMessage` HAS `content`, so its
+            // prompt text IS copied. The `errorMessage` fallback below is `assistant`-only.
+            SessMsg::Core(Message::System(m)) => Some(join_text(&m.content)),
             SessMsg::Core(Message::User { content, .. })
             | SessMsg::Core(Message::ToolResult { content, .. }) => Some(join_text(content)),
             SessMsg::Core(Message::Assistant(m)) => {

@@ -1363,33 +1363,13 @@ pub enum AttemptNote {
         max_attempts: usize,
         delay_ms: u64,
     },
+    /// SUBA-118 — the retained child session is being resumed ONCE, on the SAME model, after a
+    /// compaction-induced provider/transport abort that left useful progress behind
+    /// (`execution.ts:1881`). Verbatim, including the semicolon: it is what an operator greps for to
+    /// tell a resumed run from a relaunched one.
+    AbortRecovery,
     // UNPORTED upstream kinds, named here so the gap is greppable rather than invisible:
-    //   AbortRecovery        — `subagent-runner.ts:1401` / `execution.ts:2029`
     //   ReadonlyContinuation — `execution.ts:2004`, added upstream in v0.66.0
-    //
-    // SUBA-118 — why `AbortRecovery` is still on this list although
-    // `crate::exec::abort_recovery::plan_abort_recovery` now exists, is a verbatim port of
-    // `abort-recovery.ts` @v0.71.0, and is fully tested rung by rung:
-    //
-    // The DECISION is ported; the DISPATCH is not, and cannot be wired at this call site without
-    // inventing behaviour pi does not have. Upstream calls `planAbortRecovery` at
-    // `execution.ts:1878`, INSIDE `runSinglePath`'s attempt loop, where `lastResult` already carries
-    // `structuredOutputFailed` and `acceptanceFailed` — because upstream evaluates structured output
-    // and acceptance inside that same loop. Two of the ladder's thirteen settle rungs
-    // (`abort-recovery.ts:112-113`) read exactly those two flags, and both exist to REFUSE a resume.
-    //
-    // In this crate they are not known yet at the equivalent point. `exec::run_sync`'s pipeline is
-    // ordered ladder (step 4) → structured output (step 5) → completion guard (step 6) → acceptance
-    // (step 7) — see the `run_sync` module doc — so `run_fallback_ladder` returns BEFORE either
-    // verdict exists. Calling the plan from inside the ladder would mean passing
-    // `structured_output_failed: false` and `acceptance_failed: false` unconditionally, which turns
-    // two refusal rungs into permanent no-ops and resumes children upstream settles.
-    //
-    // Closing this needs the acceptance/structured-output gates to move inside the ladder loop, i.e.
-    // a change to `run_sync`'s documented step order, which is a larger structural port than this
-    // note's row. The evidence half IS wired and carried:
-    // `DriveOutcome::after_compaction_settlement` (`execution.ts:970-999`) is folded per attempt and
-    // tested, so the input the ladder would need is already produced.
 }
 
 impl std::fmt::Display for AttemptNote {
@@ -1418,6 +1398,11 @@ impl std::fmt::Display for AttemptNote {
                 f,
                 "[startup-retry] {model} exited before model or tool activity (attempt \
                  {attempt}/{max_attempts}). Retrying the same model in {delay_ms}ms."
+            ),
+            Self::AbortRecovery => write!(
+                f,
+                "[abort-recovery] compaction abort after useful progress; resuming the retained \
+                 child session once on the same model."
             ),
         }
     }
@@ -1851,6 +1836,41 @@ pub trait AttemptRunner {
         StartupRetryWait::Proceed
     }
 
+    /// SUBA-118 — decide whether this settled attempt may be RESUMED once against its retained
+    /// session (pi `planAbortRecovery`, `abort-recovery.ts:68-116`, called from
+    /// `execution.ts:1878`).
+    ///
+    /// It lives on the runner, not in [`run_fallback_ladder`], for the same reason
+    /// [`Self::wait_startup_retry`] does: the ladder owns the PRECEDENCE (where in
+    /// [`classify_attempt`] the question is asked) while the runner owns the EVIDENCE — the child's
+    /// transcript, its compaction/settlement witnesses, the retained session file and the run's
+    /// lifecycle tokens, none of which [`AttemptSignal`] carries or should.
+    ///
+    /// The default never resumes, and it says so in upstream's own words: an
+    /// [`AbortRecoveryInput`](crate::exec::abort_recovery::AbortRecoveryInput) with no session
+    /// settles on `retained session unavailable` (`abort-recovery.ts:103`), which is exactly true of
+    /// a runner that has no session to resume.
+    fn plan_abort_recovery(
+        &self,
+        _attempt: &Self::Attempt,
+        _signal: &AttemptSignal,
+        already_resumed: bool,
+    ) -> crate::exec::abort_recovery::AbortRecoveryPlan {
+        crate::exec::abort_recovery::plan_abort_recovery(
+            &crate::exec::abort_recovery::AbortRecoveryInput {
+                already_resumed,
+                ..crate::exec::abort_recovery::AbortRecoveryInput::default()
+            },
+        )
+    }
+
+    /// SUBA-118 — pi `recoveryPrompt = recovery.prompt` (`execution.ts:1880`): the runner's NEXT
+    /// launch of this candidate uses [`crate::exec::abort_recovery::ABORT_RECOVERY_PROMPT`] as its
+    /// task text instead of the original task. Called by the ladder exactly once per candidate,
+    /// immediately before the relaunch. Default no-op, for a runner whose
+    /// [`Self::plan_abort_recovery`] never answers *resume*.
+    fn apply_abort_recovery(&mut self) {}
+
     /// Stamp a startup-retry resolution onto this runner's own per-attempt payload — pi mutates
     /// `result.finalOutput`/`result.interrupted`/`result.progress` in place at
     /// `execution.ts:1584-1618`, which the ladder cannot do here because `Attempt` is opaque to it.
@@ -2015,6 +2035,11 @@ pub(crate) enum LadderStep {
     RetryStartup { delay_ms: u64 },
     /// Every startup launch spent with still zero activity (pi `:1606-1618`).
     StartupExhausted,
+    /// SUBA-118 — relaunch the SAME model against its RETAINED session with
+    /// [`crate::exec::abort_recovery::ABORT_RECOVERY_PROMPT`] (pi `execution.ts:1879-1882`). Never
+    /// reached twice for one candidate: the plan's own `already_resumed` rung
+    /// (`abort-recovery.ts:101`) refuses the second.
+    ResumeAbort,
     /// Advance to the next candidate.
     AdvanceModel,
 }
@@ -2034,6 +2059,11 @@ impl LadderStep {
     #[must_use]
     pub(crate) const fn reached_model_failure_classification(self) -> bool {
         match self {
+            // SUBA-118 — a resume is returned ABOVE the recording point, like the two startup-retry
+            // steps and for the same reason: the child's provider/transport aborted mid-stream after
+            // doing real work, which says nothing about the MODEL. Excluding the very model the next
+            // launch is about to use would be self-defeating.
+            Self::ResumeAbort => false,
             Self::RetryStartup { .. } | Self::StartupExhausted => false,
             Self::Settle(stop) => match stop {
                 LadderStop::TimedOut | LadderStop::Detached | LadderStop::Completed => false,
@@ -2061,13 +2091,18 @@ impl LadderStep {
 /// 3. `success` — including pi's paused-success interrupt;
 /// 4. startup retry — pi `execution.ts:1558`, BEFORE the model-fallback decision and before the
 ///    last-candidate stop, because a child that never started says nothing about the MODEL;
-/// 5. context overflow — pi `subagent-runner.ts:1408`, ABOVE the last-candidate break;
-/// 6. last candidate, or not retryable — pi `:1413`;
-/// 7. otherwise advance.
+/// 5. SUBA-118 abort recovery — pi `execution.ts:1878-1882`, BELOW the startup ladder (upstream's
+///    startup loop lives INSIDE `runSingleAttempt`, `:1518`, so it is fully spent before the
+///    abort-recovery loop that wraps it gets a say) and ABOVE the context-overflow classification
+///    (upstream decides `contextOverflow` only after its loop breaks, `:1905`);
+/// 6. context overflow — pi `subagent-runner.ts:1408`, ABOVE the last-candidate break;
+/// 7. last candidate, or not retryable — pi `:1413`;
+/// 8. otherwise advance.
 fn classify_attempt(
     signal: &AttemptSignal,
     is_last_candidate: bool,
     startup_attempt_index: usize,
+    abort_recovery: &crate::exec::abort_recovery::AbortRecoveryPlan,
 ) -> LadderStep {
     if signal.timed_out {
         return LadderStep::Settle(LadderStop::TimedOut);
@@ -2095,6 +2130,17 @@ fn classify_attempt(
     // `should_record_retryable_model_failure` (pure, all five guards) on exactly those steps and
     // performs the write itself.
 
+    // SUBA-118 — pi `execution.ts:1879-1882`: a compaction-induced provider/transport abort that
+    // left useful progress behind is resumed ONCE against the retained session, on the SAME model.
+    // The whole decision is `plan_abort_recovery`'s (the caller computed it); this line is only its
+    // PRECEDENCE, which is what the ladder owns.
+    if matches!(
+        abort_recovery,
+        crate::exec::abort_recovery::AbortRecoveryPlan::Resume
+    ) {
+        return LadderStep::ResumeAbort;
+    }
+
     // TERMINAL, not a retry hint: the next model with the same oversized input fails the same way
     // (`model-fallback.ts:624-630`).
     if is_context_overflow(signal.error.as_deref()) {
@@ -2120,6 +2166,10 @@ fn classify_attempt(
 enum LadderControl {
     /// Run the same model again without advancing.
     Relaunch,
+    /// SUBA-118 — run the same model again without advancing AND without spending a startup-retry
+    /// launch: upstream's startup ladder lives inside `runSingleAttempt`, so the resumed pass starts
+    /// that counter from zero (`execution.ts:1518` is re-entered per call, `:1857`).
+    ResumeSameModel,
     /// Move to the next candidate.
     NextCandidate,
     /// Stop the whole ladder.
@@ -2153,6 +2203,20 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
         // the SAME model may be relaunched, without advancing the ladder, when the child died
         // before doing anything at all.
         let mut startup_attempt_index = 0usize;
+        // SUBA-118 — pi's `attemptIndex > 0` (`execution.ts:1883`), i.e. its `for (let attemptIndex
+        // = 0; attemptIndex < 2; attemptIndex++)` loop (`:1855`) expressed as the one bit that loop
+        // actually carries. Scoped to the CANDIDATE, because upstream's loop wraps one candidate's
+        // launches (at v0.71.0 upstream has exactly one, so per-candidate and per-run are the same
+        // thing there) and because the resume is an argument about THIS child's retained session,
+        // not about the ladder.
+        let mut abort_resumed = false;
+        // pi `if (startupAttemptIndex === 0) attemptedModels.push(candidate)`
+        // (`execution.ts:1536-1539`) — "once per RUNG of the ladder". A startup relaunch used to be
+        // told apart by `startup_attempt_index == 0`; SUBA-118's resume relaunch resets that counter
+        // (upstream's startup loop lives inside `runSingleAttempt`, so a resumed pass starts it
+        // over), so the "already recorded this candidate" question needs its own bit rather than
+        // being inferred from a counter that now has two reasons to be zero.
+        let mut candidate_recorded = false;
         loop {
             runner.snapshot_output_file(); // R-SA-031: snapshot immediately before each fresh spawn
             // R-SA-039: always a fresh child subprocess per candidate, seeded with EVERY note
@@ -2160,8 +2224,9 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
             let (mut signal, mut attempt) = runner.run_attempt(model, &attempt_notes).await;
 
             // pi records the candidate ONCE per model (`execution.ts:1536-1539`) — a startup
-            // relaunch is the same rung of the ladder, not a new one.
-            if startup_attempt_index == 0 {
+            // relaunch, and an abort-recovery resume, are the same rung of the ladder, not a new one.
+            if !candidate_recorded {
+                candidate_recorded = true;
                 attempted_models.push(model.clone());
             }
             add_usage(&mut aggregate, &signal.usage); // R-SA-040: additive, even for a failed attempt
@@ -2187,7 +2252,53 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
             // The ENTIRE precedence lives in `classify_attempt` (pure). This match only ACTS on
             // its answer — performing the I/O the decision implies and mutating the accumulators —
             // and then funnels every path through the single settle below.
-            let step = classify_attempt(&signal, is_last_candidate, startup_attempt_index);
+            // SUBA-118 — pi computes the plan for EVERY attempt that is not a clean success
+            // (`execution.ts:1877-1878`: `if (exitCode === 0 && !error) break;` then
+            // `planAbortRecovery(...)`), which is why the success arm below short-circuits to a
+            // settle instead of asking the runner. The reason text on that short-circuit is never
+            // read — a successful attempt settles as `Completed` two lines down — and it names the
+            // rung upstream's own plan would have returned for a clean attempt.
+            let abort_recovery = if signal.success {
+                crate::exec::abort_recovery::AbortRecoveryPlan::Settle {
+                    reason: "terminal assistant abort evidence not verified".to_string(),
+                    diagnostic: None,
+                }
+            } else {
+                runner.plan_abort_recovery(&attempt, &signal, abort_resumed)
+            };
+
+            let step = classify_attempt(
+                &signal,
+                is_last_candidate,
+                startup_attempt_index,
+                &abort_recovery,
+            );
+
+            // pi `if (recovery.diagnostic) attemptResult.error = attemptResult.error ?
+            // `${attemptResult.error}\n${recovery.diagnostic}` : recovery.diagnostic`
+            // (`execution.ts:1886-1888`) — on every settle path, never on a resume. The row is
+            // updated alongside the signal for the same reason the startup-retry arm updates it:
+            // `ModelAttempt::error` is the serialized copy of this very string.
+            if let crate::exec::abort_recovery::AbortRecoveryPlan::Settle {
+                diagnostic: Some(diagnostic),
+                ..
+            } = &abort_recovery
+                && step != LadderStep::ResumeAbort
+            {
+                let merged = match signal
+                    .error
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                {
+                    Some(existing) => format!("{existing}\n{diagnostic}"),
+                    None => diagnostic.clone(),
+                };
+                signal.error = Some(merged.clone());
+                if let Some(row) = model_attempts.last_mut() {
+                    row.error = Some(merged);
+                }
+            }
 
             // SCOPE_3j — pi `recordRetryableModelFailure(candidate ?? run.model ?? step.model,
             // error)` (`subagent-runner.ts:1555`, `execution.ts:2066`), at its own precedence
@@ -2279,6 +2390,15 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
                         .apply_startup_outcome(&mut attempt, &StartupOutcome::Exhausted(exhausted));
                     LadderControl::Stop(LadderStop::ModelFailure)
                 }
+                LadderStep::ResumeAbort => {
+                    // pi `:1879-1881`: latch the recovery prompt on the runner, note the resume for
+                    // the operator AND for the relaunched child (the note is seeded into its initial
+                    // progress, like every other), and go round again on the same candidate.
+                    abort_resumed = true;
+                    runner.apply_abort_recovery();
+                    attempt_notes.push(AttemptNote::AbortRecovery);
+                    LadderControl::ResumeSameModel
+                }
                 LadderStep::AdvanceModel => {
                     if let Some(next_model) = candidates.get(i + 1) {
                         attempt_notes.push(format_attempt_note(
@@ -2300,6 +2420,12 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
                     // same model, which overwrites both before anything can read them (pi's
                     // `lastResult` is likewise overwritten on the next pass).
                     startup_attempt_index += 1;
+                    continue;
+                }
+                LadderControl::ResumeSameModel => {
+                    // The resumed pass is a fresh call of upstream's `runSingleAttempt`, so its
+                    // startup ladder starts over rather than continuing the spent one.
+                    startup_attempt_index = 0;
                     continue;
                 }
                 LadderControl::NextCandidate => {
@@ -3076,6 +3202,16 @@ mod tests {
         script: Vec<(AttemptSignal, &'static str)>,
         calls: Vec<(ModelId, Vec<AttemptNote>)>,
         snapshot_calls: u32,
+        /// SUBA-118 — per-attempt abort-recovery script. `Some(true)` at index `i` means "this
+        /// attempt HAS full abort evidence", and the answer is then computed by the real
+        /// [`crate::exec::abort_recovery::plan_abort_recovery`] against a real resumable transcript,
+        /// so the one-resume-per-candidate rung (`abort-recovery.ts:101`) is enforced by the ported
+        /// function rather than re-implemented in the test. Missing/`false` means "no evidence",
+        /// which that same function settles as `retained session unavailable`.
+        abort_evidence: Vec<bool>,
+        /// How many times the ladder latched the recovery prompt (pi `recoveryPrompt =
+        /// recovery.prompt`, `execution.ts:1880`).
+        recovery_applied: u32,
     }
 
     impl ScriptedRunner {
@@ -3084,8 +3220,37 @@ mod tests {
                 script,
                 calls: Vec::new(),
                 snapshot_calls: 0,
+                abort_evidence: Vec::new(),
+                recovery_applied: 0,
             }
         }
+
+        /// SUBA-118 — which attempts (by index) carry full compaction-abort evidence.
+        fn with_abort_evidence(mut self, evidence: Vec<bool>) -> Self {
+            self.abort_evidence = evidence;
+            self
+        }
+    }
+
+    /// SUBA-118 — a transcript that satisfies EVERY positive clause of the abort-recovery ladder: an
+    /// assistant message with real content (useful prior progress, `abort-recovery.ts:45`) and no
+    /// unresolved tool call, then a terminal assistant message that is empty, reported zero output
+    /// tokens and stopped `aborted` (`:88-92`).
+    fn resumable_transcript() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "read three files and wrote the report" }],
+                "usage": { "output": 120 },
+                "stopReason": "stop",
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": [],
+                "usage": { "output": 0 },
+                "stopReason": "aborted",
+            }),
+        ]
     }
 
     #[async_trait::async_trait]
@@ -3104,6 +3269,33 @@ mod tests {
 
         fn snapshot_output_file(&mut self) {
             self.snapshot_calls += 1;
+        }
+
+        fn plan_abort_recovery(
+            &self,
+            _attempt: &Self::Attempt,
+            _signal: &AttemptSignal,
+            already_resumed: bool,
+        ) -> crate::exec::abort_recovery::AbortRecoveryPlan {
+            let index = self.calls.len().saturating_sub(1);
+            let messages = if self.abort_evidence.get(index).copied().unwrap_or(false) {
+                resumable_transcript()
+            } else {
+                Vec::new()
+            };
+            crate::exec::abort_recovery::plan_abort_recovery(
+                &crate::exec::abort_recovery::AbortRecoveryInput {
+                    messages: &messages,
+                    session_available: !messages.is_empty(),
+                    already_resumed,
+                    after_compaction_settlement: !messages.is_empty(),
+                    ..crate::exec::abort_recovery::AbortRecoveryInput::default()
+                },
+            )
+        }
+
+        fn apply_abort_recovery(&mut self) {
+            self.recovery_applied += 1;
         }
     }
 
@@ -3161,6 +3353,268 @@ mod tests {
             message_errors: Vec::new(),
             startup: StartupEvidence::default(),
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-118: the abort-recovery DISPATCH (pi `execution.ts:1877-1889`)
+    // ---------------------------------------------------------------------------------------
+
+    /// The row's core claim: a failed attempt whose evidence licenses a resume is relaunched on the
+    /// SAME model against its retained session, ONCE, with the recovery note seeded into the
+    /// relaunched child's context — and the run then succeeds.
+    ///
+    /// RED without `classify_attempt`'s `LadderStep::ResumeAbort` rung: the ladder advances to `m2`
+    /// instead (the error is retryable), so `calls[1].0` is `m2`, the note is absent and
+    /// `recovery_applied` is 0.
+    #[tokio::test]
+    async fn an_abort_recovery_resume_relaunches_the_same_model_once_with_the_recovery_note() {
+        let candidates = [model("m1"), model("m2")];
+        let mut runner = ScriptedRunner::new(vec![
+            (
+                failed_signal("503 service unavailable", usage(3, 0, 0.0)),
+                "a1",
+            ),
+            (ok_signal(usage(4, 9, 0.0)), "a2"),
+        ])
+        .with_abort_evidence(vec![true]);
+
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
+
+        assert_eq!(runner.calls.len(), 2, "exactly two launches");
+        assert_eq!(
+            runner.calls[1].0,
+            model("m1"),
+            "the RESUME stays on the same model"
+        );
+        assert_eq!(
+            runner.recovery_applied, 1,
+            "the recovery prompt is latched exactly once"
+        );
+        assert!(
+            runner.calls[1].1.contains(&AttemptNote::AbortRecovery),
+            "the relaunched child is seeded with the abort-recovery note: {:?}",
+            runner.calls[1].1
+        );
+        assert_eq!(outcome.stop, LadderStop::Completed);
+        assert_eq!(
+            outcome.attempted_models,
+            vec![model("m1")],
+            "a resume is the SAME rung of the ladder, so the candidate is recorded once"
+        );
+        // R-SA-040: usage stays additive across the aborted attempt and the resumed one.
+        assert_eq!(outcome.aggregate_usage.input, 7);
+    }
+
+    /// pi `attemptNotes.push("[abort-recovery] ...")` (`execution.ts:1881`) — the delivered wording,
+    /// verbatim. It is the string an operator greps to tell a resumed run from a relaunched one.
+    #[test]
+    fn the_abort_recovery_note_renders_upstreams_exact_wording() {
+        assert_eq!(
+            AttemptNote::AbortRecovery.to_string(),
+            "[abort-recovery] compaction abort after useful progress; resuming the retained child \
+             session once on the same model."
+        );
+    }
+
+    /// `alreadyResumed` (`abort-recovery.ts:101`, pi's `attemptIndex > 0`): the SECOND failure on the
+    /// same candidate is never resumed again, even with identical evidence. The ladder then classifies
+    /// it normally, which for a retryable error means advancing to `m2`.
+    ///
+    /// RED without the `abort_resumed` latch (pass `false` for `already_resumed`): `m1` is resumed
+    /// forever and `m2` is never reached.
+    #[tokio::test]
+    async fn an_abort_recovery_resume_is_granted_at_most_once_per_candidate() {
+        let candidates = [model("m1"), model("m2")];
+        let mut runner = ScriptedRunner::new(vec![
+            (
+                failed_signal("503 service unavailable", Usage::default()),
+                "a1",
+            ),
+            (
+                failed_signal("503 service unavailable", Usage::default()),
+                "a2",
+            ),
+            (ok_signal(Usage::default()), "a3"),
+        ])
+        .with_abort_evidence(vec![true, true]);
+
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
+
+        assert_eq!(
+            runner.calls.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+            vec![model("m1"), model("m1"), model("m2")],
+            "one resume of m1, then the ordinary advance to m2"
+        );
+        assert_eq!(runner.recovery_applied, 1);
+        assert_eq!(outcome.attempted_models, vec![model("m1"), model("m2")]);
+    }
+
+    /// A candidate the ladder ADVANCES to gets its own resume budget — upstream's two-attempt loop is
+    /// scoped to one candidate's launches (at v0.71.0 it has exactly one candidate, so the scoping is
+    /// unobservable there; here it is the only reading that keeps the resume an argument about THIS
+    /// child's retained session).
+    #[tokio::test]
+    async fn the_resume_budget_is_per_candidate_not_per_run() {
+        let candidates = [model("m1"), model("m2")];
+        let mut runner = ScriptedRunner::new(vec![
+            (
+                failed_signal("503 service unavailable", Usage::default()),
+                "a1",
+            ),
+            (
+                failed_signal("503 service unavailable", Usage::default()),
+                "a2",
+            ),
+            (
+                failed_signal("503 service unavailable", Usage::default()),
+                "a3",
+            ),
+            (ok_signal(Usage::default()), "a4"),
+        ])
+        .with_abort_evidence(vec![true, false, true]);
+
+        let _ = run_fallback_ladder(&candidates, &mut runner, None).await;
+
+        assert_eq!(
+            runner.calls.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+            vec![model("m1"), model("m1"), model("m2"), model("m2")],
+        );
+        assert_eq!(runner.recovery_applied, 2, "once per candidate");
+    }
+
+    /// pi `if (recovery.diagnostic) attemptResult.error = attemptResult.error ?
+    /// `${attemptResult.error}\n${recovery.diagnostic}` : recovery.diagnostic` (`:1886-1888`) — a
+    /// settle that ALMOST resumed explains itself, joined onto the attempt's own error with a newline,
+    /// and the serialized `ModelAttempt` row carries the same string.
+    ///
+    /// RED without the stamping block: the error stays `"the task was impossible"`.
+    #[tokio::test]
+    async fn a_compaction_looking_settle_carries_its_diagnostic_into_the_error() {
+        let candidates = [model("m1")];
+        // The first attempt IS resumed (full evidence); the second carries the same evidence but has
+        // already spent its resume, so the plan settles on its FIRST rung (`abort-recovery.ts:101`)
+        // while `compactionAbortCandidate` is still true — which is exactly the state the diagnostic
+        // exists to explain.
+        let mut runner = ScriptedRunner::new(vec![
+            (
+                failed_signal("503 service unavailable", Usage::default()),
+                "a1",
+            ),
+            (
+                failed_signal("the task was impossible", Usage::default()),
+                "a2",
+            ),
+        ])
+        .with_abort_evidence(vec![true, true]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
+        assert_eq!(runner.calls.len(), 2);
+
+        let error = outcome
+            .last_signal
+            .as_ref()
+            .and_then(|signal| signal.error.clone())
+            .expect("the settled attempt reports an error");
+        assert_eq!(
+            error,
+            "the task was impossible\nCompaction-induced child abort could not be resumed safely: \
+             resume already attempted.",
+        );
+        assert_eq!(
+            outcome
+                .model_attempts
+                .last()
+                .and_then(|row| row.error.clone()),
+            Some(error),
+            "the serialized row carries the same string the signal does"
+        );
+    }
+
+    /// Precedence: a timeout, a detach and a success all settle ABOVE the abort-recovery rung, so
+    /// full abort evidence cannot resurrect any of them. Upstream reaches the same three answers
+    /// through the plan's own `timed_out`/`stopped`/pre-plan success break
+    /// (`abort-recovery.ts:105,110`, `execution.ts:1877`).
+    #[test]
+    fn a_timeout_a_detach_and_a_success_all_outrank_the_abort_recovery_rung() {
+        let resume = crate::exec::abort_recovery::AbortRecoveryPlan::Resume;
+        let mut timed_out = model_failure_signal("provider stream aborted");
+        timed_out.timed_out = true;
+        assert_eq!(
+            classify_attempt(&timed_out, false, 0, &resume),
+            LadderStep::Settle(LadderStop::TimedOut)
+        );
+        let mut detached = model_failure_signal("provider stream aborted");
+        detached.detached = true;
+        assert_eq!(
+            classify_attempt(&detached, false, 0, &resume),
+            LadderStep::Settle(LadderStop::Detached)
+        );
+        let mut success = model_failure_signal("provider stream aborted");
+        success.success = true;
+        assert_eq!(
+            classify_attempt(&success, false, 0, &resume),
+            LadderStep::Settle(LadderStop::Completed)
+        );
+    }
+
+    /// The resume rung sits BELOW the startup ladder (upstream's startup loop is inside
+    /// `runSingleAttempt`, so it is fully spent before the abort loop wrapping it gets a say) and
+    /// ABOVE the context-overflow classification (upstream decides `contextOverflow` only once its
+    /// loop has broken, `execution.ts:1905`).
+    #[test]
+    fn the_resume_rung_sits_below_startup_retry_and_above_context_overflow() {
+        let resume = crate::exec::abort_recovery::AbortRecoveryPlan::Resume;
+        assert_eq!(
+            classify_attempt(&startup_failure_signal(), false, 0, &resume),
+            LadderStep::RetryStartup {
+                delay_ms: SUBAGENT_STARTUP_RETRY_DELAYS_MS[0]
+            },
+            "a child that never started is relaunched by the startup ladder, not resumed"
+        );
+        let overflow = model_failure_signal("context length exceeded: 200000 tokens");
+        assert_eq!(
+            classify_attempt(&overflow, true, 0, &resume),
+            LadderStep::ResumeAbort,
+            "a resumable abort is resumed before the overflow classification is even consulted"
+        );
+    }
+
+    /// A resume must NOT record a cached model exclusion: the child's provider/transport aborted
+    /// mid-stream after real work, which says nothing about the MODEL the very next launch will use.
+    #[test]
+    fn a_resume_is_returned_above_the_model_exclusion_recording_point() {
+        assert!(!LadderStep::ResumeAbort.reached_model_failure_classification());
+    }
+
+    /// The default trait method never resumes, and settles for upstream's own reason: a runner with
+    /// no retained session has nothing to resume (`abort-recovery.ts:103`). This is what every
+    /// ladder test that does NOT script evidence relies on.
+    #[tokio::test]
+    async fn the_default_abort_recovery_plan_settles_on_the_missing_retained_session() {
+        struct Bare;
+        #[async_trait::async_trait]
+        impl AttemptRunner for Bare {
+            type Attempt = ();
+            async fn run_attempt(
+                &mut self,
+                _model: &ModelId,
+                _notes: &[AttemptNote],
+            ) -> (AttemptSignal, Self::Attempt) {
+                (
+                    failed_signal("the task was impossible", Usage::default()),
+                    (),
+                )
+            }
+        }
+        let mut bare = Bare;
+        assert_eq!(
+            bare.plan_abort_recovery(&(), &failed_signal("x", Usage::default()), false),
+            crate::exec::abort_recovery::AbortRecoveryPlan::Settle {
+                reason: "retained session unavailable".to_string(),
+                diagnostic: None,
+            }
+        );
+        let outcome = run_fallback_ladder(&[model("m1")], &mut bare, None).await;
+        assert_eq!(outcome.stop, LadderStop::ModelFailure);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -3727,6 +4181,17 @@ mod tests {
         }
     }
 
+    /// SUBA-118 — the abort-recovery plan every precedence row below is asserted against: a SETTLE,
+    /// which is what `plan_abort_recovery` answers for an attempt with no retained session
+    /// (`abort-recovery.ts:103`) and therefore what the ladder sees for every run that never enabled
+    /// one. The resume rung has its own tests, `an_abort_recovery_resume_*`.
+    fn no_abort_recovery() -> crate::exec::abort_recovery::AbortRecoveryPlan {
+        crate::exec::abort_recovery::AbortRecoveryPlan::Settle {
+            reason: "retained session unavailable".to_string(),
+            diagnostic: None,
+        }
+    }
+
     /// THE regression this whole refactor exists to make unrepresentable: a ONE-MODEL ladder — an
     /// agent with no `fallback_models`, the common case — must still classify an overflow as an
     /// overflow. When the precedence was statement order, moving the overflow check below the
@@ -3735,7 +4200,7 @@ mod tests {
     fn a_single_candidate_overflow_is_classified_as_an_overflow_not_a_model_failure() {
         let signal = model_failure_signal("context length exceeded: 200000 tokens");
         assert_eq!(
-            classify_attempt(&signal, true, 0),
+            classify_attempt(&signal, true, 0, &no_abort_recovery()),
             LadderStep::Settle(LadderStop::ContextOverflow)
         );
     }
@@ -3746,7 +4211,7 @@ mod tests {
     fn an_overflow_settles_rather_than_advancing_even_with_candidates_left() {
         let signal = model_failure_signal("maximum context length is 8192 tokens");
         assert_eq!(
-            classify_attempt(&signal, false, 0),
+            classify_attempt(&signal, false, 0, &no_abort_recovery()),
             LadderStep::Settle(LadderStop::ContextOverflow)
         );
     }
@@ -3759,7 +4224,7 @@ mod tests {
         let mut timed_out = model_failure_signal("context length exceeded");
         timed_out.timed_out = true;
         assert_eq!(
-            classify_attempt(&timed_out, false, 0),
+            classify_attempt(&timed_out, false, 0, &no_abort_recovery()),
             LadderStep::Settle(LadderStop::TimedOut)
         );
 
@@ -3768,7 +4233,7 @@ mod tests {
         detached.detached = true;
         detached.success = true;
         assert_eq!(
-            classify_attempt(&detached, false, 0),
+            classify_attempt(&detached, false, 0, &no_abort_recovery()),
             LadderStep::Settle(LadderStop::Detached)
         );
 
@@ -3776,14 +4241,14 @@ mod tests {
         let mut success = model_failure_signal("context length exceeded");
         success.success = true;
         assert_eq!(
-            classify_attempt(&success, false, 0),
+            classify_attempt(&success, false, 0, &no_abort_recovery()),
             LadderStep::Settle(LadderStop::Completed)
         );
 
         // 4. a startup failure is evaluated BEFORE the model-fallback decision, so it relaunches
         //    the same model rather than spending a candidate on a launch race.
         assert_eq!(
-            classify_attempt(&startup_failure_signal(), false, 0),
+            classify_attempt(&startup_failure_signal(), false, 0, &no_abort_recovery()),
             LadderStep::RetryStartup {
                 delay_ms: SUBAGENT_STARTUP_RETRY_DELAYS_MS[0]
             }
@@ -3793,7 +4258,8 @@ mod tests {
             classify_attempt(
                 &startup_failure_signal(),
                 false,
-                SUBAGENT_STARTUP_RETRY_DELAYS_MS.len()
+                SUBAGENT_STARTUP_RETRY_DELAYS_MS.len(),
+                &no_abort_recovery(),
             ),
             LadderStep::StartupExhausted
         );
@@ -3802,18 +4268,18 @@ mod tests {
         //    settles (pi `:1413`).
         let retryable = model_failure_signal("503 service unavailable");
         assert_eq!(
-            classify_attempt(&retryable, false, 0),
+            classify_attempt(&retryable, false, 0, &no_abort_recovery()),
             LadderStep::AdvanceModel
         );
         assert_eq!(
-            classify_attempt(&retryable, true, 0),
+            classify_attempt(&retryable, true, 0, &no_abort_recovery()),
             LadderStep::Settle(LadderStop::ModelFailure)
         );
 
         // 6. a NON-retryable failure settles even with candidates left.
         let fatal = model_failure_signal("the task was impossible");
         assert_eq!(
-            classify_attempt(&fatal, false, 0),
+            classify_attempt(&fatal, false, 0, &no_abort_recovery()),
             LadderStep::Settle(LadderStop::ModelFailure)
         );
     }
@@ -3825,7 +4291,7 @@ mod tests {
     fn a_tool_failure_mentioning_a_token_limit_is_not_classified_as_an_overflow() {
         let signal = model_failure_signal("bash failed (exit 1): token limit");
         assert_ne!(
-            classify_attempt(&signal, true, 0),
+            classify_attempt(&signal, true, 0, &no_abort_recovery()),
             LadderStep::Settle(LadderStop::ContextOverflow)
         );
     }

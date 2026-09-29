@@ -35,7 +35,9 @@ use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, ResolvedAgentPersona, RunOptions};
-use cyrup_ext_subagents::extension::{BackgroundStepsSpec, SubagentExecutor, SubagentsExtension};
+use cyrup_ext_subagents::extension::{
+    BackgroundStepsSpec, RetainedModelResponseAliases, SubagentExecutor, SubagentsExtension,
+};
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::registration::{
     DynamicFanoutConfig, ExtensionChainConfig, SubagentExtensionConfig,
@@ -135,6 +137,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     // orchestrator produces via `exec::resolve_step_agent_config` for a discovered `reviewer`
     // agent.
     let reviewer = ResolvedAgentPersona {
+        default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
@@ -153,6 +156,8 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -160,7 +165,6 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
         memory: None,
@@ -185,6 +189,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,
         runner_process_instance_id: None,
@@ -368,6 +373,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     // A Replace-mode persona with an empty system prompt so the child's task text is the raw
     // (substituted) step task — no appended prompt to obscure the marker.
     let worker = ResolvedAgentPersona {
+        default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
@@ -383,6 +389,8 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -390,7 +398,6 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
         memory: None,
@@ -415,6 +422,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,
         runner_process_instance_id: None,
@@ -512,6 +520,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        tool_timeout_ms: None,
         // SUBA-119 — a fixture launch whose model comes from its own agent config, so
         // native-child model verification is armed and no response-id alias is declared.
         model_override_from_parent: false,
@@ -599,6 +608,8 @@ fn depth_echo_agent(
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -606,7 +617,6 @@ fn depth_echo_agent(
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth,
         memory: None,
@@ -750,6 +760,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     resolved_agents.insert(
         "reviewer".to_string(),
         ResolvedAgentPersona {
+            default_tool_timeout_ms: None,
             machine: None,
             file_path: None,
             acceptance_role: None, // SUBA-082: no declared role, the name decides
@@ -765,6 +776,8 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
             extensions: None,
             subagent_only_extensions: Vec::new(),
             exclude_tools: Vec::new(),
+            // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+            allowed_agents: None,
             allow_nested_subagents: None,
             output: None,
             inherit_project_context: false,
@@ -772,7 +785,6 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
             mutation_tools: None,          // SUBA-102: built-in set only
             inherit_skills: true,
             skills: Vec::new(),
-            completion_guard: Some(false),
             max_subagent_depth: None,
             default_context: None,
             memory: None,
@@ -799,6 +811,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     // already blocked — the same terminal state a genuinely deep chain reaches once the T0.3
     // increment has walked the inherited depth up to the ceiling across successive spawns.
     let config = RunnerConfig {
+        tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,
         runner_process_instance_id: None,
@@ -934,6 +947,7 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
     // heuristic is NotRequired and the completion guard — also disabled here — never fires): the run
     // stays exit 0, which is what gates the saved-output reference.
     let reporter = ResolvedAgentPersona {
+        default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
@@ -949,6 +963,8 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -956,7 +972,6 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
         memory: None,
@@ -1079,6 +1094,7 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
     let script_path = write_script(dir.path(), "script-chain-timeout.json", &script);
 
     let reporter = ResolvedAgentPersona {
+        default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
@@ -1094,6 +1110,8 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -1101,7 +1119,6 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
         memory: None,
@@ -1243,8 +1260,9 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
         .spawn_background_steps(
             dir.path(),
             BackgroundStepsSpec {
+                tool_timeout_ms: None,
                 // SUBA-119 — no operator-declared response-id alias for this fixture run.
-                model_response_aliases: None,
+                model_response_aliases: RetainedModelResponseAliases::Live,
                 turn_budget: None,
                 permission_rules: None,
                 // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -1327,6 +1345,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
 /// these two tests is the `verify[]` command's own real exit code.
 fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
@@ -1342,6 +1361,8 @@ fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -1349,7 +1370,6 @@ fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
         memory: None,

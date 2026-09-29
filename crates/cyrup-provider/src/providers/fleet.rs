@@ -12,32 +12,41 @@
 //! its protocol in [`FleetSpec::wire`] and the test checks rows against that declaration instead of
 //! a hand-kept exception (XAI_2).
 //!
-//! # Members without an embedded catalog (PROV-014, DRIFT-009)
+//! PROV-071's refresh then made a member speak TWO: `openrouter` is
+//! `Provider<"anthropic-messages" | "openai-completions">` at v0.87.1
+//! (`packages/ai/src/providers/openrouter.ts:8,21-25`), where it was single-API at `b0c2a90e`, and
+//! its refreshed catalog carries 15 Messages rows among 393. The declaration became a SET rather
+//! than one value for that ([`FleetWire::apis`]); nothing in the request path changed, because
+//! per-row dispatch had always covered it.
 //!
-//! The three `qwen-token-plan*` members and `baseten` are registered with [`FleetCatalog::Dynamic`] — no
-//! `catalog/*.json` — and that is a statement about EVIDENCE, not a shortcut. pi's rows for them
-//! come from models.dev's `alibaba-token-plan[-cn]` records (`ai/scripts/generate-models.ts:2303-2380`
-//! @v0.84.4), generated into a gitignored `providers/data/*.json`. The providers were added at
-//! `bbb91fa8a` (v0.81.0~25, 2026-07-20) and `c03d78bdc` (2026-08-06), both AFTER `b0c2a90e` — the last
-//! revision at which any `*.models.ts` was a data literal and the revision every other embedded
-//! catalog is generated from (`xtask/src/main.rs::DEFAULT_REV`, PROV-060). So their catalog data is
-//! in git at NO revision, `xtask gen-catalogs` cannot produce it, and hand-writing rows from memory is
-//! exactly what the catalog rules forbid. What IS in git — the ids, `baseUrl`, compat, thinking maps
-//! (`qwen-token-plan-models.test.ts` @v0.84.4) — is recorded on each member's doc comment for the
-//! day the data becomes obtainable; the runtime catalog comes from the pi.dev overlay
-//! ([`crate::remote_catalog`], which fetches `/api/models/providers/<id>` for every registered
-//! provider) and from `models.json`.
+//! # Where a member's catalog comes from (PROV-014, DRIFT-009, PROV-071)
 //!
-//! **`baseten` is the fourth, and it is blocked identically (DRIFT-009).** It was added upstream at
-//! `c1019d920` (2026-08-03), also after `b0c2a90e`; its rows are models.dev's `baseten` record
-//! (`generate-models.ts:1256-1345`, `:1944` `processBasetenModels(data.baseten)` @v0.84.4) and its
-//! `providers/data/baseten.json` is in git at no revision either. The four together are DRIFT-009's
-//! whole remaining shortfall, and it is now a DATA shortfall only: every one of the four is
-//! registered, resolves auth from its env var, and streams — `xtask gen-catalogs --roster <rev>`
-//! (`xtask/src/main.rs::UNPORTED`) fails the day any of their modules parses as a data literal
-//! again, which is the day the catalogs can be generated. Registering `baseten` also required
-//! porting the `baseten` thinking format ([`crate::api::compat::ThinkingFormat::Baseten`]): every
-//! reasoning row the overlay will deliver carries it, and an unknown format fails the whole row.
+//! Every fleet member with rows now ships an EMBEDDED catalog, and every one of those catalogs is
+//! fetched live from `pi.dev/api/models/providers/<id>` by `xtask gen-catalogs` and committed under
+//! `catalog/`. [`FleetCatalog::Dynamic`] — no `catalog/*.json` at all — is left with no member here;
+//! `radius` is the only provider in the tree that still has none, and it is not a fleet member
+//! because its rows come from its own gateway rather than from pi.
+//!
+//! **This block used to say the opposite, and the history is worth keeping** because it is the
+//! reason to distrust "the data is unobtainable" as a conclusion. The three `qwen-token-plan*`
+//! members and `baseten` were `Dynamic` on the reasoning that their rows are in git at NO
+//! revision: the providers were added upstream at `bbb91fa8a` (2026-07-20), `c03d78bdc`
+//! (2026-08-06) and `c1019d920` (2026-08-03), all AFTER `b0c2a90e` — the last revision at which any
+//! `*.models.ts` was a data literal — and their data is generated into a gitignored
+//! `providers/data/*.json`. Both halves of that were true and stayed true; DRIFT-009 showed the
+//! CONCLUSION was still wrong, because pi publishes the same generated artifact over HTTP, and
+//! PROV-071 then showed the same thing was true of the other 33 catalogs, which had been frozen at
+//! `b0c2a90e` for exactly the same reason without anyone calling them blocked.
+//!
+//! What IS in git for these four — the ids, `baseUrl`, compat, thinking maps
+//! (`qwen-token-plan-models.test.ts` @v0.84.4) — is recorded on each member's doc comment below,
+//! and it is what the live rows are checked against. Registering `baseten` also required porting
+//! the `baseten` thinking format ([`crate::api::compat::ThinkingFormat::Baseten`]): every reasoning
+//! row it serves carries it, and an unknown format fails the whole row.
+//!
+//! The runtime catalog still arrives on top of all of this from the pi.dev overlay
+//! ([`crate::remote_catalog`], which fetches the SAME endpoint per registered provider) and from
+//! `models.json`. The embedded files are the offline and first-run floor, not a cache of it.
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
@@ -94,30 +103,67 @@ pub enum FleetCatalog {
 /// it survives every future xAI release unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FleetWire {
-    /// `openai-completions` — nineteen of the twenty members, including all four
+    /// `openai-completions` — eighteen of the twenty members, including all four
     /// [`FleetCatalog::Dynamic`] ones, whose overlay rows are `openai-completions` upstream.
     Completions,
     /// `openai-responses` — `xai` alone (`ai/scripts/generate-models.ts:1877` @v0.85.1).
     Responses,
+    /// `anthropic-messages` **and** `openai-completions` — `openrouter` alone.
+    ///
+    /// Upstream states it in the signature: `openrouterProvider(): Provider<"anthropic-messages" |
+    /// "openai-completions">` with an `api` MAP rather than a single impl
+    /// (`packages/ai/src/providers/openrouter.ts:8,21-25` @v0.87.1). At `b0c2a90e` — the revision
+    /// every embedded catalog was frozen at until PROV-071 — the same file declared
+    /// `Provider<"openai-completions">` with one impl, which is why a single-protocol declaration
+    /// was ever enough. The refreshed catalog carries 15 `anthropic-messages` rows among 393, and
+    /// they were the first thing the refresh surfaced.
+    ///
+    /// Nothing in the REQUEST PATH changed with it: [`WireProvider`] has always dispatched per row
+    /// on `model.api` through the [`ApiRegistry`] (`wire.rs`), so both protocols already routed.
+    /// What could not be expressed was the declaration, and a declaration that cannot say what
+    /// upstream says is a declaration that has to be widened by exception next time.
+    MessagesAndCompletions,
 }
 
 impl FleetWire {
-    /// The `Model::api` value every row of a member declaring this protocol must carry.
+    /// Every `Model::api` value a row of a member declaring this protocol may carry.
+    ///
+    /// A SET rather than one value, because upstream's own `api` field is a set for `openrouter`.
+    /// The test still asserts the positive — each row's `api` must be IN this list — so a row that
+    /// regressed to a protocol the member does not declare still fails.
     #[must_use]
-    pub fn api(self) -> &'static str {
+    pub fn apis(self) -> &'static [&'static str] {
         match self {
-            Self::Completions => crate::known_api::OPENAI_COMPLETIONS,
-            Self::Responses => crate::known_api::OPENAI_RESPONSES,
+            Self::Completions => &[crate::known_api::OPENAI_COMPLETIONS],
+            Self::Responses => &[crate::known_api::OPENAI_RESPONSES],
+            Self::MessagesAndCompletions => &[
+                crate::known_api::ANTHROPIC_MESSAGES,
+                crate::known_api::OPENAI_COMPLETIONS,
+            ],
         }
     }
 }
 
-/// The catalog half of a `fleet!` row: a file stem embeds `catalog/<stem>.json`; `dynamic(<url>)`
-/// declares a member with no embedded rows and the provider-level `baseUrl` upstream's
-/// `createProvider` call carries.
+/// The catalog half of a `fleet!` row. Three forms, because "has rows" and "carries a
+/// provider-level `baseUrl`" are INDEPENDENT facts and conflating them cost DRIFT-009 a regression:
+///
+/// * `<stem>` embeds `catalog/<stem>.json` and carries no provider-level `baseUrl` — every row of
+///   such a catalog declares its own, which is what the request path reads.
+/// * `embedded(<stem>, <url>)` embeds the catalog AND keeps `<url>`, for the members whose upstream
+///   `createProvider({ baseUrl })` sets one explicitly (`Provider.baseUrl`, PROV-017). DRIFT-009's
+///   four are exactly these: their rows became embeddable, but `providers/baseten.ts:6-14` and
+///   `providers/qwen-token-plan*.ts:6-15` still pass a `baseUrl`, so dropping it while flipping
+///   `Dynamic` -> `Embedded` would silently lose `Provider.baseUrl` for four providers.
+/// * `dynamic(<url>)` declares a member with no embedded rows at all, keeping only that `baseUrl`.
 macro_rules! fleet_catalog {
     (dynamic($base_url:literal)) => {
         (FleetCatalog::Dynamic, Some($base_url))
+    };
+    (embedded($file:literal, $base_url:literal)) => {
+        (
+            FleetCatalog::Embedded(include_str!(concat!("catalog/", $file, ".json"))),
+            Some($base_url),
+        )
     };
     ($file:literal) => {
         (
@@ -159,7 +205,7 @@ fleet! {
     // `zai-org/GLM-5.2` (`test/baseten-models.test.ts:19-54`), which is also cyrup's default
     // model for the provider (`cyrup-config/src/model/defaults.rs:37`). See the module doc for
     // why the rows themselves are not embedded.
-    "baseten"               => (BASETEN, "Baseten", "BASETEN_API_KEY", "Baseten API key", Completions, dynamic("https://inference.baseten.co/v1")),
+    "baseten"               => (BASETEN, "Baseten", "BASETEN_API_KEY", "Baseten API key", Completions, embedded("baseten", "https://inference.baseten.co/v1")),
     "cerebras"              => (CEREBRAS, "Cerebras", "CEREBRAS_API_KEY", "Cerebras API key", Completions, "cerebras"),
     "deepseek"              => (DEEPSEEK, "DeepSeek", "DEEPSEEK_API_KEY", "DeepSeek API key", Completions, "deepseek"),
     "groq"                  => (GROQ, "Groq", "GROQ_API_KEY", "Groq API key", Completions, "groq"),
@@ -167,7 +213,9 @@ fleet! {
     "moonshotai"            => (MOONSHOTAI, "Moonshot AI", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "moonshotai"),
     "moonshotai-cn"         => (MOONSHOTAI_CN, "Moonshot AI CN", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "moonshotai-cn"),
     "nvidia"                => (NVIDIA, "NVIDIA", "NVIDIA_API_KEY", "NVIDIA API key", Completions, "nvidia"),
-    "openrouter"            => (OPENROUTER, "OpenRouter", "OPENROUTER_API_KEY", "OpenRouter API key", Completions, "openrouter"),
+    // `providers/openrouter.ts:8,21-25` @v0.87.1 declares TWO apis; at `b0c2a90e` it declared one
+    // (`Provider<"openai-completions">`). See `FleetWire::MessagesAndCompletions`.
+    "openrouter"            => (OPENROUTER, "OpenRouter", "OPENROUTER_API_KEY", "OpenRouter API key", MessagesAndCompletions, "openrouter"),
     // PROV-014 — `providers/qwen-token-plan.ts:6-15` @v0.84.4 (identical at v0.83.0), registered at
     // `all.ts:118`. models.dev source `alibaba-token-plan`; the ids upstream's own test pins as
     // present (`qwen-token-plan-models.test.ts:42-58` @v0.84.4): MiniMax-M2.5, deepseek-v3.2,
@@ -176,17 +224,17 @@ fleet! {
     // row `compat: { thinkingFormat: "qwen", supportsDeveloperRole: false, supportsStore: false }`
     // (`generate-models.ts:2308-2313`), `reasoning_effort` only on the deepseek-v4-*/glm-5* rows
     // (`:306-316`). See the module doc for why the rows themselves are not embedded.
-    "qwen-token-plan"       => (QWEN_TOKEN_PLAN, "Qwen Token Plan", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan API key", Completions, dynamic("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
+    "qwen-token-plan"       => (QWEN_TOKEN_PLAN, "Qwen Token Plan", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan API key", Completions, embedded("qwen-token-plan", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
     // PROV-014 — `providers/qwen-token-plan-cn.ts:6-15` @v0.84.4 (identical at v0.83.0),
     // `all.ts:119`. models.dev source `alibaba-token-plan-cn`; same id set as the international
     // plan, China endpoint, its own key.
-    "qwen-token-plan-cn"    => (QWEN_TOKEN_PLAN_CN, "Qwen Token Plan CN", "QWEN_TOKEN_PLAN_CN_API_KEY", "Qwen Token Plan CN API key", Completions, dynamic("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")),
+    "qwen-token-plan-cn"    => (QWEN_TOKEN_PLAN_CN, "Qwen Token Plan CN", "QWEN_TOKEN_PLAN_CN_API_KEY", "Qwen Token Plan CN API key", Completions, embedded("qwen-token-plan-cn", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")),
     // VERSION LAG (v0.83.0 → v0.84.4): `providers/qwen-token-plan-individual.ts:6-15`, added at
     // `c03d78bdc` (#7659), `all.ts:120`. The international endpoint and the SAME env var as
     // `qwen-token-plan` (`env-api-keys.ts:83`: `"qwen-token-plan-individual":
     // "QWEN_TOKEN_PLAN_API_KEY"`), narrowed to the eight-model personal allowlist
     // (`generate-models.ts:324-336`; `qwen-token-plan-models.test.ts:60-69`).
-    "qwen-token-plan-individual" => (QWEN_TOKEN_PLAN_INDIVIDUAL, "Qwen Token Plan Individual", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan Individual API key", Completions, dynamic("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
+    "qwen-token-plan-individual" => (QWEN_TOKEN_PLAN_INDIVIDUAL, "Qwen Token Plan Individual", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan Individual API key", Completions, embedded("qwen-token-plan-individual", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
     // XAI_2 — the one Responses member, and the one whose catalog is LIVE-FETCHED (XAI_1). The
     // declaration is what a freshly downloaded file gets checked against.
     "xai"                   => (XAI, "xAI", "XAI_API_KEY", "xAI API key", Responses, "xai"),
@@ -205,7 +253,7 @@ impl FleetSpec {
     /// member has no embedded rows and yields an empty catalog by construction.
     pub fn models(&self) -> Vec<Model> {
         match self.catalog {
-            FleetCatalog::Embedded(json) => serde_json::from_str(json).unwrap_or_default(),
+            FleetCatalog::Embedded(json) => crate::catalog::load_catalog(json).unwrap_or_default(),
             FleetCatalog::Dynamic => Vec::new(),
         }
     }
@@ -287,39 +335,59 @@ mod tests {
     use crate::stream::StreamOptions;
     use cyrup_core::ModelThinkingLevel;
 
-    /// Per-provider minimum catalog sizes (= the entry count in Pi's `<id>.models.ts`). A parse
-    /// failure or a dropped entry makes this fail loudly.
+    /// Per-provider catalog sizes, one per fleet member that ships rows.
+    ///
+    /// # Why `xai` is no longer the exception, and why this table grew instead of shrinking
+    ///
+    /// This used to carry fifteen of the twenty members and a comment explaining that `xai` was
+    /// DELIBERATELY absent (XAI_2): its catalog was re-downloaded on every `gen-catalogs` run, so
+    /// "its row count is a property of what xAI is selling this week — pinning it schedules a red
+    /// test for the next model launch". PROV-071 made every provider catalog live-fetched, so read
+    /// literally that rule would empty the table.
+    ///
+    /// It empties nothing, because the premise was wrong in a way one live catalog was too small to
+    /// show. A count here is a property of the COMMITTED file under `providers/catalog/`, not of
+    /// the endpoint: `gen-catalogs` is run by hand, there is no CI (see `xtask`'s module docs), and
+    /// the file changes only when a maintainer regenerates and reviews the diff. A launch upstream
+    /// cannot turn this red. A regeneration can, and that is the moment the roster SHOULD be
+    /// looked at — the refresh that closed PROV-071 moved openrouter 271 -> 393, amazon-bedrock
+    /// 109 -> 174 and moonshotai 10 -> 4, and a table that opted out of counting would have let all
+    /// three land unread. So `xai` gains the count it never had, and so does every other member.
     const EXPECTED_COUNTS: &[(&str, usize)] = &[
         ("ant-ling", 3),
-        ("cerebras", 3),
+        ("baseten", 21),
+        ("cerebras", 2),
         ("deepseek", 2),
         ("groq", 7),
-        ("huggingface", 49),
-        ("moonshotai", 10),
-        ("moonshotai-cn", 10),
-        ("nvidia", 20),
-        ("openrouter", 271),
-        // xai is DELIBERATELY ABSENT from this table (XAI_2). Every other entry counts a catalog
-        // recovered from the pinned pi revision, where the row count is a property of a commit and
-        // cannot move on its own. xai's catalog is re-downloaded from
-        // https://pi.dev/api/models/providers/xai on every `gen-catalogs` run (XAI_1), so its row
-        // count is a property of what xAI is selling this week — pinning it schedules a red test for
-        // the next model launch, which is the event this whole change exists to absorb. xai's rows
-        // are checked by the invariant loop below instead: non-empty, and every generator-hardcoded
-        // field. Add nothing here for a live-fetched catalog.
+        ("huggingface", 76),
+        ("moonshotai", 4),
+        ("moonshotai-cn", 4),
+        ("nvidia", 19),
+        ("openrouter", 393),
+        ("qwen-token-plan", 20),
+        ("qwen-token-plan-cn", 20),
+        ("qwen-token-plan-individual", 9),
+        ("xai", 4),
         ("xiaomi", 6),
-        // The three token-plan catalogs dropped to 3 in pi `cc2db980`, which stopped cloning the
-        // API-billing Xiaomi catalog into every region (see `catalog_data.rs`, PROV-004).
-        ("xiaomi-token-plan-ams", 3),
-        ("xiaomi-token-plan-cn", 3),
-        ("xiaomi-token-plan-sgp", 3),
-        ("zai", 6),
-        ("zai-coding-cn", 6),
+        ("xiaomi-token-plan-ams", 4),
+        ("xiaomi-token-plan-cn", 4),
+        ("xiaomi-token-plan-sgp", 4),
+        ("zai", 7),
+        ("zai-coding-cn", 4),
     ];
 
     #[test]
     fn every_catalog_parses_with_expected_count() {
-        // Counts, for the git-pinned catalogs only (see the note in EXPECTED_COUNTS).
+        // Counts, for every member that ships rows — no exceptions, and the table must be TOTAL:
+        // a member that gains a catalog without gaining a row here would otherwise be uncounted.
+        let counted: Vec<&str> = EXPECTED_COUNTS.iter().map(|(id, _)| *id).collect();
+        for spec in FLEET.iter().filter(|s| !s.is_dynamic()) {
+            assert!(
+                counted.contains(&spec.id),
+                "{} ships an embedded catalog with no EXPECTED_COUNTS row",
+                spec.id
+            );
+        }
         for (id, count) in EXPECTED_COUNTS {
             let spec = fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));
             assert_eq!(
@@ -327,6 +395,40 @@ mod tests {
                 *count,
                 "catalog count mismatch for {id}"
             );
+        }
+
+        // Provenance: every embedded catalog must say in `catalog_manifest.json` where its rows
+        // came from, and a live-fetched one must carry the stamp its last successful fetch left.
+        // A count says a catalog is the size somebody wrote down; this says its origin is on
+        // record, which is the half a silently-stale catalog cannot fake (PROV-060).
+        let manifest: serde_json::Value =
+            serde_json::from_str(crate::providers::all::BUILTIN_CATALOG_MANIFEST_JSON)
+                .expect("catalog_manifest.json parses");
+        let catalogs = manifest
+            .get("catalogs")
+            .and_then(serde_json::Value::as_object)
+            .expect("catalog_manifest.json has a `catalogs` map");
+        for spec in FLEET.iter().filter(|s| !s.is_dynamic()) {
+            let entry = catalogs
+                .get(spec.id)
+                .unwrap_or_else(|| panic!("{}: no catalog_manifest.json entry", spec.id));
+            let source = entry.get("source").and_then(serde_json::Value::as_str);
+            assert!(
+                source.is_some_and(|src| !src.is_empty()),
+                "{}: manifest entry names no source",
+                spec.id
+            );
+            // Live-fetched catalogs carry their own stamp; a null one means the last `gen-catalogs`
+            // run could not reach pi.dev and the file on disk is older than the manifest claims.
+            if source.is_some_and(|src| src.starts_with("https://")) {
+                for key in ["fetchedAt", "revision"] {
+                    assert!(
+                        entry.get(key).and_then(serde_json::Value::as_str).is_some(),
+                        "{}: live catalog has no `{key}` — its provenance is unrecorded",
+                        spec.id
+                    );
+                }
+            }
         }
 
         // Invariants, for EVERY member that ships rows — pinned or live-fetched. None of these
@@ -340,12 +442,23 @@ mod tests {
             // Every row speaks the protocol its member DECLARES. Asserts the POSITIVE: an xai row
             // that regressed to Completions fails here, which neither the original `grok-4.5`
             // carve-out nor XAI_1's whole-provider widening could see.
-            let api = spec.wire.api();
+            let apis = spec.wire.apis();
             assert!(
-                models.iter().all(|m| m.api.as_str() == api),
-                "{}: every row must be `{api}`, the protocol its FleetSpec::wire declares",
+                models.iter().all(|m| apis.contains(&m.api.as_str())),
+                "{}: every row must speak one of {apis:?}, the protocols its FleetSpec::wire \
+                 declares",
                 spec.id
             );
+            // And the declaration is checked in the other direction too: a member that declares a
+            // protocol no row speaks is a stale declaration, which is how `Responses` would have
+            // survived xai moving back.
+            for api in apis {
+                assert!(
+                    models.iter().any(|m| m.api.as_str() == *api),
+                    "{}: declares `{api}` but no row speaks it — the declaration is stale",
+                    spec.id
+                );
+            }
             assert!(
                 models.iter().all(|m| m.provider.as_str() == spec.id),
                 "{} provider tag",
@@ -382,8 +495,13 @@ mod tests {
 
     /// PROV-014 — the three Qwen Token Plan members, field for field against
     /// `providers/qwen-token-plan{,-cn,-individual}.ts:6-15` @v0.84.4 and `env-api-keys.ts:81-83`.
-    /// Their catalogs are `Dynamic` (module doc), so the provider-level `baseUrl` is the one
-    /// `createProvider({ baseUrl })` carries, and every other embedded member stays `None`.
+    ///
+    /// DRIFT-009 moved all three from `Dynamic` to `Embedded`, so the assertions flipped with them:
+    /// each now ships rows and each row must be tagged with its own provider id. The provider-level
+    /// `baseUrl` is asserted UNCHANGED, and that is the point of the `embedded(<stem>, <url>)` macro
+    /// arm: upstream's `createProvider({ baseUrl })` still passes one for these three (and for
+    /// `baseten`) whether or not a catalog exists, so gaining a catalog must not cost
+    /// `Provider.baseUrl`.
     #[test]
     fn qwen_token_plan_members_match_upstream() {
         let expected: &[(&str, &str, &str, &str, &str)] = &[
@@ -414,12 +532,22 @@ mod tests {
             assert_eq!(spec.name, *name);
             assert_eq!(spec.env_var, *env);
             assert_eq!(spec.auth_name, *auth);
-            assert_eq!(spec.base_url, Some(*base_url));
-            assert!(
-                spec.is_dynamic(),
-                "{id} ships no embedded rows (module doc)"
+            assert_eq!(
+                spec.base_url,
+                Some(*base_url),
+                "{id}: `createProvider({{ baseUrl }})` survives the flip to Embedded (DRIFT-009)"
             );
-            assert!(spec.models().is_empty());
+            assert!(
+                !spec.is_dynamic(),
+                "{id} ships embedded rows since DRIFT-009"
+            );
+            let rows = spec.models();
+            assert!(!rows.is_empty(), "{id} parsed to an empty catalog");
+            assert!(
+                rows.iter().all(|m| m.provider.as_str() == *id),
+                "{id}: every row must be tagged with its own provider id — `rows_from_body` \
+                 enforces that at fetch time, this is the same check at LOAD time"
+            );
             let p = spec.provider();
             assert_eq!(p.id().as_str(), *id);
             assert_eq!(Provider::name(&p), *name);
@@ -446,27 +574,36 @@ mod tests {
                 "qwen-token-plan-individual"
             ]
         );
-        // Exactly these three are dynamic; every embedded member carries its rows' own baseUrl.
+        // DRIFT-009 — NO fleet member is dynamic any more. `radius` is the workspace's only
+        // remaining catalog-less built-in and it is not a fleet member (its rows come from the
+        // customer's own gateway, not from a published artifact), so this is an empty set and
+        // asserting it empty is what makes a half-finished revert fail here rather than downstream.
         let dynamic: Vec<&str> = FLEET
             .iter()
             .filter(|s| s.is_dynamic())
             .map(|s| s.id)
             .collect();
+        assert!(
+            dynamic.is_empty(),
+            "DRIFT-009 embedded the last four; {dynamic:?} is still Dynamic"
+        );
+        // The four DRIFT-009 members are the ONLY embedded members carrying a provider-level
+        // `baseUrl`: upstream passes one to `createProvider` for exactly these four, and every other
+        // member's rows carry their own.
+        let with_base_url: Vec<&str> = FLEET
+            .iter()
+            .filter(|s| s.base_url.is_some())
+            .map(|s| s.id)
+            .collect();
         assert_eq!(
-            dynamic,
+            with_base_url,
             [
                 "baseten",
                 "qwen-token-plan",
                 "qwen-token-plan-cn",
                 "qwen-token-plan-individual"
             ],
-            "DRIFT-009 added `baseten` to the dynamic set; it sorts first in `all.ts` order"
-        );
-        assert!(
-            FLEET
-                .iter()
-                .filter(|s| !s.is_dynamic())
-                .all(|s| s.base_url.is_none())
+            "in `all.ts` order"
         );
     }
 
@@ -475,12 +612,13 @@ mod tests {
     /// carries (`ai/scripts/generate-models.ts:1259`).
     ///
     /// It sits between `ant-ling` and `cerebras`, which is `all.ts`'s own order (`:92`, `:95`,
-    /// `:96`), and it is `Dynamic` for the same reason the three Qwen plans are — see the module
-    /// doc. The assertion that matters most is the last one: a Baseten row's compat is
-    /// `thinkingFormat: "baseten"`, so if that variant ever went away the provider would be
-    /// registered and permanently empty.
+    /// `:96`). DRIFT-009 turned it from `Dynamic` into an `Embedded` member fetched from
+    /// `pi.dev/api/models/providers/baseten`, so the emptiness assertion became a rows assertion —
+    /// and the `thinkingFormat: "baseten"` check below stopped being hypothetical: 10 of the 21
+    /// fetched rows really do carry it, and an unknown format fails the whole row, which would leave
+    /// the provider registered and half empty rather than loudly broken.
     #[test]
-    fn baseten_matches_upstream_and_carries_no_embedded_rows() {
+    fn baseten_matches_upstream_and_ships_its_fetched_rows() {
         let spec = fleet_spec("baseten").expect("baseten is a fleet member");
         assert_eq!(spec.name, "Baseten");
         assert_eq!(spec.env_var, "BASETEN_API_KEY");
@@ -490,8 +628,10 @@ mod tests {
             Some("https://inference.baseten.co/v1"),
             "generate-models.ts:1259 @v0.84.4"
         );
-        assert!(spec.is_dynamic());
-        assert!(spec.models().is_empty());
+        assert!(
+            !spec.is_dynamic(),
+            "DRIFT-009 — baseten's rows are live-fetched into an embedded catalog"
+        );
 
         let p = spec.provider();
         assert_eq!(p.id().as_str(), "baseten");
@@ -526,6 +666,37 @@ mod tests {
             Some(crate::api::compat::ThinkingFormat::Baseten)
         );
         assert!(compat.chat_template_args.is_some());
+
+        // DRIFT-009 — and the SHIPPED catalog really exercises it. `zai-org/GLM-5.2` is the row
+        // upstream's own `test/baseten-models.test.ts:19-54` pins in full and the id
+        // `cyrup-config`'s `default_model_per_provider` names as this provider's default, so a
+        // default that cannot resolve is a user-visible failure, not a test detail.
+        let rows = spec.models();
+        assert!(!rows.is_empty(), "baseten parsed to an empty catalog");
+        assert!(
+            rows.iter().all(|m| m.provider.as_str() == "baseten"),
+            "every fetched row must be tagged `baseten`"
+        );
+        let glm = rows
+            .iter()
+            .find(|m| m.id.as_str() == "zai-org/GLM-5.2")
+            .expect("the provider default `zai-org/GLM-5.2` must be in the shipped catalog");
+        let glm_compat = glm.compat.as_ref().expect("GLM-5.2 declares a compat");
+        assert_eq!(
+            glm_compat.thinking_format,
+            Some(crate::api::compat::ThinkingFormat::Baseten),
+            "the toggle-reasoning block (`generate-models.ts:1274-1283`) survived the fetch"
+        );
+        assert!(
+            glm_compat.chat_template_args.is_some(),
+            "`chatTemplateArgs: {{enable_thinking: {{$var: thinking.enabled}}}}` survived the fetch"
+        );
+        assert!(
+            rows.iter()
+                .any(|m| m.compat.as_ref().and_then(|c| c.thinking_format)
+                    == Some(crate::api::compat::ThinkingFormat::Baseten)),
+            "no row carries the baseten thinking format"
+        );
     }
 
     #[test]
@@ -616,17 +787,29 @@ mod tests {
     #[test]
     fn groq_qwen3_32b_no_longer_carries_the_retargeted_thinking_level_map() {
         let models = GROQ.models();
-        let qwen = models
+        // The row the retargeting moved the override OFF is gone from upstream entirely, so there
+        // is nothing left for it to be wrongly re-attached to. `xtask`'s CONVERGED table asserts
+        // the same absence at generation time and hard-errors if it comes back.
+        assert!(
+            !models.iter().any(|m| m.id.as_str() == "qwen/qwen3-32b"),
+            "qwen/qwen3-32b is retired upstream; if it is back, PROV-064's override decision has \
+             to be re-taken rather than inherited"
+        );
+        // The row the override moved ONTO carries it, from upstream's own data rather than from a
+        // generator exception. This is the positive half the old assertion could not make: while
+        // the catalog was frozen at b0c2a90e no Groq row had a map at all, so "no row has one" was
+        // as true of a correct catalog as of an empty one.
+        let retargeted = models
             .iter()
-            .find(|m| m.id.as_str() == "qwen/qwen3-32b")
-            .expect("qwen/qwen3-32b");
-        assert_eq!(qwen.thinking_level_map, None);
-        // MIRROR: no Groq row has a thinking-level map — the generator never sets one, and the sole
-        // override now names an id this catalog does not contain.
-        assert!(models.iter().all(|m| m.thinking_level_map.is_none()));
-        // MIRROR: the row itself is untouched — this is a map removal, not a model removal.
-        assert!(qwen.reasoning);
-        assert_eq!(qwen.context_window, 131_072);
+            .find(|m| m.id.as_str() == "qwen/qwen3.6-27b")
+            .expect("qwen/qwen3.6-27b — the id v0.84.1 retargeted the override to");
+        let map = retargeted
+            .thinking_level_map
+            .as_ref()
+            .expect("the retargeted row carries the override");
+        assert_eq!(map.get("off"), Some(&Some("none".to_string())));
+        assert_eq!(map.get("high"), Some(&Some("default".to_string())));
+        assert!(retargeted.reasoning);
     }
 
     #[test]

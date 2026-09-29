@@ -393,8 +393,46 @@ pub struct ModelCompat {
     pub supports_long_cache_retention: Option<bool>,
     /// Pi `supportsOpenAIGrammarTools` (`openai-responses.ts:73` @v0.83.0, default **false**):
     /// provider accepts OpenAI's grammar-constrained custom-tool encoding.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    ///
+    /// The explicit `rename` is load-bearing and is NOT what `rename_all = "camelCase"` derives
+    /// (PROV-071a). Serde camel-cases per underscore-delimited word, so `supports_openai_grammar_tools`
+    /// becomes `supportsOpenaiGrammarTools`, whereas upstream spells the acronym in full caps:
+    /// `supportsOpenAIGrammarTools` (`packages/ai/src/types.ts:729` on the completions compat and
+    /// `:766` on the responses compat @v0.87.1). `ModelCompat` sets no `deny_unknown_fields`, so
+    /// without this attribute pi's key deserializes to nothing at all — silently, with no error —
+    /// and the flag falls back to [`detect_compat`]'s pinned `false`. It is the only case mismatch
+    /// among `ModelCompat`'s fields; every other key round-trips through `camelCase` unchanged.
+    #[serde(
+        rename = "supportsOpenAIGrammarTools",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub supports_openai_grammar_tools: Option<bool>,
+    /// Pi `supportsMidConvoSystemMessages` — declared on FOUR of pi's compat interfaces with the
+    /// same name, default and meaning: completions `types.ts:731`, responses `:758`,
+    /// anthropic-messages `:830`, mistral-conversations `:851` (all @v0.87.1). Shared here in the one
+    /// merged `ModelCompat` exactly as `supports_long_cache_retention` is (PROV-083a).
+    ///
+    /// *"Whether the exact model accepts system or developer messages after the conversation has
+    /// started. When false, later system messages are folded into the leading system message."*
+    /// Default **false**; `resolve_transcript` collapses the transcript when it is off.
+    ///
+    /// The ANTHROPIC route does not fall back to that constant: it defaults from the runtime
+    /// predicate `crate::api::anthropic_messages::default_supports_mid_convo_system_messages`, the
+    /// same treatment DRIFT-001 gave `supports_tool_references` and for the same reason — no cyrup
+    /// catalog carries this key, so a constant default would make the whole port dead code.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_mid_convo_system_messages: Option<bool>,
+    /// Pi `supportsMidConvoToolAdditions` (`types.ts:733` @v0.87.1, `OpenAICompletionsCompat`):
+    /// *"Whether system messages can introduce additional tools mid-conversation. Requires
+    /// `supportsMidConvoSystemMessages`."* Default **false**.
+    ///
+    /// Generator-assigned only, with NO runtime predicate: pi sets it for Kimi K3 alone, keyed on
+    /// explicit `(provider, model.id)` pairs rather than on a pattern
+    /// (`generate-models.ts:906-924` @v0.87.1). That is catalog data, not a derivable default, so
+    /// unlike the anthropic flag below this one resolves declared-over-`false`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_mid_convo_tool_additions: Option<bool>,
 
     // --- `anthropic-messages` subset (Pi `AnthropicMessagesCompat`, types.ts:531). These are read
     // only by the anthropic-messages resolver; `supports_long_cache_retention` and
@@ -434,6 +472,15 @@ pub struct ModelCompat {
     /// `crate::api::anthropic_messages::default_supports_tool_references`. DRIFT-001.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_tool_references: Option<bool>,
+    /// Pi `supportsMidConvoToolChanges` (`types.ts:832` @v0.87.1, `AnthropicMessagesCompat`):
+    /// *"Whether the exact model accepts mid-conversation `tool_addition` and `tool_removal` blocks.
+    /// Requires `supportsMidConvoSystemMessages`."* Default **false**.
+    ///
+    /// Unset falls back to the runtime predicate
+    /// `crate::api::anthropic_messages::default_supports_mid_convo_tool_changes`, which is the
+    /// anthropic-only half of `generate-models.ts:1211-1216` (PROV-083a).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_mid_convo_tool_changes: Option<bool>,
     /// Pi `allowedFallbackModels` (`types.ts:833-839` @v0.87.1): models Anthropic accepts in
     /// `fallbacks` for server-side refusal fallback, with local pricing metadata for returned
     /// fallback responses. When absent OR empty, callers must omit `fallbacks` — Anthropic rejects
@@ -443,6 +490,20 @@ pub struct ModelCompat {
     /// the explicit empty array a user's `models.json` wrote. PROV-090.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub allowed_fallback_models: Option<Vec<AnthropicAllowedFallbackModel>>,
+    /// Pi `supportsMidConvoEffort` (`types.ts` `AnthropicMessagesCompat` @v0.87.1): the exact model
+    /// accepts per-turn `output_config` markers, so the reasoning effort of EVERY recorded turn is
+    /// replayed as its own `{role:"system",content:[],output_config:{effort}}` message instead of
+    /// one request-level `output_config.effort`. Default **false**.
+    ///
+    /// Read STRAIGHT off `model.compat` — never through
+    /// [`get_anthropic_compat`](crate::api::anthropic_messages::compat) — because pi's
+    /// `getAnthropicCompat` (`anthropic-messages.ts:206-220`) does not resolve it either: all of its
+    /// readers (`:521`, `:1028`, `:1061`, `:1069`, `:1108`, `:1153`) go directly to `model.compat`,
+    /// exactly as [`Self::allowed_fallback_models`] does. Setting it also pins
+    /// `thinkingLevelMap.off = null` upstream (`generate-models.ts:816`), which is why the managed
+    /// thinking branch is unconditional on `model.reasoning`. PROV-091.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_mid_convo_effort: Option<bool>,
 
     // --- `openai-responses` subset (Pi `OpenAIResponsesCompat`, openai-responses.ts:57-63). Read
     // only by the openai-responses resolver. `supports_developer_role` and
@@ -560,6 +621,13 @@ pub struct ResolvedCompat {
     /// (`openai-completions.ts:1473` @v0.83.0), catalog override resolved at `:1515` (PROV-024).
     pub session_affinity_format: SessionAffinityFormat,
     pub supports_long_cache_retention: bool,
+    /// Pi `supportsMidConvoSystemMessages` — detected **false** (never derived on the completions
+    /// route; `generate-models.ts:906-924` assigns it from explicit model-id sets), catalog override
+    /// resolved in [`get_compat`]. PROV-083a.
+    pub supports_mid_convo_system_messages: bool,
+    /// Pi `supportsMidConvoToolAdditions` — detected **false**, catalog override resolved in
+    /// [`get_compat`]. PROV-083a.
+    pub supports_mid_convo_tool_additions: bool,
 }
 
 /// The `thinkingLevelMap` key for a [`ModelThinkingLevel`] (Pi `ModelThinkingLevel`).
@@ -609,6 +677,64 @@ pub fn off_value_or(map: Option<&ThinkingLevelMap>, fallback: &str) -> String {
     }
 }
 
+/// The endpoint predicates that pi's runtime `detectCompat`
+/// (`openai-completions.ts:1583-1603` @v0.87.1) and its catalog generator
+/// `detectOpenAICompletionsCompat` (`generate-models.ts:693-703` @v0.87.1) declare **identically**,
+/// character for character. They live here, once, because both cyrup readers need them:
+/// [`detect_compat`] for the keys it still derives at runtime, and
+/// [`generated_supports_strict_mode`] for the one key pi bakes into generated catalog data.
+mod endpoint {
+    /// `isMoonshot` (`openai-completions.ts:1594` / `generate-models.ts:695` @v0.87.1).
+    pub fn is_moonshot(provider: &str, base_url: &str) -> bool {
+        provider == "moonshotai"
+            || provider == "moonshotai-cn"
+            || base_url.contains("api.moonshot.")
+    }
+
+    /// `isTogether` (`openai-completions.ts:1592-1593` / `generate-models.ts:693-694` @v0.87.1).
+    pub fn is_together(provider: &str, base_url: &str) -> bool {
+        provider == "together"
+            || base_url.contains("api.together.ai")
+            || base_url.contains("api.together.xyz")
+    }
+
+    /// `isCloudflareAiGateway` (`openai-completions.ts:1599` / `generate-models.ts:698`
+    /// @v0.87.1).
+    pub fn is_cloudflare_ai_gateway(provider: &str, base_url: &str) -> bool {
+        provider == "cloudflare-ai-gateway" || base_url.contains("gateway.ai.cloudflare.com")
+    }
+
+    /// `isNvidia` (`openai-completions.ts:1600` / `generate-models.ts:699` @v0.87.1).
+    pub fn is_nvidia(provider: &str, base_url: &str) -> bool {
+        provider == "nvidia" || base_url.contains("integrate.api.nvidia.com")
+    }
+
+    /// `isCerebras` (`openai-completions.ts:1602` / `generate-models.ts:701` @v0.87.1).
+    pub fn is_cerebras(provider: &str, base_url: &str) -> bool {
+        provider == "cerebras" || base_url.contains("cerebras.ai")
+    }
+}
+
+/// The `supportsStrictMode` value pi's catalog GENERATOR bakes into every generated
+/// `openai-completions` row — `!isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia &&
+/// !isCerebras` (`generate-models.ts:765-766` @v0.87.1, under the comment "Preserve built-in
+/// behavior as explicit metadata against the conservative runtime default").
+///
+/// This is deliberately NOT what [`detect_compat`] returns. Upstream `af7359b90` (#9804, v0.86.1)
+/// added `!isCerebras`, and `890f92088` (#9816, v0.87.0) then MOVED the whole expression out of the
+/// runtime detector into the generator, leaving the runtime default at a flat `false`
+/// ("OpenAI compatibility alone does not imply strict JSON-schema tool support",
+/// `openai-completions.ts:1666-1667`). A built-in row therefore carries the expression as EXPLICIT
+/// metadata, while a user-declared `models.json` row gets the conservative default.
+/// [`crate::catalog::load_catalog`] is the seam that applies it to cyrup's embedded catalogs.
+pub fn generated_supports_strict_mode(provider: &str, base_url: &str) -> bool {
+    !endpoint::is_moonshot(provider, base_url)
+        && !endpoint::is_together(provider, base_url)
+        && !endpoint::is_cloudflare_ai_gateway(provider, base_url)
+        && !endpoint::is_nvidia(provider, base_url)
+        && !endpoint::is_cerebras(provider, base_url)
+}
+
 /// Auto-detect compatibility from `provider` + `baseUrl` + model id.
 /// 1:1 port of Pi `detectCompat` (openai-completions.ts L1173-1254).
 pub fn detect_compat(model: &Model) -> ResolvedCompat {
@@ -620,18 +746,16 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         || provider == "zai-coding-cn"
         || base_url.contains("api.z.ai")
         || base_url.contains("open.bigmodel.cn");
-    let is_together = provider == "together"
-        || base_url.contains("api.together.ai")
-        || base_url.contains("api.together.xyz");
-    let is_moonshot = provider == "moonshotai"
-        || provider == "moonshotai-cn"
-        || base_url.contains("api.moonshot.");
+    let is_together = endpoint::is_together(provider, base_url);
+    let is_moonshot = endpoint::is_moonshot(provider, base_url);
     let is_openrouter = provider == "openrouter" || base_url.contains("openrouter.ai");
     let is_cloudflare_workers_ai =
         provider == "cloudflare-workers-ai" || base_url.contains("api.cloudflare.com");
-    let is_cloudflare_ai_gateway =
-        provider == "cloudflare-ai-gateway" || base_url.contains("gateway.ai.cloudflare.com");
-    let is_nvidia = provider == "nvidia" || base_url.contains("integrate.api.nvidia.com");
+    let is_cloudflare_ai_gateway = endpoint::is_cloudflare_ai_gateway(provider, base_url);
+    let is_nvidia = endpoint::is_nvidia(provider, base_url);
+    // pi declares `isCerebras` here too (`openai-completions.ts:1602` @v0.87.1), immediately
+    // before `isNonStandard` reads it; cyrup used to inline the same test into `is_non_standard`.
+    let is_cerebras = endpoint::is_cerebras(provider, base_url);
     let is_ant_ling = provider == "ant-ling" || base_url.contains("api.ant-ling.com");
     // pi lowercases the URL half here and declares this BEFORE `isNonStandard`
     // (`openai-completions.ts:1603` @v0.87.1), so every downstream reader — `isNonStandard`,
@@ -640,8 +764,7 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
     let is_deepseek = provider == "deepseek" || base_url.to_lowercase().contains("deepseek.com");
 
     let is_non_standard = is_nvidia
-        || provider == "cerebras"
-        || base_url.contains("cerebras.ai")
+        || is_cerebras
         || provider == "xai"
         || base_url.contains("api.x.ai")
         || is_together
@@ -728,10 +851,13 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         // `chatTemplateArgs: {}` (openai-completions.ts:1649 @v0.84.4) — never detected.
         chat_template_args: Map::new(),
         zai_tool_stream: false,
-        supports_strict_mode: !is_moonshot
-            && !is_together
-            && !is_cloudflare_ai_gateway
-            && !is_nvidia,
+        // `// OpenAI compatibility alone does not imply strict JSON-schema tool support.` /
+        // `supportsStrictMode: false` (`openai-completions.ts:1666-1667` @v0.87.1). The old
+        // five-predicate expression did not vanish — `890f92088` (#9816) MOVED it into the catalog
+        // generator (`generate-models.ts:765-766`), so it now reaches a model as explicit row
+        // metadata instead of a runtime guess. See [`generated_supports_strict_mode`] and
+        // [`crate::catalog::load_catalog`].
+        supports_strict_mode: false,
         // `supportsOpenAIGrammarTools: false` (openai-completions.ts:1469 @v0.83.0) — never
         // detected, only enabled by the generated catalog.
         supports_openai_grammar_tools: false,
@@ -751,6 +877,12 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
             || is_cloudflare_ai_gateway
             || is_nvidia
             || is_ant_ling),
+        // Neither flag is DETECTED on the completions route: pi's runtime `detectCompat` sets no
+        // `supportsMidConvo*` key at all, and its generator assigns both from explicit
+        // `(provider, model.id)` sets (`generate-models.ts:906-924` @v0.87.1). So both default off
+        // here and are enabled only by catalog metadata (PROV-083a).
+        supports_mid_convo_system_messages: false,
+        supports_mid_convo_tool_additions: false,
     }
 }
 
@@ -823,6 +955,13 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
         supports_long_cache_retention: c
             .supports_long_cache_retention
             .unwrap_or(detected.supports_long_cache_retention),
+        // PROV-083a — declared-over-detected, the same `?? detected.x` shape as every key above.
+        supports_mid_convo_system_messages: c
+            .supports_mid_convo_system_messages
+            .unwrap_or(detected.supports_mid_convo_system_messages),
+        supports_mid_convo_tool_additions: c
+            .supports_mid_convo_tool_additions
+            .unwrap_or(detected.supports_mid_convo_tool_additions),
     }
 }
 
@@ -1065,7 +1204,16 @@ mod tests {
         assert!(c.supports_reasoning_effort);
         assert_eq!(c.max_tokens_field, MaxTokensField::MaxCompletionTokens);
         assert_eq!(c.thinking_format, ThinkingFormat::Openai);
-        assert!(c.supports_strict_mode);
+        // PROV-078 — DETECTION no longer infers strict support from OpenAI compatibility
+        // (`openai-completions.ts:1667` @v0.87.1 is a flat `supportsStrictMode: false`). A real
+        // built-in OpenAI row still resolves `true`, because the catalog carries the generator's
+        // expression as explicit metadata — that is asserted where the metadata is applied, in
+        // `crate::catalog`'s `builtin_openai_completions_rows_carry_strict_as_metadata`.
+        assert!(!c.supports_strict_mode);
+        assert!(generated_supports_strict_mode(
+            "openai",
+            "https://api.openai.com/v1"
+        ));
         assert!(c.supports_long_cache_retention);
     }
 
@@ -1427,5 +1575,55 @@ mod tests {
         );
         assert_eq!(unsupported_temperature_reason(&m), None);
         assert!(temperature_is_supported(&m));
+    }
+
+    /// PROV-078 — an OpenAI-compatible endpoint cyrup has never heard of does NOT get `strict`.
+    ///
+    /// `890f92088` (#9816, v0.87.0) replaced the five-predicate guess with a flat
+    /// `supportsStrictMode: false` under the comment "OpenAI compatibility alone does not imply
+    /// strict JSON-schema tool support" (`openai-completions.ts:1666-1667` @v0.87.1). Speaking the
+    /// OpenAI wire format says nothing about whether a server implements strict function calling, so
+    /// an unrecognised base URL must resolve to `false` and have `strict` withheld — a self-hosted
+    /// vLLM or LiteLLM route used to be sent `strict: true` plus a strict-converted schema on the
+    /// strength of its URL alone, and would reject the call.
+    #[test]
+    fn an_unknown_openai_compatible_endpoint_is_not_strict_capable() {
+        let m = base_model("my-llm", "https://llm.internal/v1", "my-model");
+        assert!(m.compat.is_none());
+        assert!(!detect_compat(&m).supports_strict_mode);
+        assert!(!get_compat(&m).supports_strict_mode);
+    }
+
+    /// PROV-078 — the generator expression pi moved into `generate-models.ts:765-766` @v0.87.1,
+    /// including the `!isCerebras` term `af7359b90` (#9804, v0.86.1) added.
+    #[test]
+    fn the_generated_strict_expression_excludes_pis_five_endpoints() {
+        for (provider, base_url) in [
+            ("moonshotai", "https://api.moonshot.ai/v1"),
+            ("moonshotai-cn", "https://api.moonshot.cn/v1"),
+            ("together", "https://api.together.xyz/v1"),
+            (
+                "cloudflare-ai-gateway",
+                "https://gateway.ai.cloudflare.com/v1",
+            ),
+            ("nvidia", "https://integrate.api.nvidia.com/v1"),
+            ("cerebras", "https://api.cerebras.ai/v1"),
+        ] {
+            assert!(
+                !generated_supports_strict_mode(provider, base_url),
+                "{provider} must be excluded"
+            );
+        }
+        for (provider, base_url) in [
+            ("openai", "https://api.openai.com/v1"),
+            ("groq", "https://api.groq.com/openai/v1"),
+            ("xai", "https://api.x.ai/v1"),
+            ("deepseek", "https://api.deepseek.com"),
+        ] {
+            assert!(
+                generated_supports_strict_mode(provider, base_url),
+                "{provider} must keep strict"
+            );
+        }
     }
 }

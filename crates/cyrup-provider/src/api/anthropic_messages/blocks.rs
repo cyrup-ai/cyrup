@@ -79,6 +79,12 @@ pub(super) struct Decoder {
     /// `fromClaudeCodeName`, anthropic-messages.ts:592-594).
     pub(super) is_oauth: bool,
     pub(super) tool_names: Vec<String>,
+    /// The exact provider-native effort this request declared, for a managed
+    /// mid-conversation-effort model (`None` for every other model). Seeded at construction and
+    /// copied into EVERY snapshot, because pi stamps it on the `output` object it creates before the
+    /// stream opens (`anthropic-messages.ts:517-528` @v0.87.1) and `output` IS the `partial`
+    /// attached to every event as well as the terminal message. PROV-091.
+    pub(super) provider_thinking_level: Option<String>,
 }
 
 impl Decoder {
@@ -87,10 +93,15 @@ impl Decoder {
     /// Exists so [`ContentCache`] can stay a PRIVATE field: a `..Default::default()` struct literal
     /// at the driver's call site would require every field to be visible there, and the memo's
     /// whole correctness argument is that nothing outside this file can write it.
-    pub(super) fn new(is_oauth: bool, tool_names: Vec<String>) -> Self {
+    pub(super) fn new(
+        is_oauth: bool,
+        tool_names: Vec<String>,
+        provider_thinking_level: Option<String>,
+    ) -> Self {
         Self {
             is_oauth,
             tool_names,
+            provider_thinking_level,
             ..Default::default()
         }
     }
@@ -147,6 +158,7 @@ impl Decoder {
             api: api.clone(),
             response_model: self.response_model.clone(),
             response_id: self.response_id.clone(),
+            provider_thinking_level: self.provider_thinking_level.clone(),
             diagnostics: None,
             usage,
             // In-flight: Pi's `output.stopReason` is still its `"pending"` seed until a

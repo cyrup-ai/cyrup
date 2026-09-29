@@ -567,6 +567,33 @@ pub trait TerminalInputHandler: 'static {
     fn on_input(&self, data: &str) -> Option<TerminalInputResult>;
 }
 
+/// A git-branch-change callback (EXT-064; pi
+/// `ReadonlyFooterDataProvider.onBranchChange(callback: () => void)`,
+/// `core/footer-data-provider.ts:139-143` @v0.87.1 — "Subscribe to git branch changes. Returns
+/// unsubscribe function.").
+///
+/// Upstream's callback takes NO argument: its custom footer is a component that re-reads
+/// `getGitBranch()` when it repaints. A cyrup guest renders text once, so the new branch is handed
+/// in — it is exactly what `ui.footer_data().git_branch` would answer on the next call, passed
+/// directly so the callback need not make one.
+///
+/// Interactive mode only, as with `onTerminalInput`: pi builds its one `FooterDataProvider` in
+/// `interactive-mode.ts:611` and nowhere else.
+pub trait BranchChangeHandler: 'static {
+    /// The branch changed. `None` is upstream's `getGitBranch()` returning `null` — not in a repo;
+    /// the literal `"detached"` is a detached HEAD (`core/footer-data-provider.ts:126-132`).
+    fn on_branch_change(&self, branch: Option<&str>, ctx: &Ctx);
+}
+
+impl<F> BranchChangeHandler for F
+where
+    F: Fn(Option<&str>, &Ctx) + 'static,
+{
+    fn on_branch_change(&self, branch: Option<&str>, ctx: &Ctx) {
+        self(branch, ctx);
+    }
+}
+
 impl<F> TerminalInputHandler for F
 where
     F: Fn(&str) -> Option<TerminalInputResult> + 'static,
@@ -649,6 +676,11 @@ pub struct ExtensionApi {
     /// handlers would be folded once. Modelling it as one handler makes that explicit instead of
     /// silently dropping the second.
     pub(crate) terminal_input_handler: Option<Box<dyn TerminalInputHandler>>,
+    /// EXT-064: this extension's git-branch-change callback, if it subscribed. AT MOST ONE, for
+    /// the same reason as `terminal_input_handler`: upstream's `branchChangeCallbacks` is a `Set`
+    /// but the host's subscriber table is keyed by EXTENSION, so a guest with two callbacks would
+    /// be notified once.
+    pub(crate) branch_change_handler: Option<Box<dyn BranchChangeHandler>>,
     pub(crate) autocomplete: Vec<String>,
     /// Stacked global autocomplete providers (Pi `addAutocompleteProvider`, sdk gap #2). Folded in
     /// registration order over the host's built-in suggestions by [`Self::autocomplete_suggest`].
@@ -926,6 +958,28 @@ impl ExtensionApi {
     /// `ui.subscribe-terminal-input` import at init).
     pub fn has_terminal_input_handler(&self) -> bool {
         self.terminal_input_handler.is_some()
+    }
+
+    /// Subscribe to git branch changes (EXT-064; pi
+    /// `ReadonlyFooterDataProvider.onBranchChange(callback)`,
+    /// `core/footer-data-provider.ts:139-143` @v0.87.1). A second call REPLACES the first, for the
+    /// reason the `branch_change_handler` field's doc gives.
+    pub fn on_branch_change(&mut self, handler: impl BranchChangeHandler) {
+        self.branch_change_handler = Some(Box::new(handler));
+    }
+
+    /// Run this extension's branch-change callback, if it registered one (the `on-branch-change`
+    /// export body). A no-op when it did not.
+    pub fn handle_branch_change(&self, branch: Option<&str>, ctx: &Ctx) {
+        if let Some(h) = self.branch_change_handler.as_ref() {
+            h.on_branch_change(branch, ctx);
+        }
+    }
+
+    /// Whether this extension registered a branch-change callback (drives the
+    /// `ui.subscribe-branch-change` import at init).
+    pub fn has_branch_change_handler(&self) -> bool {
+        self.branch_change_handler.is_some()
     }
 
     /// Register a custom ENTRY renderer (Pi `pi.registerEntryRenderer(customType, renderer)`,

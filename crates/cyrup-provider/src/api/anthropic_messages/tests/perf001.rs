@@ -128,7 +128,7 @@ async fn drive(frames: &[SseFrame], m: &Model) -> Vec<StreamEvent> {
             .map(Ok::<SseFrame, ProviderError>)
             .collect::<Vec<_>>(),
     );
-    decode_stream(stream, m, &api, &sink, false, &[]).await;
+    decode_stream(stream, m, &api, &sink, false, &[], None).await;
     drop(sink);
     let mut events = Vec::new();
     while let Ok(ev) = rx.try_recv() {

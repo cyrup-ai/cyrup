@@ -22,13 +22,15 @@ fn url_appends_v1_messages() {
 fn api_key_headers_and_version() {
     let m = model();
     let auth = auth_with(Some("sk-ant-api03-xxx"));
-    let headers = build_headers(
-        &m,
-        &Context::default(),
-        &auth,
-        &StreamOptions::default(),
-        false,
-    );
+    // PROV-091: the interleaved-thinking beta this test asserts requires reasoning to be ON
+    // (pi `:1019-1025` @v0.87.1 gates on `options?.thinkingEnabled === true`), so the request has to
+    // ask for it. `StreamOptions::default()` is `ModelThinkingLevel::Off`, i.e. pi's
+    // `thinkingEnabled: false`, which now correctly sends no beta at all.
+    let opts = StreamOptions {
+        reasoning: ModelThinkingLevel::High,
+        ..Default::default()
+    };
+    let headers = build_headers(&m, &Context::default(), &auth, &opts, false);
     assert_eq!(
         headers.get("x-api-key").and_then(|v| v.clone()).as_deref(),
         Some("sk-ant-api03-xxx")
@@ -54,7 +56,7 @@ fn api_key_headers_and_version() {
 /// synthetic model — because the defect was never in this file's logic, which was already a
 /// faithful port, but in the data that reaches it.
 ///
-/// Two divergences per request, on all three models, which is every model the provider has:
+/// Two divergences per request, on every model the provider has:
 /// cyrup sent a budget-based `thinking` block where pi sends `{type: "adaptive"}`
 /// (pi `anthropic-messages.ts:1033`), and it sent the `interleaved-thinking-2025-05-14` beta
 /// that pi suppresses for adaptive models (`:858`,
@@ -70,7 +72,10 @@ fn kimi_coding_catalog_rows_send_adaptive_thinking_and_no_interleaved_beta() {
     let models = crate::providers::anthropic::anthropic_fleet_spec("kimi-coding")
         .expect("kimi-coding fleet spec")
         .models();
-    assert_eq!(models.len(), 5, "every kimi-coding row must be covered");
+    // Four since PROV-071's live refresh (five while the catalog was frozen at `b0c2a90e`). The
+    // count is asserted rather than the loop simply running, so a catalog that shrank to nothing
+    // could not make this test vacuously green.
+    assert_eq!(models.len(), 4, "every kimi-coding row must be covered");
 
     for m in &models {
         let body = build_body(m, &user_ctx("think"), &opts);
@@ -102,11 +107,16 @@ fn interleaved_thinking_per_api_option_suppresses_beta() {
     let m = model();
     let auth = auth_with(Some("sk-ant-api03-xxx"));
 
+    // PROV-091: reasoning must be ON for the beta to be in play at all — this test is about the
+    // per-api `interleavedThinking: false` override, not about the thinking-enabled gate.
     let default_headers = build_headers(
         &m,
         &Context::default(),
         &auth,
-        &StreamOptions::default(),
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        },
         false,
     );
     let default_beta = default_headers
@@ -119,6 +129,7 @@ fn interleaved_thinking_per_api_option_suppresses_beta() {
     );
 
     let opts = StreamOptions {
+        reasoning: ModelThinkingLevel::High,
         api_options: Some(crate::stream::ApiStreamOptions::Anthropic(
             AnthropicOptions {
                 interleaved_thinking: Some(false),
@@ -315,4 +326,69 @@ fn oauth_remaps_tool_names_to_claude_code() {
     )
     .unwrap();
     assert_eq!(body["tools"][0]["name"], "Bash");
+}
+
+/// PROV-091 — the interleaved-thinking gate, all four of pi's terms (`anthropic-messages.ts:1019-1025`
+/// @v0.87.1: `model.reasoning && options?.thinkingEnabled === true && (options.interleavedThinking ??
+/// true) && model.compat?.forceAdaptiveThinking !== true`).
+///
+/// cyrup had only the last two terms, so a reasoning-OFF request to any non-adaptive
+/// Anthropic-compatible model shipped `interleaved-thinking-2025-05-14` even though nothing on that
+/// request could use it. `ModelThinkingLevel::Off` IS pi's `thinkingEnabled: false` — there is no
+/// third state — so `opts.reasoning.is_on()` ports the missing term exactly.
+#[test]
+fn interleaved_beta_requires_thinking_enabled() {
+    let m = model();
+    let auth = auth_with(Some("sk-ant-api03-xxx"));
+    let beta_for = |level: ModelThinkingLevel| {
+        build_headers(
+            &m,
+            &Context::default(),
+            &auth,
+            &StreamOptions {
+                reasoning: level,
+                ..Default::default()
+            },
+            false,
+        )
+        .get("anthropic-beta")
+        .and_then(|v| v.clone())
+        .unwrap_or_default()
+    };
+
+    assert!(
+        !beta_for(ModelThinkingLevel::Off).contains(INTERLEAVED_THINKING_BETA),
+        "reasoning off must not send the interleaved-thinking beta"
+    );
+    assert!(
+        beta_for(ModelThinkingLevel::High).contains(INTERLEAVED_THINKING_BETA),
+        "reasoning on must still send it"
+    );
+}
+
+/// PROV-091 — the second half of the same gate: `model.reasoning` itself. A non-reasoning model
+/// never sends the beta, whatever the caller asks for.
+#[test]
+fn interleaved_beta_requires_a_reasoning_model() {
+    let m = Model {
+        reasoning: false,
+        ..model()
+    };
+    let headers = build_headers(
+        &m,
+        &Context::default(),
+        &auth_with(Some("sk-ant-api03-xxx")),
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        },
+        false,
+    );
+    assert!(
+        !headers
+            .get("anthropic-beta")
+            .and_then(|v| v.clone())
+            .unwrap_or_default()
+            .contains(INTERLEAVED_THINKING_BETA),
+    );
 }

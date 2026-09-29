@@ -2,8 +2,10 @@
 
 use super::cache::get_cache_control;
 use super::claude_code::to_claude_code_name;
-use super::compat::{force_adaptive_thinking, get_anthropic_compat, off_is_not_null};
-use super::messages::convert_messages;
+use super::compat::{
+    force_adaptive_thinking, get_anthropic_compat, off_is_not_null, supports_mid_convo_effort,
+};
+use super::messages::{convert_messages, insert_thinking_level_messages};
 use super::options::AnthropicThinkingDisplay;
 use super::tools::convert_tools;
 use crate::api::compat::sanitize_surrogates;
@@ -41,6 +43,33 @@ fn map_thinking_level_to_effort(model: &Model, level: ThinkingLevel) -> String {
         // above) promotes them to the native `xhigh`/`max` efforts.
         ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high".to_string(),
     }
+}
+
+/// The Anthropic effort THIS request runs at, for a managed mid-conversation-effort model — pi's
+/// `options?.effort ?? "high"` (`anthropic-messages.ts:1064` @v0.87.1), reproduced under cyrup's
+/// single entry point. `None` for every model that does not declare `supportsMidConvoEffort`.
+///
+/// Pi has two entry points and only `streamSimple` populates `options.effort`: it does so exactly
+/// when `model.compat.forceAdaptiveThinking` is set AND the caller asked for reasoning
+/// (`:858-884`), mapping the level through `mapThinkingLevelToEffort`. Every other path leaves
+/// `options.effort` undefined and the `?? "high"` default applies — including a reasoning-OFF
+/// request, which upstream routes through `stream(model, context, {thinkingEnabled:false})`
+/// (`:871-876`) with no effort at all.
+///
+/// One function, three readers — pi's `providerThinkingLevel` seed (`:521`), its `activeEffort`
+/// (`:1064`) and the trailing marker that [`insert_thinking_level_messages`] appends — so the
+/// request's declared effort and the effort stamped on the decoded turn can never drift apart.
+/// PROV-091.
+pub(crate) fn managed_active_effort(model: &Model, opts: &StreamOptions) -> Option<String> {
+    if !supports_mid_convo_effort(model) {
+        return None;
+    }
+    if force_adaptive_thinking(model)
+        && let Some(level) = opts.reasoning.level()
+    {
+        return Some(map_thinking_level_to_effort(model, level));
+    }
+    Some("high".to_string())
 }
 
 /// Test-only convenience wrapper for [`build_params`] with no env overlay and API-key auth.
@@ -122,18 +151,30 @@ pub(crate) fn build_params(
         clamp_max_tokens_to_context(model, ctx, opts.max_tokens.unwrap_or(model.max_tokens))
     };
 
+    // `supportsMidConvoEffort` is read straight off `model.compat` on BOTH sides — see
+    // `super::compat::supports_mid_convo_effort` for why `getAnthropicCompat` is bypassed.
+    let managed_effort = managed_active_effort(model, opts);
+
     let mut obj = Map::new();
     obj.insert("model".to_string(), json!(model.id.as_str()));
+    let converted = convert_messages(
+        &transformed,
+        is_oauth,
+        cache_control.as_ref(),
+        compat.allow_empty_signature,
+        &deferred_tool_names,
+        normalize_tool_name,
+        // Pi `model.compat?.supportsMidConvoEffort === true ? model.provider : undefined` (`:1061`):
+        // only a turn produced by the SAME provider on this api can have its effort replayed.
+        managed_effort.as_ref().map(|_| &model.provider),
+    );
     obj.insert(
         "messages".to_string(),
-        Value::Array(convert_messages(
-            &transformed,
-            is_oauth,
-            cache_control.as_ref(),
-            compat.allow_empty_signature,
-            &deferred_tool_names,
-            normalize_tool_name,
-        )),
+        Value::Array(match &managed_effort {
+            // Pi `:1066-1073`.
+            Some(active) => insert_thinking_level_messages(converted, active),
+            None => converted.messages,
+        }),
     );
     obj.insert("max_tokens".to_string(), json!(max_tokens));
     obj.insert("stream".to_string(), json!(true));
@@ -162,8 +203,13 @@ pub(crate) fn build_params(
     }
 
     // Temperature is incompatible with extended thinking and unsupported on Opus 4.7+.
+    // A managed mid-conversation-effort model is excluded outright (pi adds
+    // `model.compat?.supportsMidConvoEffort !== true` at `:1108` @v0.87.1) — it always runs adaptive
+    // thinking, and `thinking_enabled` is false on a reasoning-off request, so the older two-term
+    // gate would have let `temperature` through.
     if let Some(temp) = opts.temperature
         && !thinking_enabled
+        && managed_effort.is_none()
         && compat.supports_temperature
     {
         obj.insert("temperature".to_string(), json!(temp));
@@ -198,8 +244,34 @@ pub(crate) fn build_params(
         obj.insert("tools".to_string(), Value::Array(tools));
     }
 
-    // Thinking configuration (Pi anthropic-messages.ts:957-986).
-    if model.reasoning {
+    // Thinking configuration (Pi anthropic-messages.ts:1149-1186 @v0.87.1).
+    //
+    // Pi's in-source reason for the managed branch, verbatim: *"Managed effort models always use
+    // adaptive thinking so prefix mismatches can be dropped instead of surfacing as persistent 400
+    // responses."* It is deliberately OUTSIDE `model.reasoning` and outside `thinkingEnabled`
+    // (`:1151-1160`), which is sound because the generator pins `thinkingLevelMap.off = null` on
+    // every model it grants the flag to (`generate-models.ts:816`) — such a model has no
+    // thinking-off state to honour.
+    //
+    // `output_config.effort` here is HARDCODED `"high"`, not the active effort (`:1159`): the
+    // per-turn value travels ONLY in the trailing marker `insert_thinking_level_messages` appended.
+    if managed_effort.is_some() {
+        let display = json!(
+            opts.anthropic_options()
+                .and_then(|o| o.thinking_display)
+                .map(AnthropicThinkingDisplay::as_wire)
+                .unwrap_or("summarized")
+        );
+        obj.insert(
+            "thinking".to_string(),
+            json!({
+                "type": "adaptive",
+                "display": display,
+                "block_binding": { "prefix_mismatch_behavior": "drop_block" },
+            }),
+        );
+        obj.insert("output_config".to_string(), json!({ "effort": "high" }));
+    } else if model.reasoning {
         if thinking_enabled {
             // Pi `options.thinkingDisplay ?? "summarized"` (anthropic-messages.ts:962).
             let display = json!(

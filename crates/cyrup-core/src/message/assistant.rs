@@ -49,6 +49,20 @@ pub struct AssistantMessage {
     pub response_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_id: Option<String>,
+    /// The exact provider-native effort level used for this response (Pi
+    /// `providerThinkingLevel?: string`, `ai/src/types.ts:524` @v0.87.1, declared between
+    /// `responseId` and `diagnostics`). Absent for legacy or unmanaged responses.
+    ///
+    /// Set by the `anthropic-messages` adapter whenever the model declares
+    /// `compat.supportsMidConvoEffort` — it seeds `output.providerThinkingLevel` from
+    /// `options?.effort ?? "high"` (`anthropic-messages.ts:517-524`) — and by the `pi-messages`
+    /// adapter when a `done`/`error` frame carries the key (`pi-messages.ts:201-203`, `:213-215`).
+    /// It MUST round-trip: on the next turn the same adapter replays each recorded level as an
+    /// Anthropic `{role:"system",content:[],output_config:{effort}}` marker so the cached prefix is
+    /// reconstructed exactly (`anthropic-messages.ts:1364-1378`, `:1434-1448`); dropping it on
+    /// re-export silently changes the request prefix and invalidates the cache (PROV-091).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider_thinking_level: Option<String>,
     /// Redacted provider/runtime diagnostics for failures and recoveries (Pi
     /// `diagnostics?: AssistantMessageDiagnostic[]`, types.ts:391). Skipped when empty/none.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -128,8 +142,8 @@ pub struct DeferredHandle {
 impl serde::Serialize for AssistantMessage {
     /// Self-tagging serializer: emits `role: "assistant"` FIRST (Pi's `AssistantMessage` literal
     /// always carries it, `ai/src/types.ts:384`), then Pi's exact field order — role, content, api,
-    /// provider, model, responseModel?, responseId?, diagnostics?, usage, stopReason, deferred?,
-    /// errorMessage?, rawStopReason?, timestamp (`v0.84.1 ai/src/types.ts:413-428`, read field for
+    /// provider, model, responseModel?, responseId?, providerThinkingLevel?, diagnostics?, usage, stopReason, deferred?,
+    /// errorMessage?, rawStopReason?, timestamp (`v0.87.1 ai/src/types.ts:515-536`, read field for
     /// field). So every wire-serialized assistant turn — and every `StreamEvent` `partial`/
     /// `done.message`/`error.error` that embeds one — is byte-1:1 with Pi. Verified against captured
     /// Pi bytes (`text-turn.pi-captured` `start` partial begins `{"role":"assistant","content":[],
@@ -142,6 +156,7 @@ impl serde::Serialize for AssistantMessage {
         let len = 8
             + usize::from(self.response_model.is_some())
             + usize::from(self.response_id.is_some())
+            + usize::from(self.provider_thinking_level.is_some())
             + usize::from(self.diagnostics.is_some())
             + usize::from(self.deferred.is_some())
             + usize::from(self.error_message.is_some())
@@ -159,6 +174,10 @@ impl serde::Serialize for AssistantMessage {
         match &self.response_id {
             Some(v) => st.serialize_field("responseId", v)?,
             None => st.skip_field("responseId")?,
+        }
+        match &self.provider_thinking_level {
+            Some(v) => st.serialize_field("providerThinkingLevel", v)?,
+            None => st.skip_field("providerThinkingLevel")?,
         }
         match &self.diagnostics {
             Some(v) => st.serialize_field("diagnostics", v)?,
@@ -212,6 +231,7 @@ impl AssistantMessage {
             api: api.unwrap_or_else(|| ApiId::from(UNRESOLVED_API)),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason,
@@ -244,6 +264,7 @@ mod tests {
             api: "faux".into(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -269,6 +290,7 @@ mod tests {
             api: "faux".into(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

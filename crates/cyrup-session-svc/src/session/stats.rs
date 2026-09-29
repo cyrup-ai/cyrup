@@ -47,7 +47,7 @@ impl AgentSession {
         let models = self.full_model_registry();
         let mgr = self.manager.lock().await;
         let scan = crate::state::cache_scan_entries(mgr.entries());
-        cyrup_provider::cache_stats::compute_cache_waste(&scan, &models)
+        cyrup_provider::cache_stats::compute_cache_waste(&scan, &*models)
     }
 
     /// The prompt-cache miss charged to the MOST RECENT assistant turn, if it was above the
@@ -79,7 +79,7 @@ impl AgentSession {
         let last = scan
             .iter()
             .rposition(|e| matches!(e, CacheScanEntry::Assistant(_)))?;
-        cyrup_provider::cache_stats::collect_cache_misses(&scan, &models)
+        cyrup_provider::cache_stats::collect_cache_misses(&scan, &*models)
             .get(&last)
             .copied()
     }

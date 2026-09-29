@@ -15,6 +15,7 @@ use super::super::types::{AgentDefinition, AgentSource, ChainDefinition, SystemP
 
 pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefinition {
     AgentDefinition {
+        default_tool_timeout_ms: None,
         inherit_global_context: false,
         machine: None,
         mutation_tools: None,
@@ -35,6 +36,7 @@ pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefi
         subagent_only_extensions: None,
         subagent_only_extensions_from_default: false,
         exclude_tools: None,
+        allowed_agents: None,
         allow_nested_subagents: None,
         model: None,
         fallback_models: Vec::new(),
@@ -46,7 +48,6 @@ pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefi
         default_reads: None,
         default_progress: None,
         output: None,
-        completion_guard: None,
         interactive: None,
         max_subagent_depth: None,
         default_context: None,

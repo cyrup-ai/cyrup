@@ -44,6 +44,14 @@ pub(super) fn convert_messages(model: &Model, ctx: &Context) -> Vec<Value> {
 
     for msg in &transformed {
         match msg {
+            // PROV-083a — a `Message::System` carries the transcript's own prompt and tool
+            // state, not a turn to convert. Upstream every adapter reaches its message loop through
+            // `collapseSystemMessages` / `withoutInitialSystemMessage`
+            // (`utils/transcript.ts:114`/`:57`), so the leading system message is consumed by the
+            // params builder and no later one survives; skipping is exactly what that collapsed
+            // transcript yields. PROV-083b wires each adapter's own `resolve_transcript` and, where
+            // the transport can express it, emits later system messages in place.
+            Message::System(_) => {}
             Message::User { content, .. } => {
                 let parts = user_parts(content);
                 if parts.is_empty() {

@@ -323,6 +323,12 @@ pub struct RecoveryDescriptor {
     /// The persona's `excludeTools`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_tools: Vec<String>,
+    /// SUBA-111 — the persona's `allowedAgents` delegation bound, carried across an async resume
+    /// so a revived run keeps it (pi `async-resume.ts:326` lists `allowedAgents` among the
+    /// descriptor's own keys, re-normalizes it at `:374-375` and replays it at `:622`). Without it
+    /// a resume would silently widen a bound the original launch was subject to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_agents: Option<Vec<String>>,
     /// The persona's `allowNestedSubagents`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_nested_subagents: Option<bool>,
@@ -363,9 +369,6 @@ pub struct RecoveryDescriptor {
     /// The persona's definition file, consumed only by [`Self::synthesised_persona`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_file_path: Option<PathBuf>,
-    /// The persona's completion-guard setting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion_guard: Option<bool>,
     /// The persona's `memory:` block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<AgentMemoryConfig>,
@@ -623,6 +626,7 @@ impl RecoveryDescriptor {
             thinking_ceiling: inputs.thinking_ceiling.map(str::to_string),
             tools: persona.tools.clone(),
             exclude_tools: persona.exclude_tools.clone(),
+            allowed_agents: persona.allowed_agents.clone(),
             allow_nested_subagents: persona.allow_nested_subagents,
             extensions: persona.extensions.clone(),
             subagent_only_extensions: persona.subagent_only_extensions.clone(),
@@ -633,7 +637,6 @@ impl RecoveryDescriptor {
             inherit_skills: persona.inherit_skills,
             skills,
             agent_file_path: persona.file_path.clone(),
-            completion_guard: persona.completion_guard,
             memory: persona.memory.clone(),
             output_path: step.output_path.clone(),
             output_mode,
@@ -904,6 +907,7 @@ impl RecoveryDescriptor {
         persona.thinking = self.thinking.clone();
         persona.tools = self.tools.clone();
         persona.exclude_tools = self.exclude_tools.clone();
+        persona.allowed_agents = self.allowed_agents.clone();
         persona.allow_nested_subagents = self.allow_nested_subagents;
         persona.extensions = self.extensions.clone();
         persona.subagent_only_extensions = self.subagent_only_extensions.clone();
@@ -924,7 +928,6 @@ impl RecoveryDescriptor {
             .agent_file_path
             .clone()
             .or_else(|| persona.file_path.take());
-        persona.completion_guard = self.completion_guard;
         persona.memory = self.memory.clone();
         persona.tool_budget = self.initial_tool_budget.clone();
         persona.max_subagent_depth = Some(self.max_subagent_depth);
@@ -963,10 +966,15 @@ impl RecoveryDescriptor {
             model_provider: None,
             fallback_models: Vec::new(),
             thinking: None,
+            // CFG-067 — a synthesised recovery persona declares no per-tool deadline of its own
+            // (upstream's `recoveryAgentConfig` has no such field either), so the run's own rungs
+            // decide.
+            default_tool_timeout_ms: None,
             system_prompt_mode: self.system_prompt_mode,
             system_prompt_body: String::new(),
             tools: None,
             exclude_tools: Vec::new(),
+            allowed_agents: None,
             allow_nested_subagents: None,
             extensions: None,
             subagent_only_extensions: Vec::new(),
@@ -974,7 +982,6 @@ impl RecoveryDescriptor {
             inherit_project_context: self.inherit_project_context,
             inherit_skills: self.inherit_skills,
             skills: Vec::new(),
-            completion_guard: None,
             max_subagent_depth: None,
             default_context: None,
             memory: None,
@@ -1115,6 +1122,9 @@ fn launch_binding_projection(
             Value::Array(tools.iter().map(tool_ref_as_pi_json).collect()),
         );
     }
+    if let Some(allowed) = persona.allowed_agents.as_ref() {
+        put("allowedAgents", serde_json::json!(allowed));
+    }
     if !persona.exclude_tools.is_empty() {
         put("excludeTools", serde_json::json!(persona.exclude_tools));
     }
@@ -1161,6 +1171,7 @@ mod tests {
     /// than a matching default.
     fn distinctive_persona() -> ResolvedAgentPersona {
         ResolvedAgentPersona {
+            default_tool_timeout_ms: None,
             // SUBA-101: `true` against `inherit_project_context: false`, so the legacy default
             // (`None` -> the project flag) is distinguishable from the recorded value.
             inherit_global_context: true,
@@ -1179,6 +1190,7 @@ mod tests {
                 ToolRef::ExtensionPath("./ext-tool".to_string()),
             ]),
             exclude_tools: vec!["bash".to_string()],
+            allowed_agents: None,
             allow_nested_subagents: Some(true),
             extensions: Some(vec!["ext-a".to_string()]),
             subagent_only_extensions: vec!["./child.ts".to_string()],
@@ -1186,7 +1198,6 @@ mod tests {
             inherit_project_context: false,
             inherit_skills: false,
             skills: vec!["alpha".to_string()],
-            completion_guard: Some(false),
             max_subagent_depth: Some(2),
             default_context: None,
             memory: Some(AgentMemoryConfig {
@@ -1232,6 +1243,7 @@ mod tests {
 
     fn runner_config(step: SingleStepSpec, persona: ResolvedAgentPersona) -> RunnerConfig {
         RunnerConfig {
+            tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,
@@ -1351,7 +1363,6 @@ mod tests {
             "the per-call override wins"
         );
         assert_eq!(d.agent_file_path, Some(PathBuf::from("/agents/worker.md")));
-        assert_eq!(d.completion_guard, Some(false));
         assert_eq!(d.memory, distinctive_persona().memory);
         assert_eq!(d.output_path.as_deref(), Some("/out/out.md"));
         assert_eq!(d.output_mode, OutputMode::FileOnly);
@@ -1896,6 +1907,7 @@ mod tests {
         let config = runner_config(distinctive_step(), distinctive_persona());
         let d = RecoveryDescriptor::for_single_launch(&config, LaunchInputs::default()).unwrap();
         let mut widened = ResolvedAgentPersona {
+            default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,
             mutation_tools: None,
@@ -1911,6 +1923,7 @@ mod tests {
                 ToolRef::Builtin("bash".to_string()),
             ]),
             exclude_tools: Vec::new(),
+            allowed_agents: None,
             allow_nested_subagents: Some(false),
             extensions: Some(vec!["ext-z".to_string()]),
             subagent_only_extensions: Vec::new(),
@@ -1918,7 +1931,6 @@ mod tests {
             inherit_project_context: true,
             inherit_skills: true,
             skills: vec!["zeta".to_string()],
-            completion_guard: Some(true),
             max_subagent_depth: Some(9),
             default_context: Some(ContextMode::Fork),
             memory: None,
@@ -1966,7 +1978,6 @@ mod tests {
             "the EFFECTIVE launch list"
         );
         assert_eq!(widened.file_path, expected.file_path);
-        assert_eq!(widened.completion_guard, expected.completion_guard);
         assert_eq!(widened.memory, expected.memory);
         assert_eq!(widened.tool_budget, expected.tool_budget);
         assert_eq!(widened.max_subagent_depth, Some(2));

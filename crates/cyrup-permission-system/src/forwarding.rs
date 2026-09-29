@@ -62,6 +62,19 @@ pub const PERMISSION_FORWARDING_TIMEOUT: Duration = Duration::from_secs(10 * 60)
 /// [`PERMISSION_FORWARDING_TIMEOUT`]). A finite positive milliseconds value shortens the child's
 /// deadline — the seam the fail-closed timeout proof (`tests/forwarding_subprocess.rs`) drives so the
 /// 10-minute production default never has to elapse in a test.
+///
+/// **`[CYRUP-DELTA]` — CFG-074: cyrup-only.** It overrides a value upstream keeps as a COMPILE-TIME
+/// constant: `PERMISSION_FORWARDING_TIMEOUT_MS = 10 * 60 * 1000` (`permission-forwarding.ts:8`
+/// @v0.8.0), alongside `PERMISSION_FORWARDING_POLL_INTERVAL_MS` and
+/// `PERMISSION_FORWARDING_WATCH_DEBOUNCE_MS`, none of which is env-overridable.
+///
+/// The mechanism is what forces it, and it is the direction of the difference that makes it
+/// acceptable: upstream's child and parent are the same process, so a test can advance its own
+/// timers; cyrup's child is a real subprocess whose 10-minute wait no in-process clock can shorten,
+/// and the fail-CLOSED behaviour at that bound is exactly the property that must be proven rather
+/// than asserted. Unset (every production process), the bound is upstream's own constant
+/// [`PERMISSION_FORWARDING_TIMEOUT`] — and the override can only SHORTEN the wait, so no value of it
+/// can make a forwarded ask hang longer or fail open.
 pub const CHILD_WAIT_TIMEOUT_ENV: &str = "CYRUP_PERMISSION_FORWARDING_TIMEOUT_MS";
 
 /// pi `PERMISSION_FORWARDING_AGENT_DIR_ENV_KEY` (`permission-forwarding.ts:11` @v0.8.0) — the cyrup

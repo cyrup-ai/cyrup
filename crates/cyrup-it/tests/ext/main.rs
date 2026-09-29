@@ -56,6 +56,7 @@ mod discover_load;
 mod guest_host_mode;
 mod manifest_capabilities;
 mod wasm_bash_operations;
+mod wasm_branch_change;
 mod wasm_bus_flag;
 mod wasm_component;
 mod wasm_ctx_state;

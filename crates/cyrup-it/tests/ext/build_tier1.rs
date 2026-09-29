@@ -95,9 +95,14 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     // surface-enumeration batch to `@0.8` (two export RENAMES, EXT-069/EXT-068, plus the
     // `add-autocomplete-provider` MOVE from `interface registration` to `interface ui`, EXT-065 —
     // the move is an import re-signing in the fails-to-LINK direction), the renderer
-    // display-options batch to `@0.9` (EXT-006: `render-call`/`render-result` gained `opts-json`)
-    // and the guest bash-backend batch to `@0.10` (DRIFT-004: the NEW `bash-operations-exec`
-    // export, plus the `host-bash` imports its `onData`/`signal` halves travel over), on the
+    // display-options batch to `@0.9` (EXT-006: `render-call`/`render-result` gained `opts-json`),
+    // the guest bash-backend batch to `@0.10` (DRIFT-004: the NEW `bash-operations-exec`
+    // export, plus the `host-bash` imports its `onData`/`signal` halves travel over) and the
+    // extension-chrome batch to `@0.11` (EXT-064, and it hits both directions: `ui.set-header` /
+    // `ui.set-footer` are RE-SIGNED to `option<string>` so a guest can set an EMPTY custom footer
+    // without it meaning "restore the built-in", and the NEW `events.on-branch-change` export
+    // arrives alongside the `ui.subscribe-branch-change`/`ui.unsubscribe-branch-change` imports),
+    // on the
     // strength of
     // host `bindgen!` accepting the new shapes and
     // `cargo check -p cyrup-ext-sdk --target wasm32-wasip2` expanding `export_extension!` cleanly
@@ -112,7 +117,7 @@ async fn tier1_cargo_build_emits_a_component_that_caches_and_instantiates() {
     // instantiated the bytes the PRODUCTION Tier-1 loop returns until this assertion.
     // ---------------------------------------------------------------------------------------
     assert_eq!(
-        HOST_WORLD, "cyrup:ext@0.10",
+        HOST_WORLD, "cyrup:ext@0.11",
         "the world this artifact is being linked against"
     );
 
