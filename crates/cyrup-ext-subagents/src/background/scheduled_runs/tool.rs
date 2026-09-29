@@ -219,7 +219,7 @@ pub struct ScheduledRunActionParams {
 ///
 /// `ScheduleTarget::base_ref` (`:45` @v0.68.0) reaches upstream's worktree setup. cyrup's
 /// workflow launch path threads NO base ref: `route_workflow_mode` never had one, and the
-/// extracted [`crate::extension::executor::workflow_launch`] therefore has none either.
+/// extracted `crate::extension::executor::workflow_launch` therefore has none either.
 ///
 /// Silently dropping the value would run the schedule against the wrong tree every time it fires
 /// — a data-loss-shaped defect that the user would discover only from the diff. So the field is

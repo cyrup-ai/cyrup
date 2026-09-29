@@ -190,7 +190,7 @@ async fn terminal_result_exists(run_paths: &RunPaths, status: &RunStatus) -> boo
 /// is a workflow — §0.6 cut the detached async runner; the foreground path (§3.2) never calls this
 /// (it writes the terminal status itself). The NON-default value is produced by
 /// [`apply_workflow_settlement_plan`] below, whose caller
-/// ([`crate::extension::executor::workflow_detach`], SCOPE_8) assembles its own
+/// (`crate::extension::executor::workflow_detach`, SCOPE_8) assembles its own
 /// [`ResultFile`] rather than going through `finish_run`. Pointer: §4.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkflowResultFields {
@@ -213,15 +213,15 @@ pub(crate) struct WorkflowResultFields {
 /// Pointer: §4.
 ///
 /// **The "future async workflow arm" that doc anticipated has arrived**: SCOPE_8's detached-child
-/// reconciler ([`crate::extension::executor::workflow_detach::reconcile_detached_workflow_child_completion`])
-/// is this function's first production caller, which is why the
-/// `#[cfg_attr(not(test), allow(dead_code))]` that used to sit here is gone. It calls this and
-/// then performs its OWN `write_atomic_json` → `update_active_run_index` →
-/// `write_async_result_file` sequence — the same ordering `finish_run` performs — rather than
-/// calling `finish_run`, whose double-invocation guard (`:237-245`) refuses precisely the
-/// superseding second write over an already-published `Paused` result that a detached-child
-/// settlement IS. Hence `finish_run` stays `pub(super)`; only this stamper is re-exported
-/// (`runner_main/mod.rs`).
+/// reconciler
+/// (`crate::extension::executor::workflow_detach::reconcile_detached_workflow_child_completion`) is
+/// this function's first production caller, which is why the
+/// `#[cfg_attr(not(test), allow(dead_code))]` that used to sit here is gone. It calls this and then
+/// performs its OWN `write_atomic_json` → `update_active_run_index` → `write_async_result_file`
+/// sequence — the same ordering `finish_run` performs — rather than calling `finish_run`, whose
+/// double-invocation guard (`:237-245`) refuses precisely the superseding second write over an
+/// already-published `Paused` result that a detached-child settlement IS. Hence `finish_run` stays
+/// `pub(super)`; only this stamper is re-exported (`runner_main/mod.rs`).
 pub(crate) fn apply_workflow_settlement_plan(
     plan: &crate::workflows::WorkflowSettlementPlan,
     status: &mut RunStatus,

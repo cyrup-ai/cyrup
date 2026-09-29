@@ -175,7 +175,7 @@ pub enum KnownEntry {
     /// `replacement: null` OMITS the target from context entirely; a value replaces only its
     /// content, leaving every other field of the target's message untouched. The edit entry itself
     /// projects NO message (it is a known non-message kind, so
-    /// [`crate::context::push_as_raw`]'s catch-all skips it), and only edits admitted by
+    /// `crate::context::push_as_raw`'s catch-all skips it), and only edits admitted by
     /// `build_context_entries` apply — an edit outside the live compaction window cannot resurrect
     /// or alter anything.
     ///

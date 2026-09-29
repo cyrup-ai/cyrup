@@ -58,9 +58,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-/// pi `handleRefinementAction` (`agent-refinements.ts:546`) and the write primitives it drives.
 pub(crate) mod action;
-/// pi `validateRefinementProposal` (`agent-refinements.ts:448`) and the proposal-child plumbing.
 pub(crate) mod proposal;
 
 /// pi `REFINEMENT_DIR` (`agent-refinements.ts:10`).

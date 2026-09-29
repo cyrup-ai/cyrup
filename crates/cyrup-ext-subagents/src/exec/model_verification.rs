@@ -42,8 +42,8 @@ pub type ModelResponseAliases = BTreeMap<String, Vec<String>>;
 ///   `<label>["<key>"] must be an array of non-empty response ID strings`.
 ///
 /// Upstream's `JSON.stringify(candidate)` around the key is reproduced with
-/// [`serde_json::Value::to_string`] on a string value, so a key containing a quote or a backslash
-/// renders the same escaped form on both sides.
+/// [`serde_json::Value::to_string`](ToString::to_string) on a string value, so a key containing a
+/// quote or a backslash renders the same escaped form on both sides.
 ///
 /// An absent value (`None`, upstream's `undefined`) is valid: the setting is optional.
 ///

@@ -1,3 +1,5 @@
+//! The crate's single epoch-millisecond clock (`Date.now()`). See [`time`](crate::time).
+//!
 //! The crate's SINGLE epoch-millisecond clock.
 //!
 //! Every `Date.now()` in the upstream port lands here. One helper, one integer width (`i64`, the

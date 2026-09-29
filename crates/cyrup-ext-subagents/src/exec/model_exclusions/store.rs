@@ -13,7 +13,7 @@
 //! Upstream is module-global mutable state (`let exclusions: ModelExclusion[]`, `let loaded`), and
 //! that shape is exactly what `reloadFromDisk` and `EXCLUSIONS_PATH_ENV` exist to work around when
 //! a test needs isolation. This crate already settled the same question the other way for
-//! `completion_bus` and `workflow_resources` ([`crate::extension::executor`], whose own doc states
+//! `completion_bus` and `workflow_resources` (`crate::extension::executor`, whose own doc states
 //! the rule: *"a `static` registry cannot be reset between sessions, and pi's own store is scoped
 //! to the extension host, not the process"*). So the store is OWNED — by the executor in the
 //! foreground, by the detached runner process in the background — and reaches the ladder on

@@ -55,7 +55,7 @@
 //! * **`context === "fork"` has no field to read.** See [`respond::build_inspect_reply`]'s
 //!   task-attribution note.
 //! * **The `FAILED_OUTPUT_ARTIFACT_PREFIX` branch is dead for a cyrup-written artifact** and is
-//!   ported anyway. See [`read_output::read_output_artifact`].
+//!   ported anyway. See `read_output::read_output_artifact`.
 
 pub mod read_output;
 pub mod request;
@@ -104,7 +104,7 @@ pub const DEFAULT_MESSAGE_LINES: usize = 100;
 /// pi `MAX_MESSAGE_LINES` (`:66`).
 pub const MAX_MESSAGE_LINES: usize = 200;
 /// pi `MAX_SERIALIZED_BYTES` (`:68`) — 64 KiB, the ceiling
-/// [`respond::enforce_byte_budget`] fits the reply under.
+/// `respond::enforce_byte_budget` fits the reply under.
 pub const MAX_SERIALIZED_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]

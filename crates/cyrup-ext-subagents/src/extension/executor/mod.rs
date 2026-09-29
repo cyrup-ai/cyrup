@@ -556,10 +556,11 @@ impl SubagentExecutor {
     /// The two maps are disjoint by construction (see [`Self::foreground_runs`]'s own note): an
     /// entry appears in `foreground_runs` at the exact moment its `foreground_controls` entry is
     /// removed. So "live" and "remembered and fully settled" are the only two provable answers,
-    /// and **everything else is [`ForegroundRunOwnership::Unknown`]** — a run this process never
-    /// saw, a run whose memory was evicted, or a run with a detached child that may still be
-    /// writing into its worktree. Absence of proof is never proof of termination, which is why
-    /// the caller treats `Unknown` as non-removable.
+    /// and **everything else is
+    /// [`ForegroundRunOwnership::Unknown`](crate::spawn::cleanup_plan::model::ForegroundRunOwnership::Unknown)**
+    /// — a run this process never saw, a run whose memory was evicted, or a run with a detached
+    /// child that may still be writing into its worktree. Absence of proof is never proof of
+    /// termination, which is why the caller treats `Unknown` as non-removable.
     #[must_use]
     pub(crate) fn foreground_run_ownership(
         &self,

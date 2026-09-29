@@ -510,8 +510,8 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     }
     /// EXT-064 — pi `setFooter(factory: ((tui, theme, footerData) => Component) | undefined)`
     /// (`core/extensions/types.ts:183-193` @v0.87.1), restoring the built-in footer on `undefined`
-    /// (`modes/interactive/interactive-mode.ts:2442-2446`). See [`Self::set_header`] for the
-    /// `option<string>` mapping.
+    /// (`modes/interactive/interactive-mode.ts:2442-2446`). See
+    /// [`set_header`](bindings::cyrup::ext::ui::Host::set_header) for the `option<string>` mapping.
     async fn set_footer(&mut self, content: Option<String>) {
         if let Ok(guest) = ui_guest_of(self) {
             guest.services.set_footer(content.as_deref());
@@ -1390,7 +1390,8 @@ impl bindings::cyrup::ext::control::Host for HostState {
             .control(ControlOp::SendMessage { message, opts })
     }
     /// EXT-087 — pi `ctx.sendUserMessage(content, options)`
-    /// (`core/extensions/loader.ts:356-358` @v0.87.1), the twin of [`Self::send_message`] above and
+    /// (`core/extensions/loader.ts:356-358` @v0.87.1), the twin of
+    /// [`send_message`](bindings::cyrup::ext::control::Host::send_message) above and
     /// ungated for the same reason; see that method's note for the citation correction.
     ///
     /// Upstream's v0.87.0 DEFERRAL is worth recording here, because cyrup gets it almost free and a

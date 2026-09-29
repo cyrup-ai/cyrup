@@ -45,16 +45,16 @@
 //! So the reconciler's input is the run DIRECTORY plus a settled child result. Every value
 //! upstream reads off in-process state has a durable source — `state.asyncJobs.get(id)?.asyncDir`
 //! becomes [`RunPaths`], `readStatus(asyncDir)` becomes
-//! [`read_status_file`](crate::background::control::read_status_file), the result file becomes
-//! [`RunPaths::resolve_result`] — and upstream itself already falls back to the disk path when the
-//! job is absent, so the durable source is the PRIMARY, not a degradation. The caller supplies
-//! only what disk genuinely cannot hold: the child run id (a FOREGROUND child writes no
-//! `ResultFile`, so nothing on disk names it), its `SingleResult`, and the script trace.
+//! [`read_status_file`], the result file becomes [`RunPaths::resolve_result`] — and upstream itself
+//! already falls back to the disk path when the job is absent, so the durable source is the
+//! PRIMARY, not a degradation. The caller supplies only what disk genuinely cannot hold: the child
+//! run id (a FOREGROUND child writes no `ResultFile`, so nothing on disk names it), its
+//! `SingleResult`, and the script trace.
 //!
 //! The one piece that cannot come off disk is `state.foregroundControls`, which the identity
 //! back-fill (`identity.rs`) needs. SCOPE_8 §Y-1 named two shapes; this module takes **(a)** — the
 //! caller snapshots the registry into
-//! [`LiveForegroundControl`](identity::LiveForegroundControl) rows and hands them in. Shape (b)
+//! [`LiveForegroundControl`] rows and hands them in. Shape (b)
 //! (the driver reading `SubagentExecutor::foreground_controls` by field, legal for a descendant
 //! module) is closer to upstream but gives up the testability posture above for the ONE input that
 //! has no durable form — and it would also couple every future caller to a live executor handle it

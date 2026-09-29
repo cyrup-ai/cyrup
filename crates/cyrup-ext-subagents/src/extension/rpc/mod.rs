@@ -518,7 +518,9 @@ fn in_memory_status_summary(fleet: &Value) -> String {
 /// per-session slot pool on disk, and that module offers two reads:
 /// `get_active_async_capacity_snapshot` is a bare alias of `reconcile_active_async_capacity`
 /// (`background/active_async_capacity/sweep.rs:105-119`) which DELETES slots it can prove
-/// released, while [`capacity::snapshot_for`] (`sweep.rs:25-48`) *"counts, does not reconcile"*.
+/// released, while
+/// [`capacity::snapshot_for`](crate::background::active_async_capacity::snapshot_for)
+/// (`sweep.rs:25-48`) *"counts, does not reconcile"*.
 ///
 /// The RPC `status` surface is a READ an external bus client can drive in a loop, so it takes the
 /// counting one. Sweeping belongs to the admission path, which is where

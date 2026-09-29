@@ -1172,7 +1172,7 @@ and `$BROWSER`" — there is no host `exec` handle. Leave
 ## Definition of Done
 
 Every line below is checkable by reading the tree or by a single grep; none requires running a suite.
-`cargo check --workspace --all-targets` and `cargo doc --workspace --no-deps --bins` must both still
+`cargo check --workspace --all-targets` and `cargo doc --workspace --no-deps` must both still
 exit 0, and `cargo nextest run --workspace` must not lose any of the 7862 passing tests.
 
 **Cache identity and migration — MCP-104 + MCP-106 (land together)**

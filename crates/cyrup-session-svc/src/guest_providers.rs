@@ -29,7 +29,7 @@ pub struct GuestProviderRegistry {
     /// Realized providers keyed by provider id, in insertion order (BTreeMap for a stable catalog).
     providers: Mutex<BTreeMap<String, Arc<dyn Provider>>>,
     /// Monotonic mutation counter — the CACHE KEY for the composed-registry snapshot
-    /// ([`crate::session::model_runtime::RegistrySnapshot`], CFG-020).
+    /// (`crate::session::model_runtime::RegistrySnapshot`, CFG-020).
     ///
     /// The snapshot cannot key on this map by identity the way it keys on the installed provider
     /// and the catalog overlay (both `Arc`s whose replacement IS the mutation): a guest

@@ -1585,10 +1585,10 @@ fn env_control_channels(
 /// [`crate::exec::output::inject_single_output_instruction`], upstream
 /// `injectSingleOutputInstruction` (`runs/shared/single-output.ts:99-102`) — the one that emits the
 /// `\n\n---\n**Output:**\n…` header. That header is not decoration: it is the alternative
-/// `stripFrameworkInstructions` (`task-intent.ts:99`, ported at
-/// [`crate::exec::task_intent`]) removes before mutation-intent classification, so the injected
-/// instruction's own `write`/`persist` vocabulary never contributes write-intent signal to the task
-/// it was appended to. The system-prompt-shaped sibling
+/// `stripFrameworkInstructions` (`task-intent.ts:99`, formerly ported at
+/// `crate::exec::task_intent`, deleted in SUBA-107) removed before mutation-intent classification,
+/// so the injected instruction's own `write`/`persist` vocabulary never contributed write-intent
+/// signal to the task it was appended to. The system-prompt-shaped sibling
 /// (`build_output_path_system_prompt_instruction`, whose body opens `Runtime output path
 /// override:`) was wired here instead and is NOT one of those alternatives, so every file-only run
 /// was feeding its own scaffolding back into the classifier.

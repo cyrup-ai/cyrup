@@ -32,9 +32,8 @@
 //!    is upstream's own `alive === false` vs `alive === undefined` split;
 //! 4. **owner pid alive but its start identity changed** → stale. This is pid REUSE: the number is
 //!    live, but it is a different process. Rungs 3 and 4 are ONE call —
-//!    [`check_pid_identity_with`](crate::background::reconcile::check_pid_identity_with) — shared
-//!    with the session lease's `processDemonstrablyGone`, over
-//!    [`process_start_identity`](crate::background::session_lease::process_start_identity);
+//!    [`check_pid_identity_with`] — shared with the session lease's `processDemonstrablyGone`, over
+//!    [`process_start_identity`];
 //! 5. otherwise stale only after [`LOCK_STALE_MS`] since the owner took it.
 //!
 //! # The owner token is re-verified AFTER the work
@@ -90,9 +89,9 @@ pub struct RetentionLockIdentity {
     /// a test cannot own a pid that has been recycled, so it presents one.
     ///
     /// Rung 4 is
-    /// [`check_pid_identity_with`](crate::background::reconcile::check_pid_identity_with)'s
-    /// upgrade of an `Alive` answer to [`Liveness::Dead`] — the SAME ladder the session lease's
-    /// `processDemonstrablyGone` runs, spelled once in `reconcile` rather than twice here.
+    /// [`check_pid_identity_with`]'s upgrade of an `Alive` answer to [`Liveness::Dead`] — the SAME
+    /// ladder the session lease's `processDemonstrablyGone` runs, spelled once in `reconcile`
+    /// rather than twice here.
     pub start_identity_of: fn(u32) -> Option<ProcessStartIdentity>,
 }
 

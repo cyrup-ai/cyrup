@@ -5,8 +5,6 @@
 pub(crate) mod native_impl;
 pub(crate) mod profiles;
 pub(crate) mod registration;
-/// VL-S11 R3 — the `pi.registerShortcut` half of `/subagents-detach`
-/// (`slash/slash-commands.ts:1007-1012`).
 pub(crate) mod shortcuts;
 pub(crate) mod slash;
 pub(crate) mod slash_admin;
@@ -14,8 +12,6 @@ pub(crate) mod slash_detach;
 pub(crate) mod slash_inspect_rpc;
 pub(crate) mod slash_render;
 pub(crate) mod slash_steer;
-/// UW-7 — the `ctx.ui.onTerminalInput` half of the fleet-status widget
-/// (`pi-subagents/src/tui/fleet-status.ts:577-578` @v0.68.0).
 pub(crate) mod terminal_input;
 
 use std::path::PathBuf;

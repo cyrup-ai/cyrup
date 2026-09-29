@@ -169,7 +169,8 @@ fn tolerant_true<'de, D: serde::Deserializer<'de>>(
         .filter(|flag| *flag))
 }
 
-/// pi `parseArchive` (`:165-183`) — tolerant by contract, like [`super::parse_replay`].
+/// pi `parseArchive` (`:165-183`) — tolerant by contract, like
+/// [`parse_replay`](super::record::parse_replay).
 pub(super) fn parse_archive(bytes: &[u8]) -> Option<CompletionArchive> {
     serde_json::from_slice(bytes).ok()
 }
@@ -231,7 +232,8 @@ async fn output_artifact_path(child: &serde_json::Value) -> Option<PathBuf> {
 ///   still archive it.
 ///
 /// An archive with zero entries is still written (`:115-118`): the record needs a companion file at
-/// the canonical path or [`super::validate_replay_record`] would reject its own writer's output.
+/// the canonical path or [`validate_replay_record`](super::record::validate_replay_record) would
+/// reject its own writer's output.
 ///
 /// # Errors
 ///

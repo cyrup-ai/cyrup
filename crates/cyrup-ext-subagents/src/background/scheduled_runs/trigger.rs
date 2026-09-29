@@ -92,7 +92,7 @@ pub const STALE_LAUNCH_CLAIM_ERROR: &str =
 /// each binding, and therefore constant for the whole of any one fire. That is what keeps a fired
 /// run's `status.session_id`, its completion owner and the `sessionOnly` gate from observing three
 /// different identities across one launch:
-/// [`crate::extension::executor::SubagentExecutor::current_session_id`] is documented to read
+/// [`crate::extension::SubagentExecutor::current_session_id`] is documented to read
 /// "straight off the bound P-1 backend on every call", and a session SWITCH inside one process
 /// moves the live id.
 ///
@@ -102,7 +102,7 @@ pub const STALE_LAUNCH_CLAIM_ERROR: &str =
 /// ⚠ The invariant a reviewer checks by grep: **zero** `current_session_id` calls under
 /// `background/scheduled_runs/`.
 /// The all-`None` [`Default`] is the HEADLESS case — no session, no file — which
-/// [`SubagentExecutor::install_scheduled_runs`](crate::extension::executor::SubagentExecutor::install_scheduled_runs)
+/// [`SubagentExecutor::install_scheduled_runs`](crate::extension::SubagentExecutor::install_scheduled_runs)
 /// produces for a host with no bound session. A `sessionOnly` schedule then belongs to nobody and
 /// fires for nobody, which is the correct degradation: a gate that cannot identify the owner must
 /// refuse, not admit.
@@ -180,7 +180,7 @@ pub fn schedule_belongs_to_session(
 ///
 /// `[CYRUP-DELTA]`: upstream settles through `handleAsyncCompletion` (`:585-610`), fed by the
 /// extension's async-completion event. cyrup's scheduled run is driven by a task in THIS process
-/// (see [`crate::extension::executor::workflow_launch`] for why), so the completion edge is that
+/// (see `crate::extension::executor::workflow_launch` for why), so the completion edge is that
 /// task's own result — strictly more direct, and it cannot be missed by a subscriber that was not
 /// installed yet.
 pub type ScheduleRunCompletion =
@@ -219,7 +219,7 @@ pub struct ScheduleLaunchOutcome {
 #[async_trait::async_trait]
 pub trait ScheduleLauncher: Send + Sync {
     /// §5 — charge ONE spawn against the live session's budget
-    /// ([`crate::extension::executor::SubagentExecutor::reserve_subagent_spawns`]), consulted
+    /// ([`crate::extension::SubagentExecutor::reserve_subagent_spawns`]), consulted
     /// BEFORE the `active.lock` so a refusal costs no lock.
     ///
     /// **This is not politeness — without it the schedule path is unbilled.** `Tool::execute`

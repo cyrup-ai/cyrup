@@ -142,7 +142,8 @@ pub(crate) fn read_lease_owner_at(lease_dir: &Path) -> Option<super::types::Sess
 ///    nothing about another machine's, and a session file can live on a shared filesystem. Note
 ///    the polarity: a foreign host is not "unknown, check the next rung", it is a full stop.
 /// 2. **the owner's own pid must be demonstrably gone** (`:176`) — dead, or alive under a
-///    DIFFERENT start identity. See [`process_demonstrably_gone`].
+///    DIFFERENT start identity. See
+///    [`process_demonstrably_gone`](super::process_demonstrably_gone).
 /// 3. **`writerState == "spawning"` ⇒ never stale** (`:177`), even with a dead owner. This is the
 ///    unobservable window: a writer has been dispatched and has not yet reported a pid, so there
 ///    is no pid to probe and no evidence to be had. Reclaiming here steals the lease from a child

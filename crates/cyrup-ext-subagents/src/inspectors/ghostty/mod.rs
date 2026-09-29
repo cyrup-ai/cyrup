@@ -6,7 +6,9 @@
 //! the new surface at a directory, run one command in it, focus it or not. That is all this
 //! backend does — **one verb, `open`**. There is no pane registry to query and no binding file to
 //! write, so `status` and `close` are absent here and the success sentence says so
-//! (`ghostty/actions.ts:69`), and [`plugin::GhosttyInspectorPlugin::owns`] is a literal `false`.
+//! (`ghostty/actions.ts:69`), and
+//! [`plugin::GhosttyInspectorPlugin::owns`](crate::inspectors::ghostty::plugin::GhosttyInspectorPlugin#method.owns)
+//! is a literal `false`.
 //!
 //! Nothing in this subtree is `#[cfg]`-ed out on a non-macOS host: the AppleScript, the argv
 //! builder and [`actions::open_ghostty_inspector`] compile and are unit-tested on Linux through

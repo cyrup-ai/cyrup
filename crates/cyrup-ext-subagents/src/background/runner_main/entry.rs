@@ -593,7 +593,7 @@ async fn write_own_process_terminal_candidate(
 ///   [`run_with`] returns `Ok(())` on every path that reaches `finish_run` — its own doc says so
 ///   (*"every internal failure is captured into a terminal `Failed` … rather than propagated"*). A
 ///   run whose STEPS failed still exits 0; that failure is the run's outcome, carried by
-///   [`RunState`](crate::background::RunState), not the runner's.
+///   [`RunState`], not the runner's.
 /// * `signal` is `None`, always. A runner that died of a signal never reached this line, so its
 ///   sidecar stays `pending` forever — which is exactly the crash semantics the artifact exists to
 ///   express, and the reason a crash is now distinguishable from a slow start. **Do not invent a

@@ -1,3 +1,5 @@
+//! pi `handleRefinementAction` (`agent-refinements.ts:546`) and the write primitives it drives.
+//!
 //! pi `handleRefinementAction` (`src/agents/agent-refinements.ts:546-624` @v0.68.0) — the
 //! `refine` / `refine.show` / `refine.rollback` verbs — plus the write primitives it drives:
 //! `serializeRefinementFile` (`:239`), `writeRefinementFile` (`:262`), `metadataFor` (`:277`),
@@ -98,7 +100,7 @@ impl RefinementAction {
     ///
     /// An exhaustive match rather than a `contains`, so adding a variant is a compile error rather
     /// than a silently-permitted mutation — the shape
-    /// [`crate::extension::tool::lane_actions::LaneAction::is_mutating`] already uses for
+    /// `crate::extension::tool::lane_actions::LaneAction::is_mutating` already uses for
     /// `lane.status`.
     #[must_use]
     pub fn is_mutating(self) -> bool {

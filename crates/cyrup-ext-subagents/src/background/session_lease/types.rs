@@ -296,9 +296,9 @@ pub fn parse_owner(value: &serde_json::Value) -> Option<SessionLeaseOwner> {
 /// run it revives FROM, and the orchestrator session behind it. Everything else on the owner
 /// record ([`SessionLeaseOwner`]) is observed by the acquiring process rather than requested.
 ///
-/// [`RunId`] on both id fields, where upstream has bare strings: cyrup already has the newtype and
-/// both values ARE run ids, so the two cannot be transposed at a call site. They are written to
-/// disk as plain strings, unchanged.
+/// [`RunId`](crate::background::RunId) on both id fields, where upstream has bare strings: cyrup
+/// already has the newtype and both values ARE run ids, so the two cannot be transposed at a call
+/// site. They are written to disk as plain strings, unchanged.
 ///
 /// `Serialize`/`Deserialize` because this value travels from the ORCHESTRATOR to the RUNNER
 /// through `runner-config.json`: the orchestrator decides that a launch is a revival, the runner

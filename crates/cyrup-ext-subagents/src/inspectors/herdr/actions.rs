@@ -18,7 +18,7 @@
 //!    nothing more. If the shell was mid-command, or the binary is missing, pi writes a binding
 //!    pointing at a pane that never started the inspector — and `inspector.status` reports it open
 //!    forever. cyrup waits for the dashboard's own header
-//!    ([`INSPECTOR_READY_MARKER`]) with `pane wait-output`, and on timeout runs upstream's
+//!    ([`inspector_ready_marker`]) with `pane wait-output`, and on timeout runs upstream's
 //!    existing failure path: `pane close`, no binding (`herdr/actions.ts:112-115`).
 //! 2. **The pane is focusable** (`[CYRUP-EXCEEDS-UPSTREAM]`). `openHerdrInspector:100` tells the
 //!    user *"Herdr cannot refocus an arbitrary raw pane id; select it in the Herdr UI."* That is

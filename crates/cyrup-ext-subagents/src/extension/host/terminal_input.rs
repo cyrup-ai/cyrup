@@ -1,3 +1,6 @@
+//! UW-7 — the `ctx.ui.onTerminalInput` half of the fleet-status widget
+//! (`pi-subagents/src/tui/fleet-status.ts:577-578` @v0.68.0).
+//!
 //! UW-7 — the raw-terminal-input half of the always-on fleet-status widget: pi's
 //! `ctx.ui.onTerminalInput((data) => this.handleKey(data))`
 //! (`pi-subagents/src/tui/fleet-status.ts:577-578` @v0.68.0) and the handler it wires up

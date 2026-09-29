@@ -1917,7 +1917,7 @@ type Thing = { n?: number; };
 ## 10 · Definition of Done
 
 Checkable by reading the tree. `cargo check --workspace --all-targets`,
-`cargo doc --workspace --no-deps --bins` and `cargo nextest run --workspace` must each still exit 0
+`cargo doc --workspace --no-deps` and `cargo nextest run --workspace` must each still exit 0
 with no new failures (baseline: 7862 passing).
 
 **MCP-091 + MCP-098**

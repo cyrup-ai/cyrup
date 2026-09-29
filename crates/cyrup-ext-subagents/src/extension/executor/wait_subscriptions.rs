@@ -4,12 +4,14 @@
 //!
 //! # Why any of this lives up here
 //!
-//! `background/` sits BELOW `extension/executor/`. [`ForegroundControlEntry`] and
-//! [`ForegroundHistoryRun`] are both `pub(crate)` inside this directory, and
-//! [`cyrup_ext::host::HostServices`] is reached through the executor's own late-bound P-1 slot. A
-//! `background/wait_subscriptions/` module can name none of them, which is exactly why the manager
-//! takes injected dependencies — the same shape [`crate::background::wait::WaitDeps`] already uses
-//! for the completion bus, the completion store and the inline-answer ledger.
+//! `background/` sits BELOW `extension/executor/`.
+//! [`ForegroundControlEntry`](crate::extension::executor::notices::ForegroundControlEntry) and
+//! [`ForegroundHistoryRun`](crate::extension::executor::foreground_history::ForegroundHistoryRun)
+//! are both `pub(crate)` inside this directory, and [`cyrup_ext::host::HostServices`] is reached
+//! through the executor's own late-bound P-1 slot. A `background/wait_subscriptions/` module can
+//! name none of them, which is exactly why the manager takes injected dependencies — the same shape
+//! [`crate::background::wait::WaitDeps`] already uses for the completion bus, the completion store
+//! and the inline-answer ledger.
 
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 

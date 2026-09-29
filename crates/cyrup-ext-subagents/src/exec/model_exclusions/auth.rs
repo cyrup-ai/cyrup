@@ -56,10 +56,10 @@ pub(crate) fn is_auth_model_exclusion(entry: &ModelExclusion) -> bool {
 /// this rule is silently not running.
 ///
 /// [`std::fs::metadata`] rather than `tokio::fs`: this is one stat on a local path, on the same
-/// synchronous read path as [`super::store::ModelExclusionStore::ensure_loaded`], and upstream's
-/// own call is `statSync`. Making it async would force every candidate-filter call site — including
-/// `build_model_candidates_scoped`, which is `pub` and synchronous — to become async for a syscall
-/// measured in microseconds.
+/// synchronous read path as [`super::store::ModelExclusionStore::ensure_loaded_locked`], and
+/// upstream's own call is `statSync`. Making it async would force every candidate-filter call site
+/// — including `build_model_candidates_scoped`, which is `pub` and synchronous — to become async
+/// for a syscall measured in microseconds.
 #[must_use]
 pub(crate) fn auth_store_mtime_ms(auth_store_path: &Path) -> Option<i64> {
     match std::fs::metadata(auth_store_path) {

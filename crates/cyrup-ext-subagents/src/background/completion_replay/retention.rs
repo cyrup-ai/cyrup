@@ -88,8 +88,8 @@ pub async fn cleanup_completion_replay_if_due(
 /// Row 4 is the one that must not be simplified into row 2. An unparseable file may be a record
 /// written by a NEWER build whose version this one does not know; deleting it on sight would make
 /// two cyrup versions sharing a directory destroy each other's records. The age check is the
-/// concession that lets them coexist — and it is exactly why [`super::parse_replay`] must not take
-/// the caller's run id, which would move row 2's inputs into row 4.
+/// concession that lets them coexist — and it is exactly why [`parse_replay`] must not take the
+/// caller's run id, which would move row 2's inputs into row 4.
 ///
 /// # The archive dir (`:278-286`) sweeps on mtime ALONE
 ///

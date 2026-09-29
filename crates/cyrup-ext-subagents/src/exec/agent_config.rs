@@ -697,7 +697,7 @@ pub struct RunOptions {
     /// child (the async run dir) and — since WORKFLOW_14 — a foreground WORKFLOW child, whose
     /// control root is the WORKFLOW's own run directory (WORKFLOW_13), carried to
     /// `build_foreground_run_options` on
-    /// [`crate::extension::executor::foreground_control::ForegroundChildSteerHandle`].
+    /// [`crate::extension::ForegroundChildSteerHandle`].
     ///
     /// `None` only for a plain (non-workflow) foreground SINGLE run, which has no run directory of
     /// any kind and no reachable steer route either — `action: "steer"` refuses it outright
@@ -822,7 +822,7 @@ pub struct RunOptions {
     /// records retryable model failures into (pi `runs/shared/model-exclusions.ts`).
     ///
     /// Threaded here rather than reached through a `static` for the reason
-    /// [`crate::extension::executor`] states for `completion_bus`/`workflow_resources`: a process
+    /// `crate::extension::executor` states for `completion_bus`/`workflow_resources`: a process
     /// global cannot be reset between sessions, and upstream's own store is scoped to the extension
     /// host, not the process. `Arc` because the same store is shared by every attempt of every
     /// concurrent run under one executor — it is the one field on this struct that is not `Copy` or

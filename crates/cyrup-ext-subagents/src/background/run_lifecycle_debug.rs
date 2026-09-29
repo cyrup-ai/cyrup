@@ -8,9 +8,9 @@
 //! Upstream prints `Process terminal file: <dir>/process-terminal.json` (`:95`) and then BOTH
 //! `Status process terminal:` and `Sidecar process terminal:` (`:102-103`), fed by
 //! [`debug_process_terminal`] — pi's `debugProcessTerminal` (`:52-58`): a
-//! [`read_process_terminal`](crate::background::process_terminal::read_process_terminal) of the
-//! sidecar and the status's own `processTerminal` overlay, both read against the same expectation
-//! (`:53`: this run's id, and the runner instance the status itself names).
+//! [`read_process_terminal`] of the sidecar and the status's own `processTerminal` overlay, both
+//! read against the same expectation (`:53`: this run's id, and the runner instance the status
+//! itself names).
 //!
 //! This build writes and reads both ([`crate::background::process_terminal`]), so all three lines
 //! are printed and the file the first one names is a file the launch really wrote — before the

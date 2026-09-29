@@ -559,10 +559,10 @@ fn load_metadata_cache(dirs: &McpDirs) -> Option<MetadataCache> {
 /// # Errors
 ///
 /// [`crate::discovery::find_configured_project_root`]'s
-/// [`SubagentError::MalformedSettings`](crate::error::SubagentError::MalformedSettings) — a
-/// malformed `subagents.projectRootResolution` at a consulted root. Upstream lets
-/// `readProjectRootResolution` **throw** out of `findConfiguredProjectRoot` (`agents.ts:869-880`,
-/// the `throw new Error(...invalid 'projectRootResolution'...)` arm) and straight through
+/// [`SubagentError::MalformedSettings`] — a malformed `subagents.projectRootResolution` at a
+/// consulted root. Upstream lets `readProjectRootResolution` **throw** out of
+/// `findConfiguredProjectRoot` (`agents.ts:869-880`, the
+/// `throw new Error(...invalid 'projectRootResolution'...)` arm) and straight through
 /// `loadMcpConfig`; it must NOT silently degrade to "nearest", which would hand the child a
 /// different project's servers than the one its settings named.
 ///

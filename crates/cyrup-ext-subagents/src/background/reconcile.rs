@@ -170,7 +170,7 @@ pub(crate) const RECONCILER_UNOBSERVED_INSTANCE: &str = "observer-unavailable";
 /// Both ambient probes are INJECTED, which is pi's own shape (`:165` takes `isProcessAlive` and
 /// `getProcessStartIdentity` as required options); production callers pass
 /// [`check_pid_liveness`] and
-/// [`start_identity_of`](crate::background::session_lease::start_identity_of).
+/// [`process_start_identity`](crate::background::session_lease::process_start_identity).
 ///
 /// This is the single expression of the ladder, and
 /// [`process_demonstrably_gone`](crate::background::session_lease::process_demonstrably_gone) is

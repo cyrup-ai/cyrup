@@ -14,6 +14,13 @@ workspace = true
 [[bin]]
 name = "cyrup"
 path = "src/main.rs"
+# The lib is the documented surface; the bin shares its name. cargo always documents a package's lib
+# alongside any of its bins, and two targets named `cyrup` write one `target/doc/cyrup/`, so
+# documenting both is an output-filename collision (cargo#6313) that cargo says may become a hard
+# error. cargo's own `[[bin]] name = "cargo"` is `doc = false` for the same reason. A plain
+# `cargo doc` already skips a bin named like its lib; this makes that the declared intent, and
+# `main.rs` stays the entry point plus the `unsafe` process glue the lib cannot hold.
+doc = false
 
 [lib]
 name = "cyrup"

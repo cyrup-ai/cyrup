@@ -25,7 +25,7 @@ use super::{FOREIGN_SWEEP_GRACE_MS, FOREIGN_SWEEP_INTERVAL_MS, RECONCILE_INTERVA
 /// mutually exclusive outcomes they encode.
 ///
 /// An enum and not a `&str`, for the same reason
-/// [`crate::background::wait::WaitVerdict`](crate::background::wait::WaitVerdict) is not a `bool`:
+/// [`crate::background::wait::WaitVerdict`] is not a `bool`:
 /// every one of upstream's strings is a distinct `settle` site with a distinct meaning, and a
 /// reader's `match` must be forced to decide between them. The `as_str` below is the ONLY place
 /// the wire words live, so a rename cannot drift between the message and the `details.outcome`.

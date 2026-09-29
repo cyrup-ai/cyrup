@@ -1,10 +1,13 @@
+//! The live `_transcript.jsonl` writer fed from the parsed child-event stream (pi
+//! `shared/child-transcript.ts`).
+//!
 //! The live child transcript: `<base>_transcript.jsonl`, written WHILE a child runs, one record
 //! per parsed child event (pi `src/shared/child-transcript.ts` @v0.68.0).
 //!
 //! # Why
 //!
 //! The FleetView transcript pane ([`crate::tui::fleet::transcript_target`]) and `/subagents
-//! status` ([`crate::extension::executor::foreground_transcript`]) both open
+//! status` (`crate::extension::executor::foreground_transcript`) both open
 //! [`crate::artifacts::ArtifactPaths::transcript_path`] and fold it through
 //! [`crate::tui::fleet_transcript::read_fleet_transcript`]. The reader landed before any writer,
 //! so a running child rendered as nothing until it finished. [`ChildTranscriptWriter`] is the

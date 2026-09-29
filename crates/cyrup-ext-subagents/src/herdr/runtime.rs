@@ -2,7 +2,7 @@
 //! `extension/host/native_impl.rs` calls.
 //!
 //! [`state`](super::state) and [`label`](super::label) are pure. [`reporter`](super::reporter),
-//! [`consumer`](super::consumer) and [`reporter`](super::reporter) each own one live concern. This
+//! [`consumer`] and [`reporter`](super::reporter) each own one live concern. This
 //! file is what joins them to cyrup's own lifecycle, and it is where the decision *whether any of
 //! it runs at all* is made.
 //!

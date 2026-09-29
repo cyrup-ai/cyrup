@@ -13,7 +13,7 @@
 //! `normalizeWorktreeStatusReference` (`:76-81,99-110`) and `validateAsyncStatusLaneMetadata`
 //! (`:113-126`). Both validate the additive lane/worktree fields of a persisted **async status**
 //! — `AsyncStatus.steps[].{lane,worktreePath,branch,provider,naming}` — and cyrup's step record
-//! ([`crate::background::records::RunStatus`]) has none of those five fields. The validation they
+//! ([`crate::background::StepStatus`]) has none of those five fields. The validation they
 //! perform on the naming/provider pair lives here instead, in the types' own fallible
 //! constructors, where a manifest read reaches it; porting the outer validators as well would
 //! land two functions with nothing in this crate to validate.
