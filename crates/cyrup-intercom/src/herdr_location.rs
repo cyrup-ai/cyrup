@@ -3,7 +3,7 @@
 //!
 //! Upstream's doc comment is the contract: "The registration-time pane id is only a stable join
 //! key; workspace and tab are always taken from this snapshot and are never cached." The broker
-//! calls [`resolve_current`] once per `list` request ([`crate::broker`]'s `handle_list`) and never
+//! calls [`resolve_current`](crate::herdr_location::resolve_current) once per `list` request ([`crate::broker`]'s `handle_list`) and never
 //! keeps the answer, so a moved pane is re-resolved by the next `list`.
 //!
 //! ## Herdr is consumed, not ported
@@ -15,10 +15,10 @@
 //! upstream's `herdr` subprocess would inherit. What is ported is pi-intercom's join and its
 //! failure vocabulary, below.
 //!
-//! [CYRUP-DELTA] the snapshot is TYPED here ([`SessionSnapshot`]), where upstream probes an untyped
+//! [CYRUP-DELTA] the snapshot is TYPED here ([`SessionSnapshot`](cyrup_herdr::schema::session::SessionSnapshot)), where upstream probes an untyped
 //! object field by field. A reply that omits `panes`, `tabs` or `workspaces` — upstream's
 //! `invalid_response` "Herdr snapshot omitted panes, tabs, or workspaces." — therefore arrives as a
-//! decode failure of the client, and [`failure_reason`] maps that failure to the same
+//! decode failure of the client, and [`failure_reason`](crate::herdr_location::failure_reason) maps that failure to the same
 //! `invalid_response` reason, with the client's own message as the detail.
 
 use std::collections::HashMap;

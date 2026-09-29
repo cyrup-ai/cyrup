@@ -102,12 +102,15 @@ impl ProviderResolver for RegistryResolver {
 #[tokio::test]
 async fn selector_lists_configured_non_faux_provider_and_hides_unconfigured() {
     // The openai/anthropic assertions below are only meaningful if those providers are genuinely
-    // unconfigured. Require that of the environment (§4 R5 layer 3) instead of manufacturing it
-    // with an `unsafe` process-global scrub — see the migration note at the top of this file.
-    crate::support::env::assert_no_ambient_provider_credentials();
+    // unconfigured. The auth store's ambient env tier is pinned empty below, so that is a property
+    // of this fixture rather than of the host (the suite-wide §4 R5 guard in `support/env.rs` still
+    // refuses to run with provider credentials in the process).
     let fx = fixture();
     let provider: Arc<dyn Provider> = two_model_faux();
-    let auth = Arc::new(AuthStore::at(fx.agent_dir.join("auth.json")));
+    let auth = Arc::new(
+        AuthStore::at(fx.agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    );
     auth.set_runtime_api_key(ProviderId::from("together"), "sk-together-test".to_string());
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());
@@ -143,7 +146,10 @@ async fn selector_lists_configured_non_faux_provider_and_hides_unconfigured() {
 async fn selecting_a_different_provider_swaps_the_session_provider() {
     let fx = fixture();
     let provider: Arc<dyn Provider> = two_model_faux();
-    let auth = Arc::new(AuthStore::at(fx.agent_dir.join("auth.json")));
+    let auth = Arc::new(
+        AuthStore::at(fx.agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    );
     auth.set_runtime_api_key(ProviderId::from("together"), "sk-together-test".to_string());
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());
@@ -226,7 +232,10 @@ async fn selecting_a_different_provider_swaps_the_session_provider() {
 async fn guest_registered_provider_is_selectable_and_installed() {
     let fx = fixture();
     let provider: Arc<dyn Provider> = two_model_faux();
-    let auth = Arc::new(AuthStore::at(fx.agent_dir.join("auth.json")));
+    let auth = Arc::new(
+        AuthStore::at(fx.agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    );
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());
     let session = SessionBuilder::new(provider, cfg)
@@ -332,7 +341,10 @@ async fn guest_registered_provider_is_selectable_and_installed() {
 async fn cross_provider_select_without_resolver_errors() {
     let fx = fixture();
     let provider: Arc<dyn Provider> = two_model_faux();
-    let auth = Arc::new(AuthStore::at(fx.agent_dir.join("auth.json")));
+    let auth = Arc::new(
+        AuthStore::at(fx.agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    );
     auth.set_runtime_api_key(ProviderId::from("together"), "sk-together-test".to_string());
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());

@@ -54,7 +54,10 @@ async fn session_with(credentials: &[&str]) -> (AgentSession, tempfile::TempDir)
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    let auth = Arc::new(AuthStore::at(agent_dir.join("auth.json")));
+    let auth = Arc::new(
+        AuthStore::at(agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    );
     for id in credentials {
         auth.set_runtime_api_key(ProviderId::from(*id), format!("sk-{id}-test"));
     }

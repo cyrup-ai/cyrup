@@ -359,7 +359,12 @@ pub async fn create_harness(options: HarnessOptions) -> Result<Harness, HarnessE
 
     // Auth (Pi `withConfiguredAuth`): seed a working faux runtime key, or leave the store empty for
     // the unauthenticated path (suite/harness.ts:108-136).
-    let auth = Arc::new(AuthStore::at(cwd.join("auth.json")));
+    // The ambient env tier is pinned EMPTY: a harness session is credentialed only by what the
+    // test seeds here, never by whatever the host exports (AWS keys would otherwise make
+    // `amazon-bedrock` available and change model resolution under the test).
+    let auth = Arc::new(
+        AuthStore::at(cwd.join("auth.json")).with_ambient_env(std::collections::HashMap::new()),
+    );
     if options.with_configured_auth {
         auth.set_runtime_api_key(model_provider, "faux-key".to_string());
     }
