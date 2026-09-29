@@ -19,7 +19,7 @@ fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 /// invisible from the client side: **`params` is mandatory on every method, `ping` included.**
 /// `Method` is adjacently tagged (`tmp/herdr/src/api/schema.rs:41`) with a newtype variant per
 /// method, so the published schema's `ping` variant requires `["method","params"]` and a real herdr
-/// answers `invalid_request` (`tmp/herdr/src/api/server.rs:198`) to a line without it.
+/// answers `invalid_request` (`tmp/herdr/src/api/server.rs:185`) to a line without it.
 #[tokio::test]
 async fn ping_round_trips_and_exposes_version_protocol_capabilities() {
     let fake = FakeHerdr::start_with(|request| {
@@ -91,7 +91,7 @@ async fn an_absent_capability_block_declares_nothing() {
 /// AUG §8.2. A `result.type` this client does not name decodes to
 /// `ResponseResult::Unrecognised` — which is how `socket-api.mdx:959` ("clients should ignore
 /// unknown fields") is honoured — but the typed accessor must still refuse it. herdr's own client
-/// does the same (`tmp/herdr/src/api/client.rs:119`).
+/// does the same (`tmp/herdr/src/api/client.rs:92`).
 #[tokio::test]
 async fn an_unknown_result_type_is_not_a_success() {
     let fake = FakeHerdr::start_with(|request| {
@@ -161,7 +161,7 @@ async fn an_unknown_error_code_survives_as_other() {
 }
 
 /// `invalid_request` is the one code that means *this herdr build does not have that method*: an
-/// unknown method name fails `Request` deserialisation (`tmp/herdr/src/api/server.rs:177-204`).
+/// unknown method name fails `Request` deserialisation (`tmp/herdr/src/api/server.rs:177-191`).
 /// A caller turns that one feature off — never the whole client.
 #[tokio::test]
 async fn invalid_request_is_the_one_code_that_means_unsupported_method() {
@@ -204,7 +204,7 @@ async fn a_mismatched_response_id_is_refused() {
 }
 
 /// AUG §8.10. herdr writes `{"id":"","error":{"code":"invalid_request",…}}` when the line did not
-/// deserialise and it could not recover a correlation id (`tmp/herdr/src/api/server.rs:180-201`).
+/// deserialise, whatever id it carried (`tmp/herdr/src/api/server.rs:179-191`).
 /// An error envelope is fatal **whatever its id** — requiring a match first would make this shape
 /// invisible and the call would sit until its deadline.
 #[tokio::test]
@@ -230,7 +230,7 @@ async fn an_uncorrelated_invalid_request_is_fatal_not_a_wait() {
 }
 
 /// AUG §8.11. There is no herdr-side deadline on a plain dispatch —
-/// `tmp/herdr/src/api/server.rs:911-913` is a `recv()` with `None` timeout — so without this
+/// `tmp/herdr/src/api/server.rs:896-898` is a `recv()` with `None` timeout — so without this
 /// client's own deadline a busy UI is a hang, not an error.
 #[tokio::test]
 async fn a_server_that_never_answers_times_out() {

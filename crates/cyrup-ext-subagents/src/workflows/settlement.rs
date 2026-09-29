@@ -440,29 +440,26 @@ pub fn workflow_recovery_actions(receipt: Option<&WorkflowReceipt>) -> Vec<Workf
 }
 
 /// The three budget/deadline signals `workflowTerminalOutcomeForResult` reads
-/// (`workflow-settlement.ts:169-174`). A named input rather than `&SingleResult`, because
-/// `tool_budget_blocked` has NO carrier on [`SingleResult`] yet: the crate does block on a tool
-/// budget but never reports it in the result. Landing that field later is then a change at the two
-/// call sites, not to this signature.
+/// (`workflow-settlement.ts:169-174`), as a named input rather than `&SingleResult` so the
+/// settlement rule stays a pure function of exactly what it reads.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorkflowBudgetSignals {
     /// pi `result.timedOut` — [`SingleResult::timed_out`].
     pub timed_out: bool,
     /// pi `result.turnBudgetExceeded` — [`SingleResult::turn_budget_exceeded`].
     pub turn_budget_exceeded: bool,
-    /// pi `result.toolBudgetBlocked` — no carrier yet; always `false` from
-    /// [`Self::from_single_result`].
+    /// pi `result.toolBudgetBlocked` — [`SingleResult::tool_budget_blocked`] (SUBA-132).
     pub tool_budget_blocked: bool,
 }
 
 impl WorkflowBudgetSignals {
-    /// Reads the two signals [`SingleResult`] carries today.
+    /// Reads the three signals off a child's result.
     #[must_use]
     pub fn from_single_result(result: &SingleResult) -> Self {
         Self {
             timed_out: result.timed_out,
             turn_budget_exceeded: result.turn_budget_exceeded,
-            tool_budget_blocked: false,
+            tool_budget_blocked: result.tool_budget_blocked,
         }
     }
 }

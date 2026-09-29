@@ -91,6 +91,12 @@ async fn injected_stream_fn_serves_a_live_agent_turn() {
 
 /// One-shot loopback SSE server answering `POST /api/stream` with Pi-shaped proxy frames, then close.
 fn spawn_proxy_server(frames: Vec<String>) -> String {
+    spawn_proxy_server_with(frames, true)
+}
+
+/// [`spawn_proxy_server`], but with `terminate_last: false` the final frame is written as a bare
+/// `data: …` with no newline at all before the connection closes.
+fn spawn_proxy_server_with(frames: Vec<String>, terminate_last: bool) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("addr");
     let url = format!("http://{addr}");
@@ -113,10 +119,12 @@ fn spawn_proxy_server(frames: Vec<String>) -> String {
             let mut body = String::from(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
             );
-            for f in &frames {
+            for (i, f) in frames.iter().enumerate() {
                 body.push_str("data: ");
                 body.push_str(f);
-                body.push_str("\n\n");
+                if terminate_last || i + 1 < frames.len() {
+                    body.push_str("\n\n");
+                }
             }
             let _ = stream.write_all(body.as_bytes());
             let _ = stream.flush();
@@ -498,6 +506,44 @@ async fn agent040_live_turn_keeps_the_streamed_text_on_the_errored_message() {
     assert_eq!(a.stop_reason, StopReason::Error);
     assert_eq!(a.error_message.as_deref(), Some(PROXY_CLOSED_EARLY));
     assert_eq!(assistant_text(&new[1]), "half an ans");
+}
+
+/// AGENT-040's residual: a server whose final `done` frame has no trailing newline still sent
+/// `done`. pi flushes the unterminated tail before its `sawTerminalEvent` check (`buffer +=
+/// decoder.decode(); if (buffer) processLine(buffer);`, proxy.ts:225-230 @v0.87.1), so the turn
+/// completes. cyrup's shared framer flushes only when the caller opts in (PROV-084's
+/// `SseRequest::flush_at_eof`); without it this turn ended as "Connection closed by proxy server".
+#[tokio::test]
+async fn agent040_an_unterminated_final_done_frame_still_completes_the_turn() {
+    // Requires NO process-global `httpProxy` — see PROV-047's `PROXY_SETTING_GUARD` above.
+    let _serial = PROXY_SETTING_GUARD.lock().await;
+    let usage = r#"{"input":5,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}}"#;
+    let frames = vec![
+        r#"{"type":"start"}"#.to_string(),
+        r#"{"type":"text_start","contentIndex":0}"#.to_string(),
+        r#"{"type":"text_delta","contentIndex":0,"delta":"the whole answer"}"#.to_string(),
+        r#"{"type":"text_end","contentIndex":0}"#.to_string(),
+        format!(r#"{{"type":"done","reason":"stop","usage":{usage}}}"#),
+    ];
+    let proxy_url = spawn_proxy_server_with(frames, false);
+
+    let sf: Arc<dyn StreamFn> = Arc::new(ProxyStreamFn::new(proxy_url, "test-token"));
+    let agent = Agent::builder(anthropic_model_ref(), sf).build();
+    let handle = agent.prompt("ping the proxy").await.unwrap();
+    let new = handle.finished().await;
+    agent.wait_for_idle().await;
+
+    assert_eq!(new.len(), 2, "user + assistant");
+    let AgentMessage::Assistant(a) = &new[1] else {
+        panic!("expected an assistant message, got {:?}", new[1]);
+    };
+    assert_eq!(
+        a.stop_reason,
+        StopReason::Stop,
+        "the unterminated `done` frame must be flushed and complete the turn, got {:?}",
+        a.error_message
+    );
+    assert_eq!(assistant_text(&new[1]), "the whole answer");
 }
 
 // ----------------------------------------------------------------------------------------------

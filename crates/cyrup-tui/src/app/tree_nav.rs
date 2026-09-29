@@ -18,6 +18,8 @@ pub fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
         SessionDagKind::ModelChange => TreeKind::ModelChange,
         SessionDagKind::ThinkingChange => TreeKind::ThinkingChange,
         SessionDagKind::Compaction => TreeKind::Compaction,
+        SessionDagKind::Settings => TreeKind::Settings,
+        SessionDagKind::Usage => TreeKind::Usage,
     };
     TreeNode {
         id: n.entry_id.to_string(),
@@ -26,27 +28,11 @@ pub fn tree_node_from_dag(n: &SessionDagNode) -> TreeNode {
         kind,
         foldable: n.foldable,
         folded: false,
-        has_label: n.has_label,
-        // Pi's column here is `labelTimestamp` — WHEN the entry's label was set — and the row it
-        // decorates is a labeled one (`tree-selector.ts:741-743`). It was previously fed the literal
-        // string `"current"` on the branch tip, which is neither: the `t` toggle
-        // (`app.tree.toggleLabelTimestamp`) rendered the word "current" where Pi renders a clock
-        // time, and did so on an unlabeled row, in a column Pi leaves off by default.
-        //
-        // Pi does mark the active path, just not here: `pathMarker` is a `•` prefix ahead of the
-        // entry text, driven by an `activePathIds` SET covering the whole root→tip path
-        // (`tree-selector.ts:736-738`). `SessionDagNode` carries only `is_leaf`, so that marker is
-        // not portable from here either; it is not a substitute this column can hold.
-        //
-        // Set to `None` until the value exists to put here. It is dropped one and two layers down,
-        // not in this crate: `cyrup_session::TreeNode` (manager.rs:29-34) has no timestamp field
-        // even though `SessionManager::labels` already holds `(label, label-change timestamp)`
-        // (manager.rs:43-44), so `SessionDagNode` (cyrup-session-svc session.rs:136-155) has nothing
-        // to carry — its `timestamp` is the ENTRY's, a different quantity. Threading the label
-        // timestamp through those two crates is the remaining half of this fix; the render side
-        // (Pi's gate, Pi's default, Pi's `[+label time]` marker) is done and will display it the
-        // moment a producer sets it.
-        time_label: None,
+        // Pi `SessionTreeNode.label` / `.labelTimestamp` (`session-manager.ts:163-165` @v0.87.1),
+        // carried through the DAG unformatted; the selector formats the timestamp at render time as
+        // pi's `formatLabelTimestamp` does (SESS-S05).
+        user_label: n.user_label.clone(),
+        label_timestamp: n.label_timestamp.clone(),
     }
 }
 

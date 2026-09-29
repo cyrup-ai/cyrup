@@ -768,13 +768,16 @@ pub fn request_visible_text(pending: &PendingSupervisorRequest) -> String {
 }
 
 /// `writeReply` (`:566-576`): write the reply file, then delete the request file so no later poll
-/// re-surfaces it.
+/// re-surfaces it. Returns the reply as written, which the reply journal entry records.
 ///
 /// # Errors
 ///
 /// Returns the caller-facing text for a blank message (upstream's own guard, `:567`) or a failed
 /// write.
-pub async fn write_reply(pending: &PendingSupervisorRequest, message: &str) -> Result<(), String> {
+pub async fn write_reply(
+    pending: &PendingSupervisorRequest,
+    message: &str,
+) -> Result<SupervisorReply, String> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return Err("message is required for supervisor replies.".to_string());
@@ -794,7 +797,7 @@ pub async fn write_reply(pending: &PendingSupervisorRequest, message: &str) -> R
         .await
         .map_err(|e| format!("could not write the supervisor reply: {e}"))?;
     remove_request_file(&pending.request_file);
-    Ok(())
+    Ok(reply)
 }
 
 /// `removeStaleEmptySupervisorChannel`/`cleanupStaleEmptySupervisorChannels` (`:398-437`): drop
@@ -988,24 +991,26 @@ impl NativeSupervisorChannel {
                     continue;
                 }
                 let text = request_visible_text(&pending);
+                let details = request_message_details(&pending.request);
                 if pending.request.expects_reply {
                     state.pending.insert(pending.request.id.clone(), pending);
                 } else {
                     remove_request_file(&pending.request_file);
                 }
                 adopted.push(text.clone());
-                to_inject.push(text);
+                to_inject.push((text, details));
             }
         }
 
         if let Some(services) = self.services() {
-            for content in to_inject {
+            for (content, details) in to_inject {
                 let _ = services.inject_message(
                     &content,
                     Some(SUPERVISOR_REQUEST_MESSAGE_TYPE),
                     true,
-                    // The request is carried as rendered text; there is no structured record here.
-                    None,
+                    // SUBA-136 — the structured request the card renderer draws from
+                    // (`native-supervisor-channel.ts:753-767` @v0.71.0).
+                    Some(&details),
                     // `{ triggerTurn: true }` (`:687` @v0.43.0) — a supervisor request is exactly the
                     // case where the orchestrator must act, so it starts a turn rather than sitting
                     // in the transcript until the human happens to type.
@@ -1098,13 +1103,50 @@ impl NativeSupervisorChannel {
         message: &str,
     ) -> Result<PendingSupervisorRequest, String> {
         let chosen = self.resolve_pending(reply_to, to)?;
-        write_reply(&chosen, message).await?;
+        let reply = write_reply(&chosen, message).await?;
+        self.append_reply_entry(&chosen.request, &reply);
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending
             .remove(&chosen.request.id);
         Ok(chosen)
+    }
+
+    /// SUBA-136 — pi `appendSupervisorReplyEntry` (`native-supervisor-channel.ts:527-547`
+    /// @v0.71.0): journal the answer as a `subagent_supervisor_reply` custom entry so the session
+    /// keeps a record of what the parent said. The reply file is authoritative; a journal failure
+    /// (no session bound, or the host refusing the append) must not undo a delivered reply, so it
+    /// is logged and dropped.
+    fn append_reply_entry(&self, request: &SupervisorRequest, reply: &SupervisorReply) {
+        let Some(services) = self.services() else {
+            return;
+        };
+        let mut data = serde_json::json!({
+            "requestId": request.id,
+            "reason": request.reason.as_str(),
+            "runId": request.run_id,
+            "agent": request.agent,
+            "childIndex": request.child_index,
+            "message": reply.message,
+            "createdAt": reply.created_at,
+        });
+        if let Some(target) = request.child_target.as_deref().filter(|t| !t.is_empty())
+            && let Some(object) = data.as_object_mut()
+        {
+            object.insert("childTarget".into(), serde_json::Value::from(target));
+        }
+        if let Err(error) = services.append_entry(
+            crate::tui::supervisor_ui::SUPERVISOR_REPLY_ENTRY_TYPE,
+            &data,
+        ) {
+            tracing::warn!(
+                target: "cyrup_ext_subagents::native_supervisor",
+                request_id = %request.id,
+                %error,
+                "failed to journal native supervisor reply"
+            );
+        }
     }
 
     /// `resolvePendingRequest` (`:578-594`).
@@ -1175,6 +1217,34 @@ impl<T> OkOrDefaultErr<T> for Option<T> {
 /// The custom message type a surfaced supervisor request is injected under — upstream's
 /// `customType: "subagent_supervisor_request"` (`:672`).
 pub const SUPERVISOR_REQUEST_MESSAGE_TYPE: &str = "subagent_supervisor_request";
+
+/// SUBA-136 — the `details` a surfaced request carries (`native-supervisor-channel.ts:757-767`
+/// @v0.71.0): the structured request [`crate::tui::supervisor_ui::render_supervisor_request`]
+/// draws, so the card never re-parses the injected text.
+fn request_message_details(request: &SupervisorRequest) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "id": request.id,
+        "requestId": request.id,
+        "reason": request.reason.as_str(),
+        "expectsReply": request.expects_reply,
+        "runId": request.run_id,
+        "agent": request.agent,
+        "childIndex": request.child_index,
+        "requestBody": request.message,
+        "replyHint": crate::tui::supervisor_ui::supervisor_reply_hint(&request.id),
+    });
+    if let Some(target) = request.child_target.as_deref().filter(|t| !t.is_empty())
+        && let Some(object) = details.as_object_mut()
+    {
+        object.insert("childTarget".into(), serde_json::Value::from(target));
+    }
+    if let Some(interview) = &request.interview
+        && let Some(object) = details.as_object_mut()
+    {
+        object.insert("interview".into(), interview.clone());
+    }
+    details
+}
 
 /// `refreshPendingRequests` (`:521-529`).
 fn refresh_pending(
@@ -2144,6 +2214,147 @@ mod tests {
         let reply = read_reply_file(&reply_path(&channel, "req-1"), "req-1")
             .expect("the child reads its reply back");
         assert_eq!(reply.message, "use main");
+    }
+
+    /// SUBA-136 — the channel's two halves of upstream's supervisor UI contract, driven through
+    /// the production `poll_once` and the registered `subagent_supervisor` tool: a surfaced
+    /// request carries the structured `details` the card is drawn from
+    /// (`native-supervisor-channel.ts:753-767` @v0.71.0), and a reply journals exactly one
+    /// `subagent_supervisor_reply` entry (`appendSupervisorReplyEntry`, `:527-547`) that the reply
+    /// card can draw.
+    ///
+    /// GUT the `Some(&details)` and the first assertion reads `None`; GUT `append_reply_entry` and
+    /// no entry is recorded.
+    #[tokio::test]
+    async fn a_surfaced_request_carries_its_details_and_a_reply_is_journalled() {
+        #[derive(Default)]
+        struct Recording {
+            injected: Mutex<Vec<(Option<String>, Option<serde_json::Value>)>>,
+            entries: Mutex<Vec<(String, serde_json::Value)>>,
+        }
+        impl cyrup_ext::host::HostServices for Recording {
+            fn session_id(&self) -> Option<String> {
+                Some("session-parent-1".to_string())
+            }
+            fn inject_message(
+                &self,
+                _content: &str,
+                custom_type: Option<&str>,
+                _display: bool,
+                details: Option<&serde_json::Value>,
+                _trigger_turn: bool,
+            ) -> Result<(), String> {
+                self.injected
+                    .lock()
+                    .unwrap()
+                    .push((custom_type.map(str::to_string), details.cloned()));
+                Ok(())
+            }
+            fn append_entry(
+                &self,
+                custom_type: &str,
+                data: &serde_json::Value,
+            ) -> Result<String, String> {
+                self.entries
+                    .lock()
+                    .unwrap()
+                    .push((custom_type.to_string(), data.clone()));
+                Ok("entry-1".to_string())
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let channel_dir = dir.path().join("run-a-0");
+        ensure_supervisor_channel_dir(&channel_dir).expect("channel dirs");
+        let request = build_supervisor_request(
+            &meta(&channel_dir),
+            SupervisorReason::NeedDecision,
+            Some("which branch?"),
+            None,
+            "req-7".to_string(),
+            now_millis_u64(),
+            60_000,
+        )
+        .expect("request builds");
+        crate::background::atomic::write_atomic_json(
+            &request_path(&channel_dir, &request.id),
+            &request,
+        )
+        .await
+        .expect("write request");
+
+        let services = Arc::new(Recording::default());
+        let channel = Arc::new(NativeSupervisorChannel::with_root(dir.path().to_path_buf()));
+        channel.bind_services(Arc::clone(&services) as Arc<dyn cyrup_ext::host::HostServices>);
+        assert_eq!(channel.poll_once().len(), 1);
+
+        let (custom_type, details) = services.injected.lock().unwrap()[0].clone();
+        assert_eq!(
+            custom_type.as_deref(),
+            Some(SUPERVISOR_REQUEST_MESSAGE_TYPE)
+        );
+        let details = details.expect("the request carries its details");
+        assert_eq!(details["requestId"], serde_json::json!("req-7"));
+        assert_eq!(details["id"], serde_json::json!("req-7"));
+        assert_eq!(details["reason"], serde_json::json!("need_decision"));
+        assert_eq!(details["expectsReply"], serde_json::json!(true));
+        assert_eq!(details["runId"], serde_json::json!("run-XYZ"));
+        assert_eq!(details["agent"], serde_json::json!("reviewer"));
+        assert_eq!(details["childIndex"], serde_json::json!(2));
+        assert_eq!(
+            details["childTarget"],
+            serde_json::json!("subagent-reviewer-run-xyz-3")
+        );
+        assert_eq!(details["requestBody"], serde_json::json!(request.message));
+        assert_eq!(
+            details["replyHint"],
+            serde_json::json!(
+                "subagent_supervisor({ action: \"reply\", replyTo: \"req-7\", message: \"...\" })"
+            )
+        );
+        assert!(
+            crate::tui::supervisor_ui::render_supervisor_request(
+                &serde_json::json!({ "details": details })
+            )
+            .is_some(),
+            "the injected details must pass the card's shape checks"
+        );
+
+        let tool = SubagentSupervisorTool::new(Arc::clone(&channel));
+        tool.execute(
+            cyrup_core::ToolCallId::from("call-reply"),
+            serde_json::json!({ "action": "reply", "replyTo": "req-7", "message": " use main " }),
+            cyrup_core::CancelToken::new(),
+            Box::new(|_update| {}),
+        )
+        .await
+        .expect("the reply lands");
+
+        let entries = services.entries.lock().unwrap().clone();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let (entry_type, data) = &entries[0];
+        assert_eq!(
+            entry_type,
+            crate::tui::supervisor_ui::SUPERVISOR_REPLY_ENTRY_TYPE
+        );
+        assert_eq!(data["requestId"], serde_json::json!("req-7"));
+        assert_eq!(data["reason"], serde_json::json!("need_decision"));
+        assert_eq!(data["runId"], serde_json::json!("run-XYZ"));
+        assert_eq!(data["agent"], serde_json::json!("reviewer"));
+        assert_eq!(data["childIndex"], serde_json::json!(2));
+        assert_eq!(
+            data["childTarget"],
+            serde_json::json!("subagent-reviewer-run-xyz-3")
+        );
+        assert_eq!(data["message"], serde_json::json!("use main"));
+        assert!(data["createdAt"].is_u64());
+        assert!(
+            crate::tui::supervisor_ui::render_supervisor_reply(
+                &serde_json::json!({ "data": data })
+            )
+            .is_some(),
+            "the journalled entry must pass the reply card's shape checks"
+        );
     }
 
     #[test]

@@ -526,6 +526,7 @@ fn error_event(
         deferred: None,
         error_message: Some(message),
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: now_millis(),
     };
     // Pi attaches the diagnostic only on the non-aborted `PiMessagesResponseError` path
@@ -617,6 +618,7 @@ impl Decoder {
             deferred: None,
             error_message: self.error_message.clone(),
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: now_millis(),
         }
     }

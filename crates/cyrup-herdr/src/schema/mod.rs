@@ -8,7 +8,7 @@
 //!
 //! **No `#[serde(deny_unknown_fields)]` anywhere.** herdr's own compatibility rule is *"JSON API
 //! clients should ignore unknown fields"*
-//! (`tmp/herdr/docs/preview/website/src/content/docs/socket-api.mdx:959`), so a newer herdr adding
+//! (`tmp/herdr/docs/next/website/src/content/docs/socket-api.mdx:959`), so a newer herdr adding
 //! a field must not turn every response into a parse error. The forward-compatible counterpart on
 //! the enum side is [`response::ResponseResult::Unrecognised`].
 //!

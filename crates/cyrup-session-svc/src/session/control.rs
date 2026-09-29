@@ -404,6 +404,12 @@ impl AgentSession {
                 display,
                 timestamp: Some(now_ms()),
             };
+            // SEAM-129 — pi defers this `_runAgentPrompt(appMessage)` while `agent_settled` is
+            // being emitted (`agent-session.ts:1956-1958` @v0.87.1), exactly as it defers `prompt`.
+            if self.is_emitting_settled() {
+                self.defer_settled(super::run::DeferredSettled::Run(vec![msg]));
+                return Ok(());
+            }
             return self.spawn_run(vec![msg]).await;
         }
         self.send_custom_message(

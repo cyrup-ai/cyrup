@@ -58,7 +58,7 @@ cyrup-ext = { workspace = true, features = ["wasm-host"] }
 # message); the extension seam wants the agent-loop one.
 cyrup-agent = { workspace = true }
 cyrup-session = { workspace = true }
-# The workspace's ONE herdr client (herdr v0.9.1, `tmp/herdr` @ `d59d060`). `src/herdr/` is the
+# The workspace's ONE herdr client (pinned to the herdr `v0.9.1` tag, `065ef9d6`). `src/herdr/` is the
 # cyrup half of the status bridge — the state machine and the label rules — and it reports through
 # this crate's typed method surface rather than growing a second NDJSON client beside it. A leaf
 # with no `cyrup-*` edge of its own, so this adds no cycle and no new transitive weight.

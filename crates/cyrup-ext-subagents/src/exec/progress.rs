@@ -59,9 +59,10 @@ pub struct AgentProgress {
     /// The full parsed transcript of every recognized event this attempt observed, in
     /// chronological order — needs more than the two narrower vectors above. `run_sync` reads it
     /// directly alongside `message_end_events`/`tool_end_events` for its R-SA-029/034 wiring.
-    /// R-SA-030 (structured output) is deliberately NOT among its consumers any more: SUBA-S01's
-    /// residual pass removed the transcript scan, because pi's structured value only ever travels
-    /// through the child's capture file (`structured-output.ts:156-173`), never through prose.
+    /// R-SA-030 (structured output) reads it only for EVIDENCE about the call — whether the child
+    /// invoked `structured_output` and what a rejected call said (SUBA-127) — never for the value
+    /// itself, which only ever travels through the child's capture file
+    /// (`structured-output.ts:388-405`), never through prose.
     pub all_events: Vec<SubagentEvent>,
     /// The short argument preview captured when [`Self::current_tool`] STARTED (pi
     /// `progress.currentToolArgs = extractToolArgsPreview(toolArgs)`,

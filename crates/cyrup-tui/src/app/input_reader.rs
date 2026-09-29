@@ -10,7 +10,7 @@ use super::*;
 pub fn write_terminal_title(title: &str) {
     use std::io::Write;
     let safe: String = title.chars().filter(|c| !c.is_control()).collect();
-    let mut out = io::stdout();
+    let mut out = crate::dead_terminal::terminal_stdout();
     let _ = out.write_all(format!("\x1b]0;{safe}\x07").as_bytes());
     let _ = out.flush();
 }

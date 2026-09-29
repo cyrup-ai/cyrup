@@ -39,6 +39,12 @@ pub enum ConfigError {
     /// A settings VALUE failed validation (Pi `parseTimeoutSetting` throws).
     #[error("Invalid {key} setting: {value}")]
     InvalidSetting { key: String, value: String },
+    /// A `compaction.reserveTokens`/`keepRecentTokens` value, ordinary or under
+    /// `compaction.modelOverrides`, is not a non-negative safe integer, or an override entry is
+    /// not an object. The payload is pi's `Error` message verbatim (`getCompactionTokenSetting`,
+    /// `settings-manager.ts:859-885` @v0.87.1).
+    #[error("{0}")]
+    InvalidCompactionSetting(String),
     /// An in-memory settings lock was poisoned by a panic in another thread.
     #[error("settings lock poisoned")]
     LockPoisoned,
@@ -94,9 +100,30 @@ pub enum AuthError {
     Cancelled,
 }
 
-/// A non-fatal, scope-tagged load error surfaced to the UI instead of panicking (R-00-009).
+/// A non-fatal, scope-tagged load error surfaced to the UI instead of panicking (R-00-009) — Pi
+/// `SettingsError { scope, path?, error }` (`core/settings-manager.ts:214-218` @v0.87.1).
 #[derive(Debug, Clone)]
 pub struct ScopedError {
     pub scope: SettingsScope,
+    /// The file the scope was read from, when the store is file-backed (pi's `settingsPaths`).
+    pub path: Option<std::path::PathBuf>,
     pub message: String,
+}
+
+impl ScopedError {
+    /// The warning text pi's `collectSettingsDiagnostics` renders for this error
+    /// (`core/settings-diagnostics.ts:4-9` @v0.87.1, v0.84.3): `Invalid settings file <path>: <msg>`,
+    /// or `Invalid <scope> settings: <msg>` when there is no path. CFG-088.
+    pub fn diagnostic_message(&self) -> String {
+        match &self.path {
+            Some(path) => format!("Invalid settings file {}: {}", path.display(), self.message),
+            None => {
+                let scope = match self.scope {
+                    SettingsScope::Global => "global",
+                    SettingsScope::Project => "project",
+                };
+                format!("Invalid {scope} settings: {}", self.message)
+            }
+        }
+    }
 }

@@ -435,8 +435,12 @@ async fn run() -> anyhow::Result<i32> {
     // Pi's `startupSettingsManager` (main.ts:610-611), created after the migrations and used for
     // exactly two things: surfacing settings load/parse errors as warnings, and the `sessionDir`
     // lookup below. One manager, both jobs — as upstream.
+    //
+    // CFG-088 — its diagnostics are HELD, not printed here: pi merges them with the runtime's and
+    // prints the deduplicated list at the post-runtime checkpoint, or hands it to the interactive
+    // UI (main.ts:896-900 @v0.87.1). `--list-models` and the ACP host, which never reach that
+    // checkpoint, print them on their own way out (pi main.ts:867 for the former).
     let (mut startup_settings, settings_diagnostics) = bootstrap::load_startup_settings(&dirs);
-    diagnostics::report(&settings_diagnostics);
 
     // Experimental first-time setup — Pi main.ts:615-617, verbatim position: between
     // `startupSettingsManager` (`:610`) and the `sessionDir` tier chain (`:625-630`), for pi's stated
@@ -496,6 +500,7 @@ async fn run() -> anyhow::Result<i32> {
     // list-models.ts:35) — independent of `--provider`/`--model`, and resolved BEFORE provider
     // selection, so a `--provider <unknown>` does not gate the listing (matching Pi).
     if let Some(search) = &cli.list_models {
+        diagnostics::report(&settings_diagnostics);
         return actions::list_models_action(&dirs, &models_json, search);
     }
 
@@ -611,12 +616,19 @@ async fn run() -> anyhow::Result<i32> {
             auth_store.clone(),
             &dirs,
             models_json.clone(),
-            Some(prelaunch::trust_prompt_callback(&dirs)),
+            Some(prelaunch::trust_prompt_callback(
+                &dirs,
+                cli.use_theme.as_deref(),
+            )),
         )?;
         // SEAM-075: `require_model: false`. pi gates its modelless stop on the MODE
         // (main.ts:852-855), so a credential-less first run still gets a TUI to type `/login` and
         // then `/model` into; the banner is shown inside `run_interactive`.
-        let (runtime, session) = match session_launch::launch(
+        let session_launch::Launched {
+            runtime,
+            session,
+            notices: startup_notices,
+        } = match session_launch::launch(
             factory,
             target,
             PostBuild {
@@ -624,12 +636,14 @@ async fn run() -> anyhow::Result<i32> {
                 cli: &cli,
                 fresh,
                 require_model: false,
+                startup_diagnostics: &settings_diagnostics,
+                interactive: true,
             },
         )
         .await?
         {
             ControlFlow::Break(code) => return Ok(code),
-            ControlFlow::Continue(pair) => pair,
+            ControlFlow::Continue(launched) => launched,
         };
         // pi marks the scoped-`--models` resolution separately (`time("resolveModelScope")`,
         // main.ts:842); in cyrup that work happens inside `session_launch::apply_post_build`.
@@ -725,6 +739,8 @@ async fn run() -> anyhow::Result<i32> {
                 cyrup::TuiMode::Fullscreen => cyrup_config::settings::TuiMode::Fullscreen,
             }),
             auto_trust_on_reload_cwd,
+            cli.use_theme.clone(),
+            startup_notices,
         )
         .await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path
@@ -774,6 +790,7 @@ async fn run() -> anyhow::Result<i32> {
     // untrusted today by supplying no callback. Wiring that prompt to
     // `session/request_permission` is `cyrup-acp`'s permission seam, not this call site.
     if mode == AppMode::Acp {
+        diagnostics::report(&settings_diagnostics);
         let sessions_root = cyrup_acp::SessionsRoot(dirs.session_dir.clone());
         let factory = session_launch::build_factory(
             provider,
@@ -816,7 +833,9 @@ async fn run() -> anyhow::Result<i32> {
         models_json.clone(),
         None,
     )?;
-    let (runtime, session) = match session_launch::launch(
+    let session_launch::Launched {
+        runtime, session, ..
+    } = match session_launch::launch(
         factory,
         target,
         PostBuild {
@@ -824,12 +843,14 @@ async fn run() -> anyhow::Result<i32> {
             cli: &cli,
             fresh,
             require_model: true,
+            startup_diagnostics: &settings_diagnostics,
+            interactive: false,
         },
     )
     .await?
     {
         ControlFlow::Break(code) => return Ok(code),
-        ControlFlow::Continue(pair) => pair,
+        ControlFlow::Continue(launched) => launched,
     };
 
     match mode {

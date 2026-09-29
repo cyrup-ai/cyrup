@@ -233,6 +233,12 @@ jsonschema           = { version = "0.46.9", default-features = false }
 
 # arch-00 §7 — first used by cyrup-session (arch-04).
 time                 = { version = "0.3", features = ["formatting", "parsing"] }
+# The local time zone, first used by cyrup-tui for pi's local-clock renders (`/tree`'s
+# `formatLabelTimestamp`, SESS-S05). `time`'s `current_local_offset` refuses in a multi-threaded
+# process; chrono's `Local` reads `TZ` and the system zone database itself. Already a member of the
+# dependency graph with `clock` on (via `mermaid-text`), so this promotes it to a direct dependency
+# without adding a crate.
+chrono               = { version = "0.4.45", default-features = false, features = ["clock"] }
 uuid                 = { version = "1", features = ["v7"] }
 
 # arch-00 §7 / §7.1 — direct-wire HTTP + SSE stack, first used by cyrup-provider (arch-01).

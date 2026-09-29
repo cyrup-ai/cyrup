@@ -1791,6 +1791,66 @@ pub struct SubagentPromptRuntime {
     /// child a Herdr placement launched ([`crate::placement::remote_resources::RESOURCES_ENV`]);
     /// its `before_agent_start` override replaces the launching side's prompt rewrite.
     placed_resources: Option<Arc<crate::placement::remote_resources::ResolvedRemoteResources>>,
+    /// SUBA-134 — the child session's name and intercom route (pi
+    /// `subagent-prompt-runtime.ts:532-550` @v0.71.0). `Some` when the parent handed this child a
+    /// readable session name or an intercom routing name.
+    session_identity: Option<Arc<ChildSessionIdentity>>,
+}
+
+/// SUBA-134 — pi's `intercomSessionName` / `sessionName` pair and the `intercomIdClaimed` latch
+/// (`subagent-prompt-runtime.ts:535-550` @v0.71.0).
+///
+/// cyrup-intercom asks at session start for this session's intercom id
+/// (`intercom:session-identity`); claiming the routing name there frees the session name for the
+/// readable label. An intercom that never asks routes by name, so the route stays the name.
+#[derive(Debug)]
+pub struct ChildSessionIdentity {
+    /// pi `config.intercomSessionName` — the child's deterministic intercom target
+    /// ([`crate::spawn::intercom_target::ENV_INTERCOM_SESSION_NAME`]).
+    routing_name: Option<String>,
+    /// pi `config.sessionName` — [`crate::exec::child_session_name::CHILD_SESSION_NAME_ENV`].
+    session_name: Option<String>,
+    /// pi `intercomIdClaimed`.
+    claimed: std::sync::atomic::AtomicBool,
+}
+
+/// cyrup-intercom's `INTERCOM_SESSION_IDENTITY_EVENT` (`cyrup-intercom/src/identity.rs`) — the
+/// request, `{ "version": 1 }`, emitted on the bus at session start.
+pub const INTERCOM_SESSION_IDENTITY_EVENT: &str = "intercom:session-identity";
+/// cyrup-intercom's `INTERCOM_SESSION_IDENTITY_CLAIM_EVENT` — the reply,
+/// `{ "version": 1, "stableId": <id> }`. cyrup's bus carries JSON, so upstream's
+/// `request.claim(id)` callback is a message on this topic, accepted until the first `agent_start`.
+pub const INTERCOM_SESSION_IDENTITY_CLAIM_EVENT: &str = "intercom:session-identity-claim";
+
+impl ChildSessionIdentity {
+    /// Read both names from the child env; `None` when neither was handed down.
+    #[must_use]
+    pub fn from_env(get: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
+        let non_empty = |key: &str| {
+            get(key)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let routing_name = non_empty(crate::spawn::intercom_target::ENV_INTERCOM_SESSION_NAME);
+        let session_name = non_empty(crate::exec::child_session_name::CHILD_SESSION_NAME_ENV);
+        (routing_name.is_some() || session_name.is_some()).then(|| Self {
+            routing_name,
+            session_name,
+            claimed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// pi `:547`: `intercomIdClaimed ? config.sessionName || routingName : routingName ||
+    /// config.sessionName`.
+    #[must_use]
+    pub fn name_to_apply(&self) -> Option<&str> {
+        let (first, second) = if self.claimed.load(std::sync::atomic::Ordering::Acquire) {
+            (&self.session_name, &self.routing_name)
+        } else {
+            (&self.routing_name, &self.session_name)
+        };
+        first.as_deref().or(second.as_deref())
+    }
 }
 
 /// SUBA-096 — pi `rewriteFastModeProviderRequest` (`fast-mode-extension.ts:3-6` @v0.68.0): a JSON
@@ -1961,6 +2021,7 @@ impl SubagentPromptRuntime {
             fast_mode: false,
             runtime_acknowledgements: None,
             placed_resources: None,
+            session_identity: None,
         }
     }
 
@@ -1988,6 +2049,7 @@ impl SubagentPromptRuntime {
             fast_mode: false,
             runtime_acknowledgements: None,
             placed_resources: None,
+            session_identity: None,
         }
     }
 
@@ -2006,6 +2068,14 @@ impl SubagentPromptRuntime {
     #[must_use]
     pub fn with_fast_mode(mut self, fast_mode: bool) -> Self {
         self.fast_mode = fast_mode;
+        self
+    }
+
+    /// SUBA-134 — arm the child's session naming and intercom route claim (see the
+    /// `session_identity` field doc).
+    #[must_use]
+    pub fn with_session_identity(mut self, identity: Option<ChildSessionIdentity>) -> Self {
+        self.session_identity = identity.map(Arc::new);
         self
     }
 
@@ -2260,6 +2330,8 @@ impl SubagentPromptRuntime {
             && self.runtime_acknowledgements.is_none()
             // SUBA-100: a placed child's remote agent prompt and tools are its whole persona.
             && self.placed_resources.is_none()
+            // SUBA-134: naming the child's own session is a real job.
+            && self.session_identity.is_none()
     }
 
     /// Attach the parent-supplied tool budget (pi `registerToolBudget`,
@@ -2318,8 +2390,20 @@ impl NativeExtension for SubagentPromptRuntime {
         // unconditionally: this extension exists ONLY inside a subagent child, and every subagent
         // child must have the parent's orchestration bookkeeping filtered out of its context.
         let mut kinds = vec![EventKind::Context];
-        if self.rewrite.is_some() || self.placed_resources.is_some() {
+        if self.rewrite.is_some()
+            || self.placed_resources.is_some()
+            || self.session_identity.is_some()
+        {
             kinds.push(EventKind::BeforeAgentStart);
+        }
+        // SUBA-134 — pi `pi.events.on(INTERCOM_SESSION_IDENTITY_EVENT, …)`, registered only when
+        // there is a routing name to claim (`subagent-prompt-runtime.ts:537-543` @v0.71.0).
+        if self
+            .session_identity
+            .as_ref()
+            .is_some_and(|identity| identity.routing_name.is_some())
+        {
+            api.subscribe_bus(INTERCOM_SESSION_IDENTITY_EVENT);
         }
         // pi `registerToolBudget` subscribes `onRuntimeEvent("tool_call", …)` only when a budget
         // exists (`:172` returns early otherwise); `Dispatcher::no_subscribers` short-circuits an
@@ -2432,6 +2516,26 @@ impl NativeExtension for SubagentPromptRuntime {
             && let Some(acknowledgements) = &self.runtime_acknowledgements
         {
             acknowledgements.acknowledge(payload);
+        }
+        // SUBA-134 — pi `request.claim(routingName); intercomIdClaimed = true` for a V1 request
+        // (`subagent-prompt-runtime.ts:538-542` @v0.71.0), answered on the claim topic.
+        if topic == INTERCOM_SESSION_IDENTITY_EVENT
+            && payload.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+            && let Some(identity) = &self.session_identity
+            && let Some(routing_name) = &identity.routing_name
+            && let Some(services) = self
+                .services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        {
+            services.emit_event(
+                INTERCOM_SESSION_IDENTITY_CLAIM_EVENT,
+                &serde_json::json!({ "version": 1, "stableId": routing_name }),
+            );
+            identity
+                .claimed
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(())
     }
@@ -2611,6 +2715,21 @@ impl NativeExtension for SubagentPromptRuntime {
                 // call to be blocked, not for the batch to end.
                 terminate: TerminateHint::Unspecified,
             };
+        }
+        // SUBA-134 — pi `before_agent_start`'s `pi.setSessionName(childSessionName)`
+        // (`subagent-prompt-runtime.ts:547-550` @v0.71.0), ahead of the prompt rewrite: the
+        // readable name once intercom has claimed the routing name as the session's id, the
+        // routing name otherwise (an intercom that routes by name still finds the child).
+        if let HostEvent::BeforeAgentStart { .. } = ev
+            && let Some(identity) = &self.session_identity
+            && let Some(name) = identity.name_to_apply()
+            && let Some(services) = self
+                .services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        {
+            services.set_session_name(name);
         }
         match ev {
             // pi `:323-341`.
@@ -3041,7 +3160,9 @@ pub fn prompt_runtime_from_env(
         // SUBA-063 — pi `registerRuntimeExtensionAcknowledgements(pi)` (`:451` @v0.68.0, env-read at
         // `:117` @v0.64.0).
         .with_runtime_acknowledgements(get)
-        .with_placed_resources(placed_resources);
+        .with_placed_resources(placed_resources)
+        // SUBA-134 — pi `config.intercomSessionName` / `config.sessionName`.
+        .with_session_identity(ChildSessionIdentity::from_env(get));
 
     if runtime.is_inert() {
         return Ok(None);

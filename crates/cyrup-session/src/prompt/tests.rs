@@ -331,34 +331,43 @@ fn a06_5_untrusted_skips_project_keeps_global() {
     );
 }
 
-// ── A-06-6: read-tool gates skills section; empty skills (--no-skills) removes it regardless ─────
+// ── A-06-6: a skill-reading tool gates the skills section; empty skills (--no-skills) removes it ─
+// SESS-059 — pi v0.85.0 (#8552): `skillFileReadTool = ["read","bash"].find(selected)`
+// (`system-prompt.ts:46`), and `formatSkillsForPrompt(skills, skillFileReadTool)` names that tool
+// in its load instruction (`skills.ts:364-366` @v0.87.1).
 #[test]
 fn a06_6_read_gates_skills() {
     let with_skills = vec![skill("s1", "use s1", "/s1/SKILL.md")];
-
-    // read available -> skills present
-    let inp = PromptInputs {
-        selected_tools: Some(vec![arc("read"), arc("bash")]),
-        skills: Arc::from(with_skills.clone()),
-        ..base_inputs()
+    let prompt_for = |tools: &[&str]| {
+        SystemPromptBuilder::new().build(&PromptInputs {
+            selected_tools: Some(tools.iter().map(|t| arc(t)).collect()),
+            skills: Arc::from(with_skills.clone()),
+            ..base_inputs()
+        })
     };
+    let read_line =
+        "Use the read tool to load a skill's file when the task matches its description.";
+    let bash_line = "Use bash to load a skill's file when the task matches its description.";
+
+    // read available -> skills present, read wording (read wins over bash)
+    let out = prompt_for(&["read", "bash"]);
+    assert!(out.contains("<available_skills>"), "{out}");
+    assert!(out.contains(read_line) && !out.contains(bash_line), "{out}");
+
+    // bash only -> skills still present, with the bash load instruction
+    let out = prompt_for(&["bash"]);
+    assert!(out.contains("<available_skills>"), "{out}");
+    assert!(out.contains(bash_line) && !out.contains(read_line), "{out}");
     assert!(
-        SystemPromptBuilder::new()
-            .build(&inp)
-            .contains("<available_skills>")
+        out.contains(&format!(
+            "The following skills provide specialized instructions for specific tasks.\n{bash_line}\n\
+             When a skill file references a relative path"
+        )),
+        "the load instruction is pi's second preamble line: {out}"
     );
 
-    // read NOT available -> no skills section even with skills loaded
-    let inp_no_read = PromptInputs {
-        selected_tools: Some(vec![arc("bash")]),
-        skills: Arc::from(with_skills),
-        ..base_inputs()
-    };
-    assert!(
-        !SystemPromptBuilder::new()
-            .build(&inp_no_read)
-            .contains("<available_skills>")
-    );
+    // neither read nor bash -> no skills section even with skills loaded
+    assert!(!prompt_for(&["edit"]).contains("<available_skills>"));
 
     // read available but --no-skills (empty set) -> no section
     let inp_no_skills = PromptInputs {

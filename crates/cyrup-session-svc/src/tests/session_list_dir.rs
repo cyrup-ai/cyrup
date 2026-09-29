@@ -139,6 +139,19 @@ async fn list_sessions_filters_a_shared_dir_by_cwd() {
         !paths.contains(&foreign),
         "another project's session in a shared --session-dir must be filtered out; got {paths:#?}"
     );
+
+    // TUI-122 — the picker's `all` scope over a custom dir is pi's
+    // `SessionManager.listAll(this.sessionManager.getSessionDir())` (`interactive-mode.ts:5562`
+    // @v0.87.1): the same directory, WITHOUT the cwd filter, so the foreign session is back.
+    let all: Vec<PathBuf> = session
+        .list_all_sessions()
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    assert!(
+        all.contains(&file) && all.contains(&foreign),
+        "the all-projects scope lists every session in the shared dir; got {all:#?}"
+    );
 }
 
 /// Without `--session-dir` nothing changes: the session dir IS the cwd-encoded default, so the

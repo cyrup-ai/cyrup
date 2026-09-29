@@ -304,6 +304,11 @@ fn oauth_headers_use_bearer_and_identity() {
         headers.get("x-app").and_then(|v| v.clone()).as_deref(),
         Some("cli")
     );
+    // PROV-077: pi `claudeCodeVersion` is `2.1.280` at v0.87.1 (`anthropic-messages.ts:87`).
+    assert_eq!(
+        headers.get("user-agent").and_then(|v| v.clone()).as_deref(),
+        Some("claude-cli/2.1.280")
+    );
 }
 
 #[test]
@@ -326,6 +331,90 @@ fn oauth_remaps_tool_names_to_claude_code() {
     )
     .unwrap();
     assert_eq!(body["tools"][0]["name"], "Bash");
+}
+
+/// PROV-086 — pi `getAnthropicCompat` (`anthropic-messages.ts:211-212` @v0.87.1; `bbb61e34a`,
+/// v0.86.0, #9102): an OpenRouter model on `anthropic-messages` sends session affinity by default,
+/// in OpenRouter's form (`x-session-id`, `:967`), while a first-party model still sends nothing
+/// unless its compat opts in, and then `x-session-affinity`.
+#[test]
+fn openrouter_anthropic_sends_x_session_id_by_default() {
+    let opts = StreamOptions {
+        session_id: Some("sess-9".into()),
+        ..Default::default()
+    };
+    let auth = auth_with(Some("sk-or-v1-xxx"));
+    let headers_for = |m: &Model| build_headers(m, &Context::default(), &auth, &opts, false);
+
+    let mut router = model();
+    router.provider = "openrouter".into();
+    router.base_url = "https://openrouter.ai/api".to_string();
+    let h = headers_for(&router);
+    assert_eq!(h.get("x-session-id"), Some(&Some("sess-9".to_string())));
+    assert!(!h.contains_key("x-session-affinity"));
+
+    router.compat = Some(crate::api::compat::AnthropicMessagesCompat {
+        send_session_affinity_headers: Some(false),
+        ..Default::default()
+    });
+    assert!(!headers_for(&router).contains_key("x-session-id"));
+
+    let first_party = headers_for(&model());
+    assert!(!first_party.contains_key("x-session-id"));
+    assert!(!first_party.contains_key("x-session-affinity"));
+
+    let mut opted_in = model();
+    opted_in.compat = Some(crate::api::compat::AnthropicMessagesCompat {
+        send_session_affinity_headers: Some(true),
+        ..Default::default()
+    });
+    let h = headers_for(&opted_in);
+    assert_eq!(
+        h.get("x-session-affinity"),
+        Some(&Some("sess-9".to_string()))
+    );
+    assert!(!h.contains_key("x-session-id"));
+}
+
+/// PROV-095 — pi `mergeClientHeaders` (`anthropic-messages.ts:294-296` @v0.87.1, #8305): a default
+/// client User-Agent under every other header source, on the API-key and Copilot branches. The
+/// OAuth branch's own `claude-cli/…` identity still wins over it.
+#[test]
+fn default_user_agent_sits_under_the_overlays() {
+    let auth = auth_with(Some("sk-ant-api03-xxx"));
+    crate::utils::user_agent::assert_default_user_agent_under_overlays(|overlay| {
+        let opts = StreamOptions {
+            headers: overlay,
+            ..Default::default()
+        };
+        build_headers(&model(), &Context::default(), &auth, &opts, false)
+    });
+    let mut copilot = model();
+    copilot.provider = "github-copilot".into();
+    crate::utils::user_agent::assert_default_user_agent_under_overlays(|overlay| {
+        let opts = StreamOptions {
+            headers: overlay,
+            ..Default::default()
+        };
+        build_headers(&copilot, &Context::default(), &auth, &opts, false)
+    });
+
+    let oauth = build_headers(
+        &model(),
+        &Context::default(),
+        &auth_with(Some("sk-ant-oat01-yyy")),
+        &StreamOptions::default(),
+        true,
+    );
+    let agents: Vec<_> = oauth
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        .collect();
+    assert_eq!(agents.len(), 1, "{oauth:?}");
+    assert_eq!(
+        agents[0].1.as_deref(),
+        Some(format!("claude-cli/{CLAUDE_CODE_VERSION}").as_str())
+    );
 }
 
 /// PROV-091 — the interleaved-thinking gate, all four of pi's terms (`anthropic-messages.ts:1019-1025`

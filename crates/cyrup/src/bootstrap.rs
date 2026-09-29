@@ -15,8 +15,7 @@
 use std::sync::Arc;
 
 use cyrup_config::{
-    AuthStore, CliConfigOverrides, ConfigDirs, EnvVars, ModelFile, SettingsManager, SettingsScope,
-    SettingsStore,
+    AuthStore, CliConfigOverrides, ConfigDirs, EnvVars, ModelFile, SettingsManager, SettingsStore,
 };
 use cyrup_session_svc::{AppMode, SessionConfig};
 use cyrup_tui::{StdinTerminalProbe, UiTheme};
@@ -88,7 +87,8 @@ pub fn resolve_dirs(cli: &Cli, env: &EnvVars) -> anyhow::Result<(CliConfigOverri
 
 /// Pi's `startupSettingsManager` (main.ts:610-611), created after the migrations and used for
 /// exactly two things: surfacing settings load/parse errors as warnings, and the `sessionDir`
-/// lookup. One manager, both jobs — as upstream. The caller reports the diagnostics.
+/// lookup. One manager, both jobs — as upstream. The caller holds the diagnostics until the
+/// runtime's are known (CFG-088; see [`crate::diagnostics::report_runtime`]).
 ///
 /// `project_trusted: false` is cyrup's standing pre-trust posture (R-07-002). Pi's startup manager
 /// defaults to `projectTrusted: true` (settings-manager.ts:320), so an UNTRUSTED project's
@@ -96,28 +96,20 @@ pub fn resolve_dirs(cli: &Cli, env: &EnvVars) -> anyhow::Result<(CliConfigOverri
 /// `<agent_dir>/settings.json` tier — the documented one — behaves exactly as upstream.
 pub fn load_startup_settings(dirs: &ConfigDirs) -> (SettingsManager, Vec<Diagnostic>) {
     let mut mgr = SettingsManager::load(file_settings_store(dirs), false);
-    let diagnostics = collect_settings_diagnostics(&mut mgr, "startup session lookup");
+    let diagnostics = collect_settings_diagnostics(&mut mgr);
     (mgr, diagnostics)
 }
 
-/// Drain settings load/parse errors into warning diagnostics (Pi `collectSettingsDiagnostics`,
-/// main.ts:77-85): `(<context>, <scope> settings) <message>`. Takes the caller's manager rather than
-/// building a throwaway one, because Pi passes the *same* `startupSettingsManager` it then queries
-/// for `sessionDir` (main.ts:610-611, 629) — draining a second, independent manager's errors would
-/// leave the live one still holding them.
-fn collect_settings_diagnostics(
-    mgr: &mut cyrup_config::SettingsManager,
-    context: &str,
-) -> Vec<Diagnostic> {
+/// Drain settings load/parse errors into warning diagnostics — Pi `collectSettingsDiagnostics`
+/// (`core/settings-diagnostics.ts:4-9` @v0.87.1): `Invalid settings file <path>: <message>`, or
+/// `Invalid <scope> settings: <message>` without a path (CFG-088). Takes the caller's manager
+/// rather than building a throwaway one, because Pi passes the *same* `startupSettingsManager` it
+/// then queries for `sessionDir` (main.ts:610-611, 629) — draining a second, independent manager's
+/// errors would leave the live one still holding them.
+fn collect_settings_diagnostics(mgr: &mut cyrup_config::SettingsManager) -> Vec<Diagnostic> {
     mgr.drain_load_errors()
-        .into_iter()
-        .map(|e| {
-            let scope = match e.scope {
-                SettingsScope::Global => "global",
-                SettingsScope::Project => "project",
-            };
-            Diagnostic::warning(format!("({context}, {scope} settings) {}", e.message))
-        })
+        .iter()
+        .map(|e| Diagnostic::warning(e.diagnostic_message()))
         .collect()
 }
 

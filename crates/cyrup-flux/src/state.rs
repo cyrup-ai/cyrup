@@ -1,11 +1,12 @@
 //! Shared `~/.flux/<flattened-cwd>/` state model — a function-for-function Rust port of
-//! [`flux_status.py`](../../../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_status.py)'s
-//! data layer (`flatten_cwd`, `derive_base`, `parse_frontmatter`, `collect_todos`,
-//! `collect_done`, `format_timestamp`, `collect_reviews`). This module is the shared read model
-//! for both the plain-text `/flux/status` renderer ([`crate::render_status`], FLUX_07) and the
-//! themed interactive overlay (FLUX_09).
+//! `flux_status.py`'s data layer
+//! (`code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_status.py` @v0.0.6:
+//! `flatten_cwd`, `derive_base`, `parse_frontmatter`, `collect_todos`, `collect_done`,
+//! `format_timestamp`, `collect_reviews`). This module is the shared read model for both the
+//! plain-text `/flux/status` renderer ([`crate::render_status`], port doc §3.4.2) and the themed
+//! interactive overlay ([`crate::overlay`], §3.4.3).
 //!
-//! Tolerant parsing is a requirement, not politeness (port doc §5.6): this parser serves BOTH
+//! Tolerant parsing is a requirement, not politeness (port doc §5, item 6): this parser serves BOTH
 //! cyrup's own `/flux/*` prompt-written trees and code-puppy's — an unreadable, malformed, or
 //! frontmatter-less file yields an empty map, never an error.
 

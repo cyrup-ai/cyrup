@@ -126,7 +126,7 @@ impl AgentSession {
     /// SEAM-024. The order is load-bearing and the reason this is not simply
     /// `wait_for_idle().await` after a plain abort: the retry backoff sleeps on a child of
     /// `session_cancel` that `agent.abort()` does not touch, so awaiting idle BEFORE cancelling it
-    /// would block for the whole remaining backoff (up to `retry.baseDelayMs * 2^attempt`).
+    /// would block for the whole remaining backoff (up to `retry.maxAgentDelayMs`).
     ///
     /// Pi's `teardownCurrent` states why teardown must await: "Settle any active response first so
     /// the aborted turn (including tool results) is persisted to the outgoing session before it is

@@ -92,9 +92,10 @@ fn model(
     }
 }
 
-/// The full Together chat catalog — a verbatim 1:1 port of Pi's `together.models.ts`
-/// (every model id, name, cost, context window, max tokens, reasoning flag, modalities, the
-/// per-model `compat` block, and `thinkingLevelMap`).
+/// The full Together chat catalog — a verbatim 1:1 port of Pi's `together.models.ts` at
+/// `b0c2a90e` (every model id, name, cost, context window, max tokens, reasoning flag, modalities,
+/// the per-model `compat` block, and `thinkingLevelMap`), plus the one row pi's served Together
+/// catalog adds after it, `moonshotai/Kimi-K3`.
 pub fn together_models() -> Vec<Model> {
     // The default reasoning map shared by most Together reasoning models.
     let m = || level_map(&[("minimal", None), ("low", None), ("medium", None)]);
@@ -254,43 +255,21 @@ pub fn together_models() -> Vec<Model> {
             Some(m()),
             together_compat(false, Some(ThinkingFormat::Together)),
         ),
-        // Kimi K3 — a cyrup ADDITION, not a port. Upstream's Together catalog stops at K2.7-Code;
-        // K3 shipped 2026-07-26, after the pinned revision, and is the current flagship on this
-        // provider. Parity with pi is a floor, not a ceiling: shipping a model users want is a
-        // product decision, and it is recorded here rather than prevented.
-        //
-        // Values MEASURED from `GET https://api.together.xyz/v1/models` on 2026-08-15, not inferred:
-        // `context_length: 1000000`, `pricing.input: 3`, `pricing.output: 15`,
-        // `pricing.cached_input: 0.3`, `display_name: "Kimi K3"`. Input modalities are text+image.
-        //
-        // `max_tokens` is the one value the endpoint does NOT expose (there is no
-        // `max_output_tokens` field). 131_072 matches K2.7-Code and is accepted by the provider —
-        // verified with a live request, which returned `finish_reason: stop` rather than an error.
-        // It is a ceiling, not a promise: if K3's real limit is lower the server stops earlier and
-        // reports `length` honestly.
-        //
-        // `thinking_level_map` is deliberately `None` rather than the `m()` the K2.x rows carry.
-        // `m()` sets minimal/low/medium to explicit nulls, and `get_supported_thinking_levels`
-        // (`collection.rs:814-827`) reads an explicit null as UNSUPPORTED — which is why those rows
-        // offer only `off` and `high`. PROV-068 asked whether that reading was inverted. It is NOT:
-        // upstream is `if (mapped === null) return false` (`ai/src/models.ts:668` @v0.83.0), and the
-        // K2.6 map is asserted to be exactly `{minimal: null, low: null, medium: null}`
-        // (`ai/test/together-models.test.ts:24`). A two-rung ladder is the CORRECT rendering of a
-        // `thinkingFormat: "together"` row with `supportsReasoningEffort: false` — the wire carries
-        // only `reasoning: { enabled }`, so `off`/`high` are the only rungs that exist. The K2.x
-        // rows stay as-is; PROV-068 is closed with no code change.
-        //
-        // `None` here is a separate judgement about K3, not a hedge on the above: K3 is a cyrup
-        // addition with no upstream row, so there is no upstream null to narrow it.
+        // Kimi K3 is pi's own row, not a cyrup addition: pi's served Together catalog
+        // (`GET https://pi.dev/api/models/providers/together`, the data `together.models.ts`
+        // re-exports from gitignored `providers/data/together.json` since `a9f6a3159`, read
+        // 2026-09-28) carries it with exactly the values below. It is the one row here that the
+        // `b0c2a90e` data literal predates (K3 shipped 2026-07-26); every other row is that
+        // literal's (PROV-070).
         model(
             "moonshotai/Kimi-K3",
             "Kimi K3",
             true,
             true,
             cost(3.0, 15.0, 0.3),
-            1_000_000,
+            1_048_576,
             131_072,
-            None,
+            Some(m()),
             together_compat(false, Some(ThinkingFormat::Together)),
         ),
         model(
@@ -446,19 +425,11 @@ mod tests {
     }
 
     #[test]
-    fn full_catalog_ported_from_pi_plus_recorded_additions() {
+    fn full_catalog_ported_from_pi() {
         let models = together_models();
-        // Pi's `together.models.ts` (20 entries) PLUS every deliberate cyrup addition, which must
-        // be named here so an ACCIDENTAL extra row still fails. Parity is a floor, not a ceiling:
-        // this test guards against unintended drift, not against shipping a better catalog.
-        const ADDITIONS: &[&str] = &["moonshotai/Kimi-K3"];
-        assert_eq!(models.len(), 20 + ADDITIONS.len());
-        for id in ADDITIONS {
-            assert!(
-                models.iter().any(|m| m.id.as_str() == *id),
-                "recorded addition {id} is missing — remove it from ADDITIONS or restore the row"
-            );
-        }
+        // `together.models.ts`'s 20 rows at `b0c2a90e` plus Kimi K3 from pi's served catalog —
+        // every row is pi's, so an extra row of any kind fails here.
+        assert_eq!(models.len(), 21);
         let find = |id: &str| {
             models
                 .iter()
@@ -510,6 +481,45 @@ mod tests {
             assert_eq!(c.max_tokens_field, Some(MaxTokensField::MaxTokens));
             assert_eq!(c.thinking_format, Some(ThinkingFormat::Together));
         }
+    }
+
+    /// PROV-070: K3 is pi's row (`pi.dev/api/models/providers/together`), so it carries pi's
+    /// `contextWindow` and the same three-null `thinkingLevelMap` as its K2.x siblings — which
+    /// `get_supported_thinking_levels` reads as a two-rung `off`/`high` ladder, exactly as pi does.
+    #[test]
+    fn kimi_k3_is_pi_s_served_row() {
+        use crate::collection::get_supported_thinking_levels;
+        use cyrup_core::ModelThinkingLevel;
+        let p = together_provider();
+        let k3 = p
+            .get_model("moonshotai/Kimi-K3")
+            .expect("K3 is in pi's Together catalog");
+        assert_eq!(k3.name, "Kimi K3");
+        assert!(k3.reasoning);
+        assert!(k3.supports_image_input());
+        assert_eq!(k3.context_window, 1_048_576);
+        assert_eq!(k3.max_tokens, 131_072);
+        assert_eq!(
+            (
+                k3.cost.input,
+                k3.cost.output,
+                k3.cost.cache_read,
+                k3.cost.cache_write
+            ),
+            (3.0, 15.0, 0.3, 0.0)
+        );
+        let map = k3.thinking_level_map.as_ref().expect("pi sets a map on K3");
+        assert_eq!(map.len(), 3);
+        for level in ["minimal", "low", "medium"] {
+            assert_eq!(map.get(level), Some(&None), "{level} is an explicit null");
+        }
+        assert_eq!(
+            get_supported_thinking_levels(k3),
+            vec![ModelThinkingLevel::Off, ModelThinkingLevel::High]
+        );
+        let c = k3.compat.as_ref().unwrap();
+        assert_eq!(c.supports_reasoning_effort, Some(false));
+        assert_eq!(c.thinking_format, Some(ThinkingFormat::Together));
     }
 
     #[test]

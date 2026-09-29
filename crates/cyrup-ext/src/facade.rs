@@ -55,7 +55,7 @@ pub enum InputReduction {
     },
 }
 
-/// The reduced result of [`ExtensionHost::emit_user_bash`] (Pi `UserBashEventResult`, `extensions/types.ts:1078-1083` @v0.83.0; EXT-036 corrected `:1043`, a member of the `ExtensionEvent` union):
+/// The reduced result of [`ExtensionHost::emit_user_bash_for`] (Pi `UserBashEventResult`, `extensions/types.ts:1078-1083` @v0.83.0; EXT-036 corrected `:1043`, a member of the `ExtensionEvent` union):
 /// proceed, the extension fully serviced it (`operations`/`result`), or a block.
 #[derive(Clone, Debug)]
 pub enum UserBashReduction {
@@ -249,6 +249,10 @@ impl crate::native::LateRegistrar for HostLateRegistrar {
 /// The extension host facade (arch-08 §3.1).
 pub struct ExtensionHost {
     dispatcher: Arc<Dispatcher>,
+    /// The host-wide UI-prompt window (EXT-075): shared with every WASM guest's `ui.*` imports and
+    /// handed to the session's `HostServices` backend, so a prompt from ANY extension emits pi's
+    /// `ui_prompt_start`/`ui_prompt_end` pair exactly once.
+    ui_prompts: Arc<crate::ui_prompt::UiPromptTracker>,
     registry: Arc<ExtensionRegistry>,
     config: HostConfig,
     loaded: RwLock<Vec<ExtensionId>>,
@@ -382,8 +386,13 @@ impl ExtensionHost {
         // that leaks the whole host.
         dispatcher
             .set_bus_drain(Arc::downgrade(&fanout) as std::sync::Weak<dyn crate::bus::BusDrain>);
+        let ui_prompts = Arc::new(crate::ui_prompt::UiPromptTracker::new(
+            config.has_ui,
+            Arc::downgrade(&dispatcher),
+        ));
         Self {
             dispatcher,
+            ui_prompts,
             registry,
             config,
             loaded: RwLock::new(Vec::new()),
@@ -982,8 +991,9 @@ impl ExtensionHost {
     pub async fn aggregate_resources(&self, cancel: &CancelToken) -> crate::ResourcesAggregate {
         use crate::event::HostEvent;
         // EXT-016: pi `ResourcesDiscoverEvent {type, cwd, reason: "startup" | "reload"}`
-        // (extensions/types.ts:544-548 @v0.83.0). This entry point is the STARTUP discovery; the
-        // reload path goes through `ExtensionHost::reload`, which passes "reload".
+        // (extensions/types.ts:544-548 @v0.83.0). This entry point is the STARTUP discovery. A
+        // `/reload` rebuilds the whole session (`SessionRuntime::reload` → `SessionBuilder::build`),
+        // so it arrives here too and is reported as "startup".
         let handled = self
             .dispatcher
             .dispatch_collect_handled(
@@ -1002,7 +1012,9 @@ impl ExtensionHost {
     /// across the chain (later handlers observe the running system prompt; injected messages
     /// ACCUMULATE), returning what changed — or `None` when nothing did (Pi returns `undefined`).
     /// This is the production seam the prior doc claimed existed: it drives the live `on-before-agent-start`
-    /// export and flows the guest's reduction back to the agent loop.
+    /// export and flows the guest's reduction back to the agent loop. EXT-025: the session's
+    /// pre-send assembly (`cyrup-session-svc`'s `session/run.rs`) calls THIS rather than keeping an
+    /// inline copy of the reduction — one emitter, as pi's runner has one.
     pub async fn emit_before_agent_start(
         &self,
         prompt: &str,
@@ -1044,7 +1056,9 @@ impl ExtensionHost {
 
     /// Dispatch `input` (Pi `ExtensionRunner.emitInput`, runner.ts:1094-1134; gap-08 #2). A handler may
     /// block, fully service (`handled`), or transform the submission text/images; transforms FOLD across
-    /// handlers. Returns the reduced [`InputReduction`] for the submission pipeline to apply.
+    /// handlers. Returns the reduced [`InputReduction`] for the submission pipeline to apply — the
+    /// session's `emit_input_event` (`cyrup-session-svc`'s `session/run.rs`) is that pipeline and
+    /// calls this; it used to re-derive the same reduction inline (EXT-025).
     pub async fn emit_input(
         &self,
         text: &str,
@@ -1155,9 +1169,8 @@ impl ExtensionHost {
 
     /// Dispatch `user_bash` with the caller's own event fields — **the one reducer**, used by the
     /// production `!`/`!!` and JSON-RPC `bash` path (`cyrup-session-svc`'s
-    /// `AgentSession::emit_user_bash_event`, `session/bash.rs`) and by
-    /// [`Self::emit_user_bash`] alike (Pi `ExtensionRunner.emitUserBash`, `runner.ts:1154-1183`
-    /// @v0.87.1).
+    /// `AgentSession::emit_user_bash_event`, `session/bash.rs`) — Pi `ExtensionRunner.emitUserBash`
+    /// (`runner.ts:1154-1183` @v0.87.1).
     ///
     /// The FIRST handler that returns a defined result wins (pi short-circuits and `return`s it).
     /// Since coding-agent 0.86.0 (*Breaking*, #9068) the three non-`Continue` outcomes are all
@@ -1201,20 +1214,6 @@ impl ExtensionHost {
             }
             Reduced::Pass(_) => UserBashReduction::Continue,
         }
-    }
-
-    /// [`Self::emit_user_bash_for`] for a caller that has neither of the submission's two extra
-    /// event fields to hand: `exclude_from_context` (the `!!` prefix, decided by the submission
-    /// parser) defaults to `false` and `cwd` is the process working directory (Pi
-    /// `UserBashEvent.cwd`, `extensions/types.ts:813-821`).
-    ///
-    /// This is a convenience over the reducer, NOT a second one — a session that has a real cwd and
-    /// a real `!!` flag (every production caller) calls [`Self::emit_user_bash_for`] directly.
-    pub async fn emit_user_bash(&self, command: &str, cancel: &CancelToken) -> UserBashReduction {
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.emit_user_bash_for(command, false, &cwd, cancel).await
     }
 
     /// Resolve the per-call bash backend the extension `owner` supplied for a `user_bash` command
@@ -1980,7 +1979,10 @@ impl ExtensionHost {
     /// [`Self::terminal_input`] contains its handlers. It is strictly more forgiving than upstream,
     /// so no guest can observe a behaviour pi's would not also produce.
     pub async fn branch_change(&self, branch: Option<&str>) {
-        let owners = self.registry.branch_change_subscribers().unwrap_or_default();
+        let owners = self
+            .registry
+            .branch_change_subscribers()
+            .unwrap_or_default();
         for owner in owners {
             self.branch_change_via(&owner, branch).await;
         }
@@ -2016,6 +2018,13 @@ impl ExtensionHost {
 
     pub fn registry(&self) -> &ExtensionRegistry {
         &self.registry
+    }
+
+    /// The host-wide UI-prompt window (EXT-075). The session hands it to its `HostServices`
+    /// backend, which wraps its blocking prompts in it, so a NATIVE extension's prompt emits the
+    /// pair too — natives call that backend directly, never through a guest import.
+    pub fn ui_prompts(&self) -> &Arc<crate::ui_prompt::UiPromptTracker> {
+        &self.ui_prompts
     }
 
     pub fn dispatcher(&self) -> &Dispatcher {
@@ -2279,6 +2288,8 @@ impl ExtensionHost {
                 // `bus.subscribe`/`bus.emit` reach other guests (Pi's single shared EventBus,
                 // gap-08 §5.3).
                 .with_bus(self.bus.clone())
+                // EXT-075: this guest's `ui.*` prompts open the HOST-wide prompt window.
+                .with_ui_prompts(self.ui_prompts.clone())
                 // EXT-054: the declared grant, seeded BEFORE `init` so the guest's very first call
                 // — `init` itself registers tools and can already reach `ui`/`exec` — runs under
                 // the restriction its manifest declared.
@@ -2721,8 +2732,8 @@ impl ExtensionHost {
     /// an outgoing instance is refused rather than landing on the bus the REPLACEMENT set is
     /// listening on (pi's `assertActive`). See [`crate::host::GuestState::invalidate`].
     ///
-    /// [`Self::reload`] calls this itself. It is `pub` because pi invalidates at the OTHER
-    /// replacement points too — `dispose`/`teardownCurrent` for new/resume/fork/switch
+    /// It is `pub` because pi invalidates at the session replacement points —
+    /// `dispose`/`teardownCurrent` for new/resume/fork/switch and the reload that rebuilds the session
     /// (`agent-session-runtime.ts:167-177`) — and those live in `cyrup-session-svc`
     /// (`AgentSession::dispose_with`, which already documents itself as sitting at exactly pi's
     /// `invalidate` position). This is the one call that seam needs.
@@ -2768,79 +2779,6 @@ impl ExtensionHost {
     pub fn live_invalidations(&self) -> u64 {
         self.live_invalidations
             .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Hot reload (`/reload`, R-08-005): emit `session_shutdown{reload}` to the live set, cache-bust
-    /// (drop the dispatcher + registry + live table + loaded ids), re-discover + re-load across the
-    /// three roots, then emit `session_start{reload}`. Returns the fresh [`LoadExtensionsResult`].
-    /// Stale instances are dropped (their `Arc`s released), so no invalidated instance is reachable.
-    #[cfg(feature = "wasm-host")]
-    pub async fn reload(
-        &self,
-        roots: &DiscoveryRoots,
-        project_trusted: bool,
-        services: Arc<dyn crate::host::HostServices>,
-        cancel: &CancelToken,
-    ) -> Result<LoadExtensionsResult, ExtError> {
-        use crate::event::HostEvent;
-        // 1) signal shutdown to the current set (reason = "reload").
-        self.dispatcher
-            .dispatch_notify(
-                // EXT-015: a reload is not a session REPLACEMENT, so pi's optional
-                // `targetSessionFile` ("Destination session file when shutting down due to session
-                // replacement", extensions/types.ts:619-620 @v0.83.0) is genuinely absent here.
-                &HostEvent::SessionShutdown {
-                    reason: "reload".into(),
-                    target_session_file: None,
-                },
-                cancel,
-            )
-            .await;
-        // Pi's `reload()` opens with `resetTimings("extensions")` (`core/resource-loader.ts:389`
-        // @v0.87.1) — ahead of its `clearExtensionCache()`, which is this cache-bust — so the rows
-        // the fresh load marks below measure the reload, not whatever ran before it (AGENT-027).
-        cyrup_core::timings::reset_timings(cyrup_core::timings::TimingLabel::Extensions);
-        // 2) cache-bust: drop dispatcher entries, registry tables, live instances, loaded ids.
-        self.dispatcher.clear()?;
-        self.registry.clear()?;
-        // EXT-050 — invalidate each outgoing instance BEFORE the map is cleared, the port of pi's
-        // `runtime.invalidate()` (`extensions/loader.ts:208-214` @v0.84.1). Two things follow from
-        // it: the instance's own subscriptions are torn down (upstream runs every tracked
-        // unsubscribe), and any later `bus.emit` from a call still in flight on the OLD instance is
-        // refused instead of being queued for the FRESH set that replaced it — upstream's
-        // `assertActive`. Without this the only teardown was the whole-bus `clear()` below, which is
-        // all-or-nothing and says nothing about who is still allowed to publish.
-        self.invalidate_live(None);
-        // Drop stale bus subscriptions + any undelivered queued events; the fresh load re-declares
-        // its subscriptions during `init` (gap-08 §5.3).
-        self.bus.clear();
-        if let Ok(mut g) = self.native.write() {
-            g.clear();
-        }
-        if let Ok(mut g) = self.live.write() {
-            g.clear();
-        }
-        if let Ok(mut g) = self.loaded.write() {
-            g.clear();
-        }
-        // 3) re-discover + re-load.
-        let result = self
-            .discover_and_load(roots, project_trusted, services)
-            .await;
-        // 4) signal start to the fresh set (reason = "reload").
-        self.dispatcher
-            .dispatch_notify(
-                // EXT-015: pi documents `previousSessionFile` as "Present for \"new\",
-                // \"resume\", and \"fork\"" (extensions/types.ts:568 @v0.83.0) — a reload keeps
-                // the SAME session file, so it is absent.
-                &HostEvent::SessionStart {
-                    reason: "reload".into(),
-                    previous_session_file: None,
-                },
-                cancel,
-            )
-            .await;
-        Ok(result)
     }
 
     /// Per-call epoch budget for a loaded wasm extension. The epoch driver ticks every

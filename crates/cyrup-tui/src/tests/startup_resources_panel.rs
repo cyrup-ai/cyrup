@@ -656,3 +656,94 @@ fn the_session_swap_arm_pushes_the_panel_after_the_shortcuts_and_before_the_repl
          linear, so a push after the replay would land under the conversation"
     );
 }
+
+// ================================================================================ EXT-053 =======
+
+/// A native registering one command, for the built-in-collision diagnostics.
+struct CommandExt {
+    id: &'static str,
+    command: &'static str,
+}
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for CommandExt {
+    fn id(&self) -> cyrup_core::ExtensionId {
+        cyrup_core::ExtensionId::from(self.id)
+    }
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.register_command(
+            self.command,
+            cyrup_ext::CommandDescriptor {
+                description: format!("{} from {}", self.command, self.id),
+                completions: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+    async fn on_event(
+        &self,
+        _ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        cyrup_ext::HookOutcome::Noop
+    }
+}
+
+/// EXT-053 — an extension command named like a built-in is dropped from the `/` menu, and pi says
+/// so in `[Extension issues]` (`getBuiltInCommandConflictDiagnostics`,
+/// `interactive-mode.ts:664-677` @v0.87.1): "Skipping in autocomplete." for a lone claimant, and
+/// "Available as '/model:N'." once two extensions claimed the name and the runner suffixed both.
+/// A command with its own name draws no warning.
+///
+/// RED before this pass: the drop was silent — nothing produced either message.
+#[tokio::test]
+async fn an_extension_command_shadowing_a_builtin_is_diagnosed_in_extension_issues() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("project");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut cfg = cyrup_session_svc::SessionConfig::new(cwd, agent_dir);
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = true;
+    let mut builder = cyrup_session_svc::SessionBuilder::new(
+        std::sync::Arc::new(cyrup_provider::faux::FauxProvider::new()),
+        cfg,
+    );
+    for (id, command) in [
+        ("ext-settings", "settings"),
+        ("ext-model-a", "model"),
+        ("ext-model-b", "model"),
+        ("ext-own", "deploy"),
+    ] {
+        builder = builder.with_native_extension(std::sync::Arc::new(CommandExt { id, command })
+            as std::sync::Arc<dyn cyrup_ext::NativeExtension>);
+    }
+    let session = builder.build().await.unwrap();
+
+    let mut app = new_app();
+    app.push_session_loaded_resources(&session);
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+
+    assert!(out.contains("[Extension issues]"), "{out}");
+    for line in [
+        "Extension command '/settings' conflicts with built-in interactive command. Skipping in \
+         autocomplete.",
+        "Extension command '/model' conflicts with built-in interactive command. Available as \
+         '/model:1'.",
+        "Extension command '/model' conflicts with built-in interactive command. Available as \
+         '/model:2'.",
+    ] {
+        assert_eq!(out.matches(line).count(), 1, "missing {line:?}:\n{out}");
+    }
+    assert!(!out.contains("'/deploy'"), "{out}");
+    assert!(
+        styled(
+            &app,
+            "conflicts with built-in interactive command",
+            UiTheme::dark().warning_style()
+        ),
+        "pi's `type: \"warning\"`:\n{out}"
+    );
+}

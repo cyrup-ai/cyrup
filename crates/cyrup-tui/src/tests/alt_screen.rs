@@ -297,6 +297,20 @@ fn renders_the_tail_and_a_wheel_notch_breaks_follow() {
     assert_eq!(viewport(&mut alt), ["line 6", "line 7", "line 8", "line 9"]);
 }
 
+/// pi `tui-alt-screen.test.ts:321` @v0.87.1 — "scrolls faster while Alt is held during wheel
+/// input": a 12-line document in a 4-row viewport sits at `viewportTop === 8`, and one Alt+wheel-up
+/// notch (`\x1b[<72;1;1M`, 72 = 64 + the Alt bit 8) lands at 3 — five lines, not one.
+#[test]
+fn alt_wheel_scrolls_five_lines_per_notch() {
+    let (mut alt, _captured, area) = screen(20, 4, 12);
+    alt.draw(None).unwrap();
+    assert_eq!(alt.viewport_top(), 8);
+    let mut up = wheel(MouseEventKind::ScrollUp, 0, 0);
+    up.modifiers = KeyModifiers::ALT;
+    alt.handle_mouse(&up, area);
+    assert_eq!(alt.viewport_top(), 3);
+}
+
 /// pi `:1317` — "ignores horizontal trackpad wheel events".
 #[test]
 fn horizontal_wheel_is_ignored() {

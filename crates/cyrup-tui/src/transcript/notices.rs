@@ -30,9 +30,21 @@ impl TranscriptView {
         self.pending.push(Entry::Error(text.into()));
     }
 
-    /// Record a `warning`-styled notice line (Pi `showWarning`, `interactive-mode.ts:3956-3960`).
+    /// Record a RAW `warning`-coloured notice line, drawn verbatim — pi's
+    /// `Spacer(1)` + `Text(theme.fg("warning", text), 1, 0)` sites that do not go through
+    /// `showWarning`: the untrusted-project banner (`interactive-mode.ts:4078-4090` @v0.87.1), the
+    /// cache-miss notice (`:4051-4053`) and the compaction-cost notice (`:3979-3982`). A port of a
+    /// `showWarning(...)` call uses [`Self::show_warning`] instead.
     pub fn push_warning(&mut self, text: impl Into<String>) {
         self.pending.push(Entry::Warning(text.into()));
+    }
+
+    /// Pi `showWarning(warningMessage)` (`interactive-mode.ts:4469-4473` @v0.87.1) — the ONE place
+    /// the `Warning: ${warningMessage}` prefix is built, as it is inside pi's function (TUI-062).
+    /// Callers pass the bare message; a caller that spelled the prefix itself is how one of them
+    /// once rendered pi's `Warning: No models available…` as a bare line.
+    pub fn show_warning(&mut self, message: impl std::fmt::Display) {
+        self.push_warning(format!("Warning: {message}"));
     }
 
     /// Push a bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`).

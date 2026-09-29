@@ -1,6 +1,6 @@
 [package]
 name = "cyrup-herdr"
-description = "The workspace's one client for herdr's newline-delimited JSON socket API (herdr v0.9.1, d59d060)"
+description = "The workspace's one client for herdr's newline-delimited JSON socket API (herdr v0.9.1, 065ef9d6)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

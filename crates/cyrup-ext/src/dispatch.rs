@@ -208,14 +208,6 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Drop every loaded extension (hot-reload, R-08-005). After this the dispatcher has no
-    /// subscribers; the loader re-adds the freshly-discovered set.
-    pub fn clear(&self) -> Result<(), ExtError> {
-        let mut g = self.lock_write()?;
-        *g = DispatchInner::default();
-        Ok(())
-    }
-
     /// The union of every loaded extension's CURRENT subscription bitset (EXT-058).
     ///
     /// Computed on demand rather than folded once at [`Self::add`]. The load-time aggregate was a

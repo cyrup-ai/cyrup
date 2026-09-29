@@ -78,9 +78,11 @@ pub enum Entry {
     /// or `Error: {message}`. Rendered as a blank spacer + one error-coloured line, matching Pi's
     /// `Spacer(1)` + `Text(theme.fg("error", …), outputPad, 0)`.
     Error(String),
-    /// A `warning`-styled notice — Pi `showWarning` (`interactive-mode.ts:3956-3960`): a `Spacer(1)`
-    /// then `Text(theme.fg("warning", "Warning: …"), 1, 0)`. Structurally identical to [`Self::Error`]
-    /// but in the warning colour; reached from an extension's `notify(msg, "warning")`.
+    /// A `warning`-coloured notice — a `Spacer(1)` then `Text(theme.fg("warning", text), 1, 0)`,
+    /// drawn verbatim. Pi `showWarning` (`interactive-mode.ts:4469-4473` @v0.87.1) is this with
+    /// `Warning: ` in front ([`crate::transcript::TranscriptView::show_warning`]); the untrusted
+    /// banner and the cost notices are this with no prefix. [`Self::Error`]'s shape, in the warning
+    /// colour and with a fixed paddingX of 1 where `showError` reads `outputPad`.
     Warning(String),
     /// A bordered info block (`/hotkeys`, `/changelog`, `/session`, `/debug`): a top `DynamicBorder`,
     /// a bold-accent `title`, a blank, the `markdown` body, then a bottom `DynamicBorder`
@@ -362,10 +364,10 @@ pub struct ToolRun {
     /// Whether the execution has finished (drives the pending→success/error background tint).
     pub done: bool,
     /// Wall-clock start of the run, set on [`TranscriptView::push_tool_start`] — the basis for the
-    /// bash `Took …` duration line (`formatDuration`, bash.ts:197/284-288).
+    /// bash `Took …` duration line (`formatDuration`, renderers/bash.ts:32-42 @v0.87.1).
     pub(super) started_at: Option<std::time::Instant>,
     /// Frozen run duration in milliseconds, set on [`TranscriptView::push_tool_end`]. Rendered as the
-    /// bash `Took {d}s` footer once the command finishes.
+    /// bash `Took …` footer once the command finishes.
     pub(super) duration_ms: Option<u64>,
     /// The CALL text an extension's registered renderer produced for this tool (EXT-006; Pi
     /// `ToolDefinition.renderCall`, extensions/types.ts:491 @v0.84.4, preferred over the built-in by

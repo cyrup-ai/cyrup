@@ -168,31 +168,41 @@ impl Skill {
         })
     }
 
-    /// Parse a `SKILL.md` collecting non-fatal validation diagnostics (skills.ts:loadSkillFromFile,
-    /// lines 274-336). Returns `Ok((None, diags))` when the skill is dropped (missing description)
-    /// but the file was otherwise readable; `Err` only on IO/parse faults.
+    /// Parse a skill file collecting non-fatal validation diagnostics (Pi `loadSkillFromFile`,
+    /// `core/skills.ts:277-345` @v0.87.1). Returns `Ok((None, diags))` when the skill is dropped
+    /// but the file was otherwise readable; `Err` only on an IO fault, or a front-matter parse
+    /// fault in a DECLARED skill.
+    ///
+    /// CFG-086 — pi distinguishes a declared skill (`basename(filePath) === "SKILL.md"`, v0.84.3
+    /// #7805) from a loose `.md` under a skills root: a loose file whose YAML does not parse, or
+    /// which has no string `description`, is skipped SILENTLY (`:302-305`, `:308-311`) — a
+    /// `README.md` beside the skills is not a broken skill. `name` and `description` are used
+    /// only when they are strings (`:308`, `:321`), so `name: 123` falls back to the directory
+    /// name instead of failing the whole parse.
     pub fn load_with_diagnostics(
         skill_md: &Path,
         scope: ResourceScope,
         origin: ResourceOrigin,
     ) -> Result<(Option<Skill>, Vec<ResourceDiagnostic>), ResourceError> {
+        let is_declared = skill_md.file_name().is_some_and(|n| n == "SKILL.md");
         let raw = std::fs::read_to_string(skill_md)?;
-        let front: SkillFrontMatter = match split_front_matter(&raw).0 {
-            Some(front_str) => {
-                serde_yml::from_str(&front_str).map_err(|e| ResourceError::FrontMatter {
+        let front = match parse_skill_front_matter(&raw) {
+            Ok(front) => front,
+            Err(reason) if is_declared => {
+                return Err(ResourceError::FrontMatter {
                     path: skill_md.to_path_buf(),
-                    reason: e.to_string(),
-                })?
+                    reason,
+                });
             }
-            // No frontmatter block → empty frontmatter (utils/frontmatter.ts returns `{}`).
-            None => SkillFrontMatter {
-                name: None,
-                description: None,
-                disable_model_invocation: false,
-                allowed_tools: Vec::new(),
-                extra: std::collections::BTreeMap::new(),
-            },
+            Err(_) => return Ok((None, Vec::new())),
         };
+        let has_description = front
+            .description
+            .as_deref()
+            .is_some_and(|d| !d.trim().is_empty());
+        if !is_declared && !has_description {
+            return Ok((None, Vec::new()));
+        }
 
         let dir = skill_md.parent().map(Path::to_path_buf).unwrap_or_default();
         let parent_dir_name = dir
@@ -222,11 +232,7 @@ impl Skill {
             ));
         }
 
-        // Drop the skill entirely when the description is missing/blank (skills.ts:305-307).
-        let has_description = front
-            .description
-            .as_deref()
-            .is_some_and(|d| !d.trim().is_empty());
+        // Drop the skill entirely when the description is missing/blank (skills.ts:327-330).
         if !has_description {
             return Ok((None, diagnostics));
         }
@@ -257,6 +263,31 @@ impl Named for Skill {
     fn scope(&self) -> ResourceScope {
         self.scope
     }
+}
+
+/// The front matter as `loadSkillFromFile` reads it: `parseFrontmatter` (only a YAML SYNTAX fault
+/// is an `Err`; a missing block or a non-mapping document is `{}`), then pi's type guards —
+/// `name`/`description` kept only as strings, `disable-model-invocation` only as `true`
+/// (`frontmatter["disable-model-invocation"] === true`, `core/skills.ts:341` @v0.87.1). A
+/// wrongly-typed key is dropped rather than failing the typed parse, which would drop the skill.
+fn parse_skill_front_matter(raw: &str) -> Result<SkillFrontMatter, String> {
+    let mut map = match split_front_matter(raw).0 {
+        Some(front) => match serde_yml::from_str::<serde_yml::Value>(&front) {
+            Ok(serde_yml::Value::Mapping(map)) => map,
+            Ok(_) => serde_yml::Mapping::new(),
+            Err(e) => return Err(e.to_string()),
+        },
+        None => serde_yml::Mapping::new(),
+    };
+    map.retain(|key, value| match key.as_str() {
+        "name" | "description" => value.is_string(),
+        "disable-model-invocation" | "disableModelInvocation" => value.is_bool(),
+        "allowedTools" | "allowed-tools" => value
+            .as_sequence()
+            .is_some_and(|tools| tools.iter().all(serde_yml::Value::is_string)),
+        _ => true,
+    });
+    serde_yml::from_value(serde_yml::Value::Mapping(map)).map_err(|e| e.to_string())
 }
 
 /// Normalize newlines exactly as Pi's `normalizeNewlines` (utils/frontmatter.ts:8): `\r\n` → `\n`,

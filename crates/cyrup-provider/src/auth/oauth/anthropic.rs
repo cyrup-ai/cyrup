@@ -700,8 +700,8 @@ impl OAuthAuth for AnthropicOAuth {
     /// cancels the other. When the paste wins we still consult the listener, because upstream
     /// gives a redirect that landed concurrently precedence over the pasted value (`:272-282`).
     ///
-    /// This overrides the trait's `LoginUnsupported` default, so a `dyn OAuthAuth` obtained from
-    /// [`super::load::load_anthropic_oauth`] runs the real flow.
+    /// This overrides the trait's `LoginUnsupported` default, so the `dyn OAuthAuth` the provider
+    /// carries ([`crate::providers::builtin_oauth::builtin_provider_oauth`]) runs the real flow.
     async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
         self.run_login(interaction).await
     }
@@ -1179,7 +1179,7 @@ mod tests {
         assert!(AnthropicOAuth::new().login_label().is_none());
     }
 
-    /// `login` must be the **trait** member, not an inherent method: `load_anthropic_oauth()`
+    /// `login` must be the **trait** member, not an inherent method: `builtin_provider_oauth`
     /// hands out an `Arc<dyn OAuthAuth>`, and an inherent `login` would be shadowed by the
     /// trait's `LoginUnsupported` default, turning `cyrup login anthropic` into an error.
     #[tokio::test]

@@ -136,11 +136,8 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     "--help",
     "--mode",
     "--print",
-    "--output-format",
-    "--json",
-    "--rpc",
-    // ACP-002 — `--acp` follows `--rpc` into the known set so it reaches clap instead of being
-    // captured as an extension flag by `partition_extension_flags`.
+    // ACP-002 — `--acp` is in the known set so it reaches clap instead of being captured as an
+    // extension flag by `partition_extension_flags` (the CYRUP-DELTA on `Cli::acp`, SEAM-057).
     "--acp",
     "--provider",
     "--model",
@@ -160,6 +157,7 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     "--prompt-template",
     "--no-prompt-templates",
     "--theme",
+    "--use-theme",
     "--no-themes",
     "--no-context-files",
     "--approve",
@@ -184,7 +182,6 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
 /// intentionally excluded — its value is optional and clap resolves it.
 const KNOWN_VALUE_LONG_FLAGS: &[&str] = &[
     "--mode",
-    "--output-format",
     "--provider",
     "--model",
     "--api-key",
@@ -198,6 +195,7 @@ const KNOWN_VALUE_LONG_FLAGS: &[&str] = &[
     "--skill",
     "--prompt-template",
     "--theme",
+    "--use-theme",
     "--session",
     "--session-id",
     "--fork",

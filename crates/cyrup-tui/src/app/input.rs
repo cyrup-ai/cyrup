@@ -54,7 +54,7 @@ impl<B: Backend> App<B> {
                 // The rule's second half is resolution-time and needs nothing here: the table is
                 // consulted through `AltScreenKeymap::action_in_mode`, which answers `None` for
                 // every event under `TuiRenderMode::Regular` — so an inline `pageUp` reaches
-                // `tui.editor.pageUp` and `app.pageUp` exactly as it did before ADR-0005, and would
+                // `tui.editor.pageUp` exactly as it did before ADR-0005, and would
                 // still do so even if this block were reached with no alternate screen live.
                 if self.altscreen.is_some() {
                     let App {
@@ -166,24 +166,32 @@ impl<B: Backend> App<B> {
                         let defer_to_editor = match action {
                             Action::Interrupt => self.state.editor.autocomplete_open(),
                             Action::Quit => !self.state.editor.is_empty(),
-                            // `PageUp`/`PageDown` are EDITOR bindings upstream and only editor
-                            // bindings — pi defines no `app.pageUp`/`app.pageDown` at v0.83.0 or
-                            // v0.84.1, and `tui.editor.pageUp` (`tui/src/keybindings.ts:89-90`)
-                            // pages the CARET (`editor.ts:855-862` → `pageScroll`). cyrup resolved
-                            // them globally and always scrolled the transcript, so the key never
-                            // reached a focused multi-line editor at all. Defer to the editor
-                            // whenever the buffer spans more than one visual line — i.e. whenever
-                            // there is something in it to page — and otherwise fall through to
-                            // cyrup's active-region transcript scroll, which has no pi analogue
-                            // (pi pages committed history with the terminal's own scrollback).
-                            Action::PageUp | Action::PageDown => {
-                                self.state.editor.is_multi_visual_line()
-                            }
                             _ => false,
                         };
                         if !defer_to_editor {
                             return self.apply_action(action);
                         }
+                    }
+                }
+                // `tui.editor.pageUp` / `pageDown` (`tui/src/keybindings.ts:19-20`) are the only
+                // page ids pi has, and they page the CARET (`editor.ts` → `pageScroll`). With a
+                // buffer that spans one visual line there is nothing to page, and cyrup gives the
+                // key to the live active region instead: in-flight streaming/tool/bash output is
+                // drawn inside the inline viewport (ADR-0001) and can outgrow it, and this is the
+                // only key that reaches its top — pi's main screen has no such region because it
+                // renders everything into scrollback. The key and the id stay pi's; only what an
+                // empty page does is cyrup's (TUI-065).
+                if !self.state.editor.is_multi_visual_line() {
+                    match self.state.editor.keymap_ref().action_for(key) {
+                        Some(EditorAction::PageUp) => {
+                            self.state.transcript.page_up(PAGE_SCROLL_LINES);
+                            return AppAction::Redraw;
+                        }
+                        Some(EditorAction::PageDown) => {
+                            self.state.transcript.page_down(PAGE_SCROLL_LINES);
+                            return AppAction::Redraw;
+                        }
+                        _ => {}
                     }
                 }
                 match self.state.editor.handle_key(key) {
@@ -268,6 +276,22 @@ impl<B: Backend> App<B> {
                 AppAction::Redraw
             }
         }
+    }
+
+    /// `app.suspend` — pi `handleCtrlZ` (`interactive-mode.ts:4278-4282` @v0.87.1): on `win32` there
+    /// is no job control to suspend into, so a manually bound key only reports that
+    /// (`showStatus("Suspend to background is not supported on Windows")`) and the terminal is left
+    /// alone. Everywhere else it is the run loop's [`AppAction::Suspend`]. The default table leaves
+    /// the id unbound on `win32` (`core/keybindings.ts:96-99`), so this arm is reached there only
+    /// through `keybindings.json` (TUI-071).
+    pub(crate) fn suspend_action(&mut self, platform: crate::KeybindingPlatform) -> AppAction {
+        if platform.win32 {
+            self.state
+                .transcript
+                .push_status("Suspend to background is not supported on Windows");
+            return AppAction::Redraw;
+        }
+        AppAction::Suspend
     }
 
     /// Resolve a global keymap action (R-10-024 Ctrl+C, R-10-030 abort).
@@ -401,23 +425,10 @@ impl<B: Backend> App<B> {
             }
             // `app.suspend` (Ctrl+Z) is surfaced to the run loop, which tears down raw mode, raises
             // SIGTSTP, and re-enters on SIGCONT (the raise lives in an isolated allow-unsafe shim).
-            Action::Suspend => AppAction::Suspend,
+            Action::Suspend => self.suspend_action(crate::KeybindingPlatform::current()),
             // `app.editor.external` (Ctrl+G): surfaced to the run loop, which restores the terminal,
             // launches `$VISUAL`/`$EDITOR` on the buffer, and reloads it.
             Action::ExternalEditor => AppAction::OpenExternalEditor,
-            // Page scroll over the **active region** (spec/tui/07): committed history lives in the
-            // terminal's native scrollback (paged with the terminal's own scroll, ADR-0001), but the
-            // in-flight streaming/tool/bash output can exceed the viewport — `PageUp`/`PageDown` page
-            // it without losing the live tail. The page size is one screenful, resolved at render time
-            // against the live viewport; a fixed conservative page keeps this input-thread pure.
-            Action::PageUp => {
-                self.state.transcript.page_up(PAGE_SCROLL_LINES);
-                AppAction::Redraw
-            }
-            Action::PageDown => {
-                self.state.transcript.page_down(PAGE_SCROLL_LINES);
-                AppAction::Redraw
-            }
             // `app.thinking.cycle` (Shift+Tab): advance the reasoning level in place — no picker. The
             // cycle is GATED on the live model supporting thinking and walks the model's OWN supported
             // levels, so it rides an `AppCommand` the run loop resolves against the session (Pi

@@ -149,6 +149,7 @@ fn tc_assistant(calls: &[(&str, &str)]) -> Message {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 2,
     })
 }

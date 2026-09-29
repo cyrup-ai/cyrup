@@ -282,11 +282,14 @@ async fn tui105_a_session_swap_recounts_providers_from_the_swapped_in_session() 
     );
 }
 
-/// `App::run`'s own backend. The `session_swapped` arm is `impl App<InlineBackend<Stdout>>`, so the
-/// arm cannot be driven through the `TestBackend` the rest of this file uses.
-fn inline_app() -> App<crate::InlineBackend<std::io::Stdout>> {
+/// `App::run`'s own backend. The `session_swapped` arm is `impl App<InlineBackend<TuiStdout>>`, so
+/// the arm cannot be driven through the `TestBackend` the rest of this file uses.
+fn inline_app() -> App<crate::InlineBackend<crate::TuiStdout>> {
     App::new(
-        crate::InlineBackend::with_anchor(std::io::stdout(), ratatui::layout::Position::ORIGIN),
+        crate::InlineBackend::with_anchor(
+            crate::write_log::tui_stdout(),
+            ratatui::layout::Position::ORIGIN,
+        ),
         UiTheme::dark(),
     )
     .unwrap()

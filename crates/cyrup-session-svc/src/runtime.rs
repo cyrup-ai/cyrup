@@ -119,6 +119,15 @@ fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
             source: Some("extension-flag".to_string()),
         });
     }
+    // CFG-088: the session's settings load failures, as warnings, between `services.diagnostics`
+    // and the extension errors — pi's array order (`main.ts:782-789` @v0.87.1).
+    for message in &session.services().startup_diagnostics.settings {
+        out.push(RuntimeDiagnostic {
+            severity: "warning".to_string(),
+            message: message.clone(),
+            source: Some("settings".to_string()),
+        });
+    }
     // EXT-S01: a CONTAINED extension load failure is still an ERROR. Pi maps every entry of
     // `resourceLoader.getExtensions().errors` onto `runtime.diagnostics` as
     // `{type:"error", message:'Failed to load extension "<path>": <err>'}` (main.ts:735-738) and the
@@ -657,9 +666,10 @@ impl AgentSessionRuntime {
         // Mirror Pi (agent-session-runtime.ts:287-350): for a persisted session, open a throwaway
         // manager from the current file, branch it in place at the resolved leaf, and hand THAT
         // manager object to the factory (its on-disk write may still be deferred). For an in-memory
-        // session, branch the LIVE manager and hand it over (Pi reuses `this.session.sessionManager`
-        // verbatim, :333-341). Only a "fork before the first message" — no anchor at all — is a
-        // brand-new empty session, on either path (Pi `newSession(...)`, :291/:335).
+        // session, settle the outgoing run, then branch the LIVE manager and hand it over (Pi
+        // reuses `this.session.sessionManager` verbatim, :335-341 @v0.87.1). Only a "fork before
+        // the first message" — no anchor at all — is a brand-new empty session, on either path (Pi
+        // `newSession(...)`, :291/:335).
         let next = match (&target_leaf, session_file) {
             (Some(leaf), Some(file)) => {
                 // SEAM-056 — pi's actionable guard, verbatim and in pi's PLACE: inside the
@@ -689,27 +699,24 @@ impl AgentSessionRuntime {
             // manager is the sole copy — branch it and carry it into the forked session rather than
             // building an empty `SessionTarget::New` and losing the whole conversation.
             //
-            // The three steps are ordered, and the order is load-bearing in a way Pi's is not. Pi
-            // branches `this.session.sessionManager` in place and only THEN awaits
-            // `teardownCurrent` (agent-session-runtime.ts:333-341); because the outgoing session
-            // keeps pointing at that same object, everything the dying run appends while it settles
-            // lands in the branched manager — i.e. in the fork. cyrup's `build_from_manager` takes
-            // the manager BY VALUE, so moving it out early would leave the outgoing session writing
-            // into a throwaway placeholder that is then dropped: an in-flight turn's final content
-            // (Pi's "aborted turn including tool results", :167-169) would be lost outright, and a
-            // non-persisted session has no file to recover it from. So: branch in place, settle the
-            // outgoing run against the branched manager, and only then move it.
+            // The three steps are ordered as pi's are since v0.85.0 (#8937, SEAM-130):
+            // `await this.teardownCurrent("fork", …)` settles the outgoing run FIRST, and only then
+            // is the live manager branched (agent-session-runtime.ts:335-341 @v0.87.1). Everything
+            // the aborted turn appends while it settles is therefore a descendant of the fork
+            // point and stays out of the fork. `take_manager` comes last because
+            // `build_from_manager` takes the manager BY VALUE, and it is safe only once nothing is
+            // still writing to it.
             (Some(leaf), None) => {
-                current.branch_live_manager(leaf).await?;
                 current.abort_and_settle().await;
+                current.branch_live_manager(leaf).await?;
                 let mgr = current.take_manager().await?;
                 self.factory.build_from_manager(mgr).await?.into_shared()
             }
             // Fork before the first message: a brand-new session (both persistence modes) — and it
             // records the outgoing file as its PARENT, because both of pi's no-leaf branches do:
-            // `sessionManager.newSession({ parentSession: currentSessionFile })` at
-            // `agent-session-runtime.ts:296-299` (persisted) and `:336-337` (in-memory), each
-            // BEFORE `teardownCurrent`. Without it the session tree loses the edge back to the
+            // `sessionManager.newSession({ parentSession: … })` at `agent-session-runtime.ts:298`
+            // (persisted, before `teardownCurrent`) and `:338` (in-memory, after it since v0.85.0's
+            // #8937) @v0.87.1. Without it the session tree loses the edge back to the
             // session that was forked, silently — the fork still reports `cancelled:false`.
             // SEAM-049. `previous` is the same value pi passes, already bound above for the
             // `session_start{reason:"fork"}` event.

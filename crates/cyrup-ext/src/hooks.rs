@@ -143,6 +143,13 @@ impl Hooks for ExtHooks {
     }
 
     /// Filter/replace the LLM context (R-08-028 subset). Runs before `convert_to_llm`.
+    ///
+    /// Two phases, as pi's `emitContext` (`core/extensions/runner.ts:1190-1253` @v0.87.1): every
+    /// `context` handler first, then every `context_with_system` handler over what that chain left,
+    /// its result used as returned (EXT-079). pi's `context` phase hides the system messages and
+    /// restores them after each handler; cyrup's transcript has no system messages (the prompt
+    /// travels beside it until AGENT-039), so that half holds by construction and both phases see
+    /// the same list.
     async fn transform_context(
         &self,
         msgs: Vec<Arc<AgentMessage>>,
@@ -155,9 +162,19 @@ impl Hooks for ExtHooks {
         let ev = HostEvent::Context {
             messages: msgs.clone(),
         };
+        let msgs = match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
+            Reduced::Pass(ev) => match *ev {
+                HostEvent::Context { messages } => messages,
+                _ => msgs,
+            },
+            _ => msgs,
+        };
+        let ev = HostEvent::ContextWithSystem {
+            messages: msgs.clone(),
+        };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
             Reduced::Pass(ev) => match *ev {
-                HostEvent::Context { messages } => Ok(messages),
+                HostEvent::ContextWithSystem { messages } => Ok(messages),
                 _ => Ok(msgs),
             },
             _ => Ok(msgs),

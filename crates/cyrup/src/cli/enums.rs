@@ -17,17 +17,6 @@ pub enum Mode {
     Acp,
 }
 
-/// Output format for the non-interactive one-shot path (`--output-format`; a cyrup back-compat
-/// alias — Pi expresses this through `--mode`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-#[value(rename_all = "lower")]
-pub enum OutputFormat {
-    /// Human-oriented final assistant text (PRINT mode).
-    Text,
-    /// One `AgentSessionEvent` per line (JSON mode / JSONL).
-    Json,
-}
-
 /// `--thinking <level>` (args.ts:57,130).
 ///
 /// Clap validates membership, but it never SEES an invalid value: pi's warn-and-continue path

@@ -802,6 +802,15 @@ impl<B: Backend> App<B> {
                 // Persist a `/settings` toggle/choice live (Global scope; Pi's settings selector
                 // writes the global layer). The `/reload` re-reads the effective view.
                 let json = parse_setting_value(&value);
+                // Both theme-switch arms land here (the `/settings` confirm and an extension's
+                // `setTheme`), and both of pi's set `currentThemeSetting` as well as persisting
+                // (`setThemeSetting` / `setThemeName`, `theme-controller.ts:88-99` @v0.87.1), which
+                // is what retires a `--use-theme` override once the user picks a theme. SEAM-119.
+                if id == "theme"
+                    && let Some(controller) = self.state.theme_controller.as_mut()
+                {
+                    controller.set_current_setting(value.clone());
+                }
                 // `outputPad` also takes effect ON SCREEN immediately (Pi `onOutputPadChange` →
                 // `this.outputPad = padding` + re-render, interactive-mode.ts:4127-4136), unlike the
                 // settings that only rebind on `/reload`: push the new pad into the live transcript so
@@ -965,7 +974,8 @@ impl<B: Backend> App<B> {
                 Ok(()) => {
                     let stored = session.session_name().await;
                     if stored.as_deref() != Some(name.as_str()) {
-                        self.state.transcript.push_warning(format!(
+                        // `showWarning(...)` (`interactive-mode.ts:6425` @v0.87.1).
+                        self.state.transcript.show_warning(format!(
                             "Session name was normalized from {} to {}",
                             serde_json::to_string(&name).unwrap_or_else(|_| format!("{name:?}")),
                             match &stored {
@@ -986,14 +996,14 @@ impl<B: Backend> App<B> {
                     .push_status(format!("name error: {e}")),
             },
             // TUI-080 / TUI-084 — the getter, and pi's severity CHANNEL for the usage line: a
-            // `showWarning` (`interactive-mode.ts:5638`), not a neutral status, and pi's exact
-            // string `Usage: /name <name>` rather than cyrup's `usage: /name <session name>`.
+            // `showWarning` (`interactive-mode.ts:6416` @v0.87.1), not a neutral status, and pi's
+            // exact string `Usage: /name <name>` rather than cyrup's `usage: /name <session name>`.
             C::ShowName => match session.session_name().await {
                 Some(name) => self
                     .state
                     .transcript
                     .push_status(format!("Session name: {name}")),
-                None => self.state.transcript.push_warning("Usage: /name <name>"),
+                None => self.state.transcript.show_warning("Usage: /name <name>"),
             },
 
             // **TUI-097.** Pi's selection leg is a FOUR-part conjunction, in this order
@@ -1115,11 +1125,10 @@ impl<B: Backend> App<B> {
     /// see [`Self::share_tx`] — and settles through [`Self::apply_share_outcome`].
     async fn share_session(&mut self, session: &Arc<AgentSession>) {
         use tokio::process::Command;
-        // `exportSessionForShare(jsonlFile, context.session)` (`:52`) — one export, used for BOTH
-        // paths: the Radius body verbatim, the gist body after `session_jsonl_to_html`. pi exports
-        // twice (JSONL here, HTML at `:72`) because its HTML writer starts from the manager, not
-        // from the JSONL; cyrup's renders the same JSONL, so re-exporting could only introduce a
-        // disagreement between what the two paths upload.
+        // `exportSessionForShare(jsonlFile, context.session)` (`:52`) — the Radius body: the current
+        // branch, linearised under a fresh header (`serializeSessionBranch`, DRIFT-055). The gist
+        // arm below renders its own document over the whole tree, as pi's `exportToHtml` (`:72`)
+        // does.
         let jsonl = match session.export_to_jsonl(None).await {
             Ok(Some(jsonl)) => jsonl,
             Ok(None) => {
@@ -1140,11 +1149,16 @@ impl<B: Backend> App<B> {
         if self.try_share_via_radius(session, &jsonl).await {
             return;
         }
-        let html = cyrup_session_svc::session_jsonl_to_html_with_theme(
-            &jsonl,
-            &session.export_theme(),
-            &session.export_state().await,
-        );
+        let html = match session.export_html_document().await {
+            Ok(html) => html,
+            // pi `showError(\`Failed to export session: …\`)` around `exportToHtml` (`:70-75`).
+            Err(e) => {
+                self.state
+                    .transcript
+                    .push_status(format!("share export error: {e}"));
+                return;
+            }
+        };
         let tmp = std::env::temp_dir().join(format!("cyrup-session-{}.html", session.session_id()));
         if let Err(e) = std::fs::write(&tmp, html.as_bytes()) {
             self.state

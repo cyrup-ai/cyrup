@@ -60,6 +60,7 @@ mod clipboard;
 mod commands;
 mod component;
 mod config_selector;
+mod dead_terminal;
 mod diff;
 mod drain;
 mod editor;
@@ -106,6 +107,7 @@ mod tmux;
 mod transcript;
 mod tree_selector;
 mod user_message_selector;
+mod write_log;
 
 /// The crate's headless render / keymap / selector suites. They lived one-file-per-binary under
 /// `tests/`; compiled here they are a single unit-test target instead of ~77 linked processes.
@@ -118,10 +120,10 @@ pub use altscreen::{
 pub use app::{
     App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, ImplicitTrustReload,
     InlineBackend, LifecycleEffects, LifecycleOutcome, LoginProviderSource, MainScreenRenderState,
-    ModeSwitch, ModeSwitchOptions, QueueDrain, QueueDrainReason, RebuildBackend, TreeNavMsg,
-    crossterm_input_stream, extension_render, gist_id_from_url, implicit_trust_after_reload,
-    reanchor_inline_region, render, share_viewer_url, share_viewer_url_from,
-    should_honor_extension_shutdown, tree_node_from_dag,
+    ModeSwitch, ModeSwitchOptions, QueueDrain, QueueDrainReason, RebuildBackend, RenderDebug,
+    TreeNavMsg, crossterm_input_stream, extension_render, gist_id_from_url,
+    implicit_trust_after_reload, reanchor_inline_region, render, share_viewer_url,
+    share_viewer_url_from, should_honor_extension_shutdown, tree_node_from_dag,
 };
 pub use auth_select::{
     AuthState, StatusTone, format_auth_selector_provider_type, format_status_indicator,
@@ -148,6 +150,9 @@ pub use config_selector::{
     ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle, ConfigWriteScope,
     ProjectOverrideState,
 };
+pub use dead_terminal::{
+    DEAD_TERMINAL_EXIT_CODE, TerminalWriter, terminal_stderr, terminal_stdout,
+};
 pub use diff::render_diff;
 pub use drain::{
     DRAIN_IDLE, DRAIN_MAX, InputDrain, drain_count, drain_input, drain_stdin_before_exit,
@@ -161,10 +166,12 @@ pub use footer_data::{
 };
 pub use fuzzy::{Match, filter as fuzzy_filter, fuzzy_match, score as fuzzy_score};
 pub use image::{
-    ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities, cached_capabilities,
-    detect_capabilities, detect_capabilities_from, detect_capabilities_on_platform,
-    detect_capabilities_with_overrides, hyperlinks_supported, image_fallback_text,
+    CapabilityOverrides, ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities,
+    cached_capabilities, detect_capabilities, detect_capabilities_from,
+    detect_capabilities_on_platform, detect_capabilities_with_overrides,
+    detect_capabilities_with_settings_overrides, hyperlinks_supported, image_fallback_text,
     reset_capabilities_cache, seed_capabilities, seed_hyperlink_support, set_capabilities,
+    set_capability_overrides,
 };
 pub use keyboard_protocol::{
     DESIRED_FLAGS as KITTY_DESIRED_FLAGS, KITTY_FLAGS_QUERY, KeyboardProtocol,
@@ -176,8 +183,9 @@ pub use keyboard_protocol::{
 };
 pub use keymap::{
     Action, AltScreenAction, AltScreenKeymap, AutocompleteAction, AutocompleteKeymap, EditorAction,
-    EditorKeymap, Key, KeybindingIssue, Keymap, ModelsAction, ModelsKeymap, SelectAction,
-    SelectKeymap, SessionAction, SessionKeymap, TreeAction, TreeKeymap,
+    EditorKeymap, Key, KeybindingIssue, KeybindingPlatform, Keymap, ModelsAction, ModelsKeymap,
+    SelectAction, SelectKeymap, SessionAction, SessionKeymap, ThinkingAction, ThinkingKeymap,
+    TreeAction, TreeKeymap,
 };
 pub use login_dialog::{
     LoginDialog, LoginFinished, LoginLineKind, LoginRefreshMsg, LoginUiMsg, TuiAuthInteraction,
@@ -215,8 +223,8 @@ pub use session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
 pub use settings_selector::{FIELD_SEP, SettingRow, SettingsSelector, TrustSelector};
 pub use startup::{
     DiagnosticCollision, DiagnosticSeverity, StartupDiagnostic, StartupLine, StartupReport,
-    StartupRole, StartupSpan, build_startup_lines, display_path, extension_diagnostics,
-    resource_diagnostics, shortcut_diagnostics,
+    StartupRole, StartupSpan, build_startup_lines, builtin_command_conflict_diagnostics,
+    display_path, extension_diagnostics, resource_diagnostics, shortcut_diagnostics,
 };
 pub use startup_selector::run_startup_selector;
 pub use status::{
@@ -244,7 +252,7 @@ pub use theme::{
     detect_terminal_background_from_env, detect_terminal_background_theme,
     detect_terminal_theme_for_auto, rgb_to_256, theme_for_rgb,
 };
-pub use thinking_selector::ThinkingSelector;
+pub use thinking_selector::{ThinkingSelector, ThinkingSelectorKeys};
 pub use tmux::{
     EXTENDED_KEYS_FORMAT_WARNING, EXTENDED_KEYS_OFF_WARNING, TMUX_QUERY_TIMEOUT,
     check_keyboard_setup as check_tmux_keyboard_setup, in_tmux,
@@ -254,8 +262,11 @@ pub use transcript::{
     DEFAULT_IMAGE_WIDTH_CELLS, Entry, HIDDEN_THINKING_LABEL, ParsedSkillBlock, ResultImage,
     TranscriptView, content_text, parse_skill_block, thinking_text,
 };
-pub use tree_selector::{FilterMode, TreeEntryRole, TreeKind, TreeNode, TreeSelector};
+pub use tree_selector::{
+    FilterMode, TreeEntryRole, TreeKind, TreeNode, TreeSelector, format_label_timestamp,
+};
 pub use user_message_selector::{UserMessageRow, UserMessageSelector};
+pub use write_log::{ENV_TUI_WRITE_LOG, TeeWriter, TuiStdout};
 
 /// Re-export the exact crossterm ratatui uses (version-matched; ADR-0001 — never add a direct
 /// crossterm dep). Front-ends and tests build key events through this path.

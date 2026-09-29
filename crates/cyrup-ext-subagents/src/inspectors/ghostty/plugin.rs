@@ -10,10 +10,15 @@
 //!   success sentence says so up front.
 //! * `status`/`close` are absent from the object entirely, which is [`None`] here.
 //!
-//! # `available()` is two reads, and neither of them probes
+//! # `available()` is three reads, and none of them probes
 //!
-//! `ghostty/plugin.ts:13` is `platform === "darwin" && context.env.TERM_PROGRAM?.toLowerCase() ===
-//! "ghostty"`. No `osascript --version`, no `tell application`, no spawn — so on a Linux box (this
+//! `ghostty/plugin.ts:20-24` @v0.71.0 is `platform === "darwin"`, then
+//! `context.env.TERM_PROGRAM?.toLowerCase() === "ghostty"`, then
+//! `context.env.__CFBundleIdentifier?.trim() === "com.mitchellh.ghostty"`. The third conjunct is
+//! v0.69.0's: Ghostty embedders such as cmux export `TERM_PROGRAM=ghostty` too, and without the
+//! host bundle id macOS injects into a GUI app's children the plugin took over inside them and then
+//! failed its `osascript` with `-1728`/`-2741`, or drove a standalone Ghostty's window instead.
+//! No `osascript --version`, no `tell application`, no spawn — so on a Linux box (this
 //! container, every CI runner) `inspector.open` refuses in microseconds and **cannot hang**. The
 //! Ghostty-1.3/Automation sentence users see on failure is the *failure hint*
 //! ([`super::actions::GHOSTTY_FAILURE_HINT`], `ghostty/actions.ts:52`), appended after a real
@@ -40,6 +45,9 @@ use cyrup_core::{ToolError, ToolResult};
 use super::actions::{self, OsascriptRunner};
 use crate::inspectors::plugins::{GhosttyRunner, InspectorPlugin};
 use crate::inspectors::types::{InspectorContext, InspectorLaunch, InspectorParams};
+
+/// The standalone Ghostty.app's bundle id. pi `GHOSTTY_BUNDLE_ID` (`ghostty/plugin.ts:5` @v0.71.0).
+const GHOSTTY_BUNDLE_ID: &str = "com.mitchellh.ghostty";
 
 /// The ghostty backend.
 #[derive(Clone, Default)]
@@ -100,6 +108,14 @@ impl GhosttyInspectorPlugin {
         ctx.env.get("TERM_PROGRAM").map(String::as_str)
     }
 
+    /// `context.env.__CFBundleIdentifier?.trim()` (`:24` @v0.71.0) — the terminal host app macOS
+    /// names in a GUI app's child environment. cmux's is `com.cmuxterm.app`, not Ghostty's.
+    fn host_bundle_id(ctx: &InspectorContext) -> Option<&str> {
+        ctx.env
+            .get("__CFBundleIdentifier")
+            .map(|value| value.trim())
+    }
+
     /// The seam to run: the injected one, else the real `osascript`.
     fn seam(&self) -> Arc<dyn GhosttyRunner> {
         match &self.runner {
@@ -116,10 +132,13 @@ impl InspectorPlugin for GhosttyInspectorPlugin {
     }
 
     async fn available(&self, ctx: &InspectorContext) -> bool {
-        // `?.toLowerCase() === "ghostty"` (`:13`): case-insensitive, and an absent variable is
-        // false rather than a panic. No probe — see this module's doc.
+        // `?.toLowerCase() === "ghostty"` (`:21`): case-insensitive, and an absent variable is
+        // false rather than a panic. The bundle id is compared exactly after a trim (`:24`), so an
+        // embedder that also exports `TERM_PROGRAM=ghostty` is refused. No probe — see this
+        // module's doc.
         self.is_macos()
             && Self::term_program(ctx).is_some_and(|value| value.eq_ignore_ascii_case("ghostty"))
+            && Self::host_bundle_id(ctx) == Some(GHOSTTY_BUNDLE_ID)
     }
 
     fn owns(&self, _ctx: &InspectorContext) -> bool {
@@ -205,7 +224,13 @@ mod tests {
     }
 
     fn ghostty_env() -> BTreeMap<String, String> {
-        BTreeMap::from([("TERM_PROGRAM".to_owned(), "Ghostty".to_owned())])
+        BTreeMap::from([
+            ("TERM_PROGRAM".to_owned(), "Ghostty".to_owned()),
+            (
+                "__CFBundleIdentifier".to_owned(),
+                GHOSTTY_BUNDLE_ID.to_owned(),
+            ),
+        ])
     }
 
     /// pi `ghostty/plugin.ts:13`, both conjuncts and the case fold.
@@ -239,10 +264,56 @@ mod tests {
         for spelling in ["Ghostty", "ghostty", "GHOSTTY"] {
             let ctx = context_with(
                 dir.path(),
-                BTreeMap::from([("TERM_PROGRAM".to_owned(), spelling.to_owned())]),
+                BTreeMap::from([
+                    ("TERM_PROGRAM".to_owned(), spelling.to_owned()),
+                    (
+                        "__CFBundleIdentifier".to_owned(),
+                        GHOSTTY_BUNDLE_ID.to_owned(),
+                    ),
+                ]),
             );
             assert!(macos.available(&ctx).await, "{spelling}");
         }
+    }
+
+    /// pi v0.69.0's bundle-id conjunct (`ghostty/plugin.ts:24` @v0.71.0): `TERM_PROGRAM=ghostty`
+    /// alone is what a Ghostty embedder such as cmux exports too, so it no longer passes.
+    ///
+    /// GUT the bundle-id conjunct and the first three rows go green again — the plugin takes over
+    /// inside cmux and its `osascript` fails with `-1728`/`-2741`. GUT the `trim` and the padded row
+    /// is refused.
+    #[tokio::test]
+    async fn available_requires_the_standalone_ghostty_bundle_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let macos = GhosttyInspectorPlugin::new().with_macos(true);
+        let with_bundle = |bundle: Option<&str>| {
+            let mut env = BTreeMap::from([("TERM_PROGRAM".to_owned(), "ghostty".to_owned())]);
+            if let Some(bundle) = bundle {
+                env.insert("__CFBundleIdentifier".to_owned(), bundle.to_owned());
+            }
+            context_with(dir.path(), env)
+        };
+
+        assert!(!macos.available(&with_bundle(None)).await, "no bundle id");
+        assert!(
+            !macos
+                .available(&with_bundle(Some("com.cmuxterm.app")))
+                .await,
+            "cmux"
+        );
+        assert!(
+            !macos
+                .available(&with_bundle(Some("COM.MITCHELLH.GHOSTTY")))
+                .await,
+            "the bundle id is compared exactly, not case-folded"
+        );
+        assert!(
+            macos
+                .available(&with_bundle(Some("  com.mitchellh.ghostty\n")))
+                .await,
+            "the bundle id is trimmed"
+        );
+        assert!(macos.available(&with_bundle(Some(GHOSTTY_BUNDLE_ID))).await);
     }
 
     /// `available()` must not spawn. GUT the gate into a probe and the no-ghostty refusal becomes

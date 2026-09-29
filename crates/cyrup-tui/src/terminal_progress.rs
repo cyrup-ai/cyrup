@@ -134,7 +134,7 @@ pub fn write_terminal_progress(active: bool) {
     } else {
         TERMINAL_PROGRESS_CLEAR_SEQUENCE
     };
-    let mut out = std::io::stdout();
+    let mut out = crate::dead_terminal::terminal_stdout();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
     PROGRESS_ARMED.store(active, Ordering::Relaxed);

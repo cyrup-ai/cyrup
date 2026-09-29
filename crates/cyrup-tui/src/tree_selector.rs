@@ -1,11 +1,11 @@
 //! The `/tree` session-navigator layout engine (spec/tui/05 §5.1, §6.1; Pi `tree-selector.ts`, 47KB —
 //! the largest first-party selector). This module ports the **bespoke layout**: branch connectors
-//! (`├─ └─ │`), fold markers (`⊟`/`⊞`), per-entry glyphs (`● ◆ ◇ ⚙ ✓`), the has-label star (`☆`), a
-//! right-aligned relative-time column, the selected-row accent, the filter-mode chips, and fold/filter
+//! (`├─ └─ │`), fold markers (`⊟`/`⊞`), per-entry glyphs (`● ◆ ◇ ⚙ ✓`), pi's inline
+//! `[label] <label time> ` prefix, the selected-row accent, the filter-mode chips, and fold/filter
 //! navigation. It is a full-width editor-swap [`Selector`] just like the other first-party pickers.
 //!
 //! The node list ([`TreeNode`]) is a flattened session DAG: each node carries its `depth`, `label`,
-//! [`TreeKind`], fold state, and an optional time label. Building that list from the live session DAG
+//! [`TreeKind`], fold state, and its user label with the time that label was set. Building that list from the live session DAG
 //! is the one L5 seam (`AgentSession` exposes `navigate_tree`/`branch` actions and `session_tree`
 //! events but no flat-tree *getter* yet — tracked in the residual ledger); the **rendering + fold +
 //! filter + connector** engine that is the bulk of the 47KB is built and tested here.
@@ -42,13 +42,20 @@ pub enum TreeKind {
     ToolGroup,
     /// A compaction/branch-summary entry — `✓`.
     Compaction,
+    /// A settings/bookkeeping entry — `label`, `custom`, `session_info`, `context_edit` — drawn as a
+    /// message row but hidden by the `default` and `no-tools` filters (`isSettingsEntry`,
+    /// `tree-selector.ts:355-361` @v0.87.1).
+    Settings,
+    /// A pi v0.86+ `usage` entry: in the tree for its children's sake, never shown
+    /// (`tree-selector.ts:341` @v0.87.1).
+    Usage,
 }
 
 impl TreeKind {
     /// The single-cell glyph for this entry type.
     pub fn glyph(self) -> &'static str {
         match self {
-            TreeKind::Message => "●",
+            TreeKind::Message | TreeKind::Settings | TreeKind::Usage => "●",
             TreeKind::ModelChange => "◆",
             TreeKind::ThinkingChange => "◇",
             TreeKind::ToolGroup => "⚙",
@@ -150,8 +157,12 @@ impl TreeEntryRole {
                     TreeEntryRole::Compaction
                 }
             }
-            // `:830-834` — both are a single `theme.fg("dim", …)`.
-            TreeKind::ModelChange | TreeKind::ThinkingChange => TreeEntryRole::Dim,
+            // `:830-846` — `model_change`, `thinking_level_change`, `custom`, `context_edit`,
+            // `label` and `session_info` are each a single `theme.fg("dim", …)`.
+            TreeKind::ModelChange
+            | TreeKind::ThinkingChange
+            | TreeKind::Settings
+            | TreeKind::Usage => TreeEntryRole::Dim,
             TreeKind::Message => {
                 if label.starts_with("user: ") {
                     TreeEntryRole::User
@@ -164,11 +175,6 @@ impl TreeEntryRole {
                     }
                 } else if label.starts_with("[bash]: ") {
                     TreeEntryRole::Bash
-                } else if label.starts_with("title: ")
-                    || label.starts_with("custom ")
-                    || label.starts_with("label ")
-                {
-                    TreeEntryRole::Dim
                 } else if label.starts_with('[') && label.ends_with(']') {
                     TreeEntryRole::CustomMessage
                 } else {
@@ -240,15 +246,15 @@ impl TreeEntryRole {
 /// The `/tree` filter modes (`filterMode`, `tree-selector.ts`; cycled by `1-5`, spec/tui/05 §5.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterMode {
-    /// All entries except folded subtrees — `1 default`.
+    /// Everything but the settings/bookkeeping entries — `default`.
     Default,
-    /// Hide tool groups — `2 no-tools`.
+    /// `default` minus tool results — `no-tools`.
     NoTools,
-    /// Only user/assistant messages — `3 user`.
+    /// User messages only — `user-only`.
     UserOnly,
-    /// Only labeled entries — `4 labeled`.
+    /// Only labeled entries — `labeled-only`.
     LabeledOnly,
-    /// Everything, including tool calls — `5 all`.
+    /// Everything but `usage` entries — `all`.
     All,
 }
 
@@ -292,13 +298,26 @@ impl FilterMode {
     // binding claims is appended to the tree's text SEARCH (`tree-selector.ts:1093-1100`), and the
     // filter modes are the seven `app.tree.filter.*` ctrl chords instead.
 
-    /// Whether `node` survives this filter.
+    /// Whether `node` survives this filter — `applyFilter`'s mode arm (`tree-selector.ts:341-386`
+    /// @v0.87.1). A `usage` entry is dropped before any mode is consulted (`:341`); the settings /
+    /// bookkeeping class (`:355-361`) is hidden by `default` and `no-tools` alike; `user-only` is a
+    /// user MESSAGE and nothing else (`:366`).
     fn keeps(self, node: &TreeNode) -> bool {
+        if node.kind == TreeKind::Usage {
+            return false;
+        }
+        let is_settings_entry = matches!(
+            node.kind,
+            TreeKind::Settings | TreeKind::ModelChange | TreeKind::ThinkingChange
+        );
         match self {
-            FilterMode::Default | FilterMode::All => true,
-            FilterMode::NoTools => node.kind != TreeKind::ToolGroup,
-            FilterMode::UserOnly => node.kind == TreeKind::Message,
-            FilterMode::LabeledOnly => node.has_label,
+            FilterMode::Default => !is_settings_entry,
+            FilterMode::NoTools => !is_settings_entry && node.kind != TreeKind::ToolGroup,
+            FilterMode::UserOnly => {
+                TreeEntryRole::classify(node.kind, &node.label) == TreeEntryRole::User
+            }
+            FilterMode::LabeledOnly => node.user_label.is_some(),
+            FilterMode::All => true,
         }
     }
 }
@@ -318,18 +337,63 @@ pub struct TreeNode {
     pub foldable: bool,
     /// Whether this node is currently folded (its subtree hidden).
     pub folded: bool,
-    /// Whether the entry carries a user label (renders the `☆` star).
-    pub has_label: bool,
-    /// When this entry's **label** was last set, pre-formatted for display — Pi's
-    /// `FlatNode.node.labelTimestamp` (`session-manager.ts:165`, rendered at `tree-selector.ts:741-743`).
-    /// `None` hides the column.
+    /// The entry's user label — Pi `FlatNode.node.label` — rendered as a `[label] ` prefix ahead of
+    /// the entry text (`tree-selector.ts:745` @v0.87.1).
+    pub user_label: Option<String>,
+    /// When this entry's **label** was set, as RFC3339 — Pi `FlatNode.node.labelTimestamp`
+    /// (`session-manager.ts:165`), formatted at render time by [`format_label_timestamp`].
     ///
     /// It is the *label-change* time, not the entry's own timestamp, and it is only ever shown on a
     /// row that carries a label: Pi's render condition is
-    /// `showLabelTimestamps && node.label && node.labelTimestamp`, which [`TreeSelector::rows`]
-    /// reproduces as `show_time && has_label && time_label.is_some()`. A timestamp on an unlabeled
-    /// node is therefore ignored rather than rendered.
-    pub time_label: Option<String>,
+    /// `showLabelTimestamps && node.label && node.labelTimestamp` (`:746-748`), which
+    /// [`TreeSelector::rows`] reproduces. A timestamp on an unlabeled node is ignored.
+    pub label_timestamp: Option<String>,
+}
+
+/// Pi `formatLabelTimestamp` (`tree-selector.ts:862-885` @v0.87.1): `HH:MM` for a label set today,
+/// `M/D HH:MM` earlier this year, `YY/M/D HH:MM` otherwise — month and day unpadded, hours and
+/// minutes zero-padded. `None` for a timestamp that does not parse.
+///
+/// Pi reads the label's calendar and clock, and today's date, through `Date`'s LOCAL getters
+/// (`getHours()` et al.), each at its own instant — so a label set before a daylight-saving change
+/// shows the wall clock it was set at. `offset_at` is that zone's UTC offset at an instant; the
+/// render site passes [`local_offset_at`].
+pub fn format_label_timestamp(
+    timestamp: &str,
+    now: time::OffsetDateTime,
+    offset_at: impl Fn(time::OffsetDateTime) -> time::UtcOffset,
+) -> Option<String> {
+    let date =
+        time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
+            .ok()?;
+    let date = date.to_offset(offset_at(date));
+    let now = now.to_offset(offset_at(now));
+    let clock = format!("{:02}:{:02}", date.hour(), date.minute());
+    if date.date() == now.date() {
+        return Some(clock);
+    }
+    let (month, day) = (u8::from(date.month()), date.day());
+    if date.year() == now.year() {
+        return Some(format!("{month}/{day} {clock}"));
+    }
+    // `date.getFullYear().toString().slice(-2)` — the last two characters of the year's digits.
+    let year = date.year().to_string();
+    let yy = year.get(year.len().saturating_sub(2)..).unwrap_or(&year);
+    Some(format!("{yy}/{month}/{day} {clock}"))
+}
+
+/// The process's local time zone offset at `at` — what a JS `Date`'s local getters read. `time`'s
+/// own `current_local_offset` refuses in a multi-threaded process, so this goes through chrono's
+/// `Local`, which reads `TZ` and the system zone database itself. UTC if the zone gives no answer.
+pub(crate) fn local_offset_at(at: time::OffsetDateTime) -> time::UtcOffset {
+    use chrono::{Offset as _, TimeZone as _};
+    chrono::Local
+        .timestamp_opt(at.unix_timestamp(), 0)
+        .single()
+        .and_then(|local| {
+            time::UtcOffset::from_whole_seconds(local.offset().fix().local_minus_utc()).ok()
+        })
+        .unwrap_or(time::UtcOffset::UTC)
 }
 
 impl TreeNode {
@@ -342,8 +406,8 @@ impl TreeNode {
             kind: TreeKind::Message,
             foldable: false,
             folded: false,
-            has_label: false,
-            time_label: None,
+            user_label: None,
+            label_timestamp: None,
         }
     }
 }
@@ -423,18 +487,21 @@ impl TreeSelector {
     /// (`tree-selector.ts:337`, `:391-393`): the query is lowercased and split on whitespace, empty
     /// tokens dropped, and **every** token must appear as a substring of the node's searchable text.
     ///
-    /// **[CYRUP-DELTA]** Upstream's `getSearchableText` (`:560-614`) joins the user label, the
-    /// message role and the extracted content. cyrup's flattened [`TreeNode`] carries one
-    /// pre-rendered row text ([`TreeNode::label`]) which the DAG display already builds *from* those
-    /// same parts — the role prefix and the content preview are both in it (see the `S24(b)` note on
-    /// `cyrup_test_support::TreeRole`) — so it is the available equivalent, not a narrowing choice. The one part it
-    /// cannot carry is a user label whose text is not on the row: `SessionDagNode` exposes only
-    /// `has_label`, the same limitation [`TreeSelector::begin_label_edit`] already documents.
+    /// **[CYRUP-DELTA]** Upstream's `getSearchableText` (`:562-614`) joins the user label, the
+    /// message role and the extracted content. cyrup's flattened [`TreeNode`] carries the user label
+    /// ([`TreeNode::user_label`]) and one pre-rendered row text ([`TreeNode::label`]) which the DAG
+    /// display already builds *from* the other two parts — the role prefix and the content preview
+    /// are both in it (see the `S24(b)` note on `cyrup_test_support::TreeRole`) — so label + row
+    /// text is the available equivalent, not a narrowing choice.
     fn matches_search(&self, node: &TreeNode) -> bool {
         if self.search_query.trim().is_empty() {
             return true;
         }
-        let haystack = node.label.to_lowercase();
+        let haystack = match &node.user_label {
+            Some(user_label) => format!("{user_label} {}", node.label),
+            None => node.label.clone(),
+        }
+        .to_lowercase();
         self.search_query
             .to_lowercase()
             .split_whitespace()
@@ -599,7 +666,7 @@ impl TreeSelector {
         }
     }
 
-    /// Toggle the relative-time column.
+    /// Toggle the inline label timestamp (`app.tree.toggleLabelTimestamp`, `tree-selector.ts:1098`).
     fn toggle_time(&mut self) {
         self.show_time = !self.show_time;
     }
@@ -656,26 +723,39 @@ impl TreeSelector {
     }
 
     /// Begin inline label editing on the highlighted entry (`app.tree.editLabel` → `onLabelEdit` →
-    /// `showLabelInput`, `tree-selector.ts:1046-1049,1327,1351`). A no-op when no row is selected. The
-    /// buffer starts empty: cyrup's flattened DAG (`SessionDagNode`) carries only `has_label`, not the
-    /// label text, so unlike Pi (which seeds `selected.node.label`) there is no existing string to
-    /// pre-fill — the user types the new label from scratch.
+    /// `showLabelInput`, `tree-selector.ts:1046-1049,1327,1351`). A no-op when no row is selected.
+    /// The buffer is seeded with the entry's current label, caret at 0 — pi's `new LabelInput(entryId,
+    /// selected.node.label)` runs `if (currentLabel) this.input.setValue(currentLabel)` on a fresh
+    /// `Input` (`:1095`, `:1295-1300` @v0.87.1), and `setValue` keeps the caret at
+    /// `min(cursor, length)`, i.e. 0.
     fn begin_label_edit(&mut self) {
         if let Some(entry_id) = self.selected_id() {
-            self.label_edit = Some(LabelEdit {
-                entry_id,
-                input: crate::text_input::Input::new(),
-            });
+            let mut input = crate::text_input::Input::new();
+            if let Some(label) = self
+                .nodes
+                .iter()
+                .find(|n| n.id == entry_id)
+                .and_then(|n| n.user_label.clone())
+            {
+                input.set_value(label);
+            }
+            self.label_edit = Some(LabelEdit { entry_id, input });
         }
     }
 
-    /// Set/clear the `has_label` star on the node whose entry id is `entry_id`, mirroring Pi's
-    /// `TreeList.updateNodeLabel` (`:626-633`) local refresh so the tree reflects the rename the instant
-    /// the label input closes (the persist to the session DAG is the chrome's job). An empty label
-    /// clears the star (Pi stores `undefined`, `apply_label` drops empty labels).
-    fn update_node_label(&mut self, entry_id: &str, has_label: bool) {
+    /// Set/clear the label on the node whose entry id is `entry_id` — Pi `TreeList.updateNodeLabel`
+    /// (`tree-selector.ts:637-645` @v0.87.1): `node.label = label; node.labelTimestamp = label ?
+    /// new Date().toISOString() : undefined` — the local refresh that makes the tree reflect the
+    /// rename the instant the label input closes (the persist to the session DAG is the chrome's
+    /// job). An empty label clears both (Pi stores `undefined`, `apply_label` drops empty labels).
+    fn update_node_label(&mut self, entry_id: &str, label: Option<String>) {
         if let Some(node) = self.nodes.iter_mut().find(|n| n.id == entry_id) {
-            node.has_label = has_label;
+            node.label_timestamp = label.as_ref().map(|_| {
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            });
+            node.user_label = label;
         }
     }
 
@@ -691,7 +771,7 @@ impl TreeSelector {
                     return SelectorOutcome::Redraw;
                 };
                 let label = edit.input.value().trim().to_string();
-                self.update_node_label(&edit.entry_id, !label.is_empty());
+                self.update_node_label(&edit.entry_id, (!label.is_empty()).then(|| label.clone()));
                 SelectorOutcome::Apply(format!("{}{}{}", edit.entry_id, crate::FIELD_SEP, label))
             }
             Some(SelectAction::Cancel) => {
@@ -829,8 +909,10 @@ impl TreeSelector {
         }
     }
 
-    /// The visible rows as styled lines for `width` (used by [`Selector::render`] and tests).
-    pub fn rows(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+    /// The visible rows as styled lines (used by [`Selector::render`] and tests). A row is exactly
+    /// as wide as its content, as upstream's is (`renderHorizontalViewport`, `tree-selector.ts:85-91`);
+    /// the frame clips it at the right edge.
+    pub fn rows(&self, theme: &UiTheme) -> Vec<Line<'static>> {
         let visible = self.visible_indices();
         // The body is WINDOWED at `max_visible`, as upstream's is: `startIndex`/`endIndex`
         // (`tree-selector.ts:673-681`) is the formula [`centered_window`] already holds, and
@@ -879,6 +961,27 @@ impl TreeSelector {
                 theme.base_style()
             };
             spans.push(Span::styled(format!("{} ", node.kind.glyph()), glyph_style));
+            // SESS-S05 — pi composes the label and its timestamp INLINE, ahead of the entry text:
+            //   const label = flatNode.node.label ? theme.fg("warning", `[${flatNode.node.label}] `) : "";
+            //   const labelTimestamp = this.showLabelTimestamps && flatNode.node.label &&
+            //     flatNode.node.labelTimestamp
+            //       ? theme.fg("muted", `${this.formatLabelTimestamp(flatNode.node.labelTimestamp)} `) : "";
+            //   let body = prefixPart + label + labelTimestamp + content;
+            // (`tree-selector.ts:745-754` @v0.87.1). There is no right-hand column anywhere in that
+            // row; cyrup's former trailing `☆labeled` star and right-aligned time column are gone.
+            if let Some(user_label) = &node.user_label {
+                spans.push(Span::styled(
+                    format!("[{user_label}] "),
+                    theme.warning_style(),
+                ));
+                if self.show_time
+                    && let Some(time) = node.label_timestamp.as_deref().and_then(|ts| {
+                        format_label_timestamp(ts, time::OffsetDateTime::now_utc(), local_offset_at)
+                    })
+                {
+                    spans.push(Span::styled(format!("{time} "), theme.muted_style()));
+                }
+            }
             // S24(b): the entry text is coloured PER ROLE, with a coloured role prefix, and the
             // selected row is only BOLDED (`:851`), never repainted `accent` — see
             // [`TreeEntryRole`].
@@ -887,53 +990,11 @@ impl TreeSelector {
                 is_sel,
                 theme,
             ));
-            if node.has_label {
-                spans.push(Span::styled(
-                    "  ☆labeled".to_string(),
-                    theme.warning_style(),
-                ));
-            }
-            // Right-aligned label-timestamp column.
-            //
-            // S37: this used to ALSO render a `◀ selected` marker on the highlighted row, padded
-            // flush right. There is no upstream analog — `git grep '◀' v0.84.1 -- packages/` finds
-            // nothing anywhere in pi, and `renderHorizontalViewport` (`tree-selector.ts:85-91`)
-            // emits `row.gutter + row.body` truncated to `width` with no right-hand padding at all,
-            // so an upstream row is exactly as wide as its content. The marker was a cyrup
-            // invention that (a) added text pi never draws and (b) padded the row out to `width`,
-            // which is what made the `selectedBg` fill below look full-width. It is removed; the
-            // selection is indicated the way upstream indicates it — the `› ` cursor at `:689` plus
-            // the fill at `:750-753`.
-            //
-            // S24(a): the pad is computed from the row's **visible width**, not `chars().count()`.
-            // Upstream measures the same quantity with `visibleWidth` (`tree-selector.ts:747`
-            // `const anchorCol = visibleWidth(prefixPart);`, `:754` `bodyWidth: visibleWidth(body)`),
-            // and everything ahead of this column is unicode: the connector `│├└─⊟⊞`, the glyphs
-            // `●◆◇⚙✓`, the `☆labeled` star, and a message preview that is arbitrary user text. A CJK
-            // preview measured one column per character, so the pad overshot by the number of wide
-            // characters in the row and pushed the timestamp off the right edge. `Span::width` is
-            // the crate's `visibleWidth`; this was the eighth char-count measurement found in it.
-            let left_len: usize = spans.iter().map(Span::width).sum();
-            let mut right = String::new();
-            if self.show_time
-                // Pi's render condition in full (`tree-selector.ts:741-743`): the column is a
-                // *label* timestamp, so an entry with no label never shows one even when the toggle
-                // is on and a timestamp happens to be attached.
-                && node.has_label
-                && let Some(t) = &node.time_label
-            {
-                right.push_str(t);
-            }
-            if !right.is_empty() {
-                let pad = (width as usize).saturating_sub(left_len + Span::raw(&right).width() + 1);
-                spans.push(Span::raw(" ".repeat(pad + 1)));
-                let style = if is_sel {
-                    theme.accent_style()
-                } else {
-                    theme.dim_style()
-                };
-                spans.push(Span::styled(right, style));
-            }
+            // S37: this row used to ALSO render a `◀ selected` marker on the highlighted row, padded
+            // flush right. There is no upstream analog — `renderHorizontalViewport`
+            // (`tree-selector.ts:85-91`) emits `row.gutter + row.body` truncated to `width` with no
+            // right-hand padding at all, so an upstream row is exactly as wide as its content, and
+            // the selection is indicated by the `› ` cursor plus the fill below.
             // S2/SYS-4: the selected row carries the `selectedBg` fill. `tree-selector.ts:750-753`
             //     if (isSelected) { gutter = theme.bg("selectedBg", gutter); body = theme.bg("selectedBg", body); }
             // wraps the already-styled gutter and body — the fill is laid OVER the per-span
@@ -1105,7 +1166,7 @@ impl Selector for TreeSelector {
             );
         } else {
             frame.render_widget(
-                Paragraph::new(self.rows(body.width, theme)).style(theme.base_style()),
+                Paragraph::new(self.rows(theme)).style(theme.base_style()),
                 body,
             );
         }

@@ -6,9 +6,10 @@
 //! re-exports it for `cyrup_tui::session_jsonl_to_html` consumers; `app.rs` routes `/export` by
 //! extension exactly as Pi (`.jsonl` → `export_to_jsonl`; else → HTML, the Pi default).
 //!
-//! The two TUI call sites use [`cyrup_session_svc::session_jsonl_to_html_with_theme`] with the
-//! session's own [`cyrup_session_svc::ExportTheme`], so an interactive export carries the theme the
-//! user is looking at — pi resolves the ACTIVE theme inside `generateHtml`
+//! The two TUI call sites render through `AgentSession::export_html_document`, which calls
+//! [`cyrup_session_svc::session_jsonl_to_html_with_theme`] with the session's own
+//! [`cyrup_session_svc::ExportTheme`], so an interactive export carries the theme the user is
+//! looking at — pi resolves the ACTIVE theme inside `generateHtml`
 //! (`core/export-html/index.ts:151-157` @v0.84.4). This alias keeps the default-palette entry point
 //! reachable for embedders that have no session (DRIFT-041).
 

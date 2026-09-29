@@ -60,7 +60,9 @@ async fn a_live_guest_is_pushed_the_new_branch_and_re_renders_its_footer() {
 
     let notes = ext.guest().notifications();
     assert!(
-        notes.iter().any(|n| n == "demo: branch changed to feature/x"),
+        notes
+            .iter()
+            .any(|n| n == "demo: branch changed to feature/x"),
         "the guest's callback ran across the `on-branch-change` export with the new branch; \
          notes: {notes:?}"
     );
@@ -80,7 +82,9 @@ async fn a_live_guest_is_pushed_the_new_branch_and_re_renders_its_footer() {
     host.branch_change(None).await;
     let notes = ext.guest().notifications();
     assert!(
-        notes.iter().any(|n| n == "demo: branch changed to (no repo)"),
+        notes
+            .iter()
+            .any(|n| n == "demo: branch changed to (no repo)"),
         "`none` reached the guest unflattened; notes: {notes:?}"
     );
 }

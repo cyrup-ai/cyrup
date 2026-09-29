@@ -64,10 +64,13 @@ fn write_head(root: &Path, head: &str) {
     std::fs::write(root.join(".git").join("HEAD"), head).unwrap();
 }
 
-/// `App::run`'s own backend: the poll arm lives on `impl App<InlineBackend<Stdout>>`.
-fn inline_app() -> App<crate::InlineBackend<std::io::Stdout>> {
+/// `App::run`'s own backend: the poll arm lives on `impl App<InlineBackend<TuiStdout>>`.
+fn inline_app() -> App<crate::InlineBackend<crate::TuiStdout>> {
     App::new(
-        crate::InlineBackend::with_anchor(std::io::stdout(), ratatui::layout::Position::ORIGIN),
+        crate::InlineBackend::with_anchor(
+            crate::write_log::tui_stdout(),
+            ratatui::layout::Position::ORIGIN,
+        ),
         UiTheme::dark(),
     )
     .unwrap()

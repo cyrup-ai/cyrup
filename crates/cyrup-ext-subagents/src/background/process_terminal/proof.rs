@@ -62,6 +62,7 @@ pub fn unknown_proof(
         // pi `...(diagnostic ? { diagnostic } : {})` — an EMPTY diagnostic is omitted, not written
         // as `""`, so a reader never has to distinguish "no explanation" from "a blank one".
         diagnostic: diagnostic.filter(|text| !text.is_empty()),
+        instances: Vec::new(),
     }
 }
 

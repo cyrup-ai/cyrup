@@ -117,7 +117,7 @@ impl Tool for WriteTool {
         // (write.ts:220) AND immediately after it (write.ts:224), before the success value is
         // built — `throwIfAborted` itself is defined at write.ts:213-215 and throws
         // `"Operation aborted"`. Present at the ported v0.83.0 too (`:219`). Without the second
-        // check a cancel landing during the write yields `Successfully wrote N bytes` here while
+        // check a cancel landing during the write yields `Successfully wrote to …` here while
         // pi reports an aborted tool error, so the transcript disagrees with the user's own
         // cancellation. Pi does NOT undo the write — only the RESULT is reported as aborted — so
         // this deliberately runs after `write_in_place` has already landed the bytes. The guard is
@@ -127,16 +127,16 @@ impl Tool for WriteTool {
             return Err(error::aborted());
         }
 
-        // Pi reports `content.length` — JS string length = UTF-16 code units — not the UTF-8 byte
-        // count, and uses the verb "Successfully wrote" (write.ts:222). Match both exactly.
-        let len_utf16 = input.content.encode_utf16().count();
+        // Pi reports `Successfully wrote to ${path}` (write.ts:86 @v0.87.1). Through v0.84.4 it
+        // carried `${content.length} bytes` — a UTF-16 code-unit count mislabelled as bytes —
+        // and v0.85.0 removed the count rather than correcting it, so no number is reported here.
         Ok(ToolResult {
             content: vec![Content::text(format!(
-                "Successfully wrote {len_utf16} bytes to {}",
+                "Successfully wrote to {}",
                 input.path
             ))],
             // Pi declares `ToolDefinition<…, undefined>` and returns `details: undefined`
-            // (write.ts:223) — it never emits write details. Mirror that with `None`.
+            // (write.ts:87 @v0.87.1) — it never emits write details. Mirror that with `None`.
             details: None,
             ..Default::default()
         })

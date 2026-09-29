@@ -4,6 +4,7 @@
 //! capabilities to a pluggable [`HostServices`] backend. The default backend denies all interactive
 //! capability (no ambient authority, R-ARCH-EXT-011); the session service injects a real one.
 
+use crate::error::ExtError;
 use crate::event::{EventKind, Subscriptions};
 use crate::manifest::Capabilities;
 use crate::native::{CtxTier, ExtMode};
@@ -1725,6 +1726,16 @@ pub struct GuestState {
     /// `<LiveExtension as Extension>::subscriptions` on every dispatch, so a `subscribe` from a
     /// live handler is honoured on the next event (EXT-058) — never snapshotted after `init`.
     subs: Mutex<Subscriptions>,
+    /// EXT-082 — registrations refused while `init` runs. pi's `registerTool`/`registerFlag` THROW
+    /// inside the factory (`core/extensions/loader.ts:274-279` / `:312-316` @v0.87.1), failing the
+    /// load; the `registration.*` imports return `()`, so the refusal is collected here and
+    /// [`crate::host::LiveExtension::load`] fails the load with it once `init` returns. `Some` while
+    /// `init` runs; [`Self::finish_init_registrations`] leaves it `None`, after which a refusal from
+    /// a live handler has no load to fail and is logged instead.
+    registration_errors: Mutex<Option<Vec<String>>>,
+    /// The host-wide UI-prompt window this guest's `ui.*` prompts open (EXT-075). `None` for a
+    /// guest built outside an [`crate::ExtensionHost`] (tests), which then emits nothing.
+    ui_prompts: Option<Arc<crate::ui_prompt::UiPromptTracker>>,
     /// Flags registered via `register-flag` (name -> spec JSON).
     flags: Mutex<HashMap<String, Value>>,
     /// Autocomplete providers added via `add-autocomplete` (command names).
@@ -1928,6 +1939,8 @@ impl GuestState {
             has_ui: true,
             tier: Mutex::new(CtxTier::Command), // init runs at command tier (load time)
             subs: Mutex::new(Subscriptions::empty()),
+            registration_errors: Mutex::new(Some(Vec::new())),
+            ui_prompts: None,
             flags: Mutex::new(HashMap::new()),
             autocomplete: Mutex::new(Vec::new()),
             renderers: Mutex::new(Vec::new()),
@@ -2147,6 +2160,26 @@ impl GuestState {
         self
     }
 
+    /// Share the host's UI-prompt window (EXT-075). Called by the facade before `init`.
+    #[must_use]
+    pub fn with_ui_prompts(mut self, tracker: Arc<crate::ui_prompt::UiPromptTracker>) -> Self {
+        self.ui_prompts = Some(tracker);
+        self
+    }
+
+    /// Open the UI-prompt window for one of this guest's blocking `ui.*` prompts (pi
+    /// `withUIPrompt`, `core/extensions/runner.ts:539-566` @v0.87.1). This guest is the prompter, so
+    /// it is held out of the delivery (see [`crate::ui_prompt`]).
+    pub fn begin_ui_prompt(
+        &self,
+        kind: crate::ui_prompt::UiPromptKind,
+        title: Option<&str>,
+    ) -> Option<crate::ui_prompt::UiPromptGuard> {
+        self.ui_prompts
+            .as_ref()
+            .map(|t| t.begin(kind, title, Some(self.owner.clone())))
+    }
+
     /// The shared bus this guest is wired to (host uses it to find subscribers + drain emits).
     pub fn bus(&self) -> &Arc<SharedBus> {
         &self.bus
@@ -2170,8 +2203,9 @@ impl GuestState {
     /// (`extensions/loader.ts:208-214` @v0.84.1), which sets a one-shot `staleMessage` and then runs
     /// every tracked event-bus unsubscribe and clears the set.
     ///
-    /// Called when the instance leaves the host's live map ([`crate::ExtensionHost::reload`]), which
-    /// is cyrup's structural equivalent of the session replacement / reload pi invalidates on. Both
+    /// Called when the instance's session is torn down ([`crate::ExtensionHost::invalidate_live`],
+    /// from `AgentSession::dispose_with`), cyrup's structural equivalent of the session replacement
+    /// / reload pi invalidates on. Both
     /// halves are ported: the flag, and the subscription teardown — which here is
     /// [`SharedBus::unsubscribe_all`] for this owner rather than a set of closures, because cyrup's
     /// bus keys subscriptions by `(owner, topic)` instead of handing back an unsubscribe function.
@@ -2265,11 +2299,50 @@ impl GuestState {
         }
     }
 
+    /// Clear `kind` from this guest's live bitset (the `unsubscribe` import, EXT-080). The
+    /// dispatcher reads the bitset per dispatch and snapshots its subscribers before calling any of
+    /// them, so a removal made inside a handler applies from the NEXT dispatch — pi's
+    /// `snapshotEventHandlers` rule (`core/extensions/runner.ts:265-267` @v0.87.1).
+    pub fn remove_subscription(&self, kind: EventKind) {
+        if let Ok(mut g) = self.subs.lock() {
+            g.remove(kind);
+        }
+    }
+
     pub fn subscriptions(&self) -> Subscriptions {
         self.subs
             .lock()
             .map(|g| *g)
             .unwrap_or_else(|_| Subscriptions::empty())
+    }
+
+    /// Record a registration the registry refused (EXT-082). During `init` it is kept for
+    /// [`Self::finish_init_registrations`]; afterwards it is logged, because a live handler's
+    /// registration has no load left to fail and the import has no error channel.
+    pub fn note_registration_error(&self, error: &ExtError) {
+        if let Ok(mut g) = self.registration_errors.lock()
+            && let Some(errors) = g.as_mut()
+        {
+            errors.push(error.to_string());
+            return;
+        }
+        tracing::warn!(extension = %self.owner, %error, "extension registration refused");
+    }
+
+    /// Close the `init` window and fail the load if any registration was refused inside it — pi's
+    /// throwing factory (EXT-082). The FIRST refusal is the error, as in pi, where the first throw
+    /// ends the factory.
+    pub fn finish_init_registrations(&self) -> Result<(), ExtError> {
+        let errors = self
+            .registration_errors
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+            .unwrap_or_default();
+        match errors.into_iter().next() {
+            Some(first) => Err(ExtError::Registration(first)),
+            None => Ok(()),
+        }
     }
 
     pub fn set_flag(&self, name: String, spec: Value) {

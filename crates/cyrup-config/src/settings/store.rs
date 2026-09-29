@@ -27,6 +27,12 @@ pub trait SettingsStore: Send + Sync {
     /// Read the current raw text for a scope (`None` if absent).
     fn read(&self, scope: SettingsScope) -> Result<Option<String>, ConfigError>;
 
+    /// The file a scope is stored in, when there is one (Pi's `settingsPaths`, carried onto each
+    /// `SettingsError` so the diagnostic can name the file). `None` for a store with no file.
+    fn location(&self, _scope: SettingsScope) -> Option<PathBuf> {
+        None
+    }
+
     /// Serialized read-modify-write. `f` receives the current text (None if absent) and returns
     /// `Some(new)` to write or `None` to leave untouched.
     ///
@@ -68,6 +74,10 @@ impl FileSettingsStore {
 
 #[async_trait::async_trait]
 impl SettingsStore for FileSettingsStore {
+    fn location(&self, scope: SettingsScope) -> Option<PathBuf> {
+        Some(self.path(scope).to_path_buf())
+    }
+
     fn read(&self, scope: SettingsScope) -> Result<Option<String>, ConfigError> {
         let path = self.path(scope);
         match std::fs::read_to_string(path) {

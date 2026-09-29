@@ -70,7 +70,15 @@ pub enum SessionDagKind {
     ThinkingChange,
     /// A `compaction` or `branch_summary` entry (`✓`).
     Compaction,
-    /// Anything else (`session_info`/`label`/`custom`/unknown) — rendered as a message.
+    /// A settings/bookkeeping entry — `label`, `custom`, `session_info` or `context_edit` — which
+    /// pi's `/tree` hides in its `default` and `no-tools` views (`isSettingsEntry`,
+    /// `tree-selector.ts:355-361` @v0.87.1). `model_change` and `thinking_level_change` belong to
+    /// the same class upstream and keep their own kinds only for their glyphs.
+    Settings,
+    /// A pi v0.86+ cache-warm `usage` entry, which pi's `/tree` never shows in any filter mode
+    /// (`if (entry.type === "usage") return false;`, `tree-selector.ts:341` @v0.87.1).
+    Usage,
+    /// Anything else (`custom_message`, an unrecognised entry type) — rendered as a message.
     Other,
 }
 
@@ -96,9 +104,14 @@ pub struct SessionDagNode {
     pub foldable: bool,
     /// Whether this node is the current branch leaf (the active tip).
     pub is_leaf: bool,
-    /// Whether the entry carries a user label (renders the `☆` star).
-    pub has_label: bool,
-    /// The entry's RFC3339 timestamp (drives the right-aligned time column).
+    /// The entry's user label — Pi `SessionTreeNode.label` (`session-manager.ts:163` @v0.87.1),
+    /// rendered by the tree as a `[label] ` prefix ahead of the entry text (`tree-selector.ts:745`).
+    /// Kept apart from [`Self::label`] so the renderer can compose pi's row itself.
+    pub user_label: Option<String>,
+    /// When the label was set — Pi `SessionTreeNode.labelTimestamp` (`session-manager.ts:165`), the
+    /// label entry's RFC3339 timestamp. `None` without a label.
+    pub label_timestamp: Option<String>,
+    /// The entry's own RFC3339 timestamp.
     pub timestamp: String,
 }
 

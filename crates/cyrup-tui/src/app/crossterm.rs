@@ -38,7 +38,7 @@ pub(crate) fn run_editor_over_file(editor_cmd: &str, path: &std::path::Path) -> 
     None
 }
 
-impl App<InlineBackend<Stdout>> {
+impl App<InlineBackend<TuiStdout>> {
     /// Build the production app: raw mode on, bracketed paste + Kitty keyboard flags enabled
     /// (best-effort, with graceful fallback, R-ARCH-TUI-008), inline viewport on stdout.
     ///
@@ -49,8 +49,12 @@ impl App<InlineBackend<Stdout>> {
     /// (`interactive-mode.ts:3684-3686`, handler at `:3622-3638`).
     pub fn into_stdout(theme: UiTheme) -> Result<Self, TuiError> {
         crate::panic_hook::install_panic_hook();
+        // pi's `registerSignalHandlers` installs the stdout/stderr dead-terminal handler for the
+        // whole interactive session (`interactive-mode.ts:4252-4261`, TUI-S02); from here on a
+        // write that fails with EIO/EPIPE/ENOTCONN exits 129 instead of restoring into a dead fd.
+        crate::dead_terminal::arm();
         enable_raw_mode()?;
-        let mut out = io::stdout();
+        let mut out = crate::dead_terminal::terminal_stdout();
         out.execute(ratatui::crossterm::event::EnableBracketedPaste)?;
         // Kitty keyboard protocol where supported; ignore failure (legacy terminals). The flag
         // set is `crate::keyboard_protocol::DESIRED_FLAGS` — Pi's
@@ -81,7 +85,13 @@ impl App<InlineBackend<Stdout>> {
         let probed_row = crate::terminal_query::StdinTerminalProbe
             .query_cursor_position(crate::terminal_query::CURSOR_POSITION_TIMEOUT)
             .map(|(_, row)| row);
-        let mut backend = InlineBackend::with_anchor(out, ratatui::layout::Position::ORIGIN);
+        // Frames go through the TUI's own write channel, which `CYRUP_TUI_WRITE_LOG` tees (pi
+        // `ProcessTerminal.write`, TUI-040); the mode writes above stay on plain stdout, as pi's
+        // `process.stdout.write` ones do.
+        let mut backend = InlineBackend::with_anchor(
+            crate::write_log::tui_stdout(),
+            ratatui::layout::Position::ORIGIN,
+        );
         // A silent/absent terminal falls back to the bottom row — where `App::draw`'s first
         // `resize_viewport` bottom-anchors the region anyway (`reanchor_inline_region` with
         // `old_height` 0).
@@ -105,7 +115,9 @@ impl App<InlineBackend<Stdout>> {
         // EVERY run-loop arm that can have changed the state. Draining makes it once-per-transition
         // rather than once-per-frame.
         self.flush_terminal_progress();
-        let mut out = io::stdout();
+        // pi's markers are part of the frame buffer it hands `terminal.write`, so they are logged
+        // with it (TUI-040).
+        let mut out = crate::write_log::tui_stdout();
         let _ = out.execute(BeginSynchronizedUpdate);
         let res = self.draw();
         let _ = out.execute(EndSynchronizedUpdate);
@@ -141,10 +153,10 @@ impl App<InlineBackend<Stdout>> {
         // NOT re-negotiated: the crossterm reader thread is live by now, so a `CSI ? u` reply would
         // race it (`crate::keyboard_protocol` module docs). The startup decision still stands.
         enable_raw_mode()?;
-        let mut out = io::stdout();
+        let mut out = crate::dead_terminal::terminal_stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
         let _ = crate::keyboard_protocol::push_flags(&mut out);
-        let _ = self.terminal.clear();
+        self.reset_render_state();
         self.draw_synchronized()
     }
 
@@ -237,10 +249,10 @@ impl App<InlineBackend<Stdout>> {
         // Re-enter raw mode + bracketed paste + Kitty flags; the caller redraws. Re-pushed, never
         // re-negotiated — same reason as `suspend` above.
         enable_raw_mode()?;
-        let mut out = io::stdout();
+        let mut out = crate::dead_terminal::terminal_stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
         let _ = crate::keyboard_protocol::push_flags(&mut out);
-        let _ = self.terminal.clear();
+        self.reset_render_state();
         Ok(result)
     }
 }

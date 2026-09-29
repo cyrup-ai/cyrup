@@ -71,6 +71,9 @@ pub(super) fn build_headers(model: &Model, opts: &StreamOptions, api_key: &str) 
     {
         headers.insert("x-affinity".to_string(), Some(sid.to_string()));
     }
+    // PROV-095: `new Headers({ "User-Agent": getPiUserAgent(), … })` before both overrides
+    // (mistral-conversations.ts:337-345 @v0.87.1) — the default sits under every overlay.
+    crate::utils::user_agent::insert_default_user_agent(&mut headers);
 
     headers
 }

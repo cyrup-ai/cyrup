@@ -407,10 +407,12 @@ fn send_sigterm(child: &Child) -> bool {
 /// On Unix that means [`send_signal`]'s `kill(-pgid, SIGKILL)` whenever the child leads its own
 /// group, which a [`crate::spawn::SpawnedChild`] always does. On non-Unix it means upstream's own
 /// win32 tree kill — pi `killProcessTree` runs
-/// `spawn("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", detached: true,
-/// windowsHide: true })` (`packages/coding-agent/src/utils/shell.ts:200-212` @v0.83.0), the `/T`
-/// being precisely the tree flag — fire-and-forget, exactly as upstream leaves it, since the
-/// `child.wait()` in [`terminate_with_graces`] is what actually confirms the death.
+/// `spawn(join(SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/F", "/T", "/PID",
+/// String(pid)], { stdio: "ignore", detached: true, windowsHide: true })`
+/// (`packages/coding-agent/src/utils/shell.ts:218-230` @v0.87.1; the bare `"taskkill"` of v0.83.0
+/// became the System32 path in v0.84.4, TOOL-051), the `/T` being precisely the tree flag —
+/// fire-and-forget, exactly as upstream leaves it, since the `child.wait()` in
+/// [`terminate_with_graces`] is what actually confirms the death.
 ///
 /// `tokio::process::Child::start_kill` still runs afterward as the backstop, but it is NOT the
 /// tree kill and must never be mistaken for one: it is `TerminateProcess` against the DIRECT pid
@@ -433,7 +435,7 @@ pub(crate) fn send_sigkill(child: &mut Child) {
             // the confirmation of death is the caller's own `child.wait()`, not this command's
             // exit code, and `taskkill` failing (the tree already gone) is the benign, expected
             // race — the same one the Unix arm swallows as `ESRCH`.
-            let _ = std::process::Command::new("taskkill")
+            let _ = std::process::Command::new(cyrup_tools::ops::taskkill_program())
                 .args(win32_tree_kill_argv(pid))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())

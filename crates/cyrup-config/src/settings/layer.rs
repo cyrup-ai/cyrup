@@ -21,7 +21,10 @@ use super::types::PackageSource;
 ///   was missing, so a project `.cyrup/settings.json` could rewrite the session's egress. Note the
 ///   neighbouring `httpIdleTimeoutMs` IS merged upstream (`getHttpIdleTimeoutMs` reads
 ///   `this.settings`) — this is a per-key upstream decision, not a category.
-const GLOBAL_ONLY_KEYS: &[&str] = &["defaultProjectTrust", "httpProxy"];
+/// - `cacheWarming` — `getCacheWarmingMode()` reads `this.globalSettings.cacheWarming`
+///   (`settings-manager.ts:954-958` @v0.87.1, v0.86.0), "global only because each refresh costs
+///   money" (`:157`). CFG-093.
+const GLOBAL_ONLY_KEYS: &[&str] = &["defaultProjectTrust", "httpProxy", "cacheWarming"];
 
 /// A settings document (one scope). Wraps a JSON object so unknown / not-yet-modelled keys are
 /// preserved across a load→save round-trip (R-07-004).

@@ -24,8 +24,13 @@
 //!
 //! **Mechanism divergence from `lazyOAuth`.** Upstream defers loading the flow module because a
 //! *variable* dynamic `import()` is what keeps Node-only code (`node:http` callback servers,
-//! `node:crypto` PKCE) out of a browser bundle — see the note at the head of
-//! [`crate::auth::oauth::load`]. Rust links statically, so there is nothing to defer: every flow
+//! `node:crypto` PKCE) out of a browser bundle (`ai/src/auth/oauth/load.ts:3-12` @v0.87.1). Its
+//! `registerBundledOAuthFlowLoaders` (`:27-30`) is the escape hatch for the one build that *is*
+//! fully bundled — the standalone Bun binary, whose `registerBunOAuthFlows`
+//! (`ai/src/bun-oauth.ts:12-23`) registers every flow as a constant, `anthropic: () =>
+//! anthropicOAuth`. A Rust binary is always that build: every flow is linked in, so this match —
+//! with the two self-wired flows above — IS `bun-oauth.ts`'s table (less `meta`, which PROV-080
+//! has not ported), and `load.ts` has nothing left to do: it is not ported. Every flow
 //! constructor here is a field assignment with no I/O, and the eager value additionally makes
 //! `name`/`login_label`/`is_subscription` readable without a fallible load, which is exactly what
 //! upstream's eager `name`/`isSubscription`/`loginLabel` copy on the lazy wrapper
@@ -34,9 +39,8 @@
 use crate::auth::OAuthAuth;
 use crate::auth::oauth::anthropic::AnthropicOAuth;
 use crate::auth::oauth::kimi_coding::KimiCodingOAuth;
-use crate::auth::oauth::load::RadiusOptions;
 use crate::auth::oauth::openrouter::OpenRouterOAuth;
-use crate::auth::oauth::radius::RadiusOAuth;
+use crate::auth::oauth::radius::{RadiusOAuth, RadiusOptions};
 use crate::auth::oauth::xai::XaiOAuth;
 use std::sync::Arc;
 

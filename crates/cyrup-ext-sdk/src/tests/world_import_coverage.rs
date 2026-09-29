@@ -263,7 +263,7 @@ fn crate_root_doc_states_the_real_event_count() {
     // than an empty or truncated match that would make the count below meaningless.
     assert!(
         kind_mod.contains("TOOL_CALL: u8 = 0;")
-            && kind_mod.contains("SESSION_INFO_CHANGED: u8 = 32;"),
+            && kind_mod.contains("CONTEXT_WITH_SYSTEM: u8 = 35;"),
         "the `mod kind` slice lost its first or last discriminant, so this guard would be vacuous"
     );
 
@@ -455,10 +455,10 @@ fn every_numbered_macro_export_matches_its_mod_kind_discriminant() {
     }
     // Non-vacuity, the shape `every_ctx_submodule_is_in_sdk_sources` uses: the loops above are all
     // satisfied trivially by a parse that finds nothing, so the COUNT is the only evidence this
-    // guard read the macro at all. 33 is the full event catalog (`EventKind::COUNT`), so the floor
+    // guard read the macro at all. 36 is the full event catalog (`EventKind::COUNT`), so the floor
     // also catches an export that is deleted rather than renumbered.
     assert!(
-        paired >= 33,
+        paired >= 36,
         "only {paired} numbered `on_*` export(s) were paired with an `api::kind` const — \
          src/macros.rs declares one per event kind, so this parse lost some and the guard is \
          checking almost nothing"

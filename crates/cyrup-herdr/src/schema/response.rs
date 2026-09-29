@@ -22,8 +22,8 @@ pub struct SuccessResponse {
 /// `ErrorResponse` (`tmp/herdr/src/api/schema/response.rs:30-33`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ErrorResponse {
-    /// The `id` from the request, echoed — **or empty**, when herdr could not recover one because
-    /// the line did not deserialise (`tmp/herdr/src/api/server.rs:180-201`). An uncorrelated
+    /// The `id` from the request, echoed — **or empty**, which herdr writes for every line that
+    /// does not deserialise as a `Request` (`tmp/herdr/src/api/server.rs:179-191`). An uncorrelated
     /// `{"id":"","error":{"code":"invalid_request",…}}` is still an answer and still ends the call;
     /// waiting for a correlated one would hang to the deadline.
     pub id: String,
@@ -53,7 +53,7 @@ pub struct ErrorBody {
 #[non_exhaustive]
 pub enum ResponseResult {
     /// The answer to `ping` (`tmp/herdr/src/api/schema/response.rs:45-50`, produced at
-    /// `tmp/herdr/src/api/server.rs:356-363`).
+    /// `tmp/herdr/src/api/server.rs:343-350`).
     ///
     /// `version` and `protocol` are **required**. The docs' `{"id":"req_1","result":{"type":"pong"}}`
     /// (`socket-api.mdx:670`) is abridged; a real server always sends all three keys.
@@ -168,7 +168,7 @@ pub enum ResponseResult {
         read: PaneReadResult,
     },
     /// The **first** line of an `events.subscribe` stream (`response.rs:214`, produced at
-    /// `tmp/herdr/src/api/server.rs:749-760`).
+    /// `tmp/herdr/src/api/server.rs:734-745`).
     ///
     /// It is an acknowledgement, not a result: every later line on that connection is a pushed
     /// [`super::events::Event`] with **no `id` field at all**
@@ -188,7 +188,7 @@ pub enum ResponseResult {
         /// The content revision the match was seen at — **`0` at this pin.** `wait.rs:98` copies
         /// it out of the `PaneReadResult` the wait just read (`let revision = read.revision;`),
         /// and that read is the same `pane.read` dispatch that hard-codes `revision: 0`
-        /// (`tmp/herdr/src/app/api/panes.rs:1540`). It is dead like every other
+        /// (`tmp/herdr/src/app/api/panes.rs:1524`). It is dead like every other
         /// pane-read-derived `revision`, and unlike [`super::panes::PaneInfo::revision`], which is
         /// the terminal's live counter. See [`super::panes::PaneReadResult`].
         revision: u64,
@@ -214,7 +214,7 @@ pub enum ResponseResult {
     ///
     /// **It is never a success.** Every typed accessor turns it into
     /// [`crate::HerdrError::UnexpectedResult`] — herdr's own client does the same
-    /// (`tmp/herdr/src/api/client.rs:119`).
+    /// (`tmp/herdr/src/api/client.rs:92`).
     #[serde(other)]
     Unrecognised,
 }
@@ -499,7 +499,7 @@ impl ResponseResult {
 /// The two shapes a herdr answer line can take.
 ///
 /// herdr's own client declares this as `#[serde(untagged)]` over success-then-error
-/// (`tmp/herdr/src/api/client.rs:231-236`). **This one does not, and the difference is a
+/// (`tmp/herdr/src/api/client.rs:176-181`). **This one does not, and the difference is a
 /// diagnostic one** — `[CYRUP-EXCEEDS-UPSTREAM]`.
 ///
 /// *Premise:* an untagged enum reports every failure as the single string
@@ -510,8 +510,8 @@ impl ResponseResult {
 /// protocol: *nothing*. That is the one failure mode this crate exists to not have.
 ///
 /// [`Self::decode`] therefore dispatches on the key that is actually discriminating — herdr's
-/// server writes `error` or `result`, never both (`tmp/herdr/src/api/server.rs:180-201` versus
-/// `:301`) — and then decodes **one** arm, so the error that reaches
+/// server writes `error` or `result`, never both (`tmp/herdr/src/api/server.rs:179-191` versus
+/// `:288`) — and then decodes **one** arm, so the error that reaches
 /// [`crate::HerdrError::Malformed`] is serde's own: `missing field \`terminal_id\` at line 1
 /// column 84`.
 #[derive(Debug, Clone, PartialEq)]

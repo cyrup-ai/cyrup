@@ -437,6 +437,9 @@ pub fn build_headers(
             headers.insert(name.clone(), value.clone());
         }
     }
+    // PROV-095: `{ "User-Agent": getPiUserAgent(), ...model.headers, ...optionsHeaders }`
+    // (google-vertex.ts:398 @v0.87.1) — the default sits under every overlay.
+    crate::utils::user_agent::insert_default_user_agent(&mut headers);
     headers
 }
 
@@ -684,6 +687,20 @@ mod tests {
             Some("b")
         );
         assert_eq!(headers.get("content-type"), Some(&None));
+    }
+
+    /// PROV-095 — pi `{ "User-Agent": getPiUserAgent(), ...model.headers, ...optionsHeaders }`
+    /// (google-vertex.ts:398 @v0.87.1, #8305): a default client User-Agent under every overlay.
+    #[test]
+    fn default_user_agent_sits_under_the_overlays() {
+        let model = vertex_model("gemini-2.5-pro");
+        crate::utils::user_agent::assert_default_user_agent_under_overlays(|overlay| {
+            let opts = StreamOptions {
+                headers: overlay,
+                ..Default::default()
+            };
+            build_headers(&model, &opts, None, Some("tok"))
+        });
     }
 
     // ------------------------------------------------------------------ registration

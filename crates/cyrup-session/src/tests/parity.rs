@@ -377,6 +377,7 @@ fn assistant_text(s: &str) -> cyrup_core::AssistantMessage {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     }
 }
@@ -464,6 +465,7 @@ fn gap17_serialize_separators_json_args_and_skips_empty() {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     });
     // An empty user message must NOT emit a "[User]: " line.
@@ -514,9 +516,30 @@ fn gap19_20_prompts_are_pi_verbatim() {
         UPDATE_SUMMARIZATION_PROMPT
             .contains("The messages above are NEW conversation messages to incorporate")
     );
-    assert!(
-        TURN_PREFIX_SUMMARIZATION_PROMPT
-            .starts_with("This is the PREFIX of a turn that was too large to keep.")
+    // SESS-053 — byte-equal to pi v0.87.1 (`compaction.ts:964-977`, rewritten for #9908).
+    assert_eq!(
+        TURN_PREFIX_SUMMARIZATION_PROMPT,
+        [
+            "The messages above are earlier context from an ongoing conversation. Later messages \
+             are stored separately and do not need to be reconstructed.",
+            "",
+            "Create a concise checkpoint of the user's request and the progress shown above. This \
+             checkpoint will be placed before the later messages so the conversation can continue \
+             with the necessary context.",
+            "",
+            "## Original Request",
+            "[What did the user ask for?]",
+            "",
+            "## Progress So Far",
+            "- [Key decisions and work completed in these messages]",
+            "",
+            "## Context Needed to Continue",
+            "- [Information from these messages needed to understand the later work]",
+            "",
+            "Only summarize information explicitly present above. Do not infer or recreate later \
+             messages.",
+        ]
+        .join("\n")
     );
     // The branch prompt has NO Critical Context section (unlike compaction).
     assert!(
@@ -999,6 +1022,7 @@ fn asst_toolcall(name: &str, key: &str, path: &str) -> Message {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     })
 }

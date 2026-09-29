@@ -435,3 +435,73 @@ async fn symlinked_duplicate_skill_collapses_without_collision() {
         "symlinked duplicate of the same file is not a collision (G7)"
     );
 }
+
+/// CFG-086 — pi's `loadSkillFromFile` (`core/skills.ts:277-345` @v0.87.1, v0.84.3 #7805) treats
+/// only a file named `SKILL.md` as a declared skill: a loose root `.md` with no string description
+/// (a README) or with YAML that does not parse is skipped with NO diagnostic, while a declared
+/// `SKILL.md` with broken YAML still warns; and a non-string `name` falls back to the directory
+/// name instead of failing the parse.
+#[tokio::test]
+async fn loose_root_markdown_is_not_a_broken_skill_and_name_is_type_guarded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let skills = root.join("global/skills");
+    write(&skills.join("README.md"), "# My skills\n\nNotes.\n");
+    write(
+        &skills.join("bad.md"),
+        "---\ndescription: [unclosed\n---\nbody\n",
+    );
+    write(
+        &skills.join("x/SKILL.md"),
+        "---\ndescription: [unclosed\n---\nbody\n",
+    );
+    write(
+        &skills.join("y/SKILL.md"),
+        "---\nname: 123\ndescription: does y\n---\nbody\n",
+    );
+    // Keys yaml reads as numbers or booleans are plain object keys to pi, so they cannot cost
+    // the skill.
+    write(
+        &skills.join("z/SKILL.md"),
+        "---\ndescription: does z\n1: one\ntrue: yes\n---\nbody\n",
+    );
+    // A loose `.md` that DOES carry a string description is still a skill (`:308-311`).
+    write(
+        &skills.join("loose.md"),
+        "---\nname: loose\ndescription: a loose skill\n---\nbody\n",
+    );
+
+    let report = run_discover(&cfg(root)).await;
+
+    let names: Vec<&str> = report
+        .registry
+        .skills
+        .winners()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"y"),
+        "`name: 123` falls back to the dir: {names:?}"
+    );
+    assert!(names.contains(&"loose"), "{names:?}");
+    assert!(names.contains(&"z"), "{names:?}");
+    assert!(!names.contains(&"README"), "{names:?}");
+    assert!(!names.contains(&"bad"), "{names:?}");
+    assert!(!names.contains(&"x"), "{names:?}");
+
+    let skill_reports: Vec<String> = report
+        .warnings
+        .iter()
+        .filter(|w| matches!(w.kind, crate::ResourceKind::Skill))
+        .map(|w| w.path.display().to_string())
+        .chain(
+            report
+                .diagnostics
+                .iter()
+                .filter(|d| matches!(d.resource_type, crate::ResourceKind::Skill))
+                .map(|d| d.path.display().to_string()),
+        )
+        .collect();
+    assert_eq!(skill_reports.len(), 1, "{skill_reports:?}");
+    assert!(skill_reports[0].ends_with("x/SKILL.md"));
+}

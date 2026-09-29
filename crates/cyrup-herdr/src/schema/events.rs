@@ -142,7 +142,7 @@ impl OutputMatch {
 /// `EventsSubscribeParams` (`tmp/herdr/src/api/schema/events.rs:11-14`).
 ///
 /// An empty `subscriptions` list is accepted by herdr and acknowledged
-/// (`stream_subscriptions`, `tmp/herdr/src/api/server.rs:715-757`, iterates an empty vector and
+/// (`stream_subscriptions`, `tmp/herdr/src/api/server.rs:701-742`, iterates an empty vector and
 /// writes the ack), which gives a stream that never yields an event. It is not an error and is not
 /// refused here either — a caller that wants nothing has said so.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -523,7 +523,7 @@ pub struct PaneOutputMatchedEvent {
     /// pane-read-derived `revision` at this pin: `ActiveOutputMatchedSubscription::poll`
     /// (`tmp/herdr/src/api/subscriptions.rs:295-320`) builds this event from `pane_read`
     /// (`:493-515`), which dispatches `Method::PaneRead` to the one handler that hard-codes
-    /// `revision: 0` (`tmp/herdr/src/app/api/panes.rs:1540`). See
+    /// `revision: 0` (`tmp/herdr/src/app/api/panes.rs:1524`). See
     /// [`super::panes::PaneReadResult`] — and [`super::panes::PaneInfo::revision`] for the one
     /// herdr does advance.
     pub read: PaneReadResult,

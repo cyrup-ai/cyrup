@@ -313,8 +313,9 @@ fn tool_execution_update_and_end_carry_the_tool_name_and_the_update_carries_args
 fn before_provider_headers_patches_in_place_and_a_null_value_deletes_the_header() {
     assert_eq!(
         EventKind::COUNT,
-        33,
-        "31 + before_provider_headers + session_info_changed"
+        36,
+        "31 + before_provider_headers + session_info_changed + ui_prompt_start + ui_prompt_end \
+         + context_with_system"
     );
     assert_eq!(
         EventKind::from_u8(31),
@@ -326,7 +327,11 @@ fn before_provider_headers_patches_in_place_and_a_null_value_deletes_the_header(
     );
     assert_eq!(EventKind::from_u8(32), Some(EventKind::SessionInfoChanged));
     assert_eq!(EventKind::SessionInfoChanged.name(), "session_info_changed");
-    assert_eq!(EventKind::from_u8(33), None, "COUNT is the exclusive bound");
+    assert_eq!(
+        EventKind::from_u8(EventKind::COUNT),
+        None,
+        "COUNT is the exclusive bound"
+    );
 
     let mut ev = HostEvent::BeforeProviderHeaders {
         headers: json!({ "authorization": "Bearer x", "x-trace": "keep" }),
@@ -1208,7 +1213,7 @@ impl NativeExtension for BashRedirect {
 ///  2. `cyrup-ext` carries a `handled` payload through `decode_outcome`
 ///     (`host/live.rs`: `HookOutcome::Handled(s)` -> `serde_json::from_str` VERBATIM, with no
 ///     per-event key filter — `decode_patch`'s per-kind shaping applies to `mutate` only) and out of
-///     [`ExtensionHost::emit_user_bash`] as the whole `UserBashReduction::Handled`'s `value`.
+///     [`ExtensionHost::emit_user_bash_for`] as the whole `UserBashReduction::Handled`'s `value`.
 ///
 /// The drop used to be downstream of both, in `cyrup-session-svc`. It no longer is: `BashOptions`
 /// has an `operations` field and `execute_bash_with_user_event` fills it from the winning
@@ -1237,7 +1242,9 @@ async fn user_bash_reduction_carries_the_operations_half_not_only_the_result_hal
         .await
         .unwrap();
 
-        let reduced = host.emit_user_bash("uname -a", &CancelToken::new()).await;
+        let reduced = host
+            .emit_user_bash_for("uname -a", false, ".", &CancelToken::new())
+            .await;
 
         assert_eq!(
             seen.lock().unwrap().len(),

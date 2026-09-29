@@ -273,6 +273,9 @@ directory — `~/.cyrup/agent/intercom/` by default, moved by either `CYRUP_AGEN
 |---|---|---|
 | `CYRUP_TIMING` | exactly `1` | Emit startup phase timings |
 | `CYRUP_STARTUP_BENCHMARK` | truthy | Startup benchmarking mode |
+| `CYRUP_TUI_DEBUG` | exactly `1` | Write one `/tmp/tui/render-<ms>-<id>.log` per diffed inline frame that changes a row: the frame's decision state, then its rows and the previous frame's rows. Full repaints and unchanged frames write nothing |
+| `CYRUP_TUI_DEBUG_REDRAW` | exactly `1` | Append one `fullRender: <reason> (prev=…, new=…, height=…)` line per full repaint of the inline region to `<agent dir>/cyrup-tui-debug.log` |
+| `CYRUP_TUI_WRITE_LOG` | a path | Capture the raw ANSI stream the interface writes — every frame, the fullscreen mode's writes and the interface's terminal queries. An existing directory gets one `tui-<YYYY-MM-DD_HH-MM-SS>-<pid>.log` per session, stamped in local time; any other value is the log file itself, appended to |
 
 ## Variables cyrup sets for you — outputs
 
@@ -305,6 +308,9 @@ agent processes. They are process plumbing, not configuration; do not set them y
 | `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy` | Proxy URL. See below |
 | `NO_PROXY`, `ALL_PROXY` | Proxy exemptions and the scheme-agnostic fallback. See below |
 | `HOME` | The home directory, used to derive `~/.cyrup/agent` when no agent-dir variable is set |
+| `WSL_DISTRO_NAME`, `WSL_INTEROP` | Either one set on Linux selects the Windows keybinding defaults: `alt+p` model cycle backward, `ctrl+q` follow-up, `alt+q` dequeue, `alt+z` undo, and bare `ctrl+up`/`ctrl+down` fullscreen prompt jumps |
+| `WT_SESSION`, `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` | Windows Terminal (and none of the three SSH variables) makes a raw `0x08` byte mean Ctrl+Backspace; anywhere else it means Backspace |
+| `DISPLAY`, `TERMUX_VERSION` | The native clipboard is used on Linux only with an X11 `DISPLAY`; under Termux the Ctrl+V image read is skipped |
 
 ### The proxy variables
 

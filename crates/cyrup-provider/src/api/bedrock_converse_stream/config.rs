@@ -248,6 +248,13 @@ fn arn_region(model_id: &str) -> Option<String> {
 /// `AWS_CONFIG_FILE`, exactly as the SDK does. Role assumption / SSO / IMDS are **not** ported;
 /// a profile that needs one resolves to `None` here and the request is sent unsigned-credentialed,
 /// which surfaces as the provider's own auth error rather than a silent wrong-identity request.
+///
+/// `[CYRUP-DELTA]` (CFG-070) — neither env name appears in pi's source: pi hands `profile` to
+/// `@aws-sdk/client-bedrock-runtime` (`api/bedrock-converse-stream.ts:24`, `:160-162` @v0.87.1),
+/// whose default credential chain reads both variables itself. cyrup links no AWS SDK, so this
+/// function IS that chain's shared-file step, and the two reads are what keep a relocated
+/// credentials/config file working as it does under pi. They are SDK behaviour reimplemented on
+/// purpose, not a cyrup invention — do not remove them for name-level parity.
 pub(super) fn shared_profile_credentials(
     profile: &str,
     env: &EnvSource<'_>,

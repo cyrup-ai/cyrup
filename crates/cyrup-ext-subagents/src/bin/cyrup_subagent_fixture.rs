@@ -131,8 +131,10 @@ enum ScriptStep {
     },
     /// Sleep for `ms` milliseconds before continuing to the next step.
     SleepMs { ms: u64 },
-    /// Play the role of a real child's `structured_output` TOOL CALL: write `value` verbatim, as
-    /// JSON, to the capture path the parent handed this process in
+    /// Play the role of a real child's `structured_output` TOOL CALL: report the call on stdout
+    /// (`tool_execution_start`/`tool_execution_end`, which is how the parent knows the tool was
+    /// invoked — SUBA-127) and write `value` verbatim, as JSON, to the capture path the parent
+    /// handed this process in
     /// `CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE` (pi `structured-output.ts:9`'s
     /// `PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE`; the child-side writer is
     /// `subagent-prompt-runtime.ts`'s registered `structured_output` tool).
@@ -317,18 +319,39 @@ fn emit_env_echo(names: &[String], out: &mut impl Write) {
 }
 
 /// [`ScriptStep::WriteStructuredOutput`]'s worker: write `value` to the parent-provided capture
-/// path. Absent env var => no-op (see the variant's own doc for why both degradations are correct).
-fn write_structured_output_capture(value: &serde_json::Value) {
+/// path, bracketed by the `tool_execution_start`/`tool_execution_end` pair a real child's
+/// `structured_output` call puts on stdout — the parent reads the capture only when it saw the tool
+/// invoked (pi `structuredOutputToolInvoked`, SUBA-127). Absent env var => no-op (see the variant's
+/// own doc for why both degradations are correct).
+fn write_structured_output_capture(value: &serde_json::Value, out: &mut impl Write) {
     let Some(path) = std::env::var_os(STRUCTURED_OUTPUT_CAPTURE_ENV) else {
         return;
     };
     let Ok(bytes) = serde_json::to_vec(value) else {
         return;
     };
+    const CALL_ID: &str = "fixture-structured-output";
+    let start = serde_json::json!({
+        "type": "tool_execution_start",
+        "toolCallId": CALL_ID,
+        "toolName": "structured_output",
+        "args": { "value": value },
+    });
+    let _ = writeln!(out, "{start}");
+    let _ = out.flush();
     if let Err(err) = std::fs::write(&path, bytes) {
         // stderr is diagnostic, never protocol data (R-SA-046).
         eprintln!("cyrup-subagent-fixture: failed to write structured output capture: {err}");
     }
+    let end = serde_json::json!({
+        "type": "tool_execution_end",
+        "toolCallId": CALL_ID,
+        "toolName": "structured_output",
+        "result": { "content": [{ "type": "text", "text": "Structured output captured." }] },
+        "isError": false,
+    });
+    let _ = writeln!(out, "{end}");
+    let _ = out.flush();
 }
 
 /// Install best-effort signal-ignoring handlers per the script's `ignore_sigint`/`ignore_sigterm`
@@ -448,7 +471,7 @@ async fn main() {
                 tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
             }
             ScriptStep::WriteStructuredOutput { value } => {
-                write_structured_output_capture(value);
+                write_structured_output_capture(value, &mut out);
             }
             ScriptStep::WriteToolDiagnostic { value } => {
                 if let Some(path) = std::env::var_os(TOOL_DIAGNOSTIC_PATH_ENV)

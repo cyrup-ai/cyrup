@@ -1,6 +1,6 @@
 //! A fake herdr API server: a real `UnixListener` in a tempdir speaking the real framing.
 //!
-//! It reproduces `handle_connection_with_stop` (`tmp/herdr/src/api/server.rs:156-317`) exactly
+//! It reproduces `handle_connection_with_stop` (`tmp/herdr/src/api/server.rs:156-304`) exactly
 //! where it matters and nowhere else: accept, read **one** `\n`-terminated line, write **one**
 //! `\n`-terminated line, close. No read loop, because herdr has none — a fake that answered twice
 //! on one connection would let a client that pipelines pass here and hang against a real herdr.
@@ -30,7 +30,7 @@ pub(crate) enum Reply {
     Line(String),
     /// Read the request, then hold the connection open forever without writing. This is the
     /// "herdr accepted but the UI never answered" case, which has **no** server-side deadline
-    /// (`tmp/herdr/src/api/server.rs:911-913` is a `recv()` with `None` timeout).
+    /// (`tmp/herdr/src/api/server.rs:896-898` is a `recv()` with `None` timeout).
     Silence,
     /// Close without writing anything.
     Close,
@@ -45,7 +45,7 @@ pub(crate) enum Reply {
     /// `\n`-terminated lines, at any time, and close whenever it likes.
     ///
     /// This is the only shape that can reproduce `events.subscribe`
-    /// (`tmp/herdr/src/api/server.rs:715-779`), where the first line is an acknowledgement and
+    /// (`tmp/herdr/src/api/server.rs:701-764`), where the first line is an acknowledgement and
     /// every later line is a pushed event on the same connection. `Line`/`After` cannot: they
     /// write once and close, which is every *other* method.
     Script(Arc<dyn Fn(StreamHandle) -> BoxFuture + Send + Sync>),
@@ -61,11 +61,11 @@ pub(crate) struct StreamHandle {
 
 impl StreamHandle {
     /// Write one `\n`-terminated line, exactly as herdr's `write_text_line` does
-    /// (`tmp/herdr/src/api/server.rs:781-785`).
+    /// (`tmp/herdr/src/api/server.rs:766-770`).
     ///
     /// Errors are swallowed: a client that has closed its end mid-script is a case several tests
     /// create on purpose, and herdr tolerates it too (`write_json_line` →
-    /// `is_connection_closed_error`, `:760-770`).
+    /// `is_connection_closed_error`, `:745-755`).
     pub(crate) async fn write_line(&mut self, line: &str) {
         let _ = self.stream.write_all(line.as_bytes()).await;
         let _ = self.stream.write_all(b"\n").await;
@@ -201,7 +201,7 @@ where
 }
 
 /// A well-formed `pong`, echoing the request's `id` — what a real herdr writes
-/// (`tmp/herdr/src/api/server.rs:356-363`).
+/// (`tmp/herdr/src/api/server.rs:343-350`).
 pub(crate) fn pong_for(request: &str, capabilities: Option<&str>) -> Reply {
     let id = request_id(request);
     let capabilities =
@@ -237,7 +237,7 @@ pub(crate) fn result_after(request: &str, delay: std::time::Duration, result: &s
 /// Re-emit `json` as **one line**, and fail loudly if it is not valid JSON.
 ///
 /// Both halves matter. The framing is one JSON value per `\n`-terminated line
-/// (`tmp/herdr/src/api/server.rs:781-785`), so a fixture written across several source lines would
+/// (`tmp/herdr/src/api/server.rs:766-770`), so a fixture written across several source lines would
 /// be delivered to the client as a truncated first line — a real herdr never does that, and a test
 /// that accidentally did would be measuring the wrong failure. And a typo inside a fixture must
 /// surface here, in the fake, rather than as a client-side `Malformed` that reads exactly like the
@@ -294,7 +294,7 @@ pub(crate) fn request_id(request: &str) -> String {
 }
 
 /// The acknowledgement herdr writes as the **first** line of an `events.subscribe` stream
-/// (`tmp/herdr/src/api/server.rs:749-760`), echoing the request's `id`.
+/// (`tmp/herdr/src/api/server.rs:734-745`), echoing the request's `id`.
 pub(crate) fn subscription_ack_for(request: &str) -> String {
     compact(&format!(
         r#"{{"id":"{}","result":{{"type":"subscription_started"}}}}"#,

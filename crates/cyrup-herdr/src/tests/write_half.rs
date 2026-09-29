@@ -311,7 +311,7 @@ async fn a_refused_write_carries_herdrs_own_code_and_message() {
 /// the day a newer herdr adds a required field to a record this crate mirrors.
 ///
 /// herdr's own client decodes the answer envelope with `#[serde(untagged)]`
-/// (`tmp/herdr/src/api/client.rs:231-236`), and serde discards each arm's real error before
+/// (`tmp/herdr/src/api/client.rs:176-181`), and serde discards each arm's real error before
 /// reporting an untagged failure — so *every* decode failure reads
 /// `"data did not match any variant of untagged enum WireResponse"` at `line: 0, column: 0`,
 /// whether the line was truncated, corrupt, from another protocol, or a perfectly good response
@@ -359,11 +359,11 @@ async fn a_missing_field_is_named_in_the_error_not_swallowed() {
 #[test]
 fn the_codes_this_batch_made_reachable_are_named_not_other() {
     for (wire, expected) in [
-        // tmp/herdr/src/app/api/panes.rs:1852 — pane.send_input
+        // tmp/herdr/src/app/api/panes.rs:1836 — pane.send_input
         ("invalid_key", ApiErrorCode::InvalidKey),
         // tmp/herdr/src/app/api/env.rs:3-31 — pane.split
         ("invalid_env", ApiErrorCode::InvalidEnv),
-        // tmp/herdr/src/app/api/panes.rs:1880-1886 — pane.close
+        // tmp/herdr/src/app/api/panes.rs:1864-1870 — pane.close
         ("confirmation_required", ApiErrorCode::ConfirmationRequired),
         // tmp/herdr/src/api/wait.rs:38-48 — pane.wait_for_output
         ("invalid_regex", ApiErrorCode::InvalidRegex),

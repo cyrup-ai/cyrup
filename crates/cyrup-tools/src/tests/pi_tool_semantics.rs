@@ -258,7 +258,7 @@ impl FsOps for CancelOnWrite {
 /// ported v0.83.0 too (`:219`), so this is baseline debt rather than drift.
 ///
 /// cyrup checked only before the write, so a cancel landing during it produced
-/// `Successfully wrote N bytes` where pi reports an aborted tool error. Pi does NOT undo the
+/// `Successfully wrote to …` where pi reports an aborted tool error. Pi does NOT undo the
 /// write — the bytes stay on disk and only the RESULT is reported as aborted — which this pins on
 /// both halves. RED before; GREEN after.
 #[tokio::test]
@@ -970,7 +970,10 @@ fn the_five_declarations_are_all_cyrup_cores_one_static() {
     let mut checked = 0usize;
     for tool in reg.visible(&crate::registry::Availability::All) {
         let name = tool.name().to_string();
-        if !matches!(name.as_str(), "read" | "bash" | "powershell" | "edit" | "write") {
+        if !matches!(
+            name.as_str(),
+            "read" | "bash" | "powershell" | "edit" | "write"
+        ) {
             continue;
         }
         let declared = tool
@@ -982,5 +985,8 @@ fn the_five_declarations_are_all_cyrup_cores_one_static() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 5, "all five of pi's declaring built-ins must be covered");
+    assert_eq!(
+        checked, 5,
+        "all five of pi's declaring built-ins must be covered"
+    );
 }

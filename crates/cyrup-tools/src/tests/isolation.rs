@@ -358,7 +358,7 @@ async fn backend_swap_retargets_tools_without_contract_change() {
         .await
         .unwrap();
     // Identical tool contract/output regardless of backend.
-    assert!(first_text(&w).contains("Successfully wrote 6 bytes to out.txt"));
+    assert_eq!(first_text(&w), "Successfully wrote to out.txt");
     assert_eq!(
         writes.load(Ordering::SeqCst),
         1,

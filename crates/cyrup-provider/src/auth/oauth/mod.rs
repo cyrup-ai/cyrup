@@ -6,7 +6,6 @@
 //! | this module | pi source |
 //! |---|---|
 //! | [`pkce`] | `pkce.ts` (PKCE verifier/challenge) |
-//! | [`load`] | `load.ts` (flow-module loading / bundled registration) |
 //! | [`device_code`] | `device-code.ts` (RFC 8628 device-code poll loop) |
 //! | [`page`] | `oauth-page.ts` (the browser-facing callback pages) |
 //! | [`callback`] | the loopback callback listener shared verbatim by `openrouter.ts:135-243`, `anthropic.ts:97-170`, `openai-codex.ts:334-375` and `radius.ts:170-212` |
@@ -32,7 +31,6 @@ pub mod device_code;
 pub mod github_copilot;
 pub mod interaction;
 pub mod kimi_coding;
-pub mod load;
 pub mod openai_codex;
 pub mod openrouter;
 pub mod page;
@@ -54,12 +52,6 @@ pub use device_code::{
 pub use interaction::{
     AuthEvent, AuthInfoLink, AuthInteraction, AuthPrompt, AuthPromptKind, AuthSelectOption,
     ScriptedInteraction,
-};
-pub use load::{
-    OAuthFlowFactory, OAuthFlowId, OAuthFlowLoaders, RadiusFlowFactory, RadiusOptions,
-    load_anthropic_oauth, load_github_copilot_oauth, load_kimi_coding_oauth,
-    load_openai_codex_oauth, load_openrouter_oauth, load_radius_oauth, load_xai_oauth,
-    register_bundled_oauth_flow_loaders,
 };
 pub use page::{oauth_error_html, oauth_success_html};
 pub use pkce::{Pkce, base64url_encode, generate_pkce, pkce_challenge};
@@ -123,14 +115,6 @@ pub enum OAuthError {
     /// pi cannot hit this: `crypto.getRandomValues` is ambient in Node and the browser.
     #[error("no OS entropy source available for OAuth PKCE: {0}")]
     Entropy(String),
-
-    /// A flow module was requested that nothing registered.
-    ///
-    /// pi reaches its flows through a dynamic `import()` (`load.ts:9-12`), which Rust has no
-    /// equivalent of; an unregistered flow is the Rust shape of an import that resolves to
-    /// nothing. See [`load`].
-    #[error("OAuth flow \"{flow}\" is not registered")]
-    FlowUnavailable { flow: &'static str },
 
     /// The strategy has no interactive login. pi models this by making `login` a required member
     /// of `OAuthAuth` (`../types.ts:196`) that only real flows implement.

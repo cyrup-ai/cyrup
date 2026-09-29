@@ -47,6 +47,7 @@ fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message()
                 deferred: None,
                 error_message: None,
                 raw_stop_reason: None,
+                end_turn: None,
                 timestamp: 0,
             }),
             Message::ToolResult {

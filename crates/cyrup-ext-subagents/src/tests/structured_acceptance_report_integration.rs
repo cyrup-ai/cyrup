@@ -64,9 +64,25 @@ fn child(dir: &Path, report: Option<&serde_json::Value>, prose: &str) -> PathBuf
          *) printf '%s\\n' \"$a\" >> {argv};; esac; done\n",
         argv = quote(&dir.join("argv.txt").display().to_string())
     ));
+    // The `structured_output` call as the real child's stdout reports it: the parent reads the
+    // capture only when it saw the tool invoked (SUBA-127).
+    body.push_str(&format!(
+        "[ -n \"$CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE\" ] && printf '%s\\n' {}\n",
+        quote(
+            &json!({ "type": "tool_execution_start", "toolCallId": "so-1", "toolName": "structured_output", "args": {} })
+                .to_string()
+        )
+    ));
     body.push_str(
         "[ -n \"$CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE\" ] && printf '%s' '{\"ok\":true}' > \"$CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE\"\n",
     );
+    body.push_str(&format!(
+        "[ -n \"$CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE\" ] && printf '%s\\n' {}\n",
+        quote(
+            &json!({ "type": "tool_execution_end", "toolCallId": "so-1", "toolName": "structured_output", "result": "ok", "isError": false })
+                .to_string()
+        )
+    ));
     if let Some(report) = report {
         body.push_str(&format!(
             "[ -n \"$CYRUP_SUBAGENT_STRUCTURED_OUTPUT_ACCEPTANCE_REPORT\" ] && printf '%s' {} > \"$CYRUP_SUBAGENT_STRUCTURED_OUTPUT_ACCEPTANCE_REPORT\"\n",

@@ -767,3 +767,70 @@ impl cyrup_core::Tool for DeployTool {
         Ok(cyrup_core::ToolResult::default())
     }
 }
+
+/// CFG-081 / DRIFT-057 — the assembled run's auto-retry reads `retry.maxAgentDelayMs` from
+/// settings and caps every backoff with it (Pi `retryDelayMs(settings, attempt)`,
+/// `agent-session.ts:3393` @v0.87.1), and the two literals pi added at v0.86.0 — Cloudflare `520`
+/// and Azure's "currently experiencing high demand" — are retried at all. The base delay is ten
+/// minutes, so without the cap the run cannot finish inside the timeout.
+#[tokio::test]
+async fn assembled_run_caps_the_backoff_and_retries_520_and_high_demand() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let errored = |msg: &str| {
+        faux_assistant_message_with(
+            Vec::new(),
+            StopReason::Error,
+            FauxMessageOptions {
+                error_message: Some(msg.into()),
+                ..Default::default()
+            },
+        )
+    };
+    faux.set_responses(vec![
+        errored("520 Origin Error"),
+        errored("We're currently experiencing high demand, which may cause temporary errors."),
+        faux_assistant_message(vec![faux_text("recovered")], StopReason::Stop),
+    ]);
+
+    let mut settings = cyrup_config::Settings::new();
+    settings
+        .set_field(
+            "retry",
+            serde_json::json!({
+                "enabled": true, "maxRetries": 3, "baseDelayMs": 600_000, "maxAgentDelayMs": 5
+            }),
+        )
+        .unwrap();
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(settings)
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    let stream = session
+        .prompt(UserInput::text("go", InputSource::Sdk))
+        .await
+        .expect("prompt accepted");
+    tokio::time::timeout(Duration::from_secs(20), session.wait_for_idle())
+        .await
+        .expect("an uncapped 600 s backoff would still be sleeping");
+    let events: Vec<AgentSessionEvent> = stream.collect().await;
+
+    let starts: Vec<(u32, u64)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentSessionEvent::AutoRetryStart {
+                attempt, delay_ms, ..
+            } => Some((*attempt, *delay_ms)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, vec![(1, 5), (2, 5)]);
+    assert_eq!(faux.call_count(), 3, "both transient errors were retried");
+    // The summarization loop's policy carries the same cap (pi hands `getRetrySettings()` to
+    // `retryAssistantCall`, whose `retryDelayMs` reads `maxAgentDelayMs`, `retry.ts:209`).
+    assert_eq!(session.summarization_retry().max_agent_delay_ms, Some(5));
+}

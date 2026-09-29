@@ -217,7 +217,7 @@ impl<B: Backend> App<B> {
             self.state.editor.set_text(&text);
         }
         if let Some(warning) = effects.warning {
-            self.state.transcript.push_warning(warning);
+            self.state.transcript.show_warning(warning);
         }
         if let Some(agent_dir) = effects.reload_keybindings_in {
             // TUI-051 — Pi's ordering: session reload first, THEN `this.keybindings.reload()`

@@ -83,5 +83,8 @@ pub(super) fn build_headers(
             headers.insert(name.clone(), value.clone());
         }
     }
+    // PROV-095: `{ "User-Agent": getPiUserAgent(), ...model.headers }` (openai-responses.ts:248
+    // @v0.87.1) — the default sits under every overlay.
+    crate::utils::user_agent::insert_default_user_agent(&mut headers);
     headers
 }

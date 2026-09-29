@@ -4,7 +4,10 @@
 use cyrup_provider::Model;
 
 /// Curated default model id per known provider (Pi `defaultModelPerProvider`,
-/// model-resolver.ts:14-53 at v0.83.0). Returns `None` for an unknown provider.
+/// `model-resolver.ts:20-59` @v0.87.1). Returns `None` for an unknown provider.
+///
+/// CFG-084 — every row is pi's v0.87.1 value except `meta` (`muse-spark-1.3`), a provider cyrup
+/// does not ship, pinned by name in the test below.
 pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
     let id = match provider {
         "amazon-bedrock" => "us.anthropic.claude-opus-4-6-v1",
@@ -13,7 +16,8 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "openai" => "gpt-5.5",
         "azure-openai-responses" => "gpt-5.4",
         "openai-codex" => "gpt-5.5",
-        "radius" => "auto",
+        // Resolved against the gateway's runtime catalog (`radius.rs`), so no embedded row gates it.
+        "radius" => "balanced",
         "nvidia" => "nvidia/nemotron-3-super-120b-a12b",
         "deepseek" => "deepseek-v4-pro",
         "google" => "gemini-3.1-pro-preview",
@@ -21,16 +25,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "github-copilot" => "gpt-5.4",
         "openrouter" => "moonshotai/kimi-k2.6",
         "vercel-ai-gateway" => "zai/glm-5.1",
-        // VERSION LAG (v0.84.1 → v0.85.1), and the ONE row of this table chased ahead of the rest.
-        // `git show v0.85.1:packages/coding-agent/src/core/model-resolver.ts:35` reads
-        // `xai: "grok-4.6"`. Cite the TAG, not HEAD: ADR-0006 pins the parity target to a tag, and
-        // HEAD carries unreleased churn — HEAD also moves `radius` to "balanced" while v0.85.1 keeps
-        // "auto", which is what cyrup has, so chasing HEAD would have caused a regression.
-        //
-        // It is chased alone because it is the only one of v0.85.1's four changed rows whose id the
-        // embedded catalog carries (`grok-4.6` arrived with XAI_1's live fetch). See the test below
-        // for the other three and why they are blocked.
-        "xai" => "grok-4.6",
+        "xai" => "grok-4.7",
         "groq" => "openai/gpt-oss-120b",
         // CHASED to v0.87.1 (`model-resolver.ts:37`). These three sat in the test's `DEFERRED`
         // array because the id upstream had moved to was not in the embedded catalog — the
@@ -261,22 +256,20 @@ mod tests {
         assert_eq!(chosen.provider.as_str(), "qwen-token-plan");
     }
 
-    /// CFG-019 + CFG-041: `defaultModelPerProvider` must equal pi's 40 entries key for key AND in
+    /// CFG-019 + CFG-041: `defaultModelPerProvider` must equal pi's entries key for key AND in
     /// order — `Object.keys(defaultModelPerProvider)` IS the launch scan order at step 4
     /// (`model-resolver.ts:683-692` @v0.84.1), so a missing or misplaced key changes which model a
     /// user launches on.
     ///
-    /// Red at HEAD: 37 entries; `xai` was the retired `grok-4.20-0309-reasoning`; `radius`,
-    /// `baseten` and `qwen-token-plan-individual` were absent entirely.
-    ///
-    /// **Pinned at v0.84.1 with NAMED exceptions, not silently mixed.** v0.85.1 moved four rows;
-    /// `CHASED` is what cyrup took, `DEFERRED` is what it did not and why. The last loop is the one
-    /// that matters now that catalogs are live: a curated default naming an id the catalog no longer
-    /// carries is NOT inert — `first_default_or_first` finds no match, skips the provider entirely,
-    /// and the user silently lands on `available.first()` instead. That must be loud.
+    /// **Pinned at v0.87.1 (CFG-084) with NAMED exceptions, not silently mixed.** `DEFERRED` lists
+    /// every row cyrup does not carry at pi's value, what it carries instead, and why. The last loop
+    /// is the one that matters now that catalogs are live: a curated default naming an id the
+    /// catalog no longer carries is NOT inert — `first_default_or_first` finds no match, skips the
+    /// provider entirely, and the user silently lands on `available.first()` instead. That must be
+    /// loud.
     #[test]
     fn default_model_per_provider_matches_pi_and_every_default_resolves() {
-        // `git show v0.84.1:packages/coding-agent/src/core/model-resolver.ts`, `:20-61`.
+        // `git show v0.87.1:packages/coding-agent/src/core/model-resolver.ts`, `:20-59`.
         const PI: &[(&str, &str)] = &[
             ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
             ("ant-ling", "Ring-2.6-1T"),
@@ -284,7 +277,7 @@ mod tests {
             ("openai", "gpt-5.5"),
             ("azure-openai-responses", "gpt-5.4"),
             ("openai-codex", "gpt-5.5"),
-            ("radius", "auto"),
+            ("radius", "balanced"),
             ("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
             ("deepseek", "deepseek-v4-pro"),
             ("google", "gemini-3.1-pro-preview"),
@@ -292,11 +285,11 @@ mod tests {
             ("github-copilot", "gpt-5.4"),
             ("openrouter", "moonshotai/kimi-k2.6"),
             ("vercel-ai-gateway", "zai/glm-5.1"),
-            ("xai", "grok-4.5"),
+            ("xai", "grok-4.7"),
             ("groq", "openai/gpt-oss-120b"),
-            ("cerebras", "zai-glm-4.7"),
-            ("zai", "glm-5.1"),
-            ("zai-coding-cn", "glm-5.1"),
+            ("cerebras", "gpt-oss-120b"),
+            ("zai", "glm-5.3"),
+            ("zai-coding-cn", "glm-5.3"),
             ("mistral", "devstral-medium-latest"),
             ("minimax", "MiniMax-M2.7"),
             ("minimax-cn", "MiniMax-M2.7"),
@@ -309,6 +302,7 @@ mod tests {
             ("opencode", "kimi-k2.6"),
             ("opencode-go", "kimi-k2.6"),
             ("kimi-coding", "kimi-for-coding"),
+            ("meta", "muse-spark-1.3"),
             ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
             (
                 "cloudflare-ai-gateway",
@@ -321,22 +315,6 @@ mod tests {
             ("xiaomi-token-plan-cn", "mimo-v2.5-pro"),
             ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
             ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
-        ];
-
-        /// Rows cyrup has chased past v0.84.1, each with the tag it was chased to.
-        ///
-        /// `xai` was chased to v0.85.1 (`model-resolver.ts:35`). The other three were `DEFERRED`
-        /// until PROV-071: they are unchanged at v0.87.1 (`model-resolver.ts:37,38,39`), and the
-        /// only thing that had blocked them was that `catalog/cerebras.json`, `catalog/zai.json`
-        /// and `catalog/zai-coding-cn.json` were frozen at `b0c2a90e` and carried neither
-        /// `gpt-oss-120b` nor `glm-5.3`. The live refresh carries all three, and at the same time
-        /// RETIRED the ids cyrup was naming — `zai-glm-4.7` and `glm-5.1` are gone — so chasing
-        /// stopped being optional.
-        const CHASED: &[(&str, &str)] = &[
-            ("xai", "grok-4.6"),
-            ("cerebras", "gpt-oss-120b"),
-            ("zai", "glm-5.3"),
-            ("zai-coding-cn", "glm-5.3"),
         ];
 
         /// Rows where PI'S OWN curated default names an id pi's own catalog no longer serves.
@@ -354,13 +332,17 @@ mod tests {
             ("fireworks", "accounts/fireworks/models/kimi-k2p6"),
             ("opencode-go", "kimi-k2.6"),
         ];
-        const DEFERRED: &[(&str, &str)] = &[];
+        /// v0.87.1 rows cyrup does NOT carry at pi's value: `(provider, what cyrup carries)`, where
+        /// `None` means no row at all. `meta`: the Meta Muse provider (pi v0.86.1) is not shipped —
+        /// area 01 (PROV-080). Every other row, `radius`/`xai`/`cerebras`/`zai`/`zai-coding-cn`
+        /// included, is pi's own value now that PROV-071's live catalogs carry the ids.
+        const DEFERRED: &[(&str, Option<&str>)] = &[("meta", None)];
 
         let expected: Vec<(&str, &str)> = PI
             .iter()
-            .map(|(k, v)| {
-                let chased = CHASED.iter().find(|(ck, _)| ck == k).map(|(_, cv)| *cv);
-                (*k, chased.unwrap_or(*v))
+            .filter_map(|(k, v)| match DEFERRED.iter().find(|(dk, _)| dk == k) {
+                Some((_, carried)) => carried.map(|c| (*k, c)),
+                None => Some((*k, *v)),
             })
             .collect();
         let ours: Vec<(&str, &str)> = KNOWN_PROVIDERS
@@ -370,15 +352,11 @@ mod tests {
         assert_eq!(ours, expected);
         assert_eq!(KNOWN_PROVIDERS.len(), 40);
 
-        // The deferral is an assertion, not a comment: chasing a DEFERRED row without moving it out
-        // of this array fails here.
-        for (key, v0_85_1) in DEFERRED {
-            assert_ne!(
-                default_model_per_provider(key),
-                Some(*v0_85_1),
-                "{key} was chased to v0.85.1's value — move it from DEFERRED to CHASED and say in \
-                 the commit which catalog now carries that id"
-            );
+        // A deferred row must still be deferred: catching up with pi without removing it from
+        // `DEFERRED` fails here.
+        for (key, _) in DEFERRED {
+            let pi = PI.iter().find(|(k, _)| k == key).map(|(_, v)| *v);
+            assert_ne!(default_model_per_provider(key), pi, "{key} now matches pi");
         }
 
         // THE GUARD. Every curated default must name a model the shipped catalog actually carries.

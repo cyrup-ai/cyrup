@@ -71,6 +71,9 @@ reasoning off by default.
 | `terminal.imageWidthCells` | number | `60` | Inline image width in terminal cells. |
 | `terminal.showTerminalProgress` | bool | `false` | Report progress to the terminal's tab bar. |
 | `terminal.clearOnShrink` | bool | `false` | Clear empty rows when content shrinks. |
+| `terminal.images` | `kitty`\|`iterm2`\|`false`\|`auto` | `"auto"` | Force the inline-image protocol, or `false` for none (images fall back to block characters); `auto` keeps the detected one. |
+| `terminal.hyperlinks` | bool\|`auto` | `"auto"` | Force OSC 8 hyperlinks on or off; `auto` keeps the detected answer. |
+| `terminal.trueColor` | bool\|`auto` | `"auto"` | Force 24-bit colour on or off (off renders 256 colours); `auto` keeps the detected answer. |
 | `images.autoResize` | bool | `true` | Resize large images to 2000×2000 before sending. |
 | `images.blockImages` | bool | `false` | Never send images to providers. |
 | `markdown.codeBlockIndent` | string | `"  "` | Indent applied to rendered code fences. |
@@ -109,6 +112,7 @@ others. They apply to providers that take a token budget rather than an effort s
 | `retry.enabled` | bool | `true` | Retry failed requests. |
 | `retry.maxRetries` | integer | `3` | Retry attempts cyrup makes. |
 | `retry.baseDelayMs` | integer | `2000` | Base backoff delay. |
+| `retry.maxAgentDelayMs` | integer | `60000` | Ceiling on each doubling backoff delay. |
 | `retry.provider.maxRetryDelayMs` | integer | `60000` | Backoff ceiling inside the provider SDK. |
 | `retry.provider.timeoutMs` | integer | *unset* | Request timeout inside the provider SDK. |
 | `retry.provider.maxRetries` | integer | *unset* | Retry attempts inside the provider SDK. |
@@ -250,8 +254,9 @@ cyrup falls back to `$VISUAL`, then `$EDITOR`, then `nano` — `notepad` on Wind
 
 ## defaultProjectTrust
 
-This key is **global scope only**. It and `httpProxy` are the two keys stripped from project
-settings before the merge, so a repository cannot declare itself trusted or redirect your egress.
+This key is **global scope only**. It, `httpProxy` and `cacheWarming` are the keys stripped from
+project settings before the merge, so a repository cannot declare itself trusted, redirect your
+egress, or change what cache warming spends.
 
 - `ask` — prompt on first use of a folder that has project resources.
 - `always` — trust any folder with no saved decision.

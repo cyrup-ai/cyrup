@@ -2,7 +2,7 @@
 //!
 //! Speaks the [`openrouter-images`](crate::images::openrouter) wire protocol. Auth:
 //! `OPENROUTER_API_KEY` (Pi `envApiKeyAuth("OpenRouter API key", ["OPENROUTER_API_KEY"])`). Its
-//! catalog is the verbatim generated `IMAGE_MODELS.openrouter` (35 models).
+//! catalog is the verbatim generated `IMAGE_MODELS.openrouter` at pi v0.87.1 (55 models, PROV-089).
 
 use crate::auth::{ProviderAuth, env_key};
 use crate::images::{
@@ -67,7 +67,7 @@ mod tests {
         let p = openrouter_images_provider();
         assert_eq!(p.id(), "openrouter");
         assert_eq!(p.name(), "OpenRouter");
-        assert_eq!(p.get_models().len(), 35);
+        assert_eq!(p.get_models().len(), 55);
         assert!(p.provider_auth().is_some());
     }
 

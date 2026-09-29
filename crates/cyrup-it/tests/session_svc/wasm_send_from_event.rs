@@ -112,7 +112,9 @@ async fn a_live_guest_sends_a_user_message_from_its_agent_settled_handler() {
     //     notifies verbatim — so this assertion is the one that fails against the old live.rs.
     let notes = ext.guest().notifications();
     assert!(
-        notes.iter().any(|n| n.contains("demo: settled send queued")),
+        notes
+            .iter()
+            .any(|n| n.contains("demo: settled send queued")),
         "the guest's event-tier `send-user-message` was ACCEPTED across the wasm import; \
          notes: {notes:?}"
     );

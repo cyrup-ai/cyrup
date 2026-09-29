@@ -1126,7 +1126,6 @@ impl SessionBuilder {
         // `defaultActiveToolNames` otherwise.
         let configured_default_tools = settings.effective().default_tools();
         let base_tools = select_active_tools(&visible, &cfg, configured_default_tools.as_deref());
-        let read_available = base_tools.iter().any(|t| t.name() == "read");
         // pi `AgentSession._allowedToolNames` / `_excludedToolNames` (`sdk.ts:258-259` →
         // `agent-session.ts:395-396`). Resolved HERE, next to the built-in selection they are
         // derived from and ahead of BOTH consumers — `ext_host.active_tools_filtered` below and the
@@ -1191,6 +1190,9 @@ impl SessionBuilder {
         // this backend as an argument, so the bus cannot exist at `LiveHostServices::new` — and
         // BEFORE the native load loop below, so no extension can emit into an unattached bus.
         host_services.attach_event_bus(Arc::clone(host.bus()));
+        // EXT-075: this backend is pi's shared `ExtensionUIContext`, so its prompts open the host's
+        // UI-prompt window — the one a native's dialog goes through.
+        host_services.attach_ui_prompts(Arc::clone(host.ui_prompts()));
         // P-1 (reconciliation §2 item 1): late-bind the session's OWN `host_services` into every
         // native built-in — the SAME `LiveHostServices` the WASM path gets via `discover_and_load`
         // below — so a native extension can reach the live session id/file, dialogs, and
@@ -1317,6 +1319,14 @@ impl SessionBuilder {
             resources: report.diagnostics.clone(),
             // EXT-S01: the native built-ins that failed to load at step 4b, contained above.
             extensions: native_load_errors,
+            // CFG-088: every load this manager made (the pre-trust global read and the trusted
+            // reload) — duplicates are the bin's to collapse, as pi's `deduplicateDiagnostics`
+            // does over the merged startup + runtime list.
+            settings: settings
+                .drain_load_errors()
+                .iter()
+                .map(cyrup_config::ScopedError::diagnostic_message)
+                .collect(),
             ..Default::default()
         };
         // A malformed `packages` entry never takes the settings document (or the session) down; it
@@ -1509,8 +1519,11 @@ impl SessionBuilder {
             }
         };
         let resources = Arc::new(resources);
-        // Read-gated skill pointers (R-06-010): only when the `read` tool is available.
-        let mut skills: Vec<SkillPointer> = if read_available && !cfg.no_skills {
+        // Skill pointers are loaded whatever the tool set, as pi's `resourceLoader.getSkills()` is:
+        // whether the prompt advertises them is decided per build by the tool that can read a
+        // skill file (`read`, else `bash` — `system-prompt.ts:46` @v0.85.0, SESS-059), and the
+        // active set can change after this point.
+        let mut skills: Vec<SkillPointer> = if !cfg.no_skills {
             resources.skills.winners().map(|s| s.pointer()).collect()
         } else {
             Vec::new()
@@ -1518,7 +1531,7 @@ impl SessionBuilder {
         // Synthetic-skill injection (Pi `skillsOverride`, resource-loader.ts:630): transform the
         // discovered pointer set before it feeds the context snapshot + system prompt. Applied to the
         // (possibly-empty) base so an embedder can inject skills discovery found none of; the emit is
-        // still `read`-gated downstream (skills_inject.rs), matching Pi.
+        // still gated downstream (`SystemPromptBuilder::build`), matching Pi.
         if let Some(f) = skills_override {
             skills = f(skills);
         }
@@ -2093,16 +2106,13 @@ impl SessionBuilder {
 
         // Resolve the settings-driven knobs for the retry / auto-compaction subsystems BEFORE the
         // `settings` value is moved into the services bundle.
+        // The compaction token budgets are NOT resolved here: since v0.86.0 they depend on the
+        // active model (`compaction.modelOverrides`), so the session resolves them per call
+        // (`AgentSession::compaction_settings_for_model`, SESS-055).
         let eff = settings.effective();
-        let cfg_compaction = eff.compaction_settings();
         let to_u32 = |v: i64| u32::try_from(v.max(0)).unwrap_or(u32::MAX);
         let extras = crate::session::SessionExtras {
             telemetry_enabled,
-            compaction_settings: cyrup_session::compaction::CompactionSettings {
-                enabled: cfg_compaction.enabled,
-                reserve_tokens: to_u32(cfg_compaction.reserve_tokens),
-                keep_recent_tokens: to_u32(cfg_compaction.keep_recent_tokens),
-            },
             branch_summary_settings: cyrup_session::compaction::BranchSummarySettings {
                 reserve_tokens: to_u32(eff.branch_summary_reserve_tokens()),
                 skip_prompt: eff.branch_summary_skip_prompt(),
@@ -2111,6 +2121,8 @@ impl SessionBuilder {
             auto_retry_enabled: eff.retry_enabled(),
             retry_max_retries: to_u32(eff.retry_max_retries()),
             retry_base_delay_ms: u64::try_from(eff.retry_base_delay_ms().max(0)).unwrap_or(0),
+            retry_max_agent_delay_ms: u64::try_from(eff.retry_max_agent_delay_ms().max(0))
+                .unwrap_or(0),
             proc: bash_proc,
             shell_path: shell_path_setting,
             shell_command_prefix: shell_command_prefix_setting,

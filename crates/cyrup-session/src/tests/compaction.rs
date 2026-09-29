@@ -68,6 +68,7 @@ fn assistant(s: &str) -> Message {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     })
 }
@@ -97,6 +98,7 @@ fn assistant_tool(name: &str, path: &str) -> Message {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     })
 }
@@ -666,6 +668,8 @@ async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
     m.branch(&shared_a).unwrap();
     let _b2q = m.append_message(user("branch two question")).unwrap();
     let l2 = m.append_message(assistant("branch two answer")).unwrap();
+    // The user is on branch one and navigates to branch two.
+    m.branch(&l1).unwrap();
 
     let total_before = m.entries().len();
 
@@ -683,25 +687,19 @@ async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
         .unwrap()
         .expect("branch summary should be appended");
 
-    // SESS-017/SESS-032: Pi's `branchWithSummary` sets `leafId`, `parentId` AND `fromId` from ONE
-    // value — the navigation target (`session-manager.ts:1391-1397`), called with `newLeafId` at
-    // `agent-session.ts:3040-3046` under the comment "Summary is attached at the navigation target
-    // position (newLeafId), not the old branch". These two assertions previously contradicted each
-    // other (`from_id` = abandoned leaf, `parent_id` = target) and cited `R-05-016`, which is not
-    // in this workspace and cannot be used to defend behaviour contradicting pi's code.
+    // SESS-063: pi's `branchWithSummary` attaches the entry at the navigation target
+    // (`parentId: branchFromId`) but records the PRE-navigation leaf as `fromId` — `const fromId =
+    // this.leafId ?? "root"` is read before `this.leafId = branchFromId`
+    // (`session-manager.ts:1603-1608` @v0.87.1, since v0.84.3 `d711bd5f0`). The v0.83.0 rule
+    // SESS-017 aligned to (`fromId` = the target) is the one upstream reversed.
     assert_eq!(
-        entry.from_id, l2,
-        "fromId is the navigation TARGET (session-manager.ts:1397)"
+        entry.from_id, l1,
+        "fromId is the pre-navigation leaf (session-manager.ts:1603)"
     );
     assert_eq!(
         entry.parent_id.as_ref(),
         Some(&l2),
         "appended at the navigation point"
-    );
-    assert_eq!(
-        Some(entry.from_id.clone()),
-        entry.parent_id,
-        "pi's invariant: fromId == parentId == the new leaf"
     );
 
     // The abandoned branch is never deleted (R-05-017).
@@ -1250,9 +1248,12 @@ async fn g3_empty_branch_appends_no_content_placeholder() {
 
     assert_eq!(entry.summary, BRANCH_SUMMARY_EMPTY_PLACEHOLDER);
     assert_eq!(entry.summary, "No content to summarize");
-    // SESS-017/SESS-032: `fromId` is the navigation TARGET, not the abandoned leaf
-    // (`session-manager.ts:1391-1397`).
-    assert_eq!(entry.from_id, shared_a, "fromId is the navigation TARGET");
+    // SESS-063: `fromId` is the pre-navigation leaf — the abandoned branch — not the target
+    // (`session-manager.ts:1603` @v0.87.1).
+    assert_eq!(
+        entry.from_id, abandoned,
+        "fromId is the pre-navigation leaf"
+    );
     assert_eq!(
         entry.parent_id.as_ref(),
         Some(&shared_a),
@@ -1592,8 +1593,15 @@ async fn f1_empty_branch_summary_compaction_summarizes_the_split_turn() {
         1,
         "only the turn-prefix half is summarized: {prompts:?}"
     );
+    // SESS-053 — pi v0.87.1 frames the turn prefix as `# Conversation\n{text}\n\n# Instructions\n
+    // {TURN_PREFIX_SUMMARIZATION_PROMPT}` (`compaction.ts:1118`), not in `<conversation>` tags.
     assert!(
-        prompts[0].contains("This is the PREFIX of a turn"),
+        prompts[0].starts_with("# Conversation\n")
+            && !prompts[0].contains("<conversation>")
+            && prompts[0].ends_with(&format!(
+                "\n\n# Instructions\n{}",
+                crate::compaction::TURN_PREFIX_SUMMARIZATION_PROMPT
+            )),
         "the single call is the turn-prefix prompt: {}",
         prompts[0]
     );

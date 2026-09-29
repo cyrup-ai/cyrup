@@ -437,7 +437,7 @@ async fn pane_send_input_is_herdr_pane_run_and_close_acknowledges() {
 }
 
 /// `pane.read`'s `revision` is hard-coded to `0` by herdr
-/// (`tmp/herdr/src/app/api/panes.rs:1540`) — and so is every other `PaneReadResult` at this pin,
+/// (`tmp/herdr/src/app/api/panes.rs:1524`) — and so is every other `PaneReadResult` at this pin,
 /// because every producer of one routes through that same dispatch. (`PaneInfo::revision` is a
 /// different field and a live counter; see its doc.) A consumer that builds cache invalidation on
 /// the read's `revision` invalidates nothing, forever — so the value is read back here exactly as
@@ -478,7 +478,7 @@ async fn pane_read_answers_herdrs_own_zero_revision() {
 }
 
 /// `pane.process_info` is best effort by construction: herdr fills it from a platform probe
-/// (`tmp/herdr/src/app/api/panes.rs:536-538`) that can legitimately see nothing. An answer with
+/// (`tmp/herdr/src/app/api/panes.rs:520-522`) that can legitimately see nothing. An answer with
 /// no foreground processes must decode to an empty list — *herdr could not tell* — and not fail
 /// the line.
 #[tokio::test]
@@ -546,7 +546,7 @@ async fn pane_process_info_decodes_both_a_full_and_an_empty_answer() {
 /// The `revision` is checked on the way past, and the fixture's `91` is deliberately a value **no
 /// herdr at this pin ever sends**: `wait.rs:98` copies the field out of the `pane.read` the wait
 /// performed, and that dispatch hard-codes `revision: 0`
-/// (`tmp/herdr/src/app/api/panes.rs:1540`), so every real `output_matched` carries `0`. A fixture
+/// (`tmp/herdr/src/app/api/panes.rs:1524`), so every real `output_matched` carries `0`. A fixture
 /// that also said `0` would pass against a client that dropped the field, defaulted it, or
 /// hard-coded the same literal; `91` is the only way to prove the number is read off the wire.
 /// That is what the assertion pins — the decode, not a herdr behaviour.
@@ -593,7 +593,7 @@ async fn a_wait_deadline_is_the_herdr_wait_plus_the_poll_grace() {
     assert_eq!(
         matched.revision, 91,
         "the wire value, not a default and not a client-side literal — herdr itself always sends \
-         0 here (panes.rs:1540 -> wait.rs:98), which is why the fixture does not"
+         0 here (panes.rs:1524 -> wait.rs:98), which is why the fixture does not"
     );
     assert_eq!(matched.read.text, "...\nBUILD DONE");
 

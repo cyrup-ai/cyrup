@@ -4,9 +4,9 @@
 //!
 //! herdr says so in its own prose — *"Call `session.snapshot` again after reconnecting or when the
 //! local cache may be stale."*
-//! (`tmp/herdr/docs/preview/website/src/content/docs/socket-api.mdx:125-126`) — and its source
+//! (`tmp/herdr/docs/next/website/src/content/docs/socket-api.mdx:125-126`) — and its source
 //! says why: a new subscription's floor is `event_hub.current_sequence()` taken when the request
-//! is accepted (`tmp/herdr/src/api/server.rs:723`), so nothing that happened while the client was
+//! is accepted (`tmp/herdr/src/api/server.rs:709`), so nothing that happened while the client was
 //! away is replayed. A consumer that reconnected the stream alone would hold a cache describing a
 //! session that has since moved, with no event ever arriving to correct it — a stale cache kept
 //! silently, which is the one outcome this crate refuses.

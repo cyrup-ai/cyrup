@@ -36,10 +36,11 @@ pub fn kill_process_tree(pid: u32) {
     }
     #[cfg(not(unix))]
     {
-        // Pi's win32 arm is a fire-and-forget `spawn("taskkill", ["/F","/T","/PID", …], {stdio:
-        // "ignore", detached: true, windowsHide: true})` (`shell.ts:220-228`) — NOT a blocking
-        // wait, which matters because this runs inside a signal handler.
-        let mut cmd = std::process::Command::new("taskkill");
+        // Pi's win32 arm is a fire-and-forget `spawn(<SystemRoot>\\System32\\taskkill.exe,
+        // ["/F","/T","/PID", …], {stdio: "ignore", detached: true, windowsHide: true})`
+        // (`shell.ts:218-230` @v0.87.1) — NOT a blocking wait, which matters because this runs
+        // inside a signal handler.
+        let mut cmd = std::process::Command::new(crate::ops::win::taskkill_program());
         cmd.args(["/F", "/T", "/PID", &pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -76,7 +77,8 @@ pub(super) fn send_sigkill_tree(child: &mut tokio::process::Child) {
     #[cfg(not(unix))]
     {
         if let Some(pid) = child.id() {
-            let mut cmd = std::process::Command::new("taskkill");
+            // The System32 `taskkill.exe`, not a `PATH`-resolved name (`shell.ts:218-222`).
+            let mut cmd = std::process::Command::new(crate::ops::win::taskkill_program());
             cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
             // `killProcessTree`'s `windowsHide: true` (shell.ts:226) — this fires on every cancel
             // and every bash timeout, i.e. on the hot path the user actually watches.
@@ -148,7 +150,7 @@ pub fn kill_pid(pid: u32) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let mut cmd = std::process::Command::new("taskkill");
+        let mut cmd = std::process::Command::new(crate::ops::win::taskkill_program());
         cmd.args(["/F", "/PID", &pid.to_string()]);
         // No direct Pi counterpart — upstream's single-pid kill is `proc.kill("SIGKILL")`
         // (exec.ts:59), and this `taskkill /F /PID` exists only because Windows has no such

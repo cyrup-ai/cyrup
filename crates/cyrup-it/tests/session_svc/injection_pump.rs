@@ -9,6 +9,9 @@
 //!   follows; a PLAIN no-turn injection is not steered and never extends a run. And the race the
 //!   pump was built for (`8de7460`): a steer that lands after the run's last steering poll is not
 //!   stranded in the agent queue — the idle edge takes it back and appends it, exactly once.
+//! * **SEAM-129** — `agent_settled` is emitted with the run latch already released (pi
+//!   `_emitAgentSettled`, `agent-session.ts:870-873` @v0.87.1), so a steer sent from its handler is
+//!   appended during the emit rather than steered onto the finished run.
 //! * **ICOM-068** — a no-turn injection while idle, and `send_custom_message`'s idle arm, reach the
 //!   agent transcript as well as the tree (pi `_appendCustomMessage` → `_refreshFinalizedContext`,
 //!   `:1968-1982`, `:730-736`), so the next prompt's request carries them, before the prompt.
@@ -28,7 +31,7 @@ use cyrup_ext::{
 use cyrup_provider::faux::{
     FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
 };
-use cyrup_provider::{Context, Provider};
+use cyrup_provider::{Context, Provider, StreamOptions};
 use cyrup_session_svc::{AgentSession, InputSource, SessionBuilder, SessionConfig, UserInput};
 use tempfile::TempDir;
 
@@ -273,13 +276,13 @@ async fn send_custom_message_while_idle_reaches_the_next_prompt() {
 }
 
 /// A native extension that only captures the session's `HostServices` — the backend every native
-/// built-in (pi-intercom included) injects through.
-fn probe() -> Arc<Strander> {
-    Arc::new(Strander {
+/// built-in (pi-intercom included) injects through. (A [`SettleInjector`] that has already fired.)
+fn probe() -> Arc<SettleInjector> {
+    Arc::new(SettleInjector {
         services: Mutex::new(None),
         session: Arc::new(OnceLock::new()),
         fired: AtomicBool::new(true),
-        saw_steer: AtomicBool::new(false),
+        appended_during_emit: AtomicBool::new(false),
     })
 }
 
@@ -447,21 +450,20 @@ async fn a_plain_no_turn_injection_during_a_run_does_not_extend_it() {
     );
 }
 
-/// A native extension that, on the FIRST `agent_settled`, injects a no-turn message and holds the
-/// settle open until the pump has steered it. `agent_settled` is dispatched after the post-run
-/// driver's last `has_queued_messages` check and before its latch drops — so the steer lands
-/// exactly in the window past the run's last steering poll: the stranding race of `8de7460`.
-struct Strander {
+/// A native extension that, on the FIRST `agent_settled`, injects a `deliverAs: "steer"` message
+/// and holds the emit open until that message is in the session tree, recording whether it got
+/// there while the emit was still running — with nothing handed to the agent's steering queue.
+struct SettleInjector {
     services: Mutex<Option<Arc<dyn HostServices>>>,
     session: Arc<OnceLock<Weak<AgentSession>>>,
     fired: AtomicBool,
-    saw_steer: AtomicBool,
+    appended_during_emit: AtomicBool,
 }
 
 #[async_trait::async_trait]
-impl NativeExtension for Strander {
+impl NativeExtension for SettleInjector {
     fn id(&self) -> ExtensionId {
-        ExtensionId::from("strander")
+        ExtensionId::from("settle-injector")
     }
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
         api.subscribe(&[EventKind::AgentSettled]);
@@ -474,55 +476,76 @@ impl NativeExtension for Strander {
         if matches!(ev, HostEvent::AgentSettled) && !self.fired.swap(true, Ordering::SeqCst) {
             let services = self.services.lock().unwrap().clone().unwrap();
             services
-                .inject_message_steer("late peer note", Some(NOTE), true, None)
+                .inject_message_steer("settle-time peer note", Some(NOTE), true, None)
                 .unwrap();
-            let session = self.session.clone();
-            let steered = within(Duration::from_secs(10), || {
-                session
-                    .get()
-                    .and_then(Weak::upgrade)
-                    .is_some_and(|s| s.is_run_active() && s.has_queued_messages())
-            })
-            .await;
-            self.saw_steer.store(steered, Ordering::SeqCst);
+            let Some(session) = self.session.get().and_then(Weak::upgrade) else {
+                return HookOutcome::Noop;
+            };
+            let appended = wait_persisted(&session, NOTE, 1).await.len() == 1;
+            self.appended_during_emit.store(
+                appended && !session.is_run_active() && !session.has_queued_messages(),
+                Ordering::SeqCst,
+            );
         }
         HookOutcome::Noop
     }
 }
 
 /// ICOM-035's constraint — restoring the steer must not reintroduce the lost-steer race the pump
-/// was built to close (`8de7460`). A steer that lands past the run's last steering poll stays in
+/// was built to close. A steer handed to a run that never polls its steering queue again stays in
 /// the agent's queue with the session idle; the pump takes it back at the idle edge and appends it
 /// to the tree and transcript. It reaches the next request exactly once — not twice (once from the
 /// queue and once from the append) and not zero times.
+///
+/// The window is reached through an abort: the steer is queued while the run's only request is in
+/// flight, and the request is then aborted. An aborted response is a hard exit that polls nothing
+/// (pi `agent-loop.ts:244-254`), and pi's `abort()` leaves the agent's queues alone
+/// (`agent-session.ts:2075-2085` @v0.87.1), so the steer is past the run's last poll.
+///
+/// It used to be reached from an `agent_settled` handler instead. SEAM-129 made that emit run with
+/// the run latch already released, as pi's `_emitAgentSettled` does (`agent-session.ts:870-873`
+/// @v0.87.1), so a steer injected there is no longer steered at all — see the next test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_steer_landing_past_the_last_poll_is_delivered_once_at_the_idle_edge() {
     let fx = fixture();
     let requests: Requests = Arc::default();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_response_steps(vec![
-        recording_text(&requests, "first done"),
-        recording_text(&requests, "second done"),
-    ]);
-    let slot = Arc::new(OnceLock::new());
-    let strander = Arc::new(Strander {
-        services: Mutex::new(None),
-        session: slot.clone(),
-        fired: AtomicBool::new(false),
-        saw_steer: AtomicBool::new(false),
-    });
-    let session = build(&fx, &faux, Some(strander.clone())).await;
-    let _ = slot.set(Arc::downgrade(&session));
+    let held = {
+        let requests = requests.clone();
+        // The run's only request is held open until the run is aborted, so the steer below is
+        // queued before its end and no later request can drain it.
+        FauxResponseStep::async_factory(move |ctx: Context, options: StreamOptions, _, _| {
+            let requests = requests.clone();
+            async move {
+                requests.lock().unwrap().push(ctx.messages.clone());
+                options
+                    .cancel
+                    .expect("a run's request carries the run's cancel token")
+                    .cancelled()
+                    .await;
+                faux_assistant_message(vec![faux_text("never delivered")], StopReason::Stop)
+            }
+        })
+    };
+    faux.set_response_steps(vec![held, recording_text(&requests, "second done")]);
+    let probe = probe();
+    let session = build(&fx, &faux, Some(probe.clone())).await;
+    let services = probe.services.lock().unwrap().clone().unwrap();
 
     let _ = session
         .prompt(UserInput::text("first", InputSource::Sdk))
         .await
         .unwrap();
-    session.wait_for_idle().await;
+    assert!(within(Duration::from_secs(10), || faux.call_count() >= 1).await);
+    services
+        .inject_message_steer("late peer note", Some(NOTE), true, None)
+        .unwrap();
     assert!(
-        strander.saw_steer.load(Ordering::SeqCst),
-        "the injection was steered onto the finishing run (the stranding window was exercised)"
+        within(Duration::from_secs(10), || session.has_queued_messages()).await,
+        "the injection was steered onto the live run"
     );
+    session.abort();
+    session.wait_for_idle().await;
     let bodies = wait_persisted(&session, NOTE, 1).await;
     assert_eq!(
         bodies.len(),
@@ -549,6 +572,63 @@ async fn a_steer_landing_past_the_last_poll_is_delivered_once_at_the_idle_edge()
     );
     assert!(position_of(&texts, "late peer note").unwrap() < position_of(&texts, "next").unwrap());
     assert_eq!(persisted(&session, NOTE).await.len(), 1);
+}
+
+/// SEAM-129 at the injection seam — pi's `_emitAgentSettled` clears `_isAgentRunActive` BEFORE the
+/// emit (`agent-session.ts:870-873` @v0.87.1), so a `deliverAs: "steer"` message sent from an
+/// `agent_settled` handler meets a session that is not streaming and takes `sendCustomMessage`'s
+/// plain `_appendCustomMessage` arm (`:1964-1966`): it is in the tree while the emit is still
+/// running, nothing is handed to the agent's steering queue, and no turn follows. When the emit
+/// still ran under the run latch, the pump steered it onto the finished run and it reached the tree
+/// only after the emit, at the idle edge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_steer_sent_from_agent_settled_is_appended_during_the_emit() {
+    let fx = fixture();
+    let requests: Requests = Arc::default();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![
+        recording_text(&requests, "first done"),
+        recording_text(&requests, "second done"),
+    ]);
+    let slot = Arc::new(OnceLock::new());
+    let injector = Arc::new(SettleInjector {
+        services: Mutex::new(None),
+        session: slot.clone(),
+        fired: AtomicBool::new(false),
+        appended_during_emit: AtomicBool::new(false),
+    });
+    let session = build(&fx, &faux, Some(injector.clone())).await;
+    let _ = slot.set(Arc::downgrade(&session));
+
+    let _ = session
+        .prompt(UserInput::text("first", InputSource::Sdk))
+        .await
+        .unwrap();
+    session.wait_for_idle().await;
+    assert!(
+        injector.appended_during_emit.load(Ordering::SeqCst),
+        "the message was appended while agent_settled was being emitted, not steered"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(faux.call_count(), 1, "no turn was started for it");
+    assert_eq!(persisted(&session, NOTE).await.len(), 1);
+
+    let _ = session
+        .prompt(UserInput::text("next", InputSource::Sdk))
+        .await
+        .unwrap();
+    session.wait_for_idle().await;
+    let requests = requests.lock().unwrap().clone();
+    let texts = user_texts(&requests[1]);
+    assert_eq!(
+        count_of(&texts, "settle-time peer note"),
+        1,
+        "exactly once: {texts:?}"
+    );
+    assert!(
+        position_of(&texts, "settle-time peer note").unwrap()
+            < position_of(&texts, "next").unwrap()
+    );
 }
 
 /// The summarization system prompt's opening words (`cyrup-session` `SUMMARIZATION_SYSTEM_PROMPT`):
@@ -593,11 +673,49 @@ fn routed(
     faux
 }
 
+/// A native extension that captures the session's `HostServices` and records whether the session
+/// still reported a compaction in flight when `session_compact` was delivered to it.
+struct CompactWatcher {
+    services: Mutex<Option<Arc<dyn HostServices>>>,
+    session: OnceLock<Weak<AgentSession>>,
+    compacting_at_session_compact: Mutex<Option<bool>>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for CompactWatcher {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("compact-watcher")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::SessionCompact]);
+        Ok(())
+    }
+    fn set_host_services(&self, services: Arc<dyn HostServices>) {
+        *self.services.lock().unwrap() = Some(services);
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        if matches!(ev, HostEvent::SessionCompact { .. })
+            && let Some(session) = self.session.get().and_then(Weak::upgrade)
+        {
+            *self.compacting_at_session_compact.lock().unwrap() = Some(session.is_compacting());
+        }
+        HookOutcome::Noop
+    }
+}
+
 /// SEAM-125 + ICOM-062 step 3 — a manual compaction is busy: `is_idle()` false while
 /// `is_run_active()` stays false (pi's `isIdle` vs `isStreaming`), the extension-facing
 /// `HostServices::is_idle` agrees, `wait_for_idle()` resolves only after `compaction_end`, and an
 /// injected turn arriving mid-compaction starts NO model run until the compaction is over — then
 /// exactly one, over the compacted context plus the message.
+///
+/// The compaction's idle edge is where that held turn starts, so it must come after the agent
+/// transcript is re-seeded from the compacted context. pi clears its compaction state only after
+/// `appendCompaction` → `_refreshFinalizedContext()` and the `session_compact` emit
+/// (`agent-session.ts:2499-2528` @v0.87.1); an edge raised ahead of the re-seed let the held turn
+/// start over the pre-compaction transcript whenever the pump won that race. The watcher pins the
+/// order without depending on who wins it: the session is still compacting while `session_compact`
+/// is delivered, which comes after the re-seed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_manual_compaction_is_busy_and_holds_an_injected_turn_until_it_ends() {
     let fx = fixture();
@@ -614,16 +732,14 @@ async fn a_manual_compaction_is_busy_and_holds_an_injected_turn_until_it_ends() 
             })
         },
     );
-    let slot = Arc::new(OnceLock::new());
-    // Reuses the extension only for its captured `HostServices` (`fired: true` — it never fires).
-    let probe = Arc::new(Strander {
+    let watcher = Arc::new(CompactWatcher {
         services: Mutex::new(None),
-        session: slot,
-        fired: AtomicBool::new(true),
-        saw_steer: AtomicBool::new(false),
+        session: OnceLock::new(),
+        compacting_at_session_compact: Mutex::new(None),
     });
-    let session = build(&fx, &faux, Some(probe.clone())).await;
-    let services = probe.services.lock().unwrap().clone().unwrap();
+    let session = build(&fx, &faux, Some(watcher.clone())).await;
+    let _ = watcher.session.set(Arc::downgrade(&session));
+    let services = watcher.services.lock().unwrap().clone().unwrap();
     for turn in ["one", "two"] {
         let _ = session
             .prompt(UserInput::text(turn, InputSource::Sdk))
@@ -682,6 +798,11 @@ async fn a_manual_compaction_is_busy_and_holds_an_injected_turn_until_it_ends() 
     release_tx.send(true).unwrap();
     let result = compaction.await.unwrap().expect("the compaction succeeds");
     assert!(result.summary.contains("SUMMARY-OF-EARLIER-WORK"));
+    assert_eq!(
+        *watcher.compacting_at_session_compact.lock().unwrap(),
+        Some(true),
+        "the compaction's idle edge follows the transcript re-seed and session_compact"
+    );
     tokio::time::timeout(Duration::from_secs(10), waiter)
         .await
         .expect("wait_for_idle resolves once the compaction has ended")

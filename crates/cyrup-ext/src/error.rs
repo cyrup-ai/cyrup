@@ -42,6 +42,12 @@ pub enum ExtError {
     /// Invalid tool `parameters` JSON-Schema at registration (R-ARCH-EXT-008).
     #[error("invalid tool schema: {0}")]
     Schema(String),
+    /// A registration pi's `ExtensionAPI` refuses by THROWING inside the factory, which fails the
+    /// load (`registerTool`'s object-schema guard and `registerFlag`'s typed-default guard,
+    /// `core/extensions/loader.ts:274-279` / `:312-316` @v0.87.1). Displayed verbatim: the text is
+    /// pi's own `Error` message. EXT-082.
+    #[error("{0}")]
+    Registration(String),
     /// A duplicate extension id was loaded.
     #[error("duplicate extension id: {0}")]
     DuplicateId(String),

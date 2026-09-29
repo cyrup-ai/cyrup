@@ -3,7 +3,8 @@
 //! Pi marks `${extensionPath} module import` once an extension's module has been imported and
 //! `${extensionPath} factory` once its factory has run (`core/extensions/loader.ts:568,553`
 //! @v0.87.1), and `DefaultResourceLoader.reload()` resets the namespace first
-//! (`core/resource-loader.ts:389`). Before this, `TimingLabel::Extensions` had no producer anywhere
+//! (`core/resource-loader.ts:389`) — in cyrup `SessionBuilder::build`, which every `/reload`
+//! runs (cyrup-session-svc's `startup_timings` test). Before this, `TimingLabel::Extensions` had no producer anywhere
 //! in the workspace, so `CYRUP_TIMING=1` could never print `--- Startup Timings: extensions ---`.
 //!
 //! The one seam this file uses that its siblings do not: timings are gated on `CYRUP_TIMING=1`,
@@ -25,7 +26,7 @@ use crate::event::HostEvent;
 use crate::native::{HostCtx, InitApi, NativeExtension};
 use crate::{ExtError, ExtensionHost, HostConfig};
 use cyrup_core::ExtensionId;
-use cyrup_core::timings::{TimingLabel, snapshot, time};
+use cyrup_core::timings::{TimingLabel, snapshot};
 use std::sync::Arc;
 
 /// Set in the re-executed child so it runs the body instead of spawning again.
@@ -94,7 +95,6 @@ async fn extension_loads_fill_the_extensions_timing_namespace() {
 async fn child_body() {
     use crate::loader::{DiscoveryRoots, discover};
     use crate::{DenyServices, ExtMode};
-    use cyrup_core::CancelToken;
 
     assert!(
         cyrup_core::timings::enabled(),
@@ -126,7 +126,7 @@ async fn child_body() {
     };
     let found = discover(&roots);
     assert_eq!(found.len(), 2, "{found:?}");
-    // The rows the reload must leave, in discovery (load) order: every component marks its import,
+    // The rows the load must leave, in discovery (load) order: every component marks its import,
     // and only the one whose `init` succeeds marks its factory after it.
     let mut expected = Vec::new();
     for disc in &found {
@@ -150,12 +150,9 @@ async fn child_body() {
     })
     .expect("host with wasm");
 
-    // A row left by an earlier pass. `reload` must discard it — Pi's `resetTimings("extensions")`.
-    time("stale row", TimingLabel::Extensions);
     let result = host
-        .reload(&roots, true, Arc::new(DenyServices), &CancelToken::new())
-        .await
-        .unwrap();
+        .discover_and_load(&roots, true, Arc::new(DenyServices))
+        .await;
     assert!(
         result.loaded.len() == 1 && result.errors.len() == 1,
         "the init-less component compiles and then fails to instantiate; the real one loads: \
@@ -180,9 +177,8 @@ async fn child_body() {
     assert_eq!(
         extension_rows(),
         expected,
-        "reset dropped the stale row; each component marked its import, and only the one whose \
-         init succeeded marked its factory, after the import; only the native whose init succeeded \
-         marked a factory"
+        "each component marked its import, and only the one whose init succeeded marked its \
+         factory, after the import; only the native whose init succeeded marked a factory"
     );
     let _ = std::fs::remove_dir_all(&cwd);
 }

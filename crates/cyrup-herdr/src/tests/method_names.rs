@@ -3,7 +3,7 @@
 //! This is the cheapest test in the crate and the one that catches the most expensive mistake. A
 //! misspelled method name does not fail to compile and does not fail to serialise: it produces a
 //! perfectly well-formed line that herdr answers with `invalid_request`
-//! (`tmp/herdr/src/api/server.rs:177-204`, because `Method` is a tagged enum and an unknown tag is
+//! (`tmp/herdr/src/api/server.rs:177-191`, because `Method` is a tagged enum and an unknown tag is
 //! a serde error), which this client then reports as *"this herdr build does not have that
 //! method"* — degrading a feature that in fact works.
 //!
@@ -104,28 +104,28 @@ fn every_method() -> Vec<(Method, &'static str)> {
             Method::PaneProcessInfo(PaneProcessInfoParams::default()),
             "pane.process_info",
         ),
-        // schema.rs:178
+        // schema.rs:176
         (Method::PaneList(PaneListParams::default()), "pane.list"),
-        // schema.rs:180
+        // schema.rs:178
         (
             Method::PaneCurrent(PaneCurrentParams::default()),
             "pane.current",
         ),
-        // schema.rs:182
+        // schema.rs:180
         (Method::PaneGet(PaneTarget::new("w1:p1")), "pane.get"),
-        // schema.rs:184
+        // schema.rs:182
         (Method::PaneFocus(PaneTarget::new("w1:p1")), "pane.focus"),
-        // schema.rs:198
+        // schema.rs:196
         (
             Method::PaneSendInput(PaneSendInputParams::run("w1:p1", "ls")),
             "pane.send_input",
         ),
-        // schema.rs:200
+        // schema.rs:198
         (
             Method::PaneRead(PaneReadParams::new("w1:p1", ReadSource::Visible)),
             "pane.read",
         ),
-        // schema.rs:223
+        // schema.rs:221
         (
             Method::PaneReportAgent(PaneReportAgentParams::new(
                 "w1:p1",
@@ -135,31 +135,31 @@ fn every_method() -> Vec<(Method, &'static str)> {
             )),
             "pane.report_agent",
         ),
-        // schema.rs:225
+        // schema.rs:223
         (
             Method::PaneReportAgentSession(PaneReportAgentSessionParams::new(
                 "w1:p1", "cyrup", "cyrup",
             )),
             "pane.report_agent_session",
         ),
-        // schema.rs:227
+        // schema.rs:225
         (
             Method::PaneReportMetadata(PaneReportMetadataParams::new("w1:p1", "cyrup")),
             "pane.report_metadata",
         ),
-        // schema.rs:229
+        // schema.rs:227
         (
             Method::PaneClearAgentAuthority(PaneClearAgentAuthorityParams::new("w1:p1")),
             "pane.clear_agent_authority",
         ),
-        // schema.rs:231
+        // schema.rs:229
         (
             Method::PaneReleaseAgent(PaneReleaseAgentParams::new("w1:p1", "cyrup", "cyrup")),
             "pane.release_agent",
         ),
-        // schema.rs:233
+        // schema.rs:231
         (Method::PaneClose(PaneTarget::new("w1:p1")), "pane.close"),
-        // schema.rs:241
+        // schema.rs:239
         (
             Method::PaneWaitForOutput(PaneWaitForOutputParams::new(
                 "w1:p1",
@@ -168,7 +168,7 @@ fn every_method() -> Vec<(Method, &'static str)> {
             )),
             "pane.wait_for_output",
         ),
-        // schema.rs:237
+        // schema.rs:235
         (
             Method::EventsSubscribe(EventsSubscribeParams {
                 subscriptions: vec![Subscription::PaneCreated {}],
@@ -290,7 +290,7 @@ fn an_empty_params_method_still_sends_an_empty_object() {
 
 /// herdr's own compatibility rule, made real rather than aspirational: *"JSON API clients should
 /// ignore unknown fields"*
-/// (`tmp/herdr/docs/preview/website/src/content/docs/socket-api.mdx:959`).
+/// (`tmp/herdr/docs/next/website/src/content/docs/socket-api.mdx:959`).
 ///
 /// A newer herdr that adds a field to a record this client already decodes must not turn every
 /// reply into a parse error. No type in `schema/` carries `#[serde(deny_unknown_fields)]`, and

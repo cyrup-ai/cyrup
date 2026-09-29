@@ -637,6 +637,95 @@ pub fn detect_capabilities_with_overrides(
     caps
 }
 
+/// The settings-level capability overrides (Pi's module-level `capabilityOverrides`, a
+/// `Partial<TerminalCapabilities>`, `packages/tui/src/terminal-image.ts:35` @v0.87.1), set from
+/// `terminal.{images,trueColor,hyperlinks}` through [`set_capability_overrides`]. Each `None` is a
+/// key the partial leaves out; `images` nests because `Some(None)` is pi's `{ images: null }`.
+/// Layered ABOVE the `CYRUP_*` env overrides, exactly as pi spreads `capabilityOverrides` after
+/// `detectCapabilities()` in `getCapabilities()` (`:160-169`). CFG-090.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CapabilityOverrides {
+    pub images: Option<Option<ImageProtocol>>,
+    pub true_color: Option<bool>,
+    pub hyperlinks: Option<bool>,
+}
+
+impl CapabilityOverrides {
+    /// Pi `setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides())`'s argument.
+    pub fn from_settings(settings: cyrup_config::settings::TerminalCapabilityOverrides) -> Self {
+        use cyrup_config::settings::TerminalImagesOverride as I;
+        Self {
+            images: settings.images.map(|images| match images {
+                I::Kitty => Some(ImageProtocol::Kitty),
+                I::Iterm2 => Some(ImageProtocol::Iterm2),
+                I::Disabled => None,
+            }),
+            true_color: settings.true_color,
+            hyperlinks: settings.hyperlinks,
+        }
+    }
+
+    /// `{ ...detected, ...capabilityOverrides }`.
+    fn apply(self, mut caps: TerminalCapabilities) -> TerminalCapabilities {
+        if let Some(images) = self.images {
+            caps.images = images;
+        }
+        if let Some(true_color) = self.true_color {
+            caps.true_color = true_color;
+        }
+        if let Some(hyperlinks) = self.hyperlinks {
+            caps.hyperlinks = hyperlinks;
+        }
+        caps
+    }
+}
+
+static CAPABILITY_OVERRIDES: std::sync::RwLock<CapabilityOverrides> =
+    std::sync::RwLock::new(CapabilityOverrides {
+        images: None,
+        true_color: None,
+        hyperlinks: None,
+    });
+
+pub(crate) fn capability_overrides() -> CapabilityOverrides {
+    CAPABILITY_OVERRIDES
+        .read()
+        .map(|guard| *guard)
+        .unwrap_or_default()
+}
+
+/// Pi `setCapabilityOverrides(overrides)` (`terminal-image.ts:175-186` @v0.87.1): an unchanged set
+/// is a no-op; a changed one replaces the overrides and drops the capability cache so the next
+/// read re-detects under them. Returns whether it changed anything, which is the caller's cue to
+/// re-publish capabilities it already derived. CFG-090.
+pub fn set_capability_overrides(overrides: CapabilityOverrides) -> bool {
+    let Ok(mut guard) = CAPABILITY_OVERRIDES.write() else {
+        return false;
+    };
+    if *guard == overrides {
+        return false;
+    }
+    *guard = overrides;
+    drop(guard);
+    reset_capabilities_cache();
+    true
+}
+
+/// Pi `getCapabilities()`'s detection (`terminal-image.ts:160-169` @v0.87.1) with the full tmux
+/// probe: `detectCapabilities(hyperlinks === undefined ? undefined : () => hyperlinks)` — a
+/// hyperlinks override stands in for the probe, so no `tmux` subprocess is spawned — then the
+/// settings overrides spread on top. What [`App::detect_image_support`](crate::App) detects with.
+pub fn detect_capabilities_with_settings_overrides() -> TerminalCapabilities {
+    let overrides = capability_overrides();
+    let detected = match overrides.hyperlinks {
+        Some(hyperlinks) => {
+            detect_capabilities_with_overrides(|k| std::env::var(k).ok(), move || hyperlinks)
+        }
+        None => detect_capabilities(),
+    };
+    overrides.apply(detected)
+}
+
 /// The process-wide OSC-8 answer, Pi's module-level `cachedCapabilities` + `getCapabilities()`
 /// (`tui/src/terminal-image.ts:33`, `:138-143`): detect once, then hand the same answer to every
 /// later caller. Renderers consult it through [`hyperlinks_supported`]; the app seeds it from the
@@ -692,7 +781,13 @@ pub fn cached_capabilities() -> TerminalCapabilities {
     {
         return caps;
     }
-    let detected = detect_capabilities_with_overrides(|k| std::env::var(k).ok(), || false);
+    // CFG-090 — the settings overrides apply on this lazy path too, a hyperlinks override
+    // standing in for the (here non-probing) tmux flag as in pi's `getCapabilities()`.
+    let overrides = capability_overrides();
+    let detected = overrides.apply(detect_capabilities_with_overrides(
+        |k| std::env::var(k).ok(),
+        move || overrides.hyperlinks.unwrap_or(false),
+    ));
     if let Ok(mut guard) = CAPABILITIES.write() {
         // First writer wins, so a `set_capabilities` that raced this detection is not clobbered.
         if guard.is_none() {

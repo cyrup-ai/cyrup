@@ -30,8 +30,12 @@ const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS: &[&str] = &[
 ];
 
 /// Transient provider/transport errors that ARE retryable (Pi `RETRYABLE_PROVIDER_ERROR_PATTERN`,
-/// `retry.ts:26-89` @**v0.83.0** — `git diff v0.83.0..v0.84.1 -- packages/ai/src/utils/retry.ts` is
-/// empty, so this list is the same at both tags).
+/// `retry.ts:26-92` @v0.87.1).
+///
+/// DRIFT-057: three literals landed upstream after the ported baseline and are carried in pi's
+/// positions — `"currently experiencing high demand"` (Azure peak load, v0.86.0, ts:29),
+/// `"520"` (Cloudflare, v0.86.0, ts:37) and `"exceeded request buffer limit while retrying
+/// upstream"` (v0.84.2, ts:46).
 ///
 /// DRIFT-014: seven upstream literals were missing from the port — `"524"` (ts:36),
 /// `"getaddrinfo"` (ts:54), `"ENOTFOUND"` (ts:55), `"EAI_AGAIN"` (ts:56), `"socket connection was
@@ -57,6 +61,7 @@ const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS: &[&str] = &[
 const RETRYABLE_PROVIDER_PATTERNS: &[&str] = &[
     // Generic provider load, HTTP status, and server-side transient failures.
     "overloaded",
+    "currently experiencing high demand",
     "rate.?limit",
     "too many requests",
     "429",
@@ -64,12 +69,14 @@ const RETRYABLE_PROVIDER_PATTERNS: &[&str] = &[
     "502",
     "503",
     "504",
+    "520",
     "524",
     "service.?unavailable",
     "server.?error",
     "internal.?error",
     // Wrapper/provider text for transient upstream failures (OpenRouter "Provider returned error").
     "provider.?returned.?error",
+    "exceeded request buffer limit while retrying upstream",
     // Network, proxy, and fetch transport failures.
     "network.?error",
     "connection.?error",
@@ -144,9 +151,10 @@ pub fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     retryable_regex().is_match(error_message)
 }
 
-/// Retry policy: bounded attempts with exponential backoff (`base_delay_ms * 2^(attempt-1)`).
-/// 1:1 with Pi `RetryPolicy` (`retry.ts:97-103`), which mirrors coding-agent's `settings.retry`
-/// (`enabled` / `maxRetries` / `baseDelayMs`).
+/// Retry policy: bounded attempts with exponential backoff (`base_delay_ms * 2^(attempt-1)`),
+/// each computed delay capped by `max_agent_delay_ms`. 1:1 with Pi `RetryPolicy`
+/// (`retry.ts:101-109` @v0.87.1), which mirrors coding-agent's `settings.retry` (`enabled` /
+/// `maxRetries` / `baseDelayMs` / `maxAgentDelayMs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryPolicy {
     pub enabled: bool,
@@ -154,15 +162,19 @@ pub struct RetryPolicy {
     pub max_retries: u32,
     /// Base delay in ms. Per-attempt delay is `base_delay_ms * 2^(attempt-1)`.
     pub base_delay_ms: u64,
+    /// Cap for each computed delay in ms; `None` is Pi's `undefined`, which caps at
+    /// [`DEFAULT_MAX_AGENT_RETRY_DELAY_MS`].
+    pub max_agent_delay_ms: Option<u64>,
 }
 
 impl RetryPolicy {
     /// Pi's `retry: undefined` / `enabled: false` — the first response is returned unchanged
-    /// (`retry.ts:159-160,168`).
+    /// (`retry.ts:176-181`).
     pub const DISABLED: Self = Self {
         enabled: false,
         max_retries: 0,
         base_delay_ms: 0,
+        max_agent_delay_ms: None,
     };
 
     pub fn new(enabled: bool, max_retries: u32, base_delay_ms: u64) -> Self {
@@ -170,7 +182,15 @@ impl RetryPolicy {
             enabled,
             max_retries,
             base_delay_ms,
+            max_agent_delay_ms: None,
         }
+    }
+
+    /// Set the per-delay cap (Pi `maxAgentDelayMs`).
+    #[must_use]
+    pub fn with_max_agent_delay_ms(mut self, max_agent_delay_ms: u64) -> Self {
+        self.max_agent_delay_ms = Some(max_agent_delay_ms);
+        self
     }
 }
 
@@ -178,6 +198,21 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self::DISABLED
     }
+}
+
+/// The cap applied when a policy carries no `max_agent_delay_ms` (Pi
+/// `DEFAULT_MAX_AGENT_RETRY_DELAY_MS`, `retry.ts:111` @v0.87.1).
+pub const DEFAULT_MAX_AGENT_RETRY_DELAY_MS: u64 = 60_000;
+
+/// The backoff before retry `attempt` (1-indexed): `base_delay_ms * 2^(attempt-1)`, capped at
+/// `max_agent_delay_ms` (default [`DEFAULT_MAX_AGENT_RETRY_DELAY_MS`]) — Pi `retryDelayMs`
+/// (`retry.ts:113-117` @v0.87.1). Shared by the summarization loop below and the session's
+/// agent-level retry, exactly as pi calls the one helper from both (`retry.ts:209`,
+/// `agent-session.ts:3393`). Saturating arithmetic stands in for pi's `Number.isSafeInteger`
+/// guard: an overflowing product becomes the maximum, which the cap then bounds.
+pub fn retry_delay_ms(base_delay_ms: u64, max_agent_delay_ms: Option<u64>, attempt: u32) -> u64 {
+    let delay = base_delay_ms.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
+    delay.min(max_agent_delay_ms.unwrap_or(DEFAULT_MAX_AGENT_RETRY_DELAY_MS))
 }
 
 /// Observation points emitted by [`retry_assistant_call`] around each retry — Pi `RetryCallbacks`
@@ -268,9 +303,7 @@ where
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Unknown error".to_string());
         last_retry = Some(attempt);
-        let delay_ms = policy
-            .base_delay_ms
-            .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
+        let delay_ms = retry_delay_ms(policy.base_delay_ms, policy.max_agent_delay_ms, attempt);
         if let Some(cb) = callbacks {
             cb.on_retry_scheduled(attempt, max_attempts, delay_ms, &error_message);
         }
@@ -611,5 +644,65 @@ mod tests {
                 "finished false 1 Some(\"terminated\")".to_string(),
             ]
         );
+    }
+
+    // DRIFT-057 / CFG-081 — the per-attempt delay handed to `on_retry_scheduled` (and slept) is
+    // capped: at pi's 60 s default when the policy carries no cap, at the policy's own cap when it
+    // does. The token is cancelled up front so the scheduled delay is observed without sleeping.
+    #[tokio::test]
+    async fn the_scheduled_backoff_is_capped_by_max_agent_delay_ms() {
+        for (policy, expected) in [
+            (
+                RetryPolicy::new(true, 3, 120_000),
+                "scheduled 1/3 60000ms terminated",
+            ),
+            (
+                RetryPolicy::new(true, 3, 120_000).with_max_agent_delay_ms(5_000),
+                "scheduled 1/3 5000ms terminated",
+            ),
+        ] {
+            let script = Script::new(vec![err(StopReason::Error, Some("terminated"))]);
+            let cancel = CancelToken::new();
+            cancel.cancel();
+            let rec = Recorder::default();
+            retry_assistant_call(
+                || async { script.next() },
+                policy,
+                Some(&cancel),
+                Some(&rec),
+            )
+            .await;
+            assert_eq!(rec.events.lock().unwrap()[0], expected);
+        }
+    }
+
+    #[test]
+    fn retry_delay_ms_doubles_then_caps() {
+        assert_eq!(retry_delay_ms(2_000, None, 1), 2_000);
+        assert_eq!(retry_delay_ms(2_000, None, 3), 8_000);
+        // Pi `retryDelayMs(base 2000, attempt 10)` is `min(1_024_000, 60_000)`.
+        assert_eq!(retry_delay_ms(2_000, None, 10), 60_000);
+        assert_eq!(retry_delay_ms(2_000, Some(5_000), 3), 5_000);
+        assert_eq!(retry_delay_ms(2_000, Some(5_000), 2), 4_000);
+        // An overflowing product saturates, then the cap bounds it.
+        assert_eq!(retry_delay_ms(u64::MAX, None, 200), 60_000);
+    }
+
+    // DRIFT-057 — the three literals added upstream after the ported baseline.
+    #[test]
+    fn drift_057_upstream_literals_classify_retryable() {
+        for msg in [
+            // retry.ts:37 — Cloudflare "Web server returned an unknown error".
+            "520 Origin Error",
+            // retry.ts:29 — Azure peak load.
+            "We're currently experiencing high demand, which may cause temporary errors.",
+            // retry.ts:46.
+            "exceeded request buffer limit while retrying upstream",
+        ] {
+            assert!(
+                is_retryable_assistant_error(&err(StopReason::Error, Some(msg))),
+                "should be retryable: {msg}"
+            );
+        }
     }
 }

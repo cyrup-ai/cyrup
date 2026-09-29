@@ -221,6 +221,10 @@ pub(crate) struct SubagentToolParams {
     pub(crate) r#async: Option<bool>,
     pub(crate) timeout_ms: Option<u64>,
     pub(crate) max_runtime_ms: Option<u64>,
+    /// SUBA-128 — pi `params.checkpointBeforeDeadlineMs` (`extension/schemas.ts:363` @v0.71.0):
+    /// async single-agent runs only — how long before the run deadline the runner asks the child
+    /// to checkpoint and stop. Falls back to `config.checkpointBeforeDeadlineMs`.
+    pub(crate) checkpoint_before_deadline_ms: Option<u64>,
     /// CFG-067 — pi `params.toolTimeoutMs` (`extension/schemas.ts:364`), the HIGHEST rung of
     /// `resolveToolTimeoutMs` (`tool-timeout.ts:63`).
     ///
@@ -803,6 +807,9 @@ impl SubagentToolParams {
         }
         if self.max_runtime_ms.is_some() {
             keys.push("maxRuntimeMs");
+        }
+        if self.checkpoint_before_deadline_ms.is_some() {
+            keys.push("checkpointBeforeDeadlineMs");
         }
         if self.tool_timeout_ms.is_some() {
             keys.push("toolTimeoutMs");

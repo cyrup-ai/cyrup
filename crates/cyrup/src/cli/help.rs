@@ -66,10 +66,7 @@ Options:
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
-  --json                         cyrup alias for --mode json (not a pi flag)
-  --rpc                          cyrup alias for --mode rpc (not a pi flag)
   --acp                          cyrup alias for --mode acp: serve the Agent Client Protocol on stdio
-  --output-format <fmt>          cyrup alias: text = --print, json = --mode json (not a pi flag)
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
@@ -95,6 +92,7 @@ Options:
   --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
   --no-prompt-templates, -np     Disable prompt template discovery and loading
   --theme <path>                 Load a theme file or directory (can be used multiple times)
+  --use-theme <name[/name]>      Set the initial interactive theme for this run
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
   --export <file>                Export session file to HTML and exit

@@ -22,15 +22,15 @@ workspace = true
 
 [dependencies]
 # NB: no `default-features = false` — `HostServices`, `InteractiveOverlay` and the overlay
-# value types are `wasm-host`-gated re-exports (cyrup-ext/src/lib.rs:199-207) that FLUX_09 and
-# FLUX_10 require.
+# value types are `wasm-host`-gated re-exports (cyrup-ext/src/lib.rs:199-207) that the overlay and
+# the `ask_user_question` tool require (spec/flux.md §3.4.3, §3.4.4).
 cyrup-core = { workspace = true }
 cyrup-ext = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# FLUX_10's `ask_user_question` hops the blocking `HostServices::select` call off the async
-# executor with `spawn_blocking`.
+# `ask_user_question` (spec/flux.md §3.4.4) hops the blocking `HostServices::select` call off the
+# async executor with `spawn_blocking`.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 # FLUX-001 — the installer port (`flux_bootstrap/installer.py` @v0.0.40) tells "user hand-edited it"
 # from "we wrote it last time" by a manifest of SHA-256 hashes (`:75-80`, `:139-149`), and takes a

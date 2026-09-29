@@ -1,4 +1,4 @@
-;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.11.0`
+;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.12.0`
 ;; `extension` world and whose `init` succeeds, so the host reaches its `${path} factory` timing mark.
 ;; It imports nothing and exports every `events` function plus `init`. Each export returns a
 ;; pointer to zeroed memory, which the canonical ABI reads as the first case / empty value
@@ -35,6 +35,7 @@
     (func (export "on-tool-call") (param i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "on-tool-result") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "on-context") (param i32 i32) (result i32) i32.const 16)
+    (func (export "on-context-with-system") (param i32 i32) (result i32) i32.const 16)
     (func (export "on-message-end") (param i32 i32) (result i32) i32.const 16)
     (func (export "on-before-agent-start") (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "on-input") (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
@@ -58,6 +59,8 @@
     (func (export "on-session-shutdown") (param i32 i32 i32 i32 i32))
     (func (export "on-session-info-changed") (param i32 i32 i32))
     (func (export "on-branch-change") (param i32 i32 i32))
+    (func (export "on-ui-prompt-start") (param i32 i32 i32 i32 i32))
+    (func (export "on-ui-prompt-end") (param i32 i32 i32 i32 i32))
     (func (export "on-resources-discover") (param i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "on-project-trust") (param i32 i32) (result i32) i32.const 16)
     (func (export "on-session-before-switch") (param i32 i32 i32 i32 i32) (result i32) i32.const 16)
@@ -121,6 +124,8 @@
     (canon lift (core func $i "on-tool-result") (memory $mem) (realloc $realloc)))
   (func $on-context (param "messages-json" string) (result $hook-outcome)
     (canon lift (core func $i "on-context") (memory $mem) (realloc $realloc)))
+  (func $on-context-with-system (param "messages-json" string) (result $hook-outcome)
+    (canon lift (core func $i "on-context-with-system") (memory $mem) (realloc $realloc)))
   (func $on-message-end (param "message-json" string) (result $hook-outcome)
     (canon lift (core func $i "on-message-end") (memory $mem) (realloc $realloc)))
   (func $on-before-agent-start (param "prompt" string) (param "images-json" string) (param "system-prompt" string) (param "options-json" string) (result $hook-outcome)
@@ -167,6 +172,10 @@
     (canon lift (core func $i "on-session-info-changed") (memory $mem) (realloc $realloc)))
   (func $on-branch-change (param "branch" (option string))
     (canon lift (core func $i "on-branch-change") (memory $mem) (realloc $realloc)))
+  (func $on-ui-prompt-start (param "kind" string) (param "title" (option string))
+    (canon lift (core func $i "on-ui-prompt-start") (memory $mem) (realloc $realloc)))
+  (func $on-ui-prompt-end (param "kind" string) (param "title" (option string))
+    (canon lift (core func $i "on-ui-prompt-end") (memory $mem) (realloc $realloc)))
   (func $on-resources-discover (param "cwd" string) (param "reason" string) (result $hook-outcome)
     (canon lift (core func $i "on-resources-discover") (memory $mem) (realloc $realloc)))
   (func $on-project-trust (param "cwd" string) (result $hook-outcome)
@@ -206,6 +215,7 @@
     (export "on-tool-call" (func $on-tool-call))
     (export "on-tool-result" (func $on-tool-result))
     (export "on-context" (func $on-context))
+    (export "on-context-with-system" (func $on-context-with-system))
     (export "on-message-end" (func $on-message-end))
     (export "on-before-agent-start" (func $on-before-agent-start))
     (export "on-input" (func $on-input))
@@ -229,6 +239,8 @@
     (export "on-session-shutdown" (func $on-session-shutdown))
     (export "on-session-info-changed" (func $on-session-info-changed))
     (export "on-branch-change" (func $on-branch-change))
+    (export "on-ui-prompt-start" (func $on-ui-prompt-start))
+    (export "on-ui-prompt-end" (func $on-ui-prompt-end))
     (export "on-resources-discover" (func $on-resources-discover))
     (export "on-project-trust" (func $on-project-trust))
     (export "on-session-before-switch" (func $on-session-before-switch))
@@ -239,6 +251,6 @@
     (export "on-session-tree" (func $on-session-tree))
     (export "bus-deliver" (func $bus-deliver))
   )
-  (export "cyrup:ext/events@0.11.0" (instance $events))
+  (export "cyrup:ext/events@0.12.0" (instance $events))
   (export "init" (func $init))
 )

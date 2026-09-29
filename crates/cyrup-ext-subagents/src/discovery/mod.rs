@@ -72,6 +72,7 @@
 //! exclusion to duplicate at the package/builtin tiers, because they route through the same walk
 //! function as User/Project.
 
+pub mod advertised;
 pub(crate) mod agent_dirs;
 pub mod agent_memory;
 pub mod chains;

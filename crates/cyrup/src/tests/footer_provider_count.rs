@@ -30,9 +30,9 @@
 use std::sync::Arc;
 
 use cyrup_config::AuthStore;
-use cyrup_sdk::core::ProviderId;
 use cyrup_provider::Provider;
 use cyrup_provider::faux::FauxProvider;
+use cyrup_sdk::core::ProviderId;
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
 use cyrup_tui::{App, UiTheme};
 use ratatui::backend::TestBackend;

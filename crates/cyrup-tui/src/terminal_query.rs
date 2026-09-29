@@ -85,6 +85,7 @@
 use std::time::Duration;
 
 use crate::theme::TerminalTheme;
+use crate::write_log::tui_stdout;
 
 /// `ESC ] 11 ; ? BEL` — Pi's OSC 11 background-color query (`tui.ts:1193`).
 pub const OSC11_BACKGROUND_QUERY: &str = "\x1b]11;?\x07";
@@ -444,19 +445,23 @@ pub struct StdinTerminalProbe;
 
 impl TerminalProbe for StdinTerminalProbe {
     fn query_background_color(&self, timeout: Duration) -> Option<(u8, u8, u8)> {
-        find_osc11_background_color(&exchange(OSC11_BACKGROUND_QUERY, timeout)?)
+        find_osc11_background_color(&exchange(tui_stdout(), OSC11_BACKGROUND_QUERY, timeout)?)
     }
 
     fn query_color_scheme(&self, timeout: Duration) -> Option<TerminalTheme> {
-        find_color_scheme_report(&exchange(COLOR_SCHEME_QUERY, timeout)?)
+        find_color_scheme_report(&exchange(tui_stdout(), COLOR_SCHEME_QUERY, timeout)?)
     }
 
     fn query_cell_size(&self, timeout: Duration) -> Option<(u16, u16)> {
-        find_cell_size_report(&exchange(CELL_SIZE_QUERY, timeout)?)
+        find_cell_size_report(&exchange(tui_stdout(), CELL_SIZE_QUERY, timeout)?)
     }
 
     fn query_cursor_position(&self, timeout: Duration) -> Option<(u16, u16)> {
-        find_cursor_position_report(&exchange(CURSOR_POSITION_QUERY, timeout)?)
+        find_cursor_position_report(&exchange(
+            crate::dead_terminal::terminal_stdout(),
+            CURSOR_POSITION_QUERY,
+            timeout,
+        )?)
     }
 }
 
@@ -471,17 +476,27 @@ fn stdin_is_queryable() -> bool {
         && is_raw_mode_enabled().unwrap_or(false)
 }
 
-/// Write `request` (plus the DA1 sentinel) and collect whatever comes back within `timeout`.
+/// Write `request` (plus the DA1 sentinel) to `out` and collect whatever comes back within
+/// `timeout`.
+///
+/// `out` is the channel pi writes the same query on. The three TUI queries — OSC 11, `CSI ? 996 n`
+/// and `CSI 16 t` — go through pi's `this.terminal.write` (`tui.ts:929`, `:1426`, `:1453`
+/// @v0.87.1) and are therefore in its write log, so their callers pass
+/// [`crate::write_log::tui_stdout`]; the Kitty flags query is `process.stdout.write`
+/// (`terminal.ts:261`) and the cursor-position query has no pi counterpart, so those take plain
+/// stdout (TUI-040).
 ///
 /// `pub(crate)` so [`mod@crate::keyboard_protocol`]'s Kitty-flags negotiation reuses the SAME bounded,
 /// sentinel-terminated exchange rather than opening a second hand-rolled read of stdin — the
 /// safety contract in this module's docs is per-read, and one implementation is one contract.
-pub(crate) fn exchange(request: &str, timeout: Duration) -> Option<String> {
-    use std::io::Write;
+pub(crate) fn exchange(
+    mut out: impl std::io::Write,
+    request: &str,
+    timeout: Duration,
+) -> Option<String> {
     if !stdin_is_queryable() {
         return None;
     }
-    let mut out = std::io::stdout();
     out.write_all(request.as_bytes()).ok()?;
     out.write_all(DEVICE_ATTRIBUTES_QUERY.as_bytes()).ok()?;
     out.flush().ok()?;
@@ -702,7 +717,7 @@ mod tests {
     #[test]
     fn cursor_position_is_found_alongside_the_sentinel_answer() {
         // What a real xterm sends back for `CSI 6 n` + `CSI c`, in one read — the exact wire shape
-        // `exchange(CURSOR_POSITION_QUERY, ..)` produces.
+        // `exchange(_, CURSOR_POSITION_QUERY, ..)` produces.
         assert_eq!(
             find_cursor_position_report("\x1b[12;40R\x1b[?62;1;2c"),
             Some((39, 11))

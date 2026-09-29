@@ -23,6 +23,7 @@ pub use local::{
     track_detached_child_pid, untrack_detached_child_pid,
 };
 pub use shell::{ShellConfig, Transport, shell_env};
+pub use win::taskkill_program;
 
 /// Access mode for [`FsOps::access`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

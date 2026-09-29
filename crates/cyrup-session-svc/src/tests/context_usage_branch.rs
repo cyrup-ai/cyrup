@@ -84,7 +84,7 @@ async fn prompt_and_settle(session: &crate::AgentSession, text: &str) {
 }
 
 /// **(a) Branch isolation** — SEAM-114 defect 2. The post-compaction guard must be answered from
-/// the ACTIVE branch. RED against `has_post_compaction_usage` scanning `entries()`: the flat
+/// the ACTIVE branch. RED against the post-compaction guard scanning `entries()`: the flat
 /// store then holds a LATER, off-branch compaction with a valid assistant after it, so `rposition`
 /// latches that off-branch boundary, the guard answers `true`, and a stale pre-compaction
 /// occupancy is printed as current on a branch whose own compaction has no assistant after it.
@@ -372,9 +372,26 @@ async fn a_deferred_tail_does_not_stop_the_scan_nor_drive_the_occupancy() {
         .stats_context_usage()
         .await
         .expect("a model with a window is set");
+    // No compaction on the branch, so pi trusts the settled anchor — and, being
+    // `estimateProjectedContextTokens` (`agent-session.ts:3893` @v0.87.1), adds a chars/4 estimate
+    // of every projected message after it. The deferred receipt projects nothing
+    // (`cyrup-session/src/context.rs`, `is_deferred_assistant`), so the tail is the second prompt.
+    let projected = session.raw_context_messages().await;
+    let second_prompt = projected.last().expect("the second prompt is projected");
+    assert!(
+        matches!(
+            second_prompt,
+            cyrup_session::AgentMessage::Core(Message::User { .. })
+        ),
+        "the deferred receipt must not be projected, leaving the second prompt last: {projected:?}"
+    );
+    let trailing = u64::from(cyrup_session::compaction::tokens::estimate_agent_message(
+        second_prompt,
+    ));
+    assert!(trailing > 0, "the trailing prompt must estimate non-zero");
     assert_eq!(
         three_state.tokens,
-        Some(settled_occupancy.used_tokens),
-        "no compaction on the branch, so the settled occupancy is trusted as-is: {three_state:?}"
+        Some(settled_occupancy.used_tokens + trailing),
+        "the settled occupancy plus the trailing prompt's estimate: {three_state:?}"
     );
 }

@@ -31,6 +31,9 @@
 //! - [`node_http_proxy`] — `HTTP(S)_PROXY`/`NO_PROXY` resolution (`utils/node-http-proxy.ts`).
 //! - [`provider_retry`] — the server-directed request-retry policy (`utils/provider-retry.ts`).
 //!
+//! [`user_agent`] (crate-private) is the default client `User-Agent` (`utils/pi-user-agent.ts`),
+//! rebranded to `cyrup`, that seven adapters send under their header overlays (PROV-095).
+//!
 //! One member is crate-private and is NOT a 1:1 port of an upstream file: `provider_plumbing`
 //! holds cyrup's own cross-`api/` glue (`getProviderEnvValue`, the `resolveCacheRetention` ladder,
 //! `Date.now()` in ms, and the direct-wire SSE connect sequence pi delegates to a vendor SDK),
@@ -55,3 +58,4 @@ pub mod simple_options;
 mod tests;
 pub mod text;
 pub mod transcript;
+pub(crate) mod user_agent;

@@ -228,7 +228,7 @@ fn function_keys_and_insert_parse_and_round_trip_through_label() {
         assert_eq!(key.label(), spec, "{spec} must round-trip");
         assert_eq!(Key::parse(&key.label()).unwrap(), key, "{spec}");
     }
-    // With modifiers, and the `ins` alias.
+    // With modifiers; `ins` is not a pi `KeyId` (TUI-066).
     assert_eq!(
         Key::parse("ctrl+f4").unwrap(),
         Key {
@@ -236,7 +236,7 @@ fn function_keys_and_insert_parse_and_round_trip_through_label() {
             mods: KeyModifiers::CONTROL
         }
     );
-    assert_eq!(Key::parse("ins").unwrap().code, KeyCode::Insert);
+    assert!(Key::parse("ins").is_err());
     // MIRROR — the range is real, not a prefix match: `f0` and `f13` have no upstream `KeyId`, and
     // an `f` followed by non-digits is still an ordinary rejected token.
     assert!(Key::parse("f0").is_err(), "no f0 upstream");
@@ -341,5 +341,449 @@ fn tui073_a_clear_entry_is_reported_once_and_does_not_break_the_document() {
         km.action_for(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         None,
         "a rejected key still replaces the default, exactly as a never-matching KeyId does"
+    );
+}
+
+// ---------------------------------------------------------------- CFG-064: raw 0x08 on WT --
+
+/// pi `isWindowsTerminalSession()` (`tui/src/keys.ts:715-719` @v0.87.1) over every combination
+/// of `WT_SESSION` and the three SSH variables it negates, including JS's empty-string falsiness.
+#[test]
+fn cfg064_windows_terminal_predicate_is_pis_truth_table() {
+    use crate::keymap::is_windows_terminal_session;
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        }
+    };
+    assert!(is_windows_terminal_session(env(&[("WT_SESSION", "0b1c")])));
+    assert!(!is_windows_terminal_session(env(&[])));
+    assert!(
+        !is_windows_terminal_session(env(&[("WT_SESSION", "")])),
+        "Boolean(\"\") is false"
+    );
+    for ssh in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+        let pairs: &'static [(&'static str, &'static str)] = match ssh {
+            "SSH_CONNECTION" => &[("WT_SESSION", "0b1c"), ("SSH_CONNECTION", "10.0.0.1 22")],
+            "SSH_CLIENT" => &[("WT_SESSION", "0b1c"), ("SSH_CLIENT", "10.0.0.1 51000 22")],
+            _ => &[("WT_SESSION", "0b1c"), ("SSH_TTY", "/dev/pts/3")],
+        };
+        assert!(
+            !is_windows_terminal_session(env(pairs)),
+            "{ssh} set: the session is remote, not Windows Terminal's"
+        );
+        let empty: &'static [(&'static str, &'static str)] = match ssh {
+            "SSH_CONNECTION" => &[("WT_SESSION", "0b1c"), ("SSH_CONNECTION", "")],
+            "SSH_CLIENT" => &[("WT_SESSION", "0b1c"), ("SSH_CLIENT", "")],
+            _ => &[("WT_SESSION", "0b1c"), ("SSH_TTY", "")],
+        };
+        assert!(
+            is_windows_terminal_session(env(empty)),
+            "an empty {ssh} is falsy upstream and must not negate"
+        );
+        let no_wt: &'static [(&'static str, &'static str)] = match ssh {
+            "SSH_CONNECTION" => &[("SSH_CONNECTION", "10.0.0.1 22")],
+            "SSH_CLIENT" => &[("SSH_CLIENT", "10.0.0.1 51000 22")],
+            _ => &[("SSH_TTY", "/dev/pts/3")],
+        };
+        assert!(!is_windows_terminal_session(env(no_wt)));
+    }
+}
+
+/// A legacy terminal's raw `0x08`, as crossterm 0.29.0 decodes it (`parse.rs:106-109`).
+fn raw_bs() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)
+}
+
+/// **CFG-064, off Windows Terminal.** pi `parseKey("\x08")` is `"backspace"` and
+/// `matchesRawBackspace(data, 0)` holds (`keys.ts:730-734`, `:1287` @v0.87.1), so a terminal (or
+/// tmux setup) that sends BS for Backspace deletes a character in the editor.
+///
+/// Red before the fix: crossterm's `Ctrl+H` matched nothing, so the key did nothing at all.
+#[test]
+fn cfg064_raw_bs_is_backspace_off_windows_terminal() {
+    crate::keymap::force_windows_terminal_session(false);
+    let mut ed = crate::InputEditor::new();
+    for c in "abc".chars() {
+        ed.handle_key(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    ed.handle_key(&raw_bs());
+    assert_eq!(
+        ed.text(),
+        "ab",
+        "0x08 must reach tui.editor.deleteCharBackward"
+    );
+    assert_eq!(
+        crate::SessionKeymap::default().action_for(&raw_bs()),
+        None,
+        "off WT the byte is NOT ctrl+backspace, so /resume's deleteNoninvasive does not fire"
+    );
+}
+
+/// **CFG-064, on Windows Terminal.** WT sends `0x08` for Ctrl+Backspace, so pi reads the byte as
+/// `ctrl+backspace`: `/resume`'s `app.session.deleteNoninvasive` (`ctrl+backspace`) fires, and the
+/// editor's `backspace` binding does NOT (`matchesRawBackspace(data, 0)` is false on WT).
+#[test]
+fn cfg064_raw_bs_is_ctrl_backspace_on_windows_terminal() {
+    crate::keymap::force_windows_terminal_session(true);
+    assert_eq!(
+        crate::SessionKeymap::default().action_for(&raw_bs()),
+        Some(crate::SessionAction::DeleteNoninvasive),
+    );
+    let mut ed = crate::InputEditor::new();
+    for c in "abc".chars() {
+        ed.handle_key(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    ed.handle_key(&raw_bs());
+    assert_eq!(
+        ed.text(),
+        "abc",
+        "ctrl+backspace is not an editor binding upstream"
+    );
+}
+
+/// The alias adds a meaning to the byte; it never takes `ctrl+h` away — pi's `rawCtrlChar("h")`
+/// still matches `0x08` for a `ctrl+h` binding on both sides of the heuristic (`keys.ts:1167`).
+#[test]
+fn cfg064_a_ctrl_h_binding_still_matches_the_byte() {
+    for wt in [false, true] {
+        crate::keymap::force_windows_terminal_session(wt);
+        assert!(Key::parse("ctrl+h").unwrap().matches(&raw_bs()), "wt={wt}");
+    }
+}
+
+/// Under the kitty protocol a real Ctrl+H is `CSI 104;5u` and Ctrl+Backspace is `CSI 127;5u`, so a
+/// `Ctrl+H` event is never a raw BS byte and must not alias Backspace.
+#[test]
+fn cfg064_the_alias_is_off_under_the_kitty_protocol() {
+    use crate::keyboard_protocol::{KeyboardProtocol, set_current};
+    crate::keymap::force_windows_terminal_session(false);
+    set_current(KeyboardProtocol::Kitty);
+    let backspace = Key::plain(KeyCode::Backspace).matches(&raw_bs());
+    set_current(KeyboardProtocol::Unknown);
+    assert!(!backspace);
+}
+
+/// `ESC 0x08` — what a legacy terminal sends for Alt+Backspace when its Backspace key emits BS —
+/// is `alt+backspace` upstream on every terminal (`keys.ts:936-938`, `:1291` @v0.87.1). crossterm
+/// reports it as `Ctrl+Alt+H` (an ESC prefix adds `ALT`, `parse.rs:78-87`), so it reaches
+/// `tui.editor.deleteWordBackward` only through the same alias as the bare byte, and only outside
+/// the kitty protocol, where a `Ctrl+Alt+H` event is a real Ctrl+Alt+H.
+///
+/// Red before the fix: the event matched no editor binding, so the chord did nothing.
+#[test]
+fn cfg064_esc_bs_is_alt_backspace() {
+    use crate::keyboard_protocol::{KeyboardProtocol, set_current};
+    let esc_bs = KeyEvent::new(
+        KeyCode::Char('h'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    for wt in [false, true] {
+        crate::keymap::force_windows_terminal_session(wt);
+        let mut ed = crate::InputEditor::new();
+        for c in "foo bar".chars() {
+            ed.handle_key(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        ed.handle_key(&esc_bs);
+        assert_eq!(ed.text(), "foo ", "wt={wt}: deleteWordBackward");
+        assert!(
+            Key::parse("ctrl+alt+h").unwrap().matches(&esc_bs),
+            "an alias, not a rewrite"
+        );
+        assert!(!Key::plain(KeyCode::Backspace).matches(&esc_bs));
+    }
+    set_current(KeyboardProtocol::Kitty);
+    let alt_backspace = Key::parse("alt+backspace").unwrap().matches(&esc_bs);
+    set_current(KeyboardProtocol::Unknown);
+    assert!(!alt_backspace, "under kitty the event is a real Ctrl+Alt+H");
+}
+
+// ------------------------------------------------ CFG-091: WSL defaults, `app.thinking.save` --
+
+/// An env lookup over a fixed table (missing keys are `None`, like `std::env::var_os`).
+fn env_of(
+    pairs: &'static [(&'static str, &'static str)],
+) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+    move |k| {
+        pairs
+            .iter()
+            .find(|(name, _)| *name == k)
+            .map(|(_, v)| std::ffi::OsString::from(v))
+    }
+}
+
+/// pi `useWindowsKeybindings(platform, env)` (`core/keybindings.ts:62-67` @v0.87.1).
+#[test]
+fn cfg091_use_windows_keybindings_is_win32_or_linux_under_wsl() {
+    use crate::KeybindingPlatform as P;
+    let wsl = P::detect("linux", env_of(&[("WSL_DISTRO_NAME", "Ubuntu")]));
+    assert!(wsl.windows_keybindings && !wsl.win32);
+    assert!(
+        P::detect("linux", env_of(&[("WSL_INTEROP", "/run/WSL/1_interop")])).windows_keybindings,
+        "WSL2 sets WSL_INTEROP even when WSL_DISTRO_NAME is scrubbed"
+    );
+    assert!(!P::detect("linux", env_of(&[])).windows_keybindings);
+    assert!(
+        !P::detect("linux", env_of(&[("WSL_DISTRO_NAME", "")])).windows_keybindings,
+        "Boolean(\"\") is false"
+    );
+    assert!(
+        !P::detect("macos", env_of(&[("WSL_DISTRO_NAME", "Ubuntu")])).windows_keybindings,
+        "the WSL arm is `platform === \"linux\"` only"
+    );
+    let win = P::detect("windows", env_of(&[]));
+    assert!(win.windows_keybindings && win.win32);
+}
+
+/// **CFG-091's `Verify`.** Under WSL the app defaults move off the chords Windows Terminal
+/// reserves: `app.model.cycleBackward` is `alt+p`, `app.message.followUp` `ctrl+q`,
+/// `app.message.dequeue` `alt+q` (`core/keybindings.ts:112-141` @v0.87.1) — and the Linux chords
+/// they replace are unbound, not kept alongside.
+///
+/// Red before the fix: the table had no platform input, so WSL got `shift+ctrl+p` / `alt+enter` /
+/// `alt+up`.
+#[test]
+fn cfg091_wsl_app_defaults_are_the_windows_ones() {
+    let wsl = crate::KeybindingPlatform::detect("linux", env_of(&[("WSL_DISTRO_NAME", "Ubuntu")]));
+    let km = Keymap::for_platform(wsl);
+    let alt = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+    assert_eq!(
+        km.keys_label(Action::ModelCycleBackward).as_deref(),
+        Some("alt+p")
+    );
+    assert_eq!(km.action_for(&alt('p')), Some(Action::ModelCycleBackward));
+    assert_eq!(
+        km.action_for(&KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )),
+        None
+    );
+    assert_eq!(km.keys_label(Action::FollowUp).as_deref(), Some("ctrl+q"));
+    assert_eq!(
+        km.action_for(&KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+        None
+    );
+    assert_eq!(km.keys_label(Action::Dequeue).as_deref(), Some("alt+q"));
+    assert_eq!(km.action_for(&alt('q')), Some(Action::Dequeue));
+
+    let linux = Keymap::for_platform(crate::KeybindingPlatform::detect("linux", env_of(&[])));
+    assert_eq!(
+        linux.keys_label(Action::ModelCycleBackward).as_deref(),
+        Some("ctrl+shift+p")
+    );
+    assert_eq!(
+        linux.keys_label(Action::FollowUp).as_deref(),
+        Some("alt+enter")
+    );
+    assert_eq!(linux.keys_label(Action::Dequeue).as_deref(), Some("alt+up"));
+}
+
+/// `tui.editor.undo` is `win32 ? "ctrl+z" : windowsKeybindings ? "alt+z" : "ctrl+-"`
+/// (`core/keybindings.ts:77-80` @v0.87.1), resolved through the editor's own table.
+#[test]
+fn cfg091_wsl_undo_is_alt_z() {
+    use crate::{EditorAction, EditorKeymap, KeybindingPlatform};
+    let wsl = KeybindingPlatform::detect("linux", env_of(&[("WSL_INTEROP", "/run/WSL/1_interop")]));
+    let km = EditorKeymap::for_platform(wsl);
+    assert_eq!(km.keys_label(EditorAction::Undo).as_deref(), Some("alt+z"));
+    assert_eq!(
+        km.action_for(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+        Some(EditorAction::Undo),
+        "alt+z reaches tui.editor.undo under WSL"
+    );
+    assert_eq!(
+        km.action_for(&KeyEvent::new(KeyCode::Char('-'), KeyModifiers::CONTROL)),
+        None,
+        "and ctrl+- no longer does"
+    );
+
+    let linux = EditorKeymap::for_platform(KeybindingPlatform::detect("linux", env_of(&[])));
+    assert_eq!(
+        linux.keys_label(EditorAction::Undo).as_deref(),
+        Some("ctrl+-")
+    );
+}
+
+/// `tui.altScreen.previousPrompt` / `nextPrompt` are the bare `ctrl+up` / `ctrl+down` alone under
+/// `windowsKeybindings` (`core/keybindings.ts:81-88` @v0.87.1).
+#[test]
+fn cfg091_wsl_alt_screen_prompt_jumps_drop_the_shifted_chord() {
+    use crate::{AltScreenAction, AltScreenKeymap, KeybindingPlatform};
+    let wsl = KeybindingPlatform::detect("linux", env_of(&[("WSL_DISTRO_NAME", "Ubuntu")]));
+    let km = AltScreenKeymap::for_platform(wsl);
+    assert_eq!(
+        km.keys_label(AltScreenAction::PreviousPrompt).as_deref(),
+        Some("ctrl+up")
+    );
+    assert_eq!(
+        km.keys_label(AltScreenAction::NextPrompt).as_deref(),
+        Some("ctrl+down")
+    );
+    let linux = AltScreenKeymap::for_platform(KeybindingPlatform::detect("linux", env_of(&[])));
+    assert_eq!(
+        linux.keys_label(AltScreenAction::PreviousPrompt).as_deref(),
+        Some("ctrl+shift+up/ctrl+up")
+    );
+}
+
+/// **CFG-091, `app.thinking.save`.** A real id (`core/keybindings.ts:104-107` @v0.87.1, default
+/// `ctrl+s`) that `keybindings.json` can rebind, that the `/thinking` picker's persist check reads
+/// (`thinking-selector.ts:131`) and whose label its footer prints (`:97`) — driven through
+/// `App::load_keybindings_json` and `App::handle_input` with the picker open.
+///
+/// Red before the fix: the id resolved nowhere and the picker matched a literal `ctrl+s`, so the
+/// rebind was ignored and the footer kept advertising `Ctrl+S`.
+#[test]
+fn cfg091_app_thinking_save_is_rebindable_and_drives_the_picker() {
+    use crate::{App, AppAction, AppCommand, InputEvent, SelectorKind, UiTheme};
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new(TestBackend::new(80, 30), UiTheme::dark()).unwrap();
+    assert!(
+        app.effective_keybindings()
+            .iter()
+            .any(|(id, keys)| id == "app.thinking.save" && keys == &["ctrl+s".to_string()]),
+        "the stock default is ctrl+s"
+    );
+    let issues = app
+        .load_keybindings_json(r#"{"app.thinking.save":"ctrl+k"}"#)
+        .unwrap();
+    assert!(issues.is_empty(), "{issues:?}");
+
+    app.open_selector(SelectorKind::Thinking);
+    app.draw().unwrap();
+    let buf = app.terminal().backend().buffer().clone();
+    let text: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(
+        text.contains("Ctrl+K to set as default"),
+        "the footer names the live key:\n{text}"
+    );
+
+    let ctrl = |c: char| InputEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    // The old literal no longer persists — it falls to the search input like any other chord.
+    assert!(!matches!(
+        app.handle_input(&ctrl('s')),
+        AppAction::Command(AppCommand::ConfirmSelectionAsDefault { .. })
+    ));
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::Thinking));
+    match app.handle_input(&ctrl('k')) {
+        AppAction::Command(AppCommand::ConfirmSelectionAsDefault { kind, value }) => {
+            assert_eq!(kind, SelectorKind::Thinking);
+            assert_eq!(value, "medium");
+        }
+        other => panic!("ctrl+k must persist the highlighted level, got {other:?}"),
+    }
+}
+
+// ------------------------------------------------ TUI-071: platform-conditional app defaults --
+
+/// `app.suspend` is `process.platform === "win32" ? [] : "ctrl+z"` (`core/keybindings.ts:96-99`
+/// @v0.87.1) — unbound on native Windows only; WSL keeps job control and `ctrl+z`.
+#[test]
+fn tui071_suspend_is_unbound_on_native_windows_only() {
+    use crate::KeybindingPlatform as P;
+    let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+    let win = Keymap::for_platform(P::detect("windows", env_of(&[])));
+    assert_eq!(win.action_for(&ctrl_z), None);
+    assert_eq!(win.keys_label(Action::Suspend), None);
+    for platform in [
+        P::detect("linux", env_of(&[])),
+        P::detect("linux", env_of(&[("WSL_DISTRO_NAME", "Ubuntu")])),
+        P::detect("macos", env_of(&[])),
+    ] {
+        assert_eq!(
+            Keymap::for_platform(platform).action_for(&ctrl_z),
+            Some(Action::Suspend),
+            "{platform:?}"
+        );
+    }
+}
+
+/// `app.clipboard.pasteImage` is `windowsKeybindings ? "alt+v" : "ctrl+v"` (`:142-145`) — exactly
+/// one key, so the other chord is left to the editor / the terminal's own paste.
+#[test]
+fn tui071_paste_image_binds_one_key_per_platform() {
+    use crate::KeybindingPlatform as P;
+    let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+    let alt_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT);
+    let linux = Keymap::for_platform(P::detect("linux", env_of(&[])));
+    assert_eq!(
+        linux.keys_label(Action::ClipboardPasteImage).as_deref(),
+        Some("ctrl+v")
+    );
+    assert_eq!(linux.action_for(&ctrl_v), Some(Action::ClipboardPasteImage));
+    assert_eq!(linux.action_for(&alt_v), None);
+    for windows in [
+        P::detect("windows", env_of(&[])),
+        P::detect("linux", env_of(&[("WSL_INTEROP", "/run/WSL/1_interop")])),
+    ] {
+        let km = Keymap::for_platform(windows);
+        assert_eq!(
+            km.keys_label(Action::ClipboardPasteImage).as_deref(),
+            Some("alt+v"),
+            "{windows:?}"
+        );
+        assert_eq!(km.action_for(&ctrl_v), None, "{windows:?}");
+    }
+}
+
+/// `app.tree.foldOrUp` / `unfoldOrDown` bind the same two keys everywhere, alt-first on darwin
+/// and ctrl-first elsewhere (`:150-157`) — the first key is the one `/tree`'s help row shows.
+#[test]
+fn tui071_tree_fold_keys_are_ctrl_first_off_darwin() {
+    use crate::{KeybindingPlatform as P, TreeAction, TreeKeymap};
+    let linux = TreeKeymap::for_platform(P::detect("linux", env_of(&[])));
+    let mac = TreeKeymap::for_platform(P::detect("macos", env_of(&[])));
+    assert_eq!(
+        linux.first_key_label(TreeAction::FoldOrUp).as_deref(),
+        Some("ctrl+←")
+    );
+    assert_eq!(
+        linux.first_key_label(TreeAction::UnfoldOrDown).as_deref(),
+        Some("ctrl+→")
+    );
+    assert_eq!(
+        mac.first_key_label(TreeAction::FoldOrUp).as_deref(),
+        Some("alt+←")
+    );
+    assert_eq!(
+        mac.first_key_label(TreeAction::UnfoldOrDown).as_deref(),
+        Some("alt+→")
+    );
+    for km in [&linux, &mac] {
+        for mods in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            assert_eq!(
+                km.action_for(&KeyEvent::new(KeyCode::Left, mods)),
+                Some(TreeAction::FoldOrUp)
+            );
+            assert_eq!(
+                km.action_for(&KeyEvent::new(KeyCode::Right, mods)),
+                Some(TreeAction::UnfoldOrDown)
+            );
+        }
+    }
+}
+
+/// With `app.suspend` off `ctrl+z` on native Windows, `tui.editor.undo` takes its `win32` arm
+/// (`core/keybindings.ts:77-80`): `ctrl+z`.
+#[test]
+fn tui071_native_windows_undo_is_ctrl_z() {
+    use crate::{EditorAction, EditorKeymap, KeybindingPlatform};
+    let km = EditorKeymap::for_platform(KeybindingPlatform::detect("windows", env_of(&[])));
+    assert_eq!(km.keys_label(EditorAction::Undo).as_deref(), Some("ctrl+z"));
+    assert_eq!(
+        km.action_for(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+        Some(EditorAction::Undo)
     );
 }

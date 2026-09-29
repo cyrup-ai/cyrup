@@ -210,6 +210,15 @@ impl NativeExtension for SubagentsExtension {
                         self.supervisor_channel.clone(),
                     ),
                 ));
+                // SUBA-136 — pi `registerMessageRenderer(SUPERVISOR_REQUEST_MESSAGE_TYPE, …)` and
+                // `registerEntryRenderer(SUPERVISOR_REPLY_ENTRY_TYPE, …)`
+                // (`extension/index.ts:651-658` @v0.71.0): the request card the channel injects
+                // and the reply journal entry `subagent_supervisor` appends. Both are drawn by
+                // `Self::render_live`.
+                api.register_message_renderer(
+                    crate::tui::supervisor_ui::SUPERVISOR_REQUEST_MESSAGE_TYPE,
+                );
+                api.register_entry_renderer(crate::tui::supervisor_ui::SUPERVISOR_REPLY_ENTRY_TYPE);
 
                 // G106, upstream's SECOND parent registration (`:637`): the same channel under the
                 // bare name `intercom`, guarded by `!hasTool(pi, "intercom")`. `InitApi` has no
@@ -471,6 +480,10 @@ impl NativeExtension for SubagentsExtension {
                 // (`open_herdr_project_pane_count`, pi's `getProjectPaneCount` closure at
                 // `extension/index.ts:864`).
                 self.executor.restore_herdr_project_panes(&ctx.cwd);
+
+                // SUBA-133 — pi `session_start`'s `advertisedContext = { cwd: ctx.cwd, … };
+                // refreshAdvertisedAgents()` (`extension/index.ts:1189-1192` @v0.71.0).
+                self.executor.start_advertised_agents(&ctx.cwd).await;
 
                 // G106 (pi `extension/index.ts:757` `supervisorChannel.start()`): bind the live
                 // capability backend — the channel needs `session_id()` to decide which pending
@@ -812,12 +825,43 @@ impl NativeExtension for SubagentsExtension {
             HostEvent::BeforeAgentStart {
                 prompt,
                 system_prompt,
+                options,
                 ..
             } => {
                 self.watchdog.handle_before_agent_start(
                     &serde_json::json!({ "prompt": prompt, "systemPrompt": system_prompt }),
                     &ctx.cwd,
                 );
+                // SUBA-133 — pi's `before_agent_start` handler (`extension/index.ts:821-829`
+                // @v0.71.0): the advertised catalog rides the system prompt only while the
+                // `subagent` tool is selected (`systemPromptOptions.selectedTools ??
+                // getActiveTools()`), and a stale block is stripped either way.
+                let selected_tools: Vec<String> = match options.get("selectedTools") {
+                    Some(serde_json::Value::Array(names)) => names
+                        .iter()
+                        .filter_map(|name| name.as_str().map(str::to_string))
+                        .collect(),
+                    _ => self
+                        .executor
+                        .host_services()
+                        .and_then(|services| services.active_tools())
+                        .unwrap_or_default(),
+                };
+                let advertised = if selected_tools.iter().any(|name| name == TOOL_NAME) {
+                    self.executor.advertised_agent_prompt().await
+                } else {
+                    None
+                };
+                let rewritten = crate::discovery::advertised::append_advertised_agent_prompt(
+                    system_prompt,
+                    advertised.as_deref(),
+                );
+                if rewritten != *system_prompt {
+                    return HookOutcome::Mutate(cyrup_ext::EventPatch::SystemPromptAndInject {
+                        system: Some(rewritten),
+                        inject: None,
+                    });
+                }
             }
             // pi `register-main.ts:419-422`. The event is re-shaped into the `{type:"turn_end",
             // message, toolResults}` object `formatWatchdogTurnDelta`/`eventIndicatesRepoEdit`
@@ -1108,6 +1152,26 @@ impl NativeExtension for SubagentsExtension {
     ///
     /// Reached by: the model issues a `subagent` tool call → `cyrup-tui`'s `extension_render`
     /// resolves this extension for the tool name and calls here (`cyrup-tui/src/app.rs:4283,4295`).
+    /// SUBA-136 — the two supervisor cards (pi `renderSupervisorRequest`/`renderSupervisorReply`,
+    /// `intercom/supervisor-ui.ts:231-249` @v0.71.0). They are components rather than strings
+    /// because the card fills the LIVE width and its bounds depend on the live expand toggle.
+    /// `None` for a payload that fails upstream's shape checks, which leaves the host's own framing.
+    fn render_live(
+        &self,
+        key: &str,
+        payload: &serde_json::Value,
+    ) -> Option<Arc<dyn cyrup_ext::RenderedComponent>> {
+        match key {
+            crate::tui::supervisor_ui::SUPERVISOR_REQUEST_MESSAGE_TYPE => {
+                crate::tui::supervisor_ui::render_supervisor_request(payload)
+            }
+            crate::tui::supervisor_ui::SUPERVISOR_REPLY_ENTRY_TYPE => {
+                crate::tui::supervisor_ui::render_supervisor_reply(payload)
+            }
+            _ => None,
+        }
+    }
+
     fn render_call(&self, key: &str, call: &serde_json::Value) -> Option<serde_json::Value> {
         // pi `pi.registerMessageRenderer(SUBAGENT_WATCHDOG_WARNING_TYPE, …)`
         // (`register-main.ts:392-401`). `render_call` carries BOTH surfaces: `key` is a tool name

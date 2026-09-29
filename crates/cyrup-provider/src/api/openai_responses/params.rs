@@ -5,14 +5,14 @@ use super::convert::convert_responses_messages;
 use super::options::{reasoning_summary_or_auto, reasoning_summary_wire};
 use super::tools::{ConvertResponsesToolsOptions, convert_responses_tools};
 use crate::api::compat::{
-    clamp_openai_prompt_cache_key, get_responses_compat, mapped_effort_or, off_is_not_null,
-    off_value_or, thinking_level_key,
+    ResolvedResponsesCompat, clamp_openai_prompt_cache_key, get_responses_compat, mapped_effort_or,
+    off_is_not_null, off_value_or, thinking_level_key,
 };
 use crate::auth::ProviderEnv;
 use crate::collection::clamp_thinking_level;
 use crate::context::Context;
 use crate::model::Model;
-use crate::stream::{CacheRetention, StreamOptions};
+use crate::stream::{CacheRetention, StreamOptions, ToolChoice};
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::provider_plumbing::{EnvSource, resolve_cache_retention};
@@ -27,6 +27,51 @@ const OPENAI_TOOL_CALL_PROVIDERS: &[&str] = &["openai", "openai-codex", "opencod
 /// <https://github.com/earendil-works/pi/issues/6265>
 /// (Pi `OPENAI_RESPONSES_MIN_OUTPUT_TOKENS`, `openai-responses.ts:32` @v0.83.0.)
 pub(crate) const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: u64 = 16;
+
+/// Pi `getPromptCacheRetention` (`openai-responses.ts:83-90` @v0.87.1): `"24h"` only for long
+/// retention on a long-cache-capable model that does NOT use explicit prompt-cache mode — GPT-5.6+
+/// explicit-mode models take a `ttl` through [`prompt_cache_options`] instead (v0.85.1). PROV-093.
+pub(crate) fn prompt_cache_retention(
+    compat: &ResolvedResponsesCompat,
+    cache: CacheRetention,
+) -> Option<&'static str> {
+    (cache == CacheRetention::Long
+        && compat.supports_long_cache_retention
+        && !compat.supports_explicit_prompt_cache_mode)
+        .then_some("24h")
+}
+
+/// Pi `getPromptCacheOptions` (`openai-responses.ts:92-100` @v0.87.1). On an explicit-mode model,
+/// `cacheRetention: "none"` sends `{mode:"explicit"}` so the endpoint does not implicitly
+/// cache-WRITE a one-shot prompt (compaction/branch summaries) and bill the premium for a prefix
+/// nothing re-reads (PROV-023), and long retention sends `{ttl:"30m"}` (PROV-093).
+pub(crate) fn prompt_cache_options(
+    compat: &ResolvedResponsesCompat,
+    cache: CacheRetention,
+) -> Option<Value> {
+    if !compat.supports_explicit_prompt_cache_mode {
+        return None;
+    }
+    match cache {
+        CacheRetention::None => Some(json!({ "mode": "explicit" })),
+        CacheRetention::Long if compat.supports_long_cache_retention => {
+            Some(json!({ "ttl": "30m" }))
+        }
+        _ => None,
+    }
+}
+
+/// The Responses API `tool_choice` wire value for a [`ToolChoice`]. The string modes are shared
+/// with Chat Completions; a forced function is `{type:"function", name}` on this API (the SDK's
+/// `ToolChoiceFunction`), not Chat Completions' nested `{type, function:{name}}`. Pi passes its
+/// `ResponseCreateParamsStreaming["tool_choice"]` through verbatim (`:340-341`), so this is the
+/// shape the same choice takes there. Shared with `azure-openai-responses`. PROV-094.
+pub(crate) fn responses_tool_choice(tc: &ToolChoice) -> Value {
+    match tc {
+        ToolChoice::Function { name } => json!({ "type": "function", "name": name }),
+        other => other.to_wire(),
+    }
+}
 
 /// Test-only infallible view of [`try_build_params`]: every in-file fixture declares tools whose
 /// `constrainedSampling` is absent, so the resolver cannot fail.
@@ -109,27 +154,22 @@ pub(super) fn try_build_params(
             json!(clamp_openai_prompt_cache_key(sid.as_str())),
         );
     }
-    // prompt_cache_retention: "24h" only for long retention on a long-cache-capable model.
-    if cache == CacheRetention::Long && compat.supports_long_cache_retention {
-        obj.insert("prompt_cache_retention".to_string(), json!("24h"));
+    if let Some(retention) = prompt_cache_retention(&compat, cache) {
+        obj.insert("prompt_cache_retention".to_string(), json!(retention));
     }
-    // PROV-023. `const disableImplicitPromptCache = cacheRetention === "none" &&
-    // compat.supportsExplicitPromptCacheMode` (openai-responses.ts:278 @v0.83.0), emitted at `:285`
-    // in pi's literal — between `prompt_cache_retention` and `store`. Without it the endpoint
-    // implicitly cache-WRITES one-shot prompts (compaction/branch summaries run with
-    // `cacheRetention: "none"`) and bills the cache-write premium for a prefix nothing will re-read.
-    if cache == CacheRetention::None && compat.supports_explicit_prompt_cache_mode {
-        obj.insert(
-            "prompt_cache_options".to_string(),
-            json!({ "mode": "explicit" }),
-        );
+    if let Some(options) = prompt_cache_options(&compat, cache) {
+        obj.insert("prompt_cache_options".to_string(), options);
     }
     obj.insert("store".to_string(), json!(false));
 
-    // PROV-019. `if (options?.maxTokens) params.max_output_tokens = Math.max(options.maxTokens,
-    // OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)` (openai-responses.ts:289-290 @v0.83.0). The `.filter`
-    // reproduces pi's JS truthiness gate, so `Some(0)` omits the key rather than sending `0`.
-    if let Some(max) = opts.max_tokens.filter(|m| *m > 0) {
+    // PROV-019. `if (options?.maxTokens && compat.supportsMaxOutputTokens) params.max_output_tokens
+    // = Math.max(options.maxTokens, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)` (openai-responses.ts:321-322
+    // @v0.87.1; the compat gate is PROV-093). The `.filter` reproduces pi's JS truthiness gate, so
+    // `Some(0)` omits the key rather than sending `0`.
+    if let Some(max) = opts
+        .max_tokens
+        .filter(|m| *m > 0 && compat.supports_max_output_tokens)
+    {
         obj.insert(
             "max_output_tokens".to_string(),
             json!(max.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)),
@@ -171,6 +211,12 @@ pub(super) fn try_build_params(
                 },
             )?),
         );
+    }
+
+    // PROV-094. `if (options?.toolChoice !== undefined) params.tool_choice = options.toolChoice`
+    // (openai-responses.ts:340-341 @v0.87.1), after `tools` in pi's literal order.
+    if let Some(tc) = &opts.tool_choice {
+        obj.insert("tool_choice".to_string(), responses_tool_choice(tc));
     }
 
     if model.reasoning {

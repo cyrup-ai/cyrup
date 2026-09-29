@@ -652,6 +652,7 @@ mod tests {
                 session_dir: None,
                 artifacts: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect_err("file-only with no output path must be refused");
@@ -714,6 +715,7 @@ mod tests {
                 session_dir: None,
                 artifacts: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect_err("the agent's file-only mode with no output path must be refused");
@@ -766,6 +768,7 @@ mod tests {
                 session_dir: None,
                 artifacts: None,
                 timeout_ms: None,
+                checkpoint_before_deadline_ms: None,
             })
             .await
             .expect_err("a blocked depth ceiling must reject before discovery or any spawn setup");
@@ -982,6 +985,7 @@ mod tests {
                     include_progress: None,
                     run_id: RunId::new(),
                     timeout_ms: None,
+                    checkpoint_before_deadline_ms: None,
                     share: None,
                     artifacts_dir: None,
                     artifact_config: crate::artifacts::ArtifactConfig::default(),

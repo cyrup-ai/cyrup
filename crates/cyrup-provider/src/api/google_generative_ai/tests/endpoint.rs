@@ -36,3 +36,17 @@ fn headers_use_goog_api_key() {
         Some("application/json")
     );
 }
+
+/// PROV-095 — pi `{ "User-Agent": getPiUserAgent(), ...model.headers, ...optionsHeaders }`
+/// (google-generative-ai.ts:357 @v0.87.1, #8305): a default client User-Agent under every overlay.
+#[test]
+fn default_user_agent_sits_under_the_overlays() {
+    let m = model_with("gemini-2.0-flash", false);
+    crate::utils::user_agent::assert_default_user_agent_under_overlays(|overlay| {
+        let opts = StreamOptions {
+            headers: overlay,
+            ..Default::default()
+        };
+        build_headers(&m, &opts, "test-key")
+    });
+}

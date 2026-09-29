@@ -61,6 +61,16 @@ pub enum EventKind {
     /// `session_info_changed` (pi `SessionInfoChangedEvent`, extensions/types.ts:571-575 @v0.83.0,
     /// subscribed at `:1193` — EXT-073: `:1203` is `session_compact`'s overload). EXT-011.
     SessionInfoChanged = 32,
+    /// `ui_prompt_start` (pi `UIPromptStartEvent`, `core/extensions/types.ts:830-836` @v0.87.1,
+    /// added v0.84.4). Notify-only: an extension's blocking UI prompt opened. EXT-075.
+    UiPromptStart = 33,
+    /// `ui_prompt_end` (pi `UIPromptEndEvent`, `core/extensions/types.ts:838-845` @v0.87.1).
+    /// Notify-only: that prompt closed, however it settled. EXT-075.
+    UiPromptEnd = 34,
+    /// `context_with_system` (pi `ContextWithSystemEvent`, `core/extensions/types.ts:708-711`
+    /// @v0.87.1, added v0.87.0). Mutating: the request-time transform that runs after every
+    /// `context` handler, whose result is sent as returned. EXT-079.
+    ContextWithSystem = 35,
 }
 
 impl EventKind {
@@ -73,7 +83,11 @@ impl EventKind {
     /// claim it carried was false while `before_provider_headers` and `session_info_changed` were
     /// missing. Enumerating pi's overload names against [`EventKind::name`] now leaves an empty
     /// set difference in both directions: no missing event and no cyrup-invented one.
-    pub const COUNT: u8 = 33;
+    ///
+    /// **36 against pi v0.87.1**: the three events pi added after that baseline —
+    /// `ui_prompt_start`/`ui_prompt_end` (v0.84.4, EXT-075) and `context_with_system` (v0.87.0,
+    /// EXT-079) — are ported as kinds 33-35.
+    pub const COUNT: u8 = 36;
 
     /// Parse the `u8` a guest passes via `subscribe(event-kinds)`.
     pub fn from_u8(v: u8) -> Option<EventKind> {
@@ -112,6 +126,9 @@ impl EventKind {
             30 => AgentSettled,
             31 => BeforeProviderHeaders,
             32 => SessionInfoChanged,
+            33 => UiPromptStart,
+            34 => UiPromptEnd,
+            35 => ContextWithSystem,
             _ => return None,
         })
     }
@@ -154,6 +171,9 @@ impl EventKind {
             AgentSettled => "agent_settled",
             BeforeProviderHeaders => "before_provider_headers",
             SessionInfoChanged => "session_info_changed",
+            UiPromptStart => "ui_prompt_start",
+            UiPromptEnd => "ui_prompt_end",
+            ContextWithSystem => "context_with_system",
         }
     }
 
@@ -238,6 +258,12 @@ impl Subscriptions {
 
     pub fn add(&mut self, kind: EventKind) {
         self.0 |= 1u64 << (kind as u8);
+    }
+
+    /// Clear `kind` — the guest's `unsubscribe` import (EXT-080). Clearing an absent kind is a
+    /// no-op, like upstream's remover on a handler already gone.
+    pub fn remove(&mut self, kind: EventKind) {
+        self.0 &= !(1u64 << (kind as u8));
     }
 
     pub fn contains(&self, kind: EventKind) -> bool {
@@ -328,6 +354,13 @@ pub enum HostEvent {
     Context {
         messages: Vec<Arc<AgentMessage>>,
     },
+    /// `context_with_system` (pi `ContextWithSystemEvent`, `core/extensions/types.ts:708-711`
+    /// @v0.87.1): the transcript as the whole `context` chain left it. Upstream it carries the
+    /// system messages too — the prompt and tool declarations, which the handler then owns; cyrup's
+    /// transcript has none until AGENT-039 moves the system prompt into it. EXT-079.
+    ContextWithSystem {
+        messages: Vec<Arc<AgentMessage>>,
+    },
     MessageEnd {
         message: Message,
     },
@@ -413,6 +446,19 @@ pub enum HostEvent {
     /// `None` is upstream's `undefined`, not an empty name (EXT-011).
     SessionInfoChanged {
         name: Option<String>,
+    },
+    /// `ui_prompt_start` (pi `UIPromptStartEvent`, `core/extensions/types.ts:830-836` @v0.87.1):
+    /// `kind` is pi's `UIPromptKind`; `title` is `None` where pi omits it (`custom`, or an empty
+    /// title — `...(title ? { title } : {})`, `runner.ts:543`). EXT-075.
+    UiPromptStart {
+        kind: String,
+        title: Option<String>,
+    },
+    /// `ui_prompt_end` (pi `UIPromptEndEvent`, `core/extensions/types.ts:838-845` @v0.87.1): the
+    /// OUTER prompt's `kind`/`title`, like `runner.ts:550`'s `this.activeUIPrompt`. EXT-075.
+    UiPromptEnd {
+        kind: String,
+        title: Option<String>,
     },
     /// `resources_discover` (pi `ResourcesDiscoverEvent`, extensions/types.ts:544-548 @v0.83.0):
     /// `{type, cwd, reason: "startup" | "reload"}` (EXT-016).
@@ -545,6 +591,7 @@ impl HostEvent {
             HostEvent::ToolCall { .. } => K::ToolCall,
             HostEvent::ToolResult { .. } => K::ToolResult,
             HostEvent::Context { .. } => K::Context,
+            HostEvent::ContextWithSystem { .. } => K::ContextWithSystem,
             HostEvent::MessageEnd { .. } => K::MessageEnd,
             HostEvent::BeforeAgentStart { .. } => K::BeforeAgentStart,
             HostEvent::AgentStart => K::AgentStart,
@@ -559,6 +606,8 @@ impl HostEvent {
             HostEvent::SessionStart { .. } => K::SessionStart,
             HostEvent::SessionShutdown { .. } => K::SessionShutdown,
             HostEvent::SessionInfoChanged { .. } => K::SessionInfoChanged,
+            HostEvent::UiPromptStart { .. } => K::UiPromptStart,
+            HostEvent::UiPromptEnd { .. } => K::UiPromptEnd,
             HostEvent::ResourcesDiscover { .. } => K::ResourcesDiscover,
             HostEvent::ProjectTrust { .. } => K::ProjectTrust,
             HostEvent::Input { .. } => K::Input,

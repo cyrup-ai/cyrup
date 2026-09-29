@@ -147,11 +147,7 @@ async fn a_subscribed_extension_is_told_the_new_branch_with_the_tri_state_intact
 
     assert_eq!(
         seen.lock().unwrap().clone(),
-        vec![
-            Some("main".to_string()),
-            Some("detached".to_string()),
-            None,
-        ],
+        vec![Some("main".to_string()), Some("detached".to_string()), None,],
         "a branch name, the literal `detached` and `null`-outside-a-repo all reach the guest \
          unflattened (`core/footer-data-provider.ts:126-132` @v0.87.1)"
     );

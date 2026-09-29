@@ -762,13 +762,6 @@ impl OAuthAuth for KimiCodingOAuth {
     }
 }
 
-/// An [`super::load::OAuthFlowFactory`]-shaped constructor for
-/// [`super::load::register_bundled_oauth_flow_loaders`] under
-/// [`super::load::OAuthFlowId::KimiCoding`] (`load.ts:51-54`).
-pub fn kimi_coding_oauth_flow() -> Result<Arc<dyn OAuthAuth>, OAuthError> {
-    Ok(Arc::new(KimiCodingOAuth::new()) as Arc<dyn OAuthAuth>)
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1475,14 +1468,5 @@ mod tests {
         );
         assert!(auth.api_key.is_none());
         assert!(auth.base_url.is_none());
-    }
-
-    /// The factory is registry-shaped (`load.ts:51-54`).
-    #[test]
-    fn factory_builds_the_flow() {
-        assert_eq!(
-            kimi_coding_oauth_flow().unwrap().name(),
-            "Kimi Code (subscription)"
-        );
     }
 }

@@ -671,7 +671,10 @@ mod tests {
         // heterogeneous, which is what makes the single-row assertions above worth making.
         assert_eq!(models.iter().filter(|m| !m.reasoning).count(), 42);
         assert_eq!(
-            models.iter().filter(|m| m.input == vec![Modality::Text]).count(),
+            models
+                .iter()
+                .filter(|m| m.input == vec![Modality::Text])
+                .count(),
             43
         );
         assert_eq!(

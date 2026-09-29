@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub struct EmptyParams {}
 
 /// `PaneTarget` (`tmp/herdr/src/api/schema/common.rs:33-36`) — the params of `pane.get`,
-/// `pane.focus` and `pane.close` (`tmp/herdr/src/api/schema.rs:169,171,183,185,207,234`).
+/// `pane.focus` and `pane.close` (`tmp/herdr/src/api/schema.rs:169,181,183,205,232`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaneTarget {
     /// The public pane id, e.g. `"w1:p1"`.
@@ -88,7 +88,7 @@ pub enum SplitDirection {
 /// **Closed, and safely so** — unlike [`AgentStatus`], which had to be opened. A `ReadSource`
 /// only ever comes *back* as the echo of one this client sent: herdr's `pane.read` handler writes
 /// `source: params.source` straight out of the request
-/// (`tmp/herdr/src/app/api/panes.rs:1533-1543`), and the one place herdr substitutes a different
+/// (`tmp/herdr/src/app/api/panes.rs:1517-1527`), and the one place herdr substitutes a different
 /// value — `output_match_read_source`, `tmp/herdr/src/api/subscriptions.rs:11-18` — maps
 /// `Recent` to `RecentUnwrapped` and is the identity on everything else. A sixth variant in a
 /// newer herdr therefore cannot reach [`super::panes::PaneReadResult::source`] unless this client

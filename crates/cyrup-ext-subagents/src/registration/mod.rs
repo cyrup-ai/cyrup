@@ -551,6 +551,18 @@ pub struct SubagentExtensionConfig {
     /// operator was trying to unblock keeps failing with the same error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
+    /// SUBA-128 — pi `ExtensionConfig.checkpointBeforeDeadlineMs?: number` (`shared/types.ts:2695`
+    /// @v0.71.0, resolved at `subagent-executor.ts:3460` as `params.checkpointBeforeDeadlineMs ??
+    /// config.checkpointBeforeDeadlineMs`): the global default for the async single-agent launch
+    /// option of the same name — how long before its deadline the runner asks the child to finish
+    /// the current tool call and hand off.
+    ///
+    /// Carried RAW like [`Self::default_subagent_context`] and for the same reason: upstream
+    /// THROWS on a bad value ([`Self::validate_checkpoint_before_deadline_ms`], run by
+    /// [`Self::validate_raw_config`]), and a typed field would instead fail this whole struct's
+    /// deserialization. Read through [`Self::checkpoint_before_deadline_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_before_deadline_ms: Option<serde_json::Value>,
 }
 
 /// The `config.json` keys pi declares on `ExtensionConfig` at v0.68.0 (`shared/types.ts:2596-2690`)
@@ -558,14 +570,10 @@ pub struct SubagentExtensionConfig {
 /// [`SubagentExtensionConfig::config_warnings`] when set, rather than dropped by serde.
 ///
 /// Each is a real feature gap, not a decision that it is out of scope; the ledger carries them.
-pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 11] = [
+pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 10] = [
     ("forkContext", "pruned fork-context preparation"),
     ("mainWindowRenderer", "main-chat renderer density controls"),
     ("orcaProgressTabs", "Orca observer tabs"),
-    (
-        "checkpointBeforeDeadlineMs",
-        "pre-deadline checkpoint requests",
-    ),
     ("toolBudget", "a config-level tool-budget default"),
     ("usageBudget", "a config-level usage-budget default"),
     ("worktree", "a config-level managed-worktree default"),
@@ -577,6 +585,18 @@ pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 11] = [
     ("intercomBridge", "intercom bridge configuration"),
     ("resultScanLogging", "result-index scan logging"),
 ];
+
+/// SUBA-128 — the largest `checkpointBeforeDeadlineMs` upstream accepts, as a config value
+/// (`extension/config.ts:149`) and as a tool parameter (`extension/schemas.ts:363`).
+pub const MAX_CHECKPOINT_BEFORE_DEADLINE_MS: u64 = 2_147_483_647;
+
+/// A JSON value that is a positive integer no larger than [`MAX_CHECKPOINT_BEFORE_DEADLINE_MS`]
+/// (JS `Number.isInteger(v) && v > 0 && v <= 2147483647`).
+fn checkpoint_before_deadline_ms_value(value: &serde_json::Value) -> Option<u64> {
+    let number = value.as_f64()?;
+    (number.fract() == 0.0 && number > 0.0 && number <= MAX_CHECKPOINT_BEFORE_DEADLINE_MS as f64)
+        .then_some(number as u64)
+}
 
 /// SUBA-059 — pi's `Pick<ArtifactConfig, "cleanupDays">` (`shared/types.ts:1859` @v0.47.1): the
 /// only artifact field `config.json` may set. A separate type from
@@ -657,6 +677,8 @@ impl Default for SubagentExtensionConfig {
             // SUBA-119 — no operator-declared response-id aliases, which is every installation
             // that has not been served a substituted model.
             model_response_aliases: None,
+            // SUBA-128 — upstream has no built-in default: absent means no checkpoint request.
+            checkpoint_before_deadline_ms: None,
             // VL-S11 R3 — upstream's own default: `if (options.foregroundDetachShortcut)`
             // (`slash-commands.ts:1007`) registers NOTHING with the key absent. Opt-in, and
             // deliberately so; see the field's doc for why a default-on chord was rejected.
@@ -829,6 +851,9 @@ impl SubagentExtensionConfig {
     ///
     /// The first failing validator's own field-naming message.
     pub fn validate_raw_config(raw: &serde_json::Value) -> Result<(), String> {
+        // SUBA-128 — upstream checks `checkpointBeforeDeadlineMs` (`extension/config.ts:145-151`)
+        // ahead of `artifactDir` (`:155`).
+        Self::validate_checkpoint_before_deadline_ms(raw)?;
         Self::validate_artifact_dir(raw)?;
         Self::validate_missions(raw)?;
         Self::validate_authority_policy(raw)?;
@@ -855,6 +880,34 @@ impl SubagentExtensionConfig {
             raw.get("modelResponseAliases"),
             "config.modelResponseAliases",
         )
+    }
+
+    /// SUBA-128 — pi `validateConfig`'s `checkpointBeforeDeadlineMs` gate
+    /// (`extension/config.ts:145-151` @v0.71.0): absent, or a positive integer no larger than
+    /// `2147483647` (the largest delay a JavaScript timer honours, kept so a config written for
+    /// one side means the same on the other).
+    ///
+    /// # Errors
+    ///
+    /// Upstream's own sentence for anything else.
+    pub fn validate_checkpoint_before_deadline_ms(raw: &serde_json::Value) -> Result<(), String> {
+        match raw.get("checkpointBeforeDeadlineMs") {
+            None => Ok(()),
+            Some(value) if checkpoint_before_deadline_ms_value(value).is_some() => Ok(()),
+            Some(_) => Err(
+                "config.checkpointBeforeDeadlineMs must be a positive integer no larger than 2147483647"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// SUBA-128 — the configured `checkpointBeforeDeadlineMs` default, `None` when absent (or, as
+    /// only a config that skipped [`Self::validate_raw_config`] could be, invalid).
+    #[must_use]
+    pub fn checkpoint_before_deadline_ms(&self) -> Option<u64> {
+        self.checkpoint_before_deadline_ms
+            .as_ref()
+            .and_then(checkpoint_before_deadline_ms_value)
     }
 
     /// Non-fatal diagnostics for a raw `config.json` object: every key this port does not read.
@@ -2375,5 +2428,51 @@ mod tests {
             SubagentExtensionConfig::default().model_response_aliases,
             None
         );
+    }
+
+    /// SUBA-128 — `checkpointBeforeDeadlineMs` has a reader: it is typed onto the config, no longer
+    /// censused as unported, and validated with upstream's own sentence
+    /// (`extension/config.ts:145-151` @v0.71.0) through the aggregate the loader calls.
+    #[test]
+    fn checkpoint_before_deadline_ms_is_read_and_validated() {
+        let raw = serde_json::json!({ "checkpointBeforeDeadlineMs": 5_000 });
+        let cfg: SubagentExtensionConfig = serde_json::from_value(raw.clone()).expect("parses");
+        assert_eq!(cfg.checkpoint_before_deadline_ms(), Some(5_000));
+        assert_eq!(
+            SubagentExtensionConfig::default().checkpoint_before_deadline_ms(),
+            None
+        );
+        assert!(
+            SubagentExtensionConfig::config_warnings(&raw).is_empty(),
+            "{:?}",
+            SubagentExtensionConfig::config_warnings(&raw)
+        );
+        assert_eq!(SubagentExtensionConfig::validate_raw_config(&raw), Ok(()));
+        assert_eq!(
+            SubagentExtensionConfig::validate_raw_config(&serde_json::json!({
+                "checkpointBeforeDeadlineMs": 2_147_483_647_u64
+            })),
+            Ok(())
+        );
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-5),
+            serde_json::json!(1.5),
+            serde_json::json!("5000"),
+            serde_json::json!(2_147_483_648_u64),
+        ] {
+            let raw = serde_json::json!({ "checkpointBeforeDeadlineMs": bad });
+            assert_eq!(
+                SubagentExtensionConfig::validate_raw_config(&raw),
+                Err(
+                    "config.checkpointBeforeDeadlineMs must be a positive integer no larger than 2147483647"
+                        .to_string()
+                ),
+                "{raw}"
+            );
+            // Held raw, so a bad value never takes the rest of the config down with it.
+            let cfg: SubagentExtensionConfig = serde_json::from_value(raw).expect("parses");
+            assert_eq!(cfg.checkpoint_before_deadline_ms(), None);
+        }
     }
 }

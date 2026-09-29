@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use super::argv::ExtensionFlag;
-use super::enums::{Mode, OutputFormat, ThinkingArg, TuiMode};
+use super::enums::{Mode, ThinkingArg, TuiMode};
 
 /// The cyrup command line (arch-11 §3.7; Pi `cli/args.ts`).
 ///
-/// Mode precedence (R-11-001), resolved by [`crate::cli::resolve_app_mode`]: `--rpc`/`--mode rpc` ▷
-/// `--json`/`--mode json` ▷ `--print` ▷ (no TTY) PRINT ▷ interactive TUI.
+/// Mode precedence (R-11-001), resolved by [`crate::cli::resolve_app_mode`]: `--acp`/`--mode acp` ▷
+/// `--mode rpc` ▷ `--mode json` ▷ `--print` ▷ (no TTY) PRINT ▷ interactive TUI.
 #[derive(Parser, Debug, Default)]
 #[command(
     name = "cyrup",
@@ -41,35 +41,17 @@ pub struct Cli {
     /// One-shot PRINT mode: run to completion, print the final assistant text, exit.
     #[arg(short = 'p', long)]
     pub print: bool,
-    // CYRUP-DELTA — SEAM-057. The next three flags are **cyrup-invented**: `git grep -nE
-    // '"--output-format"|"--json"|"--rpc"' v0.84.1 -- packages/coding-agent/src` matches only
-    // `cli/auth-command.ts:82-84` (an auth SUBCOMMAND flag) and three npm/ripgrep argv strings, and
-    // pi's `parseArgs` has no such arm at either tag. Each would fall through to pi's unknown-long-
-    // flag arm (`cli/args.ts:188-201`), land in `unknownFlags`, and — with no extension registering
-    // it — produce `Unknown option(s): --json` + `process.exit(1)`
-    // (`core/agent-session-services.ts:119-124`, `main.ts:844-848`).
-    //
-    // Two consequences, and the second is the one that matters: `cyrup --json` succeeds where
-    // `pi --json` is a hard exit-1, and — because all three are in `KNOWN_LONG_FLAGS` /
-    // `KNOWN_VALUE_LONG_FLAGS` and are therefore consumed by `partition_extension_flags` before the
-    // extension-flag capture — an extension that legitimately registers a `--json` or `--rpc` flag
-    // can never receive it under cyrup; the binary silently changes output mode instead. Closing
-    // THAT half means deleting these three, which is a decision with users outside this crate
-    // (`cyrup-it`'s own fixtures pass `--rpc`), so it is recorded here and in `render_help` below
-    // rather than taken unilaterally.
-    /// One-shot output format: `text` (PRINT) or `json` (JSONL) — a cyrup back-compat alias.
-    #[arg(long = "output-format", value_enum)]
-    pub output_format: Option<OutputFormat>,
-    /// Shorthand for `--mode json` (the JSONL `AgentSessionEvent` stream) — back-compat alias.
-    #[arg(long)]
-    pub json: bool,
-    /// Shorthand for `--mode rpc` — back-compat alias.
-    #[arg(long)]
-    pub rpc: bool,
     /// Shorthand for `--mode acp` — serve the Agent Client Protocol on stdio (ACP-002).
     ///
-    /// Follows the `--rpc` precedent exactly, including the CYRUP-DELTA above: it is not a pi flag,
-    /// and being in `KNOWN_LONG_FLAGS` means an extension can never register `--acp` for itself.
+    /// CYRUP-DELTA — SEAM-057. This is the one long flag cyrup keeps that pi's `parseArgs` has no
+    /// arm for (`cli/args.ts` @v0.87.1), and being in `KNOWN_LONG_FLAGS` means an extension can
+    /// never register `--acp` for itself. It stays because cyrup's ACP host has no pi counterpart
+    /// at all (pi-acp is a separate binary) and `--acp` is the launch contract ACP clients are
+    /// configured with: `docs/guide/guides/zed-acp.md` registers `"args": ["--acp"]`, and
+    /// `acp_terminal_login_cmd::strip` removes it from the argv the terminal-login auth method
+    /// re-launches. The other three cyrup-only aliases (`--json`, `--rpc`, `--output-format`)
+    /// duplicated `--mode json`/`--mode rpc`/`--print` with nothing depending on them, and were
+    /// removed so those names reach the extension-flag capture exactly as they do in pi.
     #[arg(long)]
     pub acp: bool,
 
@@ -134,6 +116,12 @@ pub struct Cli {
     /// Load a theme file or directory (repeatable).
     #[arg(long = "theme")]
     pub theme: Vec<PathBuf>,
+    /// The initial interactive theme for this run, a name or a `light/dark` pair (pi
+    /// `--use-theme <name[/name]>`, `cli/args.ts:190-197` @v0.87.1, added v0.84.4). A one-run
+    /// override that is never written to settings; ignored outside interactive mode (`main.ts:666`).
+    /// pi assigns it, so a repeated flag keeps the last value.
+    #[arg(long = "use-theme", value_name = "NAME", overrides_with = "use_theme")]
+    pub use_theme: Option<String>,
     /// Disable theme discovery and loading.
     #[arg(long = "no-themes")]
     pub no_themes: bool,

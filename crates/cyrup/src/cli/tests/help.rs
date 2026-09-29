@@ -184,3 +184,17 @@ fn the_env_help_block_and_the_read_set_are_the_same_set() {
             "pi's row carries the default (args.ts:389): {help}"
         );
 }
+
+/// SEAM-119 — pi's help row for `--use-theme`, verbatim, directly under `--theme`
+/// (`cli/args.ts:318-319` @v0.87.1).
+#[test]
+fn help_lists_use_theme_under_theme() {
+    let help = render_help(&[]);
+    let theme_row = "  --theme <path>                 Load a theme file or directory (can be used multiple times)\n";
+    let use_theme_row =
+        "  --use-theme <name[/name]>      Set the initial interactive theme for this run\n";
+    assert!(
+        help.contains(&format!("{theme_row}{use_theme_row}")),
+        "{help}"
+    );
+}

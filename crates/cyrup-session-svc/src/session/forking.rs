@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use cyrup_agent::AgentMessage;
-use cyrup_core::{CancelToken, Content, EntryId, ModelRef, ModelThinkingLevel, SessionId, Usage};
+use cyrup_core::{CancelToken, EntryId, SessionId, Usage};
 use cyrup_ext::{HostEvent, TreeReduction};
 use cyrup_provider::Model;
 use cyrup_session::compaction::{BranchSummaryOutput, Compactor, NoHooks};
@@ -405,9 +405,12 @@ impl AgentSession {
     }
 
     /// Generate a branch summary with optional custom/replace instructions (Pi `generateBranchSummary`
-    /// with `customInstructions`/`replaceInstructions`, branch-summarization.ts:318-336). cyrup-session's
-    /// `generate_branch_summary` takes no instruction knobs, so the `/tree` op threads them here over
-    /// the same public branch-summary primitives.
+    /// with `customInstructions`/`replaceInstructions`, branch-summarization.ts:318-336), through
+    /// cyrup-session's one request builder
+    /// ([`cyrup_session::compaction::generate_branch_summary_with_instructions`]) so the prompt,
+    /// the output cap and the acceptance gate cannot drift between `/tree` and the library copy
+    /// (SESS-060: this copy had kept the pre-v0.85.0 fixed 2048-token cap). What `/tree` adds is
+    /// the summarizer: the session provider with its retry policy and retry-event observer.
     async fn generate_branch_summary_with_instructions(
         &self,
         prep: &cyrup_session::compaction::BranchPreparation,
@@ -416,30 +419,6 @@ impl AgentSession {
         replace_instructions: bool,
         cancel: CancelToken,
     ) -> Result<BranchSummaryOutput, cyrup_session::compaction::CompactionError> {
-        use cyrup_session::compaction::{
-            BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
-            SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer,
-            check_summarization_response, format_file_operations, serialize_conversation,
-        };
-        // Pi short-circuits BEFORE the model call when there is nothing to summarize
-        // (branch-summarization.ts:309-311).
-        if prep.messages.is_empty() {
-            return Ok(BranchSummaryOutput {
-                text: BRANCH_SUMMARY_EMPTY_PLACEHOLDER.to_string(),
-                usage: None,
-            });
-        }
-        let transcript = serialize_conversation(&prep.messages);
-        // Instruction selection (branch-summarization.ts:319-326): `replace` swaps the default
-        // prompt; a bare custom instruction is appended as "Additional focus".
-        let instructions = match custom_instructions {
-            Some(ci) if !ci.is_empty() && replace_instructions => ci.to_string(),
-            Some(ci) if !ci.is_empty() => {
-                format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {ci}")
-            }
-            _ => BRANCH_SUMMARY_PROMPT.to_string(),
-        };
-        let prompt = format!("<conversation>\n{transcript}\n</conversation>\n\n{instructions}");
         // Pi: `this._summarizationRetryCallbacks({ source: "branchSummary" })`
         // (agent-session.ts:2998).
         let (retry_observer, retry_rx) =
@@ -451,51 +430,20 @@ impl AgentSession {
             self.summarization_retry(),
         )
         .with_observer(retry_observer);
-        let req = SummarizationRequest {
-            system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
-            prompt_text: prompt,
-            max_tokens: 2048,
-            model: ModelRef {
-                provider: model.provider.clone(),
-                api: Some(model.api.clone()),
-                model: model.id.clone(),
-            },
-            // Pi builds the branch-summary options inline (`{ apiKey, headers, env, signal,
-            // maxTokens: 2048 }`, branch-summarization.ts:348) rather than through
-            // `createSummarizationOptions`, so `reasoning` is never set for a branch summary.
-            thinking: ModelThinkingLevel::Off,
-        };
-        let resp = summarizer.complete(req, cancel).await;
-        // Close + flush the retry queue BEFORE the `?` early-returns on a failed summarization, so
-        // an exhausted retry still reports its `summarization_retry_finished`.
+        let out = cyrup_session::compaction::generate_branch_summary_with_instructions(
+            &summarizer,
+            prep,
+            model,
+            custom_instructions,
+            replace_instructions,
+            cancel,
+        )
+        .await;
+        // Close + flush the retry queue BEFORE handing back a failed summarization, so an
+        // exhausted retry still reports its `summarization_retry_finished`.
         drop(summarizer);
         let _ = retry_pump.await;
-        let resp = resp?;
-        // The shared acceptance gate — pi `getSummarizationFailure(response, "Branch
-        // summarization")` + the toolCall check (`v0.84.4 branch-summarization.ts:357-363`), with
-        // the `aborted` short-circuit at `:354-356` as its `Aborted` arm. One function for all four
-        // cyrup call sites, so this copy cannot drift from `cyrup_session::compaction::branch`
-        // again (SESS-049: the four hand-copied matches had all kept accepting a `length` stop).
-        check_summarization_response(&resp, "Branch summarization")?;
-        let body = resp
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text, .. } => Some(text.to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let (read, modified) = prep.file_ops.compute_lists();
-        Ok(BranchSummaryOutput {
-            text: format!(
-                "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
-                format_file_operations(&read, &modified)
-            ),
-            // The branch-summary call's token spend is persisted on the entry (Pi
-            // `BranchSummaryResult.usage`, `branch-summarization.ts:372`).
-            usage: Some(resp.usage),
-        })
+        out
     }
 
     /// Republish `CYRUP_SESSION_ID` / `CYRUP_SESSION_FILE` from the LIVE manager for the next `bash`
@@ -637,19 +585,13 @@ impl AgentSession {
 
     /// Branch the **live, non-persisted** session manager at `target_leaf`, IN PLACE (SEAM-009).
     ///
-    /// Pi's in-memory fork branch mutates the very object the outgoing session still holds:
-    /// `const sessionManager = this.session.sessionManager; …
-    /// sessionManager.createBranchedSession(targetLeafId); await this.teardownCurrent("fork", …)`
-    /// (agent-session-runtime.ts:333-341). Branching first and tearing down second is not
-    /// incidental: the outgoing run is still writing, and everything it appends while it settles
-    /// lands in the *already-branched* manager — which is the manager the fork is built from. That
-    /// is how Pi honours its own teardown contract, "the aborted turn (including tool results) is
-    /// persisted to the outgoing session before it is replaced" (:167-169), on the fork path.
-    ///
-    /// So this method deliberately does NOT hand the manager over; [`Self::take_manager`] does, and
-    /// the caller must settle the outgoing run in between. Merging the two (branch + move in one
-    /// step, as this used to) re-opens the data loss from the other side: every append made between
-    /// the move and the teardown goes to the throwaway placeholder and is dropped with it.
+    /// Pi's in-memory fork reuses the very object the outgoing session holds:
+    /// `const sessionManager = this.session.sessionManager; await this.teardownCurrent("fork", …);
+    /// … sessionManager.createBranchedSession(targetLeafId)` (agent-session-runtime.ts:335-341
+    /// @v0.87.1). The teardown comes FIRST since v0.85.0 (#8937, "settle active turn before
+    /// in-memory fork"), so whatever the aborted run appends while it settles sits AFTER the fork
+    /// point and is left out of the branch. The caller must therefore settle the outgoing run
+    /// before calling this (SEAM-130); [`Self::take_manager`] then hands the branched manager over.
     ///
     /// Before any of this, the in-memory arm built a `SessionTarget::New` session and the whole
     /// transcript was silently discarded — unrecoverable, since a non-persisted session has no file

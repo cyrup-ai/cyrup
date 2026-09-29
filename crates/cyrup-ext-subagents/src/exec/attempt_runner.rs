@@ -629,7 +629,7 @@ impl SpawnedChildAttemptRunner<'_> {
         let child_depth =
             crate::spawn::depth::next_envelope(&self.agent.depth, self.agent.max_subagent_depth);
 
-        let plan = match build_attempt_spawn_plan_with_read_requirement(
+        let mut plan = match build_attempt_spawn_plan_with_read_requirement(
             self.agent,
             model,
             &task_text,
@@ -648,6 +648,21 @@ impl SpawnedChildAttemptRunner<'_> {
                 )));
             }
         };
+
+        // SUBA-134 — pi `childRuntimeConfig.sessionName` (`execution.ts:411` @v0.71.0): the child
+        // names its own session with it (`subagent-prompt-runtime.ts:547-550`). Derived from the
+        // ORIGINAL task, before reads and the acceptance contract are folded in, exactly as
+        // upstream derives from `shared.originalTask ?? task`; a launcher-assigned name wins.
+        if let Some(name) = crate::exec::child_session_name::resolve_child_session_name(
+            &self.agent.name,
+            self.task,
+            &self.opts.child_env,
+        ) {
+            plan.spec.env_overlay.insert(
+                crate::exec::child_session_name::CHILD_SESSION_NAME_ENV.to_string(),
+                name,
+            );
+        }
 
         let jsonl_path = self
             .scratch_dir

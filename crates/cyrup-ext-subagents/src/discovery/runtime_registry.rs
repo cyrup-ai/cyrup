@@ -1035,6 +1035,9 @@ fn to_agent_definition(
         // SUBA-100 — pi `...(definition.machine !== undefined ? { machine } : {})` (`:357`
         // @v0.68.0): validated by `validate_optional_string`; the catalog check is at launch.
         machine: definition.machine,
+        // SUBA-133 — runtime agents are never advertised (`advertised-agent-prompt.ts:34`
+        // @v0.71.0 filters `source !== "runtime"`), and a runtime definition has no such key.
+        advertise: None,
         // SUBA-102 — pi `...(definition.mutationTools !== undefined ? { mutationTools: [...] } :
         // {})` (`:356`): carried verbatim, already validated by `validate_string_list`.
         mutation_tools: definition.mutation_tools,

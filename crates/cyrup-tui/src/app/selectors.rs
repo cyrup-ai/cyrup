@@ -34,23 +34,17 @@ impl<B: Backend> App<B> {
                     &self.state.available_thinking_levels,
                     &self.state.thinking_level,
                     &self.state.default_thinking_level,
-                    // `keyDisplayText("app.thinking.cycle")` (`thinking-selector.ts:81`) =
-                    // `keyText(..., {capitalize:true})` (`keybinding-hints.ts:37-39`), read from
-                    // the app's LIVE table so a rebind changes the sentence — the same idiom the
-                    // `/settings` thinking row uses (`settings_rows.rs`).
-                    self.state
-                        .keymap
-                        .keys_label(Action::ThinkingCycle)
-                        .map(|k| crate::chrome::format_key_text(&k, true))
-                        .unwrap_or_default(),
-                    // The live flag and the live `app.thinking.toggle` label, read the same way
-                    // and for the same reason as the cycle key above.
+                    // Every `keyDisplayText(...)` the dialog prints (`thinking-selector.ts:81`,
+                    // `:97`) and the `app.thinking.save` table its persist check reads (`:131`),
+                    // from the app's LIVE tables so a rebind changes sentence and handler alike —
+                    // the same idiom the `/settings` thinking row uses (`settings_rows.rs`).
+                    crate::thinking_selector::ThinkingSelectorKeys::from_keymaps(
+                        &self.state.keymap,
+                        &self.state.select_keymap,
+                        &self.state.thinking_keymap,
+                    ),
+                    // The live flag, read for the same reason.
                     self.state.transcript.hide_thinking_block(),
-                    self.state
-                        .keymap
-                        .keys_label(Action::ThinkingToggle)
-                        .map(|k| crate::chrome::format_key_text(&k, true))
-                        .unwrap_or_default(),
                 )),
                 None,
             ),
@@ -553,7 +547,7 @@ impl<B: Backend> App<B> {
                 // A `/tree` label save (`e` → `LabelInput` submit, tree_selector.rs) rides an
                 // `"{entry_id}\u{1f}{label}"` `Apply` payload; the entry id is a UUID (never contains
                 // the separator) so the split is unambiguous. Persist it via the session `set_label`
-                // path and keep the slot open (the tree already refreshed its own `has_label` star).
+                // path and keep the slot open (the tree already refreshed its own label).
                 if kind == SelectorKind::Tree {
                     // `app.message.copy` inside the tree rides a unit-separator-TAGGED payload
                     // (`"\u{1f}copy\u{1f}{entry_id}"`, `TreeSelector::copy_payload`), decoded

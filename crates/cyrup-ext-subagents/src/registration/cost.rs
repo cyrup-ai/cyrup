@@ -642,16 +642,17 @@ pub async fn find_latest_session_file_by_mtime(
 }
 
 // =================================================================================================
-// `/subagent-cost` session-transcript walk (pi `buildSubagentCostReport`, slash-commands.ts:377-416)
+// `/subagent-cost` and the RPC `cost` method (pi `collectSubagentCost`, `slash/subagent-cost.ts`
+// @v0.71.0, `858661af`/#2378)
 //
 // This is the shape `/subagent-cost` actually renders (R-SA-140's user-facing surface), and it is a
 // DIFFERENT computation from the recursive background-artifact accumulator above: pi's cost command
 // walks the *session transcript* (`ctx.sessionManager.getBranch()`), summing the parent's own
-// assistant-message usage plus a per-child breakdown of every subagent `toolResult` recorded in the
-// branch — so foreground subagent usage (which never produces a background run/`status.json` at all)
-// is visible. The recursive `compute_recursive_cost` accumulator remains a separate, independently
-// useful capability (nested background-run cost), but it is not what a user sees from
-// `/subagent-cost`.
+// assistant-message and compaction usage plus a per-child breakdown of every `subagent`/`bg_wait`
+// tool result recorded in the branch — so foreground subagent usage (which never produces a
+// background run/`status.json` at all) is visible — and then resolves async WORKFLOW children
+// through their receipts and artifact metadata. One collector feeds both surfaces upstream: the
+// slash command formats [`SubagentCostReport`], and the RPC `cost` method returns it as data.
 // =================================================================================================
 
 /// The custom-message `customType` a slash-invoked subagent result is stored under in the session
@@ -660,42 +661,36 @@ pub async fn find_latest_session_file_by_mtime(
 /// on its `toolResult` message.
 const SLASH_RESULT_TYPE: &str = "subagent-slash-result";
 
-/// pi's local `Usage` accounting shape for the cost report (shared/types.ts `Usage`:
+/// pi `SUBAGENT_COST_REPORT_VERSION` (`subagent-cost.ts:30`) — advertised as
+/// `ping.capabilities.cost.version` and stamped on every report.
+pub const SUBAGENT_COST_REPORT_VERSION: u32 = 1;
+
+/// pi `MAX_USAGE_METADATA_BYTES` (`subagent-cost.ts:83`): an artifact `_meta.json` larger than this
+/// is not read.
+const MAX_USAGE_METADATA_BYTES: u64 = 2 * 1024 * 1024;
+
+/// JavaScript's `Number.MAX_SAFE_INTEGER`, the bound of `Number.isSafeInteger` (`:67`).
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// pi-subagents' own six-field `Usage` (`shared/types.ts` `Usage`:
 /// `{input, output, cacheRead, cacheWrite, cost, turns}`) — deliberately DISTINCT from
 /// [`cyrup_core::Usage`] (whose `cost` is a nested `Cost{total}` and which has no `turns` field) and
-/// from [`CostUsage`] (the recursive accumulator above). This is the flat, render-oriented total the
-/// `formatCostUsage` line renders: additive across the walked branch, one field per rendered column.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct TranscriptUsage {
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-    cost: f64,
-    turns: u64,
+/// from [`CostUsage`] (the recursive accumulator above). Serialized exactly as upstream's report
+/// carries it, so an RPC client reads the same keys.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentCostUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost: f64,
+    pub turns: u64,
 }
 
-impl TranscriptUsage {
-    /// Projects one [`cyrup_core::Usage`] plus a caller-supplied `turns` count into this flat shape
-    /// (pi reads `usage.cost.total` for the cost column; `turns` is carried separately since
-    /// `cyrup_core::Usage` has no such field — a parent assistant message contributes `turns: 1`
-    /// like pi's `assistantUsageFromMessage`, a child result contributes `turns: 0` since cyrup's
-    /// per-child `Usage` records no turn count, an honest divergence from pi's turn-carrying child
-    /// usage that the gap analysis notes as an agreed usage-turn-counting deferral).
-    fn from_core(usage: &Usage, turns: u64) -> Self {
-        Self {
-            input: usage.input,
-            output: usage.output,
-            cache_read: usage.cache_read,
-            cache_write: usage.cache_write,
-            cost: usage.cost.total,
-            turns,
-        }
-    }
-
-    /// Additive fold (pi `addUsage`, slash-commands.ts:315-322) — every column summed, never
-    /// last-write-wins.
-    fn add(&mut self, other: &TranscriptUsage) {
+impl SubagentCostUsage {
+    /// Additive fold (pi `addUsage`, `subagent-cost.ts:37-44`) — every column summed.
+    fn add(&mut self, other: &Self) {
         self.input += other.input;
         self.output += other.output;
         self.cache_read += other.cache_read;
@@ -704,9 +699,7 @@ impl TranscriptUsage {
         self.turns += other.turns;
     }
 
-    /// pi `usageHasValue` (slash-commands.ts:324-326): a child result is only listed when at least
-    /// one accounting column is non-zero, so a zero-usage tool result never adds an empty "Child N"
-    /// line.
+    /// pi `usageHasValue` (`:46-48`): a child is only listed when at least one column is non-zero.
     fn has_value(&self) -> bool {
         self.input != 0
             || self.output != 0
@@ -717,17 +710,504 @@ impl TranscriptUsage {
     }
 }
 
-/// One `{agent, usage, sessionFile?}` child entry parsed out of a subagent `toolResult`'s
-/// `details.results` array (pi `SingleResult` subset the cost walk reads, shared/types.ts:803-892).
-struct TranscriptChild {
-    agent: String,
-    usage: Usage,
-    session_file: Option<String>,
+/// One listed child (pi `SubagentCostChild`, `subagent-cost.ts:22-28`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentCostChild {
+    /// `Child <n> (<agent | "unknown">)`.
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub usage: SubagentCostUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
 }
 
-/// pi `formatCostUsage` (slash-commands.ts:368-375): `"{label}: ↑{in} ↓{out} ${cost}(...extras)"`,
+/// Structured parent-plus-child accounting for one session (pi `SubagentCostReport`,
+/// `subagent-cost.ts:11-20`): the source of `/subagent-cost` and the RPC `cost` method.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentCostReport {
+    pub version: u32,
+    pub parent: SubagentCostUsage,
+    pub children: Vec<SubagentCostChild>,
+    pub child_total: SubagentCostUsage,
+    pub total: SubagentCostUsage,
+    /// Async children whose usage metadata could not be resolved; the child total is a lower bound
+    /// when this is non-zero.
+    pub unresolved_async_children: u64,
+}
+
+/// Where [`collect_subagent_cost`] looks beyond the transcript — pi's `ctx.cwd`,
+/// `ctx.sessionManager.getSessionFile()`, `state.baseCwd`, `state.artifactDirPreference` and
+/// `DIRS.async` (`subagent-cost.ts:182-201`).
+#[derive(Clone, Copy, Debug)]
+pub struct SubagentCostSources<'a> {
+    /// The persisted session file, when there is one — it roots the `session` artifact preference.
+    pub session_file: Option<&'a Path>,
+    /// The request's working directory (`ctx.cwd`).
+    pub cwd: &'a Path,
+    /// The extension's base working directory (`state.baseCwd`).
+    pub base_cwd: &'a Path,
+    /// `config.artifactDir`.
+    pub artifact_dir_preference: crate::artifacts::ArtifactDirPreference,
+    /// The async run root a workflow run id resolves under (`DIRS.async`).
+    pub async_root: &'a Path,
+}
+
+/// pi `nonNegativeNumber` (`subagent-cost.ts:50-52`).
+fn non_negative_number(value: Option<&serde_json::Value>) -> Option<f64> {
+    value
+        .and_then(serde_json::Value::as_f64)
+        .filter(|number| number.is_finite() && *number >= 0.0)
+}
+
+/// A token column: a non-negative number, else `0`. Fractional counts truncate — JSON token counts
+/// are integers on every producer.
+fn token_column(value: Option<&serde_json::Value>) -> u64 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    non_negative_number(value).map_or(0, |number| number as u64)
+}
+
+/// pi `usageFromValue` (`subagent-cost.ts:54-68`): the six columns off a usage record, reading
+/// `cost.total` when `cost` is an object. `turns_override` replaces the record's own `turns`; a
+/// turn count that is not a safe integer rejects the whole record (`Number.isSafeInteger`).
+fn usage_from_value(
+    value: Option<&serde_json::Value>,
+    turns_override: Option<&serde_json::Value>,
+) -> Option<SubagentCostUsage> {
+    let record = value?.as_object()?;
+    let cost = match record.get("cost") {
+        Some(serde_json::Value::Object(cost)) => cost.get("total"),
+        other => other,
+    };
+    let turns = non_negative_number(turns_override.or_else(|| record.get("turns"))).unwrap_or(0.0);
+    if turns.fract() != 0.0 || turns > MAX_SAFE_INTEGER {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(SubagentCostUsage {
+        input: token_column(record.get("input")),
+        output: token_column(record.get("output")),
+        cache_read: token_column(record.get("cacheRead")),
+        cache_write: token_column(record.get("cacheWrite")),
+        cost: non_negative_number(cost).unwrap_or(0.0),
+        turns: turns as u64,
+    })
+}
+
+/// pi `assistantUsageFromMessage` (`:70-74`) or `compactionUsageFromEntry` (`:76-80`): an
+/// assistant message counts one turn, a compaction's summarizing call counts none.
+fn parent_usage_from_entry(entry: &Entry) -> Option<SubagentCostUsage> {
+    let (usage, turns) = match entry {
+        Entry::Known(KnownEntry::Message {
+            message: AgentMessage::Core(Message::Assistant(assistant)),
+            ..
+        }) => (serde_json::to_value(&assistant.usage).ok()?, 1),
+        Entry::Known(KnownEntry::Compaction {
+            usage: Some(usage), ..
+        }) => (serde_json::to_value(usage).ok()?, 0),
+        _ => return None,
+    };
+    usage_from_value(Some(&usage), Some(&serde_json::Value::from(turns)))
+}
+
+/// pi `isSubagentDetails` (`:104-108`): an object with a string `mode` and an array `results`.
+fn subagent_details(
+    value: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    let details = value.as_object()?;
+    (details
+        .get("mode")
+        .is_some_and(serde_json::Value::is_string)
+        && details
+            .get("results")
+            .is_some_and(serde_json::Value::is_array))
+    .then_some(details)
+}
+
+/// pi `detailsFromSessionEntry` (`:110-120`): subagent details stored directly on a `subagent` or
+/// `bg_wait` tool result, or nested under `details.result.details` of a [`SLASH_RESULT_TYPE`]
+/// custom message.
+fn details_from_session_entry(
+    entry: &Entry,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    match entry {
+        Entry::Known(KnownEntry::CustomMessage {
+            custom_type,
+            details,
+            ..
+        }) if custom_type == SLASH_RESULT_TYPE => subagent_details(
+            details
+                .as_ref()?
+                .get("result")
+                .and_then(|result| result.get("details"))?,
+        ),
+        Entry::Known(KnownEntry::Message {
+            message:
+                AgentMessage::Core(Message::ToolResult {
+                    tool_name, details, ..
+                }),
+            ..
+        }) if tool_name == "subagent"
+            || tool_name == crate::extension::wait_tool::WAIT_TOOL_NAME =>
+        {
+            subagent_details(details.as_ref()?)
+        }
+        _ => None,
+    }
+}
+
+/// A string field, when it is one.
+fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// pi `readUsageMetadata` (`:85-102`): a regular file of at most [`MAX_USAGE_METADATA_BYTES`]
+/// holding a JSON object. The size is checked on the open handle before anything is read.
+fn read_usage_metadata(
+    path: &Path,
+) -> std::io::Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_USAGE_METADATA_BYTES {
+        return Ok(None);
+    }
+    let mut buffer = Vec::new();
+    file.take(MAX_USAGE_METADATA_BYTES)
+        .read_to_end(&mut buffer)?;
+    Ok(serde_json::from_slice::<serde_json::Value>(&buffer)
+        .ok()
+        .and_then(|value| match value {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        }))
+}
+
+/// pi `metadataUsage` (`:122-143`): the first artifact `_meta.json` — index `0`, then unindexed, in
+/// each artifacts directory — whose `runId` and `agent` match and whose usage is non-zero.
+fn metadata_usage(
+    artifacts_dirs: &[PathBuf],
+    run_id: &str,
+    agent: &str,
+) -> Option<SubagentCostUsage> {
+    if run_id.is_empty()
+        || !run_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    for dir in artifacts_dirs {
+        for index in [Some(0), None] {
+            let path = crate::artifacts::artifact_paths(dir, run_id, agent, index).metadata_path;
+            match read_usage_metadata(&path) {
+                Ok(Some(metadata)) => {
+                    if metadata.get("runId").and_then(serde_json::Value::as_str) != Some(run_id)
+                        || metadata.get("agent").and_then(serde_json::Value::as_str) != Some(agent)
+                    {
+                        continue;
+                    }
+                    if let Some(usage) = usage_from_value(metadata.get("usage"), None)
+                        && usage.has_value()
+                    {
+                        return Some(usage);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    target: "cyrup_ext_subagents::cost",
+                    path = %path.display(),
+                    %error,
+                    "failed to read subagent usage metadata"
+                ),
+            }
+        }
+    }
+    None
+}
+
+/// The accumulator behind [`collect_subagent_cost`] — pi's closure state (`:153-176`).
+#[derive(Default)]
+struct CostCollector {
+    children: Vec<SubagentCostChild>,
+    child_total: SubagentCostUsage,
+    seen: HashSet<String>,
+}
+
+impl CostCollector {
+    /// pi `addChild` (`:161-176`): a zero-usage child is not listed and answers `false`; a child
+    /// already listed under the same `run:<id>` or `session:<file>` identity answers `true` without
+    /// being counted twice.
+    fn add_child(
+        &mut self,
+        agent: Option<String>,
+        run_id: Option<String>,
+        usage: Option<SubagentCostUsage>,
+        session_file: Option<String>,
+    ) -> bool {
+        let Some(usage) = usage.filter(SubagentCostUsage::has_value) else {
+            return false;
+        };
+        let identity = run_id
+            .as_ref()
+            .map(|id| format!("run:{id}"))
+            .or_else(|| session_file.as_ref().map(|file| format!("session:{file}")));
+        if let Some(identity) = identity
+            && !self.seen.insert(identity)
+        {
+            return true;
+        }
+        self.child_total.add(&usage);
+        self.children.push(SubagentCostChild {
+            label: format!(
+                "Child {} ({})",
+                self.children.len() + 1,
+                agent.as_deref().unwrap_or("unknown")
+            ),
+            agent,
+            run_id,
+            usage,
+            session_file,
+        });
+        true
+    }
+}
+
+/// Collect parent and child usage for one session branch (pi `collectSubagentCost`,
+/// `subagent-cost.ts:145-240`). Foreground children come from persisted `subagent`/`bg_wait`
+/// tool-result details; async workflow children are resolved through their receipts and artifact
+/// metadata.
+///
+/// `branch` is the root→leaf entry sequence — pi's `ctx.sessionManager.getBranch()`.
+///
+/// A child result's run id is upstream's `result.runId`, which cyrup's [`crate::exec::SingleResult`]
+/// spells `childRunId` (its doc names it the producer of pi's `runId`), so both spellings are read.
+/// Likewise its turn count: pi folds `turns` into `result.usage`, cyrup keeps it beside, so a
+/// usage record without its own `turns` takes the result's.
+pub async fn collect_subagent_cost<'a>(
+    branch: impl IntoIterator<Item = &'a Entry>,
+    sources: &SubagentCostSources<'_>,
+) -> SubagentCostReport {
+    let mut parent = SubagentCostUsage::default();
+    let mut collector = CostCollector::default();
+    // Insertion-ordered, as upstream's `Set` is.
+    let mut workflow_run_ids: Vec<String> = Vec::new();
+    let add_workflow_run_id = |id: &str, ids: &mut Vec<String>| {
+        if !ids.iter().any(|seen| seen == id) {
+            ids.push(id.to_string());
+        }
+    };
+
+    for entry in branch {
+        if let Some(usage) = parent_usage_from_entry(entry) {
+            parent.add(&usage);
+        }
+        let Some(details) = details_from_session_entry(entry) else {
+            continue;
+        };
+        if details.get("mode").and_then(serde_json::Value::as_str) == Some("workflow")
+            && let Some(run_id) = details
+                .get("runId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+        {
+            add_workflow_run_id(run_id, &mut workflow_run_ids);
+        }
+        for result in details
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let run_id =
+                string_field(result, "runId").or_else(|| string_field(result, "childRunId"));
+            let usage_record = result.get("usage");
+            let turns = usage_record
+                .and_then(|usage| usage.get("turns"))
+                .or_else(|| result.get("turns"));
+            collector.add_child(
+                string_field(result, "agent"),
+                run_id,
+                usage_from_value(usage_record, turns),
+                string_field(result, "sessionFile"),
+            );
+        }
+        for completion in details
+            .get("completions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if completion.get("mode").and_then(serde_json::Value::as_str) == Some("workflow")
+                && let Some(run_id) = completion.get("runId").and_then(serde_json::Value::as_str)
+            {
+                add_workflow_run_id(run_id, &mut workflow_run_ids);
+            }
+            for result in completion
+                .get("results")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                collector.add_child(
+                    string_field(result, "agent"),
+                    string_field(result, "runId"),
+                    usage_from_value(result.get("usage"), None),
+                    string_field(result, "sessionFile"),
+                );
+            }
+        }
+    }
+
+    // pi `:182-194` — the artifacts directories a workflow child's `_meta.json` may be under.
+    let mut artifacts_dirs: Vec<PathBuf> = Vec::new();
+    let add_artifacts_dir = |cwd: &Path, dirs: &mut Vec<PathBuf>| {
+        let dir = crate::artifacts::resolve_artifacts_dir(
+            sources.session_file,
+            Some(cwd),
+            cwd,
+            sources.artifact_dir_preference,
+        );
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    };
+    add_artifacts_dir(sources.cwd, &mut artifacts_dirs);
+    add_artifacts_dir(sources.base_cwd, &mut artifacts_dirs);
+
+    let mut unresolved_async_children: u64 = 0;
+    for workflow_run_id in &workflow_run_ids {
+        let Some(run) = crate::identity::RunDirName::parse(workflow_run_id) else {
+            continue;
+        };
+        let run_dir = run.resolve_in(sources.async_root);
+        if let Ok(Some(status)) = crate::background::control::read_status_file(
+            &crate::background::RunDir::for_existing(&run_dir).status(),
+        )
+        .await
+            && let Some(cwd) = status.cwd.as_deref()
+        {
+            add_artifacts_dir(cwd, &mut artifacts_dirs);
+        }
+        let receipt = match crate::workflows::read_workflow_receipt(sources.async_root, &run) {
+            Ok(receipt) => receipt,
+            Err(crate::workflows::WorkflowReceiptError::NotFound { .. }) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cyrup_ext_subagents::cost",
+                    workflow_run_id = %workflow_run_id,
+                    %error,
+                    "failed to resolve async subagent usage"
+                );
+                continue;
+            }
+        };
+        let summary_children = receipt
+            .workflow_children
+            .as_ref()
+            .map(|summary| summary.children.as_slice())
+            .unwrap_or_default();
+        let summary_child = |key: &str| {
+            summary_children
+                .iter()
+                .find(|child| child.child_id.as_str() == key)
+        };
+        // pi `refsByRunId` (`:207-212`): insertion-ordered, and an agent-less ref is upgraded by a
+        // later one that names the agent.
+        let mut refs: Vec<(String, Option<String>)> = Vec::new();
+        let add_ref = |run_id: Option<&str>, agent: Option<&str>, refs: &mut Vec<_>| {
+            let Some(run_id) = run_id.filter(|id| !id.is_empty()) else {
+                return;
+            };
+            match refs
+                .iter_mut()
+                .find(|(existing, _): &&mut (String, Option<String>)| existing == run_id)
+            {
+                Some((_, existing_agent)) => {
+                    if existing_agent.is_none() && agent.is_some() {
+                        *existing_agent = agent.map(str::to_string);
+                    }
+                }
+                None => refs.push((run_id.to_string(), agent.map(str::to_string))),
+            }
+        };
+        for entry in &receipt.entries {
+            let summary = summary_child(entry.key.as_str());
+            let agent = entry
+                .agent
+                .as_ref()
+                .map(|agent| agent.as_str())
+                .or_else(|| summary.and_then(|child| child.agent.as_ref().map(|a| a.as_str())));
+            let run_ids: Vec<&str> = if entry.continuation.run_ids.is_empty() {
+                entry
+                    .resume
+                    .latest_run_id()
+                    .map(|id| id.as_str())
+                    .or_else(|| {
+                        summary.and_then(|child| child.run_id.as_ref().map(|id| id.as_str()))
+                    })
+                    .into_iter()
+                    .collect()
+            } else {
+                entry
+                    .continuation
+                    .run_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            };
+            for run_id in run_ids {
+                add_ref(Some(run_id), agent, &mut refs);
+            }
+        }
+        for child in summary_children {
+            if receipt.entry(&child.child_id).is_none() {
+                add_ref(
+                    child.run_id.as_ref().map(|id| id.as_str()),
+                    child.agent.as_ref().map(|agent| agent.as_str()),
+                    &mut refs,
+                );
+            }
+        }
+        for (run_id, agent) in refs {
+            if collector.seen.contains(&format!("run:{run_id}")) {
+                continue;
+            }
+            let Some(agent) = agent else {
+                unresolved_async_children += 1;
+                continue;
+            };
+            let usage = metadata_usage(&artifacts_dirs, &run_id, &agent);
+            if usage.is_none() || !collector.add_child(Some(agent), Some(run_id), usage, None) {
+                unresolved_async_children += 1;
+            }
+        }
+    }
+
+    let mut total = SubagentCostUsage::default();
+    total.add(&parent);
+    total.add(&collector.child_total);
+    SubagentCostReport {
+        version: SUBAGENT_COST_REPORT_VERSION,
+        parent,
+        children: collector.children,
+        child_total: collector.child_total,
+        total,
+        unresolved_async_children,
+    }
+}
+
+/// pi `formatCostUsage` (`subagent-cost.ts:242-249`): `"{label}: ↑{in} ↓{out} ${cost}(...extras)"`,
 /// where extras (cache read / cache write / turns) are only appended when non-zero.
-fn format_cost_usage(label: &str, usage: &TranscriptUsage) -> String {
+fn format_cost_usage(label: &str, usage: &SubagentCostUsage) -> String {
     let mut extras: Vec<String> = Vec::new();
     if usage.cache_read != 0 {
         extras.push(format!("cache read {}", format_tokens(usage.cache_read)));
@@ -755,140 +1235,36 @@ fn format_cost_usage(label: &str, usage: &TranscriptUsage) -> String {
     )
 }
 
-/// pi `assistantUsageFromMessage` (slash-commands.ts:328-347): the parent's own per-turn usage for a
-/// `role: "assistant"` message. Returns the message's [`cyrup_core::Usage`] (the cost column reads
-/// its `cost.total`); the caller folds it in with `turns: 1`.
-fn assistant_usage_from_entry(entry: &Entry) -> Option<&Usage> {
-    match entry {
-        Entry::Known(KnownEntry::Message {
-            message: AgentMessage::Core(Message::Assistant(assistant)),
-            ..
-        }) => Some(&assistant.usage),
-        _ => None,
-    }
-}
-
-/// pi `isSubagentDetails` (slash-commands.ts:349-353) + the per-result field reads of
-/// `buildSubagentCostReport`: a details value is subagent details only when it is an object carrying
-/// a string `mode` AND an array `results`. Each result's `agent`/`usage`/`sessionFile` is read
-/// leniently (matching pi's untyped field access), so a malformed individual result degrades to
-/// zero usage rather than discarding the whole details object.
-fn parse_subagent_details(details: &serde_json::Value) -> Option<Vec<TranscriptChild>> {
-    let obj = details.as_object()?;
-    if !obj.get("mode").is_some_and(serde_json::Value::is_string) {
-        return None;
-    }
-    let results = obj.get("results")?.as_array()?;
-    let children = results
-        .iter()
-        .map(|result| {
-            let agent = result
-                .get("agent")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let usage = result
-                .get("usage")
-                .and_then(|value| serde_json::from_value::<Usage>(value.clone()).ok())
-                .unwrap_or_default();
-            let session_file = result
-                .get("sessionFile")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            TranscriptChild {
-                agent,
-                usage,
-                session_file,
-            }
-        })
-        .collect();
-    Some(children)
-}
-
-/// pi `detailsFromSessionEntry` (slash-commands.ts:355-366): extract subagent `{mode, results}`
-/// details from a session entry, whether stored directly on a `toolResult` message whose `toolName`
-/// is `subagent` (the tool-invoked path) or nested under `details.result.details` of a
-/// [`SLASH_RESULT_TYPE`] custom message (the slash-invoked path).
-fn details_from_session_entry(entry: &Entry) -> Option<Vec<TranscriptChild>> {
-    match entry {
-        Entry::Known(KnownEntry::CustomMessage {
-            custom_type,
-            details,
-            ..
-        }) if custom_type == SLASH_RESULT_TYPE => {
-            let inner = details
-                .as_ref()?
-                .get("result")
-                .and_then(|result| result.get("details"))?;
-            parse_subagent_details(inner)
-        }
-        Entry::Known(KnownEntry::Message {
-            message:
-                AgentMessage::Core(Message::ToolResult {
-                    tool_name, details, ..
-                }),
-            ..
-        }) if tool_name == "subagent" => parse_subagent_details(details.as_ref()?),
-        _ => None,
-    }
-}
-
-/// Build the `/subagent-cost` report by walking one session-transcript branch (pi
-/// `buildSubagentCostReport`, slash-commands.ts:377-416), root→leaf. Sums the parent's own
-/// assistant-message usage and a per-child breakdown of every subagent `toolResult` in the branch,
-/// then renders pi's exact multi-line report (Parent line, per-child lines with their optional
-/// `Session:` reference, a divider, the Children subtotal, and the grand Total).
-///
-/// `branch` is the ordered entry sequence a caller obtains from
-/// [`cyrup_session::SessionManager::branch_path`] (the cyrup analog of pi's
-/// `ctx.sessionManager.getBranch()`); an empty branch renders the well-formed "no child usage"
-/// report rather than an error.
+/// The `/subagent-cost` text rendering of a collected report (pi `formatSubagentCostReport`,
+/// `subagent-cost.ts:252-270`): the Parent line, per-child lines with their optional `Session:`
+/// reference, the unresolved-async count when non-zero, a divider, the Children subtotal and the
+/// grand Total.
 #[must_use]
-pub fn build_subagent_cost_report<'a>(branch: impl IntoIterator<Item = &'a Entry>) -> String {
-    let mut parent = TranscriptUsage::default();
-    let mut child_total = TranscriptUsage::default();
-    let mut children: Vec<(String, TranscriptUsage, Option<String>)> = Vec::new();
-
-    for entry in branch {
-        if let Some(usage) = assistant_usage_from_entry(entry) {
-            parent.add(&TranscriptUsage::from_core(usage, 1));
-        }
-        let Some(results) = details_from_session_entry(entry) else {
-            continue;
-        };
-        for child in results {
-            let usage = TranscriptUsage::from_core(&child.usage, 0);
-            if !usage.has_value() {
-                continue;
-            }
-            let label = format!("Child {} ({})", children.len() + 1, child.agent);
-            child_total.add(&usage);
-            children.push((label, usage, child.session_file));
-        }
-    }
-
-    let mut total = TranscriptUsage::default();
-    total.add(&parent);
-    total.add(&child_total);
-
+pub fn format_subagent_cost_report(report: &SubagentCostReport) -> String {
     let mut lines = vec![
         "Subagent cost".to_string(),
         String::new(),
-        format_cost_usage("Parent", &parent),
+        format_cost_usage("Parent", &report.parent),
     ];
-    if children.is_empty() {
+    if report.children.is_empty() {
         lines.push("No subagent child usage found in this session.".to_string());
     } else {
-        for (label, usage, session_file) in &children {
-            lines.push(format_cost_usage(label, usage));
-            if let Some(session_file) = session_file {
+        for child in &report.children {
+            lines.push(format_cost_usage(&child.label, &child.usage));
+            if let Some(session_file) = &child.session_file {
                 lines.push(format!("  Session: {session_file}"));
             }
         }
     }
+    if report.unresolved_async_children > 0 {
+        lines.push(format!(
+            "Async child usage unavailable: {}.",
+            report.unresolved_async_children
+        ));
+    }
     lines.push("────────────────────────────".to_string());
-    lines.push(format_cost_usage("Children", &child_total));
-    lines.push(format_cost_usage("Total", &total));
+    lines.push(format_cost_usage("Children", &report.child_total));
+    lines.push(format_cost_usage("Total", &report.total));
     lines.join("\n")
 }
 
@@ -1649,7 +2025,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
-    // `/subagent-cost` session-transcript walk (pi `buildSubagentCostReport`)
+    // `/subagent-cost` session-transcript walk (pi `collectSubagentCost` @v0.71.0)
     // ---------------------------------------------------------------------------------------
 
     /// A `cyrup_core::Usage` (camelCase, nested `cost.total`) JSON value, the shape a real session
@@ -1716,8 +2092,200 @@ mod tests {
         }))
     }
 
-    #[test]
-    fn cost_report_walks_transcript_and_sums_parent_plus_child_usage() {
+    /// [`collect_subagent_cost`] with every source rooted under `root`, so the workflow half finds
+    /// only what a test put there.
+    async fn collect_in<'a>(
+        root: &Path,
+        branch: impl IntoIterator<Item = &'a Entry>,
+    ) -> SubagentCostReport {
+        let async_root = root.join("async");
+        collect_subagent_cost(
+            branch,
+            &SubagentCostSources {
+                session_file: None,
+                cwd: root,
+                base_cwd: root,
+                artifact_dir_preference: crate::artifacts::ArtifactDirPreference::Project,
+                async_root: &async_root,
+            },
+        )
+        .await
+    }
+
+    /// The `/subagent-cost` text for `branch`.
+    async fn report_of<'a>(branch: impl IntoIterator<Item = &'a Entry>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        format_subagent_cost_report(&collect_in(dir.path(), branch).await)
+    }
+
+    /// A tool-result entry from any tool.
+    fn tool_result_entry(id: &str, tool_name: &str, details: serde_json::Value) -> Entry {
+        entry(serde_json::json!({
+            "type": "message",
+            "id": id,
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": format!("call-{id}"),
+                "toolName": tool_name,
+                "content": [{ "type": "text", "text": "done" }],
+                "details": details,
+                "timestamp": 2,
+            },
+        }))
+    }
+
+    /// pi v0.71.0's collector (`subagent-cost.ts:145-240`) beyond the v0.64 walk: a compaction's
+    /// usage is the PARENT's (no turn), a `bg_wait` result's `completions` are children, a child
+    /// listed twice under one run id is counted once, and a child's turns come off the result.
+    ///
+    /// GUT the compaction arm and the parent reads 100; GUT the `bg_wait` name and `reviewer` is
+    /// missing; GUT the `run:` identity and `worker` is listed twice; GUT the result-level
+    /// `turns` fallback and `worker` reports zero turns.
+    #[tokio::test]
+    async fn cost_report_counts_compactions_bg_wait_completions_and_dedupes_by_run_id() {
+        let compaction = entry(serde_json::json!({
+            "type": "compaction",
+            "id": "c0000001",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "summary": "s",
+            "firstKeptEntryId": "a0000001",
+            "tokensBefore": 10,
+            "usage": usage_json(10, 5, 0, 0, 0.001),
+        }));
+        let assistant = assistant_entry("a0000001", None, usage_json(100, 50, 0, 0, 0.01));
+        let foreground = tool_result_entry(
+            "t0000001",
+            "subagent",
+            serde_json::json!({
+                "mode": "single",
+                "results": [{
+                    "agent": "worker",
+                    "childRunId": "run-a",
+                    "turns": 3,
+                    "usage": usage_json(40, 20, 0, 0, 0.004),
+                }],
+            }),
+        );
+        let waited = tool_result_entry(
+            "t0000002",
+            "bg_wait",
+            serde_json::json!({
+                "mode": "management",
+                "results": [],
+                "completions": [
+                    { "runId": "run-a", "results": [{
+                        "agent": "worker", "runId": "run-a",
+                        "usage": { "input": 40, "output": 20, "cacheRead": 0, "cacheWrite": 0, "cost": 0.004, "turns": 3 },
+                    }] },
+                    { "runId": "run-b", "results": [{
+                        "agent": "reviewer", "runId": "run-b",
+                        "usage": { "input": 7, "output": 3, "cacheRead": 0, "cacheWrite": 0, "cost": 0.0007, "turns": 1 },
+                    }] },
+                ],
+            }),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let report = collect_in(dir.path(), [&compaction, &assistant, &foreground, &waited]).await;
+
+        assert_eq!(report.parent.input, 110, "{report:?}");
+        assert_eq!(
+            report.parent.turns, 1,
+            "a compaction adds no turn: {report:?}"
+        );
+        let agents: Vec<_> = report
+            .children
+            .iter()
+            .map(|child| child.agent.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(agents, ["worker", "reviewer"], "{report:?}");
+        assert_eq!(report.children[0].run_id.as_deref(), Some("run-a"));
+        assert_eq!(report.children[0].usage.turns, 3);
+        assert_eq!(report.child_total.input, 47);
+        assert_eq!(report.total.input, 157);
+        assert_eq!(report.unresolved_async_children, 0);
+
+        // The RPC `cost` payload is this struct: upstream's keys, versioned.
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(wire["version"], serde_json::json!(1));
+        assert_eq!(wire["childTotal"]["input"], serde_json::json!(47));
+        assert_eq!(
+            wire["children"][1]["label"],
+            serde_json::json!("Child 2 (reviewer)")
+        );
+        assert_eq!(wire["children"][1]["runId"], serde_json::json!("run-b"));
+        assert_eq!(wire["unresolvedAsyncChildren"], serde_json::json!(0));
+    }
+
+    /// pi `collectSubagentCost`'s workflow half (`:196-236`): a `workflow` result names its run, the
+    /// run's receipt names each child's run ids, and a child's usage is read off its artifact
+    /// `_meta.json`. A child with no agent, or with no metadata, is COUNTED as unresolved — the
+    /// report says its child total is a lower bound rather than silently under-reporting.
+    #[tokio::test]
+    async fn cost_report_resolves_workflow_children_through_receipt_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("async").join("wf-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join(crate::workflows::WORKFLOW_RECEIPT_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "workflowRunId": "wf-1",
+                "state": "complete",
+                "createdAt": 1,
+                "entries": {
+                    "a": { "key": "a", "agent": "worker", "continuation": { "runIds": ["r-a1"] },
+                           "latestRunId": "r-a1", "resumability": { "state": "resumable" } },
+                    "b": { "key": "b", "continuation": { "runIds": ["r-b"] }, "latestRunId": "r-b",
+                           "resumability": { "state": "not-resumable", "reason": "no agent" } },
+                    "c": { "key": "c", "agent": "reviewer", "continuation": { "runIds": ["r-c"] },
+                           "latestRunId": "r-c", "resumability": { "state": "resumable" } },
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let artifacts = crate::artifacts::resolve_artifacts_dir(
+            None,
+            Some(dir.path()),
+            dir.path(),
+            crate::artifacts::ArtifactDirPreference::Project,
+        );
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(
+            crate::artifacts::artifact_paths(&artifacts, "r-a1", "worker", None).metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "runId": "r-a1",
+                "agent": "worker",
+                "usage": usage_json(21, 9, 0, 0, 0.002),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let workflow = tool_result_entry(
+            "w0000001",
+            "subagent",
+            serde_json::json!({ "mode": "workflow", "runId": "wf-1", "results": [] }),
+        );
+
+        let report = collect_in(dir.path(), [&workflow]).await;
+
+        assert_eq!(report.children.len(), 1, "{report:?}");
+        assert_eq!(report.children[0].run_id.as_deref(), Some("r-a1"));
+        assert_eq!(report.children[0].usage.input, 21);
+        assert_eq!(
+            report.unresolved_async_children, 2,
+            "the agent-less `b` and the metadata-less `c`: {report:?}"
+        );
+        let text = format_subagent_cost_report(&report);
+        assert!(text.contains("Async child usage unavailable: 2."), "{text}");
+    }
+
+    #[tokio::test]
+    async fn cost_report_walks_transcript_and_sums_parent_plus_child_usage() {
         // One parent assistant turn (usage A) + one subagent toolResult carrying two child results
         // (usage B and C). The report must sum parent + both children, list each child, and show a
         // Children subtotal and a grand Total — verified against manual addition.
@@ -1747,7 +2315,7 @@ mod tests {
             ),
         ];
 
-        let report = build_subagent_cost_report(branch.iter());
+        let report = report_of(branch.iter()).await;
 
         // Structure.
         assert!(report.starts_with("Subagent cost\n"), "report: {report}");
@@ -1775,9 +2343,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cost_report_empty_transcript_reports_no_child_usage() {
-        let report = build_subagent_cost_report(std::iter::empty::<&Entry>());
+    #[tokio::test]
+    async fn cost_report_empty_transcript_reports_no_child_usage() {
+        let report = report_of(std::iter::empty::<&Entry>()).await;
         assert!(report.starts_with("Subagent cost\n"));
         assert!(
             report.contains("No subagent child usage found in this session."),
@@ -1787,8 +2355,8 @@ mod tests {
         assert!(report.contains("Total: ↑0 ↓0 $0.0000"), "report: {report}");
     }
 
-    #[test]
-    fn cost_report_ignores_non_subagent_tool_results_and_zero_usage_children() {
+    #[tokio::test]
+    async fn cost_report_ignores_non_subagent_tool_results_and_zero_usage_children() {
         // A toolResult from a DIFFERENT tool must not be counted; a subagent result whose usage is
         // all-zero must not produce a child line (pi `usageHasValue`).
         let other_tool = entry(serde_json::json!({
@@ -1814,7 +2382,7 @@ mod tests {
             }),
         );
 
-        let report = build_subagent_cost_report([&other_tool, &zero_child]);
+        let report = report_of([&other_tool, &zero_child]).await;
         assert!(
             report.contains("No subagent child usage found in this session."),
             "a non-subagent toolResult and a zero-usage subagent child must both be ignored: {report}"
@@ -1825,8 +2393,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cost_report_reads_slash_result_custom_message() {
+    #[tokio::test]
+    async fn cost_report_reads_slash_result_custom_message() {
         // The slash-invoked path: a SLASH_RESULT_TYPE custom message nests its subagent details
         // under details.result.details (pi `detailsFromSessionEntry` custom_message arm).
         let custom = entry(serde_json::json!({
@@ -1849,7 +2417,7 @@ mod tests {
             },
         }));
 
-        let report = build_subagent_cost_report([&custom]);
+        let report = report_of([&custom]).await;
         assert!(report.contains("Child 1 (scout)"), "report: {report}");
         assert!(report.contains("Children: ↑12 ↓8"), "report: {report}");
     }
