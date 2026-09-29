@@ -43,9 +43,21 @@ use cyrup_tui::{
 /// SEAM-066. This is the boot half only; the live OSC-11 re-theme
 /// (`applyDetectedStartupTheme`, `startup-ui.ts:92-100`) belongs to whichever selector owns the
 /// terminal, and `ThemeController::boot_from_env` already folds in `COLORFGBG`.
-pub fn startup_theme(dirs: &ConfigDirs) -> UiTheme {
+///
+/// SEAM-119 — `use_theme` is `--use-theme`, which pi applies to this very settings manager
+/// (`startupSettingsManager.applyOverrides({ theme })`, `main.ts:666-668` @v0.87.1) before any
+/// startup selector mounts, so the pickers already paint in the one-run theme.
+pub fn startup_theme(dirs: &ConfigDirs, use_theme: Option<&str>) -> UiTheme {
     let mgr = SettingsManager::load(crate::startup::file_settings_store(dirs), false);
-    let setting = mgr.effective().theme_setting();
+    // CFG-090 — `createStartupTui`'s first line is
+    // `setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides())`
+    // (`cli/startup-ui.ts:84` @v0.87.1), ahead of `initTheme`.
+    cyrup_tui::set_capability_overrides(cyrup_tui::CapabilityOverrides::from_settings(
+        mgr.effective().terminal_capability_overrides(),
+    ));
+    let setting = use_theme
+        .map(str::to_string)
+        .or_else(|| mgr.effective().theme_setting());
     ThemeController::boot_from_env(setting.as_deref()).theme()
 }
 

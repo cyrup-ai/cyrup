@@ -16,7 +16,7 @@ pub use helpers::{auth_credential, env_key, keyless_local};
 pub use oauth::{
     AuthEvent, AuthInfoLink, AuthInteraction, AuthPrompt, AuthPromptKind, AuthSelectOption,
     CallbackServer, CallbackServerConfig, OAuthError, Pkce, generate_pkce, oauth_credential,
-    poll_oauth_device_code_flow, register_bundled_oauth_flow_loaders,
+    poll_oauth_device_code_flow,
 };
 pub use resolve::{AuthOverrides, resolve_provider_auth};
 pub use store::{CredentialStore, InMemoryCredentialStore, ModifyFn};

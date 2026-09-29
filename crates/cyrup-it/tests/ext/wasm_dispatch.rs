@@ -5,7 +5,7 @@
 //!
 //! This is the discipline the audit demanded: NOT a hand-built event handed to `dispatch_*`, but the
 //! real `ExtensionHost::emit_before_agent_start` / `emit_input` / `emit_message_end` /
-//! `emit_before_provider_request` / `emit_user_bash` entry points reaching the live `.wasm` guest.
+//! `emit_before_provider_request` / `emit_user_bash_for` entry points reaching the live `.wasm` guest.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -183,13 +183,16 @@ async fn live_guest_dispatches_the_mutating_seams_end_to_end() {
     );
 
     // 5) user_bash (gap-08 #5): block a destructive command, proceed otherwise.
-    match host.emit_user_bash("rm -rf /", &cancel).await {
+    match host
+        .emit_user_bash_for("rm -rf /", false, ".", &cancel)
+        .await
+    {
         UserBashReduction::Blocked { by, .. } => assert_eq!(by.to_string(), "demo"),
         other => panic!("expected user_bash block, got {other:?}"),
     }
     assert!(
         matches!(
-            host.emit_user_bash("ls", &cancel).await,
+            host.emit_user_bash_for("ls", false, ".", &cancel).await,
             UserBashReduction::Continue
         ),
         "a safe user_bash command proceeds"

@@ -85,9 +85,12 @@ fn thinking(current: &str, default_level: &str) -> crate::ThinkingSelector {
         &levels,
         current,
         default_level,
-        "Shift+Tab".to_string(),
+        crate::ThinkingSelectorKeys::from_keymaps(
+            &crate::Keymap::default(),
+            &crate::SelectKeymap::default(),
+            &crate::ThinkingKeymap::default(),
+        ),
         false,
-        "Ctrl+T".to_string(),
     )
 }
 

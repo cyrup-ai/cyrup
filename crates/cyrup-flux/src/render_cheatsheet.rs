@@ -1,12 +1,12 @@
-//! `/flux/cheatsheet` panel — a function-for-function Rust port of
-//! [`flux_cheatsheet.py`](../../../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_cheatsheet.py).
+//! `/flux/cheatsheet` panel — a function-for-function Rust port of `flux_cheatsheet.py`
+//! (`code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_cheatsheet.py` @v0.0.6).
 //!
 //! SINGLE SOURCE OF TRUTH: the pipeline definitions are parsed at compile time from the vendored
 //! `_docs/pipeline.md` — the same file the resource registry walks and skips (the `_`-prefix
-//! rule, FLUX_01 Fact 5). Editing that doc changes this output automatically; nothing here is
+//! rule, `spec/flux.md` §0.1). Editing that doc changes this output automatically; nothing here is
 //! hardcoded except presentation.
 //!
-//! No ANSI (port doc §5.8): the TUI strips escape sequences from externally supplied text, so
+//! No ANSI (port doc §5, item 8): the TUI strips escape sequences from externally supplied text, so
 //! the Python's colour layer is dropped entirely. `render_flow_line`'s only remaining
 //! non-presentational behaviour is `strip_slashes`, which stays.
 
@@ -77,7 +77,7 @@ pub fn strip_slashes(line: &str) -> String {
     out
 }
 
-/// `render_flow_line` (`flux_cheatsheet.py:132-138`) with the colour layer removed: an
+/// `render_flow_line` (`flux_cheatsheet.py:134-141`) with the colour layer removed: an
 /// all-whitespace line renders empty, everything else is `strip_slashes`d.
 fn render_flow_line(raw: &str) -> String {
     if raw.trim().is_empty() {
@@ -87,7 +87,7 @@ fn render_flow_line(raw: &str) -> String {
     }
 }
 
-/// `parse_pipelines` (`flux_cheatsheet.py:85-130`), reimplemented exactly. Every line access
+/// `parse_pipelines` (`flux_cheatsheet.py:85-131`), reimplemented exactly. Every line access
 /// goes through `.get(i)` rather than raw indexing.
 fn parse_pipelines(md_text: &str) -> Vec<Pipeline> {
     let lines: Vec<&str> = md_text.lines().collect();
@@ -160,7 +160,7 @@ fn parse_pipelines(md_text: &str) -> Vec<Pipeline> {
     pipelines
 }
 
-/// Fixed panel width (`flux_cheatsheet.py:144`).
+/// Fixed panel width (`flux_cheatsheet.py:145`).
 const WIDTH: usize = 60;
 
 /// `render` (`flux_cheatsheet.py:144-164`) with the colour layer removed.
@@ -189,7 +189,7 @@ fn render_pipelines(pipelines: &[Pipeline]) -> String {
 }
 
 /// Parse the positional pipeline filter, matching the Python's validation (`main`,
-/// `flux_cheatsheet.py:186-206`). Empty/whitespace-only args -> no filter (`Ok(None)`). A
+/// `flux_cheatsheet.py:201-210`). Empty/whitespace-only args -> no filter (`Ok(None)`). A
 /// case-insensitive `A`/`B`/`C`/`D` (surrounding whitespace trimmed) -> that pipeline
 /// (`Ok(Some(letter))`). Anything else -> `Err` of the raw (untrimmed) argument text, so the
 /// caller can self-issue an Error notification with the Python's exact wording.

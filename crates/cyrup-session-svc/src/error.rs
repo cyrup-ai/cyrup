@@ -25,6 +25,13 @@ pub enum SessionServiceError {
     #[error("config: {0}")]
     Config(#[from] cyrup_config::ConfigError),
 
+    /// An invalid `compaction.reserveTokens`/`keepRecentTokens` (ordinary or under
+    /// `compaction.modelOverrides`), read at a compaction call site. Displayed bare — pi throws the
+    /// settings getter's own `Error` there, so its message is what `compaction_end.errorMessage`
+    /// (`"Compaction failed: …"`) and a refused prompt carry (SESS-055).
+    #[error(transparent)]
+    CompactionSetting(cyrup_config::ConfigError),
+
     #[error("resources: {0}")]
     Resources(#[from] cyrup_resources::ResourceError),
 

@@ -6,11 +6,14 @@ async fn drain(sse: &'static str, request_tier: Option<&str>) -> Vec<StreamEvent
     let model = codex_model("gpt-5.5-codex");
     let api = ApiId::from(API_ID);
     let (sink, mut rx) = channel(64);
-    let frames = map_codex_frames(
+    decode_codex_stream(
         decode_sse_bytes_flushing_at_eof(sse.as_bytes().to_vec()),
         request_tier.map(str::to_string),
-    );
-    decode_stream(frames, &model, &api, &sink).await;
+        &model,
+        &api,
+        &sink,
+    )
+    .await;
     drop(sink);
     let mut out = Vec::new();
     while let Some(ev) = rx.recv().await {
@@ -299,4 +302,52 @@ async fn prov084_a_transcript_cut_after_the_terminal_event_still_completes() {
     let msg = last.terminal_message().expect("terminal message");
     assert_eq!(msg.stop_reason, StopReason::Stop);
     assert_eq!(msg.usage.output, 5);
+}
+
+/// DRIFT-059 — pi `if (typeof response?.end_turn === "boolean") output.endTurn = response.end_turn`
+/// (`openai-codex-responses.ts:748-752` @v0.87.1; v0.84.2, #7766). The Codex terminal's `end_turn`
+/// lands on the assistant message and serializes as `endTurn` right before `timestamp`, pi's field
+/// order, so the session entry carries the same field pi's does. Absent or non-boolean leaves it
+/// unset, and it never reaches the plain Responses route (asserted in `openai_responses`' own
+/// decode tests by construction: that route passes no cell).
+#[tokio::test]
+async fn the_terminal_end_turn_is_recorded_on_the_message() {
+    async fn terminal(sse: &'static str) -> AssistantMessage {
+        drain(sse, None)
+            .await
+            .last()
+            .and_then(StreamEvent::terminal_message)
+            .map(|m| (**m).clone())
+            .expect("terminal")
+    }
+
+    let msg = terminal(concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m1\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi\"}\n\n",
+        "data: {\"type\":\"response.done\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"end_turn\":false}}\n\n",
+    ))
+    .await;
+    assert_eq!(msg.end_turn, Some(false));
+    let wire = serde_json::to_string(&msg).unwrap();
+    assert!(
+        wire.contains("\"endTurn\":false,\"timestamp\""),
+        "endTurn must sit right before timestamp: {wire}"
+    );
+    let back: AssistantMessage = serde_json::from_str(&wire).unwrap();
+    assert_eq!(back.end_turn, Some(false));
+
+    let msg = terminal(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"end_turn\":true}}\n\n",
+    )
+    .await;
+    assert_eq!(msg.end_turn, Some(true));
+
+    for sse in [
+        CODEX_TEXT_TURN,
+        "data: {\"type\":\"response.done\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"end_turn\":\"no\"}}\n\n",
+    ] {
+        let msg = terminal(sse).await;
+        assert_eq!(msg.end_turn, None);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("endTurn"));
+    }
 }

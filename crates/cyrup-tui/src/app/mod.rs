@@ -55,6 +55,7 @@ pub(crate) mod login;
 mod mode_switch;
 mod outcome;
 mod reload_trust;
+mod render_debug;
 #[path = "render.rs"]
 mod render_impl;
 mod run;
@@ -84,6 +85,8 @@ pub use backend::{InlineBackend, RebuildBackend, reanchor_inline_region};
 pub(crate) use bash_spawn::{BashMsg, spawn_session_bash};
 #[cfg(any(test, feature = "scrollback-accumulator"))]
 pub(crate) use event_extract::line_text;
+#[cfg(test)]
+pub(crate) use event_extract::read_clipboard_image_to_temp_with;
 pub(crate) use event_extract::{
     assistant_message_from_event, context_usage_may_have_moved, custom_message_text,
     displayable_custom_message_from_event, edit_preview, message_role_from_event, model_entries,
@@ -118,6 +121,7 @@ pub use outcome::{
     CompactOutcome, CompactionQueued, ExtensionWidget, LifecycleEffects, LifecycleOutcome,
     LoginProviderSource, QueueDrain, QueueDrainReason, TreeNavMsg,
 };
+pub use render_debug::RenderDebug;
 pub(crate) use settings_rows::PROJECT_UNTRUSTED_WARNING;
 pub(crate) use settings_rows::{
     format_saved_trust, model_thinking_summary_for_count, parse_setting_value, session_label,
@@ -144,7 +148,9 @@ pub(crate) use state::{
 };
 pub use tree_nav::tree_node_from_dag;
 
-use std::io::{self, Stdout};
+use std::io;
+
+use crate::write_log::TuiStdout;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -192,7 +198,7 @@ use crate::extension_editor::ExtensionEditorSelector;
 use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
 use crate::keymap::{
     Action, AltScreenKeymap, EditorAction, Key, KeybindingIssue, Keymap, ModelsKeymap,
-    SelectAction, SelectKeymap, SessionKeymap, TreeKeymap,
+    SelectAction, SelectKeymap, SessionKeymap, ThinkingKeymap, TreeKeymap,
 };
 use crate::login_dialog::{
     LoginDialog, LoginFinished, LoginUiMsg, TuiAuthInteraction, notify_auth_dialog,
@@ -418,4 +424,15 @@ pub struct App<B: Backend> {
     /// inline: correct there, because with no run loop there is no `ui_rx` arm for a guest dialog to
     /// be waiting on in the first place.
     lifecycle_tx: Option<tokio::sync::mpsc::UnboundedSender<LifecycleOutcome>>,
+    /// CFG-063 — the `CYRUP_TUI_DEBUG` / `CYRUP_TUI_DEBUG_REDRAW` instruments, installed by the
+    /// composition root through [`App::set_render_debug`]. Both off by default.
+    render_debug: render_debug::RenderDebug,
+    /// pi's `(previousWidth, previousHeight)`: the terminal size the previous inline frame was
+    /// drawn at, [`render_debug::NO_FRAME`] before the first one, and [`render_debug::RESET_FRAME`]
+    /// after [`App::reset_render_state`]. What tells [`App::draw`] a frame is pi's `first render`
+    /// or a `terminal width/height changed` full redraw.
+    last_frame_size: (i32, i32),
+    /// The previous inline frame's rows, kept only while the frame dump is on (pi's
+    /// `previousLines`, the second array every dump carries).
+    debug_previous_lines: Vec<String>,
 }

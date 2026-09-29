@@ -388,9 +388,10 @@ pub struct InspectorContext {
     ///
     /// **This is the gate both built-in backends are.** herdr's is
     /// `env.HERDR_ENV === "1" && env.HERDR_PANE_ID?.trim()` (`herdr/plugin.ts:13-14`); ghostty's is
-    /// `env.TERM_PROGRAM?.toLowerCase() === "ghostty"` (`ghostty/plugin.ts:13`). Neither probes,
-    /// spawns or opens a socket, which is why `inspector.open` on a box with neither installed
-    /// refuses in microseconds instead of hanging.
+    /// `env.TERM_PROGRAM?.toLowerCase() === "ghostty"` plus
+    /// `env.__CFBundleIdentifier?.trim() === "com.mitchellh.ghostty"` (`ghostty/plugin.ts:20-24`
+    /// @v0.71.0). Neither probes, spawns or opens a socket, which is why `inspector.open` on a box
+    /// with neither installed refuses in microseconds instead of hanging.
     ///
     /// It is on the CONTEXT rather than on each plugin because the dispatcher is what decides
     /// which backend runs. Each backend used to carry its own `with_env`, which works for a unit

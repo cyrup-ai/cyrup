@@ -210,13 +210,13 @@ impl<W: io::Write> Backend for InlineBackend<W> {
     }
 }
 
-impl RebuildBackend for InlineBackend<Stdout> {
-    /// A fresh wrapper over the same stdout, CARRYING the anchor across the re-wrap — the step that
+impl RebuildBackend for InlineBackend<TuiStdout> {
+    /// A fresh wrapper over the same teed stdout, CARRYING the anchor across the re-wrap — the step that
     /// makes the rebuilt `Terminal::with_options` reserve rows from the row `reanchor_inline` just
     /// moved to (`CaptureBackend::rebuild` does the same, `inline_stacking.rs:131-138`).
     fn rebuild(&self) -> Self {
         Self {
-            inner: CrosstermBackend::new(io::stdout()),
+            inner: CrosstermBackend::new(crate::write_log::tui_stdout()),
             anchor: self.anchor,
         }
     }
@@ -449,10 +449,11 @@ mod tests {
 
     #[test]
     fn rebuild_carries_the_anchor_across_the_rewrap() {
-        // `InlineBackend<Stdout>` specifically — `RebuildBackend` is only implemented for that
+        // `InlineBackend<TuiStdout>` specifically — `RebuildBackend` is only implemented for that
         // concrete type. This writes nothing (`CrosstermBackend::new` just wraps the handle), so
         // it is safe to run under `cargo test`'s captured stdout.
-        let backend = InlineBackend::with_anchor(io::stdout(), Position::new(2, 9));
+        let backend =
+            InlineBackend::with_anchor(crate::write_log::tui_stdout(), Position::new(2, 9));
         let rebuilt = backend.rebuild();
         assert_eq!(
             rebuilt.anchor(),

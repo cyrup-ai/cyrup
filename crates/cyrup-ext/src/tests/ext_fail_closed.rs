@@ -613,7 +613,7 @@ fn is_user_bash_event_result_matches_pis_predicate() {
 
 /// A handler that returns a DEFINED but invalid value is an ABORT upstream, not a pass-through:
 /// `emitUserBash` throws `Invalid user_bash handler result: …` (runner.ts:1163-1167 @v0.87.1).
-/// `emit_user_bash` must therefore surface it as `Invalid`, never as `Handled` or `Continue`.
+/// `emit_user_bash_for` must therefore surface it as `Invalid`, never as `Handled` or `Continue`.
 #[tokio::test]
 async fn an_invalid_user_bash_result_is_not_handled() {
     struct BadResult(Value);
@@ -637,7 +637,10 @@ async fn an_invalid_user_bash_result_is_not_handled() {
         .await
         .unwrap();
 
-    match host.emit_user_bash("uname -a", &CancelToken::new()).await {
+    match host
+        .emit_user_bash_for("uname -a", false, ".", &CancelToken::new())
+        .await
+    {
         crate::UserBashReduction::Invalid { by } => assert_eq!(by.to_string(), "bad-bash-result"),
         other => panic!(
             "EXT-077: a defined-but-invalid user_bash result must abort, not proceed: {other:?}"
@@ -653,7 +656,8 @@ async fn an_invalid_user_bash_result_is_not_handled() {
     .unwrap();
     assert!(
         matches!(
-            host.emit_user_bash("uname -a", &CancelToken::new()).await,
+            host.emit_user_bash_for("uname -a", false, ".", &CancelToken::new())
+                .await,
             crate::UserBashReduction::Handled { .. }
         ),
         "a pi-valid operations-only result still wins the reduction"

@@ -55,6 +55,7 @@ fn an_assistant_turn_whose_blocks_all_filter_out_is_dropped() {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     };
     let ctx = Context {
@@ -106,6 +107,7 @@ fn blank_tool_result_content_becomes_the_empty_placeholder() {
                 deferred: None,
                 error_message: None,
                 raw_stop_reason: None,
+                end_turn: None,
                 timestamp: 0,
             }),
             Message::ToolResult {
@@ -168,6 +170,7 @@ fn consecutive_tool_results_collapse_into_one_user_message() {
             deferred: None,
             error_message: None,
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: 0,
         }),
     ];
@@ -237,6 +240,7 @@ fn signatureless_thinking_replays_as_text_on_claude_and_as_reasoning_elsewhere()
                 deferred: None,
                 error_message: None,
                 raw_stop_reason: None,
+                end_turn: None,
                 timestamp: 0,
             }),
         ],
@@ -418,6 +422,7 @@ mod prov097_replay {
             deferred: None,
             error_message: None,
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: 1,
         })
     }

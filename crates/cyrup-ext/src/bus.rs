@@ -128,17 +128,6 @@ impl SharedBus {
             })
             .unwrap_or_default()
     }
-
-    /// Drop all subscriptions + queued events (hot-reload, R-08-005): the fresh load re-declares
-    /// them.
-    pub fn clear(&self) {
-        if let Ok(mut g) = self.subs.lock() {
-            g.clear();
-        }
-        if let Ok(mut g) = self.pending.lock() {
-            g.clear();
-        }
-    }
 }
 
 /// The fan-out seam (EXT-034).

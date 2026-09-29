@@ -26,6 +26,22 @@
 //! `git checkout` in another terminal still repaints the footer. Pi debounces its watch by 500 ms
 //! (`FooterDataProvider.WATCH_DEBOUNCE_MS`); [`POLL_INTERVAL`] is the same figure, and the poll
 //! costs one `stat` — strictly less than the 80 ms spinner tick the loop already pays while working.
+//!
+//! # `isWslEnvironment` / `shouldPollGitHead` (CFG-065)
+//!
+//! pi keeps TWO change sources: `fs.watch` on HEAD's directory everywhere, plus a `watchFile` stat
+//! poll of HEAD (`interval: 1000`) added only when `shouldPollGitHead(repoDir)` holds —
+//! `isWslEnvironment()` (`linux && (WSL_DISTRO_NAME || WSL_INTEROP)`) AND a `/mnt/<drive>` repo
+//! (`/^\/mnt\/[a-z](?:\/|$)/i`), because inotify never fires on WSL's 9p drive mounts
+//! (`footer-data-provider.ts:82-92`, `:313-329` @v0.87.1).
+//!
+//! `[CYRUP-DELTA]` cyrup has only the second source, unconditionally: this module holds no
+//! filesystem watch and `cyrup-tui` depends on no watcher crate, so the run loop's
+//! `git_branch_poll` arm (`app/run.rs`) is the footer's ONLY change source, on every platform. The
+//! predicate would select between that poll and itself, so it is not ported as code; the WSL
+//! `/mnt/<drive>` repo it exists for is polled like every other repo. What IS ported is what pi's
+//! poll compares — `size`, `mtime` AND `ctime` ([`Fingerprint`]) — so the one arm cyrup has
+//! detects everything pi's poll arm detects.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -106,9 +122,11 @@ fn resolve_branch_with_git(repo_dir: &Path) -> Option<String> {
     }
 }
 
-/// A cheap "did the refs move?" fingerprint: `(len, mtime)` of the watched files. Pi gets this
-/// signal from `fs.watch`/`watchFile` on the same two paths.
-type Fingerprint = Vec<(u64, Option<SystemTime>)>;
+/// A cheap "did the refs move?" fingerprint: `(size, mtime, ctime)` of the watched files — exactly
+/// the three fields pi's `watchFile` listeners compare (`current.mtimeMs !== previous.mtimeMs ||
+/// current.ctimeMs !== previous.ctimeMs || current.size !== previous.size`,
+/// `footer-data-provider.ts:320-327`, `:362-368` @v0.87.1).
+type Fingerprint = Vec<(u64, Option<SystemTime>, Option<i128>)>;
 
 /// The footer's cached git branch plus the change detection that keeps it live.
 ///
@@ -183,10 +201,25 @@ fn fingerprint_of(paths: &GitPaths) -> Fingerprint {
         paths.common_git_dir.join("reftable").join("tables.list"),
     ] {
         if let Ok(m) = std::fs::metadata(&p) {
-            out.push((m.len(), m.modified().ok()));
+            out.push((m.len(), m.modified().ok(), change_time(&m)));
         }
     }
     out
+}
+
+/// The inode change time in nanoseconds — node's `Stats.ctimeMs`. `ctime` moves on every write
+/// and rename even when a tool restores `mtime` afterwards, which is why pi's stat poll compares it.
+/// Windows has no change time in `std`; there the fingerprint is `(size, mtime)`, as pi's `ctimeMs`
+/// is on a filesystem that does not report one.
+#[cfg(unix)]
+fn change_time(m: &std::fs::Metadata) -> Option<i128> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(i128::from(m.ctime()) * 1_000_000_000 + i128::from(m.ctime_nsec()))
+}
+
+#[cfg(not(unix))]
+fn change_time(_m: &std::fs::Metadata) -> Option<i128> {
+    None
 }
 
 #[cfg(test)]
@@ -323,5 +356,46 @@ mod tests {
         assert!(b.poll());
         assert_eq!(b.branch(), Some("feature/x"));
         assert!(!b.poll());
+    }
+
+    /// CFG-065 — pi's stat poll (the arm it enables for WSL `/mnt/<drive>` repos) compares `ctimeMs`
+    /// as well as `mtimeMs` and `size` (`footer-data-provider.ts:320-327` @v0.87.1). A HEAD rewrite
+    /// to a same-length branch name whose `mtime` is then put back — what a 9p mount's coarse or
+    /// restored timestamps look like — moves ONLY `ctime`, and the footer must still see it.
+    ///
+    /// Red before the fix: the fingerprint was `(len, mtime)`, so this poll answered "nothing moved".
+    #[cfg(unix)]
+    #[test]
+    fn poll_sees_a_head_rewrite_that_only_moves_ctime() {
+        let root = tmp("ctime");
+        plain_repo(&root, "ref: refs/heads/aaaa\n");
+        let head = root.join(".git").join("HEAD");
+        let mut b = FooterGitBranch::discover(&root);
+        assert_eq!(b.branch(), Some("aaaa"));
+        let mtime = std::fs::metadata(&head).unwrap().modified().unwrap();
+        // Let the clock move so the rewrite's ctime is distinguishable from the first write's.
+        let before = std::fs::metadata(&head).unwrap();
+        let mut rewritten = false;
+        for _ in 0..200 {
+            std::fs::write(&head, "ref: refs/heads/bbbb\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&head)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            let after = std::fs::metadata(&head).unwrap();
+            if change_time(&after) != change_time(&before) {
+                rewritten = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(rewritten, "the filesystem never advanced ctime");
+        let after = std::fs::metadata(&head).unwrap();
+        assert_eq!(after.len(), before.len(), "same size");
+        assert_eq!(after.modified().unwrap(), mtime, "same mtime");
+        assert!(b.poll(), "a ctime-only change is a change to pi's poll");
+        assert_eq!(b.branch(), Some("bbbb"));
     }
 }

@@ -6,12 +6,14 @@ use crate::shared_str::SharedStr;
 /// A typed content block (func-01 §4.4).
 ///
 /// Per-role typing (gap 9): Pi types content per role — assistant = `Text|Thinking|ToolCall`,
-/// user/toolResult = `Text|Image` (types.ts:379/385/402). cyrup keeps one ergonomic `Content` enum
-/// but enforces Pi's per-role unions at the wire boundary with validating deserializers
-/// ([`de_assistant_content`], [`de_user_content`], [`de_tool_result_content`]): a payload carrying
-/// an `Image` in an assistant turn — or a `ToolCall`/`Thinking` in a user/tool-result turn — is
-/// REJECTED on deserialize, exactly as Pi's typed unions reject it. Producers still build the right
-/// variants by construction.
+/// user/toolResult = `Text|Image` (types.ts:379/385/402). Those unions are COMPILE-TIME TypeScript
+/// only: pi's session read path is a bare `JSON.parse(line) as FileEntry` that skips only malformed
+/// JSON (`parseSessionEntryLine`, `core/session-manager.ts:616-624` @v0.87.1), so an off-union
+/// block loads there. cyrup keeps one ergonomic `Content` enum and its per-role deserializers
+/// ([`de_assistant_content`], [`de_user_content`], [`de_tool_result_content`]) are READ-TOLERANT to
+/// match (SESS-001, SESS-027): an `Image` in an assistant turn, or a `ToolCall`/`Thinking` in a
+/// user/tool-result turn, is ACCEPTED on deserialize. Producers build the right variants by
+/// construction.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(
     tag = "type",

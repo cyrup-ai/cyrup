@@ -58,12 +58,12 @@ fn sse_headers_match_upstream_and_cannot_be_overridden() {
     );
     // A non-conflicting model header survives.
     assert_eq!(h.get("x-extra"), Some(&Some("kept".to_string())));
-    assert!(
-        h.get("User-Agent")
-            .and_then(|v| v.clone())
-            .is_some_and(|v| v.starts_with("pi (")),
-        "user agent: {:?}",
-        h.get("User-Agent")
+    // pi `headers.set("User-Agent", getPiUserAgent())` (`openai-codex-responses.ts:1626`
+    // @v0.87.1): pi's own product token with Node's platform, `os.release()` and arch tokens — the
+    // same builder the seven `cyrup (…)` adapters use (PROV-095).
+    assert_eq!(
+        h.get("User-Agent"),
+        Some(&Some(crate::utils::user_agent::platform_user_agent("pi")))
     );
 }
 

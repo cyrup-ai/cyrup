@@ -250,8 +250,20 @@ fn prepend(selected: &mut Vec<Message>, mut head: Vec<Message>) {
     *selected = head;
 }
 
+/// The branch-summary output cap — Pi `Math.min(4096, model.maxTokens > 0 ? model.maxTokens :
+/// Number.POSITIVE_INFINITY)` (`branch-summarization.ts:345` @v0.87.1; a fixed 2048 before v0.85.0,
+/// `e44d75c20`). A model reporting no output limit (`0`) gets the full 4096 (SESS-060).
+fn branch_summary_max_tokens(model: &Model) -> u32 {
+    const CAP: u32 = 4096;
+    if model.max_tokens > 0 {
+        u32::try_from(model.max_tokens).map_or(CAP, |m| m.min(CAP))
+    } else {
+        CAP
+    }
+}
+
 /// Generate a branch summary (preamble + structured summary + machine file blocks). The
-/// summarization completion is capped at a fixed 2048 tokens (Pi `branch-summarization.ts:341`).
+/// summarization completion is capped by [`branch_summary_max_tokens`].
 ///
 /// Returns the text together with the call's [`Usage`], which the caller persists on the
 /// `branch_summary` entry (Pi `BranchSummaryResult.usage` → `BranchSummaryEntry.usage`,
@@ -306,14 +318,14 @@ pub async fn generate_branch_summary_with_instructions<S: Summarizer>(
     let req = SummarizationRequest {
         system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
         prompt_text: prompt,
-        max_tokens: 2048,
+        max_tokens: branch_summary_max_tokens(model),
         model: ModelRef {
             provider: model.provider.clone(),
             api: Some(model.api.clone()),
             model: model.id.clone(),
         },
         // Pi builds the branch-summary request options INLINE — `{ apiKey, headers, env, signal,
-        // maxTokens: 2048 }` (`branch-summarization.ts:348`) — rather than through
+        // maxTokens }` (`branch-summarization.ts:352` @v0.87.1) — rather than through
         // `createSummarizationOptions`, so `reasoning` is never set for a branch summary even on a
         // reasoning model with thinking enabled. `Off` is that absence, not an oversight.
         thinking: ModelThinkingLevel::Off,

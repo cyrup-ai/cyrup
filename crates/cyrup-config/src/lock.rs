@@ -373,6 +373,30 @@ pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), Confi
     Ok(())
 }
 
+/// Write `bytes` to `path` IN PLACE, creating it owner-only (0600) when absent and its parent dir
+/// 0700 — Pi's `writeFileSync(authPath, next, { encoding: "utf-8", mode: 0o600 })`
+/// (`auth-storage.ts:25`, `:65`, `:106`, `:187` @v0.87.1), whose `mode` "applies only on creation
+/// so administrator-managed modes and ACLs remain intact". An existing file keeps its inode, mode,
+/// owner and ACL; this is why `auth.json` does not go through [`write_atomic`], whose rename
+/// replaces all four (CFG-089). Callers serialize writers with [`FileLock`], as Pi does with
+/// `proper-lockfile`.
+pub fn write_in_place_secret(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        ensure_dir(parent)?;
+    }
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).map_err(|e| io_err(path, e))?;
+    f.write_all(bytes).map_err(|e| io_err(path, e))?;
+    f.sync_all().map_err(|e| io_err(path, e))?;
+    Ok(())
+}
+
 /// Tag an `io::Error` with the path whose syscall produced it, so the rendered error names
 /// the file the operator has to go look at.
 fn io_err(path: &Path, source: std::io::Error) -> ConfigError {

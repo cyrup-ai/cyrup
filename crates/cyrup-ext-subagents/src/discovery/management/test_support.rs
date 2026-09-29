@@ -18,6 +18,7 @@ pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefi
         default_tool_timeout_ms: None,
         inherit_global_context: false,
         machine: None,
+        advertise: None,
         mutation_tools: None,
         default_turn_budget: None,
         default_acceptance: None,

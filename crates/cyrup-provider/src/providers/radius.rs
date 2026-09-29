@@ -52,8 +52,7 @@
 //! loader's staleness guard would discard the gateway catalog on the next start.
 
 use crate::api::{ApiRegistry, builtin_registry};
-use crate::auth::oauth::load::RadiusOptions;
-use crate::auth::oauth::radius::{RadiusOAuth, normalize_radius_gateway_url};
+use crate::auth::oauth::radius::{RadiusOAuth, RadiusOptions, normalize_radius_gateway_url};
 use crate::auth::{
     AuthContext, AuthOverrides, Credential, CredentialStore, EnvAuthContext,
     InMemoryCredentialStore, ProviderAuth, env_key, resolve_provider_auth,

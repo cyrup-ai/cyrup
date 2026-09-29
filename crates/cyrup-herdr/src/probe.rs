@@ -4,12 +4,12 @@
 //!
 //! `ping` is the only machine-readable version signal on the socket:
 //! `{version: String, protocol: u32, capabilities}` (`tmp/herdr/src/api/schema/response.rs:45-50`,
-//! produced at `tmp/herdr/src/api/server.rs:356-363`). Two things about it are easy to get wrong.
+//! produced at `tmp/herdr/src/api/server.rs:343-350`). Two things about it are easy to get wrong.
 //!
 //! **`protocol` is not a JSON-method generation.** It is `PROTOCOL_VERSION`
 //! (`tmp/herdr/src/protocol/wire.rs:20`, `22` today) and it guards herdr's **binary** attach/render
 //! endpoint; `wire.rs:6-8` says so in its own module doc. herdr's *CLI* refuses any difference
-//! before every verb (`tmp/herdr/src/cli.rs:786-801` → `cli/protocol_guard.rs:16-43`), but the CLI
+//! before every verb (`tmp/herdr/src/cli.rs:787-802` → `cli/protocol_guard.rs:16-43`), but the CLI
 //! is a herdr build talking to a herdr build of possibly different vintage. A cyrup client is
 //! neither, and refusing a JSON call because a binary protocol moved would disable a working
 //! feature for a reason that does not apply to it. So this client records `protocol` and does not
@@ -19,7 +19,7 @@
 //! *"Other missing methods disable only those actions and show a client-local notice; they do not
 //! disconnect the UI … JSON API clients should ignore unknown fields and handle unsupported methods
 //! as normal errors."* (`socket-api.mdx:951-959`). An unknown method name fails `Request`
-//! deserialisation and comes back as `invalid_request` (`tmp/herdr/src/api/server.rs:177-204`).
+//! deserialisation and comes back as `invalid_request` (`tmp/herdr/src/api/server.rs:177-191`).
 //!
 //! So the degradation rule is: **`ping` once, cache the [`Pong`], and treat `invalid_request` on a
 //! specific method as "this build lacks that one method" — turn that one feature off and keep the
@@ -118,7 +118,7 @@ impl Pong {
 /// `ping` the server at `socket`, with the default [`DEFAULT_TIMEOUT`] deadline.
 ///
 /// `ping` is answered by the API server itself without touching the app
-/// (`tmp/herdr/src/api/server.rs:355-368`), so it stays answerable while the UI is busy — which is
+/// (`tmp/herdr/src/api/server.rs:342-355`), so it stays answerable while the UI is busy — which is
 /// what makes it a liveness probe rather than another request.
 ///
 /// # Errors
@@ -157,7 +157,7 @@ pub async fn ping_current_pane(env: &impl EnvSource) -> Result<Pong> {
 ///
 /// [`ResponseResult::Unrecognised`] — a `result.type` newer than this client — is an error here,
 /// never a defaulted success. herdr's own client does the same
-/// (`tmp/herdr/src/api/client.rs:119`, `ApiClientError::UnexpectedResult`).
+/// (`tmp/herdr/src/api/client.rs:92`, `ApiClientError::UnexpectedResult`).
 fn pong(result: ResponseResult) -> Result<Pong> {
     match result {
         ResponseResult::Pong {

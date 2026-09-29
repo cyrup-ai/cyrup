@@ -1,7 +1,18 @@
 //! `cyrup-herdr` — the workspace's one client for herdr's newline-delimited JSON socket API.
 //!
-//! Pinned to herdr **v0.9.1** (`tmp/herdr` @ `d59d060`, `Cargo.toml:3`). Every claim in this crate's
-//! docs cites herdr's own source, not a consumer's use of it.
+//! Pinned to herdr **v0.9.1** — the release tag, commit `065ef9d6` (`Cargo.toml:3`). Every claim in
+//! this crate's docs cites herdr's own source, not a consumer's use of it, and every
+//! `tmp/herdr/<path>:N` citation is a line of `git -C tmp/herdr show v0.9.1:<path>`, never of the
+//! checkout's working tree, which moves. A bare `socket-api.mdx:N` is
+//! `docs/next/website/src/content/docs/socket-api.mdx` at that tag — the documentation the
+//! release was cut with; the tag's `docs/preview/` copy is older.
+//!
+//! This crate was first written against `d59d0603`, an untagged `main` commit that is not a
+//! descendant of the tag and differs from it on API paths in exactly two ways
+//! (`git -C tmp/herdr diff v0.9.1 d59d0603 -- src/api src/app/api src/cli.rs`). Neither is relied
+//! on here: `pane.clear` (`cc7c696c`) does not exist at `v0.9.1` and is not ported, and the ids
+//! herdr puts on error envelopes changed (`241063f7`) — [`transport::request`] states both shapes
+//! and treats them alike.
 //!
 //! # The shape of the protocol, in one place
 //!
@@ -17,10 +28,10 @@
 //! [`ApiErrorCode::from_wire`].
 //!
 //! **Framing.** One JSON value per `\n`-terminated line, both directions
-//! (`tmp/herdr/src/api/client.rs:185-190`, `tmp/herdr/src/api/server.rs:539-583`).
+//! (`tmp/herdr/src/api/client.rs:158-163`, `tmp/herdr/src/api/server.rs:525-569`).
 //!
 //! **Connection model — one request per connection.** `handle_connection_with_stop`
-//! (`tmp/herdr/src/api/server.rs:156-317`) reads one line, dispatches, writes one line, and
+//! (`tmp/herdr/src/api/server.rs:156-304`) reads one line, dispatches, writes one line, and
 //! returns; there is no read loop. Exactly three things hold a connection open past the first
 //! answer: `events.subscribe`, `pane.graphics.stream`, and the four in-band waits. See
 //! [`transport`] for why every independent client agrees, and what follows from it.
@@ -28,7 +39,7 @@
 //! **The one long-lived connection.** `events.subscribe` acknowledges and then pushes events on
 //! the same connection ([`stream`]). Because a snapshot cannot share that connection and a
 //! subscription does not replay
-//! (`tmp/herdr/docs/preview/website/src/content/docs/socket-api.mdx:118-130`, `:824-826`), pairing
+//! (`tmp/herdr/docs/next/website/src/content/docs/socket-api.mdx:118-130`, `:824-826`), pairing
 //! a cache with a stream has exactly one correct order — so [`HerdrClient::bootstrap`] performs it
 //! as one call, once, rather than leaving every consumer to re-derive it. That is a
 //! `[CYRUP-EXCEEDS-UPSTREAM]`; the premise and pi's contrasting shape are on the method. It is a
@@ -67,10 +78,10 @@
 //!
 //! # What is ported, and what is deliberately not
 //!
-//! herdr publishes 105 renamed methods (`tmp/herdr/src/api/schema.rs:47-271`). [`HerdrClient`]
+//! herdr publishes 104 renamed methods (`tmp/herdr/src/api/schema.rs:47-269`). [`HerdrClient`]
 //! carries **28** of them (every variant of [`schema::Method`]; 27 go through
 //! [`HerdrClient::call`] and the twenty-eighth, `events.subscribe`, keeps its connection and is
-//! driven by [`HerdrClient::subscribe`]). The remaining **77** are absent, and each block below
+//! driven by [`HerdrClient::subscribe`]). The remaining **76** are absent, and each block below
 //! says what would have to exist first — "large" is never the reason, because the envelope is
 //! generic and each method is one enum variant.
 //!
@@ -80,21 +91,21 @@
 //! placed child there, exactly the verbs pi-subagents drives
 //! (`src/runs/shared/herdr-placed-run.ts:135-175` @v0.68.0).
 //!
-//! **28 + 77 = 105, and the counts below add up to 77.** That is the point of stating them: a
+//! **28 + 76 = 104, and the counts below add up to 76.** That is the point of stating them: a
 //! family whose size is guessed hides a method nobody decided about. `pane.rename`,
 //! `pane.send_text` and `pane.send_keys` were exactly that — absent from every row of this table
 //! while being absent from the client too.
 //!
 //! | not ported | count | what would need it |
 //! |---|---|---|
-//! | `events.wait`, `agent.wait` | 2 | two of the methods that hold a connection open past the first answer (`tmp/herdr/src/api/server.rs:251-288`); the third, `agent.prompt`, is ported for placement and waits through its own `wait` option. Unlike `events.subscribe` they answer **once** and then close, so they need no stream — they need a *sibling-agent* caller, which no batch has yet. |
-//! | `pane.graphics.{info,set,clear,stream}`, plus the 4 `#[serde(skip)]` frame variants that are not among the 105 | 4 | the wire contract is a raw-byte side channel after the JSON header (`socket-api.mdx:204-236`). **cyrup has no image producer**, so these methods would have no argument to carry. |
+//! | `events.wait`, `agent.wait` | 2 | two of the methods that hold a connection open past the first answer (`tmp/herdr/src/api/server.rs:238-275`); the third, `agent.prompt`, is ported for placement and waits through its own `wait` option. Unlike `events.subscribe` they answer **once** and then close, so they need no stream — they need a *sibling-agent* caller, which no batch has yet. |
+//! | `pane.graphics.{info,set,clear,stream}`, plus the 4 `#[serde(skip)]` frame variants that are not among the 104 | 4 | the wire contract is a raw-byte side channel after the JSON header (`socket-api.mdx:204-236`). **cyrup has no image producer**, so these methods would have no argument to carry. |
 //! | `plugin.*` (11), `integration.*` (3) | 14 | require shipping a `herdr-plugin.toml` package (`socket-api.mdx:499-560`) — a distinct deliverable with its own install story. |
 //! | `worktree.*` | 4 | herdr worktrees create **herdr workspaces**. cyrup owns its worktrees through `gix` (`crates/cyrup-ext-subagents/src/spawn/worktree.rs`); adopting herdr's would move ownership of a feature that already works. |
-//! | pane geometry, scrollback and raw input — `swap` `move` `zoom` `resize` `neighbor` `edges` `focus_direction` `scroll` `copy_motion` `copy_search` `selection.read` `edit_scrollback` `clear` `input.set` `link.activate` `link.resolve` `layout` `rename` `send_text` `send_keys` + `layout.{export,apply,set_split_ratio}` | 23 | **no consumer arranges the user's terminal.** Every batch in flight splits, reads, writes and closes; none moves panes around. `send_text`/`send_keys` are the raw halves of `pane.send_input`, which is the one this client sends because it is what `herdr pane run` is (`tmp/herdr/src/cli/pane.rs:1046-1052`). Add on first caller. |
+//! | pane geometry, scrollback and raw input — `swap` `move` `zoom` `resize` `neighbor` `edges` `focus_direction` `scroll` `copy_motion` `copy_search` `selection.read` `edit_scrollback` `input.set` `link.activate` `link.resolve` `layout` `rename` `send_text` `send_keys` + `layout.{export,apply,set_split_ratio}` | 22 | **no consumer arranges the user's terminal.** Every batch in flight splits, reads, writes and closes; none moves panes around. `send_text`/`send_keys` are the raw halves of `pane.send_input`, which is the one this client sends because it is what `herdr pane run` is (`tmp/herdr/src/cli/pane.rs:1046-1052`). Add on first caller. |
 //! | `server.stop`, `server.live_handoff` | 2 | destroy or restart the user's whole terminal session. |
 //! | `workspace.*` except `create` (8), `tab.{list,focus,move,close}` (4), `agent.{read,explain,send_keys,rename,focus}` (5), `command.invoke`, `popup.close`, `notification.show`, `client.window_title.{set,clear}` (2), `product_announcement.dismiss`, `release_notes.dismiss`, `server.reload_config`, `server.{agent_manifests,reload_agent_manifests}` (2) | 27 | no caller yet. |
-//! | `client_shell.surface.set` | 1 | **cannot be ported.** The raw socket refuses it by construction — `connection_local_only`, `tmp/herdr/src/api/server.rs:370-376`. It is absent, not deferred. |
+//! | `client_shell.surface.set` | 1 | **cannot be ported.** The raw socket refuses it by construction — `connection_local_only`, `tmp/herdr/src/api/server.rs:357-363`. It is absent, not deferred. |
 //!
 //! # A leaf, deliberately
 //!

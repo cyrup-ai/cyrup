@@ -74,10 +74,83 @@
 //!   (orchestrator-side) spawn call.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::background::RunId;
+use crate::background::process_terminal::RunnerProcessInstanceId;
 use crate::error::SubagentError;
 use crate::spawn::SpawnCommand;
+
+/// SUBA-141 — what the LAUNCHING process needs to record the runner's close when it observes it:
+/// pi's `proc.once("close", (exitCode, signal) => finalizeProcessTerminal(asyncDir, runId, { … }))`
+/// (`async-execution.ts:759-770` @v0.71.0).
+///
+/// The runner already finalizes its own proof on a clean exit (`runner_main::entry`), and
+/// [`crate::background::process_terminal::finalize_process_terminal`] returns that proof
+/// untouched when this observation arrives second. What only the launcher can see is a runner
+/// that died WITHOUT reaching its tail — `SIGKILL`, an OOM kill, a panic — and its real exit code
+/// and signal are what a later stale-run repair reports (`stale-run-reconciler.ts:231-238`).
+#[derive(Clone, Debug)]
+pub struct RunnerCloseObserver {
+    /// The run's own directory, holding its `process-terminal.json` and `events.jsonl`.
+    pub run_dir: PathBuf,
+    /// The run the proof belongs to.
+    pub run_id: RunId,
+    /// The runner instance minted for this launch.
+    pub process_instance_id: RunnerProcessInstanceId,
+    /// The session-lease root the proof ladder's lease rung inspects.
+    pub lease_root: PathBuf,
+}
+
+impl RunnerCloseObserver {
+    /// Wait for the runner's close on a detached task and finalize its proof from the observed
+    /// exit. The task is fire-and-forget: the caller has already returned the pid, exactly as
+    /// upstream's close listener never delays the launch reply. If this process exits first the
+    /// task dies with it, and the runner — in its own process group — does not.
+    fn watch(self, mut child: tokio::process::Child) {
+        tokio::spawn(async move {
+            let Ok(exit) = child.wait().await else {
+                return;
+            };
+            let close = crate::background::process_terminal::RunnerCloseObservation {
+                process_instance_id: self.process_instance_id,
+                close_observed_at: crate::time::now_epoch_millis(),
+                exit_code: exit.code(),
+                signal: exit_signal_name(&exit),
+            };
+            let run_dir = crate::background::RunDir::for_existing(&self.run_dir);
+            let mut events = crate::jsonl::RunEventLog::create(&run_dir.events())
+                .await
+                .ok();
+            let _ = crate::background::process_terminal::finalize_process_terminal(
+                &run_dir,
+                &self.run_id,
+                &close,
+                &self.lease_root,
+                &mut events,
+            )
+            .await;
+        });
+    }
+}
+
+/// Node's `signal` argument to a `close` listener: the terminating signal's NAME (`"SIGKILL"`),
+/// or nothing when the process exited on its own.
+#[cfg(unix)]
+fn exit_signal_name(exit: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    let number = exit.signal()?;
+    Some(nix::sys::signal::Signal::try_from(number).map_or_else(
+        |_| format!("SIG{number}"),
+        |signal| signal.as_str().to_string(),
+    ))
+}
+
+/// No signals off Unix.
+#[cfg(not(unix))]
+fn exit_signal_name(_exit: &std::process::ExitStatus) -> Option<String> {
+    None
+}
 
 /// The internal `cyrup` CLI subcommand a detached runner process is launched under (registered in
 /// `crates/cyrup/src/subagent_runner_cmd.rs`, outside this crate — see arch-SA §2.2's crate/module
@@ -143,8 +216,9 @@ mod windows_flags {
 /// # Return value and the "never awaited" contract
 ///
 /// On success, returns the child's OS pid. The [`tokio::process::Child`] value itself is dropped
-/// before this function returns — it is NEVER `.wait()`-ed, NEVER `.wait_with_output()`-ed, and no
-/// task is spawned to await it later. This is the entire point of detachment (see module docs):
+/// before this function returns — it is NEVER `.wait()`-ed inline. (Only
+/// [`spawn_detached_runner_observed`] hands it to a detached close-observer task, which still
+/// returns the pid first.) This is the entire point of detachment (see module docs):
 /// the real OS process's lifetime is already fully independent of this process's in-memory
 /// handle, and this function's only remaining job once `spawn()` succeeds is confirming (and
 /// returning) the pid.
@@ -207,6 +281,50 @@ pub fn spawn_detached_runner_with_command(
     stderr_log_path: &Path,
     env_overlay: &BTreeMap<String, String>,
 ) -> Result<u32, SubagentError> {
+    spawn_detached(
+        spawn_command,
+        cfg_path,
+        stdout_log_path,
+        stderr_log_path,
+        env_overlay,
+        None,
+    )
+}
+
+/// [`spawn_detached_runner_with_command`] for a launch that minted a runner process instance:
+/// the launching process also observes the runner's close and records its exit
+/// ([`RunnerCloseObserver`]). Returns as soon as the pid is confirmed, exactly like the
+/// unobserved form.
+///
+/// # Errors
+///
+/// See [`spawn_detached_runner`].
+pub fn spawn_detached_runner_observed(
+    spawn_command: &SpawnCommand,
+    cfg_path: &Path,
+    stdout_log_path: &Path,
+    stderr_log_path: &Path,
+    env_overlay: &BTreeMap<String, String>,
+    observer: RunnerCloseObserver,
+) -> Result<u32, SubagentError> {
+    spawn_detached(
+        spawn_command,
+        cfg_path,
+        stdout_log_path,
+        stderr_log_path,
+        env_overlay,
+        Some(observer),
+    )
+}
+
+fn spawn_detached(
+    spawn_command: &SpawnCommand,
+    cfg_path: &Path,
+    stdout_log_path: &Path,
+    stderr_log_path: &Path,
+    env_overlay: &BTreeMap<String, String>,
+    observer: Option<RunnerCloseObserver>,
+) -> Result<u32, SubagentError> {
     let stdout_file = std::fs::File::create(stdout_log_path).map_err(SubagentError::Spawn)?;
     let stderr_file = std::fs::File::create(stderr_log_path).map_err(SubagentError::Spawn)?;
 
@@ -262,12 +380,16 @@ pub fn spawn_detached_runner_with_command(
         ))
     })?;
 
-    // THE POINT OF THIS FUNCTION: drop the child handle without ever awaiting it. The real OS
-    // process keeps running under its own detached process group, entirely independent of this
-    // in-process `tokio::process::Child` value's lifetime (module docs explain why `Drop` here is
-    // safe and correct, not a leak). No `.wait()`, no `.wait_with_output()`, no `tokio::spawn` to
-    // await it on a background task later — any of those would defeat R-SA-071/R-SA-074.
-    drop(child);
+    // THE POINT OF THIS FUNCTION: never await the child INLINE. The real OS process keeps running
+    // under its own detached process group, entirely independent of this in-process
+    // `tokio::process::Child` value's lifetime (module docs explain why `Drop` here is safe and
+    // correct, not a leak). A launch that asked to observe the close hands the handle to a
+    // detached task instead (SUBA-141, upstream's close listener) — which still returns the pid
+    // now, so R-SA-071/R-SA-074 hold either way.
+    match observer {
+        Some(observer) => observer.watch(child),
+        None => drop(child),
+    }
 
     Ok(pid)
 }

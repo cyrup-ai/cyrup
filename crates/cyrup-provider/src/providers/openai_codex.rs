@@ -779,7 +779,10 @@ mod tests {
         // seven rows carry (`supportsToolSearch`, `supportsAdditionalTools`,
         // `supportsMidConvoSystemMessages`) are still absent here, which is what made it the odd
         // row out and still does.
-        let compat = spark.compat.as_ref().expect("spark carries a compat block now");
+        let compat = spark
+            .compat
+            .as_ref()
+            .expect("spark carries a compat block now");
         assert_eq!(compat.supports_openai_grammar_tools, Some(true));
         assert_eq!(compat.supports_tool_search, None);
         assert_eq!(compat.supports_mid_convo_system_messages, None);

@@ -12,7 +12,9 @@
 //! and roughly half of upstream's suite could not be expressed at all.
 //!
 //! Production is [`Out::Stdout`] and is byte-identical to the `io::stdout()` calls it replaces:
-//! same `queue!` payloads, same order, same flush points.
+//! same `queue!` payloads, same order, same flush points. It is the TUI's write channel, teed by
+//! `CYRUP_TUI_WRITE_LOG` — upstream's alternate screen writes all of these through
+//! `this.terminal.write` (`tui-alt-screen.ts:363-400`), which is what `PI_TUI_WRITE_LOG` logs.
 //!
 //! ## Why the guards own one rather than borrow one
 //!
@@ -23,6 +25,8 @@
 //! so one renderer can hand the same capture buffer to all of them.
 
 use std::io::{self, Write};
+
+use crate::write_log::{TuiStdout, tui_stdout};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
@@ -34,7 +38,7 @@ use std::sync::{Arc, Mutex};
 /// transcript.
 pub(super) enum Out {
     /// The real terminal.
-    Stdout(io::Stdout),
+    Stdout(TuiStdout),
     /// Test-only capture. `cfg`-gated so a release build carries neither the variant nor the match
     /// arm that reads it.
     #[cfg(test)]
@@ -47,14 +51,14 @@ pub(crate) type Captured = Arc<Mutex<Vec<u8>>>;
 
 impl Default for Out {
     fn default() -> Self {
-        Self::Stdout(io::stdout())
+        Self::Stdout(tui_stdout())
     }
 }
 
 impl Clone for Out {
     fn clone(&self) -> Self {
         match self {
-            Self::Stdout(_) => Self::Stdout(io::stdout()),
+            Self::Stdout(_) => Self::Stdout(tui_stdout()),
             #[cfg(test)]
             Self::Capture(buf) => Self::Capture(Arc::clone(buf)),
         }

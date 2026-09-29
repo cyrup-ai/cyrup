@@ -42,9 +42,19 @@ fn groq_model_json(id: &str, context_window: u64) -> serde_json::Value {
 }
 
 /// Write `<agent_dir>/models-store.json` the way a completed background refresh would, with a
-/// `lastModified` strictly newer than the built-in catalog manifest so the staleness guard keeps it.
+/// `lastModified` strictly newer than groq's staleness floor so the guard keeps it.
+///
+/// The floor is groq's OWN: since PROV-071 every provider catalog is fetched live and carries a
+/// `fetchedAt` that outranks the global `generatedAt`
+/// (`cyrup_provider::builtin_model_data_generated_at_by_provider`). Stamping the store against the
+/// global value alone makes it older than the embedded rows, and the guard rightly discards it.
 fn seed_store(agent_dir: &Path, models: Vec<serde_json::Value>) {
-    let newer = cyrup_provider::builtin_model_data_generated_at().unwrap() + 1;
+    let floor = cyrup_provider::builtin_model_data_generated_at_by_provider()
+        .get("groq")
+        .copied()
+        .or_else(cyrup_provider::builtin_model_data_generated_at)
+        .unwrap();
+    let newer = floor + 1;
     let entry = serde_json::json!({
         "groq": {
             "models": models,

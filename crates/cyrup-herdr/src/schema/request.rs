@@ -37,10 +37,10 @@ pub struct Request {
 /// `Method` (`tmp/herdr/src/api/schema.rs:40-47`), adjacently tagged as
 /// `#[serde(tag = "method", content = "params")]`.
 ///
-/// herdr declares 105 renamed variants plus 4 `#[serde(skip)]` internal graphics-frame ones (109
-/// total, all covered by `api_method_name`, `tmp/herdr/src/api/server.rs:398-510`); the published
-/// JSON Schema lists 104 because `pane.graphics.stream` is `#[schemars(skip)]`
-/// (`schema.rs:209`) while still being a live wire method.
+/// herdr declares 104 renamed variants plus 4 `#[serde(skip)]` internal graphics-frame ones (108
+/// total, all covered by `api_method_name`, `tmp/herdr/src/api/server.rs:385-496`); the published
+/// JSON Schema lists 103 because `pane.graphics.stream` is `#[schemars(skip)]`
+/// (`schema.rs:207`) while still being a live wire method.
 ///
 /// **This enum carries only the variants cyrup has a caller for**, in herdr's own declaration
 /// order so a diff against a future pin stays line-for-line. Each further batch adds the ones it
@@ -56,7 +56,7 @@ pub struct Request {
 #[allow(clippy::large_enum_variant)]
 pub enum Method {
     /// `ping` (`tmp/herdr/src/api/schema.rs:48-49`), answered by the API server itself without
-    /// touching the app (`tmp/herdr/src/api/server.rs:355-368`) — so it is the one method that
+    /// touching the app (`tmp/herdr/src/api/server.rs:342-355`) — so it is the one method that
     /// proves the socket is live even while the UI is busy.
     #[serde(rename = "ping")]
     Ping(PingParams),
@@ -107,56 +107,56 @@ pub enum Method {
     /// `pane.process_info` (`schema.rs:150-151`).
     #[serde(rename = "pane.process_info")]
     PaneProcessInfo(PaneProcessInfoParams),
-    /// `pane.list` (`schema.rs:178-179`).
+    /// `pane.list` (`schema.rs:176-177`).
     #[serde(rename = "pane.list")]
     PaneList(PaneListParams),
-    /// `pane.current` (`schema.rs:180-181`).
+    /// `pane.current` (`schema.rs:178-179`).
     #[serde(rename = "pane.current")]
     PaneCurrent(PaneCurrentParams),
-    /// `pane.get` (`schema.rs:182-183`).
+    /// `pane.get` (`schema.rs:180-181`).
     #[serde(rename = "pane.get")]
     PaneGet(PaneTarget),
-    /// `pane.focus` (`schema.rs:184-185`) — answers the focused pane's
+    /// `pane.focus` (`schema.rs:182-183`) — answers the focused pane's
     /// [`super::panes::PaneInfo`].
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
-    /// `pane.send_input` (`schema.rs:198-199`) — **this is `herdr pane run`**
+    /// `pane.send_input` (`schema.rs:196-197`) — **this is `herdr pane run`**
     /// (`tmp/herdr/src/cli/pane.rs:1039-1052`).
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
-    /// `pane.read` (`schema.rs:200-201`).
+    /// `pane.read` (`schema.rs:198-199`).
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
-    /// `pane.report_agent` (`schema.rs:223-224`) — the status bridge's main verb.
+    /// `pane.report_agent` (`schema.rs:221-222`) — the status bridge's main verb.
     #[serde(rename = "pane.report_agent")]
     PaneReportAgent(PaneReportAgentParams),
-    /// `pane.report_agent_session` (`schema.rs:225-226`).
+    /// `pane.report_agent_session` (`schema.rs:223-224`).
     #[serde(rename = "pane.report_agent_session")]
     PaneReportAgentSession(PaneReportAgentSessionParams),
-    /// `pane.report_metadata` (`schema.rs:227-228`) — the only verb pi's own status bridge sends
+    /// `pane.report_metadata` (`schema.rs:225-226`) — the only verb pi's own status bridge sends
     /// (`src/integrations/herdr-status.ts:206,221` @v0.68.0).
     #[serde(rename = "pane.report_metadata")]
     PaneReportMetadata(PaneReportMetadataParams),
-    /// `pane.clear_agent_authority` (`schema.rs:229-230`).
+    /// `pane.clear_agent_authority` (`schema.rs:227-228`).
     #[serde(rename = "pane.clear_agent_authority")]
     PaneClearAgentAuthority(PaneClearAgentAuthorityParams),
-    /// `pane.release_agent` (`schema.rs:231-232`) — the `SessionShutdown` counterpart of
+    /// `pane.release_agent` (`schema.rs:229-230`) — the `SessionShutdown` counterpart of
     /// `pane.report_agent`.
     #[serde(rename = "pane.release_agent")]
     PaneReleaseAgent(PaneReleaseAgentParams),
-    /// `pane.close` (`schema.rs:233-234`).
+    /// `pane.close` (`schema.rs:231-232`).
     #[serde(rename = "pane.close")]
     PaneClose(PaneTarget),
-    /// `pane.wait_for_output` (`schema.rs:241-242`) — one of herdr's four in-band waits: it holds
+    /// `pane.wait_for_output` (`schema.rs:239-240`) — one of herdr's four in-band waits: it holds
     /// the connection open, polls, and then writes exactly one line
-    /// (`tmp/herdr/src/api/server.rs:251-288`, `tmp/herdr/src/api/wait.rs:22-128`).
+    /// (`tmp/herdr/src/api/server.rs:238-275`, `tmp/herdr/src/api/wait.rs:22-128`).
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
-    /// `events.subscribe` (`schema.rs:237-238`) — **the one method that keeps its connection**.
+    /// `events.subscribe` (`schema.rs:235-236`) — **the one method that keeps its connection**.
     ///
     /// herdr answers `{"type":"subscription_started"}` and then pushes events on the same
-    /// connection until either side closes (`tmp/herdr/src/api/server.rs:229-250` →
-    /// `:715-779`). It therefore does not go through [`crate::transport::request`], which reads
+    /// connection until either side closes (`tmp/herdr/src/api/server.rs:216-237` →
+    /// `:701-764`). It therefore does not go through [`crate::transport::request`], which reads
     /// exactly one line; [`crate::HerdrClient::subscribe`] and
     /// [`crate::HerdrClient::bootstrap`] own it.
     #[serde(rename = "events.subscribe")]
@@ -165,7 +165,7 @@ pub enum Method {
 
 impl Method {
     /// The wire method name, mirroring `api_method_name`
-    /// (`tmp/herdr/src/api/server.rs:398-510`).
+    /// (`tmp/herdr/src/api/server.rs:385-496`).
     ///
     /// Used for the `method` field on every [`crate::HerdrError`], so a failure says which call
     /// failed without the caller threading a label through.

@@ -115,7 +115,8 @@ fn launch_predicate<'a>(
 fn a_settings_default_model_can_name_a_models_json_provider() {
     let file = model_file(MYCORP);
     let dir = tempfile::tempdir().unwrap();
-    let auth = AuthStore::at(dir.path().join("auth.json"));
+    let auth = AuthStore::at(dir.path().join("auth.json"))
+        .with_ambient_env(std::collections::HashMap::new());
     let configured = launch_predicate(&auth, &file);
     let (provider, pattern) =
         default_launch_model(Some("mycorp"), Some("mycorp-large"), &configured, &file)
@@ -140,7 +141,7 @@ fn a_models_json_provider_is_available_at_launch_with_no_auth_json() {
     let dir = tempfile::tempdir().unwrap();
     let auth_path = dir.path().join("auth.json");
     assert!(!auth_path.exists(), "fresh install: nothing stored");
-    let auth = AuthStore::at(auth_path);
+    let auth = AuthStore::at(auth_path).with_ambient_env(std::collections::HashMap::new());
     let configured = launch_predicate(&auth, &file);
 
     // Step 4's input list: the composed registry filtered by the predicate.
@@ -175,7 +176,8 @@ fn a_models_json_provider_without_an_api_key_is_not_configured() {
              "models":[{"id":"k1"}]}}}"#,
     );
     let dir = tempfile::tempdir().unwrap();
-    let auth = AuthStore::at(dir.path().join("auth.json"));
+    let auth = AuthStore::at(dir.path().join("auth.json"))
+        .with_ambient_env(std::collections::HashMap::new());
     let configured = launch_predicate(&auth, &file);
     assert!(
         !all_available_models(&file)

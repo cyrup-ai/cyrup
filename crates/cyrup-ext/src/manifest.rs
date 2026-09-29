@@ -36,7 +36,7 @@ pub const MANIFEST_FILE: &str = "extension.json";
 pub struct ExtensionManifest {
     pub id: String,
     pub version: String,
-    /// WIT world compatibility, e.g. `cyrup:ext@0.10` (see [`HOST_WORLD`], which is the value a
+    /// WIT world compatibility, e.g. `cyrup:ext@0.12` (see [`HOST_WORLD`], which is the value a
     /// manifest written today should carry — this example rotted two bumps behind it once already).
     pub world: String,
     /// Source entry for a Tier-1 build; absent for a prebuilt `.wasm` package.
@@ -257,7 +257,17 @@ impl Capabilities {
 ///   OLD guest against a NEW host merely declines to call it), and bumping would refuse every
 ///   already-built 0.10 guest while preventing nothing. The ABI fingerprint (`build/abi.rs`) is
 ///   what stops a stale cached artifact being served across this edit.
-pub const HOST_WORLD: &str = "cyrup:ext@0.11";
+/// - 0.10 -> 0.11: EXPORT RE-SIGNING + ADDITION — the extension-chrome batch (EXT-064).
+///   `ui.set-header` / `ui.set-footer` are re-signed to `option<string>` and `events.on-branch-change`
+///   is new (pi `ReadonlyFooterDataProvider.onBranchChange`, `core/footer-data-provider.ts:139-143`
+///   @v0.87.1), with the additive `ui.subscribe-branch-change` / `ui.unsubscribe-branch-change`
+///   imports. A 0.10 guest has the old setters and no such export, so it takes the bump.
+/// - 0.11 -> 0.12: EXPORT ADDITION — `events.on-ui-prompt-start`/`on-ui-prompt-end` (EXT-075; pi
+///   `UIPromptStartEvent`/`UIPromptEndEvent`, `core/extensions/types.ts:830-845` @v0.87.1) and
+///   `events.on-context-with-system` (EXT-079; pi `ContextWithSystemEvent`, `:708-711`). A 0.11
+///   guest exports nothing under those names, so it takes the bump. The same batch's
+///   `registration.unsubscribe` import (EXT-080) is ADDITIVE and would not have required one.
+pub const HOST_WORLD: &str = "cyrup:ext@0.12";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

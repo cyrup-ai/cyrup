@@ -375,6 +375,8 @@ pub(crate) fn test_single_result(agent: &str, exit_code: i32) -> SingleResult {
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
+        tool_budget_blocked: false,
+        session_name: None,
         child_run_id: None,
         agent: agent.to_string(),
         task: "do the thing".to_string(),

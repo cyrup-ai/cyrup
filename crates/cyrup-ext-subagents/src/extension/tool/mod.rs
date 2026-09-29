@@ -251,6 +251,18 @@ impl Tool for SubagentTool {
             crate::placement::resolve::validate_machine_name(machine).map_err(ToolError::new)?;
         }
 
+        // SUBA-128 — the schema's own bounds on `checkpointBeforeDeadlineMs`
+        // (`extension/schemas.ts:363` @v0.71.0, `minimum: 1, maximum: 2147483647`). pi's argument
+        // validation refuses an out-of-range value for EVERY call shape, before any mode runs;
+        // cyrup's argument coercion does not enforce schema bounds, so they are checked here.
+        if parsed.checkpoint_before_deadline_ms.is_some_and(|ms| {
+            ms == 0 || ms > crate::registration::MAX_CHECKPOINT_BEFORE_DEADLINE_MS
+        }) {
+            return Err(ToolError::new(
+                "checkpointBeforeDeadlineMs must be a positive integer no larger than 2147483647.",
+            ));
+        }
+
         // pi `resolveRequestedCwd(ctx.cwd, params.cwd)` (`subagent-executor.ts:2801`): resolved ONCE
         // up front and threaded into every dispatch arm below — management/control CRUD, the
         // background-control actions, AND execution (PARALLEL/CHAIN/SINGLE) all see the SAME
@@ -431,6 +443,25 @@ impl Tool for SubagentTool {
         // makes a mission failure fatal to the call (the caller asked for mission tracking and did
         // not get it), while an automatic binding degrades to a non-fatal `details.missionWarning`
         // so mission bookkeeping can never take down a run that would otherwise have succeeded.
+        // SUBA-135 — pi `preflightLaunchCwd(requestedCwd, effectiveCwd)` (`runs/shared/launch-cwd.ts`
+        // @v0.71.0; applied by the foreground run, `execution.ts:1604`, and by the async launch,
+        // `async-execution.ts:649`): a typed `cwd` that is missing or not a directory is refused by
+        // name, with the typed spelling, before anything is launched or written. It sits AHEAD of
+        // the mission binding below because cyrup's mission store lives UNDER the project root
+        // (`missions/store.rs`, [CYRUP-DELTA] `<projectRoot>/.cyrup-subagents/missions`, where
+        // upstream keys an agent-dir directory by a hash of the root): binding first would create
+        // the typo'd directory and run the child in it. A placed launch moved `cwd` to
+        // `machine_cwd` (a directory on the machine), so there is nothing local to check.
+        if let Some(requested) = parsed
+            .cwd
+            .as_deref()
+            .filter(|requested| !requested.is_empty())
+            && let Some(refusal) =
+                crate::exec::launch_cwd::preflight_launch_cwd(requested, &effective_cwd)
+        {
+            return Err(ToolError::new(refusal));
+        }
+
         let explicit_mission = parsed.mission_id.is_some() || parsed.mission.is_some();
         let mission_config = cfg.missions.clone();
         let (mission_binding, mission_warning) = prepare_mission_binding_for_dispatch(

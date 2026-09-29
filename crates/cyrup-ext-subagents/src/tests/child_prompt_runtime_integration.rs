@@ -595,3 +595,90 @@ async fn inherit_global_context_false_removes_only_the_global_agents_md_from_the
     assert!(!project_off.contains("GLOBAL-MARKER"), "{project_off}");
     assert!(!project_off.contains("PROJECT-MARKER"), "{project_off}");
 }
+
+/// SUBA-134 — the child names its own session, and claims its intercom route when asked (pi
+/// `subagent-prompt-runtime.ts:532-550` @v0.71.0), driven through the REAL host: the runtime is
+/// built from the child env a spawn writes, the identity request arrives on the extension bus as
+/// cyrup-intercom emits it, and `before_agent_start` is the host's own emitter.
+///
+/// GUT the claim reply and the claim list stays empty; GUT the `claimed` latch and the second host
+/// names its session with the routing target instead of the readable name; GUT the
+/// `set_session_name` call and neither host names anything.
+#[tokio::test]
+async fn the_child_names_its_session_and_claims_its_intercom_route() {
+    #[derive(Default)]
+    struct Recording {
+        names: std::sync::Mutex<Vec<String>>,
+        emitted: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+    impl cyrup_ext::host::HostServices for Recording {
+        fn set_session_name(&self, name: &str) {
+            self.names.lock().unwrap().push(name.to_string());
+        }
+        fn emit_event(&self, topic: &str, payload: &serde_json::Value) {
+            self.emitted
+                .lock()
+                .unwrap()
+                .push((topic.to_string(), payload.clone()));
+        }
+    }
+    let env = |key: &str| match key {
+        k if k == crate::spawn::intercom_target::ENV_INTERCOM_SESSION_NAME => {
+            Some("subagent-worker-run1-1".to_string())
+        }
+        k if k == crate::exec::child_session_name::CHILD_SESSION_NAME_ENV => {
+            Some("worker: fix auth refresh".to_string())
+        }
+        _ => None,
+    };
+    let start = || async {
+        let host = ExtensionHost::new(cfg());
+        let services = Arc::new(Recording::default());
+        let ext = prompt_runtime_extension_from(&env)
+            .expect("builds")
+            .expect("a named child is not inert");
+        host.load_native_with_services(
+            ext,
+            Arc::clone(&services) as Arc<dyn cyrup_ext::host::HostServices>,
+        )
+        .await
+        .expect("load");
+        (host, services)
+    };
+    async fn before_agent_start(host: &ExtensionHost) {
+        host.emit_before_agent_start(
+            "go",
+            serde_json::Value::Null,
+            "You are a child.",
+            serde_json::Value::Null,
+            &CancelToken::new(),
+        )
+        .await;
+    }
+
+    // An intercom that never asks routes by name: the route stays the session name.
+    let (host, services) = start().await;
+    before_agent_start(&host).await;
+    assert_eq!(*services.names.lock().unwrap(), ["subagent-worker-run1-1"]);
+
+    // Asked at session start, the child claims the route as its intercom id and keeps the
+    // readable name for its session.
+    let (host, services) = start().await;
+    host.bus().emit(
+        crate::prompt_runtime::INTERCOM_SESSION_IDENTITY_EVENT.to_string(),
+        serde_json::json!({ "version": 1 }),
+    );
+    host.deliver_bus_events(&CancelToken::new()).await;
+    assert_eq!(
+        *services.emitted.lock().unwrap(),
+        [(
+            "intercom:session-identity-claim".to_string(),
+            serde_json::json!({ "version": 1, "stableId": "subagent-worker-run1-1" }),
+        )]
+    );
+    before_agent_start(&host).await;
+    assert_eq!(
+        *services.names.lock().unwrap(),
+        ["worker: fix auth refresh"]
+    );
+}

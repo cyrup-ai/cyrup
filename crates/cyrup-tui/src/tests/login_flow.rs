@@ -741,6 +741,10 @@ async fn first_run_fixture() -> Fixture {
         // one (`cyrup-session-svc/src/session/model.rs:47`), which needs a resolver — the real bin
         // wires the same built-in registry (`cyrup/src/session_launch.rs:177`).
         .provider_resolver(Arc::new(RegistryResolver))
+        // The ambient env tier pinned EMPTY: which providers are credentialed is the fixture's
+        // decision (`credential`), never the host's. Ambient AWS keys used to make
+        // `amazon-bedrock` available and change every provider-set assertion in this file.
+        .auth(hermetic_auth(&agent_dir))
         .build()
         .await
         .unwrap();
@@ -759,8 +763,22 @@ async fn first_run_fixture() -> Fixture {
 /// The provider TUI-105's end-to-end tests log in to: one whose curated default
 /// (`cyrup-config/src/model/defaults.rs:8`) really is in its built-in catalog, so the selection has
 /// something to select.
+/// An auth store over `<agent_dir>/auth.json` whose ambient env tier is pinned empty, so no host
+/// credential (AWS keys, `*_API_KEY`) can make a provider available behind the fixture's back.
+/// Scrubbing the process env instead would race the tests running in parallel.
+fn hermetic_auth(agent_dir: &std::path::Path) -> Arc<cyrup_config::AuthStore> {
+    Arc::new(
+        cyrup_config::AuthStore::at(agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    )
+}
+
 const DEFAULTED_PROVIDER: &str = "deepseek";
 const DEFAULTED_MODEL: &str = "deepseek-v4-pro";
+
+/// A second provider with embedded models, credentialed alongside [`DEFAULTED_PROVIDER`] where a
+/// test needs the available set to span more than one provider without relying on the host's env.
+const SECOND_PROVIDER: &str = "groq";
 
 /// The provider TUI-105's DEFERRED tests log in to: one whose curated default is NOT in any built-in
 /// catalog, because it has none — `radius` ships zero embedded models
@@ -927,6 +945,9 @@ async fn tui105_login_does_not_override_an_existing_model() {
 async fn tui105_login_recounts_providers_from_the_auth_filtered_catalog() {
     let fx = first_run_fixture().await;
     credential(&fx.session, DEFAULTED_PROVIDER);
+    // A second credentialed provider, so the auth-filtered set is wider than the pre-login count of
+    // one by construction rather than by whatever credentials the host happens to export.
+    credential(&fx.session, SECOND_PROVIDER);
     let mut app = app_with(registry_for(
         DEFAULTED_PROVIDER,
         ProviderAuth::with_oauth(Arc::new(ScriptedOauth)),
@@ -1123,9 +1144,9 @@ async fn tui105_refresh_timeout_warns_and_keeps_cached_models() {
     let text = transcript_text(&app);
     assert!(
         text.contains(&format!(
-            "{action}, but its model catalog refresh timed out; using cached models."
+            "Warning: {action}, but its model catalog refresh timed out; using cached models."
         )),
-        "`:5957` verbatim; got:\n{text}"
+        "`:5956` verbatim, through `showWarning`'s prefix (TUI-062); got:\n{text}"
     );
     assert_eq!(
         fx.session.model(),

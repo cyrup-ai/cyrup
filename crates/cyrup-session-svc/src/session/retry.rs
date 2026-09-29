@@ -6,7 +6,9 @@
 
 use cyrup_agent::AgentMessage;
 use cyrup_core::AssistantMessage;
-use cyrup_provider::{RetryPolicy, is_context_overflow, is_retryable_assistant_error};
+use cyrup_provider::{
+    RetryPolicy, is_context_overflow, is_retryable_assistant_error, retry_delay_ms,
+};
 use std::sync::Arc;
 
 use crate::event::AgentSessionEvent;
@@ -43,6 +45,7 @@ impl AgentSession {
             self.retry_max_retries,
             self.retry_base_delay_ms,
         )
+        .with_max_agent_delay_ms(self.retry_max_agent_delay_ms)
     }
 
     /// Toggle auto-retry (Pi `setAutoRetryEnabled`, agent-session.ts:2565). Facade-side override of
@@ -122,9 +125,13 @@ impl AgentSession {
             }
         }
         let attempt = self.retry_attempt();
-        let delay_ms = self
-            .retry_base_delay_ms
-            .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
+        // Pi `retryDelayMs(settings, this._retryAttempt)` (`agent-session.ts:3393` @v0.87.1): the
+        // doubling backoff capped at `retry.maxAgentDelayMs` (CFG-081 / DRIFT-057).
+        let delay_ms = retry_delay_ms(
+            self.retry_base_delay_ms,
+            Some(self.retry_max_agent_delay_ms),
+            attempt,
+        );
         self.fanout_emit(AgentSessionEvent::AutoRetryStart {
             attempt,
             max_attempts: self.retry_max_retries,

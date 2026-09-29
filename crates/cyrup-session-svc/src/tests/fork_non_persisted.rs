@@ -213,33 +213,28 @@ async fn cloning_an_unsaved_session_at_its_leaf_retains_the_whole_transcript() {
 
 // ================================================================================ ordering ====
 
-/// The ORDERING half of SEAM-009, and the one that survives a fork issued while a turn is still
+/// The ORDERING of the non-persisted arm (SEAM-130), for a fork issued while a turn is still
 /// streaming — which nothing guards against (`AgentSessionRuntime::fork` has no `is_streaming`
 /// check, so a `/fork` typed mid-response reaches here).
 ///
-/// Pi's non-persisted arm is three statements in this order (agent-session-runtime.ts:333-341):
+/// Pi's non-persisted arm, since v0.85.0 (#8937, "settle active turn before in-memory fork";
+/// agent-session-runtime.ts:335-341 @v0.87.1):
 ///
 /// ```text
 /// const sessionManager = this.session.sessionManager;   // the LIVE object, not a copy
-/// sessionManager.createBranchedSession(targetLeafId);   // branched IN PLACE
-/// await this.teardownCurrent("fork", …);                // ONLY THEN abort + settle
+/// await this.teardownCurrent("fork", …);                // abort + settle FIRST
+/// sessionManager.createBranchedSession(targetLeafId);   // ONLY THEN branch in place
 /// this.apply(await this.createRuntime({ …, sessionManager }));
 /// ```
 ///
-/// Because the outgoing session still points at that same object, everything the dying run appends
-/// while it settles lands in the branched manager — i.e. in the fork. That is Pi's own teardown
-/// contract ("Settle any active response first so the aborted turn (including tool results) is
-/// persisted to the outgoing session before it is replaced", :167-169) applied to the fork path.
+/// Through v0.84 the branch came first, so the dying run's appends landed after the fork point in
+/// the branched manager — i.e. in the fork — which is the bug #8724 reported. Settling first puts
+/// them on the abandoned tail instead, and the fork ends exactly at its anchor.
 ///
-/// cyrup's `build_from_manager` takes the manager BY VALUE, so the move is a real event that Pi
-/// does not have, and doing it first destroys exactly that content: the outgoing session goes on
-/// writing into a throwaway placeholder which is then dropped. For a session with no file, the
-/// aborted turn's output is then gone for good.
-///
-/// The assertion is on CONTENT: the partial text the model had already produced must be readable in
-/// the fork's transcript.
+/// The assertion is on CONTENT: the partial text the model had already produced must NOT be in the
+/// fork's transcript.
 #[tokio::test]
-async fn a_fork_during_a_live_turn_keeps_the_dying_turns_content_in_the_branch() {
+async fn a_fork_during_a_live_turn_leaves_the_dying_turn_out_of_the_branch() {
     let fx = fixture();
 
     // A deliberately slow second turn. Nothing below waits on a wall-clock guess: the test blocks
@@ -306,7 +301,7 @@ async fn a_fork_during_a_live_turn_keeps_the_dying_turns_content_in_the_branch()
     );
 
     // Fork AT the in-flight user message, so the branch path ends at it and the dying turn's
-    // assistant message is appended as its child — the entry Pi keeps and cyrup was dropping.
+    // assistant message — appended as its child when the run settles — lies past the fork point.
     let anchors = session.user_messages_for_forking().await;
     assert_eq!(anchors.len(), 2, "two user-message anchors");
     assert_eq!(anchors[1].text, "QUESTION-TWO");
@@ -322,22 +317,19 @@ async fn a_fork_during_a_live_turn_keeps_the_dying_turns_content_in_the_branch()
     let child = runtime.session().await;
     let after = transcript_text(&child).await;
     assert_eq!(
-        after.get(..3).map(<[String]>::to_vec),
-        Some(vec![
+        after,
+        vec![
             "QUESTION-ONE".to_string(),
             "ANSWER-ONE".to_string(),
             "QUESTION-TWO".to_string(),
-        ]),
-        "the branch path itself must survive: {after:?}"
+        ],
+        "the fork must end at its anchor: pi settles the outgoing run BEFORE branching the live \
+         manager (agent-session-runtime.ts:335-341 @v0.87.1), so the aborted turn's output is not \
+         carried into the branch. Got: {after:?}"
     );
-    let tail = after.get(3).map(String::as_str).unwrap_or("<nothing>");
     assert!(
-        tail.contains("LATE-TOKEN"),
-        "the aborted turn's own output must be persisted INTO the fork, exactly as Pi's shared \
-         sessionManager gives it (agent-session-runtime.ts:333-341 branches before \
-         teardownCurrent). Moving the manager out before the settle sends it to a placeholder that \
-         is then dropped, and a non-persisted session has no file to recover it from. Got: \
-         {after:?}"
+        !after.iter().any(|t| t.contains("LATE-TOKEN")),
+        "the aborted turn leaked into the fork: {after:?}"
     );
 }
 

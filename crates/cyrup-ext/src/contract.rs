@@ -143,7 +143,10 @@ impl HostEvent {
                     *terminate = t;
                 }
             }
-            (HostEvent::Context { messages }, EventPatch::Context { messages: m }) => *messages = m,
+            (HostEvent::Context { messages }, EventPatch::Context { messages: m })
+            | (HostEvent::ContextWithSystem { messages }, EventPatch::Context { messages: m }) => {
+                *messages = m
+            }
             // `message_end` (Pi runner.ts:785): a replacement message MUST keep the same role; a
             // mismatched role is rejected (the replacement is dropped, the original kept) — no panic.
             (HostEvent::MessageEnd { message }, EventPatch::Message(m)) => {

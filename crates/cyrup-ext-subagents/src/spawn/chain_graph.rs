@@ -1305,6 +1305,10 @@ pub struct StepResult {
     /// SUBA-100 — pi `StepResult.execution`, carried from
     /// [`crate::exec::SingleResult::execution`]; a `partial` one settles the step `partial`.
     pub execution: Option<crate::exec::run_result::ExecutionOutcome>,
+    /// SUBA-132 — pi's runner `toolBudgetBlocked` (`subagent-runner.ts:1077`), carried from
+    /// [`crate::exec::SingleResult::tool_budget_blocked`] so an async workflow child's terminal
+    /// result still settles `budget_exhausted`.
+    pub tool_budget_blocked: bool,
 }
 
 impl StepResult {
@@ -1317,6 +1321,7 @@ impl StepResult {
     pub fn success(final_output: Option<String>, structured_output: Option<Value>) -> Self {
         Self {
             execution: None,
+            tool_budget_blocked: false,
             native_machine: None,
             runtime_acknowledged_extensions: None,
             success: true,
@@ -1351,6 +1356,7 @@ impl StepResult {
     pub fn failure(error: impl Into<String>) -> Self {
         Self {
             execution: None,
+            tool_budget_blocked: false,
             native_machine: None,
             runtime_acknowledged_extensions: None,
             success: false,
@@ -2586,6 +2592,7 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
     GroupStepResult {
         aggregate: StepResult {
             execution: None,
+            tool_budget_blocked: false,
             native_machine: None,
             runtime_acknowledged_extensions: None,
             success,

@@ -643,7 +643,7 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
         .error
         .expect("a clear validation-error message must be present");
     assert!(
-        error.contains("structured output validation failed") && error.contains("count"),
+        error.contains("Structured output validation failed") && error.contains("count"),
         "expected a clear validation-error message naming the offending field, got: {error}"
     );
 }

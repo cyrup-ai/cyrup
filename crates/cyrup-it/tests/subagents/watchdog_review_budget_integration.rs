@@ -52,6 +52,9 @@ fn script() -> Vec<FauxResponse> {
                 "watchdog_warn",
                 serde_json::json!({
                     "severity": "blocker",
+                    // Required by pi-subagents v0.71.0 (`watchdog/review.ts:30`); a call without it is
+                    // refused by schema validation before the warning is ever emitted.
+                    "importance": "high",
                     "summary": SLOW_SUMMARY,
                     "evidence": "the review took longer than the dispatch budget",
                     "recommendedAction": "declare the wait",

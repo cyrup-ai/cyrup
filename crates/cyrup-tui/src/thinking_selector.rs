@@ -19,18 +19,24 @@
 //! `theme-selector.ts:35,58,61`) keep the shared engine flush, and the `Input`/title/hint chrome
 //! never leaks onto them — the failure mode `SelectorKind::draws_hint_row`'s doc exists to prevent.
 //!
+//! At v0.87.1 (pi #9149, v0.85.1) the footer's three keys became live `keyDisplayText(...)` labels
+//! and the persist check a binding id, `app.thinking.save` (`thinking-selector.ts:93-100`, `:131`)
+//! — see [`ThinkingSelectorKeys`].
+//!
 //! The rows are built from a caller-supplied ladder (pi's `availableLevels` constructor argument,
 //! `:58`, fed from `session.getAvailableThinkingLevels()` at `interactive-mode.ts:4792`), not from a
 //! hardcoded table, so a non-reasoning model offers `off` alone.
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::fuzzy;
-use crate::keymap::{EditorKeymap, SelectAction, SelectKeymap};
+use crate::keymap::{
+    Action, EditorKeymap, Keymap, SelectAction, SelectKeymap, ThinkingAction, ThinkingKeymap,
+};
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
 use crate::selector::{Selector, SelectorOutcome, border_rule_line, input_line_spans};
 use crate::text_input::{Input, InputOutcome};
@@ -56,6 +62,44 @@ pub(crate) fn level_description(level: &str) -> &'static str {
     }
 }
 
+/// The live key tables the picker reads its chrome and its persist key from — pi's
+/// `keyDisplayText(...)` / `kb.matches(...)` calls (`thinking-selector.ts:81`, `:97`, `:131`
+/// @v0.87.1), each of which consults the one live `KeybindingsManager`.
+#[derive(Clone, Debug)]
+pub struct ThinkingSelectorKeys {
+    /// `keyDisplayText("app.thinking.cycle")` (`:81`).
+    pub cycle: String,
+    /// The live `app.thinking.toggle` label, for the `[CYRUP-DELTA]` hidden-output warning.
+    pub toggle: String,
+    /// `keyDisplayText("tui.select.confirm")` (`:97`).
+    pub confirm: String,
+    /// `keyDisplayText("tui.select.cancel")` (`:97`).
+    pub cancel: String,
+    /// The `app.thinking.save` table itself — both the footer label (`:97`) and the persist
+    /// check (`:131`) come from it.
+    pub save: ThinkingKeymap,
+}
+
+impl ThinkingSelectorKeys {
+    /// Resolve every label from the live tables. `keyDisplayText` is `keyText` with
+    /// `{capitalize: true}` (`keybinding-hints.ts:38-40`), i.e. [`crate::chrome::format_key_text`]
+    /// over the `/`-joined key list; an unbound id is upstream's `""`.
+    pub fn from_keymaps(app: &Keymap, select: &SelectKeymap, save: &ThinkingKeymap) -> Self {
+        let display = |label: Option<String>| {
+            label
+                .map(|k| crate::chrome::format_key_text(&k, true))
+                .unwrap_or_default()
+        };
+        Self {
+            cycle: display(app.keys_label(Action::ThinkingCycle)),
+            toggle: display(app.keys_label(Action::ThinkingToggle)),
+            confirm: display(select.keys_label(SelectAction::Confirm)),
+            cancel: display(select.keys_label(SelectAction::Cancel)),
+            save: save.clone(),
+        }
+    }
+}
+
 /// The `/thinking` picker (`ThinkingSelectorComponent`).
 pub struct ThinkingSelector {
     /// `allItems` (`thinking-selector.ts:41,69-74`): every available level as
@@ -68,18 +112,15 @@ pub struct ThinkingSelector {
     /// The embedded search box (`:84-86`). Its `onSubmit` forwards `\r` to the list (`:85`), which
     /// here is simply the `tui.select.confirm` arm running before the input ever sees the key.
     input: Input,
-    /// `keyDisplayText("app.thinking.cycle")` (`:81`) — resolved from the app's LIVE table at
-    /// construction, so a rebind changes the sentence.
-    cycle_key: String,
+    /// Every key label the chrome names, plus the `app.thinking.save` table — resolved from the
+    /// LIVE tables at construction, so a rebind changes both the sentences and the handler.
+    keys: ThinkingSelectorKeys,
     /// **[CYRUP-DELTA]** `hideThinkingBlock` at construction. Upstream's picker never states it,
     /// because upstream's `setHideThinkingBlock` re-renders the prior assistant messages
     /// (`assistant-message.ts:57-62`) and the suppression is visible on screen. Under ADR-0001
     /// cyrup's committed rows have already left the render tree (`TUI-N06`), so this is the one
     /// place a user picks a reasoning level while the output of that choice is being swallowed.
     hidden: bool,
-    /// The live `app.thinking.toggle` label, so the warning names the actual key rather than a
-    /// hardcoded `Ctrl+T` — the same reason [`Self::cycle_key`] is resolved and not literal.
-    toggle_key: String,
 }
 
 impl ThinkingSelector {
@@ -90,14 +131,13 @@ impl ThinkingSelector {
     ///   the preselected row.
     /// * `default_level` — `settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL`
     ///   (`:4797`), the row that gets the ` · default` badge.
-    /// * `cycle_key` — the already-formatted `app.thinking.cycle` label for the hint sentence.
+    /// * `keys` — the live labels and the `app.thinking.save` table ([`ThinkingSelectorKeys`]).
     pub fn new(
         levels: &[String],
         current: &str,
         default_level: &str,
-        cycle_key: String,
+        keys: ThinkingSelectorKeys,
         hidden: bool,
-        toggle_key: String,
     ) -> Self {
         let all = levels
             .iter()
@@ -117,9 +157,8 @@ impl ThinkingSelector {
             values: Vec::new(),
             list: SelectList::new(Vec::new(), ColumnLayout::SLASH),
             input: Input::new(),
-            cycle_key,
+            keys,
             hidden,
-            toggle_key,
         };
         sel.rebuild(current);
         sel
@@ -197,7 +236,7 @@ impl ThinkingSelector {
         ))); // :79
         lines.push(Line::from("")); // :80
         lines.push(Line::from(Span::styled(
-            format!("{} cycles thinking levels in-session", self.cycle_key),
+            format!("{} cycles thinking levels in-session", self.keys.cycle),
             theme.base_style(),
         ))); // :81
         // **[CYRUP-DELTA]** — additive, and only when the flag is on: with it off this dialog is
@@ -206,10 +245,10 @@ impl ThinkingSelector {
         // nothing else on screen says so.
         if self.hidden {
             lines.push(Line::from(""));
-            let how = if self.toggle_key.is_empty() {
+            let how = if self.keys.toggle.is_empty() {
                 "set hideThinkingBlock to false to show it".to_string()
             } else {
-                format!("{} shows it", self.toggle_key)
+                format!("{} shows it", self.keys.toggle)
             };
             lines.push(Line::from(Span::styled(
                 format!("Thinking output is HIDDEN - {how}"),
@@ -230,8 +269,21 @@ impl ThinkingSelector {
         // container width and its rows start at column 0 — no `paddingX` wrapper, no inset.
         lines.extend(self.list.lines(width, theme)); // :92
         lines.push(Line::from("")); // :93
+        // `${keyDisplayText("tui.select.confirm")} to select · ${keyDisplayText("app.thinking.save")}
+        // to set as default · ${keyDisplayText("tui.select.cancel")} to cancel`
+        // (`thinking-selector.ts:93-100` @v0.87.1) — live labels since pi #9149, where 0.84.3 had
+        // the literal "Enter to select · Ctrl+S to set as default · Esc to cancel".
+        let save = self
+            .keys
+            .save
+            .keys_label(ThinkingAction::Save)
+            .map(|k| crate::chrome::format_key_text(&k, true))
+            .unwrap_or_default();
         lines.push(Line::from(Span::styled(
-            "  Enter to select \u{b7} Ctrl+S to set as default \u{b7} Esc to cancel",
+            format!(
+                "  {} to select \u{b7} {save} to set as default \u{b7} {} to cancel",
+                self.keys.confirm, self.keys.cancel
+            ),
             theme.dim_style(),
         ))); // :94
         lines.push(border_rule_line(width, theme)); // :97
@@ -252,12 +304,13 @@ impl Selector for ThinkingSelector {
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
-        // `if (matchesKey(keyData, "ctrl+s") && this.onSelectAsDefault)` (`thinking-selector.ts:
-        // 122-126`) — a LITERAL chord, not a binding id, checked before the keymap so a rebound
+        // `if (kb.matches(keyData, "app.thinking.save") && this.onSelectAsDefault)`
+        // (`thinking-selector.ts:131-135` @v0.87.1) — a binding id since v0.85.1 (#9149; 0.84.3
+        // matched the literal `"ctrl+s"`), checked before the navigation ids so a rebound
         // `tui.select.*` cannot shadow it. Unconditional here because this picker is only ever
-        // opened on the path that can persist (`interactive-mode.ts:4796` always wires the
+        // opened on the path that can persist (`interactive-mode.ts:5025` always wires the
         // callback).
-        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if self.keys.save.action_for(key) == Some(ThinkingAction::Save) {
             return match self.current_value() {
                 Some(level) => SelectorOutcome::ConfirmDefault(level),
                 None => SelectorOutcome::Redraw,

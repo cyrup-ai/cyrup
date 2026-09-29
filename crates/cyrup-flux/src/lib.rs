@@ -14,6 +14,17 @@
 //!
 //! State on disk (`~/.flux/<flattened-cwd>/`) stays byte-identical to code-puppy's so one
 //! project's task tree is readable by both harnesses.
+//!
+//! # Upstream baseline
+//!
+//! Ported from `mpfaffenberger/code_puppy_core_plugins` @ **`v0.0.6`** (cloned as
+//! `tmp/code_puppy_core_plugins`; the plugin is the `code_puppy_core_plugins/flux_bootstrap/`
+//! package inside it), whose `flux_bootstrap` tree is byte-identical through `v0.0.40` — the tag
+//! the in-source `@v0.0.40` anchors name. The host-side names the prompts call (the
+//! `invoke_agent` tool the pipeline's `subagent` rename maps from) are `mpfaffenberger/code_puppy`
+//! @ **`v0.0.720`** (cloned as `tmp/code_puppy`). Every upstream citation in this crate resolves
+//! with `git -C tmp/<that clone> show <tag>:<path>`; the design doc these modules cite
+//! as "port doc §N" is `spec/flux.md`.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,

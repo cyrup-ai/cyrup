@@ -43,7 +43,7 @@ pass added seven, one of them a reopened closure. The ranked table with reasons 
   implemented; area 15 closed most of its open rows on landed code (`0aefd08`, `cb290d1`). `CFG-067`
   and `CFG-074` were narrowed.
 - **Filed:** see the fourteenth-edition block of `../00-residual-ledger.md` for the full id ranges.
-  Next free ids: `SUBA-144`, `MCP-586`, `HERDR-004`.
+  Next free ids: `SUBA-144`, `MCP-586`, `HERDR-005`.
 
 ---
 

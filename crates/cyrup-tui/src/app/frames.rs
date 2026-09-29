@@ -18,14 +18,14 @@ pub(crate) struct FrameScheduler {
     force: bool,
     /// pi's `requestRender(true)` → `resetRenderState()` (`tui.ts:773-777`). Upstream drops its
     /// whole line-diff state so the next frame repaints from scratch; cyrup's equivalent is
-    /// `terminal.clear()` before the draw, since ratatui's diff lives in the `Terminal`'s back
-    /// buffer.
+    /// `App::reset_render_state` before the draw, since ratatui's diff lives in the
+    /// `Terminal`'s back buffer.
     ///
     /// **[CYRUP-DELTA] No requester yet, deliberately.** pi pairs this with a
     /// `requestRender(true)` caller, but every cyrup path that needs a from-scratch repaint —
     /// `suspend` after `fg`, and both external-editor returns — is one of the five SYNCHRONOUS
-    /// `renderNow` survivors, which clears the terminal itself and paints before returning
-    /// (`crossterm.rs:135`, `:225`). There is nothing to defer, so the setter is omitted rather
+    /// `renderNow` survivors, which resets the render state itself and paints before returning
+    /// (`App::suspend`, `App::edit_in_external_editor`). There is nothing to defer, so the setter is omitted rather
     /// than added dead; the field stays because [`Self::taken`] is what performs the clear, and the
     /// exit flush already routes through it.
     full: bool,

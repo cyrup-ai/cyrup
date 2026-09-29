@@ -149,7 +149,7 @@ mod remote {
         shell_quote_remote, ssh_env_command,
     };
 
-    /// `herdr status server --json` (`tmp/herdr/src/cli/status.rs:262-275`).
+    /// `herdr status server --json` (`tmp/herdr/src/cli/status.rs:262-275`), running.
     fn status(session: Option<&str>, running: bool, compatible: bool) -> String {
         serde_json::json!({
             "status": if running { "running" } else { "not_running" },
@@ -206,6 +206,107 @@ mod remote {
             .to_string(),
             "Remote Herdr endpoint discovery returned incomplete identity."
         );
+    }
+
+    /// HERDR-003. herdr's `NotRunning` arm writes `"version": null, "protocol": null`
+    /// (`git -C tmp/herdr show v0.9.1:src/cli/status.rs`, `:340-352`) — this is that JSON
+    /// verbatim, with the socket and session herdr always fills in.
+    fn not_running(session: Option<&str>) -> String {
+        serde_json::json!({
+            "status": "not_running",
+            "running": false,
+            "version": null,
+            "protocol": null,
+            "capabilities": null,
+            "compatible": null,
+            "endpoint_compatible": null,
+            "socket": "/home/me/.config/herdr/herdr.sock",
+            "session": session,
+            "restart_needed": false,
+            "server_binary_stale": false
+        })
+        .to_string()
+    }
+
+    const STOPPED: &str = "The selected remote Herdr session is stopped or incompatible.";
+
+    /// HERDR-003: a stopped server is reported as stopped, not as a malformed identity, while the
+    /// socket and session are still judged first and a RUNNING server must still carry a version
+    /// and protocol.
+    #[test]
+    fn a_stopped_server_reads_as_stopped_not_as_incomplete_identity() {
+        assert_eq!(
+            parse_endpoint(&not_running(Some("default")), None)
+                .unwrap_err()
+                .to_string(),
+            STOPPED
+        );
+        assert_eq!(
+            parse_endpoint(&not_running(Some("work")), None)
+                .unwrap_err()
+                .to_string(),
+            "Remote Herdr session identity mismatch: expected default, received work.",
+            "the session check still comes before liveness"
+        );
+        assert_eq!(
+            parse_endpoint(
+                r#"{"socket":"relative.sock","running":false,"version":null,"protocol":null}"#,
+                None
+            )
+            .unwrap_err()
+            .to_string(),
+            "Remote Herdr endpoint discovery returned incomplete identity.",
+            "the socket check still comes first"
+        );
+        assert_eq!(
+            parse_endpoint(
+                r#"{"socket":"/x","running":true,"compatible":true,"version":null,"protocol":7}"#,
+                None
+            )
+            .unwrap_err()
+            .to_string(),
+            "Remote Herdr endpoint discovery returned incomplete identity.",
+            "a running server without a version is still incomplete"
+        );
+    }
+
+    /// HERDR-003 through the production entry point: `discover_endpoint` runs the real discovery
+    /// script over an ssh stand-in that executes the remote command in a local `/bin/sh`, where
+    /// `$HOME/.local/bin/herdr` (first on [`HERDR_REMOTE_PATH`]) answers as a stopped server does.
+    #[tokio::test]
+    async fn discovery_of_a_stopped_remote_herdr_reports_it_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let herdr = bin.join("herdr");
+        std::fs::write(
+            &herdr,
+            format!(
+                "#!/bin/sh\n[ \"$*\" = 'status server --json' ] || exit 2\ncat <<'EOF'\n{}\nEOF\n",
+                not_running(None)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = dir.path().join("fake-ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; -T|-N) shift;; *) break;; esac; done\n[ \"$1\" = me@box ] || exit 255\nshift\nHOME='{}' exec /bin/sh -c \"$1\"\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let transport = SshTransport::new(ssh.display().to_string(), None);
+        let error = transport
+            .discover_endpoint("me@box", None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), STOPPED);
     }
 
     /// `remoteShellCommand`, `sshEnvCommand` and `herdrSshArgs` (`herdr-connection.ts:15-28`):

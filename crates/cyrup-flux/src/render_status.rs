@@ -1,9 +1,9 @@
-//! `/flux/status` plain-text panel — a function-for-function Rust port of
-//! [`flux_status.py`](../../../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_status.py)'s
-//! `render()` (`:180-267`) with `--no-color` semantics: the TUI strips ANSI from externally
-//! supplied text (`crates/cyrup-tui/src/ansi.rs`), so this always returns the Python's
-//! `--no-color` output — aligned columns plus the Unicode glyphs that carry the semantics colour
-//! carried upstream. Colour lives only in FLUX_09's overlay, which draws ratatui lines natively.
+//! `/flux/status` plain-text panel — a function-for-function Rust port of `flux_status.py`'s
+//! `render()` (`code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_status.py:181-270`
+//! @v0.0.6) with `--no-color` semantics: the TUI strips ANSI from externally supplied text
+//! (`crates/cyrup-tui/src/ansi.rs`), so this always returns the Python's `--no-color` output —
+//! aligned columns plus the Unicode glyphs that carry the semantics colour carried upstream.
+//! Colour lives only in the overlay (port doc §3.4.3), which draws ratatui lines natively.
 //!
 //! Padding is CHAR-COUNT based (`chars().count()`, matching Python's `len()` on `str`, i.e. code
 //! points) — not byte length, not display width.
@@ -14,12 +14,12 @@ use crate::state;
 
 /// Section name width: fixed per `flux_status.py:192`.
 const STAGE_W: usize = 8;
-/// Extra width added to `name_w + stage_w` for the main section rule (`flux_status.py:70`).
+/// Extra width added to `name_w + stage_w` for the main section rule (`flux_status.py:68`).
 const SECTION_PAD: usize = 18;
-/// Floor so short content still frames nicely (`flux_status.py:71`).
+/// Floor so short content still frames nicely (`flux_status.py:69`).
 const MIN_PANEL_W: usize = 48;
 
-/// Fixed review-grid column widths, keyed by severity (`flux_status.py:66`).
+/// Fixed review-grid column widths, keyed by severity (`flux_status.py:64`).
 fn sev_col_width(sev: &str) -> usize {
     match sev {
         "critical" => 10,
@@ -46,7 +46,7 @@ fn ljust(s: &str, width: usize) -> String {
     }
 }
 
-/// The icon for a known status, or `None` for anything else (`STATUS_STYLE`, `flux_status.py:47-52`).
+/// The icon for a known status, or `None` for anything else (`STATUS_STYLE`, `flux_status.py:49-54`).
 fn status_icon(status: &str) -> Option<&'static str> {
     match status {
         "in-progress" => Some("\u{1F504}"),

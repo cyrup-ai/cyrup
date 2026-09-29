@@ -146,6 +146,10 @@ async fn the_trigger_turn_arm_carries_display_false_through_the_run_loop() {
         !await_persisted_display(&session, KIND).await,
         "the entry persisted through the run loop keeps display:false"
     );
+    // The injected turn is still running when its input persists; let it settle before the
+    // fixture's `TempDir` is removed, or its session-file write lands in a directory already being
+    // deleted and the whole tree leaks (SEAM-073).
+    session.wait_for_idle().await;
 }
 
 /// The DURABLE arm (`trigger_turn: false`, idle): a direct append plus a `MessageStart`/`MessageEnd`
@@ -232,4 +236,6 @@ async fn display_true_still_rides_the_trigger_turn_arm() {
         await_persisted_display(&session, KIND).await,
         "display:true survives the same route unchanged"
     );
+    // As above: settle the injected turn before the fixture's `TempDir` goes (SEAM-073).
+    session.wait_for_idle().await;
 }

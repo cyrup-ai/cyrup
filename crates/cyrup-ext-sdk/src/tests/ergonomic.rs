@@ -584,15 +584,76 @@ fn all_33_event_kinds_are_registerable() {
     api.on_agent_settled(|_| {});
     api.on_before_provider_headers(|_, _| Outcome::noop());
     api.on_session_info_changed(|_, _| {});
+    // Kinds 33-35, pi's post-baseline events: `ui_prompt_start`/`ui_prompt_end` (v0.84.4,
+    // EXT-075) and `context_with_system` (v0.87.0, EXT-079).
+    api.on_ui_prompt_start(|_, _| {});
+    api.on_ui_prompt_end(|_, _| {});
+    api.on_context_with_system(|_, _| Outcome::noop());
 
     let kinds = api.subscription_kinds();
     assert_eq!(
         kinds.len(),
-        33,
-        "all 33 Pi events registerable, got {kinds:?}"
+        36,
+        "all 36 Pi events registerable, got {kinds:?}"
     );
     assert_eq!(kinds.first(), Some(&0));
-    assert_eq!(kinds.last(), Some(&32));
+    assert_eq!(kinds.last(), Some(&35));
+}
+
+/// EXT-080 — every `on_*` hands back pi's remover, naming the event it clears, so the guest glue
+/// can send exactly that kind over `registration.unsubscribe`.
+#[test]
+fn every_subscriber_returns_the_remover_for_its_own_event() {
+    let mut api = ExtensionApi::new();
+    let turn_end = api.on_turn_end(|_, _| {});
+    let context = api.on_context(|_, _| Outcome::noop());
+    let prompt_end = api.on_ui_prompt_end(|_, _| {});
+    let kinds = api.subscription_kinds();
+    for remover in [turn_end, context, prompt_end] {
+        assert!(
+            kinds.contains(&remover.event_kind()),
+            "{remover:?} must name a kind this api subscribed"
+        );
+    }
+    assert_ne!(turn_end, context);
+    // Host target: the import is not reachable, so dropping the subscription is a no-op there.
+    turn_end.unsubscribe();
+}
+
+/// EXT-075 / EXT-079 — the three new events decode their ordered args into pi's payloads.
+#[test]
+fn the_post_baseline_event_payloads_decode_from_their_args() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let seen: Rc<RefCell<Vec<String>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let s = seen.clone();
+    let start = api.on_ui_prompt_start(move |e, _| {
+        s.borrow_mut()
+            .push(format!("start {} {:?}", e.kind, e.title));
+    });
+    let s = seen.clone();
+    let end = api.on_ui_prompt_end(move |e, _| {
+        s.borrow_mut().push(format!("end {} {:?}", e.kind, e.title));
+    });
+    let s = seen.clone();
+    let cws = api.on_context_with_system(move |e, _| {
+        s.borrow_mut().push(format!("cws {}", e.messages));
+        Outcome::noop()
+    });
+    let ctx = Ctx::new();
+    api.dispatch(start.event_kind(), &["select", "Pick one"], &ctx);
+    api.dispatch(end.event_kind(), &["custom", ""], &ctx);
+    api.dispatch(cws.event_kind(), &[r#"[{"role":"user"}]"#], &ctx);
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            r#"start select Some("Pick one")"#.to_string(),
+            "end custom None".to_string(),
+            r#"cws [{"role":"user"}]"#.to_string(),
+        ]
+    );
 }
 
 #[test]

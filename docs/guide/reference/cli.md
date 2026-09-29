@@ -278,10 +278,7 @@ More in [Sessions](../guides/sessions.md).
 |---|---|---|
 | `--mode` | `<text\|json\|rpc\|acp>` | Output mode; `text` is the default |
 | `-p`, `--print` | — | Run the prompt to completion, print the final text, exit |
-| `--json` | — | Alias for `--mode json` |
-| `--rpc` | — | Alias for `--mode rpc` |
 | `--acp` | — | Alias for `--mode acp`; serve the Agent Client Protocol on stdio |
-| `--output-format` | `<text\|json>` | Alias: `text` means `--print`, `json` means `--mode json` |
 | `--tui-mode` | `<regular\|fullscreen>` | TUI renderer; `regular` is the default |
 
 Precedence when several are given: `acp`, then `rpc`, then `json`, then `print`. A non-TTY stdin or stdout
@@ -294,9 +291,10 @@ genuine unknown long flag (`--weird`) is still captured as an extension flag.
 `--tui-mode fullscreen` parses but the alternate-screen renderer is not built in this release; cyrup
 warns and falls back to `regular`.
 
-`--json`, `--rpc`, `--acp` and `--output-format` are cyrup additions. Because they are known flags, an
-extension cannot register a flag of the same name and receive it. See
-[Scripting and automation](../guides/scripting.md).
+`--acp` is a cyrup addition, kept because ACP editors are configured to launch `cyrup --acp`.
+Because it is a known flag, an extension cannot register a flag of that name and receive it. There
+are no `--json`, `--rpc` or `--output-format` shorthands: use `--mode json`, `--mode rpc` and
+`--print`. See [Scripting and automation](../guides/scripting.md).
 
 ### Tools
 
@@ -342,6 +340,7 @@ See [Tools and permissions](../guides/tools-and-permissions.md).
 | `--prompt-template` | `<path>` | Load a prompt template file or directory; repeatable |
 | `-np`, `--no-prompt-templates` | — | Disable prompt template discovery and loading |
 | `--theme` | `<path>` | Load a theme file or directory; repeatable |
+| `--use-theme` | `<name[/name]>` | Start the interactive UI on this theme (or `light/dark` pair) for this run only; not saved to settings |
 | `--no-themes` | — | Disable theme discovery and loading |
 | `-nc`, `--no-context-files` | — | Do not load `AGENTS.md` and `CLAUDE.md` |
 | `--system-prompt` | `<text\|path>` | Replace the assembled system prompt |

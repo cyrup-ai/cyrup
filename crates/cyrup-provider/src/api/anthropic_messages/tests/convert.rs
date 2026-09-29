@@ -89,6 +89,7 @@ fn redacted_thinking_replays_as_redacted_block() {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     };
     let value = build_assistant(&am, false, false).expect("assistant");
@@ -116,6 +117,7 @@ fn empty_signature_thinking_becomes_text_unless_allowed() {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     };
     // default: convert to text.

@@ -25,7 +25,7 @@
 //! Same reason as `run_loop_input_priority.rs`: the property is *ordering and pattern shape inside
 //! a macro*, in a loop that owns a terminal, a session and a dozen channels — and
 //! `runtime_swap.rs`'s coverage calls `app.rebind_session()` BY HAND (`:92`, `:137`), never through
-//! `App::run` (which is implemented only for `App<InlineBackend<Stdout>>`), so the `select!` arm
+//! `App::run` (which is implemented only for `App<InlineBackend<TuiStdout>>`), so the `select!` arm
 //! ordering itself has zero behavioural coverage. The guard is structural, the same shape as
 //! `run_loop_input_priority.rs` and `run_loop_draw_coalescing.rs`.
 #![allow(

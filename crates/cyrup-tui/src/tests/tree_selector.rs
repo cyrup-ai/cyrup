@@ -24,22 +24,23 @@ fn node(id: &str, depth: usize, label: &str, kind: TreeKind) -> TreeNode {
     n
 }
 
-/// A small DAG (the connector's middle cell carries the fold state — `tree-selector.ts:721-722`):
+/// A small DAG (the connector's middle cell carries the fold state — `tree-selector.ts:721-722`),
+/// labelled the way `dag_display` labels each entry type:
 ///   root (●)
-///   ├⊟ model→opus (◆, foldable, expanded)
+///   ├⊟ assistant (●, foldable, expanded)
 ///   │   └─ "streaming" (●)
 ///   ├─ 14 tool calls (⚙)
 ///   └─ "fix footer" (●, labeled)
 ///        └─ compaction (✓)
 fn sample() -> Vec<TreeNode> {
-    let mut model = node("m", 1, "model -> opus", TreeKind::ModelChange);
+    let mut model = node("m", 1, "assistant: switching to opus", TreeKind::Message);
     model.foldable = true;
-    let mut footer = node("f", 1, "fix footer", TreeKind::Message);
-    footer.has_label = true;
+    let mut footer = node("f", 1, "user: fix footer", TreeKind::Message);
+    footer.user_label = Some("wip".to_string());
     vec![
-        node("root", 0, "initial prompt", TreeKind::Message),
+        node("root", 0, "user: initial prompt", TreeKind::Message),
         model,
-        node("stream", 2, "wire up streaming", TreeKind::Message),
+        node("stream", 2, "user: wire up streaming", TreeKind::Message),
         node("tools", 1, "14 tool calls", TreeKind::ToolGroup),
         footer,
         node("compact", 2, "compaction", TreeKind::Compaction),
@@ -87,7 +88,6 @@ fn renders_connectors_glyphs_and_fold_markers() {
     assert!(text.contains("Session Tree"), "header: {text}");
     assert!(text.contains("Filter: default"));
     assert!(text.contains('●'), "message glyph");
-    assert!(text.contains('◆'), "model-change glyph");
     assert!(text.contains('⚙'), "tool-group glyph");
     assert!(
         text.contains("├─") || text.contains("└─"),
@@ -95,7 +95,7 @@ fn renders_connectors_glyphs_and_fold_markers() {
     );
     // S24 (corrected): pi draws the fold state INSIDE the connector — `tree-selector.ts:722`
     //   `prefixChars.push(isFolded ? "⊞" : foldable ? "⊟" : "─");`
-    // at `posInLevel === 1`, i.e. in place of the `─` of the node's own `├─ `. `model -> opus` is
+    // at `posInLevel === 1`, i.e. in place of the `─` of the node's own `├─ `. `assistant` is
     // depth-1, foldable and expanded, and is not the last child, so its connector is exactly `├⊟ `.
     // The separate `foldMarker` at `:734` is the connector-LESS fallback (`!showsFoldInConnector`),
     // not evidence that pi never emits `⊟`.
@@ -108,7 +108,11 @@ fn renders_connectors_glyphs_and_fold_markers() {
         !text.contains('\u{229e}'),
         "folded marker `⊞` present with nothing folded: {text}"
     );
-    assert!(text.contains("☆labeled"), "label star on the labeled node");
+    // Pi's label prefix, ahead of the entry text (`tree-selector.ts:745`).
+    assert!(
+        text.contains("[wip] user: fix footer"),
+        "label prefix on the labeled node: {text}"
+    );
 }
 
 #[test]
@@ -142,11 +146,14 @@ fn filter_modes_change_visible_set() {
     sel.handle(&ctrl('l'), &SelectKeymap::default());
     assert_eq!(sel.filter(), FilterMode::LabeledOnly);
     assert_eq!(sel.visible_ids(), vec!["f".to_string()]);
-    // user (ctrl+u) keeps only messages.
+    // user-only (ctrl+u) keeps user messages and nothing else — not the assistant row
+    // (`passesFilter = entry.type === "message" && entry.message.role === "user"`,
+    // `tree-selector.ts:366` @v0.87.1).
     sel.handle(&ctrl('u'), &SelectKeymap::default());
-    let ids = sel.visible_ids();
-    assert!(ids.contains(&"root".to_string()) && ids.contains(&"stream".to_string()));
-    assert!(!ids.contains(&"tools".to_string()) && !ids.contains(&"m".to_string()));
+    assert_eq!(
+        sel.visible_ids(),
+        vec!["root".to_string(), "stream".to_string(), "f".to_string()]
+    );
     // Pressing the SAME filter key again returns to `default` (`tree-selector.ts:1046-1050`).
     sel.handle(&ctrl('u'), &SelectKeymap::default());
     assert_eq!(sel.filter(), FilterMode::Default);
@@ -296,8 +303,14 @@ fn help_row_and_search_prompt_come_from_the_live_keymap() {
         text.contains("Type to search:"),
         "standing search prompt: {text}"
     );
+    // `app.tree.foldOrUp`'s first key is platform-ordered (`core/keybindings.ts:150-157`).
+    let branch = if cfg!(target_os = "macos") {
+        "alt+←/alt+→ branch"
+    } else {
+        "ctrl+←/ctrl+→ branch"
+    };
     assert!(
-        text.contains("alt+←/alt+→ branch"),
+        text.contains(branch),
         "branch cell from the live keymap: {text}"
     );
     assert!(
@@ -402,7 +415,8 @@ fn label_editor_captures_keys_and_confirms_with_apply_payload() {
 }
 
 /// Confirming an EMPTY buffer clears the label (Pi `value || undefined` → remove; the payload's label
-/// segment is empty and `apply_label` drops empty labels).
+/// segment is empty and `apply_label` drops empty labels). The editor opens on the current label
+/// with the caret at 0 (pi's `setValue(currentLabel)`), so emptying it is `ctrl+k`.
 #[test]
 fn label_editor_empty_confirm_removes_label() {
     let mut sel = TreeSelector::new(sample());
@@ -411,6 +425,7 @@ fn label_editor_empty_confirm_removes_label() {
         sel.handle(&key(KeyCode::Down), &SelectKeymap::default());
     }
     sel.handle(&shift('l'), &SelectKeymap::default());
+    sel.handle(&ctrl('k'), &SelectKeymap::default());
     // Confirm with an empty buffer → remove.
     let out = sel.handle(&key(KeyCode::Enter), &SelectKeymap::default());
     assert_eq!(out, SelectorOutcome::Apply(format!("f{FIELD_SEP}")));

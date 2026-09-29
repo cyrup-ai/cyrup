@@ -240,3 +240,69 @@ fn session_affinity_format_selects_the_completions_header_set() {
     );
     assert!(!h.contains_key("x-session-id"));
 }
+
+/// PROV-086 — pi `sendSessionAffinityHeaders: isOpenRouter` (`openai-completions.ts:1672`
+/// @v0.87.1; `bbb61e34a`, v0.86.0, #9102). An OpenRouter completions request carries
+/// `x-session-id` with NO catalog override, so OpenRouter pins the session to one replica and its
+/// prompt cache stays warm; `sendSessionAffinityHeaders: false` in `models.json` still suppresses
+/// it, and no other endpoint gains the header by default.
+#[test]
+fn openrouter_sends_session_affinity_by_default() {
+    let headers_for = |m: &Model| {
+        build_headers(
+            m,
+            &Context::default(),
+            &auth_with_key(),
+            &StreamOptions::default(),
+            &get_compat(m),
+            Some("sess-7"),
+        )
+    };
+
+    let mut router = model();
+    router.provider = "openrouter".into();
+    router.base_url = "https://openrouter.ai/api/v1".to_string();
+    assert_eq!(
+        headers_for(&router).get("x-session-id"),
+        Some(&Some("sess-7".to_string()))
+    );
+
+    // Detected from the base URL too (a custom provider id pointed at OpenRouter).
+    let mut by_url = model();
+    by_url.provider = "my-router".into();
+    by_url.base_url = "https://openrouter.ai/api/v1".to_string();
+    assert_eq!(
+        headers_for(&by_url).get("x-session-id"),
+        Some(&Some("sess-7".to_string()))
+    );
+
+    router.compat = Some(crate::api::compat::OpenAiCompletionsCompat {
+        send_session_affinity_headers: Some(false),
+        ..Default::default()
+    });
+    assert!(!headers_for(&router).contains_key("x-session-id"));
+
+    let plain = headers_for(&model());
+    assert!(!plain.contains_key("x-session-id"));
+    assert!(!plain.contains_key("x-session-affinity"));
+}
+
+/// PROV-095 — pi `{ "User-Agent": getPiUserAgent(), ...model.headers }` (openai-completions.ts:760
+/// @v0.87.1, #8305): a default client User-Agent under every overlay.
+#[test]
+fn default_user_agent_sits_under_the_overlays() {
+    crate::utils::user_agent::assert_default_user_agent_under_overlays(|overlay| {
+        let opts = StreamOptions {
+            headers: overlay,
+            ..Default::default()
+        };
+        build_headers(
+            &model(),
+            &Context::default(),
+            &auth_with_key(),
+            &opts,
+            &get_compat(&model()),
+            None,
+        )
+    });
+}

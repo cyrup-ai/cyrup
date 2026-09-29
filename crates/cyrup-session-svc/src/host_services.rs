@@ -939,6 +939,13 @@ pub struct LiveHostServices {
     /// backend was built with. `None` (no swap attached) falls back to [`Self::provider`], which is
     /// that same initial provider.
     provider_swap: Mutex<Option<Arc<crate::ProviderSwap>>>,
+    /// The extension host's UI-prompt window (EXT-075), attached by the builder via
+    /// [`Self::attach_ui_prompts`]. pi wraps the ONE `ExtensionUIContext` every extension shares
+    /// (`ExtensionRunner.setUIContext` → `wrapUIPromptContext`, `core/extensions/runner.ts:522-537`
+    /// @v0.87.1); this backend is that context in cyrup, and natives reach it directly, so its five
+    /// blocking prompts open the window here. A WASM guest's prompt already opened it in its `ui.*`
+    /// import, so the call arriving here nests and emits nothing more. `None` on the default host.
+    ui_prompts: Mutex<Option<Arc<cyrup_ext::UiPromptTracker>>>,
 }
 
 impl LiveHostServices {
@@ -974,7 +981,26 @@ impl LiveHostServices {
             editor_focus_mirror: Mutex::new(None),
             event_bus: Mutex::new(None),
             provider_swap: Mutex::new(None),
+            ui_prompts: Mutex::new(None),
         }
+    }
+
+    /// Attach the extension host's UI-prompt window (EXT-075). Called by the builder with the
+    /// event bus, before any extension can prompt.
+    pub fn attach_ui_prompts(&self, tracker: Arc<cyrup_ext::UiPromptTracker>) {
+        *Self::lock(&self.ui_prompts) = Some(tracker);
+    }
+
+    /// Open the UI-prompt window around one blocking prompt (pi `withUIPrompt`). No prompter to
+    /// exclude: a call arriving here from a WASM guest is already inside that guest's own window.
+    fn begin_ui_prompt(
+        &self,
+        kind: cyrup_ext::UiPromptKind,
+        title: Option<&str>,
+    ) -> Option<cyrup_ext::UiPromptGuard> {
+        Self::lock(&self.ui_prompts)
+            .clone()
+            .map(|t| t.begin(kind, title, None))
     }
 
     /// Attach the host-owned inter-extension event bus (PERM-011 half B), so a NATIVE extension's
@@ -1351,6 +1377,7 @@ impl HostServices for LiveHostServices {
     // the deny default WITHOUT blocking — byte-for-byte Pi `noOpUIContext` (runner.ts:230-261).
 
     fn confirm(&self, prompt: &str, message: &str, opts: &DialogOptions) -> bool {
+        let _prompt = self.begin_ui_prompt(cyrup_ext::UiPromptKind::Confirm, Some(prompt));
         match self.ui_roundtrip(
             UiKind::Confirm,
             prompt,
@@ -1370,6 +1397,7 @@ impl HostServices for LiveHostServices {
         placeholder: Option<&str>,
         opts: &DialogOptions,
     ) -> Option<String> {
+        let _prompt = self.begin_ui_prompt(cyrup_ext::UiPromptKind::Input, Some(prompt));
         let placeholder = placeholder.map(str::to_string);
         match self.ui_roundtrip(
             UiKind::Input,
@@ -1385,6 +1413,7 @@ impl HostServices for LiveHostServices {
     }
 
     fn select(&self, prompt: &str, options: &Value, opts: &DialogOptions) -> Option<String> {
+        let _prompt = self.begin_ui_prompt(cyrup_ext::UiPromptKind::Select, Some(prompt));
         match self.ui_roundtrip(
             UiKind::Select,
             prompt,
@@ -1403,6 +1432,7 @@ impl HostServices for LiveHostServices {
         // use the empty default so the roundtrip signature stays uniform. `title` rides `prompt`
         // (uniform across all four dialog kinds); `initial` rides `message` (mirroring `confirm`'s
         // reuse of the same field for its second string argument).
+        let _prompt = self.begin_ui_prompt(cyrup_ext::UiPromptKind::Editor, Some(title));
         match self.ui_roundtrip(
             UiKind::Editor,
             title,
@@ -1432,6 +1462,7 @@ impl HostServices for LiveHostServices {
     /// @v0.84.2). An empty/unparseable spec is likewise declined rather than opening a blank modal
     /// the human has to dismiss.
     fn custom(&self, spec: &Value) -> Option<String> {
+        let _prompt = self.begin_ui_prompt(cyrup_ext::UiPromptKind::Custom, None);
         let parsed = CustomSpec::from_json(spec);
         if parsed.is_empty() {
             // The WIT return is a bare `option<string>` with no error arm, so the diagnostic can
@@ -1457,6 +1488,9 @@ impl HostServices for LiveHostServices {
     }
 
     fn open_overlay(&self, overlay: Box<dyn InteractiveOverlay>) -> bool {
+        // A native's live modal is pi's `ctx.ui.custom(factory, { overlay: true })`, which the
+        // runner wraps as `custom` (EXT-075); `custom` above nests into this and emits once.
+        let _prompt = self.begin_ui_prompt(cyrup_ext::UiPromptKind::Custom, None);
         // No renderer attached (headless print/json, RPC, or a bare embedder): report "not taken"
         // WITHOUT blocking, so the caller falls back to its own non-interactive surface. This is
         // pi's `if (!ctx.hasUI)` branch, expressed as a return value rather than a capability probe.
@@ -2948,8 +2982,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn proc_spawn_never_reinterpolates_the_host_injected_default_cwd() {
         let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-        let base = std::env::temp_dir();
-        let weird = base.join("cyrup-session-cwd-${MY_REPRO_VAR}-dir");
+        // Under a `TempDir`, not bare `temp_dir()`: a fixed name there outlived every run
+        // (SEAM-073's `/tmp` delta).
+        let base = tempfile::tempdir().expect("a scratch root for the unusual cwd");
+        let weird = base.path().join("cyrup-session-cwd-${MY_REPRO_VAR}-dir");
         std::fs::create_dir_all(&weird).expect("create the literal, unusual session cwd");
         let svc = LiveHostServices::new(
             provider,

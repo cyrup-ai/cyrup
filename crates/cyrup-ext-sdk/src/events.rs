@@ -58,6 +58,17 @@ pub struct ContextEvent {
     pub messages: Value,
 }
 
+/// `context_with_system` (pi `ContextWithSystemEvent`, `core/extensions/types.ts:708-711`
+/// @v0.87.1) — EXT-079. Delivered after every `context` handler has run, on the list that chain
+/// left; the handler's [`crate::Outcome::replace_messages`] is sent as returned. Upstream this list
+/// also carries the system messages (the prompt and tool declarations); cyrup's transcript has none
+/// yet, so it is the same shape a [`ContextEvent`] carries.
+#[derive(Clone, Debug)]
+pub struct ContextWithSystemEvent {
+    /// The request transcript after the `context` chain.
+    pub messages: Value,
+}
+
 /// `message_end` (Pi types.ts:1222) — replace the just-finished message (same role).
 #[derive(Clone, Debug)]
 pub struct MessageEndEvent {
@@ -266,6 +277,18 @@ pub struct SessionInfoChangedEvent {
     /// "Current normalized session name. Undefined when the name is cleared" — so `None` is a
     /// CLEARED name, not an unknown one.
     pub name: Option<String>,
+}
+
+/// `ui_prompt_start` / `ui_prompt_end` (pi `UIPromptStartEvent` / `UIPromptEndEvent`,
+/// `core/extensions/types.ts:830-845` @v0.87.1) — EXT-075. An extension's blocking UI prompt opened
+/// or closed; `end` reports the OUTER prompt when prompts nest. pi's constant `reason: "ui_prompt"`
+/// is not carried.
+#[derive(Clone, Debug)]
+pub struct UiPromptEvent {
+    /// pi `UIPromptKind`: `"select"`, `"confirm"`, `"input"`, `"editor"` or `"custom"`.
+    pub kind: String,
+    /// The prompt's title; `None` for `custom` and for an empty title, as upstream omits it.
+    pub title: Option<String>,
 }
 
 /// `resources_discover` (pi `ResourcesDiscoverEvent`, `extensions/types.ts:544-548` @v0.83.0) —

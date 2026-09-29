@@ -63,11 +63,10 @@
 //! and is process-global — so it also covers groups left by a session that `/new`, `/fork`,
 //! `switchSession` or `reload` has already replaced.
 //!
-//! RESIDUAL — pi's interactive host also drains from two EMERGENCY paths: `emergencyTerminalExit`
-//! (`interactive-mode.ts:3605`) and its `process.on("uncaughtException")` handler (`:3631`). cyrup
-//! has no analog of either site — no panic hook and no emergency terminal-restore path exists in
-//! this crate at all — so there is nothing to add the call to from here. Those are a `cyrup-tui` /
-//! `main.rs` concern; the drain they would need is now exported and ready.
+//! pi's interactive host also drains from two EMERGENCY paths: `emergencyTerminalExit`
+//! (`interactive-mode.ts:4179-4186` @v0.87.1) and its `uncaughtCrash` handler (`:4198-4217`). Both
+//! live in `cyrup-tui`, not here: the dead-terminal exit is `cyrup_tui`'s `dead_terminal` module,
+//! which drains before its `exit(129)` (TUI-S02), and the crash path is its panic hook.
 
 use std::sync::Arc;
 

@@ -47,6 +47,27 @@ impl AgentSession {
         cyrup_session::listing::list_in_dir(dir, cwd_filter, None)
     }
 
+    /// Every persisted session the `/resume` picker's `all` scope lists, newest first — pi's second
+    /// loader (`interactive-mode.ts:5559-5562` @v0.87.1):
+    /// `this.sessionManager.usesDefaultSessionDir() ? SessionManager.listAll(…) :
+    /// SessionManager.listAll(this.sessionManager.getSessionDir(), …)`.
+    ///
+    /// `usesDefaultSessionDir()` is `sessionDir === getDefaultSessionDirPath(cwd)`
+    /// (`session-manager.ts:1148-1150`): in the cwd-encoded default every project directory under
+    /// the sessions root is scanned; under a custom directory that one directory is listed WITHOUT
+    /// the cwd filter [`Self::list_sessions`] applies, which is what makes it "all".
+    pub fn list_all_sessions(&self) -> Vec<cyrup_session::listing::SessionInfo> {
+        let dir = &self.services.session_dir;
+        let root = self.sessions_root();
+        let default_dir =
+            cyrup_session::SessionLayout::new(root.clone(), self.services.cwd.clone()).dir();
+        if *dir == default_dir {
+            cyrup_session::listing::list_all(&cyrup_session::SessionsRoot(root))
+        } else {
+            cyrup_session::listing::list_all_in_dir(dir, None)
+        }
+    }
+
     /// Delete a persisted session **file** by path (Pi `/resume` in-list delete → `app.session.delete`
     /// → `SessionManager.delete`, session-selector.ts:540). Additive seam for the TUI session selector:
     /// removes the JSONL from disk. Refuses to delete *this* session's own file (Pi guards the active

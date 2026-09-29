@@ -260,6 +260,7 @@ pub fn build_assistant_message(resp: &FauxResponse) -> AssistantMessage {
         deferred: None,
         error_message: resp.error.clone(),
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     }
 }

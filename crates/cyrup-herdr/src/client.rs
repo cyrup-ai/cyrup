@@ -2,7 +2,7 @@
 //!
 //! ## It holds no connection, on purpose
 //!
-//! herdr's `handle_connection_with_stop` (`tmp/herdr/src/api/server.rs:156-317`) reads **one**
+//! herdr's `handle_connection_with_stop` (`tmp/herdr/src/api/server.rs:156-304`) reads **one**
 //! line, dispatches it, writes one line and returns. There is no read loop, so there is no
 //! connection worth keeping: [`HerdrClient::new`] is a `PathBuf` and a [`Duration`] and nothing
 //! else, exactly as herdr's own client is (`tmp/herdr/src/api/client.rs:33-44`). Constructing one
@@ -12,7 +12,7 @@
 //! ## Every call is bounded, because herdr's own dispatch is not
 //!
 //! `dispatch_to_app` waits on a `recv()` with a `None` timeout
-//! (`tmp/herdr/src/api/server.rs:911-913`). A herdr whose UI thread is wedged therefore never
+//! (`tmp/herdr/src/api/server.rs:896-898`). A herdr whose UI thread is wedged therefore never
 //! answers and never closes, and a client without a deadline of its own hangs forever. Every
 //! method here runs under [`DEFAULT_TIMEOUT`] (15 s) unless the caller names another, and the one
 //! method that is *designed* to take longer — [`HerdrClient::pane_wait_for_output`] — derives its
@@ -23,14 +23,15 @@
 //! A success whose `id` is not the id that was sent is [`HerdrError::IdMismatch`] and the
 //! connection is dropped, never a payload accepted — see [`crate::transport::request`], which
 //! holds that rule for every method on this type. An **error** envelope is fatal whatever its
-//! `id`, including the empty one herdr writes when it could not recover a correlation id at all
-//! (`tmp/herdr/src/api/server.rs:180-201`).
+//! `id`, including the empty one herdr writes for every line that does not deserialise
+//! (`tmp/herdr/src/api/server.rs:179-191`); see [`crate::transport::request`] for the ids herdr
+//! puts on its error envelopes.
 //!
 //! ## The one method that is not a call: `events.subscribe`
 //!
 //! [`HerdrClient::subscribe`] and [`HerdrClient::bootstrap`] do not go through
 //! [`crate::transport::request`], because `events.subscribe` holds its connection open past the
-//! first line (`server.rs:229-250` → `:715-779`). See [`crate::stream`].
+//! first line (`server.rs:216-237` → `:701-764`). See [`crate::stream`].
 //!
 //! **[`HerdrClient::bootstrap`] is the supported way to pair a snapshot with a stream, and it is
 //! `[CYRUP-EXCEEDS-UPSTREAM]`.** *Premise, grepped twice:* herdr documents the ordering as
@@ -39,7 +40,7 @@
 //! snapshot, then apply the buffered events in order and continue streaming."*
 //! (`socket-api.mdx:118-130`) — and its source is stricter than its prose: `stream_subscriptions`
 //! takes `event_hub.current_sequence()` as its floor **before** any subscription exists
-//! (`tmp/herdr/src/api/server.rs:723`), so *"Lifecycle subscriptions … do not replay events
+//! (`tmp/herdr/src/api/server.rs:709`), so *"Lifecycle subscriptions … do not replay events
 //! retained before that point"* (`socket-api.mdx:817-819`) means the events in the window are
 //! never sent at all. pi's client leaves the whole sequence to its caller — `subscribe()` is a
 //! free-standing method beside `call()` (`src/runs/shared/herdr-connection.ts:93-106` @v0.68.0)
@@ -169,7 +170,7 @@ impl HerdrClient {
     /// `ping` — liveness, version, protocol and capabilities.
     ///
     /// Answered by the API server itself without touching the app
-    /// (`tmp/herdr/src/api/server.rs:355-368`), so it stays answerable while the UI is busy.
+    /// (`tmp/herdr/src/api/server.rs:342-355`), so it stays answerable while the UI is busy.
     ///
     /// # Errors
     /// As [`crate::probe::ping`].
@@ -190,7 +191,7 @@ impl HerdrClient {
     /// # Errors
     /// [`crate::ApiErrorCode::PaneNotFound`] for an unknown pane,
     /// [`crate::ApiErrorCode::InvalidAgent`] for a label herdr cannot normalise
-    /// (`tmp/herdr/src/app/api/panes.rs:1556`), plus the transport arms.
+    /// (`tmp/herdr/src/app/api/panes.rs:1540`), plus the transport arms.
     pub async fn report_agent(&self, params: PaneReportAgentParams) -> Result<()> {
         self.call(Method::PaneReportAgent(params))
             .await?
@@ -462,7 +463,7 @@ impl HerdrClient {
     /// # Errors
     /// [`crate::ApiErrorCode::ConfirmationRequired`] when the close would take a whole worktree
     /// group with it — **the pane is still open** in that case
-    /// (`tmp/herdr/src/app/api/panes.rs:1880-1886`). Plus
+    /// (`tmp/herdr/src/app/api/panes.rs:1864-1870`). Plus
     /// [`crate::ApiErrorCode::PaneNotFound`] and the transport arms.
     pub async fn pane_close(&self, pane_id: impl Into<String>) -> Result<()> {
         self.call(Method::PaneClose(PaneTarget::new(pane_id)))
@@ -487,7 +488,7 @@ impl HerdrClient {
     ///
     /// # Errors
     /// [`crate::ApiErrorCode::InvalidKey`] for an unknown key name — **nothing is written**,
-    /// herdr encodes the whole input first (`tmp/herdr/src/app/api/panes.rs:1846-1853`) —
+    /// herdr encodes the whole input first (`tmp/herdr/src/app/api/panes.rs:1830-1837`) —
     /// [`crate::ApiErrorCode::PaneSendFailed`] when the pane's writer is gone, plus the transport
     /// arms.
     pub async fn pane_send_input(&self, params: PaneSendInputParams) -> Result<()> {
@@ -499,7 +500,7 @@ impl HerdrClient {
     /// `pane.read` — a pane's text.
     ///
     /// The result's `revision` is **always `0`**, hard-coded by herdr
-    /// (`tmp/herdr/src/app/api/panes.rs:1540`) — and it is `0` on every other payload that carries
+    /// (`tmp/herdr/src/app/api/panes.rs:1524`) — and it is `0` on every other payload that carries
     /// a `PaneReadResult` too, including [`OutputMatched`], because every one of them is built
     /// from this same dispatch. See [`PaneReadResult`]. Do not build a cache key or an event floor
     /// on any of those three; the real ordering token herdr does publish is
@@ -547,7 +548,7 @@ impl HerdrClient {
     /// `pane.process_info` — the pane's shell pid, tty and foreground process group.
     ///
     /// Every field but `pane_id` is best-effort: an empty `foreground_processes` means *herdr
-    /// could not tell*, not *the pane is idle* (`tmp/herdr/src/app/api/panes.rs:536-538`).
+    /// could not tell*, not *the pane is idle* (`tmp/herdr/src/app/api/panes.rs:520-522`).
     ///
     /// # Errors
     /// [`crate::ApiErrorCode::PaneNotFound`], plus the transport arms.
@@ -582,7 +583,7 @@ impl HerdrClient {
     /// Step 2 is a genuine race, not a sequence: the snapshot call and the stream read are polled
     /// together, because a client that stops reading a subscription does not fall behind, it loses
     /// the subscription — herdr's writes are blocking with a 5 s send timeout, after which
-    /// `stream_subscriptions` returns (`tmp/herdr/src/api/server.rs:164-166`, `:762-778`). See
+    /// `stream_subscriptions` returns (`tmp/herdr/src/api/server.rs:164-166`, `:747-763`). See
     /// [`crate::stream`].
     ///
     /// # Errors
@@ -620,8 +621,10 @@ impl HerdrClient {
     ///
     /// The acknowledgement is checked, not assumed: the first line must be a success carrying this
     /// request's `id` and `{"type":"subscription_started"}`. A `pong`, an error envelope with any
-    /// `id` including the empty one herdr writes when it could not recover a correlation id
-    /// (`tmp/herdr/src/api/server.rs:180-201`), or a pushed event before the ack all fail here
+    /// `id` — the empty one herdr writes for a line that does not deserialise
+    /// (`tmp/herdr/src/api/server.rs:179-191`), or the internal probe's `<id>:sub:<n>:probe` a
+    /// failed subscription setup carries (`tmp/herdr/src/api/subscriptions.rs:184-192`, `:210`) —
+    /// or a pushed event before the ack all fail here
     /// rather than yielding a stream whose state is unknown.
     ///
     /// # Errors
@@ -697,7 +700,7 @@ impl From<&HerdrPane> for HerdrClient {
 ///
 /// herdr places no constraint on the shape — its own CLI sends the constant `"cli:request"`
 /// (`tmp/herdr/src/cli.rs:757`) and its client sends `"api-client:status"`
-/// (`tmp/herdr/src/api/client.rs:93`). A per-call counter is used here anyway, because
+/// (`tmp/herdr/src/api/client.rs:79`). A per-call counter is used here anyway, because
 /// [`crate::HerdrError::IdMismatch`] can only mean something if two calls cannot share an id.
 fn request_id(method: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};

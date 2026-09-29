@@ -139,6 +139,23 @@ impl<B: Backend> App<B> {
             self.live_floor = 0;
             raw
         };
+        // CFG-063 — pi's full-redraw reasons, first match wins (`tui-main-screen.ts:330-358`
+        // @v0.87.1): the first frame, a terminal width change, a terminal height change, then a
+        // live-region height change — each of which repaints the whole inline region rather than
+        // diffing it (see `render_debug`'s module doc).
+        let full_redraw = render_debug::full_redraw_reason(
+            std::mem::replace(
+                &mut self.last_frame_size,
+                (i32::from(term_w), i32::from(term_h)),
+            ),
+            (term_w, term_h),
+            self.viewport_height,
+            desired,
+        );
+        if let Some(reason) = full_redraw.as_deref() {
+            self.render_debug
+                .log_redraw(reason, self.viewport_height, desired, term_h);
+        }
         if desired != self.viewport_height {
             // TUI-093 — NOT `?`. A frame at the previous height is a cosmetic defect; propagating
             // here unwinds ~40 `draw_synchronized()?` call sites out of `App::run` and ENDS THE
@@ -153,14 +170,48 @@ impl<B: Backend> App<B> {
                     .push_status(format!("viewport resize failed: {e}")),
             }
         }
-        self.flush_committed()?;
+        let committed_rows = self.flush_committed()?;
         let App {
-            terminal, state, ..
+            terminal,
+            state,
+            render_debug: debug,
+            ..
         } = self;
-        terminal
+        let completed = terminal
             .draw(|frame| render(frame, state))
             .map_err(|e| TuiError::Backend(e.to_string()))?;
+        if debug.frame_dump_dir.is_some() {
+            let new_lines = render_debug::buffer_lines(completed.buffer);
+            let viewport_top = completed.area.y;
+            // pi dumps only on the differential path — a full redraw returns before the dump —
+            // but `previousLines` moves either way (`fullRender` sets it too).
+            if full_redraw.is_none() {
+                debug.dump_frame(&render_debug::FrameDump {
+                    viewport_top,
+                    height: term_h,
+                    width: term_w,
+                    live_region_height: self.viewport_height,
+                    live_floor: self.live_floor,
+                    committed_rows,
+                    new_lines: &new_lines,
+                    previous_lines: &self.debug_previous_lines,
+                });
+            }
+            self.debug_previous_lines = new_lines;
+        }
         Ok(())
+    }
+
+    /// pi `resetRenderState()` (`tui-main-screen.ts:158-166` @v0.87.1), what `requestRender(true)`
+    /// runs before the next frame: drop every piece of diff state so that frame repaints from
+    /// scratch. ratatui's diff lives in the `Terminal`'s back buffer, so the reset is
+    /// `terminal.clear()`; the render-debug state is reset with it — upstream's `previousWidth =
+    /// -1` is what makes that frame log `terminal width changed (-1 -> <width>)` rather than pass as
+    /// a diffed frame (CFG-063).
+    pub(crate) fn reset_render_state(&mut self) {
+        let _ = self.terminal.clear();
+        self.last_frame_size = render_debug::RESET_FRAME;
+        self.debug_previous_lines.clear();
     }
 
     /// Render one frame on the ADR-0005 §B-3 alternate screen — the fullscreen half of
@@ -258,10 +309,12 @@ impl<B: Backend> App<B> {
     /// (`scrollback-accumulator`, TUI-092 F1) — recording the same lines in the `scrollback`
     /// accumulator. After this the inline viewport only renders the active streaming turn,
     /// the editor, and the status line. A no-op when nothing was committed since the last flush.
-    fn flush_committed(&mut self) -> Result<(), TuiError> {
+    ///
+    /// Returns how many scrollback rows were inserted (the frame dump's `committedRows`).
+    fn flush_committed(&mut self) -> Result<u16, TuiError> {
         let committed = self.state.transcript.drain_committed();
         if committed.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         // Content width for markdown wrapping: the live terminal width (R-ARCH-TUI-005), fallback 80.
         let width = self
@@ -314,6 +367,6 @@ impl<B: Backend> App<B> {
                 crate::osc::inject(buf, &links);
             })
             .map_err(|e| TuiError::Backend(e.to_string()))?;
-        Ok(())
+        Ok(height)
     }
 }

@@ -134,8 +134,8 @@ impl AgentSession {
     ///
     /// **The caller must have settled this session's run first.** Anything the session writes after
     /// this call lands in the placeholder and is lost when the session is dropped. The sole caller
-    /// (the runtime's non-persisted fork arm) awaits `abort_and_settle()` immediately before, then
-    /// disposes and replaces the session.
+    /// (the runtime's non-persisted fork arm) awaits `abort_and_settle()` and branches the manager
+    /// before this, then disposes and replaces the session.
     pub(crate) async fn take_manager(&self) -> Result<SessionManager, SessionServiceError> {
         let mut guard = self.manager.lock().await;
         let placeholder = SessionManager::in_memory(

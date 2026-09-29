@@ -678,4 +678,56 @@ mod tests {
         assert!(should_block_tool_for_budget(&budget, "read", 1));
         assert!(!should_block_tool_for_budget(&budget, "bash", 1));
     }
+
+    /// SUBA-132 — pi `isToolBudgetBlockedMessage` (`tool-budget.ts:76-94` @v0.71.0): only the
+    /// runtime's own whole-message block for THIS budget and tool counts.
+    #[test]
+    fn only_this_runs_own_whole_blocked_message_is_a_budget_block() {
+        let budget = decode_tool_budget_env(Some("{\"hard\": 2}"), HardMinimum::One)
+            .expect("valid")
+            .expect("some");
+        let message = tool_budget_blocked_message(&budget, "read", 3);
+        assert!(is_tool_budget_blocked_message(
+            &budget,
+            &message,
+            Some("read")
+        ));
+        assert!(is_tool_budget_blocked_message(
+            &budget,
+            &format!("  {message}\n"),
+            Some(" read ")
+        ));
+        // Another tool's name, a missing name, another run's hard limit, a count within the limit,
+        // or the phrase embedded in ordinary output are all rejected.
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &message,
+            Some("grep")
+        ));
+        assert!(!is_tool_budget_blocked_message(&budget, &message, None));
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &message,
+            Some("  ")
+        ));
+        let other = decode_tool_budget_env(Some("{\"hard\": 5}"), HardMinimum::One)
+            .expect("valid")
+            .expect("some");
+        assert!(!is_tool_budget_blocked_message(
+            &other,
+            &message,
+            Some("read")
+        ));
+        let within = message.replace("after 3 tool calls", "after 2 tool calls");
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &within,
+            Some("read")
+        ));
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &format!("grep output: {message}"),
+            Some("read")
+        ));
+    }
 }

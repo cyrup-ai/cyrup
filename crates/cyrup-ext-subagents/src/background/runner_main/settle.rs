@@ -356,6 +356,7 @@ pub(super) async fn skip_child_stopped_step(
 pub(super) fn child_stopped_step_result() -> StepResult {
     StepResult {
         execution: None,
+        tool_budget_blocked: false,
         native_machine: None,
         runtime_acknowledged_extensions: None,
         success: false,
@@ -397,6 +398,7 @@ pub(super) fn stopped_single_result(step: &RunnerStep) -> SingleResult {
         step,
         &StepResult {
             execution: None,
+            tool_budget_blocked: false,
             native_machine: None,
             runtime_acknowledged_extensions: None,
             success: false,
@@ -598,6 +600,11 @@ pub(super) fn step_result_to_single_result_with(
     result: &StepResult,
 ) -> SingleResult {
     let ResultIdentity { agent, task } = identity;
+    // SUBA-134 — pi's runner results carry `sessionName: childSessionName`
+    // (`subagent-runner.ts:828,972,1043,1515` @v0.71.0), derived from the same agent and task
+    // the child was launched with — the name the child gave its own session.
+    let session_name =
+        crate::exec::child_session_name::derive_child_session_name(Some(&agent), Some(&task), None);
     SingleResult {
         // SUBA-100 — the step's result carries both onto the terminal result payload
         // (`subagent-runner.ts:1579,928` @v0.68.0).
@@ -615,6 +622,10 @@ pub(super) fn step_result_to_single_result_with(
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
+        // SUBA-132 — the step's own budget-block fact, so a detached workflow child's terminal
+        // result settles `budget_exhausted` exactly as its foreground run would.
+        tool_budget_blocked: result.tool_budget_blocked,
+        session_name,
         agent,
         task,
         // The child's real code when the executor ran one; the success/failure mapping only as the
@@ -716,6 +727,8 @@ pub(super) fn imported_root_to_single_result(
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
+        tool_budget_blocked: false,
+        session_name: None,
         agent: imported.agent.clone(),
         task: format!("Attach async root {}", spec.run_id),
         exit_code: imported.exit_code,

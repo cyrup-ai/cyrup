@@ -1,10 +1,10 @@
-//! `/flux/about` overview — a Rust port of
-//! [`flux_about.py`](../../../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_about.py)'s
-//! text pipeline, minus the Rich markdown rendering: the body is already terminal-friendly
-//! markdown, and the plain notification channel shows it as-is (port doc §3.4.3).
+//! `/flux/about` overview — a Rust port of `flux_about.py`'s text pipeline
+//! (`code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_about.py` @v0.0.6), minus the
+//! Rich markdown rendering: the body is already terminal-friendly markdown, and the plain
+//! notification channel shows it as-is (port doc §3.4.3).
 //!
 //! Frontmatter stripping and the AI-only preamble drop both happened at VENDOR time
-//! (`_docs/about.md`, FLUX_08 SUBTASK 1) — the source `.py` transforms
+//! (`_docs/about.md`, port doc §3.4.3) — the source `.py` transforms
 //! `extract_body`/`drop_ai_preamble` are one-time content edits, not renderer behaviour. The
 //! only transform that must run at render time is the `//cmd` -> `/cmd` normalization, because
 //! it is presentation (Wibey-era double-slash spellings), not content.

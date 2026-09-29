@@ -47,7 +47,7 @@
 //! routes no wheel event, exactly as before ADR-0005 (R-ARCH-TUI-003: native scrollback is what
 //! scrolls there).
 
-use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use super::scroll::{self, ScrollState};
@@ -60,9 +60,25 @@ use super::scroll::{self, ScrollState};
 /// `onRightClickPaste` and `copySelection` only (`interactive-mode.ts:372-384`).
 pub(super) const WHEEL_SCROLL_LINES: i32 = 1;
 
+/// How many times faster a notch scrolls while Alt is held — pi's `ALT_WHEEL_SCROLL_MULTIPLIER`
+/// (`tui-alt-screen.ts:75` @v0.87.1, #9166).
+const ALT_WHEEL_SCROLL_MULTIPLIER: i32 = 5;
+
+/// Lines per notch for a report carrying `modifiers` — pi's `getWheelScrollLines(button)`
+/// (`tui-alt-screen.ts:970-973` @v0.87.1), which tests bit 3 (value 8) of the SGR/X10 button code.
+/// crossterm decodes that same bit into [`KeyModifiers::ALT`] on the event it hands cyrup
+/// (`crossterm-0.29.0/src/event/sys/unix/parse.rs:802-803`).
+fn wheel_scroll_lines(modifiers: KeyModifiers) -> i32 {
+    if modifiers.contains(KeyModifiers::ALT) {
+        WHEEL_SCROLL_LINES * ALT_WHEEL_SCROLL_MULTIPLIER
+    } else {
+        WHEEL_SCROLL_LINES
+    }
+}
+
 /// The signed line count a wheel event requests, or `None` when the event is not a vertical
 /// notch — pi's `direction` (`tui-alt-screen.ts:653-656`), already multiplied by
-/// [`WHEEL_SCROLL_LINES`] as `routeWheel` does on its first line (`:676`).
+/// [`wheel_scroll_lines`] as `routeWheel` does on its first line (`:976` @v0.87.1).
 ///
 /// Negative is **up**, matching [`crate::ViewportRenderer::scroll_by`] and pi's
 /// `direction === 0 ? -1 : 1` for the wheel-up button (`:656`, `:667`).
@@ -71,10 +87,11 @@ pub(super) const WHEEL_SCROLL_LINES: i32 = 1;
 /// upstream's `if (direction !== 0 && direction !== 1) return undefined` (`:654`, `:665`): a
 /// horizontal notch is not a scroll here, and returning `None` is what lets [`route`] report the
 /// event as unconsumed so the caller can offer it to the handlers that follow.
-fn notch(kind: MouseEventKind) -> Option<i32> {
+fn notch(kind: MouseEventKind, modifiers: KeyModifiers) -> Option<i32> {
+    let lines = wheel_scroll_lines(modifiers);
     match kind {
-        MouseEventKind::ScrollUp => Some(-WHEEL_SCROLL_LINES),
-        MouseEventKind::ScrollDown => Some(WHEEL_SCROLL_LINES),
+        MouseEventKind::ScrollUp => Some(-lines),
+        MouseEventKind::ScrollDown => Some(lines),
         MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight
         | MouseEventKind::Down(_)
@@ -106,7 +123,7 @@ fn notch(kind: MouseEventKind) -> Option<i32> {
 /// unconditionally here would flash a bar up for a wheel the document cannot honour, which pi does
 /// not do.
 pub(super) fn route(scroll: &mut ScrollState, viewport: Rect, ev: &MouseEvent) -> bool {
-    let Some(lines) = notch(ev.kind) else {
+    let Some(lines) = notch(ev.kind, ev.modifiers) else {
         return false;
     };
     // `getScrollViewsAt(this.currentLayout, event.x, event.y)` (`:678`) reduced to cyrup's one

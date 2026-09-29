@@ -110,9 +110,19 @@ struct CatalogSpec {
     /// provider's sub-record belongs in this catalog (`image-models.generated.ts`, PROV-065).
     /// `None` when it binds a flat `id -> Model` record, which is every `<p>.models.ts`.
     images_provider: Option<&'static str>,
+    /// `Some(rev)` when this catalog is read at its OWN pinned revision rather than `--rev`
+    /// (PROV-089). Only a module that is still a data literal after `a9f6a3159` can carry one:
+    /// `image-models.generated.ts` stayed tracked through `v0.87.1`, so its rows are recoverable
+    /// from a revision 29 tags newer than [`DEFAULT_REV`], where every `*.models.ts` is not.
+    rev: Option<&'static str>,
 }
 
-/// The catalogs still recovered from the pinned revision with `git show` — **one**, and it is not
+/// The revision `image-models.generated.ts` is read at (PROV-089): the ledger's pinned pi tag, and
+/// the last one that tracks the file — post-tag `a328aa89a` deletes it and moves the rows into the
+/// gitignored `providers/data/openrouter.json`, after which no revision can yield newer image rows.
+const IMAGES_REV: &str = "v0.87.1";
+
+/// The catalogs still recovered from a pinned revision with `git show` — **one**, and it is not
 /// a provider module.
 ///
 /// [`LIVE_CATALOGS`] below carries the other 38. PROV-071: pi's `*.models.ts` modules stopped
@@ -125,12 +135,13 @@ struct CatalogSpec {
 /// `openrouter-images` is the exception because it is **not** a provider module: its rows are the
 /// `openrouter` sub-record of `packages/ai/src/image-models.generated.ts`, which is still a data
 /// literal in git, and `pi.dev/api/models/providers/openrouter-images` is a 404 — there is no live
-/// endpoint to move it to (PROV-065; PROV-089 tracks its own staleness, which is measurable
-/// against git precisely because this path still works for it).
+/// endpoint to move it to (PROV-065). It is read at [`IMAGES_REV`] rather than `--rev` (PROV-089):
+/// the newest revision that still tracks the file, so its rows are as fresh as git can make them.
 const CATALOGS: &[CatalogSpec] = &[CatalogSpec {
     file: "openrouter-images",
     module: "image-models.generated.ts",
     images_provider: Some("openrouter"),
+    rev: Some(IMAGES_REV),
 }];
 
 /// Every catalog whose rows are fetched LIVE, because the pinned-revision path cannot reach them.
@@ -227,6 +238,11 @@ impl CatalogSpec {
     /// nobody can trust.
     fn module_path(&self) -> String {
         self.module.to_string()
+    }
+
+    /// The revision this catalog's rows are read at: its own pin, else the run's `--rev`.
+    fn rev<'a>(&'a self, run_rev: &'a str) -> &'a str {
+        self.rev.unwrap_or(run_rev)
     }
 }
 
@@ -576,7 +592,10 @@ fn check_converged_from(
             }
             (Expect::Carries { key, value }, Some(row)) => {
                 let expected = tsdata::parse_json(value).map_err(|e| {
-                    format!("{catalog}: CONVERGED value for {}.{key} is not JSON: {e}", entry.model)
+                    format!(
+                        "{catalog}: CONVERGED value for {}.{key} is not JSON: {e}",
+                        entry.model
+                    )
                 })?;
                 let actual = row.get(key).ok_or_else(|| {
                     format!(
@@ -854,11 +873,12 @@ fn run_gen_catalogs() -> Result<(), String> {
             let fetched = generated.len().saturating_sub(CATALOGS.len() + 1);
             println!(
                 "gen-catalogs --check: all {} file(s) compared reproduce — {fetched} live from \
-                 {}<id>, {} from pi@{}{}",
+                 {}<id>, {} from pi@{}{}{}",
                 generated.len(),
                 live_catalog::LIVE_CATALOG_ENDPOINT,
                 CATALOGS.len(),
                 args.rev,
+                own_rev_summary(&args.rev),
                 if fetched == LIVE_CATALOGS.len() {
                     String::new()
                 } else {
@@ -881,11 +901,12 @@ fn run_gen_catalogs() -> Result<(), String> {
     }
 
     println!(
-        "gen-catalogs: wrote {} of {} files — {} from pi@{}, {} live from {}<id>",
+        "gen-catalogs: wrote {} of {} files — {} from pi@{}{}, {} live from {}<id>",
         differing.len(),
         generated.len(),
         CATALOGS.len(),
         args.rev,
+        own_rev_summary(&args.rev),
         LIVE_CATALOGS.len(),
         live_catalog::LIVE_CATALOG_ENDPOINT
     );
@@ -893,6 +914,21 @@ fn run_gen_catalogs() -> Result<(), String> {
         println!("  updated {name}");
     }
     Ok(())
+}
+
+/// `" (openrouter-images at pi@v0.87.1)"` for every catalog read at its own pin, so a run's summary
+/// never names one revision for rows that came from two.
+fn own_rev_summary(run_rev: &str) -> String {
+    let pinned: Vec<String> = CATALOGS
+        .iter()
+        .filter(|c| c.rev.is_some())
+        .map(|c| format!("{} at pi@{}", c.file, c.rev(run_rev)))
+        .collect();
+    if pinned.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", pinned.join(", "))
+    }
 }
 
 // -------------------------------------------------------------------------- the provider roster --
@@ -1071,7 +1107,7 @@ fn generate_all(
     for spec in CATALOGS {
         let src = git_show(
             &args.pi,
-            &args.rev,
+            spec.rev(&args.rev),
             &format!("packages/ai/src/{}", spec.module_path()),
         )?;
         let rows = extract_rows(spec, &src)?;
@@ -1253,16 +1289,18 @@ fn manifest_json(
          `cargo run -p xtask -- gen-catalogs`. {live_count} of them — every provider catalog — are \
          fetched LIVE from {endpoint}<id>, the same endpoint the runtime overlay reads \
          (cyrup-provider/src/remote_catalog.rs), and each carries its own fetchedAt/revision under \
-         `catalogs` below. {pinned_count} (openrouter-images) still comes from the pinned pi \
-         revision {source} ({generated_at}), which is what top-level `generatedAt` and `source` \
-         describe. PROV-071: the pinned path is DEAD for provider modules and always was — every \
+         `catalogs` below. {pinned_count} (openrouter-images) is read at its OWN pinned revision, \
+         pi@{IMAGES_REV}, named by its `catalogs` entry (PROV-089), and neither `generatedAt` nor \
+         any `fetchedAt` is a floor for it because the pi.dev overlay never serves image rows. \
+         Top-level `generatedAt` and `source` ({source}, {generated_at}) therefore describe no \
+         embedded catalog's rows any more; they remain the global overlay floor described below. \
+         PROV-071: the pinned path is DEAD for provider modules and always was — every \
          packages/ai/src/providers/<p>.models.ts has been a re-export of gitignored, \
          network-generated JSON since a9f6a3159 (b0c2a90e's direct child), so no revision can \
          yield newer rows for any of them; b0c2a90e was never a chosen pin, only the last \
          revision that answered. openrouter-images is not a provider module — its rows are the \
          openrouter sub-record of packages/ai/src/image-models.generated.ts, still a data literal \
-         in git, and {endpoint}openrouter-images is a 404 (PROV-065; PROV-089 owns its \
-         staleness). `catalogs` records the per-provider source so the split is machine-checkable \
+         in git, and {endpoint}openrouter-images is a 404 (PROV-065). `catalogs` records the per-provider source so the split is machine-checkable \
          rather than prose (PROV-060). Per-provider `fetchedAt` is the staleness floor for that \
          provider's pi.dev overlay and takes precedence over the global `generatedAt`; the global \
          value remains the floor for any catalog without one and must not be moved to follow a \
@@ -1291,7 +1329,10 @@ fn manifest_json(
         catalogs.push((
             spec.file.to_string(),
             Val::Obj(vec![
-                ("source".to_string(), Val::Str(source.clone())),
+                (
+                    "source".to_string(),
+                    Val::Str(format!("pi@{}", spec.rev(&args.rev))),
+                ),
                 (
                     "module".to_string(),
                     Val::Str(format!("packages/ai/src/{}", spec.module_path())),
@@ -1675,6 +1716,16 @@ mod tests {
             CATALOGS.iter().all(|c| c.images_provider.is_some()),
             "a provider module is back on the pinned path, where no revision can yield newer rows"
         );
+        // PROV-089: the images module is read at its own pin, whatever `--rev` says, and it is
+        // the only catalog that carries one.
+        assert_eq!(img.rev("b0c2a90e"), "v0.87.1");
+        assert_eq!(img.rev("some-other-rev"), "v0.87.1");
+        let own: Vec<&str> = CATALOGS
+            .iter()
+            .filter(|c| c.rev.is_some())
+            .map(|c| c.file)
+            .collect();
+        assert_eq!(own, vec!["openrouter-images"]);
     }
 
     /// The `Drop` and `Set` fixtures these guard tests run against.

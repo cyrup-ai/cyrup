@@ -3,21 +3,13 @@ use cyrup_config::AppMode;
 use super::*;
 
 #[test]
-fn mode_flag_and_aliases_take_precedence_over_tty() {
+fn mode_flag_takes_precedence_over_tty() {
     assert_eq!(
         resolve_app_mode(&parse(&["--mode", "rpc"]), true, true),
         AppMode::Rpc
     );
     assert_eq!(
-        resolve_app_mode(&parse(&["--rpc"]), true, true),
-        AppMode::Rpc
-    );
-    assert_eq!(
         resolve_app_mode(&parse(&["--mode", "json"]), true, true),
-        AppMode::Json
-    );
-    assert_eq!(
-        resolve_app_mode(&parse(&["--json"]), true, true),
         AppMode::Json
     );
     assert_eq!(
@@ -46,22 +38,22 @@ fn acp_wins_over_the_non_tty_print_fallback() {
         );
         assert_eq!(resolve_app_mode(&cli, true, true), AppMode::Acp, "{argv:?}");
     }
-    // ACP-002 — the ACP branch is FIRST, so it also wins over an explicitly-passed sibling alias.
+    // ACP-002 — the ACP branch is FIRST, so it also wins over an explicitly-passed sibling mode.
     assert_eq!(
-        resolve_app_mode(&parse(&["--acp", "--rpc"]), false, false),
+        resolve_app_mode(&parse(&["--acp", "--mode", "rpc"]), false, false),
         AppMode::Acp
     );
     assert_eq!(
-        resolve_app_mode(&parse(&["--acp", "--json", "-p"]), false, false),
+        resolve_app_mode(&parse(&["--acp", "--mode", "json", "-p"]), false, false),
         AppMode::Acp
     );
     // The other four modes are byte-identical to what they were before the variant existed.
     assert_eq!(
-        resolve_app_mode(&parse(&["--rpc"]), false, false),
+        resolve_app_mode(&parse(&["--mode", "rpc"]), false, false),
         AppMode::Rpc
     );
     assert_eq!(
-        resolve_app_mode(&parse(&["--json"]), false, false),
+        resolve_app_mode(&parse(&["--mode", "json"]), false, false),
         AppMode::Json
     );
     assert_eq!(resolve_app_mode(&parse(&[]), false, false), AppMode::Print);
@@ -98,10 +90,60 @@ fn stdout_takeover_decision_matches_pi() {
         &parse(&["-p", "hi"]),
         AppMode::Print
     ));
-    assert!(should_take_over_stdout(&parse(&["--json"]), AppMode::Json));
+    assert!(should_take_over_stdout(
+        &parse(&["--mode", "json"]),
+        AppMode::Json
+    ));
     assert!(!should_take_over_stdout(
         &parse(&["--help"]),
         AppMode::Print
     ));
     assert!(!should_take_over_stdout(&parse(&[]), AppMode::Interactive));
+}
+
+/// SEAM-057 — `--json`, `--rpc` and `--output-format` are not pi flags (pi `parseArgs` has no arm
+/// for any of them, `cli/args.ts` @v0.87.1), so they take pi's unknown-long-flag arm: captured as
+/// extension flags, never changing the mode. An extension that registers `json` receives it; with
+/// none, the runtime's reconciliation reports `Unknown option` and exits 1, exactly as pi does.
+#[test]
+fn the_removed_mode_aliases_are_extension_flags_as_in_pi() {
+    let json = parse_like_main(&["--json", "hello"]);
+    assert_eq!(
+        json.extension_flags,
+        vec![ExtensionFlag {
+            name: "json".into(),
+            value: ExtFlagValue::Str("hello".into()),
+        }],
+        "pi's capture takes the next non-flag token as the value (args.ts:226-240)"
+    );
+    assert_eq!(resolve_app_mode(&json, true, true), AppMode::Interactive);
+
+    let rpc = parse_like_main(&["--rpc"]);
+    assert_eq!(
+        rpc.extension_flags,
+        vec![ExtensionFlag {
+            name: "rpc".into(),
+            value: ExtFlagValue::Bool(true),
+        }]
+    );
+    assert_eq!(resolve_app_mode(&rpc, true, true), AppMode::Interactive);
+
+    let fmt = parse_like_main(&["--output-format", "json"]);
+    assert_eq!(
+        fmt.extension_flags,
+        vec![ExtensionFlag {
+            name: "output-format".into(),
+            value: ExtFlagValue::Str("json".into()),
+        }]
+    );
+    assert_eq!(resolve_app_mode(&fmt, false, false), AppMode::Print);
+}
+
+/// MIRROR: `--acp` is the one cyrup-only mode flag kept (its CYRUP-DELTA names the ACP clients'
+/// `"args": ["--acp"]` launch contract), so it still reaches clap and selects the ACP host.
+#[test]
+fn acp_is_still_a_known_flag() {
+    let cli = parse_like_main(&["--acp"]);
+    assert!(cli.extension_flags.is_empty(), "{:?}", cli.extension_flags);
+    assert_eq!(resolve_app_mode(&cli, false, false), AppMode::Acp);
 }

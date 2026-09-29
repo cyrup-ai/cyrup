@@ -112,7 +112,8 @@ the fork picker instead, or `none` to disable it.
 so it will not surprise you mid-sentence.
 
 `Ctrl+C` clears the buffer. A second `Ctrl+C` within 500ms quits, whether the buffer is empty or
-not. `Ctrl+Z` suspends cyrup to the background like any other job.
+not. `Ctrl+Z` suspends cyrup to the background like any other job; native Windows has no job
+control, so there it is unbound.
 
 ## Editing
 
@@ -192,7 +193,7 @@ popup instead. Directories complete without a trailing space so you can keep dri
 
 ### Pasting an image
 
-`Ctrl+V` (or `Alt+V`) with an image on the clipboard writes it to a temp `.png` and inserts **the
+`Ctrl+V` (`Alt+V` on Windows and WSL) with an image on the clipboard writes it to a temp `.png` and inserts **the
 file path as text** at your cursor. The image itself is not attached to the message, so nothing
 enters context until the agent decides to read that file. If the clipboard holds text rather than
 an image, `Ctrl+V` pastes it normally.

@@ -159,7 +159,7 @@ pub struct AgentPromptWaitOptions {
 
 /// `AgentPromptParams` (`tmp/herdr/src/api/schema/agents.rs:178-184`) — submit `text` to a
 /// managed agent. With [`Self::wait`] this is one of herdr's in-band waits: it answers once, after
-/// the agent settles (`tmp/herdr/src/api/server.rs:251-288`).
+/// the agent settles (`tmp/herdr/src/api/server.rs:238-275`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentPromptParams {
     /// A terminal id, pane id or agent name.

@@ -275,14 +275,22 @@ fn export_to_html_passes_the_live_session_state_to_the_renderer() {
     let offset = TRANSCRIPT_SRC
         .find("pub async fn export_to_html")
         .expect("transcript.rs must still define `export_to_html`");
+    assert!(
+        TRANSCRIPT_SRC[offset..].contains("self.export_html_document().await"),
+        "`export_to_html` must render through `export_html_document`"
+    );
+    // `export_html_document` is the one document builder `/export` and `/share` share too.
+    let offset = TRANSCRIPT_SRC
+        .find("pub async fn export_html_document")
+        .expect("transcript.rs must still define `export_html_document`");
     let body = &TRANSCRIPT_SRC[offset..];
     let call = body
         .find("session_jsonl_to_html_with_theme(")
-        .expect("`export_to_html` must still render through the pure renderer");
+        .expect("`export_html_document` must still render through the pure renderer");
     let call_args = &body[call..(call + 200).min(body.len())];
     assert!(
         call_args.contains("self.export_state()"),
-        "`export_to_html` must pass `self.export_state()` to the renderer — pi passes \
+        "`export_html_document` must pass `self.export_state()` to the renderer — pi passes \
          `sm.getLeafId()` AND `this.state` (`core/export-html/index.ts:263-270`, \
          `agent-session.ts:3439` @v0.84.4). Re-deriving the leaf from the JSONL names an abandoned \
          branch after a `/tree` switch (DRIFT-041), and dropping the state loses the System Prompt \

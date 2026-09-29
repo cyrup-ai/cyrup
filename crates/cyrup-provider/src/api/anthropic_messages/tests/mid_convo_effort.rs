@@ -109,6 +109,7 @@ fn assistant(model: &Model, provider: &str, level: Option<&str>) -> Message {
         response_model: None,
         response_id: None,
         provider_thinking_level: level.map(str::to_string),
+        end_turn: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,

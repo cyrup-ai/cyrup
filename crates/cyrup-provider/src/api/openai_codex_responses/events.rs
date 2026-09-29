@@ -1,8 +1,12 @@
 //! Codex → Responses event mapping (pi :721-757).
 
 use super::{CODEX_RESPONSE_STATUSES, FrameStream};
+use crate::api::EventSink;
+use crate::api::openai_responses::{EndTurnCell, decode_stream_with_end_turn};
 use crate::error::ProviderError;
+use crate::model::Model;
 use crate::stream::sse::SseFrame;
+use cyrup_core::ApiId;
 use futures::StreamExt;
 use serde_json::{Value, json};
 
@@ -133,6 +137,22 @@ struct MapState {
     inner: FrameStream,
     done: bool,
     request_service_tier: Option<String>,
+    end_turn: EndTurnCell,
+}
+
+/// pi's Codex decode: `processResponsesStream(mapCodexEvents(parseSSE(response)), output, …)`
+/// (`openai-codex-responses.ts:664-669` @v0.87.1) — the mapped frames into the SHARED Responses
+/// decoder, with the `end_turn` cell the mapper fills handed to it (DRIFT-059).
+pub(super) async fn decode_codex_stream(
+    frames: FrameStream,
+    request_service_tier: Option<String>,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+) {
+    let end_turn = EndTurnCell::default();
+    let mapped = map_codex_frames(frames, request_service_tier, end_turn.clone());
+    decode_stream_with_end_turn(mapped, model, api, sink, Some(end_turn)).await;
 }
 
 /// Apply [`map_codex_event`] across an SSE frame stream (pi's `mapCodexEvents` generator wrapped
@@ -147,14 +167,20 @@ struct MapState {
 /// [`ProviderError::Decode`], whose `Display` prefixes `"decode error: "`, because emitting an
 /// unprefixed terminal from inside the *shared* decoder would mean changing
 /// `openai_responses::decode_stream`. The message body is upstream's exact text.
-pub(super) fn map_codex_frames(
+///
+/// `end_turn` receives the terminal's `response.end_turn` when it is a boolean (pi `if (typeof
+/// response?.end_turn === "boolean") output.endTurn = response.end_turn`, `:749-752`), BEFORE the
+/// terminal frame is yielded, so the decoder's terminal message carries it.
+fn map_codex_frames(
     frames: FrameStream,
     request_service_tier: Option<String>,
+    end_turn: EndTurnCell,
 ) -> FrameStream {
     let state = MapState {
         inner: frames,
         done: false,
         request_service_tier,
+        end_turn,
     };
     Box::pin(futures::stream::unfold(state, |mut state| async move {
         if state.done {
@@ -203,6 +229,11 @@ pub(super) fn map_codex_frames(
                 }
                 MappedCodexEvent::Terminal(value) => {
                     state.done = true;
+                    if let Some(end_turn) =
+                        value.pointer("/response/end_turn").and_then(Value::as_bool)
+                    {
+                        let _ = state.end_turn.set(end_turn);
+                    }
                     return Some((Ok(reframe(&frame, &value)), state));
                 }
             }

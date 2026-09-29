@@ -277,6 +277,7 @@ mod tests {
             deferred: None,
             error_message: None,
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: 0,
         })
     }
@@ -428,6 +429,7 @@ mod tests {
                 deferred: None,
                 error_message: None,
                 raw_stop_reason: None,
+                end_turn: None,
                 timestamp: 0,
             };
             sink.send(StreamEvent::terminal(msg)).await;
@@ -617,6 +619,7 @@ mod tests {
                 deferred: None,
                 error_message: None,
                 raw_stop_reason: None,
+                end_turn: None,
                 timestamp: 0,
             };
             sink.send(StreamEvent::terminal(msg)).await;

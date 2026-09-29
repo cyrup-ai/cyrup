@@ -127,6 +127,7 @@ fn step_process_terminal_proof(
                 .reason()
                 .unwrap_or(ProcessTerminalReason::WriterCloseUnverified),
             diagnostic: None,
+            instances: Vec::new(),
         },
         ProcessTerminalState::Pending => ProcessTerminal::Pending { base },
         ProcessTerminalState::NotStarted => ProcessTerminal::NotStarted { base },
@@ -307,8 +308,9 @@ pub async fn finalize_process_terminal_with(
     let expectation = ProofExpectation::new(run_id, &close.process_instance_id);
     // pi `:248-252` — an existing answer wins. An `observed` proof for THIS run and THIS runner is
     // returned verbatim; so is ANY `unknown` proof, because re-running the ladder over the same
-    // inputs cannot produce a better answer and would double-emit the lifecycle event. A `pending`
-    // proof (the one `initialize_process_terminal` wrote) deliberately does NOT short-circuit.
+    // inputs cannot produce a better answer and would double-emit the lifecycle event — it at
+    // most gains the observed runner exit (below). A `pending` proof (the one
+    // `initialize_process_terminal` wrote) deliberately does NOT short-circuit.
     if let Some(existing) = read_process_terminal(run_dir, expectation).await
         && tokio::fs::try_exists(run_dir.process_terminal())
             .await
@@ -321,13 +323,30 @@ pub async fn finalize_process_terminal_with(
             {
                 return existing;
             }
-            ProcessTerminal::Unknown { .. } => return existing,
+            // SUBA-141 — pi `:160-170` @v0.71.0 (`2e280687`): a sticky `unknown` proof keeps its
+            // reason, and only gains the observed runner exit. One that already carries an exit,
+            // or that records a proof it could not write, is returned untouched.
+            ProcessTerminal::Unknown {
+                reason, instances, ..
+            } => {
+                if !instances.is_empty() || *reason == ProcessTerminalReason::ProofWriteFailed {
+                    return existing;
+                }
+                let with_exit = with_runner_exit(existing.clone(), close);
+                return match write_atomic_json(&run_dir.process_terminal(), &with_exit).await {
+                    Ok(()) => with_exit,
+                    Err(_) => existing,
+                };
+            }
             _ => {}
         }
     }
 
     let (proof, candidate_for_overlay) =
         build_proof(run_dir, run_id, close, lease_root, probe).await;
+    // SUBA-141 — pi `:218-219` @v0.71.0: an unverified process tree still has a directly observed
+    // runner exit, kept for failure reports.
+    let proof = with_runner_exit(proof, close);
 
     // pi `:299-309` — durability first, and NOTHING else happens without it.
     let mut durable = false;
@@ -358,6 +377,31 @@ pub async fn finalize_process_terminal_with(
             ProcessTerminalReason::ProofWriteFailed,
             Some("Failed to persist process-terminal proof.".to_string()),
         )
+    }
+}
+
+/// SUBA-141 — attach the observed runner close to an `unknown` proof as its one runner instance
+/// (pi `{ ...proof, instances: [{ kind: "runner", ...runnerClose }] }`). Every other state is
+/// returned as it is.
+fn with_runner_exit(proof: ProcessTerminal, close: &RunnerCloseObservation) -> ProcessTerminal {
+    match proof {
+        ProcessTerminal::Unknown {
+            base,
+            reason,
+            diagnostic,
+            ..
+        } => ProcessTerminal::Unknown {
+            base,
+            reason,
+            diagnostic,
+            instances: vec![ProcessInstanceExit::Runner {
+                process_instance_id: close.process_instance_id.clone(),
+                close_observed_at: close.close_observed_at,
+                exit_code: close.exit_code,
+                signal: close.signal.clone(),
+            }],
+        },
+        other => other,
     }
 }
 

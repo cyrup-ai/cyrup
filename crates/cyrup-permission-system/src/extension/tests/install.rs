@@ -303,7 +303,11 @@ fn the_install_flag_is_additive_only_and_can_never_disable_a_real_policy() {
     //     assertion that pins "additive only"; (b) alone would still pass a gating implementation.
     let policy_dir = policy_agent_dir(&agent_dir);
     std::fs::create_dir_all(&policy_dir).unwrap();
-    std::fs::write(policy_dir.join(POLICY_FILE), r#"{ "bash": { "*": "deny" } }"#).unwrap();
+    std::fs::write(
+        policy_dir.join(POLICY_FILE),
+        r#"{ "bash": { "*": "deny" } }"#,
+    )
+    .unwrap();
     for value in ["", "0", "false", "off", "no", "maybe", "1", "true"] {
         let _pin = crate::envx::pin(crate::extension::INSTALL_ENV_VAR, Some(value));
         assert!(

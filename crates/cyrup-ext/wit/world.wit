@@ -1,11 +1,11 @@
-// cyrup:ext@0.11.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.12.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
 // lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
 // values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
 //
-// The `events` interface exports 35 `on-*` hooks. THIRTY-THREE of them mirror pi's `pi.on(...)`
+// The `events` interface exports 38 `on-*` hooks. THIRTY-THREE of them mirror pi's `pi.on(...)`
 // catalog one-for-one (`extensions/types.ts:1190-1231` @v0.83.0 — 33 `on(event: "…")` overloads,
 // hand re-derived; the range `:1198-1239` this header used to cite corresponds to NO upstream
 // version and was fabricated, EXT-036). `before_provider_headers` (EXT-009, upstream `:1212`) and
@@ -20,7 +20,9 @@
 // `ReadonlyFooterDataProvider.onBranchChange(callback)` (`core/footer-data-provider.ts:139-143`
 // @v0.87.1), a closure subscription upstream hands the `setFooter` factory, paired here with the
 // `ui.subscribe-branch-change` import (EXT-064). Count the `on-*` lines, not the pi events: the two
-// numbers are 35 and 33.
+// numbers are 35 and 33. Three more mirror events pi added AFTER that tag and cyrup ported in the
+// 0.11 -> 0.12 batch below: `ui_prompt_start`/`ui_prompt_end` (v0.84.4) and `context_with_system`
+// (v0.87.0) — so 38 `on-*` exports against 36 pi events at v0.87.1.
 // The host calls only the exports a guest subscribed to (the subscription gate, R-08-034).
 //
 // VERSIONING (EXT-028): this package version and `cyrup_ext::HOST_WORLD` move TOGETHER, and ANY
@@ -83,7 +85,21 @@
 // its two closure-shaped arguments (`onData`, `signal`) come back over the new `host-bash`
 // interface. DRIFT-004. The `registration.register-bash-operations` and `host-bash.*` IMPORTS are
 // additive and would not have forced a bump on their own (see the paragraph above).
-package cyrup:ext@0.11.0;
+//
+// 0.10 -> 0.11 is the extension-CHROME batch (EXT-064), and it hits both directions of the gate:
+// `ui.set-header` / `ui.set-footer` are RE-SIGNED to `option<string>` (so a guest can set an EMPTY
+// custom footer without it meaning "restore the built-in"), and `events.on-branch-change` is a NEW
+// export, arriving with the additive `ui.subscribe-branch-change` / `ui.unsubscribe-branch-change`
+// imports. A 0.10 guest has the old setter signatures and no such export, so it takes the bump.
+//
+// 0.11 -> 0.12 is the post-baseline EVENT batch, an EXPORT addition: `events.on-ui-prompt-start`
+// and `events.on-ui-prompt-end` (EXT-075; pi `UIPromptStartEvent`/`UIPromptEndEvent`,
+// `core/extensions/types.ts:830-845` @v0.87.1) and `events.on-context-with-system` (EXT-079; pi
+// `ContextWithSystemEvent`, `:708-711`) are NEW, so a 0.11 guest exports nothing under those names
+// and `check_world` refuses it rather than letting it die in wasmtime. The same batch ADDS the
+// `registration.unsubscribe` import (EXT-080; the remover pi's `on()` has returned since v0.86.0),
+// which is additive and would not have forced a bump on its own.
+package cyrup:ext@0.12.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -208,7 +224,8 @@ interface types {
 // `on-terminal-input` — the `ExtensionUIContext.onTerminalInput` closure
 // (`extensions/types.ts:145`) — and `on-branch-change` — the `ReadonlyFooterDataProvider`'s
 // `onBranchChange(callback)` (`core/footer-data-provider.ts:139-143` @v0.87.1), EXT-064. That is
-// 35 `on-*` exports against 33 pi events. EXT-036: this line used to claim "All 30" against a range that
+// 35 `on-*` exports against 33 pi events; the three post-baseline events (header, 0.11 -> 0.12)
+// make it 38 against 36. EXT-036: this line used to claim "All 30" against a range that
 // matches no upstream version, contradicting the file's own header 81 lines above — and the count
 // test only ties the header's number, so the disagreement passed straight through an audit that
 // quoted it.
@@ -426,6 +443,13 @@ interface events {
   // context [mutate] (subscribed at types.ts:1207 @v0.83.0), message_end [mutate] (:1222),
   // before_agent_start [mutate] (:1214). EXT-073: `:1143`/`:1144`/`:1135` were the fabricated band.
   on-context:            func(messages-json: string) -> hook-outcome;
+  // context_with_system [mutate] (pi `ContextWithSystemEvent`, `core/extensions/types.ts:708-711`
+  // @v0.87.1, `on(event: "context_with_system")` at `:1382`; EXT-079): runs after EVERY `context`
+  // handler, on the transcript as the `context` chain left it, and its result is sent as returned.
+  // Upstream that transcript carries the system messages (the prompt and the tool declarations) and
+  // the handler owns them; cyrup's transcript has no system messages yet (AGENT-039), so today the
+  // payload is the same message list a `context` handler sees.
+  on-context-with-system: func(messages-json: string) -> hook-outcome;
   on-message-end:        func(message-json: string) -> hook-outcome;
   on-before-agent-start: func(prompt: string, images-json: string, system-prompt: string, options-json: string) -> hook-outcome;
 
@@ -515,6 +539,14 @@ interface events {
   // name. Undefined when the name is cleared" —
   // hence `option<string>`, where `none` is upstream's `undefined` (EXT-011).
   on-session-info-changed:  func(name: option<string>);
+  // ui_prompt_start / ui_prompt_end (pi `UIPromptStartEvent` / `UIPromptEndEvent`,
+  // `core/extensions/types.ts:830-845` @v0.87.1, `on(event: "ui_prompt_start")` / `"ui_prompt_end"`
+  // at `:1404-1405`; EXT-075): an extension's blocking UI prompt opened / closed. `kind` is pi's
+  // `UIPromptKind` ("select"|"confirm"|"input"|"editor"|"custom"); `title` is absent for `custom`
+  // and for an empty title, as upstream's `...(title ? { title } : {})`. pi's constant
+  // `reason: "ui_prompt"` does not cross.
+  on-ui-prompt-start:       func(kind: string, title: option<string>);
+  on-ui-prompt-end:         func(kind: string, title: option<string>);
   // resources_discover (pi `ResourcesDiscoverEvent`, extensions/types.ts:544-548 @v0.83.0):
   // `{type, cwd, reason: "startup" | "reload"}` (EXT-016).
   on-resources-discover:    func(cwd: string, reason: string) -> hook-outcome;   // provide skill/prompt/theme paths
@@ -647,6 +679,11 @@ interface registration {
   add-autocomplete:          func(command: string);
   // declares the subscription bitset: which §5 event kinds this guest handles.
   subscribe:                 func(event-kinds: list<u8>);
+  // EXT-080 — the remover pi's `on(event, handler)` has returned since v0.86.0
+  // (`core/extensions/loader.ts:256-271` @v0.87.1): clears these kinds from this guest's bitset.
+  // Like upstream, a removal made DURING a dispatch applies to later dispatches — the dispatcher
+  // snapshots its subscribers before calling any of them. Idempotent.
+  unsubscribe:               func(event-kinds: list<u8>);
 }
 
 // ---------------------------------------------------------------------------

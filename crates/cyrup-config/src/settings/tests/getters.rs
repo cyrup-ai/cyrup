@@ -40,7 +40,7 @@ fn typed_accessors_defaults() {
     assert_eq!(s.steering_mode(), "one-at-a-time");
     assert_eq!(s.transport(), "auto");
     assert!(s.compaction_enabled());
-    assert_eq!(s.compaction_reserve_tokens(), 16384);
+    assert_eq!(s.compaction_reserve_tokens(None).unwrap(), 16384);
     assert_eq!(s.retry_max_retries(), 3);
     assert_eq!(s.provider_max_retry_delay_ms(), 60000);
     assert_eq!(s.http_idle_timeout_ms().unwrap(), 300_000);
@@ -539,7 +539,7 @@ fn compaction_and_retry_combined_getters() {
     // settings-manager.ts:776-782 (getCompactionSettings), :808-814 (getRetrySettings).
     let s = EffectiveSettings::from_settings(Settings::default());
     assert_eq!(
-        s.compaction_settings(),
+        s.compaction_settings(None).unwrap(),
         CompactionSettings {
             enabled: true,
             reserve_tokens: 16384,
@@ -551,7 +551,8 @@ fn compaction_and_retry_combined_getters() {
         RetrySettings {
             enabled: true,
             max_retries: 3,
-            base_delay_ms: 2000
+            base_delay_ms: 2000,
+            max_agent_delay_ms: 60000
         }
     );
 
@@ -559,13 +560,13 @@ fn compaction_and_retry_combined_getters() {
         Settings::parse(
             r#"{
                 "compaction": { "enabled": false, "reserveTokens": 100, "keepRecentTokens": 200 },
-                "retry": { "enabled": false, "maxRetries": 9, "baseDelayMs": 500 }
+                "retry": { "enabled": false, "maxRetries": 9, "baseDelayMs": 500, "maxAgentDelayMs": 5000 }
             }"#,
         )
         .unwrap(),
     );
     assert_eq!(
-        s.compaction_settings(),
+        s.compaction_settings(None).unwrap(),
         CompactionSettings {
             enabled: false,
             reserve_tokens: 100,
@@ -577,7 +578,8 @@ fn compaction_and_retry_combined_getters() {
         RetrySettings {
             enabled: false,
             max_retries: 9,
-            base_delay_ms: 500
+            base_delay_ms: 500,
+            max_agent_delay_ms: 5000
         }
     );
 }
@@ -660,4 +662,135 @@ fn a_package_entry_carries_its_autoload_flag() {
     // Serializing back preserves the key (settings documents round-trip, R-07-004).
     let json = serde_json::to_string(&pkgs).unwrap();
     assert!(json.contains(r#""autoload":false"#), "{json}");
+}
+
+/// CFG-082 / SESS-055 — `compaction.modelOverrides` (Pi `getCompactionTokenSetting`,
+/// `settings-manager.ts:859-893` @v0.87.1): the exact `"provider/modelId"` entry wins over the
+/// ordinary value, which wins over the default, per field.
+#[test]
+fn compaction_model_overrides_resolve_per_model_and_per_field() {
+    let s = EffectiveSettings::from_settings(
+        Settings::parse(
+            r#"{"compaction":{"reserveTokens":16384,"modelOverrides":{
+                "anthropic/claude-opus-5-5":{"reserveTokens":4096},
+                "openai/gpt-x":{"keepRecentTokens":1000.0}
+            }}}"#,
+        )
+        .unwrap(),
+    );
+    let opus = s
+        .compaction_settings(Some(("anthropic", "claude-opus-5-5")))
+        .unwrap();
+    assert_eq!(
+        (opus.reserve_tokens, opus.keep_recent_tokens),
+        (4096, 20000)
+    );
+    let gpt = s.compaction_settings(Some(("openai", "gpt-x"))).unwrap();
+    assert_eq!((gpt.reserve_tokens, gpt.keep_recent_tokens), (16384, 1000));
+    // The key is exact: another model, the provider alone, and no model all get the global value.
+    for model in [
+        Some(("anthropic", "claude-opus-5")),
+        Some(("anthropic", "")),
+        None,
+    ] {
+        assert_eq!(
+            s.compaction_reserve_tokens(model).unwrap(),
+            16384,
+            "{model:?}"
+        );
+    }
+}
+
+/// CFG-082 — pi THROWS on an invalid budget, ordinary or override, and on a non-object override
+/// entry; each message is pi's verbatim (`settings-manager.ts:866-868`, `:874-876`, `:880-882`).
+#[test]
+fn compaction_token_settings_refuse_invalid_values_with_pis_messages() {
+    let err = |json: &str, model: Option<(&str, &str)>| {
+        EffectiveSettings::from_settings(Settings::parse(json).unwrap())
+            .compaction_settings(model)
+            .unwrap_err()
+            .to_string()
+    };
+    assert_eq!(
+        err(r#"{"compaction":{"reserveTokens":-1}}"#, None),
+        "Invalid compaction.reserveTokens setting: -1. Expected a non-negative safe integer."
+    );
+    assert_eq!(
+        err(r#"{"compaction":{"keepRecentTokens":1.5}}"#, None),
+        "Invalid compaction.keepRecentTokens setting: 1.5. Expected a non-negative safe integer."
+    );
+    assert_eq!(
+        err(r#"{"compaction":{"reserveTokens":"4096"}}"#, None),
+        "Invalid compaction.reserveTokens setting: 4096. Expected a non-negative safe integer."
+    );
+    assert_eq!(
+        err(r#"{"compaction":{"reserveTokens":9007199254740992}}"#, None),
+        "Invalid compaction.reserveTokens setting: 9007199254740992. Expected a non-negative \
+         safe integer."
+    );
+    // The ordinary value is validated even when the override would have won.
+    assert_eq!(
+        err(
+            r#"{"compaction":{"reserveTokens":null,"modelOverrides":{"a/b":{"reserveTokens":1}}}}"#,
+            Some(("a", "b"))
+        ),
+        "Invalid compaction.reserveTokens setting: null. Expected a non-negative safe integer."
+    );
+    assert_eq!(
+        err(
+            r#"{"compaction":{"modelOverrides":{"a/b":[1,2]}}}"#,
+            Some(("a", "b"))
+        ),
+        "Invalid compaction.modelOverrides[\"a/b\"] setting: 1,2. Expected an object."
+    );
+    assert_eq!(
+        err(
+            r#"{"compaction":{"modelOverrides":{"a/b":{"keepRecentTokens":{"n":1}}}}}"#,
+            Some(("a", "b"))
+        ),
+        "Invalid compaction.modelOverrides[\"a/b\"].keepRecentTokens setting: [object Object]. \
+         Expected a non-negative safe integer."
+    );
+    // A malformed entry for ANOTHER model is never read, exactly as pi only indexes `modelKey`.
+    let s = EffectiveSettings::from_settings(
+        Settings::parse(r#"{"compaction":{"modelOverrides":{"x/y":"bad"}}}"#).unwrap(),
+    );
+    assert_eq!(
+        s.compaction_reserve_tokens(Some(("a", "b"))).unwrap(),
+        16384
+    );
+}
+
+/// CFG-090 — Pi `getTerminalCapabilityOverrides()` (`settings-manager.ts:1195-1203` @v0.87.1):
+/// `images` maps `"kitty"`/`"iterm2"` through and `false` to "no protocol"; `trueColor` and
+/// `hyperlinks` override only as booleans; `"auto"` and anything else is no override.
+#[test]
+fn terminal_capability_overrides_follow_pis_mapping() {
+    let of = |json: &str| {
+        EffectiveSettings::from_settings(Settings::parse(json).unwrap())
+            .terminal_capability_overrides()
+    };
+    assert_eq!(of("{}"), TerminalCapabilityOverrides::default());
+    assert_eq!(
+        of(r#"{ "terminal": { "images": "auto", "trueColor": "auto", "hyperlinks": "auto" } }"#),
+        TerminalCapabilityOverrides::default()
+    );
+    assert_eq!(
+        of(r#"{ "terminal": { "images": false, "trueColor": false, "hyperlinks": true } }"#),
+        TerminalCapabilityOverrides {
+            images: Some(TerminalImagesOverride::Disabled),
+            true_color: Some(false),
+            hyperlinks: Some(true),
+        }
+    );
+    assert_eq!(
+        of(r#"{ "terminal": { "images": "kitty" } }"#).images,
+        Some(TerminalImagesOverride::Kitty)
+    );
+    assert_eq!(
+        of(r#"{ "terminal": { "images": "iterm2" } }"#).images,
+        Some(TerminalImagesOverride::Iterm2)
+    );
+    // `images: true` is not in pi's type and is not an override.
+    assert_eq!(of(r#"{ "terminal": { "images": true } }"#).images, None);
 }

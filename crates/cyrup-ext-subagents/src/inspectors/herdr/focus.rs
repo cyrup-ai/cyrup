@@ -32,9 +32,10 @@
 //! **So cyrup sends `pane focus <id>` and nothing else.** [`HerdrFocusErrorCode::PaneFocusUnsupported`]
 //! stays in the contract's vocabulary and stays reachable, for the one case that is real: a herdr
 //! that refuses `pane.focus` AND whose pane record carries neither id. Which herdr versions those
-//! are is NOT asserted here — `tmp/herdr` is pinned at one commit (`d59d060`, v0.9.1) with 50
-//! commits of history and no release tags, so nothing in this tree can establish when a method
-//! appeared. What is greppable is that at v0.9.1 the method exists and both ids are required, so
+//! are is NOT asserted here — this was read at `d59d060`, an untagged `main` commit that is not
+//! the `v0.9.1` tag (`065ef9d6`, HERDR-002), in a clone that then had 50 commits of history and no
+//! release tags, so nothing in it could establish when a method appeared. What is greppable is
+//! that at `d59d060` the method exists and both ids are required, so
 //! the arm is unreachable against THIS herdr; telling the user to select the pane by hand is the
 //! honest answer for any build where it is not.
 //!

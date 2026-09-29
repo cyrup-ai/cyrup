@@ -21,6 +21,28 @@ pub enum MaxTokensField {
     MaxTokens,
 }
 
+/// Top-level request field that caps reasoning tokens from the thinking budget (Pi
+/// `ThinkingTokenBudgetField`, `types.ts:98` @v0.87.1): `thinking_token_budget` is vLLM,
+/// `thinking_budget` is Qwen/DashScope/SGLang, `thinking_budget_tokens` is llama.cpp. PROV-100.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingTokenBudgetField {
+    ThinkingTokenBudget,
+    ThinkingBudget,
+    ThinkingBudgetTokens,
+}
+
+impl ThinkingTokenBudgetField {
+    /// The request field name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingTokenBudgetField::ThinkingTokenBudget => "thinking_token_budget",
+            ThinkingTokenBudgetField::ThinkingBudget => "thinking_budget",
+            ThinkingTokenBudgetField::ThinkingBudgetTokens => "thinking_budget_tokens",
+        }
+    }
+}
+
 /// How reasoning/thinking is encoded in the request body.
 /// Pi: `thinkingFormat?: "openai" | "openrouter" | ... | "ant-ling"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -374,6 +396,15 @@ pub struct ModelCompat {
     pub vercel_gateway_routing: Option<VercelGatewayRouting>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub zai_tool_stream: Option<bool>,
+    /// Pi `thinkingTokenBudgetField` (`types.ts:725` @v0.87.1; v0.85.0, #9004): the top-level field
+    /// that carries the clamped thinking budget, because reasoning and the answer share `max_tokens`
+    /// on these endpoints. Never set by the generated catalog — a `models.json` surface. PROV-100.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub thinking_token_budget_field: Option<ThinkingTokenBudgetField>,
+    /// Pi `supportsThinkingTokenBudget` (`types.ts:727` @v0.87.1; v0.84.3, #8275): alias for
+    /// `thinkingTokenBudgetField: "thinking_token_budget"` (vLLM). PROV-100.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_thinking_token_budget: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_strict_mode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -433,6 +464,12 @@ pub struct ModelCompat {
     /// unlike the anthropic flag below this one resolves declared-over-`false`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_mid_convo_tool_additions: Option<bool>,
+    /// Pi `vllmPriority` (`types.ts:750` @v0.87.1; v0.85.0): vLLM scheduler priority, sent as the
+    /// top-level `priority` request field (lower is served earlier; meaningful only under
+    /// `--scheduling-policy priority`). A JSON number carried verbatim. Never set by the generated
+    /// catalog. PROV-100.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vllm_priority: Option<serde_json::Number>,
 
     // --- `anthropic-messages` subset (Pi `AnthropicMessagesCompat`, types.ts:531). These are read
     // only by the anthropic-messages resolver; `supports_long_cache_retention` and
@@ -515,6 +552,11 @@ pub struct ModelCompat {
     /// (PROV-023).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_explicit_prompt_cache_mode: Option<bool>,
+    /// Pi `supportsMaxOutputTokens` (`types.ts` `OpenAIResponsesCompat`, `openai-responses.ts:79`
+    /// @v0.87.1, default **true**; v0.85.0, #8941): `false` suppresses `max_output_tokens` on the
+    /// request, for Responses-protocol gateways that reject the parameter. PROV-093.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_max_output_tokens: Option<bool>,
     /// Pi `supportsToolSearch` (types.ts:588-589, default **false**): provider accepts the
     /// client-side `tool_search_call`/`tool_search_output` pair, the Responses rendering of the
     /// same DRIFT-001 anchor `supports_tool_references` renders for Anthropic.
@@ -553,8 +595,10 @@ pub struct ResolvedResponsesCompat {
     /// Pi `supportsToolSearch: model.compat?.supportsToolSearch ?? false`
     /// (openai-responses.ts:74). Catalog-driven; no predicate.
     pub supports_tool_search: bool,
-    /// Pi `supportsExplicitPromptCacheMode: … ?? false` (`openai-responses.ts:75`).
+    /// Pi `supportsExplicitPromptCacheMode: … ?? false` (`openai-responses.ts:78` @v0.87.1).
     pub supports_explicit_prompt_cache_mode: bool,
+    /// Pi `supportsMaxOutputTokens: … ?? true` (`openai-responses.ts:79` @v0.87.1). PROV-093.
+    pub supports_max_output_tokens: bool,
 }
 
 /// Resolve the openai-responses compat for a model (1:1 port of Pi `getCompat`,
@@ -577,6 +621,7 @@ pub fn get_responses_compat(model: &Model) -> ResolvedResponsesCompat {
         supports_explicit_prompt_cache_mode: c
             .and_then(|c| c.supports_explicit_prompt_cache_mode)
             .unwrap_or(false),
+        supports_max_output_tokens: c.and_then(|c| c.supports_max_output_tokens).unwrap_or(true),
     }
 }
 
@@ -607,6 +652,13 @@ pub struct ResolvedCompat {
     /// override resolved at `:1695` (DRIFT-009).
     pub chat_template_args: Map<String, Value>,
     pub zai_tool_stream: bool,
+    /// Pi `supportsThinkingTokenBudget` — detected **false** (`openai-completions.ts:1664`
+    /// @v0.87.1), override at `:1712`. PROV-100.
+    pub supports_thinking_token_budget: bool,
+    /// Pi `thinkingTokenBudgetField` — detected `undefined` (`:1665`), override at `:1713`.
+    pub thinking_token_budget_field: Option<ThinkingTokenBudgetField>,
+    /// Pi `vllmPriority: model.compat.vllmPriority` (`:1724`) — never detected.
+    pub vllm_priority: Option<serde_json::Number>,
     pub supports_strict_mode: bool,
     /// Pi `supportsOpenAIGrammarTools` — detected **false** (`openai-completions.ts:1469`
     /// @v0.83.0), catalog override resolved at `:1511`. Read by
@@ -851,6 +903,9 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         // `chatTemplateArgs: {}` (openai-completions.ts:1649 @v0.84.4) — never detected.
         chat_template_args: Map::new(),
         zai_tool_stream: false,
+        supports_thinking_token_budget: false,
+        thinking_token_budget_field: None,
+        vllm_priority: None,
         // `// OpenAI compatibility alone does not imply strict JSON-schema tool support.` /
         // `supportsStrictMode: false` (`openai-completions.ts:1666-1667` @v0.87.1). The old
         // five-predicate expression did not vanish — `890f92088` (#9816) MOVED it into the catalog
@@ -864,7 +919,10 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         cache_control_format,
         // `deferredToolsMode: undefined` (openai-completions.ts:1472 @v0.83.0) — never detected.
         deferred_tools_mode: None,
-        send_session_affinity_headers: false,
+        // `sendSessionAffinityHeaders: isOpenRouter` (`openai-completions.ts:1672` @v0.87.1;
+        // `bbb61e34a`, v0.86.0, #9102) — OpenRouter pins a session to one replica via
+        // `x-session-id`, which is what keeps its prompt cache warm. PROV-086.
+        send_session_affinity_headers: is_openrouter,
         // `sessionAffinityFormat: isOpenRouter ? "openrouter" : "openai"`
         // (openai-completions.ts:1473 @v0.83.0).
         session_affinity_format: if is_openrouter {
@@ -932,6 +990,13 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
             .clone()
             .unwrap_or(detected.chat_template_args),
         zai_tool_stream: c.zai_tool_stream.unwrap_or(detected.zai_tool_stream),
+        supports_thinking_token_budget: c
+            .supports_thinking_token_budget
+            .unwrap_or(detected.supports_thinking_token_budget),
+        thinking_token_budget_field: c
+            .thinking_token_budget_field
+            .or(detected.thinking_token_budget_field),
+        vllm_priority: c.vllm_priority.clone(),
         supports_strict_mode: c
             .supports_strict_mode
             .unwrap_or(detected.supports_strict_mode),

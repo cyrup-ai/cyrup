@@ -110,6 +110,13 @@ pub struct AssistantMessage {
     /// what the provider actually said (R-00-013).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_stop_reason: Option<String>,
+    /// The provider's own indication of whether the model explicitly ended its turn (Pi
+    /// `endTurn?: boolean`, `ai/src/types.ts:531-535` @v0.87.1; v0.84.2, #7766). Diagnostics only:
+    /// upstream documents that it does not affect agent control flow, and nothing in cyrup branches
+    /// on it either. Set by `openai_codex_responses` from the terminal `response.end_turn`; `None`
+    /// everywhere else. It round-trips so a session file keeps the field pi's carries (DRIFT-059).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub end_turn: Option<bool>,
     pub timestamp: i64,
 }
 
@@ -143,8 +150,8 @@ impl serde::Serialize for AssistantMessage {
     /// Self-tagging serializer: emits `role: "assistant"` FIRST (Pi's `AssistantMessage` literal
     /// always carries it, `ai/src/types.ts:384`), then Pi's exact field order — role, content, api,
     /// provider, model, responseModel?, responseId?, providerThinkingLevel?, diagnostics?, usage, stopReason, deferred?,
-    /// errorMessage?, rawStopReason?, timestamp (`v0.87.1 ai/src/types.ts:515-536`, read field for
-    /// field). So every wire-serialized assistant turn — and every `StreamEvent` `partial`/
+    /// errorMessage?, rawStopReason?, endTurn?, timestamp (`v0.87.1 ai/src/types.ts:515-536`, read field
+    /// for field). So every wire-serialized assistant turn — and every `StreamEvent` `partial`/
     /// `done.message`/`error.error` that embeds one — is byte-1:1 with Pi. Verified against captured
     /// Pi bytes (`text-turn.pi-captured` `start` partial begins `{"role":"assistant","content":[],
     /// "api":...}`). The derived `Deserialize` ignores the extra `role` key on read.
@@ -160,7 +167,8 @@ impl serde::Serialize for AssistantMessage {
             + usize::from(self.diagnostics.is_some())
             + usize::from(self.deferred.is_some())
             + usize::from(self.error_message.is_some())
-            + usize::from(self.raw_stop_reason.is_some());
+            + usize::from(self.raw_stop_reason.is_some())
+            + usize::from(self.end_turn.is_some());
         let mut st = serializer.serialize_struct("AssistantMessage", len)?;
         st.serialize_field("role", "assistant")?;
         st.serialize_field("content", &self.content)?;
@@ -196,6 +204,10 @@ impl serde::Serialize for AssistantMessage {
         match &self.raw_stop_reason {
             Some(v) => st.serialize_field("rawStopReason", v)?,
             None => st.skip_field("rawStopReason")?,
+        }
+        match &self.end_turn {
+            Some(v) => st.serialize_field("endTurn", v)?,
+            None => st.skip_field("endTurn")?,
         }
         st.serialize_field("timestamp", &self.timestamp)?;
         st.end()
@@ -238,6 +250,7 @@ impl AssistantMessage {
             deferred: None,
             error_message: Some(message.into()),
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: 0,
         }
     }
@@ -271,6 +284,7 @@ mod tests {
             deferred: None,
             error_message: None,
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: 0,
         });
         let v = serde_json::to_value(&m).expect("serialize");
@@ -297,6 +311,7 @@ mod tests {
             deferred: None,
             error_message: None,
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: 0,
         };
         // Standalone (as embedded in `StreamEvent.partial`): role:"assistant" FIRST, Pi field order.

@@ -399,6 +399,14 @@ pub(crate) fn build_params(
             Value::Array(convert_responses_tools(&ctx.tools, tool_options)?),
         );
     }
+    // PROV-094. `if (options?.toolChoice !== undefined) params.tool_choice = options.toolChoice`
+    // (azure-openai-responses.ts:323-324 @v0.87.1; added v0.84.3).
+    if let Some(tc) = &opts.tool_choice {
+        obj.insert(
+            "tool_choice".to_string(),
+            crate::api::openai_responses::responses_tool_choice(tc),
+        );
+    }
 
     if model.reasoning {
         // The unified reasoning level maps to Pi's `reasoningEffort` (clamped; `off` => the
@@ -448,6 +456,9 @@ fn build_headers(model: &Model, opts: &StreamOptions, api_key: &str) -> HeaderMa
             headers.insert(name.clone(), value.clone());
         }
     }
+    // PROV-095: `{ "User-Agent": getPiUserAgent(), ...model.headers }`
+    // (azure-openai-responses.ts:259 @v0.87.1) — the default sits under every overlay.
+    crate::utils::user_agent::insert_default_user_agent(&mut headers);
     headers
 }
 
@@ -601,6 +612,48 @@ mod tests {
         };
         let (base2, _) = resolve_azure_config(&m, Some(&env(&[])), Some(&opt2)).unwrap();
         assert_eq!(base2, "https://optres.openai.azure.com/openai/v1");
+    }
+
+    /// PROV-094 — pi `if (options?.toolChoice !== undefined) params.tool_choice =
+    /// options.toolChoice` (`azure-openai-responses.ts:323-324` @v0.87.1, added v0.84.3): a
+    /// forced or suppressed choice reaches the Azure body in the Responses shape; unset omits it.
+    #[test]
+    fn build_params_emits_tool_choice() {
+        let m = azure_model("gpt-4", false);
+        let ctx = Context::default();
+        let with = |tc: Option<crate::stream::ToolChoice>| {
+            let opts = StreamOptions {
+                tool_choice: tc,
+                ..Default::default()
+            };
+            build_params(&m, &ctx, &opts, "dep").unwrap()
+        };
+        assert!(with(None).get("tool_choice").is_none());
+        assert_eq!(
+            with(Some(crate::stream::ToolChoice::None))["tool_choice"],
+            "none"
+        );
+        assert_eq!(
+            with(Some(crate::stream::ToolChoice::Function {
+                name: "ping".into()
+            }))["tool_choice"],
+            serde_json::json!({ "type": "function", "name": "ping" })
+        );
+    }
+
+    /// PROV-095 — pi `{ "User-Agent": getPiUserAgent(), ...model.headers }`
+    /// (azure-openai-responses.ts:259 @v0.87.1, #8305): a default client User-Agent under every
+    /// overlay.
+    #[test]
+    fn default_user_agent_sits_under_the_overlays() {
+        let m = azure_model("gpt-4", false);
+        crate::utils::user_agent::assert_default_user_agent_under_overlays(|overlay| {
+            let opts = StreamOptions {
+                headers: overlay,
+                ..Default::default()
+            };
+            build_headers(&m, &opts, "key")
+        });
     }
 
     #[test]
@@ -762,6 +815,7 @@ mod tests {
                     deferred: None,
                     error_message: None,
                     raw_stop_reason: None,
+                    end_turn: None,
                     timestamp: 2,
                 }),
                 cyrup_core::Message::ToolResult {

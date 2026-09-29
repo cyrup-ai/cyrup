@@ -18,10 +18,10 @@ use crate::transport::{self, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES};
 
 /// A request line over 1 MiB is refused **before a byte is written**, naming the bound — rather
 /// than herdr closing the connection with `"api request line is too large"`
-/// (`tmp/herdr/src/api/server.rs:563-567`) and this client reporting a bare EOF.
+/// (`tmp/herdr/src/api/server.rs:549-553`) and this client reporting a bare EOF.
 ///
 /// **The boundary is herdr's, to the byte.** `read_initial_request_line_with_limits`
-/// (`server.rs:556-568`) pushes each byte and then tests `bytes.len() > max_bytes`, but the
+/// (`server.rs:542-554`) pushes each byte and then tests `bytes.len() > max_bytes`, but the
 /// `b'\n'` branch above that test breaks out first — so the terminator is never counted and a
 /// JSON line of exactly `MAX_REQUEST_BYTES` is **accepted** by a real herdr. A client that
 /// counted its own newline would refuse a `pane.send_input` herdr would have executed, and the

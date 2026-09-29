@@ -11,9 +11,9 @@
 > 1. **The precursor has ALREADY LANDED.** Recursive, namespaced prompt-template discovery
 >    (`prompts/flux/new.md` → `/flux/new`) is implemented in `cyrup-resources` today — see
 >    §0.1 for the file:line evidence. The flat `flux-*` fallback is **dead**; do not build it.
-> 2. **The complete code-puppy source is vendored under [`../tmp/code-puppy/`](../tmp/code-puppy/)**
+> 2. **The complete code-puppy source is cloned at [`../tmp/code_puppy_core_plugins/`](../tmp/code_puppy_core_plugins/)** (ported at tag `v0.0.6`; the plugins are the `code_puppy_core_plugins/` package inside it)
 >    (all 18 command files, all 3 renderer scripts, the installer, and the dispatch engine),
->    plus Pi's [`../tmp/pi/prompt-templates.ts`](../tmp/pi/prompt-templates.ts). Every porting
+>    plus Pi's [`../tmp/pi/packages/coding-agent/src/core/prompt-templates.ts`](../tmp/pi/packages/coding-agent/src/core/prompt-templates.ts). Every porting
 >    rule below cites the exact source file.
 > 3. **No core changes are required at all.** All of it is one new crate plus its wiring. This
 >    plan touches **zero** existing `crates/*/src` files except `crates/cyrup/src/main.rs`.
@@ -49,10 +49,11 @@ Everything else here — §0 research, §1 source analysis, §3.1 naming, §3.2 
 per-file porting rules 1–9, §3.4.2–3.4.4's renderer/tool designs, §5 risks — is unchanged and
 still authoritative. Section numbers are preserved because the task files cite them.
 
-**The executable plan is [`flux/README.md`](flux/README.md) and `flux/FLUX_01.md` …
-`flux/FLUX_12.md`** (twelve tasks; the old thirteenth existed only to synchronise the two homes).
-Where a task file and this document disagree, the task file wins — it was re-verified against the
-live tree and this one was not.
+**The executable plan is [`flux/README.md`](flux/README.md)'s twelve-task table** (the old
+thirteenth existed only to synchronise the two homes). Its `FLUX_NN` numbers are task labels, not
+files: the thirteen original task files were deleted by `67b73a05` when the crate landed, and the
+re-planned twelve were never committed. Where the README and this document disagree, the README
+wins — it was re-verified against the live tree and this one was not.
 
 ---
 
@@ -60,8 +61,8 @@ live tree and this one was not.
 
 ### 0.1 The namespaced-template precursor is DONE (do not re-implement)
 
-The precursor spec (`spec/namespaced-prompt-templates.md`, referenced from code comments; the
-file itself is not in `spec/`) is fully implemented:
+The precursor spec ([`spec/namespaced-prompt-templates.md`](namespaced-prompt-templates.md), the
+decision of record for ledger row `CFG-077`) is fully implemented:
 
 - **Namespaced name derivation** — [`PromptTemplate::load_with_root`](../crates/cyrup-resources/src/prompt.rs)
   (`crates/cyrup-resources/src/prompt.rs:57-105`): the template name is the path **relative to
@@ -73,7 +74,7 @@ file itself is not in `spec/`) is fully implemented:
   (`crates/cyrup-resources/src/discovery.rs:1772-1830`): descends into subdirectories, skips
   `.`- and `_`-prefixed dirs and `node_modules` (so `prompts/flux/_docs/` never registers —
   the exact code-puppy `_SKIP_DIR_PREFIXES = ("_", ".")` semantic,
-  [`../tmp/code-puppy/customizable_commands/register_callbacks.py`](../tmp/code-puppy/customizable_commands/register_callbacks.py)),
+  [`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/customizable_commands/register_callbacks.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/customizable_commands/register_callbacks.py)),
   caps depth at `MAX_PROMPT_NAMESPACE_DEPTH = 8` (`discovery.rs:1756`), never follows directory
   symlinks (cycle-proof), loads file symlinks to regular `.md` targets, and sorts children per
   directory for deterministic first-wins tie-breaking.
@@ -107,7 +108,7 @@ the previous revision of this plan is **complete** and is removed from the work 
   never reaches the model as a prompt.
 - **Template expansion is real substitution** (unlike code-puppy's literal `$ARGUMENTS` text):
   `substitute_args` (`prompt.rs`) ports Pi's `$1 $2 $@ $ARGUMENTS ${N:-default} ${@:N} ${@:N:L}`
-  with a quote-aware tokenizer — 1:1 with [`../tmp/pi/prompt-templates.ts`](../tmp/pi/prompt-templates.ts).
+  with a quote-aware tokenizer — 1:1 with [`../tmp/pi/packages/coding-agent/src/core/prompt-templates.ts`](../tmp/pi/packages/coding-agent/src/core/prompt-templates.ts).
   The trailing `=================\n$ARGUMENTS` block in every flux command works unchanged.
 
 ### 0.3 Tool inventory and the rename map (verified)
@@ -199,16 +200,22 @@ silently flip the gate on an OS-process-spawning subsystem. Pinned by
 
 ### 0.5 Vendored sources (citation map)
 
+The paths below are working-tree links into two clones: `mpfaffenberger/code_puppy_core_plugins` at
+`../tmp/code_puppy_core_plugins/` (ported at tag **`v0.0.6`**; its `flux_bootstrap` tree is
+byte-identical through `v0.0.40`) and `mpfaffenberger/code_puppy` at `../tmp/code_puppy/` (ported at
+tag **`v0.0.720`**). A claim is settled with `git -C tmp/<clone> show <tag>:<path>`, not with the
+working tree.
+
 | Source | Vendored at |
 |---|---|
-| 18 flux command files | [`../tmp/code-puppy/flux_bootstrap/bundled/commands/flux/`](../tmp/code-puppy/flux_bootstrap/bundled/commands/flux/) |
-| Reference docs (`README`, `pipeline`, `cheatsheet`, `synopsis`) | [`../tmp/code-puppy/flux_bootstrap/bundled/commands/flux/_docs/`](../tmp/code-puppy/flux_bootstrap/bundled/commands/flux/_docs/) |
-| `flux_status.py` (345 lines) | [`../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_status.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_status.py) |
-| `flux_cheatsheet.py` (248 lines) | [`../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_cheatsheet.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_cheatsheet.py) |
-| `flux_about.py` (154 lines) | [`../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_about.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_about.py) |
-| `installer.py` + `register_callbacks.py` (flux_bootstrap) | [`../tmp/code-puppy/flux_bootstrap/`](../tmp/code-puppy/flux_bootstrap/) |
-| `customizable_commands` dispatch engine | [`../tmp/code-puppy/customizable_commands/register_callbacks.py`](../tmp/code-puppy/customizable_commands/register_callbacks.py) |
-| Pi `prompt-templates.ts` | [`../tmp/pi/prompt-templates.ts`](../tmp/pi/prompt-templates.ts) |
+| 18 flux command files | [`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/commands/flux/`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/commands/flux/) |
+| Reference docs (`README`, `pipeline`, `cheatsheet`, `synopsis`) | [`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/commands/flux/_docs/`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/commands/flux/_docs/) |
+| `flux_status.py` (345 lines) | [`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_status.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_status.py) |
+| `flux_cheatsheet.py` (248 lines) | [`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_cheatsheet.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_cheatsheet.py) |
+| `flux_about.py` (154 lines) | [`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_about.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_about.py) |
+| `installer.py` + `register_callbacks.py` (flux_bootstrap) | [`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/) |
+| `customizable_commands` dispatch engine | [`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/customizable_commands/register_callbacks.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/customizable_commands/register_callbacks.py) |
+| Pi `prompt-templates.ts` | [`../tmp/pi/packages/coding-agent/src/core/prompt-templates.ts`](../tmp/pi/packages/coding-agent/src/core/prompt-templates.ts) |
 
 ---
 
@@ -219,7 +226,7 @@ prompt files; all intelligence lives in the prompts and the agent.
 
 ### 1.1 Distribution — `flux_bootstrap` plugin
 
-[`../tmp/code-puppy/flux_bootstrap/`](../tmp/code-puppy/flux_bootstrap/) ships the whole feature
+[`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/) ships the whole feature
 as package data:
 
 ```
@@ -235,7 +242,7 @@ flux_bootstrap/bundled/
     └── flux_about.py       # Rich-markdown about renderer (reads about.md at runtime)
 ```
 
-[`installer.py`](../tmp/code-puppy/flux_bootstrap/installer.py) copies the payload into
+[`installer.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/installer.py) copies the payload into
 `~/.code_puppy/{commands,scripts}/` on the `startup` hook, version-gated by a marker file,
 idempotent, non-destructive (SHA-256 manifest; user-edited files get `.bak` backups;
 pre-existing user files are never claimed), flock-guarded against concurrent first-launch
@@ -244,7 +251,7 @@ registration (Phase 2) — nothing of it is ported.**
 
 ### 1.2 Dispatch — `customizable_commands` plugin
 
-[`../tmp/code-puppy/customizable_commands/register_callbacks.py`](../tmp/code-puppy/customizable_commands/register_callbacks.py) is
+[`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/customizable_commands/register_callbacks.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/customizable_commands/register_callbacks.py) is
 the engine cyrup's prompt-template system already replaces:
 
 - Recursively loads `*.md` from `~/.code_puppy/commands/` (global, trusted) and project dirs.
@@ -258,7 +265,7 @@ the engine cyrup's prompt-template system already replaces:
   (`subprocess.run(shell=True)`, 30 s timeout, `{python}`/`{script:…}`/`{command:…}` token
   expansion). The agent is bypassed. Used by `status`, `cheatsheet`, `about`.
   — **cyrup equivalent: Phase 2 native commands (§3.4). Deliberately NOT ported as a
-  frontmatter directive** (§5.3).
+  frontmatter directive** (§5, item 3).
 
 ### 1.3 State model — `~/.flux/`
 
@@ -273,7 +280,7 @@ FLUX_BASE="$FLUX_ROOT/$FLUX_DIR"
 
 `tr -cs 'a-zA-Z0-9' '-'` = complement-squeeze: **every maximal run of non-alphanumerics becomes
 ONE `-`** (leading `/` → leading `-`). The Python renderer's equivalent is
-`re.sub(r"[^a-zA-Z0-9]+", "-", cwd)` ([`flux_status.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_status.py)
+`re.sub(r"[^a-zA-Z0-9]+", "-", cwd)` ([`flux_status.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_status.py)
 `flatten_cwd`). Both preserve case.
 
 ```
@@ -334,7 +341,7 @@ tree, TUI, WASM extension host, native extensions). The relevant surfaces, all v
 ### 2.1 Prompt templates — the direct equivalent of code-puppy markdown commands
 
 [`crates/cyrup-resources/src/prompt.rs`](../crates/cyrup-resources/src/prompt.rs) (ports Pi
-[`prompt-templates.ts`](../tmp/pi/prompt-templates.ts) 1:1, plus the landed namespacing delta):
+[`prompt-templates.ts`](../tmp/pi/packages/coding-agent/src/core/prompt-templates.ts) 1:1, plus the landed namespacing delta):
 
 - A template is a `*.md` file under a scanned root; **name = root-relative path minus `.md`,
   `/`-joined** (§0.1). `prompts/flux/new.md` → `/flux/new`.
@@ -390,7 +397,7 @@ tool, 12+ slash commands, renderers, subscriptions, and bundled resources
 | `ask_user_question` tool | Does not exist | **Phase 2: native tool in `cyrup-ext-flux`** (§3.4.4). Phase 1: plain-text interim + `FLUX-GAP` markers. |
 | `invoke_agent` | `subagent` tool — equivalent, richer | Rename in prompts (§3.3 rule 4). |
 | `create_file` / `replace_in_file` / `read_file` | `write` / `edit` / `read` | Rename in prompts. |
-| `exec:` frontmatter directive | Not supported (by design, §5.3) | Phase 2 native commands (§3.4.2–3.4.3). |
+| `exec:` frontmatter directive | Not supported (by design, §5, item 3) | Phase 2 native commands (§3.4.2–3.4.3). |
 | Namespaced commands `/flux/new` | **Landed** (§0.1) | Use `/flux/<step>` spellings verbatim. |
 | Jira MCP | MCP via pi-mcp-adapter capability (§0.4) | Keep the conditional branch in `flux/new.md` verbatim. |
 | `ui-mode: flux-status` overlay (Wibey leftover) | n/a | Native overlay on a shortcut (§3.4.3). |
@@ -491,7 +498,7 @@ this section used to prescribe was:
 6. **Stack detection / tree listing**: keep the bash blocks byte-identical; they already fall
    back (`lsd … || find …`, `bun … || echo "JavaScript/TypeScript"`). cyrup's `bash` tool runs
    them unchanged.
-7. **MCP/Jira branch** in [`new.md`](../tmp/code-puppy/flux_bootstrap/bundled/commands/flux/new.md):
+7. **MCP/Jira branch** in [`new.md`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/commands/flux/new.md):
    keep verbatim, including the "not configured → stop" path (tool absence is detected the same
    way — the model sees its available tools).
 8. **`_docs/`**: ship as `prompts/flux/_docs/` (skipped namespace, co-located reference docs)
@@ -499,9 +506,9 @@ this section used to prescribe was:
    `/skill:flux` and auto-skill-loading surface the pipeline docs. `SKILL.md` frontmatter gets
    `name: flux` and a `description` covering when to load (pipeline orchestration, task files,
    `~/.flux` state); the body is the TL;DR from
-   [`_docs/README.md`](../tmp/code-puppy/flux_bootstrap/bundled/commands/flux/_docs/README.md)
+   [`_docs/README.md`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/commands/flux/_docs/README.md)
    plus the command table from
-   [`_docs/pipeline.md`](../tmp/code-puppy/flux_bootstrap/bundled/commands/flux/_docs/pipeline.md),
+   [`_docs/pipeline.md`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/commands/flux/_docs/pipeline.md),
    with `/flux/status`, `/flux/cheatsheet`, `/flux/about` listed as "native commands (Phase 2)"
    and the Phase 1 interim noted: `~/.flux` state can be inspected manually with
    `ls ~/.flux/$(printf '%s' "$(pwd -P)" | tr -cs 'a-zA-Z0-9' '-')/todo/`.
@@ -527,7 +534,8 @@ end-to-end against a scratch repo with correct on-disk state transitions.
 > the bundled content of §3.3 as well as the native surfaces below — there is no second home.
 > Two further corrections verified against the live tree: `NativeExtension`'s first method is
 > `fn id(&self) -> ExtensionId` (not `fn name(&self) -> &str`), and the wiring in §3.4.5 is
-> **three** blocks in `main.rs`, one per `AppMode`, not one. See `flux/FLUX_01.md` Facts 1 and 3.
+> **three** blocks in `main.rs`, one per `AppMode`, not one. Both are corrections 1 and 2 in
+`flux/README.md`.
 
 Deliverable: `crates/cyrup-flux`, a **default-on built-in** wired in
 [`crates/cyrup/src/main.rs`](../crates/cyrup/src/main.rs) next to the subagents wiring
@@ -575,7 +583,7 @@ pub struct FluxExtension {
 #[async_trait::async_trait]
 impl NativeExtension for FluxExtension {
     // CORRECTED: the trait's first method is `fn id(&self) -> ExtensionId` (native.rs:459).
-    // `fn name(&self) -> &str` does not exist on `NativeExtension` — see flux/FLUX_01.md Fact 1.
+    // `fn name(&self) -> &str` does not exist on `NativeExtension` — flux/README.md correction 1.
     fn id(&self) -> ExtensionId { self.id.clone() }   // id: "cyrup-flux"
 
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
@@ -662,7 +670,7 @@ an override; a user/project/package `flux/*` template still wins, §0.4).
 
 #### 3.4.2 `/flux/status` — Rust port of `flux_status.py`
 
-Port [`flux_status.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_status.py)'s data
+Port [`flux_status.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_status.py)'s data
 model and layout **function-for-function** into `state.rs` + `render_status.rs`:
 
 - `flatten_cwd(cwd)` — runs of non-ASCII-alphanumerics → one `-` (§1.3):
@@ -689,7 +697,7 @@ model and layout **function-for-function** into `state.rs` + `render_status.rs`:
 - `parse_frontmatter(path)` — port the Python tolerance exactly: file must START with `---`;
   read lines until the next `---`; `key: value` split on the FIRST `:`; missing/malformed →
   empty map (never error). This is what lets one renderer serve both code-puppy and cyrup state
-  trees (§5.6).
+  trees (§5, item 6).
 - `collect_todos` / `collect_done` / `collect_reviews` — same globs, same sorts
   (`todo/*.md` sorted; `done/<ts>` dirs reverse-sorted with `format_timestamp`
   `YYYY-MM-DD-HH-MM` → `YYYY-MM-DD HH:MM` 5-part split, odd names passed through; `review/`
@@ -710,16 +718,16 @@ model and layout **function-for-function** into `state.rs` + `render_status.rs`:
 #### 3.4.3 `/flux/cheatsheet`, `/flux/about`, and the `ctrl+alt+f` overlay
 
 - **`/flux/cheatsheet`** — port
-  [`flux_cheatsheet.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_cheatsheet.py):
+  [`flux_cheatsheet.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_cheatsheet.py):
   the pipeline definitions are **parsed at runtime from `pipeline.md`** (single source of
   truth; nothing hardcoded but presentation). The Rust port embeds
   `resources/prompts/flux/_docs/pipeline.md` via `include_str!` and reimplements the two parses
   (the PIPELINE A–D section blocks and the command table), normalizing `//flux` → `/flux`
   exactly as the Python does. Optional positional arg `A|B|C|D` renders one pipeline.
 - **`/flux/about`** — port
-  [`flux_about.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_about.py): the
+  [`flux_about.py`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/scripts/flux_about.py): the
   overview text lives in
-  [`about.md`](../tmp/code-puppy/flux_bootstrap/bundled/commands/flux/about.md); the Python
+  [`about.md`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/commands/flux/about.md); the Python
   strips frontmatter + the AI-only preamble and normalizes `//cmd` → `/cmd`. The Rust port
   embeds the same body via `include_str!` from `resources/` and applies the same two
   transforms, returning plain text (no Rich — the glyph/table layout is already terminal
@@ -844,7 +852,7 @@ file changes.
 ## 4. File-by-file port table
 
 Every row's source is under
-[`../tmp/code-puppy/flux_bootstrap/bundled/`](../tmp/code-puppy/flux_bootstrap/bundled/).
+[`../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/`](../tmp/code_puppy_core_plugins/code_puppy_core_plugins/flux_bootstrap/bundled/).
 "GAP" counts are `ask_user_question` sites; "renames" are `create_file`/`replace_in_file`/
 `read_file`/`invoke_agent` sites.
 

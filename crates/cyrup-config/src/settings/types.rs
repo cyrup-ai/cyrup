@@ -40,6 +40,51 @@ impl MermaidRenderingMode {
     }
 }
 
+/// `cacheWarming` — the prompt-cache warming profile (Pi `CacheWarmingMode`,
+/// `settings-manager.ts:76-78` @v0.87.1: `CACHE_WARMING_MODES = ["off", "streaming", "idle"]`;
+/// "idle" also warms between agent runs). New at v0.86.0. CFG-093.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheWarmingMode {
+    Off,
+    /// Pi's documented default (`settings-manager.ts:157`, `// default: "streaming"`).
+    #[default]
+    Streaming,
+    Idle,
+}
+
+impl CacheWarmingMode {
+    /// The settings-file spelling, i.e. the value `setCacheWarmingMode` writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Streaming => "streaming",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+/// A forced `terminal.images` value (Pi `TerminalSettings.images`, `settings-manager.ts:58`
+/// @v0.87.1: `"kitty" | "iterm2" | "auto" | false`). `"auto"` is the absence of an override, so it
+/// has no variant. CFG-090.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalImagesOverride {
+    Kitty,
+    Iterm2,
+    /// `false` — no inline-image protocol (pi's `{ images: null }`).
+    Disabled,
+}
+
+/// The settings-level terminal capability overrides (Pi `getTerminalCapabilityOverrides()`,
+/// `settings-manager.ts:1195-1203` @v0.87.1, a `Partial<TerminalCapabilities>`): each `None` field
+/// is a key pi leaves out of the partial, so the detected value stands. CFG-090.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalCapabilityOverrides {
+    pub images: Option<TerminalImagesOverride>,
+    pub true_color: Option<bool>,
+    pub hyperlinks: Option<bool>,
+}
+
 /// `tuiMode` — which renderer the interactive TUI starts in (Pi `TuiMode`, settings-manager.ts:36
 /// @v0.84.1, itself a re-export of `pi-tui`'s `TuiMode` = `"regular" | "fullscreen"`; the settings
 /// key is declared at `:135` with `// default: "regular"`). ADR-0005 §Decision A-3.
@@ -171,12 +216,13 @@ pub struct CompactionSettings {
 }
 
 /// Combined top-level retry knobs (Pi `RetrySettings` sans the nested `provider` object;
-/// settings-manager.ts:27-32, `getRetrySettings`, :808-814).
+/// `settings-manager.ts:41-47`, `getRetrySettings`, `:932-939` @v0.87.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetrySettings {
     pub enabled: bool,
     pub max_retries: i64,
     pub base_delay_ms: i64,
+    pub max_agent_delay_ms: i64,
 }
 
 /// A configured package source (Pi `PackageSource`, settings-manager.ts:74-85): either a bare

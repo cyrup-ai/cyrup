@@ -187,6 +187,29 @@ fn pgup_with_an_empty_editor_still_pages_the_transcript() {
     );
 }
 
+/// **TUI-065.** The transcript page rides pi's `tui.editor.pageUp` / `pageDown` ids — there is no
+/// second, cyrup-invented `app.pageUp` owning the same key — so one config entry moves the key for
+/// both the caret page and the empty-buffer transcript page, and the old key does neither.
+#[test]
+fn rebinding_tui_editor_page_up_moves_the_transcript_page_too() {
+    let mut app = new_app();
+    let issues = app
+        .load_keybindings_json(r#"{ "tui.editor.pageUp": "f5" }"#)
+        .unwrap();
+    assert!(issues.is_empty(), "{issues:?}");
+    app.handle_input(&key(KeyCode::PageUp));
+    assert_eq!(
+        app.state().transcript.scroll_offset(),
+        0,
+        "the rebound-away key no longer pages anything"
+    );
+    app.handle_input(&key(KeyCode::F(5)));
+    assert!(
+        app.state().transcript.scroll_offset() > 0,
+        "the rebound key pages the transcript"
+    );
+}
+
 #[test]
 fn ctrl_pgup_and_ctrl_pgdn_are_page_aliases() {
     // v0.84.1 `keybindings.ts:108-109`: `["pageUp", "ctrl+pageUp"]` / `["pageDown", "ctrl+pageDown"]`.

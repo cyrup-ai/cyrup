@@ -102,6 +102,7 @@ impl Decoder {
             deferred: None,
             error_message: self.error_message.clone(),
             raw_stop_reason: self.raw_stop_reason.clone(),
+            end_turn: None,
             timestamp: now_millis(),
         }
     }

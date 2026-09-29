@@ -32,8 +32,9 @@
 use super::harness::key_event as key;
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
-    ColumnLayout, ListSelector, SelectItem, SelectKeymap, SelectList, Selector, SelectorKind,
-    SelectorOutcome, SessionRow, SessionSelector, TreeKind, TreeNode, TreeSelector, UiTheme,
+    ColumnLayout, FilterMode, ListSelector, SelectItem, SelectKeymap, SelectList, Selector,
+    SelectorKind, SelectorOutcome, SessionRow, SessionSelector, TreeKind, TreeNode, TreeSelector,
+    UiTheme,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -85,9 +86,12 @@ fn thinking(current: &str, default_level: &str) -> crate::ThinkingSelector {
         &levels,
         current,
         default_level,
-        "Shift+Tab".to_string(),
+        crate::ThinkingSelectorKeys::from_keymaps(
+            &crate::Keymap::default(),
+            &crate::SelectKeymap::default(),
+            &crate::ThinkingKeymap::default(),
+        ),
         false,
-        "Ctrl+T".to_string(),
     )
 }
 
@@ -101,9 +105,12 @@ fn thinking_with_hidden(current: &str, default_level: &str) -> crate::ThinkingSe
         &levels,
         current,
         default_level,
-        "Shift+Tab".to_string(),
+        crate::ThinkingSelectorKeys::from_keymaps(
+            &crate::Keymap::default(),
+            &crate::SelectKeymap::default(),
+            &crate::ThinkingKeymap::default(),
+        ),
         true,
-        "Ctrl+T".to_string(),
     )
 }
 
@@ -552,8 +559,9 @@ fn session_selector_fills_the_selected_row_with_selected_bg() {
 // S2 / S24 — /tree
 
 fn tree_nodes() -> Vec<TreeNode> {
-    let mut foldable = TreeNode::message("m", 1, "model -> opus");
-    foldable.kind = TreeKind::ModelChange;
+    // A message, not a `model_change`: pi's default filter hides the settings/bookkeeping class
+    // (`tree-selector.ts:355-361` @v0.87.1), and these tests are about the connector and the fill.
+    let mut foldable = TreeNode::message("m", 1, "assistant: switching to opus");
     foldable.foldable = true;
     vec![
         TreeNode::message("root", 0, "initial prompt"),
@@ -571,7 +579,7 @@ fn tree_selector_fills_the_selected_row_with_selected_bg() {
     let theme = UiTheme::dark();
     let fill = selected_bg(&theme).expect("dark.json defines selectedBg");
     let sel = TreeSelector::new(tree_nodes());
-    let rows = sel.rows(80, &theme);
+    let rows = sel.rows(&theme);
     for span in &rows[0].spans {
         assert_eq!(
             span.style.bg,
@@ -612,7 +620,7 @@ fn tree_selector_draws_the_fold_state_inside_the_connector() {
     let theme = UiTheme::dark();
     let mut sel = TreeSelector::new(tree_nodes());
     // `m` is depth-1, foldable, expanded and the last child of the root -> `└⊟ `.
-    let expanded: String = sel.rows(80, &theme).iter().map(text).collect();
+    let expanded: String = sel.rows(&theme).iter().map(text).collect();
     assert!(
         expanded.contains("└⊟ "),
         "expanded foldable node must render `└⊟ ` in its connector: {expanded:?}"
@@ -631,7 +639,7 @@ fn tree_selector_draws_the_fold_state_inside_the_connector() {
     let km = SelectKeymap::default();
     sel.handle(&key(KeyCode::Down), &km); // -> the foldable node
     sel.handle(&tree_fold_key(), &km); // fold (`app.tree.foldOrUp`, `tree-selector.ts:1002-1009`)
-    let rows = sel.rows(80, &theme);
+    let rows = sel.rows(&theme);
     let folded: String = rows.iter().map(text).collect();
     assert!(
         folded.contains("└⊞ "),
@@ -665,7 +673,7 @@ fn tree_selector_fold_marker_is_the_connectorless_fallback() {
     let mut sel = TreeSelector::new(vec![root, child]);
 
     // Expanded depth-0 root: no connector AND no marker.
-    let rows = sel.rows(80, &theme);
+    let rows = sel.rows(&theme);
     let row0 = text(&rows[0]);
     assert!(
         !row0.contains('\u{229f}'),
@@ -679,7 +687,7 @@ fn tree_selector_fold_marker_is_the_connectorless_fallback() {
     // Fold it: now the accent `⊞ ` fallback appears, because there is no connector to hold it.
     let km = SelectKeymap::default();
     sel.handle(&tree_fold_key(), &km);
-    let rows = sel.rows(80, &theme);
+    let rows = sel.rows(&theme);
     let marker = rows[0]
         .spans
         .iter()
@@ -705,7 +713,7 @@ fn tree_selector_fold_marker_is_the_connectorless_fallback() {
 fn tree_selector_marks_the_selection_pis_way_not_with_an_invented_marker() {
     let theme = UiTheme::dark();
     let sel = TreeSelector::new(tree_nodes());
-    let rows = sel.rows(80, &theme);
+    let rows = sel.rows(&theme);
     let selected = text(&rows[0]);
     assert!(
         !selected.contains('◀'),
@@ -738,7 +746,7 @@ fn tree_selection_without_a_selected_bg_role_keeps_its_foreground() {
     let mut theme = UiTheme::dark();
     theme.roles.remove("selectedBg");
     let sel = TreeSelector::new(tree_nodes());
-    let rows = sel.rows(80, &theme);
+    let rows = sel.rows(&theme);
     assert!(
         rows[0]
             .spans
@@ -778,9 +786,11 @@ fn list_selector_draws_no_hint_row_where_pi_draws_none() {
     }
 }
 
-/// The thinking picker's footer is pi's literal string, not the generic hint row
-/// (`thinking-selector.ts:94`) — and it is what advertises the `Ctrl+S` persist key. Unconditional
-/// upstream, unlike the model picker's (`model-selector.ts:138`).
+/// The thinking picker's footer is pi's own sentence, not the generic hint row — and it is what
+/// advertises the persist key. Unconditional upstream, unlike the model picker's
+/// (`model-selector.ts:138`). Since pi #9149 (v0.85.1) its three keys are live
+/// `keyDisplayText(...)` labels (`thinking-selector.ts:93-100` @v0.87.1), so the stock
+/// `tui.select.cancel` pair (`escape`, `ctrl+c`) is printed whole.
 #[test]
 fn thinking_selector_draws_pis_set_as_default_footer() {
     let mut sel = thinking("medium", "medium");
@@ -789,7 +799,9 @@ fn thinking_selector_draws_pis_set_as_default_footer() {
     // TRAILING rows — at 16 the footer this test is about would be clipped off.
     let s = screen(&render_selector(&mut sel, 80, 20));
     assert!(
-        s.contains("Enter to select \u{b7} Ctrl+S to set as default \u{b7} Esc to cancel"),
+        s.contains(
+            "Enter to select \u{b7} Ctrl+S to set as default \u{b7} Escape/Ctrl+C to cancel"
+        ),
         "pi's footer verbatim:\n{s}"
     );
     // The generic hint row is still not invented alongside it.
@@ -1306,9 +1318,12 @@ fn roled_nodes() -> Vec<TreeNode> {
 fn tree_rows_are_coloured_per_role_like_pi() {
     let theme = UiTheme::dark();
     let mut sel = TreeSelector::new(roled_nodes());
+    // `all`, so the `model_change` row the default filter hides (`tree-selector.ts:355-361`) is
+    // drawn and its colour can be read.
+    sel.set_filter(FilterMode::All);
     // Park the cursor on a row not under test so no assertion is confounded by `:851`'s bold.
     sel.handle(&key(KeyCode::Down), &SelectKeymap::default());
-    let rows = sel.rows(120, &theme);
+    let rows = sel.rows(&theme);
 
     // `:781` — `accent` prefix, body text behind it.
     let user = &rows[0];
@@ -1398,7 +1413,7 @@ fn tree_compaction_row_reads_the_border_accent_token() {
         .expect("dark.json:25 defines borderAccent");
     let mut sel = TreeSelector::new(roled_nodes());
     sel.handle(&key(KeyCode::Down), &SelectKeymap::default());
-    let rows = sel.rows(120, &theme);
+    let rows = sel.rows(&theme);
     let got = span_style_containing(&rows[5], "compaction").fg;
     assert_eq!(
         got,
@@ -1427,7 +1442,7 @@ fn tree_compaction_row_reads_the_border_accent_token() {
 fn tree_selected_row_is_bolded_not_repainted_accent() {
     let theme = UiTheme::dark();
     let sel = TreeSelector::new(roled_nodes()); // row 0 (the `user:` row) is selected
-    let rows = sel.rows(120, &theme);
+    let rows = sel.rows(&theme);
     let prefix = span_style_containing(&rows[0], "user: ");
     let body = span_style_containing(&rows[0], "port the editor");
 
@@ -1448,7 +1463,7 @@ fn tree_selected_row_is_bolded_not_repainted_accent() {
     // And an unselected row of the same role is the same colour, minus the bold.
     let mut moved = TreeSelector::new(roled_nodes());
     moved.handle(&key(KeyCode::Down), &SelectKeymap::default());
-    let unselected = span_style_containing(&moved.rows(120, &theme)[0], "port the editor");
+    let unselected = span_style_containing(&moved.rows(&theme)[0], "port the editor");
     assert_eq!(
         unselected.fg, body.fg,
         "selection must not change the colour"
@@ -1460,48 +1475,32 @@ fn tree_selected_row_is_bolded_not_repainted_accent() {
     );
 }
 
-/// **S24(a).** The label-timestamp pad is `width - leftWidth - stampWidth - 1`, and `leftWidth` has
-/// to be a COLUMN count. Upstream measures the same quantities with `visibleWidth`
-/// (`tree-selector.ts:747` `const anchorCol = visibleWidth(prefixPart);`, `:754`
-/// `bodyWidth: visibleWidth(body)`).
-///
-/// The row here is unavoidably unicode even before the preview text: the `●` glyph, and the
-/// `☆labeled` star that a labeled row always carries. Add a CJK preview and `chars().count()`
-/// under-measures the row by one column per wide character.
-///
-/// FAILS under `spans.iter().map(|s| s.content.chars().count())`: the pad is computed from 31
-/// columns where the row really occupies 41, so the row renders 10 columns too wide and the
-/// timestamp is pushed off the right edge of an 80-column frame.
+/// **SESS-S05** (superseding S24(a)'s right-column pad). pi composes a labeled row as
+/// `prefix + "[label] " + "<label time> " + content` (`tree-selector.ts:745-754` @v0.87.1) — the
+/// timestamp sits INLINE between the label and the entry text, and the row is exactly as wide as
+/// that content (`renderHorizontalViewport` pads nothing, `:85-91`). cyrup used to push the stamp
+/// into a right-aligned column padded out to the frame width. A CJK preview keeps the width check
+/// honest: the row is measured in columns, not chars.
 #[test]
-fn tree_label_timestamp_pad_is_measured_in_columns_not_chars() {
+fn tree_label_timestamp_renders_inline_between_the_label_and_the_entry_text() {
     let theme = UiTheme::dark();
+    let today_1204 = super::tree_label_timestamp::today_at(12, 4);
     let mut labeled = TreeNode::message("e1", 0, "user: 日本語のプレビュー行です");
-    labeled.has_label = true;
-    labeled.time_label = Some("12:04".to_string());
+    labeled.user_label = Some("wip".to_string());
+    labeled.label_timestamp = Some(today_1204);
     let mut sel = TreeSelector::new(vec![labeled]);
-    // `shift+t` = `app.tree.toggleLabelTimestamp` (`tree-selector.ts:1090`, bound at
-    // `keybindings.ts:131-134`); the column is off by default.
+    // `shift+t` = `app.tree.toggleLabelTimestamp` (`tree-selector.ts:1098`); off by default.
     sel.handle(&tree_toggle_label_time_key(), &SelectKeymap::default());
 
-    let width = 80u16;
-    let row = &sel.rows(width, &theme)[0];
+    let row = &sel.rows(&theme)[0];
     let rendered = text(row);
     assert!(
-        rendered.contains("12:04"),
-        "precondition: the column is on: {rendered:?}"
+        rendered.ends_with("[wip] 12:04 user: 日本語のプレビュー行です"),
+        "label, then its time, then the entry text: {rendered:?}"
     );
-
     assert_eq!(
         row.width(),
-        usize::from(width),
-        "the padded row must occupy exactly the frame width: {rendered:?} ({} columns)",
-        row.width()
-    );
-    // The stamp is the last thing on the row, so it must end flush against the right edge.
-    let stamp_start = row.width() - 5;
-    assert_eq!(
-        ratatui::text::Span::raw(rendered.trim_end_matches("12:04")).width(),
-        stamp_start,
-        "the timestamp must end flush right: {rendered:?}"
+        ratatui::text::Span::raw(rendered.as_str()).width(),
+        "no padding beyond the content: {rendered:?}"
     );
 }

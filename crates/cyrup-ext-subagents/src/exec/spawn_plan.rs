@@ -151,6 +151,18 @@ pub const AGENT_NAME_ENV_VAR: &str = "CYRUP_SUBAGENT_AGENT_NAME";
 /// pi's `__none__` sentinel for [`MCP_DIRECT_TOOLS_ENV`] when no direct MCP tools are declared.
 const MCP_DIRECT_TOOLS_NONE_SENTINEL: &str = "__none__";
 
+/// SUBA-140 — the child-only prompt-cache tier, pi `PI_SUBAGENT_CACHE_RETENTION`
+/// (`shared/child-cache-retention.ts:14-16` @v0.71.0, `ce3cff20`/#2190). A cache write is priced by
+/// the TTL it asks for, and a short-lived child never claims a 1-hour window, so `short` here keeps
+/// the surcharge off children while the parent stays on `long`. Unset (or empty — upstream's `||`)
+/// means children inherit the parent's retention, which is the behaviour before the variable
+/// existed.
+const SUBAGENT_CACHE_RETENTION_ENV: &str = "CYRUP_SUBAGENT_CACHE_RETENTION";
+
+/// The retention variable the child's provider layer reads — pi `PI_CACHE_RETENTION`, hard-renamed
+/// (`cyrup-provider`'s `resolve_cache_retention`).
+const CACHE_RETENTION_ENV: &str = "CYRUP_CACHE_RETENTION";
+
 /// The child flag carrying a `SystemPromptMode::Replace` persona body (pi `runs/shared/pi-args.ts:165`'s
 /// `"--system-prompt"`; the host side is `cyrup/src/cli.rs`'s `#[arg(long = "system-prompt")]`).
 pub(crate) const SYSTEM_PROMPT_FLAG: &str = "--system-prompt";
@@ -590,6 +602,17 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         fast_mode_env(opts.fast, model, &agent.name, ceiling_deny_extensions)?
     {
         env_overlay.insert(key, value);
+    }
+    // SUBA-140 — pi `childCacheRetentionEnv` (`child-cache-retention.ts:22-25` @v0.71.0). Every
+    // cyrup child is a spawned process, so the launch-environment form covers both of upstream's
+    // arms (its in-process foreground child pins the same value per request instead). Written only
+    // when set, so an unset variable leaves the child inheriting the parent's own retention rather
+    // than clearing it.
+    if let Some(retention) = opts
+        .parent_env_var(SUBAGENT_CACHE_RETENTION_ENV)
+        .filter(|value| !value.is_empty())
+    {
+        env_overlay.insert(CACHE_RETENTION_ENV.to_string(), retention);
     }
     let tool_diagnostic_path = env_control_channels(
         opts,
@@ -2325,6 +2348,55 @@ mod tests {
              was {:?}",
             plan.spec.env_overlay
         );
+    }
+
+    /// SUBA-140 — `CYRUP_SUBAGENT_CACHE_RETENTION` becomes the child's `CYRUP_CACHE_RETENTION`
+    /// (pi `childCacheRetentionEnv`, `child-cache-retention.ts:22-25` @v0.71.0), read through the
+    /// launching extension's environment. Unset or empty writes nothing, so the child inherits the
+    /// parent's own retention instead of having it overwritten.
+    ///
+    /// GUT the insert and the first case is red; drop the empty filter and the second is.
+    #[test]
+    fn the_child_only_cache_retention_reaches_the_child_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let agent = sample_agent_config("m1", &[]);
+        let plan_with = |value: Option<&str>| {
+            let mut opts = base_opts(dir.path(), &["m1"]);
+            opts.parent_env_overrides.insert(
+                SUBAGENT_CACHE_RETENTION_ENV.to_string(),
+                value.map(str::to_string),
+            );
+            build_attempt_spawn_plan(
+                &agent,
+                &ModelId::from("m1"),
+                "task",
+                &opts,
+                depth,
+                dir.path(),
+                None,
+            )
+            .expect("plan builds")
+        };
+
+        let short = plan_with(Some("short"));
+        assert_eq!(
+            short.spec.env_overlay.get("CYRUP_CACHE_RETENTION"),
+            Some(&"short".to_string()),
+            "overlay was {:?}",
+            short.spec.env_overlay
+        );
+        for unset in [None, Some("")] {
+            let plan = plan_with(unset);
+            assert!(
+                !plan.spec.env_overlay.contains_key("CYRUP_CACHE_RETENTION"),
+                "{unset:?} must leave the parent's retention inherited; overlay was {:?}",
+                plan.spec.env_overlay
+            );
+        }
     }
 
     /// The uninjected path is the whole installed base: it must add neither variable, so a run

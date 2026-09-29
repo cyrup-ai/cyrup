@@ -81,9 +81,10 @@ impl<B: Backend> App<B> {
                 // interactive-mode.ts:5106-5112): a `.jsonl` target writes the raw transcript;
                 // every other target (including no path) writes a styled HTML document — HTML is the
                 // default. cyrup renders the document at the L5 seam
-                // (`cyrup_session_svc::session_jsonl_to_html_with_theme`) over the session's own
-                // JSONL, carrying the ACTIVE theme's palette as pi's `generateHtml` does
-                // (`core/export-html/index.ts:151-157` @v0.84.4).
+                // (`AgentSession::export_html_document`) over the session's whole tree, carrying
+                // the ACTIVE theme's palette as pi's `generateHtml` does
+                // (`core/export-html/index.ts:151-157` @v0.84.4); the `.jsonl` target is the
+                // current branch, linearised (`serializeSessionBranch`, SESS-058).
                 let is_jsonl = arg
                     .as_deref()
                     .is_some_and(|p| p.trim_end().to_ascii_lowercase().ends_with(".jsonl"));
@@ -106,14 +107,9 @@ impl<B: Backend> App<B> {
                             .push_status(format!("export error: {e}")),
                     }
                 } else {
-                    // Pull the transcript as JSONL (no path ⇒ returned as text), render to HTML, write.
-                    match session.export_to_jsonl(None).await {
-                        Ok(Some(jsonl)) => {
-                            let html = cyrup_session_svc::session_jsonl_to_html_with_theme(
-                                &jsonl,
-                                &session.export_theme(),
-                                &session.export_state().await,
-                            );
+                    // Render the whole-tree HTML document (pi `exportToHtml`), then write it.
+                    match session.export_html_document().await {
+                        Ok(html) => {
                             // TUI-082 — bare `/export` WRITES A FILE. It used to `push_block` the
                             // raw HTML into the transcript, so the single most likely invocation
                             // produced no artifact and flooded scrollback with markup the user
@@ -158,7 +154,6 @@ impl<B: Backend> App<B> {
                                 ),
                             }
                         }
-                        Ok(None) => self.state.transcript.push_status("exported session"),
                         Err(e) => self
                             .state
                             .transcript
@@ -285,13 +280,11 @@ impl<B: Backend> App<B> {
                         match self.maybe_save_implicit_project_trust(session).await {
                             Ok(saved) => (saved, None),
                             // pi's `catch` (`:4938-4940`): the reload proceeds, the status keeps
-                            // its plain variant, and `showWarning` frames the message
-                            // (`Warning: …`, `:4264-4266`). Surfaced post-swap via the effect.
+                            // its plain variant, and `showWarning` frames the message. Surfaced
+                            // post-swap via the effect.
                             Err(e) => (
                                 false,
-                                Some(format!(
-                                    "Warning: Could not save project trust after reload: {e}"
-                                )),
+                                Some(format!("Could not save project trust after reload: {e}")),
                             ),
                         };
                     // TUI-025 — Pi's own sentence, `interactive-mode.ts:5418-5423` @v0.83.0.
@@ -495,79 +488,94 @@ impl<B: Backend> App<B> {
     /// its confirmation is [`Self::execute_session_switch`]). Arm body moved verbatim from
     /// [`Self::execute_command`]'s `OpenSelector(SelectorKind::Session)` arm.
     pub(crate) async fn execute_open_session_selector(&mut self, session: &Arc<AgentSession>) {
-        // `/resume` (session-selector.ts): the persisted-session list for this cwd, newest
-        // first, sourced via the additive `list_sessions` seam. Confirming carries the chosen
-        // session file path; the actual runtime swap is driven by the L7 `SessionRuntime`
-        // (`switch_session`) once the runtime is threaded into the run loop (residual gap #3).
-        let sessions = session.list_sessions();
-        if sessions.is_empty() {
-            self.state
-                .transcript
-                .push_status("no saved sessions to resume");
-        } else {
-            let current = session.session_id().to_string();
-            let rows: Vec<SessionRow> = sessions
+        // `/resume` (`showSessionSelector`, `interactive-mode.ts:5549-5590` @v0.87.1): the picker
+        // is handed BOTH of pi's loaders — this project's sessions (`SessionManager.list`) and every
+        // project's (`SessionManager.listAll`) — and `Tab` swaps between them. It opens even when
+        // the current folder has none, where the empty state reads "No sessions in current folder.
+        // Press Tab to view all." (`session-selector.ts:443`) — the all-projects list is the way
+        // out. Confirming carries the chosen session file path into
+        // [`Self::execute_session_switch`].
+        let current_sessions = session.list_sessions();
+        let all_sessions = session.list_all_sessions();
+        let current = session.session_id().to_string();
+        // `new SessionSelectorComponent(..., { keybindings }, currentSessionFilePath)`
+        // (`interactive-mode.ts:5550-5587`): the picker is handed the live keybindings AND the
+        // running session's file path, and each `SessionInfo` carries its `parentSessionPath`
+        // (`session-manager.ts` → `session-selector.ts:222`). Without those three the threaded view
+        // has no edges to draw, the row you are sitting in is not accented, and the hint rows name
+        // stock keys.
+        let mut selector = SessionSelector::new(session_rows(&current_sessions, &current))
+            .with_keymaps(&self.state.session_keymap, self.state.editor.keymap_ref());
+        selector.set_all_rows(session_rows(&all_sessions, &current));
+        // The cwd column the `all` scope turns on (`session-selector.ts:468-470`) — the only thing
+        // that says which project a row in the merged listing belongs to.
+        selector.set_session_cwds(
+            current_sessions
                 .iter()
-                .map(|s| {
-                    let label = session_label(s);
-                    let is_current = s.id.to_string() == current;
-                    let desc = format!(
-                        "{} msgs{}",
-                        s.message_count,
-                        if is_current { " (current)" } else { "" }
-                    );
-                    // The query-DSL search text (`getSessionSearchText`,
-                    // session-selector-search.ts:26): `{id} {name} {allMessagesText} {cwd}`.
-                    let search_text = format!(
-                        "{} {} {} {}",
-                        s.id,
-                        s.name.as_deref().unwrap_or(""),
-                        s.all_messages_text,
-                        s.cwd
-                    );
-                    SessionRow {
-                        path: s.path.display().to_string(),
-                        label,
-                        name: s.name.clone(),
-                        desc: Some(desc),
-                        search_text,
-                        recency: system_time_nanos(s.modified),
-                    }
-                })
-                .collect();
-            // `new SessionSelectorComponent(..., { keybindings }, currentSessionFilePath)`
-            // (`interactive-mode.ts:4867-4884`): the picker is handed the live keybindings
-            // AND the running session's file path, and each `SessionInfo` carries its
-            // `parentSessionPath` (`session-manager.ts` → `session-selector.ts:222`).
-            // Without those three the threaded view has no edges to draw, the row you are
-            // sitting in is not accented, and the hint rows name stock keys.
-            let mut selector = SessionSelector::new(rows)
-                .with_keymaps(&self.state.session_keymap, self.state.editor.keymap_ref());
-            selector.set_parent_paths(sessions.iter().filter_map(|s| {
-                s.parent_session_path
-                    .as_ref()
-                    .map(|p| (s.path.display().to_string(), p.display().to_string()))
-            }));
-            // `options?.showRenameHint ?? this.canRename` (`session-selector.ts:772`):
-            // upstream's host declares the capability by passing a `renameSession`
-            // callback. cyrup's is the `SessionSelectorOutcome::Rename` arm below, which
-            // lands in `session.rename_session_file` — so the capability is present and the
-            // hint is on. Stated here rather than defaulted in the component, because the
-            // component cannot know whether its host wired the apply path.
-            selector.set_show_rename_hint(true);
-            // `currentSessionFilePath` — resolved from the listing rather than the manager
-            // so it is the SAME string the rows carry (a canonicalization mismatch would
-            // silently never match).
-            selector.set_current_session_path(
-                sessions
-                    .iter()
-                    .find(|s| s.id.to_string() == current)
-                    .map(|s| s.path.display().to_string()),
-            );
-            let inner: Box<dyn Selector> = Box::new(selector);
-            self.open_boxed_selector(SelectorKind::Session, inner);
-        }
+                .chain(all_sessions.iter())
+                .map(|s| (s.path.display().to_string(), s.cwd.clone())),
+        );
+        selector.set_parent_paths(
+            current_sessions
+                .iter()
+                .chain(all_sessions.iter())
+                .filter_map(|s| {
+                    s.parent_session_path
+                        .as_ref()
+                        .map(|p| (s.path.display().to_string(), p.display().to_string()))
+                }),
+        );
+        // `options?.showRenameHint ?? this.canRename` (`session-selector.ts:772`): upstream's host
+        // declares the capability by passing a `renameSession` callback. cyrup's is the
+        // `SessionSelectorOutcome::Rename` arm below, which lands in `session.rename_session_file`
+        // — so the capability is present and the hint is on. Stated here rather than defaulted in
+        // the component, because the component cannot know whether its host wired the apply path.
+        selector.set_show_rename_hint(true);
+        // `currentSessionFilePath` — resolved from the listing rather than the manager so it is the
+        // SAME string the rows carry (a canonicalization mismatch would silently never match).
+        selector.set_current_session_path(
+            current_sessions
+                .iter()
+                .chain(all_sessions.iter())
+                .find(|s| s.id.to_string() == current)
+                .map(|s| s.path.display().to_string()),
+        );
+        let inner: Box<dyn Selector> = Box::new(selector);
+        self.open_boxed_selector(SelectorKind::Session, inner);
     }
+}
+
+/// One `/resume` row per listed session — the projection both of the picker's scopes share.
+fn session_rows(sessions: &[cyrup_session_svc::SessionInfo], current: &str) -> Vec<SessionRow> {
+    sessions
+        .iter()
+        .map(|s| {
+            let label = session_label(s);
+            let is_current = s.id.to_string() == current;
+            let desc = format!(
+                "{} msgs{}",
+                s.message_count,
+                if is_current { " (current)" } else { "" }
+            );
+            // The query-DSL search text (`getSessionSearchText`,
+            // session-selector-search.ts:26): `{id} {name} {allMessagesText} {cwd}`.
+            let search_text = format!(
+                "{} {} {} {}",
+                s.id,
+                s.name.as_deref().unwrap_or(""),
+                s.all_messages_text,
+                s.cwd
+            );
+            SessionRow {
+                path: s.path.display().to_string(),
+                label,
+                name: s.name.clone(),
+                desc: Some(desc),
+                search_text,
+                recency: system_time_nanos(s.modified),
+            }
+        })
+        .collect()
 }
 
 impl<B: Backend> App<B> {

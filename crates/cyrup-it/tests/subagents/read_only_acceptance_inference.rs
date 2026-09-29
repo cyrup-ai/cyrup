@@ -330,11 +330,8 @@ async fn a_lowered_policy_survives_a_declared_read_only_role_at_the_live_seam() 
     // `:513-516` — the explicit side declared no `criteria`, so the read-only branch's own
     // criterion survives instead of being dropped.
     assert!(
-        effective
-            .criteria
-            .iter()
-            .any(|gate| gate.must
-                == "Return concrete findings with file paths and severity when applicable"),
+        effective.criteria.iter().any(|gate| gate.must
+            == "Return concrete findings with file paths and severity when applicable"),
         "the inferred read-only criterion must survive the merge: {:?}",
         effective.criteria
     );

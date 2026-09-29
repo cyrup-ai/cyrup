@@ -55,6 +55,7 @@ pub mod fleet_theme;
 pub mod fleet_transcript;
 pub mod notices;
 pub mod render;
+pub mod supervisor_ui;
 
 // =================================================================================================
 // RunSource (func-SA §4.6's `SubagentRunHandle.source`; shared by every type below)

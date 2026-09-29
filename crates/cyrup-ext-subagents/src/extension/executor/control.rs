@@ -573,6 +573,7 @@ impl SubagentExecutor {
                     // (`subagent-executor.ts:2180-2181`); only the unported steering-recovery path
                     // does. The descriptor's `absoluteDeadlineAt` is evidence, not a limit here.
                     timeout_ms: None,
+                    checkpoint_before_deadline_ms: None,
                     // pi `shareEnabled: recoveryDescriptor?.share` (`:2135`), `artifactsDir` and
                     // `artifactConfig` (`:2106-2107`): the launch's own, never `default()`.
                     share: Some(descriptor.share),

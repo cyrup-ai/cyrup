@@ -44,6 +44,28 @@ async fn decodes_text_with_usage_terminal() {
 }
 
 #[tokio::test]
+async fn kimi_top_level_cached_tokens_count_as_cache_reads() {
+    // PROV-076 / pi #8075: Kimi reports cache hits as a top-level `usage.cached_tokens` on the
+    // final usage chunk — the third fallback after `prompt_tokens_details` and DeepSeek's key.
+    let raw = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"cached_tokens\":60}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let events = collect_events(raw).await;
+    match events.last() {
+        Some(StreamEvent::Done { message, .. }) => {
+            assert_eq!(message.usage.cache_read, 60);
+            assert_eq!(message.usage.input, 40);
+            // Priced at the cache-read rate ($0.5/M), not as uncached input.
+            assert!((message.usage.cost.cache_read - 60.0 * 0.5 / 1_000_000.0).abs() < 1e-12);
+        }
+        other => panic!("expected Done terminal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn non_terminal_events_carry_running_partial() {
     // Pi parity (R-01-022): every non-terminal event carries a `partial` snapshot that grows
     // as deltas arrive, so consumers never reconstruct from deltas.

@@ -269,6 +269,18 @@ pub struct SingleResult {
     /// (`subagent-runner.ts:924`).
     #[serde(default, skip_serializing_if = "crate::exec::is_false")]
     pub wrap_up_requested: bool,
+    /// SUBA-132 — pi `SingleResult.toolBudgetBlocked?: boolean` (`shared/types.ts:1294` @v0.71.0,
+    /// set at `execution.ts:1144-1156`): a tool call of this child was refused by its own tool
+    /// budget's hard block. `workflowTerminalOutcomeForResult` settles such a workflow child
+    /// `budget_exhausted` ([`crate::workflows::WorkflowBudgetSignals::from_single_result`]).
+    #[serde(default, skip_serializing_if = "crate::exec::is_false")]
+    pub tool_budget_blocked: bool,
+    /// SUBA-134 — pi `SingleResult.sessionName?: string` (`execution.ts:464,503,1505` @v0.71.0):
+    /// the child session's human-readable name
+    /// ([`crate::exec::child_session_name::derive_child_session_name`]), so a host rendering the
+    /// parent stream can label each child row. Omitted when no name could be derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
     /// SUBA-021 — pi `statusPayload.usageBudget` (`subagent-runner.ts:4411`, published onto the
     /// result at `:4471` and onto `status.json` via `async-status.ts:336`): the reported-consumption
     /// budget this run ran under and where it ended up.

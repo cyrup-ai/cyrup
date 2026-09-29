@@ -163,6 +163,7 @@ pub mod provider;
 pub mod registry;
 pub mod render;
 pub mod subscriber;
+pub mod ui_prompt;
 pub mod wrapper;
 
 #[cfg(test)]
@@ -227,6 +228,7 @@ pub use registry::{
 };
 pub use render::RenderOptions;
 pub use subscriber::ExtSubscriber;
+pub use ui_prompt::{UiPromptGuard, UiPromptKind, UiPromptTracker};
 pub use wrapper::{ActiveToolNames, RegisteredTool, wrap_registered_tool};
 
 #[cfg(feature = "wasm-host")]

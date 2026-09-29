@@ -149,6 +149,7 @@ impl Provider for UnconfiguredProvider {
             deferred: None,
             error_message: Some(format_no_models_available_message()),
             raw_stop_reason: None,
+            end_turn: None,
             timestamp: 0,
         };
         let event = StreamEvent::Error {

@@ -77,6 +77,9 @@ const VALID_TUI_MODES: [&str; 2] = ["regular", "fullscreen"];
 /// pi's `--tui-mode`-with-no-usable-value error (args.ts:186 @v0.84.1), verbatim.
 const TUI_MODE_REQUIRES: &str = "--tui-mode requires regular or fullscreen";
 
+/// pi's `--use-theme`-with-no-usable-value error (args.ts:193 @v0.87.1), verbatim.
+const USE_THEME_REQUIRES: &str = "--use-theme requires a theme name";
+
 /// The single-char short flags clap accepts (Pi's exact short set, args.ts). Any OTHER single-dash
 /// token is an unknown option (Pi args.ts:202-203) rather than a clap exit-2 usage error.
 const KNOWN_SHORT_FLAGS: [&str; 9] = ["-p", "-c", "-r", "-a", "-n", "-t", "-e", "-h", "-v"];
@@ -260,6 +263,29 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
             i += 1;
             continue;
         }
+        // `--use-theme <name>` — pi args.ts:190-197 @v0.87.1: a missing value or a `-`-leading next
+        // token is the error `--use-theme requires a theme name`, and — like `--mode` and
+        // `--tui-mode` — the next token is NOT consumed on that branch, so `--use-theme --print`
+        // still parses `--print`. Any other token is the name, kept for clap. SEAM-119.
+        //
+        // CYRUP-DELTA: the `--use-theme=<name>` form is accepted, as every known long flag's `=`
+        // form is here (see the `--tui-mode` arm above); an empty `=` value is the same error.
+        if arg == "--use-theme" || arg.starts_with("--use-theme=") {
+            match arg.strip_prefix("--use-theme=") {
+                Some("") => diagnostics.push(Diagnostic::error(USE_THEME_REQUIRES)),
+                Some(_) => clean.push(arg.clone()),
+                None => match argv.get(i + 1) {
+                    Some(name) if !name.starts_with('-') => {
+                        clean.push(arg.clone());
+                        clean.push(name.clone());
+                        i += 1;
+                    }
+                    _ => diagnostics.push(Diagnostic::error(USE_THEME_REQUIRES)),
+                },
+            }
+            i += 1;
+            continue;
+        }
         // `--models` / `--tools` / `-t` / `--exclude-tools` — pi ASSIGNS these (args.ts:114,121-129),
         // so a repeated flag REPLACES the earlier value. Record the span this occurrence occupies in
         // `clean`; the post-pass below keeps only the last one per family. The value token is passed
@@ -410,8 +436,11 @@ pub fn report(diagnostics: &[Diagnostic]) {
     }
 }
 
-/// Pi's SECOND `reportDiagnostics` checkpoint — `reportDiagnostics(runtime.diagnostics)` +
-/// `process.exit(1)` on any error (main.ts:843-848). Returns `true` when the caller must exit 1.
+/// Pi's SECOND `reportDiagnostics` checkpoint (main.ts:895-904 @v0.87.1): merge the startup
+/// settings manager's diagnostics with the runtime's (`deduplicateDiagnostics([...startup,
+/// ...runtime.diagnostics])`), print them to stderr unless this is an interactive run with no
+/// runtime error, and exit 1 on any runtime error. [`RuntimeReport::notices`] carries what an
+/// interactive run shows in the transcript instead (`InteractiveMode({ startupDiagnostics })`).
 ///
 /// SEAM-S01: `AgentSessionRuntime::diagnostics()` had NO production consumer, which is why a
 /// mistyped `--flag` (captured as an extension flag, then owned by no loaded extension) was
@@ -424,26 +453,90 @@ pub fn report(diagnostics: &[Diagnostic]) {
 /// them, including Pi's `EXTENSION_LOAD_FAILURE_HINT` (`main.ts:61`, `:844-846`), reproduced below.
 /// Routing them to the interactive-only `[Extension issues]` panel alone would leave print/json/rpc
 /// silent at exit 0 — and cyrup's natives include the permission gate, so that would be fail-OPEN.
-pub async fn report_runtime(runtime: &cyrup_session_svc::AgentSessionRuntime) -> bool {
-    let diagnostics = runtime.diagnostics().await;
-    let mut fatal = false;
-    for d in &diagnostics {
+///
+/// CFG-088: both settings managers' load failures now reach this merge — the startup one held
+/// back by `main` rather than printed ahead of everything, the session's own through
+/// `runtime.diagnostics` — so one broken file is reported ONCE, and an interactive run shows it in
+/// the transcript rather than on a stderr the TUI is about to paint over.
+pub async fn report_runtime(
+    runtime: &cyrup_session_svc::AgentSessionRuntime,
+    startup: &[Diagnostic],
+    interactive: bool,
+) -> RuntimeReport {
+    let runtime_diagnostics = runtime.diagnostics().await;
+    let report = startup_report(startup, &runtime_diagnostics, interactive);
+    for line in &report.stderr {
+        eprintln!("{line}");
+    }
+    report.outcome
+}
+
+/// What [`report_runtime`] decided: exit 1 (`fatal`), and the diagnostics an interactive run shows
+/// in its transcript (empty whenever they went to stderr instead).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RuntimeReport {
+    pub fatal: bool,
+    pub notices: Vec<Diagnostic>,
+}
+
+/// The pure core of [`report_runtime`]: the stderr lines and the outcome.
+struct StartupReport {
+    stderr: Vec<String>,
+    outcome: RuntimeReport,
+}
+
+fn startup_report(
+    startup: &[Diagnostic],
+    runtime: &[cyrup_session_svc::RuntimeDiagnostic],
+    interactive: bool,
+) -> StartupReport {
+    let runtime_as_diagnostics = runtime.iter().map(|d| {
         if d.severity == "error" {
-            fatal = true;
-            eprintln!("Error: {}", d.message);
+            Diagnostic::error(d.message.clone())
         } else {
-            eprintln!("Warning: {}", d.message);
+            Diagnostic::warning(d.message.clone())
+        }
+    });
+    // Pi `deduplicateDiagnostics` (`core/settings-diagnostics.ts:15-26`): first occurrence of each
+    // type + message wins, order otherwise kept.
+    let mut merged: Vec<Diagnostic> = Vec::new();
+    for d in startup.iter().cloned().chain(runtime_as_diagnostics) {
+        if !merged.contains(&d) {
+            merged.push(d);
         }
     }
-    // Pi `main.ts:844-846`: matched on the message text, over ALL diagnostics, not just the errors.
+    let fatal = runtime.iter().any(|d| d.severity == "error");
+    if interactive && !fatal {
+        return StartupReport {
+            stderr: Vec::new(),
+            outcome: RuntimeReport {
+                fatal,
+                notices: merged,
+            },
+        };
+    }
+    let mut stderr: Vec<String> = merged
+        .iter()
+        .map(|d| match d.level {
+            DiagnosticLevel::Error => format!("Error: {}", d.message),
+            DiagnosticLevel::Warning => format!("Warning: {}", d.message),
+        })
+        .collect();
+    // Pi `main.ts:902-903`: matched on the message text, over the RUNTIME diagnostics.
     if fatal
-        && diagnostics
+        && runtime
             .iter()
             .any(|d| d.message.contains(EXTENSION_LOAD_FAILURE_MARKER))
     {
-        eprintln!("{EXTENSION_LOAD_FAILURE_HINT}");
+        stderr.push(EXTENSION_LOAD_FAILURE_HINT.to_string());
     }
-    fatal
+    StartupReport {
+        stderr,
+        outcome: RuntimeReport {
+            fatal,
+            notices: Vec::new(),
+        },
+    }
 }
 
 /// Pi `main.ts:844` — the substring that selects the extension-load hint.
@@ -710,5 +803,62 @@ mod tests {
         assert!(msg.starts_with("No models available."));
         assert!(msg.contains("/login"));
         assert!(EXTENSION_LOAD_FAILURE_HINT.contains("-ne"));
+    }
+
+    fn runtime_diag(severity: &str, message: &str) -> cyrup_session_svc::RuntimeDiagnostic {
+        cyrup_session_svc::RuntimeDiagnostic {
+            severity: severity.to_string(),
+            message: message.to_string(),
+            source: None,
+        }
+    }
+
+    /// CFG-088 — pi `main.ts:896-900` @v0.87.1: the startup settings manager's diagnostics and the
+    /// runtime's are merged and deduplicated on type + message (`deduplicateDiagnostics`), then
+    /// printed unless the run is interactive with no runtime error, in which case they go to the
+    /// UI instead.
+    #[test]
+    fn startup_and_runtime_diagnostics_merge_dedup_and_route_by_mode() {
+        let broken = "Invalid settings file /a/settings.json: parse error: x";
+        let startup = vec![Diagnostic::warning(broken)];
+        let runtime = vec![
+            runtime_diag("warning", broken),
+            runtime_diag("warning", "other"),
+        ];
+
+        let printed = startup_report(&startup, &runtime, false);
+        assert_eq!(
+            printed.stderr,
+            vec![format!("Warning: {broken}"), "Warning: other".to_string()]
+        );
+        assert_eq!(printed.outcome, RuntimeReport::default());
+
+        let shown = startup_report(&startup, &runtime, true);
+        assert!(shown.stderr.is_empty());
+        assert_eq!(
+            shown.outcome.notices,
+            vec![Diagnostic::warning(broken), Diagnostic::warning("other")]
+        );
+        assert!(!shown.outcome.fatal);
+
+        // A runtime error prints everything even in interactive mode, and is fatal.
+        let fatal = startup_report(
+            &startup,
+            &[runtime_diag(
+                "error",
+                "Failed to load extension \"x\": boom",
+            )],
+            true,
+        );
+        assert!(fatal.outcome.fatal);
+        assert!(fatal.outcome.notices.is_empty());
+        assert_eq!(
+            fatal.stderr,
+            vec![
+                format!("Warning: {broken}"),
+                "Error: Failed to load extension \"x\": boom".to_string(),
+                EXTENSION_LOAD_FAILURE_HINT.to_string(),
+            ]
+        );
     }
 }

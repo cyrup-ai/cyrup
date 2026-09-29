@@ -263,6 +263,16 @@ impl StartupReport {
             extension_diagnostics: {
                 let mut diags =
                     extension_diagnostics(&services.startup_diagnostics.extensions, home);
+                // EXT-053 — then the built-in command conflicts, pi's
+                // `getBuiltInCommandConflictDiagnostics` (`interactive-mode.ts:1884` @v0.87.1).
+                // A poisoned registry reads as "no commands", never a panic.
+                diags.extend(builtin_command_conflict_diagnostics(
+                    &services
+                        .ext_host
+                        .registry()
+                        .resolved_commands()
+                        .unwrap_or_default(),
+                ));
                 diags.extend(shortcut_diagnostics(
                     &services.ext_host.shortcut_diagnostics(),
                 ));
@@ -352,6 +362,50 @@ pub fn extension_diagnostics(
                 DiagnosticSeverity::Error,
                 Some(display_path(&e.path, home)),
                 e.error.clone(),
+            )
+        })
+        .collect()
+}
+
+/// The warning for each extension command registered under a built-in command's name — EXT-053,
+/// pi's `getBuiltInCommandConflictDiagnostics` (`modes/interactive/interactive-mode.ts:664-677`
+/// @v0.87.1), with both of its message forms verbatim.
+///
+/// The `/` menu drops such a command whatever its invocation name (`:748-753`; cyrup's
+/// [`crate::dynamic_commands_from_catalog_gated`]), so this warning is the only thing that tells
+/// its author why it vanished — and, when a second extension claimed the same name and the runner
+/// suffixed both, which `/name:N` still reaches it. Each is a `warning` carrying the owning
+/// extension (pi's `sourceInfo.path`; cyrup's extension ID, as [`shortcut_diagnostics`] does), and
+/// pi folds them into `[Extension issues]` between the load errors and the shortcut warnings
+/// (`:1884-1886`).
+pub fn builtin_command_conflict_diagnostics(
+    commands: &[cyrup_ext::ResolvedCommand],
+) -> Vec<StartupDiagnostic> {
+    commands
+        .iter()
+        .filter(|c| {
+            crate::commands::BUILTIN_SLASH_COMMANDS
+                .iter()
+                .any(|b| b.name == c.name.as_str())
+        })
+        .map(|c| {
+            let message = if c.invocation_name == c.name {
+                format!(
+                    "Extension command '/{}' conflicts with built-in interactive command. \
+                     Skipping in autocomplete.",
+                    c.name
+                )
+            } else {
+                format!(
+                    "Extension command '/{}' conflicts with built-in interactive command. \
+                     Available as '/{}'.",
+                    c.name, c.invocation_name
+                )
+            };
+            StartupDiagnostic::plain(
+                DiagnosticSeverity::Warning,
+                Some(c.owner.to_string()),
+                message,
             )
         })
         .collect()

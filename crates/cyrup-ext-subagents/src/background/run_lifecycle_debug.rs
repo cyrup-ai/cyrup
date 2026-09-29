@@ -390,6 +390,7 @@ mod tests {
                 base: base("run-x"),
                 reason: ProcessTerminalReason::WriterCloseUnverified,
                 diagnostic: None,
+                instances: Vec::new(),
             })),
             "unknown (writer-close-unverified) · runner inst-1"
         );

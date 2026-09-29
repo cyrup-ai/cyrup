@@ -370,6 +370,11 @@ pub struct BackgroundSingleRequest<'a> {
     /// applies to "foreground and async/background runs", and `async-execution.ts:924,982-983` @v0.34.0 arms
     /// a real deadline from it.
     pub timeout_ms: Option<u64>,
+    /// SUBA-128 — pi `params.checkpointBeforeDeadlineMs` (`extension/schemas.ts:363` @v0.71.0,
+    /// resolved against `config.checkpointBeforeDeadlineMs` at `subagent-executor.ts:3460`): how
+    /// long before the deadline the runner asks the child to checkpoint and stop. `None` takes the
+    /// config default.
+    pub checkpoint_before_deadline_ms: Option<u64>,
     /// CFG-067 — pi `toolTimeoutMs: params.toolTimeoutMs` on the async launch
     /// (`subagent-executor.ts:4146`): the CALL rung, raw, for the same reason
     /// [`BackgroundStepsSpec::tool_timeout_ms`] is.
@@ -442,6 +447,11 @@ pub struct BackgroundStepsSpec {
     /// SUBA-N03: pi `config.timeoutMs` — the nominal run-level timeout budget, carried to hop 2 on
     /// [`crate::background::runner_main::RunnerConfig::timeout_ms`]. `None` = no budget.
     pub timeout_ms: Option<u64>,
+    /// SUBA-128 — pi `config.checkpointBeforeDeadlineMs` (`async-execution.ts:2104` @v0.71.0),
+    /// carried to hop 2 on
+    /// [`crate::background::runner_main::RunnerConfig::checkpoint_before_deadline_ms`]. Only an
+    /// async SINGLE launch sets it, as upstream's only producer is `executeAsyncSingle`.
+    pub checkpoint_before_deadline_ms: Option<u64>,
     /// SUBA-N03: pi `params.share` (`shareEnabled`), carried to hop 2 on
     /// [`crate::background::runner_main::RunnerConfig::share`].
     pub share: Option<bool>,

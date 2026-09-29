@@ -31,7 +31,7 @@ const TEST_BACKOFF_FLOOR: Duration = Duration::from_millis(140);
 async fn a_reconnect_refetches_the_snapshot() {
     // herdr says so — "Call `session.snapshot` again after reconnecting" (`socket-api.mdx:125`) —
     // and its source says why: a new subscription's floor is `current_sequence()` at accept time
-    // (`tmp/herdr/src/api/server.rs:723`), so nothing that happened while the client was away is
+    // (`tmp/herdr/src/api/server.rs:709`), so nothing that happened while the client was away is
     // replayed. Reconnecting the stream alone keeps a cache that can never be corrected.
     let subscribes = Arc::new(AtomicUsize::new(0));
     let snapshots = Arc::new(AtomicUsize::new(0));

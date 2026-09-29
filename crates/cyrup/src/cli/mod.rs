@@ -32,7 +32,7 @@ pub use config_map::{is_local_path, resolve_cli_paths, resolve_prompt_input};
 // ACP-213 — `crate::prelaunch::resolve_session` is the second call site of the one `config.persist`
 // rule; re-exported at the module root so it does not have to reach into `config_map` by path.
 pub(crate) use config_map::persists;
-pub use enums::{Mode, OutputFormat, ThinkingArg, TuiMode, split_model_level};
+pub use enums::{Mode, ThinkingArg, TuiMode, split_model_level};
 pub use help::render_help;
 pub use runtime_mode::{
     is_plain_runtime_metadata_command, resolve_app_mode, should_take_over_stdout,

@@ -33,9 +33,10 @@ mod tests;
 pub use options::{OpenAiResponsesOptions, ReasoningSummary};
 
 pub(crate) use convert::convert_responses_messages;
-pub(crate) use decoder::decode_stream;
+pub(crate) use decoder::{EndTurnCell, decode_stream, decode_stream_with_end_turn};
 #[cfg(test)]
 pub(crate) use params::build_params;
+pub(crate) use params::responses_tool_choice;
 pub(crate) use tools::{ConvertResponsesToolsOptions, convert_responses_tools};
 
 use crate::api::{ApiImpl, EventSink};

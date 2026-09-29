@@ -37,6 +37,13 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
+    // Two credentialed providers with embedded models, so every session this fixture builds has an
+    // auth-filtered catalog spanning more than one provider — supplied here, not by the host.
+    std::fs::write(
+        agent_dir.join("auth.json"),
+        r#"{"deepseek":{"type":"api_key","key":"k"},"groq":{"type":"api_key","key":"k"}}"#,
+    )
+    .unwrap();
     let mut config = SessionConfig::new(cwd, agent_dir);
     config.trust_override = Some(true);
     Fixture { _tmp: tmp, config }
@@ -49,7 +56,13 @@ async fn runtime(fx: &Fixture) -> Arc<AgentSessionRuntime> {
         StopReason::Stop,
     )]);
     let provider: Arc<dyn Provider> = faux;
-    let factory = Arc::new(SessionFactory::new(provider, fx.config.clone()));
+    // The ambient env tier pinned EMPTY, so the provider set is exactly the fixture's `auth.json`
+    // and never the host's exported credentials.
+    let auth = Arc::new(
+        cyrup_config::AuthStore::at(fx.config.agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    );
+    let factory = Arc::new(SessionFactory::new(provider, fx.config.clone()).auth(auth));
     AgentSessionRuntime::create(factory, SessionTarget::New)
         .await
         .unwrap()
@@ -282,11 +295,14 @@ async fn tui105_a_session_swap_recounts_providers_from_the_swapped_in_session() 
     );
 }
 
-/// `App::run`'s own backend. The `session_swapped` arm is `impl App<InlineBackend<Stdout>>`, so the
-/// arm cannot be driven through the `TestBackend` the rest of this file uses.
-fn inline_app() -> App<crate::InlineBackend<std::io::Stdout>> {
+/// `App::run`'s own backend. The `session_swapped` arm is `impl App<InlineBackend<TuiStdout>>`, so
+/// the arm cannot be driven through the `TestBackend` the rest of this file uses.
+fn inline_app() -> App<crate::InlineBackend<crate::TuiStdout>> {
     App::new(
-        crate::InlineBackend::with_anchor(std::io::stdout(), ratatui::layout::Position::ORIGIN),
+        crate::InlineBackend::with_anchor(
+            crate::write_log::tui_stdout(),
+            ratatui::layout::Position::ORIGIN,
+        ),
         UiTheme::dark(),
     )
     .unwrap()

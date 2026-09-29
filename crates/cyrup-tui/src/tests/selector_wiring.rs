@@ -349,7 +349,7 @@ fn scoped_models_footer_names_the_users_own_keys() {
 #[test]
 fn model_scope_hint_names_the_users_own_tab_key() {
     let mut app = App::new(TestBackend::new(110, 30), UiTheme::dark()).unwrap();
-    app.load_keybindings_json(r#"{ "editor.tab": "ctrl+i" }"#)
+    app.load_keybindings_json(r#"{ "tui.input.tab": "ctrl+i" }"#)
         .unwrap();
     app.open_model_selector(
         vec![

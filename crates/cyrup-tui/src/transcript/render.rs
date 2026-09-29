@@ -344,26 +344,19 @@ pub(crate) fn entry_lines(
             out
         }
         Entry::Warning(text) => {
-            // Pi `showWarning` (`interactive-mode.ts:3884-3888` @v0.83.0): `Spacer(1)` then
-            // `Text(theme.fg("warning", …), 1, 0)` — the `Error` shape in the warning colour.
+            // Every pi site this entry ports is `Spacer(1)` then
+            // `Text(theme.fg("warning", …), 1, 0)` — paddingX a literal `1`, NOT `this.outputPad`:
+            // `showWarning` (`interactive-mode.ts:4469-4473` @v0.87.1), the trust banner
+            // (`:4078-4090`), the cache-miss notice (`:4051-4053`) and the compaction-cost notice
+            // (`:3979-3982`). Only `showError` reads `outputPad` (`:4463-4467`), which is why the
+            // two arms differ in margin and nothing else.
             //
-            // TUI-062(a) — the cite used to read `:3956-3960`, which is `getAllQueuedMessages` /
-            // `clearAllQueues` at that tag, not `showWarning`. Re-read at v0.83.0: `showError` is
-            // `:3878-3882` and `showWarning` immediately follows at `:3884-3888`. **The backlog's
-            // own proposed correction (`:3885-3889`) is also off by one** — `:3885` is the `Spacer`,
-            // i.e. the first line of the BODY, and `:3889` is the blank line after the closing
-            // brace.
-            //
-            // TUI-062(b), the design half, is unchanged and deliberate: pi builds
-            // `Warning: ${warningMessage}` INSIDE `showWarning` (`:3886`), while this arm renders
-            // `text` verbatim, so the prefix stays a per-caller obligation. Two callers that are
-            // ports of `showWarning` supply it (`app.rs:3626`, `crates/cyrup/src/main.rs`'s
-            // `modelFallbackMessage` push); the project-trust banner (`app.rs`'s
-            // `render_project_trust_warning_if_needed`) correctly does NOT, because pi's banner is a
-            // raw warning-coloured `Text` (`:3505`) and never goes through `showWarning`. Moving the
-            // prefix in here would therefore have to be conditional, which is why it has not been.
+            // The text is drawn verbatim: `showWarning`'s own `Warning: ` prefix is built in ONE
+            // place, [`TranscriptView::show_warning`], exactly as pi builds it inside the function
+            // (TUI-062); the raw warning-coloured sites go through
+            // [`TranscriptView::push_warning`] and carry no prefix.
             let mut out = vec![Line::default()];
-            out.extend(text_lines(text, width, output_pad, theme.warning_style()));
+            out.extend(text_lines(text, width, 1, theme.warning_style()));
             out
         }
         Entry::Error(text) => {

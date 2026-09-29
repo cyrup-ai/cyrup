@@ -84,7 +84,13 @@ use crate::auth::types::{Credential, ModelAuth};
 use crate::error::AuthError;
 use cyrup_core::CancelToken;
 
-pub use super::load::RadiusOptions;
+/// `RadiusOAuthOptions` (`radius.ts:352-355`): the provider name the flow is shown under and the
+/// gateway every OAuth call is made against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RadiusOptions {
+    pub name: String,
+    pub gateway: String,
+}
 
 // ---------------------------------------------------------------------------
 // Constants — radius.ts:27-36

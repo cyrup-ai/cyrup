@@ -6,6 +6,7 @@
 use super::config::{RunnerConfig, effective_run_paths, load_runner_config};
 use super::control_watcher::{
     init_control_flags, install_ignored_sigusr2_handler, spawn_control_watcher,
+    spawn_deadline_checkpoint,
 };
 use super::events::open_run_events;
 use super::finish::{WorkflowResultFields, finish_run, settle_loop_outcome};
@@ -178,6 +179,16 @@ pub async fn run_with(
         control_flags.clone(),
         interrupt_cancel.clone(),
         Arc::clone(&shared_status),
+    );
+    // SUBA-128 — pi arms the checkpoint timer beside the deadline timer, right after the control
+    // inbox watch (`subagent-runner.ts:3379-3406` @v0.71.0); its request is routed by the watcher
+    // above. Held for the run, like the watcher, and aborted with it.
+    let _deadline_checkpoint = spawn_deadline_checkpoint(
+        run_paths.clone(),
+        &control_flags,
+        Arc::clone(&shared_status),
+        config.deadline_at_ms,
+        config.checkpoint_before_deadline_ms,
     );
 
     // The live-telemetry channel: each dispatched step's `RunOptions::live_events` sink forwards

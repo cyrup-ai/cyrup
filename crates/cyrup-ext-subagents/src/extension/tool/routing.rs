@@ -918,6 +918,9 @@ impl SubagentTool {
                 // (pi `resolveForegroundTimeout`, `:1327-1341`), whose positivity and
                 // both-given-must-agree checks are mode-independent.
                 timeout_ms,
+                // SUBA-128 — `data.params?.checkpointBeforeDeadlineMs` (`subagent-executor.ts:3460`
+                // @v0.71.0); the config default is folded in by `spawn_background`.
+                checkpoint_before_deadline_ms: p.checkpoint_before_deadline_ms,
                 include_progress: overrides.include_progress,
             })
             .await
@@ -2212,6 +2215,12 @@ impl SubagentTool {
         .await
         {
             Ok(outcome) if !outcome.is_error => {
+                // SUBA-133 — pi `ctx.onAgentsChanged?.()` after every successful agent mutation
+                // (`agent-management.ts:1184,1246,1260,1299,1322,1347,1395` @v0.71.0), which
+                // re-discovers the advertised catalog (`extension/index.ts:636-642`).
+                if crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS.contains(&action) {
+                    self.executor.refresh_advertised_agents().await;
+                }
                 // pi `result(text, false, details)` (`agent-management.ts:55-57`): the handler's
                 // extra members are spread over `{ mode: "management", results: [] }`.
                 let mut details = serde_json::json!({ "mode": "management", "results": [] });

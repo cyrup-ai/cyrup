@@ -359,6 +359,10 @@ fn user_content(content: &[Content], supports_image: bool) -> Value {
     let mut parts: Vec<Value> = Vec::new();
     for block in content {
         match block {
+            // pi `.filter((item) => item.type !== "text" || item.text.length > 0)`
+            // (`openai-completions.ts:1261` @v0.87.1, #9797): an attachment sent with no prompt
+            // text must not carry an empty text part, which some compatible providers reject.
+            Content::Text { text, .. } if text.is_empty() => {}
             Content::Text { text, .. } => {
                 parts.push(json!({ "type": "text", "text": sanitize_surrogates(text) }))
             }

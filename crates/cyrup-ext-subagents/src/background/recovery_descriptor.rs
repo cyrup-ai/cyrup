@@ -1291,6 +1291,7 @@ mod tests {
             include_progress: Some(true),
             timeout_ms: Some(60_000),
             deadline_at_ms: Some(1_900_000_060_000),
+            checkpoint_before_deadline_ms: None,
             share: Some(true),
             artifacts_dir: Some(PathBuf::from("/artifacts")),
             artifact_config: ArtifactConfig {

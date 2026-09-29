@@ -22,7 +22,7 @@
 //!     results) is persisted to the outgoing session before it is replaced." Pi's RPC `abort` verb
 //!     likewise replies only after `await session.abort()` (rpc-mode.ts:427-430).
 //!  3. **That exact ORDER.** Awaiting idle before cancelling the retry would block for the whole
-//!     remaining backoff — up to `baseDelayMs * 2^attempt`. These tests use a 600 s backoff, so an
+//!     remaining backoff — up to `retry.maxAgentDelayMs`. These tests use a 600 s backoff, so an
 //!     implementation that inverted the two would hang rather than fail.
 #![allow(
     clippy::unwrap_used,
@@ -73,12 +73,15 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 }
 
 /// A 10-minute first retry backoff. Long enough that "the abort did not cancel it" is unambiguous:
-/// nothing in these tests waits more than a few seconds.
+/// nothing in these tests waits more than a few seconds. `maxAgentDelayMs` is raised with it, or
+/// pi's 60 s default cap (CFG-081) would shorten the backoff to a minute.
 fn slow_retry_settings() -> cyrup_config::Settings {
     let mut cli = cyrup_config::Settings::new();
     cli.set_field(
         "retry",
-        serde_json::json!({"enabled": true, "maxRetries": 3, "baseDelayMs": 600_000}),
+        serde_json::json!({
+            "enabled": true, "maxRetries": 3, "baseDelayMs": 600_000, "maxAgentDelayMs": 600_000
+        }),
     )
     .unwrap();
     cli

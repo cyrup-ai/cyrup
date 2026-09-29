@@ -44,6 +44,7 @@ fn assistant_blocks(content: Vec<Content>) -> Message {
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
+        end_turn: None,
         timestamp: 0,
     })
 }

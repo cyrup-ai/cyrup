@@ -185,7 +185,10 @@ fn catalog_service(base_url: &str) -> Arc<ModelCatalogService> {
 /// A session whose catalog service points at `origin`, with BOTH [`FAST`] and [`SLOW`] credentialed —
 /// the state a user is in after logging in to a second provider.
 async fn session_over(fx: &Fx, origin: &Origin) -> AgentSession {
-    let auth = Arc::new(AuthStore::at(fx.agent_dir.join("auth.json")));
+    let auth = Arc::new(
+        AuthStore::at(fx.agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    );
     auth.set_runtime_api_key(ProviderId::from(FAST), "sk-fast-test".to_string());
     auth.set_runtime_api_key(ProviderId::from(SLOW), "sk-slow-test".to_string());
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());

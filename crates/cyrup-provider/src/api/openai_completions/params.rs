@@ -5,13 +5,17 @@ use super::convert::convert_messages;
 use super::reasoning::apply_reasoning;
 use super::tools::{convert_tools, deferred_tool_names, message_has_tool_use};
 use crate::api::compat::{
-    DeferredToolsMode, MaxTokensField, clamp_openai_prompt_cache_key, get_compat,
+    DeferredToolsMode, MaxTokensField, ResolvedCompat, ThinkingTokenBudgetField,
+    clamp_openai_prompt_cache_key, get_compat,
 };
 use crate::context::{Context, ToolDef};
 use crate::model::Model;
 use crate::stream::{CacheRetention, StreamOptions};
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use crate::utils::provider_plumbing::{EnvSource, resolve_cache_retention};
+use crate::utils::simple_options::{
+    clamp_thinking_budget_to_answer_room, thinking_budget_for_level,
+};
 use cyrup_core::ModelThinkingLevel;
 use serde_json::{Map, Value, json};
 
@@ -183,7 +187,27 @@ pub(crate) fn build_body_with_env(
         obj.insert("tool_choice".to_string(), tc.to_wire());
     }
 
-    apply_reasoning(&mut obj, model, opts, &compat);
+    // PROV-100. `if (compat.vllmPriority !== undefined) params.priority = compat.vllmPriority`
+    // (openai-completions.ts:866-868 @v0.87.1).
+    if let Some(priority) = &compat.vllm_priority {
+        obj.insert("priority".to_string(), Value::Number(priority.clone()));
+    }
+
+    // PROV-100. `resolveThinkingTokenBudgetField(compat)` / `resolveClampedThinkingBudget(model,
+    // options, params)` (`:870-871`, `:1004-1024`). The ceiling is the output cap just written —
+    // `params.max_tokens ?? params.max_completion_tokens ?? model.maxTokens`.
+    let budget_field = thinking_token_budget_field(&compat);
+    let thinking_budget = clamped_thinking_budget(model, opts, ceiling.unwrap_or(model.max_tokens));
+
+    apply_reasoning(&mut obj, model, opts, &compat, thinking_budget);
+
+    // PROV-100. Cap reasoning with a top-level budget field, independent of `thinkingFormat`: the
+    // same server can serve zai, qwen or chat-template models, and reasoning shares `max_tokens`
+    // with the answer, so an uncapped reasoning phase can leave no answer and no tool call
+    // (`:971-978`).
+    if let (Some(field), Some(budget)) = (budget_field, thinking_budget) {
+        obj.insert(field.as_str().to_string(), json!(budget));
+    }
 
     // OpenRouter / Vercel AI Gateway routing preferences (read from raw `model.compat`).
     if let Some(c) = &model.compat {
@@ -222,6 +246,33 @@ pub(crate) fn build_body_with_env(
     apply_sampling_params(&mut obj, opts);
 
     Ok(Value::Object(obj))
+}
+
+/// Pi `resolveThinkingTokenBudgetField` (`openai-completions.ts:1004-1010` @v0.87.1): the explicit
+/// field wins; `supportsThinkingTokenBudget` is the vLLM alias.
+fn thinking_token_budget_field(compat: &ResolvedCompat) -> Option<ThinkingTokenBudgetField> {
+    compat.thinking_token_budget_field.or(compat
+        .supports_thinking_token_budget
+        .then_some(ThinkingTokenBudgetField::ThinkingTokenBudget))
+}
+
+/// Pi `resolveClampedThinkingBudget` (`openai-completions.ts:1012-1024` @v0.87.1): the level's
+/// budget (custom `thinkingBudgets` over the default table), capped so [`MIN_ANSWER_TOKENS`] of the
+/// response ceiling stay free for the answer. `None` when reasoning is off, the model does not
+/// reason, or no room is left.
+///
+/// [`MIN_ANSWER_TOKENS`]: crate::utils::simple_options::MIN_ANSWER_TOKENS
+pub(super) fn clamped_thinking_budget(
+    model: &Model,
+    opts: &StreamOptions,
+    ceiling: u64,
+) -> Option<u64> {
+    let level = opts.reasoning.level().filter(|_| model.reasoning)?;
+    let budget = clamp_thinking_budget_to_answer_room(
+        thinking_budget_for_level(level, opts.thinking_budgets.as_ref()),
+        ceiling,
+    );
+    (budget > 0).then_some(budget)
 }
 
 /// `Object.assign(params, options.samplingParams)` — the identical three-line tail of all three

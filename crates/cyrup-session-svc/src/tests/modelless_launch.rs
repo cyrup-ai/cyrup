@@ -228,7 +228,10 @@ async fn selecting_a_model_promotes_a_modelless_session() {
     let fx = fixture();
     // `/login`: a credential lands in `auth.json` for a real provider, which is what makes its
     // models pass `hasConfiguredAuth` and become selectable in `/model`.
-    let auth = Arc::new(AuthStore::at(fx.agent_dir.join("auth.json")));
+    let auth = Arc::new(
+        AuthStore::at(fx.agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    );
     auth.set_runtime_api_key(ProviderId::from("together"), "sk-together-test".to_string());
     let session = SessionBuilder::new(unconfigured(), base_config(&fx))
         .auth(auth)

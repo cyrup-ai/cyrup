@@ -1,7 +1,7 @@
 //! The `NativeExtension` impl for Flux (port doc §3.4.1 skeleton).
 //!
-//! This first version registers no commands, no shortcuts, no tools — those arrive in
-//! FLUX_07–FLUX_10. It subscribes to exactly one event and answers it: `ResourcesDiscover`,
+//! This first version registers no commands, no shortcuts, no tools — those arrive in port doc
+//! §3.4.2–§3.4.4. It subscribes to exactly one event and answers it: `ResourcesDiscover`,
 //! contributing the bundled `prompts` DIRECTORY so the pipeline's prompt templates register
 //! namespaced under `flux/…` (see [`crate::resources`]) — after first materialising the embedded
 //! bundle there (FLUX-001, [`crate::install`]).
@@ -53,9 +53,9 @@ pub const STATUS_OVERLAY_SHORTCUT_DESCRIPTION: &str = "Flux status overlay";
 /// The Flux native extension.
 pub struct FluxExtension {
     pub(crate) id: ExtensionId,
-    /// Late-bound by the host before `init` (`native.rs:683`); FLUX_09's overlay and FLUX_10's
-    /// tool both reach the live backend through this slot. The `cyrup-ext-subagents`
-    /// `OnceLock` pattern (`extension.rs:139`, `:751-759`).
+    /// Late-bound by the host before `init` (`native.rs:683`); the overlay (port doc §3.4.3) and
+    /// the `ask_user_question` tool (§3.4.4) both reach the live backend through this slot. The
+    /// `cyrup-ext-subagents` `OnceLock` pattern (`extension.rs:139`, `:751-759`).
     pub(crate) host_services: Arc<OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
     /// Where the bundled tree lives at run time — decided once, at construction
     /// (`crate::flux_extension`), from the agent dir the binary resolved for every extension and

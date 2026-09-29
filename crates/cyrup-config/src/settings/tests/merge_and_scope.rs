@@ -513,3 +513,98 @@ async fn project_write_requires_trust() {
     let err = mgr.set(SettingsScope::Project, "defaultModel", "x").await;
     assert!(matches!(err, Err(ConfigError::Untrusted)));
 }
+
+/// CFG-093 — `cacheWarming` is read off the GLOBAL document only (Pi `getCacheWarmingMode`,
+/// `settings-manager.ts:954-958` @v0.87.1), defaults to `streaming`, and degrades an unknown value
+/// to `streaming` rather than rejecting it.
+#[test]
+fn cache_warming_is_global_only_and_defaults_to_streaming() {
+    let load = |global: &str, project: &str| {
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Global, global);
+        store.seed(SettingsScope::Project, project);
+        SettingsManager::load(store, true)
+            .effective()
+            .cache_warming_mode()
+    };
+    assert_eq!(load("{}", "{}"), CacheWarmingMode::Streaming);
+    // A trusted project cannot turn warming off (or on)…
+    assert_eq!(
+        load("{}", r#"{ "cacheWarming": "off" }"#),
+        CacheWarmingMode::Streaming
+    );
+    assert_eq!(
+        load(
+            r#"{ "cacheWarming": "idle" }"#,
+            r#"{ "cacheWarming": "off" }"#
+        ),
+        CacheWarmingMode::Idle
+    );
+    // …the global one does.
+    assert_eq!(
+        load(r#"{ "cacheWarming": "off" }"#, "{}"),
+        CacheWarmingMode::Off
+    );
+    assert_eq!(
+        load(r#"{ "cacheWarming": "sometimes" }"#, "{}"),
+        CacheWarmingMode::Streaming
+    );
+}
+
+/// CFG-093 — `setCacheWarmingMode` writes the GLOBAL document (Pi `settings-manager.ts:960-963`
+/// @v0.87.1), so the value round-trips through the global-only reader even in a trusted project
+/// whose own `cacheWarming` is ignored.
+#[tokio::test]
+async fn set_cache_warming_mode_writes_the_global_scope() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    store.seed(SettingsScope::Project, r#"{ "cacheWarming": "off" }"#);
+    let mut mgr = SettingsManager::load(store, true);
+    mgr.set_cache_warming_mode(CacheWarmingMode::Idle)
+        .await
+        .unwrap();
+    assert_eq!(mgr.effective().cache_warming_mode(), CacheWarmingMode::Idle);
+    assert_eq!(
+        mgr.global().get("cacheWarming"),
+        Some(&serde_json::json!("idle"))
+    );
+    assert_eq!(
+        mgr.project().get("cacheWarming"),
+        Some(&serde_json::json!("off"))
+    );
+}
+
+/// CFG-088 — a load failure carries the file it came from, and renders as pi's
+/// `collectSettingsDiagnostics` text (`core/settings-diagnostics.ts:4-9` @v0.87.1): with a path
+/// `Invalid settings file <path>: <msg>`, without one `Invalid <scope> settings: <msg>`.
+#[test]
+fn a_load_error_names_its_file_in_pis_diagnostic_shape() {
+    let tmp = crate::test_util::temp_dir();
+    let global = tmp.join("settings.json");
+    std::fs::write(&global, "{ not json").unwrap();
+    let store = Arc::new(FileSettingsStore::new(
+        global.clone(),
+        tmp.join("project.json"),
+    ));
+    let errors = SettingsManager::load(store, true).drain_load_errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].path.as_deref(), Some(global.as_path()));
+    let message = errors[0].diagnostic_message();
+    assert_eq!(
+        message,
+        format!(
+            "Invalid settings file {}: {}",
+            global.display(),
+            errors[0].message
+        )
+    );
+
+    let store = Arc::new(InMemorySettingsStore::new());
+    store.seed(SettingsScope::Project, "{ not json");
+    let errors = SettingsManager::load(store, true).drain_load_errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].path, None);
+    assert_eq!(
+        errors[0].diagnostic_message(),
+        format!("Invalid project settings: {}", errors[0].message)
+    );
+}

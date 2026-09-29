@@ -17,7 +17,7 @@
 //! ```
 //!
 //! `cargo build --target wasm32-wasip2` then yields a loadable `cyrup:ext` COMPONENT. The macro emits
-//! the wasm guest glue — the world's `init` + `events` (all 33 hooks + `execute-tool` +
+//! the wasm guest glue — the world's `init` + `events` (all 36 hooks + `execute-tool` +
 //! `execute-command`/`get-argument-completions` + `render-call`/`render-result`) exports + the
 //! `export!` invocation — each delegating to the routing helpers in `crate::guest`. The
 //! `wit_bindgen::generate!` (with `pub_export_macro`) runs once in this crate; the downstream author's
@@ -220,6 +220,13 @@ macro_rules! export_extension {
                 ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(2, &[&messages_json])
                 }
+                // EXT-079 — `context_with_system` (pi `ContextWithSystemEvent`,
+                // core/extensions/types.ts:708-711 @v0.87.1). Kind 35; mutating.
+                fn on_context_with_system(
+                    messages_json: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(35, &[&messages_json])
+                }
                 fn on_message_end(
                     message_json: ::std::string::String,
                 ) -> bindings::cyrup::ext::types::HookOutcome {
@@ -403,6 +410,21 @@ macro_rules! export_extension {
                 // extensions/types.ts:571-575 @v0.83.0). Kind 32; notify-only.
                 fn on_session_info_changed(name: ::core::option::Option<::std::string::String>) {
                     $crate::guest::notify(32, &[name.as_deref().unwrap_or("")]);
+                }
+                // EXT-075 — `ui_prompt_start` / `ui_prompt_end` (pi `UIPromptStartEvent` /
+                // `UIPromptEndEvent`, core/extensions/types.ts:830-845 @v0.87.1). Kinds 33/34;
+                // notify-only.
+                fn on_ui_prompt_start(
+                    kind: ::std::string::String,
+                    title: ::core::option::Option<::std::string::String>,
+                ) {
+                    $crate::guest::notify(33, &[&kind, title.as_deref().unwrap_or("")]);
+                }
+                fn on_ui_prompt_end(
+                    kind: ::std::string::String,
+                    title: ::core::option::Option<::std::string::String>,
+                ) {
+                    $crate::guest::notify(34, &[&kind, title.as_deref().unwrap_or("")]);
                 }
                 fn on_after_provider_response(status: u32, headers_json: ::std::string::String) {
                     $crate::guest::notify(21, &[&status.to_string(), &headers_json]);

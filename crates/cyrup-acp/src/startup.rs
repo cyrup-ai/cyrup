@@ -269,7 +269,7 @@ fn render_block(block: &StartupBlock) -> Option<String> {
 /// The `Warning: ` prefix the modelless banner carries (`ACP-017`).
 ///
 /// The **same** string the sibling terminal front-end prefixes it with
-/// (`crates/cyrup/src/interactive.rs`'s `push_warning(format!("Warning: {msg}"))`), spelled once
+/// (`cyrup_tui::TranscriptView::show_warning`, pi's `showWarning`), spelled once
 /// here so the two front-ends cannot drift in wording. It is deliberately *not* markdown-emphasised:
 /// the prelude's other chunk is markdown, but this one is a sentence a user must be able to read in
 /// a client that renders `agent_message_chunk` as plain text, and `**Warning:**` in such a client is

@@ -87,91 +87,70 @@ impl AgentSession {
     /// The `contextUsage` sub-object of [`Self::session_stats`], in Pi's `ContextUsage` shape
     /// (`{tokens, contextWindow, percent}`, extensions/types.ts:288-294). `None` when no model /
     /// no known context window — Pi's `getContextUsage` returns `undefined` there
-    /// (agent-session.ts:3165-3170).
+    /// (`agent-session.ts:3859-3863` @v0.87.1).
     ///
-    /// Public because it is a 1:1 port of `AgentSession.getContextUsage()`, which upstream's footer
-    /// calls directly on every render (`footer.ts:108`) to build its `{pct}%/{window}` segment. The
-    /// TUI needs exactly this three-state answer — including the `percent: null` case — which the
-    /// coarser [`Self::context_usage`] (always a number) cannot express.
+    /// Public because it is a 1:1 port of `AgentSession.getContextUsage()`
+    /// (`agent-session.ts:3858-3901` @v0.87.1), which upstream's footer calls directly on every
+    /// render (`footer.ts:108`) to build its `{pct}%/{window}` segment. The TUI needs exactly this
+    /// three-state answer — including the `percent: null` case — which the coarser
+    /// [`Self::context_usage`] (always a number) cannot express.
+    ///
+    /// The number is `estimateProjectedContextTokens(projection, branch)` (`:3893`), NOT the last
+    /// assistant's usage: the anchor is the last assistant that neither aborted nor errored and
+    /// whose `calculateContextTokens(usage)` is non-zero (`compaction.ts:170-183`), and every
+    /// projected message after it is added as a chars/4 estimate. So an aborted turn — whose partial
+    /// usage is typically zero — falls through to the previous good reading plus the new prompt,
+    /// and the meter holds instead of dropping to `0.0%` (TUI-056).
     pub async fn stats_context_usage(&self) -> Option<crate::state::StatsContextUsage> {
-        let usage = self.context_usage().await;
-        if usage.context_window == 0 {
-            return None;
-        }
-        // Pi's post-compaction guard (agent-session.ts:3175-3197). After a compaction the last
-        // assistant `usage` still describes the PRE-compaction context, so reporting it would show a
-        // stale — and much larger — occupancy as if it were current. Pi only trusts a usage from an
-        // assistant that responded AFTER the latest compaction on this branch, and where that
-        // assistant neither aborted nor errored and actually consumed context. With no such
-        // assistant the count is genuinely unknown, and Pi returns `{tokens: null, percent: null}`
-        // while still reporting the window.
-        //
-        // Without this branch `tokens`/`percent` were unconditionally `Some`, so the `null` case the
-        // struct's own doc comment describes was unreachable.
-        if !self.has_post_compaction_usage().await {
-            return Some(crate::state::StatsContextUsage {
-                tokens: None,
-                context_window: usage.context_window,
-                percent: None,
-            });
-        }
-        Some(crate::state::StatsContextUsage {
-            tokens: Some(usage.used_tokens),
-            context_window: usage.context_window,
-            percent: Some(usage.fraction * 100.0),
-        })
-    }
-
-    /// `true` when this branch's occupied-token count can be trusted — i.e. there is no compaction
-    /// on the branch, or an assistant has responded since the latest one (Pi
-    /// `getContextUsage`'s `hasPostCompactionUsage` scan, agent-session.ts:3181-3193 @v0.83.0,
-    /// `:3390-3403` @v0.84.4). Branch isolation is pinned by `tests/context_usage_branch.rs`
-    /// (SEAM-115).
-    ///
-    /// Scans backwards from the branch tail to the compaction boundary, matching Pi's loop
-    /// direction, and accepts the first assistant that neither aborted nor errored and whose usage
-    /// accounts for a non-zero context.
-    async fn has_post_compaction_usage(&self) -> bool {
-        use cyrup_core::StopReason;
-        use cyrup_session::AgentMessage;
         use cyrup_session::entry::{Entry, KnownEntry};
 
+        // `const model = this.model; if (!model) return undefined;` and
+        // `if (contextWindow <= 0) return undefined;` (`:3859-3863`), taken before the branch lock
+        // exactly as [`Self::context_usage`] takes them.
+        let context_window = {
+            Self::lock(&self.compaction_model)
+                .as_ref()
+                .map_or(0, |m| m.context_window)
+        };
+        if context_window == 0 {
+            return None;
+        }
+
         let guard = self.manager.lock().await;
-        // Pi scans `sessionManager.getBranch()` (agent-session.ts:3174, indexed at :3181-3193) —
-        // the ACTIVE BRANCH — not `getEntries()`. `entries()` is the flat append-only store
-        // (`manager.rs:818`): after a `/fork` or a `/tree` navigation it also holds the abandoned
-        // branch, so `rposition` could latch an OFF-BRANCH compaction as the boundary and `skip`
-        // could then count an off-branch assistant as post-compaction usage — printing a stale
-        // pre-compaction occupancy as current, the exact failure this guard exists to prevent.
-        // `branch_path(None)` is cyrup's `getBranch()`, and is O(branch-depth) rather than O(all
-        // entries) besides (TUI-092 F4 C2).
-        let path = guard.branch_path(None);
-        let Some(compaction_idx) = path
+        let branch = guard.branch_path(None);
+        // Pi's post-compaction guard (`:3865-3891`). After a compaction the last assistant `usage`
+        // still describes the PRE-compaction context, so Pi only trusts one from an assistant that
+        // responded AFTER the latest compaction on this branch — and only if that assistant
+        // survives the projection (a `context_edit` can omit it), neither aborted nor errored, and
+        // actually consumed context. With none the count is genuinely unknown, and Pi returns
+        // `{tokens: null, percent: null}` while still reporting the window.
+        if let Some(compaction_index) = branch
             .iter()
             .rposition(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
-        else {
-            // No compaction on this branch: the last assistant usage is current by construction.
-            return true;
-        };
-        path.iter()
-            .copied()
-            .skip(compaction_idx + 1)
-            .rev()
-            .filter_map(|e| match e {
-                Entry::Known(KnownEntry::Message {
-                    message: AgentMessage::Core(Message::Assistant(a)),
-                    ..
-                }) => Some(a),
-                _ => None,
-            })
-            .any(|a| {
-                // Same four-field sum `ContextUsage::from_last_assistant` uses, so "consumed
-                // context" means the same thing in both places (Pi `calculateContextTokens`).
-                let context_tokens =
-                    a.usage.input + a.usage.cache_read + a.usage.cache_write + a.usage.output;
-                !matches!(a.stop_reason, StopReason::Aborted | StopReason::Error)
-                    && context_tokens > 0
-            })
+        {
+            let projection = cyrup_session::context::build_context_agent_messages_tagged(&branch);
+            let has_post_compaction_usage = branch.iter().skip(compaction_index + 1).any(|entry| {
+                let id = entry.id();
+                projection
+                    .iter()
+                    .any(|(source, m)| *source == id && has_valid_usage(m))
+            });
+            if !has_post_compaction_usage {
+                return Some(crate::state::StatsContextUsage {
+                    tokens: None,
+                    context_window,
+                    percent: None,
+                });
+            }
+        }
+
+        let estimate = cyrup_session::compaction::estimate_projected_context_tokens(&branch);
+        let tokens = u64::from(estimate.tokens);
+        Some(crate::state::StatsContextUsage {
+            tokens: Some(tokens),
+            context_window,
+            percent: Some(tokens as f64 / context_window as f64 * 100.0),
+        })
     }
 
     /// Context-window occupancy from the last assistant turn (Pi `getContextUsage`,
@@ -214,7 +193,7 @@ impl AgentSession {
         // (`cyrup-core/src/message.rs:172-188`), so its `usage` must not drive the footer. cyrup
         // cannot produce one yet, but a Pi-written session carrying one must still read identically
         // (R-00-013). `filter_map(..).find(..)` — not `find_map` — so a deferred tail does not stop
-        // the scan; same shape as the neighbour `has_post_compaction_usage`.
+        // the scan.
         let last = guard
             .branch_path(None)
             .into_iter()
@@ -261,4 +240,18 @@ impl AgentSession {
             context_usage,
         }
     }
+}
+
+/// The per-message predicate of Pi's `projectedAssistants` set (`agent-session.ts:3873-3885`
+/// @v0.87.1) — the same three clauses `getAssistantUsage` applies (`compaction.ts:170-183`): an
+/// assistant that neither aborted nor errored, whose `calculateContextTokens(usage)` —
+/// `totalTokens` first, else the four-field sum — is non-zero.
+fn has_valid_usage(message: &cyrup_session::AgentMessage) -> bool {
+    use cyrup_core::StopReason;
+    matches!(
+        message,
+        cyrup_session::AgentMessage::Core(Message::Assistant(a))
+            if !matches!(a.stop_reason, StopReason::Aborted | StopReason::Error)
+                && cyrup_session::compaction::context_tokens_from_usage(&a.usage) > 0
+    )
 }

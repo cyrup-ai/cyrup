@@ -48,8 +48,12 @@ async fn run_proxy(
         "options": build_proxy_request_options(&options),
     });
     let url = format!("{}/api/stream", options.proxy_url);
+    // AGENT-040 — pi flushes an unterminated final line before its `sawTerminalEvent` check
+    // (`buffer += decoder.decode(); if (buffer) processLine(buffer);`, proxy.ts:225-230 @v0.87.1),
+    // so a `done` frame with no trailing newline still completes the turn.
     let req = SseRequest::post_json(url.clone(), body)
-        .header("Authorization", format!("Bearer {}", options.auth_token));
+        .header("Authorization", format!("Bearer {}", options.auth_token))
+        .flush_at_eof();
 
     // PROV-047 — proxy-aware, per target. Pi's `applyHttpProxySettings` writes the `httpProxy`
     // setting into `process.env` (http-dispatcher.ts:43-48 @v0.83.0) and installs an
@@ -179,16 +183,9 @@ async fn run_proxy(
     } else if !saw_terminal {
         // AGENT-040 — a clean EOF with no `done`/`error` frame means the server dropped the
         // response mid-stream; pi surfaces it as a terminal `error` carrying the partial streamed
-        // so far (proxy.ts:232-243 @v0.87.1) rather than leaving consumers without a result.
-        //
-        // Known divergence, open: pi splits on `\n` and flushes a trailing line with no newline
-        // before this check (`processLine(buffer)`, proxy.ts:225-230), so a server whose final
-        // `data: {"type":"done",…}` frame lacks the blank line (or any newline) still completes.
-        // cyrup reads frames through cyrup-provider's shared WHATWG SSE framer, which dispatches
-        // only on a blank line and drops an unterminated trailing event at EOF
-        // (`stream/framer.rs` EOF arm), so that server lands here with this message even though it
-        // did send `done`. Closing it means a proxy-only EOF flush in the framer (owned by
-        // cyrup-provider), not a change to this branch.
+        // so far (proxy.ts:232-243 @v0.87.1) rather than leaving consumers without a result. An
+        // unterminated final `done` frame never lands here: the request opts into the framer's
+        // end-of-stream flush (`flush_at_eof`, above), as pi's `processLine(buffer)` does.
         let _ = tx
             .send(error_terminal(
                 &builder,

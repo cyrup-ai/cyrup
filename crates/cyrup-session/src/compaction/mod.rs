@@ -444,10 +444,10 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
             Some((summary, details, usage)) => {
                 // Pi `branchWithSummary(newLeafId, …)` (`agent-session.ts:3040-3046`) with the
                 // comment "Summary is attached at the navigation target position (newLeafId), not
-                // the old branch" (`:3036`): ONE value — the navigation target — becomes `leafId`,
-                // `parentId` AND `fromId` (`session-manager.ts:1391-1397`). Recording the ABANDONED
-                // leaf as `fromId` gave the SDK path a different provenance graph than the live
-                // `/tree` path, which already routes through `branch_with_summary`.
+                // the old branch" (`:3036`): the navigation target becomes `leafId` and `parentId`,
+                // while `fromId` is the pre-navigation leaf (`session-manager.ts:1603-1608`
+                // @v0.87.1, SESS-063). Both this SDK path and the live `/tree` path route through
+                // `branch_with_summary`, so the two record the same provenance.
                 let id = session.branch_with_summary(
                     Some(&target_id),
                     summary,

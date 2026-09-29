@@ -29,7 +29,7 @@ use crate::model::{Modality, Model, ModelCost};
 use crate::stream::ApiStreamOptions;
 use crate::stream::collect_message;
 use crate::stream::sse::decode_sse_bytes;
-use crate::stream::{CacheRetention, StreamOptions};
+use crate::stream::{CacheRetention, StreamOptions, ToolChoice};
 use crate::utils::hash::short_hash;
 use cyrup_core::{
     ApiId, AssistantMessage, Content, Message, ModelThinkingLevel, StopReason, ToolCall,

@@ -50,8 +50,9 @@
 //!   `subagents:rpc:v1:reply:unknown` (`rpc.ts:789-795`).
 //! * **`ping` answers with no session** (`rpc.ts:709`), so a client can discover the surface before
 //!   a session exists. **Every other method fails closed** with `no_active_session` (`:710`).
-//! * **The tool's own gates are not bypassed.** Every method but `ping` and the in-memory `status`
-//!   tier dispatches through the SAME [`crate::extension::SubagentTool`] instance the model uses —
+//! * **The tool's own gates are not bypassed.** Every method but `ping`, the in-memory `status`
+//!   tier and the read-only `cost` report dispatches through the SAME
+//!   [`crate::extension::SubagentTool`] instance the model uses —
 //!   the one `init` registered, captured at registration — so the authority consult
 //!   (`extension/tool/routing.rs:1729-1766`), the child-safe refusals and the single-dispatch
 //!   guard all apply to an RPC caller too. See [`Self::dispatch`](SubagentRpcBridge::dispatch).
@@ -104,9 +105,9 @@ pub const SUBAGENT_RPC_READY_EVENT: &str = "subagents:rpc:v1:ready";
 /// doc; subscribe to [`subagent_rpc_reply_event`]'s full topic.
 pub const SUBAGENT_RPC_REPLY_EVENT_PREFIX: &str = "subagents:rpc:v1:reply:";
 
-/// pi `SUBAGENT_RPC_METHODS` (`rpc.ts:34`) — EIGHT, in upstream's order, which is the order a
-/// `ping` reply advertises them in.
-pub const SUBAGENT_RPC_METHODS: [&str; 8] = [
+/// pi `SUBAGENT_RPC_METHODS` (`rpc.ts:35` @v0.71.0) — NINE, in upstream's order, which is the
+/// order a `ping` reply advertises them in. `cost` is v0.71.0's (`858661af`, #2378).
+pub const SUBAGENT_RPC_METHODS: [&str; 9] = [
     "ping",
     "status",
     "manage",
@@ -115,6 +116,7 @@ pub const SUBAGENT_RPC_METHODS: [&str; 8] = [
     "interrupt",
     "stop",
     "resume",
+    "cost",
 ];
 
 /// pi `SUBAGENT_RPC_MANAGEMENT_ACTIONS` (`rpc.ts:65-73`) — SEVEN of the nine `schedule.*` verbs
@@ -148,6 +150,7 @@ pub(crate) enum SubagentRpcMethod {
     Interrupt,
     Stop,
     Resume,
+    Cost,
 }
 
 impl SubagentRpcMethod {
@@ -162,6 +165,7 @@ impl SubagentRpcMethod {
             Self::Interrupt => "interrupt",
             Self::Stop => "stop",
             Self::Resume => "resume",
+            Self::Cost => "cost",
         }
     }
 
@@ -176,6 +180,7 @@ impl SubagentRpcMethod {
             "interrupt" => Some(Self::Interrupt),
             "stop" => Some(Self::Stop),
             "resume" => Some(Self::Resume),
+            "cost" => Some(Self::Cost),
             _ => None,
         }
     }
@@ -310,6 +315,31 @@ impl SubagentRpcBridge {
             SubagentRpcMethod::Resume => {
                 let params = resume_params(request.params.as_ref())?;
                 execute_checked(deps, request, params).await
+            }
+            // `rpc.ts:770-776` @v0.71.0 — the same parent-plus-child accounting `/subagent-cost`
+            // renders, as data. Read-only: it walks the current session branch and existing
+            // artifacts, and does not go through the tool (there is nothing to authorize).
+            SubagentRpcMethod::Cost => {
+                if request
+                    .params
+                    .as_ref()
+                    .is_some_and(|params| !params.is_object())
+                {
+                    return Err(SubagentRpcError::new(
+                        SubagentRpcErrorCode::InvalidParams,
+                        "RPC cost params must be an object when provided.",
+                    ));
+                }
+                let report =
+                    deps.executor
+                        .collect_cost_report(deps.cwd)
+                        .await
+                        .map_err(|message| {
+                            SubagentRpcError::new(SubagentRpcErrorCode::ExecutionFailed, message)
+                        })?;
+                serde_json::to_value(&report).map_err(|error| {
+                    SubagentRpcError::new(SubagentRpcErrorCode::ExecutionFailed, error.to_string())
+                })
             }
         }
     }

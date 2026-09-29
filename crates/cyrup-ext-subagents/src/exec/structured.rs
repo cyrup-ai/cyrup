@@ -55,6 +55,11 @@
 /// instance, `a.b.c`-style dotted paths for nested violations, multiple violations joined with
 /// `"; "`.
 ///
+/// The message is BARE, like upstream's `{ status: "invalid", message }` (`structured-output.ts:385`
+/// @v0.71.0): each caller adds its own prefix — `Structured output validation failed: ` for the
+/// child tool and the parent read-back, `Collected output validation failed: ` for a dynamic
+/// collection — so no caller doubles it.
+///
 /// A malformed `schema` itself (fails to compile as a JSON Schema) is also reported through this
 /// same `Err(String)` return — never a panic, never a silently-ignored no-op validation — since an
 /// orchestrator-side schema authoring mistake must fail the run exactly as loudly as a genuine
@@ -92,12 +97,12 @@ pub fn validate_structured_output(
         })
         .collect();
 
-    let joined = if messages.is_empty() {
-        "schema validation failed".to_string()
+    // pi `errors.join("; ") || "schema validation failed"`.
+    if messages.is_empty() {
+        Err("schema validation failed".to_string())
     } else {
-        messages.join("; ")
-    };
-    Err(format!("structured output validation failed: {joined}"))
+        Err(messages.join("; "))
+    }
 }
 
 // ============================================================================================
@@ -118,14 +123,16 @@ pub enum StructuredOutcome {
     /// carries the validated value verbatim (never a re-serialized/normalized copy), for direct
     /// assignment to `SingleResult::structured_output`.
     Valid(serde_json::Value),
-    /// A schema was declared but the child never wrote a captured value —
+    /// A schema was declared but the child never invoked `structured_output` —
     /// [`STRUCTURED_OUTPUT_MISSING_ERROR`]. pi's rule (`structured-output.ts:157-159`) is that this
     /// is a hard failure EVEN WHEN prose was produced, so prose is never an exemption here. This
     /// variant is also what a declared schema whose capture runtime could not be created at all
     /// resolves to: there is no file, therefore there is no value — never a transcript scan.
     Missing,
-    /// A schema was declared, a value was captured, but it failed schema validation — carries the
-    /// human-readable validation-error message R-SA-030 requires the run to fail with.
+    /// A schema was declared and the child invoked `structured_output`, but no valid value was
+    /// captured — the capture failed parent-side validation, could not be read, or the child's call
+    /// was itself rejected (SUBA-127's rejection summary). Carries the human-readable message
+    /// R-SA-030 requires the run to fail with.
     Invalid(String),
 }
 
@@ -361,8 +368,194 @@ pub fn read_structured_output(
         .map_err(|err| format!("Failed to read structured output: {err}"))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|err| format!("Failed to read structured output: {err}"))?;
-    validate_structured_output(&runtime.schema, &value)?;
+    validate_structured_output(&runtime.schema, &value)
+        .map_err(|message| format!("Structured output validation failed: {message}"))?;
     Ok(value)
+}
+
+/// SUBA-127 — pi `STRUCTURED_OUTPUT_REJECTION_ERROR` (`structured-output.ts:13` @v0.71.0): the
+/// fallback summary when the child invoked `structured_output` but no failed result of it carries
+/// any usable diagnostic.
+pub const STRUCTURED_OUTPUT_REJECTION_ERROR: &str =
+    "structured_output was invoked but no valid output was captured.";
+
+/// SUBA-127 — pi `INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR` (`structured-output.ts:14` @v0.71.0).
+pub const INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR: &str =
+    "Structured output invocation was rejected: invalid outputSchema.";
+
+/// SUBA-127 — pi `STRUCTURED_OUTPUT_VALIDATOR_UNAVAILABLE_ERROR` (`structured-output.ts:15`
+/// @v0.71.0).
+pub const STRUCTURED_OUTPUT_VALIDATOR_UNAVAILABLE_ERROR: &str =
+    "Structured output invocation was rejected: validator unavailable.";
+
+/// SUBA-127 — pi `MAX_STRUCTURED_OUTPUT_REJECTION_ERROR_BYTES` (`structured-output.ts:16` @v0.71.0).
+pub const MAX_STRUCTURED_OUTPUT_REJECTION_ERROR_BYTES: usize = 4096;
+
+/// The child tool's registered name, the one `tool_execution_start` names when it is invoked.
+const STRUCTURED_OUTPUT_TOOL_NAME: &str = "structured_output";
+
+/// SUBA-127 — pi's `structuredOutputToolInvoked` latch (`execution.ts:1036-1038` @v0.71.0; the
+/// runner's `run.structuredOutputToolInvoked`): set by a `tool_execution_start` that names
+/// `structured_output`, whatever the call's outcome.
+#[must_use]
+pub fn structured_output_tool_invoked(events: &[crate::exec::ndjson::SubagentEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            crate::exec::ndjson::SubagentEvent::ToolExecutionStart { tool_name, .. }
+                if tool_name == STRUCTURED_OUTPUT_TOOL_NAME
+        )
+    })
+}
+
+/// pi `utf8Prefix` (`structured-output.ts:18-31` @v0.71.0): cut at a character boundary so the
+/// result, `...` included, fits `max_bytes`.
+fn utf8_prefix(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    const SUFFIX: &str = "...";
+    let content_limit = max_bytes.saturating_sub(SUFFIX.len());
+    let mut result = String::new();
+    for character in value.chars() {
+        if result.len() + character.len_utf8() > content_limit {
+            break;
+        }
+        result.push(character);
+    }
+    result.push_str(SUFFIX);
+    result
+}
+
+/// pi `messageText` (`structured-output.ts:33-40` @v0.71.0): a string is itself; an array is its
+/// `text` parts joined by newlines. A tool result on cyrup's wire is `{content: [...]}` rather than
+/// the bare content array a pi `toolResult` message carries, so the object's `content` is read the
+/// same way.
+fn tool_result_text(result: &serde_json::Value) -> String {
+    let parts = match result {
+        serde_json::Value::String(text) => return text.clone(),
+        serde_json::Value::Array(parts) => parts,
+        serde_json::Value::Object(_) => match result.get("content") {
+            Some(serde_json::Value::String(text)) => return text.clone(),
+            Some(serde_json::Value::Array(parts)) => parts,
+            _ => return String::new(),
+        },
+        _ => return String::new(),
+    };
+    parts
+        .iter()
+        .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn literal_regex(pattern: &str) -> regex::Regex {
+    regex::Regex::new(pattern)
+        .unwrap_or_else(|_| unreachable!("a structured-output rejection pattern is a literal"))
+}
+
+static ANSI_ESCAPE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| literal_regex(r"\x1b\[[0-?]*[ -/]*[@-~]"));
+static CONTROL_CHARACTERS: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| literal_regex(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"));
+static INVALID_SCHEMA: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| literal_regex(r"(?i)invalid outputSchema(?:\s*:|$)"));
+static VALIDATOR_UNAVAILABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    literal_regex(r"(?i)failed to validate structured output:|cannot load typebox/compile")
+});
+static STACK_FRAME: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| literal_regex(r"^at\s"));
+static ECHOED_INPUT_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    literal_regex(
+        r"(?i)^(?:arguments?|parameters?|submitted value|input|outputSchema|schema|stack)\s*:",
+    )
+});
+// `\b` is ASCII-only in upstream's flagless `RegExp`, hence `(?-u:\b)`.
+static ECHOED_VALUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    literal_regex(
+        r#"(?i)(?-u:\b)(received|actual|got)(?:\s+value)?\s*[:=]\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\{[^\n]*\}|\[[^\n]*\]|\S+)"#,
+    )
+});
+
+/// pi `sanitizeStructuredOutputRejection` (`structured-output.ts:42-58` @v0.71.0): strip terminal
+/// controls, collapse schema/validator failures to their fixed messages, keep only the diagnostic
+/// from `Structured output validation failed:` on, drop stack frames and lines that echo the
+/// submitted input, and redact any echoed value.
+fn sanitize_structured_output_rejection(text: &str) -> String {
+    let without_ansi = ANSI_ESCAPE.replace_all(text, "");
+    let without_controls = CONTROL_CHARACTERS.replace_all(&without_ansi, "");
+    if INVALID_SCHEMA.is_match(&without_controls) {
+        return INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR.to_string();
+    }
+    if VALIDATOR_UNAVAILABLE.is_match(&without_controls) {
+        return STRUCTURED_OUTPUT_VALIDATOR_UNAVAILABLE_ERROR.to_string();
+    }
+    const VALIDATION_MARKER: &str = "Structured output validation failed:";
+    let diagnostic = without_controls
+        .find(VALIDATION_MARKER)
+        .and_then(|index| without_controls.get(index..))
+        .unwrap_or(&without_controls);
+    let kept = diagnostic
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !STACK_FRAME.is_match(trimmed)
+                && !ECHOED_INPUT_LINE.is_match(trimmed)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sanitized = ECHOED_VALUE.replace_all(&kept, "${1}: [redacted]");
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        STRUCTURED_OUTPUT_REJECTION_ERROR.to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+/// SUBA-127 — pi `formatStructuredOutputRejectionError` (`structured-output.ts:61-80` @v0.71.0):
+/// bounded, redacted evidence from the LATEST failed `structured_output` result — matched by the
+/// result's own tool name or by a call id a `structured_output` invocation opened — or
+/// [`STRUCTURED_OUTPUT_REJECTION_ERROR`] when there is none. pi scans the transcript's
+/// `toolResult` messages; cyrup's wire carries the same `toolName`/`isError`/content on
+/// `tool_execution_end`.
+#[must_use]
+pub fn format_structured_output_rejection_error(
+    events: &[crate::exec::ndjson::SubagentEvent],
+) -> String {
+    use crate::exec::ndjson::SubagentEvent;
+    let call_ids: std::collections::HashSet<&cyrup_core::ToolCallId> = events
+        .iter()
+        .filter_map(|event| match event {
+            SubagentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                ..
+            } if tool_name == STRUCTURED_OUTPUT_TOOL_NAME => Some(tool_call_id),
+            _ => None,
+        })
+        .collect();
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            SubagentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error: true,
+            } if tool_name == STRUCTURED_OUTPUT_TOOL_NAME || call_ids.contains(tool_call_id) => {
+                Some(utf8_prefix(
+                    &sanitize_structured_output_rejection(&tool_result_text(result)),
+                    MAX_STRUCTURED_OUTPUT_REJECTION_ERROR_BYTES,
+                ))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| STRUCTURED_OUTPUT_REJECTION_ERROR.to_string())
 }
 
 /// pi `cleanupStructuredOutputRuntime` (`structured-output.ts:175-182`): best-effort removal of the
@@ -468,9 +661,10 @@ mod tests {
         });
         let value = serde_json::json!({"name": "ada"}); // missing required "age"
         let err = validate_structured_output(&schema, &value).expect_err("must fail");
+        assert!(err.contains("age"), "got: {err}");
         assert!(
-            err.contains("structured output validation failed"),
-            "got: {err}"
+            !err.to_ascii_lowercase().contains("validation failed"),
+            "the message is bare; each caller adds its own prefix, got: {err}"
         );
     }
 
@@ -581,7 +775,7 @@ mod tests {
         std::fs::write(&runtime.output_path, br#"{"summary":"ok","count":"three"}"#).unwrap();
         let err = read_structured_output(&runtime).expect_err("invalid capture must fail");
         assert!(
-            err.contains("validation failed") && err.contains("count"),
+            err.starts_with("Structured output validation failed: ") && err.contains("count"),
             "got: {err}"
         );
     }

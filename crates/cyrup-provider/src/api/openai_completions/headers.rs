@@ -73,11 +73,11 @@ pub(crate) fn build_headers(
         model.provider.as_str(),
         &ctx.messages,
     );
-    // Session-affinity headers (Pi `createClient`, openai-completions.ts:647-656 @v0.83.0). The
-    // enabling flag is `false` for every provider in `detect_compat`, but the emission is ported
-    // for 1:1 parity so an explicit `model.compat.sendSessionAffinityHeaders` override takes
-    // effect. PROV-024: the header SET is chosen by `sessionAffinityFormat`, not fixed — an
-    // OpenRouter model reads `x-session-id` and none of the other three.
+    // Session-affinity headers (Pi `createClient`, openai-completions.ts:770-780 @v0.87.1). The
+    // enabling flag is detected on for OpenRouter only (PROV-086) and otherwise comes from
+    // `model.compat.sendSessionAffinityHeaders`. PROV-024: the header SET is chosen by
+    // `sessionAffinityFormat`, not fixed — an OpenRouter model reads `x-session-id` and none of the
+    // other three.
     if compat.send_session_affinity_headers
         && let Some(sid) = cache_session_id
     {
@@ -96,5 +96,8 @@ pub(crate) fn build_headers(
             headers.insert(name.clone(), value.clone());
         }
     }
+    // PROV-095: `{ "User-Agent": getPiUserAgent(), ...model.headers }` (openai-completions.ts:760
+    // @v0.87.1) — the default sits under every overlay.
+    crate::utils::user_agent::insert_default_user_agent(&mut headers);
     headers
 }

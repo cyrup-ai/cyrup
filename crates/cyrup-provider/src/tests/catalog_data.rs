@@ -208,6 +208,62 @@ fn the_images_catalog_is_an_images_shape_not_a_model_shape() {
     );
 }
 
+/// **PROV-089.** The images catalog the production loader hands the `openrouter-images` provider is
+/// `IMAGE_MODELS.openrouter` at pi `v0.87.1`: 55 rows, where the `b0c2a90e` extraction had 35. The
+/// twenty rows that tag added and the two display names it changed are asserted through
+/// [`crate::images::openrouter_image_models`], the loader the images registry resolves.
+#[test]
+fn the_images_catalog_is_image_models_at_v0_87_1() {
+    let models = crate::images::openrouter_image_models();
+    assert_eq!(
+        models.len(),
+        55,
+        "IMAGE_MODELS.openrouter @v0.87.1 declares 55 rows"
+    );
+    for id in [
+        "bytedance-seed/seedream-5-0-lite",
+        "bytedance-seed/seedream-5-0-pro",
+        "inclusionai/ming-image-0.1-design",
+        "krea/krea-2-large",
+        "krea/krea-2-medium",
+        "krea/krea-2-medium-turbo",
+        "meta/muse-image",
+        "microsoft/mai-image-2.5-pro",
+        "microsoft/mai-image-2.6",
+        "microsoft/mai-image-2.6-flash",
+        "openai/gpt-image-2.5-flare",
+        "openai/gpt-image-2.5-sunburst",
+        "openrouter/auto-beta",
+        "qwen/qwen-image-3",
+        "qwen/qwen-image-3-pro",
+        "recraft/recraft-v4-styles",
+        "recraft/recraft-v4-styles-pro",
+        "recraft/recraft-v4-styles-pro-vector",
+        "recraft/recraft-v4-styles-vector",
+        "x-ai/grok-imagine-image-2.0",
+    ] {
+        assert!(
+            models.iter().any(|m| m.id == id),
+            "{id} is in image-models.generated.ts @v0.87.1"
+        );
+    }
+    let name = |id: &str| {
+        models
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| panic!("missing {id}"))
+    };
+    assert_eq!(
+        name("microsoft/mai-image-2.5"),
+        "Microsoft AI: MAI-Image-2.5"
+    );
+    assert_eq!(
+        name("x-ai/grok-imagine-image-quality"),
+        "SpaceXAI: Grok Imagine Image Quality"
+    );
+}
+
 /// PROV-038, roster half: the set of catalog file stems must equal the registered provider ids plus
 /// the images providers. Adding a sixth catalog without registering its provider now FAILS, which
 /// is the drift the old tautological `CATALOGS.len() == 30` claimed to detect and could not.
@@ -851,7 +907,12 @@ fn kimi_coding_rows_force_adaptive_thinking() {
         .collect();
     assert_eq!(
         ids,
-        ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"]
+        [
+            "k3",
+            "k3-256k",
+            "kimi-for-coding",
+            "kimi-for-coding-highspeed"
+        ]
     );
     for id in &ids {
         let m = pick(&models, "kimi-coding", id);
@@ -1112,6 +1173,9 @@ fn the_codex_gpt_5_6_context_window_stays_at_the_ported_tags_272k() {
 /// pinned catalog cannot pass by naming a URL at all. The top-level `source` stays `pi@b0c2a90e`
 /// deliberately: it is the floor for the 34 files `git show` still produces, and repointing it at a
 /// live fetch is what pi issue #7016 warns discards every persisted overlay.
+/// **PROV-089 gives it a second.** `openrouter-images` is read at its own pin, `pi@v0.87.1` —
+/// `image-models.generated.ts` stayed a tracked data literal through that tag, so the `b0c2a90e`
+/// floor that binds every `*.models.ts` never bound it.
 #[test]
 fn the_catalog_manifest_names_one_revision_per_provider() {
     let raw = include_str!("../providers/catalog_manifest.json");
@@ -1149,6 +1213,12 @@ fn the_catalog_manifest_names_one_revision_per_provider() {
             assert!(
                 entry["fetchedAt"].is_string() || entry["fetchedAt"].is_null(),
                 "{name}'s fetchedAt is its own live provenance (string) or null (never fetched)"
+            );
+        } else if name == "openrouter-images" {
+            assert_eq!(
+                entry["source"].as_str(),
+                Some("pi@v0.87.1"),
+                "PROV-089: the images catalog is read at its own pinned tag, not b0c2a90e"
             );
         } else {
             assert!(

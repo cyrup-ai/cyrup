@@ -344,7 +344,11 @@ pub fn set_current(protocol: KeyboardProtocol) {
 /// reader thread exists; see the module docs. Returns the decision and stores it in [`current`].
 /// Costs at most [`NEGOTIATION_TIMEOUT`] and consumes no byte the terminal did not send in reply.
 pub fn negotiate() -> KeyboardProtocol {
-    let reply = crate::terminal_query::exchange(KITTY_FLAGS_QUERY, NEGOTIATION_TIMEOUT);
+    let reply = crate::terminal_query::exchange(
+        crate::dead_terminal::terminal_stdout(),
+        KITTY_FLAGS_QUERY,
+        NEGOTIATION_TIMEOUT,
+    );
     let decision = decide(reply.as_deref().unwrap_or_default());
     set_current(decision);
     decision

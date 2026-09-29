@@ -73,7 +73,12 @@ impl SettingsManager {
             SettingsScope::Global => self.global_load_error = Some(message.clone()),
             SettingsScope::Project => self.project_load_error = Some(message.clone()),
         }
-        self.load_errors.push(ScopedError { scope, message });
+        let path = self.store.location(scope);
+        self.load_errors.push(ScopedError {
+            scope,
+            path,
+            message,
+        });
     }
 
     fn load_scope(&mut self, scope: SettingsScope) -> Settings {
@@ -430,6 +435,17 @@ impl SettingsManager {
         enabled: bool,
     ) -> Result<(), ConfigError> {
         self.set(SettingsScope::Global, "fullscreenCopyOnSelect", enabled)
+            .await
+    }
+
+    /// `setCacheWarmingMode` (Pi `settings-manager.ts:960-963` @v0.87.1): GLOBAL scope —
+    /// `this.globalSettings.cacheWarming = mode` — the only scope its reader,
+    /// [`EffectiveSettings::cache_warming_mode`], consults. CFG-093.
+    pub async fn set_cache_warming_mode(
+        &mut self,
+        mode: super::types::CacheWarmingMode,
+    ) -> Result<(), ConfigError> {
+        self.set(SettingsScope::Global, "cacheWarming", mode.as_str())
             .await
     }
 

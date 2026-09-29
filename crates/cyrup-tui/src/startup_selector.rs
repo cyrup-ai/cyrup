@@ -12,7 +12,7 @@
 //! delete/rename) are routed to the caller's `on_apply` and the slot stays open (the selector already
 //! reflected the mutation in its own row list).
 
-use std::io::{self, Stdout};
+use std::io;
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -28,6 +28,7 @@ use crate::error::TuiError;
 use crate::keymap::SelectKeymap;
 use crate::selector::{Selector, SelectorOutcome};
 use crate::theme::UiTheme;
+use crate::write_log::{TuiStdout, tui_stdout};
 
 /// Restore the terminal on EVERY exit from [`run_startup_selector`] — the two setup errors, the
 /// loop's `?`, and (new with `async`) a **future-drop**: the loop now suspends at each
@@ -76,14 +77,16 @@ pub async fn run_startup_selector(
     stdout
         .execute(EnterAlternateScreen)
         .map_err(|e| TuiError::Backend(e.to_string()))?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))
+    // Frames go through the TUI's write channel — pi's startup UI renders through a
+    // `ProcessTerminal` (`cli/startup-ui.ts:89` @v0.87.1), whose `write` `PI_TUI_WRITE_LOG` tees.
+    let mut terminal = Terminal::new(CrosstermBackend::new(tui_stdout()))
         .map_err(|e| TuiError::Backend(e.to_string()))?;
 
     run_loop(&mut terminal, theme, keymap, inner, on_apply).await
 }
 
 async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<TuiStdout>>,
     theme: &UiTheme,
     keymap: &SelectKeymap,
     inner: &mut dyn Selector,
