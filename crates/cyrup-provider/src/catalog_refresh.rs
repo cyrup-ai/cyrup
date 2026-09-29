@@ -472,6 +472,48 @@ impl ModelCatalogService {
             })
             .await
     }
+
+    /// Refresh ONLY `fetch_providers`, bypassing the coordinator — pi's post-login
+    /// `session.modelRuntime.refresh({ providers: [providerId], signal: controller.signal })`
+    /// (`modes/interactive/interactive-mode.ts:5953`).
+    ///
+    /// The coordinator bypass is the PORT, not an oversight. pi reserves `refreshModelCatalogs`
+    /// (`modes/interactive/model-catalog-refresh.ts:46-51`) for WHOLE-catalog refreshes and calls
+    /// `modelRuntime.refresh` directly here. It has to: [`Self::refresh`] may JOIN an in-flight
+    /// operation, and the joined operation's provider list wins, so a scoped caller routed through
+    /// it would silently inherit a whole-catalog fetch and lose its scope — and with it the
+    /// guarantee that its whole deadline is spent on the one provider it named.
+    ///
+    /// A scoped fetch is overlay-SAFE: [`refresh_and_install`] reloads the overlay over
+    /// `overlay_providers` — every registered id — regardless of how narrow the fetch list is, so a
+    /// scoped call can never shrink the overlay another caller installed.
+    ///
+    /// Un-spawned, unlike [`Self::refresh`]: with no joiners to outlive, dropping the operation at
+    /// its next await point when `caller` fires IS the abort, which is what `signal` does upstream.
+    pub async fn refresh_scoped(
+        &self,
+        caller: CancelToken,
+        fetch_providers: Vec<String>,
+    ) -> CatalogRefreshResult {
+        // pi `signal.throwIfAborted()` — an already-cancelled caller starts nothing.
+        if caller.is_cancelled() {
+            return CatalogRefreshResult::timed_out();
+        }
+        let catalog = Arc::clone(&self.catalog);
+        let overlay = Arc::clone(&self.overlay);
+        let all = self.overlay_providers.clone();
+        let options = self.options;
+        let operation = async move {
+            refresh_and_install(&catalog, &fetch_providers, &all, options, &overlay).await
+        };
+        match caller.run_until_cancelled(operation).await {
+            Some(errors) => CatalogRefreshResult {
+                errors,
+                ..CatalogRefreshResult::default()
+            },
+            None => CatalogRefreshResult::timed_out(),
+        }
+    }
 }
 
 // `_op_cancel` is intentionally unused by the production closure above: `refresh_providers` has no

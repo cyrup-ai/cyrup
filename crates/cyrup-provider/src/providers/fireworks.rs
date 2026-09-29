@@ -28,7 +28,7 @@ const FIREWORKS_CATALOG_JSON: &str = include_str!("catalog/fireworks.json");
 /// The full Fireworks catalog (1:1 with Pi `FIREWORKS_MODELS`). A parse failure yields an empty
 /// catalog (surfaced loudly by the count test) rather than a panic (NO-PANIC policy).
 pub fn fireworks_models() -> Vec<Model> {
-    serde_json::from_str(FIREWORKS_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(FIREWORKS_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The Fireworks [`ProviderAuth`]: an API key from `$FIREWORKS_API_KEY` (Pi `envApiKeyAuth`).
@@ -76,8 +76,9 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = fireworks_models();
-        // Every entry in Pi's `fireworks.models.ts` (16 models).
-        assert_eq!(models.len(), 16);
+        // Every entry in pi's `fireworks.models.ts`, live since PROV-071 (22 models; 16 while the
+        // catalog was frozen at `b0c2a90e`).
+        assert_eq!(models.len(), 22);
         assert!(models.iter().all(|m| m.provider.as_str() == "fireworks"));
         // Mixed-API: most models are anthropic-messages, glm-5p2 is openai-completions.
         assert!(models.iter().any(|m| m.api.as_str() == ANTHROPIC_MESSAGES));
@@ -94,33 +95,29 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {id}"))
         };
 
-        // glm-5p2 is the openai-completions model with a /v1 base URL + thinking level map.
-        let glm = find("accounts/fireworks/models/glm-5p2");
+        // DRIFT-052, now CONVERGED rather than imposed. This test used to pin
+        // `accounts/fireworks/models/glm-5p2` and its `routers/glm-5p2-fast` twin, whose four-key
+        // `openAICompat` block cyrup forward-ported past `b0c2a90e` through the generator's DELTAS
+        // table. Both ids are retired upstream — GLM 5.2 gave way to 5.3 — so the pin has nothing
+        // left to act on and `xtask`'s CONVERGED table now asserts their ABSENCE instead. What the
+        // forward-port was actually about survives on the successor rows, from upstream's own data:
+        // pi `b9497c8c1` ("fix(ai): correct Fireworks GLM prompt caching, closes #7676") moved the
+        // GLM rows off an inline `candidate.compat = { supportsStore, supportsDeveloperRole }`
+        // ASSIGNMENT — which discarded the models.dev keys — onto the shared `openAICompat`
+        // constant, and `glm-5p3` carries all four keys that fix produces.
+        let glm = find("accounts/fireworks/models/glm-5p3");
         assert_eq!(glm.api.as_str(), OPENAI_COMPLETIONS);
         assert_eq!(glm.base_url, "https://api.fireworks.ai/inference/v1");
         let gc = glm.compat.as_ref().expect("compat");
         assert_eq!(gc.supports_store, Some(false));
         assert_eq!(gc.supports_developer_role, Some(false));
-        // DRIFT-052 — a signed-off v0.84.0 forward-port, carried by the generator's DELTAS table
-        // (`xtask/src/main.rs`, `WHY_FIREWORKS_GLM_COMPAT`).
-        //
-        // At the ported tag v0.83.0 the glm-5p2 patch (`ai/scripts/generate-models.ts:2151-2155`)
-        // **assigns** — it does not spread — `candidate.compat = { supportsStore: false,
-        // supportsDeveloperRole: false }`, DISCARDING all four keys the models.dev fireworks
-        // ingest had just set at `…:1560-1565`. pi `b9497c8c1` ("fix(ai): correct Fireworks GLM
-        // prompt caching, closes #7676", first tag **v0.84.0**, unchanged at v0.84.2) replaced
-        // that inline assignment with the shared `openAICompat` constant built in
-        // `processFireworksModels` (v0.84.2 `…:1239-1244`), which reinstates
-        // `sendSessionAffinityHeaders: true` and `supportsLongCacheRetention: false`. cyrup adopts
-        // the fixed behaviour: the v0.83.0 shape is an upstream BUG that costs a prompt-cache miss
-        // on every Fireworks GLM turn.
         assert_eq!(gc.send_session_affinity_headers, Some(true));
         assert_eq!(gc.supports_long_cache_retention, Some(false));
         // The declared keys are not inert, and the two do NOT behave alike on the wire — assert
         // the RESOLVED values too, because neither is auto-detected for fireworks:
         //   * `sendSessionAffinityHeaders` detects to `false` (`openai-completions.ts:1471`
-        //     @v0.83.0), so ABSENT means no `x-session-affinity` header at all (`…:647`) and every
-        //     Fireworks prompt-cache lookup misses — Fireworks routes cache by replica affinity.
+        //     @v0.83.0), so ABSENT means no `x-session-affinity` header at all and every Fireworks
+        //     prompt-cache lookup misses — Fireworks routes cache by replica affinity.
         //   * `supportsLongCacheRetention` detects to `!(isTogether || isCloudflareWorkersAI ||
         //     isCloudflareAiGateway || isNvidia || isAntLing)` (`…:1474-1480`) — all false for
         //     fireworks — so ABSENT resolves to **true** and cyrup asks for a retention Fireworks
@@ -130,13 +127,27 @@ mod tests {
         assert!(!gr.supports_long_cache_retention);
         assert!(!gr.supports_store);
         assert!(!gr.supports_developer_role);
-        // pi fireworks.models.ts @91585d9a maps the top rung as `"max":"max"` (never `xhigh`).
+        // The top rung is `"max":"max"`, never `xhigh`.
         let gm = glm.thinking_level_map.as_ref().expect("glm map");
         assert_eq!(gm.get("max"), Some(&Some("max".to_string())));
-        assert_eq!(gm.get("xhigh"), None);
+        assert_eq!(gm.get("xhigh"), Some(&None));
 
-        // deepseek-v4-flash is anthropic-messages with session-affinity + no-eager-tool-streaming.
-        let ds = find("accounts/fireworks/models/deepseek-v4-flash");
+        // The 5.2 ids are gone. Asserted, not assumed: if either comes back, DRIFT-052's
+        // forward-port decision has to be re-taken against whatever compat block it comes back
+        // with, and `xtask`'s CONVERGED table fails the generation run that brings it.
+        for gone in [
+            "accounts/fireworks/models/glm-5p2",
+            "accounts/fireworks/routers/glm-5p2-fast",
+        ] {
+            assert!(
+                !models.iter().any(|m| m.id.as_str() == gone),
+                "{gone} is retired upstream"
+            );
+        }
+
+        // The anthropic-messages half: session-affinity + no-eager-tool-streaming, on the
+        // `/inference` base URL rather than `/inference/v1`.
+        let ds = find("accounts/fireworks/models/deepseek-v4p1-flash");
         assert_eq!(ds.api.as_str(), ANTHROPIC_MESSAGES);
         assert_eq!(ds.base_url, "https://api.fireworks.ai/inference");
         let dc = ds.compat.as_ref().expect("compat");
@@ -144,29 +155,38 @@ mod tests {
         assert_eq!(dc.supports_eager_tool_input_streaming, Some(false));
         assert_eq!(dc.supports_cache_control_on_tools, Some(false));
         assert_eq!(dc.supports_long_cache_retention, Some(false));
+        // pi #9323 — every Fireworks Messages row now allows an empty thinking signature. The
+        // frozen floor had none of these, so cyrup dropped thinking blocks Fireworks does send.
+        assert_eq!(dc.allow_empty_signature, Some(true));
 
-        // MIRROR: the `routers/` twin takes the SAME four-key compat — both the v0.83.0 branch
-        // (`candidate.id.includes("glm-5p2")`, `generate-models.ts:2151`) and v0.84.2's
-        // `modelId.includes("glm-5p2")` (`…:1274`) match the router id too — and NO other row
-        // gains the openai keys.
-        let fast = find("accounts/fireworks/routers/glm-5p2-fast");
+        // MIRROR: the `routers/` twin takes the SAME openai compat, and the split is by API, not by
+        // id — every `openai-completions` row has the block and no `anthropic-messages` row does.
+        let fast = find("accounts/fireworks/routers/glm-5p3-fast");
         assert_eq!(fast.api.as_str(), OPENAI_COMPLETIONS);
         assert_eq!(fast.base_url, "https://api.fireworks.ai/inference/v1");
-        let fc = fast.compat.as_ref().expect("compat");
-        assert_eq!(fc.supports_store, Some(false));
-        assert_eq!(fc.supports_developer_role, Some(false));
-        assert_eq!(fc.send_session_affinity_headers, Some(true));
-        assert_eq!(fc.supports_long_cache_retention, Some(false));
         let fr = crate::api::compat::get_compat(fast);
         assert!(fr.send_session_affinity_headers);
         assert!(!fr.supports_long_cache_retention);
         for m in &models {
-            if !m.id.as_str().contains("glm-5p2") {
-                let c = m.compat.as_ref().expect("compat");
+            let c = m.compat.as_ref().expect("compat");
+            if m.api.as_str() == OPENAI_COMPLETIONS {
+                assert_eq!(
+                    c.supports_store,
+                    Some(false),
+                    "{} is on Completions and must carry openAICompat",
+                    m.id.as_str()
+                );
+            } else {
                 assert_eq!(
                     c.supports_store,
                     None,
-                    "{} took openAICompat",
+                    "{} is on Messages and must not take openAICompat",
+                    m.id.as_str()
+                );
+                assert_eq!(
+                    c.allow_empty_signature,
+                    Some(true),
+                    "{} is on Messages and must allow an empty signature (#9323)",
                     m.id.as_str()
                 );
             }
@@ -177,7 +197,7 @@ mod tests {
     fn provider_identity() {
         let p = fireworks_provider();
         assert_eq!(p.id().as_str(), "fireworks");
-        assert!(p.get_model("accounts/fireworks/models/kimi-k2p6").is_some());
+        assert!(p.get_model("accounts/fireworks/models/kimi-k3").is_some());
         // env mapping exists for the env-key auth.
         let vars = crate::env_api_keys::api_key_env_vars("fireworks").expect("env mapping");
         assert!(vars.contains(&FIREWORKS_API_KEY_ENV));

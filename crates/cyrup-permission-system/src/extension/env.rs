@@ -41,6 +41,29 @@ pub const SUBAGENT_ENV_HINT_KEYS: [&str; 3] = [
 ];
 
 /// The explicit opt-in flag (DI-5): set truthy to force-install the gate even with no policy file.
+///
+/// **`[CYRUP-DELTA]` — CFG-074: cyrup-only, and the mechanism is what forces it.**
+/// `pi-permission-system` v0.8.0 declares no install flag, and it has no install PROBE either: its
+/// whole env surface is `PI_PERMISSION_SYSTEM_CONFIG_PATH` / `PI_PERMISSION_SYSTEM_LOGS_DIR`
+/// (`extension-config.ts:43-44`), the four forwarding agent-dir hints
+/// (`permission-forwarding.ts:9-14`) and `PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR`
+/// (`permission-manager.ts:29`). Upstream is a PLUGIN: whether the gate exists at all is a
+/// plugin-store fact the host decides before the extension runs, and the only switch the extension
+/// itself owns is `config.enabled` (`index.ts:1473-1477` — `if (!extensionConfig.enabled) return;`),
+/// which [`crate::extension::permission_extension_for_env`] ports exactly.
+///
+/// cyrup is ONE BINARY with the gate compiled in, so the question the plugin store answers upstream
+/// has to be answered here, and [`crate::extension::is_installed`] answers it from ARTIFACTS rather
+/// than from this flag: the global or project `cyrup-permissions.jsonc`, a non-empty `agents/`
+/// directory of `permission:` frontmatter, or a hand-edited `config.json` each attach the extension
+/// on their own.
+///
+/// **This flag is ADDITIVE ONLY, and that is the whole reason the delta is safe.** It can turn the
+/// gate ON where no artifact exists; there is no spelling of it — absent, empty, `0`, `false` — that
+/// turns the gate OFF when an artifact does exist, so it cannot produce a fail-open and it is not
+/// "an invented opt-in over a security gate". It exists for the operator with no policy file yet who
+/// wants the extension attached anyway, and for this crate's own integration tests. Pinned by
+/// `extension::tests::install::the_install_flag_is_additive_only_and_can_never_disable_a_real_policy`.
 pub const INSTALL_ENV_VAR: &str = "CYRUP_PERMISSION_SYSTEM";
 
 /// pi `PERMISSION_POLICY_AGENT_DIR_ENV_KEY = "PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR"`

@@ -69,6 +69,88 @@ fn wired() -> (
 }
 
 // ---------------------------------------------------------------------------
+// SEAM-T03 — `footer_data` (EXT-064)
+// ---------------------------------------------------------------------------
+
+/// EXT-064 — the interactive app publishes pi's `FooterDataProvider` into the seam a guest reads,
+/// so `ctx.ui.footer_data()` returns real data in the one mode upstream has a provider in at all.
+///
+/// Read through the PRODUCTION path, like every other test in this file: the `HostServices` trait
+/// method on a real `LiveHostServices`, which is exactly what `cyrup-ext/src/host/live.rs`'s
+/// `footer-data` import calls.
+///
+/// PRE-FIX — and pre-`install_extension_readbacks` attaching the mirror — this fails on the first
+/// assertion: `footer_data()` takes its trait default `None`, which is right for RPC and headless
+/// (pi constructs its `FooterDataProvider` at `interactive-mode.ts:611` @v0.87.1 and nowhere else)
+/// and wrong here.
+///
+/// `git_branch` boots as `FooterGitBranch::none()` — the app has not been pointed at a cwd — so
+/// `gitBranch` is `null`, which is upstream's own "not in a repo" answer
+/// (`core/footer-data-provider.ts:127-133`). The provider count is what makes the test bite
+/// regardless of where it runs: it is set explicitly and must survive the frame.
+#[test]
+fn a_guest_reads_the_live_footer_data_provider() {
+    let (mut app, svc, _rx) = wired();
+    app.status_mut().set_provider_count(4);
+    app.draw().unwrap();
+
+    let json = HostServices::footer_data(svc.as_ref()).expect(
+        "the interactive app attaches a footer data provider — pi's `FooterDataProvider`, \
+         `interactive-mode.ts:611` @v0.87.1",
+    );
+    let data: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        data["availableProviderCount"],
+        serde_json::json!(4),
+        "pi `getAvailableProviderCount()` (`core/footer-data-provider.ts:160-162` @v0.87.1), fed \
+         from the same unique-provider set `App::refresh_provider_count` computes"
+    );
+    assert_eq!(
+        data["gitBranch"],
+        serde_json::Value::Null,
+        "an app never pointed at a cwd is not in a repo, which is upstream's `null`"
+    );
+}
+
+/// EXT-064 — a `set_status` reaches the provider a guest reads, and a session teardown clears it.
+///
+/// The WRITE is the interesting half. It goes through `HostServices::set_status` — the production
+/// path `ui.set-status` lands on — and must be visible to the very next `footer_data()` WITHOUT a
+/// frame, because upstream's is: pi binds `setStatus` straight to
+/// `this.footerDataProvider.setExtensionStatus(key, text)` (`interactive-mode.ts:2204` @v0.87.1).
+/// Note the `draw()` calls here are deliberately absent between write and read — a wiring that
+/// carried the status only on the per-frame `UiEffect` channel fails this test and no other.
+///
+/// The clear half is pi's `clearExtensionStatuses()` at the same teardown
+/// (`interactive-mode.ts:2370`): `reset_extension_ui` already emptied `StatusLine`'s copy, and a
+/// segment left behind in the provider would be read by the INCOMING session's extensions while
+/// being absent from the footer the user sees.
+#[test]
+fn a_status_reaches_the_footer_provider_and_a_swap_clears_it() {
+    let (mut app, svc, _rx) = wired();
+    app.draw().unwrap();
+
+    HostServices::set_status(svc.as_ref(), "deploy", Some("building"));
+    let data: serde_json::Value =
+        serde_json::from_str(&HostServices::footer_data(svc.as_ref()).unwrap()).unwrap();
+    assert_eq!(
+        data["extensionStatuses"],
+        serde_json::json!({"deploy": "building"}),
+        "the segment is readable with no frame in between — pi's `setStatus` writes the provider \
+         synchronously (`interactive-mode.ts:2204` @v0.87.1)"
+    );
+
+    app.reset_extension_ui();
+    let data: serde_json::Value =
+        serde_json::from_str(&HostServices::footer_data(svc.as_ref()).unwrap()).unwrap();
+    assert_eq!(
+        data["extensionStatuses"],
+        serde_json::json!({}),
+        "pi `clearExtensionStatuses()` at the same teardown (`interactive-mode.ts:2370` @v0.87.1)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // SEAM-T02 — `editor_text`
 // ---------------------------------------------------------------------------
 

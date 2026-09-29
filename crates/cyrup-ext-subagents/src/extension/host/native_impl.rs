@@ -320,6 +320,25 @@ impl NativeExtension for SubagentsExtension {
                 // from inside a child.
                 api.subscribe_bus(crate::extension::rpc::SUBAGENT_RPC_REQUEST_EVENT);
 
+                // SUBA-143 — pi `registerRuntimeAgentEventListener(pi)` (`extension/index.ts:894`,
+                // impl `agents/runtime-agent-events.ts:49-70`): the cross-extension door onto this
+                // session's runtime agent registry. Upstream carries one topic and writes its
+                // result back into the emitted object; cyrup's bus fans out by value, so the
+                // result rides a reply topic and disposal — upstream's returned `dispose()` —
+                // needs a request topic of its own. `discovery::runtime_agent_events`' module doc
+                // is the client contract.
+                //
+                // Full arm ONLY, for the RPC bridge's reason one block up: a `ChildSafe` fanout
+                // child registers no orchestrator surface, so an agent contributed into its
+                // registry could never be selected by anything — answering `{ok: true}` there
+                // would be a lie about what the registration bought.
+                api.subscribe_bus(
+                    crate::discovery::runtime_agent_events::RUNTIME_AGENT_REGISTER_EVENT,
+                );
+                api.subscribe_bus(
+                    crate::discovery::runtime_agent_events::RUNTIME_AGENT_DISPOSE_EVENT,
+                );
+
                 // The herdr status bridge's two run-ended edges (`src/herdr/`). `subscribe_bus` is
                 // `InitApi`-only (`cyrup-ext/src/native.rs:466`), so they are declared here even
                 // though whether they are ACTED on is decided per-session by
@@ -740,6 +759,12 @@ impl NativeExtension for SubagentsExtension {
                 // `restore_one`'s stale-claim recovery is what clears a claim whose process died.
                 self.executor.dispose_scheduled_runs();
                 self.executor.teardown_session().await;
+                // SUBA-143 — `teardown_session` runs pi's `clearRuntimeAgentsForPi(pi)`
+                // (`extension/index.ts:1042`), which empties the whole partition; the bridge's
+                // outstanding tokens name records that no longer exist, so they go with it. Kept
+                // after the teardown, not before: a token must not be redeemable in the window
+                // where the record it names is still live.
+                self.runtime_agent_bridge.clear();
                 // pi `fleetStatus.dispose()` — clear the widget and drop every piece of
                 // registration state (`tui/fleet-status.ts:290-299,533-563`).
                 if let Ok(mut widget) = self.fleet_status.lock() {
@@ -945,6 +970,23 @@ impl NativeExtension for SubagentsExtension {
                 let fleet = self.executor.fleet_state(&self.cwd, false, false).await;
                 bridge.sync_fleet(&fleet, self.executor.open_herdr_project_pane_count());
             }
+            return Ok(());
+        }
+        // SUBA-143 — the runtime-agent registration/disposal pair. `dispatch` answers `None` for
+        // every topic that is not one of its two, so this is the bridge's own gate rather than a
+        // second copy of its topic list here.
+        if let Some((reply_topic, reply)) =
+            self.runtime_agent_bridge
+                .dispatch(topic, payload, self.executor.runtime_agents())
+        {
+            let Some(services) = self.executor.host_services() else {
+                return Err(ExtError::Component(
+                    "subagents: no capability backend is bound, so the runtime agent registration \
+                     reply cannot be emitted"
+                        .to_string(),
+                ));
+            };
+            services.emit_event(&reply_topic, &reply);
             return Ok(());
         }
         if topic != crate::extension::rpc::SUBAGENT_RPC_REQUEST_EVENT {

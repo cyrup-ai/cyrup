@@ -40,7 +40,6 @@ use crate::exec::acceptance::{
     AcceptanceContract, AcceptanceStatus, CleanCompletionGate, VerifyCommand, evaluate_acceptance,
     model, run_verify_commands_memoized,
 };
-use crate::exec::completion_guard::CompletionMutationGuardResult;
 
 // ------------------------------------------------------------------------------------------------
 // Fixtures
@@ -64,14 +63,6 @@ fn clean_gate() -> CleanCompletionGate {
         detached: false,
         interrupted: false,
         timed_out: false,
-    }
-}
-
-fn guard_did_not_fire() -> CompletionMutationGuardResult {
-    CompletionMutationGuardResult {
-        expected_mutation: false,
-        attempted_mutation: false,
-        triggered: false,
     }
 }
 
@@ -416,7 +407,6 @@ async fn the_live_gate_replays_a_memoized_verify_result_instead_of_re_running_th
         &contract,
         clean_gate(),
         None,
-        guard_did_not_fire(),
         repo.path(),
         Some(memo(artifacts.path(), "run-A")),
         None,
@@ -455,7 +445,6 @@ async fn the_live_gate_replays_a_memoized_verify_result_instead_of_re_running_th
         &contract,
         clean_gate(),
         None,
-        guard_did_not_fire(),
         repo.path(),
         Some(memo(artifacts.path(), "run-A")),
         None,
@@ -511,7 +500,6 @@ async fn editing_a_tracked_file_invalidates_the_memo_and_the_command_runs_again(
             &contract,
             clean_gate(),
             None,
-            guard_did_not_fire(),
             repo.path(),
             Some(memo(artifacts.path(), "run-B")),
             None,
@@ -531,7 +519,6 @@ async fn editing_a_tracked_file_invalidates_the_memo_and_the_command_runs_again(
         &contract,
         clean_gate(),
         None,
-        guard_did_not_fire(),
         repo.path(),
         Some(memo(artifacts.path(), "run-B")),
         None,
@@ -561,7 +548,6 @@ async fn a_different_run_id_does_not_share_a_memo() {
             &contract,
             clean_gate(),
             None,
-            guard_did_not_fire(),
             repo.path(),
             Some(memo(artifacts.path(), run_id)),
             None,
@@ -587,16 +573,8 @@ async fn without_a_memo_context_the_gate_executes_every_time() {
     let contract = verified_contract(verify("unit", &counting_command(&marker)));
 
     for _ in 0..2 {
-        let ledger = evaluate_acceptance(
-            &contract,
-            clean_gate(),
-            None,
-            guard_did_not_fire(),
-            repo.path(),
-            None,
-            None,
-        )
-        .await;
+        let ledger =
+            evaluate_acceptance(&contract, clean_gate(), None, repo.path(), None, None).await;
         assert_eq!(ledger.status, AcceptanceStatus::Verified);
     }
 
@@ -621,7 +599,6 @@ async fn outside_a_git_working_tree_nothing_is_memoized() {
             &contract,
             clean_gate(),
             None,
-            guard_did_not_fire(),
             plain.path(),
             Some(memo(artifacts.path(), "run-C")),
             None,
@@ -658,7 +635,6 @@ async fn a_failing_verify_result_is_memoized_and_still_rejects_on_replay() {
         &contract,
         clean_gate(),
         None,
-        guard_did_not_fire(),
         repo.path(),
         Some(memo(artifacts.path(), "run-D")),
         None,
@@ -668,7 +644,6 @@ async fn a_failing_verify_result_is_memoized_and_still_rejects_on_replay() {
         &contract,
         clean_gate(),
         None,
-        guard_did_not_fire(),
         repo.path(),
         Some(memo(artifacts.path(), "run-D")),
         None,
@@ -710,7 +685,6 @@ async fn a_changed_declared_env_value_invalidates_the_memo() {
             &contract,
             clean_gate(),
             None,
-            guard_did_not_fire(),
             repo.path(),
             Some(memo(artifacts.path(), "run-E")),
             None,
@@ -981,7 +955,6 @@ async fn the_live_gate_ledger_carries_every_memoization_evidence_field() {
         &contract,
         clean_gate(),
         None,
-        guard_did_not_fire(),
         repo.path(),
         Some(memo(artifacts.path(), "run-EV")),
         None,
@@ -1081,7 +1054,6 @@ async fn the_live_gate_ledger_reports_artifact_error_instead_of_swallowing_it() 
         &contract,
         clean_gate(),
         None,
-        guard_did_not_fire(),
         repo.path(),
         Some(memo(artifacts.path(), "run-ERR")),
         None,

@@ -317,6 +317,14 @@ struct RegistryInner {
     /// folds them in that order (`:773-788`), so a `Vec` reproduces both the ordering and the
     /// `Set.add` idempotence. `unsubscribe` is `Set.delete` and is likewise idempotent.
     terminal_input_subscribers: Vec<ExtensionId>,
+    /// Extensions subscribed to git-branch changes, in LOAD order (EXT-064; pi
+    /// `ReadonlyFooterDataProvider.onBranchChange(callback)`, `core/footer-data-provider.ts:139-143`
+    /// @v0.87.1).
+    ///
+    /// Upstream keeps the callbacks in a `Set` (`branchChangeCallbacks`, `:112`) and calls every
+    /// one on a real change (`notifyBranchChange`, `:197-199`); a `Vec` reproduces the `Set.add`
+    /// idempotence and fixes the order, and `unsubscribe` is upstream's `Set.delete`.
+    branch_change_subscribers: Vec<ExtensionId>,
 }
 
 impl ExtensionRegistry {
@@ -619,6 +627,38 @@ impl ExtensionRegistry {
     /// [`crate::ExtensionHost::has_terminal_input_subscribers`] for why the shape matters.
     pub fn has_terminal_input_subscribers(&self) -> Result<bool, ExtError> {
         Ok(!self.lock_read()?.terminal_input_subscribers.is_empty())
+    }
+
+    /// Record that `owner` subscribed to git-branch changes (EXT-064; pi
+    /// `onBranchChange(callback)`, `core/footer-data-provider.ts:139-143` @v0.87.1). Idempotent,
+    /// matching upstream's `Set.add`.
+    pub fn subscribe_branch_change(&self, owner: ExtensionId) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        if !g.branch_change_subscribers.contains(&owner) {
+            g.branch_change_subscribers.push(owner);
+        }
+        Ok(())
+    }
+
+    /// The unsubscribe function upstream's `onBranchChange` RETURNS
+    /// (`() => this.branchChangeCallbacks.delete(callback)`, `core/footer-data-provider.ts:141-142`
+    /// @v0.87.1). Idempotent; unsubscribing a non-subscriber is a no-op.
+    pub fn unsubscribe_branch_change(&self, owner: &ExtensionId) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        g.branch_change_subscribers.retain(|o| o != owner);
+        Ok(())
+    }
+
+    /// Branch-change subscribers in LOAD order — upstream iterates its insertion-ordered
+    /// `branchChangeCallbacks` set (`core/footer-data-provider.ts:197-199` @v0.87.1).
+    pub fn branch_change_subscribers(&self) -> Result<Vec<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.branch_change_subscribers.clone())
+    }
+
+    /// Whether the branch-change subscriber list is non-empty, WITHOUT cloning it — the same
+    /// cheap gate [`Self::has_terminal_input_subscribers`] is.
+    pub fn has_branch_change_subscribers(&self) -> Result<bool, ExtError> {
+        Ok(!self.lock_read()?.branch_change_subscribers.is_empty())
     }
 
     pub fn message_renderer_owner(
@@ -1296,6 +1336,7 @@ impl ExtensionRegistry {
         retain_not_owner!(markdown_transformers, |o: &ExtensionId| o != owner);
         retain_not_owner!(bash_operations, |o: &ExtensionId| o != owner);
         retain_not_owner!(terminal_input_subscribers, |o: &ExtensionId| o != owner);
+        retain_not_owner!(branch_change_subscribers, |o: &ExtensionId| o != owner);
         retain_not_owner!(tool_renderer_owner, |_: &String, o: &mut ExtensionId| o
             != owner);
         retain_not_owner!(message_renderer_owner, |_: &String, o: &mut ExtensionId| o

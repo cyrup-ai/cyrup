@@ -24,7 +24,7 @@ const OPENAI_CATALOG_JSON: &str = include_str!("catalog/openai.json");
 /// The full OpenAI catalog (1:1 with Pi `OPENAI_MODELS`). A parse failure yields an empty catalog
 /// (surfaced loudly by the count test) rather than a panic (NO-PANIC policy).
 pub fn openai_models() -> Vec<Model> {
-    serde_json::from_str(OPENAI_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(OPENAI_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The OpenAI [`ProviderAuth`]: an API key from `$OPENAI_API_KEY` (Pi `envApiKeyAuth`).
@@ -87,11 +87,11 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = openai_models();
-        // Every entry in pi's `openai.models.ts` @`b0c2a90e` (46 models). The 46th is
-        // `gpt-realtime-2.1`, which cyrup was missing until the catalogs were regenerated from a
-        // single revision (PROV-057/PROV-060) — the snapshot had been taken at `91585d9a`, a week
-        // earlier, where the catalog holds 45.
-        assert_eq!(models.len(), 46);
+        // Every entry in pi's `openai.models.ts`, live from `pi.dev/api/models/providers/openai`
+        // since PROV-071 (43 models). It was 46 while the catalog was frozen at `b0c2a90e`: the
+        // refresh added the three GPT-6 rows (astra/sol/luna) and retired six older ones, so the
+        // count fell while the catalog got newer — which is why a count alone is never the claim.
+        assert_eq!(models.len(), 43);
         assert!(models.iter().all(|m| m.api.as_str() == OPENAI_RESPONSES));
         assert!(models.iter().all(|m| m.provider.as_str() == "openai"));
         assert!(models.iter().all(|m| m.base_url == OPENAI_BASE_URL));
@@ -104,8 +104,10 @@ mod tests {
     #[test]
     fn long_context_models_carry_the_272k_pricing_tier() {
         let models = openai_models();
-        // The GPT-5.6 trio (pi `7df2a94e`, openai.models.ts @91585d9a) carries the same 272k tier
-        // with the same 2x/1.5x/2x/2x multipliers as the 5.4/5.5 family.
+        // `withOpenAiLongContextPricing` (`ai/scripts/generate-models.ts`) applies ONE 272k tier
+        // with 2x/1.5x/2x/2x multipliers. The GPT-6 trio joined the 5.4/5.5/5.6 families on the
+        // same rule, which is a fact the frozen floor could not carry because the rows did not
+        // exist in it (PROV-071).
         let long_context = [
             "gpt-5.4",
             "gpt-5.4-pro",
@@ -114,6 +116,9 @@ mod tests {
             "gpt-5.6-luna",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
         ];
         for id in long_context {
             let m = models
@@ -191,13 +196,17 @@ mod tests {
         assert_eq!(t.cache_read, 0.4);
         assert_eq!(t.cache_write, 5.0);
 
-        // MIRROR: Sol is NOT in `OPENAI_GPT_56_STANDARD_COSTS` — its literal is still the inline
-        // `{5, 30, 0.5, 6.25}` at BOTH tags (v0.84.1 `…:2360`), so it must not move.
+        // Sol has JOINED the cut. It was the mirror row here — outside
+        // `OPENAI_GPT_56_STANDARD_COSTS`, still on the inline `{5, 30, 0.5, 6.25}` at v0.83.0 and
+        // v0.84.1 — and the frozen floor kept quoting that. `OPENAI_STANDARD_COSTS` at v0.87.1
+        // pins it at 4/20/0.4/5 (`packages/ai/scripts/generate-models.ts`, read in the diff
+        // `v0.85.1..v0.87.1`), and the live catalog serves exactly that, so cyrup was overcharging
+        // Sol by 25-50% on every offline estimate until PROV-071's refresh.
         let sol = find("gpt-5.6-sol");
-        assert_eq!(sol.cost.input, 5.0);
-        assert_eq!(sol.cost.output, 30.0);
-        assert_eq!(sol.cost.cache_read, 0.5);
-        assert_eq!(sol.cost.cache_write, 6.25);
+        assert_eq!(sol.cost.input, 4.0);
+        assert_eq!(sol.cost.output, 20.0);
+        assert_eq!(sol.cost.cache_read, 0.4);
+        assert_eq!(sol.cost.cache_write, 5.0);
     }
 
     /// End-to-end: the catalog rate + the pricing function together bill a real long-context

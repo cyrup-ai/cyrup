@@ -608,6 +608,7 @@ mod tests {
         default_context: Option<ContextMode>,
     ) -> ResolvedAgentPersona {
         ResolvedAgentPersona {
+            default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,
             mutation_tools: None,
@@ -622,12 +623,12 @@ mod tests {
             extensions: None,
             subagent_only_extensions: Vec::new(),
             exclude_tools: Vec::new(),
+            allowed_agents: None,
             allow_nested_subagents: None,
             output: None,
             inherit_project_context: false,
             inherit_skills: false,
             skills: Vec::new(),
-            completion_guard: None,
             max_subagent_depth: None,
             default_context,
             memory: None,

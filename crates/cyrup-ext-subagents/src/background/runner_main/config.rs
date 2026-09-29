@@ -348,6 +348,20 @@ pub struct RunnerConfig {
     /// pre-SUBA-N03 behaviour: an async run with no wall-clock budget at all.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// CFG-067 — the two per-tool-deadline rungs hop 2 cannot re-derive: the call's own
+    /// `toolTimeoutMs` param and the live `config.json` `toolTimeoutMs`, both RAW. pi carries the
+    /// same pair on every task it hands its runner (`shared/types.ts:2460-2462`). The AGENT rung is
+    /// applied per step inside the runner, against that step's own resolved persona, and the ENV
+    /// rung is read there too (hop 2 inherits this process's environment), so the runner reproduces
+    /// `resolveToolTimeoutMs`'s full four-rung ladder without a second source of truth.
+    ///
+    /// `#[serde(default)]` (an empty pair) lets an older on-disk config still deserialize and means
+    /// exactly what it says: neither rung was supplied, so only the agent and env rungs can decide.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::exec::tool_timeout::ToolTimeoutRungs::is_empty"
+    )]
+    pub tool_timeout: crate::exec::tool_timeout::ToolTimeoutRungs,
     /// SUBA-N03 — pi `config.deadlineAt` (`subagent-runner.ts:126`, fed from
     /// `async-execution.ts:924,983` @v0.34.0 `deadlineAt = Date.now() + params.timeoutMs`): the ABSOLUTE
     /// wall-clock instant this run must be finished by, as milliseconds since the Unix epoch.
@@ -581,6 +595,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,
@@ -648,6 +663,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,
             revival_lease: None,

@@ -837,6 +837,10 @@ fn assistant_content_to_text(content: &[Content]) -> String {
 
 fn message_to_text(message: &Message) -> String {
     match message {
+        // PROV-083a — the faux provider's request fingerprint. A system message's text is its
+        // rendered prompt (content plus sections), so a transcript whose prompt changed mid-run
+        // fingerprints differently, exactly as one whose `system_prompt` changed does.
+        Message::System(m) => crate::utils::text::get_system_message_text(m),
         Message::User { content, .. } => content_to_text(content),
         Message::Assistant(a) => assistant_content_to_text(&a.content),
         Message::ToolResult {
@@ -851,6 +855,7 @@ fn message_to_text(message: &Message) -> String {
 
 fn role_label(message: &Message) -> &'static str {
     match message {
+        Message::System(_) => "system",
         Message::User { .. } => "user",
         Message::Assistant(_) => "assistant",
         Message::ToolResult { .. } => "toolResult",
@@ -951,6 +956,7 @@ pub fn faux_assistant_message_with(
         api: ApiId::from(DEFAULT_API),
         response_model: None,
         response_id: options.response_id,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage {
             output,
@@ -989,6 +995,7 @@ pub fn faux_deferred_message(model: &Model, handle: DeferredHandle) -> Assistant
         api: model.api.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Deferred,

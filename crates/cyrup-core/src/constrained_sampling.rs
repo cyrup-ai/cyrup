@@ -17,20 +17,32 @@
 //! exist at all. `cyrup-provider` re-exports every item in this module from its `context` module,
 //! so the provider-facing paths are unchanged.
 //!
-//! # The four coding built-ins declare it — as of pi v0.84.2
+//! # The declaration is unconditional — pi v0.87.1
 //!
 //! At v0.83.0 no pi built-in declared the field: `git grep -n constrainedSampling v0.83.0 --
 //! packages/coding-agent/src packages/agent/src` returned exactly three hits, the `ToolDefinition`
-//! field declaration and the two `tool-definition-wrapper.ts` copies above. That changed with pi
-//! commit `7915cdac` — *"feat(ai): add strict tool schema conversion"*, first tagged **v0.84.2** —
-//! which added `constrainedSampling: getExperimentalToolSampling()` to `read`
-//! (`core/tools/read.ts:222`), the shared shell definition (`bash.ts:354`, so `powershell`
-//! inherits it), `edit.ts:329` and `write.ts:200`, plus `server/create-harness.ts:34`.
+//! field declaration and the two `tool-definition-wrapper.ts` copies above. pi commit `7915cdac` —
+//! *"feat(ai): add strict tool schema conversion"*, first tagged **v0.84.2** — added
+//! `constrainedSampling: getExperimentalToolSampling()` to the coding built-ins, gated on
+//! `PI_EXPERIMENTAL`. CHANGELOG 0.86.0 — *"Enabled strict-prefer JSON-schema sampling by default
+//! for built-in read, bash, powershell, edit, and write tools, without requiring
+//! PI_EXPERIMENTAL"* — dropped that gate and inlined the literal into each definition.
 //!
-//! [`experimental_tool_sampling`] below is `getExperimentalToolSampling`'s Rust counterpart, and
-//! `cyrup-tools` returns it from `Tool::constrained_sampling` on the same four tools. The
-//! plumbing this module also provides — an extension-registered or guest tool opting in and having
-//! the declaration reach the wire — is unchanged.
+//! So at **v0.87.1** the declaration is the inline literal
+//! `constrainedSampling: { type: "json_schema", strict: "prefer" }` at `core/tools/read.ts:80`,
+//! the shared `createShellToolDefinition` at `bash.ts:243` (so `powershell` inherits it from that
+//! one line), `edit.ts:156` and `write.ts:57` — five tools, four declarations. Both
+//! `getExperimentalToolSampling` and `server/create-harness.ts` are GONE from the repo at that tag
+//! (`git grep -n getExperimentalToolSampling v0.87.1` → no hits; `git ls-tree v0.87.1
+//! packages/coding-agent/src/server/` → empty; `core/experimental.ts` @v0.87.1 exports only
+//! `areExperimentalFeaturesEnabled`), so do not carry a flag-gated description forward: re-derive
+//! it at the tag you are reading.
+//!
+//! [`prefer_strict_tool_sampling`] below is that literal, and the four `Tool::constrained_sampling`
+//! bodies in `cyrup-tools` — `tools/read.rs`, `tools/edit.rs`, `tools/write.rs` and the shared
+//! `tools/bash.rs` `ShellTool` engine, hence `powershell` — return it unconditionally. The plumbing
+//! this module also provides — an extension-registered or guest tool opting in and having the
+//! declaration reach the wire — is unchanged.
 
 /// Pi `Tool["constrainedSampling"]` — `false | ConstrainedSamplingConfig`
 /// (`packages/ai/src/types.ts:484` @v0.83.0, and `extensions/types.ts:463` on the
@@ -86,46 +98,133 @@ pub struct GrammarVariants {
     pub openai_regex: Option<String>,
 }
 
-/// Pi `PREFER_STRICT_TOOL_SAMPLING` (`core/experimental.ts:1`) — the single value every coding
-/// built-in declares. A `static` because [`crate::Tool::constrained_sampling`] hands out a
-/// reference, so the value cannot be constructed per call.
+/// Pi's literal `{ type: "json_schema", strict: "prefer" }` — the declaration the five coding
+/// built-ins carry. Upstream held it as a shared `const PREFER_STRICT_TOOL_SAMPLING`
+/// (`core/experimental.ts:1`) **@v0.85.1 only**; v0.86.0 deleted that const along with
+/// `getExperimentalToolSampling` and inlined the object literal into each of the four definitions,
+/// so `git grep -n PREFER_STRICT v0.87.1` returns nothing — upstream has no shared constant today.
+///
+/// [CYRUP-DELTA, mechanism only] cyrup holds ONE shared `static` where pi writes four inline object
+/// literals, because [`crate::Tool::constrained_sampling`] hands out a reference and the value
+/// cannot be constructed per call. The declaration that reaches the model is byte-identical either
+/// way, so this is a mechanism difference at full feature parity.
 static PREFER_STRICT_TOOL_SAMPLING: ConstrainedSampling =
     ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
         strict: StrictSampling::Prefer,
     });
 
-/// [`experimental_tool_sampling`] against an injected environment, so the flag check is
-/// exercisable without touching process state. Same shape as
-/// `cyrup_tui::status::experimental_features_enabled_from`.
-pub fn experimental_tool_sampling_from(
-    get: impl Fn(&str) -> Option<String>,
-) -> Option<&'static ConstrainedSampling> {
-    let enabled = get("CYRUP_EXPERIMENTAL").as_deref() == Some("1");
-    enabled.then_some(&PREFER_STRICT_TOOL_SAMPLING)
-}
-
-/// Pi `getExperimentalToolSampling` (`core/experimental.ts:7-9`): the strict-`prefer` JSON-schema
-/// declaration when the experimental flag is on, and nothing otherwise.
+/// The strict-`prefer` declaration itself, by reference.
 ///
-/// `CYRUP_EXPERIMENTAL` is the renamed flag (pi `PI_EXPERIMENTAL`; the legacy spelling is no
-/// longer honoured) — the same name, checked the same way, as
-/// `cyrup::startup::are_experimental_features_enabled` (`startup.rs:76-84`) and
-/// `cyrup_tui::status::experimental_features_enabled` (`status.rs:474-483`). Upstream re-reads
-/// `process.env` on every call but only ever calls it while BUILDING a tool definition; the env is
-/// read once here and latched, because cyrup likewise builds its tool set once
-/// (`ToolRegistry::with_builtins`). A caller that mutates the process env and then rebuilds the
-/// registry would observe the latch as stale; [`experimental_tool_sampling_from`] is the escape
-/// hatch.
-pub fn experimental_tool_sampling() -> Option<&'static ConstrainedSampling> {
-    static RESOLVED: std::sync::OnceLock<Option<&'static ConstrainedSampling>> =
-        std::sync::OnceLock::new();
-    *RESOLVED.get_or_init(|| experimental_tool_sampling_from(|k| std::env::var(k).ok()))
+/// The `static` stays private so there is exactly one way to reach it: `cyrup-tools`' four built-in
+/// bodies, and any other tool opting in, all hand out this same object.
+pub fn prefer_strict_tool_sampling() -> &'static ConstrainedSampling {
+    &PREFER_STRICT_TOOL_SAMPLING
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    const SRC: &str = include_str!("constrained_sampling.rs");
+
+    /// The module header, and nothing else in this file.
+    fn header_block() -> &'static str {
+        const OPENS: &str = "# Why these types live in";
+        const CLOSES: &str = "/// Pi `Tool[\"constrainedSampling\"]`";
+        let Some((_, after_open)) = SRC.split_once(OPENS) else {
+            panic!("`{OPENS}` no longer opens the header — retarget this scan");
+        };
+        let Some((block, _)) = after_open.split_once(CLOSES) else {
+            panic!("`{CLOSES}` no longer follows the header — retarget this scan");
+        };
+        block
+    }
+
+    /// TOOL-046 — a source scan over this module's header, the record of what pi declares.
+    ///
+    /// The header was written for **v0.84.2**, where the field was
+    /// `constrainedSampling: getExperimentalToolSampling()` with per-tool line citations and
+    /// `server/create-harness.ts`. pi v0.86.0 dropped the `PI_EXPERIMENTAL` gate and inlined the
+    /// literal; by v0.87.1 every one of those citations is dead. Same shape, and for the same
+    /// reason, as `crate::tool`'s
+    /// `constrained_sampling_doc_tests::the_constrained_sampling_doc_cites_v0_87_1_and_not_the_dead_v0_84_2_lines`.
+    ///
+    /// Only the LINE citations are forbidden: the rewritten prose legitimately NAMES
+    /// `getExperimentalToolSampling` and `server/create-harness.ts` in order to record that pi
+    /// deleted them, and a blunt name scan cannot tell that from a live claim.
+    #[test]
+    fn the_module_header_cites_v0_87_1_and_not_the_dead_v0_84_2_lines() {
+        let block = header_block();
+        // Non-vacuity, both directions: prove the slice really is the header, so an over- or
+        // under-read cannot pass the forbidden half by matching nothing.
+        assert!(
+            block.contains("cyrup-provider"),
+            "the extracted slice is not the module header: {block:?}"
+        );
+        assert!(
+            !block.contains("mod tests"),
+            "the slice over-ran into this test module, so the assertions below would be vacuous"
+        );
+
+        for dead in [
+            "read.ts:222",
+            "bash.ts:354",
+            "edit.ts:329",
+            "write.ts:200",
+            "create-harness.ts:34",
+            "experimental.ts:7-9",
+        ] {
+            assert!(
+                !block.contains(dead),
+                "`{dead}` is a v0.84.2 fact that is dead at v0.87.1 — pi v0.86.0 dropped the \
+                 `PI_EXPERIMENTAL` gate, and `getExperimentalToolSampling` and \
+                 `server/create-harness.ts` no longer exist upstream. Re-derive the citation at \
+                 the tag you read instead of carrying this one forward."
+            );
+        }
+
+        for live in [
+            "v0.87.1",
+            "read.ts:80",
+            "bash.ts:243",
+            "edit.ts:156",
+            "write.ts:57",
+            // The whole substance of pi 0.86.0: no flag gates the declaration any more.
+            "unconditional",
+        ] {
+            assert!(
+                block.contains(live),
+                "the header must cite `{live}` — the tag and lines where pi actually declares \
+                 `constrainedSampling: {{ type: \"json_schema\", strict: \"prefer\" }}`"
+            );
+        }
+    }
+
+    /// TOOL-046 — the flag-gated ancestor is DELETED, not quarantined.
+    ///
+    /// `experimental_tool_sampling` / `experimental_tool_sampling_from` were pi
+    /// `getExperimentalToolSampling`'s Rust counterpart, latching `CYRUP_EXPERIMENTAL` in a
+    /// `OnceLock`. Upstream deleted that function at v0.86.0 and nothing in this workspace called
+    /// cyrup's copy, so it was dead production API. A deletion's regression pin is a scan
+    /// forbidding the symbol's return — the only artifact left to test.
+    #[test]
+    fn the_dead_flag_gated_api_is_gone() {
+        // The production half only — this module's own test prose names the dead symbol in order
+        // to forbid it, exactly as `crate::tool`'s doc scan has to.
+        let Some((production, _)) = SRC.split_once("#[cfg(test)]") else {
+            panic!("`#[cfg(test)]` no longer closes the production half — retarget this scan");
+        };
+        assert!(
+            production.contains("fn prefer_strict_tool_sampling"),
+            "non-vacuity: the slice must be this module's production source"
+        );
+        assert!(
+            !production.contains("fn experimental_tool_sampling"),
+            "pi deleted `getExperimentalToolSampling` at v0.86.0 and the declaration is \
+             unconditional; the flag-gated accessor must not come back"
+        );
+    }
 
     /// pi serializes `constrainedSampling: false` literally; the untagged `Disabled` arm must
     /// round-trip as the bare JSON `false`, not as an object.
@@ -175,43 +274,6 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({"type": "grammar", "variants": {"openai_lark": "start: /x/"}})
-        );
-    }
-    /// DoD 2 — the `CYRUP_*` flag at the literal `"1"` yields pi's `PREFER_STRICT_TOOL_SAMPLING`;
-    /// the dropped `PI_*` spelling and every other value turn nothing on.
-    #[test]
-    fn experimental_tool_sampling_reads_the_cyrup_flag_and_nothing_else() {
-        let prefer = ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
-            strict: StrictSampling::Prefer,
-        });
-        let got = experimental_tool_sampling_from(|k| {
-            (k == "CYRUP_EXPERIMENTAL").then(|| "1".to_string())
-        });
-        assert_eq!(got, Some(&prefer), "CYRUP_EXPERIMENTAL=1 must enable it");
-        let legacy =
-            experimental_tool_sampling_from(|k| (k == "PI_EXPERIMENTAL").then(|| "1".to_string()));
-        assert_eq!(
-            legacy, None,
-            "the dropped PI_EXPERIMENTAL spelling must be inert"
-        );
-        assert_eq!(experimental_tool_sampling_from(|_| None), None);
-        for value in ["", "0", "true", "yes"] {
-            assert_eq!(
-                experimental_tool_sampling_from(|_| Some(value.to_string())),
-                None,
-                "only the literal \"1\" enables it, not {value:?}"
-            );
-        }
-    }
-
-    /// The declaration serializes as pi's literal `{ type: "json_schema", strict: "prefer" }`
-    /// (`core/experimental.ts:1`).
-    #[test]
-    fn the_experimental_declaration_is_pis_prefer_literal() {
-        let got = experimental_tool_sampling_from(|_| Some("1".to_string())).unwrap();
-        assert_eq!(
-            serde_json::to_value(got).unwrap(),
-            serde_json::json!({ "type": "json_schema", "strict": "prefer" })
         );
     }
 }

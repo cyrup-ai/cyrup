@@ -10,7 +10,7 @@ use crate::native::{CtxTier, ExtMode};
 use crate::registry::ExtensionRegistry;
 use cyrup_core::{CancelToken, ExtensionId};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -385,6 +385,55 @@ pub trait HostServices: Send + Sync {
         false
     }
 
+    /// EXT-064 — the read half of pi's `ReadonlyFooterDataProvider`, the value upstream hands the
+    /// `setFooter` factory as its third argument
+    /// (`setFooter(factory: (tui, theme, footerData) => Component)`,
+    /// `core/extensions/types.ts:183-187` @v0.87.1; the call site is
+    /// `this.customFooter = factory(this.ui, theme, this.footerDataProvider)`,
+    /// `modes/interactive/interactive-mode.ts:2440` @v0.87.1).
+    ///
+    /// `ReadonlyFooterDataProvider` is
+    /// `Pick<FooterDataProvider, "getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange">`
+    /// (`core/footer-data-provider.ts:385-388` @v0.87.1). CITATION NOTE, carried forward from the
+    /// row: the file is `core/footer-data-provider.ts`, NOT
+    /// `modes/interactive/footer-data-provider.ts` — a pass greping the latter concludes the type
+    /// was deleted.
+    ///
+    /// The three POLLABLE members ride this one getter as a json object under pi's own field
+    /// names, because cyrup's chrome seam takes the RENDERED footer text once rather than a
+    /// factory the draw path re-invokes (the `[CYRUP-DELTA]` above `set-footer` in `world.wit`), so
+    /// there is no factory argument to hang them off — the guest pulls them instead:
+    ///
+    /// ```json
+    /// {"gitBranch": "main" | null, "extensionStatuses": {"<key>": "<text>"}, "availableProviderCount": 3}
+    /// ```
+    ///
+    /// * `gitBranch` — `getGitBranch(): string | null` (`:126-132`), whose doc reads *"null if not
+    ///   in repo, \"detached\" if detached HEAD"*. That TRI-STATE survives the port intact:
+    ///   `"detached"` is an ordinary `Some("detached")`, distinct from both a branch name and the
+    ///   `null` of "no repo". Collapsing it would lose the one thing the footer renders
+    ///   differently.
+    /// * `extensionStatuses` — `getExtensionStatuses(): ReadonlyMap<string, string>` (`:135-137`),
+    ///   the segments OTHER extensions set through [`Self::set_status`]. A json object, so key
+    ///   order is the serializer's; upstream's `Map` iterates in insertion order and nothing in
+    ///   pi's footer depends on it (`footer.ts` joins them).
+    /// * `availableProviderCount` — `getAvailableProviderCount(): number` (`:160-162`).
+    ///
+    /// The FOURTH member, `onBranchChange(callback): () => void` (`:140-143`), is deliberately NOT
+    /// here: it is a PUSH subscription, which no import signature can satisfy — it needs an event
+    /// EXPORT, and that is a `HOST_WORLD` bump of its own rather than something to smuggle into a
+    /// pollable getter. Filed separately.
+    ///
+    /// `None` — not an empty object — is "no footer data provider attached", and that is
+    /// upstream's own answer outside the interactive TUI rather than a cyrup gap: pi constructs
+    /// its ONE `FooterDataProvider` in `interactive-mode.ts:611` and nowhere else, so in RPC,
+    /// print and json modes no extension footer factory is ever invoked and no extension ever sees
+    /// this value. The default below therefore reproduces upstream exactly in every headless mode,
+    /// the same way the [`Self::theme`] family's defaults reproduce `noOpUIContext`.
+    fn footer_data(&self) -> Option<String> {
+        None
+    }
+
     // --- fire-and-forget ui effects (Pi `ExtensionUIContext` mutators, types.ts:131-281) ---
     // Unlike confirm/input/select/editor above, the guest does NOT block on a reply for any of
     // these — Pi's own signatures return `void` (`types.ts:142,148,164,170,183,190,193,216,281`
@@ -441,10 +490,16 @@ pub trait HostServices: Send + Sync {
     /// The label shown for hidden thinking blocks (Pi `setHiddenThinkingLabel(label?)`,
     /// `extensions/types.ts:167` @v0.83.0). `None` restores the default.
     fn set_hidden_thinking_label(&self, _label: Option<&str>) {}
-    /// Custom header content (Pi `setHeader(factory)`, `types.ts:190` @v0.83.0).
-    fn set_header(&self, _content: &str) {}
-    /// Custom footer content (Pi `setFooter(factory)`, `types.ts:183-187` @v0.83.0).
-    fn set_footer(&self, _content: &str) {}
+    /// Custom header content (Pi `setHeader(factory)`, `types.ts:190` @v0.83.0; `:195` @v0.87.1).
+    ///
+    /// EXT-064 — `None` is upstream's `undefined`, "restore the built-in header"
+    /// (`modes/interactive/interactive-mode.ts:2481-2490` @v0.87.1). `Some("")` is an EMPTY CUSTOM
+    /// header, which is a distinct state: it used to be unreachable because the empty string was
+    /// the only value `&str` had left to carry the restore.
+    fn set_header(&self, _content: Option<&str>) {}
+    /// Custom footer content (Pi `setFooter(factory)`, `types.ts:183-187` @v0.83.0; `:188-192`
+    /// @v0.87.1). See [`Self::set_header`] for the `Option` mapping.
+    fn set_footer(&self, _content: Option<&str>) {}
     /// The terminal/window title (Pi `setTitle(title)`, `types.ts:193` @v0.83.0).
     fn set_title(&self, _title: &str) {}
     /// Replace (`is_paste=false`, Pi `setEditorText`, `types.ts:216` @v0.83.0) or paste-insert
@@ -898,8 +953,11 @@ pub trait HostServices: Send + Sync {
 /// are observable host-side (tests/diagnostics) and would drive the TUI widget protocol (arch-11).
 #[derive(Clone, Debug, Default)]
 pub struct UiChrome {
-    pub header: Option<String>,
-    pub footer: Option<String>,
+    /// EXT-064 — the OUTER `Option` is "was `set-header` ever called"; the INNER one is pi's
+    /// `factory | undefined`, so `Some(None)` is a restore-the-built-in and `Some(Some(""))` an
+    /// empty CUSTOM header. Collapsing them is the very state the row was filed for.
+    pub header: Option<Option<String>>,
+    pub footer: Option<Option<String>>,
     pub title: Option<String>,
     /// `set-editor-text`/`paste-editor-text` writes (text, is_paste).
     pub editor_writes: Vec<(String, bool)>,
@@ -964,6 +1022,19 @@ pub struct CannedResponses {
     /// Canned `ctx.getSystemPromptOptions()` (pi `extensions/types.ts:355` @v0.83.0; EXT-061).
     /// `None` = no bag attached, which is what makes the caller fall back to pi's `{cwd}` default.
     pub system_prompt_options: Option<Value>,
+    /// EXT-064 — whether a footer data provider is ATTACHED at all, i.e. whether
+    /// [`HostServices::footer_data`] answers `Some` (default `true`, this backend being the
+    /// in-crate analog of the interactive TUI's). `false` reproduces every headless mode, where pi
+    /// has no `FooterDataProvider` to hand out (`interactive-mode.ts:611` @v0.87.1 is its one
+    /// construction site).
+    pub footer_data_attached: bool,
+    /// EXT-064 — the canned `getGitBranch(): string | null`
+    /// (`core/footer-data-provider.ts:126-132` @v0.87.1). `None` is upstream's "not in a repo";
+    /// `Some("detached")` is its detached-HEAD answer, and it is an ordinary string here because
+    /// that is what it is upstream.
+    pub footer_git_branch: Option<String>,
+    /// EXT-064 — the canned `getAvailableProviderCount(): number` (`:160-162`).
+    pub footer_provider_count: u32,
 }
 
 impl Default for CannedResponses {
@@ -998,6 +1069,9 @@ impl Default for CannedResponses {
             is_project_trusted: false,
             system_prompt: None,
             system_prompt_options: None,
+            footer_data_attached: true,
+            footer_git_branch: None,
+            footer_provider_count: 0,
         }
     }
 }
@@ -1027,6 +1101,18 @@ struct RecordingState {
     /// The `(key, text)` of each fire-and-forget `set_status` call, in call order — the same live
     /// proof as `notify_calls`, for the WIT `ui.set-status` import.
     set_status_calls: Vec<(String, Option<String>)>,
+    /// EXT-064 — the AUTHORITATIVE extension-status map behind `footer_data`, the analog of pi's
+    /// `FooterDataProvider.extensionStatuses`. Written by `set_status` at the same synchronous
+    /// point `set_status_calls` is, because upstream's is
+    /// (`interactive-mode.ts:2204` @v0.87.1 binds `setStatus` straight to `setExtensionStatus`) —
+    /// so a guest that calls `set-status` and then `footer-data` in ONE command sees its own
+    /// write. `set_status_calls` is the call LOG and keeps every call including deletions; this is
+    /// the resulting STATE, in which `text: None` deletes (`core/footer-data-provider.ts:146-152`).
+    footer_extension_statuses: BTreeMap<String, String>,
+    /// EXT-064 — how many times `footer_data` reached this backend. Zero for a guest the host
+    /// refused at the `capabilities.ui` gate, which is what separates "the host said no" from
+    /// "the backend answered None".
+    footer_data_reads: usize,
     /// The `message` body of each `confirm` call (L4 review §2.6), in call order.
     confirm_messages: Vec<String>,
     /// The `placeholder` of each `input` call (L4 review §2.7), in call order.
@@ -1163,6 +1249,13 @@ impl RecordingServices {
             .unwrap_or_default()
     }
 
+    /// EXT-064 — how many times `footer_data` reached this backend. A guest denied `capabilities.ui`
+    /// must leave this at ZERO: that is the difference between the host refusing at the gate and
+    /// the backend merely having nothing to report.
+    pub fn footer_data_reads(&self) -> usize {
+        self.state.lock().map(|g| g.footer_data_reads).unwrap_or(0)
+    }
+
     /// The `message` body of each `confirm` call, in call order (L4 review §2.6 live proof: a guest
     /// `confirm_with(title, message, ..)` call's `message` reaches the host distinct from `title`).
     pub fn confirm_messages(&self) -> Vec<String> {
@@ -1192,8 +1285,43 @@ impl HostServices for RecordingServices {
         if let Ok(mut g) = self.state.lock() {
             g.set_status_calls
                 .push((key.to_string(), text.map(str::to_string)));
+            // EXT-064 — and the provider map, synchronously, exactly as `LiveHostServices` does and
+            // for the same reason: pi's `setStatus` is bound straight to
+            // `footerDataProvider.setExtensionStatus(key, text)` (`interactive-mode.ts:2204`
+            // @v0.87.1), so the write lands before the call returns. `None` deletes the key and any
+            // `Some` — the empty string included — stores it, which is where upstream draws the
+            // line (`core/footer-data-provider.ts:146-152`).
+            match text {
+                Some(text) => {
+                    g.footer_extension_statuses
+                        .insert(key.to_string(), text.to_string());
+                }
+                None => {
+                    g.footer_extension_statuses.remove(key);
+                }
+            }
         }
     }
+
+    /// EXT-064 — pi's `ReadonlyFooterDataProvider` (`core/footer-data-provider.ts:385-388`
+    /// @v0.87.1) as the json object the WIT import promises, composed from the canned branch and
+    /// provider count plus the LIVE status map `set_status` above maintains.
+    fn footer_data(&self) -> Option<String> {
+        let mut g = self.state.lock().ok()?;
+        g.footer_data_reads += 1;
+        if !self.responses.footer_data_attached {
+            return None;
+        }
+        Some(
+            json!({
+                "gitBranch": self.responses.footer_git_branch,
+                "extensionStatuses": g.footer_extension_statuses,
+                "availableProviderCount": self.responses.footer_provider_count,
+            })
+            .to_string(),
+        )
+    }
+
     fn confirm(&self, _prompt: &str, message: &str, _opts: &DialogOptions) -> bool {
         if let Ok(mut g) = self.state.lock() {
             g.confirm_messages.push(message.to_string());
@@ -2108,11 +2236,21 @@ impl GuestState {
         self.tier.lock().map(|g| *g).unwrap_or(CtxTier::Event)
     }
 
-    /// Deadlock guard (R-08-008): the session-replacement / turn-starting control ops
-    /// (new-session/switch/fork/navigate/reload/compact/wait-idle/send-message/send-user-message)
-    /// require the command tier. GAP-11: `set_model`/`set_thinking_level` are EXEMPT — they are pure
-    /// agent-state mutations that Pi allows from any handler (loader.ts:342-354), so live.rs no longer
-    /// calls this for them; they queue unconditionally and apply at the store-free turn-boundary drain.
+    /// Deadlock guard (R-08-008): the session-replacement control ops
+    /// (new-session/switch/fork/navigate/reload/compact/wait-idle) require the command tier.
+    ///
+    /// EXEMPT, and live.rs does not call this for any of them:
+    /// * GAP-11 — `set_model`/`set_thinking_level`, pure agent-state mutations pi allows from any
+    ///   handler (`loader.ts:342-354`).
+    /// * EXT-087 — `send-message`/`send-user-message`. Upstream's bodies are
+    ///   `assertActive(); runtime.sendMessage(...)` and `assertActive(); runtime.sendUserMessage(...)`
+    ///   (`core/extensions/loader.ts:351-354` and `:356-358` @v0.87.1) with NO tier check at all, so
+    ///   an `agent_settled` handler queueing the next message is ordinary upstream usage. They queue
+    ///   unconditionally and apply at the post-settle drain in `cyrup-session-svc`'s
+    ///   `AgentSession::settle_run`.
+    ///
+    /// Everything exempt queues unconditionally and applies at a store-free drain, never inside a
+    /// suspended event-hook store.
     pub fn require_command_tier(&self) -> Result<(), String> {
         if self.tier() == CtxTier::Command {
             Ok(())
@@ -2263,10 +2401,12 @@ impl GuestState {
         self.chrome.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    pub fn set_header(&self, content: String) {
+    /// EXT-064 — the RECORDED value is the `Option` itself, so a test can tell an empty custom
+    /// header (`Some(Some(""))`) from a restore (`Some(None)`) from "never set" (`None`).
+    pub fn set_header(&self, content: Option<String>) {
         self.with_chrome(|c| c.header = Some(content));
     }
-    pub fn set_footer(&self, content: String) {
+    pub fn set_footer(&self, content: Option<String>) {
         self.with_chrome(|c| c.footer = Some(content));
     }
     pub fn set_title(&self, title: String) {

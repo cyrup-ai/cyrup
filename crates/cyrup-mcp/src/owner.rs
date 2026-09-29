@@ -489,8 +489,8 @@ impl cyrup_ext::HostServices for OwnedServices {
         fn set_working_visible(&self, visible: bool) => ();
         fn set_working_indicator(&self, opts: Option<&serde_json::Value>) => ();
         fn set_hidden_thinking_label(&self, label: Option<&str>) => ();
-        fn set_header(&self, content: &str) => ();
-        fn set_footer(&self, content: &str) => ();
+        fn set_header(&self, content: Option<&str>) => ();
+        fn set_footer(&self, content: Option<&str>) => ();
         fn set_title(&self, title: &str) => ();
         fn thinking_level(&self) -> Option<String> => None;
 
@@ -920,6 +920,10 @@ pub(crate) fn sampling_block_type(block: &SamplingMessageContentBlock) -> String
 /// mislabel one if it ever arrived.
 fn message_role(message: &Message) -> &'static str {
     match message {
+        // `system` joins `toolResult` as a role `convertSamplingMessage` cannot produce, spelled
+        // for the same reason (PROV-083a): `Message` admits it, and a silent default would mislabel
+        // it. `packages/ai/src/types.ts:492` @v0.87.1 is the wire spelling.
+        Message::System(_) => "system",
         Message::User { .. } => "user",
         Message::Assistant(_) => "assistant",
         Message::ToolResult { .. } => "toolResult",
@@ -941,6 +945,7 @@ fn message_role(message: &Message) -> &'static str {
 ///   `task` guard.
 fn message_text(message: &Message) -> String {
     let blocks: &[Content] = match message {
+        Message::System(system) => &system.content,
         Message::User { content, .. } => content,
         Message::Assistant(assistant) => &assistant.content,
         Message::ToolResult { content, .. } => content,

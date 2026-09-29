@@ -68,3 +68,57 @@ fn normalize_tool_call_id_matches_pi() {
     let out = normalize_tool_call_id(&m, &tiny);
     assert_eq!(out, format!("c_{}", &short_hash(&tiny)[..8]));
 }
+
+/// PROV-083a — pi `transform-messages.ts:164-166`/`:216-221` @v0.87.1, verbatim: *"System messages
+/// are transparent to tool-call accounting: one that lands between a tool call and its results is
+/// held back and emitted after the results (synthetic ones included), so it never causes a duplicate
+/// result for a call that is answered later."*
+///
+/// Red before the change in two ways: the arm did not exist (a compile error), and once it existed
+/// as a plain `result.push(msg)` the system message split the assistant/toolResult run, so the
+/// synthetic "No result provided" result landed AFTER it instead of before.
+#[test]
+fn a_system_message_between_a_tool_call_and_its_results_is_held_back() {
+    let sys = |ts: i64| {
+        Message::System(cyrup_core::SystemMessage {
+            content: vec![Content::text("mid")],
+            sections: None,
+            tools_added: Vec::new(),
+            tools_removed: Vec::new(),
+            timestamp: ts,
+        })
+    };
+    let roles = |msgs: &[Message]| -> Vec<&'static str> {
+        msgs.iter()
+            .map(|m| match m {
+                Message::System(_) => "system",
+                Message::User { .. } => "user",
+                Message::Assistant(_) => "assistant",
+                Message::ToolResult { .. } => "toolResult",
+            })
+            .collect()
+    };
+
+    // One assistant tool call, then a system message, then NOTHING: the synthetic result for the
+    // orphaned call is emitted FIRST, and the held system message follows it.
+    let ctx = ctx_with_tool_call_ids(&["call_1"]);
+    let assistant = ctx.messages[0].clone();
+    let out = transform_messages(&[assistant.clone(), sys(1)], &model());
+    assert_eq!(roles(&out), ["assistant", "toolResult", "system"]);
+    let Some(Message::ToolResult { is_error, .. }) = out.get(1) else {
+        panic!("expected the synthesized result, got {out:?}");
+    };
+    assert!(*is_error, "the synthesized orphan result is an error");
+
+    // The real result answers the call, so the system message still lands after it.
+    let real_result = ctx.messages[1].clone();
+    let out = transform_messages(&[assistant.clone(), sys(1), real_result.clone()], &model());
+    assert_eq!(roles(&out), ["assistant", "toolResult", "system"]);
+
+    // With NO pending call, a system message is emitted in place (`:218-220`).
+    let out = transform_messages(&[sys(0), assistant, real_result], &model());
+    assert_eq!(roles(&out), ["system", "assistant", "toolResult"]);
+
+    // And a system message on its own passes straight through the first pass untouched (`:79-82`).
+    assert_eq!(transform_messages(&[sys(5)], &model()), vec![sys(5)]);
+}

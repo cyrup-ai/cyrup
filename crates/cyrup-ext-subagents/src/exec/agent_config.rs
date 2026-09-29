@@ -27,8 +27,9 @@ use crate::spawn::depth::DepthEnvelope;
 /// (`source`, `file_path`, `present_fields`, …) that has no bearing on one execution.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// The agent's local (unqualified) name — feeds [`crate::exec::completion_guard::expects_implementation_mutation`]'s
-    /// `agent` classification input and [`crate::exec::acceptance::AcceptanceContract::heuristic_default`].
+    /// The agent's local (unqualified) name — the identity the control loop stamps onto every
+    /// raised [`crate::exec::control::ControlEvent`], and the `agent` input
+    /// [`crate::exec::acceptance::AcceptanceContract::heuristic_default`] classifies.
     pub name: String,
     pub model: Option<ModelId>,
     /// SUBA-088 — pi `AgentConfig.modelProvider` (`agents.ts:144` @v0.64.0), copied off
@@ -55,6 +56,11 @@ pub struct AgentConfig {
     /// (`:502`) does. Subtracted from the child's declared builtin set and direct-MCP names at
     /// spawn time, or emitted as `--exclude-tools` when nothing pins an allowlist.
     pub exclude_tools: Vec<String>,
+    /// SUBA-111 — pi `agent.allowedAgents`, passed to `buildInProcessChildLaunch` as
+    /// `descendantAllowedAgents` (`execution.ts:403`, `runner-child-launch.ts:53` @v0.71.0) and
+    /// turned there into an agent-sourced capability ceiling on the CHILD
+    /// (`child-launch.ts:185-187`). `None` = no bound declared.
+    pub allowed_agents: Option<Vec<String>>,
     /// SUBA-092 — pi `ResolvePiLaunchToolPlanInput.allowNestedSubagents` (`pi-args.ts:302`): the
     /// independent nested-delegation grant folded into `fanoutAuthorized` (`:505-509`). Only
     /// `Some(true)` counts (`input.allowNestedSubagents === true`).
@@ -89,10 +95,6 @@ pub struct AgentConfig {
     /// pointers, exactly like pi. Empty (the common case) short-circuits skill resolution entirely —
     /// no discovery pass runs.
     pub skills: Vec<String>,
-    /// `None`/`Some(true)` leaves the completion-mutation guard active (subject to that
-    /// subsystem's own read-only-tools short-circuit); `Some(false)` disables it entirely
-    /// (R-SA-034).
-    pub completion_guard: Option<bool>,
     /// The byte/line truncation budget for this agent's delivered output (R-SA-042). Reuses
     /// [`crate::exec::output::OutputCap`] directly (the type `exec/output.rs` already defines and tests)
     /// rather than inventing a second, competing cap type — architecture.md §3.4's illustrative
@@ -155,6 +157,7 @@ impl AgentConfig {
             system_prompt_body: agent.system_prompt_body.clone(),
             tools: agent.tools.clone(),
             exclude_tools: agent.exclude_tools.clone().unwrap_or_default(),
+            allowed_agents: agent.allowed_agents.clone(),
             allow_nested_subagents: agent.allow_nested_subagents,
             extensions: agent.extensions.clone(),
             subagent_only_extensions: agent.subagent_only_extensions.clone().unwrap_or_default(),
@@ -162,7 +165,6 @@ impl AgentConfig {
             inherit_project_context: agent.inherit_project_context,
             inherit_skills: agent.inherit_skills,
             skills: agent.skills.clone(),
-            completion_guard: agent.completion_guard,
             max_output: OutputCap::default(),
             max_subagent_depth: agent.max_subagent_depth,
             depth,
@@ -222,6 +224,12 @@ pub struct ResolvedAgentPersona {
     /// runner-config hand-off backward compatible.
     #[serde(default)]
     pub thinking: Option<String>,
+    /// CFG-067 — the persona's own `toolTimeoutMs:` (pi `AgentConfig.defaultToolTimeoutMs`,
+    /// `agents.ts:158`), carried across the runner-config hand-off so a chain/parallel/background
+    /// step applies the SAME second rung of `resolveToolTimeoutMs` the single-run path does.
+    /// `#[serde(default)]` keeps an older on-disk config deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tool_timeout_ms: Option<u64>,
     pub system_prompt_mode: SystemPromptMode,
     pub system_prompt_body: String,
     pub tools: Option<Vec<ToolRef>>,
@@ -231,6 +239,11 @@ pub struct ResolvedAgentPersona {
     /// `#[serde(default)]` keeps the runner-config hand-off backward compatible.
     #[serde(default)]
     pub exclude_tools: Vec<String>,
+    /// SUBA-111 — pi `agent.allowedAgents`, passed to `buildInProcessChildLaunch` as
+    /// `descendantAllowedAgents` (`execution.ts:403`, `runner-child-launch.ts:53` @v0.71.0) and
+    /// turned there into an agent-sourced capability ceiling on the CHILD
+    /// (`child-launch.ts:185-187`). `None` = no bound declared.
+    pub allowed_agents: Option<Vec<String>>,
     /// SUBA-092 — the agent's own `allowNestedSubagents` grant, carried for the same reason
     /// (`async-execution.ts:949,1012,1742`). `#[serde(default)]` keeps the hand-off compatible.
     #[serde(default)]
@@ -274,10 +287,6 @@ pub struct ResolvedAgentPersona {
     /// `#[serde(default)]` keeps the runner-config hand-off backward compatible.
     #[serde(default)]
     pub skills: Vec<String>,
-    /// `None`/`Some(true)` leaves the completion-mutation guard active; `Some(false)` disables it
-    /// (R-SA-034). Carried through verbatim so a chain/parallel/background step honors the agent's
-    /// OWN guard configuration rather than the placeholder's hard-`Some(false)` (C13).
-    pub completion_guard: Option<bool>,
     /// The agent's own recursion-depth ceiling for ITS children (R-SA-056's tightening-only merge
     /// input), preserved so [`crate::spawn::depth::next_envelope`] can apply it at the child spawn
     /// boundary.
@@ -385,10 +394,13 @@ impl ResolvedAgentPersona {
             model_provider: agent.model_provider.clone(),
             fallback_models: agent.fallback_models.clone(),
             thinking: agent.thinking.clone(),
+            // CFG-067 — copied, never re-derived, exactly as every other field here is.
+            default_tool_timeout_ms: agent.default_tool_timeout_ms,
             system_prompt_mode: agent.system_prompt_mode,
             system_prompt_body: agent.system_prompt_body.clone(),
             tools: agent.tools.clone(),
             exclude_tools: agent.exclude_tools.clone().unwrap_or_default(),
+            allowed_agents: agent.allowed_agents.clone(),
             allow_nested_subagents: agent.allow_nested_subagents,
             extensions: agent.extensions.clone(),
             subagent_only_extensions: agent.subagent_only_extensions.clone().unwrap_or_default(),
@@ -396,7 +408,6 @@ impl ResolvedAgentPersona {
             inherit_project_context: agent.inherit_project_context,
             inherit_skills: agent.inherit_skills,
             skills: agent.skills.clone(),
-            completion_guard: agent.completion_guard,
             max_subagent_depth: agent.max_subagent_depth,
             default_context: agent.default_context,
             memory: agent.memory.clone(),
@@ -427,6 +438,7 @@ impl ResolvedAgentPersona {
             system_prompt_body: self.system_prompt_body.clone(),
             tools: self.tools.clone(),
             exclude_tools: self.exclude_tools.clone(),
+            allowed_agents: self.allowed_agents.clone(),
             allow_nested_subagents: self.allow_nested_subagents,
             extensions: self.extensions.clone(),
             subagent_only_extensions: self.subagent_only_extensions.clone(),
@@ -434,7 +446,6 @@ impl ResolvedAgentPersona {
             inherit_project_context: self.inherit_project_context,
             inherit_skills: self.inherit_skills,
             skills: self.skills.clone(),
-            completion_guard: self.completion_guard,
             max_output: OutputCap::default(),
             max_subagent_depth: self.max_subagent_depth,
             depth,
@@ -489,6 +500,13 @@ pub struct RunOptions {
     /// the deadline from it (pi `resolveAttemptTimeout`: `deadlineAt ?? now + timeoutMs`). `None`
     /// means no foreground timeout at all.
     pub timeout_ms: Option<u64>,
+    /// CFG-067 — pi `options.toolTimeoutMs` (`shared/types.ts:2460`), already through
+    /// `resolveToolTimeoutMs`'s four rungs (call > agent frontmatter > `config.toolTimeoutMs` >
+    /// `CYRUP_SUBAGENT_TOOL_TIMEOUT_MS`). It is the CONFIGURED value, not the effective one: the
+    /// per-tool-name fast defaults and the exemption list are applied per call by
+    /// [`crate::exec::tool_timeout::effective_tool_timeout_ms`] at the moment a tool starts, which
+    /// is why `None` here does NOT mean "no tool ever has a deadline".
+    pub tool_timeout_ms: Option<u64>,
     pub output_path: Option<PathBuf>,
     pub output_mode: OutputMode,
     /// Where this run's structured-output capture directory lives, and therefore whether it
@@ -1043,6 +1061,7 @@ mod tests {
     #[test]
     fn resolved_agent_persona_round_trips_through_json_preserving_every_field() {
         let persona = ResolvedAgentPersona {
+            default_tool_timeout_ms: None,
             inherit_global_context: true,
             machine: None,
             mutation_tools: Some(vec!["apply_patch".to_string()]),
@@ -1055,6 +1074,7 @@ mod tests {
             system_prompt_body: "You are the REVIEWER persona.".to_string(),
             tools: Some(vec![ToolRef::Builtin("read".to_string())]),
             exclude_tools: vec!["bash".to_string()],
+            allowed_agents: None,
             allow_nested_subagents: Some(true),
             extensions: Some(vec!["./allowed-ext.ts".to_string()]),
             subagent_only_extensions: vec!["./child-tool.ts".to_string()],
@@ -1062,7 +1082,6 @@ mod tests {
             inherit_project_context: true,
             inherit_skills: false,
             skills: vec!["accessibility".to_string(), "deslop".to_string()],
-            completion_guard: Some(true),
             max_subagent_depth: Some(1),
             default_context: None,
             memory: None,
@@ -1137,6 +1156,7 @@ mod tests {
     #[test]
     fn to_agent_config_stamps_the_live_depth_and_reproduces_the_persona() {
         let persona = ResolvedAgentPersona {
+            default_tool_timeout_ms: None,
             inherit_global_context: true,
             machine: None,
             mutation_tools: Some(vec!["apply_patch".to_string()]),
@@ -1149,6 +1169,7 @@ mod tests {
             system_prompt_body: "You are the REVIEWER persona.".to_string(),
             tools: Some(vec![ToolRef::Builtin("read".to_string())]),
             exclude_tools: vec!["bash".to_string()],
+            allowed_agents: None,
             allow_nested_subagents: Some(true),
             extensions: Some(vec!["./allowed-ext.ts".to_string()]),
             subagent_only_extensions: vec!["./child-tool.ts".to_string()],
@@ -1156,7 +1177,6 @@ mod tests {
             inherit_project_context: true,
             inherit_skills: false,
             skills: vec!["accessibility".to_string()],
-            completion_guard: Some(true),
             max_subagent_depth: Some(1),
             default_context: None,
             memory: None,
@@ -1191,7 +1211,6 @@ mod tests {
             Some("reviewer-model")
         );
         assert_eq!(cfg.fallback_models, vec![ModelId::from("backup-model")]);
-        assert_eq!(cfg.completion_guard, Some(true));
         // SUBA-101/102 — the hop-2 dispatch reconstitutes both from the persona.
         assert!(cfg.inherit_global_context);
         assert_eq!(cfg.mutation_tools, Some(vec!["apply_patch".to_string()]));

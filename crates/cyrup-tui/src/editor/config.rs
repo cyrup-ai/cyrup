@@ -192,14 +192,14 @@ impl InputEditor {
 
     /// Install the argument-completion sources for `/model`, `/login` and `/thinking`. Pi rebuilds
     /// the equivalent closures whenever it rebuilds the autocomplete provider
-    /// (`createBaseAutocompleteProvider`, `interactive-mode.ts:677-736` @v0.84.3); cyrup pushes a
-    /// snapshot instead, from [`crate::App::refresh_argument_sources`].
+    /// (`createBaseAutocompleteProvider`, `interactive-mode.ts:679-736` @v0.87.1); cyrup installs
+    /// the same three closures, from [`crate::App::refresh_argument_sources`], and reads them at
+    /// completion time.
     ///
     /// `extension_completions` is deliberately CARRIED OVER rather than replaced: it is fed on a
     /// different clock (per keystroke, by [`crate::App::refresh_extension_completions`]) than the
-    /// three builtin sets (boot / session swap / credential change / scope save), and the snapshot
-    /// the caller builds has nothing to say about it. Overwriting it here would blank the popup
-    /// whenever an unrelated refresh landed mid-argument.
+    /// three builtin callbacks, and the set the caller builds has nothing to say about it.
+    /// Overwriting it here would blank the popup whenever an unrelated install landed mid-argument.
     pub fn set_argument_sources(&mut self, sources: crate::autocomplete::ArgumentSources) {
         let extensions = std::mem::take(&mut self.arg_sources.extension_completions);
         self.arg_sources = sources;

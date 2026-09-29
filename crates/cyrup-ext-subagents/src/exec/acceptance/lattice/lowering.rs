@@ -70,8 +70,52 @@ pub fn lower_acceptance_input(
     // the level arms below produce.
     let report_mode = crate::exec::acceptance::model::resolve_acceptance_report_mode(raw);
     let report_declared = crate::exec::acceptance::model::acceptance_declares_report(raw);
-    Ok(lower_acceptance_level(raw, report_declared)?
-        .map(|contract| contract.with_report(report_mode, report_declared)))
+    // SUBA-108 — `explicitAcceptanceRequestsPolicy` (`acceptance.ts:243-245` @v0.71.0) over the
+    // RAW authored value, which is the only place the authored KEY SET still exists. Carried onto
+    // the contract for `resolve_effective_for_role`'s `:505` upgrade.
+    let requests_policy = explicit_acceptance_requests_policy(raw);
+    Ok(
+        lower_acceptance_level(raw, report_declared)?.map(|contract| {
+            let mut contract = contract.with_report(report_mode, report_declared);
+            contract.requests_policy = requests_policy;
+            contract
+        }),
+    )
+}
+
+/// pi `explicitAcceptanceRequestsPolicy(explicit)` (`acceptance.ts:243-245` @v0.71.0), over the RAW
+/// authored value rather than a normalized struct:
+///
+/// ```text
+/// (explicit.level !== undefined && explicit.level !== "auto")
+///     || Object.keys(explicit).some((key) => key !== "level")
+/// ```
+///
+/// Upstream runs it on the output of `normalizeAcceptanceInput` (`acceptance.ts:503`), so the two
+/// non-object forms are read through that normalization:
+///
+/// * `false` normalizes to `{ level: "none", reason: "disabled by deprecated false shorthand" }`
+///   (`:127-132`), whose `reason` key makes it a requested policy. It is also
+///   `explicitAcceptanceCanDisable`, so the resolved level is `none` regardless.
+/// * a bare level string normalizes to `{ level: <that> }` — requested unless the level is `auto`.
+/// * `null`/absent normalizes to `{ level: "auto" }` — NOT requested.
+///
+/// [`crate::exec::acceptance::model::validate_acceptance_input`] has already run by the time this
+/// is called, so an unsupported key cannot reach it and every key present is one upstream counts.
+fn explicit_acceptance_requests_policy(raw: &serde_json::Value) -> bool {
+    match raw {
+        serde_json::Value::Bool(false) => true,
+        serde_json::Value::String(level) => level != "auto",
+        serde_json::Value::Object(config) => {
+            let level_requests = config
+                .get("level")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|level| level != "auto");
+            let non_level_key_present = config.keys().any(|key| key != "level");
+            level_requests || non_level_key_present
+        }
+        _ => false,
+    }
 }
 
 /// [`lower_acceptance_input`]'s level arms, after validation. `report_declared` keeps a policy
@@ -217,6 +261,10 @@ fn lower_verify_command(item: &serde_json::Value, index: usize) -> Option<Verify
 /// evidence de-duplicated in declaration order, criteria normalized AGAINST that evidence so a
 /// criterion declaring none inherits the config-level list.
 struct LoweredAcceptancePolicy {
+    /// SUBA-108 — the authored criteria BEFORE `normalizeCriteria`, kept so
+    /// [`AcceptanceContract::resolve_effective_for_role`] can re-normalize them against the
+    /// MERGED evidence set the way `acceptance.ts:513-516` does.
+    criteria_input: Vec<crate::exec::acceptance::model::CriterionInput>,
     criteria: Vec<crate::exec::acceptance::model::ResolvedAcceptanceGate>,
     evidence: Vec<crate::exec::acceptance::model::AcceptanceEvidenceKind>,
     review: Option<crate::exec::acceptance::model::ReviewSetting>,
@@ -235,7 +283,10 @@ impl LoweredAcceptancePolicy {
     }
 
     fn apply(self, contract: AcceptanceContract) -> AcceptanceContract {
-        contract.with_policy(self.criteria, self.evidence, self.review, self.stop_rules)
+        let mut contract =
+            contract.with_policy(self.criteria, self.evidence, self.review, self.stop_rules);
+        contract.criteria_input = self.criteria_input;
+        contract
     }
 }
 
@@ -311,6 +362,7 @@ fn lower_acceptance_policy(
         .unwrap_or_default();
 
     LoweredAcceptancePolicy {
+        criteria_input,
         criteria,
         evidence,
         review,

@@ -201,15 +201,16 @@ impl CommandCtx {
     ///
     /// Both `message` and `opts` are author-supplied; either encoding failing is returned as `Err`
     /// rather than sending a `null` message or dropping the options.
+    /// EXT-087: NOT command-only any more — a delegating wrapper kept for source compatibility,
+    /// exactly as [`Self::set_model`] is. Upstream declares it on the extension api itself with no
+    /// tier check (`core/extensions/loader.ts:351-354` @v0.87.1), so the implementation and its
+    /// citations now live on [`Ctx::send_message`], reachable from every handler.
     pub fn send_message(
         &self,
         message: impl Serialize,
         opts: impl Serialize,
     ) -> Result<(), String> {
-        let m =
-            serde_json::to_string(&message).map_err(|e| format!("send_message message: {e}"))?;
-        let o = serde_json::to_string(&opts).map_err(|e| format!("send_message opts: {e}"))?;
-        control(Control::SendMessage(&m, &o))
+        self.base.send_message(message, opts)
     }
     /// Queue a user-authored message with author-supplied options — pi
     /// `ctx.sendUserMessage(content, options)` (`core/agent-session.ts:2006-2035` @v0.87.1, bound
@@ -228,9 +229,12 @@ impl CommandCtx {
     /// relayed `/…` was dispatched as a command and every `deliverAs: "followUp"` became a steer.
     ///
     /// An `opts` encode failure is returned as `Err` rather than sending with an empty option bag.
+    ///
+    /// EXT-087: NOT command-only any more — this delegates to [`Ctx::send_user_message`], which is
+    /// reachable from every handler because upstream's is (no tier check in
+    /// `core/extensions/loader.ts:356-358` @v0.87.1).
     pub fn send_user_message(&self, content: &str, opts: impl Serialize) -> Result<(), String> {
-        let o = serde_json::to_string(&opts).map_err(|e| format!("send_user_message opts: {e}"))?;
-        control(Control::SendUserMessage(content, &o))
+        self.base.send_user_message(content, opts)
     }
 }
 
@@ -243,8 +247,10 @@ enum Control<'a> {
     Reload,
     Compact(&'a str),
     WaitIdle,
-    SendMessage(&'a str, &'a str),
-    SendUserMessage(&'a str, &'a str),
+    // EXT-087: `SendMessage`/`SendUserMessage` are NOT here. This enum is the command-tier
+    // `control.*` set, and the two send ops left it when they moved to [`Ctx`] — upstream declares
+    // them on the extension api with no tier check (`core/extensions/loader.ts:351-358` @v0.87.1),
+    // so they reach their WIT imports from there and a handler at any tier can call them.
 }
 
 fn control(op: Control<'_>) -> Result<(), String> {
@@ -259,8 +265,6 @@ fn control(op: Control<'_>) -> Result<(), String> {
             Control::Reload => c::reload(),
             Control::Compact(o) => c::compact(o),
             Control::WaitIdle => c::wait_idle(),
-            Control::SendMessage(m, o) => c::send_message(m, o),
-            Control::SendUserMessage(co, o) => c::send_user_message(co, o),
         };
     }
     #[cfg(not(target_arch = "wasm32"))]

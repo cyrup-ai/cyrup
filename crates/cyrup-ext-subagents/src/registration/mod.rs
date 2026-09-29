@@ -424,6 +424,20 @@ pub struct SubagentExtensionConfig {
     /// — named rather than linked, because `extension::tool` is a private module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<serde_json::Value>,
+    /// CFG-067 — pi `ExtensionConfig.toolTimeoutMs` (`shared/types.ts:2686-2689`, advertised at
+    /// `extension/schemas.ts:364`): the global PER-TOOL-CALL deadline, the third rung of
+    /// `resolveToolTimeoutMs` under an explicit call-site `toolTimeoutMs` and each agent's own
+    /// `toolTimeoutMs:` frontmatter, and above
+    /// [`crate::exec::tool_timeout::TOOL_TIMEOUT_ENV`].
+    ///
+    /// Carried RAW for the same reason [`Self::timeout_ms`] is — `"toolTimeoutMs": -5` must not fail
+    /// this whole struct's deserialization and take every other setting with it — but the validated
+    /// outcome differs, and the difference is upstream's: `resolveToolTimeoutMs` REFUSES an invalid
+    /// value with a message (`tool-timeout.ts:82`) where `resolveConfigDefaultTimeoutMs` silently
+    /// ignores one. A run whose only `toolTimeoutMs` is a malformed global therefore fails to start,
+    /// which is what upstream does (`execution.ts:1675-1685`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_timeout_ms: Option<serde_json::Value>,
     /// SUBA-079 — pi `config.defaultSubagentContext` (`extension/config.ts:140-142` @v0.57.0): the
     /// global fork/fresh preference for every subagent launch that does not name one explicitly.
     ///
@@ -544,11 +558,10 @@ pub struct SubagentExtensionConfig {
 /// [`SubagentExtensionConfig::config_warnings`] when set, rather than dropped by serde.
 ///
 /// Each is a real feature gap, not a decision that it is out of scope; the ledger carries them.
-pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 12] = [
+pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 11] = [
     ("forkContext", "pruned fork-context preparation"),
     ("mainWindowRenderer", "main-chat renderer density controls"),
     ("orcaProgressTabs", "Orca observer tabs"),
-    ("toolTimeoutMs", "a config-level per-tool-call timeout"),
     (
         "checkpointBeforeDeadlineMs",
         "pre-deadline checkpoint requests",
@@ -590,6 +603,9 @@ impl Default for SubagentExtensionConfig {
     /// Tier 5 of R-SA-133: the hardcoded extension defaults every other tier layers on top of.
     fn default() -> Self {
         Self {
+            // CFG-067 — no global per-tool deadline unless `config.json` states one; the fast-tool
+            // defaults still apply per call (`tool_timeout::effective_tool_timeout_ms`).
+            tool_timeout_ms: None,
             // pi `resolveAsyncByDefault` (`config.ts:222-224`): `config.asyncByDefault !== false`
             // — an ABSENT key means TRUE, so a stock install with no `config.json` backgrounds.
             // A plain `bool` seeded `true` reproduces that tri-state exactly: absent -> this

@@ -75,6 +75,8 @@ fn agent_config(name: &str) -> AgentConfig {
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -84,7 +86,6 @@ fn agent_config(name: &str) -> AgentConfig {
         skills: Vec::new(),
         // The completion-mutation guard is a separate gate; disabled so each run's outcome is
         // decided by the acceptance ledger alone.
-        completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth: None,
         memory: None,
@@ -104,6 +105,7 @@ fn agent_config(name: &str) -> AgentConfig {
 /// artifact the AUTHORITATIVE report source (`execution.ts:1680-1701`).
 fn run_options(cwd: &Path, output_path: &Path) -> RunOptions {
     RunOptions {
+        tool_timeout_ms: None,
         // SUBA-119 — a fixture launch whose model comes from its own agent config, so
         // native-child model verification is armed and no response-id alias is declared.
         model_override_from_parent: false,

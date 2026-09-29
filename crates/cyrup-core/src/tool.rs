@@ -256,8 +256,9 @@ pub trait Tool: Send + Sync {
     /// else outside the field declaration, the two `tool-definition-wrapper.ts` copies and
     /// `experimental/micro/`. `grep`, `find` and `ls` carry no key on either side and keep this
     /// default. `cyrup-tools` mirrors the five by returning
-    /// `cyrup_tools::tools::prefer_strict_tool_sampling` — a `static` strict-`prefer` value in that
-    /// crate, read off the built-in registry by
+    /// `cyrup_tools::tools::prefer_strict_tool_sampling`, which hands out
+    /// [`crate::prefer_strict_tool_sampling`] — this crate's single strict-`prefer` `static`, read
+    /// off the built-in registry by
     /// `cyrup_tools::tests::pi_tool_semantics::only_pis_five_tools_declare_strict_prefer_constrained_sampling`
     /// and carried through `cyrup_ext::wrapper` into the provider request by that module's
     /// `real_built_ins_carry_strict_prefer_through_the_wrapper_into_the_provider_request`.

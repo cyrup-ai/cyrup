@@ -95,3 +95,18 @@ pub use exec::{AGENT_NAME_ENV_VAR, PARENT_SESSION_ENV_VAR};
 pub use discovery::runtime_registry::{
     RuntimeAgentDefinition, RuntimeAgentRegistration, RuntimeAgentRegistry, RuntimeThinking,
 };
+
+// SUBA-143 — pi `src/api/agents.ts:3-10` re-exports the EVENT bridge beside it: the constants, the
+// request builder and the result reader a SIBLING extension uses to register an agent with nothing
+// but the bus. cyrup's bus fans out by value, so the surface is four topics and two envelope
+// readers instead of one topic and a mutated object; `discovery::runtime_agent_events`' module doc
+// is the client contract, and the `[CYRUP-DELTA, mechanism]` there says exactly what the token
+// standing in for upstream's `dispose()` does and does not change.
+pub use discovery::runtime_agent_events::{
+    RUNTIME_AGENT_BRIDGE_ABSENT_MESSAGE, RUNTIME_AGENT_DISPOSE_EVENT,
+    RUNTIME_AGENT_DISPOSE_REPLY_EVENT_PREFIX, RUNTIME_AGENT_MALFORMED_RESULT_MESSAGE,
+    RUNTIME_AGENT_REGISTER_EVENT, RUNTIME_AGENT_REGISTER_REPLY_EVENT_PREFIX,
+    RUNTIME_AGENT_REGISTER_VERSION, RuntimeAgentEventBridge, read_disposal_reply,
+    read_registration_reply, runtime_agent_dispose_reply_event, runtime_agent_dispose_request,
+    runtime_agent_register_reply_event, runtime_agent_register_request,
+};

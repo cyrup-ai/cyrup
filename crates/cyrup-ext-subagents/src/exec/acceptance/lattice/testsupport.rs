@@ -4,7 +4,6 @@
 
 use crate::exec::acceptance::lattice::contract::VerifyCommand;
 use crate::exec::acceptance::lattice::gate::CleanCompletionGate;
-use crate::exec::completion_guard::CompletionMutationGuardResult;
 use std::time::Duration;
 
 /// A `verify[]` entry declaring nothing but its shell command — the run-level `cwd`, the
@@ -46,13 +45,5 @@ pub(crate) fn clean_gate() -> CleanCompletionGate {
         detached: false,
         interrupted: false,
         timed_out: false,
-    }
-}
-
-pub(crate) fn no_guard_trigger() -> CompletionMutationGuardResult {
-    CompletionMutationGuardResult {
-        expected_mutation: true,
-        attempted_mutation: true,
-        triggered: false,
     }
 }

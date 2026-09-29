@@ -28,10 +28,10 @@ async fn a_session_swap_clears_extension_owned_surfaces() {
 
     // Drive the REAL effect path an extension uses, not the fields directly.
     app.apply_ui_effect(UiEffect::SetHeader {
-        content: "ext header".to_string(),
+        content: Some("ext header".to_string()),
     });
     app.apply_ui_effect(UiEffect::SetFooter {
-        content: "ext footer".to_string(),
+        content: Some("ext footer".to_string()),
     });
     app.apply_ui_effect(UiEffect::SetWidget {
         widget: serde_json::json!({"key": "k", "lines": ["widget"], "placement": "aboveEditor"}),

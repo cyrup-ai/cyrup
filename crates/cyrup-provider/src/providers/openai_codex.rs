@@ -119,7 +119,7 @@ impl OpenAiCodexAuthError {
 /// The full Codex catalog (1:1 with pi `OPENAI_CODEX_MODELS`). A parse failure yields an empty
 /// catalog (surfaced loudly by the count test) rather than a panic (NO-PANIC policy).
 pub fn openai_codex_models() -> Vec<Model> {
-    serde_json::from_str(OPENAI_CODEX_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(OPENAI_CODEX_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The Codex [`ProviderAuth`] (pi `openai-codex.ts:13-15`): OAuth **only** — there is no env API
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = openai_codex_models();
-        assert_eq!(models.len(), 7);
+        assert_eq!(models.len(), 8);
         assert!(
             models
                 .iter()
@@ -605,14 +605,18 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
+            // v0.86.0 REMOVED `gpt-5.4` and `gpt-5.4-mini` from Codex (`packages/ai/CHANGELOG.md`)
+            // and v0.87.1 added the GPT-6 trio. Both were invisible while the catalog was frozen at
+            // `b0c2a90e` (PROV-071), so cyrup was offering two Codex models OpenAI had withdrawn.
             vec![
                 "gpt-5.3-codex-spark",
-                "gpt-5.4",
-                "gpt-5.4-mini",
                 "gpt-5.5",
                 "gpt-5.6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
             ]
         );
     }
@@ -686,8 +690,8 @@ mod tests {
             (4.0, 18.0, 0.4, 5.0)
         );
 
-        // MIRROR: Sol has no entry in `OPENAI_GPT_56_STANDARD_COSTS`; its literal is the unchanged
-        // inline `{5, 30, 0.5, 6.25}` (v0.84.1 `…:2609`), so only its contextWindow moved.
+        // Sol joined the standard cost table upstream (see `providers/openai.rs` for the move), so
+        // the Codex clone moved with it.
         let sol = find("gpt-5.6-sol");
         assert_eq!(
             (
@@ -696,42 +700,45 @@ mod tests {
                 sol.cost.cache_read,
                 sol.cost.cache_write
             ),
-            (5.0, 30.0, 0.5, 6.25)
+            (4.0, 20.0, 0.4, 5.0)
         );
         // MIRROR: the non-5.6 rows keep their own windows (`CODEX_SPARK_CONTEXT` / `CODEX_CONTEXT`).
         assert_eq!(find("gpt-5.3-codex-spark").context_window, 128_000);
-        assert_eq!(find("gpt-5.4").context_window, 272_000);
+        assert_eq!(find("gpt-5.5").context_window, 272_000);
     }
 
     /// `gpt-5.4` verbatim from `openai-codex.models.ts` @`b0c2a90e`, including the long-context
     /// pricing tier that doubles every rate above 272 000 input tokens.
     #[test]
-    fn gpt_5_4_matches_the_upstream_row() {
+    fn gpt_5_5_matches_the_upstream_row() {
         let models = openai_codex_models();
+        // This was `gpt-5.4`, which v0.86.0 removed from Codex along with `gpt-5.4-mini`
+        // (`packages/ai/CHANGELOG.md`). `gpt-5.5` is the row it left behind in that shape: the
+        // non-5.6 long-context row that bills no cache writes.
         let m = models
             .iter()
-            .find(|m| m.id.as_str() == "gpt-5.4")
-            .expect("gpt-5.4");
-        assert_eq!(m.name, "GPT-5.4");
+            .find(|m| m.id.as_str() == "gpt-5.5")
+            .expect("gpt-5.5");
+        assert_eq!(m.name, "GPT-5.5");
         assert_eq!(m.input, vec![Modality::Text, Modality::Image]);
         assert_eq!(m.context_window, 272_000);
         assert_eq!(m.max_tokens, 128_000);
-        assert_eq!(m.cost.input, 2.5);
-        assert_eq!(m.cost.output, 15.0);
-        assert_eq!(m.cost.cache_read, 0.25);
+        assert_eq!(m.cost.input, 5.0);
+        assert_eq!(m.cost.output, 30.0);
+        assert_eq!(m.cost.cache_read, 0.5);
         assert_eq!(m.cost.cache_write, 0.0);
 
         let tiers = m
             .cost
             .tiers
             .as_ref()
-            .expect("gpt-5.4 has a long-context tier");
+            .expect("gpt-5.5 has a long-context tier");
         assert_eq!(tiers.len(), 1);
         let tier = &tiers[0];
         assert_eq!(tier.input_tokens_above, 272_000);
-        assert_eq!(tier.input, 5.0);
-        assert_eq!(tier.output, 22.5);
-        assert_eq!(tier.cache_read, 0.5);
+        assert_eq!(tier.input, 10.0);
+        assert_eq!(tier.output, 45.0);
+        assert_eq!(tier.cache_read, 1.0);
         assert_eq!(tier.cache_write, 0.0);
 
         assert_eq!(
@@ -742,6 +749,15 @@ mod tests {
         assert_eq!(map.get("xhigh"), Some(&Some("xhigh".to_string())));
         assert_eq!(map.get("minimal"), Some(&Some("low".to_string())));
         assert_eq!(map.len(), 2);
+
+        // MIRROR: `gpt-5.4` and `gpt-5.4-mini` are GONE, which is the withdrawal the frozen floor
+        // could not see. If either is back, this row's shape claim has to be re-derived.
+        for gone in ["gpt-5.4", "gpt-5.4-mini"] {
+            assert!(
+                !models.iter().any(|m| m.id.as_str() == gone),
+                "{gone} was removed from Codex at v0.86.0"
+            );
+        }
     }
 
     /// `gpt-5.3-codex-spark` is the MIRROR row: the ONLY model without `supportsToolSearch`, the
@@ -756,9 +772,17 @@ mod tests {
             .expect("gpt-5.3-codex-spark");
         assert_eq!(spark.input, vec![Modality::Text]);
         assert!(!spark.supports_image_input());
-        assert!(spark.compat.is_none());
         assert!(spark.cost.tiers.is_none());
         assert_eq!(spark.context_window, 128_000);
+        // It used to be the row with NO compat block at all. It has one now —
+        // `{"supportsOpenAIGrammarTools": true}` — and that is the whole of it: the flags the other
+        // seven rows carry (`supportsToolSearch`, `supportsAdditionalTools`,
+        // `supportsMidConvoSystemMessages`) are still absent here, which is what made it the odd
+        // row out and still does.
+        let compat = spark.compat.as_ref().expect("spark carries a compat block now");
+        assert_eq!(compat.supports_openai_grammar_tools, Some(true));
+        assert_eq!(compat.supports_tool_search, None);
+        assert_eq!(compat.supports_mid_convo_system_messages, None);
 
         // Every other row opts into tool search.
         for m in models
@@ -796,8 +820,9 @@ mod tests {
             // Unlike every earlier row, the trio bills cache WRITES.
             assert!(m.cost.cache_write > 0.0, "{id}");
         }
-        // MIRROR: the 5.4/5.5 rows have no `max` level and no cache-write charge.
-        for id in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5"] {
+        // MIRROR: the pre-5.6 rows have no `max` level and no cache-write charge. `gpt-5.4` and
+        // `gpt-5.4-mini` were here until v0.86.0 withdrew them from Codex.
+        for id in ["gpt-5.3-codex-spark", "gpt-5.5"] {
             let m = models
                 .iter()
                 .find(|m| m.id.as_str() == id)
@@ -817,7 +842,7 @@ mod tests {
         let provider = openai_codex_provider();
         assert_eq!(provider.id().as_str(), "openai-codex");
         assert_eq!(provider.name(), "OpenAI Codex");
-        assert_eq!(provider.models().len(), 7);
+        assert_eq!(provider.models().len(), 8);
 
         let auth = provider.provider_auth().expect("codex declares auth");
         assert!(auth.oauth.is_some());

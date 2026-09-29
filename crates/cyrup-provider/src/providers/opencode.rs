@@ -22,7 +22,7 @@ const OPENCODE_CATALOG_JSON: &str = include_str!("catalog/opencode.json");
 /// The full OpenCode Zen catalog (1:1 with Pi `OPENCODE_MODELS`). A parse failure yields an empty
 /// catalog (surfaced loudly by the catalog-count test) rather than a panic (NO-PANIC policy).
 pub fn opencode_models() -> Vec<Model> {
-    serde_json::from_str(OPENCODE_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(OPENCODE_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The OpenCode [`ProviderAuth`]: `OPENCODE_API_KEY` (Pi `envApiKeyAuth`, env-api-keys.ts:97).
@@ -89,7 +89,7 @@ mod tests {
         let models = opencode_models();
         // pi `opencode.models.ts` @`b0c2a90e` (54). The three cyrup lacked at `91585d9a` are the
         // GPT-5.6 trio (`luna`/`sol`/`terra`) — PROV-057/PROV-060.
-        assert_eq!(models.len(), 54);
+        assert_eq!(models.len(), 76);
         assert!(models.iter().all(|m| m.provider.as_str() == "opencode"));
         assert!(models.iter().all(|m| !m.base_url.is_empty()));
         // The catalog spans all four wire protocols this provider declares (Pi opencode.ts:8-23).

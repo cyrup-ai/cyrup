@@ -625,6 +625,7 @@ mod tests {
 
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -687,6 +688,7 @@ mod tests {
 
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -738,6 +740,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
                 thinking: None,
@@ -958,7 +961,8 @@ mod tests {
             .spawn_background_steps(
                 dir.path(),
                 BackgroundStepsSpec {
-                    model_response_aliases: None,
+                    tool_timeout_ms: None,
+                    model_response_aliases: crate::extension::RetainedModelResponseAliases::Live,
                     // SUBA-021: unbudgeted on this path (see the field doc).
                     usage_budget: None,
                     turn_budget: None,

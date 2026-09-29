@@ -22,9 +22,9 @@
 //! | [`GitHubCopilotLogin::exchange_copilot_token`] | `refreshGitHubCopilotAccessToken`, `:244-277` |
 //! | [`GitHubCopilotLogin::fetch_with_rate_limit_retry`] | `fetchWithRateLimitRetry`, `:135-166` |
 //! | [`GitHubCopilotLogin::fetch_model_catalog`] | `fetchGitHubCopilotModels`, `:168-194` |
-//! | [`GitHubCopilotLogin::enable_model`] | `enableGitHubCopilotModel`, `:373-407` |
-//! | [`GitHubCopilotLogin::enable_models`] | `enableGitHubCopilotModels`, `:411-431` |
-//! | [`GitHubCopilotLogin::run_login`] | `loginGitHubCopilot`, `:433-485` |
+//! | [`GitHubCopilotLogin::enable_model`] | `enableGitHubCopilotModel`, `:373-408` |
+//! | [`GitHubCopilotLogin::enable_models`] | `enableGitHubCopilotModels`, `:414-432` |
+//! | [`GitHubCopilotLogin::run_login`] | `loginGitHubCopilot`, `:434-485` |
 //! | `impl OAuthAuth for GitHubCopilotLogin` | `githubCopilotOAuth`, `:367-379` |
 //!
 //! `normalizeDomain` (`:40-49`), `getBaseUrlFromToken` (`:63-73`), `getGitHubCopilotBaseUrl`
@@ -50,7 +50,7 @@
 //!   of an [`OAuthError`], folded into the crate taxonomy by
 //!   [`OAuthError::into_auth_error`] at the trait boundary (func-01 R-01-017).
 //! * **The policy pass is SEQUENTIAL** ([`GitHubCopilotLogin::enable_models`], a plain `for` loop),
-//!   because `enableGitHubCopilotModels` (`:411-431` @v0.87.1) is one: it collects the successful ids
+//!   because `enableGitHubCopilotModels` (`:414-432` @v0.87.1) is one: it collects the successful ids
 //!   and `break`s the batch on an exhausted rate limit, neither of which a concurrent fan-out can
 //!   express. This supersedes the earlier note here, which recorded `join_all` as the port of
 //!   v0.83.0's `Promise.all` over the whole embedded catalog (PROV-098).
@@ -133,14 +133,57 @@ const INVALID_COPILOT_TOKEN_RESPONSE: &str = "Invalid Copilot token response";
 /// `github-copilot.ts:267`.
 const INVALID_COPILOT_TOKEN_FIELDS: &str = "Invalid Copilot token response fields";
 
-/// `AbortSignal.timeout(5000)` on the model listing (`github-copilot.ts:123`).
-const MODELS_REQUEST_TIMEOUT: Duration = Duration::from_millis(5000);
+/// `AbortSignal.timeout(5000)` — the cap pi puts on EVERY attempt issued through
+/// `fetchWithRateLimitRetry`, not just on the model listing (`github-copilot.ts:150` @v0.87.1,
+/// inside the retry loop: `signal: AbortSignal.any([requestSignal, AbortSignal.timeout(5000)])`).
+/// So the listing GET and each `/models/{id}/policy` POST are bounded alike. PROV-098 corrected both
+/// the name and the citation, which used to read `:123` and "on the model listing".
+const COPILOT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// pi's `{ maxRetries: 2, maxElapsedMs: 5000 }` — the retry policy `loginGitHubCopilot` passes to
-/// `fetchGitHubCopilotModels` (`github-copilot.ts:465-471`) and `enableGitHubCopilotModel` passes to
+/// `fetchGitHubCopilotModels` (`github-copilot.ts:462-470`) and `enableGitHubCopilotModel` passes to
 /// `fetchWithRateLimitRetry` (`:398`). PROV-098.
 const COPILOT_MAX_RATE_LIMIT_RETRIES: u32 = 2;
 const COPILOT_MAX_RATE_LIMIT_ELAPSED_MS: i64 = 5000;
+
+/// One attempt was aborted before it could produce a response — either the per-attempt
+/// `AbortSignal.timeout(5000)` (`github-copilot.ts:150`) or the armed retry budget
+/// `AbortSignal.timeout(maxElapsedMs)` (`:143`) fired.
+///
+/// In pi both arrive as an abort on the COMPOSED signal, so the caller's own `signal.aborted` is
+/// still `false`: `enableGitHubCopilotModel`'s `catch` (`:400-403`) turns it into `false` and the
+/// batch carries on, while a real caller cancellation is rethrown. That is why this is an
+/// `OAuthError::Failed` and never an `OAuthError::Cancelled`.
+const COPILOT_ATTEMPT_ABORTED: &str = "GitHub Copilot request timed out";
+
+/// pi's `retryPolicy` parameter (`github-copilot.ts:139` @v0.87.1) plus the per-attempt cap pi
+/// hardcodes one line into the loop body (`:150`).
+///
+/// The cap is a FIELD rather than a constant read inside the loop for one reason: a test can then
+/// shorten it to milliseconds and assert the bound without spending five real seconds. Production
+/// only ever uses [`CopilotRetryPolicy::LOGIN`], which carries pi's literals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CopilotRetryPolicy {
+    /// `retryPolicy.maxRetries` (`:139`).
+    max_retries: u32,
+    /// `retryPolicy.maxElapsedMs` (`:139`) — the budget for the WHOLE loop, in-flight requests
+    /// included, armed only when both knobs are positive (`:141-144`).
+    max_elapsed_ms: i64,
+    /// `AbortSignal.timeout(5000)` (`:150`) — the cap on each individual attempt.
+    attempt_timeout: Duration,
+}
+
+impl CopilotRetryPolicy {
+    /// What `loginGitHubCopilot` passes on both of its retry-loop paths: `{maxRetries: 2,
+    /// maxElapsedMs: 5000}` to `fetchGitHubCopilotModels` (`:462-470`) and the same literal to
+    /// `enableGitHubCopilotModel` → `fetchWithRateLimitRetry` (`:398`), each attempt capped at
+    /// `:150`'s 5s.
+    const LOGIN: Self = Self {
+        max_retries: COPILOT_MAX_RATE_LIMIT_RETRIES,
+        max_elapsed_ms: COPILOT_MAX_RATE_LIMIT_ELAPSED_MS,
+        attempt_timeout: COPILOT_ATTEMPT_TIMEOUT,
+    };
+}
 
 /// `expiresAt * 1000 - 5 * 60 * 1000` (`github-copilot.ts:274`).
 const COPILOT_TOKEN_EXPIRY_SKEW_MS: i64 = 5 * 60 * 1000;
@@ -411,6 +454,10 @@ pub struct GitHubCopilotLogin {
     /// The runtime half of the same upstream object.
     runtime: GitHubCopilotOAuth,
     origins: Option<OriginOverride>,
+    /// The retry policy every call through [`Self::fetch_with_rate_limit_retry`] runs under. Always
+    /// [`CopilotRetryPolicy::LOGIN`] in production — the tests shorten it so a bound can be asserted
+    /// in milliseconds instead of pi's five real seconds.
+    retry_policy: CopilotRetryPolicy,
 }
 
 impl Default for GitHubCopilotLogin {
@@ -433,7 +480,17 @@ impl GitHubCopilotLogin {
             runtime: GitHubCopilotOAuth::new().with_auth_context(Arc::clone(&ctx)),
             auth_ctx: ctx,
             origins: None,
+            retry_policy: CopilotRetryPolicy::LOGIN,
         }
+    }
+
+    /// Shorten the retry policy every retry-loop call runs under. Test-only seam (rule 4: a test
+    /// must not spend pi's five real seconds proving a five-second cap); it does not exist in
+    /// release builds.
+    #[cfg(test)]
+    fn with_retry_policy(mut self, policy: CopilotRetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 
     /// Point all three GitHub origins at a loopback listener. Test-only seam (rule 4: never hit
@@ -633,33 +690,60 @@ impl GitHubCopilotLogin {
     /// branch, which returns the response rather than guessing a delay. A negative delay clamps to
     /// zero, and a delay that would overrun the remaining budget returns the response too.
     ///
-    /// `[CYRUP-DELTA]` pi composes `AbortSignal.any([signal, AbortSignal.timeout(maxElapsedMs)])`
-    /// and hands it to `fetch`, so the budget also caps the in-flight request. cyrup has no signal
-    /// composition: the per-request cap is the caller's `reqwest` timeout, and the budget is checked
-    /// against a deadline before each sleep, which is the only place pi's timeout can fire that
-    /// changes the outcome.
+    /// Every attempt is bounded on BOTH axes pi bounds it on (`:148-151`): the caller's signal
+    /// composed with the armed retry budget (`:145`) and with a fresh per-attempt
+    /// `AbortSignal.timeout(5000)` (`:150`). So `max_elapsed_ms` caps total elapsed time including
+    /// requests still in flight — not merely the sleeps between them — and a cancellation aborts a
+    /// request mid-send rather than only at the next sleep.
     async fn fetch_with_rate_limit_retry(
         &self,
         url: &str,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
         cancel: Option<&CancelToken>,
+        policy: CopilotRetryPolicy,
     ) -> Result<reqwest::Response, OAuthError> {
         let client =
             crate::stream::sse::build_client_for_target(url, self.auth_ctx.as_ref(), None, None)
                 .await
                 .map_err(|e| OAuthError::Failed(e.to_string()))?;
-        // pi `:143-146`: the budget exists only when BOTH knobs are positive.
-        let deadline = (COPILOT_MAX_RATE_LIMIT_RETRIES > 0
-            && COPILOT_MAX_RATE_LIMIT_ELAPSED_MS > 0)
-            .then(|| now_millis() + COPILOT_MAX_RATE_LIMIT_ELAPSED_MS);
+        // pi `:141-146`: the budget exists only when BOTH knobs are positive.
+        let deadline = (policy.max_retries > 0 && policy.max_elapsed_ms > 0)
+            .then(|| now_millis() + policy.max_elapsed_ms);
 
         let mut retry: u32 = 0;
         loop {
-            let response = build(&client)
-                .send()
-                .await
-                .map_err(|e| OAuthError::Failed(e.to_string()))?;
-            if response.status().as_u16() != 429 || retry == COPILOT_MAX_RATE_LIMIT_RETRIES {
+            // pi `:148-151` — the request runs under `AbortSignal.any([requestSignal,
+            // AbortSignal.timeout(5000)])`, so whichever of the per-attempt cap and the remaining
+            // budget is shorter is what actually bounds this send. `reqwest`'s per-request timeout
+            // covers the body read too, exactly as pi's signal stays attached to the `Response`.
+            let mut effective = policy.attempt_timeout;
+            if let Some(deadline) = deadline {
+                let remaining = deadline - now_millis();
+                if remaining <= 0 {
+                    // The budget signal has already fired, so pi's `fetch` rejects before the
+                    // request leaves: an abort, not a rate-limit response.
+                    return Err(OAuthError::Failed(COPILOT_ATTEMPT_ABORTED.to_string()));
+                }
+                effective = effective.min(Duration::from_millis(remaining.unsigned_abs()));
+            }
+            let send = build(&client).timeout(effective).send();
+            // pi `:145` — the caller's own signal is part of the composition, so a cancellation
+            // aborts the in-flight request instead of waiting for the next sleep.
+            let sent = match cancel {
+                Some(cancel) => match cancel.run_until_cancelled(send).await {
+                    Some(sent) => sent,
+                    None => return Err(OAuthError::Cancelled),
+                },
+                None => send.await,
+            };
+            let response = sent.map_err(|e| {
+                if e.is_timeout() {
+                    OAuthError::Failed(COPILOT_ATTEMPT_ABORTED.to_string())
+                } else {
+                    OAuthError::Failed(e.to_string())
+                }
+            })?;
+            if response.status().as_u16() != 429 || retry == policy.max_retries {
                 return Ok(response);
             }
 
@@ -704,12 +788,15 @@ impl GitHubCopilotLogin {
 
     /// `fetchGitHubCopilotModels` (`github-copilot.ts:168-194` @v0.87.1).
     ///
-    /// `allowPolicyFallback` is `baseUrl === "https://api.individual.githubcopilot.com"` (`:171`):
-    /// some Individual accounts report `model_picker_enabled: false` for every row despite explicit
-    /// enabled policies, and limiting the fallback to that endpoint keeps strict picker semantics
-    /// everywhere else. It is derived from the REAL base url rather than
-    /// [`Self::copilot_origin`], which the tests override to loopback — the override changes where
-    /// the request goes, never which account type this is.
+    /// `allowPolicyFallback` is `baseUrl === "https://api.individual.githubcopilot.com"` (`:177`,
+    /// under the comment at `:175-176`): some Individual accounts report
+    /// `model_picker_enabled: false` for every row despite explicit enabled policies, and limiting
+    /// the fallback to that endpoint keeps strict picker semantics everywhere else. It is derived
+    /// from the REAL base url rather than [`Self::copilot_origin`], which the tests override to
+    /// loopback — the override changes where the request goes, never which account type this is.
+    ///
+    /// The retry policy is pi's `{maxRetries: 2, maxElapsedMs: 5000}` (`:462-470`), which caps this
+    /// GET at `:150`'s 5s per attempt and the whole loop at 5s of elapsed time.
     async fn fetch_model_catalog(
         &self,
         copilot_token: &str,
@@ -730,14 +817,14 @@ impl GitHubCopilotLogin {
                         .get(&url)
                         .header("Accept", "application/json")
                         .header("Authorization", format!("Bearer {token}"))
-                        .header("X-GitHub-Api-Version", COPILOT_API_VERSION)
-                        .timeout(MODELS_REQUEST_TIMEOUT);
+                        .header("X-GitHub-Api-Version", COPILOT_API_VERSION);
                     for (name, value) in Self::copilot_headers() {
                         request = request.header(name, value);
                     }
                     request
                 },
                 cancel,
+                self.retry_policy,
             )
             .await?;
 
@@ -753,13 +840,17 @@ impl GitHubCopilotLogin {
             .map_err(|e| OAuthError::Failed(e.to_string()))
     }
 
-    /// `enableGitHubCopilotModel` (`github-copilot.ts:373-407` @v0.87.1): accept the model policy for
-    /// one model id, through [`Self::fetch_with_rate_limit_retry`].
+    /// `enableGitHubCopilotModel` (`github-copilot.ts:373-408` @v0.87.1): accept the model policy for
+    /// one model id, through [`Self::fetch_with_rate_limit_retry`] under pi's `{maxRetries: 2,
+    /// maxElapsedMs: 5000}` (`:398`).
     ///
     /// `Ok(response.ok)`, with transport and client-build failures still swallowed as `Ok(false)`
-    /// (upstream's `catch { return false }`, `:400-403`). A 429 that SURVIVES the retry budget is
-    /// the one failure upstream raises instead (`:404-406`) — it means the endpoint is rate-limiting
-    /// the whole batch, so the caller stops rather than hammering it for every remaining id.
+    /// (upstream's `catch { return false }`, `:400-403`). A per-attempt or retry-budget abort lands
+    /// there too: pi's `if (signal.aborted) throw error` is false for it, because what aborted was
+    /// the COMPOSED signal, not the caller's — so a policy POST that outlives its cap costs this one
+    /// id and the batch continues. A 429 that SURVIVES the retry budget is the one failure upstream
+    /// raises instead (`:404-406`) — it means the endpoint is rate-limiting the whole batch, so the
+    /// caller stops rather than hammering it for every remaining id.
     async fn enable_model(
         &self,
         token: &str,
@@ -791,6 +882,7 @@ impl GitHubCopilotLogin {
                         .body(r#"{"state":"enabled"}"#)
                 },
                 cancel,
+                self.retry_policy,
             )
             .await
         {
@@ -805,7 +897,7 @@ impl GitHubCopilotLogin {
         Ok(response.status().is_success())
     }
 
-    /// `enableGitHubCopilotModels` (`github-copilot.ts:411-431` @v0.87.1): a SEQUENTIAL pass over
+    /// `enableGitHubCopilotModels` (`github-copilot.ts:414-432` @v0.87.1): a SEQUENTIAL pass over
     /// the requested ids, collecting the successes. Policy updates are best effort, so a failure is
     /// simply not collected — but an exhausted rate limit `break`s the whole batch, and a
     /// cancellation propagates.
@@ -836,7 +928,8 @@ impl GitHubCopilotLogin {
         Ok(enabled)
     }
 
-    /// `loginGitHubCopilot` (`github-copilot.ts:329-359`).
+    /// `loginGitHubCopilot` (`github-copilot.ts:434-485` @v0.87.1, wired as `githubCopilotOAuth.login`
+    /// at `:496`).
     async fn run_login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
         // `:330-334`
         let input = interaction
@@ -1004,7 +1097,7 @@ impl OAuthAuth for GitHubCopilotLogin {
         true
     }
 
-    /// 1:1 port of `loginGitHubCopilot` (`github-copilot.ts:329-359`, wired at `:369`): prompt for
+    /// 1:1 port of `loginGitHubCopilot` (`github-copilot.ts:434-485` @v0.87.1, wired at `:496`): prompt for
     /// an optional GitHub Enterprise domain, run the RFC 8628 device grant against that domain,
     /// exchange the resulting GitHub token for a Copilot token, accept every model policy, then
     /// record the account's selectable model ids on the credential.
@@ -1081,8 +1174,8 @@ mod tests {
     /// A `/models` payload exercising all three `isSelectableCopilotModel` rules.
     fn models_body() -> Value {
         json!({"data": [
-            {"id": "gpt-5.2", "model_picker_enabled": true},
-            {"id": "claude-sonnet-4.5", "model_picker_enabled": true,
+            {"id": "gpt-5.5", "model_picker_enabled": true},
+            {"id": "claude-sonnet-4.6", "model_picker_enabled": true,
              "capabilities": {"supports": {"tool_calls": true}}},
             {"id": "disabled-by-policy", "model_picker_enabled": true,
              "policy": {"state": "disabled"}},
@@ -1250,6 +1343,14 @@ mod tests {
                     });
 
                     let (status, extra, reply) = router(&path, nth);
+                    // PROV-098 sentinel: status 0 means STALL — accept the request, hold the socket
+                    // open and never answer. It is how a test scripts a server that is reachable but
+                    // unresponsive, which is the only shape that can observe a per-attempt or
+                    // retry-budget abort (`github-copilot.ts:148-151` @v0.87.1).
+                    if status == 0 {
+                        tokio::time::sleep(Duration::from_secs(600)).await;
+                        return;
+                    }
                     let mut response =
                         format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n");
                     for (name, value) in extra {
@@ -1589,7 +1690,7 @@ mod tests {
         );
     }
 
-    /// `enableGitHubCopilotModel` (`github-copilot.ts:373-407` @v0.87.1): `Ok(response.ok)`, and a
+    /// `enableGitHubCopilotModel` (`github-copilot.ts:373-408` @v0.87.1): `Ok(response.ok)`, and a
     /// non-429 failure is still swallowed as `Ok(false)` so one refused policy cannot fail a login.
     #[tokio::test]
     async fn enable_model_reports_ok_and_swallows_failures() {
@@ -1603,13 +1704,13 @@ mod tests {
         .await;
         let flow = flow(&origin);
         assert!(
-            flow.enable_model("copilot-token", "claude-sonnet-4.5", None, None)
+            flow.enable_model("copilot-token", "claude-sonnet-4.6", None, None)
                 .await
                 .expect("a 200 is not an error")
         );
         assert!(
             !flow
-                .enable_model("copilot-token", "claude-sonnet-4.5", None, None)
+                .enable_model("copilot-token", "claude-sonnet-4.6", None, None)
                 .await
                 .expect("a 403 is swallowed, not raised")
         );
@@ -1617,7 +1718,7 @@ mod tests {
         let recorded = log.lock().unwrap().clone();
         assert_eq!(
             recorded[0].line.split(' ').nth(1).unwrap(),
-            "/models/claude-sonnet-4.5/policy"
+            "/models/claude-sonnet-4.6/policy"
         );
         assert_eq!(recorded[0].body, r#"{"state":"enabled"}"#);
         let head = recorded[0].head.to_ascii_lowercase();
@@ -1644,7 +1745,7 @@ mod tests {
         );
         assert!(
             !flow
-                .enable_model("t", "gpt-5.2", None, None)
+                .enable_model("t", "gpt-5.5", None, None)
                 .await
                 .expect("a dead endpoint is swallowed")
         );
@@ -1652,7 +1753,7 @@ mod tests {
 
     // ------------------------------------------------------------------ login
 
-    /// The full `loginGitHubCopilot` sequence (`github-copilot.ts:433-485` @v0.87.1) over loopback:
+    /// The full `loginGitHubCopilot` sequence (`github-copilot.ts:434-485` @v0.87.1) over loopback:
     /// prompt → device code → poll → Copilot token → model listing → policy pass → credential.
     ///
     /// PROV-098 rewrote the tail of this test rather than replacing it. Upstream now fetches the
@@ -1699,7 +1800,7 @@ mod tests {
         assert!(!ext.contains_key("enterpriseUrl"));
         assert_eq!(
             ext.get("availableModelIds").unwrap(),
-            &json!(["gpt-5.2", "claude-sonnet-4.5"]),
+            &json!(["gpt-5.5", "claude-sonnet-4.6"]),
             "only picker-enabled, non-disabled, tool-calling models"
         );
 
@@ -1752,15 +1853,15 @@ mod tests {
     mod prov098 {
         use super::*;
 
-        /// A `/models` body covering every `policyModelIds` predicate at once. `gpt-5.2` and
-        /// `claude-sonnet-4.5` are real embedded-catalog ids; `not-in-our-catalog` is not.
+        /// A `/models` body covering every `policyModelIds` predicate at once. `gpt-5.5` and
+        /// `claude-sonnet-4.6` are real embedded-catalog ids; `not-in-our-catalog` is not.
         fn policy_models_body() -> Value {
             json!({"data": [
                 // `unconfigured` + picker-enabled + in the catalog → the ONLY policy target.
-                {"id": "gpt-5.2", "model_picker_enabled": true,
+                {"id": "gpt-5.5", "model_picker_enabled": true,
                  "policy": {"state": "unconfigured"}},
                 // Already `enabled` → available, never posted.
-                {"id": "claude-sonnet-4.5", "model_picker_enabled": true,
+                {"id": "claude-sonnet-4.6", "model_picker_enabled": true,
                  "policy": {"state": "enabled"}},
                 // `unconfigured` but NOT in the embedded catalog → skipped
                 // (`Object.hasOwn(GITHUB_COPILOT_MODELS, id)`).
@@ -1843,14 +1944,14 @@ mod tests {
             let interaction = ScriptedInteraction::new(vec![Ok(String::new())]);
             let credential = flow(&origin).login(&interaction).await.unwrap();
 
-            assert_eq!(policy_paths(&log), vec!["/models/gpt-5.2/policy"]);
+            assert_eq!(policy_paths(&log), vec!["/models/gpt-5.5/policy"]);
             // (d) the union, deduplicated, in first-seen order: the picker ids then the newly
-            // enabled one. `gpt-5.2` is already among the picker ids, so it must NOT appear twice.
+            // enabled one. `gpt-5.5` is already among the picker ids, so it must NOT appear twice.
             assert_eq!(
                 available_ids(&credential),
                 vec![
-                    "gpt-5.2".to_string(),
-                    "claude-sonnet-4.5".to_string(),
+                    "gpt-5.5".to_string(),
+                    "claude-sonnet-4.6".to_string(),
                     "not-in-our-catalog".to_string(),
                     // `claude-opus-4.1` is absent: `model_picker_enabled: false` keeps it out of
                     // the picker set, and the fallback does not apply while that set is non-empty.
@@ -1871,10 +1972,10 @@ mod tests {
         /// reaches the credential, because the listing already happened.
         #[tokio::test]
         async fn a_newly_enabled_id_joins_available_model_ids_through_the_union() {
-            // `gpt-5.2` is `unconfigured` AND not picker-enabled, with the fallback ON (the
+            // `gpt-5.5` is `unconfigured` AND not picker-enabled, with the fallback ON (the
             // individual token), so it is a policy target but not a picker id.
             let models = json!({"data": [
-                {"id": "gpt-5.2", "model_picker_enabled": false,
+                {"id": "gpt-5.5", "model_picker_enabled": false,
                  "policy": {"state": "unconfigured"}},
             ]})
             .to_string();
@@ -1891,8 +1992,8 @@ mod tests {
 
             let interaction = ScriptedInteraction::new(vec![Ok(String::new())]);
             let credential = flow(&origin).login(&interaction).await.unwrap();
-            assert_eq!(policy_paths(&log), vec!["/models/gpt-5.2/policy"]);
-            assert_eq!(available_ids(&credential), vec!["gpt-5.2".to_string()]);
+            assert_eq!(policy_paths(&log), vec!["/models/gpt-5.5/policy"]);
+            assert_eq!(available_ids(&credential), vec!["gpt-5.5".to_string()]);
         }
 
         /// (c) `:154-164` — a 429 with `retry-after: 0` is RETRIED, and a 200 on the retry counts the
@@ -1900,7 +2001,7 @@ mod tests {
         #[tokio::test]
         async fn a_429_with_retry_after_zero_is_retried_and_then_succeeds() {
             let models = json!({"data": [
-                {"id": "gpt-5.2", "model_picker_enabled": true,
+                {"id": "gpt-5.5", "model_picker_enabled": true,
                  "policy": {"state": "unconfigured"}},
             ]})
             .to_string();
@@ -1924,10 +2025,10 @@ mod tests {
             let credential = flow(&origin).login(&interaction).await.unwrap();
             assert_eq!(
                 policy_paths(&log),
-                vec!["/models/gpt-5.2/policy", "/models/gpt-5.2/policy"],
+                vec!["/models/gpt-5.5/policy", "/models/gpt-5.5/policy"],
                 "the 429 was retried, not abandoned"
             );
-            assert_eq!(available_ids(&credential), vec!["gpt-5.2".to_string()]);
+            assert_eq!(available_ids(&credential), vec!["gpt-5.5".to_string()]);
         }
 
         /// (b) `:404-406` + `:420-424` — a 429 on EVERY attempt exhausts the budget, raises, and
@@ -1936,9 +2037,9 @@ mod tests {
         #[tokio::test]
         async fn an_exhausted_rate_limit_stops_the_batch_without_failing_the_login() {
             let models = json!({"data": [
-                {"id": "gpt-5.2", "model_picker_enabled": true,
+                {"id": "gpt-5.5", "model_picker_enabled": true,
                  "policy": {"state": "unconfigured"}},
-                {"id": "claude-sonnet-4.5", "model_picker_enabled": true,
+                {"id": "claude-sonnet-4.6", "model_picker_enabled": true,
                  "policy": {"state": "unconfigured"}},
             ]})
             .to_string();
@@ -1968,15 +2069,15 @@ mod tests {
             assert_eq!(
                 policy_paths(&log),
                 vec![
-                    "/models/gpt-5.2/policy",
-                    "/models/gpt-5.2/policy",
-                    "/models/gpt-5.2/policy",
+                    "/models/gpt-5.5/policy",
+                    "/models/gpt-5.5/policy",
+                    "/models/gpt-5.5/policy",
                 ],
                 "three attempts for the first id, then the batch breaks"
             );
             assert_eq!(
                 available_ids(&credential),
-                vec!["gpt-5.2".to_string(), "claude-sonnet-4.5".to_string()],
+                vec!["gpt-5.5".to_string(), "claude-sonnet-4.6".to_string()],
                 "the listing's ids survive an entirely failed policy pass"
             );
         }
@@ -1987,8 +2088,8 @@ mod tests {
         #[tokio::test]
         async fn the_policy_fallback_is_limited_to_the_individual_endpoint() {
             let body = json!({"data": [
-                {"id": "gpt-5.2", "model_picker_enabled": false, "policy": {"state": "enabled"}},
-                {"id": "claude-sonnet-4.5", "model_picker_enabled": false,
+                {"id": "gpt-5.5", "model_picker_enabled": false, "policy": {"state": "enabled"}},
+                {"id": "claude-sonnet-4.6", "model_picker_enabled": false,
                  "policy": {"state": "enabled"}},
                 {"id": "not-enabled", "model_picker_enabled": false,
                  "policy": {"state": "unconfigured"}},
@@ -1997,7 +2098,7 @@ mod tests {
             for (enterprise, expected) in [
                 (
                     false,
-                    vec!["gpt-5.2".to_string(), "claude-sonnet-4.5".to_string()],
+                    vec!["gpt-5.5".to_string(), "claude-sonnet-4.6".to_string()],
                 ),
                 (true, Vec::new()),
             ] {
@@ -2022,6 +2123,139 @@ mod tests {
                     "enterprise = {enterprise}"
                 );
             }
+        }
+
+        /// A `/models` body whose single row is a policy target but NOT an available id: `gpt-5.5` is
+        /// `unconfigured` and not picker-enabled, so with the individual token's fallback ON it is
+        /// posted while `availableModelIds` comes only from the `enabled` rows (`:119-123`,
+        /// `:124-132`). A successful POST therefore SHOWS UP in the credential through the union, and
+        /// a failed one leaves `availableModelIds` empty — which is what makes an abort observable.
+        fn one_policy_target_no_available_ids() -> String {
+            json!({"data": [
+                {"id": "gpt-5.5", "model_picker_enabled": false,
+                 "policy": {"state": "unconfigured"}},
+            ]})
+            .to_string()
+        }
+
+        /// `:141-151` — the retry budget bounds the whole loop, IN-FLIGHT REQUESTS INCLUDED, not just
+        /// the sleeps between them.
+        ///
+        /// pi arms `AbortSignal.timeout(maxElapsedMs)` (`:143`), composes it into `requestSignal`
+        /// (`:145`) and hands that to EVERY `fetch` (`:148-151`). So an attempt that straddles the
+        /// deadline is aborted mid-flight. Before PROV-098 cyrup only consulted the deadline when
+        /// deciding whether the next SLEEP fit, and `send()` was bounded by nothing on this path:
+        /// a policy endpoint that accepted the connection and then went quiet held the login for the
+        /// five-MINUTE read-idle timeout of `stream/sse.rs:66`, with `COPILOT_MAX_RATE_LIMIT_ELAPSED_MS`
+        /// powerless to stop it.
+        ///
+        /// The abort is pi's composed-signal abort, where the CALLER's `signal.aborted` is still
+        /// false, so `enableGitHubCopilotModel`'s `catch` (`:400-403`) yields `false` and the login
+        /// still succeeds — it just enables nothing.
+        #[tokio::test]
+        async fn an_attempt_that_outlives_the_retry_budget_fails_like_pis_abort() {
+            let models = one_policy_target_no_available_ids();
+            let (origin, log) = spawn_with_headers(Arc::new(move |path, nth| {
+                if let Some((status, reply)) = base_reply(path, nth, false) {
+                    return (status, Vec::new(), reply);
+                }
+                match path {
+                    "/models" => (200, Vec::new(), models.clone()),
+                    // First policy POST: rate-limited with a zero delay, so the loop retries at once.
+                    p if p.ends_with("/policy") && nth == 0 => (
+                        429,
+                        vec![("retry-after".to_string(), "0".to_string())],
+                        "slow down".to_string(),
+                    ),
+                    // The retry never gets an answer. Only the budget can end it.
+                    p if p.ends_with("/policy") => (0, Vec::new(), String::new()),
+                    _ => (200, Vec::new(), "{}".to_string()),
+                }
+            }))
+            .await;
+
+            let interaction = ScriptedInteraction::new(vec![Ok(String::new())]);
+            // `attempt_timeout` is deliberately far LONGER than the budget: the only thing that can
+            // end the stalled retry is `max_elapsed_ms`, so this isolates the budget from the
+            // per-attempt cap.
+            let flow = flow(&origin).with_retry_policy(CopilotRetryPolicy {
+                max_retries: 2,
+                max_elapsed_ms: 400,
+                attempt_timeout: Duration::from_secs(10),
+            });
+            // 4s is far above the ~2.2s the scripted device flow itself costs and far below the
+            // five MINUTES an unbounded stall would take (`stream/sse.rs:66`), so what this wrapper
+            // measures is the budget and nothing else.
+            let credential = tokio::time::timeout(Duration::from_secs(4), flow.login(&interaction))
+                .await
+                .expect("the retry budget must end the stalled attempt")
+                .expect("an abort inside the batch must not fail the login");
+
+            // Two attempts: the 429 and the stalled retry. `max_retries: 2` would allow a third, but
+            // the budget is gone before it can be issued.
+            assert_eq!(
+                policy_paths(&log),
+                vec![
+                    "/models/gpt-5.5/policy".to_string(),
+                    "/models/gpt-5.5/policy".to_string()
+                ]
+            );
+            // The POST never succeeded, so the union adds nothing.
+            assert!(available_ids(&credential).is_empty());
+        }
+
+        /// `:150` — every attempt runs under its own `AbortSignal.timeout(5000)`, the policy POST
+        /// included.
+        ///
+        /// This is pi's `{maxRetries: 0, maxElapsedMs: 0}` shape (`:359-362`), where `:141-144` leaves
+        /// the budget signal unarmed and the per-attempt cap is the ONLY bound left. cyrup used to
+        /// set `.timeout(...)` on the `/models` GET alone (`fetch_model_catalog`), leaving
+        /// `/models/{id}/policy` with no deadline of its own at all.
+        #[tokio::test]
+        async fn the_policy_post_is_capped_per_attempt() {
+            let models = json!({"data": [
+                {"id": "gpt-5.5", "model_picker_enabled": false,
+                 "policy": {"state": "unconfigured"}},
+                {"id": "claude-sonnet-4.6", "model_picker_enabled": false,
+                 "policy": {"state": "enabled"}},
+            ]})
+            .to_string();
+            let (origin, log) = spawn_with_headers(Arc::new(move |path, nth| {
+                if let Some((status, reply)) = base_reply(path, nth, false) {
+                    return (status, Vec::new(), reply);
+                }
+                match path {
+                    "/models" => (200, Vec::new(), models.clone()),
+                    p if p.ends_with("/policy") => (0, Vec::new(), String::new()),
+                    _ => (200, Vec::new(), "{}".to_string()),
+                }
+            }))
+            .await;
+
+            let interaction = ScriptedInteraction::new(vec![Ok(String::new())]);
+            let flow = flow(&origin).with_retry_policy(CopilotRetryPolicy {
+                max_retries: 0,
+                max_elapsed_ms: 0,
+                attempt_timeout: Duration::from_millis(120),
+            });
+            // Same margin as the budget test: well above the scripted device flow's own ~2.2s,
+            // far below an unbounded stall's five minutes.
+            let credential = tokio::time::timeout(Duration::from_secs(4), flow.login(&interaction))
+                .await
+                .expect("the per-attempt cap must end the stalled POST")
+                .expect("an abort inside the batch must not fail the login");
+
+            // `max_retries: 0` means `retry == policy.max_retries` on the first pass, so there is
+            // exactly one attempt — and it was capped.
+            assert_eq!(
+                policy_paths(&log),
+                vec!["/models/gpt-5.5/policy".to_string()]
+            );
+            // The stalled id never joins the union; the already-`enabled` row still does.
+            assert_eq!(
+                available_ids(&credential),
+                vec!["claude-sonnet-4.6".to_string()]
+            );
         }
     }
 

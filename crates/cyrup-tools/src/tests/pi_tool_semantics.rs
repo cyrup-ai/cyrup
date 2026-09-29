@@ -949,3 +949,38 @@ fn only_pis_five_tools_declare_strict_prefer_constrained_sampling() {
         "all eight built-ins must be covered; got {seen:?}"
     );
 }
+
+/// TOOL-046 — the five declarations are all ONE object: `cyrup_core::prefer_strict_tool_sampling`.
+///
+/// The value-equality pin above structurally cannot see this — five separately-constructed but
+/// equal values would satisfy it. Upstream at v0.87.1 there is no shared constant at all (`git grep
+/// -n PREFER_STRICT v0.87.1` → nothing; the const lived in `core/experimental.ts` up to v0.85.1 and
+/// v0.86.0 inlined the literal into `core/tools/read.ts:80`, `bash.ts:243`, `edit.ts:156` and
+/// `write.ts:57`), so holding one shared `static` is cyrup's mechanism and it belongs in exactly
+/// one place. This pins that: address identity, not value equality. It was RED while `cyrup-tools`
+/// kept a second fn-local `static` of its own.
+#[test]
+fn the_five_declarations_are_all_cyrup_cores_one_static() {
+    let reg = crate::registry::ToolRegistry::with_builtins(
+        std::env::temp_dir(),
+        crate::ops::Backend::default(),
+        crate::ToolsOptions::default(),
+    );
+    let one = cyrup_core::prefer_strict_tool_sampling();
+    let mut checked = 0usize;
+    for tool in reg.visible(&crate::registry::Availability::All) {
+        let name = tool.name().to_string();
+        if !matches!(name.as_str(), "read" | "bash" | "powershell" | "edit" | "write") {
+            continue;
+        }
+        let declared = tool
+            .constrained_sampling()
+            .expect("the five coding built-ins declare strict-prefer sampling");
+        assert!(
+            std::ptr::eq(declared, one),
+            "{name} must hand out cyrup-core's single static, not a second equal value"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 5, "all five of pi's declaring built-ins must be covered");
+}

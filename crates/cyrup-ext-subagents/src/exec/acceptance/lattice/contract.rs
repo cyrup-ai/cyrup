@@ -113,6 +113,35 @@ pub struct AcceptanceContract {
     /// DECLARED `report` (either value), which `validateAcceptanceReportMode` refuses on a step
     /// with no `outputSchema`.
     pub report_declared: bool,
+    /// SUBA-108 — pi `explicitAcceptanceRequestsPolicy(explicit)` (`acceptance.ts:243-245`
+    /// @v0.71.0), evaluated over the RAW authored value by
+    /// [`crate::exec::acceptance::lattice::lowering::lower_acceptance_input`] because that is the
+    /// only place the authored KEY SET still exists:
+    ///
+    /// ```text
+    /// (explicit.level !== undefined && explicit.level !== "auto")
+    ///     || Object.keys(explicit).some((key) => key !== "level")
+    /// ```
+    ///
+    /// [`Self::resolve_effective_for_role`] consults it at upstream's `:505` to upgrade an inferred
+    /// `none` to `attested`. Without it a caller-supplied policy handed to an agent whose declared
+    /// `acceptanceRole: read-only` infers `none` resolved to `NotRequired`, made [`Self::is_no_op`]
+    /// true, and had its criteria/evidence/verify/review silently discarded — a fail-OPEN.
+    ///
+    /// `false` for a contract built directly in Rust rather than lowered from a wire policy: such a
+    /// caller stated its level outright and has no authored key set to inspect.
+    pub requests_policy: bool,
+    /// SUBA-108 — the policy's criteria BEFORE normalization (pi `explicit.criteria`,
+    /// `shared/types.ts:1068`), kept alongside the normalized [`Self::criteria`] so
+    /// [`Self::resolve_effective_for_role`] can re-run `normalizeCriteria` against the MERGED
+    /// evidence set exactly as `acceptance.ts:510-513` does. A criterion that declares no
+    /// `evidence` of its own inherits the config's, and after the merge the config's set is wider
+    /// than the declared one — so normalizing once at lowering time gave those criteria a narrower
+    /// inherited set than upstream's.
+    ///
+    /// Empty means "declared none", which is upstream's `explicit.criteria?.length ? … : inferred`
+    /// falsy arm.
+    pub criteria_input: Vec<crate::exec::acceptance::model::CriterionInput>,
 }
 
 impl AcceptanceContract {
@@ -145,6 +174,8 @@ impl AcceptanceContract {
             stop_rules: Vec::new(),
             report_mode: crate::exec::acceptance::model::AcceptanceReportMode::Optional,
             report_declared: false,
+            requests_policy: false,
+            criteria_input: Vec::new(),
         }
     }
 
@@ -241,7 +272,7 @@ impl AcceptanceContract {
     /// (`formatAcceptancePrompt` returns `""` only for `level === "none"`, `acceptance.ts:408`, and
     /// `execution.ts:1037-1038` appends it unconditionally) and always produces a real ledger.
     /// Before this change this function ran the enum-lattice
-    /// [`crate::exec::completion_guard::expects_implementation_mutation`] classifier instead and
+    /// retired `expects_implementation_mutation` classifier instead and
     /// returned [`AcceptanceStatus::NotRequired`] for anything that did not read as
     /// implementation-expecting — so a reviewer/scout/researcher/summariser child was sent a
     /// materially different prompt from pi's (no criteria, no required evidence, no
@@ -318,6 +349,17 @@ impl AcceptanceContract {
             explicit: false,
             reviewer_result: None,
             disables_gate: false,
+            // SUBA-108 — kept BEFORE normalization too, so
+            // [`Self::resolve_effective_for_role`] can re-normalize against the merged evidence
+            // set. `inferLevel` returns plain `string[]` (`acceptance.ts:96,105,113,120`), so the
+            // faithful pre-normalization shape of an inferred criterion is
+            // [`crate::exec::acceptance::model::CriterionInput::Text`]: no id, no own evidence,
+            // default severity — exactly what `normalizeCriteria` receives upstream.
+            criteria_input: inferred
+                .criteria
+                .iter()
+                .map(|gate| crate::exec::acceptance::model::CriterionInput::Text(gate.must.clone()))
+                .collect(),
             criteria: inferred.criteria,
             evidence: inferred.evidence,
             review: inferred.review,
@@ -325,6 +367,8 @@ impl AcceptanceContract {
             // No authored policy: `resolveAcceptanceReportMode(undefined)` is `optional`.
             report_mode: crate::exec::acceptance::model::AcceptanceReportMode::Optional,
             report_declared: false,
+            // An inferred contract is not an authored policy.
+            requests_policy: false,
         }
     }
 
@@ -361,10 +405,12 @@ impl AcceptanceContract {
     /// both tracked separately from this function's own concern, which is strictly the combination
     /// rule.
     ///
-    /// This function combines LEVELS only. The inferred contract's `criteria`/`evidence`/`review`
-    /// are dropped whenever an explicit contract is present, where upstream merges them
-    /// (`acceptance.ts:283-292`); an explicit policy that declares none of the three therefore
-    /// gates on nothing rather than on `requiredEvidenceForLevel(level)`.
+    /// SUBA-108 — this used to combine LEVELS ONLY, and the inferred contract's
+    /// `criteria`/`evidence`/`review` were dropped outright whenever an explicit contract was
+    /// present. It now performs upstream's whole `:505-514` resolution: the policy-presence
+    /// upgrade, the MAX, the evidence union (over `requiredEvidenceForLevel(level)` when the
+    /// resolved level left the inferred one behind), the criteria selection with re-normalization
+    /// against the merged evidence, and the review fallback.
     #[must_use]
     pub fn resolve_effective(explicit: Option<Self>, agent_local_name: &str, task: &str) -> Self {
         Self::resolve_effective_for_role(explicit, agent_local_name, None, task)
@@ -381,21 +427,145 @@ impl AcceptanceContract {
         acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
         task: &str,
     ) -> Self {
-        let inferred = Self::heuristic_default_for_role(agent_local_name, acceptance_role, task);
         let Some(mut contract) = explicit else {
-            return inferred;
+            return Self::heuristic_default_for_role(agent_local_name, acceptance_role, task);
         };
+        // `explicitAcceptanceCanDisable(explicit) ? "none"` (`acceptance.ts:507`): the gate is off,
+        // and `:521-522` clears criteria and evidence for a `none` level.
         if contract.disables_gate {
+            contract.criteria = Vec::new();
+            contract.criteria_input = Vec::new();
+            contract.evidence = Vec::new();
             return contract;
         }
-        // MAX(explicit, inferred) by lattice rank. `AcceptanceStatus`'s derived `Ord` IS that rank
-        // (the enum's own doc comment: declaration order is normative), and neither side can be
-        // `Rejected` — `heuristic_default` never produces it and `explicit`/`explicit_floor` clamp
-        // it away — so the sink variant cannot leak in through this comparison.
-        if inferred.required_level > contract.required_level {
-            contract.required_level = inferred.required_level;
+
+        // `acceptance.ts:503-504`: `const inferred = inferLevel(input)` — the RAW branch value,
+        // not [`Self::heuristic_default_for_role`]'s already-resolved contract. The difference is
+        // load-bearing: `resolveEffectiveAcceptance` clears a `none` level's criteria and evidence
+        // on the way OUT (`:521-522`), so the resolved read-only contract carries neither, while
+        // the merge at `:512-517` reads the branch's own `criteria`/`evidence`/`review`.
+        let inferred = crate::exec::acceptance::model::infer_level(
+            &crate::exec::acceptance::model::AcceptanceResolveInput {
+                explicit: None,
+                agent_name: agent_local_name.to_string(),
+                acceptance_role,
+                task: Some(task.to_string()),
+                mode: None,
+                is_async: false,
+                dynamic: false,
+                dynamic_group: false,
+            },
+        );
+        let inferred_status = Self::status_of_model_level(inferred.level);
+
+        // `acceptance.ts:505`: `const inferredLevel = inferred.level === "none" &&
+        // explicitAcceptanceRequestsPolicy(explicit) ? "attested" : inferred.level;`
+        //
+        // Reachable only since `inferLevel`'s `read-only` branch began returning `none`
+        // (`acceptance.ts:109-117` @v0.71.0). Without it, MAX(NotRequired, NotRequired) is
+        // `NotRequired`, [`Self::is_no_op`] is true, `inject_acceptance_contract` returns the task
+        // verbatim and the gate short-circuits to `not_required` — the caller's whole policy gone.
+        let inferred_level =
+            if inferred_status == AcceptanceStatus::NotRequired && contract.requests_policy {
+                AcceptanceStatus::Attested
+            } else {
+                inferred_status
+            };
+
+        // `acceptance.ts:506-511` — MAX(explicit, inferred) by lattice rank. `AcceptanceStatus`'s
+        // derived `Ord` IS that rank (the enum's own doc comment: declaration order is normative),
+        // and neither side can be `Rejected` — `heuristic_default` never produces it and
+        // `explicit`/`explicit_floor` clamp it away — so the sink variant cannot leak in through
+        // this comparison. A policy that named no `level` at all is lowered as a `NotRequired`
+        // FLOOR, which ranks lowest and so behaves exactly as upstream's `explicitLevel === "auto"`
+        // arm does.
+        let level = contract.required_level.max(inferred_level);
+
+        // `acceptance.ts:512`: `unique([...(level === inferredLevel ? inferred.evidence :
+        // requiredEvidenceForLevel(level)), ...(explicit.evidence ?? [])])`.
+        //
+        // The comparison is against the UPGRADED `inferredLevel`, so a read-only agent whose policy
+        // pushed it to `attested` keeps the read-only branch's own `["review-findings",
+        // "residual-risks"]` rather than `requiredEvidenceForLevel("attested")`.
+        let mut combined = if level == inferred_level {
+            inferred.evidence.clone()
+        } else {
+            crate::exec::acceptance::model::required_evidence_for_level(Self::model_level_of(level))
+        };
+        combined.extend(contract.evidence.iter().copied());
+        let evidence = crate::exec::acceptance::model::unique_evidence(&combined);
+
+        // `acceptance.ts:513-516`: the explicit criteria win when non-empty, otherwise the inferred
+        // ones, and either way `normalizeCriteria` runs against the MERGED evidence so a criterion
+        // declaring no `evidence` of its own inherits the merged set.
+        let criteria_input = if contract.criteria_input.is_empty() {
+            inferred.criteria.clone()
+        } else {
+            contract.criteria_input.clone()
+        };
+        let criteria =
+            crate::exec::acceptance::model::normalize_criteria(&criteria_input, &evidence);
+
+        // `acceptance.ts:517`: `explicit.review !== undefined ? explicit.review : inferred.review`.
+        let review = if contract.review.is_some() {
+            contract.review.clone()
+        } else {
+            inferred.review.clone()
+        };
+
+        contract.required_level = level;
+        contract.review = review;
+        // `acceptance.ts:521-522`: `criteria: level === "none" ? [] : criteria`, same for evidence.
+        // A `none` level renders no prompt block at all (`formatAcceptancePrompt` returns `""`), so
+        // anything surviving here would be a contract the child was never told about.
+        if level == AcceptanceStatus::NotRequired {
+            contract.criteria = Vec::new();
+            contract.criteria_input = Vec::new();
+            contract.evidence = Vec::new();
+        } else {
+            contract.criteria = criteria;
+            contract.criteria_input = criteria_input;
+            contract.evidence = evidence;
         }
         contract
+    }
+
+    /// The inverse of [`Self::model_level_of`], factored out of
+    /// [`Self::heuristic_default_for_role`] so [`Self::resolve_effective_for_role`] can lift
+    /// `inferLevel`'s own `AcceptanceLevel` onto this crate's lattice the same way.
+    fn status_of_model_level(
+        level: crate::exec::acceptance::model::AcceptanceLevel,
+    ) -> AcceptanceStatus {
+        match level {
+            crate::exec::acceptance::model::AcceptanceLevel::Verified => AcceptanceStatus::Verified,
+            crate::exec::acceptance::model::AcceptanceLevel::Checked => AcceptanceStatus::Checked,
+            crate::exec::acceptance::model::AcceptanceLevel::None => AcceptanceStatus::NotRequired,
+            crate::exec::acceptance::model::AcceptanceLevel::Attested
+            | crate::exec::acceptance::model::AcceptanceLevel::Auto => AcceptanceStatus::Attested,
+        }
+    }
+
+    /// The [`AcceptanceStatus`] -> [`crate::exec::acceptance::model::AcceptanceLevel`] projection
+    /// [`Self::to_resolved_config`] performs, factored out so
+    /// [`Self::resolve_effective_for_role`] can feed
+    /// [`crate::exec::acceptance::model::required_evidence_for_level`] the same way upstream feeds
+    /// `requiredEvidenceForLevel` its own `AcceptanceLevel`.
+    fn model_level_of(status: AcceptanceStatus) -> crate::exec::acceptance::model::AcceptanceLevel {
+        match status {
+            AcceptanceStatus::NotRequired => crate::exec::acceptance::model::AcceptanceLevel::None,
+            AcceptanceStatus::Claimed | AcceptanceStatus::Attested => {
+                crate::exec::acceptance::model::AcceptanceLevel::Attested
+            }
+            // `reviewed` is not an `AcceptanceLevel` at v0.43.0+; upstream expresses that shape as
+            // `level: "checked"` plus `review.required`, which is exactly what
+            // [`Self::to_resolved_config`] does too.
+            AcceptanceStatus::Checked | AcceptanceStatus::Reviewed => {
+                crate::exec::acceptance::model::AcceptanceLevel::Checked
+            }
+            AcceptanceStatus::Verified | AcceptanceStatus::Rejected => {
+                crate::exec::acceptance::model::AcceptanceLevel::Verified
+            }
+        }
     }
 
     /// Whether this contract requires no gate evaluation at all — `required_level ==

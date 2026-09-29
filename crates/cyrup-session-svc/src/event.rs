@@ -400,6 +400,10 @@ impl AgentSessionEvent {
 pub(crate) fn agent_message_to_core(m: &AgentMessage) -> Option<cyrup_core::Message> {
     use cyrup_core::Message;
     match m {
+        // PROV-083a — a system message IS a core LLM message and IS persisted: pi's
+        // `defaultConvertToLlm` keeps the role (`packages/agent/src/agent.ts:38-46` @v0.87.1) and its
+        // session write path is a bare `JSON.stringify(entry)`.
+        AgentMessage::System(s) => Some(Message::System(s.clone())),
         AgentMessage::User { content, timestamp } => Some(Message::User {
             content: content.clone(),
             timestamp: timestamp.unwrap_or(0),
@@ -511,7 +515,10 @@ fn app_role_of(m: &cyrup_session::agent_message::AgentMessage) -> Option<AppRole
         MessageRole::BashExecution => Some(AppRole::BashExecution),
         MessageRole::BranchSummary => Some(AppRole::BranchSummary),
         MessageRole::CompactionSummary => Some(AppRole::CompactionSummary),
-        MessageRole::User
+        // `system` is not one of the declaration-merged app roles either — pi's `Message` union
+        // carries it (PROV-083a).
+        MessageRole::System
+        | MessageRole::User
         | MessageRole::Assistant
         | MessageRole::ToolResult
         | MessageRole::Custom => None,
@@ -522,6 +529,8 @@ fn app_role_of(m: &cyrup_session::agent_message::AgentMessage) -> Option<AppRole
 pub(crate) fn core_message_to_agent(m: &cyrup_core::Message) -> AgentMessage {
     use cyrup_core::Message;
     match m {
+        // PROV-083a — the RESUME direction of the `agent_message_to_core` arm above.
+        Message::System(s) => AgentMessage::System(s.clone()),
         Message::User { content, timestamp } => AgentMessage::User {
             content: content.clone(),
             timestamp: Some(*timestamp),

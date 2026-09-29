@@ -733,6 +733,12 @@ impl SubagentTool {
             .map_err(ToolError::new)?,
             output: p.output.clone(),
             output_mode: p.output_mode.clone(),
+            // CFG-067 — the call rung of `resolveToolTimeoutMs`, carried RAW. Unlike `turnBudget`
+            // and `usageBudget` above, it is NOT validated at this boundary: upstream resolves all
+            // four rungs together (`execution.ts:1669-1685`) precisely because the winner is the
+            // first rung that is PRESENT, so refusing here would report the call's value even in the
+            // cases where a lower rung is the one that decides.
+            tool_timeout_ms: p.tool_timeout_ms.clone(),
             // SUBA-096 — the call rung of `params.fast ?? a.fast`.
             fast: p.fast,
             // SUBA-100 — the call rung of `params.machine ?? agentConfig.machine`, plus the
@@ -839,6 +845,10 @@ impl SubagentTool {
         let run_id = self
             .executor
             .spawn_background(BackgroundSingleRequest {
+                // CFG-067 — the call's own `toolTimeoutMs`, carried raw to the async launch exactly
+                // as the foreground branch carries it on `SingleRunOverrides` (pi
+                // `subagent-executor.ts:4146`).
+                tool_timeout_ms: p.tool_timeout_ms.clone(),
                 // SUBA-100 — the call rung of the async single placement.
                 machine_cwd: p.machine_cwd.clone(),
                 machine: p.machine.clone(),

@@ -5,7 +5,7 @@
 //! blob into a typed shape, with zero I/O") is genuinely separable from CRUD orchestration — see
 //! this task's own rationale for keeping it a distinct file despite the 1:1 caller relationship.
 //! Exact pi error strings are reproduced verbatim (the tool test-suite pins several, e.g.
-//! `config.completionGuard must be a boolean`).
+//! `config.maxSubagentDepth must be an integer >= 0 or false`).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -388,14 +388,6 @@ pub(crate) fn apply_agent_config(
                 "config.maxSubagentDepth must be an integer >= 0 or false when provided."
                     .to_string(),
             );
-        }
-    }
-    if let Some(v) = cfg.get("completionGuard") {
-        match v.as_bool() {
-            Some(b) => fields.completion_guard = Some(Some(b)),
-            None => {
-                return Err("config.completionGuard must be a boolean when provided.".to_string());
-            }
         }
     }
     Ok(())

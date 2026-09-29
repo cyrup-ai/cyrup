@@ -99,7 +99,6 @@ mod tests {
     use crate::exec::acceptance::lattice::gate::evaluate_acceptance;
     use crate::exec::acceptance::lattice::lowering::lower_acceptance_input;
     use crate::exec::acceptance::lattice::testsupport::clean_gate;
-    use crate::exec::acceptance::lattice::testsupport::no_guard_trigger;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_allow_failure_command_that_exits_nonzero_still_reaches_verified() {
@@ -122,7 +121,6 @@ mod tests {
             &contract,
             clean_gate(),
             Some("Done.\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```"),
-            no_guard_trigger(),
             dir.path(),
             None,
             None,

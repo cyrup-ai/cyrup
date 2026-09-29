@@ -57,6 +57,11 @@ pub const PARENT_PATH_ENV: &str = "CYRUP_SUBAGENT_PARENT_PATH";
 /// Inherited capability token (pi `PI_SUBAGENT_PARENT_CAPABILITY_TOKEN`).
 pub const PARENT_CAPABILITY_TOKEN_ENV: &str = "CYRUP_SUBAGENT_PARENT_CAPABILITY_TOKEN";
 
+/// CFG-074 — pi `PI_SUBAGENTS_TEMP_ROOT` (`src/shared/types.ts:2808` @v0.71.0, `:2688` @v0.64.0:
+/// `process.env.PI_SUBAGENTS_TEMP_ROOT?.trim()`), under this workspace's `CYRUP_` env-var
+/// convention. A real upstream variable, renamed — NOT a cyrup invention, which is what the ledger
+/// row that enumerated it assumed.
+///
 /// Optional override for the temp root the nested-event directories live under; when unset,
 /// defaults to `<temp_dir>/cyrup-subagents`.
 pub const TEMP_ROOT_ENV: &str = "CYRUP_SUBAGENTS_TEMP_ROOT";
@@ -97,10 +102,36 @@ pub fn temp_root_dir() -> PathBuf {
 /// [`temp_root_dir`] with its two ambient inputs supplied — the crate's `_from` convention, which
 /// this resolver was the last one in the crate to lack. Its absence is why
 /// [`crate::paths::Roots::from_lookup`] could not resolve every root from one lookup.
+///
+/// # The override's own three rules are upstream's, and two of them were missing
+///
+/// pi `shared/types.ts:2808-2811`:
+///
+/// ```text
+/// const configuredTempRoot = process.env.PI_SUBAGENTS_TEMP_ROOT?.trim();
+/// export const TEMP_ROOT_DIR = configuredTempRoot
+///     ? path.resolve(configuredTempRoot)
+///     : path.join(os.tmpdir(), `pi-subagents-${resolveTempScopeId()}`);
+/// ```
+///
+/// * **`.trim()`**, and the trimmed value is tested for TRUTHINESS — so `CYRUP_SUBAGENTS_TEMP_ROOT`
+///   set to `""` or to whitespace is "not configured" and falls back to the default. This used to
+///   take the empty string as the root, which is a RELATIVE empty path: every nested-event route
+///   file, registry and supervisor channel then hung off the process's own cwd instead of the temp
+///   root, in a repository the agent is editing.
+/// * **`path.resolve`** — a relative value is made absolute ONCE, here, rather than re-resolved
+///   against whatever cwd each consumer happens to have. [`std::path::absolute`] is its analogue
+///   (lexical, cwd-based, no filesystem access); on the only failure it can report — an empty input,
+///   already excluded above — the trimmed value is kept as-is rather than silently reverting to the
+///   default the operator overrode.
 #[must_use]
 pub fn temp_root_dir_from(env: crate::paths::EnvLookup<'_>, os_temp_dir: PathBuf) -> PathBuf {
     env(TEMP_ROOT_ENV)
-        .map(PathBuf::from)
+        .and_then(|raw| {
+            let trimmed = raw.to_string_lossy().trim().to_string();
+            (!trimmed.is_empty())
+                .then(|| std::path::absolute(&trimmed).unwrap_or_else(|_| PathBuf::from(trimmed)))
+        })
         .unwrap_or_else(|| os_temp_dir.join("cyrup-subagents"))
 }
 
@@ -1990,6 +2021,87 @@ mod tests {
 
     use super::*;
     use std::process::Command as StdCommand;
+
+    /// CFG-074 — the `CYRUP_SUBAGENTS_TEMP_ROOT` override's own three rules, all upstream's
+    /// (`shared/types.ts:2808-2811` @v0.71.0: `?.trim()`, truthiness, `path.resolve`).
+    ///
+    /// The BLANK cases are the ones that were wrong: an empty or whitespace-only value used to
+    /// become `PathBuf::from("")`, a relative empty path, so every nested-event route file,
+    /// registry and supervisor channel hung off the process's own cwd — inside the repository the
+    /// agent is editing — instead of falling back to the temp root. Killing mutations: dropping the
+    /// trim, dropping the emptiness check, or dropping the `absolute` call.
+    #[test]
+    fn a_blank_temp_root_override_falls_back_and_a_relative_one_is_made_absolute() {
+        let os_temp = PathBuf::from("/os-temp");
+        let with = |value: Option<&str>| {
+            let owned = value.map(std::ffi::OsString::from);
+            temp_root_dir_from(
+                &|key| {
+                    if key == TEMP_ROOT_ENV {
+                        owned.clone()
+                    } else {
+                        None
+                    }
+                },
+                os_temp.clone(),
+            )
+        };
+        let default = os_temp.join("cyrup-subagents");
+        assert_eq!(with(None), default, "unset");
+        assert_eq!(with(Some("")), default, "empty is not a configured root");
+        assert_eq!(with(Some("   ")), default, "nor is whitespace");
+        assert_eq!(with(Some("\t\n")), default);
+        assert_eq!(
+            with(Some("  /scratch/roots  ")),
+            PathBuf::from("/scratch/roots"),
+            "a configured root is trimmed before it is used"
+        );
+        // `path.resolve` — a relative value is made absolute ONCE, here, so every consumer reads the
+        // same directory whatever cwd it happens to run with.
+        let relative = with(Some("rel/root"));
+        assert!(
+            relative.is_absolute(),
+            "a relative override must be resolved, got {relative:?}"
+        );
+        assert!(relative.ends_with("rel/root"), "{relative:?}");
+    }
+
+    /// CFG-074's `Verify` line for this crate: the one env var the row confirmed is cyrup-ORIGINAL
+    /// must carry a `[CYRUP-DELTA]` in the doc block that declares it, and the one that turned out to
+    /// be a RENAME of a real upstream variable must instead cite the upstream name — so neither can
+    /// be re-filed as an unexplained invention by the next enumeration.
+    ///
+    /// Killing mutation: deleting either doc block.
+    #[test]
+    fn the_cyrup_only_and_renamed_env_vars_declare_which_they_are() {
+        let nested = include_str!("nested_events.rs");
+        let doc = doc_block_above(nested, "pub const TEMP_ROOT_ENV");
+        assert!(
+            doc.contains("PI_SUBAGENTS_TEMP_ROOT"),
+            "the rename must name the upstream variable it renames:\n{doc}"
+        );
+        let spawn_plan = include_str!("../exec/spawn_plan.rs");
+        let doc = doc_block_above(spawn_plan, "pub const AGENT_NAME_ENV_VAR");
+        assert!(
+            doc.contains("[CYRUP-DELTA]"),
+            "a cyrup-original env var must carry a delta:\n{doc}"
+        );
+    }
+
+    /// The contiguous run of `///` lines immediately above the line starting with `decl`.
+    fn doc_block_above(source: &str, decl: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(decl))
+            .unwrap_or_else(|| panic!("{decl} not found"));
+        let mut start = at;
+        while start > 0 && lines[start - 1].trim_start().starts_with("///") {
+            start -= 1;
+        }
+        assert!(start < at, "{decl} has no doc block at all");
+        lines[start..at].join("\n")
+    }
 
     /// Unique root id per test so parallel tests never share a route directory (routes are also
     /// keyed by a random capability token, so this is belt-and-suspenders).

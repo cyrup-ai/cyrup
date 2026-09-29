@@ -38,7 +38,22 @@ use crate::transport::target::{self, BrokerConnectTarget};
 
 /// The hidden subcommand the broker re-exec appends (mirrors `__subagent-runner`).
 pub const INTERCOM_BROKER_SUBCOMMAND: &str = "__intercom-broker";
-/// The broker-binary override (mirrors `CYRUP_SUBAGENT_BINARY`; pi `brokerCommand`).
+/// The broker-binary override (mirrors `CYRUP_SUBAGENT_BINARY`).
+///
+/// **`[CYRUP-DELTA]` — CFG-074: cyrup-only, forced by the port mechanism.** `pi-intercom` has no
+/// broker-binary variable at any tag; `spawn.ts` resolves the thing it launches through NODE'S OWN
+/// module resolution — `getTsxCliPath` (`broker/spawn.ts:46-63`) `require.resolve("tsx")`s from the
+/// extension directory and falls back to two fixed layouts — so upstream's "which broker" question is
+/// answered by the package layout and has no operator-facing spelling. Its `PI_INTERCOM_PI_BIN` /
+/// `PI_BIN` (`project-agent.ts`) name the PI binary to launch in a Herdr pane: a different object,
+/// which is why this is not a rename of them.
+///
+/// cyrup's broker is not a module but the `cyrup` binary re-exec'd with
+/// [`INTERCOM_BROKER_SUBCOMMAND`], so the equivalent of upstream's resolution is `current_exe()` —
+/// and that is exactly what runs when this variable is unset, which is every production process. The
+/// override exists because `current_exe()` has no analogue of `require.resolve`'s fallbacks: a test
+/// harness, or an install whose binary is not the one that should host the broker, has no other way
+/// to name it.
 pub const ENV_INTERCOM_BROKER_BINARY: &str = "CYRUP_INTERCOM_BROKER_BINARY";
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
@@ -527,6 +542,50 @@ mod tests {
     )]
     use super::*;
     use crate::transport::target::{BrokerTcpEndpoint, INTERCOM_TCP_HOST};
+
+    /// CFG-074's `Verify` line for this crate: the env var this crate INVENTED carries a
+    /// `[CYRUP-DELTA]` in the doc block that declares it, and the two that turned out to be RENAMES
+    /// of real `pi-intercom` variables cite the upstream names instead — so the next enumeration of
+    /// the env surface reads the answer at the declaration rather than re-filing either as an
+    /// invention. (The ledger row that enumerated them did exactly that, from a `PI_*` census whose
+    /// "full set" was incomplete: `broker/paths.ts:52,57` declares both.)
+    ///
+    /// Killing mutation: deleting any of the three doc blocks.
+    #[test]
+    fn the_cyrup_only_broker_binary_var_declares_its_delta_and_the_renames_name_their_originals() {
+        let spawn_rs = include_str!("spawn.rs");
+        let doc = doc_block_above(spawn_rs, "pub const ENV_INTERCOM_BROKER_BINARY");
+        assert!(
+            doc.contains("[CYRUP-DELTA]"),
+            "a cyrup-original env var must declare it:\n{doc}"
+        );
+        let target_rs = include_str!("target.rs");
+        for (decl, upstream) in [
+            ("pub const ENV_INTERCOM_TRANSPORT", "PI_INTERCOM_TRANSPORT"),
+            ("pub const ENV_INTERCOM_TCP", "PI_INTERCOM_TCP"),
+        ] {
+            let doc = doc_block_above(target_rs, decl);
+            assert!(
+                doc.contains(upstream),
+                "{decl} renames {upstream} and must say so:\n{doc}"
+            );
+        }
+    }
+
+    /// The contiguous run of `///` lines immediately above the line starting with `decl`.
+    fn doc_block_above(source: &str, decl: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(decl))
+            .unwrap_or_else(|| panic!("{decl} not found"));
+        let mut start = at;
+        while start > 0 && lines[start - 1].trim_start().starts_with("///") {
+            start -= 1;
+        }
+        assert!(start < at, "{decl} has no doc block at all");
+        lines[start..at].join("\n")
+    }
 
     /// Read length-prefixed frames off `stream` until the first one arrives, answer it with
     /// `reply`, and hand the probe frame back to the test as raw JSON — a broker stand-in narrow

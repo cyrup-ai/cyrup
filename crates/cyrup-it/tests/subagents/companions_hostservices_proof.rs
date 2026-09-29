@@ -55,6 +55,9 @@ fn assistant(s: &str) -> Message {
         api: "faux".into(),
         response_model: None,
         response_id: None,
+        // PROV-091 (sibling lane): `AssistantMessage` grew this field in `cyrup-core`; this
+        // fixture message declares no provider thinking level.
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,

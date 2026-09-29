@@ -515,6 +515,7 @@ fn error_event(
         api: api.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: if aborted {
@@ -560,6 +561,11 @@ struct Decoder {
     tool_json: HashMap<usize, SharedStr>,
     usage: Usage,
     response_id: Option<String>,
+    /// Pi `partial.providerThinkingLevel` (`pi-messages.ts:201-203`, `:213-215` @v0.87.1): the exact
+    /// provider-native effort a backend reports for the turn, carried on the `done`/`error` frame
+    /// beside `responseId`. Assigned only when the frame CARRIES the key — see the terminal arms.
+    /// PROV-091.
+    provider_thinking_level: Option<String>,
     diagnostics: Option<Vec<AssistantMessageDiagnostic>>,
     stop_reason: StopReason,
     error_message: Option<String>,
@@ -572,6 +578,7 @@ impl Decoder {
             tool_json: HashMap::new(),
             usage: Usage::default(),
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             // Pi seeds `stopReason: "pending"` (pi-messages.ts:184).
             stop_reason: StopReason::Pending,
@@ -603,6 +610,7 @@ impl Decoder {
             api: api.clone(),
             response_model: None,
             response_id: self.response_id.clone(),
+            provider_thinking_level: self.provider_thinking_level.clone(),
             diagnostics: self.diagnostics.clone(),
             usage: self.usage.clone(),
             stop_reason: self.stop_reason,
@@ -628,6 +636,17 @@ impl Decoder {
     /// Pi `appendRewriteDiagnostic` (pi-messages.ts:165-174): a `pi_messages_rewrite` record
     /// carrying `{...rewrite}` as its details. Spread verbatim, exactly as Pi does, so a backend
     /// that adds a field to the impact summary is not silently dropped.
+    /// Pi's GUARDED copy: `if (event.providerThinkingLevel !== undefined) { partial.
+    /// providerThinkingLevel = event.providerThinkingLevel; }` (`pi-messages.ts:201-203`, `:213-215`
+    /// @v0.87.1). Deliberately unlike the `Object.assign` that sits beside it — which overwrites
+    /// `responseId` with `undefined` when the frame omits it — so a level already on the partial
+    /// survives a terminal frame that does not restate it. PROV-091.
+    fn apply_provider_thinking_level(&mut self, event: &Value) {
+        if let Some(level) = event.get("providerThinkingLevel").and_then(Value::as_str) {
+            self.provider_thinking_level = Some(level.to_string());
+        }
+    }
+
     fn append_rewrite(&mut self, rewrite: Option<&Value>) {
         let Some(rewrite) = rewrite.filter(|v| v.is_object()) else {
             return;
@@ -776,6 +795,7 @@ async fn process_event(
                 .get("responseId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            dec.apply_provider_thinking_level(event);
             dec.append_rewrite(event.get("rewrite"));
             sink.send(StreamEvent::terminal(dec.snapshot_owned(model, api)))
                 .await;
@@ -794,6 +814,7 @@ async fn process_event(
                 .get("responseId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            dec.apply_provider_thinking_level(event);
             dec.append_rewrite(event.get("rewrite"));
             sink.send(StreamEvent::terminal(dec.snapshot_owned(model, api)))
                 .await;
@@ -1388,6 +1409,82 @@ mod tests {
         assert_eq!(message.stop_reason, StopReason::Stop);
         assert_eq!(message.response_id.as_deref(), Some("resp_9"));
         assert_eq!(message.content, vec![Content::text("Hello")]);
+    }
+
+    /// PROV-091 — a `done` frame's `providerThinkingLevel` settles onto the message
+    /// (`pi-messages.ts:201-203` @v0.87.1). The field is the record of the exact provider-native
+    /// effort a turn ran at, and the anthropic-messages adapter replays it as an `output_config`
+    /// marker on the next request, so dropping it here silently changes that request's prefix.
+    #[tokio::test]
+    async fn prov091_done_frame_carries_provider_thinking_level() {
+        let raw = concat!(
+            "data: {\"type\":\"start\"}\n\n",
+            "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
+            "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"hi\"}\n\n",
+            "data: {\"type\":\"done\",\"reason\":\"stop\",\"responseId\":\"resp_1\",\"providerThinkingLevel\":\"xhigh\",",
+            "\"usage\":{\"input\":1,\"output\":1,\"totalTokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = collect(raw, &model()).await;
+        let StreamEvent::Done { message, .. } = events.last().expect("a terminal") else {
+            panic!("expected a done terminal, got {:?}", events.last());
+        };
+        assert_eq!(message.provider_thinking_level.as_deref(), Some("xhigh"));
+        assert_eq!(message.response_id.as_deref(), Some("resp_1"));
+    }
+
+    /// The same for the `error` terminal (`pi-messages.ts:213-215`), where the field is the only
+    /// record of what effort the failed turn was attempted at.
+    #[tokio::test]
+    async fn prov091_error_frame_carries_provider_thinking_level() {
+        let raw = concat!(
+            "data: {\"type\":\"start\"}\n\n",
+            "data: {\"type\":\"error\",\"reason\":\"error\",\"errorMessage\":\"boom\",",
+            "\"providerThinkingLevel\":\"max\",\"usage\":{\"input\":1,\"output\":0,\"totalTokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = collect(raw, &model()).await;
+        let StreamEvent::Error { error, .. } = events.last().expect("a terminal") else {
+            panic!("expected an error terminal, got {:?}", events.last());
+        };
+        assert_eq!(error.provider_thinking_level.as_deref(), Some("max"));
+        assert_eq!(error.error_message.as_deref(), Some("boom"));
+    }
+
+    /// The GUARDED half of pi's copy: `if (event.providerThinkingLevel !== undefined)`
+    /// (`pi-messages.ts:201-203`, `:213-215`) — deliberately unlike the `Object.assign` beside it,
+    /// which overwrites `responseId` with `undefined` when the frame omits it. A terminal frame that
+    /// does not restate the level must leave whatever the partial already held untouched, so the
+    /// frame is not itself the only chance to learn it.
+    #[tokio::test]
+    async fn prov091_a_terminal_without_the_key_does_not_clear_the_level() {
+        let (sink, mut rx) = channel(16);
+        let api = ApiId::from(API_ID);
+        let m = model();
+        let task = tokio::spawn(async move {
+            let mut dec = Decoder::new();
+            // The partial already carries a level, as it would after an earlier frame set it.
+            dec.provider_thinking_level = Some("medium".to_string());
+            let event = serde_json::json!({
+                "type": "done",
+                "reason": "stop",
+                "usage": { "input": 1, "output": 1, "totalTokens": 2 },
+            });
+            process_event(&event, &mut dec, &m, &api, &sink).await;
+        });
+        let mut last = None;
+        while let Some(ev) = rx.recv().await {
+            last = Some(ev);
+        }
+        task.await.unwrap();
+        let Some(StreamEvent::Done { message, .. }) = last else {
+            panic!("expected a done terminal, got {last:?}");
+        };
+        assert_eq!(
+            message.provider_thinking_level.as_deref(),
+            Some("medium"),
+            "an omitted key must not clear a level the partial already held"
+        );
     }
 
     /// A backend `toolcall_delta` stream is re-parsed on EVERY delta, so `partial` shows the

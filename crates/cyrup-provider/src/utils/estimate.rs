@@ -8,6 +8,7 @@
 //! exactly, so the estimate is byte-identical to Pi for non-ASCII content.
 
 use crate::context::{Context, ToolDef};
+use crate::utils::text::get_system_message_text;
 use cyrup_core::{Content, Message, Usage};
 
 /// Per-call context-usage estimate (Pi `ContextUsageEstimate`, estimate.ts:3-12).
@@ -80,6 +81,15 @@ pub fn estimate_text_and_image_content_tokens(content: &[Content]) -> u64 {
 /// Estimate tokens for one message (Pi `estimateMessageTokens`, estimate.ts:45-61).
 pub fn estimate_message_tokens(message: &Message) -> u64 {
     match message {
+        // PROV-083a — pi `estimate.ts:49-55` @v0.87.1: the rendered prompt text (content plus its
+        // sections) plus BOTH tool lists, each through `estimateToolsTokens`. Note this arm returns
+        // TOKENS, not chars: the three sub-totals are each rounded up independently, exactly as
+        // upstream's three `estimate*Tokens` calls are, so it is not equivalent to summing chars.
+        Message::System(m) => {
+            estimate_text_tokens(&get_system_message_text(m))
+                + estimate_tools_tokens(&m.tools_added)
+                + estimate_tools_tokens(&m.tools_removed)
+        }
         Message::User { content, .. } => estimate_text_and_image_content_tokens(content),
         Message::ToolResult { content, .. } => estimate_text_and_image_content_tokens(content),
         Message::Assistant(assistant) => {
@@ -104,6 +114,7 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
 /// types.ts:379/402 and `AssistantMessage`).
 fn message_timestamp(message: &Message) -> i64 {
     match message {
+        Message::System(m) => m.timestamp,
         Message::User { timestamp, .. } | Message::ToolResult { timestamp, .. } => *timestamp,
         Message::Assistant(assistant) => assistant.timestamp,
     }
@@ -176,9 +187,12 @@ fn estimate_messages(messages: &[Message]) -> ContextUsageEstimate {
     }
 }
 
-/// `estimateToolsTokens` (Pi `estimate.ts:105-108` @v0.83.0): `undefined`/empty ⇒ 0, else the
-/// token estimate of the JSON-stringified tool array.
-fn estimate_tools_tokens(tools: &[ToolDef]) -> u64 {
+/// `estimateToolsTokens` (Pi `estimate.ts:114-117` @v0.87.1, `:105-108` @v0.83.0):
+/// `undefined`/empty ⇒ 0, else the token estimate of the JSON-stringified tool array.
+///
+/// Generic over the element since PROV-083a: upstream's parameter is `readonly unknown[]`, and a
+/// system message's `toolsRemoved` is a `ToolReference[]`, not a `Tool[]`.
+fn estimate_tools_tokens<T: serde::Serialize>(tools: &[T]) -> u64 {
     if tools.is_empty() {
         return 0;
     }
@@ -253,8 +267,9 @@ pub fn estimate_message_list_tokens(messages: &[Message]) -> ContextUsageEstimat
 }
 
 /// Serialize the tool defs the way `JSON.stringify(context.tools)` would (so the char count matches
-/// Pi). [`ToolDef`] is camelCase-serde, so this is byte-1:1 with Pi's `Tool[]` JSON.
-fn tools_to_json(tools: &[ToolDef]) -> serde_json::Value {
+/// Pi). [`ToolDef`] and [`cyrup_core::ToolReference`] are camelCase-serde, so this is byte-1:1 with
+/// Pi's `Tool[]` / `ToolReference[]` JSON.
+fn tools_to_json<T: serde::Serialize>(tools: &[T]) -> serde_json::Value {
     serde_json::to_value(tools).unwrap_or(serde_json::Value::Null)
 }
 
@@ -465,5 +480,56 @@ mod tests {
         assert!(expected > 0, "the fixture tool must cost something");
         assert_eq!(with.tokens, without.tokens + expected);
         assert_eq!(with.trailing_tokens, without.trailing_tokens + expected);
+    }
+
+    /// PROV-083a — `estimateMessageTokens`'s system arm (`estimate.ts:49-55` @v0.87.1):
+    /// `estimateTextTokens(getSystemMessageText(m)) + estimateToolsTokens(m.toolsAdded) +
+    /// estimateToolsTokens(m.toolsRemoved)`.
+    ///
+    /// The three sub-totals are rounded up INDEPENDENTLY, so the result is NOT `ceil(total_chars/4)`;
+    /// this test pins that, and pins that BOTH tool lists are charged (the coding-agent's own
+    /// `compaction.ts:324-334` estimator charges only `toolsAdded` — two upstream functions, two
+    /// formulas). Red before the arm existed: a system message estimated as 0 tokens.
+    #[test]
+    fn system_message_charges_prompt_text_and_both_tool_lists() {
+        let tools = vec![ToolDef {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({ "type": "object" }),
+            constrained_sampling: None,
+        }];
+        let removed = vec![cyrup_core::ToolReference::new("write")];
+        let sections =
+            cyrup_core::Sections::from_iter([("tone".to_string(), Some("be terse".to_string()))]);
+        let m = Message::System(cyrup_core::SystemMessage {
+            content: vec![Content::text("be helpful")],
+            sections: Some(sections),
+            tools_added: tools.clone(),
+            tools_removed: removed.clone(),
+            timestamp: 3,
+        });
+
+        // The rendered prompt is content + section values joined `"\n\n"` (`utils/text.ts:15-21`).
+        let prompt = "be helpful\n\nbe terse";
+        let expected = estimate_text_tokens(prompt)
+            + estimate_tools_tokens(&tools)
+            + estimate_tools_tokens(&removed);
+        assert_eq!(estimate_message_tokens(&m), expected);
+        assert!(expected > 0, "a system message is not free");
+
+        // Each term is independently non-zero and independently rounded.
+        assert_eq!(estimate_text_tokens(prompt), 5, "20 chars / 4");
+        assert!(
+            estimate_tools_tokens(&removed) > 0,
+            "`toolsRemoved` is charged too"
+        );
+
+        // An EMPTY system message costs nothing — `estimateToolsTokens` short-circuits on empty
+        // (`estimate.ts:115`) and the empty prompt estimates 0.
+        let bare = Message::System(cyrup_core::SystemMessage::default());
+        assert_eq!(estimate_message_tokens(&bare), 0);
+
+        // `message_timestamp` reads the system arm, so the usage-prefix walk sees it.
+        assert_eq!(super::message_timestamp(&m), 3);
     }
 }

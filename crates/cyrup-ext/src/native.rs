@@ -375,12 +375,25 @@ impl HostCtx {
         Arc::clone(&self.human_wait)
     }
 
-    /// Deadlock guard (R-08-008): returns `Err(ExtError::Deadlock)` if a session-replacement /
-    /// turn-starting control op (new-session/switch/fork/navigate/reload/compact/wait-idle/
-    /// send-message/send-user-message) is attempted from an event handler. Authoritative regardless
-    /// of the guest SDK's types. GAP-11: `set_model`/`set_thinking_level` are EXEMPT — Pi allows them
-    /// from any handler (loader.ts:342-354); live.rs queues them unconditionally and they apply at the
-    /// store-free turn-boundary drain, so this gate is not consulted for them.
+    /// Deadlock guard (R-08-008): returns `Err(ExtError::Deadlock)` if a session-replacement
+    /// control op (new-session/switch/fork/navigate/reload/compact/wait-idle) is attempted from an
+    /// event handler. Authoritative regardless of the guest SDK's types.
+    ///
+    /// EXEMPT, and live.rs does not consult this gate for any of them:
+    /// * GAP-11 — `set_model`/`set_thinking_level`; pi allows them from any handler
+    ///   (`loader.ts:342-354`).
+    /// * EXT-087 — `send-message`/`send-user-message`; upstream's bodies carry no tier check at all
+    ///   (`core/extensions/loader.ts:351-354`, `:356-358` @v0.87.1). They queue unconditionally and
+    ///   apply at the post-settle drain in `cyrup-session-svc`'s `AgentSession::settle_run`.
+    ///
+    /// EXT-087, recorded because the row expected otherwise: there is no NATIVE send path to
+    /// exempt. This list used to name the two send ops, which read as though a native extension
+    /// were gated on them somewhere — it is not. `ControlOp::SendMessage`/`SendUserMessage` have
+    /// exactly ONE producer in the workspace, `host/live.rs`'s two wasm imports; a native extension
+    /// queues through `HostServices::control` directly, which has never consulted a tier. So the
+    /// wasm and native paths agree BECAUSE this gate is gone from the wasm side, not because a
+    /// matching native gate was also removed — and the EXT-054/-055 divergence class the row was
+    /// worried about does not arise here.
     pub fn require_command_tier(&self) -> Result<(), ExtError> {
         if self.tier == CtxTier::Command {
             Ok(())
@@ -410,6 +423,7 @@ pub(crate) type InitParts = (
     Vec<String>,
     u32,
     Vec<String>,
+    bool,
     bool,
     bool,
 );
@@ -446,6 +460,10 @@ pub struct InitApi {
     /// the same reason as `markdown_transformer`: upstream's `Set` de-duplicates by handler and a
     /// native has exactly one [`NativeExtension::on_terminal_input`].
     terminal_input: bool,
+    /// EXT-064: whether this extension subscribed to git-branch changes. A BOOL for the same
+    /// reason as `terminal_input`: a native has exactly one
+    /// [`NativeExtension::on_branch_change`].
+    branch_change: bool,
 }
 
 impl InitApi {
@@ -537,6 +555,15 @@ impl InitApi {
         self.terminal_input = true;
     }
 
+    /// Subscribe to git-branch changes (EXT-064; pi
+    /// `ReadonlyFooterDataProvider.onBranchChange(callback)`,
+    /// `core/footer-data-provider.ts:139-143` @v0.87.1). The handler itself is
+    /// [`NativeExtension::on_branch_change`]; this only declares that it exists, matching the guest
+    /// side where the callback lives behind the `on-branch-change` export.
+    pub fn subscribe_branch_change(&mut self) {
+        self.branch_change = true;
+    }
+
     /// Declare a CLI flag (EXT-035; pi `registerFlag`, `extensions/loader.ts:274-410` @v0.83.0).
     /// `spec` is the flag's JSON spec; the resolved value is read back through
     /// [`crate::ExtensionRegistry::flag_value`].
@@ -598,6 +625,7 @@ impl InitApi {
             self.bus_topics,
             self.markdown_transformer,
             self.terminal_input,
+            self.branch_change,
         )
     }
 }
@@ -886,6 +914,18 @@ pub trait NativeExtension: Send + Sync {
     fn on_terminal_input(&self, _data: &str) -> Option<crate::TerminalInputResult> {
         None
     }
+
+    /// The git branch changed (EXT-064; pi `ReadonlyFooterDataProvider.onBranchChange`'s callback,
+    /// invoked from `notifyBranchChange`, `core/footer-data-provider.ts:197-199` @v0.87.1). Only
+    /// consulted on a native that declared [`InitApi::subscribe_branch_change`], and only on a REAL
+    /// change — upstream calls its callbacks inside `if (this.cachedBranch !== next)` (`:224-227`).
+    ///
+    /// `branch` is upstream's `getGitBranch()` tri-state verbatim: a branch name, the literal
+    /// `"detached"`, or `None` outside a repo (`:126-132`).
+    ///
+    /// Sync, and subject to the same "must not block" hazard as [`Self::on_terminal_input`]: it is
+    /// driven from the TUI's own poll arm.
+    fn on_branch_change(&self, _branch: Option<&str>) {}
 
     /// Render a custom ENTRY this extension declared a renderer for via
     /// [`InitApi::register_entry_renderer`] (Pi `EntryRenderer`, extensions/types.ts:1165-1169).

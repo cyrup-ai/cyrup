@@ -92,9 +92,11 @@ pub const COPILOT_HEADERS: [(&str, &str); 4] = [
 /// `auth/oauth/github-copilot.ts:17`).
 pub const COPILOT_API_VERSION: &str = "2026-06-01";
 
-/// Deadline on the model-listing call (Pi `AbortSignal.timeout(5000)`,
-/// `auth/oauth/github-copilot.ts:123`).
-const MODELS_REQUEST_TIMEOUT: Duration = Duration::from_millis(5000);
+/// Pi's per-attempt deadline — `AbortSignal.timeout(5000)` inside `fetchWithRateLimitRetry`'s loop
+/// (`auth/oauth/github-copilot.ts:150` @v0.87.1), which is the only bound that survives the
+/// `{maxRetries: 0, maxElapsedMs: 0}` policy this refresh path passes (`:359-362`). PROV-098
+/// corrected the name and the citation, which used to read `:123` and "on the model-listing call".
+const COPILOT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// Safety margin subtracted from the Copilot token's `expires_at` (Pi
 /// `expiresAt * 1000 - 5 * 60 * 1000`, `auth/oauth/github-copilot.ts:260`). Note this is a *second*
@@ -131,7 +133,7 @@ impl CopilotAuthError {
 /// The full Copilot catalog (1:1 with Pi `GITHUB_COPILOT_MODELS`). A parse failure yields an empty
 /// catalog (surfaced loudly by the count test) rather than a panic (NO-PANIC policy).
 pub fn github_copilot_models() -> Vec<Model> {
-    serde_json::from_str(GITHUB_COPILOT_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(GITHUB_COPILOT_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The Copilot [`ProviderAuth`] (Pi `github-copilot.ts:16-19`): an API key from
@@ -663,8 +665,8 @@ impl GitHubCopilotOAuth {
     /// `auth/oauth/github-copilot.ts:168-194` @v0.87.1, as `refreshGitHubCopilotToken` calls it at
     /// `:354-367`).
     ///
-    /// `allowPolicyFallback` is `baseUrl === "https://api.individual.githubcopilot.com"` (`:171`) on
-    /// THIS path too — refresh and login share one fetcher upstream and differ only in the retry
+    /// `allowPolicyFallback` is `baseUrl === "https://api.individual.githubcopilot.com"` (`:177`,
+    /// under the comment at `:175-176`) on THIS path too — refresh and login share one fetcher upstream and differ only in the retry
     /// policy. Some Individual accounts report `model_picker_enabled: false` for every row despite
     /// explicit enabled policies; limiting the fallback to that endpoint keeps strict picker
     /// semantics everywhere else. It is derived from the REAL base url rather than
@@ -676,10 +678,11 @@ impl GitHubCopilotOAuth {
     /// `[]` at the first token refresh for exactly those accounts (PROV-098).
     ///
     /// `[CYRUP-DELTA]` the rate-limit retry loop is not reused on this path. Upstream passes
-    /// `{maxRetries: 0, maxElapsedMs: 0}` (`:361`): `maxElapsedMs: 0` leaves the budget signal
-    /// unarmed (`:136-139`) and `retry === retryPolicy.maxRetries` holds on the very first iteration
-    /// (`:157`), so `fetchWithRateLimitRetry` returns the first response unconditionally — a plain
-    /// GET with the same 5s per-request timeout (`:150`) is byte-identical on the wire.
+    /// `{maxRetries: 0, maxElapsedMs: 0}` (`:359-362` — `maxRetries: 0` at `:360`,
+    /// `maxElapsedMs: 0` at `:361`): `maxElapsedMs: 0` leaves the budget signal unarmed (`:141-144`)
+    /// and `retry === retryPolicy.maxRetries` holds on the very first iteration (`:152`), so
+    /// `fetchWithRateLimitRetry` returns the first response unconditionally — a plain GET with the
+    /// same 5s per-attempt timeout (`:150`) is byte-identical on the wire.
     async fn fetch_available_model_ids(
         &self,
         copilot_token: &str,
@@ -698,7 +701,7 @@ impl GitHubCopilotOAuth {
         headers.push(("X-GitHub-Api-Version", COPILOT_API_VERSION.to_string()));
 
         let raw = self
-            .fetch_json(&url, &headers, Some(MODELS_REQUEST_TIMEOUT))
+            .fetch_json(&url, &headers, Some(COPILOT_ATTEMPT_TIMEOUT))
             .await?;
         parse_github_copilot_model_catalog(&raw, allow_policy_fallback)
             .map(|catalog| catalog.available_model_ids)
@@ -841,12 +844,14 @@ mod tests {
 
     // ------------------------------------------------------------------ catalog
 
-    /// The catalog is Pi's `GITHUB_COPILOT_MODELS` verbatim at `b0c2a90e` — 28 models across the
-    /// three wire APIs Pi declares at `github-copilot.ts:27-31`.
+    /// The catalog is pi's `GITHUB_COPILOT_MODELS` verbatim, live since PROV-071 — 32 models
+    /// across the three wire APIs pi declares at `github-copilot.ts:27-31`. It was 28 while the
+    /// catalog was frozen at `b0c2a90e`, and the split moved as well as the total: Copilot put its
+    /// `gpt-*` rows on Responses and its Claude rows on Messages.
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = github_copilot_models();
-        assert_eq!(models.len(), 28);
+        assert_eq!(models.len(), 32);
         assert!(
             models
                 .iter()
@@ -856,8 +861,8 @@ mod tests {
 
         let count = |api: &str| models.iter().filter(|m| m.api.as_str() == api).count();
         assert_eq!(count("anthropic-messages"), 9);
-        assert_eq!(count("openai-completions"), 7);
-        assert_eq!(count("openai-responses"), 12);
+        assert_eq!(count("openai-completions"), 6);
+        assert_eq!(count("openai-responses"), 17);
         // Nothing outside the three APIs Pi's `createProvider` maps.
         assert_eq!(
             count("anthropic-messages") + count("openai-completions") + count("openai-responses"),
@@ -903,9 +908,15 @@ mod tests {
         assert_eq!(api_of("kimi-k2.7-code"), "openai-completions");
     }
 
-    /// Spot-check a row against Pi's literal source: `claude-fable-5` (`github-copilot.models.ts`
-    /// @`b0c2a90e`) — 1M window, the three `openai-completions` compat negatives, and the
+    /// Spot-check a row against pi's literal source: `claude-fable-5` — 1M window and the
     /// `off: null` thinking level that makes "off" unsupported.
+    ///
+    /// It has MOVED WIRE: `openai-completions` while the catalog was frozen at `b0c2a90e`,
+    /// `anthropic-messages` now, and the compat block moved with it — the three
+    /// completions-shaped negatives (`supportsStore`, `supportsDeveloperRole`,
+    /// `supportsReasoningEffort`) are gone and `forceAdaptiveThinking` has replaced them. That is
+    /// the difference the frozen floor was hiding on a Claude row: cyrup was sending Copilot's
+    /// Claude traffic down the Completions encoder.
     #[test]
     fn claude_fable_5_matches_the_upstream_row() {
         let models = github_copilot_models();
@@ -914,7 +925,7 @@ mod tests {
             .find(|m| m.id.as_str() == "claude-fable-5")
             .expect("claude-fable-5");
         assert_eq!(m.name, "Claude Fable 5");
-        assert_eq!(m.api.as_str(), "openai-completions");
+        assert_eq!(m.api.as_str(), "anthropic-messages");
         assert_eq!(m.context_window, 1_000_000);
         assert_eq!(m.max_tokens, 128_000);
         assert_eq!(m.cost.input, 10.0);
@@ -922,9 +933,11 @@ mod tests {
         assert_eq!(m.cost.cache_read, 1.0);
         assert_eq!(m.cost.cache_write, 12.5);
         let compat = m.compat.as_ref().expect("compat");
-        assert_eq!(compat.supports_store, Some(false));
-        assert_eq!(compat.supports_developer_role, Some(false));
-        assert_eq!(compat.supports_reasoning_effort, Some(false));
+        assert_eq!(compat.force_adaptive_thinking, Some(true));
+        assert_eq!(compat.supports_mid_convo_system_messages, Some(true));
+        assert_eq!(compat.supports_store, None);
+        assert_eq!(compat.supports_developer_role, None);
+        assert_eq!(compat.supports_reasoning_effort, None);
         let map = m.thinking_level_map.as_ref().expect("thinkingLevelMap");
         assert_eq!(map.get("off"), Some(&None));
         assert_eq!(map.get("xhigh"), Some(&Some("xhigh".to_string())));
@@ -1110,11 +1123,11 @@ mod tests {
         let models = github_copilot_models();
         let cred = oauth_cred(ext_with(
             EXT_AVAILABLE_MODEL_IDS,
-            json!(["gpt-5.4", "claude-sonnet-4.5", "not-in-catalog"]),
+            json!(["gpt-5.4", "claude-sonnet-4.6", "not-in-catalog"]),
         ));
         let filtered = filter_github_copilot_models(&models, Some(&cred));
         let ids: Vec<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["claude-sonnet-4.5", "gpt-5.4"]);
+        assert_eq!(ids, vec!["claude-sonnet-4.6", "gpt-5.4"]);
     }
 
     /// MIRROR cases: every fall-through in `:21-25` returns the FULL catalog.
@@ -1356,7 +1369,7 @@ mod tests {
         // Only ids in the embedded catalog are asserted, so the listing is the same shape login sees.
         const MODELS: &str = r#"{"data":[
             {"id":"gpt-5.4","model_picker_enabled":false,"policy":{"state":"enabled"}},
-            {"id":"claude-sonnet-4.5","model_picker_enabled":false,"policy":{"state":"enabled"}},
+            {"id":"claude-sonnet-4.6","model_picker_enabled":false,"policy":{"state":"enabled"}},
             {"id":"unconfigured","model_picker_enabled":false,"policy":{"state":"unconfigured"}}
         ]}"#;
 
@@ -1378,7 +1391,7 @@ mod tests {
         };
         assert_eq!(
             ext.get(EXT_AVAILABLE_MODEL_IDS),
-            Some(&json!(["gpt-5.4", "claude-sonnet-4.5"])),
+            Some(&json!(["gpt-5.4", "claude-sonnet-4.6"])),
             "the enabled policies stand in for the empty picker set"
         );
 
@@ -1480,7 +1493,7 @@ mod tests {
     fn provider_identity_and_env_mapping() {
         let p = github_copilot_provider();
         assert_eq!(p.id().as_str(), GITHUB_COPILOT_PROVIDER_ID);
-        assert!(p.get_model("claude-sonnet-4.5").is_some());
+        assert!(p.get_model("claude-sonnet-4.6").is_some());
         assert!(p.get_model("gpt-5.4").is_some());
         let vars =
             crate::env_api_keys::api_key_env_vars(GITHUB_COPILOT_PROVIDER_ID).expect("env mapping");
@@ -1604,7 +1617,7 @@ mod tests {
 
         let provider = github_copilot_provider_with(Arc::new(store), Arc::new(builtin_registry()))
             .with_auth_context(empty_env());
-        let mut model = provider.get_model("claude-sonnet-4.5").unwrap().clone();
+        let mut model = provider.get_model("claude-sonnet-4.6").unwrap().clone();
         model.base_url = format!("http://{catalog}");
         let msg = collect_message(provider.stream(
             &model,
@@ -1647,7 +1660,7 @@ mod tests {
             Arc::new(builtin_registry()),
         )
         .with_auth_context(Arc::new(env));
-        let mut model = provider.get_model("claude-sonnet-4.5").unwrap().clone();
+        let mut model = provider.get_model("claude-sonnet-4.6").unwrap().clone();
         model.base_url = format!("http://{catalog}");
         let _ = collect_message(provider.stream(
             &model,
@@ -1722,6 +1735,7 @@ mod tests {
             models
                 .get_available(Some(GITHUB_COPILOT_PROVIDER_ID))
                 .await
+                .expect("get_available")
                 .len(),
             3,
             "getAvailable() applies filterModels after the auth check"
@@ -1751,9 +1765,16 @@ mod tests {
             models
                 .check_auth(GITHUB_COPILOT_PROVIDER_ID)
                 .await
+                .expect("check_auth")
                 .is_none()
         );
-        assert!(models.get_available(None).await.is_empty());
+        assert!(
+            models
+                .get_available(None)
+                .await
+                .expect("get_available")
+                .is_empty()
+        );
         assert!(!models.get_models(None).is_empty());
     }
 

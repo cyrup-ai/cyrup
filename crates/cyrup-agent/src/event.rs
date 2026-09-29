@@ -3,7 +3,7 @@
 //! tagged enums add `rename_all_fields = "camelCase"` so payload fields are camelCase for
 //! Pi-interop (R-00-013).
 
-use cyrup_core::{AssistantMessage, Content, SharedStr, ToolCallId, Usage};
+use cyrup_core::{AssistantMessage, Content, SharedStr, SystemMessage, ToolCallId, Usage};
 use cyrup_provider::StreamEvent;
 use serde_json::Value;
 use std::sync::Arc;
@@ -22,6 +22,18 @@ use std::sync::Arc;
 /// raw context projection handed over by `cyrup-session` (SESS-043).
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentMessage {
+    /// The transcript's own system instructions and tool declarations (PROV-083a).
+    ///
+    /// Upstream this arm is not a merged app role at all: pi's `AgentMessage` union includes the
+    /// whole `Message` union (`packages/agent/src/types.ts:319` @v0.83.0), and `SystemMessage` joined
+    /// that union at v0.86.0 (`packages/ai/src/types.ts:553` @v0.87.1). `convertToLlm` passes it
+    /// straight through with `user`, `assistant` and `toolResult`
+    /// (`coding-agent/src/core/messages.ts:184-188`).
+    ///
+    /// A newtype over [`SystemMessage`] so its self-tagging serializer — which owns pi's key order,
+    /// the bare-string `content` form, and `Sections`' wire order — is the ONLY writer of these
+    /// bytes, here as in `cyrup_core::Message::System`.
+    System(SystemMessage),
     User {
         content: Vec<Content>,
         timestamp: Option<i64>,
@@ -149,9 +161,9 @@ impl serde::Serialize for AgentMessage {
     /// during the G43 review, not by any test — every existing assertion looked at parsed values,
     /// where the duplicate is invisible.
     ///
-    /// The three non-`Assistant` arms delegate to a private mirror enum carrying the identical serde
+    /// The three non-self-tagging arms delegate to a private mirror enum carrying the identical serde
     /// attributes, so their bytes are unchanged by construction; only the `Assistant` arm's spurious
-    /// outer tag is removed.
+    /// outer tag is removed. `System` self-tags like `Assistant` and so is absent from the mirror.
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -186,8 +198,9 @@ impl serde::Serialize for AgentMessage {
         }
 
         match self {
-            // Self-tagging: emits `role:"assistant"` first, then Pi's field order.
+            // Self-tagging: emits `role:"assistant"` / `role:"system"` first, then Pi's field order.
             AgentMessage::Assistant(m) => m.serialize(serializer),
+            AgentMessage::System(m) => m.serialize(serializer),
             AgentMessage::User { content, timestamp } => {
                 TaggedNonAssistant::User { content, timestamp }.serialize(serializer)
             }
@@ -241,6 +254,7 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
                 timestamp: Option<i64>,
             },
             Assistant(AssistantMessage),
+            System(SystemMessage),
             ToolResult(ToolResultMessage),
             Custom {
                 kind: String,
@@ -274,6 +288,7 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
             match serde_json::from_value::<Typed>(v).map_err(D::Error::custom)? {
                 Typed::User { content, timestamp } => AgentMessage::User { content, timestamp },
                 Typed::Assistant(a) => AgentMessage::Assistant(Arc::new(a)),
+                Typed::System(m) => AgentMessage::System(m),
                 Typed::ToolResult(t) => AgentMessage::ToolResult(t),
                 Typed::Custom {
                     kind,

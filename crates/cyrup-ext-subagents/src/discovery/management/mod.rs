@@ -1267,19 +1267,29 @@ mutationTools:\nthinking: low\n---\n\nBody\n",
         );
     }
 
+    /// SUBA-107 — this used to be `create_rejects_non_boolean_completion_guard_with_exact_pi_message`.
+    /// pi-subagents deleted the `completionGuard` setting at v0.70.1 (`7c98a696`); at v0.71.0
+    /// `agent-management.ts`'s `applyAgentConfig` (`:410-625`) has no `completionGuard` branch, and
+    /// an unrecognized config key is simply not read. Upstream does NOT refuse it by name the way
+    /// it refuses, say, a malformed `package` — so neither may cyrup. A `completionGuard` key of
+    /// ANY shape, including the non-boolean `"false"` that used to be the exact refusal this test
+    /// pinned, must now be IGNORED and the create must SUCCEED.
     #[tokio::test]
-    async fn create_rejects_non_boolean_completion_guard_with_exact_pi_message() {
+    async fn create_ignores_a_retired_completion_guard_key_instead_of_refusing_it() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
-        let bad = serde_json::json!({ "name": "test-runner", "description": "Run tests", "scope": "project", "completionGuard": "false" });
-        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&bad)))
+        let retired = serde_json::json!({ "name": "test-runner", "description": "Run tests", "scope": "project", "completionGuard": "false" });
+        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&retired)))
             .await
             .expect("no discovery error");
-        assert!(out.is_error);
         assert!(
+            !out.is_error,
+            "a retired, unknown config key must not refuse the create: {}",
             out.text
-                .contains("config.completionGuard must be a boolean"),
-            "{}",
+        );
+        assert!(
+            !out.text.contains("completionGuard"),
+            "nothing may mention the retired key: {}",
             out.text
         );
     }

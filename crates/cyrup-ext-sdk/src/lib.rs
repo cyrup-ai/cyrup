@@ -65,7 +65,7 @@ pub mod guest;
 mod tests;
 
 pub use api::{
-    ArgCompleter, BashOperations, CommandExec, ContentBlock, ExtensionApi,
+    ArgCompleter, BashOperations, BranchChangeHandler, CommandExec, ContentBlock, ExtensionApi,
     MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
     RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, RenderOptions,
     ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
@@ -74,7 +74,7 @@ pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
 };
 pub use ctx::{
-    BashCommand, CommandCtx, Ctx, ExecResult, ExtMode, HttpRequest, HttpResponse,
+    BashCommand, CommandCtx, Ctx, ExecResult, ExtMode, FooterData, HttpRequest, HttpResponse,
     HttpStreamResponse, Models, NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session,
     Signal, ToolCall, Ui,
 };
@@ -101,7 +101,7 @@ pub use widget::WidgetPlacement;
 /// instead of a downstream author's.
 pub mod prelude {
     pub use crate::api::{
-        ArgCompleter, BashOperations, CommandExec, ContentBlock, ExtensionApi,
+        ArgCompleter, BashOperations, BranchChangeHandler, CommandExec, ContentBlock, ExtensionApi,
         MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
         RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, RenderOptions,
         ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
@@ -110,7 +110,7 @@ pub mod prelude {
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
     };
     pub use crate::ctx::{
-        BashCommand, CommandCtx, Ctx, ExecResult, ExtMode, HttpRequest, HttpResponse,
+        BashCommand, CommandCtx, Ctx, ExecResult, ExtMode, FooterData, HttpRequest, HttpResponse,
         HttpStreamResponse, Models, NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session,
         Signal, ToolCall, Ui,
     };

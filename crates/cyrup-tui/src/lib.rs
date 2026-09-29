@@ -129,8 +129,8 @@ pub use auth_select::{
 };
 pub use autocomplete::{
     Applied, ArgumentSources, Autocomplete, Completion, CompletionContext, ExtensionCompletions,
-    LoginProviderArgument, ModelArgument, list_files as mention_list_files, mention_autocomplete,
-    mention_query,
+    LiveSource, LoginProviderArgument, ModelArgument, list_files as mention_list_files,
+    mention_autocomplete, mention_query,
 };
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use chrome::{

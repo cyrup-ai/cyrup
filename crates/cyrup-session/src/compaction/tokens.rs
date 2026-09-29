@@ -40,6 +40,26 @@ fn utf16_len(s: &str) -> usize {
 /// splits the arms this way.
 pub fn estimate_tokens(msg: &Message) -> u32 {
     let chars: usize = match msg {
+        // pi `compaction.ts:324-334` @v0.87.1 — the system case is its OWN arm and counts content
+        // chars, then each non-`null` section's length, then `JSON.stringify(toolsAdded).length`.
+        // `toolsRemoved` is deliberately NOT counted: this is the coding-agent's own cut-point
+        // estimator, and it differs from `cyrup_provider::estimate_message_tokens`, which ports
+        // `packages/ai/src/utils/estimate.ts:49-55` and DOES charge both lists. Two upstream
+        // functions, two formulas (PROV-083a).
+        Message::System(m) => {
+            let mut chars: usize = m.content.iter().map(text_and_image_chars).sum();
+            if let Some(sections) = &m.sections {
+                for section in sections.values() {
+                    chars += utf16_len(section);
+                }
+            }
+            if !m.tools_added.is_empty() {
+                // `JSON.stringify(system.toolsAdded).length`. Serialization of a `ToolDef` vec
+                // cannot fail; an impossible error contributes 0 rather than panicking.
+                chars += serde_json::to_string(&m.tools_added).map_or(0, |s| utf16_len(&s));
+            }
+            chars
+        }
         Message::User { content, .. } | Message::ToolResult { content, .. } => {
             content.iter().map(text_and_image_chars).sum()
         }
@@ -253,13 +273,35 @@ pub fn estimate_context_tokens_raw(messages: &[AgentMessage]) -> ContextUsageEst
 /// `context_edit` whose target was summarized away still counts as invalidating, exactly as
 /// upstream's `branchEntries.findIndex` / reverse walk does.
 ///
-/// CYRUP-DELTA (mechanism, full parity): upstream's fallback re-sums
-/// `getCurrentSystemMessage(projection.messages)` plus every `message.role !== "system"`
-/// (`compaction.ts:277-282`), because pi carries the system prompt as an in-band transcript message.
-/// cyrup's [`AgentMessage`] union has no system arm at all — the system prompt is built out-of-band
-/// by `crate::prompt` and never becomes a session entry — so `currentSystem` is unconditionally
-/// absent and the `role !== "system"` filter excludes nothing. The remaining sum over every
-/// projected message is therefore byte-identical to upstream's, with no arm to port.
+/// The fallback is upstream's, arm for arm (`compaction.ts:277-282`): the REPLAYED current system
+/// message counted ONCE, then every `message.role !== "system"`.
+///
+/// This used to be a `CYRUP-DELTA` claiming both halves were no-ops here, on the reasoning that
+/// "cyrup's [`AgentMessage`] union has no system arm at all" and that a system prompt "never becomes
+/// a session entry". That was TRUE when it was written, and PROV-083a is what ended it: adding the
+/// [`Message::System`] arm (`cyrup-core/src/message/conversation.rs`) and
+/// [`crate::agent_message::MessageRole::System`] turned both halves false in one step, and the delta
+/// then read as a licence to skip two arms that had become load-bearing. Concretely, with that arm
+/// present:
+///
+/// * a pi ≥v0.86 `{"type":"message","message":{"role":"system",…}}` entry deserializes as a
+///   KNOWN message entry rather than `Entry::Unknown` — pi writes such entries itself
+///   (`agent-session.ts:1420`,`:1441` @v0.87.1);
+/// * [`crate::context::context_message_role`] returns `Some(System)` for it, so it IS a projected
+///   message and the `role !== "system"` filter finally has something to exclude.
+///
+/// So both of upstream's arms became load-bearing on a resumed pi file, and summing every projected
+/// message instead over-counted it. pi replays the system messages into ONE current message —
+/// `content` joined `"\n\n"`, `sections` patched by name with a `null` DELETING, tools resolved —
+/// and charges that once; the per-message sum charges every system entry separately, including ones
+/// whose sections a later entry deleted. Two system entries where the second nulls a 60-char section
+/// the first added measured 23 tokens here against upstream's 8.
+///
+/// [`cyrup_provider::get_current_system_message`] is pi's `getCurrentSystemMessage`
+/// (`packages/ai/src/utils/transcript.ts:73-101` @v0.87.1) and [`estimate_tokens`]'s
+/// `Message::System` arm is pi's `case "system"` (`compaction.ts:324-334`) — both landed with
+/// PROV-083a, so this port is those two composed and is COUPLED to that row: unpicking PROV-083a
+/// unpicks this with it.
 pub fn estimate_projected_context_tokens(path: &[&Entry]) -> ContextUsageEstimate {
     let tagged = crate::context::build_context_agent_messages_tagged(path);
     let messages: Vec<AgentMessage> = tagged.iter().map(|(_, m)| m.clone()).collect();
@@ -289,10 +331,28 @@ pub fn estimate_projected_context_tokens(path: &[&Entry]) -> ContextUsageEstimat
         }
     }
 
-    let tokens = messages
+    // `const currentSystem = getCurrentSystemMessage(projection.messages);`
+    // `let tokens = currentSystem ? estimateTokens(currentSystem) : 0;` (`compaction.ts:277-278`).
+    // Only a `Core` message can be a system message, so narrowing to `Message` loses nothing —
+    // `get_current_tools`, which `get_current_system_message` consults for `toolsAdded`, reads system
+    // messages and nothing else.
+    let core: Vec<Message> = messages
         .iter()
-        .map(estimate_agent_message)
-        .fold(0u32, |a, b| a.saturating_add(b));
+        .filter_map(|m| match m {
+            AgentMessage::Core(c) => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut tokens = cyrup_provider::get_current_system_message(&core)
+        .map_or(0, |s| estimate_tokens(&Message::System(s)));
+    // `for (const message of projection.messages) if (message.role !== "system") tokens +=
+    // estimateTokens(message);` (`:279-281`) — the replayed head above already carries every system
+    // message's current contribution, so charging them again here would double-count.
+    for m in &messages {
+        if !matches!(m, AgentMessage::Core(Message::System(_))) {
+            tokens = tokens.saturating_add(estimate_agent_message(m));
+        }
+    }
     ContextUsageEstimate {
         tokens,
         usage_tokens: 0,

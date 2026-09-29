@@ -484,6 +484,7 @@ impl SubagentsExtension {
             let run_id = self
                 .executor
                 .spawn_background(BackgroundSingleRequest {
+                    tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
                     // SUBA-021: the slash surfaces advertise no `usageBudget` param upstream either.
@@ -846,6 +847,7 @@ impl SubagentsExtension {
             let run_id = self
                 .executor
                 .spawn_background(BackgroundSingleRequest {
+                    tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
                     // SUBA-021: the slash surfaces advertise no `usageBudget` param upstream either.

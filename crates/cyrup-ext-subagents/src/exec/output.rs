@@ -1043,16 +1043,82 @@ pub fn format_saved_output_reference(saved_path: &Path, full_output: &str) -> Sa
 // R-SA-024: argv/system-prompt steering for file-only output mode
 // ============================================================================================
 
+// ============================================================================================
+// SUBA-107 — output WRITE capability (upstream `single-output.ts:6-14` @v0.71.0)
+// ============================================================================================
+
+/// pi `READ_ONLY_OUTPUT_TOOLS` (`single-output.ts:6-9` @v0.71.0), verbatim and in source order.
+///
+/// This set used to live in `exec/completion_guard.rs` as `READ_ONLY_BUILTIN_TOOLS`, cyrup's port
+/// of the identically-named set in `completion-guard.ts`. Upstream DELETED that file at v0.70.1
+/// (`7c98a696`), keeping only this copy — so the set is now, on both sides, exclusively about one
+/// question: can this agent WRITE its output file itself, or must the runtime persist it for it?
+///
+/// Re-homing it corrected two omissions the old copy carried against upstream's own v0.70.0 list —
+/// `source_check` and `structured_output` were missing — and added `watchdog_diff`, which v0.71.0
+/// introduced. Without them an agent restricted to, say, `read` + `source_check` counted as
+/// write-capable here and was told "Write your findings to exactly this path", an instruction it
+/// had no tool to obey; upstream tells it to return the artifact in its final response instead.
+const READ_ONLY_OUTPUT_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "web_search",
+    "fetch_content",
+    "get_search_content",
+    "source_check",
+    "intercom",
+    "contact_supervisor",
+    "structured_output",
+    "watchdog_diff",
+];
+
+/// pi `hasOutputWriteCapability(tools, mcpDirectTools)` (`single-output.ts:11-14` @v0.71.0):
+///
+/// ```text
+/// if ((mcpDirectTools?.length ?? 0) > 0 || tools === undefined) return true;
+/// return tools.some((tool) => !READ_ONLY_OUTPUT_TOOLS.has(tool));
+/// ```
+///
+/// Re-scoped to this crate's [`AgentDefinition::tools`]/[`crate::discovery::types::ToolRef`]
+/// shapes: a `ToolRef::Mcp` entry is this crate's equivalent of a non-empty `mcpDirectTools`, and
+/// `ToolRef::ExtensionPath` counts as a non-read-only (write-capable-or-unknown) entry, exactly as
+/// an unrecognized builtin name would satisfy upstream's `tools.some(...)`.
+///
+/// `tools == None` ("no allowlist restriction, all builtins available", per
+/// [`AgentDefinition::tools`]'s own doc) is upstream's `tools === undefined` arm: write-capable.
+///
+/// `tools == Some(vec![])` — an EXPLICITLY empty allowlist — is NOT write-capable, because
+/// `[].some(...) === false`. An agent granted no tools at all cannot write anything.
+///
+/// This was `crate::exec::completion_guard::has_mutation_tool_capability` until SUBA-107 retired
+/// the completion-mutation guard; [`format_output_path_instruction`] was already its only live
+/// consumer, and is the consumer upstream has.
+#[must_use]
+pub fn has_output_write_capability(agent: &AgentDefinition) -> bool {
+    let Some(tools) = &agent.tools else {
+        return true;
+    };
+    tools.iter().any(|tool_ref| match tool_ref {
+        crate::discovery::types::ToolRef::Builtin(name) => {
+            !READ_ONLY_OUTPUT_TOOLS.contains(&name.as_str())
+        }
+        crate::discovery::types::ToolRef::Mcp(_)
+        | crate::discovery::types::ToolRef::ExtensionPath(_) => true,
+    })
+}
+
 /// G82 — source: `formatOutputPathInstruction`'s `capabilities` parameter
 /// (`pi-subagents/src/runs/shared/single-output.ts:79-82,85`). Upstream passes the resolved
 /// agent/step config straight in (`injectOutputPathSystemPrompt(systemPrompt, outputPath, agent)`,
 /// `execution.ts:1443`), reading only its `tools`/`mcpDirectTools`; this crate's equivalent view of
 /// exactly those two fields is [`AgentDefinition`], so the capability is expressed as
 /// `Option<&AgentDefinition>` and answered by
-/// [`crate::exec::completion_guard::has_mutation_tool_capability`].
+/// [`has_output_write_capability`].
 ///
 /// `None` means "capabilities unknown", which upstream's `!capabilities ||
-/// hasMutationToolCapability(...)` treats as write-capable — the direct-write instruction.
+/// hasOutputWriteCapability(...)` treats as write-capable — the direct-write instruction.
 pub type OutputInstructionCapabilities<'a> = Option<&'a AgentDefinition>;
 
 /// G82 — source: `formatOutputPathInstruction(outputPath, capabilities)`
@@ -1061,7 +1127,7 @@ pub type OutputInstructionCapabilities<'a> = Option<&'a AgentDefinition>;
 /// `delivery` line has TWO branches.
 ///
 /// ```text
-/// const delivery = !capabilities || hasMutationToolCapability(capabilities.tools, capabilities.mcpDirectTools)
+/// const delivery = !capabilities || hasOutputWriteCapability(capabilities.tools, capabilities.mcpDirectTools)
 ///     ? `Write your findings to exactly this path: ${outputPath}`
 ///     : [
 ///         "Return the complete artifact in your final response.",
@@ -1082,8 +1148,7 @@ pub fn format_output_path_instruction(
     output_path: &Path,
     capabilities: OutputInstructionCapabilities<'_>,
 ) -> String {
-    let write_capable =
-        capabilities.is_none_or(crate::exec::completion_guard::has_mutation_tool_capability);
+    let write_capable = capabilities.is_none_or(has_output_write_capability);
     let delivery = if write_capable {
         format!(
             "Write your findings to exactly this path: {}",
@@ -2526,6 +2591,7 @@ mod tests {
 
     fn capability_agent(tools: Option<Vec<crate::discovery::types::ToolRef>>) -> AgentDefinition {
         AgentDefinition {
+            default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,
             mutation_tools: None,
@@ -2546,6 +2612,7 @@ mod tests {
             subagent_only_extensions: None,
             subagent_only_extensions_from_default: false,
             exclude_tools: None,
+            allowed_agents: None,
             allow_nested_subagents: None,
             model: None,
             fallback_models: Vec::new(),
@@ -2557,7 +2624,6 @@ mod tests {
             default_reads: None,
             default_progress: None,
             output: None,
-            completion_guard: None,
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
@@ -2643,6 +2709,61 @@ mod tests {
             !output.contains("Write your findings to exactly this path"),
             "the direct-write instruction must NOT appear: {output:?}"
         );
+    }
+
+    /// SUBA-107 — the three tool names cyrup's read-only set was MISSING against upstream's own
+    /// `READ_ONLY_OUTPUT_TOOLS` (`single-output.ts:6-9` @v0.71.0).
+    ///
+    /// The constant used to be `exec/completion_guard.rs`'s `READ_ONLY_BUILTIN_TOOLS`, transcribed
+    /// from `completion-guard.ts` with nine entries. Upstream's v0.70.0 copy already had ELEVEN —
+    /// `source_check` and `structured_output` were dropped in transcription — and v0.71.0's
+    /// surviving copy adds `watchdog_diff`, for twelve. Every missing name made a genuinely
+    /// read-only agent read as write-capable HERE, at the predicate's only live consumer, so it
+    /// was told "Write your findings to exactly this path" with no tool able to obey.
+    ///
+    /// Red before the re-home: each of these three agents took the direct-write branch.
+    #[test]
+    fn source_check_structured_output_and_watchdog_diff_are_read_only_for_output_capability() {
+        for tool in ["source_check", "structured_output", "watchdog_diff"] {
+            let agent = capability_agent(builtin(&["read", tool]));
+            assert!(
+                !has_output_write_capability(&agent),
+                "'{tool}' is in upstream's READ_ONLY_OUTPUT_TOOLS, so read+{tool} is NOT \
+                 write-capable"
+            );
+            let output = inject_single_output_instruction(
+                "Analyze this",
+                Some(Path::new("/tmp/report.md")),
+                Some(&agent),
+            );
+            assert!(
+                output.contains("Return the complete artifact in your final response."),
+                "read+{tool} must get the runtime-persistence branch: {output:?}"
+            );
+            assert!(
+                !output.contains("Write your findings to exactly this path"),
+                "read+{tool} must NOT be told to write the file itself: {output:?}"
+            );
+        }
+    }
+
+    /// The complement, so the set correction cannot be over-applied: a name that is NOT in
+    /// upstream's list still makes the agent write-capable.
+    #[test]
+    fn a_name_outside_the_read_only_set_still_confers_output_write_capability() {
+        for tool in ["write", "edit", "bash", "apply_patch"] {
+            let agent = capability_agent(builtin(&["read", tool]));
+            assert!(
+                has_output_write_capability(&agent),
+                "'{tool}' is not in upstream's READ_ONLY_OUTPUT_TOOLS"
+            );
+        }
+        // `tools: None` is upstream's `tools === undefined` arm.
+        assert!(has_output_write_capability(&capability_agent(None)));
+        // An EXPLICITLY empty allowlist is `[].some(...) === false`.
+        assert!(!has_output_write_capability(&capability_agent(Some(
+            Vec::new()
+        ))));
     }
 
     /// `single-output.test.ts:110-115` — "uses runtime-persistence instructions in read-only system

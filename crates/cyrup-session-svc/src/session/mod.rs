@@ -31,6 +31,7 @@ mod forking;
 mod inject;
 mod lifecycle;
 mod model;
+pub(crate) mod model_runtime;
 mod queue;
 mod retry;
 mod run;
@@ -67,7 +68,7 @@ use compaction::CompactionCancelGuard;
 use crate::error::SessionServiceError;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use cyrup_agent::{Agent, AgentMessage};
 use cyrup_core::{AssistantMessage, CancelToken, EventStream, ModelRef, SessionId};
@@ -220,6 +221,14 @@ pub struct AgentSession {
     /// that validate message order reject on replay — so it waits for a turn boundary and is
     /// drained by [`Self::flush_pending_custom_messages`]. SEAM-127.
     pending_custom_messages: Mutex<Vec<AgentMessage>>,
+    /// The composed multi-provider model registry, cached beside the three inputs that can change
+    /// it — pi's `ModelRuntime.snapshot` (`model-runtime.ts:142-148` @v0.87.1), which is written by
+    /// `rebuildProviders()` and read as a bare field thereafter. CFG-020.
+    ///
+    /// `None` until the first registry read composes it. See
+    /// [`model_runtime`] for the keys, why they are exhaustive, and why a
+    /// stale hit is not reachable.
+    model_registry: RwLock<Option<model_runtime::RegistrySnapshot>>,
     /// Models available for `cycle_model` (Pi `_scopedModels`, agent-session.ts:870).
     scoped_models: Mutex<Vec<ScopedModel>>,
     /// Facade mirror of the agent's steering-queue mode (the agent exposes only a setter; Pi reads
@@ -305,6 +314,27 @@ pub struct AgentSession {
     /// [`Self::wait_for_idle`] waits on this so a one-shot caller sees the WHOLE loop settle, not just
     /// the first `agent_end`.
     driver_tx: tokio::sync::watch::Sender<bool>,
+    /// EXT-087 — `true` while [`Self::settle_run`]'s post-settle control drain is in flight.
+    ///
+    /// This is pi's `_deferredSettledActions.length > 0`, and it exists because `driver_tx` was
+    /// doing the work of TWO separate pieces of upstream state. pi clears `_isAgentRunActive` at
+    /// the TOP of `_emitAgentSettled` (`core/agent-session.ts:872` @v0.87.1) — that is the flag
+    /// `prompt()` consults to route a submission to a run rather than a steer — and separately
+    /// resolves the idle wait at the BOTTOM, after the deferred actions and only if still idle
+    /// (`:881-890`). cyrup's `driver_tx` was both at once, and the drain needs them apart:
+    ///
+    /// * it must read NOT-RUNNING, or `prompt_with` takes the streaming branch and answers
+    ///   `StreamingNeedsBehavior` for a send that carried no `deliverAs` — the op would be
+    ///   reported as a control failure and no run would start at all; yet
+    /// * `wait_for_idle` must NOT return between the latch dropping and the drained send reaching
+    ///   `spawn_run`, or a caller sees the session go idle and then watches a run start under it.
+    ///
+    /// So `driver_tx` drops before the drain (satisfying the first) while THIS flag is held across
+    /// it (satisfying the second). [`Self::wait_for_run_settled`] honours both.
+    settled_drain_tx: tokio::sync::watch::Sender<bool>,
+    /// A keep-alive receiver for [`Self::settled_drain_tx`], for the reason `driver_keepalive`
+    /// exists: a `watch::Sender` with no receivers drops the value it sends.
+    _settled_drain_keepalive: tokio::sync::watch::Receiver<bool>,
     /// A keep-alive receiver so `driver_tx.send` never fails for want of a live receiver (a watch
     /// `Sender` with zero receivers drops the sent value); `wait_for_idle` subscribes fresh ones.
     _driver_keepalive: tokio::sync::watch::Receiver<bool>,
@@ -355,6 +385,8 @@ impl AgentSession {
         // The post-run-driver liveness channel; the keep-alive receiver keeps `send` from failing for
         // want of a live receiver (see field docs).
         let (driver_tx_init, driver_keepalive) = tokio::sync::watch::channel(false);
+        // EXT-087 — see `settled_drain_tx`.
+        let (settled_drain_init, settled_drain_keepalive) = tokio::sync::watch::channel(false);
         Self {
             agent,
             manager,
@@ -378,6 +410,7 @@ impl AgentSession {
             branch_summary_cancel: Mutex::new(None),
             pending_next_turn: Mutex::new(Vec::new()),
             pending_custom_messages: Mutex::new(Vec::new()),
+            model_registry: RwLock::new(None),
             scoped_models: Mutex::new(Vec::new()),
             steering_mode: Mutex::new(steering_mode),
             follow_up_mode: Mutex::new(follow_up_mode),
@@ -405,6 +438,8 @@ impl AgentSession {
             handle: extras.handle,
             last_assistant: Mutex::new(None),
             driver_tx: driver_tx_init,
+            settled_drain_tx: settled_drain_init,
+            _settled_drain_keepalive: settled_drain_keepalive,
             _driver_keepalive: driver_keepalive,
             compaction_settled: tokio::sync::watch::channel(0).0,
             runtime_actions: OnceLock::new(),

@@ -92,7 +92,7 @@ pub use models::Models;
 pub use proc::ProcSpawnOptions;
 pub use session::Session;
 pub use tool_call::{Signal, ToolCall};
-pub use ui::{NotifyKind, Ui};
+pub use ui::{FooterData, NotifyKind, Ui};
 pub use with_session::{
     ReplacedSessionContext, WithSessionFn, register_with_session, run_with_session,
 };

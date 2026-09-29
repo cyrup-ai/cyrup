@@ -208,7 +208,34 @@ pub async fn reconcile_before_control_op(paths: &RunPaths) -> Result<RunStatus, 
         let mut status = read_status_file(&paths.status)
             .await?
             .unwrap_or_else(|| RunStatus::queued(result.run_id.clone(), result.mode, None));
-        if !status.state.is_terminal() {
+        // SUBA-116 — pi `stale-run-reconciler.ts:392` @v0.71.0, VERBATIM:
+        //
+        // ```ts
+        // const terminalStatus = effectiveStatus.state === "running" || effectiveStatus.state === "queued"
+        //     ? terminalStatusFromResult(effectiveStatus, existingResultPath, now)
+        //     : undefined;
+        // ```
+        //
+        // # The gate this replaces was `!status.state.is_terminal()`, and `Paused` is the difference
+        //
+        // The original condition admitted `Paused` as well, because "not terminal" reads like the
+        // obvious spelling of "still repairable". It is not upstream's, and the consequence was
+        // concrete rather than cosmetic: a paused run ALWAYS has a result file (R-SA-084 writes one
+        // at the pause), so every control op on a paused run took the repair branch, and cyrup's
+        // `terminal_status_from_result` rebuilds the record from the `ResultFile` alone — dropping
+        // `session_id`, `process_terminal`, `steps` and `tool_call_id`, none of which a `ResultFile`
+        // carries. Upstream never rebuilds a paused status at all; it returns it untouched at
+        // `:417`. SUBA-116's `seal_paused_run` reads exactly those dropped fields, which is how the
+        // divergence surfaced.
+        //
+        // FINDING, recorded and NOT fixed here: even on the `running`/`queued` path upstream's
+        // `terminalStatusFromResult` is `{ ...status, state: repair.state, … }`
+        // (`stale-run-reconciler.ts:183-196`) — it SPREADS the existing status and additionally
+        // re-attaches the current `processTerminal` and per-step proofs (`:398-411`), where cyrup's
+        // `terminal_status_from_result` builds a fresh record and keeps only what the result file
+        // holds. That is a second, wider divergence on a path this row does not need, and belongs
+        // to its own row rather than being smuggled in here.
+        if matches!(status.state, RunState::Running | RunState::Queued) {
             // Repair status.json from the authoritative ResultFile (R-SA-077's "readers MUST
             // treat presence of the ResultFile as authoritative... repairing status.json from it
             // if needed"). `advance_state` only succeeds along the legal transition graph; if the
@@ -851,8 +878,22 @@ pub enum StopOutcome {
     /// The reconciled status is neither `Running` nor `Queued` — pi's
     /// `if (!status || (status.state !== "running" && status.state !== "queued"))` guard
     /// (`async-stop-action.ts:41`), whose message is `"No running or queued async run was found for
-    /// '{id}'."` and whose `isError` is `true`. Note this makes a stop of an already-`Paused` run an
-    /// ERROR upstream, not a silent no-op the way a duplicate `interrupt` is.
+    /// '{id}'."` and whose `isError` is `true`.
+    ///
+    /// # SUBA-116 — the `Paused` clause of this doc was true at v0.64.0 and is false at v0.71.0
+    ///
+    /// The original claim, kept verbatim because it was the accurate reading of the pinned tag it
+    /// was written against: *"Note this makes a stop of an already-`Paused` run an ERROR upstream,
+    /// not a silent no-op the way a duplicate `interrupt` is."* That is exactly `:41` @v0.64.0.
+    ///
+    /// `03b92ee7` (#2176, shipped v0.68.0) widened the guard. At v0.71.0 it reads
+    /// `const pausedWholeRun = status?.state === "paused" && childId === undefined;`
+    /// (`async-stop-action.ts:120`) then
+    /// `if (!status || (status.state !== "running" && status.state !== "queued" && !pausedWholeRun))`
+    /// (`:121`) — so a WHOLE-RUN stop of a paused run is admitted and seals the run
+    /// ([`Self::PausedStopped`]). A CHILD-scoped stop of a paused run is still refused here, which
+    /// is the `childId === undefined` half of `pausedWholeRun` and is why the two halves must not
+    /// be collapsed.
     NotStoppable,
     /// SUBA-087 — `childId` named no child, or more than one (pi `if (!resolution.ok) return {
     /// text: resolution.message, isError: true }`, `:51-57`). Carries the resolver's own sentence.
@@ -877,6 +918,24 @@ pub enum StopOutcome {
     /// session identity of its own still controls its runs. Distinct from [`Self::NotStoppable`]
     /// because the run may be perfectly stoppable — just not by us.
     NotInActiveSession,
+    /// SUBA-116 — a whole-run stop of a `Paused` run SEALED it: the run is now `Stopped` on
+    /// disk, its unfinished steps are `stopped`, its result file records the stop, and its
+    /// active-capacity slot has been released (pi `sealPausedRun` returning `undefined`, then
+    /// `"Stopped paused async run {id}."`, `async-stop-action.ts:151-164` @v0.71.0).
+    ///
+    /// Distinct from [`Self::Requested`]: no runner is listening. A cyrup `Paused` run has no
+    /// live runner at all (see [`stop`]'s own doc), so the stop request written just before the
+    /// seal is a durable record rather than a message anybody reads.
+    PausedStopped,
+    /// SUBA-116 — the whole-run stop of a `Paused` run was PERSISTED but could not be sealed,
+    /// because one of `sealPausedRun`'s five refusal rungs fired (`async-stop-action.ts:31-101`).
+    /// Carries upstream's own failure sentence, which the caller interpolates into
+    /// `"Stop request persisted for paused async run {id}, but terminal proof is not ready
+    /// ({failure}). Retry stop after runner shutdown is observed."` (`:154`).
+    PausedSealPending {
+        /// Upstream's refusal sentence for the rung that fired.
+        reason: String,
+    },
 }
 
 /// Delivers a stop request against the run identified by `run_id_token` (G77 / SUBA-087; pi
@@ -947,12 +1006,31 @@ pub async fn stop(
         return Ok(StopOutcome::NotInActiveSession);
     }
 
-    if !matches!(status.state, RunState::Running | RunState::Queued) {
+    // SUBA-116 — pi `async-stop-action.ts:120` @v0.71.0, verbatim:
+    // `const pausedWholeRun = status?.state === "paused" && childId === undefined;`. BOTH halves
+    // matter: a child-scoped stop of a paused run stays refused below, because a paused run's
+    // individual child cannot be torn down by a seal that rewrites the whole run.
+    let paused_whole_run = status.state == RunState::Paused && child_id.is_none();
+
+    // pi `:121` — the widened guard.
+    if !matches!(status.state, RunState::Running | RunState::Queued) && !paused_whole_run {
         return Ok(StopOutcome::NotStoppable);
     }
 
     let Some(child_id) = child_id else {
+        // pi `:149` — the request is delivered FIRST, before any seal is attempted, so a seal
+        // that refuses still leaves the operator's stop durably recorded (`:154`'s "Stop request
+        // persisted … Retry stop after runner shutdown is observed.").
         deliver_stop_request(&paths.run_dir, source, reason).await?;
+        if paused_whole_run {
+            // pi `:151-156`.
+            if let Some(reason) = seal_paused_run(&paths, &status).await {
+                return Ok(StopOutcome::PausedSealPending { reason });
+            }
+            // The seal already rewrote `status.json` with `activity_state` cleared; re-clearing it
+            // from the STALE in-memory `status` would resurrect the pre-seal record.
+            return Ok(StopOutcome::PausedStopped);
+        }
         clear_stopped_run_activity(&paths, status).await;
         return Ok(StopOutcome::Requested);
     };
@@ -978,6 +1056,207 @@ pub async fn stop(
     Ok(StopOutcome::ChildRequested { child_id: child.id })
 }
 
+/// SUBA-116 — pi `sealPausedRun` (`runs/foreground/async-stop-action.ts:31-101` @v0.71.0,
+/// introduced by `03b92ee7` / #2176, shipped v0.68.0): turn a `Paused` run into a genuinely
+/// `Stopped` one, on disk, and release the capacity slot it was holding.
+///
+/// Returns upstream's failure SENTENCE when one of the five refusal rungs fires, and `None` when
+/// the run was sealed. Upstream's own return type is `string | undefined` with exactly this
+/// meaning, and the caller interpolates the sentence into `:154`'s retry advice.
+///
+/// # Why the parent seals rather than asking a runner to
+///
+/// Upstream ALSO widened its runner-side `stopRunner` to accept `paused`
+/// (`runs/background/subagent-runner.ts:3291`), because a pi runner is a long-lived closure that
+/// can observe a stop request while already holding `state: "paused"`. cyrup's runner is
+/// outcome-driven and cannot be in that position: [`crate::background::runner_main`]'s
+/// `finish.rs:60-67` maps `LoopOutcome::Interrupted` onto [`RunState::Paused`] and then EXITS,
+/// and a stop request that arrives while the loop is still alive is consumed by
+/// `runner_main/control_watcher.rs` into `LoopOutcome::Stopped` instead (`finish.rs:86-102`). A
+/// cyrup `Paused` run therefore has no live runner at all, so this parent-side seal is the whole
+/// of the port and the runner needs no change. That is a finding, not an omission.
+///
+/// # The two fields upstream writes that cyrup's schema does not carry
+///
+/// Upstream's step rewrite sets `exitCode: 1` and `durationMs` alongside the state and the
+/// message. [`crate::background::StepStatus`] has neither field — cyrup carries `exit_code` on
+/// the per-child [`SingleResult`] only, and computes durations from
+/// `started_at`/`ended_at` — which is why the existing runner-side sweep
+/// [`crate::background::runner_main`]`::status::mark_remaining_stopped` (the port of
+/// `subagent-runner.ts:3842`, the SAME rewrite from the runner's side) also writes neither. This
+/// function matches that precedent field for field rather than widening the schema; the
+/// `exitCode: 1` upstream promises a reader is still written, on the result entries below, where
+/// cyrup's schema has somewhere to put it.
+async fn seal_paused_run(paths: &RunPaths, status: &RunStatus) -> Option<String> {
+    // pi `:32-33` — rung (a). `status.processTerminal?.runnerProcessInstanceId`: the OVERLAY's
+    // instance id, which is what the sidecar read below is then matched against.
+    let Some(runner_process_instance_id) = status
+        .process_terminal
+        .as_ref()
+        .map(|proof| proof.runner_process_instance_id().clone())
+    else {
+        return Some("runner process identity is missing".to_string());
+    };
+
+    // pi `:34-37` — rung (b).
+    let run_dir = super::RunDir::for_existing(&paths.run_dir);
+    let proof = super::process_terminal::read_process_terminal(
+        &run_dir,
+        super::process_terminal::ProofExpectation::new(&status.run_id, &runner_process_instance_id),
+    )
+    .await;
+    let observed = proof.as_ref().is_some_and(|proof| {
+        proof.state() == super::process_terminal::ProcessTerminalState::Observed
+            && *proof.run_id() == status.run_id
+            && *proof.runner_process_instance_id() == runner_process_instance_id
+    });
+    if !observed {
+        // pi's interpolation verbatim: `unknown (<reason>)` for the unknown arm, the state word
+        // for any other, and the literal `missing` when the sidecar is not there at all.
+        let word = match proof.as_ref() {
+            Some(proof) => match proof.reason() {
+                Some(reason) => format!("unknown ({})", reason.as_str()),
+                None => proof.state().as_str().to_string(),
+            },
+            None => "missing".to_string(),
+        };
+        return Some(format!("process-terminal proof is {word}"));
+    }
+
+    // pi `:38` — rung (c).
+    let Some(session_id) = status.session_id.as_ref() else {
+        return Some("session identity is missing".to_string());
+    };
+
+    // pi `:39-40` — rung (d).
+    let existing_path = match super::result_index::result_payload_path_for_session_run(
+        &paths.results_dir,
+        session_id,
+        &status.run_id,
+    )
+    .await
+    {
+        Ok(Some(path)) => path,
+        // A read fault on the index is upstream's `undefined` here just as an absent entry is:
+        // `resultPayloadPathForSessionRun` returns `string | undefined` and a throw would escape
+        // into `stopAsyncRun`'s own catch, which reports the SAME "retry the stop" class of
+        // advice. Collapsing both onto the rung keeps the refusal, and the stop request that was
+        // already delivered, intact.
+        Ok(None) | Err(_) => return Some("paused result is missing".to_string()),
+    };
+
+    // pi `:41-50` — rung (e), both halves: unparsable/non-object, then identity mismatch.
+    let existing: ResultFile = match tokio::fs::read(&existing_path).await {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(error) => return Some(format!("paused result is unavailable: {error}")),
+        },
+        Err(error) => return Some(format!("paused result is unavailable: {error}")),
+    };
+    // pi `:48-50`. Upstream reads `existingResult.runId ?? existingResult.id`; cyrup's schema
+    // carries both and `ResultFile` keeps them equal by construction, so `run_id` alone answers.
+    if existing.run_id != status.run_id || existing.session_id.as_ref() != Some(session_id) {
+        return Some("paused result identity does not match the run".to_string());
+    }
+
+    let now = crate::time::now_epoch_millis();
+
+    // pi `:52-66` — the step rewrite. `!is_terminal()` is byte-equal to upstream's
+    // `pending | running | paused` (`background/state.rs:307` makes the other four terminal).
+    let mut stopped_status = status.clone();
+    let sealed: Vec<bool> = stopped_status
+        .steps
+        .iter()
+        .map(|step| !step.status.is_terminal())
+        .collect();
+    for step in &mut stopped_status.steps {
+        if step.status.is_terminal() {
+            continue;
+        }
+        step.status = StepState::Stopped;
+        step.error = Some(STOP_MESSAGE.to_string());
+        step.stopped = true;
+        // Upstream ASSIGNS `endedAt: now` here rather than filling a hole, because a paused step
+        // already carries the `endedAt` of its pause and that timestamp is not when it stopped.
+        step.ended_at = Some(now);
+        step.telemetry.last_activity_at = Some(now);
+        // pi's `const { activityState: _activityState, ...rest } = step;` (`:55`).
+        step.telemetry.activity_state = None;
+    }
+
+    // pi `:67-76` — the per-entry result rewrite, indexed against the step list so an entry whose
+    // step had already settled keeps its own outcome.
+    let mut stopped_result = existing;
+    for (index, entry) in stopped_result.results.iter_mut().enumerate() {
+        if !sealed.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        entry.final_output = Some(STOP_MESSAGE.to_string());
+        entry.error = Some(STOP_MESSAGE.to_string());
+        entry.exit_code = 1;
+        entry.stopped = true;
+        // pi's `const { interrupted: _interrupted, ...result } = entry;` (`:73`) — the pause's own
+        // flag must not survive onto a record that now says the run was stopped.
+        entry.interrupted = false;
+    }
+    // pi `:77-87`. cyrup's `ResultFile` is a typed record rather than upstream's
+    // `Record<string, unknown>`, and it carries no run-level `summary`/`error`/`stopped`/
+    // `exitCode`/`timestamp` — those live on the per-child `SingleResult`s rewritten just above,
+    // which is where this port already put them. `success`/`state` are the two run-level fields
+    // that exist, and both are set.
+    stopped_result.success = false;
+    stopped_result.state = RunState::Stopped;
+
+    // pi `:88-97`. Routed through `advance_state` rather than assigned, because
+    // `RunState`'s own doc names it *"the single choke point every in-process state mutation in
+    // this subsystem MUST route through"*. SUBA-116 is what makes `Paused -> Stopped` a legal
+    // edge (`background/state.rs`); before it, no writer could produce that transition.
+    if let Err(error) = stopped_status.advance_state(RunState::Stopped) {
+        return Some(format!("paused run could not be sealed stopped: {error}"));
+    }
+    stopped_status.error = Some(STOP_MESSAGE.to_string());
+    stopped_status.ended_at = Some(now);
+    stopped_status.last_update = now;
+    stopped_status.telemetry.activity_state = None;
+
+    // pi `:98` — `writeAsyncResultFile(resultFilePath(DIRS.results, status.runId), stoppedResult)`.
+    if let Err(error) = super::result_index::write_async_result_file(
+        &super::result_index::ResultWrite {
+            results_dir: &paths.results_dir,
+            session_id,
+            run_id: &status.run_id,
+            written_at: now,
+            async_dir: Some(&paths.run_dir),
+            tool_call_id: stopped_status.tool_call_id.as_deref(),
+        },
+        &stopped_result,
+    )
+    .await
+    {
+        // The seal is not done if the terminal result did not land: reporting success here would
+        // tell the operator the run is stopped while the authoritative terminal record still says
+        // paused, and reconciliation would walk it straight back.
+        return Some(format!("paused result could not be rewritten: {error}"));
+    }
+
+    // pi `:99` — `writeAtomicJson(path.join(asyncDir, "status.json"), stoppedStatus)`.
+    if let Err(error) = write_atomic_json(&paths.status, &stopped_status).await {
+        return Some(format!("paused status could not be rewritten: {error}"));
+    }
+
+    // pi `:100` — `updateActiveRunIndex(asyncDir, "stopped", status.toolCallId,
+    // { retryCapacityErrors: true, terminalIndexBeforeRelease: true })`. NO options plumbing is
+    // needed: cyrup's `update_for_state` already implements BOTH of those flags unconditionally
+    // (`active_run_index.rs:263-283`, whose own comment cites `:97-112`) — the terminal index is
+    // written before the release, and a capacity error is RETURNED rather than swallowed.
+    if let Err(error) =
+        super::active_run_index::update_active_run_index(&paths.run_dir, &stopped_status).await
+    {
+        return Some(format!("capacity slot could not be released: {error}"));
+    }
+
+    None
+}
 /// pi `async-stop-action.ts:69-73`: once a stop request is on disk the run's live activity flag is
 /// a lie — a `needs_attention`/`active_long_running` notice for a run that is being torn down is
 /// the one notice the user can do nothing about. Upstream drops it off the in-memory `asyncJobs`
@@ -3931,28 +4210,34 @@ mod tests {
             StopOutcome::Requested
         );
 
-        // Paused is NOT.
-        let paused_id = RunId::from_token("stoppaused01");
-        let paused_paths = RunPaths::for_run(&async_root, &results_dir, &paused_id);
-        let mut paused = write_running_status(
-            &paused_paths,
-            &paused_id,
-            RunMode::Single,
-            Some(11),
-            Vec::new(),
-        )
-        .await;
-        paused
-            .advance_state(RunState::Paused)
-            .expect("Running -> Paused");
-        write_atomic_json(&paused_paths.status, &paused)
+        // A TERMINAL run is not.
+        //
+        // # SUBA-116 — this half used to assert `Paused`, and that assertion was v0.64.0's
+        //
+        // The original body seeded a `Paused` run and asserted `NotStoppable` with no request
+        // file, which was a faithful reading of `async-stop-action.ts:41` @v0.64.0. `03b92ee7`
+        // (#2176, shipped v0.68.0) widened the guard: at v0.71.0 `:120-121` admit a WHOLE-RUN
+        // stop of a paused run and seal it. Keeping the old assertion would have pinned cyrup to
+        // a behaviour upstream had abandoned, so the paused case moved to the four SUBA-116 tests
+        // below — including `a_child_scoped_stop_of_a_paused_run_is_still_refused`, which keeps
+        // the `NotStoppable`-with-no-trace clause alive for the half of `pausedWholeRun` that is
+        // still refused. `Complete` is substituted here because it exercises the SAME guard with
+        // a state upstream refuses at every tag.
+        let done_id = RunId::from_token("stopdone0001");
+        let done_paths = RunPaths::for_run(&async_root, &results_dir, &done_id);
+        let mut done =
+            write_running_status(&done_paths, &done_id, RunMode::Single, Some(11), Vec::new())
+                .await;
+        done.advance_state(RunState::Complete)
+            .expect("Running -> Complete");
+        write_atomic_json(&done_paths.status, &done)
             .await
             .expect("write");
         assert_eq!(
             stop(
                 &async_root,
                 &results_dir,
-                paused_id.as_str(),
+                done_id.as_str(),
                 "stop-action",
                 None,
                 None,
@@ -3963,9 +4248,406 @@ mod tests {
             StopOutcome::NotStoppable
         );
         assert!(
-            !stop_request_path(&paused_paths.run_dir).exists(),
+            !stop_request_path(&done_paths.run_dir).exists(),
             "a refused stop must not leave a request file behind"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-116 — the paused whole-run stop (pi `sealPausedRun`, `async-stop-action.ts:31-101`
+    // @v0.71.0; the widened guard at `:120-121`; introduced by `03b92ee7` / #2176 @v0.68.0)
+    // ---------------------------------------------------------------------------------------
+
+    /// The runner instance a SUBA-116 fixture binds its proof to.
+    fn suba116_instance() -> crate::background::process_terminal::RunnerProcessInstanceId {
+        crate::background::process_terminal::RunnerProcessInstanceId::from_token("runner-inst-116")
+    }
+
+    /// One `SingleResult` in the shape the paused run's result file already holds: interrupted,
+    /// not stopped, no error — exactly what the seal has to rewrite.
+    fn suba116_interrupted_child() -> crate::exec::SingleResult {
+        crate::exec::SingleResult {
+            execution: None,
+            native_machine: None,
+            runtime_acknowledged_extensions: None,
+            skills_warning: None,
+            watchdog: None,
+            usage_budget: None,
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
+            child_run_id: None,
+            agent: "worker".to_string(),
+            task: "do the thing".to_string(),
+            exit_code: 0,
+            usage: cyrup_core::Usage::default(),
+            turns: 0,
+            model: None,
+            attempted_models: Vec::new(),
+            model_attempts: Vec::new(),
+            final_output: Some("partial work".to_string()),
+            structured_output: None,
+            session_file: None,
+            output_state: Default::default(),
+            structured_output_path: None,
+            artifact_paths: None,
+            transcript_path: None,
+            transcript_error: None,
+            acceptance: None,
+            detached: false,
+            detached_reason: None,
+            interrupted: true,
+            timed_out: false,
+            timeout_recovery: None,
+            context_overflow: false,
+            stopped: false,
+            process_signal: None,
+            error: None,
+            saved_output_path: None,
+            tool_calls: Vec::new(),
+            output_truncated: false,
+            control_events: Vec::new(),
+            progress: None,
+            runner: None,
+            external_process: None,
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
+        }
+    }
+
+    /// Seed a whole `Paused` run tree: a status carrying the run-level process-terminal OVERLAY
+    /// (upstream's `status.processTerminal.runnerProcessInstanceId`, rung (a)), a session id
+    /// (rung (c)) and one still-`Paused` step; plus its indexed result payload (rung (d)/(e)) and
+    /// its active-capacity marker.
+    ///
+    /// `observed_proof` decides whether the SIDECAR gets an `observed` record — the difference
+    /// between rung (b) passing and refusing.
+    async fn seed_paused_run_for_seal(
+        async_root: &Path,
+        results_dir: &Path,
+        run_id: &RunId,
+        observed_proof: bool,
+        write_result: bool,
+    ) -> (RunPaths, crate::identity::SessionId) {
+        let paths = RunPaths::for_run(async_root, results_dir, run_id);
+        let session =
+            crate::identity::SessionId::parse("session-sess116").expect("a well-formed session id");
+        let instance = suba116_instance();
+
+        let mut step = super::super::StepStatus::pending("worker");
+        step.status = StepState::Paused;
+        step.started_at = Some(1_700_000_000_000);
+        step.ended_at = Some(1_700_000_000_500);
+        step.telemetry.activity_state =
+            Some(crate::background::telemetry::ActivityState::NeedsAttention);
+
+        let mut status =
+            write_running_status(&paths, run_id, RunMode::Single, Some(4242), vec![step]).await;
+        status.session_id = Some(session.clone());
+        status.process_terminal = Some(
+            crate::background::process_terminal::ProcessTerminal::Observed {
+                base: crate::background::process_terminal::ProcessTerminalBase::new(
+                    run_id.clone(),
+                    instance.clone(),
+                ),
+                observed_at: 1_700_000_000_000,
+                instances: vec![
+                    crate::background::process_terminal::ProcessInstanceExit::Runner {
+                        process_instance_id: instance.clone(),
+                        close_observed_at: 1_700_000_000_000,
+                        exit_code: Some(0),
+                        signal: None,
+                    },
+                ],
+                canonical_session: None,
+            },
+        );
+        status.telemetry.activity_state =
+            Some(crate::background::telemetry::ActivityState::NeedsAttention);
+        status
+            .advance_state(RunState::Paused)
+            .expect("Running -> Paused");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write paused status");
+
+        if observed_proof {
+            let proof = crate::background::process_terminal::ProcessTerminal::Observed {
+                base: crate::background::process_terminal::ProcessTerminalBase::new(
+                    run_id.clone(),
+                    instance.clone(),
+                ),
+                observed_at: 1_700_000_000_000,
+                instances: vec![
+                    crate::background::process_terminal::ProcessInstanceExit::Runner {
+                        process_instance_id: instance.clone(),
+                        close_observed_at: 1_700_000_000_000,
+                        exit_code: Some(0),
+                        signal: None,
+                    },
+                ],
+                canonical_session: None,
+            };
+            write_atomic_json(
+                &super::super::RunDir::for_existing(&paths.run_dir).process_terminal(),
+                &proof,
+            )
+            .await
+            .expect("write observed proof");
+        }
+
+        if write_result {
+            let payload = ResultFile {
+                schedule_origin: None,
+                id: run_id.clone(),
+                run_id: run_id.clone(),
+                agent: "worker".to_string(),
+                mode: RunMode::Single,
+                state: RunState::Paused,
+                success: false,
+                cwd: PathBuf::from("/tmp"),
+                session_file: None,
+                session_id: Some(session.clone()),
+                completion_owner_id: None,
+                results: vec![suba116_interrupted_child()],
+                workflow_children: None,
+                workflow_receipt: None,
+            };
+            crate::background::result_index::write_async_result_file(
+                &crate::background::result_index::ResultWrite {
+                    results_dir,
+                    session_id: &session,
+                    run_id,
+                    written_at: 1_700_000_000_000,
+                    async_dir: Some(&paths.run_dir),
+                    tool_call_id: None,
+                },
+                &payload,
+            )
+            .await
+            .expect("seed the paused result payload");
+        }
+
+        // The slot the paused run is holding — what the seal has to give back.
+        crate::background::active_run_index::update_active_run_index(
+            &paths.run_dir,
+            &RunStatus::queued(run_id.clone(), RunMode::Single, Some(4242)),
+        )
+        .await
+        .expect("seed the active-run marker");
+        assert!(
+            active_run_marker(&paths.run_dir).exists(),
+            "fixture must start with the slot held"
+        );
+
+        (paths, session)
+    }
+
+    /// `<async_root>/.active-runs/<run dir name>` — the marker whose absence IS the released slot.
+    fn active_run_marker(run_dir: &Path) -> PathBuf {
+        run_dir
+            .parent()
+            .expect("run dir has a parent")
+            .join(crate::background::active_run_index::ACTIVE_RUN_INDEX_DIR)
+            .join(run_dir.file_name().expect("run dir has a name"))
+    }
+
+    /// SUBA-116 — pi `:120-121` (the widened guard) plus `:52-100` (the seal) plus `:164`.
+    ///
+    /// Before this row, `stop` returned `NotStoppable` for a paused run and wrote NOTHING, so a
+    /// paused run held its capacity slot forever unless somebody resumed it.
+    #[tokio::test]
+    async fn stopping_a_paused_run_seals_it_stopped_and_releases_its_capacity_slot() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("sealpaused01");
+        let (paths, session) =
+            seed_paused_run_for_seal(&async_root, &results_dir, &run_id, true, true).await;
+
+        assert_eq!(
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                None,
+                None
+            )
+            .await
+            .expect("stop resolves"),
+            StopOutcome::PausedStopped,
+            "a whole-run stop of a paused run must SEAL it (pi `:151-164`)"
+        );
+
+        // --- the status (`:88-97`) ---
+        let sealed: RunStatus =
+            serde_json::from_slice(&tokio::fs::read(&paths.status).await.expect("reread status"))
+                .expect("status parses");
+        assert_eq!(sealed.state, RunState::Stopped);
+        assert_eq!(sealed.error.as_deref(), Some(STOP_MESSAGE));
+        assert!(sealed.ended_at.is_some(), "`endedAt: now`");
+        assert!(sealed.last_update > 0, "`lastUpdate: now`");
+        assert_eq!(
+            sealed.telemetry.activity_state, None,
+            "`delete stoppedStatus.activityState` (`:96`)"
+        );
+        let step = sealed.steps.first().expect("the one step");
+        assert_eq!(step.status, StepState::Stopped);
+        assert_eq!(step.error.as_deref(), Some(STOP_MESSAGE));
+        assert!(step.stopped, "pi `stopped: true` (`:60`)");
+        assert!(step.ended_at.is_some());
+        assert_eq!(
+            step.telemetry.activity_state, None,
+            "pi drops the step's activityState at `:55`"
+        );
+
+        // --- the result (`:67-87`) ---
+        let payload_path = crate::background::result_index::result_payload_path_for_session_run(
+            &results_dir,
+            &session,
+            &run_id,
+        )
+        .await
+        .expect("payload lookup")
+        .expect("the sealed payload is still addressable");
+        let sealed_result: ResultFile =
+            serde_json::from_slice(&tokio::fs::read(&payload_path).await.expect("reread result"))
+                .expect("result parses");
+        assert_eq!(sealed_result.state, RunState::Stopped);
+        assert!(!sealed_result.success, "pi `success: false` (`:79`)");
+        let child = sealed_result.results.first().expect("the one child result");
+        assert_eq!(child.final_output.as_deref(), Some(STOP_MESSAGE));
+        assert_eq!(child.error.as_deref(), Some(STOP_MESSAGE));
+        assert_eq!(child.exit_code, 1, "pi `exitCode: 1` (`:74`)");
+        assert!(child.stopped, "pi `stopped: true` (`:74`)");
+        assert!(
+            !child.interrupted,
+            "pi drops `interrupted` from the entry (`:73`)"
+        );
+
+        // --- the slot (`:100`) ---
+        assert!(
+            !active_run_marker(&paths.run_dir).exists(),
+            "`updateActiveRunIndex(asyncDir, \"stopped\", …)` must release the slot"
+        );
+
+        // …and the run is no longer revivable, which is what "stopped" has to mean.
+        let err = resume(&async_root, &results_dir, run_id.as_str(), None, None)
+            .await
+            .expect_err("a sealed run must not be resumable");
+        assert!(
+            matches!(err, SubagentError::ResumeStopped(ref id) if id == run_id.as_str()),
+            "{err:?}"
+        );
+    }
+
+    /// SUBA-116 rung (b), pi `:34-37`. The rung that keeps the seal from being a blind rewrite:
+    /// with no OBSERVED close, the runner may still be alive and rewriting the run out from under
+    /// it would race a live writer.
+    ///
+    /// The stop request is nonetheless durably on disk, because upstream delivers at `:149` and
+    /// only then seals at `:151` — which is the whole point of `:154`'s "Retry stop after runner
+    /// shutdown is observed."
+    #[tokio::test]
+    async fn a_paused_run_whose_terminal_proof_is_not_observed_keeps_the_stop_request_and_refuses()
+    {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("sealpaused02");
+        let (paths, _session) =
+            seed_paused_run_for_seal(&async_root, &results_dir, &run_id, false, true).await;
+
+        match stop(
+            &async_root,
+            &results_dir,
+            run_id.as_str(),
+            "stop-action",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("stop resolves")
+        {
+            StopOutcome::PausedSealPending { reason } => assert!(
+                reason.starts_with("process-terminal proof is "),
+                "upstream's own sentence, got {reason:?}"
+            ),
+            other => panic!("an unproven close must refuse the seal: {other:?}"),
+        }
+
+        assert!(
+            !pending_stop_request_paths(&paths.run_dir).await.is_empty(),
+            "pi delivers the request at `:149` BEFORE sealing at `:151`"
+        );
+        let after: RunStatus =
+            serde_json::from_slice(&tokio::fs::read(&paths.status).await.expect("reread status"))
+                .expect("status parses");
+        assert_eq!(
+            after.state,
+            RunState::Paused,
+            "a refused seal must not move the run"
+        );
+    }
+
+    /// SUBA-116 rung (d), pi `:39-40` — verbatim sentence.
+    #[tokio::test]
+    async fn a_paused_run_with_no_result_payload_refuses_with_upstreams_sentence() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("sealpaused03");
+        let (_paths, _session) =
+            seed_paused_run_for_seal(&async_root, &results_dir, &run_id, true, false).await;
+
+        match stop(
+            &async_root,
+            &results_dir,
+            run_id.as_str(),
+            "stop-action",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("stop resolves")
+        {
+            StopOutcome::PausedSealPending { reason } => {
+                assert_eq!(reason, "paused result is missing");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// SUBA-116 — the `childId === undefined` half of `pausedWholeRun` (`:120`), which is the one
+    /// clause a careless widening of `:121` would lose. A child-scoped stop of a paused run is
+    /// still refused, and still leaves no trace.
+    #[tokio::test]
+    async fn a_child_scoped_stop_of_a_paused_run_is_still_refused() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("sealpaused04");
+        let (paths, _session) =
+            seed_paused_run_for_seal(&async_root, &results_dir, &run_id, true, true).await;
+
+        assert_eq!(
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("worker"),
+                None
+            )
+            .await
+            .expect("stop resolves"),
+            StopOutcome::NotStoppable,
+            "`pausedWholeRun` is false when a childId is named"
+        );
+        assert!(
+            pending_stop_request_paths(&paths.run_dir).await.is_empty(),
+            "a refused stop must leave no request behind"
+        );
+        let after: RunStatus =
+            serde_json::from_slice(&tokio::fs::read(&paths.status).await.expect("reread status"))
+                .expect("status parses");
+        assert_eq!(after.state, RunState::Paused);
     }
 
     /// G77 — pi `async-resume.ts:406` @v0.43.0: a stopped run is NOT resumable, and the refusal is

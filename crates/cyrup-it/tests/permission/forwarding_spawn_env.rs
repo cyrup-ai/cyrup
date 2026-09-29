@@ -162,6 +162,8 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         subagent_only_extensions: Vec::new(),
         // SUBA-092: no `excludeTools`, no nested-delegation grant — the planner's defaults.
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -169,7 +171,6 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth: None,
         depth: DepthEnvelope {
@@ -182,6 +183,7 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         runner: None, // SUBA-074: the native child, as before
     };
     let opts = RunOptions {
+        tool_timeout_ms: None,
         parent_env_overrides: std::collections::BTreeMap::new(),
         machine: None,
         // SUBA-119 — this fixture's model comes from its own agent config, not from the parent

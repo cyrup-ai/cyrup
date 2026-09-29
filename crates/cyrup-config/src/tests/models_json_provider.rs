@@ -95,6 +95,7 @@ impl ApiImpl for RecordingApi {
             api: model.api.clone(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

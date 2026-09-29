@@ -46,7 +46,7 @@ const CATALOG_JSON: &str = include_str!("catalog/cloudflare-workers-ai.json");
 /// Parse the embedded Cloudflare Workers AI catalog into [`Model`]s. A parse failure yields an empty
 /// catalog (surfaced loudly by the catalog tests) rather than a panic (NO-PANIC policy).
 pub fn cloudflare_workers_ai_models() -> Vec<Model> {
-    serde_json::from_str(CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(CATALOG_JSON).unwrap_or_default()
 }
 
 /// Resolve a single Cloudflare field (Pi `cloudflare-auth.ts` `resolveValue`): from a stored
@@ -163,7 +163,7 @@ pub fn cloudflare_workers_ai_auth() -> ProviderAuth {
 /// Parse the embedded Cloudflare AI Gateway catalog into [`Model`]s. A parse failure yields an empty
 /// catalog (surfaced loudly by the catalog tests) rather than a panic (NO-PANIC policy).
 pub fn cloudflare_ai_gateway_models() -> Vec<Model> {
-    serde_json::from_str(AI_GATEWAY_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(AI_GATEWAY_CATALOG_JSON).unwrap_or_default()
 }
 
 /// Cloudflare AI Gateway auth (Pi `cloudflareAIGatewayAuth()` + `resolveCloudflareEnv("ai-gateway")`,
@@ -358,7 +358,8 @@ mod tests {
     #[test]
     fn catalog_parses_with_expected_count_and_tags() {
         let models = cloudflare_workers_ai_models();
-        assert_eq!(models.len(), 13);
+        // 13 while the catalog was frozen at `b0c2a90e`; 18 since PROV-071 made it live.
+        assert_eq!(models.len(), 18);
         assert!(models.iter().all(|m| m.api.as_str() == OPENAI_COMPLETIONS));
         assert!(
             models
@@ -568,29 +569,29 @@ mod tests {
         let p = cloudflare_workers_ai_provider();
         assert_eq!(p.id(), &ProviderId::from("cloudflare-workers-ai"));
         assert_eq!(p.name(), "Cloudflare Workers AI");
-        assert_eq!(p.models().len(), 13);
+        assert_eq!(p.models().len(), 18);
     }
 
     // ----------------------- Cloudflare AI Gateway (Pi cloudflareAIGatewayAuth) ----------------
 
     #[test]
     fn ai_gateway_catalog_parses_with_expected_api_mix() {
-        // pi `cloudflare-ai-gateway.models.ts` @`b0c2a90e`: 42 models = 18 anthropic-messages + 5
-        // openai-completions + 19 openai-responses, all carrying the dual account/gateway
-        // placeholders. cyrup's `91585d9a` snapshot held 38: the GPT-5.6 trio (openai-responses)
-        // and `workers-ai/@cf/zai-org/glm-5.2` (openai-completions) landed in the week between the
-        // two revisions and were never picked up (PROV-057/PROV-060).
+        // pi `cloudflare-ai-gateway.models.ts`, live since PROV-071: 54 models = 12
+        // anthropic-messages + 18 openai-completions + 24 openai-responses, all carrying the dual
+        // account/gateway placeholders. At `b0c2a90e` it was 42 = 18 + 5 + 19, and the mix moved in
+        // every direction at once — the gateway retired six older Claude ids, added the GPT-6 trio
+        // on Responses, and more than tripled the Workers-AI passthrough rows on Completions.
         let models = cloudflare_ai_gateway_models();
-        assert_eq!(models.len(), 42);
+        assert_eq!(models.len(), 54);
         assert!(
             models
                 .iter()
                 .all(|m| m.provider.as_str() == "cloudflare-ai-gateway")
         );
         let count = |api: &str| models.iter().filter(|m| m.api.as_str() == api).count();
-        assert_eq!(count(crate::known_api::ANTHROPIC_MESSAGES), 18);
-        assert_eq!(count(OPENAI_COMPLETIONS), 5);
-        assert_eq!(count(crate::known_api::OPENAI_RESPONSES), 19);
+        assert_eq!(count(crate::known_api::ANTHROPIC_MESSAGES), 12);
+        assert_eq!(count(OPENAI_COMPLETIONS), 18);
+        assert_eq!(count(crate::known_api::OPENAI_RESPONSES), 24);
         assert!(models.iter().all(|m| {
             let b = m.base_url.as_str();
             b.contains("{CLOUDFLARE_ACCOUNT_ID}") && b.contains("{CLOUDFLARE_GATEWAY_ID}")
@@ -611,7 +612,9 @@ mod tests {
         let auth = CloudflareAiGatewayAuth;
         let model = cloudflare_ai_gateway_models()
             .into_iter()
-            .find(|m| m.id.as_str() == "claude-3-5-haiku")
+            // `claude-3-5-haiku` and `gpt-4` were the anthropic-messages / openai-responses
+            // samples here; the gateway retired both. `claude-haiku-4.5` is the same shape.
+            .find(|m| m.id.as_str() == "claude-haiku-4.5")
             .expect("model");
         let ctx = MapEnv(BTreeMap::from([
             (CLOUDFLARE_API_KEY.to_string(), "cf-key".to_string()),
@@ -687,7 +690,7 @@ mod tests {
         let auth = CloudflareAiGatewayAuth;
         let model = cloudflare_ai_gateway_models()
             .into_iter()
-            .find(|m| m.id.as_str() == "gpt-4")
+            .find(|m| m.id.as_str() == "gpt-4.1")
             .expect("model");
         let cred = Credential::ApiKey {
             key: Some("stored-key".to_string()),
@@ -723,7 +726,7 @@ mod tests {
         )
         .with_auth_context(Arc::new(MapEnv(BTreeMap::new())));
         let model = provider
-            .get_model("claude-3-5-haiku")
+            .get_model("claude-haiku-4.5")
             .expect("model")
             .clone();
         let msg = collect_message(provider.stream(
@@ -742,9 +745,9 @@ mod tests {
         // a fully-configured gateway resolves auth and reaches transport (proving each api accepts
         // header-only auth with no api key). Point at an unroutable host so it fails fast at connect.
         for id in [
-            "claude-3-5-haiku",
-            "workers-ai/@cf/moonshotai/kimi-k2.5",
-            "gpt-4",
+            "claude-haiku-4.5",
+            "workers-ai/@cf/moonshotai/kimi-k2.6",
+            "gpt-4.1",
         ] {
             let provider = cloudflare_ai_gateway_provider_with(
                 Arc::new(InMemoryCredentialStore::new()),
@@ -781,6 +784,6 @@ mod tests {
         let p = cloudflare_ai_gateway_provider();
         assert_eq!(p.id(), &ProviderId::from("cloudflare-ai-gateway"));
         assert_eq!(p.name(), "Cloudflare AI Gateway");
-        assert_eq!(p.models().len(), 42);
+        assert_eq!(p.models().len(), 54);
     }
 }

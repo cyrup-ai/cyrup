@@ -372,6 +372,10 @@ impl<B: Backend> App<B> {
             let index = next_index;
             next_index += 1;
             match message {
+                // pi `case "system": break;` (`interactive-mode.ts:3781-3782` @v0.87.1) — a system
+                // message draws NOTHING in the replayed transcript. It is prompt state, and the
+                // prompt is not a chat bubble (PROV-083a).
+                AgentMessage::Core(Message::System(_)) => continue,
                 AgentMessage::Core(Message::User { content, .. }) => {
                     let text = content_text(content);
                     if text.trim().is_empty() {

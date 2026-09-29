@@ -40,6 +40,7 @@ fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message()
                 api: API_ID.into(),
                 response_model: None,
                 response_id: None,
+                provider_thinking_level: None,
                 diagnostics: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,
@@ -253,11 +254,14 @@ fn constrained_sampling_drives_completions_strict_flag() {
 
 /// PROV-011 DoD 4/5 — the WIRE shape of an opted-in tool on a real OpenAI-completions route.
 ///
-/// `supports_strict_mode` is `true` by DEFAULT here (`compat.rs:660` excludes only Moonshot,
-/// Together, the Cloudflare AI gateway and NVIDIA), so `strict: true` and the raw `read` schema
-/// would go out together — and be REJECTED, since strict function calling demands every key of
-/// `properties` in `required` plus `additionalProperties: false`. The schema must therefore be
-/// the strict-converted one.
+/// `supports_strict_mode` is `true` here because the ROW SAYS SO. PROV-078 — at v0.87.1 detection
+/// alone never yields it (`openai-completions.ts:1667` is a flat `supportsStrictMode: false`); a
+/// built-in row carries the generator's `!isMoonshot && !isTogether && !isCloudflareAiGateway &&
+/// !isNvidia && !isCerebras` as explicit metadata instead (`generate-models.ts:765-766`), which is
+/// what [`super::super::super::compat::ModelCompat`] spells out below. Given that, `strict: true`
+/// and the raw `read` schema would go out together — and be REJECTED, since strict function calling
+/// demands every key of `properties` in `required` plus `additionalProperties: false`. The schema
+/// must therefore be the strict-converted one.
 #[test]
 fn an_opted_in_tool_is_serialized_with_the_strict_converted_schema() {
     use super::super::tools::convert_tools;
@@ -281,10 +285,15 @@ fn an_opted_in_tool_is_serialized_with_the_strict_converted_schema() {
         )),
     };
 
-    // A strict-capable route: `provider` is not one of the four exclusions.
-    let mut strict_model = model();
-    strict_model.provider = "openai".into();
-    strict_model.base_url = "https://api.openai.com/v1".into();
+    // A strict-capable route: a built-in `openai` row, carrying the metadata pi's generator bakes in.
+    let strict_model = super::super::tests::openai_model();
+    assert_eq!(
+        strict_model
+            .compat
+            .as_ref()
+            .and_then(|c| c.supports_strict_mode),
+        Some(true)
+    );
     let strict_compat = get_compat(&strict_model);
     assert!(strict_compat.supports_strict_mode);
 

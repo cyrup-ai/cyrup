@@ -5,14 +5,18 @@
 //! [`crate::ProviderSwap`], the configured-auth checks that gate a candidate, attribution headers,
 //! and the `cycle_model` rotation over the scoped or available set.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use cyrup_core::{ModelId, ModelRef, ModelThinkingLevel, ProviderId};
 use cyrup_ext::HostEvent;
-use cyrup_provider::Model;
+use cyrup_provider::{CatalogOverlay, Model, Provider};
 
 use crate::error::SessionServiceError;
 use crate::event::AgentSessionEvent;
 
 use super::AgentSession;
+use super::model_runtime::{AvailabilityFilter, RegistrySnapshot};
 use super::types::{ModelCycleResult, ScopedModel};
 
 impl AgentSession {
@@ -104,18 +108,7 @@ impl AgentSession {
     /// exposes in its catalog is always usable (the scripted faux provider needs no key), so the
     /// active/offline model stays selectable exactly as before.
     pub fn has_configured_auth(&self, model: &Model) -> bool {
-        if self.provider_has_configured_auth(&model.provider) {
-            return true;
-        }
-        // A guest-registered provider carries its own credentials (apiKey/oauth in the registration,
-        // Pi `providerRequestConfigs`, model-registry.ts:659-662), so its models are always available
-        // in the selector — exactly as Pi's `hasConfiguredAuth` returns true when a provider request
-        // config supplies a key.
-        if self
-            .services
-            .guest_providers
-            .has_provider(model.provider.as_str())
-        {
+        if self.provider_is_available(&model.provider) {
             return true;
         }
         self.provider
@@ -123,6 +116,27 @@ impl AgentSession {
             .models()
             .iter()
             .any(|m| m.provider == model.provider && m.id == model.id)
+    }
+
+    /// The PER-PROVIDER half of [`Self::has_configured_auth`]: configured auth, or a guest
+    /// registration that carries its own credentials.
+    ///
+    /// Split out because it depends on nothing but the provider id, which is what lets
+    /// [`Self::available_model_catalog`] evaluate it once per distinct provider (~40) instead of
+    /// once per model (~1100) — pi's `snapshot.configuredProviders`, a `Set` built from one
+    /// `checkAuth` per provider (model-runtime.ts:302-311). Splitting it changes no answer: the two
+    /// arms are the first two arms of `has_configured_auth`, in the same order.
+    fn provider_is_available(&self, provider: &ProviderId) -> bool {
+        if self.provider_has_configured_auth(provider) {
+            return true;
+        }
+        // A guest-registered provider carries its own credentials (apiKey/oauth in the registration,
+        // Pi `providerRequestConfigs`, model-registry.ts:659-662), so its models are always available
+        // in the selector — exactly as Pi's `hasConfiguredAuth` returns true when a provider request
+        // config supplies a key.
+        self.services
+            .guest_providers
+            .has_provider(provider.as_str())
     }
 
     /// Whether `provider` has configured auth in the Pi sense — a stored credential / runtime
@@ -188,7 +202,7 @@ impl AgentSession {
     /// Public view of [`Self::full_model_registry`] — every model the session can resolve, before
     /// the configured-auth filter [`Self::available_model_catalog`] applies.
     pub fn full_model_catalog(&self) -> Vec<Model> {
-        self.full_model_registry()
+        self.full_model_registry().as_ref().clone()
     }
 
     /// The FULL multi-provider model registry, deduped by `provider/id`: the session's own installed
@@ -196,13 +210,56 @@ impl AgentSession {
     /// `<agent_dir>/models.json` composed over the whole union LAST — Pi's single composed registry
     /// (`ModelRuntime.rebuildProviders`, model-runtime.ts:225-231). This is the resolution /
     /// enumeration source that spans providers, independent of which single provider is installed.
-    pub(super) fn full_model_registry(&self) -> Vec<Model> {
+    pub(super) fn full_model_registry(&self) -> Arc<Vec<Model>> {
+        let provider = self.provider.current();
+        let overlay = self.services.catalog_overlay.load();
+        let guest_gen = self.services.guest_providers.generation();
+
+        // HIT: the same installed provider, the same guest generation and the same overlay compose
+        // to the same registry, so hand back the `Arc` (pi reads `this.snapshot.all`, a field).
+        if let Some(cached) = self
+            .model_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|snap| snap.matches(&provider, guest_gen, overlay.as_ref()))
+        {
+            return Arc::clone(&cached.models);
+        }
+
+        // MISS: compose once (pi `rebuildProviders()` → `updateModelSnapshot()`,
+        // model-runtime.ts:268-284) and store the snapshot beside the keys it was composed from.
+        //
+        // Two racing misses may both compose; the loser's identical result is simply overwritten.
+        // That is deliberate — composition is pure, so the duplicate costs work and nothing else,
+        // whereas holding the write lock across it would serialize every registry reader behind it.
+        let models = Arc::new(self.compose_model_registry(&provider, overlay.as_ref()));
+        *self
+            .model_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RegistrySnapshot {
+            provider,
+            guest_gen,
+            overlay,
+            models: Arc::clone(&models),
+        });
+        models
+    }
+
+    /// Compose the registry from scratch — the body [`Self::full_model_registry`] used to be, run
+    /// once per invalidation instead of once per read. Pure: same inputs, same output, no
+    /// session-state mutation.
+    fn compose_model_registry(
+        &self,
+        current: &Arc<dyn Provider>,
+        overlay: Option<&Arc<CatalogOverlay>>,
+    ) -> Vec<Model> {
         // --- BASE layer, in Pi's `recomposeProvider` precedence (model-runtime.ts:201) ---
         // `base = nativeExtensionProviders.get(id) ?? builtins.get(id)`: a registered provider
         // shadows the compiled-in catalog, and the compiled-in catalog fills in the rest. The
         // session's own installed provider comes first because it also carries the offline faux
         // models and any custom-id model that is not a registry entry.
-        let mut base: Vec<Model> = self.provider.current().models().to_vec();
+        let mut base: Vec<Model> = current.models().to_vec();
         // Guest-registered providers (Pi folds `registerProvider` models into the same `ModelRegistry`
         // that `find`/`getAvailable`/`setModel` read, model-registry.ts:917-940).
         for m in self.services.guest_providers.models() {
@@ -216,10 +273,11 @@ impl AgentSession {
         for m in cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
             credentials: None,
             auth_context: None,
-            // The LIVE pi.dev overlay (DRIFT-007 + XAI_3). One `RwLock` read + one `Arc` clone —
-            // the same cost as the by-value `.clone()` this replaces — so this SYNC, hot registry
-            // read stays free of disk and network I/O while now observing a mid-session refresh.
-            catalog_overlay: self.services.catalog_overlay.load(),
+            // The LIVE pi.dev overlay (DRIFT-007 + XAI_3), read by the CALLER and passed in so the
+            // composition is provably the one the cache key names. Still no disk and no network on
+            // this SYNC path, and a mid-session refresh still reaches it — installing a fresh
+            // overlay replaces the slot's `Arc`, which is exactly what misses the cache.
+            catalog_overlay: overlay.cloned(),
         })
         .get_models(None)
         {
@@ -251,10 +309,40 @@ impl AgentSession {
     /// appears once `TOGETHER_API_KEY` is set), plus cyrup's offline-faux accommodation keeps the
     /// current provider's own catalog (the scripted faux default) selectable. Deduped by `provider/id`.
     pub fn available_model_catalog(&self) -> Vec<Model> {
-        self.full_model_registry()
-            .into_iter()
-            .filter(|m| self.has_configured_auth(m))
+        let registry = self.full_model_registry();
+        let filter = self.availability_filter(&registry);
+        registry
+            .iter()
+            .filter(|m| filter.allows(m))
+            .cloned()
             .collect()
+    }
+
+    /// Build [`Self::available_model_catalog`]'s predicate — pi's `snapshot.configuredProviders`
+    /// (`model-runtime.ts:302-311`), which runs ONE `checkAuth` per provider and then filters the
+    /// models by `configuredProviders.has(model.provider)` (`:283`).
+    ///
+    /// This is the shape the filter always had and never exploited: two of
+    /// [`Self::has_configured_auth`]'s three arms depend only on the provider id, and the third is
+    /// a membership test against one fixed catalog. Evaluating them per MODEL meant ~1100
+    /// credential-store reads and ~1100 linear catalog scans per `/model` press; evaluating them
+    /// per distinct PROVIDER is ~40 credential-store reads and one set build, and returns the same
+    /// answer for every model by construction.
+    ///
+    /// Rebuilt on every call and deliberately NOT cached: the auth half must observe a mid-session
+    /// `/login` immediately (`cyrup-tui/src/tests/login_flow.rs:941-952`), which is the freshness
+    /// pi buys back with an explicit `runAvailabilityRefresh` after each credential operation.
+    fn availability_filter(&self, registry: &[Model]) -> AvailabilityFilter {
+        let mut seen: HashSet<&ProviderId> = HashSet::new();
+        let mut configured: HashSet<ProviderId> = HashSet::new();
+        for model in registry {
+            // `insert` is the distinctness gate: the predicate runs on a provider's FIRST model and
+            // is never re-run for its other ~30.
+            if seen.insert(&model.provider) && self.provider_is_available(&model.provider) {
+                configured.insert(model.provider.clone());
+            }
+        }
+        AvailabilityFilter::new(configured, self.provider.current().models())
     }
 
     /// Trigger — or JOIN — the single in-flight whole-catalog refresh, bounded by `cancel`
@@ -295,6 +383,46 @@ impl AgentSession {
         svc.refresh(cancel, configured).await
     }
 
+    /// Refresh ONE provider's catalog, bounded by `cancel` — pi's post-login
+    /// `session.modelRuntime.refresh({ providers: [providerId], signal: controller.signal })`
+    /// (`modes/interactive/interactive-mode.ts:5953`).
+    ///
+    /// The narrow sibling of [`Self::refresh_model_catalogs`], and deliberately NOT built on it. pi
+    /// runs its post-login refresh directly rather than through the `refreshModelCatalogs`
+    /// coordinator (`modes/interactive/model-catalog-refresh.ts:46-51`) it uses for `/model` and
+    /// startup, so this goes to [`cyrup_provider::ModelCatalogService::refresh_scoped`] — read that
+    /// method's doc for why joining a whole-catalog operation would destroy the caller's scope. The
+    /// practical guarantee is the one the login path needs: the WHOLE deadline is spent on the
+    /// provider just authenticated, and a slow unrelated provider cannot consume it.
+    ///
+    /// NO `has_auth` gate, unlike its neighbour: pi passes the provider unconditionally because it
+    /// was JUST authenticated, and resolves the credential inside the fetch
+    /// (`packages/ai/src/models.ts:420-421`). Gating here would race the credential write and skip
+    /// the very refresh the login asked for.
+    ///
+    /// `radius` is filtered out of the FETCH list — the fetch/overlay split
+    /// [`cyrup_provider::refresh_and_install`] documents: the pi.dev route 404s for radius. The
+    /// overlay is still reloaded over every id inside the service, so a `/login radius` still
+    /// reinstalls the gateway's own catalog.
+    ///
+    /// `Ok`-shaped by construction for the same reason [`Self::refresh_model_catalogs`] is: a
+    /// session with no wired catalog service is a configuration, not a failure.
+    pub async fn refresh_provider_catalog(
+        &self,
+        cancel: cyrup_core::CancelToken,
+        provider_id: &str,
+    ) -> cyrup_provider::CatalogRefreshResult {
+        let Some(svc) = self.services.model_catalog.as_ref() else {
+            return cyrup_provider::CatalogRefreshResult::default();
+        };
+        let fetch: Vec<String> = if provider_id == cyrup_provider::RADIUS_PROVIDER_ID {
+            Vec::new()
+        } else {
+            vec![provider_id.to_string()]
+        };
+        svc.refresh_scoped(cancel, fetch).await
+    }
+
     /// The provider-attribution + session-affinity headers this session attaches to provider requests
     /// for `model` (Pi `mergeProviderAttributionHeaders`, sdk.ts:323; #20). Computed from the merge
     /// function + the session's telemetry flag + id. The builder threads the resolved model's headers
@@ -325,9 +453,9 @@ impl AgentSession {
             return self.attribution_headers(cur);
         }
         self.full_model_registry()
-            .into_iter()
-            .find(matches)
-            .and_then(|c| self.attribution_headers(&c))
+            .iter()
+            .find(|c| matches(c))
+            .and_then(|c| self.attribution_headers(c))
     }
 
     /// Emit the `model_select` extension event when the model actually changes (Pi `_emitModelSelect`,
@@ -602,29 +730,36 @@ impl AgentSession {
             .append_model_change(next.provider.clone(), next.id.clone())?;
         // Re-clamp the thinking level for the new model. Pi
         // `_getThinkingLevelForModelSwitch(targetModel, explicitLevel)`
-        // (`agent-session.ts:1828-1839`), in its exact precedence:
-        //   1. an explicit level passed to this switch wins outright (`:1829-1831`);
+        // (`core/agent-session.ts:2310-2322` @v0.87.1), in its exact precedence:
+        //   1. an explicit level passed to this switch wins outright (`:2311-2313`);
         //   2. else the PER-MODEL override for the model being switched TO
-        //      (`getModelThinkingLevel(provider, id)`, `:1833-1838`) — this tier is what lets a
+        //      (`getModelThinkingLevel(provider, id)`, `:2315-2320`) — this tier is what lets a
         //      user reason hard on a large model and cheaply on a small one across a `Ctrl+P`
         //      cycle, instead of one global level following them everywhere;
-        //   3. else the global default, else the current session level (`:1839`).
-        // Cyrup's step 3 keeps the SESSION level ahead of the settings default, which is the order
-        // that preserves an in-session Shift+Tab across an unrelated model switch; pi reads its
-        // global default first there. \[CYRUP-DELTA] — noted rather than changed, because
-        // reversing it would silently discard a live cycle on every switch.
+        //   3. else the CONFIGURED GLOBAL DEFAULT (`getDefaultThinkingLevel()`, `:2321`), which is
+        //      `settings.defaultThinkingLevel` and is `undefined` unless the user wrote the key
+        //      (`core/settings-manager.ts:799-801`);
+        //   4. else the current SESSION level, else `DEFAULT_THINKING_LEVEL` (`:2321`'s last two
+        //      `??` arms) — [`Self::thinking_level`] is total and already carries that floor, so
+        //      one arm covers both.
+        //
+        // Steps 3 and 4 are in upstream's order and not the reverse: a user who has written
+        // `defaultThinkingLevel` has asked for every model switch to land there, and an in-session
+        // Shift+Tab cycle survives a switch exactly when that key is UNSET — which is the default,
+        // and the only case in which reversing the two could ever have looked equivalent.
         let level = match explicit_thinking {
             Some(l) => l,
             None => {
                 // Bound to a `Copy` `Option` FIRST so the effective-settings borrow is released
-                // before the `.await` below, and so `thinking_level()` is not paid for on the
-                // override path.
-                let per_model = self
-                    .services
-                    .settings
-                    .effective()
-                    .model_thinking_level(next.provider.as_str(), next.id.as_str());
-                match per_model {
+                // before the `.await` below, and so `thinking_level()` is not paid for when either
+                // configured tier answers.
+                let configured = {
+                    let settings = self.services.settings.effective();
+                    settings
+                        .model_thinking_level(next.provider.as_str(), next.id.as_str())
+                        .or_else(|| settings.default_thinking_level())
+                };
+                match configured {
                     Some(l) => l,
                     None => self.thinking_level().await,
                 }

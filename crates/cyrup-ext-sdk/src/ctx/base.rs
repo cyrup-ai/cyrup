@@ -269,6 +269,57 @@ impl Ctx {
         Ok(())
     }
 
+    /// EXT-087 — queue an author-supplied message (pi `ctx.sendMessage(message, options)`).
+    ///
+    /// On the BASE context, not on [`crate::CommandCtx`] alone, because upstream puts it on the
+    /// extension api itself: `sendMessage(message, options): void { assertActive();
+    /// runtime.sendMessage(message, options); }` (`core/extensions/loader.ts:351-354` @v0.87.1),
+    /// with no tier check of any kind. An `agent_settled` handler queueing the next message is
+    /// ordinary upstream usage, and while this lived only on the command-tier context the SDK
+    /// mirrored a host gate that no longer exists.
+    ///
+    /// The host queues it unconditionally and applies it at the post-settle drain
+    /// (`cyrup-session-svc`'s `AgentSession::settle_run`), so a send from a handler takes effect at
+    /// the turn boundary rather than being refused.
+    ///
+    /// Both `message` and `opts` are author-supplied; either encoding failing is returned as `Err`
+    /// rather than sending a `null` message or dropping the options.
+    pub fn send_message(
+        &self,
+        message: impl Serialize,
+        opts: impl Serialize,
+    ) -> Result<(), String> {
+        let m =
+            serde_json::to_string(&message).map_err(|e| format!("send_message message: {e}"))?;
+        let o = serde_json::to_string(&opts).map_err(|e| format!("send_message opts: {e}"))?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::control::send_message(&m, &o);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (m, o);
+            Ok(())
+        }
+    }
+
+    /// EXT-087 — queue a user-authored message (pi `ctx.sendUserMessage(content, options)`,
+    /// `core/extensions/loader.ts:356-358` @v0.87.1). On the base context for the reason
+    /// [`Self::send_message`] is; see [`crate::CommandCtx::send_user_message`] for what the option
+    /// bag carries and how the host honours it.
+    pub fn send_user_message(&self, content: &str, opts: impl Serialize) -> Result<(), String> {
+        let o = serde_json::to_string(&opts).map_err(|e| format!("send_user_message opts: {e}"))?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::control::send_user_message(content, &o);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (content, o);
+            Ok(())
+        }
+    }
+
     /// Request a graceful host shutdown (Pi `ctx.shutdown()`, types.ts:340 @v0.83.0, doc
     /// "Gracefully shutdown pi and exit. Available in all contexts." at `:339`). The host exits at
     /// its next settle point. EXT-073: `:344` is `compact`.

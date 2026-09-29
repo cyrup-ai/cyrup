@@ -37,7 +37,9 @@ use cyrup_ext_subagents::background::{
     RunId, RunMode, RunPaths, RunState, RunStatus, StepState, StepStatus,
     active_async_capacity_root_in, run_artifact_roots_in,
 };
-use cyrup_ext_subagents::extension::{BackgroundStepsSpec, SubagentsExtension};
+use cyrup_ext_subagents::extension::{
+    BackgroundStepsSpec, RetainedModelResponseAliases, SubagentsExtension,
+};
 use cyrup_ext_subagents::identity::SessionId;
 use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
@@ -125,8 +127,9 @@ fn worker_step() -> RunnerStep {
 
 fn background_spec(run_id: RunId) -> BackgroundStepsSpec {
     BackgroundStepsSpec {
+        tool_timeout_ms: None,
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
-        model_response_aliases: None,
+        model_response_aliases: RetainedModelResponseAliases::Live,
         steps: vec![worker_step()],
         mode: RunMode::Single,
         session_file: None,

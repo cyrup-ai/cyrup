@@ -1,11 +1,11 @@
-// cyrup:ext@0.10.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.11.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
 // lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
 // values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
 //
-// The `events` interface exports 34 `on-*` hooks. THIRTY-THREE of them mirror pi's `pi.on(...)`
+// The `events` interface exports 35 `on-*` hooks. THIRTY-THREE of them mirror pi's `pi.on(...)`
 // catalog one-for-one (`extensions/types.ts:1190-1231` @v0.83.0 — 33 `on(event: "…")` overloads,
 // hand re-derived; the range `:1198-1239` this header used to cite corresponds to NO upstream
 // version and was fabricated, EXT-036). `before_provider_headers` (EXT-009, upstream `:1212`) and
@@ -16,7 +16,11 @@
 // `ExtensionUIContext.onTerminalInput(handler)` (`extensions/types.ts:145` @v0.83.0), which
 // upstream registers as a closure rather than a named event — a closure cannot cross a component
 // boundary, so it lands here as an export paired with the `ui.subscribe-terminal-input` import
-// (EXT-021). Count the `on-*` lines, not the pi events: the two numbers are 34 and 33.
+// (EXT-021). The 35th, `on-branch-change`, is the same shape for the same reason: it is
+// `ReadonlyFooterDataProvider.onBranchChange(callback)` (`core/footer-data-provider.ts:139-143`
+// @v0.87.1), a closure subscription upstream hands the `setFooter` factory, paired here with the
+// `ui.subscribe-branch-change` import (EXT-064). Count the `on-*` lines, not the pi events: the two
+// numbers are 35 and 33.
 // The host calls only the exports a guest subscribed to (the subscription gate, R-08-034).
 //
 // VERSIONING (EXT-028): this package version and `cyrup_ext::HOST_WORLD` move TOGETHER, and ANY
@@ -79,7 +83,7 @@
 // its two closure-shaped arguments (`onData`, `signal`) come back over the new `host-bash`
 // interface. DRIFT-004. The `registration.register-bash-operations` and `host-bash.*` IMPORTS are
 // additive and would not have forced a bump on their own (see the paragraph above).
-package cyrup:ext@0.10.0;
+package cyrup:ext@0.11.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -200,9 +204,11 @@ interface types {
 // host -> guest: the §5 event catalog (exports the guest may implement).
 // The host only calls events the guest subscribed to (subscription gate, R-08-034).
 // All 33 pi events (the `on(event: "…")` overload block, extensions/types.ts:1190-1231 @v0.83.0)
-// are represented here, plus `on-terminal-input` — the `ExtensionUIContext.onTerminalInput`
-// closure (`extensions/types.ts:145`), which has no `on(event: …)` name upstream — for 34 `on-*`
-// exports against 33 pi events. EXT-036: this line used to claim "All 30" against a range that
+// are represented here, plus TWO closure subscriptions that have no `on(event: …)` name upstream:
+// `on-terminal-input` — the `ExtensionUIContext.onTerminalInput` closure
+// (`extensions/types.ts:145`) — and `on-branch-change` — the `ReadonlyFooterDataProvider`'s
+// `onBranchChange(callback)` (`core/footer-data-provider.ts:139-143` @v0.87.1), EXT-064. That is
+// 35 `on-*` exports against 33 pi events. EXT-036: this line used to claim "All 30" against a range that
 // matches no upstream version, contradicting the file's own header 81 lines above — and the count
 // test only ties the header's number, so the disagreement passed straight through an audit that
 // quoted it.
@@ -386,6 +392,22 @@ interface events {
   // faulting or panicking guest is treated as, so a broken extension can never swallow the user's
   // keyboard.
   on-terminal-input: func(data: string) -> option<terminal-input-result>;
+
+  // EXT-064 — pi `ReadonlyFooterDataProvider.onBranchChange(callback: () => void): () => void`
+  // ("Subscribe to git branch changes. Returns unsubscribe function.",
+  // `core/footer-data-provider.ts:139-143` @v0.87.1). This is the FOURTH member of the provider
+  // upstream hands the `setFooter` factory, and the one the `ui.footer-data` import cannot carry,
+  // because it is a PUSH rather than a read: upstream's custom footer COMPONENT is re-rendered by
+  // the draw path and re-reads `getGitBranch()` every frame, so a branch change repaints it with
+  // no extension code involved (`interactive-mode.ts:1046` re-requests the render). A cyrup guest
+  // hands over rendered text once, so without a push its footer would freeze at whatever branch
+  // was current when it called `set-footer` — a behavioural difference, not a mechanism one.
+  //
+  // Called only on a guest that declared `ui.subscribe-branch-change`, and — like upstream's
+  // `notifyBranchChange` (`:197-199`) — ONLY when the branch actually changed, never on an
+  // unchanged poll. `branch` is upstream's `getGitBranch()` tri-state verbatim: a branch name, the
+  // literal `"detached"`, or `none` outside a repo (`:126-132`).
+  on-branch-change: func(branch: option<string>);
 
   // --- 5.4 tools — the mutating seams ---
   // tool_call [block/mutate] (subscribed at types.ts:1228 @v0.83.0), tool_result [mutate] (:1229).
@@ -679,6 +701,15 @@ interface ui {
   // because an export addition forces a HOST_WORLD bump"). That bump is 0.6 -> 0.7.
   subscribe-terminal-input:   func();
   unsubscribe-terminal-input: func();
+  // EXT-064 — the subscription half of `ReadonlyFooterDataProvider.onBranchChange(callback)`
+  // (`core/footer-data-provider.ts:139-143` @v0.87.1). Argument-less for the same reason the
+  // terminal-input pair above is: the callback is a guest closure the host reaches through the
+  // `on-branch-change` EXPORT, so this import only declares that this guest HAS one. Upstream's
+  // `onBranchChange` RETURNS the unsubscribe function (`() => this.branchChangeCallbacks.delete(cb)`,
+  // `:141-142`); that return value is `unsubscribe-branch-change`, idempotent because upstream's
+  // is a `Set.delete`.
+  subscribe-branch-change:    func();
+  unsubscribe-branch-change:  func();
   // `opts-json` is pi's `ExtensionUIDialogOptions` bag (`extensions/types.ts:95-101` @v0.83.0):
   // `{signal, timeout}` — `timeout?: number`, "Timeout in milliseconds. Dialog auto-dismisses with
   // live countdown display" (:100), and/or a programmatic-dismiss signal id (none = `{}`).
@@ -729,21 +760,42 @@ interface ui {
   // --- chrome (Pi `setHeader` `types.ts:190`, `setFooter` `:183-187`, `setTitle` `:193` @v0.83.0;
   //     EXT-036: the range `:130-150` this line used to cite is the dialog/notify block above) ---
   //
-  // [CYRUP-DELTA] EXT-064 / TUI-033 — TWO collapses live in these two signatures, and neither is
-  // visible from the pi lines they cite:
-  //   (1) FACTORY -> STRING. Upstream both take a component FACTORY re-invoked by the draw path
-  //       (`setFooter(factory: ((tui, theme, footerData) => Component) | undefined)` at `:183-187`,
-  //       `setHeader(factory: ((tui, theme) => Component) | undefined)` at `:190`); a factory cannot
-  //       cross a component boundary, so cyrup takes the rendered text once.
-  //   (2) `undefined` -> `""`. Upstream restores the built-in chrome by passing `undefined`; WIT
-  //       `string` has no such value here, so the EMPTY STRING carries "restore the built-in".
-  // Consequence, stated because nothing else in the tree states it: pi hands the footer factory a
-  // `ReadonlyFooterDataProvider` (the git branch plus the `setStatus` segments other extensions set,
-  // `:179-181`), and cyrup has NO analog — so an extension footer cannot render either. That half of
-  // EXT-064 is open; it needs a data channel (a `ui.footer-data` import or extra `set-footer`
-  // parameters) and should batch with EXT-006's render-path widening.
-  set-header: func(content: string);
-  set-footer: func(content: string);
+  // [CYRUP-DELTA] EXT-064 / TUI-033 — ONE collapse lives in these two signatures, and it is a
+  // MECHANISM difference at full feature parity. Upstream both take a component FACTORY
+  // (`setFooter(factory: ((tui, theme, footerData) => Component) | undefined)` at `:183-187`,
+  // `setHeader(factory: ((tui, theme) => Component) | undefined)` at `:190`), invoked ONCE per
+  // `setFooter`/`setHeader` call (`interactive-mode.ts:2440` and `:2471` @v0.87.1 — the factory is
+  // NOT re-invoked by the draw path; the COMPONENT it returns is what the draw path re-renders).
+  // A closure cannot cross a component boundary, so cyrup takes the rendered text instead, and the
+  // two halves of what upstream's component gets for free are restored explicitly:
+  //   * the DATA the factory's third argument carries — a `ReadonlyFooterDataProvider` (`:179-181`)
+  //     — is PULLED through the `footer-data` import below;
+  //   * the RE-RENDER a data change would have caused is PUSHED through the `on-branch-change`
+  //     export (`events`), so a guest's footer tracks the branch instead of freezing at whatever
+  //     was current when it called `set-footer`.
+  // All four members of `ReadonlyFooterDataProvider` are therefore covered: `getGitBranch`,
+  // `getExtensionStatuses` and `getAvailableProviderCount` by `footer-data`, and `onBranchChange`
+  // by the `ui.subscribe-branch-change` / `events.on-branch-change` pair.
+  //
+  // `option<string>` is upstream's `Component | undefined` argument, NOT a collapse: `none` is
+  // upstream's `undefined` — "restore the built-in chrome" (`interactive-mode.ts:2442-2446`,
+  // `:2481-2490`) — and `some(s)` is a custom one carrying `s`. `some("")` is therefore an EMPTY
+  // CUSTOM footer, which is a state upstream has (a factory returning a component that renders
+  // nothing) and which is distinct from restoring the built-in. EXT-064: this WAS the second
+  // collapse — `set-footer(content: string)` with the EMPTY STRING overloaded to mean "restore the
+  // built-in" — and it cost a guest that state outright, so it was a behavioural difference
+  // wearing a delta's clothes rather than a mechanism note. Fixed by the signature, not documented.
+  set-header: func(content: option<string>);
+  set-footer: func(content: option<string>);
+  // EXT-064 — the read half of pi's `ReadonlyFooterDataProvider`
+  // (`core/footer-data-provider.ts:385-388` @v0.87.1; the file is under `core/`, NOT
+  // `modes/interactive/`). A json object under pi's own field names:
+  //   {"gitBranch": string|null, "extensionStatuses": {key: text}, "availableProviderCount": number}
+  // `gitBranch` keeps upstream's TRI-STATE verbatim — a branch name, the literal `"detached"`, or
+  // `null` outside a repo (`:126-132`). The outer `none` is "no footer data provider attached",
+  // which is upstream's own answer everywhere but the interactive TUI: pi constructs its one
+  // `FooterDataProvider` at `interactive-mode.ts:611` and nowhere else.
+  footer-data: func() -> option<string>;
   set-title:  func(title: string);
   // custom overlay component; returns an optional serialized result (Pi
   // `custom<T>(factory, ...)`, `types.ts:196` @v0.83.0 — "Show a custom component with keyboard

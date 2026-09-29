@@ -566,6 +566,7 @@ impl ExtensionHost {
             bus_topics,
             markdown_transformer,
             terminal_input,
+            branch_change,
         ) = api.into_parts();
 
         // EXT-003 footgun guard: a native that subscribes to `project_trust` but did NOT override
@@ -644,6 +645,12 @@ impl ExtensionHost {
         // (`packages/tui/src/tui.ts:651-655`, folded `:773-788`).
         if terminal_input {
             self.registry.subscribe_terminal_input(id.clone())?;
+        }
+        // EXT-064: git-branch-change subscription, in LOAD ORDER for the same reason — upstream
+        // iterates its insertion-ordered `branchChangeCallbacks` set
+        // (`core/footer-data-provider.ts:197-199` @v0.87.1).
+        if branch_change {
+            self.registry.subscribe_branch_change(id.clone())?;
         }
         // EXT-018: a native's bus subscriptions land in the SAME host-owned bus a guest's
         // `bus.subscribe` import writes to (pi's single `createEventBus()`, `loader.ts:389`).
@@ -1934,6 +1941,77 @@ impl ExtensionHost {
         self.registry
             .has_terminal_input_subscribers()
             .unwrap_or(false)
+    }
+
+    /// Whether ANY extension subscribed to git-branch changes (EXT-064) — the sync pre-check twin
+    /// of [`Self::has_terminal_input_subscribers`], for [`Self::branch_change`]. Upstream's own
+    /// guard is the emptiness of `branchChangeCallbacks`
+    /// (`core/footer-data-provider.ts:197-199` @v0.87.1).
+    pub fn has_branch_change_subscribers(&self) -> bool {
+        self.registry
+            .has_branch_change_subscribers()
+            .unwrap_or(false)
+    }
+
+    /// The git branch CHANGED — notify every subscriber, in LOAD order (EXT-064; pi
+    /// `FooterDataProvider.notifyBranchChange`, `core/footer-data-provider.ts:197-199` @v0.87.1:
+    /// `for (const cb of this.branchChangeCallbacks) { try { cb(); } catch {} }`).
+    ///
+    /// This is the PUSH half of `ReadonlyFooterDataProvider` — the one member `ui.footer-data`
+    /// cannot carry, and the reason a guest's custom footer tracks the branch instead of freezing
+    /// at whatever `set-footer` was handed. Upstream needs no such call because its custom footer
+    /// is a COMPONENT the draw path re-renders, which re-reads `getGitBranch()` each frame; a
+    /// cyrup guest hands over rendered text, so the re-render has to be asked for.
+    ///
+    /// The caller is the TUI's branch poll (`cyrup_tui::app::App::on_git_branch_poll`), which
+    /// already fires only on a REAL change — upstream's callbacks likewise run inside
+    /// `if (this.cachedBranch !== next)` (`:224-227`).
+    ///
+    /// `branch` is upstream's `getGitBranch()` tri-state verbatim: a branch name, the literal
+    /// `"detached"`, or `None` outside a repo (`:126-132`).
+    ///
+    /// A faulting or panicking extension is CONTAINED and skipped. This is a CYRUP-ORIGINAL
+    /// guarantee, not a port, and is recorded as such: upstream's `notifyBranchChange` is the bare
+    /// loop `for (const cb of this.branchChangeCallbacks) cb();`
+    /// (`core/footer-data-provider.ts:197-199` @v0.87.1) with no `try`/`catch` anywhere in it, so a
+    /// throwing listener there DOES stop the ones after it. Containment is required here rather
+    /// than optional because a cyrup subscriber can be a native built-in whose panic would unwind
+    /// through the TUI's poll arm, which upstream has no equivalent of — the same reason
+    /// [`Self::terminal_input`] contains its handlers. It is strictly more forgiving than upstream,
+    /// so no guest can observe a behaviour pi's would not also produce.
+    pub async fn branch_change(&self, branch: Option<&str>) {
+        let owners = self.registry.branch_change_subscribers().unwrap_or_default();
+        for owner in owners {
+            self.branch_change_via(&owner, branch).await;
+        }
+    }
+
+    /// One branch-change callback invocation, whichever tier its owner lives in. See
+    /// [`Self::branch_change`] for why a fault is contained rather than surfaced.
+    async fn branch_change_via(&self, owner: &ExtensionId, branch: Option<&str>) {
+        if let Some(native) = self.native.read().ok().and_then(|g| g.get(owner).cloned())
+            && let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                native.on_branch_change(branch);
+            }))
+        {
+            tracing::warn!(
+                extension = %owner, error = %native_panic_msg(panic),
+                "native branch-change handler panicked (the other subscribers still run)"
+            );
+            return;
+        }
+        #[cfg(feature = "wasm-host")]
+        {
+            let Some(ext) = self.live.read().ok().and_then(|g| g.get(owner).cloned()) else {
+                return;
+            };
+            if let Err(e) = ext.on_branch_change(branch).await {
+                tracing::warn!(
+                    extension = %owner, error = %e,
+                    "branch-change handler contained (the other subscribers still run)"
+                );
+            }
+        }
     }
 
     pub fn registry(&self) -> &ExtensionRegistry {

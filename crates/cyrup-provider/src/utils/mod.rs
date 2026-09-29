@@ -7,6 +7,9 @@
 //! - [`deferred_tools`] — split the active tool list into an immediate prefix and transcript-
 //!   anchored definitions (`utils/deferred-tools.ts`), DRIFT-001.
 //! - [`estimate`] — heuristic context-token estimation (`utils/estimate.ts`).
+//! - [`text`] — the content/system-message renderers (`utils/text.ts`), PROV-083a.
+//! - [`transcript`] — system-message + tool-declaration replay over a transcript
+//!   (`utils/transcript.ts`), PROV-083a.
 //! - [`overflow`] — context-overflow error classification (`utils/overflow.ts`).
 //! - [`retry`] — transient provider/transport error classification (`utils/retry.ts`).
 //! - [`json_parse`] — best-effort/partial JSON recovery for streamed tool-call args
@@ -48,3 +51,7 @@ pub mod refresh;
 pub mod regexlite;
 pub mod retry;
 pub mod simple_options;
+#[cfg(test)]
+mod tests;
+pub mod text;
+pub mod transcript;

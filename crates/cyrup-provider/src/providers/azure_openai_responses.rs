@@ -24,7 +24,7 @@ const CATALOG_JSON: &str = include_str!("catalog/azure-openai-responses.json");
 /// The full Azure OpenAI catalog (1:1 with Pi `AZURE_OPENAI_RESPONSES_MODELS`). A parse failure
 /// yields an empty catalog (surfaced loudly by the catalog-count test) rather than a panic.
 pub fn azure_openai_responses_models() -> Vec<Model> {
-    serde_json::from_str(CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(CATALOG_JSON).unwrap_or_default()
 }
 
 /// The Azure OpenAI [`ProviderAuth`]: an API key from `AZURE_OPENAI_API_KEY` (Pi
@@ -88,10 +88,10 @@ mod tests {
     #[test]
     fn catalog_parses_with_expected_count_and_tags() {
         let models = azure_openai_responses_models();
-        // pi `azure-openai-responses.models.ts` @`b0c2a90e` (46). The 46th is the derived clone
-        // of `openai`'s `gpt-realtime-2.1` row, absent from cyrup's `91585d9a` snapshot
-        // (PROV-057/PROV-060).
-        assert_eq!(models.len(), 46);
+        // pi `azure-openai-responses.models.ts`, live since PROV-071 (43). It is a DERIVED clone
+        // of the `openai` catalog (`ai/scripts/generate-models.ts` copies the four scalar rates and
+        // drops `tiers`), so it tracks that catalog's 46 -> 43 row for row.
+        assert_eq!(models.len(), 43);
         assert!(
             models
                 .iter()
@@ -147,8 +147,9 @@ mod tests {
         );
         assert!(terra.cost.tiers.is_none());
 
-        // MIRROR: Sol is absent from the price table, so its clone is unchanged, and the Azure
-        // context-window override still applies to all three (`…:2704-2710`).
+        // Sol is in the price table now (see `providers/openai.rs` for the upstream move), so its
+        // clone moved with it — which is the point of asserting the clone separately: it proves
+        // the derivation followed, rather than the Azure rows carrying their own stale copy.
         let sol = find("gpt-5.6-sol");
         assert_eq!(
             (
@@ -157,8 +158,9 @@ mod tests {
                 sol.cost.cache_read,
                 sol.cost.cache_write
             ),
-            (5.0, 30.0, 0.5, 6.25)
+            (4.0, 20.0, 0.4, 5.0)
         );
+        assert!(sol.cost.tiers.is_none(), "the Azure clone drops tiers");
         for id in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
             assert_eq!(find(id).context_window, 1_050_000, "{id}");
         }
@@ -176,7 +178,7 @@ mod tests {
         let p = azure_openai_responses_provider();
         assert_eq!(p.id(), &ProviderId::from("azure-openai-responses"));
         assert_eq!(p.name(), "Azure OpenAI");
-        assert_eq!(p.models().len(), 46);
+        assert_eq!(p.models().len(), 43);
     }
 
     #[tokio::test]

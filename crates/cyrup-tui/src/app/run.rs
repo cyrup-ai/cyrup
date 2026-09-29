@@ -413,7 +413,7 @@ impl App<InlineBackend<Stdout>> {
                     self.on_elapsed_tick()?
                 }
                 _ = git_branch_poll.tick(), if self.state.git_branch.in_repo() => {
-                    self.on_git_branch_poll()?
+                    self.on_git_branch_poll(&mut ctx).await?
                 }
                 // ADR-0005 §B-14. Below the input arm and the rebind arm like every other ticker,
                 // and safe there for the same reason: `alt_deadline` is `None` — a future that

@@ -17,7 +17,18 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gemini-2.5-flash-lite",
@@ -37,7 +48,18 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65535,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gemini-2.5-pro",
@@ -57,7 +79,18 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gemini-3-flash-preview",
@@ -67,7 +100,13 @@
 		"baseUrl": "https://{location}-aiplatform.googleapis.com",
 		"reasoning": true,
 		"thinkingLevelMap": {
-			"off": null
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
 		"input": [
 			"text",
@@ -80,7 +119,18 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gemini-3.1-flash-lite",
@@ -90,7 +140,13 @@
 		"baseUrl": "https://{location}-aiplatform.googleapis.com",
 		"reasoning": true,
 		"thinkingLevelMap": {
-			"off": null
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
 		"input": [
 			"text",
@@ -103,7 +159,18 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gemini-3.1-pro-preview",
@@ -115,9 +182,11 @@
 		"thinkingLevelMap": {
 			"off": null,
 			"minimal": null,
-			"low": "LOW",
-			"medium": null,
-			"high": "HIGH"
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
 		"input": [
 			"text",
@@ -130,7 +199,18 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gemini-3.1-pro-preview-customtools",
@@ -142,9 +222,11 @@
 		"thinkingLevelMap": {
 			"off": null,
 			"minimal": null,
-			"low": "LOW",
-			"medium": null,
-			"high": "HIGH"
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
 		"input": [
 			"text",
@@ -157,7 +239,18 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gemini-3.5-flash",
@@ -167,7 +260,13 @@
 		"baseUrl": "https://{location}-aiplatform.googleapis.com",
 		"reasoning": true,
 		"thinkingLevelMap": {
-			"off": null
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
 		"input": [
 			"text",
@@ -180,7 +279,178 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gemini-3.5-flash-lite",
+		"name": "Gemini 3.5 Flash Lite",
+		"api": "google-vertex",
+		"provider": "google-vertex",
+		"baseUrl": "https://{location}-aiplatform.googleapis.com",
+		"reasoning": true,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 0.3,
+			"output": 2.5,
+			"cacheRead": 0.03,
+			"cacheWrite": 0
+		},
+		"contextWindow": 1048576,
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gemini-3.6-flash",
+		"name": "Gemini 3.6 Flash",
+		"api": "google-vertex",
+		"provider": "google-vertex",
+		"baseUrl": "https://{location}-aiplatform.googleapis.com",
+		"reasoning": true,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 0.75,
+			"output": 3.75,
+			"cacheRead": 0.075,
+			"cacheWrite": 0
+		},
+		"contextWindow": 1048576,
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gemini-3.7-flash",
+		"name": "Gemini 3.7 Flash",
+		"api": "google-vertex",
+		"provider": "google-vertex",
+		"baseUrl": "https://{location}-aiplatform.googleapis.com",
+		"reasoning": true,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 0.75,
+			"output": 3.75,
+			"cacheRead": 0.075,
+			"cacheWrite": 0
+		},
+		"contextWindow": 1048576,
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gemini-3.8-flash",
+		"name": "Gemini 3.8 Flash",
+		"api": "google-vertex",
+		"provider": "google-vertex",
+		"baseUrl": "https://{location}-aiplatform.googleapis.com",
+		"reasoning": true,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 0.75,
+			"output": 3.75,
+			"cacheRead": 0.075,
+			"cacheWrite": 0
+		},
+		"contextWindow": 1048576,
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gemini-flash-latest",
@@ -190,7 +460,13 @@
 		"baseUrl": "https://{location}-aiplatform.googleapis.com",
 		"reasoning": true,
 		"thinkingLevelMap": {
-			"off": null
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
 		"input": [
 			"text",
@@ -203,7 +479,18 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gemini-flash-lite-latest",
@@ -213,7 +500,13 @@
 		"baseUrl": "https://{location}-aiplatform.googleapis.com",
 		"reasoning": true,
 		"thinkingLevelMap": {
-			"off": null
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
 		"input": [
 			"text",
@@ -226,6 +519,17 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 65536
+		"maxTokens": 65536,
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	}
 ]

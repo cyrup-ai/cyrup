@@ -66,6 +66,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -73,7 +75,6 @@ fn base_agent_config(model: &str) -> AgentConfig {
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false), // isolate this test from R-SA-034's own separate gate
         max_output: OutputCap::default(),
         max_subagent_depth: None,
         memory: None,
@@ -88,6 +89,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
     RunOptions {
+        tool_timeout_ms: None,
         // SUBA-119 — a fixture launch whose model comes from its own agent config, so
         // native-child model verification is armed and no response-id alias is declared.
         model_override_from_parent: false,
@@ -203,7 +205,27 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
             {"kind": "emit", "line": tool_execution_start_line("c1", "edit")},
             {"kind": "emit", "line": tool_execution_end_line("c1", "edit")},
             {"kind": "emit", "line": message_end_line(
-                "I implemented the fix.\n```acceptance-report\n{\"criteriaSatisfied\": true, \"changedFiles\": [\"a.rs\"]}\n```",
+                // SUBA-108 — this report used to be `{"criteriaSatisfied": true, "changedFiles":
+                // ["a.rs"]}`, which satisfied NOTHING: before SUBA-108 an explicit contract
+                // dropped the inferred contract's criteria and evidence outright, so
+                // `declared_structural_failures` had an empty set to check and the gate reached
+                // Checked on an empty report. `resolveEffectiveAcceptance` (`acceptance.ts:512-516`
+                // @v0.71.0) does the opposite: `criteria = normalizeCriteria(explicit.criteria
+                // ?.length ? explicit.criteria : inferred.criteria, evidence)` and `evidence =
+                // unique([...requiredEvidenceForLevel(level), ...(explicit.evidence ?? [])])`, so
+                // an explicit `checked` policy on a role-less agent INHERITS `criterion-1` from
+                // the default-attestation branch and demands all five `checked` evidence kinds.
+                // A child that reports none of them is `rejected` upstream too
+                // (`acceptance.ts:1560-1569,1605-1608`), so the report below is what a real child
+                // has to send to reach Checked under that contract.
+                "I implemented the fix.\n```acceptance-report\n{\
+                 \"criteriaSatisfied\": [{\"id\": \"criterion-1\", \"status\": \"satisfied\", \
+                 \"evidence\": \"parser.rs now handles the case\"}], \
+                 \"changedFiles\": [\"a.rs\"], \
+                 \"testsAddedOrUpdated\": [\"a_test.rs\"], \
+                 \"commandsRun\": [{\"command\": \"cargo test\", \"result\": \"passed\", \
+                 \"summary\": \"1 passed\"}], \
+                 \"residualRisks\": []}\n```",
                 42, 17,
             )},
             {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_end"}"#.to_string())}
@@ -283,8 +305,14 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
         }]
     );
 
-    // R-SA-032: acceptance ledger reached at least Checked given the real (non-triggered)
-    // completion-mutation guard and the self-reported acceptance-report block.
+    // R-SA-032: acceptance ledger reached at least Checked. SUBA-107 retired the
+    // completion-mutation guard this rung used to consult; SUBA-108 made the rung inherit the
+    // inferred contract's criteria and `requiredEvidenceForLevel("checked")` exactly as
+    // `acceptance.ts:512-516` does, so what carries the run to Checked now is the child's own
+    // report satisfying every declared criterion and evidence kind. `no-staged-files` is the one
+    // kind with no report field above: the child said nothing about it (so the report-derived
+    // check is skipped, `acceptance.ts:1136`) and the parent's real `git status --short` in this
+    // tempdir is outside any repository, which is `not-applicable`, not `failed`.
     let ledger = result
         .acceptance
         .expect("acceptance ledger must be populated");

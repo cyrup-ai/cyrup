@@ -7,7 +7,7 @@
 //!    first space. No space → the fuzzy-filtered command NAME list (via [`crate::fuzzy`] + the
 //!    [`CommandRegistry`]); space → the ARGUMENT list of whichever completer the named command owns
 //!    ([`crate::commands::ArgumentCompleter`]), ranked over the live [`ArgumentSources`] the app
-//!    pushes in — including an extension command's own completer, whose answers the app fetches
+//!    installs — including an extension command's own completer, whose answers the app fetches
 //!    from the guest and pushes in the same way (see
 //!    [`crate::commands::ArgumentCompleter::Extension`]).
 //! 2. **Bare path** (`extractPathPrefix`, `:480-507`; `getFileSuggestions`, `:560-693`): the trailing
@@ -22,36 +22,109 @@
 //! Completion never executes a command — it only edits the buffer text (spec/tui/04 §1). Execution
 //! happens on submit via [`CommandRegistry::dispatch`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::commands::{ArgumentCompleter, CommandRegistry};
 use crate::fuzzy;
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
 
-/// The live data pi's argument completers close over — the three builtin closures
-/// (`interactive-mode.ts:685-736` @v0.84.3) plus each extension command's own callback (`:753`).
+/// One argument completer's candidate source — the Rust shape of pi's `getArgumentCompletions`
+/// closure (`interactive-mode.ts:689-736` @v0.87.1).
 ///
-/// Pushed in by the app ([`crate::App::refresh_argument_sources`]) rather than reached for globally:
-/// [`Autocomplete::compute`] is synchronous and holds no session. [`Default`] (all empty) until the
-/// first push, which makes an argument popup an honest no-op rather than a stale one.
+/// pi's three builtin completers read the session INSIDE the callback, so each keystroke is answered
+/// from whatever the session holds at that instant. A plain `Vec` field cannot do that; a callback
+/// can, and the editor still holds no session — which is the only reason the field was ever a `Vec`.
+///
+/// [`Self::Static`] is the [`Default`] and what a host with nothing to read (a test, a non-session
+/// embedder) supplies.
+pub enum LiveSource<T> {
+    /// A fixed list.
+    Static(Vec<T>),
+    /// pi's closure: invoked on every [`Autocomplete::compute`] that reaches this completer.
+    Live(Arc<dyn Fn() -> Vec<T> + Send + Sync>),
+}
+
+impl<T> LiveSource<T> {
+    /// Wrap a reader as the live arm — pi assigning `getArgumentCompletions`.
+    pub fn live(read: impl Fn() -> Vec<T> + Send + Sync + 'static) -> Self {
+        Self::Live(Arc::new(read))
+    }
+}
+
+impl<T: Clone> LiveSource<T> {
+    /// Read the source: a borrow for [`Self::Static`], a call for [`Self::Live`].
+    pub fn get(&self) -> Cow<'_, [T]> {
+        match self {
+            Self::Static(items) => Cow::Borrowed(items),
+            Self::Live(read) => Cow::Owned(read()),
+        }
+    }
+}
+
+impl<T> Clone for LiveSource<T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Static(items) => Self::Static(items.clone()),
+            Self::Live(read) => Self::Live(Arc::clone(read)),
+        }
+    }
+}
+
+impl<T> Default for LiveSource<T> {
+    fn default() -> Self {
+        Self::Static(Vec::new())
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for LiveSource<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(items) => f.debug_tuple("Static").field(items).finish(),
+            // The closure is opaque; naming it is more useful than `{ .. }`.
+            Self::Live(_) => f.write_str("Live(<fn>)"),
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for LiveSource<T> {
+    fn from(items: Vec<T>) -> Self {
+        Self::Static(items)
+    }
+}
+
+/// The live data pi's argument completers close over — the three builtin closures
+/// (`interactive-mode.ts:689-736` @v0.87.1) plus each extension command's own callback (`:753`).
+///
+/// Installed by the app ([`crate::App::refresh_argument_sources`]) rather than reached for globally:
+/// [`Autocomplete::compute`] is synchronous and holds no session, so the session is captured in the
+/// [`LiveSource::Live`] callbacks instead. Each is read at completion time, exactly as pi reads
+/// `this.session` inside its closures, so a set that changes mid-session — a guest provider
+/// registered by an extension, a `/scoped-models` save, a `/login`, a model switch that shortens the
+/// thinking ladder — is offered on the very next keystroke. [`Default`] (all empty) until the first
+/// install, which makes an argument popup an honest no-op rather than a stale one.
 #[derive(Clone, Debug, Default)]
 pub struct ArgumentSources {
     /// `/model` candidates — the scoped set when one is active, else the available catalog
-    /// (`interactive-mode.ts:689-691` @v0.84.3).
-    pub models: Vec<ModelArgument>,
+    /// (`interactive-mode.ts:689-691` @v0.87.1).
+    pub models: LiveSource<ModelArgument>,
     /// `/login` candidates, already merged per provider (`getLoginProviderCompletionOptions`,
-    /// `interactive-mode.ts:299-318` @v0.84.3).
-    pub login_providers: Vec<LoginProviderArgument>,
-    /// `/thinking` candidates (`interactive-mode.ts:713-725` @v0.84.3) — the current model's
+    /// `interactive-mode.ts:299-318` @v0.87.1).
+    pub login_providers: LiveSource<LoginProviderArgument>,
+    /// `/thinking` candidates (`interactive-mode.ts:713-725` @v0.87.1) — the current model's
     /// reasoning ladder, ranked for the `/thinking` builtin (`commands.rs:130`).
-    pub thinking_levels: Vec<String>,
+    pub thinking_levels: LiveSource<String>,
     /// The most recent answer each EXTENSION command's own completer gave
     /// (`getArgumentCompletions`, `interactive-mode.ts:753` @v0.84.3), keyed by the command's
     /// INVOCATION name — the name that appears on the line and in the registry.
     ///
-    /// Unlike the three fields above this is not a periodic snapshot: it is refreshed per keystroke
-    /// against the argument the user has actually typed, by
+    /// Unlike the three fields above this cannot be a synchronous callback: the guest call is
+    /// `async`. It is refreshed per keystroke against the argument the user has actually typed, by
     /// [`crate::App::refresh_extension_completions`]. See [`ArgumentCompleter::Extension`] for why
     /// the guest call lives there and not in [`Autocomplete::compute`].
     pub extension_completions: HashMap<String, ExtensionCompletions>,
@@ -332,11 +405,15 @@ fn argument_context(
         // Unreachable through `argument_completer`, which filters `None` out; matched rather than
         // `unreachable!()` because the workspace denies `clippy::panic`.
         ArgumentCompleter::None => return None,
-        ArgumentCompleter::Models => model_rows(&arguments.models, argument)?,
+        // `.get()` is where pi's closure runs: the candidate set is read HERE, per keystroke, not
+        // carried in from an earlier refresh.
+        ArgumentCompleter::Models => model_rows(&arguments.models.get(), argument)?,
         ArgumentCompleter::LoginProviders => {
-            login_provider_rows(&arguments.login_providers, argument)?
+            login_provider_rows(&arguments.login_providers.get(), argument)?
         }
-        ArgumentCompleter::ThinkingLevels => thinking_rows(&arguments.thinking_levels, argument)?,
+        ArgumentCompleter::ThinkingLevels => {
+            thinking_rows(&arguments.thinking_levels.get(), argument)?
+        }
         ArgumentCompleter::Extension => {
             extension_rows(arguments.extension_completions.get(name), argument)?
         }

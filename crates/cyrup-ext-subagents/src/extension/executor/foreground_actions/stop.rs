@@ -217,6 +217,16 @@ impl SubagentExecutor {
             Ok(control::StopOutcome::NotStoppable) => Err(format!(
                 "No running or queued async run was found for '{run_id}'."
             )),
+            // SUBA-116 — `async-stop-action.ts:164` @v0.71.0: a PAUSED whole-run stop that sealed.
+            Ok(control::StopOutcome::PausedStopped) => {
+                Ok(format!("Stopped paused async run {run_id}."))
+            }
+            // SUBA-116 — `async-stop-action.ts:154`: the stop IS on disk; only the seal refused,
+            // and the sentence says which rung and what to do about it.
+            Ok(control::StopOutcome::PausedSealPending { reason }) => Err(format!(
+                "Stop request persisted for paused async run {run_id}, but terminal proof is not \
+                 ready ({reason}). Retry stop after runner shutdown is observed."
+            )),
             // S4 (pi `async-stop-action.ts:34`) — upstream's exact refusal sentence. Distinct from
             // `NotStoppable`: the run may be perfectly stoppable, just not by this instance.
             Ok(control::StopOutcome::NotInActiveSession) => Err(format!(
@@ -391,6 +401,62 @@ mod tests {
             .expect("the owning session may stop its own run");
         assert_eq!(ok, "Stop requested for async run foreignstop1.");
         assert!(control::has_pending_stop_request(&paths.run_dir).await);
+    }
+
+    /// SUBA-116 at the USER surface — pi `async-stop-action.ts:120-121` (the widened guard) and
+    /// `:154` (the sentence when the seal refuses).
+    ///
+    /// Before this row `stop` refused a `Paused` run outright, so THIS input produced
+    /// `"No running or queued async run was found for 'pausedstop01'."` and wrote nothing at all.
+    /// Upstream admits it, delivers the stop request FIRST (`:149`) and only then attempts the seal,
+    /// which is exactly why `:154` can promise the operator that a retry is worth making.
+    ///
+    /// The fixture deliberately stops one rung short of a completed seal: the run carries no
+    /// run-level process-terminal overlay, so `sealPausedRun`'s rung (a) is the one that answers.
+    /// That is the reachable everyday case — an operator stopping a run they paused a moment ago,
+    /// before the runner's close has been observed — and it is the only one of the five rungs whose
+    /// sentence a user sees without a crashed runner.
+    #[tokio::test]
+    async fn control_stop_admits_a_paused_run_and_reports_the_seal_that_is_not_ready_yet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = seed_orphaned_run(
+            dir.path(),
+            "pausedstop01",
+            Some("session-OWNER"),
+            Some(std::process::id()),
+        );
+        // Running -> Paused through the one legal choke point, so the fixture cannot encode a
+        // transition the state machine forbids.
+        let mut status: crate::background::RunStatus =
+            serde_json::from_slice(&std::fs::read(&paths.status).expect("read status"))
+                .expect("status parses");
+        status
+            .advance_state(crate::background::RunState::Paused)
+            .expect("Running -> Paused");
+        std::fs::write(
+            &paths.status,
+            serde_json::to_string(&status).expect("serialize"),
+        )
+        .expect("write paused status");
+
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedSessionHost("session-OWNER")));
+        let message = executor
+            .control_stop(dir.path(), Some("pausedstop01"), None, None)
+            .await
+            .expect_err("an unproven close must refuse the seal, with `isError: true`");
+        assert_eq!(
+            message,
+            "Stop request persisted for paused async run pausedstop01, but terminal proof is not \
+             ready (runner process identity is missing). Retry stop after runner shutdown is \
+             observed.",
+            "pi `async-stop-action.ts:154`'s exact sentence"
+        );
+        assert!(
+            control::has_pending_stop_request(&paths.run_dir).await,
+            "pi delivers the request at `:149` BEFORE sealing at `:151`, so the operator's stop is \
+             durable even when the seal refuses"
+        );
     }
 
     /// The PERMISSIVE half of the class (pi `state.currentSessionId && ...`): a headless host has

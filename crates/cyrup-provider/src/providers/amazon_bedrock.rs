@@ -156,7 +156,7 @@ const AMAZON_BEDROCK_CATALOG_JSON: &str = include_str!("catalog/amazon-bedrock.j
 /// failure yields an empty catalog (surfaced loudly by the count test) rather than a panic
 /// (NO-PANIC policy).
 pub fn amazon_bedrock_models() -> Vec<Model> {
-    serde_json::from_str(AMAZON_BEDROCK_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(AMAZON_BEDROCK_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The Bedrock [`ProviderAuth`] (pi `auth: { apiKey: bedrockAuth }`, `amazon-bedrock.ts:78`).
@@ -517,12 +517,17 @@ mod tests {
 
     // ------------------------------------------------------------------ catalog
 
-    /// pi `AMAZON_BEDROCK_MODELS` @`b0c2a90e`: 109 rows, every one on the
-    /// `bedrock-converse-stream` wire api and owned by `amazon-bedrock`.
+    /// pi `AMAZON_BEDROCK_MODELS`: 174 rows, every one on the `bedrock-converse-stream` wire api
+    /// and owned by `amazon-bedrock`.
+    ///
+    /// 109 until PROV-071, which is the same statement with a different date on it: the catalog was
+    /// frozen at `b0c2a90e` (2026-07-17) because no later revision could be read, and the 65 rows
+    /// AWS added in the two months after it were invisible. The count moved with the source, not
+    /// with a decision here.
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = amazon_bedrock_models();
-        assert_eq!(models.len(), 109);
+        assert_eq!(models.len(), 174);
         assert!(
             models
                 .iter()
@@ -541,7 +546,7 @@ mod tests {
             u.dedup();
             u.len()
         };
-        assert_eq!(unique, 109, "duplicate model id in the Bedrock catalog");
+        assert_eq!(unique, 174, "duplicate model id in the Bedrock catalog");
         assert!(models.iter().all(|m| m.context_window > 0));
         assert!(models.iter().all(|m| m.max_tokens > 0));
         assert!(models.iter().all(|m| !m.base_url.is_empty()));
@@ -559,18 +564,29 @@ mod tests {
             .filter(|m| m.base_url == BEDROCK_EU_CENTRAL_1_BASE_URL)
             .map(|m| m.id.as_str())
             .collect();
+        // Nine at `b0c2a90e`, seventeen now, and the shape of the growth is the point: the EU
+        // region gained four Nova profiles and a Pixtral one, so "the eu.* profiles are the Claude
+        // ones" — true of the frozen catalog — was never a rule, only that catalog's contents.
         assert_eq!(
             eu,
             vec![
+                "eu.amazon.nova-2-lite-v1:0",
+                "eu.amazon.nova-lite-v1:0",
+                "eu.amazon.nova-micro-v1:0",
+                "eu.amazon.nova-pro-v1:0",
                 "eu.anthropic.claude-fable-5",
                 "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
                 "eu.anthropic.claude-opus-4-5-20251101-v1:0",
                 "eu.anthropic.claude-opus-4-6-v1",
                 "eu.anthropic.claude-opus-4-7",
                 "eu.anthropic.claude-opus-4-8",
+                "eu.anthropic.claude-opus-5",
+                "eu.anthropic.claude-opus-5-5",
+                "eu.anthropic.claude-sonnet-4-20250514-v1:0",
                 "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
                 "eu.anthropic.claude-sonnet-4-6",
                 "eu.anthropic.claude-sonnet-5",
+                "eu.mistral.pixtral-large-2502-v1:0",
             ]
         );
         // MIRROR: every OTHER row — including the `us.`/`jp.`/`au.`/`global.` profiles — is
@@ -586,7 +602,7 @@ mod tests {
                 .iter()
                 .filter(|m| m.base_url == BEDROCK_US_EAST_1_BASE_URL)
                 .count(),
-            100
+            157
         );
     }
 
@@ -608,10 +624,13 @@ mod tests {
         assert_eq!(m.context_window, 1_000_000);
         assert_eq!(m.max_tokens, 128_000);
         // Real, distinct, non-zero rates — Bedrock's Opus 4.6 pricing, not a defaulted cost block.
-        assert_eq!(m.cost.input, 5.0);
-        assert_eq!(m.cost.output, 25.0);
-        assert_eq!(m.cost.cache_read, 0.5);
-        assert_eq!(m.cost.cache_write, 6.25);
+        // Bedrock's Opus 4.6 rates, 10% over the direct-Anthropic ones. They were 5/25/0.5/6.25 at
+        // `b0c2a90e`; AWS repriced, and a floor frozen two months back would have kept quoting the
+        // old number to every offline and first-run user (PROV-071).
+        assert_eq!(m.cost.input, 5.5);
+        assert_eq!(m.cost.output, 27.5);
+        assert_eq!(m.cost.cache_read, 0.55);
+        assert_eq!(m.cost.cache_write, 6.875);
         assert!(
             m.cost.tiers.is_none(),
             "Bedrock ships no long-context tiers"
@@ -635,6 +654,11 @@ mod tests {
         assert_eq!(m.name, "DeepSeek-V3.1");
         assert_eq!(m.input, vec![Modality::Text]);
         assert!(!m.supports_image_input());
+        // No thinking LADDER, although the row is now marked `reasoning` (it was not at
+        // `b0c2a90e`): V3.1 thinks, but Bedrock exposes no per-level control for it, and those are
+        // independent facts. A test that read `reasoning` as "has a map" would have gone red here
+        // for a change that is neither a defect nor a regression.
+        assert!(m.reasoning);
         assert!(m.thinking_level_map.is_none());
         assert_eq!(m.cost.input, 0.58);
         assert_eq!(m.cost.output, 1.68);
@@ -643,21 +667,60 @@ mod tests {
         assert_eq!(m.context_window, 163_840);
         assert_eq!(m.max_tokens, 81_920);
 
-        // 29 of the 109 rows are non-reasoning, and 37 are text-only — the catalog is genuinely
-        // heterogeneous.
-        assert_eq!(models.iter().filter(|m| !m.reasoning).count(), 29);
+        // 42 of the 174 rows are non-reasoning and 43 are text-only — the catalog is genuinely
+        // heterogeneous, which is what makes the single-row assertions above worth making.
+        assert_eq!(models.iter().filter(|m| !m.reasoning).count(), 42);
+        assert_eq!(
+            models.iter().filter(|m| m.input == vec![Modality::Text]).count(),
+            43
+        );
         assert_eq!(
             models.iter().filter(|m| m.supports_image_input()).count(),
-            72
+            131
         );
     }
 
-    /// Bedrock is the one catalog with **no** `compat` block anywhere, so it cannot leak
-    /// `supportsToolSearch` into the blast radius pinned by
+    /// No Bedrock row may enable a wire-payload compat flag, which is what kept it out of the
+    /// blast radius pinned by
     /// `api/anthropic_messages.rs::tool_search_is_confined_to_the_openai_responses_catalog`.
+    ///
+    /// It used to say "no `compat` block anywhere" and that is no longer true — 88 of the 174 rows
+    /// carry one. The block is `{"supportsStrictMode": true}` on every single one of them, which is
+    /// PROV-078's change: upstream stopped INFERRING strict-tool support from the provider and
+    /// started writing it into the catalog. That is metadata about the tool schema, not a flag that
+    /// adds anything to a request, so the invariant this test exists for is intact — and it is now
+    /// asserted directly instead of being implied by an emptiness that has stopped holding.
     #[test]
-    fn no_bedrock_row_carries_a_compat_block() {
-        assert!(amazon_bedrock_models().iter().all(|m| m.compat.is_none()));
+    fn no_bedrock_row_carries_a_wire_payload_compat_flag() {
+        let models = amazon_bedrock_models();
+        for m in &models {
+            let Some(compat) = m.compat.as_ref() else {
+                continue;
+            };
+            assert!(
+                !compat.supports_tool_search.unwrap_or(false),
+                "{}: a Bedrock row enabled supportsToolSearch",
+                m.id.as_str()
+            );
+            assert!(
+                !compat.supports_tool_references.unwrap_or(false),
+                "{}: a Bedrock row enabled supportsToolReferences",
+                m.id.as_str()
+            );
+        }
+        assert_eq!(
+            models.iter().filter(|m| m.compat.is_some()).count(),
+            88,
+            "every Bedrock compat block is PROV-078's `supportsStrictMode`; a different count \
+             means a different flag arrived and has to be read"
+        );
+        assert!(
+            models
+                .iter()
+                .filter_map(|m| m.compat.as_ref())
+                .all(|c| c.supports_strict_mode == Some(true)),
+            "the only Bedrock compat flag upstream sets is `supportsStrictMode: true`"
+        );
     }
 
     /// pi `fbdd4638` added the `max` rung; the Bedrock catalog picks it up on the Claude profiles
@@ -670,7 +733,7 @@ mod tests {
             .iter()
             .filter(|m| m.thinking_level_map.is_some())
             .collect();
-        assert_eq!(with_map.len(), 37);
+        assert_eq!(with_map.len(), 70);
         for m in &with_map {
             let map = m.thinking_level_map.as_ref().expect("checked above");
             assert_ne!(
@@ -711,7 +774,7 @@ mod tests {
         let provider = amazon_bedrock_provider();
         assert_eq!(provider.id().as_str(), "amazon-bedrock");
         assert_eq!(provider.name(), "Amazon Bedrock");
-        assert_eq!(provider.models().len(), 109);
+        assert_eq!(provider.models().len(), 174);
 
         let auth = provider.provider_auth().expect("bedrock declares auth");
         assert!(auth.api_key.is_some());

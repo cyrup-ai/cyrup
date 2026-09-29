@@ -276,6 +276,7 @@ fn empty_partial(model: &ModelRef) -> AssistantMessage {
             .unwrap_or_else(|| cyrup_core::ApiId::from(cyrup_core::UNRESOLVED_API)),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         // Pi seeds the client-rebuilt partial with `stopReason: "pending"` verbatim

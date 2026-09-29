@@ -211,6 +211,9 @@ async fn events(wire: Wire, raw: &str) -> Vec<StreamEvent> {
                     &sink,
                     false,
                     &[],
+                    // Truncation parity uses the plain fixture model, which declares no
+                    // `supportsMidConvoEffort`, so pi's `providerThinkingLevel` is `undefined` here.
+                    None,
                 )
                 .await
             }

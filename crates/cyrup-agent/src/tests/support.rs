@@ -238,6 +238,7 @@ pub(super) fn ev_kind(e: &AgentEvent) -> String {
 /// The wire role of an agent message.
 pub(super) fn role(m: &AgentMessage) -> &'static str {
     match m {
+        AgentMessage::System(_) => "system",
         AgentMessage::User { .. } => "user",
         AgentMessage::Assistant(_) => "assistant",
         AgentMessage::ToolResult(_) => "tool",

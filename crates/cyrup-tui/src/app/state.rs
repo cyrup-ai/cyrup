@@ -279,6 +279,14 @@ pub struct AppState {
     /// [`App::editor_has_keyboard_focus`](crate::App::editor_has_keyboard_focus) for what is
     /// published and why it is NOT terminal-window focus.
     pub(super) editor_focus_mirror: cyrup_session_svc::EditorFocusMirror,
+    /// EXT-064 — the footer's extension-visible data (SEAM-T03): pi's `FooterDataProvider` as the
+    /// cell an extension pulls through `ctx.ui.footer_data()`. The git branch and the provider
+    /// count are published into it by [`App::publish_extension_readbacks`] from
+    /// [`Self::git_branch`] and [`StatusLine::provider_count`]; the extension-status map is
+    /// written synchronously by `LiveHostServices::set_status`, because upstream's is
+    /// (`interactive-mode.ts:2204` @v0.87.1). Handed to the session's `LiveHostServices` by
+    /// [`App::install_extension_readbacks`].
+    pub(super) footer_data_mirror: cyrup_session_svc::FooterDataMirror,
     /// The live theme seam handed to the session's `LiveHostServices` (SEAM-T01) — pi's four
     /// `createExtensionUIContext` theme bindings (`interactive-mode.ts:2401-2417` @v0.84.2). `None`
     /// until a session binds ([`App::install_extension_readbacks`]), and rebuilt on every session
@@ -549,6 +557,7 @@ impl AppState {
             pending_ui_reply: None,
             editor_mirror: cyrup_session_svc::EditorTextMirror::new(),
             editor_focus_mirror: cyrup_session_svc::EditorFocusMirror::new(),
+            footer_data_mirror: cyrup_session_svc::FooterDataMirror::new(),
             theme_access: None,
             theme_controller: None,
             pending_tree_nav: None,

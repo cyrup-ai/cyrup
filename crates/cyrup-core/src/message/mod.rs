@@ -15,11 +15,15 @@
 //! - `usage` — token + cost accounting ([`Usage`], [`Cost`]).
 //! - `assistant` — [`AssistantMessage`], [`DeferredHandle`], [`UNRESOLVED_API`].
 //! - `conversation` — the role-tagged [`Message`] enum.
+//! - `sections` — the ordered named prompt sections of a system message ([`Sections`]).
+//! - `system` — [`SystemMessage`], the transcript's prompt + tool-declaration state.
 
 mod assistant;
 mod content;
 mod conversation;
+mod sections;
 mod stop_reason;
+mod system;
 mod text_signature;
 mod thinking;
 mod tool_call;
@@ -28,7 +32,9 @@ mod usage;
 pub use assistant::{AssistantMessage, DeferredHandle, UNRESOLVED_API};
 pub use content::Content;
 pub use conversation::Message;
+pub use sections::Sections;
 pub use stop_reason::StopReason;
+pub use system::SystemMessage;
 pub use text_signature::{TextPhase, TextSignatureV1};
 pub use thinking::{ModelThinkingLevel, ThinkingLevel};
 pub use tool_call::ToolCall;

@@ -109,6 +109,24 @@ pub(crate) fn serialize_agent(
             exclude_tools_value.as_deref().unwrap_or("")
         ));
     }
+    // SUBA-111 allowedAgents (`agent-serializer.ts:82-84` @v0.71.0):
+    // `if (config.allowedAgents !== undefined || preserve("allowedAgents"))
+    //     lines.push(`allowedAgents: ${joinComma(config.allowedAgents) ?? ""}`)`.
+    //
+    // NOTE the gate differs from `excludeTools`' one line above: upstream emits on
+    // `!== undefined`, so an EXPLICITLY EMPTY list is still written (as an empty value), where an
+    // empty `excludeTools` is not. That asymmetry is upstream's and is reproduced verbatim — an
+    // agent that declared `allowedAgents:` with nothing after it has declared a bound of nothing,
+    // which is not the same as declaring no bound.
+    if def.allowed_agents.is_some() || preserve(&["allowedAgents"]) {
+        lines.push(format!(
+            "allowedAgents: {}",
+            def.allowed_agents
+                .as_ref()
+                .map(|list| list.join(", "))
+                .unwrap_or_default()
+        ));
+    }
     // SUBA-092 allowNestedSubagents (`agent-serializer.ts:76-78` @v0.64.0): emitted only when
     // `=== true` or under preserve, and under preserve an unset value is written as an EMPTY value
     // (never as `false`) while an explicit `false` is written back as `false`.
@@ -289,17 +307,6 @@ pub(crate) fn serialize_agent(
     if let Some(depth) = def.max_subagent_depth {
         lines.push(format!("maxSubagentDepth: {depth}"));
     }
-    // completionGuard: pi emits it only when explicitly disabled (`=== false`) or under preserve,
-    // writing "" for an undefined value under preserve (`agent-serializer.ts:87-89`).
-    if def.completion_guard == Some(false) || preserve(&["completionGuard"]) {
-        let value = match def.completion_guard {
-            None => "",
-            Some(true) => "true",
-            Some(false) => "false",
-        };
-        lines.push(format!("completionGuard: {value}"));
-    }
-
     // async / timeoutMs launch defaults (`agent-serializer.ts:87-88` @ v0.43.0): emitted whenever
     // set, or as an empty value under preserve. Same silent-deletion trap as `toolBudget` below —
     // a KNOWN_FIELD the serializer never writes is dropped on the first management rewrite.
@@ -316,6 +323,17 @@ pub(crate) fn serialize_agent(
             .default_timeout_ms
             .map_or_else(String::new, |ms| ms.to_string());
         lines.push(format!("timeoutMs: {value}"));
+    }
+    // CFG-067 — pi `agent-serializer.ts:106` @v0.71.0:
+    // `if (config.defaultToolTimeoutMs !== undefined || preserve("toolTimeoutMs"))
+    //    lines.push(`toolTimeoutMs: ${config.defaultToolTimeoutMs ?? ""}`)`. Same empty-value
+    // preserve shape `timeoutMs` above uses, for the same reason: a key the author wrote and a
+    // rewrite must not silently drop.
+    if def.default_tool_timeout_ms.is_some() || preserve(&["toolTimeoutMs"]) {
+        let value = def
+            .default_tool_timeout_ms
+            .map_or_else(String::new, |ms| ms.to_string());
+        lines.push(format!("toolTimeoutMs: {value}"));
     }
 
     // SUBA-082 acceptance / acceptanceRole (`agent-serializer.ts:103-110` @v0.64.0):
@@ -443,8 +461,8 @@ pub(crate) fn serialize_agent(
 /// discovered agent is exactly [`AgentDefinition::present_fields`]), REMOVE any key this update is
 /// changing (so the changed field is re-serialized from its NEW value, not preserved at its old
 /// one), then ADD BACK the keys pi re-pins even when changed: `systemPromptMode`/
-/// `inheritProjectContext`/`inheritSkills` always; `thinking` only when set to exactly `off`;
-/// `completionGuard` only when set to `true`. The result is the `preserveFrontmatterFields` set
+/// `inheritProjectContext`/`inheritSkills` always; `thinking` only when set to exactly `off`.
+/// The result is the `preserveFrontmatterFields` set
 /// [`serialize_agent`] consults for a preserve-aware UPDATE.
 ///
 /// `fields.<x>.is_some()` is the faithful analog of pi's `hasKey(cfg, "<x>")` because the update
@@ -544,12 +562,6 @@ pub(crate) fn preserved_frontmatter_fields(
     }
     if fields.max_subagent_depth.is_some() {
         set.remove("maxSubagentDepth");
-    }
-    if fields.completion_guard.is_some() {
-        set.remove("completionGuard");
-        if matches!(fields.completion_guard, Some(Some(true))) {
-            set.insert("completionGuard".to_string());
-        }
     }
     set
 }
@@ -995,6 +1007,70 @@ mod tests {
         // An agent with no aliases emits no line at all on a CREATE (pi's `if (aliasesValue || ...)`).
         def.aliases.clear();
         assert!(!serialize_agent(&def, None).contains("aliases:"));
+    }
+
+    /// SUBA-111 — `allowedAgents` survives a management rewrite (`agent-serializer.ts:82-84`
+    /// @v0.71.0). Without the emit arm, the key is in `KNOWN_FIELDS` and so the FIRST management
+    /// write of an agent that declared a delegation bound would silently delete it — a capability
+    /// bound quietly widening, which is the worst possible direction for this failure.
+    ///
+    /// The emit gate is `!== undefined`, NOT truthiness, so an EXPLICITLY EMPTY bound survives
+    /// too — it is upstream's own asymmetry against `excludeTools` one line above.
+    #[test]
+    fn serialize_agent_round_trips_allowed_agents_including_an_empty_bound() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "worker".to_string();
+        def.name = "worker".to_string();
+        def.description = "Works".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.allowed_agents = Some(vec!["planner".to_string(), "reviewer".to_string()]);
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("\nallowedAgents: planner, reviewer\n"),
+            "allowedAgents must be emitted as a comma list:\n{serialized}"
+        );
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(
+            reparsed.allowed_agents, def.allowed_agents,
+            "allowedAgents lost on round trip"
+        );
+        assert!(!reparsed.extra_fields.contains_key("allowedAgents"));
+
+        // An EXPLICITLY EMPTY bound — `Some(vec![])`, pi's `allowedAgents: []` — is a declaration
+        // of "delegate to nobody", and upstream's `!== undefined` gate emits it as an empty value
+        // (`joinComma([])` is `undefined`, so the `?? ""` arm writes the bare key). It must survive
+        // the round trip AS an empty bound, because reading it back as `None` would silently widen
+        // a total delegation ban into unrestricted delegation.
+        def.allowed_agents = Some(Vec::new());
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("\nallowedAgents: \n"),
+            "an explicitly empty bound is still emitted, as a bare key:\n{serialized}"
+        );
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(
+            reparsed.allowed_agents,
+            Some(Vec::new()),
+            "an empty bound must NOT come back as `None` — that would widen it to unrestricted"
+        );
+        assert!(!reparsed.extra_fields.contains_key("allowedAgents"));
+
+        // `None` emits nothing on a create.
+        def.allowed_agents = None;
+        assert!(!serialize_agent(&def, None).contains("allowedAgents:"));
+
+        // …but under preserve it is written back as a bare key, the same `|| preserve(...)` arm
+        // every other `KNOWN_FIELDS` key above uses (`agent-serializer.ts:82`).
+        let preserved = HashSet::from(["allowedAgents".to_string()]);
+        assert!(
+            serialize_agent(&def, Some(&preserved)).contains("\nallowedAgents: \n"),
+            "preserve must re-emit the key an author wrote"
+        );
     }
 
     /// SUBA-092 — the same silent-deletion trap as `toolBudget`/`turnBudget` above, for the two keys

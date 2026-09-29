@@ -788,6 +788,7 @@ mod tests {
 
         // The executor built for THIS run, exactly as `run` builds it.
         let executor = ExecSingleStepExecutor {
+            tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
             lease_writer: None,
@@ -847,6 +848,7 @@ mod tests {
                 current_depth: 0,
                 max_depth: 5,
             },
+            Arc::new(BTreeMap::new()),
             Arc::new(BTreeMap::new()),
             None,
             None,

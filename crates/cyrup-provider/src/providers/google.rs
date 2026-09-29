@@ -26,7 +26,7 @@ const GOOGLE_CATALOG_JSON: &str = include_str!("catalog/google.json");
 /// The full Google catalog (1:1 with Pi `GOOGLE_MODELS`). A parse failure yields an empty catalog
 /// (surfaced loudly by the catalog-count test) rather than a panic (NO-PANIC policy).
 pub fn google_models() -> Vec<Model> {
-    serde_json::from_str(GOOGLE_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(GOOGLE_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The Google [`ProviderAuth`]: `GEMINI_API_KEY` (Pi `envApiKeyAuth`, env-api-keys.ts:80).
@@ -89,7 +89,8 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = google_models();
-        assert_eq!(models.len(), 16);
+        // 16 while the catalog was frozen at `b0c2a90e`; 22 since PROV-071 made it live.
+        assert_eq!(models.len(), 22);
         assert!(
             models
                 .iter()
@@ -108,8 +109,14 @@ mod tests {
         let pro = find("gemini-2.5-pro").expect("gemini-2.5-pro");
         assert!(pro.reasoning);
         assert_eq!(pro.context_window, 1_048_576);
-        // A non-reasoning flash model.
-        assert!(!find("gemini-2.0-flash").expect("2.0-flash").reasoning);
+        // There is no longer a non-reasoning row to mirror against: `gemini-2.0-flash` was the
+        // last one and upstream retired it, so EVERY Gemini row this provider ships now reasons.
+        // Asserted as the positive rather than dropped, because "some row does not reason" was the
+        // real claim and its absence is a fact about the catalog worth failing on if it returns.
+        assert!(
+            models.iter().all(|m| m.reasoning),
+            "a non-reasoning Gemini row is back; the flagship assertions above assume it is not"
+        );
     }
 
     #[test]

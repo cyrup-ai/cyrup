@@ -119,6 +119,7 @@ fn signed_block_ctx(provider: &str, model: &str, content: Vec<Content>) -> Conte
                 api: API_ID.into(),
                 response_model: None,
                 response_id: None,
+                provider_thinking_level: None,
                 diagnostics: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,

@@ -24,7 +24,7 @@ const OPENCODE_GO_CATALOG_JSON: &str = include_str!("catalog/opencode-go.json");
 /// The full OpenCode Go catalog (1:1 with Pi `OPENCODE_GO_MODELS`). A parse failure yields an
 /// empty catalog (surfaced loudly by the count test) rather than a panic (NO-PANIC policy).
 pub fn opencode_go_models() -> Vec<Model> {
-    serde_json::from_str(OPENCODE_GO_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(OPENCODE_GO_CATALOG_JSON).unwrap_or_default()
 }
 
 /// The OpenCode [`ProviderAuth`]: an API key from `$OPENCODE_API_KEY` (Pi `envApiKeyAuth`).
@@ -77,12 +77,16 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = opencode_go_models();
-        // Every entry in pi's `opencode-go.models.ts` @`b0c2a90e` (15 models). `grok-4.5` and
-        // `kimi-k3` were added after cyrup's `91585d9a` snapshot (PROV-057/PROV-060).
-        assert_eq!(models.len(), 15);
+        // Every entry in pi's `opencode-go.models.ts`, live since PROV-071 (29 models; 15 while
+        // the catalog was frozen at `b0c2a90e`). The mix gained a THIRD api in that window —
+        // `openai-responses`, for the Grok and Muse Spark rows — which is why the assertions below
+        // enumerate the split instead of asserting "at least two are present".
+        assert_eq!(models.len(), 29);
         assert!(models.iter().all(|m| m.provider.as_str() == "opencode-go"));
-        assert!(models.iter().any(|m| m.api.as_str() == ANTHROPIC_MESSAGES));
-        assert!(models.iter().any(|m| m.api.as_str() == OPENAI_COMPLETIONS));
+        let count = |api: &str| models.iter().filter(|m| m.api.as_str() == api).count();
+        assert_eq!(count(OPENAI_COMPLETIONS), 21);
+        assert_eq!(count(crate::known_api::OPENAI_RESPONSES), 6);
+        assert_eq!(count(ANTHROPIC_MESSAGES), 2);
     }
 
     #[test]
@@ -111,11 +115,31 @@ mod tests {
         assert_eq!(mm.base_url, "https://opencode.ai/zen/go");
         assert!(mm.compat.is_none());
 
-        // qwen3.6-plus: openai-completions, qwen thinking format.
-        let q = find("qwen3.6-plus");
+        // The third api: the Grok rows are `openai-responses`, and their whole compat block is the
+        // no-session affinity format. Upstream added this api to the provider after `b0c2a90e`, so
+        // the frozen floor could not route these rows at all.
+        let grok = find("grok-4.7");
+        assert_eq!(grok.api.as_str(), crate::known_api::OPENAI_RESPONSES);
+        let gc = grok.compat.as_ref().expect("compat");
         assert_eq!(
-            q.compat.as_ref().and_then(|c| c.thinking_format),
-            Some(ThinkingFormat::Qwen)
+            gc.session_affinity_format,
+            Some(crate::api::compat::SessionAffinityFormat::OpenaiNosession)
+        );
+        assert_eq!(gc.thinking_format, None);
+
+        // `qwen3.6-plus` was the qwen-thinking-format sample here and upstream retired it; no
+        // opencode-go row carries `thinkingFormat: "qwen"` any more. Asserted rather than dropped,
+        // because it is a claim about the catalog: the only declared formats are `deepseek`.
+        assert!(
+            !models.iter().any(|m| m.id.as_str() == "qwen3.6-plus"),
+            "qwen3.6-plus is retired upstream"
+        );
+        assert!(
+            models
+                .iter()
+                .filter_map(|m| m.compat.as_ref().and_then(|c| c.thinking_format))
+                .all(|f| f == ThinkingFormat::Deepseek),
+            "deepseek is the only thinking format opencode-go declares"
         );
     }
 
@@ -127,7 +151,7 @@ mod tests {
         // (v0.83.0 `…:11`). The sibling `opencode` provider is NOT renamed: it is still
         // `name: "OpenCode Zen"` at v0.84.1 `ai/src/providers/opencode.ts:14`.
         assert_eq!(p.name(), "OpenCode Go");
-        assert!(p.get_model("kimi-k2.6").is_some());
+        assert!(p.get_model("kimi-k3").is_some());
         let vars = crate::env_api_keys::api_key_env_vars("opencode-go").expect("env mapping");
         assert!(vars.contains(&OPENCODE_API_KEY_ENV));
     }

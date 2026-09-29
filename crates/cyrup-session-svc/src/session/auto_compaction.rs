@@ -503,12 +503,27 @@ impl AgentSession {
     /// Returns `Some(rebuilt context)` when a compaction ran, for the caller to stamp onto the
     /// turn's `TurnUpdate::context`; `None` when nothing was needed.
     ///
-    /// The estimate basis differs from `check_compaction`'s preferred path on purpose:
-    /// `check_compaction` reads the assistant turn's OWN reported `usage` first and only estimates
-    /// as a fallback, whereas this boundary has no fresh assistant message whose usage it could
-    /// read — so it always estimates, which is exactly what pi does here
-    /// (`estimateProjectedContextTokens`, no usage read, `:596`). The basis is the raw
-    /// `AgentMessage` transcript (SESS-028), the same projection pi estimates over.
+    /// The estimate basis differs from [`Self::check_compaction`]'s preferred path on purpose:
+    /// `check_compaction` reads the assistant turn's OWN reported `usage` first (pi's
+    /// `directContextTokens`) and only estimates as a fallback, whereas this boundary has no fresh
+    /// assistant message of its own to read and goes straight to
+    /// `estimateProjectedContextTokens(projection, branch)` — pi's exact expression at `:596`.
+    ///
+    /// CORRECTION (SESS-052, round 3). Two earlier claims here were both wrong at v0.87.1, and the
+    /// pair of them is what made the call site below look inert:
+    ///
+    /// * "it always estimates … no usage read" — `estimateProjectedContextTokens`
+    ///   (`core/compaction/compaction.ts:249-283` @v0.87.1) DOES read usage: it anchors on
+    ///   `estimateContextTokens(projection.messages)` and RETURNS that anchored estimate unchanged
+    ///   whenever `usageEntryIndex > latestInvalidatingEntryIndex`. It falls back to the pure
+    ///   per-message sum only when a `context_edit`/`compaction` post-dates the entry the anchor came
+    ///   from. So the difference from `check_compaction` is *whose* usage is consulted — the
+    ///   projection's newest valid assistant rather than this turn's — not whether any is.
+    /// * "the basis is the raw `AgentMessage` transcript (SESS-028)" — the basis is now the
+    ///   branch-entry pair `(projection, branch)`, via
+    ///   [`cyrup_session::SessionManager::projected_context_estimate`], because the invalidation scan
+    ///   needs the branch entries and a bare message slice cannot carry them. SESS-028's raw-transcript
+    ///   basis still describes `check_compaction`'s error/zero fallback, which is where that row lives.
     pub(crate) async fn compact_before_next_assistant_response(
         &self,
     ) -> Option<Vec<cyrup_agent::AgentMessage>> {

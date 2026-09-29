@@ -28,6 +28,13 @@ mod usage;
 #[cfg(test)]
 mod tests;
 
+/// PROV-083a — the mid-conversation compat resolvers. Public because the flags decide whether a
+/// transcript's later system messages reach the model in place or are folded into the leading one,
+/// which a caller inspecting a model's capabilities needs to be able to ask.
+pub use compat::{
+    default_supports_mid_convo_system_messages, default_supports_mid_convo_tool_changes,
+    supports_mid_convo_system_messages, supports_mid_convo_tool_changes,
+};
 pub(crate) use driver::decode_stream;
 pub use options::{AnthropicOptions, AnthropicThinkingDisplay};
 #[cfg(test)]
@@ -44,7 +51,7 @@ use crate::utils::provider_plumbing::{EnvSource, connect_sse};
 use claude_code::resolve_is_oauth;
 use cyrup_core::{ApiId, CancelToken};
 use headers::{build_headers, resolve_url};
-use params::build_params;
+use params::{build_params, managed_active_effort};
 use std::sync::Arc;
 
 /// The wire-protocol id this impl serves.
@@ -144,6 +151,18 @@ impl ApiImpl for AnthropicMessagesApi {
             return;
         };
 
-        decode_stream(frames, model, &self.api, &sink, is_oauth, &ctx.tools).await;
+        decode_stream(
+            frames,
+            model,
+            &self.api,
+            &sink,
+            is_oauth,
+            &ctx.tools,
+            // pi seeds `output.providerThinkingLevel` from the SAME `options?.effort ?? "high"` the
+            // request body's trailing marker carries (`anthropic-messages.ts:521`, `:1064`), so both
+            // read one `managed_active_effort` (PROV-091).
+            managed_active_effort(model, opts),
+        )
+        .await;
     }
 }

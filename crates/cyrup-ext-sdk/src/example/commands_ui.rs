@@ -100,6 +100,44 @@ pub(super) fn install(api: &mut ExtensionApi) {
         },
     );
 
+    // EXT-064 — a command exercising `ui.footer-data`, pi's `ReadonlyFooterDataProvider`
+    // (`core/footer-data-provider.ts:385-388` @v0.87.1), the value upstream hands the `setFooter`
+    // factory as its third argument. It does the two things a real custom footer does, IN ORDER:
+    // writes its own status segment, then reads the provider back — so the command proves the
+    // read reflects the guest's OWN write without a frame in between, which is upstream's
+    // behaviour (`setStatus` is bound straight to `setExtensionStatus`, `interactive-mode.ts:2204`)
+    // and the one thing a per-frame effect channel could not deliver.
+    //
+    // The `none` branch is not a failure: it is what every headless mode answers, pi having no
+    // `FooterDataProvider` outside interactive mode at all.
+    api.register_command(
+        "footerdemo",
+        CommandDescriptor::new("Read the footer data provider after writing a status (demo)."),
+        |args: &str, ctx: &crate::CommandCtx| {
+            let key = if args.trim().is_empty() {
+                "footerdemo"
+            } else {
+                args.trim()
+            };
+            ctx.ui().set_status(key, Some("demo-status"));
+            let text = match ctx.ui().footer_data() {
+                Some(data) => format!(
+                    "footer branch {} statuses {} count {}",
+                    data.git_branch.as_deref().unwrap_or("none"),
+                    data.extension_statuses
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    data.available_provider_count
+                ),
+                None => "footer none".to_string(),
+            };
+            ctx.ui().notify(&text);
+            Ok(Some(text))
+        },
+    );
+
     // A keyboard shortcut (R-08-017) whose handler itself opens a SYNCHRONOUS `ui.confirm` dialog (L4
     // review §2.1): proves the run loop's `AppAction::ExtensionShortcut` no longer self-deadlocks now
     // that it is spawned rather than awaited inline (a shortcut handler blocking on `ui_roundtrip`

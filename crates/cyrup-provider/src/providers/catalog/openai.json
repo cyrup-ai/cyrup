@@ -16,7 +16,11 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 8192,
-		"maxTokens": 8192
+		"maxTokens": 8192,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-4-turbo",
@@ -36,7 +40,23 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 4096
+		"maxTokens": 4096,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-4.1",
@@ -56,7 +76,23 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1047576,
-		"maxTokens": 32768
+		"maxTokens": 32768,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-4.1-mini",
@@ -76,7 +112,23 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1047576,
-		"maxTokens": 32768
+		"maxTokens": 32768,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-4.1-nano",
@@ -96,7 +148,23 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1047576,
-		"maxTokens": 32768
+		"maxTokens": 32768,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-4o",
@@ -116,7 +184,23 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 16384
+		"maxTokens": 16384,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-4o-2024-05-13",
@@ -136,7 +220,23 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 4096
+		"maxTokens": 4096,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-4o-2024-08-06",
@@ -156,7 +256,23 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 16384
+		"maxTokens": 16384,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-4o-2024-11-20",
@@ -176,7 +292,23 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 16384
+		"maxTokens": 16384,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-4o-mini",
@@ -196,7 +328,23 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 16384
+		"maxTokens": 16384,
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5",
@@ -205,9 +353,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null
-		},
 		"input": [
 			"text",
 			"image"
@@ -219,18 +364,41 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5-chat-latest",
 		"name": "GPT-5 Chat Latest",
 		"api": "openai-responses",
-		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
+		"provider": "openai",
 		"reasoning": false,
-		"thinkingLevelMap": {
-			"off": null
-		},
 		"input": [
 			"text",
 			"image"
@@ -242,30 +410,27 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 16384
-	},
-	{
-		"id": "gpt-5-codex",
-		"name": "GPT-5-Codex",
-		"api": "openai-responses",
-		"provider": "openai",
-		"baseUrl": "https://api.openai.com/v1",
-		"reasoning": true,
+		"maxTokens": 16384,
 		"thinkingLevelMap": {
 			"off": null
 		},
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 1.25,
-			"output": 10,
-			"cacheRead": 0.125,
-			"cacheWrite": 0
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
 		},
-		"contextWindow": 400000,
-		"maxTokens": 128000
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5-mini",
@@ -274,9 +439,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null
-		},
 		"input": [
 			"text",
 			"image"
@@ -288,7 +450,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5-nano",
@@ -297,9 +485,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null
-		},
 		"input": [
 			"text",
 			"image"
@@ -311,7 +496,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5-pro",
@@ -320,9 +531,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null
-		},
 		"input": [
 			"text",
 			"image"
@@ -334,7 +542,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": null,
+			"medium": null,
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.1",
@@ -343,9 +577,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none"
-		},
 		"input": [
 			"text",
 			"image"
@@ -357,99 +588,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
-	},
-	{
-		"id": "gpt-5.1-chat-latest",
-		"name": "GPT-5.1 Chat",
-		"api": "openai-responses",
-		"provider": "openai",
-		"baseUrl": "https://api.openai.com/v1",
-		"reasoning": true,
+		"maxTokens": 128000,
 		"thinkingLevelMap": {
-			"off": null
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 1.25,
-			"output": 10,
-			"cacheRead": 0.125,
-			"cacheWrite": 0
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
 		},
-		"contextWindow": 128000,
-		"maxTokens": 16384
-	},
-	{
-		"id": "gpt-5.1-codex",
-		"name": "GPT-5.1 Codex",
-		"api": "openai-responses",
-		"provider": "openai",
-		"baseUrl": "https://api.openai.com/v1",
-		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
 		},
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 1.25,
-			"output": 10,
-			"cacheRead": 0.125,
-			"cacheWrite": 0
-		},
-		"contextWindow": 400000,
-		"maxTokens": 128000
-	},
-	{
-		"id": "gpt-5.1-codex-max",
-		"name": "GPT-5.1 Codex Max",
-		"api": "openai-responses",
-		"provider": "openai",
-		"baseUrl": "https://api.openai.com/v1",
-		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null
-		},
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 1.25,
-			"output": 10,
-			"cacheRead": 0.125,
-			"cacheWrite": 0
-		},
-		"contextWindow": 400000,
-		"maxTokens": 128000
-	},
-	{
-		"id": "gpt-5.1-codex-mini",
-		"name": "GPT-5.1 Codex mini",
-		"api": "openai-responses",
-		"provider": "openai",
-		"baseUrl": "https://api.openai.com/v1",
-		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null
-		},
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 0.25,
-			"output": 2,
-			"cacheRead": 0.025,
-			"cacheWrite": 0
-		},
-		"contextWindow": 400000,
-		"maxTokens": 128000
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.2",
@@ -458,10 +623,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none",
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -473,7 +634,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.2-chat-latest",
@@ -482,10 +669,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null,
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -497,31 +680,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 16384
-	},
-	{
-		"id": "gpt-5.2-codex",
-		"name": "GPT-5.2 Codex",
-		"api": "openai-responses",
-		"provider": "openai",
-		"baseUrl": "https://api.openai.com/v1",
-		"reasoning": true,
+		"maxTokens": 16384,
 		"thinkingLevelMap": {
 			"off": null,
-			"xhigh": "xhigh"
+			"minimal": null,
+			"low": null,
+			"medium": "medium",
+			"high": null,
+			"xhigh": "xhigh",
+			"max": null
 		},
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 1.75,
-			"output": 14,
-			"cacheRead": 0.175,
-			"cacheWrite": 0
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
 		},
-		"contextWindow": 400000,
-		"maxTokens": 128000
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.2-pro",
@@ -530,10 +715,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null,
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -545,7 +726,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": null,
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.3-chat-latest",
@@ -554,10 +761,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": false,
-		"thinkingLevelMap": {
-			"off": null,
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -569,7 +772,28 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 16384
+		"maxTokens": 16384,
+		"thinkingLevelMap": {
+			"off": null,
+			"xhigh": "xhigh"
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.3-codex",
@@ -578,10 +802,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none",
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -593,7 +813,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.3-codex-spark",
@@ -602,10 +848,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null,
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -617,7 +859,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 32000
+		"maxTokens": 32000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.4",
@@ -625,14 +893,7 @@
 		"api": "openai-responses",
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none",
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -653,7 +914,36 @@
 			]
 		},
 		"contextWindow": 272000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.4-mini",
@@ -661,14 +951,7 @@
 		"api": "openai-responses",
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none",
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -680,7 +963,36 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.4-nano",
@@ -689,10 +1001,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none",
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -704,7 +1012,33 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 400000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.4-pro",
@@ -712,14 +1046,7 @@
 		"api": "openai-responses",
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null,
-			"xhigh": "xhigh"
-		},
 		"input": [
 			"text",
 			"image"
@@ -740,7 +1067,36 @@
 			]
 		},
 		"contextWindow": 1050000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": null,
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.5",
@@ -748,15 +1104,7 @@
 		"api": "openai-responses",
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none",
-			"xhigh": "xhigh",
-			"minimal": null
-		},
 		"input": [
 			"text",
 			"image"
@@ -777,7 +1125,36 @@
 			]
 		},
 		"contextWindow": 272000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.5-pro",
@@ -786,12 +1163,6 @@
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null,
-			"xhigh": "xhigh",
-			"minimal": null,
-			"low": null
-		},
 		"input": [
 			"text",
 			"image"
@@ -812,7 +1183,33 @@
 			]
 		},
 		"contextWindow": 1050000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": null,
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.6-luna",
@@ -820,15 +1217,7 @@
 		"api": "openai-responses",
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none",
-			"xhigh": "xhigh",
-			"max": "max"
-		},
 		"input": [
 			"text",
 			"image"
@@ -849,7 +1238,37 @@
 			]
 		},
 		"contextWindow": 272000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsExplicitPromptCacheMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.6-sol",
@@ -857,36 +1276,58 @@
 		"api": "openai-responses",
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none",
-			"xhigh": "xhigh",
-			"max": "max"
-		},
 		"input": [
 			"text",
 			"image"
 		],
 		"cost": {
-			"input": 5,
-			"output": 30,
-			"cacheRead": 0.5,
-			"cacheWrite": 6.25,
+			"input": 4,
+			"output": 20,
+			"cacheRead": 0.4,
+			"cacheWrite": 5,
 			"tiers": [
 				{
 					"inputTokensAbove": 272000,
-					"input": 10,
-					"output": 45,
-					"cacheRead": 1,
-					"cacheWrite": 12.5
+					"input": 8,
+					"output": 30,
+					"cacheRead": 0.8,
+					"cacheWrite": 10
 				}
 			]
 		},
 		"contextWindow": 272000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsExplicitPromptCacheMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-5.6-terra",
@@ -894,15 +1335,7 @@
 		"api": "openai-responses",
 		"provider": "openai",
 		"baseUrl": "https://api.openai.com/v1",
-		"compat": {
-			"supportsToolSearch": true
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": "none",
-			"xhigh": "xhigh",
-			"max": "max"
-		},
 		"input": [
 			"text",
 			"image"
@@ -923,7 +1356,306 @@
 			]
 		},
 		"contextWindow": 272000,
-		"maxTokens": 128000
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsExplicitPromptCacheMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gpt-6-astra",
+		"name": "GPT-6 Astra",
+		"api": "openai-responses",
+		"provider": "openai",
+		"baseUrl": "https://api.openai.com/v1",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 10,
+			"output": 50,
+			"cacheRead": 1,
+			"cacheWrite": 12.5,
+			"tiers": [
+				{
+					"inputTokensAbove": 272000,
+					"input": 20,
+					"output": 75,
+					"cacheRead": 2,
+					"cacheWrite": 25
+				}
+			]
+		},
+		"contextWindow": 272000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsExplicitPromptCacheMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gpt-6-luna",
+		"name": "GPT-6 Luna",
+		"api": "openai-responses",
+		"provider": "openai",
+		"baseUrl": "https://api.openai.com/v1",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 0.1,
+			"output": 0.5,
+			"cacheRead": 0.01,
+			"cacheWrite": 0.125,
+			"tiers": [
+				{
+					"inputTokensAbove": 272000,
+					"input": 0.2,
+					"output": 0.75,
+					"cacheRead": 0.02,
+					"cacheWrite": 0.25
+				}
+			]
+		},
+		"contextWindow": 272000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsExplicitPromptCacheMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gpt-6-sol",
+		"name": "GPT-6 Sol",
+		"api": "openai-responses",
+		"provider": "openai",
+		"baseUrl": "https://api.openai.com/v1",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 2,
+			"output": 10,
+			"cacheRead": 0.2,
+			"cacheWrite": 2.5,
+			"tiers": [
+				{
+					"inputTokensAbove": 272000,
+					"input": 4,
+					"output": 15,
+					"cacheRead": 0.4,
+					"cacheWrite": 5
+				}
+			]
+		},
+		"contextWindow": 272000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsOpenAIGrammarTools": true,
+			"supportsAdditionalTools": true,
+			"supportsToolSearch": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsExplicitPromptCacheMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gpt-daybreak-blue-latest",
+		"name": "Daybreak Blue",
+		"api": "openai-responses",
+		"provider": "openai",
+		"baseUrl": "https://api.openai.com/v1",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 4,
+			"output": 20,
+			"cacheRead": 0.4,
+			"cacheWrite": 5
+		},
+		"contextWindow": 1050000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsExplicitPromptCacheMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "gpt-daybreak-red-latest",
+		"name": "Daybreak Red",
+		"api": "openai-responses",
+		"provider": "openai",
+		"baseUrl": "https://api.openai.com/v1",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 12.5,
+			"output": 75,
+			"cacheRead": 1.25,
+			"cacheWrite": 15.625
+		},
+		"contextWindow": 400000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": "none",
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsStrictMode": true,
+			"supportsExplicitPromptCacheMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "gpt-realtime-2.1",
@@ -943,7 +1675,32 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 128000,
-		"maxTokens": 32000
+		"maxTokens": 32000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": "minimal",
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "o1",
@@ -963,7 +1720,32 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 200000,
-		"maxTokens": 100000
+		"maxTokens": 100000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "o1-pro",
@@ -983,7 +1765,32 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 200000,
-		"maxTokens": 100000
+		"maxTokens": 100000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "o3",
@@ -1003,27 +1810,32 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 200000,
-		"maxTokens": 100000
-	},
-	{
-		"id": "o3-deep-research",
-		"name": "o3-deep-research",
-		"api": "openai-responses",
-		"provider": "openai",
-		"baseUrl": "https://api.openai.com/v1",
-		"reasoning": true,
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 10,
-			"output": 40,
-			"cacheRead": 2.5,
-			"cacheWrite": 0
+		"maxTokens": 100000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
-		"contextWindow": 200000,
-		"maxTokens": 100000
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "o3-mini",
@@ -1042,7 +1854,20 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 200000,
-		"maxTokens": 100000
+		"maxTokens": 100000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"type": "chat"
 	},
 	{
 		"id": "o3-pro",
@@ -1062,7 +1887,32 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 200000,
-		"maxTokens": 100000
+		"maxTokens": 100000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
+		},
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "o4-mini",
@@ -1082,26 +1932,31 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 200000,
-		"maxTokens": 100000
-	},
-	{
-		"id": "o4-mini-deep-research",
-		"name": "o4-mini-deep-research",
-		"api": "openai-responses",
-		"provider": "openai",
-		"baseUrl": "https://api.openai.com/v1",
-		"reasoning": true,
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 2,
-			"output": 8,
-			"cacheRead": 0.5,
-			"cacheWrite": 0
+		"maxTokens": 100000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": null,
+			"max": null
 		},
-		"contextWindow": 200000,
-		"maxTokens": 100000
+		"compat": {
+			"supportsStrictMode": true
+		},
+		"inputLimits": {
+			"maxRequestBytes": 536870912,
+			"images": {
+				"maxPerRequest": 1500,
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	}
 ]

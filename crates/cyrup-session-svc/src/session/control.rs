@@ -64,6 +64,15 @@ fn control_op_name(op: &ControlOp) -> &'static str {
     }
 }
 
+/// EXT-087 — whether this op is one of the two SENDS [`AgentSession::apply_send_op`] services.
+/// Kept beside [`control_op_name`] so the two move together when a `ControlOp` variant is added.
+fn is_send_op(op: &ControlOp) -> bool {
+    matches!(
+        op,
+        ControlOp::SendUserMessage { .. } | ControlOp::SendMessage { .. }
+    )
+}
+
 /// Parse a guest `setModel` payload (a `control` capability arg) into `(provider, model)`. Accepts
 /// either `"provider/model"` (Pi's `provider/model` id form) or `{ "provider": .., "model": .. }`.
 /// Returns `None` for an unparseable payload (degrade, never panic).
@@ -146,63 +155,16 @@ impl AgentSession {
                 continue;
             };
             let name = control_op_name(&op);
-            let outcome = match op {
-                ControlOp::SendUserMessage { content, opts } => {
-                    // EXT-083 — the options bag is HONOURED here, not dropped. pi's
-                    // `sendUserMessage` is a thin wrapper over `prompt`:
-                    //
-                    // ```ts
-                    // await this.prompt(text, {
-                    //     expandPromptTemplates: options?.expandPromptTemplates ?? false,
-                    //     streamingBehavior: options?.deliverAs,
-                    //     images,
-                    //     source: "extension",
-                    // });
-                    // ```
-                    // (`core/agent-session.ts:2030-2035` @v0.87.1)
-                    //
-                    // so [`Self::prompt_with`] — cyrup's `prompt(text, options)` — is the call, and
-                    // both of pi's option reads land on it: `expand_prompt_templates` becomes
-                    // `UserInput::expand_templates`, `deliver_as` becomes
-                    // `PromptOptions::streaming_behavior`.
-                    //
-                    // NOT [`Self::send_user_message`], which is `sendUserMessage`'s name but not its
-                    // body: that helper defaults a missing behaviour to a STEER and queues through
-                    // the PUBLIC `steer`/`follow_up`. pi does neither — it throws "Agent is already
-                    // processing. Specify streamingBehavior…" for a missing behaviour while
-                    // streaming (`:1655-1659`, cyrup's
-                    // [`SessionServiceError::StreamingNeedsBehavior`]) and queues through the
-                    // PRIVATE `_queueSteer`/`_queueFollowUp` after `prepare` has already run the
-                    // `input` handlers and the expansion once (SEAM-121). The helper stays as it is
-                    // for its other caller, the ICOM injection pump.
-                    //
-                    // The `expand_templates: false` default is the whole behavioural point of the
-                    // row: `UserInput::text` sets it TRUE, so a relayed `"/deploy"` used to dispatch
-                    // a registered extension command (`run.rs`'s step 0) or expand a skill/template
-                    // before the model ever saw the text. Upstream a chat bridge, a macro or a
-                    // subagent summary that happens to start with `/` is sent AS TEXT unless the
-                    // guest asks otherwise.
-                    let opts: SendUserMessageOpts =
-                        serde_json::from_value(opts).unwrap_or_default();
-                    let input = UserInput {
-                        text: content,
-                        images: Vec::new(),
-                        source: InputSource::Sdk,
-                        expand_templates: opts.expand_prompt_templates.unwrap_or(false),
-                    };
-                    // A guest `sendUserMessage` op re-enters the prompt path (`prompt_with` →
-                    // `prepare` → `try_execute_extension_command`), closing an `async fn` cycle. Box
-                    // this cold re-entry edge so the future stays finitely sized (E0733) without
-                    // adding indirection to the hot prompt path.
-                    Box::pin(self.prompt_with(
-                        input,
-                        PromptOptions {
-                            streaming_behavior: opts.deliver_as,
-                        },
-                    ))
-                    .await
-                    .map(|_| ())
+            // EXT-087 — the two SEND arms live in the shared helper so the MID-RUN drain
+            // ([`Self::apply_pending_agent_control`]) applies them with byte-identical option
+            // handling instead of a second copy that can drift.
+            if is_send_op(&op) {
+                if let Err(e) = self.apply_send_op(op).await {
+                    self.report_control_failure(name, &e);
                 }
+                continue;
+            }
+            let outcome = match op {
                 // Pi `ctx.compact(options)` (extensions/types.ts:344): `customInstructions`
                 // (types.ts:296-300) rides the op through to the summarizer — the same
                 // `Option<String>` a `/compact <instructions>` slash command passes.
@@ -228,9 +190,6 @@ impl AgentSession {
                                 .into(),
                         )),
                     }
-                }
-                ControlOp::SendMessage { message, opts } => {
-                    Box::pin(self.control_send_message(&message, &opts)).await
                 }
                 // ---- RUNTIME-tier ops: only a host that installed a `RuntimeActions` can do these ----
                 ControlOp::NewSession { opts } => match self.runtime_actions.get() {
@@ -258,6 +217,105 @@ impl AgentSession {
             if let Err(e) = outcome {
                 self.report_control_failure(name, &e);
             }
+        }
+    }
+
+    /// EXT-087 — the two SEND arms of the control drain, shared by the COMMAND-tier drain
+    /// ([`Self::apply_pending_control`]) and the MID-RUN turn-boundary drain
+    /// ([`Self::apply_pending_agent_control`]).
+    ///
+    /// Upstream both sends are applied AT CALL TIME, from whatever handler called them, and
+    /// `prompt`/`sendCustomMessage` then branch on `this.isStreaming`: while a run is live the
+    /// message is STEERED or FOLLOWED-UP into that run (`core/agent-session.ts:1653-1665` for
+    /// `prompt`, `:1949-1954` for `sendCustomMessage`, both @v0.87.1) — it never starts a second
+    /// run. cyrup queues instead, so the only way to reproduce that is to drain the send at a
+    /// point where the run latch is still raised; that is what the mid-run caller does.
+    ///
+    /// Callers gate on [`is_send_op`] rather than having this hand the op back: returning a
+    /// `ControlOp` in an `Err` variant trips `clippy::result_large_err` (the enum is 144 bytes).
+    /// The final arm stays total so a new `ControlOp` variant is a compile error here, and reports
+    /// rather than panics if it is ever reached without the gate.
+    async fn apply_send_op(&self, op: ControlOp) -> Result<(), SessionServiceError> {
+        match op {
+            ControlOp::SendUserMessage { content, opts } => {
+                // EXT-083 — the options bag is HONOURED here, not dropped. pi's
+                // `sendUserMessage` is a thin wrapper over `prompt`:
+                //
+                // ```ts
+                // await this.prompt(text, {
+                //     expandPromptTemplates: options?.expandPromptTemplates ?? false,
+                //     streamingBehavior: options?.deliverAs,
+                //     images,
+                //     source: "extension",
+                // });
+                // ```
+                // (`core/agent-session.ts:2030-2035` @v0.87.1)
+                //
+                // so [`Self::prompt_with`] — cyrup's `prompt(text, options)` — is the call, and
+                // both of pi's option reads land on it: `expand_prompt_templates` becomes
+                // `UserInput::expand_templates`, `deliver_as` becomes
+                // `PromptOptions::streaming_behavior`.
+                //
+                // NOT [`Self::send_user_message`], which is `sendUserMessage`'s name but not its
+                // body: that helper defaults a missing behaviour to a STEER and queues through
+                // the PUBLIC `steer`/`follow_up`. pi does neither — it throws "Agent is already
+                // processing. Specify streamingBehavior…" for a missing behaviour while
+                // streaming (`:1655-1659`, cyrup's
+                // [`SessionServiceError::StreamingNeedsBehavior`]) and queues through the
+                // PRIVATE `_queueSteer`/`_queueFollowUp` after `prepare` has already run the
+                // `input` handlers and the expansion once (SEAM-121). The helper stays as it is
+                // for its other caller, the ICOM injection pump.
+                //
+                // The `expand_templates: false` default is the whole behavioural point of the
+                // row: `UserInput::text` sets it TRUE, so a relayed `"/deploy"` used to dispatch
+                // a registered extension command (`run.rs`'s step 0) or expand a skill/template
+                // before the model ever saw the text. Upstream a chat bridge, a macro or a
+                // subagent summary that happens to start with `/` is sent AS TEXT unless the
+                // guest asks otherwise.
+                let opts: SendUserMessageOpts = serde_json::from_value(opts).unwrap_or_default();
+                let input = UserInput {
+                    text: content,
+                    images: Vec::new(),
+                    source: InputSource::Sdk,
+                    expand_templates: opts.expand_prompt_templates.unwrap_or(false),
+                };
+                // A guest `sendUserMessage` op re-enters the prompt path (`prompt_with` →
+                // `prepare` → `try_execute_extension_command`), closing an `async fn` cycle. Box
+                // this cold re-entry edge so the future stays finitely sized (E0733) without
+                // adding indirection to the hot prompt path.
+                //
+                // EXT-087 — this arm is now reachable from the POST-SETTLE drain in
+                // `settle_run` as well as from the command tier, which closes a second loop on
+                // top of the E0733 one:
+                // `settle_run -> apply_pending_control -> prompt_with -> spawn_run ->
+                // tokio::spawn(drive_run) -> drive_accepted_run -> settle_run`. Every edge of
+                // that loop used to be an `impl Future` opaque type, and asking whether an
+                // opaque type is `Send` when the answer depends on itself is a question rustc
+                // declines — it reports `cannot satisfy impl Future<..>: Send`, which reads
+                // exactly like a genuinely non-`Send` value held across an await but is NOT
+                // one. There is no `Rc`, `RefCell`, `LocalSet` or `spawn_local` anywhere in
+                // this path; the failure was inference, not fact.
+                //
+                // The loop is cut at [`super::AgentSession::drive_run`], whose SIGNATURE now
+                // names `Pin<Box<dyn Future<Output = ()> + Send>>` instead of returning an
+                // opaque one — see the note there for why the cut has to be a signature and not
+                // a coercion at a call site (a coercion re-enters the same opaque-type
+                // computation and fails as E0391 instead).
+                Box::pin(self.prompt_with(
+                    input,
+                    PromptOptions {
+                        streaming_behavior: opts.deliver_as,
+                    },
+                ))
+                .await
+                .map(|_| ())
+            }
+            ControlOp::SendMessage { message, opts } => {
+                Box::pin(self.control_send_message(&message, &opts)).await
+            }
+            other => Err(SessionServiceError::Io(format!(
+                "apply_send_op reached without `is_send_op`: {other:?}"
+            ))),
         }
     }
 
@@ -381,9 +439,29 @@ impl AgentSession {
     /// later command happens to run.
     ///
     /// Shared by [`Self::apply_pending_control`] (command-tier drain) and
-    /// [`Self::apply_pending_agent_control`] so the two never drift. Note it does NOT touch the
-    /// `send_user_message`/`compact` re-entry arms — whose prompt-path futures are `!Send` — so a
-    /// caller that needs a `Send` future (the spawned post-run driver) can use it.
+    /// [`Self::apply_pending_agent_control`] so the two never drift. It does NOT touch the
+    /// `send_user_message`/`compact` re-entry arms; the sends have their own shared helper
+    /// ([`Self::apply_send_op`]), which the mid-loop drain calls only while the RUN LATCH is
+    /// raised — the condition under which `prepare` can answer nothing but
+    /// `Prepared::Queued`/`StreamingNeedsBehavior`, so nothing there can start a second run while
+    /// the continuation loop is still deciding whether to continue this one. `compact` stays
+    /// command-tier in `live.rs`, so it cannot reach the mid-loop drain at all.
+    ///
+    /// EXT-087, CORRECTING THIS DOC: that exclusion used to be justified as "whose prompt-path
+    /// futures are `!Send`", so a caller needing a `Send` future had to avoid them. THAT CLAIM IS
+    /// FALSE, and it was load-bearing enough to be worth saying so rather than quietly deleting.
+    /// It was checked empirically — an `assert_send` probe over
+    /// `AgentSession::apply_pending_control()`'s future compiles, with a deliberate `Rc`-holding
+    /// negative control alongside it that does not — so the whole drain, send and compact arms
+    /// included, is `Send`. The `Box::pin` at the send arm is for E0733 (a finitely sized future
+    /// across the recursive `apply_pending_control -> prompt_with -> prepare ->
+    /// try_execute_extension_command -> apply_pending_control` cycle), which is what its own
+    /// comment at that arm says; boxing a concrete future PRESERVES `Send`, and a recursive async
+    /// cycle can defeat auto-trait INFERENCE without the future actually being `!Send`. The
+    /// exclusion here is therefore about RUN ORDERING, not about `Send`, and
+    /// [`super::AgentSession::settle_run`] calls the full [`Self::apply_pending_control`] inside
+    /// the spawned post-run driver on the strength of that. `ext_087_post_settle_drain_future_is_send`
+    /// pins it.
     async fn apply_agent_state_op(&self, op: ControlOp) -> Option<ControlOp> {
         match op {
             ControlOp::SetThinkingLevel(level) => {
@@ -423,13 +501,21 @@ impl AgentSession {
     /// handler, loader.ts:342-354). The re-emit (`thinking_level_select`/`model_select`) fires here as
     /// a fresh top-level guest call, never a re-entry into the suspended event-hook store.
     ///
-    /// This is the `Send`-safe subset of [`Self::apply_pending_control`]: only SetModel/
-    /// SetThinkingLevel can reach the queue from an event handler (every other control op stays
-    /// command-tier-gated in live.rs), and this never touches the `!Send` `send_user_message`/
-    /// `compact` arms — so it runs inside the spawned post-run driver ([`Self::drive_run`]). It also
-    /// drains the same pending facade-event / active-tool fan-out `apply_pending_control` does, so a
-    /// guest that appended/renamed/restricted tools from the event handler is observed here too. Any
-    /// op it does not handle is re-queued (never dropped) for the command-tier drain.
+    /// EXT-087 — it also services the two SENDS, through the same
+    /// [`Self::apply_send_op`] the command-tier drain uses, whenever the RUN LATCH is still raised.
+    /// That is the mid-run half of the row: upstream applies `sendMessage`/`sendUserMessage`
+    /// synchronously from the handler and `prompt` steers or follows-up into the live run
+    /// (`core/agent-session.ts:1653-1665`, `:1949-1954` @v0.87.1), so deferring them to the
+    /// post-settle drain started a SECOND run instead of joining the current one. See the arm
+    /// itself for why the latch makes that safe. With the latch down, and for every other op, the
+    /// op is re-queued (never dropped) for the command-tier / post-settle drain.
+    ///
+    /// The whole future stays `Send` — `apply_pending_control`'s is (`apply_agent_state_op` and
+    /// `apply_send_op` are its only awaits that can recurse), which
+    /// `ext_087_post_settle_drain_future_is_send` pins — so this still runs inside the spawned
+    /// post-run driver ([`Self::drive_run`]). It also drains the same pending facade-event /
+    /// active-tool fan-out `apply_pending_control` does, so a guest that appended/renamed/restricted
+    /// tools from the event handler is observed here too.
     pub(super) async fn apply_pending_agent_control(&self) {
         for ev in self.services.host_services.take_pending_events() {
             self.fanout_emit(ev).await;
@@ -443,15 +529,53 @@ impl AgentSession {
             self.set_active_tools_by_name(&names).await;
         }
         for op in self.services.host_services.take_pending_control() {
-            if let Some(other) = self.apply_agent_state_op(op).await {
-                // Unreachable in practice — live.rs gates every non-base-context control op to the
-                // command tier, so only SetModel/SetThinkingLevel/Abort/Shutdown can be queued from
-                // an event handler, and `apply_agent_state_op` handles all four. Re-queue (never
-                // drop) as a guard so a future gating change can't silently lose a command-tier op;
-                // the command-tier drain (`apply_pending_control`) will handle it.
-                let _ =
-                    cyrup_ext::host::HostServices::control(&*self.services.host_services, other);
+            let Some(op) = self.apply_agent_state_op(op).await else {
+                continue;
+            };
+            // EXT-087, the MID-RUN half — `send-message`/`send-user-message` queued from an event
+            // handler that fired DURING a run (`tool_call`, `tool_result`, `message_end`,
+            // `agent_end`, an `input` handler while streaming) are applied HERE, while the run
+            // latch is still raised, and not carried forward to the post-settle drain.
+            //
+            // That is what upstream does and the whole of what it does. `pi.sendUserMessage` runs
+            // synchronously from the handler into `prompt`, which branches on `this.isStreaming`
+            // and routes to `_queueSteer`/`_queueFollowUp` (`core/agent-session.ts:1653-1665`
+            // @v0.87.1) — or throws "Agent is already processing. Specify streamingBehavior…"
+            // (`:1655-1658`) when the call carried no `deliverAs`. `pi.sendMessage` branches the
+            // same way at `:1949-1954`. NEITHER starts a run: the message joins the run that is
+            // already going.
+            //
+            // Draining at the post-settle point instead — which is what this arm used to do —
+            // turned every one of those into a SECOND run after the first settled: a second
+            // `agent_start`/`agent_end`/`agent_settled` pair, a steer that arrived a whole turn
+            // late, and a `deliverAs` that was read and then could not matter because nothing was
+            // streaming by the time it was read. That is a behavioural difference, not a timing
+            // one, and the `deliverAs`-less case silently ran a turn where upstream reports an
+            // error to the extension error channel (`core/agent-session.ts:3057-3064` binds the
+            // rejection to `runner.emitError`; cyrup's twin is `report_control_failure`).
+            //
+            // The latch is the guard that makes this safe: with `is_run_active()` true, `prepare`
+            // can only answer `Prepared::Queued` or `StreamingNeedsBehavior`
+            // (`session/run.rs::prepare` step 2), never `Prepared::Run` — so this cannot start a
+            // second run and cannot race the continuation loop that has not yet decided whether to
+            // continue this one. `queue_steer`/`queue_follow_up` make `agent.has_queued_messages()`
+            // true, which is exactly how `handle_post_agent_run` (`run.rs:543`, pi `:1009-1012`)
+            // already decides to continue — so the message is delivered by the CURRENT run.
+            //
+            // With the latch down (this drain also runs from `prepare`, before a run exists) the
+            // op is re-queued exactly as before, so a send from an idle-time handler still lands on
+            // the post-settle / command-tier drain that starts its run.
+            let name = control_op_name(&op);
+            if is_send_op(&op) && self.is_run_active() {
+                if let Err(e) = Box::pin(self.apply_send_op(op)).await {
+                    self.report_control_failure(name, &e);
+                }
+                continue;
             }
+            // Anything else: re-queue (never drop) for the command-tier / post-settle drain. It
+            // remains the guard it always was — a future gating change cannot silently lose a
+            // command-tier op.
+            let _ = cyrup_ext::host::HostServices::control(&*self.services.host_services, op);
         }
     }
 }

@@ -101,6 +101,7 @@ fn ctx_with_tool_call_ids(ids: &[&str]) -> Context {
         api: "openai-responses".into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
@@ -128,11 +129,24 @@ fn ctx_with_tool_call_ids(ids: &[&str]) -> Context {
     }
 }
 
+/// A strict-capable OpenAI-completions route: a BUILT-IN catalog row, which is the only kind that
+/// is strict-capable at v0.87.1.
+///
+/// PROV-078 — `890f92088` (#9816, v0.87.0) moved the `supportsStrictMode` expression out of the
+/// runtime detector (now a flat `false`, `openai-completions.ts:1666-1667`) into the catalog
+/// generator, which bakes it into each generated row as explicit metadata
+/// (`generate-models.ts:765-766`, `:802-809`). So `provider: "openai"` alone no longer implies
+/// strict support — the row's own `compat` does, and that is what this fixture spells out, exactly as
+/// [`crate::catalog::load_catalog`] writes it onto every embedded `openai-completions` row.
 fn openai_model() -> Model {
     let mut m = model();
     m.id = "gpt-5".into();
     m.provider = "openai".into();
     m.base_url = "https://api.openai.com/v1".to_string();
+    m.compat = Some(crate::api::compat::ModelCompat {
+        supports_strict_mode: Some(true),
+        ..Default::default()
+    });
     m
 }
 

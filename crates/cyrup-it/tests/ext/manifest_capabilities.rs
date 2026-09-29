@@ -429,6 +429,132 @@ async fn ui_effects_are_dropped_when_the_manifest_denies_ui() {
     let _ = std::fs::remove_dir_all(&granted);
 }
 
+/// EXT-064 — `ui.footer-data` is behind the SAME `capabilities.ui` grant every other `ui` member
+/// is, because its host impl goes through the GATED `ui_guest_of` and not the ungated `guest_of`.
+///
+/// That is the EXT-065 lesson applied before the fact: the autocomplete test below exists because a
+/// `ui` surface wired to `guest_of` silently ignored the manifest. Asserted at the BACKEND, not on
+/// the guest's return value, and that distinction is the whole test — `footer-data` returns
+/// `option<string>`, so a refused guest and an unattached provider BOTH hand the guest `None`, and
+/// only `footer_data_reads()` tells them apart. A `guest_of` wiring passes the guest's-eye check
+/// and fails this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn footer_data_is_refused_when_the_manifest_denies_ui() {
+    let denied = project_with_caps(
+        "footer-deny",
+        r#"{ "fs": [], "exec": false, "net": false, "ui": false }"#,
+    );
+    let (host, rec) = load(&denied).await;
+    let out = host
+        .run_command("footerdemo", "", &CancelToken::new())
+        .await
+        .expect("command runs")
+        .unwrap_or_default();
+    assert!(
+        out.contains("footer none"),
+        "the denied guest reads no footer data, got: {out}"
+    );
+    assert_eq!(
+        rec.footer_data_reads(),
+        0,
+        "the host refused at the `capabilities.ui` gate, BEFORE the backend — a `guest_of` wiring \
+         would have let the read through and still shown the guest `None` (EXT-064/EXT-065)"
+    );
+    drop(host);
+    let _ = std::fs::remove_dir_all(&denied);
+
+    let granted = project_with_caps("footer-grant", r#"{ "ui": true }"#);
+    let (host, rec) = load(&granted).await;
+    let out = host
+        .run_command("footerdemo", "", &CancelToken::new())
+        .await
+        .expect("command runs")
+        .unwrap_or_default();
+    assert!(
+        !out.contains("footer none"),
+        "the same run WITH the ui grant reads the provider — so the refusal above is the grant, \
+         not an absent provider; got: {out}"
+    );
+    assert_eq!(
+        rec.footer_data_reads(),
+        1,
+        "the granted read reached the backend exactly once"
+    );
+    drop(host);
+    let _ = std::fs::remove_dir_all(&granted);
+}
+
+/// EXT-064 — the READ itself: a guest at command tier gets back pi's `ReadonlyFooterDataProvider`
+/// as a json object carrying the git branch, the available-provider count, and the status segments
+/// `set-status` wrote — INCLUDING the one this very command wrote a line earlier.
+///
+/// That last clause is the part a weaker wiring fails. pi binds `ctx.ui.setStatus` straight to
+/// `this.footerDataProvider.setExtensionStatus(key, text)` (`interactive-mode.ts:2204` @v0.87.1), a
+/// plain map write that lands before the call returns, so an extension's footer factory sees its
+/// own segment immediately. Routing cyrup's status write ONLY through the per-frame
+/// `UiEffect::SetStatus` channel would have made `footer-data` answer from the previous frame —
+/// a behavioural difference from pi, not a mechanism one. `/footerdemo` writes then reads, so it
+/// catches exactly that.
+///
+/// The branch is the canned `"detached"` on purpose: upstream's `getGitBranch()` is documented
+/// *"null if not in repo, \"detached\" if detached HEAD"* (`core/footer-data-provider.ts:127-133`
+/// @v0.87.1), and that middle case is the one a port collapses first. It has to arrive as the
+/// literal string, distinct from both a branch name and from absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guest_reads_the_footer_data_provider_back() {
+    let bytes = std::fs::read(fixture_component()).expect("read fixture component");
+    let cwd = temp_project("footer-read");
+    let cfg = HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: cwd.clone(),
+    };
+    let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");
+    let rec = Arc::new(RecordingServices::new(CannedResponses {
+        footer_git_branch: Some("detached".to_string()),
+        footer_provider_count: 3,
+        ..CannedResponses::default()
+    }));
+    let caps = cyrup_ext::Capabilities {
+        fs: Vec::new(),
+        exec: false,
+        net: false,
+        ui: true,
+    };
+    host.load_wasm_with_caps("demo".into(), &bytes, rec.clone(), &caps)
+        .await
+        .expect("load + init");
+
+    let out = host
+        .run_command("footerdemo", "mine", &CancelToken::new())
+        .await
+        .expect("command runs")
+        .unwrap_or_default();
+
+    assert!(
+        out.contains("branch detached"),
+        "upstream's detached-HEAD sentinel survives as the literal string, got: {out}"
+    );
+    assert!(
+        out.contains("statuses mine=demo-status"),
+        "the guest reads back the status segment it wrote in this same command, with no frame in \
+         between — pi's `setStatus` writes the provider synchronously \
+         (`interactive-mode.ts:2204` @v0.87.1); got: {out}"
+    );
+    assert!(
+        out.contains("count 3"),
+        "getAvailableProviderCount rides the same object, got: {out}"
+    );
+    assert_eq!(
+        rec.set_status_calls(),
+        vec![("mine".to_string(), Some("demo-status".to_string()))],
+        "the status write went through the real `ui.set-status` import"
+    );
+
+    drop(host);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
 /// EXT-065 — the `ui` grant reaches `add-autocomplete-provider`.
 ///
 /// It did not before: the import was declared on `interface registration`, whose host impl calls the

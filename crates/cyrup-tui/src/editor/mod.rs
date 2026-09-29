@@ -148,13 +148,14 @@ pub struct InputEditor {
     /// keystroke). Lazily built on the first `@`-mention, invalidated on `set_cwd`. `None` until
     /// first needed.
     mention_files: Option<Vec<String>>,
-    /// The live `/model` / `/login` / `/thinking` candidate sets the argument completers rank
-    /// (`interactive-mode.ts:685-736` @v0.84.3), plus the answers extension commands' own
-    /// completers gave (`:753`). Push-fed like `registry` and `mention_files`, because
-    /// [`Autocomplete::compute`] is synchronous and the editor holds no session: the app snapshots
-    /// the builtin three on boot, session swap, credential change and scope save
-    /// ([`crate::App::refresh_argument_sources`]) and refreshes the extension entries per keystroke
-    /// ([`crate::App::refresh_extension_completions`]). Empty until the first push.
+    /// The live `/model` / `/login` / `/thinking` candidate sources the argument completers rank
+    /// (`interactive-mode.ts:689-736` @v0.87.1), plus the answers extension commands' own
+    /// completers gave (`:753`). Installed like `registry` and `mention_files`, because
+    /// [`Autocomplete::compute`] is synchronous and the editor holds no session: the app installs
+    /// the builtin three as session-capturing callbacks
+    /// ([`crate::App::refresh_argument_sources`]), read per keystroke exactly as pi reads its
+    /// closures, and refreshes the extension entries per keystroke
+    /// ([`crate::App::refresh_extension_completions`]). Empty until the first install.
     arg_sources: crate::autocomplete::ArgumentSources,
     /// The layout width (in columns) used to wrap logical lines into **visual** lines for vertical
     /// motion (`editor.ts:1690` `build_visual_line_map(width)`). Updated every render; `80` until the

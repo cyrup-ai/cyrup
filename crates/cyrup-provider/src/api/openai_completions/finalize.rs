@@ -27,6 +27,7 @@ pub(super) fn build_final_message(dec: Decoder, model: &Model, api: &ApiId) -> A
         api: api.clone(),
         response_model: dec.response_model,
         response_id: dec.response_id,
+        provider_thinking_level: None,
         diagnostics: None,
         usage,
         stop_reason,

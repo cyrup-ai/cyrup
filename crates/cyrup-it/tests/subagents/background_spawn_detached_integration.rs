@@ -482,6 +482,7 @@ fn orchestrator_sim_binary_path() -> PathBuf {
 /// mode. Every step's agent must now have a plan-time persona in `resolved_agents`.
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
@@ -497,6 +498,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -504,7 +507,6 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         mutation_tools: None,          // SUBA-102: built-in set only
         inherit_skills: true,
         skills: Vec::new(),
-        completion_guard: Some(false),
         max_subagent_depth: None,
         default_context: None,
         memory: None,
@@ -578,6 +580,7 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     // fragile against this type's own serde shape) — one SingleStep, matching
     // `background_runner_main_integration.rs`'s own identical `single_step` helper shape.
     let runner_config = RunnerConfig {
+        tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,
         runner_process_instance_id: None,
@@ -822,6 +825,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // has real remaining work to cut short (R-SA-084 marks the NOT-yet-dispatched step(s) Paused
     // too — see `mark_remaining_paused`'s own doc).
     let runner_config = RunnerConfig {
+        tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,
         runner_process_instance_id: None,

@@ -182,3 +182,60 @@ fn mirror_turn_without_the_new_fields_gains_no_new_keys() {
         "invented a deferred key:\n{exported}"
     );
 }
+
+/// PROV-091 — `providerThinkingLevel` (`v0.87.1 ai/src/types.ts:524`) round-trips, in pi's exact
+/// slot: after `responseId`, before `diagnostics`.
+///
+/// This is the same class of loss as `rawStopReason` above, but with a live consequence beyond the
+/// record itself. The `anthropic-messages` adapter replays each recorded level as a
+/// `{role:"system",content:[],output_config:{effort}}` marker immediately before that turn
+/// (`anthropic-messages.ts:1364-1378`, `:1434-1448`), so the request prefix is a function of the
+/// transcript. Dropping the field on re-export silently SHORTENS that prefix on every later turn:
+/// Anthropic's cache no longer matches, and under
+/// `block_binding.prefix_mismatch_behavior: "error"` the turn fails outright
+/// (upstream's `anthropic-thinking-binding-e2e.test.ts` asserts `stopReason: "error"` with
+/// "Invalid `signature`" for exactly this deletion).
+#[test]
+fn provider_thinking_level_survives_import_and_re_export() {
+    let input = jsonl(&[
+        user("ccccccc1", None, "hello"),
+        assistant(
+            "ccccccc2",
+            "ccccccc1",
+            r#""responseId":"msg_01abc","providerThinkingLevel":"xhigh","diagnostics":[{"type":"retry","timestamp":1754611200000}],"stopReason":"stop","rawStopReason":"end_turn""#,
+        ),
+    ]);
+
+    let exported = assert_jsonl_roundtrip(&input).expect("pi turn must round-trip");
+    assert!(
+        exported.contains(r#""providerThinkingLevel":"xhigh""#),
+        "providerThinkingLevel must survive re-export, got:\n{exported}"
+    );
+    // Pi's declaration order, which cyrup's manual `Serialize` reproduces field for field.
+    assert!(
+        exported
+            .contains(r#""responseId":"msg_01abc","providerThinkingLevel":"xhigh","diagnostics":"#),
+        "providerThinkingLevel must sit between responseId and diagnostics, got:\n{exported}"
+    );
+}
+
+/// The negative half: a turn that never had a level must not grow one. Pi's field is optional and
+/// absent for every legacy or unmanaged response, and inventing `"high"` on re-export would change
+/// the request prefix just as surely as dropping a real one.
+#[test]
+fn a_turn_without_a_provider_thinking_level_does_not_gain_one() {
+    let input = jsonl(&[
+        user("ddddddd1", None, "hello"),
+        assistant(
+            "ddddddd2",
+            "ddddddd1",
+            r#""responseId":"msg_01def","stopReason":"stop","rawStopReason":"end_turn""#,
+        ),
+    ]);
+
+    let exported = assert_jsonl_roundtrip(&input).expect("pi turn must round-trip");
+    assert!(
+        !exported.contains("providerThinkingLevel"),
+        "invented a providerThinkingLevel key:\n{exported}"
+    );
+}

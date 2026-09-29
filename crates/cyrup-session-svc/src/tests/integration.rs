@@ -380,6 +380,7 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
 
 fn role_with_toolcall(m: &AgentMessage) -> &'static str {
     match m {
+        AgentMessage::System(_) => "system",
         AgentMessage::User { .. } => "user",
         AgentMessage::Assistant(a) => {
             if a.content.iter().any(|c| matches!(c, Content::ToolCall(_))) {

@@ -12,6 +12,7 @@ fn assistant_text_replay_carries_message_item() {
         api: API_ID.into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,

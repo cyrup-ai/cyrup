@@ -263,6 +263,62 @@ pub fn tool_budget_blocked_message(
     )
 }
 
+/// pi `TOOL_BUDGET_BLOCKED_MESSAGE` (`tool-budget.ts:69`) — the recognizer for the exact string
+/// [`tool_budget_blocked_message`] renders, anchored at both ends so an incidental occurrence of the
+/// phrase inside ordinary tool output cannot be mistaken for a block. The three captures are
+/// upstream's own (`(\d+)` count, `(\d+)` hard, `'([^']+)'` tool).
+///
+/// `(?-u:\d)` because upstream builds the `RegExp` without the `u` flag, which makes JavaScript's
+/// `\d` ASCII-only; the Rust engine's default `\d` also matches other Unicode decimal digits, and a
+/// count written in Devanagari digits is not a string this run rendered.
+static TOOL_BUDGET_BLOCKED_MESSAGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+            r"^Tool budget hard limit reached after ((?-u:\d)+) tool calls? \(hard ((?-u:\d)+)\)\. The '([^']+)' tool is blocked so you can finalize from the context you already have\.$",
+        )
+        .unwrap_or_else(|_| {
+            unreachable!("TOOL_BUDGET_BLOCKED_MESSAGE is a literal and always compiles")
+        })
+    },
+);
+
+/// pi `isToolBudgetBlockedMessage(budget, resultText, blockedTool)` (`tool-budget.ts:76-84`).
+///
+/// A tool result counts as a hard block only when the WHOLE trimmed message matches the runtime
+/// format AND the embedded hard limit and tool name belong to THIS run — upstream's own comment at
+/// `:70-75`: "incidental occurrences of the phrase inside ordinary tool output are rejected".
+///
+/// SUBA-118 — the parent needs this because
+/// [`crate::exec::abort_recovery::plan_abort_recovery`]'s `tool_budget_exhausted` rung
+/// (`abort-recovery.ts:111`) refuses a resume for a child that was stopped by its budget, and the
+/// budget is enforced CHILD-side (it crosses as [`TOOL_BUDGET_ENV`]), so the child's own blocked
+/// tool result is the only evidence the parent ever sees.
+#[must_use]
+pub fn is_tool_budget_blocked_message(
+    budget: &ResolvedToolBudget,
+    result_text: &str,
+    blocked_tool: Option<&str>,
+) -> bool {
+    let Some(tool) = blocked_tool.map(str::trim).filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    let Some(captures) = TOOL_BUDGET_BLOCKED_MESSAGE.captures(result_text.trim()) else {
+        return false;
+    };
+    let count = captures.get(1).and_then(|m| m.as_str().parse::<u64>().ok());
+    let hard = captures.get(2).and_then(|m| m.as_str().parse::<u64>().ok());
+    let named = captures.get(3).map(|m| m.as_str());
+    // Upstream's `Number(hard)` / `Number(blockedToolCount)` cannot fail on a `\d+` capture; a Rust
+    // parse still can (an integer wider than `u64`), and a message claiming an absurd count is not
+    // one this run rendered, so an unparseable capture is NOT a block.
+    match (count, hard, named) {
+        (Some(count), Some(hard), Some(named)) => {
+            hard == u64::from(budget.hard) && count > u64::from(budget.hard) && named == tool
+        }
+        _ => false,
+    }
+}
+
 /// pi `encodeToolBudgetEnv` (`tool-budget.ts:70-72`): the resolved budget as JSON, or `None`.
 #[must_use]
 pub fn encode_tool_budget_env(budget: Option<&ResolvedToolBudget>) -> Option<String> {
@@ -426,6 +482,79 @@ mod tests {
         assert!(should_block_tool_for_budget(&budget, "read", 2));
         assert!(!should_block_tool_for_budget(&budget, "bash", 2));
         assert!(!should_block_tool_for_budget(&budget, "read", 1));
+    }
+
+    /// SUBA-118 — `isToolBudgetBlockedMessage` (`tool-budget.ts:76-84`): the message
+    /// [`tool_budget_blocked_message`] rendered for THIS budget and THIS tool is recognized, and
+    /// nothing else is.
+    ///
+    /// RED without the recognizer: the parent has no evidence its child was stopped by its budget, so
+    /// `plan_abort_recovery`'s `tool_budget_exhausted` rung (`abort-recovery.ts:111`) can never fire
+    /// and such a child is resumed where upstream settles.
+    #[test]
+    fn a_hard_block_message_is_recognized_only_for_its_own_budget_and_tool() {
+        let budget = validate_tool_budget_config(Some(&v("{\"hard\": 3}")), "toolBudget")
+            .expect("valid")
+            .expect("some");
+        let rendered = tool_budget_blocked_message(&budget, "read", 4);
+        assert!(is_tool_budget_blocked_message(
+            &budget,
+            &rendered,
+            Some("read")
+        ));
+        // Upstream trims the result text before matching (`:80`).
+        assert!(is_tool_budget_blocked_message(
+            &budget,
+            &format!("  {rendered}\n"),
+            Some(" read ")
+        ));
+
+        // A different TOOL than the message names.
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &rendered,
+            Some("grep")
+        ));
+        // No tool name at all — upstream's `if (!tool) return false` (`:78`).
+        assert!(!is_tool_budget_blocked_message(&budget, &rendered, None));
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &rendered,
+            Some("   ")
+        ));
+        // A message rendered for a DIFFERENT hard limit: `Number(hard) === budget.hard` (`:83`).
+        let other = validate_tool_budget_config(Some(&v("{\"hard\": 9}")), "toolBudget")
+            .expect("valid")
+            .expect("some");
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &tool_budget_blocked_message(&other, "read", 10),
+            Some("read")
+        ));
+        // A count that does not EXCEED the hard limit is not a block (`:83`).
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &tool_budget_blocked_message(&budget, "read", 3),
+            Some("read")
+        ));
+        // The whole point of the anchored pattern: ordinary tool output that merely QUOTES the
+        // phrase is rejected (upstream's comment at `:70-75`).
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &format!("here is what the docs say:\n{rendered}"),
+            Some("read")
+        ));
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &format!("{rendered} — and then it kept going"),
+            Some("read")
+        ));
+        // The soft nudge is a different message and is never a block.
+        assert!(!is_tool_budget_blocked_message(
+            &budget,
+            &tool_budget_soft_nudge(&budget, 2),
+            Some("read")
+        ));
     }
 
     #[test]

@@ -76,6 +76,7 @@ fn roles(messages: &[Message]) -> Vec<&'static str> {
     messages
         .iter()
         .map(|m| match m {
+            Message::System(_) => "system",
             Message::User { .. } => "user",
             Message::Assistant(_) => "assistant",
             Message::ToolResult { .. } => "toolResult",

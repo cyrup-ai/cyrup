@@ -538,26 +538,54 @@ impl Models {
     /// catalog row stands in as the resolution subject; a provider with an empty catalog has
     /// nothing to make available and reports `None`.
     ///
-    /// pi's optional `ApiKeyAuth.check?` hook (`auth/types.ts:173`, consulted at `:373-382`) has no
-    /// counterpart on cyrup's trait, so the resolution path is always taken. No built-in provider
-    /// implements `check` upstream.
-    pub async fn check_auth(&self, provider: &str) -> Option<AuthCheck> {
-        let entry = self.providers.get(provider)?;
-        let auth = entry.provider_auth()?;
+    /// A strategy's optional [`crate::auth::ApiKeyAuth::check`] hook is consulted at pi's exact
+    /// position (`models.ts:507-517` @v0.87.1) — after the stored-OAuth branch, after the "no
+    /// api-key strategy" guard, and INSTEAD OF the resolution path. No built-in provider implements
+    /// `check` on either side, so every shipped provider still resolves; the seam exists for a
+    /// strategy whose `resolve` executes commands.
+    ///
+    /// Failures PROPAGATE rather than reading as "unconfigured", as upstream's
+    /// `ModelsError("auth", ...)` rethrows do: the credential-store read (`:490-494`), the `check`
+    /// hook (`:514-516`) and the resolution (`:518`) each surface their error to the caller.
+    pub async fn check_auth(&self, provider: &str) -> Result<Option<AuthCheck>, ProviderError> {
+        // `const provider = this.providers.get(providerId); if (!provider) return undefined` (:527-528).
+        let Some(entry) = self.providers.get(provider) else {
+            return Ok(None);
+        };
+        let Some(auth) = entry.provider_auth() else {
+            return Ok(None);
+        };
         let id = entry.id().clone();
-        let stored = self.credentials.read(&id).await.ok().flatten();
+        let stored = self.credentials.read(&id).await?;
 
         // `if (credential?.type === "oauth") return provider.auth.oauth ? {source:"OAuth",
-        // type:"oauth"} : undefined` (models.ts:368-370).
+        // type:"oauth"} : undefined` (models.ts:502-503).
         if matches!(stored, Some(crate::auth::Credential::Oauth { .. })) {
-            return auth.oauth.as_ref().map(|_| AuthCheck {
+            return Ok(auth.oauth.as_ref().map(|_| AuthCheck {
                 auth_type: AuthType::Oauth,
                 source: Some("OAuth".to_string()),
-            });
+            }));
         }
-        // `const apiKey = provider.auth.apiKey; if (!apiKey) return undefined` (:371-372).
-        auth.api_key.as_ref()?;
-        let model = entry.models().first()?;
+        // `const apiKey = provider.auth.apiKey; if (!apiKey) return undefined` (:504-505).
+        let Some(api_key) = auth.api_key.as_ref() else {
+            return Ok(None);
+        };
+        // `if (apiKey.check) { try { return await apiKey.check({ctx, credential: credential?.type
+        // === "api_key" ? credential : undefined, signal}); } catch (error) { throw new
+        // ModelsError("auth", `API key auth check failed for provider ${provider.id}`, {cause:
+        // error}); } }` (:506-517).
+        if api_key.supports_check() {
+            let cred = stored
+                .as_ref()
+                .filter(|cred| matches!(cred, crate::auth::Credential::ApiKey { .. }));
+            return api_key
+                .check(self.auth_context.as_ref(), cred)
+                .await
+                .map_err(|cause| crate::error::AuthError::api_key(id.clone(), cause).into());
+        }
+        let Some(model) = entry.models().first() else {
+            return Ok(None);
+        };
         let resolved = resolve_provider_auth(
             &id,
             auth,
@@ -566,13 +594,11 @@ impl Models {
             self.auth_context.as_ref(),
             AuthOverrides::default(),
         )
-        .await
-        .ok()
-        .flatten()?;
-        Some(AuthCheck {
+        .await?;
+        Ok(resolved.map(|resolved| AuthCheck {
             auth_type: AuthType::ApiKey,
             source: resolved.source,
-        })
+        }))
     }
 
     /// Models whose providers have complete auth configuration (1:1 port of Pi
@@ -582,20 +608,25 @@ impl Models {
     /// entirely when it is unconfigured, and otherwise pass its complete catalog through
     /// [`Provider::filter_models`] — pi's exact position, `models.ts:407` (PROV-032).
     /// [`Models::get_models`] still returns everything, as pi's `getModels()` does.
-    pub async fn get_available(&self, provider: Option<&str>) -> Vec<Model> {
+    ///
+    /// An auth-check failure PROPAGATES, as upstream's does — `getAvailable` awaits
+    /// `checkProviderAuth` without a catch (`models.ts:544`), so a rejecting
+    /// [`crate::auth::ApiKeyAuth::check`] or credential-store read surfaces here instead of quietly
+    /// removing a provider's whole catalog.
+    pub async fn get_available(&self, provider: Option<&str>) -> Result<Vec<Model>, ProviderError> {
         let entries: Vec<&Arc<dyn Provider>> = match provider {
             Some(id) => self.providers.get(id).into_iter().collect(),
             None => self.providers.values().collect(),
         };
         let mut out = Vec::new();
         for entry in entries {
-            if self.check_auth(entry.id().as_str()).await.is_none() {
+            if self.check_auth(entry.id().as_str()).await?.is_none() {
                 continue;
             }
-            let credential = self.credentials.read(entry.id()).await.ok().flatten();
+            let credential = self.credentials.read(entry.id()).await?;
             out.extend(entry.filter_models(entry.models(), credential.as_ref()));
         }
-        out
+        Ok(out)
     }
 
     /// Run a provider-owned login flow and persist the credential it returns (Pi `Models.login`,
@@ -1777,5 +1808,315 @@ mod tests {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
             Box::pin(ReceiverStream::new(rx))
         }
+    }
+
+    // ---- CFG-020c: the optional `ApiKeyAuth.check` hook ----
+    // pi `ai/src/auth/types.ts:180-186` (the `check?` member) consulted by
+    // `Models.checkProviderAuth` at `ai/src/models.ts:506-517` @v0.87.1.
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CheckOutcome {
+        /// `check?` absent upstream: `supports_check()` is false and `Models` falls through to the
+        /// resolution path. Every built-in provider is this, on both sides.
+        Absent,
+        /// `check` answers "configured", with its own `source` string.
+        Configured,
+        /// `check` answers `undefined` even though `resolve` would report configured.
+        Unconfigured,
+        /// `check` rejects — upstream rethrows it as `ModelsError("auth", ...)` (`models.ts:514-516`).
+        Fails,
+    }
+
+    /// An api-key strategy that answers `check` and records whether `resolve` was reached.
+    /// `resolve` always reports CONFIGURED with `source = "resolve-path"`, so "which path ran" is
+    /// readable straight off the returned `AuthCheck`.
+    struct CheckingAuth {
+        outcome: CheckOutcome,
+        checks: Arc<std::sync::atomic::AtomicUsize>,
+        resolves: Arc<std::sync::atomic::AtomicUsize>,
+        saw_api_key_credential: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auth::ApiKeyAuth for CheckingAuth {
+        fn name(&self) -> &str {
+            "checking"
+        }
+
+        fn supports_check(&self) -> bool {
+            self.outcome != CheckOutcome::Absent
+        }
+
+        async fn check(
+            &self,
+            _ctx: &dyn AuthContext,
+            cred: Option<&Credential>,
+        ) -> Result<Option<AuthCheck>, crate::error::AuthError> {
+            self.checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.saw_api_key_credential.store(
+                matches!(cred, Some(Credential::ApiKey { .. })),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            match self.outcome {
+                CheckOutcome::Configured => Ok(Some(AuthCheck {
+                    auth_type: AuthType::ApiKey,
+                    source: Some("check-hook".to_string()),
+                })),
+                CheckOutcome::Unconfigured | CheckOutcome::Absent => Ok(None),
+                CheckOutcome::Fails => Err(crate::error::AuthError::api_key(
+                    ProviderId::from("checked"),
+                    "check hook exploded",
+                )),
+            }
+        }
+
+        async fn resolve(
+            &self,
+            _model: &Model,
+            _ctx: &dyn AuthContext,
+            _cred: Option<&Credential>,
+        ) -> Result<Option<AuthResult>, crate::error::AuthError> {
+            self.resolves
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(AuthResult {
+                auth: crate::auth::types::ModelAuth {
+                    api_key: Some("k".to_string()),
+                    headers: None,
+                    base_url: None,
+                },
+                env: None,
+                source: Some("resolve-path".to_string()),
+            }))
+        }
+    }
+
+    struct CheckProbe {
+        models: Models,
+        checks: Arc<std::sync::atomic::AtomicUsize>,
+        resolves: Arc<std::sync::atomic::AtomicUsize>,
+        saw_api_key_credential: Arc<std::sync::atomic::AtomicBool>,
+        store: Arc<InMemoryCredentialStore>,
+    }
+
+    impl CheckProbe {
+        fn checks(&self) -> usize {
+            self.checks.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn resolves(&self) -> usize {
+            self.resolves.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn saw_api_key_credential(&self) -> bool {
+            self.saw_api_key_credential
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        async fn store_credential(&self, cred: Credential) {
+            self.store
+                .modify(
+                    &ProviderId::from("checked"),
+                    Box::new(move |_| Box::pin(async move { Ok(Some(cred)) })),
+                )
+                .await
+                .expect("store credential");
+        }
+    }
+
+    fn check_probe(outcome: CheckOutcome) -> CheckProbe {
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let saw_api_key_credential = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let mut models = create_models(CreateModelsOptions {
+            credentials: Some(store.clone()),
+            ..Default::default()
+        });
+        let mut model = header_model();
+        model.provider = "checked".into();
+        models.set_provider(Arc::new(HeaderAuthProvider {
+            id: ProviderId::from("checked"),
+            models: vec![model],
+            auth: crate::auth::ProviderAuth::with_api_key(Arc::new(CheckingAuth {
+                outcome,
+                checks: checks.clone(),
+                resolves: resolves.clone(),
+                saw_api_key_credential: saw_api_key_credential.clone(),
+            })),
+        }));
+        CheckProbe {
+            models,
+            checks,
+            resolves,
+            saw_api_key_credential,
+            store,
+        }
+    }
+
+    /// CFG-020c. `if (apiKey.check) { return await apiKey.check(...) }` (`models.ts:506-517`)
+    /// returns from `checkProviderAuth` — the `resolveProviderAuth` call at `:518` is NOT reached.
+    ///
+    /// Red before the fix: `ApiKeyAuth` had no `check`, so `check_auth` always resolved and the
+    /// reported source was `"resolve-path"`, not the hook's `"check-hook"`.
+    #[tokio::test]
+    async fn check_auth_answers_from_the_check_hook_instead_of_resolving() {
+        let probe = check_probe(CheckOutcome::Configured);
+        let checked = probe
+            .models
+            .check_auth("checked")
+            .await
+            .expect("check_auth")
+            .expect("configured");
+        assert_eq!(checked.auth_type, AuthType::ApiKey);
+        assert_eq!(
+            checked.source.as_deref(),
+            Some("check-hook"),
+            "the hook's own AuthCheck is returned verbatim (models.ts:508-512)"
+        );
+        assert_eq!(probe.checks(), 1, "the hook is consulted exactly once");
+        assert_eq!(
+            probe.resolves(),
+            0,
+            "consulting `check` REPLACES the resolution path — that is the point of the hook: \
+             upstream documents it for strategies whose `resolve` executes commands"
+        );
+    }
+
+    /// CFG-020c. A hook answering `undefined` means "not configured" and stops there; it does not
+    /// fall through to resolution. Absent-vs-present-and-undefined is the distinction
+    /// `supports_check` exists to carry.
+    #[tokio::test]
+    async fn check_hook_reporting_unconfigured_beats_a_resolvable_strategy() {
+        let probe = check_probe(CheckOutcome::Unconfigured);
+        assert!(
+            probe
+                .models
+                .check_auth("checked")
+                .await
+                .expect("check_auth")
+                .is_none(),
+            "check() -> undefined is the answer, even though resolve() would report configured"
+        );
+        assert_eq!(probe.checks(), 1);
+        assert_eq!(probe.resolves(), 0);
+        assert!(
+            probe
+                .models
+                .get_available(None)
+                .await
+                .expect("get_available")
+                .is_empty(),
+            "getAvailable drops a provider whose checkProviderAuth answered undefined \
+             (models.ts:546-547)"
+        );
+    }
+
+    /// CFG-020c. The credential handed to the hook is the stored one and only when it is an
+    /// api-key credential — `credential?.type === "api_key" ? credential : undefined`
+    /// (`models.ts:510`).
+    #[tokio::test]
+    async fn check_hook_receives_the_stored_api_key_credential() {
+        let probe = check_probe(CheckOutcome::Configured);
+        assert!(
+            probe
+                .models
+                .check_auth("checked")
+                .await
+                .expect("check_auth")
+                .is_some()
+        );
+        assert!(
+            !probe.saw_api_key_credential(),
+            "nothing stored yet, so the hook is passed None"
+        );
+
+        probe.store_credential(Credential::api_key("stored")).await;
+        assert!(
+            probe
+                .models
+                .check_auth("checked")
+                .await
+                .expect("check_auth")
+                .is_some()
+        );
+        assert!(
+            probe.saw_api_key_credential(),
+            "the stored api-key credential reaches the hook"
+        );
+    }
+
+    /// CFG-020c. `catch (error) { throw new ModelsError("auth", ...) }` (`models.ts:514-516`) —
+    /// a failing hook is an ERROR, never "this provider is unconfigured".
+    ///
+    /// Red before the fix: `check_auth` returned a bare `Option` with no error channel at all, and
+    /// answered `Some(resolve-path)` here.
+    #[tokio::test]
+    async fn check_hook_failure_propagates_rather_than_reading_as_unconfigured() {
+        let probe = check_probe(CheckOutcome::Fails);
+        let error = probe
+            .models
+            .check_auth("checked")
+            .await
+            .expect_err("a failing check hook must surface");
+        assert!(
+            matches!(error, ProviderError::Auth(ref e) if e.code() == "auth"),
+            "taxonomy code `auth`, as `new ModelsError(\"auth\", ...)` (models.ts:515): {error:?}"
+        );
+        assert_eq!(probe.resolves(), 0);
+        probe
+            .models
+            .get_available(None)
+            .await
+            .expect_err("getAvailable inherits the rethrow (models.ts:544)");
+    }
+
+    /// CFG-020c. `check?` is OPTIONAL: every built-in provider omits it on both sides, so the
+    /// default must leave today's behaviour untouched — `Missing means Models checks availability
+    /// by resolving auth` (`auth/types.ts:182-184`). Green before and after the fix.
+    #[tokio::test]
+    async fn a_strategy_without_check_still_takes_the_resolution_path() {
+        let probe = check_probe(CheckOutcome::Absent);
+        let checked = probe
+            .models
+            .check_auth("checked")
+            .await
+            .expect("check_auth")
+            .expect("configured");
+        assert_eq!(checked.source.as_deref(), Some("resolve-path"));
+        assert_eq!(probe.checks(), 0, "the hook is not consulted when absent");
+        assert_eq!(probe.resolves(), 1);
+        assert_eq!(
+            probe
+                .models
+                .get_available(None)
+                .await
+                .expect("get_available")
+                .len(),
+            1
+        );
+    }
+
+    /// CFG-020c. The hook sits AFTER the stored-OAuth branch (`models.ts:502-503`), so a stored
+    /// OAuth credential on an api-key-only provider never reaches it.
+    #[tokio::test]
+    async fn a_stored_oauth_credential_short_circuits_before_the_check_hook() {
+        let probe = check_probe(CheckOutcome::Configured);
+        probe
+            .store_credential(Credential::Oauth {
+                refresh: "r".to_string(),
+                access: "a".to_string(),
+                expires: 0,
+                ext: serde_json::Map::new(),
+            })
+            .await;
+        assert!(
+            probe
+                .models
+                .check_auth("checked")
+                .await
+                .expect("check_auth")
+                .is_none(),
+            "no oauth strategy on this provider, so the oauth branch answers undefined"
+        );
+        assert_eq!(probe.checks(), 0);
+        assert_eq!(probe.resolves(), 0);
     }
 }

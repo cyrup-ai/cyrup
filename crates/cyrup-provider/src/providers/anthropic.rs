@@ -29,7 +29,7 @@ const ANTHROPIC_CATALOG_JSON: &str = include_str!("catalog/anthropic.json");
 /// The full Anthropic catalog (1:1 with Pi `ANTHROPIC_MODELS`). A parse failure yields an empty
 /// catalog (surfaced loudly by the catalog-count test) rather than a panic (NO-PANIC policy).
 pub fn anthropic_models() -> Vec<Model> {
-    serde_json::from_str(ANTHROPIC_CATALOG_JSON).unwrap_or_default()
+    crate::catalog::load_catalog(ANTHROPIC_CATALOG_JSON).unwrap_or_default()
 }
 
 /// `ANTHROPIC_AUTH_TOKEN` — the bearer-token variable used by Anthropic-compatible gateways and
@@ -232,7 +232,7 @@ impl AnthropicFleetSpec {
     /// Parse the embedded catalog into [`Model`]s (verbatim from Pi; a parse failure yields an empty
     /// catalog, surfaced loudly by the count tests, rather than a panic).
     pub fn models(&self) -> Vec<Model> {
-        serde_json::from_str(self.catalog_json).unwrap_or_default()
+        crate::catalog::load_catalog(self.catalog_json).unwrap_or_default()
     }
 
     /// The provider's [`ProviderAuth`]: an API key from its env var (Pi `envApiKeyAuth`), plus the
@@ -318,10 +318,12 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = anthropic_models();
-        // Every entry in Pi's `anthropic.models.ts` @91585d9a (14 models). pi `cc2db980` switched
-        // generation to models.dev's per-provider catalogs, retiring the ten EOL Claude 3.x/4.0
-        // entries cyrup's older snapshot still carried (see `tests/catalog_data.rs`, PROV-004).
-        assert_eq!(models.len(), 14);
+        // Every entry in pi's `anthropic.models.ts`, live from
+        // `pi.dev/api/models/providers/anthropic` since PROV-071. 14 while the catalog was frozen
+        // at `b0c2a90e`; the refresh added Opus 5, Opus 5.5, Sonnet 5.5 and Fable 5.1 and retired
+        // the two Opus 4.1 rows, which is two months of Anthropic releases the frozen floor could
+        // not show.
+        assert_eq!(models.len(), 16);
         assert!(models.iter().all(|m| m.api.as_str() == ANTHROPIC_MESSAGES));
         assert!(models.iter().all(|m| m.provider.as_str() == "anthropic"));
         assert!(models.iter().all(|m| m.base_url == ANTHROPIC_BASE_URL));
@@ -386,16 +388,16 @@ mod tests {
         let p = anthropic_provider();
         assert_eq!(p.id().as_str(), "anthropic");
         assert!(p.get_model("claude-opus-4-5").is_some());
-        assert_eq!(p.models().len(), 14);
+        assert_eq!(p.models().len(), 16);
     }
 
     #[test]
     fn anthropic_fleet_catalogs_parse_with_expected_counts() {
         let expected = [
-            ("kimi-coding", 5usize),
+            ("kimi-coding", 4usize),
             ("minimax", 3),
             ("minimax-cn", 3),
-            ("vercel-ai-gateway", 190),
+            ("vercel-ai-gateway", 248),
         ];
         for (id, count) in expected {
             let spec = anthropic_fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));

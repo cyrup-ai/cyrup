@@ -60,7 +60,10 @@ pub fn has_copilot_vision_input(messages: &[Message]) -> bool {
         Message::User { content, .. } | Message::ToolResult { content, .. } => {
             content.iter().any(|c| matches!(c, Content::Image { .. }))
         }
-        Message::Assistant(_) => false,
+        // pi's `hasCopilotVisionInput` tests ONLY the `user` and `toolResult` roles and falls
+        // through to `return false` for everything else (`github-copilot-headers.ts:12-20`
+        // @v0.87.1) — a system message declares tools and prompt text, never an image block.
+        Message::System(_) | Message::Assistant(_) => false,
     })
 }
 
@@ -146,6 +149,7 @@ mod tests {
             api: "anthropic-messages".into(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

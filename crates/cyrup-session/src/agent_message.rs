@@ -116,6 +116,13 @@ pub enum AgentMessage {
 /// cloning its message (see [`crate::context::context_message_role`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageRole {
+    /// Pi's `"system"` role (PROV-083a). It appears in NO case of `isCutPointMessage`
+    /// (`compaction.ts:373-386` @v0.87.1) or `isTurnStartMessage` (`:388-401`), so both fall through
+    /// to their trailing `return false` — see the two predicates below. Compaction does not normally
+    /// see one at all: `getMessagesFromProjectedEntryForCompaction` drops it up front, *"System
+    /// messages are prompt state, not conversation; the compaction entry carries their replay"*
+    /// (`compaction.ts:98-100`).
+    System,
     User,
     Assistant,
     ToolResult,
@@ -126,14 +133,29 @@ pub enum MessageRole {
 }
 
 impl MessageRole {
-    /// Pi `isCutPointMessage` (`compaction.ts:308-321`): every role EXCEPT `toolResult` may serve
-    /// as a cut boundary — a tool result must stay with its call.
+    /// Pi `isCutPointMessage` (`compaction.ts:373-386` @v0.87.1, `:308-321` @v0.83.0): `user`,
+    /// `assistant`, `bashExecution`, `custom`, `branchSummary` and `compactionSummary` may serve as
+    /// a cut boundary; `toolResult` may not — it must stay with its call.
+    ///
+    /// PROV-083a made the allow-list EXPLICIT. It used to read `!matches!(self, ToolResult)`, which
+    /// was equivalent while `toolResult` was the only excluded role, but upstream's switch has no
+    /// `"system"` case and falls through to its trailing `return false` (`:385`), so the inverted
+    /// form would have silently made a system message a legal cut point.
     pub fn is_cut_point(self) -> bool {
-        !matches!(self, MessageRole::ToolResult)
+        matches!(
+            self,
+            MessageRole::User
+                | MessageRole::Assistant
+                | MessageRole::BashExecution
+                | MessageRole::Custom
+                | MessageRole::BranchSummary
+                | MessageRole::CompactionSummary
+        )
     }
 
-    /// Pi `isTurnStartMessage` (`compaction.ts:323-336`): `user`, `bashExecution`, `custom`,
-    /// `branchSummary` and `compactionSummary` start a turn; `assistant` and `toolResult` do not.
+    /// Pi `isTurnStartMessage` (`compaction.ts:388-401` @v0.87.1, `:323-336` @v0.83.0): `user`,
+    /// `bashExecution`, `custom`, `branchSummary` and `compactionSummary` start a turn; `assistant`,
+    /// `toolResult` and `system` do not (the last by falling through to `return false`, `:400`).
     pub fn is_turn_start(self) -> bool {
         matches!(
             self,
@@ -155,6 +177,7 @@ impl AgentMessage {
     /// The wire `role` of this message.
     pub fn role(&self) -> MessageRole {
         match self {
+            AgentMessage::Core(Message::System(_)) => MessageRole::System,
             AgentMessage::Core(Message::User { .. }) => MessageRole::User,
             AgentMessage::Core(Message::Assistant(_)) => MessageRole::Assistant,
             AgentMessage::Core(Message::ToolResult { .. }) => MessageRole::ToolResult,

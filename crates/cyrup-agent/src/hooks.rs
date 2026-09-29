@@ -283,11 +283,18 @@ impl std::fmt::Debug for RequestUpdate {
     }
 }
 
-/// The default `convert_to_llm`: keep only `user`/`assistant`/`toolResult`, drop `Custom`
+/// The default `convert_to_llm`: keep only `system`/`user`/`assistant`/`toolResult`, drop `Custom`
 /// (func-02 R-02-029/052).
+///
+/// PROV-083a added the `system` role. pi's `defaultConvertToLlm` is a four-way filter that names it
+/// FIRST — `message.role === "system" || … "user" || … "assistant" || … "toolResult"`
+/// (`packages/agent/src/agent.ts:38-46` @v0.87.1) — and so does the coding-agent's own override
+/// (`coding-agent/src/core/messages.ts:184-188`, `packages/agent/src/harness/messages.ts:159-163`).
+/// A system message IS an LLM message: it carries the prompt and the tool declarations.
 pub fn default_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Message> {
     msgs.iter()
         .filter_map(|m| match m.as_ref() {
+            AgentMessage::System(s) => Some(Message::System(s.clone())),
             AgentMessage::User { content, timestamp } => Some(Message::User {
                 content: content.clone(),
                 timestamp: timestamp.unwrap_or(0),

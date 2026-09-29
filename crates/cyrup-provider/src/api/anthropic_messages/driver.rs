@@ -26,13 +26,21 @@ pub(crate) async fn decode_stream<S>(
     sink: &EventSink,
     is_oauth: bool,
     tools: &[ToolDef],
+    // `provider_thinking_level`: the effort this request declared, from
+    // `super::params::managed_active_effort` — stamped on every partial and on the terminal, exactly
+    // as pi seeds it on `output` before the stream opens (`anthropic-messages.ts:517-528`). PROV-091.
+    provider_thinking_level: Option<String>,
 ) where
     S: Stream<Item = Result<SseFrame, ProviderError>> + Unpin,
 {
     let provider = model.provider.clone();
     let model_id = model.id.as_str().to_string();
 
-    let mut dec = Decoder::new(is_oauth, tools.iter().map(|t| t.name.clone()).collect());
+    let mut dec = Decoder::new(
+        is_oauth,
+        tools.iter().map(|t| t.name.clone()).collect(),
+        provider_thinking_level,
+    );
     if !sink
         .send(StreamEvent::Start {
             partial: dec.snapshot(model, api),

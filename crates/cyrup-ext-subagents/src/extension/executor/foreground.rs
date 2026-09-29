@@ -116,6 +116,10 @@ struct ForegroundRunOptionsInput<'a> {
     overrides: SingleRunOverrides,
     cwd: &'a Path,
     timeout_ms: Option<u64>,
+    /// CFG-067 — the run's ALREADY-RESOLVED per-tool-call deadline (pi's post-`resolveToolTimeoutMs`
+    /// `options.toolTimeoutMs`, `execution.ts:1686`).
+    tool_timeout_ms: Option<u64>,
+
     cancel: CancelToken,
     /// Borrowed for [`AgentDefinition::default_reads`] (SUBA-054); the caller drives the run with it.
     agent: &'a AgentDefinition,
@@ -378,10 +382,25 @@ impl SubagentExecutor {
             session_dir,
         } = self.resolve_run_channels(&cfg, &overrides, cwd, &agent, timeout_ms);
 
+        // CFG-067 — pi `execution.ts:1669-1686`: the four rungs are resolved TOGETHER and a
+        // malformed winner refuses the run outright, carrying `resolveToolTimeoutMs`'s own sentence.
+        // Resolved here, before the options are built, so no run ever starts holding a value the
+        // resolver rejected.
+        let tool_timeout_ms = crate::exec::tool_timeout::resolve_tool_timeout_ms(
+            &crate::exec::tool_timeout::ToolTimeoutResolutionInput {
+                call_value: overrides.tool_timeout_ms.as_ref(),
+                agent_value: agent.default_tool_timeout_ms,
+                config_value: cfg.tool_timeout_ms.as_ref(),
+                env_value: crate::exec::tool_timeout::tool_timeout_from_env(),
+            },
+        )
+        .map_err(SubagentError::Management)?;
+
         let run_options = self.build_foreground_run_options(ForegroundRunOptionsInput {
             overrides,
             cwd,
             timeout_ms,
+            tool_timeout_ms,
             cancel,
             agent: &agent,
             turn_budget,
@@ -1157,6 +1176,7 @@ impl SubagentExecutor {
             overrides,
             cwd,
             timeout_ms,
+            tool_timeout_ms,
             spawn_command,
             cancel,
             agent,
@@ -1224,6 +1244,9 @@ impl SubagentExecutor {
             cwd: cwd.to_path_buf(),
             deadline_at,
             timeout_ms,
+            // CFG-067 — resolved before this builder runs, in `run_foreground_impl`, because a
+            // malformed value must refuse the call rather than travel onto the options.
+            tool_timeout_ms,
             output_path,
             output_mode,
             // pi's FOREGROUND structured-output policy (`subagent-executor.ts:3780-3787`): the
@@ -1932,6 +1955,7 @@ mod tests {
     /// never quietly make these assertions pass for the wrong reason.
     fn gate_agent(model: Option<&str>, fallbacks: &[&str]) -> AgentDefinition {
         AgentDefinition {
+            default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,
             mutation_tools: None,
@@ -1946,6 +1970,7 @@ mod tests {
             subagent_only_extensions: None,
             subagent_only_extensions_from_default: false,
             exclude_tools: None,
+            allowed_agents: None,
             allow_nested_subagents: None,
             model: model.map(ModelId::from),
             fallback_models: fallbacks.iter().map(|m| ModelId::from(*m)).collect(),
@@ -1957,7 +1982,6 @@ mod tests {
             default_reads: None,
             default_progress: None,
             output: None,
-            completion_guard: None,
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
@@ -2786,6 +2810,7 @@ mod detach_producer_tests {
             .expect("the fixture persona parses");
             executor
                 .build_foreground_run_options(ForegroundRunOptionsInput {
+                    tool_timeout_ms: None,
                     overrides: SingleRunOverrides::default(),
                     cwd: dir.path(),
                     timeout_ms: None,

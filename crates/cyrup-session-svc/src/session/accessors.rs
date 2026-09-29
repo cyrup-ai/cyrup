@@ -18,9 +18,10 @@ use crate::services::AgentSessionServices;
 
 use super::AgentSession;
 
-// Doc-only — see `types.rs`. `model_catalog`'s doc names the swappable provider; the original
-// `session.rs` had it in scope via `use crate::provider_swap::ProviderSwap` (session.rs:41).
-#[cfg(doc)]
+// `model_catalog`'s doc names the swappable provider and the `cfg(test)` `provider_swap` returns
+// one; the original `session.rs` had it in scope via `use crate::provider_swap::ProviderSwap`
+// (session.rs:41).
+#[cfg(any(doc, test))]
 use crate::provider_swap::ProviderSwap;
 
 impl AgentSession {
@@ -268,7 +269,7 @@ impl AgentSession {
         // the branch projection would change the answer (`cache_stats.rs:110-115`).
         let scan = crate::state::cache_scan_entries(entries);
         let misses: HashMap<EntryId, cyrup_provider::cache_stats::CacheMiss> =
-            cyrup_provider::cache_stats::collect_cache_misses(&scan, &models)
+            cyrup_provider::cache_stats::collect_cache_misses(&scan, &*models)
                 .into_iter()
                 .filter_map(|(i, miss)| entries.get(i).map(|e| (e.id(), miss)))
                 .collect();
@@ -405,6 +406,21 @@ impl AgentSession {
     /// [`Self::available_model_catalog`], which spans the full configured registry.
     pub fn model_catalog(&self) -> Vec<cyrup_provider::Model> {
         self.provider.current().models().to_vec()
+    }
+
+    /// The live stream source the agent loop runs through — the slot a cross-provider `/model`
+    /// select installs into ([`ProviderSwap::store`]).
+    ///
+    /// Crate-internal: the swap is an implementation detail of model selection, and the two public
+    /// views onto it are [`Self::model_catalog`] (the installed provider's own catalog) and
+    /// [`Self::available_model_catalog`] (the whole configured registry). Exposed so the
+    /// composed-registry snapshot's invalidation contract (CFG-020) can be exercised against the
+    /// real slot rather than a stand-in — which is the whole of its use, hence `cfg(test)`:
+    /// production swaps go through [`Self::set_model_resolved`]'s `install_owning_provider`, and
+    /// nothing outside the session has any business installing a provider behind it.
+    #[cfg(test)]
+    pub(crate) fn provider_swap(&self) -> &Arc<ProviderSwap> {
+        &self.provider
     }
 
     /// The session-scoped resource registry (Pi `resourceLoader` getter, agent-session.ts:363).

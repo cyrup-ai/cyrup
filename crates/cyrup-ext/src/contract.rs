@@ -219,6 +219,8 @@ impl HostEvent {
 /// The role discriminant of an LLM message (for the `message_end` same-role rule, R-08-011).
 fn message_role(m: &Message) -> &'static str {
     match m {
+        // PROV-083a — pi's wire `role` literal for a `SystemMessage` (`packages/ai/src/types.ts:492`).
+        Message::System(_) => "system",
         Message::User { .. } => "user",
         Message::Assistant(_) => "assistant",
         Message::ToolResult { .. } => "toolResult",

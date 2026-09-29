@@ -10,7 +10,7 @@ use crate::discovery::types::AgentReadScope;
 use crate::error::SubagentError;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
-use crate::extension::executor::requests::BackgroundStepsSpec;
+use crate::extension::executor::requests::{BackgroundStepsSpec, RetainedModelResponseAliases};
 use crate::fork_context::ContextMode;
 use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
@@ -510,6 +510,7 @@ impl SubagentExecutor {
             .spawn_background_steps(
                 &effective_cwd,
                 BackgroundStepsSpec {
+                    tool_timeout_ms: None,
                     // The four cyrup-only run-level keys the descriptor carries (SUBA-021/008/073/
                     // N06). Before the descriptor every one of these was `None` on a revive — the
                     // exact degradation this contract exists to remove.
@@ -595,7 +596,12 @@ impl SubagentExecutor {
                     // the launch-time declaration, NOT today's `config.json`. A revive that re-read
                     // the live config could fail a run the operator had already unblocked, and the
                     // verification error's own last-but-one sentence promises it will not.
-                    model_response_aliases: descriptor.model_response_aliases.clone(),
+                    //
+                    // The ONLY producer of `Retained`: `Retained(None)` here is upstream's
+                    // meaningful absence, not "unset, go look at the config".
+                    model_response_aliases: RetainedModelResponseAliases::Retained(
+                        descriptor.model_response_aliases.clone(),
+                    ),
                 },
             )
             .await?;

@@ -250,7 +250,14 @@ impl Capabilities {
 ///   `registration.register-bash-operations` and the `host-bash` interface carrying pi's two
 ///   closure-shaped `exec` options (`emit-bash-output` for `onData`, `is-bash-cancelled` for
 ///   `signal`) are ADDITIVE imports and would not have required a bump on their own.
-pub const HOST_WORLD: &str = "cyrup:ext@0.10";
+/// - 0.10, still 0.10: IMPORT ADDITION — `ui.footer-data` (EXT-064), the read half of pi's
+///   `ReadonlyFooterDataProvider` (`core/footer-data-provider.ts:385-388` @v0.87.1). Deliberately
+///   NOT a bump, for the reason the `ctx-state.get-system-prompt-options` entry above spells out:
+///   an added import cannot fail the one direction [`ExtensionManifest::check_world`] defends (an
+///   OLD guest against a NEW host merely declines to call it), and bumping would refuse every
+///   already-built 0.10 guest while preventing nothing. The ABI fingerprint (`build/abi.rs`) is
+///   what stops a stale cached artifact being served across this edit.
+pub const HOST_WORLD: &str = "cyrup:ext@0.11";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

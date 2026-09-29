@@ -314,7 +314,7 @@ impl<T> OverrideField<T> {
 /// pi uses to explicitly CLEAR a `string | false` / `string[] | false` override field
 /// (`agents.ts:66-77`). It is tried only AFTER a concrete `Value(T)` (see the `untagged` helper in
 /// [`OverrideField`]'s `Deserialize`), which is what lets a genuinely boolean-typed override field
-/// (`disabled`/`completionGuard`, where `false` is a real VALUE, not a clear) keep `false` as
+/// (`disabled`, where `false` is a real VALUE, not a clear) keeps `false` as
 /// `Value(false)` while a `string`/`array`-typed field reads `false` as
 /// [`OverrideField::ExplicitClear`].
 struct OverrideClearSentinel;
@@ -375,7 +375,7 @@ where
     {
         // Try a concrete `Value(T)` FIRST; only a genuine JSON `false` that is not itself a valid
         // `T` (i.e. a `string|false` / `array|false` field) falls through to the clear sentinel.
-        // For a `bool`-typed `T` (`disabled`/`completionGuard`), `false` deserializes as
+        // For a `bool`-typed `T` (`disabled`), `false` deserializes as
         // `Value(false)` and never reaches the sentinel — matching pi, where those fields are plain
         // booleans and `false` is a real value.
         #[derive(serde::Deserialize)]
@@ -585,7 +585,7 @@ pub struct AgentOverrideInfo {
     ///
     /// **Key spelling is load-bearing.** These are pi's own `BuiltinAgentOverrideConfig` JSON keys
     /// (`agents.ts:85-112`) in on-disk camelCase — `model`, `thinking`, `systemPrompt`,
-    /// `completionGuard`, `subagentOnlyExtensions`, … — matching this crate's
+    /// `subagentOnlyExtensions`, … — matching this crate's
     /// [`AgentOverrideConfig`] `#[serde(rename_all = "camelCase")]` names, never the Rust field
     /// names. `subagents-admin.ts:117`'s `EditableOverrideField` is a union of exactly these
     /// strings and `:129` tests membership with them literally.
@@ -651,10 +651,10 @@ pub struct AgentOverrideInfo {
 ///   deserializes to [`OverrideField::ExplicitClear`] (pi's explicit "reset this field" sentinel).
 /// - pi's plain `boolean` / `SystemPromptMode` / `string` fields (no `| false`:
 ///   `description`/`systemPromptMode`/`inheritProjectContext`/`inheritSkills`/`disabled`/
-///   `systemPrompt`/`completionGuard`) are also [`OverrideField<T>`]. What a JSON `false` means for
+///   `systemPrompt`) are also [`OverrideField<T>`]. What a JSON `false` means for
 ///   them depends on `T`, and the two cases differ — the untagged `Deserialize` below tries
 ///   `Value(T)` first and only falls through to the clear sentinel when that arm rejects the input:
-///   - `T = bool` (`inheritProjectContext`/`inheritSkills`/`disabled`/`completionGuard`): the
+///   - `T = bool` (`inheritProjectContext`/`inheritSkills`/`disabled`): the
 ///     `Value` arm ACCEPTS `false`, so it is a real `Value(false)` and never a clear. This is the
 ///     case the port has always relied on.
 ///   - `T = String` / `SystemPromptMode` (`description`/`systemPrompt`/`systemPromptMode`): the
@@ -752,6 +752,16 @@ pub struct AgentOverrideConfig {
     /// settings value is carried here verbatim like `skills`/`extensions` are.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub exclude_tools: OverrideField<Vec<String>>,
+    /// SUBA-111 — pi `allowedAgents?: string[] | false` (`agents.ts:1140-1141` @v0.71.0), parsed by
+    /// the same `parseOverrideStringArrayOrFalse` `excludeTools` uses and then put through
+    /// `normalizeCapabilityCeilingAllowedAgents`. Lands in [`AgentDefinition::allowed_agents`]; a
+    /// JSON `false` CLEARS it (`OverrideField::ExplicitClear`), restoring unrestricted delegation.
+    ///
+    /// The value is an agent-sourced CAPABILITY CEILING, not a tool list: it bounds which agents
+    /// the launched child may itself delegate to, one level down. See
+    /// [`crate::exec::capability_ceiling::normalize_capability_ceiling_allowed_agents`].
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub allowed_agents: OverrideField<Vec<String>>,
     /// SUBA-092 — pi `allowNestedSubagents?: boolean` (`agents.ts:105` @v0.64.0; parsed at
     /// `agents.ts:1099-1102`, applied at `:1405`). A plain boolean toggle with NO `| false` clear
     /// form — as with `inheritSkills`, `OverrideField<bool>`'s `Value` arm accepts `false`, so a
@@ -768,8 +778,6 @@ pub struct AgentOverrideConfig {
     /// paths, or a JSON `false` to clear them.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub subagent_only_extensions: OverrideField<Vec<String>>,
-    #[serde(skip_serializing_if = "OverrideField::is_unset")]
-    pub completion_guard: OverrideField<bool>,
     /// pi `toolBudget?: ToolBudgetConfig | false` (`agents.ts:102`) — the per-agent tool-call
     /// budget, or a JSON `false` to clear it.
     ///
@@ -888,10 +896,10 @@ impl AgentOverrideConfig {
             || self.skills.is_present()
             || self.tools.is_present()
             || self.exclude_tools.is_present()
+            || self.allowed_agents.is_present()
             || self.allow_nested_subagents.is_present()
             || self.extensions.is_present()
             || self.subagent_only_extensions.is_present()
-            || self.completion_guard.is_present()
             || self.tool_budget.is_present()
             || self.output_mode.is_some()
             || self.fast.is_present()
@@ -1233,6 +1241,18 @@ pub struct AgentDefinition {
     /// produced, entries untrimmed and undeduplicated here — `pi-args.ts:502` trims, drops empties
     /// and de-duplicates at the consumer, and so does [`crate::exec::build_attempt_spawn_plan`].
     pub exclude_tools: Option<Vec<String>>,
+    /// SUBA-111 — pi `allowedAgents?: string[]` (`agents.ts:2118-2119` @v0.71.0): the set of agent
+    /// names this agent's own CHILDREN may delegate to, already through
+    /// [`crate::exec::capability_ceiling::normalize_capability_ceiling_allowed_agents`] (trimmed,
+    /// validated against `^[A-Za-z0-9_.:-]+$`, de-duplicated, SORTED).
+    ///
+    /// `None` = the key was absent (pi's `undefined`), i.e. no bound. `Some(list)` becomes an
+    /// agent-sourced [`crate::exec::capability_ceiling::ResolvedCapabilityCeiling`] with
+    /// `sources: ["agent:<name>"]`, intersected into what the child's process environment carries
+    /// (`child-launch.ts:185-187,211` @v0.71.0). It binds the child's DESCENDANTS, one level
+    /// deeper than the ceiling this agent was itself admitted by — so an agent naming only
+    /// `reviewer` here does not thereby refuse to launch itself.
+    pub allowed_agents: Option<Vec<String>>,
     /// SUBA-092 — pi `AgentConfig.allowNestedSubagents?: boolean` (`agents.ts:141` @v0.64.0), from
     /// the `allowNestedSubagents:` frontmatter key (strictly `true`/`false`, `agents.ts:2061-2066`)
     /// or a settings override. An INDEPENDENT grant of nested delegation for an agent that declares
@@ -1335,10 +1355,6 @@ pub struct AgentDefinition {
     pub default_progress: Option<bool>,
     /// Agent-level default output path/mode (func-SA §4.1).
     pub output: Option<OutputSpec>,
-    /// `Some(false)` disables the completion-mutation guard for this agent entirely (R-SA-034);
-    /// `None`/`Some(true)` leaves the guard active subject to that subsystem's own read-only-tools
-    /// short-circuit.
-    pub completion_guard: Option<bool>,
     /// Parsed but **unenforced in v1** (func-SA §4.1): round-tripped for forward compatibility.
     /// MUST NOT be silently dropped from `extra_fields`/serialization even though no code path
     /// currently consults it. Enforcement (if ever added) is out of scope for this crate's
@@ -1359,6 +1375,17 @@ pub struct AgentDefinition {
     /// call-site `maxRuntimeMs` (the alias of `timeoutMs`) ALSO suppresses it
     /// (`subagent-executor.ts:1937`).
     pub default_timeout_ms: Option<u64>,
+    /// CFG-067 — pi `AgentConfig.defaultToolTimeoutMs` (`agents.ts:158` @v0.71.0), from
+    /// `toolTimeoutMs:` frontmatter (parsed at `agents.ts:2163-2169`). The SECOND rung of
+    /// `resolveToolTimeoutMs` (`tool-timeout.ts:60-86`), under an explicit call-site
+    /// `toolTimeoutMs` and over `config.toolTimeoutMs` and
+    /// [`crate::exec::tool_timeout::TOOL_TIMEOUT_ENV`].
+    ///
+    /// It is a per-TOOL-CALL deadline, not a run budget — unrelated to
+    /// [`Self::default_timeout_ms`], which is the whole run's. Before CFG-067 the key was validated
+    /// and then discarded, so an agent declaring `toolTimeoutMs: 5000` ran with no per-tool
+    /// deadline at all.
+    pub default_tool_timeout_ms: Option<u64>,
     /// The agent's `memory:` scope (pi `AgentConfig.memory`, `agents.ts` + `agent-memory.ts`).
     /// `None` means the agent declared none, or declared one that failed validation (pi's
     /// `parseMemoryFrontmatter` returns `undefined` for both). When set, spawn time resolves it to
@@ -1718,8 +1745,9 @@ mod tests {
         assert!(valued.is_present());
     }
 
-    /// SUBA-096 census — the literal 26 keys of pi's `BuiltinAgentOverrideConfig`
-    /// (`agents.ts:86-111` @v0.68.0) are each either read by this port (a serde field of
+    /// SUBA-096 census — the literal 25 keys of pi's `BuiltinAgentOverrideConfig`
+    /// (`agents.ts:86-111`; 26 at v0.68.0, minus `completionGuard`, which SUBA-107 retired after
+    /// `7c98a696` deleted it upstream at v0.70.1) are each either read by this port (a serde field of
     /// [`AgentOverrideConfig`], or `toolBudget`, which is populated by the settings parser) or
     /// named in [`UNPORTED_OVERRIDE_KEYS`] — never both, never neither. `fallbackModels` is the one
     /// modeled key upstream does not declare (cyrup's own).
@@ -1749,11 +1777,11 @@ mod tests {
             "skills",
             "tools",
             "excludeTools",
+            "allowedAgents",
             "allowNestedSubagents",
             "extensions",
             "subagentOnlyExtensions",
             "mutationTools",
-            "completionGuard",
             "toolBudget",
         ];
         let mut modeled: BTreeSet<&str> =
@@ -1777,8 +1805,9 @@ mod tests {
         let extra: Vec<&&str> = modeled.iter().filter(|k| !UPSTREAM.contains(k)).collect();
         assert_eq!(extra, vec![&"fallbackModels"]);
         // 23 upstream keys + `fallbackModels` before the `1aecfca` contract; that contract added
-        // `machine`, `inheritGlobalContext` and `mutationTools` as serde fields, so all 26 upstream
-        // keys plus `fallbackModels` are now struct fields.
+        // `machine`, `inheritGlobalContext` and `mutationTools` as serde fields. SUBA-107 then
+        // removed `completionGuard` and SUBA-111 added `allowedAgents`, so all 26 surviving
+        // upstream keys plus `fallbackModels` are struct fields.
         assert_eq!(modeled.len(), 27);
     }
 
@@ -1815,6 +1844,7 @@ mod tests {
             aliases: Vec::new(),
             tools,
             exclude_tools: None,
+            allowed_agents: None,
             allow_nested_subagents: None,
             extensions: None,
             extensions_from_default: false,
@@ -1830,12 +1860,12 @@ mod tests {
             default_reads: None,
             default_progress: None,
             output: None,
-            completion_guard: None,
             interactive: None,
             max_subagent_depth: None,
             default_context: None,
             default_async: None,
             default_timeout_ms: None,
+            default_tool_timeout_ms: None,
             memory: None,
             tool_budget: None,
             disabled: None,
@@ -1917,7 +1947,7 @@ mod tests {
 
     #[test]
     fn override_field_bool_reads_false_as_value_not_clear() {
-        // `disabled`/`completionGuard` are plain booleans: `false` is a real VALUE, never a clear.
+        // `disabled` is a plain boolean: `false` is a real VALUE, never a clear.
         let f: OverrideField<bool> = serde_json::from_str("false").expect("bool false");
         assert_eq!(f, OverrideField::Value(false));
         let t: OverrideField<bool> = serde_json::from_str("true").expect("bool true");
@@ -1935,7 +1965,7 @@ mod tests {
     fn subagent_settings_deserializes_a_pi_shaped_block() {
         let raw = serde_json::json!({
             "agentOverrides": {
-                "reviewer": { "model": "openai/gpt-5.4", "thinking": "xhigh", "completionGuard": false },
+                "reviewer": { "model": "openai/gpt-5.4", "thinking": "xhigh" },
                 "implementer": { "tools": ["bash", "mcp:xcodebuild_list_sims"] }
             },
             "defaultModel": "deepseek-v4-flash",
@@ -1954,7 +1984,6 @@ mod tests {
             OverrideField::Value("openai/gpt-5.4".to_string())
         );
         assert_eq!(reviewer.thinking, OverrideField::Value("xhigh".to_string()));
-        assert_eq!(reviewer.completion_guard, OverrideField::Value(false));
 
         let implementer = settings
             .overrides

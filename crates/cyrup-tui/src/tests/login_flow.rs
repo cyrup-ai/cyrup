@@ -1227,20 +1227,27 @@ fn model_named(provider: &str, id: &str) -> Model {
     model
 }
 
-/// **TUI-105, the documentation half.** `begin_post_login_catalog_refresh`'s `CYRUP-DELTA` ends by
-/// naming what decides a deferred selection — the epoch guard and the previous model the refresh
-/// carries — and it wrote that second half as a bare ``[`LoginRefreshMsg::previous_model`]``. The
-/// type is `crate::login_dialog::LoginRefreshMsg` (`login_dialog.rs:623`) and `app::login` imports
-/// no such name, so the workspace's `rustdoc::broken_intra_doc_links` deny turned
-/// `cargo doc -p cyrup-tui --no-deps` into `error: unresolved link to
-/// `LoginRefreshMsg::previous_model`` / `error: could not document `cyrup-tui``: this row's own
-/// change stopped the crate's docs building.
+/// **TUI-105, the documentation half.** Every intra-doc link `app/login.rs` writes must RESOLVE: the
+/// workspace denies `rustdoc::broken_intra_doc_links`, so one bare name turns
+/// `cargo doc -p cyrup-tui --no-deps` into `error: could not document `cyrup-tui``. The original
+/// offender was a bare ``[`LoginRefreshMsg::previous_model`]`` — the type is
+/// `crate::login_dialog::LoginRefreshMsg` (`login_dialog.rs:623`) and `app::login` imports no such
+/// name.
 ///
 /// Read out of the source because rustdoc, not the binary, is what consumes the link.
 ///
-/// **Red without the change:** the bare spelling is back and the first assertion fires.
+/// The second assertion moved with the prose it guards. It used to pin the `CYRUP-DELTA` that
+/// recorded the post-login refresh being WIDER than pi's; that delta is now DELETED, because the
+/// refresh was narrowed to upstream's own scope instead (pi's direct
+/// `modelRuntime.refresh({ providers: [providerId], signal })`, `interactive-mode.ts:5953`) and a
+/// `CYRUP-DELTA` may only record a mechanism difference at full parity, never a lost guarantee. What
+/// replaced it is the port note naming the scoped call, so that is what is pinned by its resolvable
+/// path.
+///
+/// **Red without the change:** a bare `[`LoginRefreshMsg::` spelling is back, or the port note stops
+/// naming the scoped refresh by a path rustdoc can follow.
 #[test]
-fn tui105_the_deferred_selection_delta_resolves_its_link() {
+fn tui105_the_post_login_refresh_doc_resolves_its_links() {
     const LOGIN_SRC: &str = include_str!("../app/login.rs");
 
     assert!(
@@ -1251,9 +1258,199 @@ fn tui105_the_deferred_selection_delta_resolves_its_link() {
          `cargo doc -p cyrup-tui --no-deps` fail with `could not document `cyrup-tui``"
     );
     assert!(
-        LOGIN_SRC.contains("[`crate::login_dialog::LoginRefreshMsg::previous_model`]"),
-        "the `CYRUP-DELTA` on the WIDENED post-login refresh must still point at the field that \
-         makes the widening harmless — the previous model a late refresh compares against \
-         (`interactive-mode.ts:5960-5963`) — by its resolvable path"
+        LOGIN_SRC.contains("[`cyrup_session_svc::AgentSession::refresh_provider_catalog`]"),
+        "the post-login refresh's doc must name the SCOPED session call it now makes — pi's \
+         `refresh({{ providers: [providerId], signal }})` (`interactive-mode.ts:5953`) — by a path \
+         rustdoc can resolve"
+    );
+    assert!(
+        !LOGIN_SRC.contains("CYRUP-DELTA` pi scopes the refresh"),
+        "the WIDENED-refresh `CYRUP-DELTA` recorded a lost guarantee, not a mechanism at parity; it \
+         must stay deleted now that the refresh is scoped like upstream's"
+    );
+}
+
+// ================================================ TUI-105 — the post-login refresh is SCOPED
+
+/// An `AuthContext` over an EMPTY environment, so the catalog fetch below cannot be rerouted by an
+/// ambient `HTTP_PROXY` on the machine running the suite.
+struct EmptyEnv;
+
+#[async_trait::async_trait]
+impl cyrup_provider::AuthContext for EmptyEnv {
+    async fn env(&self, _name: &str) -> Option<String> {
+        None
+    }
+    async fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
+}
+
+/// A loopback catalog origin that records which providers were fetched and answers each immediately.
+///
+/// **No network.** `127.0.0.1:0`, the technique `cyrup-provider/src/tests/remote_catalog.rs`
+/// established; a test that "passed" by reaching `https://pi.dev` would be worse than no test.
+struct RecordingOrigin {
+    base_url: String,
+    requested: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingOrigin {
+    async fn spawn() -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let requested = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&requested);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    // `GET /api/models/providers/<id> HTTP/1.1`
+                    if let Some(provider) = head
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|p| p.rsplit('/').next())
+                    {
+                        seen.lock().unwrap().push(provider.to_string());
+                    }
+                    let body = "[]";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            requested,
+        }
+    }
+
+    fn fetched(&self) -> std::collections::BTreeSet<String> {
+        self.requested.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+/// [`first_run_fixture`] with a real [`cyrup_provider::ModelCatalogService`] wired at `base_url`.
+///
+/// The plain fixture wires `model_catalog: None`, which makes every post-login refresh a clean no-op
+/// — fine for the selection tests above, useless for proving WHICH providers get fetched. This one
+/// gives the session something to fetch from.
+async fn first_run_fixture_with_catalog(base_url: &str) -> Fixture {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut config = SessionConfig::new(cwd, agent_dir.clone());
+    config.trust_override = Some(true);
+    let catalog = Arc::new(
+        cyrup_provider::RemoteCatalog::new(Arc::new(cyrup_provider::InMemoryModelsStore::new()))
+            .with_base_url(base_url)
+            .with_auth_context(Arc::new(EmptyEnv))
+            .with_request_timeout(Duration::from_secs(30)),
+    );
+    let svc = Arc::new(
+        cyrup_provider::ModelCatalogService::new(
+            catalog,
+            Arc::new(cyrup_provider::CatalogOverlaySlot::new()),
+        )
+        .with_overlay_providers(
+            cyrup_provider::all_providers()
+                .iter()
+                .map(|p| p.id().as_str().to_string())
+                .collect(),
+        )
+        .with_options(cyrup_provider::RefreshOptions {
+            allow_network: true,
+            force: true,
+        }),
+    );
+    let provider: Arc<dyn Provider> = Arc::new(ModellessProvider(ProviderId::from("none")));
+    let session = SessionBuilder::new(provider, config)
+        .provider_resolver(Arc::new(RegistryResolver))
+        .model_catalog_service(svc)
+        .build()
+        .await
+        .unwrap();
+    Fixture {
+        _tmp: tmp,
+        agent_dir,
+        session: Arc::new(session),
+    }
+}
+
+/// **TUI-105, end to end.** The post-login catalog refresh fetches ONLY the provider that was just
+/// logged into, even though another provider is credentialed and the whole-catalog path would sweep
+/// both.
+///
+/// This is pi's `completeProviderAuthentication` tail: `session.modelRuntime.refresh({ providers:
+/// [providerId], signal: controller.signal })` (`interactive-mode.ts:5953`), called DIRECTLY rather
+/// than through `refreshModelCatalogs` (`model-catalog-refresh.ts:46-51`). The unit tests in
+/// `cyrup-provider` and `cyrup-session-svc` pin the API; this one pins the LOGIN PATH, which is what
+/// the row was filed about — when the shared budget was eaten by a stranger, `apply_login_refresh`
+/// never re-ran the deferred selection and the user was left modelless.
+///
+/// Uses [`DEFAULTED_PROVIDER`] rather than the deferred [`DYNAMIC_PROVIDER`] deliberately: `radius`
+/// is excluded from the FETCH list by design (the pi.dev route 404s for it, so its scoped fetch set
+/// is empty), which would make "only the provider logged into" vacuous here. The radius exclusion has
+/// its own test in `cyrup-session-svc`.
+///
+/// **Red without the change:** `begin_post_login_catalog_refresh` called
+/// `session.refresh_model_catalogs(cancel)`, whose provider list is every credentialed provider, so
+/// the recorded set also contains the bystander.
+#[tokio::test]
+async fn tui105_post_login_refresh_fetches_only_the_provider_logged_into() {
+    const BYSTANDER: &str = "groq";
+
+    let origin = RecordingOrigin::spawn().await;
+    let fx = first_run_fixture_with_catalog(&origin.base_url).await;
+    // A second provider the user logged in to earlier. The whole-catalog refresh would sweep it.
+    credential(&fx.session, BYSTANDER);
+    credential(&fx.session, DEFAULTED_PROVIDER);
+
+    let mut app = app_with(registry_for(
+        DEFAULTED_PROVIDER,
+        ProviderAuth::with_oauth(Arc::new(ScriptedOauth)),
+    ));
+    let mut rx = app.install_login_channel();
+    let mut refresh_rx = app.install_login_refresh_channel();
+
+    let (_action, msg) =
+        drive_login_to_finished(&mut app, &fx.session, &mut rx, DEFAULTED_PROVIDER).await;
+    app.apply_login_msg(&fx.session, msg).await;
+
+    let refresh = tokio::time::timeout(Duration::from_secs(10), refresh_rx.recv())
+        .await
+        .expect("the post-login refresh must settle")
+        .expect("the refresh channel stays open");
+    assert_eq!(
+        refresh.provider_id, DEFAULTED_PROVIDER,
+        "the settled message names the provider that was logged into"
+    );
+
+    let fetched = origin.fetched();
+    assert!(
+        fetched.contains(DEFAULTED_PROVIDER),
+        "the provider just authenticated must be fetched, saw {fetched:?}"
+    );
+    assert!(
+        !fetched.contains(BYSTANDER),
+        "pi spends the WHOLE budget on the provider it just authenticated (`:5953`); fetching \
+         `{BYSTANDER}` too is the widening this row removed, saw {fetched:?}"
+    );
+    assert_eq!(
+        fetched.len(),
+        1,
+        "exactly one provider is fetched by a scoped post-login refresh, saw {fetched:?}"
     );
 }

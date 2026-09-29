@@ -77,7 +77,7 @@ pub(crate) mod wait_tool;
 pub use executor::SubagentExecutor;
 pub use executor::requests::{
     BackgroundSingleRequest, BackgroundStepsSpec, ForegroundRunRequest, GraphRunOutcome,
-    SingleRunOverrides, StatusViewSelector,
+    RetainedModelResponseAliases, SingleRunOverrides, StatusViewSelector,
 };
 // WORKFLOW_14 — a field type of the publicly re-exported `ForegroundRunRequest`, so it must be
 // reachable at the same visibility or the field is a private interface.

@@ -133,7 +133,7 @@ pub(super) async fn run_inner(
     let depth = crate::spawn::depth::resolve_effective_depth(config.max_subagent_depth);
     ensure_depth_available(&depth)?;
 
-    let (executor, mut ctx) = build_chain_context(
+    let (step_executor, mut ctx) = build_chain_context(
         child_env,
         spawn_command,
         config,
@@ -144,7 +144,9 @@ pub(super) async fn run_inner(
         writer_ledgers,
         lease_writer,
         depth,
-    );
+    )?;
+    // SUBA-119: widen once, here, so `build_chain_context` can stay concrete and testable.
+    let executor: Arc<dyn SingleStepExecutor> = step_executor;
 
     let mut io = TurnLoopIo {
         roots,
@@ -354,7 +356,12 @@ fn build_chain_context(
     writer_ledgers: super::executor::WriterProcessLedgers,
     lease_writer: Option<super::executor::LeaseWriterSender>,
     depth: DepthEnvelope,
-) -> (Arc<dyn SingleStepExecutor>, ChainRunContext) {
+    // SUBA-119: the CONCRETE executor, not `Arc<dyn SingleStepExecutor>`. This is a private
+    // function whose body only ever builds an `ExecSingleStepExecutor`, and narrowing the return
+    // to that type is what lets a test read the fields this function is responsible for filling
+    // — chiefly `model_response_aliases`, whose seam had no test at all. `run_inner` widens it
+    // to the trait object in one line at the call site.
+) -> Result<(Arc<ExecSingleStepExecutor>, ChainRunContext), SubagentError> {
     let global_limit = GlobalConcurrencyLimit::new(config.global_concurrency_limit.max(1));
     let cancel_root = cyrup_core::CancelToken::new();
     // T0.1 / C13: the per-agent resolved-persona map the orchestrator baked into the one-shot
@@ -362,7 +369,23 @@ fn build_chain_context(
     // persona (never re-discovered, never a placeholder). `Arc`-shared so a parallel/dynamic
     // group's fanned-out children share one map rather than cloning it per child.
     let resolved_agents = Arc::new(config.resolved_agents.clone());
-    let executor: Arc<dyn SingleStepExecutor> = Arc::new(ExecSingleStepExecutor {
+    // CFG-067 — the run's four-rung per-tool deadline, resolved ONCE for every persona this runner
+    // may dispatch (pi resolves the same ladder per step at `async-execution.ts:1006-1012`). The two
+    // rungs hop 2 cannot re-derive ride on `RunnerConfig::tool_timeout`; this process's own
+    // environment supplies `CYRUP_SUBAGENT_TOOL_TIMEOUT_MS`, and each persona supplies its own
+    // `toolTimeoutMs:`. A malformed rung refuses the whole run rather than one step, which is what
+    // upstream's `AsyncStartValidationError` does at the START.
+    let tool_timeouts = Arc::new(
+        crate::exec::tool_timeout::resolve_tool_timeouts_by_agent(
+            &config.tool_timeout,
+            resolved_agents
+                .iter()
+                .map(|(name, persona)| (name.as_str(), persona.default_tool_timeout_ms)),
+        )
+        .map_err(SubagentError::MalformedSettings)?,
+    );
+    let executor = Arc::new(ExecSingleStepExecutor {
+        tool_timeouts: Arc::clone(&tool_timeouts),
         // `None` on the REAL detached hop-2 runner: it reaches its steps through a `RunnerConfig`
         // written to disk as JSON, so nothing in-process can be handed down and these steps resolve
         // their command from the environment they inherited, exactly as before. `Some` only when a
@@ -491,7 +514,7 @@ fn build_chain_context(
             source: crate::handoff::HandoffSource::Async,
         }),
     };
-    (executor, ctx)
+    Ok((executor, ctx))
 }
 
 /// pi `(config.resultMode ?? statusPayload.mode) === "parallel" ? "parallel" : "chain"`
@@ -903,5 +926,92 @@ pub(super) fn append_steps(
                 });
         status.steps.extend(appended);
         steps.push(step.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+
+    /// SUBA-119 item 1(b) — the DETACHED runner's wiring seam.
+    ///
+    /// `build_chain_context` is what turns the one-shot `RunnerConfig` the orchestrator wrote
+    /// into the `ExecSingleStepExecutor` every dispatched step runs through. Hop 2 has no
+    /// `config.json` access, so this single line is the ONLY channel by which an operator's
+    /// declared `modelResponseAliases` reaches a background child's model-verification check.
+    ///
+    /// It had no test. The one test over the concern
+    /// (`background/runner_main/executor.rs::the_declared_response_alias_map_reaches_every_dispatched_step`)
+    /// assigns `runner.model_response_aliases` by hand and asserts the executor's own
+    /// `build_step_run_options` forwards it — which stays green even if nothing in production ever
+    /// copies the field off the config. Reverting `config.model_response_aliases.clone()` to
+    /// `.clone().and(None)` left the whole suite passing before this test existed.
+    #[tokio::test]
+    async fn the_runner_configs_alias_map_reaches_the_step_executor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let aliases: crate::exec::model_verification::ModelResponseAliases =
+            std::collections::BTreeMap::from([(
+                "prov/model".to_string(),
+                vec!["router/substitute".to_string()],
+            )]);
+        let run_id = RunId::new();
+
+        // Only eight `RunnerConfig` fields lack a serde default; the rest are built from theirs,
+        // which keeps this fixture about the one field under test rather than about the schema.
+        let mut config: RunnerConfig = serde_json::from_value(serde_json::json!({
+            "runId": run_id.as_str(),
+            "mode": "single",
+            "steps": [],
+            "cwd": dir.path(),
+            "sessionFile": null,
+            "globalConcurrencyLimit": 1,
+            "worktreeBaseDir": null,
+            "maxSubagentDepth": 5,
+        }))
+        .expect("the one-shot config fixture deserializes");
+        config.model_response_aliases = Some(aliases.clone());
+
+        let run_paths = RunPaths::for_run(
+            &dir.path().join("async"),
+            &dir.path().join("results"),
+            &run_id,
+        );
+        let flags = ControlFlags {
+            interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            child_stops: crate::background::child_stop::ChildStopRegistry::new(),
+        };
+        let (telemetry, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let (executor, _ctx) = build_chain_context(
+            &std::collections::HashMap::new(),
+            None,
+            &config,
+            &run_paths,
+            &flags,
+            &cyrup_core::CancelToken::new(),
+            telemetry,
+            Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            None,
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+        )
+        .expect("the fixture config's tool-timeout rungs resolve");
+
+        assert_eq!(
+            executor.model_response_aliases.as_ref(),
+            Some(&aliases),
+            "the detached runner's step executor must carry `RunnerConfig::model_response_aliases`"
+        );
     }
 }

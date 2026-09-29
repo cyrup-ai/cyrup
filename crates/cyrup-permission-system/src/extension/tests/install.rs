@@ -1,5 +1,6 @@
 //! The DI-5 install probe: which of the policy file, the agent-markdown frontmatter and the
 //! opt-in env var attach the gate, and which do not.
+#![allow(clippy::panic)]
 
 use crate::ext_config::ExtensionConfig;
 
@@ -260,4 +261,110 @@ fn auto_materialized_config_does_not_latch_the_gate_on() {
             "a policy file must still install the gate"
         );
     });
+}
+
+// ------------------------------------------------------- CFG-074: the two cyrup-ORIGINAL env vars
+
+/// CFG-074 — `CYRUP_PERMISSION_SYSTEM` is cyrup-only (`pi-permission-system` v0.8.0 has no install
+/// flag), and the property that makes the delta safe is that it is **ADDITIVE ONLY**: it can turn
+/// the gate ON in addition to upstream's policy-artifact rule, and there is no spelling of it that
+/// turns the gate OFF.
+///
+/// Killing mutation: any rewrite of `is_installed` that makes the flag authoritative — e.g.
+/// `env_truthy(INSTALL_ENV_VAR) && has_policy(..)`, or an `is_some() && !truthy -> false` early
+/// return. Each would let a falsy value disable a REAL policy file, which is the fail-open this
+/// asserts cannot exist.
+#[test]
+fn the_install_flag_is_additive_only_and_can_never_disable_a_real_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // (a) The flag alone installs, with no policy artifact anywhere — the one thing it is for.
+    for truthy in ["1", "true", "on", "yes", " true "] {
+        let _pin = crate::envx::pin(crate::extension::INSTALL_ENV_VAR, Some(truthy));
+        assert!(
+            is_installed(&agent_dir, &cwd),
+            "{truthy:?} must force-install the gate"
+        );
+    }
+
+    // (b) Anything else is simply "not opted in" — never "opted out".
+    for falsy in ["", "0", "false", "off", "no", "maybe"] {
+        let _pin = crate::envx::pin(crate::extension::INSTALL_ENV_VAR, Some(falsy));
+        assert!(
+            !is_installed(&agent_dir, &cwd),
+            "{falsy:?} must not install a gate with no policy artifact"
+        );
+    }
+
+    // (c) With a real policy file present, NO value of the flag can take the gate away. This is the
+    //     assertion that pins "additive only"; (b) alone would still pass a gating implementation.
+    let policy_dir = policy_agent_dir(&agent_dir);
+    std::fs::create_dir_all(&policy_dir).unwrap();
+    std::fs::write(policy_dir.join(POLICY_FILE), r#"{ "bash": { "*": "deny" } }"#).unwrap();
+    for value in ["", "0", "false", "off", "no", "maybe", "1", "true"] {
+        let _pin = crate::envx::pin(crate::extension::INSTALL_ENV_VAR, Some(value));
+        assert!(
+            is_installed(&agent_dir, &cwd),
+            "a real policy file must install the gate whatever {value:?} says"
+        );
+    }
+}
+
+/// CFG-074's `Verify` line for this crate: each env var this crate INVENTED carries a
+/// `[CYRUP-DELTA]` in the doc block that declares it, and the one that turned out to be a RENAME of
+/// a real upstream variable cites the upstream name instead — so the next enumeration of the env
+/// surface reads the answer at the declaration rather than re-filing it.
+///
+/// Killing mutation: deleting any of the three doc blocks.
+#[test]
+fn every_cyrup_only_env_var_in_this_crate_carries_a_cyrup_delta() {
+    let env_rs = include_str!("../env.rs");
+    let forwarding_rs = include_str!("../../forwarding.rs");
+    for (source, decl) in [
+        (env_rs, "pub const INSTALL_ENV_VAR"),
+        (forwarding_rs, "pub const CHILD_WAIT_TIMEOUT_ENV"),
+    ] {
+        let doc = doc_block_above(source, decl);
+        assert!(
+            doc.contains("[CYRUP-DELTA]"),
+            "{decl} is cyrup-original and must declare it:\n{doc}"
+        );
+    }
+    // The two renames of real upstream variables must name what they rename, NOT claim a delta.
+    for (source, decl, upstream) in [
+        (
+            env_rs,
+            "pub const POLICY_AGENT_DIR_ENV_KEY",
+            "PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR",
+        ),
+        (
+            forwarding_rs,
+            "pub const FORWARDING_AGENT_DIR_ENV",
+            "PERMISSION_FORWARDING_AGENT_DIR_ENV_KEY",
+        ),
+    ] {
+        let doc = doc_block_above(source, decl);
+        assert!(
+            doc.contains(upstream),
+            "{decl} renames {upstream} and must say so:\n{doc}"
+        );
+    }
+}
+
+/// The contiguous run of `///` lines immediately above the line starting with `decl`.
+fn doc_block_above(source: &str, decl: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with(decl))
+        .unwrap_or_else(|| panic!("{decl} not found"));
+    let mut start = at;
+    while start > 0 && lines[start - 1].trim_start().starts_with("///") {
+        start -= 1;
+    }
+    assert!(start < at, "{decl} has no doc block at all");
+    lines[start..at].join("\n")
 }

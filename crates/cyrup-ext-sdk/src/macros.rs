@@ -127,6 +127,11 @@ macro_rules! export_extension {
                         }
                     })
                 }
+                // EXT-064 — the guest half of `ReadonlyFooterDataProvider.onBranchChange`.
+                // Called only on a guest that declared `ui.subscribe-branch-change`.
+                fn on_branch_change(branch: ::core::option::Option<::std::string::String>) {
+                    $crate::guest::on_branch_change(branch)
+                }
 
                 // --- provider OAuth + streamSimple + autocomplete stacking ---
                 fn provider_login(

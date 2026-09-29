@@ -816,3 +816,101 @@ fn merge_is_the_floor_guarantee() {
         assert!(merged.len() >= baseline.len());
     }
 }
+
+// ----------------------------------------------------------- PROV-071a: the acronym on the wire --
+
+/// PROV-071a — pi spells the key `supportsOpenAIGrammarTools`, with the acronym in full caps
+/// (`packages/ai/src/types.ts:729`, `:766` @v0.87.1). `#[serde(rename_all = "camelCase")]` on
+/// [`crate::api::compat::ModelCompat`] derives `supportsOpenaiGrammarTools` from the Rust field
+/// name, so the two do not match, and because `ModelCompat` sets no `deny_unknown_fields` the
+/// mismatch is SILENT: the overlay body parses cleanly and the flag is simply lost.
+///
+/// The body below is pi's own, verbatim: 24 of the 41 rows the live `openai` endpoint serves carry
+/// `compat.supportsOpenAIGrammarTools: true`, and 106 rows do across the six providers that declare
+/// it (`openai`, `azure-openai-responses`, `opencode`, `cloudflare-ai-gateway`, `github-copilot`,
+/// `openai-codex`). Without the explicit `rename` the field deserializes to `None`, `get_compat`
+/// falls back to `detect_compat`'s pinned `false` (`compat.rs` — "never detected, only enabled by
+/// the generated catalog"), and [`resolve_grammar_constrained_sampling`] early-returns `None`, so
+/// every one of those models silently loses OpenAI's grammar-constrained custom-tool encoding.
+#[test]
+fn a_live_row_keeps_pis_full_caps_grammar_tools_key() {
+    let body = serde_json::json!({
+        "gpt-5.2": {
+            "id": "gpt-5.2",
+            "name": "GPT-5.2",
+            "api": "openai-responses",
+            "provider": "openai",
+            "baseUrl": "https://api.openai.com/v1",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": {"input": 1.25, "output": 10.0, "cacheRead": 0.125, "cacheWrite": 0.0},
+            "contextWindow": 400_000,
+            "maxTokens": 128_000,
+            "compat": {"supportsOpenAIGrammarTools": true}
+        }
+    });
+    let parsed = crate::remote_catalog::parse_catalog("openai", &body).unwrap();
+    assert_eq!(parsed.len(), 1);
+    let compat = parsed[0]
+        .compat
+        .as_ref()
+        .expect("the row declares a compat");
+    assert_eq!(
+        compat.supports_openai_grammar_tools,
+        Some(true),
+        "pi's `supportsOpenAIGrammarTools` did not reach the field; serde's camelCase derivation \
+         spells it `supportsOpenaiGrammarTools`, so the key was dropped without an error"
+    );
+
+    // The flag is only worth reading because it gates a real encoding decision.
+    let tool = crate::context::ToolDef {
+        name: "calc".into(),
+        description: "d".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "expression": { "type": "string" } },
+            "required": ["expression"],
+        }),
+        constrained_sampling: Some(crate::context::ConstrainedSampling::Config(
+            crate::context::ConstrainedSamplingConfig::Grammar {
+                variants: crate::context::GrammarVariants {
+                    openai_lark: Some("start: /[0-9+*() -]+/".into()),
+                    openai_regex: None,
+                },
+            },
+        )),
+    };
+    let resolved = crate::utils::constrained_sampling::resolve_grammar_constrained_sampling(
+        &tool,
+        crate::api::compat::get_compat(&parsed[0]).supports_openai_grammar_tools,
+    )
+    .unwrap();
+    assert!(
+        resolved.is_some(),
+        "the resolved compat refused a grammar custom tool for a model pi says accepts one"
+    );
+}
+
+/// PROV-071a — the SERIALIZER must emit pi's spelling too, so the generated catalog floor
+/// `xtask gen-catalogs` writes stays readable by the very reader that wrote it.
+///
+/// `LiveCatalogSpec` rendering copies pi's bytes verbatim, but `Model`/`ModelCompat` round-trip
+/// through serde everywhere else in the tree (`models.json`, the overlay cache in `models_store`,
+/// every snapshot fixture). A rename applied to only one direction would let the key drift back out
+/// on the next write, which is why this asserts the emitted JSON key and not just the parsed value.
+#[test]
+fn the_grammar_tools_key_round_trips_under_pis_spelling() {
+    let compat = crate::api::compat::ModelCompat {
+        supports_openai_grammar_tools: Some(true),
+        ..Default::default()
+    };
+    let value = serde_json::to_value(&compat).unwrap();
+    let object = value.as_object().expect("a compat serializes to an object");
+    assert_eq!(
+        object.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["supportsOpenAIGrammarTools"],
+        "the serialized key drifted away from pi's `types.ts` spelling"
+    );
+    let back: crate::api::compat::ModelCompat = serde_json::from_value(value).unwrap();
+    assert_eq!(back, compat);
+}

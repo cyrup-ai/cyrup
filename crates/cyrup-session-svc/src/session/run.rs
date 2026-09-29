@@ -198,7 +198,7 @@ impl AgentSession {
                 // Flag the loop active BEFORE returning so an immediate `wait_for_idle` waits for the
                 // WHOLE loop, not just the first `agent_end`.
                 let _ = self.driver_tx.send(true);
-                tokio::spawn(async move { this.drive_run(messages).await });
+                tokio::spawn(this.drive_run(messages));
                 Ok(())
             }
             None => {
@@ -212,18 +212,44 @@ impl AgentSession {
     /// agent-session.ts:973-1022). Runs the prompt, then — for as long as the post-run handler asks —
     /// drives `agent.continue()` for an auto-retry, a threshold/overflow auto-compaction, or an
     /// `agent_end`-queued continuation. Spawned by [`Self::spawn_run`] on a bound session.
-    async fn drive_run(self: Arc<Self>, messages: Vec<AgentMessage>) {
-        // The refusal used to be silent (`if let Ok`): a `RunActive`/`Empty` here left the session
-        // with no run, no event, and no log line. It cannot be returned — this is the spawned
-        // driver — so it is logged at the one place that knows it happened. A caller that CAN act
-        // on the refusal uses [`Self::run_injection`] instead, which awaits the claim itself.
-        match self.agent.prompt(messages).await {
-            Ok(handle) => self.drive_accepted_run(handle).await,
-            Err(e) => {
-                tracing::warn!(error = %e, "prompt refused inside the run driver");
-                self.settle_run().await;
+    ///
+    /// EXT-087, and the reason this is a `fn` returning a boxed future rather than an `async fn`:
+    /// it is the CUT POINT for an auto-trait inference cycle, and the cut has to be a signature.
+    ///
+    /// Since `settle_run` drains the control queue, the call graph contains a loop —
+    /// `settle_run -> apply_pending_control -> prompt_with -> spawn_run -> tokio::spawn(drive_run)
+    /// -> drive_accepted_run -> settle_run`. While every edge of it was an `async fn`, every edge
+    /// was an opaque type whose `Send`-ness depended on its own, and rustc declines that question:
+    /// `tokio::spawn` below failed with `cannot satisfy impl Future<..>: Send`. That message reads
+    /// exactly like a genuinely non-`Send` value held across an await, and it is NOT one — there is
+    /// no `Rc`, `RefCell`, `LocalSet` or `spawn_local` anywhere in this path, and an `assert_send`
+    /// probe over `apply_pending_control()` compiles cleanly once the loop is cut.
+    ///
+    /// Naming the return type here removes one opaque type from the loop, so proving the inner
+    /// block `Send` terminates at a trait object that is `Send` by declaration. Cutting instead at
+    /// a CALL SITE — coercing the `Box::pin` in `apply_pending_control`'s send arm to
+    /// `Pin<Box<dyn Future + Send>>` — does not work: the coercion is part of the very opaque-type
+    /// computation it depends on, and fails as E0391 `cycle detected` rather than resolving.
+    /// `tests::ext_087_send_from_event::ext_087_post_settle_drain_future_is_send` pins the result,
+    /// so re-opening the loop is a named assertion failure instead of a wall of E0277 here.
+    fn drive_run(
+        self: Arc<Self>,
+        messages: Vec<AgentMessage>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            // The refusal used to be silent (`if let Ok`): a `RunActive`/`Empty` here left the
+            // session with no run, no event, and no log line. It cannot be returned — this is the
+            // spawned driver — so it is logged at the one place that knows it happened. A caller
+            // that CAN act on the refusal uses [`Self::run_injection`] instead, which awaits the
+            // claim itself.
+            match self.agent.prompt(messages).await {
+                Ok(handle) => self.drive_accepted_run(handle).await,
+                Err(e) => {
+                    tracing::warn!(error = %e, "prompt refused inside the run driver");
+                    self.settle_run().await;
+                }
             }
-        }
+        })
     }
 
     /// Start a run and REPORT whether the agent accepted it, then drive the post-run loop in the
@@ -386,10 +412,61 @@ impl AgentSession {
         // settled. Ordered AFTER the settle emit so a run-scoped subscriber (what `prompt` hands
         // back) actually observes `agent_settled` as its last event.
         self.fanout.end_run();
-        // Pi's `_resolveIdleWaitIfIdle()` runs in `_emitAgentSettled`'s own `finally` — i.e. the
-        // idle wait releases only after the event has been delivered. `driver_tx` is cyrup's idle
-        // latch, so it drops last.
+        // EXT-087 — HOLD the settled-drain latch across everything below. `wait_for_run_settled`
+        // honours it, so a `wait_for_idle` cannot return in the window between `driver_tx` dropping
+        // and a queued send reaching `spawn_run`. This is pi's `_deferredSettledActions.length > 0`
+        // keeping the idle wait pending (`core/agent-session.ts:881-890` @v0.87.1); see the field's
+        // own doc for why cyrup needs a second flag where pi already had two.
+        let _ = self.settled_drain_tx.send(true);
+        // pi clears `_isAgentRunActive` at the TOP of `_emitAgentSettled` (`:872`), BEFORE the
+        // deferred actions run, and that is the flag its `prompt()` consults. cyrup's equivalent
+        // routing predicate is `is_run_active`, which reads this latch — so it has to drop BEFORE
+        // the drain, or `prompt_with` takes the streaming branch and refuses a send that carried no
+        // `deliverAs` with `StreamingNeedsBehavior` instead of starting a run.
         let _ = self.driver_tx.send(false);
+        // The POST-SETTLE drain: apply the control ops an `agent_settled` handler queued,
+        // now that the dispatch above has fully returned.
+        //
+        // This is upstream's `_deferredSettledActions` splice, in the one shape cyrup needs.
+        // pi guards `prompt()`'s entry on `_isEmittingAgentSettled` and pushes a closure
+        // (`core/agent-session.ts:1607-1608` @v0.87.1), then takes the queue exactly once and
+        // awaits each action after the emit's `finally` has cleared the flag (`:873-885`). It needs
+        // that guard because `pi.sendUserMessage` reaches `prompt()` SYNCHRONOUSLY inside the
+        // dispatch. cyrup's `send-user-message` crosses a wasm import onto the control queue, so
+        // the QUEUE is the deferral and the only missing piece was a drain that runs here.
+        //
+        // Three things make this position the right one, and each is load-bearing:
+        //
+        // 1. STORE-FREE. `emit_agent_settled` has returned, so every `LiveExtension.inner` guard is
+        //    released and the run this starts dispatches `agent_start` as a fresh top-level guest
+        //    call — it cannot re-enter the `agent_settled` handler that is still on the stack. Same
+        //    invariant `apply_pending_agent_control`'s `model_select` re-emit states.
+        // 2. BELOW `driver_tx.send(false)`, and INSIDE the `settled_drain_tx` hold. Both halves are
+        //    forced. Below, because `driver_tx` is also the `is_run_active` routing predicate: with
+        //    it still raised, `prompt_with` takes the STREAMING branch and a send carrying no
+        //    `deliverAs` comes back `StreamingNeedsBehavior` — the op is reported as a control
+        //    failure and no run starts at all. Inside the hold, because `spawn_run` re-raises
+        //    `driver_tx` only once the drain reaches it, and a `wait_for_idle` landing in that gap
+        //    would see the session go idle and then watch a run start under it.
+        // 3. EXACTLY ONCE per settle. `take_pending_control` is take-once and this function runs
+        //    once per run (its only callers are `drive_run`'s refusal arm and `drive_accepted_run`'s
+        //    tail), so a send queued from `agent_settled` starts exactly ONE run — the same
+        //    guarantee pi gets from `_deferredSettledActions.splice(0)` (`:881`), and the reason
+        //    this is a single take rather than a counter.
+        //
+        // The FULL drain, not the focused `apply_pending_agent_control`: the send arms are the whole
+        // point, and routing them through `apply_pending_control` is what makes EXT-083's options
+        // handling (`expandPromptTemplates` / `deliverAs`) identical from both call sites instead of
+        // a second copy that can drift. Its future is `Send`, which this crate's
+        // `ext_087_post_settle_drain_future_is_send` pins so the spawned driver keeps compiling.
+        // The other queues it drains (pending events, tool refresh, active tools) are all take-once,
+        // so running them again here is a no-op when the earlier drains already emptied them.
+        self.apply_pending_control().await;
+        // Release the latch LAST — pi's `_resolveIdleWaitIfIdle()` in the `finally` of its deferred
+        // loop (`core/agent-session.ts:885-887`). By now a send the drain applied has already run
+        // `spawn_run`, which raised `driver_tx` again, so `wait_for_run_settled` re-checks that and
+        // keeps waiting; if nothing was queued, both latches are down and it returns.
+        let _ = self.settled_drain_tx.send(false);
     }
 
     /// Emit `agent_settled` (Pi `_emitAgentSettled`, agent-session.ts:581-588) — to the EXTENSION
@@ -939,10 +1016,34 @@ impl AgentSession {
     /// [`Self::abort_and_settle`] waits on this rather than [`Self::wait_for_idle`]: `abort()` does
     /// not yet cancel a compaction (that is area 03's `SESS-062`), so waiting for one there would
     /// hold a teardown or a `/compact` preflight for the whole summarization call.
+    ///
+    /// EXT-087 — it waits on a SECOND latch, `settled_drain_tx`, and the loop around the pair is
+    /// the point. `settle_run` drops `driver_tx` before draining the control queue (it must: the
+    /// same latch is the `is_run_active` routing predicate, and a drain that read RUNNING would
+    /// have `prompt_with` refuse a `deliverAs`-less send instead of starting a run). Without the
+    /// second latch there is a window where `driver_tx` reads idle while a queued send has not yet
+    /// reached `spawn_run`, and a caller would watch the session go idle and then watch a run start
+    /// under it. pi has no such window because it holds two pieces of state where cyrup held one —
+    /// `_isAgentRunActive` cleared early (`core/agent-session.ts:872` @v0.87.1) and the idle wait
+    /// resolved late and conditionally (`:881-890`).
+    ///
+    /// Both receivers are subscribed BEFORE either is read, so a raise that lands between the two
+    /// reads is still observed as a change rather than missed.
     pub(super) async fn wait_for_run_settled(&self) {
-        let mut rx = self.driver_tx.subscribe();
-        while *rx.borrow_and_update() {
-            if rx.changed().await.is_err() {
+        loop {
+            let mut drain_rx = self.settled_drain_tx.subscribe();
+            let mut rx = self.driver_tx.subscribe();
+            while *rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            if !*drain_rx.borrow_and_update() {
+                break;
+            }
+            // A post-settle drain is in flight; it may be about to start a run. Wait for it to
+            // finish, then re-check `driver_tx` — which that run's `spawn_run` will have raised.
+            if drain_rx.changed().await.is_err() {
                 break;
             }
         }

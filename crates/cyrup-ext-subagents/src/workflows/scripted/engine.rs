@@ -3706,6 +3706,99 @@ return { gatedOk: gated.ok, barred, reviewOk: review.ok };
         assert_eq!(object.get("reviewOk"), Some(&json!(true)));
     }
 
+    /// SUBA-144 — the recovery barrier at the LIVE seam, with a launch that clears upstream
+    /// v0.71.0's TEN surviving patterns but that the retired `classifyTaskMutationIntent` would
+    /// have classified `Unknown` rather than `read-only`.
+    ///
+    /// `agent: "review"` matches upstream's `/\b(?:advisor|oracle|review|reviewer)\b/i` agent
+    /// probe but not the narrower `isReviewerStyleAgent`, and "Read-only: assess the saved
+    /// analysis." carries no read-only DELIVERABLE phrase — so the deleted classifier said
+    /// `Unknown`, and cyrup's eleventh `&&` term refused the launch. Upstream permits it; so must
+    /// cyrup. The second launch in the same script proves the barrier still HOLDS for a mutating
+    /// task with the same reviewer-shaped agent name, by upstream's own `MUTATION_VERB` pattern.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_recovery_barrier_admits_a_ten_term_clean_read_only_review() {
+        struct RecoveryHost(FakeHost);
+        #[async_trait::async_trait]
+        impl WorkflowScriptHost for RecoveryHost {
+            async fn launch(
+                &self,
+                key: &str,
+                params: Map<String, Value>,
+                cancel: CancelToken,
+                admission: WorkflowLaunchAdmission,
+            ) -> Result<WorkflowScriptChildResult, String> {
+                if key == "gated" {
+                    return Ok(WorkflowScriptChildResult {
+                        key: key.to_string(),
+                        ok: false,
+                        output: "rejected".into(),
+                        error: Some("rejected".into()),
+                        recovery: Some(crate::workflows::AcceptanceRecoveryMetadata {
+                            status: "available-for-review".into(),
+                            reason: "acceptance-metadata-rejected".into(),
+                            report_path: "report.md".into(),
+                            report_hash: "hash".into(),
+                        }),
+                        ..Default::default()
+                    });
+                }
+                self.0.launch(key, params, cancel, admission).await
+            }
+            async fn status(
+                &self,
+                key_or_run_id: &str,
+                cancel: CancelToken,
+            ) -> Result<WorkflowScriptChildResult, String> {
+                self.0.status(key_or_run_id, cancel).await
+            }
+        }
+        let host = Arc::new(RecoveryHost(FakeHost::new(Duration::from_millis(10))));
+        let script = r#"
+const gated = await runs.run("gated", { agent: "worker", task: "T" });
+const admitted = await runs.run("review1", { agent: "review", task: "Read-only: assess the saved analysis.", acceptance: false });
+let barred = "";
+try {
+  await runs.run("review2", { agent: "review", task: "Read-only: rewrite the failing module.", acceptance: false });
+} catch (error) {
+  barred = error.message;
+}
+return { gatedOk: gated.ok, admittedOk: admitted.ok, barred };
+"#;
+        let mut opts = RunWorkflowScriptOptions {
+            script: script.to_string(),
+            one_use_permit: None,
+            timeout_ms: Some(120_000),
+            cancel: None,
+            continue_after_abort_when_children_settled: None,
+            global_concurrency_limit: None,
+            host,
+            state: None,
+            register_stop_child: None,
+            on_trace: None,
+            on_lane_plan: None,
+            on_emit: None,
+            on_host_step: None,
+        };
+        opts.timeout_ms = Some(120_000);
+        let result = run_workflow_script(opts).await.unwrap();
+        let object = result.value.as_object().unwrap();
+        assert_eq!(object.get("gatedOk"), Some(&json!(false)));
+        assert_eq!(
+            object.get("admittedOk"),
+            Some(&json!(true)),
+            "a launch clearing all ten surviving upstream patterns must be admitted"
+        );
+        assert_eq!(
+            object.get("barred").unwrap().as_str().unwrap(),
+            format!(
+                "Run 'review2' failed: {}",
+                recovery_barrier_message("gated", "review2")
+            ),
+            "the barrier must still hold for a mutating task"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn state_without_a_mission_uses_the_verbatim_refusal() {
         let host = Arc::new(FakeHost::new(Duration::from_millis(10)));

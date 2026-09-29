@@ -58,7 +58,8 @@ pub use aggregate::{AggregateChild, aggregate_acceptance_report};
 pub use checks::{check_criteria_satisfied, run_structural_checks};
 pub use evaluate::{EvaluateAcceptanceInput, acceptance_failure_message, evaluate_acceptance};
 pub use level::{
-    AcceptanceResolveInput, SubagentRunMode, normalize_acceptance_input, normalize_criteria,
+    AcceptanceResolveInput, InferredLevel, SubagentRunMode, infer_level,
+    normalize_acceptance_input, normalize_criteria, required_evidence_for_level,
     resolve_effective_acceptance, unique_evidence,
 };
 pub use prompt::{

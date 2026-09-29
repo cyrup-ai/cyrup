@@ -285,7 +285,7 @@ async fn models_json_overrides_reach_the_provider_the_session_is_running_on() {
         &fx.agent_dir.join("models.json"),
         r#"{"providers": {"anthropic": {
              "baseUrl": "https://proxy.internal/v1",
-             "modelOverrides": {"claude-opus-4-1": {"contextWindow": 999000}}
+             "modelOverrides": {"claude-opus-4-5": {"contextWindow": 999000}}
            }}}"#,
     );
 
@@ -323,7 +323,7 @@ async fn models_json_overrides_reach_the_provider_the_session_is_running_on() {
     // Exactly one entry per id — composition REPLACES, it does not append a second copy.
     let opus: Vec<_> = entries
         .iter()
-        .filter(|m| m.id.as_str() == "claude-opus-4-1")
+        .filter(|m| m.id.as_str() == "claude-opus-4-5")
         .collect();
     assert_eq!(
         opus.len(),

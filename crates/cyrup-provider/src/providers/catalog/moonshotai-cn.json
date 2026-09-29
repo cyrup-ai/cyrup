@@ -1,181 +1,10 @@
 [
 	{
-		"id": "kimi-k2-0711-preview",
-		"name": "Kimi K2 0711",
-		"api": "openai-completions",
-		"provider": "moonshotai-cn",
-		"baseUrl": "https://api.moonshot.cn/v1",
-		"compat": {
-			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"supportsReasoningEffort": false,
-			"maxTokensField": "max_tokens",
-			"supportsStrictMode": false,
-			"thinkingFormat": "deepseek"
-		},
-		"reasoning": false,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 0.6,
-			"output": 2.5,
-			"cacheRead": 0.15,
-			"cacheWrite": 0
-		},
-		"contextWindow": 131072,
-		"maxTokens": 16384
-	},
-	{
-		"id": "kimi-k2-0905-preview",
-		"name": "Kimi K2 0905",
-		"api": "openai-completions",
-		"provider": "moonshotai-cn",
-		"baseUrl": "https://api.moonshot.cn/v1",
-		"compat": {
-			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"supportsReasoningEffort": false,
-			"maxTokensField": "max_tokens",
-			"supportsStrictMode": false,
-			"thinkingFormat": "deepseek"
-		},
-		"reasoning": false,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 0.6,
-			"output": 2.5,
-			"cacheRead": 0.15,
-			"cacheWrite": 0
-		},
-		"contextWindow": 262144,
-		"maxTokens": 262144
-	},
-	{
-		"id": "kimi-k2-thinking",
-		"name": "Kimi K2 Thinking",
-		"api": "openai-completions",
-		"provider": "moonshotai-cn",
-		"baseUrl": "https://api.moonshot.cn/v1",
-		"compat": {
-			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"supportsReasoningEffort": false,
-			"maxTokensField": "max_tokens",
-			"supportsStrictMode": false,
-			"thinkingFormat": "deepseek"
-		},
-		"reasoning": true,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 0.6,
-			"output": 2.5,
-			"cacheRead": 0.15,
-			"cacheWrite": 0
-		},
-		"contextWindow": 262144,
-		"maxTokens": 262144
-	},
-	{
-		"id": "kimi-k2-thinking-turbo",
-		"name": "Kimi K2 Thinking Turbo",
-		"api": "openai-completions",
-		"provider": "moonshotai-cn",
-		"baseUrl": "https://api.moonshot.cn/v1",
-		"compat": {
-			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"supportsReasoningEffort": false,
-			"maxTokensField": "max_tokens",
-			"supportsStrictMode": false,
-			"thinkingFormat": "deepseek"
-		},
-		"reasoning": true,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 1.15,
-			"output": 8,
-			"cacheRead": 0.15,
-			"cacheWrite": 0
-		},
-		"contextWindow": 262144,
-		"maxTokens": 262144
-	},
-	{
-		"id": "kimi-k2-turbo-preview",
-		"name": "Kimi K2 Turbo",
-		"api": "openai-completions",
-		"provider": "moonshotai-cn",
-		"baseUrl": "https://api.moonshot.cn/v1",
-		"compat": {
-			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"supportsReasoningEffort": false,
-			"maxTokensField": "max_tokens",
-			"supportsStrictMode": false,
-			"thinkingFormat": "deepseek"
-		},
-		"reasoning": false,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 2.4,
-			"output": 10,
-			"cacheRead": 0.6,
-			"cacheWrite": 0
-		},
-		"contextWindow": 262144,
-		"maxTokens": 262144
-	},
-	{
-		"id": "kimi-k2.5",
-		"name": "Kimi K2.5",
-		"api": "openai-completions",
-		"provider": "moonshotai-cn",
-		"baseUrl": "https://api.moonshot.cn/v1",
-		"compat": {
-			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"supportsReasoningEffort": false,
-			"maxTokensField": "max_tokens",
-			"supportsStrictMode": false,
-			"thinkingFormat": "deepseek"
-		},
-		"reasoning": true,
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 0.6,
-			"output": 3,
-			"cacheRead": 0.1,
-			"cacheWrite": 0
-		},
-		"contextWindow": 262144,
-		"maxTokens": 262144
-	},
-	{
 		"id": "kimi-k2.6",
 		"name": "Kimi K2.6",
 		"api": "openai-completions",
 		"provider": "moonshotai-cn",
 		"baseUrl": "https://api.moonshot.cn/v1",
-		"compat": {
-			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"supportsReasoningEffort": false,
-			"maxTokensField": "max_tokens",
-			"supportsStrictMode": false,
-			"thinkingFormat": "deepseek"
-		},
 		"reasoning": true,
 		"input": [
 			"text",
@@ -188,7 +17,27 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 262144,
-		"maxTokens": 262144
+		"maxTokens": 262144,
+		"compat": {
+			"supportsStore": false,
+			"supportsDeveloperRole": false,
+			"supportsReasoningEffort": false,
+			"maxTokensField": "max_tokens",
+			"supportsStrictMode": false,
+			"thinkingFormat": "deepseek",
+			"supportsMidConvoSystemMessages": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "kimi-k2.7-code",
@@ -196,18 +45,7 @@
 		"api": "openai-completions",
 		"provider": "moonshotai-cn",
 		"baseUrl": "https://api.moonshot.cn/v1",
-		"compat": {
-			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"supportsReasoningEffort": false,
-			"maxTokensField": "max_tokens",
-			"supportsStrictMode": false,
-			"thinkingFormat": "deepseek"
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null
-		},
 		"input": [
 			"text",
 			"image"
@@ -219,7 +57,30 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 262144,
-		"maxTokens": 262144
+		"maxTokens": 262144,
+		"compat": {
+			"supportsStore": false,
+			"supportsDeveloperRole": false,
+			"supportsReasoningEffort": false,
+			"maxTokensField": "max_tokens",
+			"supportsStrictMode": false,
+			"thinkingFormat": "deepseek",
+			"supportsMidConvoSystemMessages": true
+		},
+		"thinkingLevelMap": {
+			"off": null
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	},
 	{
 		"id": "kimi-k2.7-code-highspeed",
@@ -227,18 +88,7 @@
 		"api": "openai-completions",
 		"provider": "moonshotai-cn",
 		"baseUrl": "https://api.moonshot.cn/v1",
-		"compat": {
-			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"supportsReasoningEffort": false,
-			"maxTokensField": "max_tokens",
-			"supportsStrictMode": false,
-			"thinkingFormat": "deepseek"
-		},
 		"reasoning": true,
-		"thinkingLevelMap": {
-			"off": null
-		},
 		"input": [
 			"text",
 			"image"
@@ -250,14 +100,7 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 262144,
-		"maxTokens": 262144
-	},
-	{
-		"id": "kimi-k3",
-		"name": "Kimi K3",
-		"api": "openai-completions",
-		"provider": "moonshotai-cn",
-		"baseUrl": "https://api.moonshot.cn/v1",
+		"maxTokens": 262144,
 		"compat": {
 			"supportsStore": false,
 			"supportsDeveloperRole": false,
@@ -265,19 +108,30 @@
 			"maxTokensField": "max_tokens",
 			"supportsStrictMode": false,
 			"thinkingFormat": "deepseek",
-			"requiresReasoningContentOnAssistantMessages": true,
-			"deferredToolsMode": "kimi"
+			"supportsMidConvoSystemMessages": true
 		},
-		"reasoning": true,
 		"thinkingLevelMap": {
-			"off": null,
-			"minimal": null,
-			"low": null,
-			"medium": null,
-			"high": null,
-			"xhigh": null,
-			"max": "max"
+			"off": null
 		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
+		"id": "kimi-k3",
+		"name": "Kimi K3",
+		"api": "openai-completions",
+		"provider": "moonshotai-cn",
+		"baseUrl": "https://api.moonshot.cn/v1",
+		"reasoning": true,
 		"input": [
 			"text",
 			"image"
@@ -289,6 +143,37 @@
 			"cacheWrite": 0
 		},
 		"contextWindow": 1048576,
-		"maxTokens": 131072
+		"maxTokens": 1048576,
+		"compat": {
+			"supportsStore": false,
+			"supportsDeveloperRole": false,
+			"supportsReasoningEffort": true,
+			"maxTokensField": "max_tokens",
+			"supportsStrictMode": false,
+			"thinkingFormat": "openai",
+			"requiresReasoningContentOnAssistantMessages": true,
+			"supportsMidConvoSystemMessages": true,
+			"supportsMidConvoToolAdditions": true
+		},
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": null,
+			"high": "high",
+			"xhigh": null,
+			"max": "max"
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
 	}
 ]

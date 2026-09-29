@@ -23,7 +23,8 @@
 //! that side.
 //!
 //! Before this change `AcceptanceContract::heuristic_default` classified with the enum-lattice
-//! `completion_guard::expects_implementation_mutation` instead and returned
+//! `expects_implementation_mutation` classifier (SUBA-107 has since deleted it outright, as
+//! upstream did at v0.70.1) instead and returned
 //! `AcceptanceStatus::NotRequired` for anything that did not read as implementation-expecting.
 //! `inject_acceptance_contract` then returned the task VERBATIM for such a contract
 //! (`is_no_op()`), and `evaluate_acceptance` short-circuited to `AcceptanceLedger::not_required()`.
@@ -109,6 +110,8 @@ fn agent_config(name: &str) -> AgentConfig {
         extensions: None,
         subagent_only_extensions: Vec::new(),
         exclude_tools: Vec::new(),
+        // SUBA-111: this literal predates `allowedAgents`; it declares no delegation bound.
+        allowed_agents: None,
         allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
@@ -118,7 +121,6 @@ fn agent_config(name: &str) -> AgentConfig {
         skills: Vec::new(),
         // The completion-mutation guard is a separate gate; disabled so this run's outcome is
         // decided by the child's exit code and the acceptance ledger alone.
-        completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth: None,
         memory: None,
@@ -135,6 +137,7 @@ fn agent_config(name: &str) -> AgentConfig {
 /// through `AcceptanceContract::heuristic_default` — pi's `level: "auto"` (`acceptance.ts:127`).
 fn run_options(cwd: &Path) -> RunOptions {
     RunOptions {
+        tool_timeout_ms: None,
         // SUBA-119 — a fixture launch whose model comes from its own agent config, so
         // native-child model verification is armed and no response-id alias is declared.
         model_override_from_parent: false,
@@ -273,6 +276,167 @@ fn a_declared_read_only_role_infers_no_contract_at_all() {
         AcceptanceStatus::Attested,
         "control: the same name with no declared role keeps the attestation default"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// SUBA-108 (A) — the LIVE seam: `lower_acceptance_input` -> `resolve_effective_for_role`
+// -------------------------------------------------------------------------------------------
+
+/// SUBA-108 (A) — `acceptance.ts:505` @v0.71.0 at the seam production actually uses.
+///
+/// `model::resolve_effective_acceptance` carried the upgrade already, but its only non-test caller
+/// was `heuristic_default_for_role`, which passes `explicit: None` unconditionally — so the
+/// upgrade was DEAD on every production path. The live explicit policy goes through
+/// `lower_acceptance_input` from raw JSON and then `AcceptanceContract::resolve_effective_for_role`,
+/// which did a MAX of levels and nothing else.
+///
+/// With a declared `read-only` role the inferred level is `none` -> `NotRequired`, and a policy
+/// naming no `level` lowers to a `NotRequired` FLOOR, so MAX(NotRequired, NotRequired) was
+/// `NotRequired`: `is_no_op()`, an unchanged task, and `evaluate_acceptance` short-circuiting to
+/// `not_required` with the caller's evidence discarded. Fail-OPEN.
+///
+/// Red before the fix: `required_level == NotRequired`, `is_no_op() == true`, the task verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lowered_policy_survives_a_declared_read_only_role_at_the_live_seam() {
+    use cyrup_ext_subagents::exec::acceptance::model::AcceptanceEvidenceKind;
+    use cyrup_ext_subagents::exec::acceptance::{
+        inject_acceptance_contract, lower_acceptance_input,
+    };
+
+    let lowered = lower_acceptance_input(&serde_json::json!({"evidence": ["review-findings"]}))
+        .expect("a valid policy")
+        .expect("a policy this shape lowers to a contract");
+    assert!(
+        lowered.requests_policy,
+        "`Object.keys(explicit).some(key => key !== \"level\")` is true for {{evidence: [..]}}"
+    );
+
+    let effective = AcceptanceContract::resolve_effective_for_role(
+        Some(lowered),
+        "scout",
+        Some(AcceptanceRole::ReadOnly),
+        "Audit the flow",
+    );
+
+    assert_eq!(
+        effective.required_level,
+        AcceptanceStatus::Attested,
+        "`:505` upgrades a `none` inferred level when the caller asked for a policy: {effective:?}"
+    );
+    assert!(
+        !effective.is_no_op(),
+        "an upgraded contract must not short-circuit the gate: {effective:?}"
+    );
+    // `:513-516` — the explicit side declared no `criteria`, so the read-only branch's own
+    // criterion survives instead of being dropped.
+    assert!(
+        effective
+            .criteria
+            .iter()
+            .any(|gate| gate.must
+                == "Return concrete findings with file paths and severity when applicable"),
+        "the inferred read-only criterion must survive the merge: {:?}",
+        effective.criteria
+    );
+    // `:512` compares against the UPGRADED inferred level, so the base is the read-only branch's
+    // own list, not `requiredEvidenceForLevel("attested")`. Order-preserving unique, and the
+    // declared `review-findings` is already in it.
+    assert_eq!(
+        effective.evidence,
+        vec![
+            AcceptanceEvidenceKind::ReviewFindings,
+            AcceptanceEvidenceKind::ResidualRisks,
+        ],
+        "{effective:?}"
+    );
+
+    let injected = inject_acceptance_contract("Audit the flow", &effective);
+    assert!(
+        injected.contains("## Acceptance Contract"),
+        "an upgraded contract must actually reach the child: {injected:?}"
+    );
+
+    // And the gate no longer short-circuits.
+    let dir = tempfile::tempdir().expect("real tempdir");
+    let ledger = cyrup_ext_subagents::exec::acceptance::lattice::gate::evaluate_acceptance(
+        &effective,
+        cyrup_ext_subagents::exec::acceptance::CleanCompletionGate {
+            exit_code: 0,
+            detached: false,
+            interrupted: false,
+            timed_out: false,
+        },
+        None,
+        dir.path(),
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(
+        ledger.status,
+        AcceptanceStatus::NotRequired,
+        "the gate must actually evaluate: {ledger:?}"
+    );
+}
+
+/// SUBA-108 (B) — `{"report": "on"}` and `{"report": "off"}` are each a non-`level` key, so
+/// `explicitAcceptanceRequestsPolicy` (`acceptance.ts:243-245`) is true for both and each upgrades
+/// a declared read-only agent's inferred `none` to `attested`.
+///
+/// `report` is upstream's SECOND `AcceptanceConfig` key (`shared/types.ts:1065`) and the second
+/// entry of `ACCEPTANCE_CONFIG_KEYS` (`acceptance.ts:54`). Red before the fix in two ways at once:
+/// the raw-value predicate did not exist at this seam at all, and `model::AcceptanceConfig` had no
+/// `report` field for the model-side predicate to read either.
+#[test]
+fn a_report_only_policy_upgrades_a_declared_read_only_role() {
+    use cyrup_ext_subagents::exec::acceptance::lower_acceptance_input;
+
+    for value in ["on", "off"] {
+        let lowered = lower_acceptance_input(&serde_json::json!({"report": value}))
+            .unwrap_or_else(|error| panic!("`report: {value}` is a valid policy: {error}"))
+            .unwrap_or_else(|| panic!("`report: {value}` must lower to a contract"));
+        assert!(
+            lowered.requests_policy,
+            "`report` is a non-`level` key, so the policy IS requested: report={value}"
+        );
+
+        let effective = AcceptanceContract::resolve_effective_for_role(
+            Some(lowered),
+            "scout",
+            Some(AcceptanceRole::ReadOnly),
+            "Audit the flow",
+        );
+        assert_eq!(
+            effective.required_level,
+            AcceptanceStatus::Attested,
+            "report={value}: {effective:?}"
+        );
+        assert!(!effective.is_no_op(), "report={value}: {effective:?}");
+    }
+}
+
+/// The control for both tests above: a policy with NO keys at all is not a requested policy, so a
+/// declared read-only role still infers `none` and still short-circuits. Without this the two
+/// tests above would pass just as well against an unconditional upgrade.
+#[test]
+fn an_empty_policy_does_not_upgrade_a_declared_read_only_role() {
+    use cyrup_ext_subagents::exec::acceptance::lower_acceptance_input;
+
+    assert!(
+        lower_acceptance_input(&serde_json::json!({}))
+            .expect("an empty object is valid")
+            .is_none(),
+        "`{{}}` declares nothing, so it is upstream's `undefined`: no contract at all"
+    );
+
+    let inferred = AcceptanceContract::resolve_effective_for_role(
+        None,
+        "scout",
+        Some(AcceptanceRole::ReadOnly),
+        "Audit the flow",
+    );
+    assert_eq!(inferred.required_level, AcceptanceStatus::NotRequired);
+    assert!(inferred.is_no_op(), "{inferred:?}");
 }
 
 /// End to end: a research child that emits ordinary prose and no `acceptance-report` block gets a

@@ -426,6 +426,37 @@ async fn a_paused_run_keeps_its_slot() {
     }
 }
 
+/// SUBA-116 — the OTHER half of the paused-run capacity contract, deliberately sitting beside
+/// `a_paused_run_keeps_its_slot` so neither half can be changed without the reader seeing both.
+///
+/// A paused run keeps its slot because it is resumable (the test above). A paused run that has
+/// been STOPPED is not resumable — `control::resume` refuses it with `ResumeStopped` — so its slot
+/// must come back. Before SUBA-116 there was no way to reach this state at all: `control::stop`
+/// refused a paused run outright (`NotStoppable`), so a paused run held its slot forever unless
+/// somebody resumed it. `seal_paused_run` now performs this transition and calls
+/// `update_active_run_index`, which is what this verdict then agrees with.
+#[tokio::test]
+async fn a_stopped_paused_run_releases_its_slot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = probing(Liveness::Dead, options(tmp.path()));
+    let s = session("s");
+    let run_id = RunId::from_token("stoppedpaused");
+    let dir = write_run(tmp.path(), &run_id, &s, RunState::Stopped, Some(7)).await;
+    let instance =
+        crate::background::process_terminal::RunnerProcessInstanceId::from_token("inst-stopped");
+    seed_observed_proof(&dir, &run_id, &instance).await;
+    let mut owner = owner_record(&s, &run_id, &dir, ActiveAsyncCapacityKind::Runner);
+    owner.runner_process_instance_id = Some(instance);
+    owner.runner_pid = Some(7);
+    owner.runner_started_at = Some(1);
+    seed_slot(&options, &owner).await;
+
+    match owner_release_verdict(&owner, &options).await {
+        ActiveAsyncCapacityReleaseVerdict::Releasable { .. } => {}
+        other => panic!("a stopped run with an observed close must release: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_reservation_with_no_runner_identity_is_retained() {
     // pi `:218` — a slot claimed but never bound is reconciliation's to leave alone; only

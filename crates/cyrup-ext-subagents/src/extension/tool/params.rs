@@ -221,6 +221,16 @@ pub(crate) struct SubagentToolParams {
     pub(crate) r#async: Option<bool>,
     pub(crate) timeout_ms: Option<u64>,
     pub(crate) max_runtime_ms: Option<u64>,
+    /// CFG-067 — pi `params.toolTimeoutMs` (`extension/schemas.ts:364`), the HIGHEST rung of
+    /// `resolveToolTimeoutMs` (`tool-timeout.ts:63`).
+    ///
+    /// Carried RAW, unlike [`Self::timeout_ms`], because upstream's resolver REFUSES a malformed
+    /// value with its own message (`tool-timeout.ts:82`) and a typed `Option<u64>` would instead
+    /// fail the whole tool call's deserialization with a serde error the model cannot act on — the
+    /// same reasoning [`Self::additional`] records. A JSON `null` is deliberately NOT collapsed to
+    /// "absent" either: upstream's `candidate.value === undefined` skip does not skip `null`, so a
+    /// `null` wins the ladder and is then refused.
+    pub(crate) tool_timeout_ms: Option<serde_json::Value>,
     pub(crate) agent_scope: Option<String>,
     /// SUBA-046 / pi `params.additional` (`extension/schemas.ts:283` @v0.43.0) — the launches to
     /// add with `action='grant-spawn-budget'`. Typed `i64` rather than `u32` deliberately: pi
@@ -793,6 +803,9 @@ impl SubagentToolParams {
         }
         if self.max_runtime_ms.is_some() {
             keys.push("maxRuntimeMs");
+        }
+        if self.tool_timeout_ms.is_some() {
+            keys.push("toolTimeoutMs");
         }
         if self.agent_scope.is_some() {
             keys.push("agentScope");
