@@ -6,8 +6,10 @@
 //!    session's active-capacity slot (`slot-0/owner.json`), spawns the detached hop-1 runner (the
 //!    scripted fixture with no script, which exits 0 at once), and binds the runner's real pid onto
 //!    the slot with `mark_started`.
-//! 2. The runner's terminal `status.json` is written into the run directory the spawn created,
-//!    carrying that same pid — the record the fixture-as-runner does not write itself.
+//! 2. The launch observes that runner's close and finalizes its process-terminal sidecar from the
+//!    observed exit (SUBA-141, pi `async-execution.ts:759-770` @v0.71.0). Then the runner's
+//!    terminal `status.json` is written into the run directory the spawn created, carrying that
+//!    same pid — the record the fixture-as-runner does not write itself.
 //! 3. `{ action: "debug.run", id }` and `{ action: "debug.run", dir }` go through
 //!    `SubagentTool::execute` → `route_action` → `route_control_action` →
 //!    `SubagentExecutor::control_debug_run`, which reconciles the status, inspects the slot, reads
@@ -17,8 +19,8 @@
 //!
 //! The dump prints upstream's three process-terminal lines (`run-status.ts:95`, `:102-103`), and
 //! the file the first of them names is asserted to EXIST on disk: `initialize_process_terminal`
-//! writes the `pending` sidecar before the runner is spawned, so a diagnostic that names it is
-//! naming a real file. The negative assertion at the end pins that the old substitute line —
+//! writes the `pending` sidecar before the runner is spawned, and the launch's close listener
+//! finalizes that same file, so a diagnostic that names it is naming a real file. The negative assertion at the end pins that the old substitute line —
 //! `Process terminal: not recorded` — is gone, along with the premise under it.
 
 #![allow(
@@ -39,7 +41,8 @@ use cyrup_ext_subagents::background::active_async_capacity::{
 };
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::process_terminal::{
-    ProcessTerminal, ProcessTerminalBase, RunnerProcessInstanceId,
+    ProcessInstanceExit, ProcessTerminal, ProcessTerminalBase, ProcessTerminalReason,
+    ProcessTerminalState, ProofExpectation, RunnerProcessInstanceId, read_process_terminal,
 };
 use cyrup_ext_subagents::background::reconcile::{Liveness, check_pid_liveness};
 use cyrup_ext_subagents::background::{
@@ -89,6 +92,8 @@ fn worker_step() -> RunnerStep {
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     })
 }
 
@@ -134,6 +139,32 @@ fn wait_until_dead(pid: u32) {
             "runner pid {pid} did not exit within 10s"
         );
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Wait, bounded, until the launch's close listener has finalized the run's sidecar — the
+/// `pending` proof `initialize_process_terminal` wrote is replaced once the runner's close is
+/// observed. The observation runs on a detached task, so it is asynchronous to this test even
+/// after the runner pid is gone.
+async fn wait_for_finalized_sidecar(
+    run_dir: &cyrup_ext_subagents::background::RunDir,
+    run_id: &RunId,
+    instance: &RunnerProcessInstanceId,
+) -> ProcessTerminal {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(proof) =
+            read_process_terminal(run_dir, ProofExpectation::new(run_id, instance)).await
+            && proof.state() != ProcessTerminalState::Pending
+        {
+            return proof;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the launch never finalized {} from the runner's close",
+            run_dir.process_terminal().display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -242,7 +273,8 @@ async fn debug_run_prints_the_real_sidecar_overlay_pair_and_capacity_slot() {
     assert!(owner.runner_started_at.is_some());
     wait_until_dead(pid);
 
-    // (2) The runner's terminal record, in the run dir the spawn created.
+    // (2) The launch's close observation, then the runner's terminal record, in the run dir the
+    // spawn created.
     let artifact_roots = run_artifact_roots_in(&roots, cwd.path());
     let paths = RunPaths::for_run(
         &artifact_roots.async_root,
@@ -258,6 +290,33 @@ async fn debug_run_prints_the_real_sidecar_overlay_pair_and_capacity_slot() {
         .runner_process_instance_id
         .clone()
         .expect("mark_started bound the minted runner instance onto the slot");
+    // SUBA-141 — the launching process keeps the runner's handle and finalizes the proof from its
+    // observed close, as pi's `proc.once("close", …)` listener does (`async-execution.ts:759-770`
+    // @v0.71.0). The fixture exited 0 without ever declaring a writer, so upstream's ladder lands
+    // on `writer-close-unverified` (`process-terminal.ts:196` — no recorded AND no declared
+    // writers), and the unknown proof keeps the directly observed runner exit (`:218-219`).
+    let run_dir = cyrup_ext_subagents::background::RunDir::for_existing(&paths.run_dir);
+    let sidecar = wait_for_finalized_sidecar(&run_dir, &run_id, &instance).await;
+    match &sidecar {
+        ProcessTerminal::Unknown {
+            reason, instances, ..
+        } => {
+            assert_eq!(*reason, ProcessTerminalReason::WriterCloseUnverified);
+            assert!(
+                matches!(
+                    instances.as_slice(),
+                    [ProcessInstanceExit::Runner {
+                        process_instance_id,
+                        exit_code: Some(0),
+                        signal: None,
+                        ..
+                    }] if *process_instance_id == instance
+                ),
+                "the proof carries the runner's observed exit: {sidecar:?}"
+            );
+        }
+        other => panic!("expected an unknown proof from the observed close, got {other:?}"),
+    }
     write_terminal_status(&paths, &run_id, pid, &instance).await;
 
     // (3) The id form, through the production tool.
@@ -278,8 +337,7 @@ async fn debug_run_prints_the_real_sidecar_overlay_pair_and_capacity_slot() {
     // `pending` sidecar before `spawn_detached_runner_with_command` was called, which is the whole
     // point of that ordering. A diagnostic that names a file nothing writes is lying; this one
     // names a file the launch wrote.
-    let sidecar_path =
-        cyrup_ext_subagents::background::RunDir::for_existing(&paths.run_dir).process_terminal();
+    let sidecar_path = run_dir.process_terminal();
     assert!(
         sidecar_path.is_file(),
         "the launch wrote {}",
@@ -289,8 +347,10 @@ async fn debug_run_prints_the_real_sidecar_overlay_pair_and_capacity_slot() {
         &text,
         &format!("Process terminal file: {}", sidecar_path.display()),
     );
-    // pi `:102-103`, both fed by `debugProcessTerminal` (`:52-58`). The runner here never reached
-    // a close, so BOTH records are the launch's `pending` — and they name the instance the
+    // pi `:102-103`, both fed by `debugProcessTerminal` (`:52-58`), and this is why the dump
+    // prints the pair: they disagree. The status is the runner's own record, carrying the
+    // launch's `pending` overlay (the fixture wrote none, and the close listener had no status to
+    // stamp); the sidecar is the proof the close listener finalized. Both name the instance the
     // orchestrator minted, which is what makes them matchable at all.
     assert_line(
         &text,
@@ -298,21 +358,20 @@ async fn debug_run_prints_the_real_sidecar_overlay_pair_and_capacity_slot() {
     );
     assert_line(
         &text,
-        &format!("Sidecar process terminal: pending · runner {instance}"),
+        &format!("Sidecar process terminal: unknown (writer-close-unverified) · runner {instance}"),
     );
     // The NO-PROOF FALLBACK ladder's sentence, carrying pi's own
-    // `process-terminal proof is ${proofState}` prefix (`active-async-capacity.ts:239`).
+    // `process-terminal proof is ${proofState}` prefix (`active-async-capacity.ts:236`).
     //
-    // This run has a `pending` sidecar — the launch established ownership, and the orchestrator
-    // simulator that stands in for the runner here never reaches a close to observe — so
-    // `runner_release_verdict`'s proof rung finds nothing to match and falls THROUGH to the pid
-    // ladder beneath it. That fall-through is the behaviour under test: a runner that dies before
-    // it can write a proof must still release its slot, or after `limit` such runs the session
-    // could never spawn again.
+    // This run's sidecar is `unknown` — the runner closed without proving its writers — so
+    // `runner_release_verdict`'s proof rung, which releases on an `observed` proof only, finds
+    // nothing to match and falls THROUGH to the pid ladder beneath it. That fall-through is the
+    // behaviour under test: a runner that dies before it can prove a clean close must still
+    // release its slot, or after `limit` such runs the session could never spawn again.
     assert_line(
         &text,
         &format!(
-            "Active capacity: releasable — process-terminal proof is pending; runner pid {pid} \
+            "Active capacity: releasable — process-terminal proof is unknown; runner pid {pid} \
              is confirmed gone and the run is terminal"
         ),
     );

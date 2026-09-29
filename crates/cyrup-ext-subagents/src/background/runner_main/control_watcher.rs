@@ -894,6 +894,7 @@ mod tests {
             lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
+            names_child_sessions: true,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,

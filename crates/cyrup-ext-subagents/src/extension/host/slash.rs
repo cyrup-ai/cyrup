@@ -962,6 +962,8 @@ impl SubagentsExtension {
                     acceptance: None,
                     context: None,
                     agent_scope: None,
+                    label: None,
+                    session_name: None,
                 })
             })
             .collect();

@@ -2098,6 +2098,55 @@ async fn a_workflow_that_dies_on_a_host_command_still_records_the_step() {
     assert_eq!(steps[0]["exitCode"].as_i64(), Some(9));
 }
 
+/// SUBA-134 — a workflow row whose child never launched keeps pi's placeholder name,
+/// `deriveChildSessionName({ agent: entry.agent ?? entry.key, label: entryLabel })`
+/// (`subagent-executor.ts:5774` @v0.71.0): named from the `runs.run` label, never the key. Driven
+/// through the real dispatch and read back off the terminal `status.json` the settlement wrote.
+///
+/// *Gutted by*: the trace-label lookup `settle_foreground_workflow` hands `workflow_step_statuses`
+/// (the row is named by its agent alone).
+#[tokio::test]
+async fn a_workflow_child_that_never_launched_is_named_from_its_label() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+
+    let script = r#"
+        try {
+            await runs.run("lane.a", { agent: "ghost", task: "survey the cache", label: "Lane A" });
+        } catch (error) {}
+        return "done";
+    "#;
+    let result = dispatch_tool(&tool, serde_json::json!({ "workflowScript": script }))
+        .await
+        .expect("a caught child failure does not fail the workflow");
+    let workflow_run_id = result.details.as_ref().expect("details")["workflowRunId"]
+        .as_str()
+        .expect("the settlement stamps the run id")
+        .to_string();
+
+    let cfg = executor.config_snapshot().await;
+    let async_root =
+        crate::extension::executor::paths::default_async_root_in(&cfg.roots, dir.path());
+    let results_dir =
+        crate::extension::executor::paths::default_results_dir_in(&cfg.roots, dir.path());
+    let runs = crate::tui::fleet::collect_fleet_history(&async_root, &results_dir, None)
+        .await
+        .expect("the async root exists");
+    let job = runs
+        .iter()
+        .find(|run| run.status.run_id.as_str() == workflow_run_id)
+        .expect("the workflow's own status.json must be on disk and readable");
+    let names: Vec<Option<&str>> = job
+        .status
+        .steps
+        .iter()
+        .map(|step| step.session_name.as_deref())
+        .collect();
+    assert_eq!(names, [Some("ghost: Lane A")], "{:?}", job.status.steps);
+}
+
 /// THE REACHABILITY PROOF for `background::async_status_snapshot::project::host_steps_for_run`.
 ///
 /// That projector used to return `&'static []` unconditionally, on the recorded reasoning that a

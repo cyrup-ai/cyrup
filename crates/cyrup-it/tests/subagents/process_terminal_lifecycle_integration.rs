@@ -128,6 +128,8 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     }
 }
 

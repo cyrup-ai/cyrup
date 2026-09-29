@@ -470,6 +470,12 @@ pub(super) fn record_step_outcome(
                         if let Some(evidence) = outcome.native_machine.clone() {
                             entry.native_machine = Some(evidence);
                         }
+                        // SUBA-134 — pi `setOptionalProperty(requiredStatusStep(…),
+                        // "sessionName", singleResult.sessionName)` (`subagent-runner.ts:3759`
+                        // @v0.71.0): the name the member's child actually ran under.
+                        if let Some(name) = outcome.session_name.clone() {
+                            entry.session_name = Some(name);
+                        }
                     }
                     None => {
                         entry.status = StepState::Failed;
@@ -519,6 +525,10 @@ pub(super) fn record_step_outcome(
                 // SUBA-100 — on the single-slot shape too.
                 if let Some(evidence) = result.native_machine.clone() {
                     entry.native_machine = Some(evidence);
+                }
+                // SUBA-134 — on the single-slot shape too.
+                if let Some(name) = result.session_name.clone() {
+                    entry.session_name = Some(name);
                 }
             }
         }
@@ -786,6 +796,7 @@ mod tests {
             super::super::settle::ResultIdentity {
                 agent: "scout".to_string(),
                 task: "look".to_string(),
+                session_name: None,
             },
             &result,
         );
@@ -866,6 +877,93 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_step_index, 0);
         assert_eq!(groups[0].children.len(), 3);
+    }
+
+    /// SUBA-134 — pi `setOptionalProperty(requiredStatusStep(…), "sessionName",
+    /// singleResult.sessionName)` (`subagent-runner.ts:3759,4178,4658` @v0.71.0): the name a
+    /// member's (or a single step's) child actually ran under replaces the declared one, and a
+    /// result that reports none leaves the declaration in place.
+    ///
+    /// *Gutted by*: either `session_name` copy in `record_step_outcome`.
+    #[test]
+    fn a_settled_childs_session_name_lands_on_its_status_entry() {
+        let reported = |name: Option<&str>| {
+            let mut result = StepResult::success(Some("out".to_string()), None);
+            result.session_name = name.map(str::to_string);
+            result
+        };
+        let mut status = RunStatus::queued(
+            RunId::from_token("flatnamed001".to_string()),
+            RunMode::Chain,
+            Some(1),
+        );
+        status.state = RunState::Running;
+        let group_step = RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
+            steps: vec![single_step("alpha", "a"), single_step("beta", "b")],
+            concurrency: 2,
+            fail_fast: false,
+            worktree: false,
+            lane: None,
+        });
+        let tail = RunnerStep::SingleStep(single_step("tail", "t"));
+        status.steps = [&group_step, &tail]
+            .into_iter()
+            .flat_map(pending_step_statuses_for)
+            .collect();
+        let group_result = crate::spawn::chain_graph::GroupStepResult {
+            handoff: None,
+            aggregate: StepResult::success(None, None),
+            children: vec![Some(reported(Some("alpha: ran as this"))), Some(reported(None))],
+            fail_fast_skipped: vec![false, false],
+        };
+        let aggregate = group_result.aggregate.clone();
+        record_step_outcome(
+            &mut status,
+            &(0..2),
+            &group_step,
+            &aggregate,
+            Some(&group_result),
+        );
+        record_step_outcome(
+            &mut status,
+            &(2..3),
+            &tail,
+            &reported(Some("tail: ran as this")),
+            None,
+        );
+        let names: Vec<Option<&str>> = status
+            .steps
+            .iter()
+            .map(|step| step.session_name.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Some("alpha: ran as this"),
+                Some("beta: b"),
+                Some("tail: ran as this")
+            ]
+        );
+    }
+
+    /// SUBA-134 — a stopped step's result carries the name its status step was declared under
+    /// (pi `stoppedStepResult(agent, context, requiredStatusStep(…).sessionName)`,
+    /// `subagent-runner.ts:2315` @v0.71.0), and a settled child's result the name it ran under
+    /// (`sessionName: childSessionName`, `:1515`).
+    ///
+    /// *Gutted by*: dropping either rung of `result.session_name.clone().or(session_name)` in
+    /// `step_result_to_single_result_with`.
+    #[test]
+    fn a_step_result_carries_the_name_its_child_ran_under_else_its_declared_one() {
+        let mut spec = single_step("worker", "fix auth");
+        spec.label = Some("Lane A".to_string());
+        let step = RunnerStep::SingleStep(spec);
+        let stopped = super::super::settle::stopped_single_result(&step);
+        assert_eq!(stopped.session_name.as_deref(), Some("worker: Lane A"));
+        let mut ran = StepResult::success(Some("out".to_string()), None);
+        ran.session_name = Some("worker: item 3".to_string());
+        let settled = super::super::settle::step_result_to_single_result(&step, &ran);
+        assert_eq!(settled.session_name.as_deref(), Some("worker: item 3"));
     }
 
     /// SUBA-3c — the OTHER two `record_step_outcome` arms carry `timeoutRecovery` as well: the

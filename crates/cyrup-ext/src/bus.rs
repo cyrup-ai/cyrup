@@ -23,7 +23,14 @@
 use cyrup_core::ExtensionId;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Mutex, Weak};
+
+use crate::native::NativeExtension;
+
+/// One typed-bus listener: its owner, its topic and the native that handles it. Held WEAKLY: the
+/// native owns (through its `HostServices`) a handle to this bus, so a strong edge back would be a
+/// cycle; the host's native map is what keeps a loaded native alive.
+type TypedSub = (ExtensionId, String, Weak<dyn NativeExtension>);
 
 /// The host-owned inter-extension event bus (pi `createEventBus()`, `core/event-bus.ts:12-32`
 /// @v0.83.0). One per [`crate::ExtensionHost`], shared into every loaded guest AND consulted for
@@ -34,6 +41,8 @@ pub struct SharedBus {
     subs: Mutex<Vec<(ExtensionId, String)>>,
     /// Emitted `(topic, payload)` awaiting fan-out, FIFO (pi emits in call order).
     pending: Mutex<VecDeque<(String, Value)>>,
+    /// Typed-bus listeners ([`Self::subscribe_typed`]) in load order.
+    typed_subs: Mutex<Vec<TypedSub>>,
 }
 
 impl SharedBus {
@@ -69,12 +78,59 @@ impl SharedBus {
     /// (`extensions/loader.ts:206-214` @v0.84.1). Called when an extension leaves the host's live
     /// map, so a replaced or unloaded instance stops receiving. Returns how many were removed.
     pub fn unsubscribe_all(&self, owner: &ExtensionId) -> usize {
+        let typed = self
+            .typed_subs
+            .lock()
+            .map(|mut g| {
+                let before = g.len();
+                g.retain(|(o, _, _)| o != owner);
+                before - g.len()
+            })
+            .unwrap_or(0);
         let Ok(mut g) = self.subs.lock() else {
-            return 0;
+            return typed;
         };
         let before = g.len();
         g.retain(|(o, _)| o != owner);
-        before - g.len()
+        typed + before - g.len()
+    }
+
+    /// Record that the native `listener` (owned by `owner`) listens on the typed `topic`
+    /// ([`crate::InitApi::subscribe_typed_bus`]). Idempotent per `(owner, topic)` pair.
+    pub fn subscribe_typed(
+        &self,
+        owner: ExtensionId,
+        topic: String,
+        listener: Weak<dyn NativeExtension>,
+    ) {
+        if let Ok(mut g) = self.typed_subs.lock()
+            && !g.iter().any(|(o, t, _)| *o == owner && *t == topic)
+        {
+            g.push((owner, topic, listener));
+        }
+    }
+
+    /// Hand `event` to every native listening on the typed `topic`, in load order, and return once
+    /// each has run — pi's synchronous `emit` (`core/event-bus.ts:15-17` @v0.87.1), which is what
+    /// lets an emitter read what its listeners did to `event` (a `claim`) as soon as this returns.
+    ///
+    /// Not queued, unlike [`Self::emit`]: the listeners are natives, which share no store to
+    /// re-enter, so nothing forces the deferral here. The listener list is copied out of the lock
+    /// before any listener runs, so a listener may itself emit or subscribe.
+    pub fn emit_typed(&self, topic: &str, event: &dyn std::any::Any) {
+        let listeners: Vec<Weak<dyn NativeExtension>> = self
+            .typed_subs
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .filter(|(_, t, _)| t == topic)
+                    .map(|(_, _, l)| l.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for listener in listeners.iter().filter_map(Weak::upgrade) {
+            listener.on_typed_bus_event(topic, event);
+        }
     }
 
     /// Enqueue an emitted event for deferred fan-out.

@@ -1622,6 +1622,7 @@ mod tests {
             run_id: None,
             runner: None,
             session_name: None,
+            label: None,
             interrupted: false,
             output_path_mapping: None,
             telemetry: crate::background::StepTelemetry::default(),

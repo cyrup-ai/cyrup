@@ -233,7 +233,11 @@ impl AgentSession {
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
         drop(compactor);
         let _ = retry_pump.await;
-        cancel_slot.clear();
+        // The slot is NOT cleared here: clearing it is the compaction's idle edge (SEAM-125), and
+        // the injection pump starts a waiting turn on that edge. pi clears it on the success path
+        // only after `appendCompaction` → `_refreshFinalizedContext()` and the `session_compact`
+        // emit (`agent-session.ts:2499-2528` @v0.87.1); clearing before the re-seed below let a
+        // turn queued behind the compaction start over the PRE-compaction transcript.
 
         match result {
             Ok(Some(entry)) => {
@@ -305,6 +309,10 @@ impl AgentSession {
                         &notify_cancel,
                     )
                     .await;
+                // pi `:2527-2528` — "compaction_end listeners may submit queued prompts, so expose
+                // idle state before notifying them": after the re-seed and `session_compact`,
+                // before `compaction_end`.
+                cancel_slot.clear();
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
                     result: Some(cr.clone()),
@@ -318,6 +326,8 @@ impl AgentSession {
             // The internal `CompactionHooks` seam cancelled (`BeforeCompactDecision::Cancel`) — the
             // same refusal Pi reports as "Compaction cancelled" (agent-session.ts:1824/1869).
             Ok(None) => {
+                // pi's `catch` clears before its `compaction_end` too (`:2541`).
+                cancel_slot.clear();
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
                     result: None,
@@ -335,6 +345,7 @@ impl AgentSession {
                 } else {
                     Some(format!("Compaction failed: {e}"))
                 };
+                cancel_slot.clear();
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
                     result: None,

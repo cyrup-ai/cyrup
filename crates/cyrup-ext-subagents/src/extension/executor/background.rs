@@ -289,6 +289,8 @@ impl SubagentExecutor {
             acceptance,
             context: Some(effective_context),
             agent_scope: None,
+            label: None,
+            session_name: None,
         };
 
         self.spawn_background_steps(
@@ -3971,6 +3973,8 @@ mutationTools: apply_patch, notebook_edit\n",
                 session_dir: None,
                 context: Some(ContextMode::Fresh),
                 agent_scope: None,
+                label: None,
+                session_name: None,
             };
 
             let error = executor
@@ -4065,6 +4069,8 @@ mutationTools: apply_patch, notebook_edit\n",
                     session_dir: None,
                     context: Some(ContextMode::Fresh),
                     agent_scope: None,
+                    label: None,
+                    session_name: None,
                 })],
                 mode: RunMode::Single,
                 session_file: None,

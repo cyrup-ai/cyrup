@@ -485,7 +485,8 @@ fn format_async_fleet_lines(runs: &[ActiveRun], now: i64) -> Vec<String> {
                 step.telemetry.thinking.as_deref(),
             );
             let mut parts = vec![
-                format!("{index}. {}", step.agent),
+                // SUBA-134 — pi `fleetStepDisplayName(step)` (`fleet-view.ts:364` @v0.71.0).
+                format!("{index}. {}", step.display_name()),
                 step_state_label(step.status).to_string(),
             ];
             if let Some(a) = step_activity {
@@ -641,7 +642,8 @@ fn select_transcript_step(
             steps
                 .iter()
                 .enumerate()
-                .map(|(i, s)| format!("{i}={}", s.agent))
+                // SUBA-134 — pi `fleetChildDisplayName(candidate)` (`fleet-view.ts:461`).
+                .map(|(i, s)| format!("{i}={}", s.child_display_name()))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -661,7 +663,8 @@ fn step_state_line(status: &RunStatus, index: Option<usize>, now: i64) -> Option
         "Step"
     };
     let mut parts = vec![
-        format!("{label}: {index} ({})", step.agent),
+        // SUBA-134 — pi `fleetChildDisplayName(step)` (`fleet-view.ts:471`).
+        format!("{label}: {index} ({})", step.child_display_name()),
         step_state_label(step.status).to_string(),
     ];
     if let Some(a) = format_activity_facts(&step_activity_facts(step), now) {
@@ -1206,6 +1209,27 @@ mod tests {
             .as_deref(),
             Some("active but long-running · last activity 2m ago")
         );
+    }
+
+    /// SUBA-134 — pi `fleetStepDisplayName(step)` (`fleet-view.ts:83-84,364` @v0.71.0): an async
+    /// run's step line names the child by its trimmed session name, else by its agent.
+    #[test]
+    fn fleet_step_lines_show_the_child_session_name_over_the_agent() {
+        let mut named = StepStatus::pending("worker");
+        named.session_name = Some(" worker: Lane A ".to_string());
+        let status = status_with(vec![named, StepStatus::pending("critic")]);
+        let text = format_fleet(
+            &[],
+            &[ActiveRun {
+                dir: std::path::PathBuf::from("/runs/run1234"),
+                status,
+            }],
+            false,
+            0,
+        )
+        .unwrap();
+        assert!(text.contains("  0. worker: Lane A | "), "{text}");
+        assert!(text.contains("  1. critic | "), "{text}");
     }
 
     #[test]

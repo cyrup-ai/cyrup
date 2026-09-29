@@ -1296,6 +1296,9 @@ pub fn step_token_to_spec(
             .map(|level| serde_json::Value::String(level.to_string())),
         context: None,
         agent_scope: None,
+        // SUBA-134 — `label=<text>`, which a child session name prefers over the task excerpt.
+        label: step.config.label.clone(),
+        session_name: None,
     })
 }
 

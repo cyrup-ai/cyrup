@@ -575,6 +575,7 @@ impl ExtensionHost {
             bus_topics,
             markdown_transformer,
             terminal_input,
+            typed_bus_topics,
         ) = api.into_parts();
 
         // EXT-003 footgun guard: a native that subscribes to `project_trust` but did NOT override
@@ -658,6 +659,12 @@ impl ExtensionHost {
         // `bus.subscribe` import writes to (pi's single `createEventBus()`, `loader.ts:389`).
         for topic in bus_topics {
             self.bus.subscribe(id.clone(), topic);
+        }
+        // The typed half (`InitApi::subscribe_typed_bus`): the listener is this native itself,
+        // called inline by `SharedBus::emit_typed`.
+        for topic in typed_bus_topics {
+            self.bus
+                .subscribe_typed(id.clone(), topic, Arc::downgrade(&ext));
         }
 
         // Keep the native handle for command-tier slash execution (R-08-016) before it is wrapped

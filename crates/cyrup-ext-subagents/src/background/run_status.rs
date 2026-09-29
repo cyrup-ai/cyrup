@@ -476,7 +476,8 @@ async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRen
         lines.push(format!(
             "{}: {} {}{}{}{}",
             step_line_label(status, index),
-            step.agent,
+            // SUBA-134 — pi `runStatusStepDisplayName(step)` (`run-status.ts:633` @v0.71.0).
+            step.display_name(),
             step_state_label(step.status),
             model_text,
             steering_suffix,
@@ -998,7 +999,8 @@ pub fn format_run_list(runs: &[ActiveRun]) -> String {
             lines.push(format!(
                 "  {}. {} | {}{}",
                 index.saturating_add(1),
-                step.agent,
+                // SUBA-134 — pi `step.sessionName?.trim() || …` (`async-status.ts:632` @v0.71.0).
+                step.display_name(),
                 step_state_label(step.status),
                 model_text
             ));
@@ -1250,6 +1252,8 @@ mod tests {
             acceptance: None,
             context: None,
             agent_scope: None,
+            label: None,
+            session_name: None,
         }
     }
 
@@ -1311,6 +1315,37 @@ mod tests {
         assert!(
             !rendered.contains("run0donexxx"),
             "terminal run absent: {rendered}"
+        );
+    }
+
+    /// SUBA-134 — a step line shows the child's session name, trimmed, else `<label> (<agent>)`,
+    /// else the agent (pi `step.sessionName?.trim() || (step.label ? `${step.label}
+    /// (${step.agent})` : step.agent)`, `async-status.ts:632` @v0.71.0).
+    #[test]
+    fn active_run_step_lines_show_the_child_session_name_over_the_agent() {
+        let id = RunId::from_token("run0named0");
+        let mut named = StepStatus::pending("worker");
+        named.session_name = Some(" worker: Lane A ".to_string());
+        named.label = Some("Lane A".to_string());
+        let mut blank = StepStatus::pending("scout");
+        blank.session_name = Some("   ".to_string());
+        let mut labelled = StepStatus::pending("planner");
+        labelled.label = Some("Attached run-7f".to_string());
+        let status = running_status(
+            &id,
+            RunMode::Chain,
+            vec![named, blank, StepStatus::pending("critic"), labelled],
+        );
+        let rendered = format_run_list(&[ActiveRun {
+            dir: PathBuf::from("/runs/run0named0"),
+            status,
+        }]);
+        assert!(rendered.contains("  1. worker: Lane A | "), "{rendered}");
+        assert!(rendered.contains("  2. scout | "), "{rendered}");
+        assert!(rendered.contains("  3. critic | "), "{rendered}");
+        assert!(
+            rendered.contains("  4. Attached run-7f (planner) | "),
+            "{rendered}"
         );
     }
 

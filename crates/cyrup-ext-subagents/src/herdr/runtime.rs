@@ -671,6 +671,8 @@ mod tests {
             acceptance: None,
             context: None,
             agent_scope: None,
+            label: None,
+            session_name: None,
         })];
         status.telemetry.workflow_graph =
             Some(crate::background::workflow_graph_from_run(&steps, &status));

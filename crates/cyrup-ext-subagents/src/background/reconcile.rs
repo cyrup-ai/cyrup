@@ -891,7 +891,9 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             turn_budget_exceeded: false,
             wrap_up_requested: false,
             tool_budget_blocked: false,
-            session_name: None,
+            // SUBA-134 — `...(step.sessionName ? { sessionName: step.sessionName } : {})` on each
+            // synthesized child (`stale-run-reconciler.ts:278` @v0.71.0).
+            session_name: step.session_name.clone(),
             agent: step.agent.clone(),
             task: String::new(),
             exit_code: -1,
@@ -1591,6 +1593,8 @@ mod tests {
         // A real run carries its launching session; the reconciler writes the repaired result only
         // when it does (pi `stale-run-reconciler.ts:283`).
         status.session_id = crate::identity::SessionId::parse("test-session");
+        // SUBA-134 — the step's declared child session name rides onto its synthesized result.
+        status.steps[0].session_name = Some("researcher: map the auth flow".to_string());
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -1639,6 +1643,12 @@ mod tests {
         assert!(
             !reread_result.results.is_empty(),
             "a synthesized diagnostic result must be present"
+        );
+        // pi `...(step.sessionName ? { sessionName: step.sessionName } : {})`
+        // (`stale-run-reconciler.ts:278` @v0.71.0).
+        assert_eq!(
+            reread_result.results[0].session_name.as_deref(),
+            Some("researcher: map the auth flow")
         );
     }
 

@@ -62,6 +62,8 @@ pub(crate) fn bare_single_step(
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     }
 }
 

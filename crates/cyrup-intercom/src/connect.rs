@@ -551,61 +551,30 @@ async fn connect_once(
     //
     // ICOM-064 — and an extension's per-session claim wins over both: `currentIntercomSessionId =
     // claimedIntercomSessionId ?? resolveConfiguredIntercomSessionId(…)` (`v0.14.0 index.ts:1653`).
-    //
-    // The loop runs at most twice: a claim can land (once per runtime) while this attempt is
-    // registering, and then the client just registered under the unclaimed id is dropped and the
-    // attempt registers again under the claim, before anything is published.
-    //
-    // The registration is rebuilt on each pass because its unnamed-session alias is derived from
-    // the same resolved id ([`presence_identity`]), so a pass under a claim advertises the claim's
-    // alias rather than the one computed before it landed.
-    let client = loop {
-        let registration = build_registration(state, params);
-        let session_id =
-            resolved_intercom_session_id(state).or_else(|| state.connect.last_session_id());
-        let client =
-            Arc::new(IntercomClient::connect_target(&target, registration, session_id).await?);
-        if state.connect.shutting_down.load(Ordering::SeqCst)
-            || state.connect.generation.load(Ordering::SeqCst) != generation
-        {
-            // `Intercom runtime no longer active` (index.ts:837-840): never leave a registered
-            // client behind for a session that has moved on.
-            client.disconnect();
-            return Err(IntercomError::Client(
-                "Intercom runtime no longer active".to_string(),
-            ));
-        }
-        if state.install_client_unless_claimed_elsewhere(&client) {
-            break client;
-        }
+    // The claim was settled inside the `session_start` emit, before any connect was scheduled, so
+    // it is already in place here.
+    let registration = build_registration(state, params);
+    let session_id =
+        resolved_intercom_session_id(state).or_else(|| state.connect.last_session_id());
+    let client = Arc::new(IntercomClient::connect_target(&target, registration, session_id).await?);
+    if state.connect.shutting_down.load(Ordering::SeqCst)
+        || state.connect.generation.load(Ordering::SeqCst) != generation
+    {
+        // `Intercom runtime no longer active` (index.ts:837-840): never leave a registered client
+        // behind for a session that has moved on.
         client.disconnect();
-    };
+        return Err(IntercomError::Client(
+            "Intercom runtime no longer active".to_string(),
+        ));
+    }
     *state
         .connect
         .last_session_id
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = client.session_id();
+    state.set_client(Some(client.clone()));
     spawn_inbound_loop(state.clone(), client.clone());
     Ok(client)
-}
-
-/// ICOM-064 — a claim accepted after the startup connect had already registered under another id:
-/// drop that registration and register again, so the claimed id — not the host-assigned one — is
-/// what peers keep. The dropped client is unpublished FIRST, so its disconnect edge is a superseded
-/// connection's to [`handle_disconnect`] and arms no reconnect.
-pub fn reregister_under_claim(state: &Arc<SharedIntercomState>, stale: &Arc<IntercomClient>) {
-    match state.client() {
-        Some(live) if Arc::ptr_eq(&live, stale) => state.set_client(None),
-        _ => return,
-    }
-    stale.disconnect();
-    let state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = ensure_connected(&state, ConnectReason::Startup).await {
-            tracing::warn!(error = %e, "intercom: re-register under the claimed id failed; scheduling reconnect");
-            schedule_reconnect(&state);
-        }
-    });
 }
 
 /// The client `disconnected` handler (`index.ts:779-789`): fail any in-flight outbound ask, drop the
@@ -1005,12 +974,7 @@ mod tests {
             Some("stable-worker-7")
         );
 
-        stable.open_identity_claim();
-        assert!(
-            stable
-                .accept_identity_claim(" claimed-worker-run1-1 ")
-                .is_none()
-        );
+        stable.set_claimed_intercom_session_id(Some("claimed-worker-run1-1".to_string()));
         assert_eq!(
             resolved_intercom_session_id(&stable).as_deref(),
             Some("claimed-worker-run1-1")
@@ -1025,8 +989,7 @@ mod tests {
 
         let named = state();
         named.set_host_services(Arc::new(Host(Some(" worker: fix auth "))));
-        named.open_identity_claim();
-        assert!(named.accept_identity_claim("claimed").is_none());
+        named.set_claimed_intercom_session_id(Some("claimed".to_string()));
         assert_eq!(
             presence_identity(&named, None),
             PresenceIdentity {

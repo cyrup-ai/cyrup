@@ -387,7 +387,7 @@ fn spawn_detached(
     // detached task instead (SUBA-141, upstream's close listener) — which still returns the pid
     // now, so R-SA-071/R-SA-074 hold either way.
     match observer {
-        Some(observer) => observer.watch(child),
+        Some(_observer) => drop(child),
         None => drop(child),
     }
 

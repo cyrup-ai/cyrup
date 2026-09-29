@@ -1244,6 +1244,9 @@ fn chain_step_to_single_step_spec(step: &ChainStepConfig) -> SingleStepSpec {
             .cloned(),
         context: None,
         agent_scope: None,
+        // SUBA-134 — the step label a child session name prefers over the task excerpt.
+        label: step.label.clone(),
+        session_name: None,
     }
 }
 

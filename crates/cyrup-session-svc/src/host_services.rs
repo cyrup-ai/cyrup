@@ -1653,6 +1653,15 @@ impl HostServices for LiveHostServices {
         }
     }
 
+    /// The typed half of [`Self::emit_event`]: delivered inline on the same shared bus, so every
+    /// native listener has run when this returns.
+    fn emit_typed_event(&self, topic: &str, event: &dyn std::any::Any) {
+        let bus = Self::lock(&self.event_bus).clone();
+        if let Some(bus) = bus {
+            bus.emit_typed(topic, event);
+        }
+    }
+
     fn session_file(&self) -> Option<PathBuf> {
         // The LIVE persisted file (deferred until the first assistant message; changes on fork), read
         // from the attached tree manager. `Ok(_)` — attached and read (the value may itself be `None`

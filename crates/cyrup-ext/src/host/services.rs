@@ -515,6 +515,13 @@ pub trait HostServices: Send + Sync {
     /// [`crate::bus::SharedBus::emit`] for why cyrup queues instead of fanning out inline.
     fn emit_event(&self, _topic: &str, _payload: &Value) {}
 
+    /// Emit a TYPED event to the natives listening on `topic`
+    /// ([`crate::InitApi::subscribe_typed_bus`]) and return after every listener has run — pi's
+    /// synchronous `pi.events.emit`, for a payload whose methods the listeners call (see
+    /// [`crate::SharedBus::emit_typed`]). A host with no bus attached has no listeners, so the
+    /// event is handed to nobody and the emitter reads it back untouched.
+    fn emit_typed_event(&self, _topic: &str, _event: &dyn std::any::Any) {}
+
     /// The live session's persisted file path (Pi `sessionManager.sessionFilePath`). `None` when
     /// unattached, headless, or the session is not persisted (an ephemeral/in-memory session). This is
     /// the REAL orchestrator session file that cyrup-ext-subagents fork-context branches from, instead

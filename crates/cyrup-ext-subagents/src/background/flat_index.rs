@@ -99,26 +99,32 @@ pub fn flat_total(steps: &[RunnerStep]) -> usize {
 /// is deliberately not taken here.
 #[must_use]
 pub fn pending_step_statuses_for(step: &RunnerStep) -> Vec<StepStatus> {
-    // SUBA-134 — pi declares each status step with its child's `sessionName`
-    // (`subagent-runner.ts:1913-1917` @v0.71.0), so a status reader can label a child before it
-    // settles; the child runs under the same derivation.
-    let named = |agent: &str, task: &str| {
-        let mut status = StepStatus::pending(agent);
-        status.session_name = crate::exec::child_session_name::derive_child_session_name(
-            Some(agent),
-            Some(task),
-            None,
-        );
+    // SUBA-134 — pi declares each status step with its child's `sessionName: step.sessionName ??
+    // deriveChildSessionName({ agent, task, label })` (`subagent-runner.ts:1913-1917,1967-1971`
+    // @v0.71.0), so a status reader can label a child before it settles, and with its `label`.
+    let named = |spec: &crate::spawn::chain_graph::SingleStepSpec| {
+        let mut status = StepStatus::pending(spec.agent.clone());
+        status.session_name = spec.child_session_name(&spec.task);
+        status.label.clone_from(&spec.label);
         status
     };
     match step {
-        RunnerStep::SingleStep(spec) => vec![named(&spec.agent, &spec.task)],
-        RunnerStep::ImportAsyncRoot(spec) => vec![StepStatus::pending(spec.agent.clone())],
-        RunnerStep::ParallelGroup(group) => group
-            .steps
-            .iter()
-            .map(|task| named(&task.agent, &task.task))
-            .collect(),
+        RunnerStep::SingleStep(spec) => vec![named(spec)],
+        // An attached root is a sequential step with an empty task and its attachment label
+        // (`async-execution.ts:1294-1300`), so it takes the same `:1967` derivation.
+        RunnerStep::ImportAsyncRoot(spec) => {
+            let mut status = StepStatus::pending(spec.agent.clone());
+            status.session_name = crate::exec::child_session_name::derive_child_session_name(
+                Some(&spec.agent),
+                Some(""),
+                Some(&spec.label()),
+            );
+            status.label = Some(spec.label());
+            vec![status]
+        }
+        RunnerStep::ParallelGroup(group) => group.steps.iter().map(named).collect(),
+        // pi's `expand:<agent>` placeholder carries a label but no `sessionName` (`:1938-1956`);
+        // each member is named when it is materialized (`chain_graph::run_dynamic_group`).
         RunnerStep::DynamicGroup(dynamic) => {
             vec![StepStatus::pending(format!(
                 "<dynamic:{}>",
@@ -182,6 +188,8 @@ mod tests {
             acceptance: None,
             context: None,
             agent_scope: None,
+            label: None,
+            session_name: None,
         }
     }
 
@@ -245,6 +253,75 @@ mod tests {
         let steps = vec![single("a"), group(&["x", "y"])];
         assert_eq!(flat_base(&steps, 9), 3);
         assert_eq!(flat_range(&steps, 9), 3..3);
+    }
+
+    /// SUBA-134 — pi declares each status step with `sessionName: step.sessionName ??
+    /// deriveChildSessionName({ agent, task, label })` (`subagent-runner.ts:1913,1967`,
+    /// `chain-append.ts:164` @v0.71.0): a labelled step or member is named by its label, a
+    /// launcher-assigned name wins, and an attached root — an empty task with its attachment label
+    /// (`async-execution.ts:1294-1300`) — is `<agent>: Attached <runId>`. A dynamic group's
+    /// `expand:` placeholder carries none (`:1938-1956`).
+    #[test]
+    fn pending_entries_are_named_from_their_label_and_an_attached_root_from_its_attachment() {
+        let mut labelled = spec("scout");
+        labelled.task = "survey the auth module".to_string();
+        labelled.label = Some("Lane A".to_string());
+        let mut assigned = spec("builder");
+        assigned.session_name = Some("builder: item 2".to_string());
+        let plain = spec("critic");
+
+        let names = |step: &RunnerStep| -> Vec<Option<String>> {
+            pending_step_statuses_for(step)
+                .into_iter()
+                .map(|status| status.session_name)
+                .collect()
+        };
+        assert_eq!(
+            names(&RunnerStep::SingleStep(labelled.clone())),
+            [Some("scout: Lane A".to_string())]
+        );
+        assert_eq!(
+            names(&RunnerStep::ParallelGroup(ParallelGroupSpec {
+                steps: vec![labelled, assigned, plain],
+                concurrency: 4,
+                fail_fast: false,
+                worktree: false,
+                lane: None,
+            })),
+            [
+                Some("scout: Lane A".to_string()),
+                Some("builder: item 2".to_string()),
+                Some("critic: t".to_string()),
+            ]
+        );
+        assert_eq!(
+            names(&RunnerStep::ImportAsyncRoot(
+                crate::spawn::chain_graph::ImportAsyncRootSpec {
+                    run_id: "run-7f".to_string(),
+                    async_root: std::path::PathBuf::from("/a"),
+                    results_dir: std::path::PathBuf::from("/r"),
+                    index: 0,
+                    agent: "planner".to_string(),
+                    output: None,
+                }
+            )),
+            [Some("planner: Attached run-7f".to_string())]
+        );
+        assert_eq!(names(&dynamic()), [None]);
+        // Each entry also carries its label (`label: task.label`, `subagent-runner.ts:1922`).
+        let labels = |step: &RunnerStep| -> Vec<Option<String>> {
+            pending_step_statuses_for(step)
+                .into_iter()
+                .map(|status| status.label)
+                .collect()
+        };
+        let mut labelled = spec("scout");
+        labelled.label = Some("Lane A".to_string());
+        assert_eq!(
+            labels(&RunnerStep::SingleStep(labelled)),
+            [Some("Lane A".to_string())]
+        );
+        assert_eq!(labels(&RunnerStep::SingleStep(spec("critic"))), [None]);
     }
 
     /// SUBA-093's headline: a `tasks[]` fan-out publishes one status entry PER MEMBER, named by
