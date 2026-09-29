@@ -144,10 +144,10 @@ pub enum InspectorArgvError {
 /// (`"1e3"`) is accepted exactly as upstream accepts it.
 ///
 /// [CYRUP-DELTA, unrepresentable]: JavaScript also accepts the `0x`/`0o`/`0b` literal forms, which
-/// [`f64::from_str`] does not. `--index 0x10` refuses here and parses as 16 upstream. Nothing
-/// produces those forms — [`super::actions::launch_for`] writes `index.to_string()` and a human
-/// typing the flag types decimal — and accepting them would mean hand-rolling a second numeric
-/// grammar for one unreachable spelling.
+/// [`f64::from_str`](f64#method.from_str) does not. `--index 0x10` refuses here and parses as 16
+/// upstream. Nothing produces those forms — [`super::actions::launch_for`] writes
+/// `index.to_string()` and a human typing the flag types decimal — and accepting them would mean
+/// hand-rolling a second numeric grammar for one unreachable spelling.
 fn js_whole_number(raw: &str) -> Option<f64> {
     let trimmed = raw.trim();
     let value = if trimmed.is_empty() {
@@ -325,7 +325,7 @@ pub fn steering_receipt(message: &str, receipt: &str) -> String {
 }
 
 /// The length of the longest run of three-or-more backticks in `value` — upstream's
-/// `[...preview.matchAll(/`{3,}/g)].map((match) => match[0]!.length)` (`steering.ts:43`).
+/// ``[...preview.matchAll(/`{3,}/g)].map((match) => match[0]!.length)`` (`steering.ts:43`).
 ///
 /// Runs SHORTER than three are not candidates upstream (the regex demands `{3,}`) and are not
 /// counted here either; the `max(2, …)` floor at the call site is what supplies the default.

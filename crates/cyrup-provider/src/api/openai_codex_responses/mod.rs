@@ -12,7 +12,7 @@
 //! | `extractAccountId` (`:1564-1575`) | [`extract_account_id`](headers::extract_account_id) |
 //! | `buildBaseCodexHeaders`/`buildSSEHeaders` (`:1577-1617`) | [`build_sse_headers`](headers::build_sse_headers) |
 //! | `buildRequestBody` (`:529-596`) | [`build_request_body`](request::build_request_body) |
-//! | `mapCodexEvents`/`normalizeCodexStatus` (`:721-757`) | [`map_codex_event`](events::map_codex_event) + [`map_codex_frames`](events::map_codex_frames) |
+//! | `mapCodexEvents`/`normalizeCodexStatus` (`:721-757`) | [`map_codex_event`](events::map_codex_event) + `map_codex_frames` |
 //! | `resolveCodexServiceTier` (`:627-635`) | [`resolve_codex_service_tier`](events::resolve_codex_service_tier) |
 //! | `isRetryableError`/`isTerminalRateLimitError` (`:130-144`) | [`is_retryable_error`](retry::is_retryable_error) |
 //! | `getRetryAfterDelayMs`/`validateRetryDelayMs` (`:146-183`) | [`get_retry_after_delay_ms`](retry::get_retry_after_delay_ms) |
@@ -25,7 +25,7 @@
 //! `openai-responses-shared.ts`. `getServiceTierCostMultiplier` (`:598-610`) is byte-identical to
 //! `openai-responses.ts:281-293`, which that decoder already implements, so the codex-specific
 //! `resolveCodexServiceTier` is applied by rewriting `response.service_tier` on the terminal event
-//! before the shared decoder reads it (see [`map_codex_frames`](events::map_codex_frames)) rather than by duplicating the
+//! before the shared decoder reads it (see `map_codex_frames`) rather than by duplicating the
 //! pricing table.
 //!
 //! # Mechanism deltas (the language/dependency forces them; behaviour is unchanged)

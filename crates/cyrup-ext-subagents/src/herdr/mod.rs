@@ -1,3 +1,5 @@
+//! The herdr status bridge: cyrup's fleet state in herdr's sidebar. See [`herdr`](crate::herdr).
+//!
 //! The herdr status bridge — cyrup's fleet in herdr's sidebar.
 //!
 //! When cyrup runs inside a [herdr](https://github.com/herdr) pane, this module is what makes the

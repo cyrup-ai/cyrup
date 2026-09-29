@@ -26,7 +26,6 @@
 //! those same primitives.
 
 pub mod chain_graph;
-/// The two-phase worktree cleanup PLAN — the read-only half of `worktree.cleanup`.
 pub mod cleanup_plan;
 pub mod depth;
 pub mod dynamic_fanout;

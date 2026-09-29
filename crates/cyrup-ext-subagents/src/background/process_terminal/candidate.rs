@@ -30,16 +30,16 @@ use super::types::{
 /// `pi-writer` record to carry one. A decode-then-check port would accept the first (serde
 /// ignores unknown fields by default) and could not distinguish the second from a default.
 ///
-/// # `[CYRUP-DELTA]` — the validator accepts two of [`ProcessTreeTerminal`]'s three arms
+/// # `[CYRUP-DELTA]` — the validator accepts two of [`ProcessTreeTerminal`](super::ProcessTreeTerminal)'s three arms
 ///
 /// `types.ts:660-665` declares an observed `windows-taskkill` process tree, and
-/// [`ProcessTreeTerminal::ObservedTaskkill`] ports it because it is the ON-DISK FORMAT and a
-/// record written by a Windows build must round-trip. But `process-terminal.ts:46-53` accepts an
-/// observed tree only when `mechanism === "posix-process-group"`; a `windows-taskkill` tree falls
-/// through to `:54`, fails the `state === "unknown"` test, and is REFUSED. That asymmetry is
-/// upstream's, not this port's, and it is reproduced here deliberately so the two builds agree on
-/// exactly the same accept set. A reader who "fixes" it introduces a divergence in which cyrup
-/// accepts a candidate pi rejects.
+/// [`ProcessTreeTerminal::ObservedTaskkill`](super::ProcessTreeTerminal::ObservedTaskkill) ports it
+/// because it is the ON-DISK FORMAT and a record written by a Windows build must round-trip. But
+/// `process-terminal.ts:46-53` accepts an observed tree only when
+/// `mechanism === "posix-process-group"`; a `windows-taskkill` tree falls through to `:54`, fails
+/// the `state === "unknown"` test, and is REFUSED. That asymmetry is upstream's, not this port's,
+/// and it is reproduced here deliberately so the two builds agree on exactly the same accept set. A
+/// reader who "fixes" it introduces a divergence in which cyrup accepts a candidate pi rejects.
 ///
 /// `kind` narrows the accept set to one arm — pi's optional second parameter (`:37`), used as
 /// `Some(Runner)` for the runner instance an `observed` proof must carry (`:174`) and as

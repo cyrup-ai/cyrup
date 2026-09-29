@@ -1,3 +1,6 @@
+//! pi `collectBoundedRefinementEvidence` (`agents/agent-refinements.ts:349`) — the bounded,
+//! recent, this-cwd evidence packet the `refine` verb puts in front of a proposal child.
+//!
 //! pi `collectBoundedRefinementEvidence` (`src/agents/agent-refinements.ts:349-424` @v0.68.0) and
 //! the four bounds that make it safe to put in front of a model — `withinAge` (`:292`),
 //! `tailBytes` (`:298`), `pushCapped` (`:304`) and `evidencePacket` (`:337`).
@@ -124,15 +127,14 @@ fn within_age(at_ms: Option<i64>, now_ms: i64) -> bool {
 ///
 /// [CYRUP-DELTA] `tailBytes` (`:298-302`) slices raw bytes and lets `Buffer.toString("utf-8")`
 /// emit U+FFFD for a code point split by the cut;
-/// [`crate::exec::child_protocol::utf8_tail`](crate::exec::child_protocol::utf8_tail) instead
-/// advances off continuation bytes so the tail starts on a character boundary
-/// (`child_protocol.rs`'s `BoundedByteTail::push`). Both cut to at most `max_bytes`; the
-/// difference is at most three bytes and one replacement character. `utf8_tail` is this crate's
-/// single existing port of upstream's own `trimToUtf8Boundary`, and a second boundary walk here is
-/// exactly the duplication that helper exists to prevent. [`evidence_packet`]'s budget is computed
-/// from the ACTUAL serialized item, so the size difference is accounted for rather than assumed
-/// away. `utf8_tail`'s documented `max_bytes == 0` edge is unreachable here: [`MAX_ITEM_BYTES`] is
-/// 2048.
+/// [`crate::exec::child_protocol::utf8_tail`] instead advances off continuation bytes so the tail
+/// starts on a character boundary (`child_protocol.rs`'s `BoundedByteTail::push`). Both cut to at
+/// most `max_bytes`; the difference is at most three bytes and one replacement character.
+/// `utf8_tail` is this crate's single existing port of upstream's own `trimToUtf8Boundary`, and a
+/// second boundary walk here is exactly the duplication that helper exists to prevent.
+/// [`evidence_packet`]'s budget is computed from the ACTUAL serialized item, so the size difference
+/// is accounted for rather than assumed away. `utf8_tail`'s documented `max_bytes == 0` edge is
+/// unreachable here: [`MAX_ITEM_BYTES`] is 2048.
 fn push_capped(items: &mut Vec<RefinementEvidenceItem>, mut item: RefinementEvidenceItem) {
     if items.len() >= MAX_EVIDENCE_ITEMS as usize {
         return;

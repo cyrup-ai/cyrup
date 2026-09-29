@@ -36,7 +36,7 @@
 //!   [`SubagentFleetStatus::handle_key`] and [`SubagentFleetStatus::widget_payload`]. What pi's
 //!   interval does, the owner's poll does; what pi's `onTerminalInput` does, the owner's key
 //!   forwarding does. **That owner is
-//!   [`crate::extension::host::terminal_input`]** (UW-7): it subscribes through
+//!   `crate::extension::host::terminal_input`** (UW-7): it subscribes through
 //!   `InitApi::subscribe_terminal_input`, parses the raw chunk with
 //!   [`FleetStatusKey::from_terminal_data`], calls [`SubagentFleetStatus::handle_key`], and
 //!   republishes — the last of which is the owner's job here where it is inline upstream, see

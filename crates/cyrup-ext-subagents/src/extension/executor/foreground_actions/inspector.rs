@@ -19,9 +19,11 @@
 //! [`crate::tui::fleet::action_result_from_control`], which takes a `Result<String, String>` — pi's
 //! own `firstToolResultText(result, fallback)` (`fleet.ts:324-328`) reduced to the two cases a TUI
 //! can render. So this method flattens the dispatcher's `Result<ToolResult, ToolError>` to its
-//! text exactly as [`Self::control_stop`] does for its own primitive: `Err(ToolError)` — which is
-//! how the frozen contract ports upstream's `isError: true` (`inspectors/types.rs`'s module doc) —
-//! becomes `Err(String)`, and an `Ok` result becomes its concatenated text.
+//! text exactly as
+//! [`SubagentExecutor::control_stop`](crate::extension::SubagentExecutor::control_stop) does for
+//! its own primitive: `Err(ToolError)` — which is how the frozen contract ports upstream's
+//! `isError: true` (`inspectors/types.rs`'s module doc) — becomes `Err(String)`, and an `Ok` result
+//! becomes its concatenated text.
 //!
 //! It does NOT re-implement the verb. Every decision — target resolution, the trusted-directory
 //! gate, backend order, the no-backend refusal — stays in

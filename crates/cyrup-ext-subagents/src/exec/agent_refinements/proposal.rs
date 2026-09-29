@@ -1,3 +1,5 @@
+//! pi `validateRefinementProposal` (`agent-refinements.ts:448`) and the proposal-child plumbing.
+//!
 //! pi `validateRefinementProposal` (`src/agents/agent-refinements.ts:448-472` @v0.68.0) and the
 //! proposal-child plumbing around it: `proposalSchema` (`:474`), `proposalFromChild` (`:502`),
 //! `proposalTask` (`:514`) and `guidanceFromProposal` (`:534`).
@@ -70,7 +72,7 @@ pub(crate) const PROPOSAL_AGENT: &str = "reviewer";
 ///   `disable\u{FEFF}tool`, `acceptance\u{FEFF}instructions` and `skip\u{FEFF}tools`. Adding
 ///   U+FEFF to the class makes the class a strict SUPERSET of ECMAScript's `\s`, so no upstream
 ///   acceptance is lost. Pinned row-by-row by
-///   [`tests::a_zero_width_no_break_space_does_not_evade_the_whitespace_runs`].
+///   `tests::a_zero_width_no_break_space_does_not_evade_the_whitespace_runs`.
 ///
 /// Only `\s`, `\b` and the `.` above are class-like; the remaining alternatives (`tool safety`,
 /// `review gates`, `rewrite base`, `base agent file`, `settings\.json`, `\.pi/agent`) are literal
@@ -84,7 +86,7 @@ pub(crate) const PROPOSAL_AGENT: &str = "reviewer";
 /// One upstream hole is reproduced deliberately: the `\b` immediately before the literal `\.` in
 /// the `\.pi/agent` alternative requires a WORD character to its left, so `edit .pi/agent/foo`
 /// passes while `edit x.pi/agent` blocks. Verified against node on this exact pattern and pinned
-/// by [`tests::the_pi_agent_alternative_reproduces_upstreams_leading_boundary_hole`] so nobody
+/// by `tests::the_pi_agent_alternative_reproduces_upstreams_leading_boundary_hole` so nobody
 /// "fixes" it silently — tightening it needs a lookbehind, which needs `fancy-regex`, which
 /// cannot express `(?-u:\b)`.
 static BLOCKED_GUIDANCE: LazyLock<Regex> = LazyLock::new(|| {

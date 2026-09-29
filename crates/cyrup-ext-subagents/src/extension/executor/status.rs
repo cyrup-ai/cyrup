@@ -803,9 +803,10 @@ impl SubagentExecutor {
     /// `async-job-tracker.ts:759`, none of which has a cyrup counterpart — so the selection
     /// degenerates to `:370` alone. That is a DEGRADATION, not an equivalence: with two live
     /// controls in one session the host's own last-activated one may not be the most recently
-    /// updated. [`ForegroundControlEntry::updated_at`] is bumped on every control-event
-    /// transition, so the fallback is the sharpest signal in the tree today; porting the field is
-    /// a separate task with its own writers.
+    /// updated.
+    /// [`ForegroundControlEntry::updated_at`](crate::extension::executor::notices::ForegroundControlEntry::updated_at)
+    /// is bumped on every control-event transition, so the fallback is the sharpest signal in the
+    /// tree today; porting the field is a separate task with its own writers.
     ///
     /// The run-id tie-break is cyrup's: upstream's `sort` is stable over a `Map`'s insertion
     /// order, and a `HashMap` has none, so ties resolve ascending by id rather than

@@ -1,3 +1,6 @@
+//! VL-S11 R3 — the `pi.registerShortcut` half of `/subagents-detach`
+//! (`slash/slash-commands.ts:1007-1012`).
+//!
 //! The extension's keyboard-shortcut surface — pi `pi.registerShortcut(options.foregroundDetachShortcut
 //! as KeyId, { description, handler })` (`slash/slash-commands.ts:1007-1012` @v0.68.0).
 //!

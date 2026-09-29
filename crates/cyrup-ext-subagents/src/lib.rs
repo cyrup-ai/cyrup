@@ -34,10 +34,7 @@ pub mod fork_context;
 /// The crate's single port of pi's `shared/formatters.ts` (`formatTokens`,
 /// `formatModelThinking`, the run-mode label) — see [`formatters`].
 pub mod formatters;
-/// The parallel-handoff manifest: the coordination layer over a worktree fan-out. See
-/// [`handoff`].
 pub mod handoff;
-/// The herdr status bridge: cyrup's fleet state in herdr's sidebar. See [`herdr`].
 pub mod herdr;
 pub mod identity;
 pub mod inspectors;
@@ -47,13 +44,11 @@ pub mod native_supervisor;
 /// The crate's single port of pi's `shared/utils.ts` path helpers: the `CYRUP_HOME` -> `HOME` ->
 /// tempdir home ladder, `getAgentDir()` and `getProjectConfigDir()`. See [`paths`].
 pub mod paths;
-/// SUBA-100 — Herdr saved-machine placement: run a subagent on a machine saved in herdr.
 pub mod placement;
 pub mod prompt_runtime;
 pub mod registration;
 pub mod runner;
 pub mod spawn;
-/// The crate's single epoch-millisecond clock (`Date.now()`). See [`time`].
 pub mod time;
 pub mod tui;
 pub mod watchdog;

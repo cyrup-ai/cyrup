@@ -238,7 +238,7 @@ pub(crate) use crate::time::format_iso8601_millis;
 /// reduced to the three facts S6 tests plus the one its rendered line interpolates.
 ///
 /// `run_id` is a FIELD here because it is the `foreground_controls` MAP KEY on the cyrup side:
-/// [`crate::extension::executor::notices::ForegroundControlEntry`] carries no run id of its own
+/// `crate::extension::executor::notices::ForegroundControlEntry` carries no run id of its own
 /// (pi's `ForegroundRunControl.runId` is a field), which is the same reason
 /// `extension/executor/workflow_steering.rs` carries a `control_run_id` beside its cloned entry.
 ///
@@ -294,7 +294,7 @@ pub struct LiveWorkflowControl {
 /// entry point is [`inspect_status_by_id`], which RESOLVES the selector (an id, or a unique
 /// directory-name prefix) to a [`RunId`] inside this module — so at the moment the executor builds
 /// these deps there is no run id yet to ask about. A snapshot of
-/// [`crate::extension::executor::workflow_controllers`]' keys answers the same question at the
+/// `crate::extension::executor::workflow_controllers`' keys answers the same question at the
 /// same instant, and `contains` at the seam below IS `has`.
 ///
 /// `Default::default()` is upstream's `deps.state === undefined`: every optional chain
@@ -347,7 +347,7 @@ impl RunStatusRenderDeps {
     /// status does not name.
     ///
     /// The sibling gate at `run-status.ts:249` IS `SessionGate::Strict` — see
-    /// [`crate::extension::executor`]'s live-foreground transcript refusal. These are different
+    /// `crate::extension::executor`'s live-foreground transcript refusal. These are different
     /// gates with different classes and the difference is upstream's, not cyrup's.
     ///
     /// # The two comparisons are against two DIFFERENT objects

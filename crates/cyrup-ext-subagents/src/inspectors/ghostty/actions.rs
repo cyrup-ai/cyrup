@@ -13,16 +13,17 @@
 //! [`crate::inspectors::plugins::GhosttyRunner`]: [`GHOSTTY_APPLESCRIPT`], the argv builder and
 //! [`open_ghostty_inspector`] are platform-independent, and only [`OsascriptRunner`] ever touches
 //! `/usr/bin/osascript`. Nothing here is `#[cfg]`-ed out — the platform gate lives in
-//! [`super::plugin::GhosttyInspectorPlugin::available`], exactly where upstream puts it.
+//! [`super::plugin::GhosttyInspectorPlugin::available`](crate::inspectors::ghostty::plugin::GhosttyInspectorPlugin#method.available),
+//! exactly where upstream puts it.
 //!
 //! # `[CYRUP-DELTA: the runner's error channel carries a CODE, not upstream's `cause.message`]`
 //!
 //! Upstream's catch renders `Ghostty inspector error: ${cause.message}. ${hint}`
 //! (`ghostty/actions.ts:70-72`) where `cause` is Node's `execFile` rejection — which fires for a
 //! spawn failure, a timeout **and** a non-zero exit, and whose `message` carries the real text.
-//! The FROZEN [`GhosttyRunner`](crate::inspectors::plugins::GhosttyRunner) returns
-//! `Result<CommandOutput, HerdrErrorCode>`: a bare code with no message. So this module recovers
-//! upstream's text where the information still exists and renders the code where it does not:
+//! The FROZEN [`GhosttyRunner`] returns `Result<CommandOutput, HerdrErrorCode>`: a bare code with
+//! no message. So this module recovers upstream's text where the information still exists and
+//! renders the code where it does not:
 //!
 //! * **Non-zero exit** — the realistic AppleScript failure (no Automation permission, no front
 //!   window, Ghostty below 1.3). [`OsascriptRunner`] returns `Ok` with the captured stderr, and

@@ -934,10 +934,10 @@ impl ModelTurnReviewAgent {
     /// not a second copy that can drift from the one the agent runs under: gutting it guts the
     /// running turn. It is `pub` because the layer it guards is unreachable end to end — cyrup's
     /// nested agent gets its tool list from [`Self::turn_request`] and nowhere else, so a tool the
-    /// permit list rejects is a tool the agent does not have and the loop answers "Tool <name> not
-    /// found" before any hook runs (`cyrup-agent`'s `agent/run/tools/preflight.rs:17`, where the
-    /// lookup precedes `before_tool_call`). An out-of-crate test therefore has to reach the policy
-    /// here to assert the sentence a blocked call produces.
+    /// permit list rejects is a tool the agent does not have and the loop answers "Tool `<name>`
+    /// not found" before any hook runs (`cyrup-agent`'s `agent/run/tools/preflight.rs:17`, where
+    /// the lookup precedes `before_tool_call`). An out-of-crate test therefore has to reach the
+    /// policy here to assert the sentence a blocked call produces.
     #[must_use]
     #[allow(clippy::type_complexity)]
     pub fn tool_call_block_reason(&self) -> Arc<dyn Fn(&str) -> Option<String> + Send + Sync> {

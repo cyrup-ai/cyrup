@@ -1344,7 +1344,7 @@ Every line below is checkable by reading the tree or by one `grep`. No fixture, 
 benchmark.
 
 **Builds clean.** `cargo check --workspace --all-targets` and
-`cargo doc --workspace --no-deps --bins` both exit 0 — the latter matters because
+`cargo doc --workspace --no-deps` both exit 0 — the latter matters because
 `.cargo/config.toml` sets `--document-private-items` and the workspace denies
 `rustdoc::broken_intra_doc_links`. No `unwrap`/`expect`/`panic`/indexing was introduced (all four are
 `deny`).

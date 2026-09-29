@@ -2359,7 +2359,7 @@ impl AltScreenKeymap {
     ///
     /// Under [`TuiRenderMode::Regular`] this answers `None` for every event, including the four
     /// chords the table binds, so an inline session's `pageUp` still reaches
-    /// [`EditorAction::PageUp`] and [`Action::PageUp`], and its `home`/`end` still reach
+    /// [`EditorAction::PageUp`], and its `home`/`end` still reach
     /// [`EditorAction::CursorLineStart`]/[`EditorAction::CursorLineEnd`]. Under
     /// [`TuiRenderMode::Fullscreen`] it is [`Self::action_for`], and the alternate screen's
     /// dispatcher resolves it ahead of the editor — which is where upstream's precedence comes

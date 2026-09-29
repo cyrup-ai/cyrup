@@ -1,7 +1,10 @@
+//! SUBA-124 — the two MCP-server sources `loadMcpConfig` merges beside the `mcp.json` ladder
+//! (settings `packages`, `settings.agentPluginPaths`). Upstream's own file split.
+//!
 //! SUBA-124 — a faithful port of pi-subagents' `runs/shared/mcp-config-sources.ts` @v0.71.0: the
 //! two MCP-server sources `loadMcpConfig` merges BESIDE the `mcp.json` ladder.
 //!
-//! [`crate::exec::mcp_direct_tools::load_mcp_config`] used to read only the `mcp.json` files and
+//! `crate::exec::mcp_direct_tools::load_mcp_config` used to read only the `mcp.json` files and
 //! their imports, so a child granted `mcp:<server>` for a server contributed by a settings
 //! `packages` entry or by an `agentPluginPaths` plugin resolved to **no tools at all**, silently:
 //! `resolve_direct_tool_names` skips a selection whose server is absent from the config with no

@@ -110,7 +110,7 @@ fn is_persistable(run: &ForegroundHistoryRun) -> bool {
 /// session's last ordinary foreground settle was not restorable across a restart. This is what it
 /// calls.
 ///
-/// [`SubagentExecutor::persist_foreground_run_history`] delegates here, so the two entry points
+/// [`SubagentExecutor::persist_foreground_run_history_for`] delegates here, so the two entry points
 /// cannot drift in what they merge, what they bound, or what they refuse to write.
 pub(crate) fn persist_foreground_run_history_from(
     foreground_runs: &std::sync::Mutex<HashMap<RunId, ForegroundHistoryRun>>,

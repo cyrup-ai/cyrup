@@ -18,10 +18,10 @@
 //! ```
 //!
 //! `blocked` outranks `working` because a cyrup that is blocked is *also* mid-turn — the
-//! permission dialog is raised from inside a tool call, so [`Self::edge_depth`] is non-zero the
-//! whole time it is up. Ranking `working` first would mean the pane never says `blocked` at all,
-//! and `blocked` is the reason this feature exists: it is the signal that tells herdr's sidebar
-//! which pane needs the human.
+//! permission dialog is raised from inside a tool call, so [`StateModel::edge_depth`] is non-zero
+//! the whole time it is up. Ranking `working` first would mean the pane never says `blocked` at
+//! all, and `blocked` is the reason this feature exists: it is the signal that tells herdr's
+//! sidebar which pane needs the human.
 //!
 //! # The two states this machine never produces
 //!
@@ -47,12 +47,12 @@
 //! 1. **The root turn and foreground runs** are *edges* — [`StateModel::agent_start`] /
 //!    [`StateModel::agent_end`] and [`StateModel::foreground_run_started`] /
 //!    [`StateModel::foreground_run_finished`] — folded into one refcount,
-//!    [`Self::edge_depth`]. Refcounted rather than a boolean precisely so **a finishing child
+//!    [`StateModel::edge_depth`]. Refcounted rather than a boolean precisely so **a finishing child
 //!    does not flip the pane idle mid-turn**: the pane only needs the sign of the count, and one
 //!    of several concurrent runs ending must not take it to zero.
-//! 2. **Background runs** are a *level*, [`Self::active_background_runs`], recomputed at every
-//!    resync from the fleet projection. A detached runner started by a previous cyrup process is
-//!    still going and will never deliver a "started" edge to this one, so an edge count could
+//! 2. **Background runs** are a *level*, [`StateModel::active_background_runs`], recomputed at
+//!    every resync from the fleet projection. A detached runner started by a previous cyrup process
+//!    is still going and will never deliver a "started" edge to this one, so an edge count could
 //!    never see it; a level always does.
 //!
 //! Every decrement saturates. `agent_end` without a matching `agent_start` is a shape this

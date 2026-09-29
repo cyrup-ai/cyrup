@@ -196,7 +196,7 @@ pub use utils::simple_options::{
     clamp_max_tokens_to_context, clamp_reasoning,
 };
 /// PROV-083a — the transcript replay surface. `normalize_context` is the only constructor of a
-/// [`TranscriptContext`](utils::transcript::TranscriptContext), so the whole module is re-exported
+/// [`TranscriptContext`], so the whole module is re-exported
 /// at the root beside `estimate` and `simple_options`, the other 1:1 `utils/*` ports.
 pub use utils::text::{
     content_text, content_text_default, get_system_message_text, render_system_message_update,

@@ -2303,7 +2303,7 @@ Source-observable. Each line is checkable by reading the tree.
 
 **Whole-tree**
 
-- [ ] `cargo check --workspace --all-targets` and `cargo doc --workspace --no-deps --bins` both exit 0.
+- [ ] `cargo check --workspace --all-targets` and `cargo doc --workspace --no-deps` both exit 0.
       The second matters: `.cargo/config.toml` sets `--document-private-items` and the workspace denies
       `rustdoc::broken_intra_doc_links`, which is the lint that made the new module `live.rs` and not
       `env.rs`.

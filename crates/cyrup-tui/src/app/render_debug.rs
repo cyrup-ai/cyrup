@@ -22,7 +22,8 @@
 //! # `[CYRUP-DELTA]` what a "full redraw" and a "line" are here
 //!
 //! cyrup's inline renderer is ratatui's diffing `Terminal`, not pi's hand-rolled line differ, so the
-//! events and fields are the ones cyrup's frame path actually has ([`App::draw`]):
+//! events and fields are the ones cyrup's frame path actually has
+//! ([`App::draw`](crate::app::App::draw)):
 //!
 //! * A full redraw is anything that repaints the whole inline region instead of diffing it: the
 //!   first frame, a terminal WIDTH or HEIGHT change (ratatui's autoresize clears the viewport), and
@@ -52,7 +53,7 @@ pub const FRAME_DUMP_DIR: &str = "/tmp/tui";
 pub const REDRAW_LOG_FILE: &str = "cyrup-tui-debug.log";
 
 /// Where each instrument writes, or `None` when it is off. The default is both off, which is what an
-/// [`App`] the composition root never configures behaves as.
+/// [`App`](crate::app::App) the composition root never configures behaves as.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RenderDebug {
     /// `CYRUP_TUI_DEBUG=1` → [`FRAME_DUMP_DIR`].

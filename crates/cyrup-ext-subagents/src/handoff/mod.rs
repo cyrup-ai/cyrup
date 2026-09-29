@@ -1,3 +1,6 @@
+//! The parallel-handoff manifest: the coordination layer over a worktree fan-out. See
+//! [`handoff`](crate::handoff).
+//!
 //! The parallel-handoff manifest — the coordination layer over a worktree fan-out.
 //!
 //! Port of pi `src/runs/shared/parallel-handoff.ts` @`v0.68.0` (741 lines, read in full). A

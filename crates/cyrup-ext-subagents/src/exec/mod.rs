@@ -41,14 +41,10 @@ pub mod agent_refinements;
 pub mod capability_ceiling;
 pub mod child_protocol;
 pub mod child_session_name;
-/// The live `_transcript.jsonl` writer fed from the parsed child-event stream (pi
-/// `shared/child-transcript.ts`).
 pub mod child_transcript;
 pub mod control;
 pub mod fallback;
 pub mod launch_cwd;
-/// SUBA-124 — the two MCP-server sources `loadMcpConfig` merges beside the `mcp.json` ladder
-/// (settings `packages`, `settings.agentPluginPaths`). Upstream's own file split.
 mod mcp_config_sources;
 pub mod mcp_direct_tools;
 pub mod model_exclusions;
@@ -59,8 +55,6 @@ pub mod ndjson;
 pub mod output;
 pub mod output_state;
 pub mod permissions;
-/// pi `collectBoundedRefinementEvidence` (`agents/agent-refinements.ts:349`) — the bounded,
-/// recent, this-cwd evidence packet the `refine` verb puts in front of a proposal child.
 pub mod refinement_evidence;
 pub mod result_summary;
 pub mod spawn_budget;
@@ -103,8 +97,6 @@ pub mod run_fanout_budget;
 /// half; [`agent_config`] is the input-contract half).
 pub mod run_result;
 
-/// SUBA-063 — the runtime-acknowledged-extensions protocol (child collector, file hand-back,
-/// parent read-back and sanitizer).
 pub mod runtime_acknowledged_extensions;
 
 /// Pure computation of *what to spawn* for one model-fallback attempt: argv/env/system-prompt

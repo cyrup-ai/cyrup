@@ -1,3 +1,7 @@
+//! The nested single-turn `Agent` both the review and the permission arbiter run — upstream's
+//! `new Agent({…}); await agent.prompt(…)`, expressed once. Pinned to **v0.68.0**, unlike the
+//! v0.43.0 modules around it; see "Tag pinning" below.
+//!
 //! The nested single-turn `Agent` both watchdog seams run — upstream's
 //! `new Agent({ … }); await agent.prompt(…)`.
 //!

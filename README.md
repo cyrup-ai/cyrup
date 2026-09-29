@@ -293,7 +293,7 @@ cargo clippy -p cyrup-ext-sdk --target wasm32-wasip2   # --workspace does not re
 cargo clippy -p cyrup-it --features it --all-targets   # nor the gated harness
 cargo nextest run --workspace --features test-fixtures # 11,311 tests, 9 skipped
 cargo run -p xtask -- feature-matrix                   # non-default feature combos, and runs the integration suite
-cargo doc --workspace --no-deps --bins                 # rustdoc links are denied, not warned
+cargo doc --workspace --no-deps                        # every lib and bin; rustdoc links are denied
 ```
 
 Run clippy. The no-panic policy is expressed as `[workspace.lints.clippy]` denials, and clippy tool

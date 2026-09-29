@@ -242,7 +242,7 @@ pub(crate) struct ForegroundChildEntry {
 /// `workflow_steering.rs`'s delivery arm does `target.control.active_children.get(&index)` and then
 /// `child.steer.as_ref()`, and [`crate::extension::executor::workflow::WorkflowRunHost`]'s
 /// `runs.steer` mints its own handle from the index it launched the key at. A
-/// [`ForegroundControlEntry::steer`] added today would be written on every control event and read
+/// `ForegroundControlEntry::steer` added today would be written on every control event and read
 /// nowhere, which `dead_code` reports and which this module already refuses once above for
 /// `finishForegroundChild`: ports land WITH their first call site, never ahead of one.
 ///

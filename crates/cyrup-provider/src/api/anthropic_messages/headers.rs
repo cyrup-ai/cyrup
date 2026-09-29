@@ -64,7 +64,7 @@ fn should_use_fine_grained_beta(model: &Model, ctx: &Context) -> bool {
 /// `(model.compat?.allowedFallbackModels?.length ?? 0) > 0`).
 ///
 /// Read straight off `model.compat` rather than through
-/// [`get_anthropic_compat`](super::compat::get_anthropic_compat): pi's `getAnthropicCompat`
+/// [`get_anthropic_compat`]: pi's `getAnthropicCompat`
 /// (`:206-220`) does NOT resolve this key either — both of its readers (this predicate and
 /// `buildParams` `:1199-1201`) go to `model.compat` directly, because the value is a list with no
 /// default rather than a flag with one.

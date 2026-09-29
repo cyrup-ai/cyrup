@@ -634,10 +634,10 @@ impl SubagentExecutor {
     /// about to do all of it against the real result.
     ///
     /// cyrup's equivalent of `workflowAwaitDetached` is
-    /// [`ForegroundRunRequest::parent_workflow_run_id`](crate::extension::executor::ForegroundRunRequest::parent_workflow_run_id)
+    /// [`ForegroundRunRequest::parent_workflow_run_id`](crate::extension::executor::requests::ForegroundRunRequest::parent_workflow_run_id)
     /// being `Some`, whose ONE production writer is `WorkflowRunHost::launch` (`workflow.rs`) —
-    /// i.e. precisely the launches upstream stamps the flag on. No new request field is
-    /// introduced for a boolean that would be a function of one already carried.
+    /// i.e. precisely the launches upstream stamps the flag on. No new request field is introduced
+    /// for a boolean that would be a function of one already carried.
     ///
     /// # What the human still gets, either way
     ///
@@ -793,8 +793,8 @@ impl SubagentExecutor {
     ///
     /// Returns `false` only when [`SubagentExecutor::remember_foreground_run`] declined to record
     /// the run, which it does for exactly one reason: no `current_session_id`, which
-    /// [`ForegroundHistoryRun`](crate::extension::executor::foreground_history::ForegroundHistoryRun)'s
-    /// required `session_id` makes unrepresentable rather than merely unchecked.
+    /// [`ForegroundHistoryRun`]'s required `session_id` makes unrepresentable rather than merely
+    /// unchecked.
     ///
     /// The stamp itself is here and not inside `remember_foreground_run` because cyrup's
     /// [`SingleResult`] carries no `output_save_error` field to thread it through — see

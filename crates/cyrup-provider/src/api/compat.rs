@@ -533,7 +533,7 @@ pub struct ModelCompat {
     /// one request-level `output_config.effort`. Default **false**.
     ///
     /// Read STRAIGHT off `model.compat` — never through
-    /// [`get_anthropic_compat`](crate::api::anthropic_messages::compat) — because pi's
+    /// `get_anthropic_compat` — because pi's
     /// `getAnthropicCompat` (`anthropic-messages.ts:206-220`) does not resolve it either: all of its
     /// readers (`:521`, `:1028`, `:1061`, `:1069`, `:1108`, `:1153`) go directly to `model.compat`,
     /// exactly as [`Self::allowed_fallback_models`] does. Setting it also pins

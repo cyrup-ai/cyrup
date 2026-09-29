@@ -40,7 +40,7 @@ pub(crate) const EXCLUSIONS_FILE_NAME: &str = "model-exclusions.json";
 ///
 /// The env value is TRIMMED and a set-but-blank value falls through to the default, which is
 /// upstream's own `typeof envPath === "string" && envPath.trim()` rule (`:95`) and the same rule
-/// [`crate::background::artifact_roots::temp_root_dir_from`] applies for the reason stated there:
+/// [`crate::background::temp_root_dir_from`] applies for the reason stated there:
 /// `PathBuf::from("")` is the RELATIVE empty path, so a blank override would root the store at the
 /// process working directory rather than anywhere a later run could find it.
 #[must_use]

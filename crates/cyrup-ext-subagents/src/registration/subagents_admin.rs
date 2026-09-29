@@ -1,3 +1,5 @@
+//! VL-S11a — the `/subagents` admin surface (pi `src/slash/subagents-admin.ts` @v0.68.0).
+//!
 //! VL-S11a — `/subagents`, the admin surface. Port of pi `src/slash/subagents-admin.ts` @v0.68.0
 //! (460 lines), registered at `slash-commands.ts:869-875` with upstream's own description
 //! (*"Administer subagents: inspect metadata and update models, thinking, or prompts"*) and the
@@ -6,7 +8,7 @@
 //! Every function below names the upstream symbol and its v0.68.0 line. The shapes this module
 //! exports — [`EditableOverrideField`] (`:117`), [`AgentSelection`] (`:119-123`),
 //! [`AdminAction`] (`:418-423`) and [`SubagentsAdminError`] (`readOnlyAgentMessage`, `:150-160`) —
-//! are the ones the slash handler [`crate::extension::host::SubagentsExtension::slash_subagents`]
+//! are the ones the slash handler [`crate::extension::SubagentsExtension::slash_subagents`]
 //! drives.
 //!
 //! ## The three seams where cyrup's primitives differ from pi's, and what was done instead

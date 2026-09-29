@@ -59,7 +59,6 @@ pub mod profiles;
 pub mod prompt_workflows;
 pub mod resources;
 pub mod slash_commands;
-/// VL-S11a — the `/subagents` admin surface (pi `src/slash/subagents-admin.ts` @v0.68.0).
 pub(crate) mod subagents_admin;
 pub mod tool_description;
 
@@ -476,7 +475,7 @@ pub struct SubagentExtensionConfig {
     /// `/subagents-detach` remains reachable as a command either way. The empty string is the same
     /// falsy value and means the same thing; it is also how a user turns the chord back OFF at this
     /// tier after setting it, without falling through to
-    /// [`crate::extension::host::shortcuts::FOREGROUND_DETACH_SHORTCUT_ENV`].
+    /// `crate::extension::host::shortcuts::FOREGROUND_DETACH_SHORTCUT_ENV`.
     ///
     /// **This tier OUTRANKS that env var**, which is the `[CYRUP-DELTA]` lower rung and the crate's
     /// only pre-existing home for the key. The order is upstream's own: the chord IS a settings
@@ -484,7 +483,7 @@ pub struct SubagentExtensionConfig {
     /// must be a valid keybinding string such as \"ctrl+b\""*), and the env var is cyrup's
     /// addition for a caller that cannot edit `config.json`. A configured setting must therefore be
     /// what a machine-wide exported variable cannot silently override. Resolved by
-    /// [`crate::extension::host::SubagentsExtension::foreground_detach_shortcut`], which is where
+    /// [`crate::extension::SubagentsExtension::foreground_detach_shortcut`], which is where
     /// both rungs and the trimming live.
     ///
     /// Carried as a plain `Option<String>` rather than validated here: the resolver trims and

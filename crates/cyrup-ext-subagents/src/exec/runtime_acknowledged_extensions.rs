@@ -1,3 +1,6 @@
+//! SUBA-063 — the runtime-acknowledged-extensions protocol (child collector, file hand-back,
+//! parent read-back and sanitizer).
+//!
 //! SUBA-063 — the runtime-acknowledged-extensions protocol: how a subagent CHILD tells its parent
 //! which extensions actually registered inside it, and how the parent reads that back onto the
 //! child's result.

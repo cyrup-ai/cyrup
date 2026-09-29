@@ -1,3 +1,5 @@
+//! SUBA-100 — Herdr saved-machine placement: run a subagent on a machine saved in herdr.
+//!
 //! SUBA-100 — Herdr saved-machine placement: run a subagent on a machine the operator saved in
 //! herdr (`herdr machine add me@gpu-box --label gpu-box`), not on this one.
 //!

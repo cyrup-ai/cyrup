@@ -1376,16 +1376,19 @@ pub async fn diff_worktrees(
 ///
 /// `intent` says why removal is running, and it decides BOTH which gate a worktree that still
 /// holds work must clear and what a FAILED removal records:
-/// * [`WorktreeCleanupIntent::Preserve`] — the ordinary post-harvest path. A worktree holding
-///   work is removed only if the harvest's [`PreserveEvidence`](crate::handoff::PreserveEvidence)
+/// * [`WorktreeCleanupIntent::Preserve`](crate::handoff::WorktreeCleanupIntent::Preserve) — the
+///   ordinary post-harvest path. A worktree holding work is removed only if the harvest's
+///   [`PreserveEvidence`](crate::handoff::PreserveEvidence)
 ///   proves the work survives it (see [`refuse_uncaptured_preserve`]); otherwise it is kept. A
 ///   task that did not fully remove keeps `preserved: true`, so a later `worktree.cleanup` plan
 ///   still sees it.
-/// * [`WorktreeCleanupIntent::Discard`] — an operator authorized removal; a worktree holding work
-///   must clear pi's SECOND authority consult, and a task that did not fully remove is reported
-///   with pi's `discard cleanup remains incomplete` reason (`:711`).
-/// * [`WorktreeCleanupIntent::SetupRollback`] — allocation failed before any child ran, so there
-///   is nothing to preserve and no probe runs at all (pi `:1171`).
+/// * [`WorktreeCleanupIntent::Discard`](crate::handoff::WorktreeCleanupIntent::Discard) — an
+///   operator authorized removal; a worktree holding work must clear pi's SECOND authority consult,
+///   and a task that did not fully remove is reported with pi's
+///   `discard cleanup remains incomplete` reason (`:711`).
+/// * [`WorktreeCleanupIntent::SetupRollback`](crate::handoff::WorktreeCleanupIntent::SetupRollback)
+///   — allocation failed before any child ran, so there is nothing to preserve and no probe runs at
+///   all (pi `:1171`).
 pub async fn cleanup_worktrees(
     setup: &WorktreeSetup,
     intent: &crate::handoff::WorktreeCleanupIntent,
@@ -1557,8 +1560,9 @@ async fn probe_worktree_work(setup: &WorktreeSetup, worktree: &WorktreeInfo) -> 
 /// * there IS work, the intent is `discard`, and the authorization does not clear it
 ///   (`:1232-1252`).
 ///
-/// [`WorktreeCleanupIntent::SetupRollback`] skips all three (pi `:1171`): allocation failed before
-/// any child ran, so the only thing in those worktrees is the allocation this call is unwinding.
+/// [`WorktreeCleanupIntent::SetupRollback`](crate::handoff::WorktreeCleanupIntent::SetupRollback)
+/// skips all three (pi `:1171`): allocation failed before any child ran, so the only thing in those
+/// worktrees is the allocation this call is unwinding.
 async fn refuse_unsafe_cleanup(
     setup: &WorktreeSetup,
     worktree: &WorktreeInfo,

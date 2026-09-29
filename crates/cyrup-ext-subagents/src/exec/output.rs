@@ -1250,10 +1250,10 @@ pub fn inject_output_path_system_prompt(
 /// `async-execution.ts:711,1289` @v0.43.0 — never on `outputMode`, which is consulted only by
 /// `validateFileOnlyOutputMode` and by delivery-side `finalizeSingleOutput`.
 ///
-/// Its `**Output:**` header is one of the lines [`crate::exec::task_intent`]'s
-/// `stripFrameworkInstructions` port removes before classification, so an injected output
-/// instruction never contributes write-intent signal to the task it was appended to. That is the
-/// concrete reason this function, and not the `Runtime output path override:`-prefixed
+/// Its `**Output:**` header is one of the lines the `stripFrameworkInstructions` port (the former
+/// `crate::exec::task_intent`, deleted in SUBA-107) removed before classification, so an injected
+/// output instruction never contributed write-intent signal to the task it was appended to. That
+/// is the concrete reason this function, and not the `Runtime output path override:`-prefixed
 /// [`build_output_path_system_prompt_instruction`], is what belongs in the task text: the latter's
 /// header is NOT one of `stripFrameworkInstructions`' alternatives.
 #[must_use]

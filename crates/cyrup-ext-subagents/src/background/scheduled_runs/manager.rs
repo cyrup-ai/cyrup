@@ -43,7 +43,7 @@ use super::trigger::{SCHEDULE_TICK, ScheduleFireContext};
 /// The manager's home on the executor — one slot, shared by every reader.
 ///
 /// `Arc<Mutex<Option<…>>>` rather than a bare `Option` for the reason
-/// [`crate::extension::executor::wait_subscriptions::WaitSubscriptionSlot`] gives: the tool arm
+/// `crate::extension::executor::wait_subscriptions::WaitSubscriptionSlot` gives: the tool arm
 /// must reach whichever manager is current at DISPATCH time, not whichever one existed when the
 /// tool was built, and the two are re-created on independent `SessionStart` edges.
 pub type ScheduledRunSlot = Arc<Mutex<Option<Arc<ScheduledRunManager>>>>;
@@ -226,7 +226,7 @@ impl ScheduledRunManager {
     /// deleted.
     ///
     /// Read at SWEEP time, never snapshotted at install, for the reason
-    /// [`crate::extension::executor::notices`]'s own doc gives for the other two sources: a set
+    /// `crate::extension::executor::notices`'s own doc gives for the other two sources: a set
     /// captured a minute ago protects the runs that were live then and leaves every run fired
     /// since unprotected, which is exactly the reap this must never perform.
     ///

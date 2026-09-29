@@ -1712,7 +1712,7 @@ no version bump (**C-4**).
 
 Structural, greppable, and checkable without running a suite.
 
-1. `cargo check --workspace --all-targets` exits 0 and `cargo doc --workspace --no-deps --bins`
+1. `cargo check --workspace --all-targets` exits 0 and `cargo doc --workspace --no-deps`
    exits 0 (`--document-private-items` is on; `rustdoc::broken_intra_doc_links` is `deny`).
 2. `crates/cyrup-mcp/src/` contains **four new modules** — `sampling.rs`, `elicitation.rs`,
    `schema.rs`, `trace.rs` — each declared in `lib.rs` and each opening with a module doc that cites

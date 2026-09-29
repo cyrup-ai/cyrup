@@ -1,3 +1,5 @@
+//! The two-phase worktree cleanup PLAN — the read-only half of `worktree.cleanup`.
+//!
 //! The two-phase worktree cleanup PLAN — pi `src/runs/shared/worktree-cleanup-plan.ts` @`v0.68.0`
 //! (869 lines, read in full).
 //!
