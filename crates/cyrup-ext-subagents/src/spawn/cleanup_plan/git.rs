@@ -17,6 +17,9 @@ use crate::spawn::worktree::GitResult;
 /// which is exactly pi's `{ status: null, error }` shape and keeps every caller's
 /// "exit 0 or 1?" logic honest.
 pub(crate) async fn run(cwd: &Path, args: &[&str]) -> GitResult {
+    // `run_git` is the unbounded entry point: the plan builder is an operator action with no run
+    // context, so there is no deadline or stop token to honour (upstream's `runGit` here is an
+    // unbounded `spawnSync` too). The process-group kill and the output cap still apply.
     match crate::spawn::worktree::run_git(cwd, args).await {
         Ok(result) => result,
         Err(err) => GitResult {

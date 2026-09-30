@@ -6,9 +6,11 @@
 //! Pi gets this for free from ordering. The cache-only restore is part of runtime CREATION —
 //! `agent-session-services.ts:180` `await modelRuntime.refresh({ allowNetwork: false })`, reached
 //! from `createAgentSessionRuntime` at `main.ts:793` — and the `--list-models` exit is downstream of
-//! it at `main.ts:816`. The NETWORK refresh is downstream of the exit instead (`main.ts:863-866`),
-//! so `pi --list-models` shows the cached overlay and issues no request. cyrup must land in the same
-//! place: the disk-only restore before the early return, the detached revalidation after it.
+//! it at `main.ts:866-871` @v0.87.1. The NETWORK refresh is downstream of the exit instead
+//! (`main.ts:920-928`), so `pi --list-models` shows the cached overlay and issues no request. cyrup
+//! lands in the same place: the disk-only restore in `main`, the listing exit in
+//! `session_launch::launch` once the runtime exists (SEAM-135), the detached revalidation gated off
+//! for a listing run.
 //!
 //! **No network.** The store is written directly, exactly as a completed refresh would have left it,
 //! and the child runs with `CYRUP_OFFLINE=1` so the revalidation phase is gated off in any case. The

@@ -323,10 +323,18 @@ impl<B: Backend> App<B> {
         // lands here rather than in the sync fold for the same reason the compaction flush above
         // does: the scan is an async session call and `ingest_event` holds no session. Position is
         // still pi's — on the SAME event, so the notice precedes any tool row of the next event.
-        if std::mem::take(&mut self.state.cache_miss_check_pending)
-            && let Some(miss) = session.last_cache_miss().await
-        {
-            self.state.transcript.push_cache_miss_notice(&miss);
+        //
+        // TUI-117 — pi runs `maybeShowThinkingDropNotice` immediately BEFORE the cache-miss check,
+        // on the same clean branch and behind the same `getShowCacheMissNotices()` gate
+        // (`interactive-mode.ts:3468-3469` @v0.87.1), so it rides the same flag and keeps that order.
+        if std::mem::take(&mut self.state.cache_miss_check_pending) {
+            let (previous, current) = session.thinking_drop_counts().await;
+            self.state
+                .transcript
+                .push_thinking_drop_notice(previous, current);
+            if let Some(miss) = session.last_cache_miss().await {
+                self.state.transcript.push_cache_miss_notice(&miss);
+            }
         }
         // `autoCompactionEnabled` is a plain `bool` read with no session walk behind it, and
         // upstream's THIRD `setAutoCompactEnabled` call site is a settings toggle rather than a turn

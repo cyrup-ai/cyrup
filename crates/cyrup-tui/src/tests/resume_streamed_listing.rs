@@ -37,13 +37,13 @@ use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, SessionLayo
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
 
-struct Fixture {
+pub(super) struct Fixture {
     _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
+    pub(super) cwd: PathBuf,
+    pub(super) agent_dir: PathBuf,
 }
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let tmp = TempDir::new().unwrap();
     let cwd = tmp.path().join("project");
     let agent_dir = tmp.path().join("agent");
@@ -64,13 +64,13 @@ async fn session(fx: &Fixture) -> Arc<AgentSession> {
 }
 
 /// The current folder's session directory — the one `/resume`'s first loader lists.
-fn session_dir(fx: &Fixture) -> PathBuf {
+pub(super) fn session_dir(fx: &Fixture) -> PathBuf {
     let dir = SessionLayout::new(fx.agent_dir.join("sessions"), fx.cwd.clone()).dir();
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-fn session_lines(id: &str, cwd: &Path, text: &str) -> String {
+pub(super) fn session_lines(id: &str, cwd: &Path, text: &str) -> String {
     let header = serde_json::json!({
         "type": "session", "version": 3, "id": id,
         "timestamp": "2026-08-09T10:00:00Z", "cwd": cwd.display().to_string(),
@@ -89,7 +89,7 @@ fn session_lines(id: &str, cwd: &Path, text: &str) -> String {
 /// A guard thread is the FIFO's only writer. It writes when released — or, after a long backstop,
 /// on its own, so a listing wrongly run on the caller's thread still finishes (and the test fails
 /// on `released_early`) instead of hanging the suite.
-struct Blocker {
+pub(super) struct Blocker {
     release_tx: std::sync::mpsc::Sender<()>,
     /// Set by the guard just before it opens the FIFO: the listing can only have got past the FIFO
     /// once this is `true`.
@@ -98,7 +98,7 @@ struct Blocker {
 }
 
 impl Blocker {
-    fn new(dir: &Path, cwd: &Path) -> Self {
+    pub(super) fn new(dir: &Path, cwd: &Path) -> Self {
         std::fs::write(
             dir.join("2026-08-09T10-00-00-000Z_aaaa.jsonl"),
             session_lines(
@@ -136,12 +136,12 @@ impl Blocker {
         }
     }
 
-    fn released_early(&self) -> bool {
+    pub(super) fn released_early(&self) -> bool {
         self.released.load(Ordering::SeqCst)
     }
 
     /// Let the listing past the FIFO, and wait until the writer has handed it the session.
-    async fn release(&mut self) {
+    pub(super) async fn release(&mut self) {
         let _ = self.release_tx.send(());
         let guard = self.guard.take().unwrap();
         tokio::task::spawn_blocking(move || guard.join().unwrap())

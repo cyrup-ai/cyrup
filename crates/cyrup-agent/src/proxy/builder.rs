@@ -162,6 +162,7 @@ impl ProxyMessageBuilder {
                         name: tool_name,
                         arguments: Map::new().into(),
                         thought_signature: None,
+                        namespace: None,
                     }),
                 );
                 self.tool_json.insert(content_index, SharedStr::new());

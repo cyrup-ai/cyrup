@@ -69,42 +69,44 @@ fn format_token_count(count: u64) -> String {
     }
 }
 
-/// The `--list-models [search]` ACTION: resolve the models pi would list, then render them.
+/// The `--list-models [search]` ACTION, run on the BUILT session: render the models pi would list
+/// and print them through the stdout guard, exiting 0 (Pi `listModels(modelRuntime, pattern)`,
+/// `main.ts:866-871` @v0.87.1, which is `await`ed after `--help`'s exit at `:857-864`).
 ///
-/// SEAM-020 — pi lists `getAvailable()`, not `getModels()`. It keeps only models whose provider has
-/// COMPLETE auth configuration (`packages/ai/src/models.ts:394-405` @v0.83.0) and prints
-/// `formatNoModelsAvailableMessage()` when that set is empty (`list-models.ts:37-40`). cyrup was
-/// listing the whole compiled catalog, so a fresh install saw hundreds of rows for providers it has
-/// no credential for and the guidance branch was unreachable.
+/// SEAM-135 — the listing used to run before runtime creation over the compiled catalog
+/// (`provider::available_models`), which cannot see a model an extension registered through
+/// `registerProvider`. Reading the SESSION's registry is what makes those rows appear: it is the
+/// composed union of the built-in catalogs, the persisted overlay, `models.json` and every guest
+/// registration.
 ///
-/// `has_configured_auth` is the same predicate the default-launch path uses
-/// ([`crate::bootstrap::resolve_default_launch_model`]): a stored credential, a known provider env
-/// var, or a user-declared `models.json` block carrying its own `apiKey` (CFG-022).
-pub fn list_models_action(
-    dirs: &cyrup_config::ConfigDirs,
-    models_json: &std::sync::Arc<cyrup_config::ModelFile>,
-    search: &str,
-) -> anyhow::Result<i32> {
-    let auth = cyrup_config::AuthStore::at(dirs.agent_dir.join("auth.json"));
-    let auth_models_json = models_json.clone();
-    let has_configured_auth = move |m: &cyrup_provider::Model| {
-        cyrup_config::provider_is_configured(&auth, &auth_models_json, &m.provider, None)
-    };
-    list_models(
-        &crate::provider::available_models(models_json, &has_configured_auth),
+/// SEAM-020 — pi lists `getAvailable()`, not `getModels()`: only models whose provider has COMPLETE
+/// auth configuration (`packages/ai/src/models.ts:394-405` @v0.83.0) — a stored credential, a known
+/// provider env var, a runtime `--api-key`, a `models.json` block carrying its own `apiKey`
+/// (CFG-022), or a guest registration that brings its own credentials — with
+/// `formatNoModelsAvailableMessage()` when that set is empty (`list-models.ts:37-40`).
+/// [`cyrup_session_svc::AgentSession::configured_model_catalog`] is that set; the `/model`
+/// selector's `available_model_catalog` is deliberately NOT used because it also keeps the installed
+/// provider's own catalog selectable, which would make `--provider anthropic --list-models` list
+/// anthropic without a credential.
+pub fn list_models_for_session(session: &cyrup_session_svc::AgentSession, search: &str) -> i32 {
+    crate::output_guard::emit_stray(&render_model_listing(
+        &session.configured_model_catalog(),
         search,
-    )
+    ));
+    0
 }
 
-/// `--list-models [search]` (Pi `listModels`, list-models.ts:29-110): print the provider catalog as
+/// `--list-models [search]` (Pi `listModels`, list-models.ts:29-110): render the provider catalog as
 /// an aligned `provider/model/context/max-out/thinking/images` table — token counts humanised, sorted
 /// by provider then id, fuzzy-filtered by `search` — with Pi's `No models matching "x"` empty message.
-fn list_models(models: &[cyrup_provider::Model], search: &str) -> anyhow::Result<i32> {
+/// Returns the text (every line newline-terminated) so the caller can route it through the stdout
+/// guard and a test can assert on it.
+pub(crate) fn render_model_listing(models: &[cyrup_provider::Model], search: &str) -> String {
     use cyrup_provider::Modality;
+    use std::fmt::Write as _;
     if models.is_empty() {
         // Pi `formatNoModelsAvailableMessage` (auth-guidance.ts:14) — the no-models guidance text.
-        println!("{}", crate::format_no_models_available_message());
-        return Ok(0);
+        return format!("{}\n", crate::format_no_models_available_message());
     }
 
     // Pi: `fuzzyFilter(models, searchPattern, (m) => `${m.provider} ${m.id}`)` (list-models.ts:45
@@ -124,8 +126,7 @@ fn list_models(models: &[cyrup_provider::Model], search: &str) -> anyhow::Result
             .filter_map(|m| models.get(m.index))
             .collect();
     if filtered.is_empty() {
-        println!("No models matching \"{search}\"");
-        return Ok(0);
+        return format!("No models matching \"{search}\"\n");
     }
 
     // Sort by provider, then by model id (Pi list-models.ts:54-58).
@@ -201,17 +202,20 @@ fn list_models(models: &[cyrup_provider::Model], search: &str) -> anyhow::Result
         .max()
         .unwrap_or(0);
 
-    println!(
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "{:<w_provider$}  {:<w_model$}  {:<w_context$}  {:<w_max$}  {:<w_think$}  {:<w_img$}",
         hdr.0, hdr.1, hdr.2, hdr.3, hdr.4, hdr.5
     );
     for r in &rows {
-        println!(
+        let _ = writeln!(
+            out,
             "{:<w_provider$}  {:<w_model$}  {:<w_context$}  {:<w_max$}  {:<w_think$}  {:<w_img$}",
             r.provider, r.model, r.context, r.max_out, r.thinking, r.images
         );
     }
-    Ok(0)
+    out
 }
 
 #[cfg(test)]

@@ -318,6 +318,29 @@ impl AgentSession {
             .collect()
     }
 
+    /// The models pi's `ModelRuntime.getAvailable()` returns: the full composed registry filtered
+    /// to providers with configured auth (or a guest registration that carries its own
+    /// credentials), with NO offline-faux accommodation.
+    ///
+    /// This is the catalog `--list-models` prints (`cli/list-models.ts:35` @v0.87.1). It differs
+    /// from [`Self::available_model_catalog`] in exactly one arm: that method also keeps every model
+    /// the CURRENTLY installed provider exposes, so the `/model` selector never loses the active
+    /// model. For a listing that arm is wrong — `cyrup --provider anthropic --list-models` with no
+    /// anthropic credential would print anthropic's whole catalog, because `--provider` installed it
+    /// — whereas pi filters by auth alone (`models.ts:522-538`). Same registry, same per-provider
+    /// predicate ([`Self::availability_filter`]'s `configured` half), no `current_catalog`.
+    pub fn configured_model_catalog(&self) -> Vec<Model> {
+        let registry = self.full_model_registry();
+        let filter = self
+            .availability_filter(&registry)
+            .without_current_catalog();
+        registry
+            .iter()
+            .filter(|m| filter.allows(m))
+            .cloned()
+            .collect()
+    }
+
     /// Build [`Self::available_model_catalog`]'s predicate — pi's `snapshot.configuredProviders`
     /// (`model-runtime.ts:302-311`), which runs ONE `checkAuth` per provider and then filters the
     /// models by `configuredProviders.has(model.provider)` (`:283`).

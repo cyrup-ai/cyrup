@@ -40,12 +40,12 @@
 //! `create_worktrees`/`diff_worktrees`/`cleanup_worktrees` contract.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use cyrup_core::CancelToken;
 
 use crate::error::SubagentError;
+use crate::spawn::bounded_argv::{self, BoundedError, Bounds, DEFAULT_MAX_BYTES};
 
 /// Default bound on the optional setup hook's total runtime, in milliseconds (pi's
 /// `DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`, 30000ms).
@@ -194,6 +194,10 @@ pub struct CreateWorktreesOptions {
     /// Base directory override; see [`WORKTREE_DIR_ENV`] and [`std::env::temp_dir`] for the
     /// resolution order.
     pub base_dir: Option<String>,
+    /// The run's stop token and absolute deadline, which every `git` command and the setup hook
+    /// of the allocation obey (pi `CreateWorktreesOptions.signal` / `deadlineAt`,
+    /// `worktree.ts:239-252`). Defaults to [`GitBounds::unbounded`].
+    pub bounds: GitBounds,
 }
 
 /// The resolved, validated setup hook (pi `ResolvedWorktreeSetupHook`).
@@ -250,11 +254,154 @@ pub(crate) struct GitResult {
 // git subprocess helpers (pi runGit / runGitChecked)
 // =================================================================================================
 
-pub(crate) async fn run_git(cwd: &Path, args: &[&str]) -> Result<GitResult, SubagentError> {
-    run_git_env(cwd, args, &[]).await
+/// How long a git command may run, and what can stop it (pi `SetupTransaction.options`
+/// `{ signal, deadlineAt }`, `worktree.ts:239-252`, plus `runSetupCommand`'s `maxBuffer`).
+///
+/// `cancel` is the run's stop token; `deadline_at` is its absolute deadline. Both are optional, and
+/// the default ([`GitBounds::unbounded`]) is for a caller that truly has no run context (an
+/// operator-invoked `worktree.discard` / `worktree.cleanup` plan): it still gets the process-group
+/// kill and the output cap, just no stop and no deadline.
+#[derive(Debug, Clone)]
+pub struct GitBounds {
+    /// The run's stop token; `None` = this git call cannot be stopped from outside.
+    pub cancel: Option<CancelToken>,
+    /// The run's absolute deadline; `None` = none.
+    pub deadline_at: Option<Instant>,
+    /// Combined stdout + stderr budget per command. Overflow fails the call; it never truncates.
+    pub max_bytes: usize,
 }
 
-/// [`run_git`] with extra environment variables for the child process only.
+impl Default for GitBounds {
+    fn default() -> Self {
+        Self::unbounded()
+    }
+}
+
+/// How long a settled run's accounting (rollback, diff capture, cleanup) may still run past the
+/// run's own deadline: a run that timed out must still get to capture and remove its worktrees,
+/// but a hung git may not hold it open forever.
+const ACCOUNTING_GRACE: Duration = Duration::from_secs(10);
+
+/// Byte budget for a captured patch (and its stat/numstat). Far above pi's 1 MiB `maxBuffer`,
+/// because a patch is legitimately large; still finite, because a capture that overflows must FAIL
+/// (the worktree is then preserved) rather than store a truncated patch.
+pub const PATCH_CAPTURE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+impl GitBounds {
+    /// No stop token, no deadline: a caller with no run context.
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self {
+            cancel: None,
+            deadline_at: None,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+
+    /// The run's own stop token and deadline — what allocation obeys.
+    #[must_use]
+    pub fn new(cancel: Option<CancelToken>, deadline_at: Option<Instant>) -> Self {
+        Self {
+            cancel,
+            deadline_at,
+            ..Self::unbounded()
+        }
+    }
+
+    /// pi's setup-compensation bounds (`worktree.ts:1305-1325`): *"Cancellation stops allocation,
+    /// not accounting. Compensation has ONLY the remaining original absolute deadline; it does not
+    /// reuse the launch signal."*
+    ///
+    /// `[CYRUP-DELTA]` the deadline is floored at [`ACCOUNTING_GRACE`] from now. Upstream's
+    /// rollback inherits an already-expired deadline verbatim, every rollback command then fails
+    /// its pre-check, and it reports the leftovers through `writeWorktreeSetupHandoff`. cyrup has
+    /// no such evidence path (the rollback report is discarded by [`create_worktrees`]), so an
+    /// exact port would leak a worktree and a branch every time the deadline fires mid-setup —
+    /// which is exactly when a hook or a git call was hung. A bounded grace removes them instead.
+    #[must_use]
+    pub fn for_compensation(&self) -> Self {
+        Self {
+            cancel: None,
+            deadline_at: self
+                .deadline_at
+                .map(|at| at.max(Instant::now() + ACCOUNTING_GRACE)),
+            max_bytes: self.max_bytes,
+        }
+    }
+
+    /// Bounds for the harvest that follows a run: diff capture and worktree removal.
+    ///
+    /// `[CYRUP-DELTA]` upstream's `runGit`/`runGitChecked` (`worktree.ts:277-296`, used for diff and
+    /// cleanup) are unbounded `spawnSync`. A hung git there holds a finished run open past its
+    /// deadline and ignores stop, which is strictly worse than bounding it. Two rules keep the
+    /// bound from costing the work it protects: (1) a run that is ALREADY stopped or past its
+    /// deadline is exactly the run whose work most needs capturing, so the deadline gets the
+    /// [`ACCOUNTING_GRACE`] floor and an already-cancelled token is not obeyed (a stop that
+    /// ended the run is not a stop of its accounting); (2) a stop that arrives DURING the
+    /// harvest does end a hung git.
+    #[must_use]
+    pub fn for_harvest(cancel: &CancelToken, deadline_at: Option<Instant>) -> Self {
+        Self {
+            cancel: (!cancel.is_cancelled()).then(|| cancel.clone()),
+            deadline_at: deadline_at.map(|at| at.max(Instant::now() + ACCOUNTING_GRACE)),
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+
+    /// The same bounds with a different output budget.
+    #[must_use]
+    pub fn with_max_bytes(&self, max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            ..self.clone()
+        }
+    }
+
+    fn to_bounds(&self) -> Bounds {
+        Bounds {
+            cancel: self.cancel.clone(),
+            deadline: self.deadline_at,
+            max_bytes: self.max_bytes,
+        }
+    }
+}
+
+/// pi's error texts for a bound that fired (`worktree-setup-command.ts`: `ABORT_ERR`,
+/// `ETIMEDOUT`, `ENOBUFS`).
+fn bounded_error(error: BoundedError) -> SubagentError {
+    match error {
+        BoundedError::Io(err) => SubagentError::Spawn(err),
+        BoundedError::Aborted => SubagentError::WorktreeSetup("Worktree setup aborted".to_string()),
+        BoundedError::DeadlineExceeded => {
+            SubagentError::WorktreeSetup("Worktree setup deadline exceeded".to_string())
+        }
+        BoundedError::OutputOverflow { max_bytes } => SubagentError::WorktreeSetup(format!(
+            "Worktree setup command output exceeds maxBuffer ({max_bytes} bytes)"
+        )),
+    }
+}
+
+/// [`run_git_bounded`] with NO stop and NO deadline — only for a call that truly has no run
+/// context (the operator-invoked cleanup-plan builder, [`crate::spawn::cleanup_plan`]). Anything
+/// inside a run uses [`run_git_bounded`].
+pub(crate) async fn run_git(cwd: &Path, args: &[&str]) -> Result<GitResult, SubagentError> {
+    run_git_bounded(cwd, args, &GitBounds::unbounded()).await
+}
+
+/// Run `git <args>` in `cwd`, killed (with its whole process group) when `bounds` fires.
+///
+/// A bound that fires is an `Err`, never a `GitResult`: a git that was killed did not answer, and
+/// [`git_failure_text`] / the callers' `Err(_)` arms already treat "did not answer" as "unknown",
+/// never as "clean".
+pub(crate) async fn run_git_bounded(
+    cwd: &Path,
+    args: &[&str],
+    bounds: &GitBounds,
+) -> Result<GitResult, SubagentError> {
+    run_git_env_bounded(cwd, args, &[], bounds).await
+}
+
+/// [`run_git_bounded`] with extra environment variables for the child process only.
 ///
 /// Required by [`crate::spawn::cleanup_plan`]'s patch re-capture, which reproduces pi
 /// `currentWorktreePatch` (`worktree.ts:303-327`): it stages into a TEMPORARY `GIT_INDEX_FILE`
@@ -262,26 +409,39 @@ pub(crate) async fn run_git(cwd: &Path, args: &[&str]) -> Result<GitResult, Suba
 /// variant a transliteration of that function would `git add -A` into the live index — a
 /// mutation, during an operation whose whole contract is that it mutates nothing but the plan
 /// file. The env seam is therefore a SAFETY requirement, not a convenience.
-pub(crate) async fn run_git_env(
+pub(crate) async fn run_git_env_bounded(
     cwd: &Path,
     args: &[&str],
     env: &[(&str, &Path)],
+    bounds: &GitBounds,
 ) -> Result<GitResult, SubagentError> {
-    let mut command = Command::new("git");
-    command.args(args).current_dir(cwd);
-    for (key, value) in env {
-        command.env(key, value);
-    }
-    let output = command.output().await.map_err(SubagentError::Spawn)?;
+    let env: Vec<(&str, &std::ffi::OsStr)> = env
+        .iter()
+        .map(|(key, value)| (*key, value.as_os_str()))
+        .collect();
+    let output = bounded_argv::run_bounded_argv(
+        std::ffi::OsStr::new("git"),
+        args,
+        cwd,
+        &env,
+        None,
+        &bounds.to_bounds(),
+    )
+    .await
+    .map_err(bounded_error)?;
     Ok(GitResult {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        status: output.status.code(),
+        status: output.status,
     })
 }
 
-pub(crate) async fn run_git_checked(cwd: &Path, args: &[&str]) -> Result<String, SubagentError> {
-    let result = run_git(cwd, args).await?;
+pub(crate) async fn run_git_checked(
+    cwd: &Path,
+    args: &[&str],
+    bounds: &GitBounds,
+) -> Result<String, SubagentError> {
+    let result = run_git_bounded(cwd, args, bounds).await?;
     if result.status != Some(0) {
         let command = format!("git -C {} {}", cwd.display(), args.join(" "));
         let stderr = result.stderr.trim();
@@ -428,14 +588,17 @@ fn resolve_worktree_base_dir(
 
 /// pi `resolveRepoCwdRelative`: verify `cwd` is inside a work tree, then return its normalized
 /// repo-relative prefix (`""` at the repo root).
-async fn resolve_repo_cwd_relative(cwd: &Path) -> Result<String, SubagentError> {
-    let repo_check = run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).await?;
+async fn resolve_repo_cwd_relative(
+    cwd: &Path,
+    bounds: &GitBounds,
+) -> Result<String, SubagentError> {
+    let repo_check = run_git_bounded(cwd, &["rev-parse", "--is-inside-work-tree"], bounds).await?;
     if repo_check.status != Some(0) || repo_check.stdout.trim() != "true" {
         return Err(SubagentError::WorktreeSetup(
             "worktree isolation requires a git repository".to_string(),
         ));
     }
-    let raw_prefix = run_git_checked(cwd, &["rev-parse", "--show-prefix"]).await?;
+    let raw_prefix = run_git_checked(cwd, &["rev-parse", "--show-prefix"], bounds).await?;
     let stripped = raw_prefix.trim().trim_end_matches(['/', '\\']);
     if stripped.is_empty() {
         return Ok(String::new());
@@ -461,10 +624,11 @@ pub async fn resolve_expected_worktree_agent_cwd(
     run_id: &str,
     index: u32,
     base_dir: Option<&str>,
+    bounds: &GitBounds,
 ) -> Result<PathBuf, SubagentError> {
-    let cwd_relative = resolve_repo_cwd_relative(cwd).await?;
+    let cwd_relative = resolve_repo_cwd_relative(cwd, bounds).await?;
     let repo_root = PathBuf::from(
-        run_git_checked(cwd, &["rev-parse", "--show-toplevel"])
+        run_git_checked(cwd, &["rev-parse", "--show-toplevel"], bounds)
             .await?
             .trim(),
     );
@@ -478,10 +642,10 @@ pub async fn resolve_expected_worktree_agent_cwd(
 }
 
 /// pi `resolveRepoState`.
-async fn resolve_repo_state(cwd: &Path) -> Result<RepoState, SubagentError> {
-    let cwd_relative = resolve_repo_cwd_relative(cwd).await?;
+async fn resolve_repo_state(cwd: &Path, bounds: &GitBounds) -> Result<RepoState, SubagentError> {
+    let cwd_relative = resolve_repo_cwd_relative(cwd, bounds).await?;
     let toplevel = PathBuf::from(
-        run_git_checked(cwd, &["rev-parse", "--show-toplevel"])
+        run_git_checked(cwd, &["rev-parse", "--show-toplevel"], bounds)
             .await?
             .trim(),
     );
@@ -496,6 +660,7 @@ async fn resolve_repo_state(cwd: &Path) -> Result<RepoState, SubagentError> {
     let status = run_git_checked(
         &toplevel,
         &["status", "--porcelain", "--", &artifact_root_exclude],
+        bounds,
     )
     .await?;
     if !status.trim().is_empty() {
@@ -505,7 +670,7 @@ async fn resolve_repo_state(cwd: &Path) -> Result<RepoState, SubagentError> {
         ));
     }
 
-    let base_commit = run_git_checked(&toplevel, &["rev-parse", "HEAD"])
+    let base_commit = run_git_checked(&toplevel, &["rev-parse", "HEAD"], bounds)
         .await?
         .trim()
         .to_string();
@@ -678,8 +843,12 @@ fn normalize_synthetic_path(worktree_path: &Path, raw_path: &str) -> Result<Stri
 }
 
 /// pi `hasTrackedEntries`: `git ls-files -- <relativePath>` reports a tracked match.
-async fn has_tracked_entries(worktree_path: &Path, relative_path: &str) -> bool {
-    match run_git(worktree_path, &["ls-files", "--", relative_path]).await {
+async fn has_tracked_entries(
+    worktree_path: &Path,
+    relative_path: &str,
+    bounds: &GitBounds,
+) -> bool {
+    match run_git_bounded(worktree_path, &["ls-files", "--", relative_path], bounds).await {
         Ok(result) => result.status == Some(0) && !result.stdout.trim().is_empty(),
         Err(_) => false,
     }
@@ -690,6 +859,7 @@ async fn has_tracked_entries(worktree_path: &Path, relative_path: &str) -> bool 
 async fn parse_and_validate_hook_output(
     worktree_path: &Path,
     raw_stdout: &str,
+    bounds: &GitBounds,
 ) -> Result<Vec<String>, SubagentError> {
     let trimmed = raw_stdout.trim();
     if trimmed.is_empty() {
@@ -728,7 +898,7 @@ async fn parse_and_validate_hook_output(
             ));
         };
         let normalized = normalize_synthetic_path(worktree_path, &candidate)?;
-        if has_tracked_entries(worktree_path, &normalized).await {
+        if has_tracked_entries(worktree_path, &normalized, bounds).await {
             return Err(SubagentError::WorktreeSetup(format!(
                 "worktree setup hook cannot mark tracked paths as synthetic: {normalized}"
             )));
@@ -740,21 +910,26 @@ async fn parse_and_validate_hook_output(
     Ok(unique)
 }
 
-/// pi `runWorktreeSetupHook` (`pi-subagents/src/runs/shared/worktree.ts:323-329` @v0.43.0): invoke
-/// the hook (no args) with the worktree as cwd, the input JSON on stdin, bounded by the resolved
-/// timeout, and validate its `syntheticPaths` response.
+/// pi `runWorktreeSetupHook` (`runs/shared/worktree.ts:853` @v0.71.0): invoke the hook (no
+/// args) with the worktree as cwd, the input JSON on stdin, and validate its `syntheticPaths`
+/// response.
 ///
-/// Upstream uses `spawnSync(hook.hookPath, [], { …, timeout: hook.timeoutMs })`, and Node's
-/// `timeout` option KILLS the child on expiry (surfacing as `result.error.code === "ETIMEDOUT"`).
-/// So must this: the `Child` binding is deliberately held OUTSIDE the `tokio::time::timeout`, and
-/// the elapsed arm drives [`crate::spawn::signal::terminate_on_timeout`] (SIGTERM, then a hard
-/// SIGKILL a second later). Racing a future that OWNS the child instead — which this function used
-/// to do — dropped the only handle on expiry and left a hung setup hook running indefinitely.
+/// The hook runs through [`bounded_argv::run_bounded_argv`], the port of upstream's
+/// `runSetupCommand` that `tx.command(hook.hookPath, [], { cwd, input, hookTimeoutMs })` uses
+/// (`worktree.ts:239-252`): it leads its own process group, is killed (SIGTERM, then SIGKILL, and
+/// confirmed reaped) when the run's stop token fires or the run's deadline passes, and its output
+/// is capped. `hookTimeoutMs` is `min(run deadline, now + timeout)` — `runSetupCommand`'s
+/// `Math.min(deadlineAt, Date.now() + hookTimeoutMs)` — so the hook's own timeout can shorten the
+/// run's budget but never extend it.
+///
+/// The `Child` is owned by the runner for the whole of its life: racing a future that OWNS the
+/// child against `tokio::time::timeout` dropped the only handle on expiry and left a hung setup
+/// hook running indefinitely (SUBA-027).
 async fn run_worktree_setup_hook(
     hook: &ResolvedWorktreeSetupHook,
     input: &WorktreeSetupHookInput<'_>,
+    bounds: &GitBounds,
 ) -> Result<Vec<String>, SubagentError> {
-    let timeout = Duration::from_millis(hook.timeout_ms);
     let payload = serde_json::to_vec(input).map_err(|err| {
         SubagentError::WorktreeSetup(format!(
             "failed to serialize worktree setup hook input: {err}"
@@ -762,77 +937,64 @@ async fn run_worktree_setup_hook(
     })?;
     let worktree_path = input.worktree_path;
 
-    let mut child = Command::new(&hook.hook_path)
-        .current_dir(worktree_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            SubagentError::WorktreeSetup(format!("worktree setup hook failed: {err}"))
-        })?;
-
-    let call = async {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(&payload)
-                .await
-                .map_err(SubagentError::Spawn)?;
-            stdin.shutdown().await.map_err(SubagentError::Spawn)?;
-            drop(stdin);
-        }
-
-        let mut stdout_buf = Vec::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            stdout
-                .read_to_end(&mut stdout_buf)
-                .await
-                .map_err(SubagentError::Spawn)?;
-        }
-        let mut stderr_buf = Vec::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_end(&mut stderr_buf).await;
-        }
-
-        let status = child.wait().await.map_err(SubagentError::Spawn)?;
-        if !status.success() {
-            let stderr = String::from_utf8_lossy(&stderr_buf);
-            let stdout = String::from_utf8_lossy(&stdout_buf);
-            let details = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else if !stdout.trim().is_empty() {
-                stdout.trim().to_string()
-            } else {
-                "no output".to_string()
-            };
-            let code = status
-                .code()
-                .map_or_else(|| "signal".to_string(), |c| c.to_string());
-            return Err(SubagentError::WorktreeSetup(format!(
-                "worktree setup hook failed with exit code {code}: {details}"
-            )));
-        }
-
-        let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
-        parse_and_validate_hook_output(worktree_path, &stdout).await
+    let hook_deadline = Instant::now() + Duration::from_millis(hook.timeout_ms);
+    let run_deadline_governs = bounds.deadline_at.is_some_and(|at| at <= hook_deadline);
+    let hook_bounds = Bounds {
+        cancel: bounds.cancel.clone(),
+        deadline: Some(
+            bounds
+                .deadline_at
+                .map_or(hook_deadline, |at| at.min(hook_deadline)),
+        ),
+        max_bytes: DEFAULT_MAX_BYTES,
     };
 
-    // Bind the race outcome in its own statement so `call` (which mutably borrows `child`) is
-    // dropped before the elapsed arm needs `&mut child` again.
-    let outcome = tokio::time::timeout(timeout, call).await;
-    match outcome {
-        Ok(result) => result,
-        Err(_elapsed) => {
-            // Node's `spawnSync` timeout kills; so do we. `terminate_on_timeout` returns only once
-            // the OS process is confirmed reaped, so a hook that outlived its budget can never be
-            // left behind holding the worktree we are about to report as failed.
-            let _ = crate::spawn::signal::terminate_on_timeout(&mut child).await;
-            Err(SubagentError::WorktreeSetup(format!(
-                "worktree setup hook timed out after {}ms",
-                hook.timeout_ms
-            )))
+    let output = bounded_argv::run_bounded_argv(
+        hook.hook_path.as_os_str(),
+        &[] as &[&str],
+        worktree_path,
+        &[],
+        Some(payload),
+        &hook_bounds,
+    )
+    .await
+    .map_err(|err| match err {
+        // The hook's OWN timeout keeps its long-standing message; the run's deadline and stop
+        // are reported with upstream's `worktree setup hook failed: <reason>` wrapper.
+        BoundedError::DeadlineExceeded if !run_deadline_governs => SubagentError::WorktreeSetup(
+            format!("worktree setup hook timed out after {}ms", hook.timeout_ms),
+        ),
+        BoundedError::Io(err) => {
+            SubagentError::WorktreeSetup(format!("worktree setup hook failed: {err}"))
         }
+        other => match bounded_error(other) {
+            SubagentError::WorktreeSetup(message) => {
+                SubagentError::WorktreeSetup(format!("worktree setup hook failed: {message}"))
+            }
+            passthrough => passthrough,
+        },
+    })?;
+
+    if output.status != Some(0) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let details = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            "no output".to_string()
+        };
+        let code = output
+            .status
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
+        return Err(SubagentError::WorktreeSetup(format!(
+            "worktree setup hook failed with exit code {code}: {details}"
+        )));
     }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    parse_and_validate_hook_output(worktree_path, &stdout, bounds).await
 }
 
 // =================================================================================================
@@ -849,11 +1011,12 @@ async fn create_single_worktree(
     setup_hook: Option<&ResolvedWorktreeSetupHook>,
     agent: Option<&str>,
     base_dir: &Path,
+    bounds: &GitBounds,
 ) -> Result<WorktreeInfo, SubagentError> {
     let branch = build_worktree_branch(run_id, index);
     let worktree_path = build_worktree_path(base_dir, run_id, index);
 
-    let add = run_git(
+    let add = run_git_bounded(
         toplevel,
         &[
             "worktree",
@@ -863,6 +1026,7 @@ async fn create_single_worktree(
             &branch,
             "HEAD",
         ],
+        bounds,
     )
     .await?;
     if add.status != Some(0) {
@@ -908,6 +1072,7 @@ async fn create_single_worktree(
                     base_commit,
                     agent,
                 },
+                bounds,
             )
             .await?;
             synthetic_paths.extend(hook_synthetic);
@@ -927,7 +1092,10 @@ async fn create_single_worktree(
     match build {
         Ok(info) => Ok(info),
         Err(err) => {
-            let _ = run_git(
+            // Compensation obeys only the original deadline, never the launch signal (pi
+            // `compensateSetup`, `worktree.ts:1305-1325`) — see [`GitBounds::for_compensation`].
+            let rollback = bounds.for_compensation();
+            let _ = run_git_bounded(
                 toplevel,
                 &[
                     "worktree",
@@ -935,9 +1103,10 @@ async fn create_single_worktree(
                     "--force",
                     &worktree_path.to_string_lossy(),
                 ],
+                &rollback,
             )
             .await;
-            let _ = run_git(toplevel, &["branch", "-D", &branch]).await;
+            let _ = run_git_bounded(toplevel, &["branch", "-D", &branch], &rollback).await;
             Err(err)
         }
     }
@@ -1010,7 +1179,9 @@ pub async fn create_worktrees(
 ) -> Result<WorktreeSetup, SubagentError> {
     // Held for the whole allocation — see [`worktree_turn`].
     let _turn = worktree_turn().await;
-    let repo = resolve_repo_state(cwd).await?;
+    let default_options = CreateWorktreesOptions::default();
+    let bounds = &options.unwrap_or(&default_options).bounds;
+    let repo = resolve_repo_state(cwd, bounds).await?;
     let setup_hook =
         resolve_worktree_setup_hook(&repo.toplevel, options.and_then(|o| o.setup_hook.as_ref()))?;
     let base_dir =
@@ -1031,6 +1202,7 @@ pub async fn create_worktrees(
             setup_hook.as_ref(),
             agent,
             &base_dir,
+            bounds,
         )
         .await
         {
@@ -1047,6 +1219,8 @@ pub async fn create_worktrees(
                         base_commit: repo.base_commit.clone(),
                     },
                     &crate::handoff::WorktreeCleanupIntent::SetupRollback,
+                    // pi `compensateSetup`: the original deadline only, never the launch signal.
+                    &bounds.for_compensation(),
                 )
                 .await;
                 return Err(err);
@@ -1156,11 +1330,15 @@ const PATCH_VALIDATION_OPTIONS: &[&str] = &[
 /// Returns `None` when the patch applies cleanly in reverse (i.e. it faithfully describes the
 /// worktree's staged state), or `Some(message)` carrying pi's own `stderr -> stdout ->
 /// "<command> failed"` ladder.
-async fn validate_worktree_patch(worktree_path: &Path, patch_path: &Path) -> Option<String> {
+async fn validate_worktree_patch(
+    worktree_path: &Path,
+    patch_path: &Path,
+    bounds: &GitBounds,
+) -> Option<String> {
     let mut args: Vec<&str> = PATCH_VALIDATION_OPTIONS.to_vec();
     let patch = patch_path.to_string_lossy();
     args.push(&patch);
-    let result = run_git(worktree_path, &args).await;
+    let result = run_git_bounded(worktree_path, &args, bounds).await;
     match &result {
         Ok(result) if result.status == Some(0) => None,
         _ => Some(git_failure_text(
@@ -1178,7 +1356,13 @@ async fn validate_worktree_patch(worktree_path: &Path, patch_path: &Path) -> Opt
 /// [`MACHINE_PATCH_OPTIONS`] — because this function's only callers compare the two byte for byte
 /// (pi `:341`). The two sides are a matched pair: changing the flags on one without the other
 /// turns the patch-preservation gate into a permanent refusal.
-async fn current_worktree_patch(worktree_path: &Path, base_commit: &str) -> Result<String, String> {
+async fn current_worktree_patch(
+    worktree_path: &Path,
+    base_commit: &str,
+    bounds: &GitBounds,
+) -> Result<String, String> {
+    // The re-capture is the same `git diff` as the capture itself, so it gets the same budget.
+    let bounds = &bounds.with_max_bytes(PATCH_CAPTURE_MAX_BYTES);
     // pi mkdtemp's a directory and puts `index` inside it (`:307-311`). `GIT_INDEX_FILE` names a
     // FILE that git creates, so cyrup uses a unique temp file path directly: one fewer directory
     // to leak, and the uuid dependency is already in this crate's manifest.
@@ -1189,18 +1373,19 @@ async fn current_worktree_patch(worktree_path: &Path, base_commit: &str) -> Resu
     let env = [("GIT_INDEX_FILE", index_file.as_path())];
 
     let captured = async {
-        let read_tree = run_git_env(worktree_path, &["read-tree", "HEAD"], &env).await;
+        let read_tree =
+            run_git_env_bounded(worktree_path, &["read-tree", "HEAD"], &env, bounds).await;
         if !matches!(&read_tree, Ok(result) if result.status == Some(0)) {
             return Err(git_failure_text(&read_tree, "git read-tree"));
         }
-        let add = run_git_env(worktree_path, &["add", "-A"], &env).await;
+        let add = run_git_env_bounded(worktree_path, &["add", "-A"], &env, bounds).await;
         if !matches!(&add, Ok(result) if result.status == Some(0)) {
             return Err(git_failure_text(&add, "git add"));
         }
         let mut diff_args: Vec<&str> = vec!["diff", "--cached"];
         diff_args.extend_from_slice(MACHINE_PATCH_OPTIONS);
         diff_args.push(base_commit);
-        let diff = run_git_env(worktree_path, &diff_args, &env).await;
+        let diff = run_git_env_bounded(worktree_path, &diff_args, &env, bounds).await;
         match diff {
             Ok(result) if result.status == Some(0) => Ok(result.stdout),
             other => Err(git_failure_text(&other, "git diff")),
@@ -1221,20 +1406,21 @@ async fn current_worktree_patch(worktree_path: &Path, base_commit: &str) -> Resu
 /// AND a fresh re-capture must be byte-identical to it. Returns `None` when both hold.
 ///
 /// Neither probe mutates the worktree: the `--check` never applies, and the re-capture stages
-/// into a temporary [`GIT_INDEX_FILE`](run_git_env).
+/// into a temporary [`GIT_INDEX_FILE`](run_git_env_bounded).
 pub(crate) async fn validate_worktree_patch_represents_current_worktree(
     worktree_path: &Path,
     base_commit: &str,
     patch_path: &Path,
+    bounds: &GitBounds,
 ) -> Option<String> {
-    if let Some(error) = validate_worktree_patch(worktree_path, patch_path).await {
+    if let Some(error) = validate_worktree_patch(worktree_path, patch_path, bounds).await {
         return Some(error);
     }
     let captured = match tokio::fs::read_to_string(patch_path).await {
         Ok(text) => text,
         Err(err) => return Some(err.to_string()),
     };
-    match current_worktree_patch(worktree_path, base_commit).await {
+    match current_worktree_patch(worktree_path, base_commit, bounds).await {
         Err(error) if error.is_empty() => Some("failed to capture current worktree patch".into()),
         Err(error) => Some(error),
         Ok(current) if current != captured => {
@@ -1256,9 +1442,17 @@ pub async fn capture_worktree_diff(
     worktree: &WorktreeInfo,
     agent: &str,
     patch_path: &Path,
+    bounds: &GitBounds,
 ) -> Result<WorktreeDiff, SubagentError> {
     remove_synthetic_paths_before_diff(worktree);
-    run_git_checked(&worktree.path, &["add", "-A"]).await?;
+    // [CYRUP-DELTA] upstream's `runGit`/`runGitChecked` (`worktree.ts:277-296`), which it uses for
+    // the diff, are unbounded `spawnSync`. Here every command of the capture obeys `bounds`: a
+    // hung git would otherwise hold a finished run open past its deadline and ignore stop, which
+    // is strictly worse. The output budget is [`PATCH_CAPTURE_MAX_BYTES`], and an overflow FAILS
+    // the capture (the worktree is then preserved) instead of storing a truncated patch — upstream
+    // silently truncates at `spawnSync`'s 1 MiB default.
+    let bounds = &bounds.with_max_bytes(PATCH_CAPTURE_MAX_BYTES);
+    run_git_checked(&worktree.path, &["add", "-A"], bounds).await?;
     let machine_diff = |extra: &'static str| {
         let mut args: Vec<&str> = vec!["diff", "--cached"];
         args.extend_from_slice(MACHINE_DIFF_OPTIONS);
@@ -1266,7 +1460,7 @@ pub async fn capture_worktree_diff(
         args.push(&setup.base_commit);
         args
     };
-    let diff_stat = run_git_checked(&worktree.path, &machine_diff("--stat"))
+    let diff_stat = run_git_checked(&worktree.path, &machine_diff("--stat"), bounds)
         .await?
         .trim()
         .to_string();
@@ -1274,9 +1468,9 @@ pub async fn capture_worktree_diff(
         let mut args: Vec<&str> = vec!["diff", "--cached"];
         args.extend_from_slice(MACHINE_PATCH_OPTIONS);
         args.push(&setup.base_commit);
-        run_git_checked(&worktree.path, &args).await?
+        run_git_checked(&worktree.path, &args, bounds).await?
     };
-    let numstat = run_git_checked(&worktree.path, &machine_diff("--numstat")).await?;
+    let numstat = run_git_checked(&worktree.path, &machine_diff("--numstat"), bounds).await?;
 
     std::fs::write(patch_path, &patch).map_err(SubagentError::Spawn)?;
 
@@ -1294,7 +1488,9 @@ pub async fn capture_worktree_diff(
     // harvest removes the worktree immediately afterwards, letting an unapplyable patch through
     // as a successful capture is how the work disappears. The error travels out through
     // [`diff_worktrees`] into `WorktreeDiff::error`, which the preserve gate reads.
-    if let Some(validation_error) = validate_worktree_patch(&worktree.path, patch_path).await {
+    if let Some(validation_error) =
+        validate_worktree_patch(&worktree.path, patch_path, bounds).await
+    {
         return Err(SubagentError::WorktreeSetup(format!(
             "captured worktree patch is not machine-applyable: {validation_error}"
         )));
@@ -1328,6 +1524,7 @@ pub async fn diff_worktrees(
     setup: &WorktreeSetup,
     agents: &[String],
     diffs_dir: &Path,
+    bounds: &GitBounds,
 ) -> Vec<WorktreeDiff> {
     if std::fs::create_dir_all(diffs_dir).is_err() {
         // Returning no diffs is safer than failing the whole command on artifact-dir issues.
@@ -1344,7 +1541,7 @@ pub async fn diff_worktrees(
             "task-{index}-{}.patch",
             safe_patch_agent_name(&agent)
         ));
-        match capture_worktree_diff(setup, worktree, &agent, &patch_path).await {
+        match capture_worktree_diff(setup, worktree, &agent, &patch_path, bounds).await {
             Ok(diff) => diffs.push(diff),
             Err(err) => {
                 write_empty_patch(&patch_path);
@@ -1392,6 +1589,7 @@ pub async fn diff_worktrees(
 pub async fn cleanup_worktrees(
     setup: &WorktreeSetup,
     intent: &crate::handoff::WorktreeCleanupIntent,
+    bounds: &GitBounds,
 ) -> crate::handoff::WorktreeCleanupReport {
     use crate::handoff::{WorktreeCleanupIntent, WorktreeCleanupTask};
 
@@ -1399,11 +1597,12 @@ pub async fn cleanup_worktrees(
     let mut errors: Vec<String> = Vec::new();
     // Reverse order: a worktree created later may sit inside one created earlier.
     for worktree in setup.worktrees.iter().rev() {
-        if let Some(task) = refuse_unsafe_cleanup(setup, worktree, intent).await {
+        if let Some(task) = refuse_unsafe_cleanup(setup, worktree, intent, bounds).await {
             tasks.push(task);
             continue;
         }
-        let remove = run_git(
+        // [CYRUP-DELTA] bounded — see [`capture_worktree_diff`]; upstream's cleanup git is unbounded.
+        let remove = run_git_bounded(
             &setup.cwd,
             &[
                 "worktree",
@@ -1411,6 +1610,7 @@ pub async fn cleanup_worktrees(
                 "--force",
                 &worktree.path.to_string_lossy(),
             ],
+            bounds,
         )
         .await;
         let worktree_removed = matches!(&remove, Ok(result) if result.status == Some(0));
@@ -1427,7 +1627,8 @@ pub async fn cleanup_worktrees(
         // the case where the commits matter.)
         let mut branch_removed = false;
         if worktree_removed {
-            let branch = run_git(&setup.cwd, &["branch", "-D", &worktree.branch]).await;
+            let branch =
+                run_git_bounded(&setup.cwd, &["branch", "-D", &worktree.branch], bounds).await;
             branch_removed = matches!(&branch, Ok(result) if result.status == Some(0));
             if !branch_removed {
                 task_errors.push(git_failure_text(&branch, "git branch -D"));
@@ -1475,7 +1676,7 @@ pub async fn cleanup_worktrees(
     // Restore task order: the removal loop runs in reverse, but the ledger is read by index.
     tasks.sort_by_key(|task| task.index);
 
-    let prune = run_git(&setup.cwd, &["worktree", "prune"]).await;
+    let prune = run_git_bounded(&setup.cwd, &["worktree", "prune"], bounds).await;
     let pruned = matches!(&prune, Ok(result) if result.status == Some(0));
     if !pruned {
         errors.push(git_failure_text(&prune, "git worktree prune"));
@@ -1518,13 +1719,17 @@ enum WorktreeWorkProbe {
 }
 
 /// Run both probes against `worktree`.
-async fn probe_worktree_work(setup: &WorktreeSetup, worktree: &WorktreeInfo) -> WorktreeWorkProbe {
-    let status = run_git(&worktree.path, &["status", "--porcelain"]).await;
+async fn probe_worktree_work(
+    setup: &WorktreeSetup,
+    worktree: &WorktreeInfo,
+    bounds: &GitBounds,
+) -> WorktreeWorkProbe {
+    let status = run_git_bounded(&worktree.path, &["status", "--porcelain"], bounds).await;
     let mut base_diff_args: Vec<&str> = vec!["diff", "--quiet"];
     base_diff_args.extend_from_slice(MACHINE_DIFF_OPTIONS);
     base_diff_args.push(&setup.base_commit);
     base_diff_args.push("--");
-    let base_diff = run_git(&worktree.path, &base_diff_args).await;
+    let base_diff = run_git_bounded(&worktree.path, &base_diff_args, bounds).await;
 
     let status_ok = matches!(&status, Ok(result) if result.status == Some(0));
     let diff_answered =
@@ -1567,6 +1772,7 @@ async fn refuse_unsafe_cleanup(
     setup: &WorktreeSetup,
     worktree: &WorktreeInfo,
     intent: &crate::handoff::WorktreeCleanupIntent,
+    bounds: &GitBounds,
 ) -> Option<crate::handoff::WorktreeCleanupTask> {
     use crate::handoff::WorktreeCleanupIntent;
 
@@ -1595,7 +1801,7 @@ async fn refuse_unsafe_cleanup(
     // away simply keeps the worktree, which is the safe direction.
     remove_synthetic_paths_before_diff(worktree);
 
-    match probe_worktree_work(setup, worktree).await {
+    match probe_worktree_work(setup, worktree, bounds).await {
         WorktreeWorkProbe::Unanswered(detail) => {
             return Some(preserved(
                 "cleanup safety check failed",
@@ -1611,7 +1817,7 @@ async fn refuse_unsafe_cleanup(
         // be `--force`-removed on the ORDINARY success path, with nobody asked. The only thing
         // that makes that safe is a captured patch that demonstrably still represents it.
         WorktreeCleanupIntent::Preserve(evidence) => {
-            refuse_uncaptured_preserve(setup, worktree, evidence).await?
+            refuse_uncaptured_preserve(setup, worktree, evidence, bounds).await?
         }
         // pi's SECOND authority consult (`:1232-1252`), the one
         // `subagent({action:"worktree.discard"})` makes reachable by a model.
@@ -1659,6 +1865,7 @@ async fn refuse_uncaptured_preserve(
     setup: &WorktreeSetup,
     worktree: &WorktreeInfo,
     evidence: &crate::handoff::PreserveEvidence,
+    bounds: &GitBounds,
 ) -> Option<String> {
     let captured = evidence
         .captured_diffs
@@ -1688,6 +1895,7 @@ async fn refuse_uncaptured_preserve(
                     &worktree.path,
                     &setup.base_commit,
                     &captured.patch_path,
+                    bounds,
                 )
                 .await;
                 patch_captured = patch_validation_error.is_none();
@@ -1835,6 +2043,8 @@ pub struct WorktreeGroupConfig<'a> {
     pub setup_hook: Option<&'a HookSpec>,
     /// Bound on the setup hook's runtime, in milliseconds.
     pub setup_hook_timeout_ms: Option<u64>,
+    /// The run's stop token and deadline, obeyed by every git command and the hook.
+    pub bounds: GitBounds,
 }
 
 /// Legacy per-task worktree assignment. `path` is the child's actual `cwd` (pi `agentCwd`).
@@ -1917,6 +2127,7 @@ pub async fn setup_worktree_group(
         base_dir: config
             .worktree_base_dir
             .map(|dir| dir.to_string_lossy().into_owned()),
+        bounds: config.bounds.clone(),
     };
 
     let count = u32::try_from(task_cwd_overrides.len()).unwrap_or(u32::MAX);
@@ -2115,6 +2326,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
     }
@@ -2140,6 +2352,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
     }
@@ -2166,6 +2379,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
     }
@@ -2199,7 +2413,7 @@ mod tests {
             .join("x");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("run.json"), "{}\n").unwrap();
-        resolve_repo_state(repo.path())
+        resolve_repo_state(repo.path(), &GitBounds::unbounded())
             .await
             .expect("durable runtime state under the artifact root must not block isolation");
     }
@@ -2218,7 +2432,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(repo.path().join("scratch.txt"), "untracked\n").unwrap();
-        match resolve_repo_state(repo.path()).await {
+        match resolve_repo_state(repo.path(), &GitBounds::unbounded()).await {
             Err(SubagentError::WorktreeSetup(msg)) => {
                 assert!(msg.contains("clean git working tree"), "{msg}");
             }
@@ -2298,7 +2512,7 @@ mod tests {
 
         let diffs_dir = repo.path().join("artifacts").join("worktree-diffs");
         let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
-        let diffs = diff_worktrees(&setup, &agents, &diffs_dir).await;
+        let diffs = diff_worktrees(&setup, &agents, &diffs_dir, &GitBounds::unbounded()).await;
 
         assert_eq!(diffs.len(), 2);
         for (i, diff) in diffs.iter().enumerate() {
@@ -2333,6 +2547,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
         for path in &paths {
@@ -2376,7 +2591,13 @@ mod tests {
         std::fs::write(worktree.path.join("asset.bin"), &blob).unwrap();
 
         let diffs_dir = repo.path().join("diffs");
-        let diffs = diff_worktrees(&setup, &["agent-a".to_string()], &diffs_dir).await;
+        let diffs = diff_worktrees(
+            &setup,
+            &["agent-a".to_string()],
+            &diffs_dir,
+            &GitBounds::unbounded(),
+        )
+        .await;
         assert!(diffs[0].error.is_none(), "{:?}", diffs[0].error);
 
         let patch = std::fs::read(&diffs[0].patch_path).unwrap();
@@ -2462,6 +2683,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
 
@@ -2527,6 +2749,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
     }
@@ -2587,6 +2810,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
     }
@@ -2655,7 +2879,7 @@ mod tests {
             agent: None,
         };
 
-        let err = run_worktree_setup_hook(&hook, &input)
+        let err = run_worktree_setup_hook(&hook, &input, &GitBounds::unbounded())
             .await
             .expect_err("a hook that never exits must surface as a timeout");
         assert!(
@@ -2798,6 +3022,7 @@ mod tests {
             &setup,
             &["agent-a".to_string()],
             &repo.path().join("hook-diff"),
+            &GitBounds::unbounded(),
         )
         .await;
         let patch = std::fs::read_to_string(&diffs[0].patch_path).unwrap();
@@ -2811,6 +3036,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
     }
@@ -2879,6 +3105,293 @@ mod tests {
         );
     }
 
+    // ---- SUBA-130: worktree git obeys the run's deadline and stop ----
+
+    /// Everything a failed or aborted allocation must NOT leave behind.
+    fn assert_no_worktree_leftovers(repo: &Path, base: &Path) {
+        let worktrees = git(repo, &["worktree", "list", "--porcelain"]);
+        assert_eq!(
+            worktrees
+                .lines()
+                .filter(|l| l.starts_with("worktree "))
+                .count(),
+            1,
+            "only the main checkout may remain: {worktrees}"
+        );
+        let branches = git(repo, &["branch", "--list", "subagents/*"]);
+        assert!(branches.trim().is_empty(), "leaked branches: {branches}");
+        assert_eq!(
+            std::fs::read_dir(base).unwrap().count(),
+            0,
+            "leaked worktree directories"
+        );
+    }
+
+    /// pi `SetupTransaction.check()` / `runSetupCommand`'s pre-check (`worktree.ts:229-233`): a
+    /// deadline that has already passed fails setup before ANY git runs or anything is created.
+    ///
+    /// RED without the bound: `create_worktrees` ignored the deadline, allocated the worktree and
+    /// returned `Ok`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_worktrees_with_an_expired_deadline_creates_nothing() {
+        let repo = make_real_git_repo();
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            bounds: GitBounds::new(None, Some(Instant::now())),
+            ..Default::default()
+        };
+        let err = create_worktrees(repo.path(), "expired", 1, Some(&options))
+            .await
+            .expect_err("a setup past its deadline must fail");
+        assert!(
+            err.to_string().contains("deadline exceeded"),
+            "unexpected error: {err}"
+        );
+        assert_no_worktree_leftovers(repo.path(), base.path());
+    }
+
+    /// A stop that arrives while the setup hook runs ends the hook promptly and unwinds the
+    /// allocation (pi `tx.command(hook)` carries the launch `signal`; compensation does not).
+    ///
+    /// RED without the bound: the hook ran to its own `sleep 30` end.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_during_the_setup_hook_aborts_creation_and_rolls_back() {
+        let repo = make_real_git_repo();
+        let (_d, hook) = write_hook_script("sleep 30");
+        let base = tempfile::tempdir().unwrap();
+        let cancel = CancelToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            trigger.cancel();
+        });
+        let options = CreateWorktreesOptions {
+            setup_hook: Some(WorktreeSetupHookConfig {
+                hook_path: hook.to_string_lossy().into_owned(),
+                timeout_ms: Some(60_000),
+            }),
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            bounds: GitBounds::new(Some(cancel), None),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let err = create_worktrees(repo.path(), "stopped", 1, Some(&options))
+            .await
+            .expect_err("stop must end the setup");
+        assert!(
+            err.to_string().contains("aborted"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "stop must be prompt: {:?}",
+            started.elapsed()
+        );
+        assert_no_worktree_leftovers(repo.path(), base.path());
+    }
+
+    /// The run's deadline governs a setup hook whose own timeout is longer (upstream's
+    /// `Math.min(deadlineAt, now + hookTimeoutMs)`), AND the rollback still removes the allocation
+    /// even though that deadline is gone by then ([CYRUP-DELTA] `GitBounds::for_compensation`'s
+    /// grace floor — an exact port would leak the worktree and branch here).
+    ///
+    /// RED without the clamp: the hook ran for its own 60 s.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_run_deadline_clamps_the_hook_timeout_and_rollback_still_cleans_up() {
+        let repo = make_real_git_repo();
+        let (_d, hook) = write_hook_script("sleep 30");
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            setup_hook: Some(WorktreeSetupHookConfig {
+                hook_path: hook.to_string_lossy().into_owned(),
+                timeout_ms: Some(60_000),
+            }),
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            bounds: GitBounds::new(None, Some(Instant::now() + Duration::from_millis(2_500))),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let err = create_worktrees(repo.path(), "clamped", 1, Some(&options))
+            .await
+            .expect_err("the deadline must end the hook");
+        assert!(
+            err.to_string().contains("deadline exceeded"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the hook must not outlive the run deadline: {:?}",
+            started.elapsed()
+        );
+        assert_no_worktree_leftovers(repo.path(), base.path());
+    }
+
+    /// Point `core.fsmonitor` at a hook that never answers: from then on every `git status`,
+    /// `git add` and `git diff` in the repository (and its worktrees) HANGS — a real hung git,
+    /// without faking `PATH`. Returns the script's tempdir guard.
+    #[cfg(unix)]
+    fn hang_every_git_index_read(repo: &Path) -> tempfile::TempDir {
+        let (dir, hook) = write_hook_script("sleep 15");
+        git(repo, &["config", "core.fsmonitor", &hook.to_string_lossy()]);
+        dir
+    }
+
+    /// The CYRUP-DELTA half: upstream's diff and cleanup git are unbounded `spawnSync`. Here a git
+    /// that hangs during the harvest is ended at the deadline and the capture FAILS (its row
+    /// carries the error, which the preserve gate reads), instead of holding the run open.
+    ///
+    /// RED without the bound: `diff_worktrees` waited for the hung git's own 15 s end, then
+    /// captured successfully.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_git_in_the_diff_capture_is_ended_at_the_deadline() {
+        let repo = make_real_git_repo();
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup = create_worktrees(repo.path(), "hungdiff", 1, Some(&options))
+            .await
+            .expect("create");
+        std::fs::write(setup.worktrees[0].path.join("work.txt"), "work\n").unwrap();
+        let _hang = hang_every_git_index_read(repo.path());
+
+        let bounds = GitBounds::new(None, Some(Instant::now() + Duration::from_millis(800)));
+        let started = Instant::now();
+        let diffs = diff_worktrees(
+            &setup,
+            &["agent".to_string()],
+            &repo.path().join("hung-diffs"),
+            &bounds,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        git(repo.path(), &["config", "--unset", "core.fsmonitor"]);
+        assert!(
+            diffs[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("deadline exceeded")),
+            "the capture must fail at the deadline: {:?}",
+            diffs[0].error
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must end at the deadline, not at the hung git's own end: {elapsed:?}"
+        );
+    }
+
+    /// Same, for the cleanup gate's probe — and this one is ended by STOP, not by a deadline.
+    ///
+    /// RED without the bound: the cleanup waited out the hung `git status` (15 s).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_git_in_cleanup_is_ended_by_stop_and_the_worktree_is_preserved() {
+        let repo = make_real_git_repo();
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup = create_worktrees(repo.path(), "hungclean", 1, Some(&options))
+            .await
+            .expect("create");
+        let _hang = hang_every_git_index_read(repo.path());
+
+        let cancel = CancelToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let report = cleanup_worktrees(
+            &setup,
+            &crate::handoff::WorktreeCleanupIntent::Preserve(crate::handoff::PreserveEvidence {
+                captured_diffs: Vec::new(),
+                handoff_manifest_path: None,
+            }),
+            &GitBounds::new(Some(cancel), None),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        git(repo.path(), &["config", "--unset", "core.fsmonitor"]);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "stop must be prompt: {elapsed:?}"
+        );
+        let task = &report.tasks[0];
+        assert!(
+            !task.worktree_removed,
+            "an unanswered probe never removes: {task:?}"
+        );
+        assert_eq!(task.preserved, Some(true));
+        let errors = task.errors.clone().unwrap_or_default().join(" ");
+        assert!(errors.contains("aborted"), "unexpected errors: {errors}");
+        assert!(setup.worktrees[0].path.exists());
+    }
+
+    /// `GitBounds::for_harvest` — a run that is ALREADY stopped and past its deadline is exactly
+    /// the run whose work most needs capturing, so its harvest is not cut off; a stop that
+    /// arrives during the harvest still is.
+    ///
+    /// RED if `for_harvest` obeyed the expired run bounds: the capture failed with
+    /// `Worktree setup aborted` and the work was not captured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_harvest_after_stop_and_deadline_still_captures_the_work() {
+        let repo = make_real_git_repo();
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup = create_worktrees(repo.path(), "afterstop", 1, Some(&options))
+            .await
+            .expect("create");
+        std::fs::write(setup.worktrees[0].path.join("work.txt"), "work\n").unwrap();
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let past = Instant::now().checked_sub(Duration::from_secs(60));
+        let bounds = GitBounds::for_harvest(&cancel, past);
+        assert!(
+            bounds.cancel.is_none(),
+            "an already-ended run's stop is not obeyed"
+        );
+        assert!(
+            bounds
+                .deadline_at
+                .is_none_or(|at| at > Instant::now() + Duration::from_secs(5)),
+            "an expired run deadline gets the accounting grace"
+        );
+
+        let diffs = diff_worktrees(
+            &setup,
+            &["agent".to_string()],
+            &repo.path().join("after-stop-diffs"),
+            &bounds,
+        )
+        .await;
+        assert!(
+            diffs[0].error.is_none(),
+            "capture failed: {:?}",
+            diffs[0].error
+        );
+        assert_eq!(diffs[0].files_changed, 1);
+
+        let live = CancelToken::new();
+        assert!(
+            GitBounds::for_harvest(&live, None).cancel.is_some(),
+            "a stop during the harvest must still end a hung git"
+        );
+    }
+
     // ---- preview ----
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2896,6 +3409,7 @@ mod tests {
             "preview",
             2,
             Some(&base.path().to_string_lossy()),
+            &GitBounds::unbounded(),
         )
         .await
         .expect("preview");
@@ -2919,6 +3433,7 @@ mod tests {
             worktree_base_dir: Some(base.path()),
             setup_hook: None,
             setup_hook_timeout_ms: None,
+            bounds: GitBounds::unbounded(),
         };
         let overrides: Vec<Option<&Path>> = vec![None, None];
         let plan = setup_worktree_group(repo.path(), &overrides, &config)
@@ -2949,6 +3464,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
     }
@@ -3008,6 +3524,7 @@ mod tests {
                 captured_diffs: Vec::new(),
                 handoff_manifest_path: None,
             }),
+            &GitBounds::unbounded(),
         )
         .await;
 
@@ -3040,6 +3557,7 @@ mod tests {
             &crate::handoff::WorktreeCleanupIntent::Discard {
                 authorization: test_discard_authorization(),
             },
+            &GitBounds::unbounded(),
         )
         .await;
     }
@@ -3063,6 +3581,7 @@ mod tests {
                 captured_diffs: Vec::new(),
                 handoff_manifest_path: None,
             }),
+            &GitBounds::unbounded(),
         )
         .await;
 
@@ -3111,6 +3630,7 @@ mod tests {
                 captured_diffs: Vec::new(),
                 handoff_manifest_path: None,
             }),
+            &GitBounds::unbounded(),
         )
         .await;
 

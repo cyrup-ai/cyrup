@@ -194,6 +194,7 @@ fn project_block(b: &Block) -> Content {
                 // A handle on the buffer, not a parse of it (PERF-001).
                 arguments: LazyArgs::streaming(partial_json.clone()),
                 thought_signature: None,
+                namespace: None,
             }),
         }
     }

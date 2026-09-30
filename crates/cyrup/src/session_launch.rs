@@ -270,6 +270,30 @@ pub async fn launch(
         return Ok(ControlFlow::Break(0));
     }
 
+    // `--list-models [search]` (SEAM-135) — pi's second runtime-metadata exit, the sibling of the
+    // `--help` one above and in the same place, `main.ts:866-871` @v0.87.1:
+    //
+    // ```ts
+    // if (parsed.listModels !== undefined) {
+    //     reportDiagnostics(startupSettingsDiagnostics);
+    //     const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
+    //     await listModels(modelRuntime, searchPattern, AbortSignal.timeout(15_000));
+    //     process.exit(0);
+    // }
+    // ```
+    //
+    // Running it on the built session (not before runtime creation, where cyrup used to exit) is
+    // what lets the listing see a model an extension registered with `registerProvider`. Same
+    // teardown story as `--help`: `process.exit(0)` runs none, and `create_unannounced` announced
+    // nothing.
+    if let Some(search) = post.cli.list_models.as_deref() {
+        diagnostics::report(post.startup_diagnostics);
+        let session = runtime.session().await;
+        return Ok(ControlFlow::Break(crate::actions::list_models_for_session(
+            &session, search,
+        )));
+    }
+
     // Pi main.ts:895-904 (SEAM-S01, CFG-088) — report the merged startup + runtime diagnostics
     // and exit 1 on any runtime error. Same checkpoint, every mode.
     let report =

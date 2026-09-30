@@ -60,6 +60,7 @@ pub(super) async fn process_tool_call(
             name,
             arguments: Map::new().into(),
             thought_signature: None,
+            namespace: None,
         }));
         let block_idx = dec.block_index();
         dec.tool_blocks_by_key.insert(key.clone(), block_idx);
@@ -154,6 +155,7 @@ pub(super) async fn finalize_tool_blocks(
             name,
             arguments: args.clone().into(),
             thought_signature: None,
+            namespace: None,
         };
         if let Some(Content::ToolCall(tc)) = dec.block_mut(idx) {
             tc.arguments = args.into();

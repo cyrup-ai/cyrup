@@ -396,6 +396,7 @@ mod tests {
                     .expect("object")
                     .into(),
                 thought_signature: None,
+                namespace: None,
             };
             sink.send(StreamEvent::ToolCallEnd {
                 content_index: 1,
@@ -415,6 +416,7 @@ mod tests {
                             .expect("object")
                             .into(),
                         thought_signature: None,
+                        namespace: None,
                     }),
                 ],
                 provider: ProviderId::from("p"),

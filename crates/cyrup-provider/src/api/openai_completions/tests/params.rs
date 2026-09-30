@@ -70,6 +70,7 @@ fn request_body_matches_openai_shape() {
                         .expect("object")
                         .into(),
                     thought_signature: None,
+                    namespace: None,
                 })],
                 provider: "together".into(),
                 model: "m".into(),

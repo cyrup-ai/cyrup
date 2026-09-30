@@ -23,7 +23,7 @@ use cyrup_session_svc::{AppMode, SessionConfig, SessionTarget};
 
 use crate::cli::Cli;
 use crate::session_resolve::{
-    Outcome, SessionFlags, gather_session_refs, gather_session_scopes, resolve_session_target,
+    Outcome, SessionFlags, gather_session_refs, resolve_session_target, session_scope_listings,
 };
 use crate::startup::file_settings_store;
 
@@ -150,16 +150,16 @@ pub async fn resolve_startup_ui(
     let theme = crate::startup_theme(dirs, cli.use_theme.as_deref());
     let keymaps = crate::startup_keymaps(dirs);
 
-    // --resume (#1): mount the `SessionSelector` over the merged local+global session listing and
+    // --resume (#1): mount the `SessionSelector` over the two streamed session loaders and
     // resume the chosen session (Pi `selectSession`, session-picker.ts:15-55). A bare `--resume`
     // mapped to `New` in `to_session_config`; the picker resolves the real target here.
     if cli.resume && matches!(config.target, SessionTarget::New) {
         // SEAM-061: the picker takes pi's two loaders, not one merged list — `Tab` swaps between
-        // them (`session-picker.ts:15-19` hands `selectSession` both).
-        let (current_sessions, all_sessions) = gather_session_scopes(dirs);
-        let (choice, status) =
-            crate::run_resume_picker(&theme, &keymaps, &current_sessions, &all_sessions, None)
-                .await?;
+        // them (`session-picker.ts:15-19` hands `selectSession` both). SEAM-134: and they are
+        // handed over UNRUN — the picker opens at once and streams each listing in.
+        let (current_loader, all_loader) = session_scope_listings(dirs);
+        let (choice, status, stored_cwds) =
+            crate::run_resume_picker(&theme, &keymaps, current_loader, all_loader).await?;
         // Pi renders these inside the picker header with a 2 s / 3 s dwell
         // (session-selector.ts:847,851); cyrup's selector has no status channel yet (area 07), so
         // they are printed after the alternate screen is torn down rather than dropped. SEAM-063.
@@ -174,14 +174,12 @@ pub async fn resolve_startup_ui(
                 // must still get the interactive Continue/Cancel prompt, exactly as the
                 // `--session`/`--session-id` open paths do via `resolve_session`. The picked session's
                 // stored cwd comes from its `SessionInfo` listing (Pi `sessionManager.getCwd()`).
-                // Searched across BOTH scopes: with the `Tab` toggle live the chosen row may have
-                // come from the all-projects set, and a cross-project session is exactly the one
-                // whose stored cwd is most likely to be gone.
-                let stored_cwd = current_sessions
-                    .iter()
-                    .chain(all_sessions.iter())
-                    .find(|s| s.path == path)
-                    .map(|s| s.cwd.clone())
+                // Looked up across BOTH scopes' batches: with the `Tab` toggle live the chosen row
+                // may have come from the all-projects set, and a cross-project session is exactly
+                // the one whose stored cwd is most likely to be gone.
+                let stored_cwd = stored_cwds
+                    .get(&path.display().to_string())
+                    .cloned()
                     .unwrap_or_default();
                 if crate::session_cwd_is_missing(&stored_cwd) {
                     let body = crate::format_missing_session_cwd_prompt(&stored_cwd, &dirs.cwd);

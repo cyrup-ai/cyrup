@@ -90,6 +90,7 @@ fn ctx_with_tool_call_ids(ids: &[&str]) -> Context {
                 name: "read".into(),
                 arguments: Map::new().into(),
                 thought_signature: None,
+                namespace: None,
             })
         })
         .collect();

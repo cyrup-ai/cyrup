@@ -88,6 +88,59 @@ pub(crate) fn session_row_set(sessions: &[SessionInfo], current: &str) -> Sessio
     }
 }
 
+/// Run one `/resume` load on the blocking pool and report it over `tx` as [`SessionListMsg`]s
+/// tagged with `epoch` (pi's `loadScope` awaiting its loader, `session-selector.ts:941-988`
+/// @v0.87.1). Shared by the in-session picker ([`App::start_requested_session_load`]) and the
+/// pre-launch `--resume` picker (`startup_loop`, SEAM-134), which differ in who owns the channel
+/// and the epoch, not in how a listing is run.
+///
+/// Blocking file reads, so the blocking pool: the caller's task — and the async workers the rest of
+/// the process runs on — never waits on a session file. Needs a tokio runtime. `cancel` stops the
+/// listing before its next file and suppresses its `Done`.
+pub(crate) fn spawn_session_load(
+    listing: SessionListing,
+    current_id: String,
+    scope: SessionScope,
+    epoch: u64,
+    tx: tokio::sync::mpsc::UnboundedSender<SessionListMsg>,
+    cancel: CancelToken,
+) {
+    tokio::task::spawn_blocking(move || {
+        // pi's `signal?.throwIfAborted()` ahead of the first read (`session-manager.ts:946`).
+        if cancel.is_cancelled() {
+            return;
+        }
+        let mut on_progress = |loaded: usize, total: usize, partial: Option<&[SessionInfo]>| {
+            if cancel.is_cancelled() {
+                return ControlFlow::Break(());
+            }
+            let update = SessionListUpdate::Progress {
+                loaded,
+                total,
+                partial: partial.map(|p| session_row_set(p, &current_id)),
+            };
+            // A closed channel means the receiver is gone: nobody will read the rest.
+            match tx.send(SessionListMsg {
+                epoch,
+                scope,
+                update,
+            }) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(_) => ControlFlow::Break(()),
+            }
+        };
+        let sessions = listing.run(Some(&mut on_progress));
+        if cancel.is_cancelled() {
+            return;
+        }
+        let _ = tx.send(SessionListMsg {
+            epoch,
+            scope,
+            update: SessionListUpdate::Done(session_row_set(&sessions, &current_id)),
+        });
+    });
+}
+
 impl<B: Backend> App<B> {
     /// Install the `/resume` listing channel and hand back its receiver (TUI-121).
     ///
@@ -160,42 +213,7 @@ impl<B: Backend> App<B> {
         let current_id = loads.current_id.clone();
         let cancel = CancelToken::new();
         loads.cancels.push(cancel.clone());
-        // Blocking file reads, so the blocking pool: the run loop's task — and the async workers
-        // the rest of the session runs on — never waits on a session file.
-        tokio::task::spawn_blocking(move || {
-            // pi's `signal?.throwIfAborted()` ahead of the first read (`session-manager.ts:946`).
-            if cancel.is_cancelled() {
-                return;
-            }
-            let mut on_progress = |loaded: usize, total: usize, partial: Option<&[SessionInfo]>| {
-                if cancel.is_cancelled() {
-                    return ControlFlow::Break(());
-                }
-                let update = SessionListUpdate::Progress {
-                    loaded,
-                    total,
-                    partial: partial.map(|p| session_row_set(p, &current_id)),
-                };
-                // A closed channel means the run loop is gone: nobody will read the rest.
-                match tx.send(SessionListMsg {
-                    epoch,
-                    scope,
-                    update,
-                }) {
-                    Ok(()) => ControlFlow::Continue(()),
-                    Err(_) => ControlFlow::Break(()),
-                }
-            };
-            let sessions = listing.run(Some(&mut on_progress));
-            if cancel.is_cancelled() {
-                return;
-            }
-            let _ = tx.send(SessionListMsg {
-                epoch,
-                scope,
-                update: SessionListUpdate::Done(session_row_set(&sessions, &current_id)),
-            });
-        });
+        spawn_session_load(listing, current_id, scope, epoch, tx, cancel);
     }
 
     /// pi `cancelLoads`' abort half (`session-selector.ts:872-883` @v0.87.1): fire every load the

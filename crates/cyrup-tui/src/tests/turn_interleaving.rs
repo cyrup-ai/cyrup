@@ -63,6 +63,7 @@ fn assistant(text: &str, tool: Option<(&str, &str, serde_json::Value)>) -> Assis
             name: name.to_string(),
             arguments: arguments.into(),
             thought_signature: None,
+            namespace: None,
         }));
     }
     m.content = content;

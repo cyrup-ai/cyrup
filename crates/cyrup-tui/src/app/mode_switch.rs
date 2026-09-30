@@ -469,6 +469,12 @@ impl<B: RebuildBackend> App<B> {
         Some(captured)
     }
 
+    /// The live alternate screen, for a test that asserts on its painted cells.
+    #[cfg(test)]
+    pub(crate) fn altscreen_for_test(&mut self) -> Option<&mut AltScreen<B>> {
+        self.altscreen.as_mut()
+    }
+
     /// Everything [`Self::enter_fullscreen`] does after the renderer exists, shared with
     /// `enter_fullscreen_captured`, which exists only under `cfg(test)`, so the two cannot diverge.
     fn adopt_fullscreen_renderer(&mut self, mut alt: AltScreen<B>) {
@@ -482,6 +488,10 @@ impl<B: RebuildBackend> App<B> {
         // the renderer's `?? true` default. This is that argument, moved to the one place both the
         // production and the captured entry paths pass through.
         alt.set_copy_on_select(self.fullscreen_copy_on_select);
+        // TUI-109 — the "Jump to latest message" label's shortcut, pi's `keyDisplayText(
+        // "tui.altScreen.bottom")` (`tui-renderer.ts:30`); `load_keybindings_json` and
+        // `reload_keybindings_from` push it again when the bindings change.
+        alt.set_scroll_to_end_key(self.scroll_to_end_key());
         // §B-1. The retained document is the ONLY thing the alternate screen has to paint, and it
         // grows exclusively inside `TranscriptView::drain_committed` (`transcript/view.rs:110-116`)
         // — so retention has to be on before the first drain of the excursion or the screen would

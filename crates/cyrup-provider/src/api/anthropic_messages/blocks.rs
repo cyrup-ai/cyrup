@@ -5,8 +5,10 @@ use crate::model::{Model, ModelCost};
 use crate::usage::apply_cost;
 use crate::utils::provider_plumbing::now_millis;
 use cyrup_core::{
-    ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId, Usage,
+    ApiId, AssistantMessage, AssistantMessageDiagnostic, Content, LazyArgs, SharedStr, StopReason,
+    ToolCall, ToolCallId, Usage, append_assistant_message_diagnostic,
 };
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
 /// One in-progress content block, keyed by the Anthropic `index`.
@@ -85,6 +87,14 @@ pub(super) struct Decoder {
     /// stream opens (`anthropic-messages.ts:517-528` @v0.87.1) and `output` IS the `partial`
     /// attached to every event as well as the terminal message. PROV-091.
     pub(super) provider_thinking_level: Option<String>,
+    /// The API's report of what it rewrote in the request (`message.input_transformations` at
+    /// `message_start`, top-level `input_transformations` at `message_delta`). The LAST array seen
+    /// REPLACES an earlier one, it does not append — the delta carries the serving model's final
+    /// list (pi `anthropic-messages.ts:545,604-605,753-754` @v0.87.1, test
+    /// `anthropic-sse-parsing.test.ts:285` "uses the serving model input transformations from the
+    /// final stream event"). Surfaced by [`Self::terminal_snapshot`] as an
+    /// `anthropic_input_transformations` diagnostic. TUI-117.
+    pub(super) input_transformations: Option<Vec<Value>>,
 }
 
 impl Decoder {
@@ -176,6 +186,49 @@ impl Decoder {
     }
 }
 
+impl Decoder {
+    /// The terminal message for a stream that ended cleanly: [`Self::snapshot_owned`] plus the
+    /// `anthropic_input_transformations` diagnostic when the API reported any (pi
+    /// `anthropic-messages.ts:801-812` @v0.87.1, appended just before `done`). Not appended for a
+    /// message that has no stop reason yet or ended in `error` — pi throws before reaching it.
+    ///
+    /// Each transformation keeps only its `type`/`path`/`reason` strings, and a field the API left
+    /// out or nulled is left out (pi's `x ?? undefined`).
+    pub(super) fn terminal_snapshot(&mut self, model: &Model, api: &ApiId) -> AssistantMessage {
+        let mut msg = self.snapshot_owned(model, api);
+        let clean = matches!(self.stop_reason, Some(r) if r != StopReason::Error);
+        if let Some(transformations) = self
+            .input_transformations
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            && clean
+        {
+            let listed: Vec<Value> = transformations
+                .iter()
+                .map(|t| {
+                    let mut entry = Map::new();
+                    for key in ["type", "path", "reason"] {
+                        if let Some(v) = t.get(key).filter(|v| !v.is_null()) {
+                            entry.insert(key.to_string(), v.clone());
+                        }
+                    }
+                    Value::Object(entry)
+                })
+                .collect();
+            append_assistant_message_diagnostic(
+                &mut msg.diagnostics,
+                AssistantMessageDiagnostic {
+                    r#type: "anthropic_input_transformations".to_string(),
+                    timestamp: now_millis(),
+                    error: None,
+                    details: Some(json!({ "transformations": listed })),
+                },
+            );
+        }
+        msg
+    }
+}
+
 /// Project ONE block to its `Content`. Was the body of a `blocks_to_content(&[Block])` map, split
 /// out per block so [`ContentCache`] can memoise it (PERF-001). The arms are unchanged.
 fn project_block(b: &Block) -> Content {
@@ -208,6 +261,7 @@ fn project_block(b: &Block) -> Content {
             // them (PERF-001).
             arguments: LazyArgs::streaming(partial_json.clone()),
             thought_signature: None,
+            namespace: None,
         }),
     }
 }

@@ -1524,11 +1524,7 @@ pub fn project_nested_events_in(
 // Route discovery (pi findNestedRouteForRootId / listNestedRoutes / projectNestedRegistryForRoot)
 // =================================================================================================
 
-fn route_from_root_dir(route_root: &Path) -> Option<NestedRoute> {
-    route_from_root_dir_in(&nested_events_dir(), route_root)
-}
-
-/// [`route_from_root_dir`] validated against an explicitly supplied nested-events root.
+/// Read a route dir's `route.json`, validated against the supplied nested-events root.
 fn route_from_root_dir_in(events_root: &Path, route_root: &Path) -> Option<NestedRoute> {
     let metadata: Value =
         serde_json::from_str(&std::fs::read_to_string(route_root.join(ROUTE_FILE)).ok()?).ok()?;
@@ -1558,9 +1554,21 @@ fn route_from_root_dir_in(events_root: &Path, route_root: &Path) -> Option<Neste
 pub fn find_nested_route_for_root_id(
     root_run_id: &str,
 ) -> Result<Option<NestedRoute>, SubagentError> {
+    find_nested_route_for_root_id_in(&nested_events_dir(), root_run_id)
+}
+
+/// [`find_nested_route_for_root_id`] over an explicitly supplied nested-events root (the tree
+/// [`crate::paths::Roots::nested_events`] resolves), validated against that same root.
+///
+/// # Errors
+///
+/// See [`find_nested_route_for_root_id`].
+pub fn find_nested_route_for_root_id_in(
+    events_root: &Path,
+    root_run_id: &str,
+) -> Result<Option<NestedRoute>, SubagentError> {
     assert_safe_id("rootRunId", root_run_id)?;
-    let dir = nested_events_dir();
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(events_root) {
         Ok(read) => read,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(SubagentError::Spawn(err)),
@@ -1570,7 +1578,7 @@ pub fn find_nested_route_for_root_id(
         if !name.starts_with(&format!("{root_run_id}-")) {
             continue;
         }
-        if let Some(route) = route_from_root_dir(&dir.join(&name))
+        if let Some(route) = route_from_root_dir_in(events_root, &events_root.join(&name))
             && route.root_run_id == root_run_id
         {
             return Ok(Some(route));
@@ -1587,10 +1595,61 @@ pub fn find_nested_route_for_root_id(
 pub fn project_nested_registry_for_root(
     root_run_id: &str,
 ) -> Result<Option<NestedRegistry>, SubagentError> {
-    match find_nested_route_for_root_id(root_run_id)? {
-        Some(route) => Ok(Some(project_nested_events(&route)?)),
+    project_nested_registry_for_root_in(&nested_events_dir(), root_run_id)
+}
+
+/// [`project_nested_registry_for_root`] over an explicitly supplied nested-events root.
+///
+/// # Errors
+///
+/// See [`project_nested_registry_for_root`].
+pub fn project_nested_registry_for_root_in(
+    events_root: &Path,
+    root_run_id: &str,
+) -> Result<Option<NestedRegistry>, SubagentError> {
+    match find_nested_route_for_root_id_in(events_root, root_run_id)? {
+        Some(route) => Ok(Some(project_nested_events_in(events_root, &route)?)),
         None => Ok(None),
     }
+}
+
+/// pi `attachRootChildrenToSteps` (`nested-events.ts:964-975` @v0.71.0): the per-step view of a
+/// root run's nested children.
+///
+/// Upstream mutates each status step's `children` in place; a cyrup [`crate::background::StepStatus`]
+/// is a persisted record with no such field, so this returns the attachment instead: element `i`
+/// is what upstream leaves on `steps[i].children`. A child attaches only when it was spawned by the
+/// root itself (`parentRunId === rootRunId`) and names a step the root has
+/// (`parentStepIndex`, compared with the step's position — cyrup steps carry no separate `index`).
+/// A child already attached under the same id is replaced and re-appended, and the list keeps at
+/// most [`MAX_CHILDREN`] entries, so a 17th child is dropped exactly as upstream drops it.
+///
+/// Pure, so the attachment is testable without any nested registry on disk.
+#[must_use]
+pub fn attach_root_children_to_steps(
+    root_run_id: &str,
+    step_count: usize,
+    children: &[NestedRunSummary],
+) -> Vec<Vec<NestedRunSummary>> {
+    let mut attached: Vec<Vec<NestedRunSummary>> = vec![Vec::new(); step_count];
+    for child in children {
+        if child.parent_run_id != root_run_id {
+            continue;
+        }
+        let Some(step_index) = child
+            .parent_step_index
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            continue;
+        };
+        let Some(step_children) = attached.get_mut(step_index) else {
+            continue;
+        };
+        step_children.retain(|existing| existing.id != child.id);
+        step_children.push(child.clone());
+        step_children.truncate(MAX_CHILDREN);
+    }
+    attached
 }
 
 /// pi `listNestedRoutes`.

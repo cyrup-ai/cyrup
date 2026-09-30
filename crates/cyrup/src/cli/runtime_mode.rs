@@ -35,7 +35,21 @@ pub fn resolve_app_mode(cli: &Cli, stdin_tty: bool, stdout_tty: bool) -> AppMode
 /// `--list-models` invocation. Such commands keep stdout pristine for their own output (they are NOT
 /// stdout-guarded).
 pub fn is_plain_runtime_metadata_command(cli: &Cli) -> bool {
-    !cli.print && cli.mode.is_none() && (cli.help || cli.list_models.is_some())
+    !cli.print && cli.mode.is_none() && cli.exits_after_runtime()
+}
+
+impl Cli {
+    /// The two runtime-metadata commands that build the runtime, print, and exit 0 before anything
+    /// else happens: `--help` (`main.ts:857-864` @v0.87.1) and `--list-models` (`:866-871`).
+    ///
+    /// Every gate pi writes as `parsed.help || parsed.listModels !== undefined` asks this: the
+    /// in-memory session (`createSessionManager`, `:363`), the `print` trust mode (`:710`), and
+    /// "this is a runtime diagnostic, not a startup error" — the diagnostics checkpoint at `:896`
+    /// is downstream of both exits, so a bad `--provider`, `--api-key` or `--model` does not stop
+    /// either command. SEAM-135 widened the `cli.help` gates that SEAM-020 added to this.
+    pub fn exits_after_runtime(&self) -> bool {
+        self.help || self.list_models.is_some()
+    }
 }
 
 /// `shouldTakeOverStdout` (main.ts:535): take over stdout for non-interactive modes that are not a

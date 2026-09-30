@@ -64,6 +64,11 @@ pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// (`-` as the name for a single-file mirror) · `D <key> <name>` a mirrored file is gone ·
 /// `S <n>` the child's stderr tail · `X <code>` the child exited · `L <sentence>` the child was
 /// lost. The script exits 0 after `X`/`L`; any other end is a lost transport.
+///
+/// It also ends, with status 66 (HERDR-006), the moment the runtime directory is gone: killing the
+/// local ssh client ends no remote command, so a run that was cleaned up (timed out, cancelled)
+/// leaves this loop running unless it notices by itself that there is nothing left to relay.
+/// Cleanup removes the directory, so the check fires within one 200 ms poll.
 pub const RELAY_SCRIPT: &str = r#"rt=$1; id=$2; off=$3; shift 3
 case "${rt##*/}" in cyrup-subagents-herdr-*) ;; *) echo "not a placed-run runtime directory" >&2; exit 64;; esac
 if [ ! -d "$rt" ] || [ -L "$rt" ]; then echo "The placed run's runtime directory is gone." >&2; exit 66; fi
@@ -71,6 +76,7 @@ if [ "$(cat "$rt/run-id" 2>/dev/null)" != "$id" ]; then echo "The placed run's i
 printf 'H 1\n'
 n=0
 while [ ! -e "$rt/started" ]; do
+  if [ ! -d "$rt" ]; then echo "The placed run's runtime directory is gone." >&2; exit 66; fi
   n=$((n+1))
   if [ "$n" -gt 300 ]; then printf 'L The placed cyrup child did not start in its Herdr pane within 60 s.\n'; exit 0; fi
   sleep 0.2 2>/dev/null || sleep 1
@@ -110,6 +116,7 @@ events() {
   if [ "$size" -gt "$off" ]; then len=$((size-off)); printf 'E %s\n' "$len"; tail -c +"$((off+1))" "$f" | head -c "$len"; off=$size; fi
 }
 while :; do
+  if [ ! -d "$rt" ]; then echo "The placed run's runtime directory is gone." >&2; exit 66; fi
   fin=0
   if [ -e "$rt/exit" ]; then fin=1
   elif [ -s "$rt/pid" ] && ! kill -0 "$(cat "$rt/pid")" 2>/dev/null && [ ! -e "$rt/exit" ]; then fin=2
@@ -131,8 +138,10 @@ done"#;
 
 /// Upload one channel file atomically: `$1` runtime dir, `$2` relative dir, `$3` file name; the
 /// content arrives on stdin and is renamed into place only once complete, so a child never reads a
-/// partial request.
-const UPLOAD_SCRIPT: &str = "umask 077; d=\"$1/$2\"; mkdir -p \"$d\" && cat > \"$d/.$3.part\" && mv -f \"$d/.$3.part\" \"$d/$3\"";
+/// partial request. The channel directory must already exist — `run.sh` creates it before it
+/// publishes `started` — so an upload racing a cleanup fails (and is retried by
+/// [`RunRelay::upload_dir`]) instead of recreating the removed runtime directory (HERDR-006).
+const UPLOAD_SCRIPT: &str = "umask 077; d=\"$1/$2\"; [ -d \"$d\" ] || exit 66; cat > \"$d/.$3.part\" && mv -f \"$d/.$3.part\" \"$d/$3\"";
 
 /// Whether a mirror is a directory of `*.json` files or one file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

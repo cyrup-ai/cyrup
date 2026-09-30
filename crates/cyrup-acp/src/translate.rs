@@ -1079,6 +1079,7 @@ mod tests {
             name: name.to_string(),
             arguments: map.into(),
             thought_signature: None,
+            namespace: None,
         }
     }
 
@@ -1491,6 +1492,7 @@ mod tests {
             name: "read".to_string(),
             arguments: cyrup_core::LazyArgs::streaming("{\"path\": \"/et".into()),
             thought_signature: None,
+            namespace: None,
         };
         let out = translate(
             &mut ledger,

@@ -25,6 +25,9 @@ pub(super) enum RBlock {
         /// REPLACE it wholesale (`…arguments.done`, `output_item.done`) need no repair: there is
         /// no derived scanner left to fall out of step with it.
         partial_json: SharedStr,
+        /// Pi `item.namespace` (`openai-responses-shared.ts:491`, `:715`): read when the item
+        /// opens and again on `output_item.done`, where a namespace can arrive alone.
+        namespace: Option<String>,
     },
 }
 
@@ -50,12 +53,14 @@ pub(super) fn project_block(b: &RBlock) -> Content {
                 item_id,
                 name,
                 partial_json,
+                namespace,
             } => Content::ToolCall(ToolCall {
                 id: ToolCallId::from(format!("{call_id}|{item_id}").as_str()),
                 name: name.clone(),
                 // A handle on the buffer, not a parse of it (PERF-001).
                 arguments: LazyArgs::streaming(partial_json.clone()),
                 thought_signature: None,
+                namespace: namespace.clone(),
             }),
         }
     }

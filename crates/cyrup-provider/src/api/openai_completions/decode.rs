@@ -106,6 +106,7 @@ where
                     name: name.clone(),
                     arguments: parse_partial_json(args).into(),
                     thought_signature: thought_signature.clone(),
+                    namespace: None,
                 },
                 partial,
             },

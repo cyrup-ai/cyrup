@@ -181,6 +181,7 @@ mod tests {
                 name: name.to_string(),
                 arguments: serde_json::Map::new().into(),
                 thought_signature: None,
+                namespace: None,
             })],
             provider: "anthropic".into(),
             model: "claude-opus-4-6".to_string(),

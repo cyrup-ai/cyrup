@@ -148,6 +148,7 @@ pub(crate) use crossterm::run_editor_over_file;
 pub use reload_trust::{ImplicitTrustReload, implicit_trust_after_reload};
 pub use render_impl::render;
 pub(crate) use render_impl::{env_rows, fallback_columns, is_extension_command};
+pub(crate) use session_list::spawn_session_load;
 pub use session_list::{SessionListMsg, SessionListUpdate};
 pub use state::{ActiveSelector, AppState, ShortcutSpec, SwapCaption};
 pub(crate) use state::{
@@ -266,10 +267,10 @@ pub struct App<B: Backend> {
     /// whose resolution is gated on which renderer is live
     /// ([`AltScreenKeymap::action_in_mode`]).
     ///
-    /// **Not yet reachable from a `keybindings.json`.** The five other maps are merged by
-    /// [`App::load_keybindings_json`] (`app/shell.rs:159-172`) and reset by
-    /// [`App::reload_keybindings_from`]; adding this one is a line in each, and until then the
-    /// table is upstream's defaults for the session's life.
+    /// Merged by [`App::load_keybindings_json`] and reset by [`App::reload_keybindings_from`] like
+    /// the other maps (TUI-109; it was upstream's defaults for the session's life before), and
+    /// `tui.altScreen.bottom` is pushed into the live renderer for its "Jump to latest message"
+    /// label by [`App::push_scroll_to_end_key`].
     alt_keymap: AltScreenKeymap,
     /// The `fullscreenExitOutput` setting (CFG-078) — what [`App::run`]'s exit teardown puts on the
     /// main screen. pi reads `settingsManager.getFullscreenExitOutput()` at the moment it stops

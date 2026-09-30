@@ -1930,7 +1930,11 @@ async fn publish_worktree_handoff(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(format!("worktree-diffs-step-{step_index}"));
-    let diffs = crate::spawn::worktree::diff_worktrees(setup, agents, &diffs_dir).await;
+    // [CYRUP-DELTA] the harvest's git obeys the run's deadline and stop (upstream's diff/cleanup git
+    // is unbounded); see `GitBounds::for_harvest` for why an already-stopped run is not cut off.
+    let git_bounds = crate::spawn::worktree::GitBounds::for_harvest(&ctx.cancel, ctx.deadline_at);
+    let diffs =
+        crate::spawn::worktree::diff_worktrees(setup, agents, &diffs_dir, &git_bounds).await;
 
     let results: Vec<crate::handoff::HandoffResult> = agents
         .iter()
@@ -1998,6 +2002,7 @@ async fn publish_worktree_handoff(
             captured_diffs: diffs.clone(),
             handoff_manifest_path: Some(binding.manifest_path.clone()),
         }),
+        &git_bounds,
     )
     .await;
 
@@ -2467,6 +2472,9 @@ async fn assign_worktree_cwds(
         worktree_base_dir: ctx.worktree_base_dir.as_deref(),
         setup_hook: None,
         setup_hook_timeout_ms: None,
+        // pi `SetupTransaction`: every allocation git command obeys the run's stop and deadline
+        // (`worktree.ts:239-252`).
+        bounds: crate::spawn::worktree::GitBounds::new(Some(ctx.cancel.clone()), ctx.deadline_at),
     };
 
     let plan = crate::spawn::worktree::setup_worktree_group(&ctx.cwd, &overrides, &config).await?;
@@ -3018,9 +3026,13 @@ mod tests {
         std::fs::write(worktree.path.join("untracked.txt"), "only here\n").unwrap();
 
         let diffs_dir = fixture.repo.path().join("diffs");
-        let diffs =
-            crate::spawn::worktree::diff_worktrees(&setup, &["agent-a".to_string()], &diffs_dir)
-                .await;
+        let diffs = crate::spawn::worktree::diff_worktrees(
+            &setup,
+            &["agent-a".to_string()],
+            &diffs_dir,
+            &crate::spawn::worktree::GitBounds::unbounded(),
+        )
+        .await;
         assert!(diffs[0].error.is_none(), "the capture itself succeeds");
 
         // No manifest was ever written, so nothing records the patch.
@@ -3030,6 +3042,7 @@ mod tests {
                 captured_diffs: diffs,
                 handoff_manifest_path: None,
             }),
+            &crate::spawn::worktree::GitBounds::unbounded(),
         )
         .await;
 

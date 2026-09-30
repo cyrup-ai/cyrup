@@ -167,3 +167,24 @@ fn next_event_returns_events_in_order() {
         key(KeyCode::Char('c'), KeyModifiers::CONTROL)
     );
 }
+
+/// The startup selector's wait: `None` when nothing arrives in time (so its loop can look at the
+/// channel a streamed listing reports on), the event as soon as one does.
+#[test]
+fn next_event_timeout_returns_none_when_nothing_arrives_and_the_event_when_it_does() {
+    let (mut master, slave) = pty();
+    let mut r = reader(slave, None);
+    let started = Instant::now();
+    assert_eq!(
+        r.next_event_timeout(Duration::from_millis(40)).unwrap(),
+        None
+    );
+    assert!(started.elapsed() >= Duration::from_millis(30));
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    master.write_all(b"\x1b[B").unwrap();
+    assert_eq!(
+        r.next_event_timeout(Duration::from_secs(2)).unwrap(),
+        Some(key(KeyCode::Down, KeyModifiers::NONE))
+    );
+}

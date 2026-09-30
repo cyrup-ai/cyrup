@@ -574,6 +574,21 @@ impl RunShared {
         // `value` is cloned rather than moved because the callback below needs it after the push.
         let (forwarded, index) = {
             let mut inner = self.lock();
+            // A run whose emit already failed accepts no further emits. The check shares the
+            // `inner` critical section with the failure path's truncate-and-record below, so an
+            // emit dispatched concurrently (the script does not `await` them) either lands before
+            // the rollback and is swept out by it, or sees the fatal here and never appends —
+            // without this, it could append after the rollback, outlive it, and surface in the
+            // failure's `partial.emits`.
+            let recorded_fatal = self
+                .fatal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|failure| failure.message.clone());
+            if let Some(message) = recorded_fatal {
+                return Err(message);
+            }
             let index = inner.emits.len();
             inner.emits.push(value.clone());
             (value, index)
@@ -584,9 +599,16 @@ impl RunShared {
         // Awaited, not blocked on: §5.5. A sync callback here would force the embedder to block
         // the isolate thread inside a running op.
         if let Err(error) = on_emit(forwarded, index).await {
-            self.lock().emits.pop();
             let message = format!("Workflow emit could not be persisted: {error}");
-            self.record_fatal(message.clone(), None);
+            {
+                // Truncate to this emit's own slot rather than `pop()`: a concurrently dispatched
+                // emit may have appended after it, and `pop()` would then remove THAT one and
+                // leave this rejected value in the partial. Recording the fatal inside the same
+                // critical section is what makes the refusal above atomic with the rollback.
+                let mut inner = self.lock();
+                inner.emits.truncate(index);
+                self.record_fatal(message.clone(), None);
+            }
             return Err(message);
         }
         Ok(())
@@ -3459,6 +3481,113 @@ return "done";
         );
         // Rolled back: nothing was persisted, and the partial says so on the failure arm.
         assert!(error.partial.emits.is_empty());
+    }
+
+    /// A bare [`RunShared`] around `on_emit`, for driving `emit` directly: the script-level tests
+    /// cannot order two unawaited emits against each other, these can.
+    fn shared_with_emit(on_emit: WorkflowEmitCallback) -> Arc<RunShared> {
+        let (settle_tx, _settle_rx) = watch::channel(0_u64);
+        let (telemetry, _telemetry_rx) = tokio::sync::mpsc::unbounded_channel();
+        Arc::new(RunShared {
+            host: Arc::new(FakeHost::new(Duration::ZERO)),
+            state_store: None,
+            one_use_permit: None,
+            on_trace: None,
+            on_lane_plan: None,
+            on_emit: Some(on_emit),
+            on_host_step: None,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            child_cancel: CancelToken::new(),
+            fatal_signal: CancelToken::new(),
+            fatal: Mutex::new(None),
+            settle_tx,
+            main_handle: tokio::runtime::Handle::current(),
+            telemetry,
+            last_progress: Mutex::new(Instant::now()),
+            inner: Mutex::new(RunInner::default()),
+        })
+    }
+
+    /// Once one emit has failed the run, a LATER emit is refused without reaching the callback and
+    /// appends nothing. Before, it appended after the rollback had already run, so it survived
+    /// into the failure's `partial.emits` — the flake in
+    /// `a_rejected_emit_aborts_the_run_and_is_rolled_back_out_of_the_partial`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_emit_after_the_run_has_failed_is_refused_and_appends_nothing() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shared = shared_with_emit(recording_on_emit(
+            Arc::clone(&recorded),
+            Err("sink is gone".to_string()),
+        ));
+        let first = shared.emit(json!({ "step": 1 })).await;
+        assert_eq!(
+            first,
+            Err("Workflow emit could not be persisted: sink is gone".to_string())
+        );
+        let second = shared.emit(json!({ "step": 2 })).await;
+        assert_eq!(
+            second,
+            Err("Workflow emit could not be persisted: sink is gone".to_string()),
+            "the refusal carries the run's own fatal"
+        );
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "only the first emit was delivered"
+        );
+        assert!(
+            shared.lock().emits.is_empty(),
+            "nothing survives the rollback"
+        );
+    }
+
+    /// Two emits in flight at once, the FIRST rejected after the SECOND has already appended: the
+    /// rollback must take out the rejected value and everything stacked after it. `pop()` took out
+    /// the second emit's value instead and left the rejected first one in the partial.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_emit_rolls_back_an_emit_that_appended_after_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second_arrived = Arc::new(tokio::sync::Notify::new());
+        let on_emit: WorkflowEmitCallback = {
+            let calls = Arc::clone(&calls);
+            let second_arrived = Arc::clone(&second_arrived);
+            Arc::new(move |_value: Value, _index: usize| {
+                let ordinal = calls.fetch_add(1, Ordering::SeqCst);
+                let second_arrived = Arc::clone(&second_arrived);
+                Box::pin(async move {
+                    if ordinal == 0 {
+                        // Hold the rejection until the second emit has appended and been accepted.
+                        second_arrived.notified().await;
+                        Err("sink is gone".to_string())
+                    } else {
+                        second_arrived.notify_one();
+                        Ok(())
+                    }
+                })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+                    >
+            })
+        };
+        let shared = shared_with_emit(on_emit);
+        let first = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move { shared.emit(json!({ "step": 1 })).await }
+        });
+        // The first emit has appended and is parked in its callback.
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        shared
+            .emit(json!({ "step": 2 }))
+            .await
+            .expect("the second emit is accepted: no fatal yet");
+        assert!(first.await.unwrap().is_err());
+        assert!(
+            shared.lock().emits.is_empty(),
+            "the rejected emit and the one after it are both rolled back, got {:?}",
+            shared.lock().emits
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

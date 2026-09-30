@@ -213,7 +213,8 @@ pub struct AppState {
     /// (`cyrup-config/src/settings/effective.rs`'s `show_cache_miss_notices`).
     pub show_cache_miss_notices: bool,
     /// Raised by [`App::finalize_assistant_message`] when the just-settled turn should be tested
-    /// for a prompt-cache miss, and consumed by [`App::ingest_session_event_owned`], which has the
+    /// for a prompt-cache miss (and, TUI-117, for a rise in dropped Anthropic thinking blocks —
+    /// pi gates both on the same setting and the same clean stop), and consumed by [`App::ingest_session_event_owned`], which has the
     /// session the (async) scan needs — the same sync-fold/async-wrapper split
     /// [`Self::compaction_flush_pending`] uses, and for the same reason.
     pub cache_miss_check_pending: bool,

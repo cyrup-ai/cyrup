@@ -138,8 +138,7 @@ pub async fn maybe_run_first_time_setup(
     settings: &mut SettingsManager,
 ) -> anyhow::Result<bool> {
     if mode != AppMode::Interactive
-        || cli.help
-        || cli.list_models.is_some()
+        || cli.exits_after_runtime()
         || !crate::startup::should_run_first_time_setup(
             &dirs.settings_path(),
             env.agent_dir.is_some(),

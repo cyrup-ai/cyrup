@@ -489,3 +489,85 @@ mod prov090_server_side_fallback {
         assert_eq!(msg.content.len(), 1);
     }
 }
+
+/// TUI-117 provider half — the API's `input_transformations` become ONE
+/// `anthropic_input_transformations` diagnostic on the terminal message, and the `message_delta`
+/// list replaces the `message_start` one (pi `anthropic-messages.ts:545,604-605,753-754,801-812`;
+/// test `anthropic-sse-parsing.test.ts:285-350` @v0.87.1).
+mod tui117_input_transformations {
+    use super::*;
+
+    fn stream(start: &str, delta: &str, stop: &str) -> String {
+        format!(
+            concat!(
+                "event: message_start\n",
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_t\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":0}}{start}}}}}\n\n",
+                "event: content_block_start\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"hi\"}}}}\n\n",
+                "event: content_block_stop\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "event: message_delta\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop}\"}},\"usage\":{{\"output_tokens\":1}}{delta}}}\n\n",
+                "event: message_stop\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            start = start,
+            delta = delta,
+            stop = stop,
+        )
+    }
+
+    async fn terminal(raw: &str) -> AssistantMessage {
+        collect(raw.as_bytes().to_vec(), &model())
+            .await
+            .iter()
+            .find_map(StreamEvent::terminal_message)
+            .map(|m| (**m).clone())
+            .expect("terminal")
+    }
+
+    const START: &str = ",\"input_transformations\":[{\"type\":\"thinking_dropped\",\"path\":\"messages.1.content.0\",\"reason\":\"prefix_binding_mismatch\"}]";
+    const DELTA: &str = ",\"input_transformations\":[{\"type\":\"thinking_dropped\",\"path\":\"messages.3.content.0\",\"reason\":\"model_binding_mismatch\"}]";
+
+    #[tokio::test]
+    async fn the_delta_list_replaces_the_start_list_and_yields_one_diagnostic() {
+        let msg = terminal(&stream(START, DELTA, "end_turn")).await;
+        let diagnostics = msg.diagnostics.expect("diagnostics");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].r#type, "anthropic_input_transformations");
+        assert!(diagnostics[0].timestamp > 0);
+        assert_eq!(
+            diagnostics[0].details,
+            Some(json!({"transformations": [
+                {"type": "thinking_dropped", "path": "messages.3.content.0", "reason": "model_binding_mismatch"}
+            ]}))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_only_list_is_kept_and_null_fields_are_omitted() {
+        let start = ",\"input_transformations\":[{\"type\":\"thinking_dropped\",\"path\":null}]";
+        let msg = terminal(&stream(start, "", "end_turn")).await;
+        let diagnostics = msg.diagnostics.expect("diagnostics");
+        assert_eq!(
+            diagnostics[0].details,
+            Some(json!({"transformations": [{"type": "thinking_dropped"}]}))
+        );
+    }
+
+    #[tokio::test]
+    async fn no_or_empty_transformations_leave_diagnostics_none() {
+        assert_eq!(
+            terminal(&stream("", "", "end_turn")).await.diagnostics,
+            None
+        );
+        let empty = ",\"input_transformations\":[]";
+        assert_eq!(
+            terminal(&stream(START, empty, "end_turn"))
+                .await
+                .diagnostics,
+            None,
+            "an empty delta list replaces the start list"
+        );
+    }
+}

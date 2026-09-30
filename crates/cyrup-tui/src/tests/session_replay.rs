@@ -85,6 +85,7 @@ fn tool_call_id(id: &str, name: &str, args: serde_json::Value) -> Content {
         name: name.to_string(),
         arguments: arguments.into(),
         thought_signature: None,
+        namespace: None,
     })
 }
 

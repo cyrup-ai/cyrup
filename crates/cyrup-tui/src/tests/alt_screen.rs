@@ -946,3 +946,332 @@ fn teardown_is_idempotent() {
         "a second teardown writes nothing"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// indicator.rs — the "Jump to latest message" label (TUI-109)
+// ---------------------------------------------------------------------------------------------
+//
+// pi has no test for `compositeScrollToEndIndicator` in `test/tui-alt-screen.test.ts` @v0.87.1, so
+// these pin the contract from its source (`tui-alt-screen.ts:1018-1024`, `:1623-1645`) and the
+// label from `modes/interactive/tui-renderer.ts:29-33`.
+
+/// A left press — `handleScrollToEndIndicatorMouseEvent` tests `release`, the motion bit and the
+/// button bits (`:1019`), which is `Down(Left)` here.
+fn press(column: u16, row: u16) -> MouseEvent {
+    wheel(MouseEventKind::Down(MouseButton::Left), column, row)
+}
+
+/// The last painted row of the viewport.
+fn last_row(alt: &mut AltScreen<TestBackend>) -> String {
+    viewport(alt).pop().unwrap_or_default()
+}
+
+/// The label on the last row, without the document text to its left: from the arrow to the end.
+fn label_text(alt: &mut AltScreen<TestBackend>) -> String {
+    let row = last_row(alt);
+    row.split_once('↓').map_or_else(String::new, |(_, rest)| {
+        format!("↓{rest}").trim().to_owned()
+    })
+}
+
+/// A 60x6 screen over 40 rows, parked 10 rows above its tail with the `End` shortcut pushed in.
+fn scrolled_up() -> (AltScreen<TestBackend>, Rect) {
+    let (mut alt, _captured, area) = screen(60, 6, 40);
+    alt.set_scroll_to_end_key(Some("End".to_owned()));
+    alt.draw(None).unwrap();
+    let tail = alt.max_scroll_top_for_test();
+    alt.scroll_to_row_for_test(tail - 10);
+    alt.draw(None).unwrap();
+    // Every negative case below is only meaningful against a label that IS on screen.
+    assert!(
+        last_row(&mut alt).contains("Jump"),
+        "fixture: label painted"
+    );
+    (alt, area)
+}
+
+/// Scrolled up 10 rows: the last row carries the label, centred, with the shortcut.
+#[test]
+fn a_scrolled_up_view_shows_the_jump_label_on_its_last_row() {
+    let (mut alt, _) = scrolled_up();
+    assert!(!alt.is_following_output());
+    let row = last_row(&mut alt);
+    assert!(
+        row.contains("Jump to latest message"),
+        "last row was {row:?}"
+    );
+    assert!(row.contains("· End"), "the shortcut follows it: {row:?}");
+    // Centred on the 60-column viewport: ` ↓ Jump to latest message · End ` is 32 columns wide.
+    assert_eq!(row.find('↓'), Some(14 + 1), "centred at column 14: {row:?}");
+    // ...and only the last row: the rows above are the document.
+    let rows = viewport(&mut alt);
+    assert!(rows[..rows.len() - 1].iter().all(|r| !r.contains("Jump")));
+}
+
+/// At the tail, or while following: no label.
+#[test]
+fn no_jump_label_at_the_tail() {
+    let (mut alt, _captured, _) = screen(60, 6, 40);
+    alt.set_scroll_to_end_key(Some("End".to_owned()));
+    alt.draw(None).unwrap();
+    assert!(alt.is_following_output());
+    assert!(!last_row(&mut alt).contains("Jump"));
+
+    // Away and back by keys: the label appears, then goes when the tail is re-armed.
+    let (mut alt, _) = scrolled_up();
+    assert!(last_row(&mut alt).contains("Jump"));
+    let keys = AltScreenKeymap::default();
+    let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+    assert!(alt.handle_key(&end, &keys, &[]));
+    alt.draw(None).unwrap();
+    assert!(alt.is_following_output());
+    assert!(!last_row(&mut alt).contains("Jump"));
+}
+
+/// A renderer nobody installed the indicator on paints none, scrolled away or not — upstream's
+/// `scrollToEndIndicator` is an optional constructor callback, and every case in
+/// `test/tui-alt-screen.test.ts` builds a bare `TuiAltScreen`.
+#[test]
+fn a_renderer_without_the_indicator_paints_none() {
+    let (mut alt, _captured, _) = screen(60, 6, 40);
+    alt.draw(None).unwrap();
+    let tail = alt.max_scroll_top_for_test();
+    alt.scroll_to_row_for_test(tail - 10);
+    alt.draw(None).unwrap();
+    assert!(!alt.is_following_output());
+    assert!(!viewport(&mut alt).iter().any(|r| r.contains("Jump")));
+}
+
+/// A content that fits is always at its tail: no label.
+#[test]
+fn no_jump_label_when_the_document_fits() {
+    let (mut alt, _captured, _) = screen(60, 6, 3);
+    alt.set_scroll_to_end_key(Some("End".to_owned()));
+    alt.draw(None).unwrap();
+    assert!(!viewport(&mut alt).iter().any(|r| r.contains("Jump")));
+}
+
+/// A left press on the label re-arms the tail follow and the label goes.
+#[test]
+fn clicking_the_jump_label_returns_to_the_tail() {
+    let (mut alt, area) = scrolled_up();
+    let outcome = alt.handle_mouse(&press(20, area.height - 1), area);
+    assert_eq!(outcome, PointerOutcome::Handled);
+    assert!(alt.is_following_output(), "the click re-arms the follow");
+    alt.draw(None).unwrap();
+    assert!(!last_row(&mut alt).contains("Jump"));
+    assert_eq!(
+        viewport(&mut alt).last().map(String::as_str),
+        Some("line 40"),
+        "and the viewport is at the tail"
+    );
+}
+
+/// A press outside the label's rectangle does not: the row above, the same row left of the label,
+/// and the same row right of it.
+#[test]
+fn clicking_outside_the_jump_label_does_not() {
+    for (column, row) in [(20, 4), (2, 5), (55, 5)] {
+        let (mut alt, area) = scrolled_up();
+        assert!(row < area.height && column < area.width);
+        alt.handle_mouse(&press(column, row), area);
+        assert!(
+            !alt.is_following_output(),
+            "a press at ({column}, {row}) must not jump"
+        );
+        alt.draw(None).unwrap();
+        assert!(last_row(&mut alt).contains("Jump"));
+    }
+}
+
+/// Only an unreleased left press counts (`:1019`): a release, a drag and another button do not.
+#[test]
+fn only_a_left_press_activates_the_jump_label() {
+    for kind in [
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Right),
+        MouseEventKind::Down(MouseButton::Middle),
+        MouseEventKind::Moved,
+    ] {
+        let (mut alt, area) = scrolled_up();
+        alt.handle_mouse(&wheel(kind, 20, area.height - 1), area);
+        assert!(!alt.is_following_output(), "{kind:?} must not jump");
+    }
+}
+
+/// The label stops at the scrollbar column (`:1635`): in `always` mode the bar's column is left to
+/// the bar.
+#[test]
+fn the_jump_label_does_not_overpaint_the_scrollbar_column() {
+    let (mut alt, _captured, area) = screen(30, 6, 40);
+    alt.set_scrollbar_mode(ScrollbarMode::Always);
+    alt.set_scroll_to_end_key(Some("End".to_owned()));
+    alt.draw(None).unwrap();
+    let tail = alt.max_scroll_top_for_test();
+    alt.scroll_to_row_for_test(tail - 10);
+    alt.draw(None).unwrap();
+
+    // ` ↓ Jump to latest message · End ` is 32 columns; the viewport is 30 and the bar owns the
+    // 30th, so 29 survive: ... `· E`.
+    assert_eq!(last_row(&mut alt), " ↓ Jump to latest message · E");
+    let bar_cell = alt
+        .backend_for_test()
+        .buffer()
+        .cell((area.width - 1, area.height - 1))
+        .map(|cell| cell.symbol().to_owned());
+    assert_ne!(
+        bar_cell.as_deref(),
+        Some("n"),
+        "the bar column stays the bar's"
+    );
+}
+
+/// A click in the column the label was clipped out of is not a click on the label.
+#[test]
+fn the_clipped_column_is_not_part_of_the_jump_label() {
+    let (mut alt, _captured, area) = screen(30, 6, 40);
+    alt.set_scrollbar_mode(ScrollbarMode::Always);
+    alt.set_scroll_to_end_key(Some("End".to_owned()));
+    alt.draw(None).unwrap();
+    let tail = alt.max_scroll_top_for_test();
+    alt.scroll_to_row_for_test(tail - 10);
+    alt.draw(None).unwrap();
+    assert!(
+        last_row(&mut alt).contains("Jump"),
+        "fixture: label painted"
+    );
+    alt.handle_mouse(&press(area.width - 1, area.height - 1), area);
+    assert!(
+        !alt.is_following_output(),
+        "the scrollbar column belongs to the bar (here: a track press), not to the label"
+    );
+}
+
+/// The label's shortcut is what the owner pushed; unbound drops the ` · key` (`shortcut ? … : ""`),
+/// and a later push replaces it.
+#[test]
+fn the_jump_label_shows_the_pushed_shortcut() {
+    let (mut alt, _) = scrolled_up();
+    assert_eq!(label_text(&mut alt), "↓ Jump to latest message · End");
+
+    alt.set_scroll_to_end_key(Some("Ctrl+G".to_owned()));
+    alt.draw(None).unwrap();
+    assert_eq!(label_text(&mut alt), "↓ Jump to latest message · Ctrl+G");
+
+    alt.set_scroll_to_end_key(None);
+    alt.draw(None).unwrap();
+    assert_eq!(label_text(&mut alt), "↓ Jump to latest message");
+}
+
+/// The label is skipped when the last row holds an image (`isImageLine`, `:1631`): an attachment
+/// strip drawn through a graphics protocol that fills the viewport keeps its last row.
+#[test]
+fn the_jump_label_is_skipped_on_an_image_row() {
+    use crate::altscreen::Strip;
+    use crate::image::{ImageProtocol, TerminalCapabilities};
+    use crate::{ImageBlock, ImageRenderer};
+    use image::{DynamicImage, Rgba, RgbaImage};
+
+    let mut pixels = RgbaImage::new(100, 400);
+    for px in pixels.pixels_mut() {
+        *px = Rgba([220, 30, 30, 255]);
+    }
+    let block = ImageBlock::new(DynamicImage::ImageRgba8(pixels), "red.png");
+    let kitty = ImageRenderer::from_capabilities(TerminalCapabilities {
+        images: Some(ImageProtocol::Kitty),
+        true_color: true,
+        hyperlinks: false,
+    });
+    let halfblocks = ImageRenderer::halfblocks();
+    let theme = UiTheme::dark();
+    let blocks = [block];
+    let strip = |renderer| Strip {
+        renderer,
+        blocks: &blocks,
+        theme: &theme,
+        show_images: true,
+        width_cells: 30,
+    };
+
+    let (mut alt, _) = scrolled_up();
+    // The baseline: no attachment, label present.
+    assert!(last_row(&mut alt).contains("Jump"));
+
+    // A kitty image taller than the viewport occupies the last row: no label.
+    alt.draw(Some(strip(&kitty))).unwrap();
+    assert!(
+        !last_row(&mut alt).contains("Jump"),
+        "a graphics image owns the row"
+    );
+
+    // The half-block/no-protocol renderer draws one text placeholder line, not an image line, so
+    // the label is composited over the (otherwise empty) last row as it is over any text.
+    alt.draw(Some(strip(&halfblocks))).unwrap();
+    assert!(last_row(&mut alt).contains("Jump"));
+}
+
+/// `tui.altScreen.bottom` is rebound by `keybindings.json`, and the LIVE label follows — on
+/// `load_keybindings_json` and on `/reload`, including going back to the default when the entry is
+/// deleted. The table was never merged before TUI-109, so the rebind did not even move the key.
+#[test]
+fn a_rebound_bottom_key_updates_the_label() {
+    let mut app = crate::App::new(TestBackend::new(60, 8), UiTheme::dark()).unwrap();
+    for i in 0..40 {
+        app.transcript_mut().push_status(format!("status {i}"));
+    }
+    let _captured = app.enter_fullscreen_captured().unwrap();
+    app.draw().unwrap();
+    {
+        let alt = app.altscreen_for_test().unwrap();
+        let tail = alt.max_scroll_top_for_test();
+        alt.scroll_to_row_for_test(tail - 10);
+    }
+    app.draw().unwrap();
+    let label = |app: &mut crate::App<TestBackend>| label_text(app.altscreen_for_test().unwrap());
+    assert_eq!(label(&mut app), "↓ Jump to latest message · End");
+
+    let issues = app
+        .load_keybindings_json(r#"{"tui.altScreen.bottom": "ctrl+g"}"#)
+        .unwrap();
+    assert!(issues.is_empty(), "{issues:?}");
+    app.draw().unwrap();
+    assert_eq!(label(&mut app), "↓ Jump to latest message · Ctrl+G");
+
+    // `/reload` re-reads the file: a rebind in it wins, and deleting it restores the default.
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("keybindings.json"),
+        r#"{"tui.altScreen.bottom": ["ctrl+e", "ctrl+b"]}"#,
+    )
+    .unwrap();
+    app.reload_keybindings_from(dir.path()).unwrap();
+    app.draw().unwrap();
+    assert_eq!(label(&mut app), "↓ Jump to latest message · Ctrl+E/Ctrl+B");
+
+    std::fs::remove_file(dir.path().join("keybindings.json")).unwrap();
+    app.reload_keybindings_from(dir.path()).unwrap();
+    app.draw().unwrap();
+    assert_eq!(label(&mut app), "↓ Jump to latest message · End");
+}
+
+/// A renderer adopted AFTER the bindings changed starts with the current key, not the default.
+#[test]
+fn a_screen_entered_after_a_rebind_is_built_with_the_key() {
+    let mut app = crate::App::new(TestBackend::new(60, 8), UiTheme::dark()).unwrap();
+    for i in 0..40 {
+        app.transcript_mut().push_status(format!("status {i}"));
+    }
+    app.load_keybindings_json(r#"{"tui.altScreen.bottom": "ctrl+g"}"#)
+        .unwrap();
+    let _captured = app.enter_fullscreen_captured().unwrap();
+    app.draw().unwrap();
+    {
+        let alt = app.altscreen_for_test().unwrap();
+        let tail = alt.max_scroll_top_for_test();
+        alt.scroll_to_row_for_test(tail - 10);
+    }
+    app.draw().unwrap();
+    let row = last_row(app.altscreen_for_test().unwrap());
+    assert!(row.contains("· Ctrl+G"), "{row:?}");
+}
