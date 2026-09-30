@@ -4,7 +4,6 @@
 //! capabilities to a pluggable [`HostServices`] backend. The default backend denies all interactive
 //! capability (no ambient authority, R-ARCH-EXT-011); the session service injects a real one.
 
-use crate::error::ExtError;
 use crate::event::{EventKind, Subscriptions};
 use crate::manifest::Capabilities;
 use crate::native::{CtxTier, ExtMode};
@@ -569,6 +568,13 @@ pub trait HostServices: Send + Sync {
     /// tier drops ui effects. Delivery is DEFERRED even when a bus is attached — see
     /// [`crate::bus::SharedBus::emit`] for why cyrup queues instead of fanning out inline.
     fn emit_event(&self, _topic: &str, _payload: &Value) {}
+
+    /// Emit a TYPED event to the natives listening on `topic`
+    /// ([`crate::InitApi::subscribe_typed_bus`]) and return after every listener has run — pi's
+    /// synchronous `pi.events.emit`, for a typed request the listeners answer (see
+    /// [`crate::SharedBus::emit_typed`]). A host with no bus attached has no listeners, so the
+    /// event is handed to nobody and the emitter reads it back unanswered.
+    fn emit_typed_event(&self, _topic: &str, _event: &dyn std::any::Any) {}
 
     /// The live session's persisted file path (Pi `sessionManager.sessionFilePath`). `None` when
     /// unattached, headless, or the session is not persisted (an ephemeral/in-memory session). This is
@@ -1726,13 +1732,6 @@ pub struct GuestState {
     /// `<LiveExtension as Extension>::subscriptions` on every dispatch, so a `subscribe` from a
     /// live handler is honoured on the next event (EXT-058) — never snapshotted after `init`.
     subs: Mutex<Subscriptions>,
-    /// EXT-082 — registrations refused while `init` runs. pi's `registerTool`/`registerFlag` THROW
-    /// inside the factory (`core/extensions/loader.ts:274-279` / `:312-316` @v0.87.1), failing the
-    /// load; the `registration.*` imports return `()`, so the refusal is collected here and
-    /// [`crate::host::LiveExtension::load`] fails the load with it once `init` returns. `Some` while
-    /// `init` runs; [`Self::finish_init_registrations`] leaves it `None`, after which a refusal from
-    /// a live handler has no load to fail and is logged instead.
-    registration_errors: Mutex<Option<Vec<String>>>,
     /// The host-wide UI-prompt window this guest's `ui.*` prompts open (EXT-075). `None` for a
     /// guest built outside an [`crate::ExtensionHost`] (tests), which then emits nothing.
     ui_prompts: Option<Arc<crate::ui_prompt::UiPromptTracker>>,
@@ -1939,7 +1938,6 @@ impl GuestState {
             has_ui: true,
             tier: Mutex::new(CtxTier::Command), // init runs at command tier (load time)
             subs: Mutex::new(Subscriptions::empty()),
-            registration_errors: Mutex::new(Some(Vec::new())),
             ui_prompts: None,
             flags: Mutex::new(HashMap::new()),
             autocomplete: Mutex::new(Vec::new()),
@@ -2314,35 +2312,6 @@ impl GuestState {
             .lock()
             .map(|g| *g)
             .unwrap_or_else(|_| Subscriptions::empty())
-    }
-
-    /// Record a registration the registry refused (EXT-082). During `init` it is kept for
-    /// [`Self::finish_init_registrations`]; afterwards it is logged, because a live handler's
-    /// registration has no load left to fail and the import has no error channel.
-    pub fn note_registration_error(&self, error: &ExtError) {
-        if let Ok(mut g) = self.registration_errors.lock()
-            && let Some(errors) = g.as_mut()
-        {
-            errors.push(error.to_string());
-            return;
-        }
-        tracing::warn!(extension = %self.owner, %error, "extension registration refused");
-    }
-
-    /// Close the `init` window and fail the load if any registration was refused inside it — pi's
-    /// throwing factory (EXT-082). The FIRST refusal is the error, as in pi, where the first throw
-    /// ends the factory.
-    pub fn finish_init_registrations(&self) -> Result<(), ExtError> {
-        let errors = self
-            .registration_errors
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
-            .unwrap_or_default();
-        match errors.into_iter().next() {
-            Some(first) => Err(ExtError::Registration(first)),
-            None => Ok(()),
-        }
     }
 
     pub fn set_flag(&self, name: String, spec: Value) {

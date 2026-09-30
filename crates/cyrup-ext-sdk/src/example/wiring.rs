@@ -17,7 +17,7 @@ pub(super) fn install(api: &mut ExtensionApi) {
         FlagSpec {
             r#type: "string".into(),
             default: Some(json!("off")),
-            description: String::new(),
+            description: None,
         },
     );
     api.register_command(

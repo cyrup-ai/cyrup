@@ -15,7 +15,11 @@ use crate::events::*;
 use crate::provider::{OAuthCallbacks, OAuthCredentials, ProviderHandlers, ProviderStream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+mod fold;
 
 // Event-kind discriminants. Three hand-maintained copies carry this numbering — the host's
 // `EventKind` (cyrup-ext/src/event.rs), this table, and the literals `export_extension!` passes to
@@ -81,28 +85,151 @@ mod kind {
 /// The remover every `on_*` subscriber returns — pi's `on(event, handler): () => void`
 /// (`core/extensions/loader.ts:256-271` @v0.87.1, returned since v0.86.0). EXT-080.
 ///
-/// [`Self::unsubscribe`] stops the host calling this extension for that event. As upstream, a
-/// removal made while the event is being dispatched applies from the NEXT dispatch — the current
-/// one still reaches this handler. `Copy`, so a handler can hold its own remover (a one-shot
-/// listener), and idempotent, like upstream's remover on a handler already gone.
+/// [`Self::unsubscribe`] removes the ONE registration that returned it, as upstream's remover
+/// removes its own wrapped `registeredHandler` and no other (`loader.ts:258-270`):
 ///
-/// Unlike pi, where every `on` call adds another handler, an [`ExtensionApi`] keeps ONE handler per
-/// event — a second `on_*` for the same event replaces the first — so this removes the event's
-/// subscription as a whole.
+/// - **In the factory** (before `init` returns), the registration is dropped from the api before
+///   the subscription bitset is declared, so `let off = api.on_x(h); off.unsubscribe();` leaves the
+///   event unsubscribed and `h` never called — upstream's handler list is empty before the first
+///   dispatch.
+/// - **After `init`** (from a handler), it calls the `registration.unsubscribe` import. As
+///   upstream, a removal made while the event is being dispatched applies from the NEXT dispatch —
+///   the current one still reaches this handler.
+///
+/// `Copy`, so a handler can hold its own remover (a one-shot listener), and idempotent, like
+/// upstream's remover on a handler already gone.
+///
+/// An [`ExtensionApi`] keeps EVERY handler registered for an event, as pi's `on()` pushes onto the
+/// event's handler list (EXT-089). Removing one registration leaves the others running; the host
+/// subscription is dropped only when the last handler for the event is removed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Unsubscribe(u8);
+pub struct Unsubscribe {
+    kind: u8,
+    /// This registration's identity (upstream: the `registeredHandler` closure object). Unique
+    /// across every api in the process, so no two `on_*` calls share one.
+    registration: u64,
+}
+
+/// The next registration id [`ExtensionApi::subscribe`] hands out. Never reused.
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// The registrations whose remover has run (EXT-080). [`ExtensionApi::subscription_kinds`] and
+    /// [`ExtensionApi::dispatch`] skip them, which is how a removal made inside the factory reaches
+    /// the bitset `init` declares.
+    static REMOVED: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+    /// Once `init` has returned: the installed api's event kind → registrations table, so a
+    /// remover run from a handler can tell whether it removes the LAST handler the host holds the
+    /// subscription for. `None` while the factory runs.
+    static LIVE: RefCell<Option<HashMap<u8, Vec<u64>>>> = const { RefCell::new(None) };
+}
+
+/// What [`Unsubscribe::unsubscribe`] did (EXT-080). Returned by [`Unsubscribe::remove`] so the
+/// decision is testable on the host target, where the import is unreachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Removal {
+    /// Before `init` returned: the registration is dropped from the api, so its kind is not
+    /// declared unless a later `on_*` for the same event registers a new handler.
+    InFactory,
+    /// After `init`, and the LAST live handler for its kind: the host must drop the subscription.
+    Live,
+    /// After `init`, with other live handlers for the same kind (or a registration of an api that
+    /// was never installed): only this handler stops, and the host subscription stays (EXT-089).
+    Remaining,
+    /// This remover already ran: a no-op.
+    AlreadyRemoved,
+}
 
 impl Unsubscribe {
-    /// Drop the subscription (the `registration.unsubscribe` import). A no-op on the host target.
+    /// Remove this registration: in the factory it never subscribes; after `init` it is not called
+    /// from the next dispatch, and when it was the event's last handler the host stops dispatching
+    /// the event at all (the `registration.unsubscribe` import). Other handlers for the same event
+    /// keep running. A no-op on a second call.
     pub fn unsubscribe(self) {
+        let removal = self.remove();
         #[cfg(target_arch = "wasm32")]
-        crate::guest::bindings::cyrup::ext::registration::unsubscribe(&[self.0]);
+        if removal == Removal::Live {
+            crate::guest::bindings::cyrup::ext::registration::unsubscribe(&[self.kind]);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = removal;
+    }
+
+    /// Record the removal and classify it (see [`Removal`]).
+    pub(crate) fn remove(self) -> Removal {
+        if !REMOVED.with(|r| r.borrow_mut().insert(self.registration)) {
+            return Removal::AlreadyRemoved;
+        }
+        LIVE.with(|l| match l.borrow().as_ref() {
+            None => Removal::InFactory,
+            Some(live) => match live.get(&self.kind) {
+                Some(regs)
+                    if regs.contains(&self.registration)
+                        && regs
+                            .iter()
+                            .all(|r| *r == self.registration || is_removed(*r)) =>
+                {
+                    Removal::Live
+                }
+                _ => Removal::Remaining,
+            },
+        })
     }
 
     /// The event-kind discriminant this remover clears.
     pub fn event_kind(self) -> u8 {
-        self.0
+        self.kind
     }
+}
+
+/// A registration the host refused — pi's `registerTool` / `registerFlag` THROW as a value
+/// (EXT-082; `core/extensions/loader.ts:274-279` and `:312-316` @v0.87.1). The message is pi's,
+/// verbatim: `Tool "<name>" registered by extension "<id>" must define an object parameter
+/// schema.` or `Invalid default for flag "<name>": expected <type>, got <typeof default>`.
+///
+/// pi's throw ends the rest of the handler body; `?` does the same here. It converts into the
+/// `String` error every tool, command and shortcut handler returns, so
+/// `ctx.register_flag("x", spec)?;` stops the handler at the refusal and fails its call. Handling
+/// it instead (`if let Err(e) = … { fallback }`) is pi's `try`/`catch`: the handler carries on and
+/// its call succeeds, with nothing registered.
+///
+/// [CYRUP-DELTA] EXT-082: the refusal is `#[must_use]`, on this type and on the `Result` every
+/// `register_*` returns, so ignoring it is a compiler warning. pi's throw cannot be ignored by
+/// accident either, but a JS author only learns a call CAN throw by reading its docs; here the
+/// signature says so. Strictly additive: nothing pi allows is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "a refused registration is pi's throw: `?` it out of the handler, or handle it"]
+pub struct RegistrationError(String);
+
+impl RegistrationError {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn new(message: String) -> Self {
+        Self(message)
+    }
+
+    /// pi's error message, verbatim.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RegistrationError {}
+
+impl From<RegistrationError> for String {
+    fn from(e: RegistrationError) -> Self {
+        e.0
+    }
+}
+
+/// Whether `registration`'s remover has run.
+fn is_removed(registration: u64) -> bool {
+    REMOVED.with(|r| r.borrow().contains(&registration))
 }
 
 /// The block/mutate/notify contribution a handler returns (mirrors the host `HookOutcome`). The
@@ -684,7 +811,10 @@ type Handler = Box<dyn Fn(&[&str], &Ctx) -> RawOutcome + 'static>;
 /// The collected registrations + handlers an extension declares in its factory (arch-08 §3.6).
 #[derive(Default)]
 pub struct ExtensionApi {
-    handlers: HashMap<u8, Handler>,
+    /// Every handler per event kind, in registration order, each tagged with its registration id
+    /// (EXT-080). pi's `on()` pushes onto the event's handler list
+    /// (`core/extensions/loader.ts:256-271` @v0.87.1) and its runner calls them all (EXT-089).
+    handlers: HashMap<u8, Vec<(u64, Handler)>>,
     pub(crate) tools: Vec<RegisteredTool>,
     pub(crate) commands: Vec<(String, RegisteredCommand)>,
     pub(crate) shortcuts: Vec<RegisteredShortcut>,
@@ -1106,7 +1236,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(ToolCallEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::TOOL_CALL,
             Box::new(move |a, c| {
                 let ev = ToolCallEvent {
@@ -1116,8 +1246,7 @@ impl ExtensionApi {
                 };
                 f(ev, c).into_raw()
             }),
-        );
-        Unsubscribe(kind::TOOL_CALL)
+        )
     }
     /// `tool_result` — VETOABLE (returns [`Outcome`]): override result fields with
     /// [`Outcome::patch_tool_result`] (replace-not-merge, R-08-011). Payload [`ToolResultEvent`].
@@ -1125,7 +1254,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(ToolResultEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::TOOL_RESULT,
             Box::new(move |a, c| {
                 let ev = ToolResultEvent {
@@ -1141,8 +1270,7 @@ impl ExtensionApi {
                 };
                 f(ev, c).into_raw()
             }),
-        );
-        Unsubscribe(kind::TOOL_RESULT)
+        )
     }
     /// `context` — VETOABLE (returns [`Outcome`]): filter or replace the LLM message list with
     /// [`Outcome::replace_messages`]. Payload [`ContextEvent`].
@@ -1150,7 +1278,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(ContextEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::CONTEXT,
             Box::new(move |a, c| {
                 f(
@@ -1161,8 +1289,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::CONTEXT)
+        )
     }
     /// `context_with_system` (EXT-079) — VETOABLE (returns [`Outcome`]): runs after every
     /// `context` handler; [`Outcome::replace_messages`] is sent as returned. Payload
@@ -1171,7 +1298,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(ContextWithSystemEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::CONTEXT_WITH_SYSTEM,
             Box::new(move |a, c| {
                 f(
@@ -1182,8 +1309,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::CONTEXT_WITH_SYSTEM)
+        )
     }
     /// `message_end` — VETOABLE (returns [`Outcome`]): replace the just-finished message with
     /// [`Outcome::replace_message`] (same role enforced host-side). Payload [`MessageEndEvent`].
@@ -1191,7 +1317,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(MessageEndEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::MESSAGE_END,
             Box::new(move |a, c| {
                 f(
@@ -1202,8 +1328,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::MESSAGE_END)
+        )
     }
     /// `before_agent_start` — VETOABLE (returns [`Outcome`]): inject a message and/or replace the
     /// system prompt with [`Outcome::before_agent_start`]. Payload [`BeforeAgentStartEvent`].
@@ -1211,7 +1336,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(BeforeAgentStartEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::BEFORE_AGENT_START,
             Box::new(move |a, c| {
                 let ev = BeforeAgentStartEvent {
@@ -1222,13 +1347,12 @@ impl ExtensionApi {
                 };
                 f(ev, c).into_raw()
             }),
-        );
-        Unsubscribe(kind::BEFORE_AGENT_START)
+        )
     }
     /// `input` — VETOABLE (returns [`Outcome`]): transform the submission, or service it outright
     /// with [`Outcome::handled`]. Payload [`InputEvent`].
     pub fn on_input(&mut self, f: impl Fn(InputEvent, &Ctx) -> Outcome + 'static) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::INPUT,
             Box::new(move |a, c| {
                 let ev = InputEvent {
@@ -1239,8 +1363,7 @@ impl ExtensionApi {
                 };
                 f(ev, c).into_raw()
             }),
-        );
-        Unsubscribe(kind::INPUT)
+        )
     }
     /// `user_bash` — VETOABLE (returns [`Outcome`]): block, transform or fully service a `!`/`!!`
     /// bash invocation ([`Outcome::handled`]). Payload [`UserBashEvent`].
@@ -1248,7 +1371,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(UserBashEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::USER_BASH,
             Box::new(move |a, c| {
                 let ev = UserBashEvent {
@@ -1258,8 +1381,7 @@ impl ExtensionApi {
                 };
                 f(ev, c).into_raw()
             }),
-        );
-        Unsubscribe(kind::USER_BASH)
+        )
     }
     /// `before_provider_request` — VETOABLE (returns [`Outcome`]): mutate the outbound provider
     /// payload. Payload [`BeforeProviderRequestEvent`].
@@ -1267,7 +1389,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(BeforeProviderRequestEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::BEFORE_PROVIDER_REQUEST,
             Box::new(move |a, c| {
                 f(
@@ -1278,8 +1400,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::BEFORE_PROVIDER_REQUEST)
+        )
     }
     /// `before_provider_headers` (EXT-009) — VETOABLE-shaped: it returns [`Outcome`], not `()`.
     /// The reading the host gives that outcome is the header patch — return it via
@@ -1290,7 +1411,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(BeforeProviderHeadersEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::BEFORE_PROVIDER_HEADERS,
             Box::new(move |a, c| {
                 f(
@@ -1301,8 +1422,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::BEFORE_PROVIDER_HEADERS)
+        )
     }
     /// `session_info_changed` (EXT-011) — notify-only (returns `()`). Payload
     /// [`SessionInfoChangedEvent`].
@@ -1310,7 +1430,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(SessionInfoChangedEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::SESSION_INFO_CHANGED,
             notify(move |a, c| {
                 f(
@@ -1320,26 +1440,23 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::SESSION_INFO_CHANGED)
+        )
     }
     /// `ui_prompt_start` (EXT-075) — notify-only (returns `()`): an extension's blocking UI prompt
     /// opened. Payload [`UiPromptEvent`].
     pub fn on_ui_prompt_start(&mut self, f: impl Fn(UiPromptEvent, &Ctx) + 'static) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::UI_PROMPT_START,
             notify(move |a, c| f(ui_prompt_event(a), c)),
-        );
-        Unsubscribe(kind::UI_PROMPT_START)
+        )
     }
     /// `ui_prompt_end` (EXT-075) — notify-only (returns `()`): that prompt closed, however it
     /// settled. Payload [`UiPromptEvent`].
     pub fn on_ui_prompt_end(&mut self, f: impl Fn(UiPromptEvent, &Ctx) + 'static) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::UI_PROMPT_END,
             notify(move |a, c| f(ui_prompt_event(a), c)),
-        );
-        Unsubscribe(kind::UI_PROMPT_END)
+        )
     }
     /// `resources_discover` — VETOABLE (returns [`Outcome`]): contribute skill/prompt/theme paths
     /// with [`Outcome::handled`] ([`ResourcesResult`]). Payload [`ResourcesDiscoverEvent`].
@@ -1350,7 +1467,7 @@ impl ExtensionApi {
         // EXT-016: `cwd` + `reason` (pi extensions/types.ts:544-548 @v0.83.0) — a
         // resource-contributing extension could not tell which directory it was discovering for,
         // nor startup from `/reload`, so it could not scope or cache its contribution.
-        self.handlers.insert(
+        self.subscribe(
             kind::RESOURCES_DISCOVER,
             Box::new(move |a, c| {
                 f(
@@ -1362,8 +1479,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::RESOURCES_DISCOVER)
+        )
     }
     /// `project_trust` — VETOABLE (returns [`Outcome`]): decide whether `cwd` is trusted. The
     /// answer shape is [`ProjectTrustResult`], whose `trusted` is pi's TRI-STATE — `undecided`
@@ -1375,7 +1491,7 @@ impl ExtensionApi {
     ) -> Unsubscribe {
         // EXT-043: `cwd` (pi extensions/types.ts:519-522 @v0.83.0) — the key the trust store is
         // keyed by, so `remember` has a well-defined meaning from the handler's point of view.
-        self.handlers.insert(
+        self.subscribe(
             kind::PROJECT_TRUST,
             Box::new(move |a, c| {
                 f(
@@ -1386,8 +1502,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::PROJECT_TRUST)
+        )
     }
     /// `session_before_switch` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the
     /// switch. Payload [`SessionBeforeSwitchEvent`].
@@ -1395,7 +1510,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(SessionBeforeSwitchEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::SESSION_BEFORE_SWITCH,
             Box::new(move |a, c| {
                 f(
@@ -1407,8 +1522,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::SESSION_BEFORE_SWITCH)
+        )
     }
     /// `session_before_fork` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the fork.
     /// Payload [`SessionBeforeForkEvent`].
@@ -1416,7 +1530,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(SessionBeforeForkEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::SESSION_BEFORE_FORK,
             Box::new(move |a, c| {
                 f(
@@ -1428,8 +1542,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::SESSION_BEFORE_FORK)
+        )
     }
     /// `session_before_compact` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the
     /// compaction, or [`Outcome::compaction_override`] supplies the summary instead of the model.
@@ -1438,7 +1551,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(SessionBeforeCompactEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::SESSION_BEFORE_COMPACT,
             Box::new(move |a, c| {
                 let ev = SessionBeforeCompactEvent {
@@ -1450,8 +1563,7 @@ impl ExtensionApi {
                 };
                 f(ev, c).into_raw()
             }),
-        );
-        Unsubscribe(kind::SESSION_BEFORE_COMPACT)
+        )
     }
     /// `session_before_tree` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the
     /// branch summarization, or [`Outcome::tree_override`] overrides its
@@ -1461,7 +1573,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(SessionBeforeTreeEvent, &Ctx) -> Outcome + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::SESSION_BEFORE_TREE,
             Box::new(move |a, c| {
                 f(
@@ -1472,8 +1584,7 @@ impl ExtensionApi {
                 )
                 .into_raw()
             }),
-        );
-        Unsubscribe(kind::SESSION_BEFORE_TREE)
+        )
     }
 
     // --- notify-only subscriptions (return ignored) ---
@@ -1481,14 +1592,12 @@ impl ExtensionApi {
     /// `agent_start` — notify-only: the handler returns `()`, which the SDK lowers to
     /// [`RawOutcome::Noop`]. Carries no payload, so the handler receives only the [`Ctx`].
     pub fn on_agent_start(&mut self, f: impl Fn(&Ctx) + 'static) -> Unsubscribe {
-        self.handlers
-            .insert(kind::AGENT_START, notify(move |_a, c| f(c)));
-        Unsubscribe(kind::AGENT_START)
+        self.subscribe(kind::AGENT_START, notify(move |_a, c| f(c)))
     }
     /// `agent_end` — notify-only (the handler returns `()`; the SDK reports [`RawOutcome::Noop`]).
     /// Payload [`AgentEndEvent`], the full final message list.
     pub fn on_agent_end(&mut self, f: impl Fn(AgentEndEvent, &Ctx) + 'static) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::AGENT_END,
             notify(move |a, c| {
                 f(
@@ -1498,8 +1607,7 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::AGENT_END)
+        )
     }
     /// `agent_settled` — notify-only (returns `()`), and payload-free like
     /// [`Self::on_agent_start`]: the handler receives only the [`Ctx`].
@@ -1509,13 +1617,11 @@ impl ExtensionApi {
     /// automatic retry / post-run compaction / queued continuation has finished — unlike
     /// [`Self::on_agent_end`], which fires once per `agent.prompt`/`agent.continue`.
     pub fn on_agent_settled(&mut self, f: impl Fn(&Ctx) + 'static) -> Unsubscribe {
-        self.handlers
-            .insert(kind::AGENT_SETTLED, notify(move |_a, c| f(c)));
-        Unsubscribe(kind::AGENT_SETTLED)
+        self.subscribe(kind::AGENT_SETTLED, notify(move |_a, c| f(c)))
     }
     /// `turn_start` — notify-only (returns `()`). Payload [`TurnStartEvent`].
     pub fn on_turn_start(&mut self, f: impl Fn(TurnStartEvent, &Ctx) + 'static) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::TURN_START,
             notify(move |a, c| {
                 f(
@@ -1526,13 +1632,12 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::TURN_START)
+        )
     }
     /// `turn_end` — notify-only (returns `()`). Payload [`TurnEndEvent`]: the finalized assistant
     /// message AND the tool results produced this turn.
     pub fn on_turn_end(&mut self, f: impl Fn(TurnEndEvent, &Ctx) + 'static) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::TURN_END,
             notify(move |a, c| {
                 f(
@@ -1544,15 +1649,14 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::TURN_END)
+        )
     }
     /// `message_start` — notify-only (returns `()`). Payload [`MessageStartEvent`].
     pub fn on_message_start(
         &mut self,
         f: impl Fn(MessageStartEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::MESSAGE_START,
             notify(move |a, c| {
                 f(
@@ -1562,8 +1666,7 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::MESSAGE_START)
+        )
     }
     /// `message_update` — notify-only (returns `()`) and HIGH-FREQ. Payload
     /// [`MessageUpdateEvent`]: the full in-flight message AND the provider delta.
@@ -1571,7 +1674,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(MessageUpdateEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::MESSAGE_UPDATE,
             notify(move |a, c| {
                 f(
@@ -1582,8 +1685,7 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::MESSAGE_UPDATE)
+        )
     }
     /// `tool_execution_start` — notify-only (returns `()`). Payload [`ToolExecStartEvent`]; the
     /// vetoable seam for a tool invocation is [`Self::on_tool_call`].
@@ -1591,7 +1693,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(ToolExecStartEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::TOOL_EXEC_START,
             notify(move |a, c| {
                 f(
@@ -1603,8 +1705,7 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::TOOL_EXEC_START)
+        )
     }
     /// `tool_execution_update` — notify-only (returns `()`) and HIGH-FREQ. Payload
     /// [`ToolExecUpdateEvent`], which carries the streamed `chunk`.
@@ -1612,7 +1713,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(ToolExecUpdateEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::TOOL_EXEC_UPDATE,
             notify(move |a, c| {
                 f(
@@ -1625,8 +1726,7 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::TOOL_EXEC_UPDATE)
+        )
     }
     /// `tool_execution_end` — notify-only (returns `()`). Payload [`ToolExecEndEvent`]; the
     /// vetoable seam for the finished result is [`Self::on_tool_result`].
@@ -1634,7 +1734,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(ToolExecEndEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::TOOL_EXEC_END,
             notify(move |a, c| {
                 f(
@@ -1647,8 +1747,7 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::TOOL_EXEC_END)
+        )
     }
     /// `session_start` — notify-only (returns `()`). Payload [`SessionLifecycleEvent`], whose
     /// `reason` includes `"reload"` and whose `session_file` is pi's `previousSessionFile`.
@@ -1656,7 +1755,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(SessionLifecycleEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::SESSION_START,
             notify(move |a, c| {
                 f(
@@ -1667,8 +1766,7 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::SESSION_START)
+        )
     }
     /// `session_shutdown` — notify-only (returns `()`). Payload [`SessionLifecycleEvent`], whose
     /// `session_file` is pi's `targetSessionFile` — the destination of a session replacement.
@@ -1676,7 +1774,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(SessionLifecycleEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::SESSION_SHUTDOWN,
             notify(move |a, c| {
                 f(
@@ -1687,8 +1785,7 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::SESSION_SHUTDOWN)
+        )
     }
     /// `after_provider_response` — notify-only (returns `()`). Payload
     /// [`AfterProviderResponseEvent`]: the HTTP status + response headers.
@@ -1696,7 +1793,7 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(AfterProviderResponseEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::AFTER_PROVIDER_RESPONSE,
             notify(move |a, c| {
                 f(
@@ -1707,13 +1804,12 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::AFTER_PROVIDER_RESPONSE)
+        )
     }
     /// `model_select` — notify-only (returns `()`). Payload [`ModelSelectEvent`]: the new model,
     /// the previous one, and the `source` of the change.
     pub fn on_model_select(&mut self, f: impl Fn(ModelSelectEvent, &Ctx) + 'static) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::MODEL_SELECT,
             notify(move |a, c| {
                 f(
@@ -1725,15 +1821,14 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::MODEL_SELECT)
+        )
     }
     /// `thinking_level_select` — notify-only (returns `()`). Payload [`ThinkingLevelSelectEvent`].
     pub fn on_thinking_level_select(
         &mut self,
         f: impl Fn(ThinkingLevelSelectEvent, &Ctx) + 'static,
     ) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::THINKING_LEVEL_SELECT,
             notify(move |a, c| {
                 f(
@@ -1744,8 +1839,7 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::THINKING_LEVEL_SELECT)
+        )
     }
     /// `session_compact` — notify-only (returns `()`): the compaction entry has already been
     /// produced. Payload [`SessionCompactEvent`]; the vetoable seam is
@@ -1757,7 +1851,7 @@ impl ExtensionApi {
         // The host seam supplies the full Pi shape: the produced compaction entry, whether an
         // extension drove it, the trigger reason, and the retry flag (L4 gap #5, wired through the
         // cyrup-session-svc producer).
-        self.handlers.insert(
+        self.subscribe(
             kind::SESSION_COMPACT,
             notify(move |a, c| {
                 let ev = SessionCompactEvent {
@@ -1768,13 +1862,12 @@ impl ExtensionApi {
                 };
                 f(ev, c)
             }),
-        );
-        Unsubscribe(kind::SESSION_COMPACT)
+        )
     }
     /// `session_tree` — notify-only (returns `()`). Payload [`SessionTreeEvent`]; the vetoable seam
     /// is [`Self::on_session_before_tree`].
     pub fn on_session_tree(&mut self, f: impl Fn(SessionTreeEvent, &Ctx) + 'static) -> Unsubscribe {
-        self.handlers.insert(
+        self.subscribe(
             kind::SESSION_TREE,
             notify(move |a, c| {
                 f(
@@ -1784,18 +1877,66 @@ impl ExtensionApi {
                     c,
                 )
             }),
-        );
-        Unsubscribe(kind::SESSION_TREE)
+        )
     }
 
     // --- dispatch + subscription bitset ---
 
-    /// Run the handler for `kind` (if any) with the ordered string `args` and `ctx`.
+    /// Add `handler` to this api's handlers for `kind`, after any earlier ones, and return the
+    /// remover for THIS registration (EXT-080). pi's `on()` pushes onto the event's handler list
+    /// (`core/extensions/loader.ts:256-271` @v0.87.1); it never replaces (EXT-089).
+    fn subscribe(&mut self, kind: u8, handler: Handler) -> Unsubscribe {
+        let registration = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
+        self.handlers
+            .entry(kind)
+            .or_default()
+            .push((registration, handler));
+        Unsubscribe { kind, registration }
+    }
+
+    /// Run every handler for `kind` whose remover has not run, in registration order, with the
+    /// ordered string `args` and `ctx`, and combine their outcomes into one the way pi's runner
+    /// combines one extension's handlers for that event (EXT-089; `api/fold.rs` has the per-event
+    /// table).
+    ///
+    /// The handler set is fixed before the first one runs — pi's `snapshotEventHandlers`
+    /// (`core/extensions/runner.ts:265-267` @v0.87.1) — so a handler removed by an earlier handler
+    /// of the same dispatch still runs this time.
     pub fn dispatch(&self, kind: u8, args: &[&str], ctx: &Ctx) -> RawOutcome {
-        match self.handlers.get(&kind) {
-            Some(h) => h(args, ctx),
-            None => RawOutcome::Noop,
-        }
+        let Some(registered) = self.handlers.get(&kind) else {
+            return RawOutcome::Noop;
+        };
+        let snapshot: Vec<&Handler> = registered
+            .iter()
+            .filter(|(registration, _)| !is_removed(*registration))
+            .map(|(_, handler)| handler)
+            .collect();
+        fold::run(kind, args, &snapshot, ctx)
+    }
+
+    /// The live event kind → registrations table: every handler whose remover has not run, per
+    /// kind, in registration order. A kind with none is absent.
+    fn live_registrations(&self) -> HashMap<u8, Vec<u64>> {
+        self.handlers
+            .iter()
+            .filter_map(|(kind, registered)| {
+                let live: Vec<u64> = registered
+                    .iter()
+                    .map(|(registration, _)| *registration)
+                    .filter(|registration| !is_removed(*registration))
+                    .collect();
+                (!live.is_empty()).then_some((*kind, live))
+            })
+            .collect()
+    }
+
+    /// Mark `init` finished for this api (EXT-080): from now on a remover asks the host to drop
+    /// the subscription instead of dropping the handler before the bitset is declared. Called by
+    /// the guest's `run_init` right after the author's factory returns.
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    pub(crate) fn install_live(&self) {
+        let live = self.live_registrations();
+        LIVE.with(|l| *l.borrow_mut() = Some(live));
     }
 
     /// Execute a guest-registered tool by name (R-08-015).
@@ -1963,9 +2104,10 @@ impl ExtensionApi {
     }
 
     /// The `u8` event-kind list this extension subscribed to, for the host `subscribe` import
-    /// (R-ARCH-EXT-014). Exactly the kinds with a registered handler.
+    /// (R-ARCH-EXT-014). Exactly the kinds with a registered handler whose remover has not run
+    /// (EXT-080).
     pub fn subscription_kinds(&self) -> Vec<u8> {
-        let mut v: Vec<u8> = self.handlers.keys().copied().collect();
+        let mut v: Vec<u8> = self.live_registrations().into_keys().collect();
         v.sort_unstable();
         v
     }

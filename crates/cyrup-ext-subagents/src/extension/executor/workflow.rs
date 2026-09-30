@@ -347,7 +347,10 @@ impl WorkflowRunHost {
             let Ok(settled) = self.settled.lock() else {
                 return;
             };
-            let mut steps = crate::workflows::workflow_step_statuses(&settled);
+            // No trace: every child in `settled` was launched, so its `results[0]` carries the
+            // session name `run_sync` gave it, which is what the row shows. The trace-derived
+            // placeholder is for a child that never launched, which only the terminal write sees.
+            let mut steps = crate::workflows::workflow_step_statuses(&settled, &[]);
             let Ok(mut status) = self.status.lock() else {
                 return;
             };

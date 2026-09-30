@@ -332,6 +332,9 @@ pub(crate) fn tool_task_to_spec(item: &ToolTaskItem) -> SingleStepSpec {
         acceptance: parse_tool_acceptance(item.acceptance.as_ref()),
         context: None,
         agent_scope: None,
+        // SUBA-134 — the task label a child session name prefers over the task excerpt.
+        label: item.label.clone(),
+        session_name: None,
     }
 }
 

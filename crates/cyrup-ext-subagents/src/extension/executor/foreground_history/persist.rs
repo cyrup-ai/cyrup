@@ -202,6 +202,7 @@ mod tests {
             children: vec![ForegroundHistoryChild {
                 agent: "scout".to_string(),
                 index: 0,
+                session_name: None,
                 status: status.to_string(),
                 updated_at: Some(updated_at),
                 context: None,

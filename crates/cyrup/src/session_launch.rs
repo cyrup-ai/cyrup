@@ -241,6 +241,35 @@ pub async fn launch(
         .context("building agent session runtime")?;
     timings::time("createAgentSessionRuntime", timings::TimingLabel::Main);
 
+    // `--help` (CFG-088 / SEAM-020) — pi's one help exit, `main.ts:857-864` @v0.87.1:
+    //
+    // ```ts
+    // if (parsed.help) {
+    //     reportDiagnostics(startupSettingsDiagnostics);
+    //     const extensionFlags = resourceLoader.getExtensions()
+    //         .extensions.flatMap((extension) => Array.from(extension.flags.values()));
+    //     printHelp(extensionFlags);
+    //     process.exit(0);
+    // }
+    // ```
+    //
+    // It sits HERE, straight after the runtime is built and BEFORE the diagnostics checkpoint
+    // below (`:896-904`), because both halves of its output need the runtime and neither may wait
+    // for the checkpoint: the flag list is the loaded extensions' declarations, and the startup
+    // settings diagnostics are printed on their own — a runtime error (a conflicting extension
+    // flag, say) does not stop `--help`. `process.exit(0)` runs no teardown, so neither does this:
+    // `create_unannounced` never announced the session, and nothing is shut down.
+    if post.cli.help {
+        diagnostics::report(post.startup_diagnostics);
+        let session = runtime.session().await;
+        // `console.log` — through the stdout guard, which a `--mode json --help` run has
+        // installed (pi's takeover is not lifted for `--help` either, `main.ts:639-642`).
+        crate::output_guard::emit_stray(&crate::cli::render_help(
+            &session.extension_flag_declarations(),
+        ));
+        return Ok(ControlFlow::Break(0));
+    }
+
     // Pi main.ts:895-904 (SEAM-S01, CFG-088) — report the merged startup + runtime diagnostics
     // and exit 1 on any runtime error. Same checkpoint, every mode.
     let report =

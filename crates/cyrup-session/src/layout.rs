@@ -78,7 +78,7 @@ impl SessionLayout {
 }
 
 /// The top-level sessions root (for `list_all`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionsRoot(pub PathBuf);
 
 impl Default for SessionsRoot {

@@ -1,4 +1,4 @@
-// cyrup:ext@0.12.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.13.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -99,7 +99,15 @@
 // and `check_world` refuses it rather than letting it die in wasmtime. The same batch ADDS the
 // `registration.unsubscribe` import (EXT-080; the remover pi's `on()` has returned since v0.86.0),
 // which is additive and would not have forced a bump on its own.
-package cyrup:ext@0.12.0;
+//
+// 0.12 -> 0.13 is the registration-REFUSAL batch, an IMPORT RE-SIGNING: `registration.register-tool`
+// and `registration.register-flag` now return `result<_, string>` (EXT-082). pi's `registerTool`
+// and `registerFlag` THROW on an invalid registration (`core/extensions/loader.ts:274-279` and
+// `:312-316` @v0.87.1), which ends the rest of the calling handler body; the `err` arm is that
+// throw as a value, so an SDK guest hands it to the author as a Rust `Result` to `?` out of the
+// handler. They are the only two registration imports pi validates. A 0.12 guest calls both at
+// the old `()`-returning signature and would fail to LINK against this host, so it takes the bump.
+package cyrup:ext@0.13.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -624,10 +632,16 @@ interface events {
 // ---------------------------------------------------------------------------
 interface registration {
   use types.{tool-descriptor};
-  register-tool:             func(t: tool-descriptor);
+  // EXT-082 — pi's `registerTool` / `registerFlag` throw on an invalid registration
+  // (`core/extensions/loader.ts:274-279`, `:312-316` @v0.87.1): a non-object `parameters`, or a
+  // flag `default` whose `typeof` is not its `type`. The `err` arm carries pi's message verbatim;
+  // nothing is registered, and that is the whole effect: a guest that propagates it fails its own
+  // call (an `init` returning it fails the load), and one that handles it carries on, as a pi
+  // `try`/`catch` around the throw does.
+  register-tool:             func(t: tool-descriptor) -> result<_, string>;
   register-command:          func(name: string, desc-json: string);
   register-shortcut:         func(key: string, desc: string);
-  register-flag:             func(name: string, spec-json: string);
+  register-flag:             func(name: string, spec-json: string) -> result<_, string>;
   get-flag:                  func(name: string) -> option<string>;
   register-provider:         func(id: string, config-json: string);
   unregister-provider:       func(id: string);

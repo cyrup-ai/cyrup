@@ -80,6 +80,11 @@ impl<'de> serde::Deserialize<'de> for HistoryVersion {
 pub(crate) struct ForegroundHistoryChild {
     pub(crate) agent: String,
     pub(crate) index: usize,
+    /// SUBA-134 — pi `ForegroundResumeChild.sessionName`, kept by `compactChild`
+    /// (`foreground-history.ts:33` @v0.71.0): the name the child's session ran under, which the
+    /// remembered-run status line shows over the agent (`run-status.ts:217`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_name: Option<String>,
     /// pi's `SubagentResultStatus` string; kept as a plain string for the same reason
     /// [`crate::tui::fleet_state::ForegroundResumeChildView::status`] is — `statusGlyph` compares
     /// it against literals including `"detached"`, which is not itself ever persisted here (see
@@ -249,6 +254,7 @@ impl SubagentExecutor {
             .map(|(index, result)| ForegroundHistoryChild {
                 agent: result.agent.clone(),
                 index,
+                session_name: result.session_name.clone(),
                 status: foreground_history_child_status(result).to_string(),
                 updated_at: Some(now),
                 // cyrup's `SingleResult` carries no context-mode/thinking field yet — the same

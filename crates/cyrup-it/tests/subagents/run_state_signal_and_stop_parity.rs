@@ -215,6 +215,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         // `build_attempt_spawn_plan` gates both env keys on presence (exec/mod.rs:2227-2250), so
         // `None` keeps the child's env overlay byte-identical to a real foreground child's.
         steer_ack_dir: None,
+        external_log_dir: None,
         steer_capability_path: None,
         control_config: None,
         on_control_event: None,
@@ -479,6 +480,7 @@ async fn stopping_a_nested_run_gets_pis_own_scope_refusal_not_the_not_found_text
         async_dir: Some(dir.path().join("nested-async").display().to_string()),
         pid: None,
         session_id: None,
+        session_name: None,
         session_file: None,
         intercom_target: None,
         owner_intercom_target: None,
@@ -635,6 +637,8 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     }
 }
 

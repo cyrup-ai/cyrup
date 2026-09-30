@@ -141,10 +141,53 @@ impl<B: Backend> App<B> {
             .push_warning(PROJECT_UNTRUSTED_WARNING);
     }
 
+    /// Pi's `renderInitialMessages()` (`interactive-mode.ts:4056-4071` @v0.87.1), whole:
+    ///
+    /// ```ts
+    /// renderInitialMessages(): void {
+    ///     const entries = this.sessionManager.buildContextEntries();
+    ///     this.renderSessionEntries(entries, { updateFooter: true, populateHistory: true });
+    ///     this.renderProjectTrustWarningIfNeeded();
+    ///     const allEntries = this.sessionManager.getEntries();
+    ///     const compactionCount = allEntries.filter((e) => e.type === "compaction").length;
+    ///     if (compactionCount > 0) { … this.showStatus(`Session compacted ${times}`); }
+    /// }
+    /// ```
+    ///
+    /// The replay ([`AgentSession::replay_items`] through
+    /// [`Self::replay_items_with_extensions`]), then [`Self::render_project_trust_warning_if_needed`],
+    /// then [`Self::render_compaction_count_if_needed`] — ONE sequence, so the two cyrup call sites
+    /// cannot reorder it. TUI-003: the boot site (`crates/cyrup/src/interactive.rs`, pi's `init()`
+    /// at `:1036`) calls it BEFORE the startup warnings and the CLI's initial prompt, which pi
+    /// shows from `run()` (`:1120-1170`); the `session_swapped` arm (pi `renderCurrentSessionState`,
+    /// `:2115-2124`) calls it after the loaded-resources panel. The trailing pair used to run from
+    /// `seed_session_ui` inside `App::run`, i.e. after the host had already pushed the CLI's
+    /// initial message, so `cyrup -c "msg"` on a compacted session showed the count BELOW the
+    /// user's message.
+    ///
+    /// The caller refreshes [`Self::refresh_known_tool_definitions`] first, as both sites do: the
+    /// replay walk reads it.
+    pub async fn render_initial_messages(&mut self, session: &Arc<AgentSession>) {
+        // `replay_items` is `raw_context_messages` plus the cache-miss and compaction-cost notices pi
+        // re-derives on every rebuild (`interactive-mode.ts:3694-3696`, `:3788-3794`); neither is
+        // persisted, so this is the only way a resumed transcript carries them.
+        let restored = session.replay_items().await;
+        if !restored.is_empty() {
+            // X11 — WITH the loaded extensions: pi resolves `getMessageRenderer(message.customType)`
+            // on the replay walk (`interactive-mode.ts:3471`) exactly as on the live path.
+            let ext_host = session.services().ext_host.clone();
+            self.replay_items_with_extensions(&restored, &ext_host)
+                .await;
+        }
+        self.render_project_trust_warning_if_needed(session);
+        self.render_compaction_count_if_needed(session).await;
+    }
+
     /// The tail of pi's `renderInitialMessages()` (`interactive-mode.ts:4064-4070` @v0.87.1): once
     /// the replay and the trust banner are down, `Session compacted 1 time` / `N times` when the
     /// session file holds any `compaction` entry. Runs on every path that re-renders the initial
-    /// messages — the boot bind and the session swap — right after
+    /// messages — the boot bind and the session swap, both through
+    /// [`Self::render_initial_messages`] — right after
     /// [`Self::render_project_trust_warning_if_needed`], and like it is UNconditional on the
     /// replay: a session compacted down to nothing still says so.
     pub async fn render_compaction_count_if_needed(&mut self, session: &Arc<AgentSession>) {

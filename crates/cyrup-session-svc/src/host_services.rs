@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cyrup_agent::AgentMessage;
 use cyrup_core::{CancelToken, EntryId, ModelRef};
 use cyrup_ext::caps::http::HttpCaps;
 use cyrup_ext::caps::proc::ProcCaps;
@@ -305,6 +306,16 @@ pub trait SessionActivity: Send + Sync {
     /// that called `ctx.abort()` (agent-session.ts:2412-2418); deferring it to a turn-boundary drain
     /// would abort a run that has already finished, i.e. nothing at all.
     fn abort(&self);
+    /// ICOM-063 — hand a `deliverAs: "steer"` injection to the in-flight run's steering queue NOW,
+    /// in the caller's own call, and return the exact message steered; `None` (nothing done) when
+    /// no run is active or the message is not a steer.
+    ///
+    /// Pi `sendCustomMessage(msg, { deliverAs: "steer" })` on a streaming session is
+    /// `this.agent.steer(appMessage)` — synchronous (`agent-session.ts:1949-1954` @v0.87.1). An
+    /// extension that steers from a `turn_end` handler (pi-intercom's `human-first` release,
+    /// `index.ts:1814-1822` @v0.14.0) therefore reaches the loop's very next steering poll, because
+    /// the loop awaits that handler before polling. Only a synchronous steer keeps that guarantee.
+    fn steer_onto_live_run(&self, message: &InjectMessage) -> Option<AgentMessage>;
 }
 
 /// The live session's guest-facing INTROSPECTION catalog — the two listings only the running
@@ -796,7 +807,21 @@ pub struct InjectRequest {
 /// per-request `ack` removes the first (the sink learns the real outcome). Unbounded because the
 /// producer is a filesystem watcher that must never block; depth is bounded in practice by the
 /// number of in-flight background runs.
-pub type InjectSink = tokio::sync::mpsc::UnboundedSender<InjectRequest>;
+pub type InjectSink = tokio::sync::mpsc::UnboundedSender<InjectItem>;
+
+/// One item on the injection pump's queue ([`InjectSink`]).
+#[derive(Debug)]
+pub enum InjectItem {
+    /// A message for the pump to schedule: steer onto a live run, append at the idle edge, or run
+    /// as a turn.
+    Request(InjectRequest),
+    /// ICOM-063 — a message the producer ALREADY steered onto a live run, synchronously
+    /// ([`SessionActivity::steer_onto_live_run`]). The pump takes over only its fate: at the idle
+    /// edge a copy still in the agent's steering queue landed past the run's last poll and is taken
+    /// back and appended with no turn, exactly as for a steer the pump made itself. The producer
+    /// is fire-and-forget (pi's `sendMessage`), so there is no obligation to carry.
+    Steered(AgentMessage),
+}
 
 /// The live host-services backend (arch-08 §5.6).
 pub struct LiveHostServices {
@@ -1321,10 +1346,21 @@ impl LiveHostServices {
     /// No sink bound (default host / headless-by-value session), or the pump has exited — in both
     /// cases nothing was queued and the caller still owns whatever the message announced.
     fn enqueue_injection(&self, message: InjectMessage, ack: InjectAck) -> Result<(), String> {
-        let sink = Self::lock(&self.inject_sink)
+        Self::send_injection(
+            &self.injection_sink()?,
+            InjectItem::Request(InjectRequest { message, ack }),
+        )
+    }
+
+    /// The bound pump queue, or the seam-unavailable error.
+    fn injection_sink(&self) -> Result<InjectSink, String> {
+        Self::lock(&self.inject_sink)
             .clone()
-            .ok_or("message injection not wired to a live session")?;
-        sink.send(InjectRequest { message, ack })
+            .ok_or_else(|| "message injection not wired to a live session".to_string())
+    }
+
+    fn send_injection(sink: &InjectSink, item: InjectItem) -> Result<(), String> {
+        sink.send(item)
             .map_err(|_| "session injection pump is no longer running".to_string())
     }
 
@@ -1824,6 +1860,15 @@ impl HostServices for LiveHostServices {
         }
     }
 
+    /// The typed half of [`Self::emit_event`]: delivered inline on the same shared bus, so every
+    /// native listener has run when this returns.
+    fn emit_typed_event(&self, topic: &str, event: &dyn std::any::Any) {
+        let bus = Self::lock(&self.event_bus).clone();
+        if let Some(bus) = bus {
+            bus.emit_typed(topic, event);
+        }
+    }
+
     fn session_file(&self) -> Option<PathBuf> {
         // The LIVE persisted file (deferred until the first assistant message; changes on fork), read
         // from the attached tree manager. `Ok(_)` — attached and read (the value may itself be `None`
@@ -1871,20 +1916,44 @@ impl HostServices for LiveHostServices {
         display: bool,
         details: Option<&serde_json::Value>,
     ) -> Result<(), String> {
-        // ICOM-035 — the same queue and the same single consumer as every other injection; the
-        // `steer` flag only tells the pump it may hand the message to a live run's steering queue
-        // instead of holding it for the idle edge (see `drive_injections`). Fire-and-forget like
-        // `inject_message`: the caller (pi-intercom's `sendMessage`) awaits nothing.
-        self.enqueue_injection(
-            InjectMessage {
-                content: content.to_string(),
-                custom_type: custom_type.map(str::to_string),
-                display,
-                details: details.cloned(),
-                trigger_turn: false,
-                steer: true,
-            },
-            InjectAck::detached(),
+        // ICOM-035 / ICOM-063 — pi's `sendCustomMessage(msg, { deliverAs: "steer" })`:
+        // `agent.steer(appMessage)` at once while a run is active, else the no-turn append.
+        //
+        // While a run is active the steer is made HERE, synchronously, so a caller inside a
+        // `turn_end` handler (which the agent loop awaits before its next steering poll) reaches
+        // that poll — pi's guarantee, which pi-intercom's `human-first` release relies on. Handing
+        // it to the pump instead (a separate task) raced that poll and could miss the run. The pump
+        // is still told, because it owns the steer's fate: one that lands past the run's last poll
+        // (the run ended between the activity check and the push) is taken back and appended at the
+        // idle edge. The sink is resolved first, so no steer is made that nothing would own.
+        //
+        // Otherwise the same queue and the same single consumer as every other injection; the
+        // `steer` flag lets the pump steer it onto a run that starts before it is scheduled.
+        // Fire-and-forget like `inject_message`: the caller (pi-intercom's `sendMessage`) awaits
+        // nothing.
+        //
+        // One ordering window remains, narrower than a pump wake: a steer enqueued while no run
+        // was active and not yet taken by the pump when a run starts is steered after a later
+        // synchronous one.
+        let sink = self.injection_sink()?;
+        let message = InjectMessage {
+            content: content.to_string(),
+            custom_type: custom_type.map(str::to_string),
+            display,
+            details: details.cloned(),
+            trigger_turn: false,
+            steer: true,
+        };
+        let activity = Self::lock(&self.activity).clone();
+        if let Some(steered) = activity.and_then(|a| a.steer_onto_live_run(&message)) {
+            return Self::send_injection(&sink, InjectItem::Steered(steered));
+        }
+        Self::send_injection(
+            &sink,
+            InjectItem::Request(InjectRequest {
+                message,
+                ack: InjectAck::detached(),
+            }),
         )
     }
 

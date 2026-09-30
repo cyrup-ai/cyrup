@@ -170,6 +170,13 @@ pub struct StepStatus {
     /// status written before this field existed still round-trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<crate::runner::status::ExternalCliRunnerStatus>,
+    /// SUBA-141 — pi `AsyncStatus.steps[].externalProcess` (`shared/types.ts:1940` @v0.71.0): an
+    /// external-CLI step's process receipt, published LIVE by the runner from the external runner's
+    /// process hook (`updateExternalProcess`, `subagent-runner.ts:2247-2251`) — at spawn (pid,
+    /// start, the two log paths) and again at close. Fleet tails its logs and times the step from
+    /// it (`fleet-view.ts:342-349,590-599`). `None` for every native child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_process: Option<crate::runner::status::ExternalProcessStatus>,
     /// Human-readable display name for the child session, when derived at launch — pi
     /// `AsyncStatus.steps[].sessionName` (`shared/types.ts:1868`) /
     /// `WorkflowChildSummary.children[].sessionName` (`shared/types.ts:200-201`), bounded to 256
@@ -178,6 +185,12 @@ pub struct StepStatus {
     /// keeps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
+    /// The step's user-facing label, when it has one — pi `AsyncStatus.steps[].label`
+    /// (`shared/types.ts:1947` @v0.71.0): a chain step's or parallel task's `label`, an attached
+    /// root's `Attached <runId>`, a dynamic fan-out placeholder's. A status line names a step with
+    /// no session name `<label> (<agent>)` ([`Self::display_name`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// pi `WorkflowStatusStep.interrupted` (`workflow-settlement.ts:18`) — NOT on the base
     /// `AsyncStatus["steps"][number]`; the settlement family adds it.
     ///
@@ -221,6 +234,34 @@ pub struct StepStatus {
 }
 
 impl StepStatus {
+    /// SUBA-134 — the name a status line shows for this step: pi's `step.sessionName?.trim() ||
+    /// (step.label ? `${step.label} (${step.agent})` : step.agent)` (`run-status.ts:167-168`,
+    /// `fleet-view.ts:83-84`, `async-status.ts:632` @v0.71.0).
+    #[must_use]
+    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
+        match self.label.as_deref().filter(|label| !label.is_empty()) {
+            Some(label) if self.trimmed_session_name().is_none() => {
+                format!("{label} ({})", self.agent).into()
+            }
+            _ => self.child_display_name().into(),
+        }
+    }
+
+    /// SUBA-134 — the name a single child's line shows: pi `fleetChildDisplayName(child)`, i.e.
+    /// `child.sessionName?.trim() || child.agent` (`fleet-view.ts:79-80`, `run-status.ts:290,309`
+    /// @v0.71.0) — no label rung.
+    #[must_use]
+    pub fn child_display_name(&self) -> &str {
+        self.trimmed_session_name().unwrap_or(&self.agent)
+    }
+
+    fn trimmed_session_name(&self) -> Option<&str> {
+        self.session_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
     /// A freshly declared, not-yet-dispatched step for `agent`.
     #[must_use]
     pub fn pending(agent: impl Into<String>) -> Self {
@@ -250,7 +291,9 @@ impl StepStatus {
             workflow_key: None,
             run_id: None,
             runner: None,
+            external_process: None,
             session_name: None,
+            label: None,
             interrupted: false,
             output_path_mapping: None,
             // No proof exists until the run closes and the overlay pass runs.

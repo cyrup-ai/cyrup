@@ -353,6 +353,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), Confi
     {
         let mut opts = OpenOptions::new();
         opts.create(true).write(true).truncate(true);
+        // File modes are a unix concept; elsewhere the file inherits its directory's ACL.
+        #[cfg(not(unix))]
+        let _ = secret;
         #[cfg(unix)]
         if secret {
             use std::os::unix::fs::OpenOptionsExt;

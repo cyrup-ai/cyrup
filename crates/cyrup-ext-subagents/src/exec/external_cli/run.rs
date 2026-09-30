@@ -70,6 +70,26 @@ pub struct ExternalCliRunInput<'a> {
     pub timeout_message: String,
     /// `input.stopMessage ?? "Subagent stopped by user."` (`:402`).
     pub stop_message: String,
+    /// SUBA-141 — upstream's `input.onProcess` (`external-cli-runner.ts:348,399` @v0.71.0): told
+    /// the process receipt once at spawn (pid, start, the two log paths) and again at close (exit,
+    /// duration, byte counts), so a live reader can tail the logs while the process runs.
+    pub on_process: Option<ProcessHook<'a>>,
+}
+
+/// SUBA-141 — the live process hook [`ExternalCliRunInput::on_process`] carries.
+#[derive(Clone, Copy)]
+pub struct ProcessHook<'a>(pub &'a (dyn Fn(&ExternalProcessStatus) + Send + Sync));
+
+impl std::fmt::Debug for ProcessHook<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProcessHook(..)")
+    }
+}
+
+impl ProcessHook<'_> {
+    fn report(self, process: &ExternalProcessStatus) {
+        (self.0)(process);
+    }
 }
 
 /// The launch half the runner consumes: what to spawn and how to read it.
@@ -212,6 +232,23 @@ pub async fn run_external_cli_process(
         }
     };
     let pid = child.id();
+    // `const initialProcess = { pid, startedAt, stdoutPath, stderrPath, finalOutputPath };
+    // input.onProcess?.(initialProcess);` (`external-cli-runner.ts:340-348` @v0.71.0) — before any
+    // output is read, so a reader sees the log paths from the first moment they can hold anything.
+    let initial_process = ExternalProcessStatus {
+        pid,
+        started_at,
+        stdout_path: stdout_path.display().to_string(),
+        stderr_path: stderr_path.display().to_string(),
+        final_output_path: plan
+            .final_output_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        ..ExternalProcessStatus::default()
+    };
+    if let Some(hook) = input.on_process {
+        hook.report(&initial_process);
+    }
 
     let mut stdout_log = BoundedLog::create(&stdout_path, plan.limits.stdout_log_bytes);
     let mut stderr_log = BoundedLog::create(&stderr_path, plan.limits.stderr_log_bytes);
@@ -444,6 +481,22 @@ pub async fn run_external_cli_process(
         _ => stdout_tail.text(),
     };
 
+    // `input.onProcess?.(externalProcess)` at close (`external-cli-runner.ts:386-399`).
+    let external_process = ExternalProcessStatus {
+        ended_at: Some(ended_at),
+        duration_ms: Some(ended_at - started_at),
+        exit_code,
+        process_signal: process_signal.clone(),
+        stdout_bytes: Some(stdout_log.total()),
+        stderr_bytes: Some(stderr_log.total()),
+        stdout_truncated: stdout_log.truncated(),
+        stderr_truncated: stderr_log.truncated(),
+        ..initial_process
+    };
+    if let Some(hook) = input.on_process {
+        hook.report(&external_process);
+    }
+
     ExternalCliRunOutcome {
         output: output.trim().to_string(),
         // `:409` — a timeout, a stop or a parser failure is exit 1 regardless of what the process
@@ -456,25 +509,8 @@ pub async fn run_external_cli_process(
         error,
         timed_out,
         stopped,
-        process_signal: process_signal.clone(),
-        external_process: ExternalProcessStatus {
-            pid,
-            started_at,
-            ended_at: Some(ended_at),
-            duration_ms: Some(ended_at - started_at),
-            exit_code,
-            process_signal,
-            stdout_path: stdout_path.display().to_string(),
-            stderr_path: stderr_path.display().to_string(),
-            final_output_path: plan
-                .final_output_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            stdout_bytes: Some(stdout_log.total()),
-            stderr_bytes: Some(stderr_log.total()),
-            stdout_truncated: stdout_log.truncated(),
-            stderr_truncated: stderr_log.truncated(),
-        },
+        process_signal,
+        external_process,
     }
 }
 
@@ -626,6 +662,7 @@ mod tests {
             stop,
             timeout_message: "Subagent timed out.".to_string(),
             stop_message: "Subagent stopped by user.".to_string(),
+            on_process: None,
         }
     }
 

@@ -150,6 +150,7 @@ fn run_options(cwd: &Path) -> RunOptions {
         child_index: None,
         steer_inbox_dir: None,
         steer_ack_dir: None,
+        external_log_dir: None,
         steer_capability_path: None,
         control_config: None,
         on_control_event: None,

@@ -9,14 +9,14 @@
 //! readable session name") claims `" subagent-worker-run1-1 "` over a process-wide stable id and
 //! asserts the peer sees that id under the session's own name.
 //!
-//! cyrup's bus carries JSON and delivers after the emitting dispatch, so the claim is a reply on
-//! `intercom:session-identity-claim` (`{ version: 1, stableId }`) — see
-//! `cyrup_intercom::identity::INTERCOM_SESSION_IDENTITY_CLAIM_EVENT`.
+//! cyrup's port is the same synchronous shape: the request is a typed
+//! `IntercomSessionIdentityRequestV1` emitted with `HostServices::emit_typed_event`, which runs
+//! every native claimant inline, so the id is settled before the session registers anywhere.
 //!
 //! The first test is the whole production path: a real `AgentSession` whose host bus carries the
-//! request from the intercom extension to a second native extension and the claim back, against a
-//! real broker. The other two drive `IntercomExtension::on_bus_event` — the entry point the host bus
-//! delivers through — to pin the late-claim re-register and the closed window.
+//! request from the intercom extension to a second native extension, against a real broker. The
+//! second drives `IntercomExtension::on_event(SessionStart)` over a backend whose typed emit claims,
+//! to pin upstream's `??=` and the per-runtime reset.
 
 #![allow(
     clippy::unwrap_used,
@@ -25,7 +25,7 @@
     clippy::indexing_slicing
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,9 +36,7 @@ use cyrup_ext::{
 };
 use cyrup_intercom::config::{config_path, load_config};
 use cyrup_intercom::extension::IntercomExtension;
-use cyrup_intercom::identity::{
-    INTERCOM_SESSION_IDENTITY_CLAIM_EVENT, INTERCOM_SESSION_IDENTITY_EVENT,
-};
+use cyrup_intercom::identity::{INTERCOM_SESSION_IDENTITY_EVENT, IntercomSessionIdentityRequestV1};
 use cyrup_intercom::paths::{broker_socket_path, intercom_dir_path};
 use cyrup_intercom::transport::client::IntercomClient;
 use cyrup_intercom::transport::spawn::wait_for_broker;
@@ -46,12 +44,11 @@ use cyrup_provider::Provider;
 use cyrup_provider::faux::FauxProvider;
 use cyrup_session_svc::{AppMode, SessionBuilder, SessionConfig};
 
-/// A subagent-launcher stand-in: answers the identity request with a claim, exactly as upstream's
+/// A subagent-launcher stand-in: claims inside the emit, exactly as upstream's
 /// `pi.events.on(INTERCOM_SESSION_IDENTITY_EVENT, (request) => request.claim(" subagent-worker-run1-1 "))`.
 #[derive(Default)]
 struct Claimant {
-    services: Mutex<Option<Arc<dyn HostServices>>>,
-    requests: Mutex<Vec<serde_json::Value>>,
+    requests: Mutex<usize>,
 }
 
 #[async_trait::async_trait]
@@ -59,33 +56,20 @@ impl NativeExtension for Claimant {
     fn id(&self) -> ExtensionId {
         ExtensionId::from("identity-claimant")
     }
-    fn set_host_services(&self, services: Arc<dyn HostServices>) {
-        *self.services.lock().unwrap() = Some(services);
-    }
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
-        api.subscribe_bus(INTERCOM_SESSION_IDENTITY_EVENT);
+        api.subscribe_typed_bus(INTERCOM_SESSION_IDENTITY_EVENT);
         Ok(())
     }
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         HookOutcome::Noop
     }
-    async fn on_bus_event(
-        &self,
-        topic: &str,
-        payload: &serde_json::Value,
-        _ctx: &HostCtx,
-    ) -> Result<(), ExtError> {
-        if topic == INTERCOM_SESSION_IDENTITY_EVENT {
-            self.requests.lock().unwrap().push(payload.clone());
-            let services = self.services.lock().unwrap().clone();
-            if let Some(services) = services {
-                services.emit_event(
-                    INTERCOM_SESSION_IDENTITY_CLAIM_EVENT,
-                    &serde_json::json!({ "version": 1, "stableId": " subagent-worker-run1-1 " }),
-                );
-            }
+    fn on_typed_bus_event(&self, topic: &str, event: &dyn std::any::Any) {
+        if topic == INTERCOM_SESSION_IDENTITY_EVENT
+            && let Some(request) = event.downcast_ref::<IntercomSessionIdentityRequestV1>()
+        {
+            *self.requests.lock().unwrap() += 1;
+            request.claim(" subagent-worker-run1-1 ");
         }
-        Ok(())
     }
 }
 
@@ -155,19 +139,22 @@ async fn a_claiming_extension_sets_the_intercom_id_over_the_stable_id() {
         .set_session_name("worker: fix auth refresh");
     session.bind_extensions().await;
 
+    // The claim is settled before the startup connect is even scheduled, so the FIRST client this
+    // session ever publishes is already registered under it — there is no host-assigned
+    // registration to replace.
     let state = ext.state().clone();
     assert!(
-        within(Duration::from_secs(30), || state
-            .client()
-            .and_then(|c| c.session_id())
-            .is_some_and(|id| id == "subagent-worker-run1-1"))
-        .await,
-        "the session registers under the trimmed claim, not `process-wide-id`; got {:?}",
-        state.client().and_then(|c| c.session_id())
+        within(Duration::from_secs(30), || state.client().is_some()).await,
+        "the session connects"
     );
     assert_eq!(
-        claimant.requests.lock().unwrap().clone(),
-        vec![serde_json::json!({ "version": 1 })],
+        state.client().and_then(|c| c.session_id()).as_deref(),
+        Some("subagent-worker-run1-1"),
+        "the session registers under the trimmed claim, not `process-wide-id`"
+    );
+    assert_eq!(
+        *claimant.requests.lock().unwrap(),
+        1,
         "exactly one V1 request per session start"
     );
 
@@ -194,156 +181,119 @@ async fn a_claiming_extension_sets_the_intercom_id_over_the_stable_id() {
 
 const HOST_SESSION_ID: &str = "session-c1a1mc1a1mc1a1m0";
 
-struct HostSession;
+/// A backend whose typed bus has the listeners `claims` stands for: each entry is one listener's
+/// `request.claim(…)` call, in listener order.
+struct ClaimingHost {
+    claims: Mutex<Vec<&'static str>>,
+}
 
-impl HostServices for HostSession {
+impl HostServices for ClaimingHost {
     fn session_id(&self) -> Option<String> {
         Some(HOST_SESSION_ID.to_string())
     }
+    fn emit_typed_event(&self, topic: &str, event: &dyn std::any::Any) {
+        if topic == INTERCOM_SESSION_IDENTITY_EVENT
+            && let Some(request) = event.downcast_ref::<IntercomSessionIdentityRequestV1>()
+        {
+            for claim in self.claims.lock().unwrap().iter() {
+                request.claim(claim);
+            }
+        }
+    }
 }
 
-/// A session started through the production `SessionStart` arm and connected under its host id.
-async fn started(agent_dir: &Path) -> (Arc<IntercomExtension>, HostCtx, tokio::process::Child) {
-    let intercom_dir = intercom_dir_path(agent_dir);
-    write_broker_command(&intercom_dir);
-    let socket = broker_socket_path(&intercom_dir);
-    let broker = spawn_broker(agent_dir);
-    wait_for_broker(&socket, Duration::from_secs(20))
-        .await
-        .expect("broker up");
-    let ext = Arc::new(
-        IntercomExtension::new(
-            agent_dir.to_path_buf(),
-            PathBuf::from("/tmp/work"),
-            load_config(&intercom_dir).expect("config loads"),
-            None,
-        )
-        .expect("build the extension"),
-    );
-    ext.set_host_services(Arc::new(HostSession));
-    let ctx = HostCtx::event(ExtMode::Print, false, agent_dir.to_path_buf());
+async fn start_session(ext: &IntercomExtension, ctx: &HostCtx) {
     let _ = ext
         .on_event(
             &HostEvent::SessionStart {
                 reason: "test".to_string(),
                 previous_session_file: None,
             },
-            &ctx,
+            ctx,
         )
         .await;
-    let state = ext.state().clone();
-    assert!(
-        within(Duration::from_secs(30), || state
-            .client()
-            .and_then(|c| c.session_id())
-            .is_some_and(|id| id == HOST_SESSION_ID))
-        .await,
-        "unclaimed, the session registers under its host session id"
-    );
-    (ext, ctx, broker)
 }
 
-async fn claim(ext: &IntercomExtension, ctx: &HostCtx, payload: serde_json::Value) {
-    ext.on_bus_event(INTERCOM_SESSION_IDENTITY_CLAIM_EVENT, &payload, ctx)
-        .await
-        .expect("the claim listener never faults");
-}
-
-/// cyrup's bus delivers the claim after the `session_start` dispatch, so the startup connect can
-/// register first. The claim still wins: the session re-registers under it and the host-assigned id
-/// leaves the roster. A second claim does not move it again (`??=`: the first claim wins).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_claim_that_lands_after_registration_re_registers_under_it() {
-    let agent_dir = tempfile::tempdir().unwrap();
-    let (ext, ctx, mut broker) = started(agent_dir.path()).await;
-    let socket = broker_socket_path(&intercom_dir_path(agent_dir.path()));
-    let peer = IntercomClient::connect(&socket, registration("peer"), Some("peer".into()))
-        .await
-        .expect("peer connects");
-
-    // Not a V1 claim, then a blank one: both ignored.
-    claim(&ext, &ctx, serde_json::json!({ "stableId": "no-version" })).await;
-    claim(
-        &ext,
-        &ctx,
-        serde_json::json!({ "version": 1, "stableId": "   " }),
-    )
-    .await;
-    claim(
-        &ext,
-        &ctx,
-        serde_json::json!({ "version": 1, "stableId": " late-claim " }),
-    )
-    .await;
-    claim(
-        &ext,
-        &ctx,
-        serde_json::json!({ "version": 1, "stableId": "second" }),
-    )
-    .await;
-
+async fn registered_as(ext: &IntercomExtension, expected: &str) -> bool {
     let state = ext.state().clone();
-    assert!(
-        within(Duration::from_secs(30), || state
+    within(Duration::from_secs(30), || {
+        state
             .client()
             .filter(|c| c.is_connected())
             .and_then(|c| c.session_id())
-            .is_some_and(|id| id == "late-claim"))
-        .await,
-        "re-registered under the first valid claim; got {:?}",
-        state.client().and_then(|c| c.session_id())
+            .is_some_and(|id| id == expected)
+    })
+    .await
+}
+
+/// `claimedIntercomSessionId ??= stableId.trim() || undefined` (`index.ts:1648-1650`): a blank
+/// claim is no claim and the first real one wins over every later one. The slot is a fresh `let`
+/// per `session_start` (`:1645`), so a runtime whose listeners claim nothing registers under its
+/// host id again rather than inheriting the previous runtime's claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_non_blank_claim_wins_and_does_not_outlive_its_runtime() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let intercom_dir = intercom_dir_path(agent_dir.path());
+    write_broker_command(&intercom_dir);
+    let socket = broker_socket_path(&intercom_dir);
+    let mut broker = spawn_broker(agent_dir.path());
+    wait_for_broker(&socket, Duration::from_secs(20))
+        .await
+        .expect("broker up");
+    let ext = Arc::new(
+        IntercomExtension::new(
+            agent_dir.path().to_path_buf(),
+            PathBuf::from("/tmp/work"),
+            load_config(&intercom_dir).expect("config loads"),
+            None,
+        )
+        .expect("build the extension"),
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let ids = loop {
-        let ids: Vec<String> = roster(&peer).await.into_iter().map(|(id, _)| id).collect();
-        if !ids.iter().any(|id| id == HOST_SESSION_ID) || tokio::time::Instant::now() >= deadline {
-            break ids;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-    assert!(ids.contains(&"late-claim".to_string()), "{ids:?}");
+    let host = Arc::new(ClaimingHost {
+        claims: Mutex::new(vec!["   ", " first-claim ", "second-claim"]),
+    });
+    ext.set_host_services(host.clone());
+    let ctx = HostCtx::event(ExtMode::Print, false, agent_dir.path().to_path_buf());
+
+    start_session(&ext, &ctx).await;
     assert!(
-        !ids.iter()
-            .any(|id| id == HOST_SESSION_ID || id == "second" || id == "no-version"),
-        "the host id is gone and no later claim registered: {ids:?}"
+        registered_as(&ext, "first-claim").await,
+        "registered under the first non-blank claim; got {:?}",
+        ext.state().client().and_then(|c| c.session_id())
     );
+    let peer = IntercomClient::connect(&socket, registration("peer"), Some("peer".into()))
+        .await
+        .expect("peer connects");
     // `buildPresenceIdentity(pi, currentIntercomSessionId ?? …)` (`index.ts:910,956,1657`): the
     // session is unnamed, so its alias is cut from the claimed id, not the host id.
     let sessions = roster(&peer).await;
     assert!(
         sessions.contains(&(
-            "late-claim".to_string(),
-            Some("subagent-chat-late-claim".to_string())
+            "first-claim".to_string(),
+            Some("subagent-chat-first-claim".to_string())
         )),
         "the unnamed claimed session advertises the claim's alias: {sessions:?}"
     );
+    assert!(
+        !sessions
+            .iter()
+            .any(|(id, _)| id == HOST_SESSION_ID || id == "second-claim"),
+        "no registration under the host id or a later claim: {sessions:?}"
+    );
+
+    // The next runtime's listeners claim nothing.
+    host.claims.lock().unwrap().clear();
+    start_session(&ext, &ctx).await;
+    assert!(
+        registered_as(&ext, HOST_SESSION_ID).await,
+        "an unclaimed runtime registers under its host id; got {:?}",
+        ext.state().client().and_then(|c| c.session_id())
+    );
+    assert_eq!(ext.state().claimed_intercom_session_id(), None);
 
     peer.disconnect();
     if let Some(c) = ext.state().client() {
         c.disconnect();
     }
-    let _ = broker.kill().await;
-}
-
-/// The window closes at the session's first `agent_start`: a claim after it changes nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_claim_after_the_first_run_started_is_ignored() {
-    let agent_dir = tempfile::tempdir().unwrap();
-    let (ext, ctx, mut broker) = started(agent_dir.path()).await;
-    let _ = ext.on_event(&HostEvent::AgentStart, &ctx).await;
-    claim(
-        &ext,
-        &ctx,
-        serde_json::json!({ "version": 1, "stableId": "too-late" }),
-    )
-    .await;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let client = ext.state().client().expect("still connected");
-    assert!(client.is_connected());
-    assert_eq!(client.session_id().as_deref(), Some(HOST_SESSION_ID));
-    assert_eq!(ext.state().claimed_intercom_session_id(), None);
-
-    client.disconnect();
     let _ = broker.kill().await;
 }

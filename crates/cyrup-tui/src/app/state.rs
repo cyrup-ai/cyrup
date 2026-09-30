@@ -434,6 +434,14 @@ pub struct AppState {
     /// Pi's purposes: the 15 s deadline fires it, `dispose()` fires it (`:225`), and the settled
     /// refresh clears it (Pi's `finally { clearTimeout }`). `None` when no refresh is in flight.
     pub(super) model_refresh_cancel: Option<CancelToken>,
+    /// The `/resume` picker generation the in-flight listing belongs to (TUI-121) — the
+    /// [`Self::model_refresh_epoch`] guard for pi's `isActive()` (`session-selector.ts:955`
+    /// @v0.87.1). Bumped on every open; a [`crate::app::SessionListMsg`] from another epoch is
+    /// dropped.
+    pub(super) session_list_epoch: u64,
+    /// The open `/resume` picker's loaders and one abort handle per load it started (pi's
+    /// `currentLoad` / `allLoad` controllers). `None` when no streamed `/resume` picker is open.
+    pub(super) session_list: Option<super::session_list::SessionListLoads>,
     /// Provider ids whose STORED credential is an OAuth one — cyrup's standing copy of the half of
     /// pi's `modelRuntime.snapshot.auth` that `isUsingOAuth` reads
     /// (`model-runtime.ts:458-460`, pi v0.84.1: `this.snapshot.auth.get(providerId)?.type ===
@@ -600,6 +608,8 @@ impl AppState {
             login_refresh_cancel: None,
             model_refresh_epoch: 0,
             model_refresh_cancel: None,
+            session_list_epoch: 0,
+            session_list: None,
             oauth_credential_providers: std::collections::BTreeSet::new(),
             extension_oauth_subscription: std::collections::BTreeMap::new(),
             known_tool_definitions: std::collections::HashMap::new(),

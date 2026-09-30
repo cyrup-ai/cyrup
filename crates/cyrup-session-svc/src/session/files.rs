@@ -39,12 +39,19 @@ impl AgentSession {
     /// never filtered. Same predicate the CLI `--resume` path computes (`session_list_cwd_filter`,
     /// crates/cyrup/src/main.rs:1132-1138). An absent/empty dir yields an empty list, never an error.
     pub fn list_sessions(&self) -> Vec<cyrup_session::listing::SessionInfo> {
-        let dir = &self.services.session_dir;
+        self.current_sessions_listing().run(None)
+    }
+
+    /// [`Self::list_sessions`] as an owned [`cyrup_session::SessionListing`] — pi's
+    /// `currentSessionsLoader` (`interactive-mode.ts:5551-5557` @v0.87.1) — so the `/resume` picker
+    /// can run it off its event loop and stream partial results (TUI-121).
+    pub fn current_sessions_listing(&self) -> cyrup_session::SessionListing {
+        let dir = self.services.session_dir.clone();
         let default_dir =
             cyrup_session::SessionLayout::new(self.sessions_root(), self.services.cwd.clone())
                 .dir();
-        let cwd_filter = (*dir != default_dir).then_some(self.services.cwd.as_path());
-        cyrup_session::listing::list_in_dir(dir, cwd_filter, None)
+        let cwd_filter = (dir != default_dir).then(|| self.services.cwd.clone());
+        cyrup_session::SessionListing::Dir { dir, cwd_filter }
     }
 
     /// Every persisted session the `/resume` picker's `all` scope lists, newest first — pi's second
@@ -57,14 +64,25 @@ impl AgentSession {
     /// the sessions root is scanned; under a custom directory that one directory is listed WITHOUT
     /// the cwd filter [`Self::list_sessions`] applies, which is what makes it "all".
     pub fn list_all_sessions(&self) -> Vec<cyrup_session::listing::SessionInfo> {
-        let dir = &self.services.session_dir;
+        self.all_sessions_listing().run(None)
+    }
+
+    /// [`Self::list_all_sessions`] as an owned [`cyrup_session::SessionListing`] — pi's
+    /// `allSessionsLoader` (`interactive-mode.ts:5558-5561` @v0.87.1) — for the same off-loop,
+    /// streamed `/resume` load as [`Self::current_sessions_listing`] (TUI-121).
+    pub fn all_sessions_listing(&self) -> cyrup_session::SessionListing {
+        let dir = self.services.session_dir.clone();
         let root = self.sessions_root();
         let default_dir =
             cyrup_session::SessionLayout::new(root.clone(), self.services.cwd.clone()).dir();
-        if *dir == default_dir {
-            cyrup_session::listing::list_all(&cyrup_session::SessionsRoot(root))
+        if dir == default_dir {
+            cyrup_session::SessionListing::AllProjects(cyrup_session::SessionsRoot(root))
         } else {
-            cyrup_session::listing::list_all_in_dir(dir, None)
+            // `SessionManager.listAll(sessionDir, …)` — the one directory, unfiltered.
+            cyrup_session::SessionListing::Dir {
+                dir,
+                cwd_filter: None,
+            }
         }
     }
 

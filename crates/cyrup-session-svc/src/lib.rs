@@ -56,6 +56,9 @@ pub use command::{SessionCommand, SessionCommandOutput};
 /// `toJsonEvent` does (`modes/json-event.ts:58` @v0.84.4) — could otherwise not match on it without
 /// a direct `cyrup-agent` dependency.
 pub use cyrup_agent::AgentMessage;
+/// Re-exported so the binary's `--help` can name the flag declarations
+/// [`AgentSession::extension_flag_declarations`] returns without a direct `cyrup-ext` dependency.
+pub use cyrup_ext::ExtensionFlagDeclaration;
 pub use cyrup_ext::NotifyKind;
 /// Re-exported so a front-end can name the `/model` refresh result (XAI_4's status strings) without
 /// a direct `cyrup-provider` dependency.
@@ -77,9 +80,9 @@ pub use export::{
 pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;
 pub use host_services::{
-    ControlSink, EditorFocusMirror, EditorTextMirror, FooterDataMirror, InjectAck, InjectMessage,
-    InjectRequest, InjectSink, LiveHostServices, OverlayRequest, OverlaySink, ThemeAccess,
-    UiEffect, UiEffectSink, UiKind, UiReply, UiRequest, UiSink,
+    ControlSink, EditorFocusMirror, EditorTextMirror, FooterDataMirror, InjectAck, InjectItem,
+    InjectMessage, InjectRequest, InjectSink, LiveHostServices, OverlayRequest, OverlaySink,
+    ThemeAccess, UiEffect, UiEffectSink, UiKind, UiReply, UiRequest, UiSink,
 };
 pub use provider_swap::{ProviderResolver, ProviderSwap};
 pub use runtime::{
@@ -155,6 +158,6 @@ pub use cyrup_session::layout::{SessionLayout, SessionsRoot, encode_cwd};
 /// Re-exported so the TUI `/resume` selector can name the session-list rows
 /// [`AgentSession::list_sessions`] returns without a direct `cyrup-session` dependency.
 pub use cyrup_session::listing::SessionInfo;
-pub use cyrup_session::listing::{list_all, list_in_dir};
+pub use cyrup_session::listing::{SessionListing, list_all, list_in_dir};
 pub use cyrup_session::prompt::{ContextFile, ContextScope};
 pub use cyrup_tools::{Availability, PermissionPolicy};

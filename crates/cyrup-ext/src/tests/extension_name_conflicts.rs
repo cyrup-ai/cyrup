@@ -275,6 +275,66 @@ fn first_extension_wins_a_flag_name() {
     );
 }
 
+/// SEAM-020 (b)/(d) — the declarations `--help` lists: pi's
+/// `resourceLoader.getExtensions().extensions.flatMap((e) => Array.from(e.flags.values()))`
+/// (`main.ts:859-862` @v0.87.1) — extension load order, then each extension's own declaration
+/// order, the conflict loser included (it keeps its own `extension.flags` entry; the conflict is
+/// only a diagnostic), and a same-owner re-registration replacing its entry in place (`Map.set` on
+/// an existing key keeps its position). cyrup kept flags only in a `HashMap` keyed by name, so
+/// neither the order nor the loser's declaration survived.
+#[test]
+fn flag_declarations_are_in_load_then_declaration_order_with_losers_kept() {
+    let host = ExtensionHost::new(cfg());
+    let reg = host.registry();
+    reg.register_flag(
+        "alpha".into(),
+        "zeta",
+        json!({ "type": "boolean", "description": "first" }),
+    )
+    .unwrap();
+    reg.register_flag("alpha".into(), "persona", json!({ "type": "string" }))
+        .unwrap();
+    reg.register_flag(
+        "alpha".into(),
+        "zeta",
+        json!({ "type": "boolean", "description": "re-declared" }),
+    )
+    .unwrap();
+    reg.register_flag(
+        "beta".into(),
+        "persona",
+        json!({ "type": "boolean", "description": "loser", "default": false }),
+    )
+    .unwrap();
+
+    let got: Vec<(String, String, Option<String>, Option<String>)> = reg
+        .flag_declarations()
+        .unwrap()
+        .into_iter()
+        .map(|d| (d.extension.to_string(), d.name, d.flag_type, d.description))
+        .collect();
+    let row = |ext: &str, name: &str, ty: &str, desc: Option<&str>| {
+        (
+            ext.to_string(),
+            name.to_string(),
+            Some(ty.to_string()),
+            desc.map(str::to_string),
+        )
+    };
+    assert_eq!(
+        got,
+        vec![
+            row("alpha", "zeta", "boolean", Some("re-declared")),
+            row("alpha", "persona", "string", None),
+            row("beta", "persona", "boolean", Some("loser")),
+        ]
+    );
+    assert_eq!(
+        reg.flag_declarations().unwrap()[2].default,
+        Some(json!(false))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Detection: pi resource-loader.ts:1059-1094 + :625-632 — conflicts become load `errors`.
 // ---------------------------------------------------------------------------

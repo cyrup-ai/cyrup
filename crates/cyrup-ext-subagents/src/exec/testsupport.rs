@@ -86,6 +86,7 @@ pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions
         output_mode: OutputMode::Inline,
         reads: None,
         steer_ack_dir: None,
+        external_log_dir: None,
         steer_capability_path: None,
         structured_output_schema: None,
         model_override: ModelOverride::Inherit,

@@ -52,15 +52,27 @@ pub enum ProxyAssistantMessageEvent {
     },
     /// Terminal: normal completion. `reason` ∈ {stop, length, toolUse} (Pi narrows `done.reason`,
     /// proxy.ts:49).
+    ///
+    /// AGENT-041 — `providerThinkingLevel` is the provider-native thinking level the server
+    /// resolved (proxy.ts:51 @v0.87.1, present from v0.85.0); the client copies it onto the
+    /// message. Optional, so a frame from an older server that omits it still decodes.
     #[serde(rename = "done")]
-    Done { reason: DoneReason, usage: Usage },
+    Done {
+        reason: DoneReason,
+        usage: Usage,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        provider_thinking_level: Option<String>,
+    },
     /// Terminal: error/abort. `reason` ∈ {error, aborted} (Pi narrows `error.reason`, proxy.ts:54).
+    /// Carries `providerThinkingLevel` like [`Self::Done`] (proxy.ts:58 @v0.87.1, AGENT-041).
     #[serde(rename = "error")]
     Error {
         reason: ErrorReason,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         error_message: Option<String>,
         usage: Usage,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        provider_thinking_level: Option<String>,
     },
 }
 
@@ -108,7 +120,8 @@ mod tests {
                     output: 20,
                     total_tokens: 30,
                     ..Usage::default()
-                }
+                },
+                provider_thinking_level: None,
             }
         );
         assert!(matches!(

@@ -50,7 +50,7 @@
 //!    deadline. This is also what keeps a *late* reply from corrupting input: the sentinel reply is
 //!    consumed here rather than surfacing to crossterm later.
 //! 3. **It runs in the one safe window.** The probe is issued after raw mode is on
-//!    (`App::into_stdout`) and *before* the crossterm reader thread exists
+//!    (`App::into_stdout`) and *before* the input reader thread exists
 //!    (`crossterm_input_stream`), so there is no second reader to race for the bytes. Both
 //!    preconditions are re-checked here ([`stdin_is_queryable`]); if either fails the probe is
 //!    skipped and the caller falls back to `COLORFGBG`. (crossterm reads `/dev/tty` where it can
@@ -59,28 +59,25 @@
 //!    this point, so nothing is stranded inside it either.)
 //!
 //! Residual risk, and how it is now covered: a terminal that answers OSC 11 but *not* DA1, more than
-//! `timeout` late, has its reply reach crossterm and decoded as stray key events. That is a real,
-//! user-reported failure (`11;rgb:0c0c/0b0b/1313` typed into the prompt at launch). Pi is not exposed
-//! to it because its `setTimeout` giving up is only its FIRST line of defence — `handleTerminalInput`
-//! (`tui/src/tui.ts:788-794`) also swallows an OSC 11 / colour-scheme reply arriving at ANY later
-//! time, before any input listener sees it. [`crate::stray_reply`] is the port of that second
-//! mechanism, operating over crossterm's already-parsed key events rather than raw bytes; it is
-//! installed in [`crate::app::crossterm_input_stream`]'s reader thread. A longer `timeout` here would
-//! only narrow the window and would cost every user that latency at every launch, so it is unchanged.
+//! `timeout` late, has its reply reach the input reader. That is a real, user-reported failure
+//! (`11;rgb:0c0c/0b0b/1313` typed into the prompt at launch, when crossterm's parser read the tty).
+//! Pi is not exposed to it because its `setTimeout` giving up is only its FIRST line of defence —
+//! `handleTerminalInput` (`tui/src/tui.ts:788-794`) also swallows an OSC 11 / colour-scheme reply
+//! arriving at ANY later time, before any input listener sees it. On unix cyrup's byte reader now
+//! does the same for every reply at once: it frames an OSC, DCS or APC string, a `CSI ?` reply, a
+//! cursor-position report and a `CSI … t` window report as one sequence each and decodes them as a
+//! terminal reply that reaches no listener (`crate::input::decode`). A longer `timeout` here would
+//! only narrow the window and would cost every user that latency at every launch, so it is
+//! unchanged.
 //!
-//! The DSR `?996` reply has a different exposure that a key-level filter cannot reach: crossterm's
-//! `parse_csi` `?` arm terminates only on a final `u` or `c`, so a late `CSI ? 997 ; 1 n` emits ZERO
-//! events and leaves the sequence wedged in crossterm's buffer until some later `c` flushes it —
-//! destroying the keystrokes in between. The DA1 sentinel appended to every probe here is what makes
-//! that unreachable in practice: a terminal answering the DSR late answers DA1 late too, and the DA1
-//! reply's trailing `c` flushes the buffer in the same read.
-//!
-//! The `CSI 16 t` reply sits in the same bucket as the DSR and is covered the same way. crossterm's
-//! numeric-parameter arm accepts any final byte in `64..=126` and routes an unrecognized one to
-//! `parse_csi_modifier_key_code` (`crossterm-0.29.0/src/event/sys/unix/parse.rs:184-207`), so a
-//! *late* `CSI 6 ; 18 ; 9 t` would be decoded as some arbitrary key rather than dropped. The DA1
-//! sentinel is again what keeps it from being late: a terminal that answers `CSI 16 t` answers DA1
-//! after it, and both are consumed here.
+//! Two replies used to be worse than garbage under crossterm, and the DA1 sentinel appended to every
+//! probe here is what kept them from being late: crossterm's `parse_csi` `?` arm terminates only on
+//! a final `u` or `c`, so a late `CSI ? 997 ; 1 n` wedged its buffer until some later `c` and
+//! destroyed the keystrokes in between; and its numeric-parameter arm routed an unrecognized final
+//! byte to `parse_csi_modifier_key_code` (`crossterm-0.29.0/src/event/sys/unix/parse.rs:184-207`),
+//! so a late `CSI 6 ; 18 ; 9 t` became some arbitrary key. The byte reader frames both by their
+//! final byte and swallows them, so on unix the sentinel is now a latency bound only. On Windows,
+//! where crossterm's console reader remains, it still does both jobs.
 
 use std::time::Duration;
 
@@ -117,6 +114,7 @@ pub const CURSOR_POSITION_TIMEOUT: Duration = Duration::from_millis(100);
 const DEVICE_ATTRIBUTES_QUERY: &str = "\x1b[c";
 
 /// Hard cap on how much a reply may be, so a chatty/garbage terminal cannot make the boot probe spin.
+#[cfg(unix)]
 const MAX_REPLY_BYTES: usize = 1024;
 
 /// The two terminal questions, behind a trait so the theme layer can be driven from a scripted reply

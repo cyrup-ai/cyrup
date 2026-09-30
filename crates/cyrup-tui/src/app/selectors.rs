@@ -468,6 +468,12 @@ impl<B: Backend> App<B> {
         active.inner.set_editor_keymap(editor.keymap_ref());
         let outcome = active.inner.handle(key, select_keymap);
         let kind = active.kind;
+        // TUI-121 — a `Tab` onto a `/resume` scope that was never loaded asks for its load (pi's
+        // `toggleScope` → `void this.loadScope(this.scope)`, `session-selector.ts:1039`
+        // @v0.87.1); start it before the outcome can close the picker.
+        if kind == SelectorKind::Session {
+            self.start_requested_session_load();
+        }
         self.apply_selector_outcome(kind, outcome)
     }
 
@@ -867,6 +873,12 @@ impl<B: Backend> App<B> {
                 && let Some(cancel) = self.state.model_refresh_cancel.take()
             {
                 cancel.cancel();
+            }
+            // pi `cancelLoads()` on select, cancel and exit (`session-selector.ts:801-813`,
+            // `:872-883` @v0.87.1): closing the `/resume` picker aborts every listing it started,
+            // and anything they report afterwards finds no picker to land in (TUI-121).
+            if active.kind == SelectorKind::Session {
+                self.cancel_session_list_loads();
             }
             if cancelled && let Some(theme) = active.restore_theme {
                 self.set_theme(theme);

@@ -2,6 +2,7 @@
 //! selection by full path or unique uuid prefix.
 
 use std::io::{BufRead as _, BufReader};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -37,9 +38,57 @@ pub enum SessionSelector {
     Uuid(String),
 }
 
-/// Progress callback for listing: invoked `(loaded, total)` after each session file is processed —
-/// Pi `SessionListProgress` (`session-manager.ts:670`), used by the TUI session selector.
-pub type SessionListProgress<'a> = dyn FnMut(usize, usize) + 'a;
+/// Progress callback for listing — pi's `SessionListProgress` (`session-manager.ts:884-889`
+/// @v0.87.1): `(loaded, total, partialSessions?)`, invoked after EVERY attempted file. On the
+/// periodic publishes (see [`CURRENT_SESSION_LIST_PUBLISH_INTERVAL`] /
+/// [`ALL_SESSION_LIST_PUBLISH_INTERVAL`]) the third argument carries every session loaded so far,
+/// sorted newest-first and already cwd-filtered; otherwise it is `None`.
+///
+/// The return value is pi's `AbortSignal`, which the listing checks between files
+/// (`mapWithConcurrency`'s `signal?.throwIfAborted()`, `:911`): [`ControlFlow::Break`] stops the
+/// scan before the next file is read. A Rust callback that already owns the "is anyone still
+/// listening?" answer — the `/resume` picker's channel closes when the picker does — returns it
+/// here instead of threading a second handle through every listing function. A listing that was
+/// broken returns what it had loaded; the caller that broke it knows the result is partial and
+/// discards it, as pi's `if (!isActive()) return` does.
+pub type SessionListProgress<'a> =
+    dyn FnMut(usize, usize, Option<&[SessionInfo]>) -> ControlFlow<()> + 'a;
+
+/// pi `CURRENT_SESSION_LIST_PUBLISH_INTERVAL` (`session-manager.ts:893` @v0.87.1): a single
+/// directory's listing publishes its partial set after the first file, every 10th, and the last.
+pub const CURRENT_SESSION_LIST_PUBLISH_INTERVAL: usize = 10;
+/// pi `ALL_SESSION_LIST_PUBLISH_INTERVAL` (`session-manager.ts:894`): the all-projects listing
+/// publishes after the first (newest) file, every 100th, and the last.
+pub const ALL_SESSION_LIST_PUBLISH_INTERVAL: usize = 100;
+
+/// Which session set a listing reads — the two loaders pi's `/resume` picker is handed
+/// (`interactive-mode.ts:5549-5566` @v0.87.1), as owned data, so a host can run one on a blocking
+/// thread and stream its progress (`SessionManager.list` / `SessionManager.listAll`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionListing {
+    /// One directory, optionally filtered to sessions recorded in `cwd_filter` — pi
+    /// `SessionManager.list(cwd, sessionDir, …)` (`session-manager.ts:1897-1912`); see
+    /// [`list_in_dir`].
+    Dir {
+        dir: PathBuf,
+        cwd_filter: Option<PathBuf>,
+    },
+    /// Every project directory under the sessions root — pi `SessionManager.listAll(…)`
+    /// (`:1919-2008`); see [`list_all_with_progress`].
+    AllProjects(SessionsRoot),
+}
+
+impl SessionListing {
+    /// Run the listing, reporting through `on_progress` (and stopping when it breaks).
+    pub fn run(&self, on_progress: Option<&mut SessionListProgress>) -> Vec<SessionInfo> {
+        match self {
+            SessionListing::Dir { dir, cwd_filter } => {
+                list_in_dir(dir, cwd_filter.as_deref(), on_progress)
+            }
+            SessionListing::AllProjects(root) => list_all_with_progress(root, on_progress),
+        }
+    }
+}
 
 /// All sessions for a cwd, newest first (R-04-015).
 pub fn list(layout: &SessionLayout) -> Vec<SessionInfo> {
@@ -47,20 +96,32 @@ pub fn list(layout: &SessionLayout) -> Vec<SessionInfo> {
 }
 
 /// List a directory's sessions newest-first, optionally filtering by `cwd_filter` and reporting
-/// `(loaded, total)` progress — Pi `SessionManager.list(cwd, sessionDir, onProgress)`
-/// (`session-manager.ts:1507-1516`): a `cwd_filter` (set when a custom/shared `sessionDir` is not
-/// the cwd-default) keeps only sessions whose header cwd matches, so a shared directory only shows
-/// the current project. Listing is synchronous (Pi's bounded-concurrency is an arch choice); the
-/// `(loaded, total)` affordance is preserved.
+/// progress — pi `SessionManager.list(cwd, sessionDir, onProgress, signal)` over
+/// `listSessionsFromDir` (`session-manager.ts:941-975`, `:1897-1912` @v0.87.1): a `cwd_filter` (set
+/// when a custom/shared `sessionDir` is not the cwd-default) keeps only sessions whose header cwd
+/// matches, so a shared directory only shows the current project — and it filters the partial sets
+/// too (`:1907-1909`). Files are read in pi's order, filename-descending (`:950-953`), which for
+/// cyrup's `<timestamp>_<uuid>.jsonl` names is newest-created first, so the first partial publish
+/// is already the most recent session.
+///
+/// **[CYRUP-DELTA]** — files are read one at a time rather than pi's ten concurrent
+/// `buildSessionInfo` calls (`MAX_CONCURRENT_SESSION_INFO_LOADS`, `:892`): the host runs the whole
+/// listing on one blocking thread off its event loop, so the concurrency pi needs to keep a
+/// single-threaded runtime responsive buys nothing here, and a strictly sequential scan publishes
+/// partial sets in exactly the file order above.
 pub fn list_in_dir(
     dir: &Path,
     cwd_filter: Option<&Path>,
     on_progress: Option<&mut SessionListProgress>,
 ) -> Vec<SessionInfo> {
-    let paths = collect_paths(dir);
+    let mut paths = collect_paths(dir);
+    // `.sort((a, b) => b.localeCompare(a))` on the file NAMES (`:951`).
+    paths.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     let total = paths.len();
-    let mut out = load_infos(&paths, cwd_filter, total, on_progress);
-    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    let mut out = load_infos(&paths, cwd_filter, total, on_progress, |loaded, _index| {
+        loaded == 1 || loaded % CURRENT_SESSION_LIST_PUBLISH_INTERVAL == 0 || loaded == total
+    });
+    sort_session_infos(&mut out);
     out
 }
 
@@ -69,35 +130,56 @@ pub fn list_all(root: &SessionsRoot) -> Vec<SessionInfo> {
     list_all_with_progress(root, None)
 }
 
-/// All sessions across every project directory under the root, with total-first `(loaded, total)`
-/// progress — Pi `SessionManager.listAll(onProgress)` (`session-manager.ts:1522-1580`): file counts
-/// are summed across project dirs first so progress totals are accurate, then every file is loaded.
+/// All sessions across every project directory under the root, with progress — pi
+/// `SessionManager.listAll(onProgress, signal)` (`session-manager.ts:1919-2008` @v0.87.1): every
+/// project directory's `.jsonl` files are gathered first so `total` is exact, then ordered by file
+/// mtime, newest first, ties broken by basename descending (`:1972-1976`) — "using file
+/// modification times to prioritize" (v0.86.0) — so the first partial publish (after the newest
+/// candidate, `:1995-1998`) already shows the most recently touched session.
 pub fn list_all_with_progress(
     root: &SessionsRoot,
     on_progress: Option<&mut SessionListProgress>,
 ) -> Vec<SessionInfo> {
-    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut candidates: Vec<(Option<SystemTime>, PathBuf)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(root.path()) {
         for dir in rd.flatten() {
             let p = dir.path();
             if p.is_dir() {
-                paths.extend(collect_paths(&p));
+                for path in collect_paths(&p) {
+                    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                    candidates.push((mtime, path));
+                }
             }
         }
     }
+    // `(b.mtimeMs ?? -Infinity) - (a.mtimeMs ?? -Infinity) || basename(b).localeCompare(basename(a))`:
+    // an unstattable file sorts last.
+    candidates
+        .sort_by(|(ma, pa), (mb, pb)| mb.cmp(ma).then_with(|| pb.file_name().cmp(&pa.file_name())));
+    let paths: Vec<PathBuf> = candidates.into_iter().map(|(_, p)| p).collect();
     let total = paths.len();
-    let mut out = load_infos(&paths, None, total, on_progress);
-    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    // `firstCandidateLoaded && (index === 0 || loaded % 100 === 0 || loaded === totalFiles)`: read
+    // in order, the first candidate is the first file loaded.
+    let mut out = load_infos(&paths, None, total, on_progress, |loaded, index| {
+        index == 0 || loaded % ALL_SESSION_LIST_PUBLISH_INTERVAL == 0 || loaded == total
+    });
+    sort_session_infos(&mut out);
     out
 }
 
 /// List a single custom session directory newest-first with progress (no cwd filter) — Pi's
-/// `SessionManager.listAll(sessionDir, onProgress)` overload (`session-manager.ts:1528-1535`).
+/// `SessionManager.listAll(sessionDir, onProgress)` overload (`session-manager.ts:1941-1943`), which
+/// is `listSessionsFromDir` with no filter.
 pub fn list_all_in_dir(
     dir: &Path,
     on_progress: Option<&mut SessionListProgress>,
 ) -> Vec<SessionInfo> {
     list_in_dir(dir, None, on_progress)
+}
+
+/// pi `sortSessionInfos` (`session-manager.ts:919-921`): newest `modified` first, stable.
+fn sort_session_infos(sessions: &mut [SessionInfo]) {
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
 }
 
 /// Newest `*.jsonl` in `dir` whose header parses, optionally restricted to sessions whose header
@@ -147,27 +229,35 @@ fn collect_paths(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Parse `paths` into [`SessionInfo`]s, applying an optional cwd filter and invoking `on_progress`
-/// `(loaded, total)` after EVERY file (matching Pi, which counts each attempted file regardless of
-/// parse success — `session-manager.ts:695-698,731-734`).
+/// Parse `paths` into [`SessionInfo`]s in order, applying an optional cwd filter and invoking
+/// `on_progress` after EVERY attempted file (pi counts each file whether or not it parsed —
+/// `listSessionsFromDir`'s `onLoaded`, `session-manager.ts:959-966`). `publish(loaded, index)` is
+/// the caller's partial-publish predicate; when it holds, the callback is handed the filtered set so
+/// far, newest-first. A [`ControlFlow::Break`] from the callback stops the scan.
 fn load_infos(
     paths: &[PathBuf],
     cwd_filter: Option<&Path>,
     total: usize,
     mut on_progress: Option<&mut SessionListProgress>,
+    publish: impl Fn(usize, usize) -> bool,
 ) -> Vec<SessionInfo> {
     let mut out = Vec::new();
-    let mut loaded = 0usize;
-    for p in paths {
-        let info = scan_file(p);
-        loaded += 1;
-        if let Some(cb) = on_progress.as_mut() {
-            cb(loaded, total);
-        }
-        if let Some(info) = info
+    for (index, p) in paths.iter().enumerate() {
+        let loaded = index + 1;
+        if let Some(info) = scan_file(p)
             && cwd_filter.is_none_or(|c| session_cwd_matches(&info.cwd, c))
         {
             out.push(info);
+        }
+        if let Some(cb) = on_progress.as_mut() {
+            let partial = publish(loaded, index).then(|| {
+                let mut sorted = out.clone();
+                sort_session_infos(&mut sorted);
+                sorted
+            });
+            if cb(loaded, total, partial.as_deref()).is_break() {
+                break;
+            }
         }
     }
     out

@@ -1238,6 +1238,8 @@ mod tests {
             session_dir: Some(PathBuf::from("/sessions/run-0")),
             context: Some(ContextMode::Fresh),
             agent_scope: None,
+            label: None,
+            session_name: None,
         }
     }
 

@@ -326,8 +326,10 @@ fn the_session_swap_arm_reapplies_the_theme_after_the_registry_and_before_the_re
     let readbacks = arm
         .find("self.install_extension_readbacks(")
         .unwrap_or_else(|| panic!("the `session_swapped` arm must rebuild the theme registry"));
+    // The replay is the first step of `render_initial_messages` (pi's `renderInitialMessages()`,
+    // shared with the boot host since TUI-003).
     let replay = arm
-        .find(".replay_items()")
+        .find("self.render_initial_messages(")
         .unwrap_or_else(|| panic!("the `session_swapped` arm must still replay the conversation"));
 
     assert!(

@@ -154,7 +154,10 @@ pub(super) fn install(api: &mut ExtensionApi) {
                     .unwrap_or("");
                 Ok(ToolOutput::text(format!("late: {text}")))
             },
-        );
+        )
+        // EXT-082: `Err` is pi's `registerTool` throw. A notify handler has nowhere to `?` it to,
+        // so it catches it and says so.
+        .unwrap_or_else(|e| ctx.ui().notify(&format!("demo: {e}")));
     });
 
     // --- the previously-dead mutating seams, now driven by the assembled host (gap-08 #1-#5) ---

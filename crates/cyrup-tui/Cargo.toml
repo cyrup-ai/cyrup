@@ -151,6 +151,10 @@ cyrup-agent = { workspace = true }
 # where the `HostServices` trait for the `/tree` label-append is pulled in) and the
 # extension-dialog-countdown test builds a synthetic `UiRequest` from it.
 tempfile.workspace = true
+# The byte reader's pty tests (`src/tests/input_pty.rs`): a real pseudo-terminal for the reader under
+# test to own (`pty`), and `TIOCSWINSZ` on its master so the kernel sends the child a real `SIGWINCH`
+# (`termios`). Both are safe wrappers, so `#![forbid(unsafe_code)]` holds in the tests too.
+rustix = { workspace = true, features = ["pty", "termios"] }
 # `async-trait` was listed here for EXT-006 (the renderer-routing test declares a `NativeExtension`)
 # and for `tests/login_flow.rs`'s stub `OAuthAuth`/`ApiKeyAuth`; it is now a REGULAR dependency
 # above (the `AuthInteraction` impl needs it in `src/`), which covers dev builds too.

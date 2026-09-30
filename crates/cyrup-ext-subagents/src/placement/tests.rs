@@ -1594,6 +1594,47 @@ async fn a_timed_out_placed_run_closes_its_pane() {
     assert_eq!(machine.runtime_dirs(), Vec::<PathBuf>::new());
 }
 
+/// The runtime dir is removed even while something still writes into it by path. The relay's
+/// remote script is not a child of the local ssh the attempt stops (killing an ssh client ends
+/// no remote command), so it is still polling the dir, and writing its `.relay-*` state files
+/// there, when cleanup runs. An `rm -rf` descheduled between clearing the dir and removing it (CPU
+/// load) then fails with "Directory not empty". This machine's `rm` widens that window
+/// deterministically: it clears the dir, waits up to 2 s for any entry to reappear, then
+/// `rmdir`s.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_placed_run_removes_its_runtime_dir_while_the_relay_still_writes() {
+    let machine = FakeMachine::start("#!/bin/sh\nexec sleep 30\n");
+    write_executable(
+        &machine.home.join(".local").join("bin").join("rm"),
+        r#"#!/bin/sh
+if [ "$1" = "-rf" ] && [ "$2" = "--" ] && [ -d "$3" ]; then
+  find "$3" -mindepth 1 -delete
+  i=0
+  while [ "$i" -lt 20 ] && [ -z "$(ls -A "$3")" ]; do sleep 0.1; i=$((i+1)); done
+  exec rmdir -- "$3"
+fi
+exec /bin/rm "$@"
+"#,
+    );
+    let local = tempfile::tempdir().unwrap();
+    let agent = crate::exec::testsupport::sample_agent_config("m1", &[]);
+    let mut opts = placed_opts(local.path(), &machine);
+    opts.timeout_ms = Some(3_000);
+    opts.deadline_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(3_000));
+    let result = crate::exec::run_sync(&agent, "Say hello", &opts).await;
+    assert!(result.timed_out, "{result:?}");
+    assert!(machine.methods().contains(&"pane.close".to_string()));
+    let left = machine.runtime_dirs();
+    let entries: Vec<_> = left
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(left, Vec::<PathBuf>::new(), "still in it: {entries:?}");
+}
+
 /// The live channels of a placed child (pi's bridge `supervisor-request` / `supervisor-reply` /
 /// `steer` / `follow-up` frames, `herdr-pi-bridge.ts` @v0.68.0), end to end through `run_sync`:
 /// the child's `contact_supervisor` request lands in the parent's LOCAL supervisor channel, the

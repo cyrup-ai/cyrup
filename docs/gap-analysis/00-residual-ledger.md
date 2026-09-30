@@ -82,7 +82,7 @@ next work item**.
 > * **04/05/08:** `TOOL-051`, `CFG-086`…`093`, `SEAM-123`…`131`, `SEAM-133`, tracker `SEAM-132`
 >   (`/bug`, crash log).
 > * **07:** `TUI-104`…`122` (`TUI-118` is a tracker owned by `SEAM-132`).
-> * **09b:** `SUBA-114`…`143` (`SUBA-142` tracker). Next free id `SUBA-144`.
+> * **09b:** `SUBA-114`…`143` (`SUBA-142` tracker). Next free id `SUBA-146`.
 > * **11:** `ICOM-068`…`070`; `ICOM-062` raised to high.
 > * **16 (new, herdr client):** `HERDR-001`…`003`. **17 (new):** trackers `HARN-001`, `HARN-002`.
 > * **13, outside the count:** `MCP-551`…`585`. Next free id `MCP-586`. **15:** `ACP-297`, `ACP-298`.

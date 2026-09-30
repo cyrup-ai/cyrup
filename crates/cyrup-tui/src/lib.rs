@@ -65,12 +65,14 @@ mod diff;
 mod drain;
 mod editor;
 mod error;
+#[cfg(not(unix))]
 mod escape_reassembly;
 mod export;
 mod extension_editor;
 mod footer_data;
 mod fuzzy;
 mod image;
+mod input;
 mod keyboard_protocol;
 mod keymap;
 mod login_dialog;
@@ -93,6 +95,7 @@ mod startup;
 mod startup_selector;
 mod status;
 mod status_indicator;
+#[cfg(not(unix))]
 mod stray_reply;
 mod submenu_selector;
 mod terminal_progress;
@@ -121,9 +124,9 @@ pub use app::{
     App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, ImplicitTrustReload,
     InlineBackend, LifecycleEffects, LifecycleOutcome, LoginProviderSource, MainScreenRenderState,
     ModeSwitch, ModeSwitchOptions, QueueDrain, QueueDrainReason, RebuildBackend, RenderDebug,
-    TreeNavMsg, crossterm_input_stream, extension_render, gist_id_from_url,
-    implicit_trust_after_reload, reanchor_inline_region, render, share_viewer_url,
-    share_viewer_url_from, should_honor_extension_shutdown, tree_node_from_dag,
+    SessionListMsg, SessionListUpdate, TreeNavMsg, crossterm_input_stream, extension_render,
+    gist_id_from_url, implicit_trust_after_reload, reanchor_inline_region, render,
+    share_viewer_url, share_viewer_url_from, should_honor_extension_shutdown, tree_node_from_dag,
 };
 pub use auth_select::{
     AuthState, StatusTone, format_auth_selector_provider_type, format_status_indicator,
@@ -219,7 +222,9 @@ pub use session_search::{
     filter_and_sort as filter_and_sort_sessions, match_text as match_session_text,
     parse_search_query,
 };
-pub use session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
+pub use session_selector::{
+    SessionRow, SessionRowSet, SessionScope, SessionSelector, SessionSelectorOutcome,
+};
 pub use settings_selector::{FIELD_SEP, SettingRow, SettingsSelector, TrustSelector};
 pub use startup::{
     DiagnosticCollision, DiagnosticSeverity, StartupDiagnostic, StartupLine, StartupReport,

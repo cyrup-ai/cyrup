@@ -475,6 +475,8 @@ impl SubagentExecutor {
             // own resolved context.
             context: Some(descriptor.context.unwrap_or(ContextMode::Fork)),
             agent_scope: None,
+            label: None,
+            session_name: None,
         };
         // SUBA-100 — the revived step's placement is resolved like any launch's
         // (`buildSeqStep`/`executeAsyncSingle`'s block). A placed revive then meets upstream's own
@@ -762,6 +764,14 @@ impl SubagentExecutor {
             acceptance: None,
             context: None,
             agent_scope: None,
+            // SUBA-134 — `buildAsyncRunnerSteps` keeps the appended step's `label: s.label`
+            // (`async-execution.ts:1138` @v0.71.0), which names its child and its pending status
+            // (`chain-append.ts:164`, `subagent-runner.ts:828`).
+            label: step_val
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            session_name: None,
         };
         let placement_cfg = self.config_snapshot().await;
         let roots = placement_cfg.roots.clone();
@@ -1100,6 +1110,84 @@ mod tests {
                 serde_json::json!("m-fake"),
                 serde_json::json!("/srv/repo/sub")
             ))
+        );
+    }
+
+    /// SUBA-134 — an appended step keeps its `label` (`async-execution.ts:1138` @v0.71.0), so the
+    /// runner declares it as `sessionName: task.sessionName ?? deriveChildSessionName({ agent,
+    /// task, label })` (`chain-append.ts:164`) and names its child the same way
+    /// (`subagent-runner.ts:828`). Enqueued through `control_append_step` and read back as the
+    /// runner reads it.
+    ///
+    /// *Gutted by*: `label: None` on the appended spec (the step is named from its task).
+    #[tokio::test]
+    async fn an_appended_step_is_named_from_its_label() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agents = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents).expect("mkdir");
+        std::fs::write(
+            agents.join("plain.md"),
+            "---\nname: plain\ndescription: d\n---\n\nbody\n",
+        )
+        .expect("write persona");
+        let executor = SubagentExecutor::new();
+        let roots = crate::paths::Roots::sandboxed(dir.path());
+        executor.config_cell().lock().await.roots = roots.clone();
+        let paths = RunPaths::for_run(
+            &default_async_root_in(&roots, dir.path()),
+            &default_results_dir_in(&roots, dir.path()),
+            &RunId::from_token("chainrun0003".to_string()),
+        );
+        std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
+        let mut status = crate::background::RunStatus::queued(
+            RunId::from_token("chainrun0003".to_string()),
+            RunMode::Chain,
+            Some(std::process::id()),
+        );
+        status.state = RunState::Running;
+        status.current_step = Some(0);
+        status.steps = vec![crate::background::StepStatus::pending("plain")];
+        std::fs::write(&paths.status, serde_json::to_string(&status).expect("json"))
+            .expect("write status");
+
+        for step in [
+            serde_json::json!({"agent": "plain", "task": "audit the cache", "label": "Lane B"}),
+            serde_json::json!({"agent": "plain", "task": "audit the queue"}),
+        ] {
+            executor
+                .control_append_step(
+                    dir.path(),
+                    Some("chainrun0003"),
+                    std::slice::from_ref(&step),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{step}: {e}"));
+        }
+
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&paths.append_dir).expect("append dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let request: crate::background::control::ChainAppendRequest =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+                    .expect("request");
+            for step in &request.steps {
+                names.extend(
+                    crate::background::flat_index::pending_step_statuses_for(step)
+                        .into_iter()
+                        .map(|status| status.session_name),
+                );
+            }
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                Some("plain: Lane B".to_string()),
+                Some("plain: audit the queue".to_string()),
+            ]
         );
     }
 

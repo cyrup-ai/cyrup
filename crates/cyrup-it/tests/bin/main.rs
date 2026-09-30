@@ -88,6 +88,9 @@ mod acp_session;
 mod acp_transport;
 mod auth_credential_print;
 mod extension_load_failure_exit;
+/// CFG-088 / SEAM-020: `--help` after the runtime — extension flags plus the startup settings
+/// diagnostics, both only visible on the real binary's stdio.
+mod help_after_runtime;
 mod list_models_overlay;
 mod one_shot_parity;
 mod package_update_check;

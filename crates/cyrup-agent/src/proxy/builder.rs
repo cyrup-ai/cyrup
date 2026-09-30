@@ -228,9 +228,18 @@ impl ProxyMessageBuilder {
                 }
             }
 
-            ProxyAssistantMessageEvent::Done { reason, usage } => {
+            // AGENT-041: pi copies `providerThinkingLevel` onto the partial only when the frame
+            // carries one (`proxy.ts:386-387`, `:395-396` @v0.87.1), so an absent key leaves it.
+            ProxyAssistantMessageEvent::Done {
+                reason,
+                usage,
+                provider_thinking_level,
+            } => {
                 self.partial.stop_reason = reason.into();
                 self.partial.usage = usage;
+                if provider_thinking_level.is_some() {
+                    self.partial.provider_thinking_level = provider_thinking_level;
+                }
                 Ok(Some(StreamEvent::Done {
                     reason,
                     message: self.shared(),
@@ -240,10 +249,14 @@ impl ProxyMessageBuilder {
                 reason,
                 error_message,
                 usage,
+                provider_thinking_level,
             } => {
                 self.partial.stop_reason = reason.into();
                 self.partial.error_message = error_message;
                 self.partial.usage = usage;
+                if provider_thinking_level.is_some() {
+                    self.partial.provider_thinking_level = provider_thinking_level;
+                }
                 Ok(Some(StreamEvent::Error {
                     reason,
                     error: self.shared(),
@@ -509,6 +522,53 @@ mod tests {
                 assert_eq!(error.error_message.as_deref(), Some("boom"));
             }
             other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    /// AGENT-041 — pi v0.85.0's `done`/`error` frames carry `providerThinkingLevel`, which
+    /// `processProxyEvent` copies onto the message (`proxy.ts:386-387`, `:395-396` @v0.87.1). A
+    /// frame without the key leaves the message's level unset.
+    #[test]
+    fn terminal_frames_copy_provider_thinking_level_onto_the_message() {
+        let mut b = ProxyMessageBuilder::new(&model());
+        match b
+            .process(ev(serde_json::json!({
+                "type": "done", "reason": "stop", "usage": usage_json(),
+                "providerThinkingLevel": "high",
+            })))
+            .unwrap()
+        {
+            Some(StreamEvent::Done { message, .. }) => {
+                assert_eq!(message.provider_thinking_level.as_deref(), Some("high"));
+            }
+            other => panic!("expected done, got {other:?}"),
+        }
+
+        let mut b = ProxyMessageBuilder::new(&model());
+        match b
+            .process(ev(serde_json::json!({
+                "type": "error", "reason": "aborted", "usage": usage_json(),
+                "providerThinkingLevel": "xhigh",
+            })))
+            .unwrap()
+        {
+            Some(StreamEvent::Error { error, .. }) => {
+                assert_eq!(error.provider_thinking_level.as_deref(), Some("xhigh"));
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+
+        let mut b = ProxyMessageBuilder::new(&model());
+        match b
+            .process(ev(
+                serde_json::json!({"type": "done", "reason": "stop", "usage": usage_json()}),
+            ))
+            .unwrap()
+        {
+            Some(StreamEvent::Done { message, .. }) => {
+                assert_eq!(message.provider_thinking_level, None);
+            }
+            other => panic!("expected done, got {other:?}"),
         }
     }
 }

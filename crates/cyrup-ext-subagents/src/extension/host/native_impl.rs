@@ -859,7 +859,7 @@ impl NativeExtension for SubagentsExtension {
                 if rewritten != *system_prompt {
                     return HookOutcome::Mutate(cyrup_ext::EventPatch::SystemPromptAndInject {
                         system: Some(rewritten),
-                        inject: None,
+                        inject: Vec::new(),
                     });
                 }
             }

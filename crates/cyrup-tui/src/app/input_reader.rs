@@ -15,7 +15,9 @@ pub fn write_terminal_title(title: &str) {
     let _ = out.flush();
 }
 
-/// How long the reader thread idles between `event::poll` rounds when nothing is held.
+/// The longest single wait of the reader thread. It bounds how late the thread notices a cancelled
+/// token, a dropped receiver or the end of a `$EDITOR` handoff, and how often the TUI-092
+/// escalation ladder is ticked; input itself wakes the thread at once.
 pub(crate) const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The much shorter poll used while [`EscapeReassembler`] or [`StrayReplyFilter`] is holding
@@ -23,11 +25,25 @@ pub(crate) const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// and so is a lone `Esc` on a local link (see [`resolve_escape_timeout`]), so a real `Escape` press
 /// costs one imperceptible tick rather than a full [`INPUT_POLL_INTERVAL`] — the standard
 /// escape-timeout trade every terminal app makes to tell `ESC` from an escape *sequence*.
+#[cfg(not(unix))]
 pub(crate) const HELD_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
+
+/// How long a lone `ESC` is held on a local link.
+///
+/// On unix this is pi's `DEFAULT_ESCAPE_TIMEOUT_MS`, 10 ms (`terminal.ts:115`,
+/// `stdin-buffer.ts:24`): the byte reader waits on the framer's own deadline, so it can honour
+/// pi's value exactly. cyrup used 20 ms while it could only see crossterm's events, because a hold
+/// could end no sooner than the next idle poll; that is still the case on Windows, where
+/// crossterm's console reader remains.
+#[cfg(unix)]
+pub(crate) const LOCAL_ESCAPE_TIMEOUT: Duration = crate::input::frame::DEFAULT_ESCAPE_TIMEOUT;
+/// See the unix definition.
+#[cfg(not(unix))]
+pub(crate) const LOCAL_ESCAPE_TIMEOUT: Duration = HELD_FLUSH_INTERVAL;
 
 /// Pi `DEFAULT_SSH_ESCAPE_TIMEOUT_MS` (v0.84.2 `tui/src/terminal.ts:116`, #7899): how long a lone
 /// `ESC` is held under SSH, where the two halves of a split `Alt+Enter` or arrow key can arrive
-/// further apart than [`HELD_FLUSH_INTERVAL`].
+/// further apart than [`LOCAL_ESCAPE_TIMEOUT`].
 pub(crate) const SSH_ESCAPE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Pi's `PI_TUI_ESC_TIMEOUT` in cyrup's spelling. Only the `CYRUP_` name is read, as with
@@ -37,12 +53,12 @@ pub(crate) const ENV_ESC_TIMEOUT: &str = "CYRUP_TUI_ESC_TIMEOUT";
 /// Pi `resolveEscapeTimeoutMs` (v0.84.2 `tui/src/terminal.ts:123-131`): how long the reader holds a
 /// lone `ESC` before releasing it as the `Escape` key. A positive [`ENV_ESC_TIMEOUT`] wins; else
 /// [`SSH_ESCAPE_TIMEOUT`] when `SSH_CONNECTION` or `SSH_TTY` is set (JS truthiness: non-empty);
-/// else [`HELD_FLUSH_INTERVAL`], cyrup's local hold, where Pi's is 10 ms.
+/// else [`LOCAL_ESCAPE_TIMEOUT`].
 ///
 /// The override is parsed the way `Number(env.PI_TUI_ESC_TIMEOUT)` parses it ([`js_number`]), and
 /// the result is bounded the way Node's `setTimeout` bounds the delay Pi hands it: anything outside
 /// `1..=2^31-1` ms becomes 1 ms (`lib/internal/timers.js`, `TIMEOUT_MAX`). That bound also keeps
-/// `event::poll` clear of an unrepresentable deadline.
+/// the reader's poll clear of an unrepresentable deadline.
 pub(crate) fn resolve_escape_timeout(env: impl Fn(&str) -> Option<String>) -> Duration {
     const NODE_TIMEOUT_MAX_MS: f64 = 2_147_483_647.0;
     let configured = env(ENV_ESC_TIMEOUT).as_deref().and_then(js_number);
@@ -58,7 +74,7 @@ pub(crate) fn resolve_escape_timeout(env: impl Fn(&str) -> Option<String>) -> Du
     if set("SSH_CONNECTION") || set("SSH_TTY") {
         return SSH_ESCAPE_TIMEOUT;
     }
-    HELD_FLUSH_INTERVAL
+    LOCAL_ESCAPE_TIMEOUT
 }
 
 /// JavaScript's `Number(string)`, as far as a timeout needs it: surrounding whitespace is ignored,
@@ -91,6 +107,9 @@ fn js_number(s: &str) -> Option<f64> {
 /// across a poll unless the reassembler is holding the `Esc` behind it (`Esc` `Esc`), because every
 /// other way an `Esc` reaches the filter is followed by its successor in the same push or by
 /// [`StrayReplyFilter::flush`] on the same idle tick.
+///
+/// Windows only: the unix byte reader waits on [`crate::input::frame::StdinBuffer::deadline`].
+#[cfg(not(unix))]
 pub(crate) fn reader_poll_wait(
     reassembler: &EscapeReassembler,
     filter: &StrayReplyFilter,
@@ -405,7 +424,72 @@ impl Escalation {
     }
 }
 
-/// A terminal input stream backed by a blocking `event::read()` reader thread (the async crossterm
+/// The terminal input stream: a reader thread that owns the tty and forwards [`InputEvent`]s over
+/// an unbounded channel. Stops when `cancel` fires (see the loop condition for the one exception).
+///
+/// On unix the thread is [`crate::input::reader::TtyReader`] — cyrup's port of pi's `StdinBuffer`
+/// (`stdin-buffer.ts` @v0.87.1) over raw `read(2)` chunks, decoding to the crossterm events every
+/// consumer already takes. It replaces crossterm's event source, which could not be handed bytes
+/// and so could not be taught the escape-sequence framing pi does (`TUI-045`, `TUI-046`,
+/// `TUI-047`, `TUI-050`); see [`crate::input`]. The lone-`ESC` hold is
+/// [`resolve_escape_timeout`], read once here as pi reads it once in `ProcessTerminal.start`.
+///
+/// While `$EDITOR` or a `Ctrl+Z` suspend owns the terminal ([`TerminalReleased`]) the thread does
+/// not read the tty at all, as pi's `ProcessTerminal.stop` pauses stdin (`terminal.ts:462`). The
+/// crossterm thread it replaces kept draining the tty under the editor.
+///
+/// If no terminal can be opened the stream ends at once, as the crossterm thread's first failed
+/// `event::poll` ended it.
+#[cfg(unix)]
+pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
+    let escape_timeout = resolve_escape_timeout(|k| std::env::var(k).ok());
+    // Opened on the caller's thread: the `SIGWINCH` listener registers on the caller's runtime.
+    if let Ok(mut reader) = crate::input::reader::TtyReader::open(escape_timeout) {
+        std::thread::spawn(move || {
+            let mut events: Vec<Event> = Vec::new();
+            let mut escalation = Escalation::Idle;
+            let may_read = || !terminal_released();
+            // TUI-092 — NOT `while !cancel.is_cancelled()`. This thread FIRES that token
+            // (`Escalation::on_press`), and that condition would retire the one reader still able
+            // to see the NEXT chord at the exact moment that chord becomes the only way out.
+            //
+            // `!tx.is_closed()` is the LEADING conjunct, and that ordering is the whole safety
+            // argument: the receiver is dropped when `App::run` returns, so a real SIGTERM/SIGHUP
+            // teardown (`signals.rs` → the biased cancel arm → `drain_and_restore` → return) still
+            // ends this thread even with an escalation armed. `holds_open()` can only extend the
+            // reader's life across the window where teardown has been REQUESTED but has not
+            // COMPLETED — which is precisely the window a wedged teardown must remain escapable in.
+            'reader: while !tx.is_closed() && (!cancel.is_cancelled() || escalation.holds_open()) {
+                let open = reader.pump(INPUT_POLL_INTERVAL, &may_read, &mut events);
+                for ev in events.drain(..) {
+                    // TUI-092 — counted on the decoded event, before the send below, which starts
+                    // failing the moment the run loop breaks and drops the receiver. A `Ctrl+C`
+                    // byte is never held by the framer, so nothing delays the escape hatch.
+                    if is_escalate_chord(&ev) {
+                        escalation = escalation.on_press(&cancel);
+                    }
+                    if let Some(mapped) = map_event(ev)
+                        && tx.send(mapped).is_err()
+                    {
+                        break 'reader;
+                    }
+                }
+                // TUI-092 — the disarm tick, on EVERY iteration (at most one
+                // `INPUT_POLL_INTERVAL` apart). It never promotes; it only drops a stale ladder once
+                // the loop resumes servicing input or announces a by-design block, so a chord
+                // pressed before a `Ctrl+Z` is not still armed minutes later.
+                escalation = escalation.tick();
+                if !matches!(open, Ok(true)) {
+                    break;
+                }
+            }
+        });
+    }
+    Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+}
+
+/// Windows: a terminal input stream backed by a blocking `event::read()` reader thread (the async crossterm
 /// `EventStream` feature is not enabled in this build; arch-10 §5 fallback). Maps `crossterm::Event`
 /// to [`InputEvent`] and forwards over an unbounded channel; stops when `cancel` fires.
 ///
@@ -428,6 +512,7 @@ impl Escalation {
 /// Both hold, so both are flushed on the *same* idle tick and in the same order: a lone `Escape`
 /// costs one escape timeout in total ([`resolve_escape_timeout`], read once here as Pi reads it
 /// once in `ProcessTerminal.start`), not one per machine.
+#[cfg(not(unix))]
 pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
     let escape_timeout = resolve_escape_timeout(|k| std::env::var(k).ok());
@@ -579,6 +664,7 @@ mod tests {
         clippy::panic
     )]
     use super::*;
+    #[cfg(not(unix))]
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// An env lookup over a fixed table (missing keys ⇒ `None`, exactly like `std::env::var`).
@@ -591,6 +677,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(unix))]
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
@@ -598,7 +685,7 @@ mod tests {
     /// Pi `resolveEscapeTimeoutMs`'s three outcomes: override, SSH, local.
     #[test]
     fn escape_timeout_is_widened_under_ssh_and_overridable() {
-        assert_eq!(resolve_escape_timeout(env_of(&[])), HELD_FLUSH_INTERVAL);
+        assert_eq!(resolve_escape_timeout(env_of(&[])), LOCAL_ESCAPE_TIMEOUT);
         for var in ["SSH_CONNECTION", "SSH_TTY"] {
             assert_eq!(
                 resolve_escape_timeout(env_of(&[(var, "10.0.0.1 5000 10.0.0.2 22")])),
@@ -607,7 +694,7 @@ mod tests {
             );
             assert_eq!(
                 resolve_escape_timeout(env_of(&[(var, "")])),
-                HELD_FLUSH_INTERVAL,
+                LOCAL_ESCAPE_TIMEOUT,
                 "an empty {var} is falsy in JS"
             );
         }
@@ -622,7 +709,7 @@ mod tests {
         // Pi reads only its own spelling; cyrup reads only `CYRUP_`.
         assert_eq!(
             resolve_escape_timeout(env_of(&[("PI_TUI_ESC_TIMEOUT", "250")])),
-            HELD_FLUSH_INTERVAL
+            LOCAL_ESCAPE_TIMEOUT
         );
     }
 
@@ -645,9 +732,30 @@ mod tests {
         assert_eq!(ssh("1e12"), Duration::from_millis(1));
     }
 
-    /// The reader's poll: the escape timeout applies to a lone held `ESC` and to nothing else.
+    /// The unix reader's hold: the escape timeout applies to a lone held `ESC` and to nothing else;
+    /// any other partial sequence waits pi's 50 ms sequence timeout (`stdin-buffer.ts:388`).
+    #[cfg(unix)]
     #[test]
     fn only_a_lone_held_escape_waits_the_escape_timeout() {
+        use crate::input::frame::DEFAULT_SEQUENCE_TIMEOUT;
+        use crate::input::reader::ByteDecoder;
+        let timeout = SSH_ESCAPE_TIMEOUT;
+        let mut d = ByteDecoder::new(timeout);
+        let mut out = Vec::new();
+        let t0 = std::time::Instant::now();
+        assert_eq!(d.deadline(), None);
+        d.feed(b"\x1b", t0, &mut out);
+        assert_eq!(d.deadline(), Some(t0 + timeout));
+        // `ESC [` is a sequence prefix, not a lone `ESC`: the sequence timeout.
+        d.feed(b"[", t0, &mut out);
+        assert_eq!(d.deadline(), Some(t0 + DEFAULT_SEQUENCE_TIMEOUT));
+        assert!(out.is_empty());
+    }
+
+    /// The reader's poll: the escape timeout applies to a lone held `ESC` and to nothing else.
+    #[cfg(not(unix))]
+    #[test]
+    fn only_a_lone_held_escape_waits_the_escape_timeout_windows() {
         let timeout = SSH_ESCAPE_TIMEOUT;
         let mut r = EscapeReassembler::new();
         let f = StrayReplyFilter::new();
@@ -663,7 +771,9 @@ mod tests {
 
     /// `REPRO-LOG.md`'s `TUI-045` split (`1b`, 60 ms, `5b 41`) under SSH, driven through the same
     /// two machines and the same wait the reader thread uses. `event::poll(wait)` returns `false`
-    /// (idle ⇒ flush) exactly when the next byte is further away than `wait`.
+    /// (idle ⇒ flush) exactly when the next byte is further away than `wait`. The unix byte reader's
+    /// version is `tests::input_pipeline::a_split_arrow_over_ssh_reassembles_across_a_60ms_gap`.
+    #[cfg(not(unix))]
     #[test]
     fn a_split_arrow_over_ssh_reassembles_across_a_60ms_gap() {
         let deliver = |escape_timeout: Duration| {

@@ -352,9 +352,13 @@ pub struct FlagSpec {
     /// The value the flag takes when the user does not pass it; `None` for no default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
-    /// The flag's help text.
-    #[serde(default)]
-    pub description: String,
+    /// The flag's help text — pi's optional `description?` (`ExtensionFlag`,
+    /// `core/extensions/types.ts:1737-1743` @v0.87.1). `None` is omitted from the wire, so `--help`
+    /// can fall back to `Registered by <extension>` exactly where pi does
+    /// (`description ?? \`Registered by ${flag.extensionPath}\``, `cli/args.ts:267`) — an empty
+    /// string would print an empty description instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 // --- Provider registration (Pi `ProviderConfig`, types.ts:1363-1421; R-08-019) ---

@@ -11,7 +11,7 @@
 
 #![allow(clippy::all)]
 
-use crate::api::{ExtensionApi, RawOutcome};
+use crate::api::{ExtensionApi, RawOutcome, RegistrationError};
 use crate::ctx::ToolCall;
 use core::cell::RefCell;
 use serde_json::Value;
@@ -42,7 +42,13 @@ thread_local! {
 /// event/tool/command exports. Called by the macro-generated `Guest::init`.
 pub fn run_init(factory: fn() -> ExtensionApi) -> Result<(), String> {
     let api = factory();
-    push_registrations(&api);
+    // EXT-080: a remover run inside the factory has already dropped its registration, so the
+    // bitset `push_registrations` declares leaves that event out; from here on a remover asks the
+    // host instead.
+    api.install_live();
+    // EXT-082: the first refused registration ends `init` with its message, as pi's first throw
+    // ends the factory; the host then fails the load.
+    push_registrations(&api)?;
     API.with(|c| *c.borrow_mut() = Some(api));
     Ok(())
 }
@@ -117,18 +123,32 @@ fn _lower_tool_descriptor_is_exhaustive(d: crate::descriptor::ToolDescriptor) {
 
 /// Register a tool from inside a live handler (the body behind [`crate::ctx::Ctx::register_tool`]).
 /// Pushes the descriptor across the `registration.register-tool` import — which marks the host's
-/// tool set dirty — and stores the executor so the subsequent `execute-tool` can find it.
-pub fn register_tool_late(tool: crate::api::RegisteredTool) {
-    registration::register_tool(&lower_tool_descriptor(&tool.descriptor));
+/// tool set dirty — and stores the executor so the subsequent `execute-tool` can find it. A refused
+/// descriptor (EXT-082) stores nothing.
+pub fn register_tool_late(tool: crate::api::RegisteredTool) -> Result<(), RegistrationError> {
+    registration::register_tool(&lower_tool_descriptor(&tool.descriptor))
+        .map_err(RegistrationError::new)?;
     LATE_TOOLS.with(|c| c.borrow_mut().push(tool));
+    Ok(())
+}
+
+/// Register a flag from inside a live handler (the body behind [`crate::ctx::Ctx::register_flag`]).
+pub fn register_flag_late(
+    name: &str,
+    spec: &crate::descriptor::FlagSpec,
+) -> Result<(), RegistrationError> {
+    let spec_json = serde_json::to_string(spec).unwrap_or_else(|_| "{}".into());
+    registration::register_flag(name, &spec_json).map_err(RegistrationError::new)
 }
 
 /// Flush the author's declared registrations through the host imports + declare the subscription set.
-fn push_registrations(api: &ExtensionApi) {
+/// The first registration the host refuses (EXT-082) is returned, and nothing after it is sent —
+/// pi's factory stops at its first throw.
+fn push_registrations(api: &ExtensionApi) -> Result<(), String> {
     registration::subscribe(&api.subscription_kinds());
 
     for t in api.tools() {
-        registration::register_tool(&lower_tool_descriptor(&t.descriptor));
+        registration::register_tool(&lower_tool_descriptor(&t.descriptor))?;
     }
     for (name, cmd) in &api.commands {
         let desc_json = serde_json::to_string(&cmd.descriptor).unwrap_or_else(|_| "{}".into());
@@ -139,7 +159,7 @@ fn push_registrations(api: &ExtensionApi) {
     }
     for (name, spec) in &api.flags {
         let spec_json = serde_json::to_string(spec).unwrap_or_else(|_| "{}".into());
-        registration::register_flag(name, &spec_json);
+        registration::register_flag(name, &spec_json)?;
     }
     for (id, config) in &api.providers {
         let config_json = serde_json::to_string(config).unwrap_or_else(|_| "{}".into());
@@ -193,6 +213,7 @@ fn push_registrations(api: &ExtensionApi) {
     for topic in api.bus_topics() {
         bindings::cyrup::ext::bus::subscribe(&topic);
     }
+    Ok(())
 }
 
 /// Run the registered handler for `kind` with ordered string args; returns the lowered outcome.

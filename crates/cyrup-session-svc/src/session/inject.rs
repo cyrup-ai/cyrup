@@ -13,7 +13,7 @@ use crate::event::{AgentSessionEvent, PromptAccepted, StreamingBehavior, UserInp
 
 use super::run::InjectionOffer;
 use super::{AgentSession, now_ms};
-use crate::host_services::{InjectAck, InjectRequest};
+use crate::host_services::{InjectAck, InjectMessage, InjectRequest};
 
 /// A no-turn injection the pump handed to a live run's steering queue, kept with its ack until the
 /// idle edge settles whether the run drained it (ICOM-035).
@@ -293,25 +293,33 @@ impl AgentSession {
         let mut kept = Vec::with_capacity(inbox.len());
         for req in inbox.drain(..) {
             let InjectRequest { message, ack } = req;
-            let Some(kind) = message
-                .custom_type
-                .clone()
-                .filter(|_| message.steer && !message.trigger_turn)
-            else {
+            let Some(msg) = steer_message(&message) else {
                 kept.push(InjectRequest { message, ack });
                 continue;
-            };
-            let msg = AgentMessage::Custom {
-                kind,
-                payload: serde_json::Value::String(message.content),
-                details: message.details,
-                display: message.display,
-                timestamp: Some(now_ms()),
             };
             self.agent.steer(msg.clone());
             steered.push(SteeredInjection { message: msg, ack });
         }
         *inbox = kept;
+    }
+
+    /// ICOM-063 — the synchronous half of [`Self::steer_injections_onto_live_run`], for a producer
+    /// calling [`cyrup_ext::host::HostServices::inject_message_steer`] while a run is active: steer
+    /// `message` onto the run NOW, in the caller's call, as pi's `agent.steer` does
+    /// (`agent-session.ts:1949-1954` @v0.87.1), and return what was steered so the caller can hand
+    /// its fate to the pump ([`crate::host_services::InjectItem::Steered`]). `None`, with nothing
+    /// done, when no run is active or `message` is not a no-turn custom steer.
+    ///
+    /// The activity check and the push are not atomic, and need not be: a run that ends between
+    /// them leaves the steer in the agent's queue with the session idle, which is the stranded
+    /// steer the pump already takes back at the idle edge once it owns the message.
+    pub(crate) fn steer_injection_now(&self, message: &InjectMessage) -> Option<AgentMessage> {
+        if !self.is_run_active() {
+            return None;
+        }
+        let msg = steer_message(message)?;
+        self.agent.steer(msg.clone());
+        Some(msg)
     }
 
     /// Append no-turn custom messages to the session tree AND the agent's transcript, as ONE
@@ -532,6 +540,22 @@ pub(super) struct InjectionPlan {
     pub(super) turn: Vec<AgentMessage>,
     /// Messages that asked for no turn: persisted and surfaced, never run.
     pub(super) durable: Vec<AgentMessage>,
+}
+
+/// The agent message a pi `deliverAs: "steer"` injection is steered as — a no-turn custom
+/// message (ICOM-035). `None` for anything else, which waits for the idle edge instead.
+fn steer_message(message: &InjectMessage) -> Option<AgentMessage> {
+    let kind = message
+        .custom_type
+        .clone()
+        .filter(|_| message.steer && !message.trigger_turn)?;
+    Some(AgentMessage::Custom {
+        kind,
+        payload: serde_json::Value::String(message.content.clone()),
+        details: message.details.clone(),
+        display: message.display,
+        timestamp: Some(now_ms()),
+    })
 }
 
 /// Split an inbox into the requests whose merge group asks for NO turn and those whose group does,

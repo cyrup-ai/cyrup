@@ -28,13 +28,17 @@ pub enum ConfigError {
     /// abandoned and the file is left byte-for-byte intact for the user to repair. Unlike Pi — which
     /// returns silently — cyrup surfaces this to the caller so a `/config` toggle can say why it
     /// did not stick.
+    ///
+    /// `cause` is the typed load failure the latch holds — never recovered by matching on its text
+    /// (CFG-088: that text is `JSON.parse`'s own message now, with no marker of its own).
     #[error(
-        "refusing to write {scope:?} settings: the file could not be parsed ({message}); \
-         fix or remove it, then retry — the existing file was left unchanged"
+        "refusing to write {scope:?} settings: the file could not be {verb} ({cause}); \
+         fix or remove it, then retry — the existing file was left unchanged",
+        verb = cause.verb()
     )]
     SettingsWriteRefused {
         scope: SettingsScope,
-        message: String,
+        cause: SettingsLoadError,
     },
     /// A settings VALUE failed validation (Pi `parseTimeoutSetting` throws).
     #[error("Invalid {key} setting: {value}")]
@@ -100,6 +104,52 @@ pub enum AuthError {
     Cancelled,
 }
 
+/// Why a settings scope failed to load — the `Error` pi's `tryLoadFromStorage` catches
+/// (`settings-manager.ts:428-438` @v0.87.1) and latches into `globalSettingsLoadError` /
+/// `projectSettingsLoadError`. Typed, so the write-refusal latch (CFG-001) and its message can tell
+/// a file that would not parse from one that could not be read without inspecting the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsLoadError {
+    /// The file is not valid JSON. Carries the message `JSON.parse` throws for it
+    /// ([`crate::js_json::json_parse_error_message`]) — pi's `error.message` — or, for a document
+    /// V8 accepts but cyrup cannot load, serde's own message.
+    Parse(String),
+    /// The store could not read the file.
+    Read(String),
+}
+
+impl SettingsLoadError {
+    /// The failure for `text`, which `Settings::parse` rejected with `err`: `JSON.parse`'s message
+    /// when V8 would reject the (BOM-stripped, as pi's `stripBom`) text too, else serde's.
+    pub fn parse(text: &str, err: &serde_json::Error) -> Self {
+        SettingsLoadError::Parse(
+            crate::js_json::json_parse_error_message(crate::strip_bom(text))
+                .unwrap_or_else(|| err.to_string()),
+        )
+    }
+
+    /// The failure's message — pi's `error.message`.
+    pub fn message(&self) -> &str {
+        match self {
+            SettingsLoadError::Parse(m) | SettingsLoadError::Read(m) => m,
+        }
+    }
+
+    /// What could not be done to the file, for [`ConfigError::SettingsWriteRefused`].
+    fn verb(&self) -> &'static str {
+        match self {
+            SettingsLoadError::Parse(_) => "parsed",
+            SettingsLoadError::Read(_) => "read",
+        }
+    }
+}
+
+impl std::fmt::Display for SettingsLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 /// A non-fatal, scope-tagged load error surfaced to the UI instead of panicking (R-00-009) — Pi
 /// `SettingsError { scope, path?, error }` (`core/settings-manager.ts:214-218` @v0.87.1).
 #[derive(Debug, Clone)]
@@ -107,7 +157,7 @@ pub struct ScopedError {
     pub scope: SettingsScope,
     /// The file the scope was read from, when the store is file-backed (pi's `settingsPaths`).
     pub path: Option<std::path::PathBuf>,
-    pub message: String,
+    pub error: SettingsLoadError,
 }
 
 impl ScopedError {
@@ -116,13 +166,13 @@ impl ScopedError {
     /// or `Invalid <scope> settings: <msg>` when there is no path. CFG-088.
     pub fn diagnostic_message(&self) -> String {
         match &self.path {
-            Some(path) => format!("Invalid settings file {}: {}", path.display(), self.message),
+            Some(path) => format!("Invalid settings file {}: {}", path.display(), self.error),
             None => {
                 let scope = match self.scope {
                     SettingsScope::Global => "global",
                     SettingsScope::Project => "project",
                 };
-                format!("Invalid {scope} settings: {}", self.message)
+                format!("Invalid {scope} settings: {}", self.error)
             }
         }
     }

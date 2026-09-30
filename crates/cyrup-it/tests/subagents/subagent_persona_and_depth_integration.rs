@@ -103,6 +103,8 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     }
 }
 
@@ -580,6 +582,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         // `build_attempt_spawn_plan` gates both env keys on presence (exec/mod.rs:2227-2250), so
         // `None` keeps the child's env overlay byte-identical to a real foreground child's.
         steer_ack_dir: None,
+        external_log_dir: None,
         steer_capability_path: None,
         control_config: None,
         on_control_event: None,
@@ -1006,6 +1009,8 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     };
 
     let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
@@ -1152,6 +1157,8 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     };
 
     let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
@@ -1257,6 +1264,8 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     };
 
     let run_id = executor

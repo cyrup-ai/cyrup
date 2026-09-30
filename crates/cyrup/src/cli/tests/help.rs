@@ -1,4 +1,5 @@
 use super::*;
+use cyrup_session_svc::ExtensionFlagDeclaration;
 
 #[test]
 fn help_body_contains_pi_catalogue_examples_and_tools() {
@@ -11,12 +12,49 @@ fn help_body_contains_pi_catalogue_examples_and_tools() {
     assert!(help.contains("Examples:"));
     assert!(help.contains("cyrup install <source>"));
     // Extension flags inject into the body when present.
-    let with_ext = render_help(&[ExtensionFlag {
-        name: "plan".into(),
-        value: ExtFlagValue::Bool(true),
-    }]);
+    let with_ext = render_help(&[declared("plan", "boolean", Some("Plan first"))]);
     assert!(with_ext.contains("Extension CLI Flags:"));
     assert!(with_ext.contains("--plan"));
+}
+
+fn declared(name: &str, ty: &str, description: Option<&str>) -> ExtensionFlagDeclaration {
+    ExtensionFlagDeclaration {
+        name: name.to_string(),
+        description: description.map(str::to_string),
+        flag_type: Some(ty.to_string()),
+        default: None,
+        extension: cyrup_sdk::core::ExtensionId::from("demo-ext"),
+    }
+}
+
+/// SEAM-020 (c) — pi's extension-flag rows (`printHelp`, `cli/args.ts:262-270` @v0.87.1):
+/// `` `  --${flag.name}${value}`.padEnd(30) + (flag.description ?? `Registered by ${flag.extensionPath}`) ``,
+/// in declaration order, ` <value>` only for a `"string"` flag. cyrup printed the bare
+/// `  --name` head with no description column at all.
+#[test]
+fn extension_flag_rows_are_pis_padded_head_and_description() {
+    let help = render_help(&[
+        declared("mcp-config", "string", Some("Path to MCP config file")),
+        declared("plan", "boolean", None),
+        declared(
+            "a-flag-name-longer-than-the-column",
+            "boolean",
+            Some("Tight"),
+        ),
+    ]);
+    let block = help
+        .split("Extension CLI Flags:\n")
+        .nth(1)
+        .expect("the extension flag block");
+    let rows: Vec<&str> = block.lines().take(3).collect();
+    assert_eq!(
+        rows,
+        vec![
+            "  --mcp-config <value>        Path to MCP config file",
+            "  --plan                      Registered by demo-ext",
+            "  --a-flag-name-longer-than-the-columnTight",
+        ]
+    );
 }
 
 /// CFG-068 — every directory variable cyrup reads must be visible in one place, and the set is

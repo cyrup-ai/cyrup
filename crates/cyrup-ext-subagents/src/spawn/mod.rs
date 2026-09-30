@@ -33,6 +33,7 @@ pub mod git_env;
 pub mod intercom_target;
 pub mod nested_events;
 pub mod nested_path;
+pub mod nested_render;
 pub mod parallel;
 pub mod signal;
 pub mod worktree;

@@ -199,7 +199,12 @@ pub async fn run_external_cli(
 
     let started_at = crate::time::now_epoch_millis();
     let output_snapshot = crate::exec::output::snapshot_output_file(opts.output_path.as_deref());
-    let scratch_dir = crate::background::attempt_scratch_dir(&opts.cwd);
+    // SUBA-141 — the run's own directory when it has one (pi `asyncDir`, `subagent-runner.ts:924`
+    // @v0.71.0), so a live reader can tail the logs inside the run it is reading.
+    let scratch_dir = opts
+        .external_log_dir
+        .clone()
+        .unwrap_or_else(|| crate::background::attempt_scratch_dir(&opts.cwd));
     let step_index = opts.child_index.unwrap_or(0);
     // Every pre-spawn failure below still publishes a receipt naming these two, exactly as
     // upstream's pre-spawn `catch` does (`external-cli-runner.ts:212-213`) — an empty
@@ -316,6 +321,16 @@ pub async fn run_external_cli(
             opts.timeout_ms
                 .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms))
         });
+    // SUBA-141 — pi `onProcess: ctx.onExternalProcess` (`subagent-runner.ts:936` @v0.71.0): each
+    // process report goes to the live sink with this launch's runner descriptor, typed.
+    let report_process = |process: &crate::runner::status::ExternalProcessStatus| {
+        if let Some(sink) = opts.live_events.as_ref() {
+            sink.emit_external_process(crate::exec::ExternalProcessUpdate {
+                runner: status.clone(),
+                process: process.clone(),
+            });
+        }
+    };
     let outcome = run::run_external_cli_process(
         run::ExternalCliProcessPlan {
             program,
@@ -337,6 +352,7 @@ pub async fn run_external_cli(
                 crate::exec::format_timeout_message,
             ),
             stop_message: "Subagent stopped by user.".to_string(),
+            on_process: Some(run::ProcessHook(&report_process)),
         },
     )
     .await;

@@ -27,8 +27,9 @@
 //! them with no indication on screen and no pointer to `/trust`. It is the surface that tells the
 //! user a security decision is in force.
 //!
-//! These tests drive the real `App::render_project_trust_warning_if_needed` seam — the one both the
-//! boot path (`App::run`, before the first frame) and the `session_swapped` arm call — and read the
+//! These tests drive the real `App::render_project_trust_warning_if_needed` seam — the one
+//! `App::render_initial_messages` runs for both the boot host (`crates/cyrup/src/interactive.rs`,
+//! before the startup warnings) and the `session_swapped` arm — and read the
 //! COMMITTED SCROLLBACK, i.e. what the user actually sees, including the warning colour.
 #![allow(
     clippy::unwrap_used,

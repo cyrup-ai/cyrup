@@ -71,6 +71,7 @@ pub(crate) mod run_action;
 mod run_arms;
 mod selectors;
 mod session_bind;
+mod session_list;
 mod settings_rows;
 mod share;
 mod shell;
@@ -101,9 +102,15 @@ pub use extension_render_impl::{
 };
 #[cfg(test)]
 pub(crate) use input_reader::{
-    ACTIVE_ARM, Escalation, PANIC_MIN_GAP, input_serviced, is_escalate_chord, map_event,
-    map_event_on,
+    ACTIVE_ARM, Escalation, PANIC_MIN_GAP, input_serviced, is_escalate_chord, map_event_on,
 };
+// Unix-only consumers: the byte-level pipeline tests drive bytes through `map_event`, and the
+// startup selector's own reader reads the escape timeout (the non-unix reader calls both inside
+// `input_reader` directly).
+#[cfg(all(test, unix))]
+pub(crate) use input_reader::map_event;
+#[cfg(unix)]
+pub(crate) use input_reader::resolve_escape_timeout;
 pub(crate) use input_reader::{
     ARM_BUDGET, ArmGuard, OVER_BUDGET_ARM, TerminalReleased, mark_input_serviced,
 };
@@ -136,11 +143,12 @@ pub use share::{
 };
 
 pub(crate) use crossterm::resolve_external_editor;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use crossterm::run_editor_over_file;
 pub use reload_trust::{ImplicitTrustReload, implicit_trust_after_reload};
 pub use render_impl::render;
 pub(crate) use render_impl::{env_rows, fallback_columns, is_extension_command};
+pub use session_list::{SessionListMsg, SessionListUpdate};
 pub use state::{ActiveSelector, AppState, ShortcutSpec, SwapCaption};
 pub(crate) use state::{
     BRANCH_SUMMARY_CUSTOM, BRANCH_SUMMARY_NONE, BRANCH_SUMMARY_YES, CONFIRM_YES, PendingImport,
@@ -193,6 +201,7 @@ use crate::commands::{CommandRegistry, Dispatch};
 use crate::component::{Component, InputEvent};
 use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
+#[cfg(not(unix))]
 use crate::escape_reassembly::EscapeReassembler;
 use crate::extension_editor::ExtensionEditorSelector;
 use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
@@ -211,6 +220,7 @@ use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcom
 use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
 use crate::status_indicator::{IndicatorKind, SPINNER_INTERVAL, StatusIndicator, WorkingIndicator};
+#[cfg(not(unix))]
 use crate::stray_reply::StrayReplyFilter;
 use crate::terminal_title::session_terminal_title;
 use crate::text_input::TextInputSelector;
@@ -345,6 +355,10 @@ pub struct App<B: Backend> {
     /// test relies on. There is deliberately NO inline fallback: awaiting a 15 s network refresh
     /// on the run loop's task would freeze every other arm for its whole duration.
     model_refresh_tx: Option<tokio::sync::mpsc::UnboundedSender<ModelRefreshMsg>>,
+    /// The `/resume` listing channel's sender (TUI-121), installed by
+    /// [`App::install_session_list_channel`]. `None` means no run loop is servicing it (an embedder,
+    /// a widget test), and `/resume` then lists inline, as before TUI-121.
+    session_list_tx: Option<tokio::sync::mpsc::UnboundedSender<session_list::SessionListMsg>>,
     /// Where [`App::login_provider_inputs`] sources the provider registry Pi reads off
     /// `modelRuntime` (`getLoginProviderOptions`, `interactive-mode.ts:4939`).
     ///

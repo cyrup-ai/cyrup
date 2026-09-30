@@ -268,6 +268,7 @@ mod tests {
             mode: None,
             state: state.to_string(),
             agent: None,
+            session_name: None,
             agents: None,
             current_step: None,
             chain_step_count: None,
@@ -296,6 +297,7 @@ mod tests {
 
         let mut step = crate::spawn::nested_events::NestedStepSummary {
             agent: "a".to_string(),
+            session_name: None,
             status: "running".to_string(),
             session_file: None,
             activity_state: None,

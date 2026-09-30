@@ -476,7 +476,8 @@ async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRen
         lines.push(format!(
             "{}: {} {}{}{}{}",
             step_line_label(status, index),
-            step.agent,
+            // SUBA-134 — pi `runStatusStepDisplayName(step)` (`run-status.ts:633` @v0.71.0).
+            step.display_name(),
             step_state_label(step.status),
             model_text,
             steering_suffix,
@@ -497,6 +498,7 @@ async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRen
                 "  ",
             ),
         );
+        lines.extend(format_external_cli_runner_lines(step));
         let step_log = paths.step_output_log(index);
         if step_log.exists() {
             lines.push(format!("  Output: {}", step_log.display()));
@@ -554,6 +556,321 @@ async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRen
         lines.push(format!("Events: {}", paths.events.display()));
     }
 
+    lines.join("\n")
+}
+
+/// JS template interpolation of a `safety` member: a string renders bare, anything else as its
+/// JSON text (`true`/`false`/a number), and a missing key as `undefined`.
+fn js_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None => "undefined".to_string(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// pi's per-adapter `Safety:` line (`run-status.ts:646-651` @v0.71.0), chosen by which keys the
+/// normalized block carries: Codex has `approvalPolicy`, Cursor `mode`, Claude Code
+/// `authentication`, and anything else is upstream's legacy read-only fallback.
+fn format_external_cli_safety(safety: &serde_json::Value) -> String {
+    let get = |key: &str| safety.get(key);
+    let has = |key: &str| get(key).is_some();
+    if has("approvalPolicy") {
+        let access = if has("access") {
+            format!("access={}, ", js_text(get("access")))
+        } else {
+            String::new()
+        };
+        format!(
+            "  Safety: {access}sandbox={}, approval={}, ephemeral={}",
+            js_text(get("sandbox")),
+            js_text(get("approvalPolicy")),
+            js_text(get("ephemeral")),
+        )
+    } else if has("mode") {
+        format!(
+            "  Safety: access={}, auth={}, mode={}, sandbox={}, workspaceTrust={}, sessionReuse={}",
+            js_text(get("access")),
+            js_text(get("authentication")),
+            js_text(get("mode")),
+            js_text(get("sandbox")),
+            js_text(get("workspaceTrust")),
+            js_text(get("sessionReuse")),
+        )
+    } else if has("authentication") {
+        format!(
+            "  Safety: access={}, auth={}, permission={}, tools={}, mcp={}, settings={}, \
+             settingsTrust={}, persistence={}",
+            js_text(get("access")),
+            js_text(get("authentication")),
+            js_text(get("permissionMode")),
+            js_text(get("tools")),
+            js_text(get("mcp")),
+            js_text(get("settingSources")),
+            js_text(get("userSettingsTrust")),
+            js_text(get("sessionPersistence")),
+        )
+    } else {
+        format!(
+            "  Safety: access=read-only, permission={}, tools={}, mcp={}, settings={}, \
+             persistence={}",
+            js_text(get("permissionMode")),
+            js_text(get("tools")),
+            js_text(get("mcp")),
+            js_text(get("settingSources")),
+            js_text(get("sessionPersistence")),
+        )
+    }
+}
+
+/// SUBA-134 — pi's external-CLI runner block under a step line (`run-status.ts:641-664` @v0.71.0):
+/// the runner command, adapter, safety envelope, capability envelope and the three unsupported
+/// reasons, then the live process receipt (`Process:`/`Stdout:`/`Stderr:`/`Final output:`) that
+/// SUBA-141's runner hook publishes onto [`StepStatus::external_process`].
+///
+/// The descriptor is re-normalized before it is rendered, as upstream's is
+/// (`normalizeExternalCliRunnerStatus(step.runner)`): the capability envelope and safety block
+/// shown are rebuilt from the adapter id, never read from the persisted copy, and one that cannot
+/// be normalized (a blank command) is reported as invalid metadata.
+fn format_external_cli_runner_lines(step: &StepStatus) -> Vec<String> {
+    let Some(persisted) = step
+        .runner
+        .as_ref()
+        .filter(|runner| runner.kind == "external-cli")
+    else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let runner = serde_json::to_value(persisted)
+        .ok()
+        .and_then(|value| crate::runner::status::normalize_external_cli_runner_status(&value));
+    match runner {
+        Some(runner) => {
+            let args = if runner.args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", runner.args.join(" "))
+            };
+            lines.push(format!("  Runner: external-cli ({}{args})", runner.command));
+            lines.push(format!(
+                "  Adapter: {} v{} ({})",
+                runner.adapter.id.wire(),
+                runner.adapter.version,
+                runner.adapter.execution_mode
+            ));
+            if let Some(safety) = runner.safety.as_ref() {
+                lines.push(format_external_cli_safety(safety));
+            }
+            lines.push(format!(
+                "  Capabilities: stop={}, steer=false, resume=false, structuredOutput=false, \
+                 toolEvents=false, supervisor=unsupported, forkContext=false, \
+                 extensionBindings=false",
+                runner.capabilities.stop
+            ));
+            lines.push(format!(
+                "  Unsupported steer: {}",
+                runner.unsupported_reasons.steer
+            ));
+            lines.push(format!(
+                "  Unsupported resume: {}",
+                runner.non_resumable_reason
+            ));
+            lines.push(format!(
+                "  Unsupported supervisor: {}",
+                runner.unsupported_reasons.supervisor
+            ));
+            lines.push(format!(
+                "  Context handoff: fresh only ({})",
+                runner.unsupported_reasons.fork_context
+            ));
+        }
+        None => {
+            lines.push("  Runner: external-cli (invalid persisted runner metadata)".to_string())
+        }
+    }
+    if let Some(process) = step.external_process.as_ref() {
+        if let Some(pid) = process.pid {
+            lines.push(format!("  Process: {pid}"));
+        }
+        lines.push(format!("  Stdout: {}", process.stdout_path));
+        lines.push(format!("  Stderr: {}", process.stderr_path));
+        if let Some(final_output) = process
+            .final_output_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+        {
+            lines.push(format!("  Final output: {final_output}"));
+        }
+    }
+    lines
+}
+
+/// SUBA-134 — pi `nestedRunDisplayName(run)` (`run-status.ts:171-176` @v0.71.0): the nested run's
+/// child session name, else its agent, else its agents joined, else its id.
+#[must_use]
+pub fn nested_run_display_name(run: &crate::spawn::nested_events::NestedRunSummary) -> String {
+    if let Some(name) = run.session_name.as_deref().map(str::trim)
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
+    if let Some(agent) = run.agent.as_deref().filter(|agent| !agent.is_empty()) {
+        return agent.to_string();
+    }
+    if let Some(agents) = run.agents.as_ref().filter(|agents| !agents.is_empty()) {
+        return agents.join(", ");
+    }
+    run.id.clone()
+}
+
+/// SUBA-134 — pi `formatNestedExactStatus(rootRunId, run)` (`run-status.ts:322-345` @v0.71.0): the
+/// `status` report for an id that resolves to a nested descendant run rather than a top-level async
+/// run. `now` is upstream's `Date.now()` behind `formatActivityLabel`.
+///
+/// Upstream's two `Turn budget:` lines (run and step) are not rendered: cyrup's
+/// [`crate::spawn::nested_events::NestedRunSummary`] carries no `turnBudget` (nor `model`/
+/// `thinking`), so they would always be absent.
+#[must_use]
+pub fn format_nested_exact_status(
+    root_run_id: &str,
+    run: &crate::spawn::nested_events::NestedRunSummary,
+    now: i64,
+) -> String {
+    use crate::spawn::nested_render::{
+        NestedLinesOptions, format_nested_run_status_lines, nested_step_display_name,
+        parse_activity_state,
+    };
+    let activity_label = |last: Option<i64>, state: Option<&str>| {
+        super::fleet_view::format_activity_label(last, parse_activity_state(state), now)
+    };
+    let mut lines: Vec<String> = vec![
+        format!("Nested run: {}", run.id),
+        format!("Root: {root_run_id}"),
+        format!(
+            "Parent: {}{}",
+            run.parent_run_id,
+            run.parent_step_index
+                .map(|index| format!(" step {}", index + 1))
+                .unwrap_or_default()
+        ),
+        format!("State: {}", run.state),
+    ];
+    // `run.activityState || run.lastActivityAt ? … : undefined` — a `0` timestamp is falsy.
+    if run.activity_state.as_deref().is_some_and(|s| !s.is_empty())
+        || run.last_activity_at.is_some_and(|at| at != 0)
+    {
+        lines.push(format!(
+            "Activity: {}",
+            activity_label(run.last_activity_at, run.activity_state.as_deref())
+                .unwrap_or_else(|| "undefined".to_string())
+        ));
+    }
+    if let Some(mode) = run.mode.as_deref().filter(|mode| !mode.is_empty()) {
+        lines.push(format!("Mode: {mode}"));
+    }
+    lines.push(format!("Agent: {}", nested_run_display_name(run)));
+    if let Some(current) = run.current_step {
+        let total = run
+            .chain_step_count
+            .or_else(|| {
+                run.steps
+                    .as_ref()
+                    .map(|steps| i64::try_from(steps.len()).unwrap_or(i64::MAX))
+            })
+            .unwrap_or(1);
+        lines.push(format!("Progress: step {}/{total}", current + 1));
+    }
+    if let Some(dir) = run.async_dir.as_deref().filter(|dir| !dir.is_empty()) {
+        lines.push(format!("Dir: {dir}"));
+    }
+    if let Some(session) = run.session_file.as_deref().filter(|s| !s.is_empty()) {
+        lines.push(format!("Session: {session}"));
+    }
+    if let Some(error) = run.error.as_deref().filter(|e| !e.is_empty()) {
+        lines.push(format!("Error: {error}"));
+    }
+    if !run.path.is_empty() {
+        let hops = run
+            .path
+            .iter()
+            .map(|part| {
+                format!(
+                    "{}{}{}",
+                    part.run_id,
+                    part.step_index
+                        .map(|index| format!(":{}", index + 1))
+                        .unwrap_or_default(),
+                    part.agent
+                        .as_deref()
+                        .filter(|agent| !agent.is_empty())
+                        .map(|agent| format!(":{agent}"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" > ");
+        lines.push(format!("Path: {hops} > {}", run.id));
+    }
+    if let Some(steps) = run.steps.as_ref().filter(|steps| !steps.is_empty()) {
+        lines.push("Steps:".to_string());
+        for (index, step) in steps.iter().enumerate() {
+            let activity = if step.status == "running" {
+                activity_label(step.last_activity_at, step.activity_state.as_deref())
+            } else {
+                None
+            };
+            lines.push(format!(
+                "  {}. {} {}{}{}",
+                index + 1,
+                nested_step_display_name(step),
+                step.status,
+                activity.map(|a| format!(", {a}")).unwrap_or_default(),
+                step.error
+                    .as_deref()
+                    .filter(|e| !e.is_empty())
+                    .map(|e| format!(", error: {e}"))
+                    .unwrap_or_default()
+            ));
+            lines.extend(format_nested_run_status_lines(
+                step.children.as_deref().unwrap_or_default(),
+                NestedLinesOptions {
+                    indent: "    ",
+                    command_hints: true,
+                    ..NestedLinesOptions::default()
+                },
+                now,
+            ));
+        }
+    }
+    lines.extend(format_nested_run_status_lines(
+        run.children.as_deref().unwrap_or_default(),
+        NestedLinesOptions {
+            indent: "  ",
+            command_hints: true,
+            ..NestedLinesOptions::default()
+        },
+        now,
+    ));
+    lines.push("Commands:".to_string());
+    lines.push(format!(
+        "  Status: subagent({{ action: \"status\", id: \"{}\" }})",
+        run.id
+    ));
+    lines.push(format!(
+        "  Interrupt: subagent({{ action: \"interrupt\", id: \"{}\" }})",
+        run.id
+    ));
+    lines.push(format!(
+        "  Resume: subagent({{ action: \"resume\", id: \"{}\", message: \"...\" }})",
+        run.id
+    ));
+    lines.push(format!(
+        "  Steer: subagent({{ action: \"steer\", id: \"{}\", message: \"...\" }})",
+        run.id
+    ));
+    lines.push(format!(
+        "  Root status: subagent({{ action: \"status\", id: \"{root_run_id}\" }})"
+    ));
     lines.join("\n")
 }
 
@@ -630,15 +947,7 @@ pub(crate) async fn resolve_run_id(
 
     // Exact match first: a run directory, its status.json, or its terminal result file already
     // exists under this exact id.
-    let exact = RunPaths::for_run(
-        async_root,
-        results_dir,
-        &RunId::from_token(selector.to_string()),
-    );
-    if path_exists(&exact.run_dir).await
-        || path_exists(&exact.status).await
-        || path_exists(&exact.legacy_result_root).await
-    {
+    if exact_async_run_exists(async_root, results_dir, selector).await {
         return Ok(Some(RunId::from_token(selector.to_string())));
     }
 
@@ -674,6 +983,29 @@ pub(crate) async fn resolve_run_id(
             matches.len()
         ))),
     }
+}
+
+/// pi `exactAsyncLocation(id, …)` (`run-id-resolver.ts:22-32` @v0.71.0) as a predicate — the
+/// exact-id half of [`resolve_run_id`]. `resolveSubagentRunId` asks it BEFORE the nested lookup
+/// (`:152-161`), so an exact async run always wins over a nested run of the same id.
+pub(crate) async fn exact_async_run_exists(
+    async_root: &Path,
+    results_dir: &Path,
+    selector: &str,
+) -> bool {
+    if validate_safe_token(selector).is_err()
+        || crate::background::terminal_run_index::is_reserved_async_root_entry(selector)
+    {
+        return false;
+    }
+    let exact = RunPaths::for_run(
+        async_root,
+        results_dir,
+        &RunId::from_token(selector.to_string()),
+    );
+    path_exists(&exact.run_dir).await
+        || path_exists(&exact.status).await
+        || path_exists(&exact.legacy_result_root).await
 }
 
 /// Non-erroring existence probe (a read-only lookup treats an I/O error the same as "absent").
@@ -998,7 +1330,8 @@ pub fn format_run_list(runs: &[ActiveRun]) -> String {
             lines.push(format!(
                 "  {}. {} | {}{}",
                 index.saturating_add(1),
-                step.agent,
+                // SUBA-134 — pi `step.sessionName?.trim() || …` (`async-status.ts:632` @v0.71.0).
+                step.display_name(),
                 step_state_label(step.status),
                 model_text
             ));
@@ -1250,6 +1583,8 @@ mod tests {
             acceptance: None,
             context: None,
             agent_scope: None,
+            label: None,
+            session_name: None,
         }
     }
 
@@ -1311,6 +1646,37 @@ mod tests {
         assert!(
             !rendered.contains("run0donexxx"),
             "terminal run absent: {rendered}"
+        );
+    }
+
+    /// SUBA-134 — a step line shows the child's session name, trimmed, else `<label> (<agent>)`,
+    /// else the agent (pi `step.sessionName?.trim() || (step.label ? `${step.label}
+    /// (${step.agent})` : step.agent)`, `async-status.ts:632` @v0.71.0).
+    #[test]
+    fn active_run_step_lines_show_the_child_session_name_over_the_agent() {
+        let id = RunId::from_token("run0named0");
+        let mut named = StepStatus::pending("worker");
+        named.session_name = Some(" worker: Lane A ".to_string());
+        named.label = Some("Lane A".to_string());
+        let mut blank = StepStatus::pending("scout");
+        blank.session_name = Some("   ".to_string());
+        let mut labelled = StepStatus::pending("planner");
+        labelled.label = Some("Attached run-7f".to_string());
+        let status = running_status(
+            &id,
+            RunMode::Chain,
+            vec![named, blank, StepStatus::pending("critic"), labelled],
+        );
+        let rendered = format_run_list(&[ActiveRun {
+            dir: PathBuf::from("/runs/run0named0"),
+            status,
+        }]);
+        assert!(rendered.contains("  1. worker: Lane A | "), "{rendered}");
+        assert!(rendered.contains("  2. scout | "), "{rendered}");
+        assert!(rendered.contains("  3. critic | "), "{rendered}");
+        assert!(
+            rendered.contains("  4. Attached run-7f (planner) | "),
+            "{rendered}"
         );
     }
 
@@ -2251,5 +2617,235 @@ mod tests {
             !rendered.contains(".deleting-run-"),
             "a tombstone must never reach a user-visible fleet listing: {rendered}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // SUBA-134 — the external-runner block and the nested exact-status view (pi `run-status.ts`
+    // @v0.71.0). Every expected string is upstream's literal.
+    // ---------------------------------------------------------------------------------------------
+
+    fn external_cli_step(adapter: Option<crate::runner::contract::AdapterId>) -> StepStatus {
+        let mut step = StepStatus::pending("worker");
+        step.status = StepState::Running;
+        step.runner = Some(crate::runner::status::resolve_external_cli_runner_status(
+            adapter,
+            "codex",
+            &["exec".to_string(), "--json".to_string()],
+        ));
+        step
+    }
+
+    /// pi `run-status.ts:641-664`: the runner, adapter, safety and capability lines, the three
+    /// unsupported reasons and the context handoff, then the live process receipt — directly
+    /// under the step line, ahead of its `Output:` log.
+    #[tokio::test]
+    async fn an_external_cli_step_renders_the_runner_block_and_its_live_process() {
+        let (_dir, async_root, results_dir) = roots();
+        let run_id = RunId::from_token("run0external");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let mut step = external_cli_step(Some(crate::runner::contract::AdapterId::CodexExec));
+        step.external_process = Some(crate::runner::status::ExternalProcessStatus {
+            pid: Some(4242),
+            started_at: 100,
+            stdout_path: "/runs/x/external-0.stdout.log".to_string(),
+            stderr_path: "/runs/x/external-0.stderr.log".to_string(),
+            final_output_path: Some("/runs/x/external-0.final.md".to_string()),
+            ..crate::runner::status::ExternalProcessStatus::default()
+        });
+        write_status(
+            &paths,
+            &running_status(&run_id, RunMode::Single, vec![step]),
+        )
+        .await;
+
+        let report = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "run0external",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect("inspect ok")
+        .expect("run found");
+
+        let expected = [
+            "Step 1: worker running",
+            "  Runner: external-cli (codex exec --json)",
+            "  Adapter: codex-exec v1 (one-shot-stdin)",
+            "  Safety: sandbox=read-only, approval=never, ephemeral=true",
+            "  Capabilities: stop=true, steer=false, resume=false, structuredOutput=false, \
+             toolEvents=false, supervisor=unsupported, forkContext=false, extensionBindings=false",
+            "  Unsupported steer: The one-shot stdin adapter closes input after launch and cannot \
+             accept live steer messages.",
+            "  Unsupported resume: The one-shot stdin adapter has no durable external session \
+             identity.",
+            "  Unsupported supervisor: The generic external CLI adapter has no trusted supervisor \
+             event transport.",
+            "  Context handoff: fresh only (Native Pi fork context is not available without an \
+             adapter-owned handoff artifact.)",
+            "  Process: 4242",
+            "  Stdout: /runs/x/external-0.stdout.log",
+            "  Stderr: /runs/x/external-0.stderr.log",
+            "  Final output: /runs/x/external-0.final.md",
+        ]
+        .join("\n");
+        assert!(report.contains(&expected), "{report}");
+    }
+
+    /// pi `run-status.ts:646-651`: each adapter family's `Safety:` shape; the generic adapter has
+    /// none. And a receipt with no pid yet (spawn failed) prints no `Process:` line but still its
+    /// log paths (`:660-662`).
+    #[test]
+    fn each_adapter_family_renders_its_own_safety_line_and_a_pidless_receipt_its_logs() {
+        use crate::runner::contract::AdapterId;
+        let safety_line = |adapter: Option<AdapterId>| {
+            format_external_cli_runner_lines(&external_cli_step(adapter))
+                .into_iter()
+                .find(|line| line.starts_with("  Safety:"))
+        };
+        assert_eq!(
+            safety_line(Some(AdapterId::CodexExecWriter)).as_deref(),
+            Some(
+                "  Safety: access=workspace-write, sandbox=workspace-write, approval=never, \
+                 ephemeral=true"
+            )
+        );
+        assert_eq!(
+            safety_line(Some(AdapterId::CursorAgent)).as_deref(),
+            Some(
+                "  Safety: access=read-only, auth=cursor-api-key-or-existing-login, mode=ask, \
+                 sandbox=enabled, workspaceTrust=existing-required, sessionReuse=false"
+            )
+        );
+        assert_eq!(
+            safety_line(Some(AdapterId::ClaudeCode)).as_deref(),
+            Some(
+                "  Safety: access=read-only, auth=existing-cli-required, permission=plan, \
+                 tools=none, mcp=empty-strict, settings=user, settingsTrust=required, \
+                 persistence=false"
+            )
+        );
+        assert_eq!(safety_line(None), None);
+
+        let mut step = external_cli_step(None);
+        step.external_process = Some(crate::runner::status::ExternalProcessStatus {
+            started_at: 100,
+            stdout_path: "/o.log".to_string(),
+            stderr_path: "/e.log".to_string(),
+            ..crate::runner::status::ExternalProcessStatus::default()
+        });
+        let lines = format_external_cli_runner_lines(&step);
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("  Runner: external-cli (codex exec --json)")
+        );
+        assert_eq!(
+            lines.get(1).map(String::as_str),
+            Some("  Adapter: external-cli v1 (one-shot-stdin)")
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .rev()
+                .take(2)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["  Stderr: /e.log", "  Stdout: /o.log"]
+        );
+        assert!(!lines.iter().any(|line| line.starts_with("  Process:")));
+    }
+
+    /// pi `run-status.ts:657-658`: a persisted descriptor normalization refuses (a blank command)
+    /// is reported as invalid metadata rather than rendered; a native step prints no block at all.
+    #[test]
+    fn an_unnormalizable_runner_is_invalid_metadata_and_a_native_step_has_no_block() {
+        let mut step = external_cli_step(None);
+        if let Some(runner) = step.runner.as_mut() {
+            runner.command = "  ".to_string();
+        }
+        assert_eq!(
+            format_external_cli_runner_lines(&step),
+            vec!["  Runner: external-cli (invalid persisted runner metadata)".to_string()]
+        );
+        assert!(format_external_cli_runner_lines(&StepStatus::pending("worker")).is_empty());
+    }
+
+    fn nested_summary(value: serde_json::Value) -> crate::spawn::nested_events::NestedRunSummary {
+        crate::spawn::nested_events::sanitize_summary(&value).expect("a valid nested summary")
+    }
+
+    /// pi `formatNestedExactStatus` (`run-status.ts:322-345`) over the upstream test's own run
+    /// (`run-status.test.ts:1373-1411`), plus the child session names `nestedRunDisplayName`
+    /// (`:171-176`) and the step/descendant lines prefer over the agent.
+    #[test]
+    fn the_nested_exact_status_names_the_run_its_steps_and_descendants_by_session_name() {
+        let run = nested_summary(serde_json::json!({
+            "id": "nested-exact-child",
+            "parentRunId": "run-nested-exact-root",
+            "parentStepIndex": 0,
+            "depth": 1,
+            "path": [{ "runId": "run-nested-exact-root", "stepIndex": 0, "agent": "orchestrator" }],
+            "state": "running",
+            "mode": "single",
+            "agent": "validator",
+            "sessionName": "  validator: check the refresh path  ",
+            "asyncDir": "/nested/runs/nested-exact-child",
+            "steps": [{
+                "agent": "leaf",
+                "sessionName": "  leaf: grep the callers  ",
+                "status": "complete",
+                "children": [{
+                    "id": "grandchild",
+                    "parentRunId": "nested-exact-child",
+                    "depth": 2,
+                    "path": [],
+                    "state": "complete",
+                    "agent": "scout",
+                    "sessionName": "scout: map the module",
+                }],
+            }],
+            "lastUpdate": 150,
+        }));
+
+        let text = format_nested_exact_status("run-nested-exact-root", &run, 1_000);
+
+        let expected = [
+            "Nested run: nested-exact-child",
+            "Root: run-nested-exact-root",
+            "Parent: run-nested-exact-root step 1",
+            "State: running",
+            "Mode: single",
+            "Agent: validator: check the refresh path",
+            "Dir: /nested/runs/nested-exact-child",
+            "Path: run-nested-exact-root:1:orchestrator > nested-exact-child",
+            "Steps:",
+            "  1. leaf: grep the callers complete",
+            "    ↳ scout: map the module [grandchild] complete",
+            "      Status: subagent({ action: \"status\", id: \"grandchild\" })",
+            "Commands:",
+            "  Status: subagent({ action: \"status\", id: \"nested-exact-child\" })",
+            "  Interrupt: subagent({ action: \"interrupt\", id: \"nested-exact-child\" })",
+            "  Resume: subagent({ action: \"resume\", id: \"nested-exact-child\", message: \"...\" })",
+            "  Steer: subagent({ action: \"steer\", id: \"nested-exact-child\", message: \"...\" })",
+            "  Root status: subagent({ action: \"status\", id: \"run-nested-exact-root\" })",
+        ]
+        .join("\n");
+        assert_eq!(text, expected);
+    }
+
+    /// pi `nestedRunDisplayName` (`run-status.ts:171-176`): a blank session name falls back to the
+    /// agent, then the agents joined in full (not the tree's `+N` compaction), then the id.
+    #[test]
+    fn the_nested_display_name_falls_back_agent_then_agents_then_id() {
+        let mut run = nested_summary(serde_json::json!({
+            "id": "n1", "parentRunId": "root", "depth": 0, "path": [], "state": "running",
+            "sessionName": "   ", "agents": ["a", "b", "c"],
+        }));
+        assert_eq!(nested_run_display_name(&run), "a, b, c");
+        run.agent = Some("solo".to_string());
+        assert_eq!(nested_run_display_name(&run), "solo");
+        run.agent = None;
+        run.agents = None;
+        assert_eq!(nested_run_display_name(&run), "n1");
     }
 }

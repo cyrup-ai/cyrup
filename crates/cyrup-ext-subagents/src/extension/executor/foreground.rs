@@ -1370,6 +1370,7 @@ impl SubagentExecutor {
             // derivation verbatim with the async path.
             steer_ack_dir: workflow_steer
                 .map(|h| crate::background::control::steer_acks_dir(&h.run_dir, h.index)),
+            external_log_dir: None,
             steer_capability_path: workflow_steer
                 .map(|h| crate::background::control::steer_capability_path(&h.run_dir, h.index)),
             // pi's shared `execute` entry's `controlConfig = resolveControlConfig(deps.config.control,
@@ -1468,7 +1469,15 @@ impl SubagentExecutor {
                 ForegroundChildEntry {
                     index: 0,
                     agent: agent.name.clone(),
-                    session_name: None,
+                    // SUBA-134 — pi `target.sessionName = progress.sessionName`
+                    // (`foreground-control.ts:22` @v0.71.0), whose progress carries the child's
+                    // `sessionName: childSessionName` from its first update (`execution.ts:411`):
+                    // the same name the child is launched under.
+                    session_name: crate::exec::child_session_name::resolve_child_session_name(
+                        &agent.name,
+                        task,
+                        &run_options.child_env,
+                    ),
                     // pi `description: task` (`runs/foreground/execution.ts`'s control registration)
                     // — the caller's own task text, which is what the roster row identifies the run
                     // by (`fleet.ts:723`) and the detail pane prints as `Task` (`fleet.ts:434-437`).
@@ -2209,6 +2218,9 @@ mod tests {
         assert_eq!(entry.current_agent.as_deref(), Some("worker"));
         assert_eq!(entry.current_index, Some(0));
         assert_eq!(entry.description.as_deref(), Some("do the thing"));
+        // SUBA-134 — the live child's session name, which the fleet row shows over the agent
+        // (pi `target.sessionName = progress.sessionName`, `foreground-control.ts:22` @v0.71.0).
+        assert_eq!(entry.session_name.as_deref(), Some("worker: do the thing"));
         assert_eq!(entry.active_children.len(), 1, "one child, at flat index 0");
         // Stamped from the identity WORKFLOW_6 threads through `ForegroundRunRequest` ->
         // `run_foreground_impl` -> `ForegroundControlIdentity`.

@@ -58,13 +58,44 @@ pub(super) fn refresh_workflow_graph(status: &mut RunStatus, steps: &[RunnerStep
 /// released), mirroring `background/tracker.rs`'s identical `std::sync::Mutex` discipline.
 pub(super) type SharedStatus = Arc<std::sync::Mutex<RunStatus>>;
 
-/// One raw child NDJSON line, tagged with the flat step index it belongs to, sent from a dispatched
-/// step's [`crate::exec::RunOptions::live_events`] sink to the runner's telemetry task.
-pub(crate) struct TelemetryMsg {
-    /// The flat index of the step whose child produced this line.
-    pub(super) flat_index: usize,
-    /// The raw NDJSON line, exactly as read from the child's stdout.
-    pub(super) raw: String,
+/// One live report from a dispatched step's [`crate::exec::RunOptions::live_events`] sink to the
+/// runner's telemetry task, tagged with the flat step index it belongs to.
+pub(crate) enum TelemetryMsg {
+    /// One raw child NDJSON line, exactly as read from the child's stdout.
+    ChildLine {
+        /// The flat index of the step whose child produced this line.
+        flat_index: usize,
+        /// The raw NDJSON line.
+        raw: String,
+    },
+    /// SUBA-141 — an external-CLI step's process report (pi `updateExternalProcess(index,
+    /// process)`, `subagent-runner.ts:2247-2251` @v0.71.0).
+    ExternalProcess {
+        /// The flat index of the external-CLI step.
+        flat_index: usize,
+        /// The runner descriptor and the process as it stands.
+        update: Box<crate::exec::ExternalProcessUpdate>,
+    },
+}
+
+/// SUBA-141 — pi `updateExternalProcess`: `requiredStatusStep(statusPayload, index).externalProcess
+/// = process; statusPayload.lastUpdate = Date.now();` (`subagent-runner.ts:2247-2251` @v0.71.0).
+/// The step also takes the launch's runner descriptor if it has none yet, so it reads as an
+/// external-CLI step while it runs.
+pub(super) fn apply_external_process_update(
+    status: &mut RunStatus,
+    flat_index: usize,
+    update: crate::exec::ExternalProcessUpdate,
+) -> bool {
+    let Some(step) = status.steps.get_mut(flat_index) else {
+        return false;
+    };
+    step.external_process = Some(update.process);
+    if step.runner.is_none() {
+        step.runner = Some(update.runner);
+    }
+    status.touch();
+    true
 }
 
 /// Lock the shared status, recovering the guard on a poisoned mutex rather than propagating the
@@ -113,8 +144,21 @@ pub(super) fn spawn_telemetry_task(
         loop {
             tokio::select! {
                 message = rx.recv() => {
-                    let Some(TelemetryMsg { flat_index, raw }) = message else {
-                        break; // every sender dropped — the run's step loop has finished
+                    let (flat_index, raw) = match message {
+                        None => break, // every sender dropped — the run's step loop has finished
+                        Some(TelemetryMsg::ChildLine { flat_index, raw }) => (flat_index, raw),
+                        Some(TelemetryMsg::ExternalProcess { flat_index, update }) => {
+                            // pi `writeStatusPayload()` right after the assignment (`:2250`).
+                            let applied = apply_external_process_update(
+                                &mut lock_status(&shared),
+                                flat_index,
+                                *update,
+                            );
+                            if applied {
+                                let _ = write_shared_status(&run_paths, &shared).await;
+                            }
+                            continue;
+                        }
                     };
                     let provenance = {
                         let status = lock_status(&shared);
@@ -470,6 +514,12 @@ pub(super) fn record_step_outcome(
                         if let Some(evidence) = outcome.native_machine.clone() {
                             entry.native_machine = Some(evidence);
                         }
+                        // SUBA-134 — pi `setOptionalProperty(requiredStatusStep(…),
+                        // "sessionName", singleResult.sessionName)` (`subagent-runner.ts:3759`
+                        // @v0.71.0): the name the member's child actually ran under.
+                        if let Some(name) = outcome.session_name.clone() {
+                            entry.session_name = Some(name);
+                        }
                     }
                     None => {
                         entry.status = StepState::Failed;
@@ -519,6 +569,10 @@ pub(super) fn record_step_outcome(
                 // SUBA-100 — on the single-slot shape too.
                 if let Some(evidence) = result.native_machine.clone() {
                     entry.native_machine = Some(evidence);
+                }
+                // SUBA-134 — on the single-slot shape too.
+                if let Some(name) = result.session_name.clone() {
+                    entry.session_name = Some(name);
                 }
             }
         }
@@ -585,6 +639,94 @@ mod tests {
         flat_base, flat_range, flat_total, pending_step_statuses_for,
     };
     use crate::background::{RunId, RunMode, RunState};
+
+    /// SUBA-141 — pi `updateExternalProcess(index, process)`: `requiredStatusStep(…).externalProcess
+    /// = process` then `writeStatusPayload()` (`subagent-runner.ts:2247-2251` @v0.71.0). A report
+    /// sent through the runner's telemetry channel lands on the addressed step in `status.json`
+    /// (with the launch's runner descriptor), and the close report replaces the spawn report.
+    ///
+    /// *Gutted by*: the `TelemetryMsg::ExternalProcess` arm's `write_shared_status`, or
+    /// `apply_external_process_update`'s field assignment.
+    #[tokio::test]
+    async fn an_external_process_report_is_published_onto_its_step_in_status_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_id = RunId::from_token("extproc0001".to_string());
+        let paths = RunPaths::for_run(dir.path(), dir.path(), &run_id);
+        std::fs::create_dir_all(&paths.run_dir).expect("mkdir");
+        let mut status = RunStatus::queued(run_id, RunMode::Chain, Some(1));
+        status.state = RunState::Running;
+        status.steps = vec![
+            StepStatus::pending("native"),
+            StepStatus::pending("foreign"),
+        ];
+        let shared: SharedStatus = Arc::new(std::sync::Mutex::new(status));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TelemetryMsg>();
+        let task = spawn_telemetry_task(paths.clone(), shared.clone(), rx, None);
+        let runner = crate::exec::external_cli::resolve_generic_launch(
+            &crate::runner::ExternalCliRunner {
+                adapter: None,
+                command: "foreign".to_string(),
+                args: Vec::new(),
+                prompt_delivery_stdin: false,
+                capabilities: None,
+            },
+            &crate::exec::external_cli::ExternalCliLaunchContext::default(),
+        )
+        .status()
+        .clone();
+        let spawned = crate::runner::status::ExternalProcessStatus {
+            pid: Some(4242),
+            started_at: 1_000,
+            stdout_path: "/run/external-1.stdout.log".to_string(),
+            stderr_path: "/run/external-1.stderr.log".to_string(),
+            ..Default::default()
+        };
+        let read_back = || -> RunStatus {
+            serde_json::from_str(&std::fs::read_to_string(&paths.status).expect("status.json"))
+                .expect("parse status.json")
+        };
+
+        tx.send(TelemetryMsg::ExternalProcess {
+            flat_index: 1,
+            update: Box::new(crate::exec::ExternalProcessUpdate {
+                runner: runner.clone(),
+                process: spawned.clone(),
+            }),
+        })
+        .expect("send");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let on_disk = loop {
+            if paths.status.exists() {
+                let on_disk = read_back();
+                if on_disk.steps[1].external_process.is_some() {
+                    break on_disk;
+                }
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never published");
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(on_disk.steps[1].external_process.as_ref(), Some(&spawned));
+        assert_eq!(on_disk.steps[1].runner.as_ref(), Some(&runner));
+        assert_eq!(on_disk.steps[0].external_process, None);
+
+        let closed = crate::runner::status::ExternalProcessStatus {
+            ended_at: Some(2_500),
+            duration_ms: Some(1_500),
+            exit_code: Some(0),
+            ..spawned
+        };
+        tx.send(TelemetryMsg::ExternalProcess {
+            flat_index: 1,
+            update: Box::new(crate::exec::ExternalProcessUpdate {
+                runner,
+                process: closed.clone(),
+            }),
+        })
+        .expect("send");
+        drop(tx);
+        task.await.expect("telemetry task");
+        assert_eq!(read_back().steps[1].external_process, Some(closed));
+    }
 
     fn watchdog_line(run: &str, agent: &str, index: u64, seq: u64, phase: &str) -> String {
         serde_json::json!({
@@ -786,6 +928,7 @@ mod tests {
             super::super::settle::ResultIdentity {
                 agent: "scout".to_string(),
                 task: "look".to_string(),
+                session_name: None,
             },
             &result,
         );
@@ -866,6 +1009,96 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_step_index, 0);
         assert_eq!(groups[0].children.len(), 3);
+    }
+
+    /// SUBA-134 — pi `setOptionalProperty(requiredStatusStep(…), "sessionName",
+    /// singleResult.sessionName)` (`subagent-runner.ts:3759,4178,4658` @v0.71.0): the name a
+    /// member's (or a single step's) child actually ran under replaces the declared one, and a
+    /// result that reports none leaves the declaration in place.
+    ///
+    /// *Gutted by*: either `session_name` copy in `record_step_outcome`.
+    #[test]
+    fn a_settled_childs_session_name_lands_on_its_status_entry() {
+        let reported = |name: Option<&str>| {
+            let mut result = StepResult::success(Some("out".to_string()), None);
+            result.session_name = name.map(str::to_string);
+            result
+        };
+        let mut status = RunStatus::queued(
+            RunId::from_token("flatnamed001".to_string()),
+            RunMode::Chain,
+            Some(1),
+        );
+        status.state = RunState::Running;
+        let group_step = RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
+            steps: vec![single_step("alpha", "a"), single_step("beta", "b")],
+            concurrency: 2,
+            fail_fast: false,
+            worktree: false,
+            lane: None,
+        });
+        let tail = RunnerStep::SingleStep(single_step("tail", "t"));
+        status.steps = [&group_step, &tail]
+            .into_iter()
+            .flat_map(pending_step_statuses_for)
+            .collect();
+        let group_result = crate::spawn::chain_graph::GroupStepResult {
+            handoff: None,
+            aggregate: StepResult::success(None, None),
+            children: vec![
+                Some(reported(Some("alpha: ran as this"))),
+                Some(reported(None)),
+            ],
+            fail_fast_skipped: vec![false, false],
+        };
+        let aggregate = group_result.aggregate.clone();
+        record_step_outcome(
+            &mut status,
+            &(0..2),
+            &group_step,
+            &aggregate,
+            Some(&group_result),
+        );
+        record_step_outcome(
+            &mut status,
+            &(2..3),
+            &tail,
+            &reported(Some("tail: ran as this")),
+            None,
+        );
+        let names: Vec<Option<&str>> = status
+            .steps
+            .iter()
+            .map(|step| step.session_name.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Some("alpha: ran as this"),
+                Some("beta: b"),
+                Some("tail: ran as this")
+            ]
+        );
+    }
+
+    /// SUBA-134 — a stopped step's result carries the name its status step was declared under
+    /// (pi `stoppedStepResult(agent, context, requiredStatusStep(…).sessionName)`,
+    /// `subagent-runner.ts:2315` @v0.71.0), and a settled child's result the name it ran under
+    /// (`sessionName: childSessionName`, `:1515`).
+    ///
+    /// *Gutted by*: dropping either rung of `result.session_name.clone().or(session_name)` in
+    /// `step_result_to_single_result_with`.
+    #[test]
+    fn a_step_result_carries_the_name_its_child_ran_under_else_its_declared_one() {
+        let mut spec = single_step("worker", "fix auth");
+        spec.label = Some("Lane A".to_string());
+        let step = RunnerStep::SingleStep(spec);
+        let stopped = super::super::settle::stopped_single_result(&step);
+        assert_eq!(stopped.session_name.as_deref(), Some("worker: Lane A"));
+        let mut ran = StepResult::success(Some("out".to_string()), None);
+        ran.session_name = Some("worker: item 3".to_string());
+        let settled = super::super::settle::step_result_to_single_result(&step, &ran);
+        assert_eq!(settled.session_name.as_deref(), Some("worker: item 3"));
     }
 
     /// SUBA-3c — the OTHER two `record_step_outcome` arms carry `timeoutRecovery` as well: the

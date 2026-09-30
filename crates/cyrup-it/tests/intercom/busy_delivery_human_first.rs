@@ -47,24 +47,23 @@ fn gated(releases: &Arc<Releases>) -> TurnFn {
 ///
 /// * `settled` counts `agent_settled` — upstream's `priority-probe`. A peer that rode the running
 ///   human run needed no settle boundary; one that got its own triggered turn did.
-/// * The `turn_end` pair is test-side synchronisation for ONE host difference, and nothing else:
-///   upstream's turn-boundary release reaches `agent.steer` synchronously inside the `turn_end`
-///   handler, while cyrup's `inject_message_steer` hands the steer to the live host's injection
-///   pump, a separate task. When the first probe saw more held peers than the second one does, the
-///   intercom handler released one, and the second probe waits (bounded) until the pump has put it
-///   on the agent's steering queue — so each case measures the policy, not the pump's scheduling.
-///   Without it the steer can land after the loop's last steering poll under load (~5% of runs at
-///   4x process contention), which the result reports as a residual for ICOM-063.
-///
-///   Consequence: nothing in this file tests SAME-RUN delivery against a free-running pump, and
-///   these cases must not be cited as evidence for it. The probe pair and the `yield_now` in
-///   `IntercomExtension`'s `TurnEnd` arm go together, in the same change that makes
-///   `LiveHostServices::inject_message_steer` steer onto the live agent synchronously while a run
-///   is active (area 08; pi `sendCustomMessage`'s streaming arm → `agent.steer`).
+/// * The `turn_end` pair OBSERVES the release and synchronises nothing. When the first probe saw
+///   more held peers than the second one does, the intercom handler (between them, awaited before
+///   the agent loop's next steering poll) released one; the second probe then records whether that
+///   peer was ALREADY on the agent's steering queue, with no wait. Upstream's release reaches
+///   `agent.steer` synchronously inside the `turn_end` handler (`sendMessage` → `sendCustomMessage`
+///   → `agent.steer`), which is what makes same-run delivery a guarantee rather than a race; cyrup's
+///   `LiveHostServices::inject_message_steer` must do the same (ICOM-063). When it handed the steer
+///   to the injection pump (a separate task) instead, this pair had to WAIT for the pump, and
+///   without that wait ~5% of runs under load saw the peer miss its run.
 #[derive(Default)]
 struct Handoff {
     held_at_turn_end: AtomicUsize,
     settled: AtomicUsize,
+    /// Peers the intercom `turn_end` handler released.
+    released: AtomicUsize,
+    /// …of which were not yet on the agent's steering queue when the handler returned.
+    released_unqueued: AtomicUsize,
     session: OnceLock<Weak<AgentSession>>,
     state: OnceLock<Arc<cyrup_intercom::session_state::SharedIntercomState>>,
 }
@@ -106,11 +105,18 @@ impl NativeExtension for Probe {
             HostEvent::TurnEnd { .. } => {
                 let released =
                     self.handoff.held() < self.handoff.held_at_turn_end.load(Ordering::SeqCst);
-                let session = self.handoff.session.get().and_then(Weak::upgrade);
-                if let (true, Some(session)) = (released, session) {
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                    while !session.has_queued_messages() && tokio::time::Instant::now() < deadline {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                if released {
+                    self.handoff.released.fetch_add(1, Ordering::SeqCst);
+                    let queued = self
+                        .handoff
+                        .session
+                        .get()
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|s| s.has_queued_messages());
+                    if !queued {
+                        self.handoff
+                            .released_unqueued
+                            .fetch_add(1, Ordering::SeqCst);
                     }
                 }
             }
@@ -212,6 +218,22 @@ impl Worker {
         );
     }
 
+    /// ICOM-063 — every peer released at a turn boundary was on the agent's steering queue by the
+    /// time the intercom `turn_end` handler returned, i.e. before the loop's next steering poll.
+    fn assert_turn_end_releases_steered_synchronously(&self, expected: usize) {
+        assert_eq!(
+            self.settled.released.load(Ordering::SeqCst),
+            expected,
+            "peers released at a turn boundary"
+        );
+        assert_eq!(
+            self.settled.released_unqueued.load(Ordering::SeqCst),
+            0,
+            "a released peer was not yet steered when the `turn_end` handler returned, so it could \
+             miss the loop's next steering poll (and with it the run)"
+        );
+    }
+
     fn injected(&self, id: &str) -> bool {
         self.live
             .script
@@ -286,6 +308,7 @@ async fn a_busy_peer_is_held_then_steered_into_the_same_run_at_the_next_turn_bou
     );
     w.releases.release(1);
     w.settled(1).await;
+    w.assert_turn_end_releases_steered_synchronously(1);
 
     let texts = w.last_inputs();
     assert_eq!(texts.len(), 2, "{texts:?}");
@@ -342,6 +365,7 @@ async fn a_human_steer_and_follow_up_arriving_after_a_held_peer_go_first() {
     );
     w.releases.release(3);
     w.settled(1).await;
+    w.assert_turn_end_releases_steered_synchronously(1);
 
     let texts = w.last_inputs();
     assert_eq!(texts.len(), 4, "{texts:?}");
@@ -392,6 +416,7 @@ async fn held_peers_drain_one_per_turn_and_human_input_between_them_wins() {
     w.model_call(4).await;
     w.releases.release(3);
     w.settled(1).await;
+    w.assert_turn_end_releases_steered_synchronously(2);
 
     let texts = w.last_inputs();
     assert_eq!(texts.len(), 4, "{texts:?}");
@@ -427,6 +452,7 @@ async fn held_peers_hand_off_one_triggered_turn_when_the_run_ends_without_a_turn
     w.model_call(3).await;
     w.releases.release(2);
     w.settled(2).await;
+    w.assert_turn_end_releases_steered_synchronously(1);
 
     let requests = w.live.script.requests();
     let second = user_texts(&requests[1]);

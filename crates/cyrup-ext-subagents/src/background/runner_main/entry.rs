@@ -702,6 +702,7 @@ pub(super) async fn publish_initial_status(
             // that step's own `run_sync` creates at exactly this path.
             step.transcript_path =
                 resolve_async_step_transcript_path(config, &step.agent, flat_index);
+            crate::background::flat_index::declare_step_runner(config, &mut step);
             step
         })
         .collect();

@@ -788,6 +788,70 @@ impl From<&IntercomPayload> for ReducedInlinePayload {
 }
 
 // =================================================================================================
+// Session-identity claim (ICOM-064 / SUBA-134)
+// =================================================================================================
+
+/// `INTERCOM_SESSION_IDENTITY_EVENT` (pi-intercom `v0.14.0 extension-api.ts:7`; pi-subagents keeps
+/// its own copy, `shared/types.ts` @v0.71.0). cyrup-intercom emits an
+/// [`IntercomSessionIdentityRequestV1`] on this TYPED bus topic at `session_start`, before it
+/// chooses the session's intercom id; a native that owns the session's routing address claims it
+/// inline.
+pub const INTERCOM_SESSION_IDENTITY_EVENT: &str = "intercom:session-identity";
+
+/// pi-intercom `IntercomSessionIdentityRequestV1 { version: 1; claim(stableId): void }`
+/// (`v0.14.0 extension-api.ts:17-20`), and the `claimedIntercomSessionId` slot its `claim` writes
+/// (`index.ts:1645-1651`).
+///
+/// Emitted with `HostServices::emit_typed_event`, which runs every listener before it returns, so
+/// the emitter reads [`Self::claimed`] right after the emit and registers under it — upstream's
+/// order exactly: nothing is registered before the claim is settled.
+///
+/// [CYRUP-DELTA] the version is the TYPE, not a runtime field: a listener downcasts the typed-bus
+/// event to this struct (`cyrup_ext::NativeExtension::on_typed_bus_event`) where upstream checks
+/// `request.version !== 1 || typeof request.claim !== "function"` (pi-subagents
+/// `subagent-prompt-runtime.ts:538`), so a request of any other shape never reaches `claim`, and a
+/// future V2 is a different type that an old listener cannot misread.
+#[derive(Debug, Default)]
+pub struct IntercomSessionIdentityRequestV1 {
+    claimed: std::sync::Mutex<Option<String>>,
+}
+
+impl IntercomSessionIdentityRequestV1 {
+    /// A fresh request with nothing claimed — upstream's `let claimedIntercomSessionId: string |
+    /// undefined;`, one per `session_start`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `claim(stableId)`: `claimedIntercomSessionId ??= (typeof stableId === "string" &&
+    /// stableId.trim()) || undefined` (`v0.14.0 index.ts:1648-1650`). The first non-empty trimmed
+    /// claim wins; a blank one, or any claim after the first, changes nothing.
+    pub fn claim(&self, stable_id: &str) {
+        let trimmed = stable_id.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let mut claimed = self
+            .claimed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if claimed.is_none() {
+            *claimed = Some(trimmed.to_string());
+        }
+    }
+
+    /// The winning claim, if any listener made one.
+    #[must_use]
+    pub fn claimed(&self) -> Option<String> {
+        self.claimed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+// =================================================================================================
 // Clarify/ask pause primitive (R-SA-119/120)
 //
 // NOTE(clarify-wired): the real `ClarifyChannel` is now wired (reconciliation §4 step 5 item 3 —

@@ -54,27 +54,18 @@ pub const ENV_INTERCOM_STABLE_ID: &str = "CYRUP_INTERCOM_STABLE_ID";
 /// stored there would apply to every session on the machine and erase the boundary it draws.
 pub const ENV_INTERCOM_SCOPE_ID: &str = "CYRUP_INTERCOM_SCOPE_ID";
 /// `INTERCOM_SESSION_IDENTITY_EVENT` (`v0.14.0 extension-api.ts:7`, `eae462a` #135): emitted on this
-/// session's extension bus at `session_start`, before the intercom id is chosen, so an extension that
-/// owns the session's routing address (a subagent launcher) can give it a fixed id per session while
-/// its name stays free for a human-readable label. The payload is `{ "version": 1 }`.
+/// session's TYPED bus at `session_start`, before the intercom id is chosen, carrying an
+/// [`IntercomSessionIdentityRequestV1`], so an extension that owns the session's routing address (a
+/// subagent launcher) can give it a fixed id per session while its name stays free for a
+/// human-readable label.
 ///
 /// The first non-empty claim wins over [`ENV_INTERCOM_STABLE_ID`] and `stableId`
 /// (`v0.14.0 index.ts:1645-1653`), which are process- and machine-wide and so cannot tell two
-/// sessions of one process apart.
-pub const INTERCOM_SESSION_IDENTITY_EVENT: &str = "intercom:session-identity";
-/// The claim reply to [`INTERCOM_SESSION_IDENTITY_EVENT`]: `{ "version": 1, "stableId": "<id>" }`.
-///
-/// # [CYRUP-DELTA] — a reply topic stands in for `claim(stableId)`
-///
-/// Upstream's request carries a method (`IntercomSessionIdentityRequestV1 { version: 1;
-/// claim(stableId): void }`, `v0.14.0 extension-api.ts:17-20`) that a listener calls synchronously
-/// inside `pi.events.emit`. cyrup's bus carries JSON and delivers after the emitting dispatch
-/// (`cyrup_ext::bus::SharedBus::emit`), so a function cannot cross it and "synchronously" cannot
-/// mean "before `emit` returns". The claim is therefore a message on this topic, accepted until the
-/// session's first `agent_start` ([`crate::session_state::SharedIntercomState::close_identity_claim`]),
-/// and a claim that lands after the startup connect already registered re-registers under it —
-/// peers see the claimed id, never a lasting host-assigned one.
-pub const INTERCOM_SESSION_IDENTITY_CLAIM_EVENT: &str = "intercom:session-identity-claim";
+/// sessions of one process apart. The request type lives beside the other intercom seam types in
+/// `cyrup-ext-subagents` (the claimant), because that crate cannot depend on this one.
+pub use cyrup_ext_subagents::tui::intercom::{
+    INTERCOM_SESSION_IDENTITY_EVENT, IntercomSessionIdentityRequestV1,
+};
 /// `HERDR_BIN` — NOT `CYRUP_HERDR_BIN`. Same rule as [`ENV_TMUX_PANE`]: the `CYRUP_` prefix applies
 /// to pi's OWN variables, and this one belongs to the Herdr vendor, read verbatim by upstream at
 /// `v0.12.0 project-agent.ts:68` (`options.bin ?? process.env.HERDR_BIN ?? "herdr"`). A user who has

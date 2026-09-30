@@ -564,7 +564,7 @@ impl NativeExtension for PromptRewriter {
             };
             HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
                 system: Some("REWRITTEN_SYSTEM_PROMPT".to_string()),
-                inject: Some(Box::new(inject)),
+                inject: vec![inject],
             })
         } else {
             HookOutcome::Noop

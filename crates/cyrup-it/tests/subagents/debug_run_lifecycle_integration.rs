@@ -94,6 +94,8 @@ fn worker_step() -> RunnerStep {
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     })
 }
 

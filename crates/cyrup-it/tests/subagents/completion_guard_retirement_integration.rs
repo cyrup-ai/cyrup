@@ -135,6 +135,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         child_index: None,
         steer_inbox_dir: None,
         steer_ack_dir: None,
+        external_log_dir: None,
         steer_capability_path: None,
         // Control raises are ENABLED for this run, so a surviving guard would really have emitted
         // its `completion_guard` needs-attention notice into the sink below rather than being

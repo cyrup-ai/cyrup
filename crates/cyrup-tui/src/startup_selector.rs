@@ -18,7 +18,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::ExecutableCommand;
 use ratatui::crossterm::cursor::Show;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{Event, KeyEventKind};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -59,11 +59,15 @@ impl Drop for StartupTerminalRestore {
 ///
 /// `async` because [`SelectorOutcome::Apply`] is now AWAITED: `on_apply` persists the mutation
 /// before the loop repaints the row that shows it, so an in-place edit is durable before the frame
-/// that reflects it is painted. The **input** read is still the blocking `event::read()`, so this
-/// parks its executor thread between keys — unchanged from the sync version every caller already
-/// blocked on, and NOT fixable in isolation: see the `.flux` task "unify the pre-launch input path
-/// with the app reader" for why a second background reader on stdin is unsafe while
+/// that reflects it is painted. The **input** read is still a blocking read, so this parks its
+/// executor thread between keys — unchanged from the sync version every caller already blocked
+/// on, and NOT fixable in isolation: see the `.flux` task "unify the pre-launch input path with the
+/// app reader" for why a second background reader on stdin is unsafe while
 /// [`crate::app::crossterm_input_stream`] is coupled to `App::run`'s singleton statics.
+///
+/// On unix that read is the app's own byte reader ([`crate::input::reader::TtyReader`]), so the
+/// selector frames and decodes keys exactly as the app will a moment later; elsewhere it is
+/// crossterm's `event::read()`.
 pub async fn run_startup_selector(
     theme: &UiTheme,
     keymap: &SelectKeymap,
@@ -82,11 +86,48 @@ pub async fn run_startup_selector(
     let mut terminal = Terminal::new(CrosstermBackend::new(tui_stdout()))
         .map_err(|e| TuiError::Backend(e.to_string()))?;
 
-    run_loop(&mut terminal, theme, keymap, inner, on_apply).await
+    let mut input = Input::open()?;
+    run_loop(&mut terminal, &mut input, theme, keymap, inner, on_apply).await
+}
+
+/// The selector's key source.
+#[cfg(unix)]
+struct Input(crate::input::reader::TtyReader);
+
+#[cfg(unix)]
+impl Input {
+    fn open() -> Result<Self, TuiError> {
+        let timeout = crate::app::resolve_escape_timeout(|k| std::env::var(k).ok());
+        crate::input::reader::TtyReader::open(timeout)
+            .map(Self)
+            .map_err(|e| TuiError::Backend(e.to_string()))
+    }
+
+    fn read(&mut self) -> Result<Event, TuiError> {
+        self.0
+            .next_event()
+            .map_err(|e| TuiError::Backend(e.to_string()))
+    }
+}
+
+/// The selector's key source.
+#[cfg(not(unix))]
+struct Input;
+
+#[cfg(not(unix))]
+impl Input {
+    fn open() -> Result<Self, TuiError> {
+        Ok(Self)
+    }
+
+    fn read(&mut self) -> Result<Event, TuiError> {
+        ratatui::crossterm::event::read().map_err(|e| TuiError::Backend(e.to_string()))
+    }
 }
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<TuiStdout>>,
+    input: &mut Input,
     theme: &UiTheme,
     keymap: &SelectKeymap,
     inner: &mut dyn Selector,
@@ -112,7 +153,7 @@ async fn run_loop(
             })
             .map_err(|e| TuiError::Backend(e.to_string()))?;
 
-        match event::read().map_err(|e| TuiError::Backend(e.to_string()))? {
+        match input.read()? {
             // Ignore key-release events (Kitty protocol) so a single press is not double-counted.
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 match inner.handle(&key, keymap) {

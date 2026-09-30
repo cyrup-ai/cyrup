@@ -78,7 +78,7 @@ use cyrup_tools::ProcOps;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::event::AgentSessionEvent;
-use crate::host_services::InjectRequest;
+use crate::host_services::{InjectAck, InjectItem, InjectRequest};
 use crate::provider_swap::ProviderSwap;
 use crate::services::AgentSessionServices;
 use crate::subscriber::Fanout;
@@ -508,7 +508,7 @@ impl AgentSession {
         // no pump would accept messages that nothing could ever deliver, which is precisely the
         // "acknowledged but lost" failure this seam was rebuilt to remove.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InjectRequest>();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InjectItem>();
             let weak = Arc::downgrade(&arc);
             runtime.spawn(drive_injections(weak, rx));
             arc.services.host_services.set_inject_sink(tx);
@@ -760,9 +760,14 @@ impl Drop for AgentSession {
 /// the idle edge [`AgentSession::append_no_turn_messages`] takes back any the run never drained —
 /// the stranded steer this task was built to prevent — and appends them to the tree and transcript
 /// instead. A turn-triggering message still waits for the idle edge, as it always has.
+///
+/// ICOM-063 — while a run is active the producer now makes that steer itself, synchronously
+/// (`LiveHostServices::inject_message_steer`), because a steer from a `turn_end` handler must reach
+/// the loop's next poll and this task cannot be scheduled in between. It still arrives here, as
+/// [`InjectItem::Steered`], so its fate is owned by this task exactly like one it steered itself.
 async fn drive_injections(
     session: Weak<AgentSession>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<InjectRequest>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<InjectItem>,
 ) {
     let mut inbox: Vec<InjectRequest> = Vec::new();
     let mut steered: Vec<SteeredInjection> = Vec::new();
@@ -774,7 +779,7 @@ async fn drive_injections(
                 return;
             }
             match rx.recv().await {
-                Some(req) => inbox.push(req),
+                Some(item) => route_injection(item, &mut inbox, &mut steered),
                 // Every producer is gone (the host services backend dropped): nothing more can
                 // ever arrive, and nothing is owned, so there is nothing to answer for.
                 None => return,
@@ -786,7 +791,7 @@ async fn drive_injections(
         // notifications is upstream's own shape — and it is what lets an orchestrator answer about
         // a whole fan-out in a single turn instead of three sequential ones.
         if open {
-            open = drain_ready(&mut rx, &mut inbox);
+            open = drain_ready(&mut rx, &mut inbox, &mut steered);
         }
         let Some(session) = session.upgrade() else {
             for req in inbox.drain(..) {
@@ -809,9 +814,9 @@ async fn drive_injections(
             tokio::select! {
                 () = session.wait_for_idle() => {}
                 next = rx.recv(), if open => match next {
-                    Some(req) => {
-                        inbox.push(req);
-                        open = drain_ready(&mut rx, &mut inbox);
+                    Some(item) => {
+                        route_injection(item, &mut inbox, &mut steered);
+                        open = drain_ready(&mut rx, &mut inbox, &mut steered);
                     }
                     None => open = false,
                 },
@@ -824,7 +829,7 @@ async fn drive_injections(
         // it only takes what is already queued. It helps every producer (completions, steers,
         // watchdog warnings, intercom), which is why it lives here and not in the completion batcher.
         if open {
-            open = drain_ready(&mut rx, &mut inbox);
+            open = drain_ready(&mut rx, &mut inbox, &mut steered);
         }
         let (durable, turn) = split_by_group_trigger(std::mem::take(&mut inbox));
         // The no-turn half first: it is independent of the turn, and answering it before a possible
@@ -902,15 +907,33 @@ async fn drive_injections(
 /// Move every request already queued on `rx` into `inbox` without waiting. Returns `false` once the
 /// channel is closed and empty — every producer is gone.
 fn drain_ready(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<InjectRequest>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<InjectItem>,
     inbox: &mut Vec<InjectRequest>,
+    steered: &mut Vec<SteeredInjection>,
 ) -> bool {
     loop {
         match rx.try_recv() {
-            Ok(req) => inbox.push(req),
+            Ok(item) => route_injection(item, inbox, steered),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return true,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return false,
         }
+    }
+}
+
+/// File one queue item with the pump: a request joins the inbox to be scheduled; a message its
+/// producer already steered onto a live run (ICOM-063) joins `steered`, whose fate the idle edge
+/// settles exactly as for a steer the pump made itself.
+fn route_injection(
+    item: InjectItem,
+    inbox: &mut Vec<InjectRequest>,
+    steered: &mut Vec<SteeredInjection>,
+) {
+    match item {
+        InjectItem::Request(req) => inbox.push(req),
+        InjectItem::Steered(message) => steered.push(SteeredInjection {
+            message,
+            ack: InjectAck::detached(),
+        }),
     }
 }
 
