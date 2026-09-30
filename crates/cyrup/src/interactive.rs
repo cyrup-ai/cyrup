@@ -63,6 +63,61 @@ fn push_startup_warnings(
     }
 }
 
+/// The boot transcript up to the first turn, in pi's order (TUI-003):
+///
+/// 1. `init()`'s `renderInitialMessages()` (`interactive-mode.ts:1036` @v0.87.1) —
+///    [`App::render_initial_messages`]: the `--resume`/`--continue` replay, the untrusted-project
+///    banner, `Session compacted N times`;
+/// 2. `run()`'s startup-warning block (`:1120-1161`) — [`push_startup_warnings`] (the merged
+///    startup diagnostics, then the migrated-credential notice) and the `modelFallbackMessage`
+///    warning (`:1149-1151`); on a credential-less start that is `formatNoModelsAvailableMessage()`,
+///    the instruction that turns a modelless launch (SEAM-075) into a working session;
+/// 3. the CLI's initial message (`:1164-1166`), when there is one.
+///
+/// The loaded-resources panel (pi's `rebindCurrentSession`, `:1033`) is pushed by the caller ahead
+/// of this, as pi's `init()` does. Before TUI-003 the replay followed the startup warnings, and the
+/// trust banner and the compaction count were pushed from `App::run`'s seed — after the initial
+/// message — so `cyrup -c "msg"` on a compacted session showed the count below the user's message.
+///
+/// Pushing the initial message is the transcript half of submitting it; the caller submits it
+/// (`prompt_accepted`) once the event stream is subscribed.
+pub(crate) async fn render_boot_transcript<B: cyrup_tui::RebuildBackend>(
+    app: &mut App<B>,
+    session: &Arc<AgentSession>,
+    startup_diagnostics: &[crate::diagnostics::Diagnostic],
+    migrated_providers: &[String],
+    model_fallback_message: Option<String>,
+    initial_message: Option<&str>,
+) {
+    // The replay walk holds messages, not a session, so seed the has-a-definition registry it reads
+    // first (Pi's `definitionRegistry`, agent-session.ts:2659-2676, consulted per tool-execution
+    // component as `hasRendererDefinition()`, tool-execution.ts:103-105). Without it a `--resume`d
+    // MCP/extension tool call replays through `formatToolExecution`'s full argument dump.
+    app.refresh_known_tool_definitions(session);
+    // `showCacheMissNotices` gates the derived notices the replay re-injects, and
+    // `App::seed_session_ui` — which caches it — does not run until `App::run` takes over, so seed
+    // it here or a `--resume` would replay with the boot default rather than the persisted value.
+    app.state_mut().show_cache_miss_notices = session
+        .services()
+        .settings
+        .effective()
+        .show_cache_miss_notices();
+    app.render_initial_messages(session).await;
+
+    push_startup_warnings(
+        &mut app.state_mut().transcript,
+        startup_diagnostics,
+        migrated_providers,
+    );
+    if let Some(msg) = model_fallback_message {
+        app.state_mut().transcript.show_warning(msg);
+    }
+
+    if let Some(text) = initial_message {
+        app.state_mut().transcript.push_user(text);
+    }
+}
+
 /// Write Pi's exit hint — `To resume this session: cyrup [--session-dir DIR] --session ID` — on the
 /// way out of interactive mode (`interactive-mode.ts:3594-3597`, using `formatResumeCommand`,
 /// `:231-244`).
@@ -374,69 +429,25 @@ pub async fn run_interactive(
     app.set_verbose_startup(verbose);
     app.push_session_loaded_resources(&session);
 
-    // Pi's startup-warning block (interactive-mode.ts:871-885 @v0.83.0), in pi's order. Both lines
-    // go in the TRANSCRIPT, not on stderr, because that is the only place a first-run user will
-    // still see them once the alternate screen is up. Pushed after `showLoadedResources` (which pi
-    // runs from `init()`, ahead of `run()`'s startup-warning block) and before the replay.
-    //
-    // The `Warning: ` prefix belongs to pi's `showWarning` itself — `new Text(theme.fg("warning",
-    // `Warning: ${warningMessage}`), 1, 0)`, `interactive-mode.ts:4469-4473` @v0.87.1 — and is
-    // built in cyrup's one port of it, `TranscriptView::show_warning` (TUI-062).
-
-    // FIRST the startup diagnostics (CFG-088), THEN the migrated-credential notice. The latter
-    // tells the user their OAuth tokens and API keys were relocated out of
-    // `oauth.json`/`settings.json` into `auth.json` — a change that silently invalidates any backup
-    // or tooling pointing at the old files — and on stderr it lived exactly one frame before the
-    // paint that erased it (CFG-051).
-    push_startup_warnings(
-        &mut app.state_mut().transcript,
+    // TUI-003 — the boot transcript in pi's order: `init()`'s `renderInitialMessages()`
+    // (`interactive-mode.ts:1036` @v0.87.1) — the replay, the trust banner, the compaction count —
+    // and only then `run()`'s startup warnings (`:1120-1161`) and the initial message (`:1164`).
+    let model_fallback = runtime.model_fallback_message().await;
+    let initial = (!inputs.is_empty()).then_some(inputs.initial.as_str());
+    render_boot_transcript(
+        &mut app,
+        &session,
         &startup_diagnostics,
         &migrated_providers,
-    );
-    // THEN the `modelFallbackMessage` warning (`:883-885`). Reading it is the whole point: on a
-    // credential-less start it is `formatNoModelsAvailableMessage()`, i.e. "No models available.
-    // Use /login …" (auth-guidance.ts:14-16), the instruction that turns a modelless launch
-    // (SEAM-075) into a working session.
-    if let Some(msg) = runtime.model_fallback_message().await {
-        app.state_mut().transcript.show_warning(msg);
-    }
+        model_fallback,
+        initial,
+    )
+    .await;
 
     let input_stream = crossterm_input_stream(cancel.clone());
     let events = session.subscribe();
 
-    // TUI-003: a `--resume`/`--continue` boot starts on an existing branch, so seed the transcript
-    // from it before the first frame — Pi's `renderInitialMessages()` (interactive-mode.ts:3548).
-    // A fresh session has no messages and replays nothing. The raw projection keeps the
-    // `compactionSummary`/`branchSummary`/`custom`/`bashExecution` roles that `messages()` would
-    // have flattened to `user` prose at the LLM boundary (Pi feeds `renderSessionEntries` the same
-    // raw projection, interactive-mode.ts:3506-3516).
-    // The replay walk holds messages, not a session, so seed the has-a-definition registry it reads
-    // first (Pi's `definitionRegistry`, agent-session.ts:2659-2676, consulted per tool-execution
-    // component as `hasRendererDefinition()`, tool-execution.ts:103-105). Without it a `--resume`d
-    // MCP/extension tool call replays through `formatToolExecution`'s full argument dump.
-    app.refresh_known_tool_definitions(&session);
-    // `showCacheMissNotices` gates the derived notices below, and `App::seed_session_ui` — which
-    // caches it — does not run until `App::run` takes over, so seed it here or a `--resume` would
-    // replay with the boot default rather than the persisted value.
-    app.state_mut().show_cache_miss_notices = session
-        .services()
-        .settings
-        .effective()
-        .show_cache_miss_notices();
-    // `replay_items` is `raw_context_messages` plus the cache-miss and compaction-cost notices pi
-    // re-derives on every rebuild (`interactive-mode.ts:3694-3696`, `:3788-3794`); neither is
-    // persisted, so this is the only way a resumed transcript carries them.
-    let restored = session.replay_items().await;
-    if !restored.is_empty() {
-        // X11 — WITH the loaded extensions: Pi resolves `getMessageRenderer(message.customType)` on
-        // the replay walk (`interactive-mode.ts:3471`) exactly as it does on the live
-        // `addMessageToChat` path, so a `--resume`d session keeps the extension rendering it had.
-        app.replay_items_with_extensions(&restored, &session.services().ext_host)
-            .await;
-    }
-
     if !inputs.is_empty() {
-        app.state_mut().transcript.push_user(inputs.initial.clone());
         let _ = session.prompt_accepted(initial_input(&inputs)).await;
         // Queue any follow-up CLI messages into the interactive loop (Pi `initialMessages`,
         // main.ts:816): each becomes a sequential turn after the first.

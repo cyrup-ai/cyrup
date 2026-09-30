@@ -202,6 +202,34 @@ pub struct SingleStepSpec {
     pub context: Option<ContextMode>,
     /// Per-step override of discovery scope (func-SA §4.3 `RunOptions::agent_scope`).
     pub agent_scope: Option<AgentReadScope>,
+    /// SUBA-134 — pi's step / parallel-task `label` (`extension/schemas.ts:155,189,218` @v0.71.0):
+    /// the user-facing label, which [`Self::child_session_name`] prefers over the task excerpt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// SUBA-134 — pi's `step.sessionName`: a launcher-assigned child session name (a dynamic
+    /// fan-out member's, set at expansion; an appended chain step's), which wins over the
+    /// derivation in [`Self::child_session_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+}
+
+impl SingleStepSpec {
+    /// SUBA-134 — the name this step's child session runs under: pi `step.sessionName ??
+    /// deriveChildSessionName({ agent: step.agent, task, label: step.label })`
+    /// (`subagent-runner.ts:828,1913,1967` @v0.71.0).
+    #[must_use]
+    pub fn child_session_name(&self, task: &str) -> Option<String> {
+        self.session_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                crate::exec::child_session_name::derive_child_session_name(
+                    Some(&self.agent),
+                    Some(task),
+                    self.label.as_deref(),
+                )
+            })
+    }
 }
 
 /// A static-width fan-out over a fixed list of [`SingleStepSpec`] (func-SA §4.2 `ParallelGroup`).
@@ -390,6 +418,16 @@ pub struct ImportAsyncRootSpec {
     /// [`OutputRegistry`] (pi's `outputName`/`as`) — `None` means the imported root's output is not
     /// referenceable by any later `{outputs.name}` reference.
     pub output: Option<String>,
+}
+
+impl ImportAsyncRootSpec {
+    /// The attached step's label — pi's production attach passes `` label: `Attached ${runId}` ``
+    /// (`subagent-executor.ts:1996` @v0.71.0), which `executeAsyncChain` keeps over its own
+    /// `Attached root ${runId}` default (`async-execution.ts:1299`).
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("Attached {}", self.run_id)
+    }
 }
 
 /// The discriminated union `SingleStep | ParallelGroup | DynamicGroup | ImportAsyncRoot`
@@ -1309,6 +1347,11 @@ pub struct StepResult {
     /// [`crate::exec::SingleResult::tool_budget_blocked`] so an async workflow child's terminal
     /// result still settles `budget_exhausted`.
     pub tool_budget_blocked: bool,
+    /// SUBA-134 — the name the step's child session ran under
+    /// ([`crate::exec::SingleResult::session_name`], pi `sessionName: childSessionName` on the
+    /// runner's step result, `subagent-runner.ts:972,1043,1515` @v0.71.0). `None` for every
+    /// executor that runs no child.
+    pub session_name: Option<String>,
 }
 
 impl StepResult {
@@ -1346,6 +1389,7 @@ impl StepResult {
             transcript_path: None,
             transcript_error: None,
             watchdog: None,
+            session_name: None,
         }
     }
 
@@ -1381,6 +1425,7 @@ impl StepResult {
             transcript_path: None,
             transcript_error: None,
             watchdog: None,
+            session_name: None,
         }
     }
 }
@@ -2132,10 +2177,34 @@ async fn run_dynamic_group(
             )
             .map_err(SubagentError::StructuredOutputInvalid)?;
             let resolved = resolve_step_task(&item_task, registry, ctx, spec.template.as_ref())?;
+            // SUBA-134 — pi's per-item `label: task.label ?? step.parallel.label` (item
+            // templates supported) and `sessionName: deriveChildSessionName({ agent, task:
+            // taskText, label })` (`subagent-runner.ts:3561-3567,3580` @v0.71.0): named from the
+            // item's own task text, before any chain instruction is folded in.
+            let label = spec
+                .template
+                .label
+                .as_deref()
+                .map(|label| {
+                    crate::spawn::dynamic_fanout::resolve_item_template(
+                        label,
+                        item_name,
+                        &entry.item,
+                    )
+                })
+                .transpose()
+                .map_err(SubagentError::StructuredOutputInvalid)?;
+            let session_name = crate::exec::child_session_name::derive_child_session_name(
+                Some(&spec.template.agent),
+                Some(&item_task),
+                label.as_deref(),
+            );
             expanded.push(SingleStepSpec {
                 skills: None,
                 session_dir: None,
                 task: resolved,
+                label,
+                session_name,
                 ..(*spec.template).clone()
             });
         }
@@ -2593,6 +2662,7 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
         aggregate: StepResult {
             execution: None,
             tool_budget_blocked: false,
+            session_name: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,
             success,
@@ -2667,6 +2737,8 @@ mod tests {
             acceptance: None,
             context: None,
             agent_scope: None,
+            label: None,
+            session_name: None,
         }
     }
 
@@ -4059,6 +4131,90 @@ mod tests {
         assert!(
             calls[1].contains("Review src/b.ts"),
             "second child's task must be substituted from its own item: {calls:?}"
+        );
+    }
+
+    /// Records each dispatched member's `(label, session_name)`.
+    #[derive(Default)]
+    struct NameRecordingExecutor {
+        names: StdMutex<Vec<(Option<String>, Option<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SingleStepExecutor for NameRecordingExecutor {
+        async fn run_single(
+            &self,
+            step: &SingleStepSpec,
+            _resolved_task: &str,
+            _ctx: &ChainRunContext,
+        ) -> Result<StepResult, SubagentError> {
+            self.names
+                .lock()
+                .expect("lock")
+                .push((step.label.clone(), step.session_name.clone()));
+            Ok(StepResult::success(Some("ok".to_string()), None))
+        }
+    }
+
+    /// SUBA-134 — pi's per-item `label: task.label ?? step.parallel.label` (item templates
+    /// resolved per item) and `sessionName: deriveChildSessionName({ agent, task: taskText, label
+    /// })` (`subagent-runner.ts:3561-3567` @v0.71.0; `dynamic-fanout.ts:253-254`): every member
+    /// is dispatched already named, from its own item's label — or, with no label, from its own
+    /// item's task, never the chain instructions folded in after.
+    #[tokio::test]
+    async fn dynamic_group_names_each_member_from_its_own_item() {
+        let run = |template: SingleStepSpec| async move {
+            let dynamic = dynamic_group_full(
+                "outputs.targets",
+                template,
+                "reviews",
+                Some("t"),
+                Some("/path"),
+                Some(4),
+                OnEmpty::Skip,
+            );
+            let graph: ChainGraph = vec![RunnerStep::DynamicGroup(dynamic)];
+            let executor = Arc::new(NameRecordingExecutor::default());
+            let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
+            let mut registry = OutputRegistry::new();
+            registry.register(
+                "targets",
+                serde_json::json!([{ "path": "src/a.ts" }, { "path": "src/b.ts" }]),
+            );
+            walk_chain(
+                &graph,
+                &mut registry,
+                &executor_dyn,
+                &run_ctx(CancelToken::new()),
+            )
+            .await
+            .expect("walk succeeds");
+            let mut names = executor.names.lock().expect("lock").clone();
+            names.sort();
+            names
+        };
+
+        let mut labelled = single_step("reviewer", "Review {t.path}");
+        labelled.label = Some("Lane {t.path}".to_string());
+        assert_eq!(
+            run(labelled).await,
+            [
+                (
+                    Some("Lane src/a.ts".to_string()),
+                    Some("reviewer: Lane src/a.ts".to_string())
+                ),
+                (
+                    Some("Lane src/b.ts".to_string()),
+                    Some("reviewer: Lane src/b.ts".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            run(single_step("reviewer", "Review {t.path}")).await,
+            [
+                (None, Some("reviewer: Review src/a.ts".to_string())),
+                (None, Some("reviewer: Review src/b.ts".to_string())),
+            ]
         );
     }
 

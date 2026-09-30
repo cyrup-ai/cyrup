@@ -11,16 +11,18 @@
 //! | tracing, HTTP proxy, dirs, settings, first-time setup, `models.json`, catalogs | [`cyrup::bootstrap`] |
 //! | arg leniency, extension-flag capture, the `Cli` surface | [`cyrup::cli`] |
 //! | run-and-exit actions (`--export`, `--list-models`) | [`cyrup::actions`] |
-//! | which session, and under what project trust | [`cyrup::prelaunch`] |
-//! | factory + native extensions + runtime launch + post-build knobs | [`cyrup::session_launch`] |
+//! | which session (none for `--help`: pi's in-memory session), and under what project trust | [`cyrup::prelaunch`] |
+//! | factory + native extensions + runtime launch + the `--help` exit + post-build knobs | [`cyrup::session_launch`] |
 //! | the TTY front end | [`cyrup::interactive`] |
 //! | the non-interactive PRINT/JSON/RPC dispatchers | [`cyrup::run`] |
 //!
 //! What stays here is the ORDER, and the order is the behaviour. Each phase carries the pi
 //! `main.ts` line it corresponds to, because several of them are correct only where they sit —
 //! PROV-047 above every path that can egress, SEAM-106's `--export` position, DRIFT-007's two
-//! catalog phases straddling the `--list-models` exit, `apply_post_build` before pi's `:852`. Read
-//! top to bottom, this function is the audit trail for all of it.
+//! catalog phases straddling the `--list-models` exit, `apply_post_build` before pi's `:852`, and
+//! SEAM-020's `--help` exit — pi's `main.ts:857-864` @v0.87.1, only once the runtime exists, so the
+//! help lists the loaded extensions' flags after the startup settings diagnostics. Read top to
+//! bottom, this function is the audit trail for all of it.
 //!
 //! [`set_process_name`] cannot move into the library: it needs `unsafe` (`prctl(PR_SET_NAME)` /
 //! `pthread_setname_np`) and `cyrup`'s lib root is `#![forbid(unsafe_code)]`. That is also why
@@ -38,9 +40,9 @@ use cyrup::session_launch::PostBuild;
 use cyrup::{
     AppMode, Cli, Diagnostic, DiagnosticLevel, actions, apply_arg_leniency, bootstrap,
     build_inputs, diagnostics, interactive, migrations, normalize_short_aliases,
-    partition_extension_flags, predispatch, prelaunch, render_help, resolve_app_mode,
-    run_acp_dispatch, run_json_dispatch, run_print_dispatch, run_rpc_dispatch, select_provider,
-    session_launch, should_take_over_stdout, spawn_abort_on_signal, timings,
+    partition_extension_flags, predispatch, prelaunch, resolve_app_mode, run_acp_dispatch,
+    run_json_dispatch, run_print_dispatch, run_rpc_dispatch, select_provider, session_launch,
+    should_take_over_stdout, spawn_abort_on_signal, timings,
 };
 use cyrup_config::{AuthStore, EnvVars};
 use cyrup_sdk::core::CancelToken;
@@ -379,12 +381,10 @@ async fn run() -> anyhow::Result<i32> {
         return actions::export_session_html(export, messages.first().map(String::as_str)).await;
     }
 
-    // Rich `--help` body (Pi printHelp, args.ts:212). Loaded-extension flags are the outer extension
-    // tier; the bin injects an empty set today (the injection point is preserved 1:1).
-    if cli.help {
-        print!("{}", render_help(&[]));
-        return Ok(0);
-    }
+    // (`--help` is NOT handled here. Pi answers it only once the runtime exists — `main.ts:857-864`
+    // @v0.87.1, after `createAgentSessionRuntime` at `:845` — because its body lists the flags the
+    // loaded extensions declared and is preceded by the startup settings diagnostics. It exits from
+    // `session_launch::launch`, below. CFG-088 / SEAM-020.)
 
     // Conflicting-session-flag diagnostics (Pi `validateForkFlags`/`validateSessionIdFlags`).
     if let Err(msg) = cli.validate_session_flags() {
@@ -466,7 +466,12 @@ async fn run() -> anyhow::Result<i32> {
 
     // `--api-key` requires a resolvable model spec (Pi main.ts:701-710): without any of
     // `--model`/`--provider`/`--models` there is no provider to attach the key to.
-    if cli.api_key.is_some()
+    //
+    // `!cli.help`: pi raises this as a runtime diagnostic inside `createRuntime` (`main.ts:810-818`
+    // @v0.87.1), which is only reported after the `--help` exit (`:857`), so `--api-key k --help`
+    // prints the help.
+    if !cli.help
+        && cli.api_key.is_some()
         && cli.model.is_none()
         && cli.provider.is_none()
         && cli.models.is_empty()
@@ -504,21 +509,30 @@ async fn run() -> anyhow::Result<i32> {
         return actions::list_models_action(&dirs, &models_json, search);
     }
 
-    let mut provider = select_provider(
+    // An unknown `--provider` is a runtime diagnostic upstream (`buildSessionOptions`,
+    // `main.ts:468-479` @v0.87.1), reported only after the `--help` exit — so under `--help` it must
+    // not stop the run before the help is printed. The help needs a runtime, not a model.
+    let mut provider = match select_provider(
         cli.provider.as_deref(),
         cli.model.as_deref(),
         cli.api_key.as_deref(),
         &models_json,
-    )?;
+    ) {
+        Err(_) if cli.help => select_provider(None, None, None, &models_json)?,
+        selected => selected?,
+    };
 
     // Unknown-model diagnostic (Pi `resolveCliModel`, main.ts:377-378 / model-resolver.ts:494-500):
     // a `--model` on a *known* provider whose id is not in the catalog warns (the build still proceeds
     // with a custom-id model). An *unknown provider* already errored in `select_provider` above.
-    if let Some(warning) = cyrup::unknown_model_warning(
-        cli.provider.as_deref(),
-        cli.model.as_deref(),
-        &cyrup::provider::all_available_models(&models_json),
-    ) {
+    // Under `--help` it is pi's runtime diagnostic too, never printed on the help path.
+    if !cli.help
+        && let Some(warning) = cyrup::unknown_model_warning(
+            cli.provider.as_deref(),
+            cli.model.as_deref(),
+            &cyrup::provider::all_available_models(&models_json),
+        )
+    {
         diagnostics::report(&[Diagnostic::warning(warning)]);
     }
 
@@ -526,7 +540,11 @@ async fn run() -> anyhow::Result<i32> {
     // (resource-loader.ts:60-63): a `--system-prompt`/`--append-system-prompt` token that names an
     // EXISTING but unreadable file warns and falls back to being used as literal text — never fatal.
     let (mut config, prompt_diagnostics) = cli.to_session_config_with_diagnostics(&dirs, mode);
-    diagnostics::report(&prompt_diagnostics);
+    // Upstream these come out of the resource loader with the runtime's diagnostics, which a
+    // `--help` run exits before reporting (`main.ts:857-864` @v0.87.1).
+    if !cli.help {
+        diagnostics::report(&prompt_diagnostics);
+    }
     // CFG-003: a package declared in `settings.json` whose working tree is missing is CLONED during
     // session assembly, exactly as Pi's resource loader does — `packageManager.resolve()` with no
     // `onMissing` (resource-loader.ts:403,549 @v0.83.0) reaches `installMissing`
@@ -535,13 +553,23 @@ async fn run() -> anyhow::Result<i32> {
     // already folded into `overrides.offline` above. It is the ONLY gate upstream has, so no
     // settings key or extra flag is invented for it.
     config.install_missing_packages = !overrides.offline;
+    // `--help` runs on an in-memory session — pi's `createSessionManager` opens with `if
+    // (parsed.noSession || parsed.help || parsed.listModels !== undefined) return
+    // SessionManager.inMemory(cwd, …)` (`main.ts:363-365` @v0.87.1) — so no session is looked up,
+    // picked, forked or written: `--help --resume` opens no picker, and `--help --session <missing>`
+    // still prints the help (SEAM-020).
+    if cli.help {
+        config.target = cyrup_session_svc::SessionTarget::New;
+        config.persist = false;
+    }
 
     // Non-interactive session-resolution depth (Pi `createSessionManager`, main.ts:254-350): a
     // `--session`/`--fork` partial-UUID prefix match, a global cross-project search, a
     // `--session-id` create-if-missing-by-exact-id, the plain-stdin fork-into-cwd confirm, and the
     // non-interactive missing-session-cwd guard. Engaged only when a session ref is supplied — the
     // bare `New`/`Continue` target from `to_session_config` stands otherwise (no needless listing).
-    if (cli.fork.is_some() || cli.session.is_some() || cli.session_id.is_some())
+    if !cli.help
+        && (cli.fork.is_some() || cli.session.is_some() || cli.session_id.is_some())
         && let Some(code) = prelaunch::resolve_session(&cli, &dirs, mode, &mut config).await?
     {
         return Ok(code);
@@ -552,6 +580,7 @@ async fn run() -> anyhow::Result<i32> {
     // Interactive-only (it needs a real TTY); the one-shot/RPC live path is untouched. Returns
     // `Some(0)` when the user cancels the picker.
     if mode == AppMode::Interactive
+        && !cli.help
         && let Some(code) = prelaunch::resolve_startup_ui(&cli, &dirs, mode, &mut config).await?
     {
         return Ok(code);
@@ -568,7 +597,11 @@ async fn run() -> anyhow::Result<i32> {
     // Runtime model-catalog overlay, phase 2 (DRIFT-007) — pi's detached, mode-gated
     // `void modelRuntime.refresh()` (main.ts:863-866). Downstream of the `--list-models` exit, like
     // pi's, so a listing run issues no request. Nothing is awaited.
-    bootstrap::maybe_spawn_catalog_refresh(mode, &dirs, &env, &overrides, &settings_store);
+    // `!cli.help`: pi's refresh starts after the `--help` exit (`main.ts:920-928` @v0.87.1), so a
+    // help run issues no request.
+    if !cli.help {
+        bootstrap::maybe_spawn_catalog_refresh(mode, &dirs, &env, &overrides, &settings_store);
+    }
 
     let cancel = CancelToken::new();
 
@@ -609,6 +642,8 @@ async fn run() -> anyhow::Result<i32> {
         // SEAM-065: trust is resolved INSIDE the build, in pi's tier order, so the extension
         // `project_trust` hook runs BEFORE the human is asked (project-trust.ts:54-70 vs :90-94).
         // The prompt callback is supplied for the interactive host only — pi's `hasUI` gate (:86-88).
+        // A `--help` run is not asked either: pi resolves its initial runtime's trust in `print`
+        // mode (`trustPromptMode = parsed.help || … ? "print" : appMode`, `main.ts:710` @v0.87.1).
         let factory = session_launch::build_factory(
             provider,
             config,
@@ -616,10 +651,7 @@ async fn run() -> anyhow::Result<i32> {
             auth_store.clone(),
             &dirs,
             models_json.clone(),
-            Some(prelaunch::trust_prompt_callback(
-                &dirs,
-                cli.use_theme.as_deref(),
-            )),
+            (!cli.help).then(|| prelaunch::trust_prompt_callback(&dirs, cli.use_theme.as_deref())),
         )?;
         // SEAM-075: `require_model: false`. pi gates its modelless stop on the MODE
         // (main.ts:852-855), so a credential-less first run still gets a TUI to type `/login` and
@@ -758,8 +790,9 @@ async fn run() -> anyhow::Result<i32> {
         return Ok(0);
     }
 
-    // `PI_STARTUP_BENCHMARK` is interactive-only (Pi main.ts:800-804).
-    if timings::startup_benchmark_enabled() {
+    // `PI_STARTUP_BENCHMARK` is interactive-only (Pi main.ts:800-804) — checked after the `--help`
+    // exit upstream (`main.ts:914-918` @v0.87.1), so a help run is not refused.
+    if !cli.help && timings::startup_benchmark_enabled() {
         anyhow::bail!("PI_STARTUP_BENCHMARK only supports interactive mode");
     }
 
@@ -789,7 +822,10 @@ async fn run() -> anyhow::Result<i32> {
     // an untrusted project reaching an ACP host resolves `NeedsPrompt` — which this arm answers as
     // untrusted today by supplying no callback. Wiring that prompt to
     // `session/request_permission` is `cyrup-acp`'s permission seam, not this call site.
-    if mode == AppMode::Acp {
+    //
+    // A `--help` run takes the shared launch below instead: pi has one `--help` exit, after the
+    // runtime exists, and the ACP arm never builds one here.
+    if mode == AppMode::Acp && !cli.help {
         diagnostics::report(&settings_diagnostics);
         let sessions_root = cyrup_acp::SessionsRoot(dirs.session_dir.clone());
         let factory = session_launch::build_factory(

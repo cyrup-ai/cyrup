@@ -289,9 +289,9 @@ fn renumber_markers(line: &[char], target: u32) -> Vec<char> {
 /// [`sanitize_paste`]'s per-char filter, not after: the filter drops the ESC and there is nothing
 /// left to recognise.
 ///
-/// The payload really does arrive intact — `escape_reassembly.rs`'s paste-body state machine emits
-/// an ESC inside `ESC [200~ … ESC [201~` verbatim, and `app::input` hands that straight to
-/// [`InputEditor::handle_paste`].
+/// The payload really does arrive intact — the input reader's framer (`crate::input::frame`, pi's
+/// `StdinBuffer` paste mode) keeps an ESC inside `ESC [200~ … ESC [201~` verbatim, and `app::input`
+/// hands that straight to [`InputEditor::handle_paste`].
 ///
 /// Hand-written scan rather than a regex: no new dependency, and no `&str` slicing (the crate denies
 /// `clippy::string_slice`). Codepoints outside `a`–`z` / `A`–`Z`, and any incomplete or malformed

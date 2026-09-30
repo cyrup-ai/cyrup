@@ -71,5 +71,6 @@ mod thinking_level_on_model_switch;
 mod tool_usage_extension_seam;
 mod transport_setting;
 mod tree_branch_summary_cap;
+mod turn_end_steer;
 mod type_driven_boundaries;
 mod ui_prompt_events;

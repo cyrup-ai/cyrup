@@ -67,10 +67,13 @@ pub enum EventPatch {
     Context { messages: Vec<Arc<AgentMessage>> },
     /// `message_end`: replace the message.
     Message(Box<Message>),
-    /// `before_agent_start`: system-prompt replacement + optional injection.
+    /// `before_agent_start`: system-prompt replacement + the messages to inject, in order. A
+    /// `Vec` because pi accumulates every handler's `message` (`emitBeforeAgentStart`,
+    /// `core/extensions/runner.ts:1330-1360` @v0.87.1), and one guest that registered several
+    /// handlers folds all of their messages into ONE outcome (the SDK's per-event fold).
     SystemPromptAndInject {
         system: Option<String>,
-        inject: Option<Box<Message>>,
+        inject: Vec<Message>,
     },
     /// `input` (Pi `action:"transform"`, runner.ts:1116-1119): rewrite the submission text and
     /// (optionally) its images. `images: None` keeps the current images (Pi `result.images ??
@@ -167,9 +170,7 @@ impl HostEvent {
                 if let Some(s) = system {
                     *system_prompt = s;
                 }
-                if let Some(m) = inject {
-                    injected.push(*m);
-                }
+                injected.extend(inject);
             }
             // `input` (Pi runner.ts:1116-1119): always rewrite the text; replace images only when
             // the handler supplied them (`Some`), else keep the folded-so-far images.

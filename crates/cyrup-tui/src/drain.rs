@@ -41,7 +41,7 @@
 //! producing. [`drain_stdin_before_exit`] keeps that ordering.
 //!
 //! `process.stdin.pause()` has no direct Rust analog — cyrup has no flowing stdin stream to pause,
-//! and the crossterm reader thread it *does* have is detached and unstoppable. The property that
+//! and the input reader thread it *does* have is detached and cannot be stopped mid-read. The property that
 //! call buys Pi (nothing buffered gets re-read after raw mode is off) is bought here by the drain
 //! itself, which is why the drain must run BEFORE [`crate::App::restore`] rather than after it.
 //!

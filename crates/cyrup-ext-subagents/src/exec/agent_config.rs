@@ -730,6 +730,13 @@ pub struct RunOptions {
     /// whether this child can be steered at all and under which pid. A parent that sees
     /// `supported: false` knows not to wait out the acknowledgment timeout.
     pub steer_capability_path: Option<PathBuf>,
+    /// SUBA-141 — where an external-CLI child writes its two bounded stream logs
+    /// (`external-<flatIndex>.stdout.log` / `.stderr.log`): pi's `asyncDir: path.dirname(ctx.outputFile)`
+    /// (`subagent-runner.ts:924` @v0.71.0) — the async run's own directory, which is what lets
+    /// Fleet tail them inside its `[asyncDir]` containment (`fleet-view.ts:590-599`). Set by the
+    /// background runner; `None` (a run with no run directory) falls back to the per-cwd attempt
+    /// scratch directory.
+    pub external_log_dir: Option<PathBuf>,
     /// pi `options.controlConfig` (`execution.ts:245`, threaded from `runSinglePath`'s
     /// `resolveControlConfig(deps.config.control, effectiveParams.control)`, `subagent-executor.ts:3385`
     /// @v0.34.0; the detached async runner reads the same value back out of its one-shot config,
@@ -912,6 +919,31 @@ pub struct LiveEventSink {
     /// `None` for every sink that has no process-terminal candidate to build (the foreground path,
     /// and every test), in which case the observations are dropped.
     writer_processes: Option<WriterProcessCallback>,
+    /// SUBA-141 — the external-CLI runner's live process hook — see
+    /// [`LiveEventSink::emit_external_process`]. `None` drops the updates.
+    external_processes: Option<ExternalProcessCallback>,
+}
+
+/// The [`ExternalProcessUpdate`] callback half of [`LiveEventSink`].
+type ExternalProcessCallback = std::sync::Arc<dyn Fn(ExternalProcessUpdate) + Send + Sync>;
+
+/// SUBA-141 — one live report from the external-CLI runner about its foreign process: pi's
+/// `input.onProcess?.(externalProcess)` (`external-cli-runner.ts:348,399` @v0.71.0), which the
+/// async runner publishes onto the step's `status.json` entry as `externalProcess`
+/// (`subagent-runner.ts:2247-2251`).
+///
+/// Carries the launch's runner descriptor beside the process. The runner already declared it on
+/// the pending step ([`crate::background::flat_index::declare_step_runner`], pi `runner:
+/// externalRunnerStatus(task.runner)`, `subagent-runner.ts:1918`); the telemetry fold fills it
+/// only on a step that has none, so a step the declaration could not resolve still reads as an
+/// external-CLI step once its process exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalProcessUpdate {
+    /// The launch's published runner descriptor.
+    pub runner: crate::runner::status::ExternalCliRunnerStatus,
+    /// The process as it stands: the spawn report (pid, start, log paths) or the close report
+    /// (exit, duration, byte counts).
+    pub process: crate::runner::status::ExternalProcessStatus,
 }
 
 /// One installed live-event callback. Named so [`LiveEventSink`]'s fields do not each have to
@@ -962,6 +994,26 @@ impl LiveEventSink {
             lines: std::sync::Arc::new(sink),
             notes: None,
             writer_processes: None,
+            external_processes: None,
+        }
+    }
+
+    /// SUBA-141 — also route the external-CLI runner's live process reports to `sink`
+    /// (additive; a sink without one drops them). Installed by the background runner, which
+    /// publishes each report onto the step's `status.json` entry.
+    #[must_use]
+    pub fn with_external_process_sink(
+        mut self,
+        sink: impl Fn(ExternalProcessUpdate) + Send + Sync + 'static,
+    ) -> Self {
+        self.external_processes = Some(std::sync::Arc::new(sink));
+        self
+    }
+
+    /// Deliver one external-process report to the installed callback, if there is one.
+    pub fn emit_external_process(&self, update: ExternalProcessUpdate) {
+        if let Some(sink) = self.external_processes.as_ref() {
+            sink(update);
         }
     }
 

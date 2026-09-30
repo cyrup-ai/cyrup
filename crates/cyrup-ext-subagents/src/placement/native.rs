@@ -671,7 +671,21 @@ const UPLOAD_SCRIPT: &str = "umask 077; cat > \"$1/$2\"";
 const STDERR_TAIL_SCRIPT: &str =
     "p=\"$1/stderr\"; if test -f \"$p\" && test ! -L \"$p\"; then tail -c 4096 \"$p\"; fi";
 const FETCH_SCRIPT: &str = "p=\"$1/$2\"; test -f \"$p\" && test ! -L \"$p\" && cat \"$p\"";
-const REMOVE_SCRIPT: &str = "p=$1; case \"${p##*/}\" in cyrup-subagents-herdr-*) test -d \"$p\" && test ! -L \"$p\" && rm -rf -- \"$p\";; *) exit 64;; esac";
+/// `removeRemoteRuntimeDir` (`herdr-placed-run.ts:135`), made atomic against the writers that
+/// outlive the attempt: the dir is first moved into a fresh private holder beside it, and only the
+/// holder is then deleted.
+///
+/// Upstream removes the dir once its only remote writer is gone: the bridge lives inside the
+/// remote Pi, which `pane.close` ends, and the bridge forward has been awaited closed
+/// (`HerdrPiSession.dispose`, `:212`). Here the relay's remote half is a separate process that
+/// polls the dir and rewrites its `.relay-*` state files there every 200 ms, and stopping the
+/// local ssh does not end it (killing an ssh client ends no remote command), so it is still
+/// running when cleanup starts. A plain `rm -rf` that is descheduled between clearing the dir and
+/// its final `rmdir` then fails with "Directory not empty", and the dir survives. After the
+/// `mv`, every such writer addresses a path that no longer exists, so nothing can put an entry
+/// into what is being deleted. `mktemp -d` makes the holder private (a predictable name in a
+/// shared `/tmp` could be planted), and `mv` into a directory is portable across GNU and BSD.
+const REMOVE_SCRIPT: &str = "p=$1; case \"${p##*/}\" in cyrup-subagents-herdr-*) ;; *) exit 64;; esac; test -d \"$p\" && test ! -L \"$p\" || exit 1; h=$(mktemp -d \"${p%/*}/cyrup-subagents-herdr-removing-XXXXXXXX\") || exit 1; mv -- \"$p\" \"$h/\" || { rmdir -- \"$h\"; exit 1; }; rm -rf -- \"$h\"";
 const MAX_FETCH_BYTES: usize = 16 * 1024 * 1024;
 
 /// A runtime directory safe to type into a pane unquoted.
@@ -863,7 +877,18 @@ impl PlacedNativeRun {
         }
         if disposition != PlacedDisposition::Unknown {
             let _ = self.close_pane().await;
-            let _ = self.remote(REMOVE_SCRIPT, &[&self.runtime_dir], None).await;
+            // Upstream's `removeRemoteRuntimeDir` throws on a non-zero status; the attempt's result
+            // is already decided here, so a dir left behind is reported rather than silent.
+            let removed = self.remote(REMOVE_SCRIPT, &[&self.runtime_dir], None).await;
+            if removed.error.is_some() || removed.status != Some(0) {
+                tracing::warn!(
+                    runtime_dir = %self.runtime_dir,
+                    status = ?removed.status,
+                    error = ?removed.error,
+                    stderr = %removed.stderr.chars().take(512).collect::<String>(),
+                    "Could not remove the exact owned remote runtime directory"
+                );
+            }
         }
         if let Some(connection) = self.connection.take() {
             connection.close().await;

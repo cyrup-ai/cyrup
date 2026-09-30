@@ -95,7 +95,7 @@ pub(crate) use executor::ExecSingleStepExecutor;
 pub(crate) use finish::{WorkflowResultFields, apply_workflow_settlement_plan};
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -113,7 +113,7 @@ mod tests {
 
     /// A minimal resolved persona, for the tests that need a dispatch to get PAST the
     /// persona-map lookup and reach the spawn.
-    pub(super) fn resolved_persona(name: &str) -> crate::exec::ResolvedAgentPersona {
+    pub(crate) fn resolved_persona(name: &str) -> crate::exec::ResolvedAgentPersona {
         crate::exec::ResolvedAgentPersona {
             default_tool_timeout_ms: None,
             inherit_global_context: false,
@@ -169,6 +169,8 @@ mod tests {
             acceptance: None,
             context: None,
             agent_scope: None,
+            label: None,
+            session_name: None,
         }
     }
 

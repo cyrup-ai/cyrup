@@ -36,7 +36,7 @@ pub const MANIFEST_FILE: &str = "extension.json";
 pub struct ExtensionManifest {
     pub id: String,
     pub version: String,
-    /// WIT world compatibility, e.g. `cyrup:ext@0.12` (see [`HOST_WORLD`], which is the value a
+    /// WIT world compatibility, e.g. `cyrup:ext@0.13` (see [`HOST_WORLD`], which is the value a
     /// manifest written today should carry — this example rotted two bumps behind it once already).
     pub world: String,
     /// Source entry for a Tier-1 build; absent for a prebuilt `.wasm` package.
@@ -267,7 +267,12 @@ impl Capabilities {
 ///   `events.on-context-with-system` (EXT-079; pi `ContextWithSystemEvent`, `:708-711`). A 0.11
 ///   guest exports nothing under those names, so it takes the bump. The same batch's
 ///   `registration.unsubscribe` import (EXT-080) is ADDITIVE and would not have required one.
-pub const HOST_WORLD: &str = "cyrup:ext@0.12";
+/// - 0.12 -> 0.13: IMPORT RE-SIGNING — `registration.register-tool` and
+///   `registration.register-flag` return `result<_, string>` (EXT-082), the value form of pi's
+///   `registerTool` / `registerFlag` throw (`core/extensions/loader.ts:274-279`, `:312-316`
+///   @v0.87.1), so a guest can stop its handler at the refusal. A 0.12 guest calls them at the old
+///   `()`-returning signature and fails to link, so it takes the bump.
+pub const HOST_WORLD: &str = "cyrup:ext@0.13";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

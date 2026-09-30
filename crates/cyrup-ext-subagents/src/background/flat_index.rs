@@ -55,6 +55,23 @@ pub fn flat_step_width(step: &RunnerStep) -> usize {
     }
 }
 
+/// SUBA-141 — pi's declared `runner: externalRunnerStatus(task.runner)` on each pending status
+/// step (`subagent-runner.ts:1572-1575,1918,1972` @v0.71.0): a step whose agent runs an external
+/// CLI reads as one from declaration, so Fleet labels it `external-cli` before its process exists.
+pub fn declare_step_runner(config: &RunnerConfig, step: &mut StepStatus) {
+    if let Some(crate::runner::AgentRunnerConfig::ExternalCli(cli)) = config
+        .resolved_agents
+        .get(&step.agent)
+        .and_then(|persona| persona.runner.as_ref())
+    {
+        step.runner = Some(crate::runner::status::resolve_external_cli_runner_status(
+            cli.adapter,
+            &cli.command,
+            &cli.args,
+        ));
+    }
+}
+
 /// The flat status index the step at `top_index` starts at — pi's `flatStepCount` at the moment
 /// that step was declared (`subagent-runner.ts:2620,2657,2672`).
 ///
@@ -99,26 +116,32 @@ pub fn flat_total(steps: &[RunnerStep]) -> usize {
 /// is deliberately not taken here.
 #[must_use]
 pub fn pending_step_statuses_for(step: &RunnerStep) -> Vec<StepStatus> {
-    // SUBA-134 — pi declares each status step with its child's `sessionName`
-    // (`subagent-runner.ts:1913-1917` @v0.71.0), so a status reader can label a child before it
-    // settles; the child runs under the same derivation.
-    let named = |agent: &str, task: &str| {
-        let mut status = StepStatus::pending(agent);
-        status.session_name = crate::exec::child_session_name::derive_child_session_name(
-            Some(agent),
-            Some(task),
-            None,
-        );
+    // SUBA-134 — pi declares each status step with its child's `sessionName: step.sessionName ??
+    // deriveChildSessionName({ agent, task, label })` (`subagent-runner.ts:1913-1917,1967-1971`
+    // @v0.71.0), so a status reader can label a child before it settles, and with its `label`.
+    let named = |spec: &crate::spawn::chain_graph::SingleStepSpec| {
+        let mut status = StepStatus::pending(spec.agent.clone());
+        status.session_name = spec.child_session_name(&spec.task);
+        status.label.clone_from(&spec.label);
         status
     };
     match step {
-        RunnerStep::SingleStep(spec) => vec![named(&spec.agent, &spec.task)],
-        RunnerStep::ImportAsyncRoot(spec) => vec![StepStatus::pending(spec.agent.clone())],
-        RunnerStep::ParallelGroup(group) => group
-            .steps
-            .iter()
-            .map(|task| named(&task.agent, &task.task))
-            .collect(),
+        RunnerStep::SingleStep(spec) => vec![named(spec)],
+        // An attached root is a sequential step with an empty task and its attachment label
+        // (`async-execution.ts:1294-1300`), so it takes the same `:1967` derivation.
+        RunnerStep::ImportAsyncRoot(spec) => {
+            let mut status = StepStatus::pending(spec.agent.clone());
+            status.session_name = crate::exec::child_session_name::derive_child_session_name(
+                Some(&spec.agent),
+                Some(""),
+                Some(&spec.label()),
+            );
+            status.label = Some(spec.label());
+            vec![status]
+        }
+        RunnerStep::ParallelGroup(group) => group.steps.iter().map(named).collect(),
+        // pi's `expand:<agent>` placeholder carries a label but no `sessionName` (`:1938-1956`);
+        // each member is named when it is materialized (`chain_graph::run_dynamic_group`).
         RunnerStep::DynamicGroup(dynamic) => {
             vec![StepStatus::pending(format!(
                 "<dynamic:{}>",
@@ -182,6 +205,8 @@ mod tests {
             acceptance: None,
             context: None,
             agent_scope: None,
+            label: None,
+            session_name: None,
         }
     }
 
@@ -247,6 +272,75 @@ mod tests {
         assert_eq!(flat_range(&steps, 9), 3..3);
     }
 
+    /// SUBA-134 — pi declares each status step with `sessionName: step.sessionName ??
+    /// deriveChildSessionName({ agent, task, label })` (`subagent-runner.ts:1913,1967`,
+    /// `chain-append.ts:164` @v0.71.0): a labelled step or member is named by its label, a
+    /// launcher-assigned name wins, and an attached root — an empty task with its attachment label
+    /// (`async-execution.ts:1294-1300`) — is `<agent>: Attached <runId>`. A dynamic group's
+    /// `expand:` placeholder carries none (`:1938-1956`).
+    #[test]
+    fn pending_entries_are_named_from_their_label_and_an_attached_root_from_its_attachment() {
+        let mut labelled = spec("scout");
+        labelled.task = "survey the auth module".to_string();
+        labelled.label = Some("Lane A".to_string());
+        let mut assigned = spec("builder");
+        assigned.session_name = Some("builder: item 2".to_string());
+        let plain = spec("critic");
+
+        let names = |step: &RunnerStep| -> Vec<Option<String>> {
+            pending_step_statuses_for(step)
+                .into_iter()
+                .map(|status| status.session_name)
+                .collect()
+        };
+        assert_eq!(
+            names(&RunnerStep::SingleStep(labelled.clone())),
+            [Some("scout: Lane A".to_string())]
+        );
+        assert_eq!(
+            names(&RunnerStep::ParallelGroup(ParallelGroupSpec {
+                steps: vec![labelled, assigned, plain],
+                concurrency: 4,
+                fail_fast: false,
+                worktree: false,
+                lane: None,
+            })),
+            [
+                Some("scout: Lane A".to_string()),
+                Some("builder: item 2".to_string()),
+                Some("critic: t".to_string()),
+            ]
+        );
+        assert_eq!(
+            names(&RunnerStep::ImportAsyncRoot(
+                crate::spawn::chain_graph::ImportAsyncRootSpec {
+                    run_id: "run-7f".to_string(),
+                    async_root: std::path::PathBuf::from("/a"),
+                    results_dir: std::path::PathBuf::from("/r"),
+                    index: 0,
+                    agent: "planner".to_string(),
+                    output: None,
+                }
+            )),
+            [Some("planner: Attached run-7f".to_string())]
+        );
+        assert_eq!(names(&dynamic()), [None]);
+        // Each entry also carries its label (`label: task.label`, `subagent-runner.ts:1922`).
+        let labels = |step: &RunnerStep| -> Vec<Option<String>> {
+            pending_step_statuses_for(step)
+                .into_iter()
+                .map(|status| status.label)
+                .collect()
+        };
+        let mut labelled = spec("scout");
+        labelled.label = Some("Lane A".to_string());
+        assert_eq!(
+            labels(&RunnerStep::SingleStep(labelled)),
+            [Some("Lane A".to_string())]
+        );
+        assert_eq!(labels(&RunnerStep::SingleStep(spec("critic"))), [None]);
+    }
+
     /// SUBA-093's headline: a `tasks[]` fan-out publishes one status entry PER MEMBER, named by
     /// that member's own agent — not one `<parallel:N tasks>` entry for the whole group.
     #[test]
@@ -275,6 +369,48 @@ mod tests {
             .map(|s| s.agent)
             .collect();
         assert_eq!(single_agents, ["solo".to_string()]);
+    }
+
+    /// SUBA-141 — pi declares each pending step with `runner: externalRunnerStatus(task.runner)`
+    /// (`subagent-runner.ts:1572-1575,1918,1972` @v0.71.0), so a step whose agent runs an external
+    /// CLI reads as one (Fleet's `external-cli` fact) before its process exists; a native agent's
+    /// step declares none.
+    ///
+    /// *Gutted by*: `declare_step_runner`'s assignment.
+    #[test]
+    fn a_pending_external_cli_step_declares_its_runner() {
+        let mut cfg = config(None, crate::artifacts::ArtifactConfig::default());
+        let mut foreign = crate::background::runner_main::tests::resolved_persona("foreign");
+        foreign.runner = Some(crate::runner::AgentRunnerConfig::ExternalCli(
+            crate::runner::ExternalCliRunner {
+                adapter: None,
+                command: "my-cli".to_string(),
+                args: vec!["--flag".to_string()],
+                prompt_delivery_stdin: false,
+                capabilities: None,
+            },
+        ));
+        cfg.resolved_agents.insert("foreign".to_string(), foreign);
+        cfg.resolved_agents.insert(
+            "native".to_string(),
+            crate::background::runner_main::tests::resolved_persona("native"),
+        );
+        let mut external = StepStatus::pending("foreign");
+        declare_step_runner(&cfg, &mut external);
+        let declared = external.runner.as_ref().map(|runner| {
+            (
+                runner.kind.as_str(),
+                runner.command.as_str(),
+                runner.args.clone(),
+            )
+        });
+        assert_eq!(
+            declared,
+            Some(("external-cli", "my-cli", vec!["--flag".to_string()]))
+        );
+        let mut native = StepStatus::pending("native");
+        declare_step_runner(&cfg, &mut native);
+        assert_eq!(native.runner, None);
     }
 
     // ---- resolve_async_step_transcript_path (pi `resolveAsyncStepTranscriptPath`) ----

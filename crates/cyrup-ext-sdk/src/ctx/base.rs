@@ -123,19 +123,48 @@ impl Ctx {
     /// `extensions/loader.ts:249-256` follows every registration with `runtime.refreshTools()`).
     /// The host re-materializes it into an executable handle at its next tool refresh, so the tool
     /// is model-visible on the following turn.
+    ///
+    /// `Err` is pi's `registerTool` throw (EXT-082): `parameters` is not a JSON object. Nothing is
+    /// registered. `?` stops the handler here and fails its call, as pi's uncaught throw does;
+    /// handling the `Err` is pi's `try`/`catch`, and the handler carries on.
+    #[must_use = "a refused registration is pi's throw: `?` it out of the handler, or handle it"]
     pub fn register_tool(
         &self,
         descriptor: crate::descriptor::ToolDescriptor,
         exec: impl crate::api::ToolExec,
-    ) {
+    ) -> Result<(), crate::api::RegistrationError> {
         let tool = crate::api::RegisteredTool {
             descriptor,
             exec: Box::new(exec),
         };
         #[cfg(target_arch = "wasm32")]
-        crate::guest::register_tool_late(tool);
+        return crate::guest::register_tool_late(tool);
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = tool;
+        {
+            let _ = tool;
+            Ok(())
+        }
+    }
+
+    /// Register a CLI flag from inside a LIVE handler, after `init` (pi `api.registerFlag(name,
+    /// options)` called at runtime, `core/extensions/loader.ts:307-325` @v0.87.1).
+    ///
+    /// `Err` is pi's `registerFlag` throw (EXT-082): a `default` whose `typeof` is not the flag's
+    /// `type`. Nothing is registered. `?` stops the handler here and fails its call, as pi's
+    /// uncaught throw does; handling the `Err` is pi's `try`/`catch`, and the handler carries on.
+    #[must_use = "a refused registration is pi's throw: `?` it out of the handler, or handle it"]
+    pub fn register_flag(
+        &self,
+        name: &str,
+        spec: &crate::descriptor::FlagSpec,
+    ) -> Result<(), crate::api::RegistrationError> {
+        #[cfg(target_arch = "wasm32")]
+        return crate::guest::register_flag_late(name, spec);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (name, spec);
+            Ok(())
+        }
     }
 
     // --- base-context state + lifecycle (pi `ExtensionContext`, types.ts:307-347 @v0.83.0;

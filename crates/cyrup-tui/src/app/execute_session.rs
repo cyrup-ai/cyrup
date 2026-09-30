@@ -22,10 +22,14 @@ impl<B: Backend> App<B> {
                 // `Failed to delete: ${error}` (`:849`). It used to say "deleted session" whether
                 // or not the file went.
                 match session.delete_session_file(std::path::Path::new(&path)) {
-                    Ok(method) => self
-                        .state
-                        .transcript
-                        .push_status(method.status_message().to_string()),
+                    Ok(method) => {
+                        self.state
+                            .transcript
+                            .push_status(method.status_message().to_string());
+                        // `await this.refreshSessionsAfterMutation()` (`session-selector.ts:859`
+                        // @v0.87.1) — only on success.
+                        self.refresh_session_list_after_mutation();
+                    }
                     Err(e) => self
                         .state
                         .transcript
@@ -40,10 +44,15 @@ impl<B: Backend> App<B> {
                     .rename_session_file(std::path::Path::new(&path), &name)
                     .await
                 {
-                    Ok(()) => self
-                        .state
-                        .transcript
-                        .push_status(format!("renamed session → {name}")),
+                    Ok(()) => {
+                        self.state
+                            .transcript
+                            .push_status(format!("renamed session → {name}"));
+                        // `confirmRename`: `await renameSession(target, next); await
+                        // this.refreshSessionsAfterMutation();` (`session-selector.ts:934-935`
+                        // @v0.87.1) — a failed rename throws past the reload.
+                        self.refresh_session_list_after_mutation();
+                    }
                     Err(e) => self
                         .state
                         .transcript
@@ -495,8 +504,6 @@ impl<B: Backend> App<B> {
         // Press Tab to view all." (`session-selector.ts:443`) — the all-projects list is the way
         // out. Confirming carries the chosen session file path into
         // [`Self::execute_session_switch`].
-        let current_sessions = session.list_sessions();
-        let all_sessions = session.list_all_sessions();
         let current = session.session_id().to_string();
         // `new SessionSelectorComponent(..., { keybindings }, currentSessionFilePath)`
         // (`interactive-mode.ts:5550-5587`): the picker is handed the live keybindings AND the
@@ -504,49 +511,52 @@ impl<B: Backend> App<B> {
         // (`session-manager.ts` → `session-selector.ts:222`). Without those three the threaded view
         // has no edges to draw, the row you are sitting in is not accented, and the hint rows name
         // stock keys.
-        let mut selector = SessionSelector::new(session_rows(&current_sessions, &current))
+        if self.has_session_list_channel() {
+            // TUI-121 — the picker opens NOW, empty, in its `Loading …` state; the current folder's
+            // load starts on the blocking pool and streams its partial sets in, and `Tab` starts
+            // the all-projects load the first time it is asked for (`session-selector.ts:869`,
+            // `:941-1040`). See `app/session_list.rs`.
+            let mut selector = SessionSelector::new(Vec::new())
+                .with_keymaps(&self.state.session_keymap, self.state.editor.keymap_ref())
+                .with_async_loaders();
+            // `showRenameHint`: see the inline branch below.
+            selector.set_show_rename_hint(true);
+            self.open_boxed_selector(SelectorKind::Session, Box::new(selector));
+            self.begin_session_list(
+                session.current_sessions_listing(),
+                session.all_sessions_listing(),
+                current,
+            );
+            return;
+        }
+        // No run loop is servicing the listing channel (an embedder, a widget test): list both
+        // sets inline and hand them over up front, as before TUI-121.
+        let current_set = super::session_list::session_row_set(&session.list_sessions(), &current);
+        let all_set = super::session_list::session_row_set(&session.list_all_sessions(), &current);
+        let mut selector = SessionSelector::new(current_set.rows)
             .with_keymaps(&self.state.session_keymap, self.state.editor.keymap_ref());
-        selector.set_all_rows(session_rows(&all_sessions, &current));
+        selector.set_all_rows(all_set.rows);
         // The cwd column the `all` scope turns on (`session-selector.ts:468-470`) — the only thing
         // that says which project a row in the merged listing belongs to.
-        selector.set_session_cwds(
-            current_sessions
-                .iter()
-                .chain(all_sessions.iter())
-                .map(|s| (s.path.display().to_string(), s.cwd.clone())),
-        );
-        selector.set_parent_paths(
-            current_sessions
-                .iter()
-                .chain(all_sessions.iter())
-                .filter_map(|s| {
-                    s.parent_session_path
-                        .as_ref()
-                        .map(|p| (s.path.display().to_string(), p.display().to_string()))
-                }),
-        );
+        selector.set_session_cwds(current_set.cwds.into_iter().chain(all_set.cwds));
+        selector.set_parent_paths(current_set.parents.into_iter().chain(all_set.parents));
+        selector.set_current_session_path(current_set.current_path.or(all_set.current_path));
         // `options?.showRenameHint ?? this.canRename` (`session-selector.ts:772`): upstream's host
         // declares the capability by passing a `renameSession` callback. cyrup's is the
         // `SessionSelectorOutcome::Rename` arm below, which lands in `session.rename_session_file`
         // — so the capability is present and the hint is on. Stated here rather than defaulted in
         // the component, because the component cannot know whether its host wired the apply path.
         selector.set_show_rename_hint(true);
-        // `currentSessionFilePath` — resolved from the listing rather than the manager so it is the
-        // SAME string the rows carry (a canonicalization mismatch would silently never match).
-        selector.set_current_session_path(
-            current_sessions
-                .iter()
-                .chain(all_sessions.iter())
-                .find(|s| s.id.to_string() == current)
-                .map(|s| s.path.display().to_string()),
-        );
         let inner: Box<dyn Selector> = Box::new(selector);
         self.open_boxed_selector(SelectorKind::Session, inner);
     }
 }
 
 /// One `/resume` row per listed session — the projection both of the picker's scopes share.
-fn session_rows(sessions: &[cyrup_session_svc::SessionInfo], current: &str) -> Vec<SessionRow> {
+pub(super) fn session_rows(
+    sessions: &[cyrup_session_svc::SessionInfo],
+    current: &str,
+) -> Vec<SessionRow> {
     sessions
         .iter()
         .map(|s| {

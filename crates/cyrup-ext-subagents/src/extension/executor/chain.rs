@@ -635,6 +635,8 @@ mod tests {
             acceptance: None,
             context: None,
             agent_scope: None,
+            label: None,
+            session_name: None,
         })];
         // `GraphRunOutcome` (the Ok type) is not `Debug`, so match manually rather than `expect_err`.
         match executor
@@ -697,6 +699,8 @@ mod tests {
                 acceptance: None,
                 context: None,
                 agent_scope: None,
+                label: None,
+                session_name: None,
             },
         )];
 

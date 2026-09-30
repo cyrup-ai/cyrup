@@ -17,10 +17,10 @@
 //! }
 //! ```
 //!
-//! cyrup's two `renderInitialMessages()` sites — the boot seed (`App::seed_session_ui`, after
-//! `crates/cyrup/src/interactive.rs` has replayed a `--resume`/`--continue` branch) and the run
-//! loop's `session_swapped` arm (`/resume`, `/fork`, `/import`, `/new`) — replayed and raised the
-//! trust banner but never counted compactions. Both are driven here through their real entry points
+//! cyrup's two `renderInitialMessages()` sites — the boot host (`crates/cyrup/src/interactive.rs`,
+//! through `App::render_initial_messages`) and the run loop's `session_swapped` arm (`/resume`,
+//! `/fork`, `/import`, `/new`) — replayed and raised the trust banner but never counted
+//! compactions. Both are driven here through their real entry points
 //! and read off the transcript's pending entries, which is what the next frame commits.
 #![allow(
     clippy::unwrap_used,
@@ -224,8 +224,11 @@ async fn a_fresh_session_reports_no_compaction() {
     );
 }
 
-/// The boot half: a `--resume` launch replays in `crates/cyrup/src/interactive.rs` and then
-/// `App::run` seeds the UI — where `renderInitialMessages()`'s tail has to land.
+/// The boot half: a `--resume` launch renders pi's `renderInitialMessages()` through
+/// `App::render_initial_messages`, which `crates/cyrup/src/interactive.rs` calls ahead of the startup
+/// warnings and the CLI's initial message (pi `init()`, `interactive-mode.ts:1036`). The count follows
+/// the replayed branch. The ordering against the startup warnings and the initial message is pinned
+/// in the `cyrup` crate (`tests::boot_transcript_order`), where the boot host lives.
 #[tokio::test]
 async fn a_resume_boot_reports_the_compaction_count() {
     let fx = fixture();
@@ -233,11 +236,35 @@ async fn a_resume_boot_reports_the_compaction_count() {
     let rt = runtime(&fx, SessionTarget::Resume(path)).await;
     let session = rt.session().await;
     let mut app = inline_app();
+    app.render_initial_messages(&session).await;
+    let pending = app.state().transcript.pending();
+    let at = pending
+        .iter()
+        .position(|e| matches!(e, Entry::Status(s) if s == "Session compacted 3 times"))
+        .unwrap_or_else(|| panic!("no `Session compacted 3 times` status: {pending:?}"));
+    let replayed_user = pending
+        .iter()
+        .position(
+            |e| matches!(e, Entry::User { text, .. } if text.contains("after the compaction")),
+        )
+        .unwrap_or_else(|| panic!("the resumed branch was not replayed: {pending:?}"));
+    assert!(replayed_user < at, "{pending:?}");
+}
+
+/// `App::run`'s seed no longer renders `renderInitialMessages()`'s tail: it runs after the boot host
+/// has pushed the CLI's initial prompt, which is where the count used to land (TUI-003).
+#[tokio::test]
+async fn the_run_loop_seed_does_not_push_the_compaction_count() {
+    let fx = fixture();
+    let path = session_file(fx.tmp.path(), &fx.config.cwd, 2);
+    let rt = runtime(&fx, SessionTarget::Resume(path)).await;
+    let session = rt.session().await;
+    let mut app = inline_app();
     app.seed_session_ui(&session, Some(&rt)).await;
     assert!(
-        statuses(&app)
+        !statuses(&app)
             .iter()
-            .any(|s| s == "Session compacted 3 times"),
+            .any(|s| s.starts_with("Session compacted")),
         "{:?}",
         statuses(&app)
     );

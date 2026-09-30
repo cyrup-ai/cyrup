@@ -457,6 +457,17 @@ impl AgentSession {
         &self.services.ext_host
     }
 
+    /// Every CLI flag the loaded extensions declared, in pi's order — the list `main.ts:859-862`
+    /// @v0.87.1 flat-maps out of `resourceLoader.getExtensions().extensions` for `printHelp`
+    /// (SEAM-020). Empty when the registry cannot be read.
+    pub fn extension_flag_declarations(&self) -> Vec<cyrup_ext::ExtensionFlagDeclaration> {
+        self.services
+            .ext_host
+            .registry()
+            .flag_declarations()
+            .unwrap_or_default()
+    }
+
     /// Whether any loaded extension handles `kind` (pi `hasExtensionHandlers(eventType: string):
     /// boolean { return this._extensionRunner.hasHandlers(eventType); }`,
     /// `core/agent-session.ts:3334` @v0.83.0). The `:3135` this used to cite is inside an unrelated

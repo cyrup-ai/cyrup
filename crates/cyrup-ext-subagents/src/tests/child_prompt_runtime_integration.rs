@@ -598,28 +598,21 @@ async fn inherit_global_context_false_removes_only_the_global_agents_md_from_the
 
 /// SUBA-134 — the child names its own session, and claims its intercom route when asked (pi
 /// `subagent-prompt-runtime.ts:532-550` @v0.71.0), driven through the REAL host: the runtime is
-/// built from the child env a spawn writes, the identity request arrives on the extension bus as
-/// cyrup-intercom emits it, and `before_agent_start` is the host's own emitter.
+/// built from the child env a spawn writes, the identity request arrives on the host's typed bus
+/// exactly as cyrup-intercom emits it, and `before_agent_start` is the host's own emitter.
 ///
-/// GUT the claim reply and the claim list stays empty; GUT the `claimed` latch and the second host
-/// names its session with the routing target instead of the readable name; GUT the
-/// `set_session_name` call and neither host names anything.
+/// GUT the `subscribe_typed_bus` or the `claim` call and the request comes back unclaimed; GUT the
+/// `claimed` latch and the second host names its session with the routing target instead of the
+/// readable name; GUT the `set_session_name` call and neither host names anything.
 #[tokio::test]
 async fn the_child_names_its_session_and_claims_its_intercom_route() {
     #[derive(Default)]
     struct Recording {
         names: std::sync::Mutex<Vec<String>>,
-        emitted: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
     }
     impl cyrup_ext::host::HostServices for Recording {
         fn set_session_name(&self, name: &str) {
             self.names.lock().unwrap().push(name.to_string());
-        }
-        fn emit_event(&self, topic: &str, payload: &serde_json::Value) {
-            self.emitted
-                .lock()
-                .unwrap()
-                .push((topic.to_string(), payload.clone()));
         }
     }
     let env = |key: &str| match key {
@@ -664,17 +657,15 @@ async fn the_child_names_its_session_and_claims_its_intercom_route() {
     // Asked at session start, the child claims the route as its intercom id and keeps the
     // readable name for its session.
     let (host, services) = start().await;
-    host.bus().emit(
-        crate::prompt_runtime::INTERCOM_SESSION_IDENTITY_EVENT.to_string(),
-        serde_json::json!({ "version": 1 }),
+    let request = crate::tui::intercom::IntercomSessionIdentityRequestV1::new();
+    host.bus().emit_typed(
+        crate::tui::intercom::INTERCOM_SESSION_IDENTITY_EVENT,
+        &request,
     );
-    host.deliver_bus_events(&CancelToken::new()).await;
     assert_eq!(
-        *services.emitted.lock().unwrap(),
-        [(
-            "intercom:session-identity-claim".to_string(),
-            serde_json::json!({ "version": 1, "stableId": "subagent-worker-run1-1" }),
-        )]
+        request.claimed().as_deref(),
+        Some("subagent-worker-run1-1"),
+        "claimed inline, before the emit returned"
     );
     before_agent_start(&host).await;
     assert_eq!(

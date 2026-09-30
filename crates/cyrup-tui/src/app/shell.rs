@@ -49,6 +49,7 @@ impl<B: Backend> App<B> {
             login_tx: None,
             login_refresh_tx: None,
             model_refresh_tx: None,
+            session_list_tx: None,
             login_providers: None,
             radius_gateway: None,
             compact_tx: None,

@@ -106,8 +106,8 @@ fn notify_kind_from_wit(kind: bindings::cyrup::ext::ui::NotifyKind) -> NotifyKin
 impl bindings::cyrup::ext::types::Host for HostState {}
 
 impl bindings::cyrup::ext::registration::Host for HostState {
-    async fn register_tool(&mut self, t: wit_types::ToolDescriptor) {
-        let Ok(guest) = guest_of(self) else { return };
+    async fn register_tool(&mut self, t: wit_types::ToolDescriptor) -> Result<(), String> {
+        let guest = guest_of(self)?;
         let parameters: Value = serde_json::from_str(&t.parameters_json).unwrap_or(Value::Null);
         let desc_name_for_log = t.name.clone();
         let desc = ToolDescriptor {
@@ -148,14 +148,14 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         };
         // A guest tool is dispatched back across the boundary; register it via the registry's
         // descriptor table so the active-tool set can surface it (R-08-012/014). A refusal (pi's
-        // object-schema guard — an unparseable `parameters-json` arrives here as `null`) fails the
-        // load once `init` returns, where pi's `registerTool` throws out of the factory (EXT-082).
-        if let Err(e) = guest
+        // object-schema guard — an unparseable `parameters-json` arrives here as `null`) is pi's
+        // `registerTool` throw (EXT-082), returned as the `err` arm. That is the WHOLE effect,
+        // as pi's throw is: a guest that propagates it fails its own call (an `init` that returns
+        // it fails the load), and a guest that catches it carries on with the tool unregistered.
+        guest
             .registry
             .register_guest_tool(guest.owner.clone(), desc)
-        {
-            guest.note_registration_error(&e);
-        }
+            .map_err(|e| e.to_string())
     }
 
     /// EXT-058 — pi `registerCommand(name, options)` writes STRAIGHT into the extension's live
@@ -197,22 +197,24 @@ impl bindings::cyrup::ext::registration::Host for HostState {
             .register_shortcut(guest.owner.clone(), key, desc);
     }
 
-    async fn register_flag(&mut self, name: String, spec_json: String) {
-        let Ok(guest) = guest_of(self) else { return };
+    async fn register_flag(&mut self, name: String, spec_json: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
         let spec: Value = serde_json::from_str(&spec_json).unwrap_or(Value::Null);
         // Owner-attributed so Pi's first-wins flag rule (`getFlags`, runner.ts:473-483) and its
         // `Flag "--x" conflicts with <owner>` diagnostic apply to a guest's `registerFlag`. A
         // default that does not match its `type` is refused BEFORE anything is stored, as pi's
-        // `registerFlag` throws before `extension.flags.set` (EXT-082).
+        // `registerFlag` throws before `extension.flags.set` (EXT-082). The refusal returns to
+        // the guest as the `err` arm, the value form of that throw, with the same meaning as
+        // `register_tool`'s.
         if let Err(e) =
             guest
                 .registry
                 .register_flag(guest.owner.clone(), name.clone(), spec.clone())
         {
-            guest.note_registration_error(&e);
-            return;
+            return Err(e.to_string());
         }
         guest.set_flag(name, spec);
+        Ok(())
     }
 
     async fn get_flag(&mut self, name: String) -> Option<String> {
@@ -1683,14 +1685,16 @@ impl LiveExtension {
             .await
             .map_err(|e| map_wasm_error(&e))?;
 
+        // EXT-082: a registration refused during `init` reaches the guest as the import's `err`.
+        // An `init` that propagates it (the SDK's `push_registrations` does) fails the load here,
+        // as pi's throwing factory does (`Failed to load extension: <message>`,
+        // `core/extensions/loader.ts:576-578` @v0.87.1), and the caller's failure tail (EXT-081)
+        // sweeps whatever `init` did register.
         match instance.call_init(&mut store).await {
             Ok(Ok(())) => {}
             Ok(Err(msg)) => return Err(ExtError::Component(format!("init failed: {msg}"))),
             Err(e) => return Err(map_wasm_error(&e)),
         }
-        // EXT-082: a registration refused during `init` is pi's throwing factory — the load fails
-        // and the caller's failure tail (EXT-081) sweeps whatever `init` did register.
-        guest.finish_init_registrations()?;
 
         // EXT-058: command registrations declared during `init` already landed in the registry —
         // `registration::register-command` writes through like every sibling import, so there is
@@ -2030,13 +2034,9 @@ impl LiveExtension {
         self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
-        match api
-            .call_get_argument_completions(&mut inner.store, name, prefix)
+        api.call_get_argument_completions(&mut inner.store, name, prefix)
             .await
-        {
-            Ok(v) => Ok(v),
-            Err(e) => Err(map_wasm_error(&e)),
-        }
+            .map_err(|e| map_wasm_error(&e))
     }
 
     /// Render a tool call via a guest-registered message renderer (Pi `renderCall`,
@@ -2080,13 +2080,9 @@ impl LiveExtension {
         self.guest.set_tier(CtxTier::Event);
         let ctx_s = ctx.to_string();
         let api = inner.instance.cyrup_ext_events();
-        match api
-            .call_transform_markdown(&mut inner.store, markdown, &ctx_s)
+        api.call_transform_markdown(&mut inner.store, markdown, &ctx_s)
             .await
-        {
-            Ok(out) => Ok(out),
-            Err(e) => Err(map_wasm_error(&e)),
-        }
+            .map_err(|e| map_wasm_error(&e))
     }
 
     /// Offer one raw terminal-input chunk to this guest's `onTerminalInput` handler (EXT-021; pi
@@ -2966,11 +2962,20 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
                 .get("systemPrompt")
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string());
+            // pi's `BeforeAgentStartEventResult.message` (one per handler), then `messages` — the
+            // SDK's fold of several handlers' messages into one outcome, in handler order. An
+            // unparseable message is dropped, as before.
             let inject = v
                 .get("message")
-                .cloned()
-                .and_then(|m| serde_json::from_value::<Message>(m).ok())
-                .map(Box::new);
+                .into_iter()
+                .chain(
+                    v.get("messages")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten(),
+                )
+                .filter_map(|m| serde_json::from_value::<Message>(m.clone()).ok())
+                .collect();
             Some(EventPatch::SystemPromptAndInject { system, inject })
         }
         // `input` (Pi `InputEventResult` `{action:"transform", text, images?}`, types.ts:805): the
@@ -3021,6 +3026,61 @@ mod tests {
             services,
         );
         HostState::with_guest(StoreLimits::default(), Arc::new(guest))
+    }
+
+    /// EXT-089 — one guest with several `before_agent_start` handlers folds every handler's
+    /// `message` into ONE outcome (the SDK's `api/fold.rs`), sent as `messages` after pi's single
+    /// `message` key. pi pushes each handler's message (`emitBeforeAgentStart`,
+    /// `core/extensions/runner.ts:1345` @v0.87.1), so all of them must be injected, in order. Red
+    /// before the fix: `EventPatch::SystemPromptAndInject.inject` held ONE message and this decode
+    /// read only `message`, so the folded messages were dropped.
+    #[test]
+    fn a_folded_before_agent_start_outcome_injects_every_message_in_order() {
+        let msg = |t: &str| Message::User {
+            content: vec![Content::text(t)],
+            timestamp: 0,
+        };
+        let patch = serde_json::json!({
+            "systemPrompt": "two",
+            "message": msg("one"),
+            "messages": [msg("two"), msg("three")],
+        });
+        let outcome = decode_outcome(
+            EventKind::BeforeAgentStart,
+            wit_types::HookOutcome::Mutate(patch.to_string()),
+        );
+        let p = match outcome {
+            HookOutcome::Mutate(p) => Some(p),
+            _ => None,
+        }
+        .expect("a before_agent_start patch decodes to a mutate");
+        let mut ev = HostEvent::BeforeAgentStart {
+            prompt: "hi".into(),
+            images: Value::Null,
+            system_prompt: "base".into(),
+            options: Value::Null,
+            injected: vec![msg("earlier extension")],
+        };
+        ev.apply_patch(p);
+        let (system_prompt, injected) = match ev {
+            HostEvent::BeforeAgentStart {
+                system_prompt,
+                injected,
+                ..
+            } => Some((system_prompt, injected)),
+            _ => None,
+        }
+        .expect("still a before_agent_start event");
+        assert_eq!(system_prompt, "two");
+        assert_eq!(
+            injected,
+            vec![
+                msg("earlier extension"),
+                msg("one"),
+                msg("two"),
+                msg("three")
+            ]
+        );
     }
 
     /// EXT-M03 — a guest tool's declared `label` (pi `ToolDefinition.label: string`, "Human-readable

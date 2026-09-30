@@ -182,6 +182,10 @@ impl App<InlineBackend<TuiStdout>> {
         // picker Pi renders BEFORE the refresh starts (`model-selector.ts:153-158`) would otherwise
         // not reach a frame until the refresh settled.
         let mut model_refresh_rx = self.install_model_refresh_channel();
+        // The `/resume` listing channel (TUI-121). Installed for the same reason: reading every
+        // session file on this task froze the UI between `/resume` and the picker, so the listing
+        // runs on the blocking pool and streams its batches back here.
+        let mut session_list_rx = self.install_session_list_channel();
         // The `/compact` outcome channel (TUI-055). Installed for exactly the same reason as
         // `tree_nav_rx`: a 10–20 s provider call awaited on THIS task freezes every other arm, so
         // the compaction status band Pi shows for the whole operation never reaches a frame.
@@ -438,6 +442,7 @@ impl App<InlineBackend<TuiStdout>> {
                 Some(msg) = login_rx.recv() => self.on_login_msg(&mut ctx, msg).await?,
                 Some(msg) = login_refresh_rx.recv() => self.on_login_refresh_msg(&mut ctx, msg).await?,
                 Some(msg) = model_refresh_rx.recv() => self.on_model_refresh_msg(&mut ctx, msg)?,
+                Some(msg) = session_list_rx.recv() => self.on_session_list_msg(msg)?,
                 Some(msg) = tree_nav_rx.recv() => self.on_tree_nav_msg(&mut ctx, msg).await?,
                 Some(msg) = share_rx.recv() => self.on_share_msg(msg)?,
                 // A refutable pattern: a `None` from a closed stream does NOT match `Some(ev)`, so

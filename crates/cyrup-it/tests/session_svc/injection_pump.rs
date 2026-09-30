@@ -9,6 +9,8 @@
 //!   follows; a PLAIN no-turn injection is not steered and never extends a run. And the race the
 //!   pump was built for (`8de7460`): a steer that lands after the run's last steering poll is not
 //!   stranded in the agent queue — the idle edge takes it back and appends it, exactly once.
+//! * **ICOM-063** — that steer is made synchronously while a run is active, so one sent from a
+//!   `turn_end` handler reaches the loop's very next steering poll and rides the same run.
 //! * **SEAM-129** — `agent_settled` is emitted with the run latch already released (pi
 //!   `_emitAgentSettled`, `agent-session.ts:870-873` @v0.87.1), so a steer sent from its handler is
 //!   appended during the emit rather than steered onto the finished run.
@@ -629,6 +631,103 @@ async fn a_steer_sent_from_agent_settled_is_appended_during_the_emit() {
         position_of(&texts, "settle-time peer note").unwrap()
             < position_of(&texts, "next").unwrap()
     );
+}
+
+/// A native extension that, on the FIRST `turn_end`, injects a `deliverAs: "steer"` message and
+/// records whether it was on the agent's steering queue when the call returned — pi-intercom's
+/// `human-first` turn-boundary release, reduced to its host seam.
+struct TurnEndSteerer {
+    services: Mutex<Option<Arc<dyn HostServices>>>,
+    session: Arc<OnceLock<Weak<AgentSession>>>,
+    fired: AtomicBool,
+    queued_on_return: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for TurnEndSteerer {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("turn-end-steerer")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::TurnEnd]);
+        Ok(())
+    }
+    fn set_host_services(&self, services: Arc<dyn HostServices>) {
+        *self.services.lock().unwrap() = Some(services);
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        if matches!(ev, HostEvent::TurnEnd { .. }) && !self.fired.swap(true, Ordering::SeqCst) {
+            let services = self.services.lock().unwrap().clone().unwrap();
+            services
+                .inject_message_steer("turn-boundary peer note", Some(NOTE), true, None)
+                .unwrap();
+            // No await between the call and this read: only a steer made INSIDE the call is seen.
+            let queued = self
+                .session
+                .get()
+                .and_then(Weak::upgrade)
+                .is_some_and(|s| s.has_queued_messages());
+            self.queued_on_return.store(queued, Ordering::SeqCst);
+        }
+        HookOutcome::Noop
+    }
+}
+
+/// ICOM-063 at the session seam — a `deliverAs: "steer"` injection made from a `turn_end` handler
+/// rides the SAME run. The agent loop awaits `turn_end` handlers and then polls steering once; with
+/// a text-only turn that poll is the run's last, so the steer must already be on the agent's queue
+/// when the handler returns. pi guarantees it because `sendCustomMessage`'s streaming arm is a
+/// synchronous `agent.steer` (`agent-session.ts:1949-1954` @v0.87.1), and pi-intercom's
+/// `human-first` release depends on it (`index.ts:1814-1822` @v0.14.0). When the live host handed
+/// the steer to the injection pump — a separate task — it was not yet queued on return, missed the
+/// poll whenever the pump was scheduled late, and was appended after the run with no turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_steer_injected_from_turn_end_rides_the_same_run() {
+    let fx = fixture();
+    let requests: Requests = Arc::default();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![
+        recording_text(&requests, "first answer"),
+        recording_text(&requests, "answer to the peer"),
+    ]);
+    let slot = Arc::new(OnceLock::new());
+    let steerer = Arc::new(TurnEndSteerer {
+        services: Mutex::new(None),
+        session: slot.clone(),
+        fired: AtomicBool::new(false),
+        queued_on_return: AtomicBool::new(false),
+    });
+    let session = build(&fx, &faux, Some(steerer.clone())).await;
+    let _ = slot.set(Arc::downgrade(&session));
+
+    let _ = session
+        .prompt(UserInput::text("human task", InputSource::Sdk))
+        .await
+        .unwrap();
+    session.wait_for_idle().await;
+
+    assert!(
+        steerer.queued_on_return.load(Ordering::SeqCst),
+        "the steer was on the agent's steering queue when `inject_message_steer` returned"
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the steer continued the run with one more request"
+    );
+    let second = user_texts(&requests[1]);
+    assert_eq!(
+        count_of(&second, "turn-boundary peer note"),
+        1,
+        "{second:?}"
+    );
+    assert_eq!(
+        persisted(&session, NOTE).await.len(),
+        1,
+        "persisted exactly once"
+    );
+    assert!(!session.has_queued_messages());
 }
 
 /// The summarization system prompt's opening words (`cyrup-session` `SUMMARIZATION_SYSTEM_PROMPT`):

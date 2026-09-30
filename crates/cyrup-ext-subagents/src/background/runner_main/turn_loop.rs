@@ -392,6 +392,8 @@ fn build_chain_context(
         // caller drives `run_with` in-process and therefore IS the runner.
         spawn_command: spawn_command.cloned(),
         child_env: child_env.clone(),
+        // SUBA-134 — the async runner names each child from its step (label included).
+        names_child_sessions: true,
         depth,
         interrupted: Arc::clone(&flags.interrupted),
         interrupt_cancel: interrupt_cancel.clone(),
@@ -801,6 +803,7 @@ pub(super) async fn run_import_async_root(
     let step_result = StepResult {
         execution: None,
         tool_budget_blocked: false,
+        session_name: None,
         native_machine: None,
         runtime_acknowledged_extensions: None,
         success: imported.success,
@@ -923,6 +926,7 @@ pub(super) fn append_steps(
                     // the flat index this entry will occupy.
                     entry.transcript_path =
                         resolve_async_step_transcript_path(config, &entry.agent, base + offset);
+                    crate::background::flat_index::declare_step_runner(config, &mut entry);
                     entry
                 });
         status.steps.extend(appended);

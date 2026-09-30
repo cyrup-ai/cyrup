@@ -128,6 +128,8 @@ fn step(output_path: Option<&str>) -> SingleStepSpec {
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     }
 }
 

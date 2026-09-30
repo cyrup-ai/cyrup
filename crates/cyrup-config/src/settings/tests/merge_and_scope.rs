@@ -594,7 +594,7 @@ fn a_load_error_names_its_file_in_pis_diagnostic_shape() {
         format!(
             "Invalid settings file {}: {}",
             global.display(),
-            errors[0].message
+            errors[0].error
         )
     );
 
@@ -605,6 +605,6 @@ fn a_load_error_names_its_file_in_pis_diagnostic_shape() {
     assert_eq!(errors[0].path, None);
     assert_eq!(
         errors[0].diagnostic_message(),
-        format!("Invalid project settings: {}", errors[0].message)
+        format!("Invalid project settings: {}", errors[0].error)
     );
 }

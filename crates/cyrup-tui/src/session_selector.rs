@@ -62,6 +62,22 @@ pub enum SessionScope {
     All,
 }
 
+/// One loader result in the picker's terms — a partial publish or the final set (TUI-121): the rows
+/// plus the per-row metadata the picker keeps beside them, so a streamed batch carries everything
+/// [`SessionSelector::set_session_cwds`], [`SessionSelector::set_parent_paths`] and
+/// [`SessionSelector::set_current_session_path`] would otherwise be fed once up front.
+#[derive(Clone, Debug, Default)]
+pub struct SessionRowSet {
+    /// The rows, newest first (pi's `sortSessionInfos` order).
+    pub rows: Vec<SessionRow>,
+    /// Session file path → the session's stored `cwd`.
+    pub cwds: Vec<(String, String)>,
+    /// Child session path → parent session path.
+    pub parents: Vec<(String, String)>,
+    /// The running session's row path, when this set contains it.
+    pub current_path: Option<String>,
+}
+
 /// One row of the display list plus the tree metadata pi's `FlatSessionNode`
 /// (`session-selector.ts:197-203`) carries: the nesting `depth`, whether the node is the last of its
 /// siblings, and for each ancestor level whether that ancestor has more siblings after it.
@@ -154,13 +170,38 @@ pub struct SessionSelector {
     /// i.e. whichever of [`Self::current_rows`] / [`Self::all_rows`] the live [`Self::scope`] names.
     /// Always re-derived through [`Self::resync_rows`]; never edited independently of the two caches.
     rows: Vec<SessionRow>,
-    /// pi's `SessionSelectorComponent.currentSessions` (`:707`) — the `currentSessionsLoader` result,
-    /// the cwd's own sessions.
-    current_rows: Vec<SessionRow>,
-    /// pi's `allSessions` (`:708`) — the `allSessionsLoader` result, every project's sessions.
-    /// `None` is upstream's un-wired `onToggleScope` (`:551-556`): `Tab` is still SWALLOWED, it just
-    /// has nothing to switch to. A host that can reach other projects calls [`Self::set_all_rows`].
+    /// pi's `SessionSelectorComponent.currentSessions` (`:716` @v0.87.1) — the
+    /// `currentSessionsLoader` result, the cwd's own sessions. `None` = not loaded (pi's `null`):
+    /// a picker built with [`Self::with_async_loaders`] starts here and the host streams it in.
+    current_rows: Option<Vec<SessionRow>>,
+    /// pi's `allSessions` (`:717`) — the `allSessionsLoader` result, every project's sessions.
+    /// `None` until loaded (or handed over by [`Self::set_all_rows`]).
     all_rows: Option<Vec<SessionRow>>,
+    /// Whether the host wired the all-projects loader at all. `false` is upstream's un-wired
+    /// `onToggleScope` (`:551-556`): `Tab` is still SWALLOWED, it just has nothing to switch to.
+    all_wired: bool,
+    /// pi's `currentLoad` / `allLoad` (`:722-723`): a load for that scope is in flight. The abort
+    /// handle itself is the host's ([`crate::App`] keeps one `CancelToken` per load); these flags
+    /// are the component's `isActive()` half.
+    current_load: bool,
+    all_load: bool,
+    /// Whether the host handed the picker pi's loaders ([`Self::with_async_loaders`]). Only such a
+    /// picker can reload a scope after a delete or rename ([`Self::refresh_after_mutation`]); the
+    /// synchronous `--resume` picker holds the only sets it will ever get.
+    streamed: bool,
+    /// The header's `loading` + `loadProgress` (`SessionSelectorHeader`, `:61-62`): the scope radio
+    /// is replaced by `Loading …` / `Loading n/m` while the shown scope loads (`:141-143`).
+    header_loading: bool,
+    load_progress: Option<(usize, usize)>,
+    /// A `loadScope(scope)` the component asked for and the host has not started yet — pi's
+    /// `void this.loadScope(...)` (`:869`, `:1039`). The component cannot run a loader itself (it
+    /// holds no session), so it records the request and the host drains it through
+    /// [`Self::take_load_request`].
+    load_request: Option<SessionScope>,
+    /// pi `SessionList.selectionTouched` (`:291`): set by any key that reaches the list's
+    /// navigation / search half (`:611`). An untouched selection snaps back to the top when a batch
+    /// lands; a touched one follows its row (`setSessions`, `:362-371`).
+    selection_touched: bool,
     /// Session file path → the session's stored `cwd` (`SessionInfo.cwd`), for the `showCwd` column
     /// at `:468-470`. Fed like [`Self::set_parent_paths`] rather than carried on [`SessionRow`], so
     /// the row struct every existing caller builds stays source-compatible.
@@ -221,8 +262,16 @@ impl SessionSelector {
     /// no edges every row is a root, so the list degrades to the same flat, newest-first order.
     pub fn new(rows: Vec<SessionRow>) -> Self {
         SessionSelector {
-            current_rows: rows.clone(),
+            current_rows: Some(rows.clone()),
             all_rows: None,
+            all_wired: false,
+            current_load: false,
+            all_load: false,
+            streamed: false,
+            header_loading: false,
+            load_progress: None,
+            load_request: None,
+            selection_touched: false,
             cwds: HashMap::new(),
             rows,
             input: Input::new(),
@@ -283,12 +332,176 @@ impl SessionSelector {
     /// is `if (this.onToggleScope) this.onToggleScope();` (`session-selector.ts:551-556`), so a host
     /// that never wires the second loader still SWALLOWS `Tab` — it just has nowhere to go.
     ///
-    /// pi loads this set lazily on the first toggle (`toggleScope`, `:1003-1018`) because its loader
-    /// is async and can report progress; cyrup's picker is fed synchronously, so the host hands both
-    /// sets over up front and the "loading" header branch (`:141-143`) has nothing to report.
+    /// This is the SYNCHRONOUS host's feed (the pre-TUI `--resume` picker): both sets are handed
+    /// over up front and the "loading" header branch (`:141-143`) has nothing to report. The
+    /// in-session `/resume` picker instead uses [`Self::with_async_loaders`], which loads this set
+    /// lazily on the first toggle, as pi does (`toggleScope`, `:1031-1040` @v0.87.1).
     pub fn set_all_rows(&mut self, rows: Vec<SessionRow>) {
         self.all_rows = Some(rows);
+        self.all_wired = true;
         self.resync_rows();
+    }
+
+    /// Hand the picker pi's two async loaders (TUI-121; `SessionSelectorComponent`'s constructor,
+    /// `session-selector.ts:757-870` @v0.87.1): both scopes start unloaded, the `Tab` toggle is
+    /// wired, and — pi's last constructor statement, `void this.loadScope("current")` (`:869`) —
+    /// the current folder's load starts at once, so the picker opens EMPTY with the `Loading …`
+    /// header and fills as the host streams batches in through [`Self::apply_load_progress`] and
+    /// [`Self::finish_load`]. The host starts each requested load from
+    /// [`Self::take_load_request`].
+    #[must_use]
+    pub fn with_async_loaders(mut self) -> Self {
+        self.current_rows = None;
+        self.all_rows = None;
+        self.all_wired = true;
+        self.streamed = true;
+        self.rows.clear();
+        self.load_scope(SessionScope::Current);
+        self
+    }
+
+    /// pi `refreshSessionsAfterMutation` (`session-selector.ts:1024-1029` @v0.87.1), run after a
+    /// successful delete (`:842-859`) or rename (`confirmRename`, `:934-935`):
+    ///
+    /// ```ts
+    /// this.cancelLoads();
+    /// this.currentSessions = null;
+    /// this.allSessions = null;
+    /// await this.loadScope(this.scope);
+    /// ```
+    ///
+    /// Both cached sets are forgotten and the scope on screen is loaded again, so the list shows
+    /// what is on disk now rather than the picker's own patch of it. The rows on screen stay until
+    /// the reload's first batch replaces them (pi's `loadScope` does not clear the list). Returns
+    /// whether a reload was asked for — `false` for a picker without loaders, which keeps the
+    /// patched caches `remove_row` / `apply_rename` left it. The host cancels the
+    /// loads it was running and starts the one requested.
+    pub fn refresh_after_mutation(&mut self) -> bool {
+        if !self.streamed {
+            return false;
+        }
+        self.current_load = false;
+        self.all_load = false;
+        self.current_rows = None;
+        self.all_rows = None;
+        self.load_scope(self.scope);
+        true
+    }
+
+    /// The `loadScope` a load the component asked for, if the host has not started it yet
+    /// (TUI-121). Taking it is the host's promise to run the loader and report back.
+    pub fn take_load_request(&mut self) -> Option<SessionScope> {
+        self.load_request.take()
+    }
+
+    /// Whether a load for `scope` is in flight (pi's `this.currentLoad` / `this.allLoad`).
+    pub fn is_loading(&self, scope: SessionScope) -> bool {
+        match scope {
+            SessionScope::Current => self.current_load,
+            SessionScope::All => self.all_load,
+        }
+    }
+
+    /// The header's `Loading` state and `loaded/total` progress (test/inspection).
+    pub fn load_status(&self) -> (bool, Option<(usize, usize)>) {
+        (self.header_loading, self.load_progress)
+    }
+
+    fn set_in_flight(&mut self, scope: SessionScope, in_flight: bool) {
+        match scope {
+            SessionScope::Current => self.current_load = in_flight,
+            SessionScope::All => self.all_load = in_flight,
+        }
+    }
+
+    fn cache_mut(&mut self, scope: SessionScope) -> &mut Option<Vec<SessionRow>> {
+        match scope {
+            SessionScope::Current => &mut self.current_rows,
+            SessionScope::All => &mut self.all_rows,
+        }
+    }
+
+    /// Fold a batch's per-row metadata into the picker's maps.
+    fn merge_row_meta(&mut self, set: &SessionRowSet) {
+        self.cwds.extend(set.cwds.iter().cloned());
+        self.parents.extend(set.parents.iter().cloned());
+        if set.current_path.is_some() {
+            self.current_path.clone_from(&set.current_path);
+        }
+    }
+
+    /// pi `loadScope`'s synchronous prologue (`session-selector.ts:941-953` @v0.87.1): a scope that
+    /// is already loading is left alone; otherwise the load is marked in flight, the header switches
+    /// to `Loading …` with its progress cleared (`setLoading(true)`, `:88-92`), and the host is asked
+    /// to run the loader.
+    fn load_scope(&mut self, scope: SessionScope) {
+        if self.is_loading(scope) {
+            return;
+        }
+        self.set_in_flight(scope, true);
+        self.header_loading = true;
+        self.load_progress = None;
+        self.load_request = Some(scope);
+    }
+
+    /// pi's `onProgress` (`session-selector.ts:956-970` @v0.87.1): a partial set replaces that
+    /// scope's cache and, when it is the scope on screen, the list (keeping a touched selection on
+    /// its row); the header then shows `Loading loaded/total` for the scope on screen. A report for
+    /// a scope with no load in flight — cancelled, or already finished — is dropped (pi's
+    /// `if (!isActive()) return`).
+    pub fn apply_load_progress(
+        &mut self,
+        scope: SessionScope,
+        loaded: usize,
+        total: usize,
+        partial: Option<SessionRowSet>,
+    ) {
+        if !self.is_loading(scope) {
+            return;
+        }
+        if let Some(set) = partial {
+            self.merge_row_meta(&set);
+            *self.cache_mut(scope) = Some(set.rows.clone());
+            if scope == self.scope {
+                self.set_sessions(set.rows);
+            }
+        }
+        if scope != self.scope {
+            return;
+        }
+        self.load_progress = Some((loaded, total));
+    }
+
+    /// pi `loadScope`'s success tail (`session-selector.ts:972-988` @v0.87.1): the full set is
+    /// cached, the load is no longer in flight and — for the scope on screen — the header drops its
+    /// `Loading` state and the list takes the final set. Dropped when no load is in flight.
+    pub fn finish_load(&mut self, scope: SessionScope, set: SessionRowSet) {
+        if !self.is_loading(scope) {
+            return;
+        }
+        self.merge_row_meta(&set);
+        *self.cache_mut(scope) = Some(set.rows.clone());
+        self.set_in_flight(scope, false);
+        if scope != self.scope {
+            return;
+        }
+        self.header_loading = false;
+        self.load_progress = None;
+        self.set_sessions(set.rows);
+    }
+
+    /// pi `cancelLoads` (`session-selector.ts:872-883` @v0.87.1), run on select, cancel and exit: a
+    /// load in flight is abandoned and its scope forgotten, so nothing it reports later can land.
+    /// The host cancels the loader itself.
+    pub fn cancel_loads(&mut self) {
+        if self.current_load {
+            self.current_load = false;
+            self.current_rows = None;
+        }
+        if self.all_load {
+            self.all_load = false;
+            self.all_rows = None;
+        }
     }
 
     /// Session file path → that session's stored `cwd` (`SessionInfo.cwd`), for the extra right-hand
@@ -315,30 +528,58 @@ impl SessionSelector {
 
     /// `toggleScope` (`session-selector.ts:1003-1026`): `current` ⇄ `all`, re-pointing the list at
     /// the other cached set. Upstream flips `this.scope` FIRST (`:1005`) and only then decides
-    /// whether the set is cached (`:1008`) or has to be loaded (`:1015-1017`) — cyrup has no async
-    /// load, so the only reachable "nothing to switch to" case is a host that supplied no all-set,
-    /// and that is upstream's un-wired `onToggleScope` (`:552`), where the scope does not move
-    /// either because `toggleScope` is never entered.
+    /// whether the set is cached (`:1008`) or has to be loaded (`:1015-1017`). Without loaders the
+    /// only reachable "nothing to switch to" case is a host that supplied no all-set, and that is
+    /// upstream's un-wired `onToggleScope` (`:552`), where the scope does not move either because
+    /// `toggleScope` is never entered.
+    ///
+    /// TUI-121 — with async loaders (`toggleScope`, `:1031-1040` @v0.87.1) the header takes the
+    /// target scope's loading state, the list shows its cached set (or nothing), and a scope that is
+    /// neither cached nor loading starts its load — which is how the all-projects scan runs only
+    /// when the user first asks for it.
     fn toggle_scope(&mut self) {
-        if self.all_rows.is_none() {
+        if !self.all_wired {
             return;
         }
         self.scope = match self.scope {
             SessionScope::Current => SessionScope::All,
             SessionScope::All => SessionScope::Current,
         };
-        self.resync_rows();
+        let loading = self.is_loading(self.scope);
+        self.header_loading = loading;
+        self.load_progress = None;
+        let cached = self.cache_mut(self.scope).clone();
+        self.set_sessions(cached.clone().unwrap_or_default());
+        if cached.is_none() && !loading {
+            self.load_scope(self.scope);
+        }
     }
 
-    /// Re-point the display list at the set the live scope names — pi's `setSessions(sessions,
-    /// showCwd)` (`:361-365`), whose `filterSessions` tail clamps the highlight into the new,
-    /// possibly shorter list (`:386`).
+    /// Re-point the display list at the set the live scope names.
     fn resync_rows(&mut self) {
-        self.rows = match self.scope {
-            SessionScope::Current => self.current_rows.clone(),
-            SessionScope::All => self.all_rows.clone().unwrap_or_default(),
+        let rows = self.cache_mut(self.scope).clone().unwrap_or_default();
+        self.set_sessions(rows);
+    }
+
+    /// pi `SessionList.setSessions` (`session-selector.ts:362-372` @v0.87.1): swap the list, re-run
+    /// the filter (whose tail clamps the highlight into the new, possibly shorter list, `:394`),
+    /// then put the highlight back — on the top row if the user has not moved it, else on the row
+    /// it was on, wherever that row now sits.
+    fn set_sessions(&mut self, rows: Vec<SessionRow>) {
+        let selected_path = if self.selection_touched {
+            self.current().map(|r| r.path)
+        } else {
+            None
         };
+        self.rows = rows;
         self.clamp_selection();
+        if !self.selection_touched {
+            self.selected = 0;
+        } else if let Some(path) = selected_path
+            && let Some(i) = self.filtered().iter().position(|n| n.row.path == path)
+        {
+            self.selected = i;
+        }
     }
 
     /// The filtered + sorted display list for the current query/sort/name-filter (clones for borrow
@@ -453,7 +694,9 @@ impl SessionSelector {
     /// (`session-selector.ts:835-845` — `:836-841` filters, `:845` re-sets). Filtering only the visible set would resurrect the row on
     /// the next `Tab`.
     fn remove_row(&mut self, path: &str) {
-        self.current_rows.retain(|r| r.path != path);
+        if let Some(current) = self.current_rows.as_mut() {
+            current.retain(|r| r.path != path);
+        }
         if let Some(all) = self.all_rows.as_mut() {
             all.retain(|r| r.path != path);
         }
@@ -461,8 +704,10 @@ impl SessionSelector {
     }
 
     /// Apply a rename to **both** cached sets, for the same reason [`Self::remove_row`] does.
-    /// (pi reloads the scope instead — `refreshSessionsAfterMutation`, `:999-1001`; cyrup's picker
-    /// has no loader to re-run, so it patches the caches it was handed.)
+    /// (pi additionally reloads the scope once the host has applied the rename or the delete —
+    /// `refreshSessionsAfterMutation`, `:1024-1029` @v0.87.1 — which the in-session picker does
+    /// through [`Self::refresh_after_mutation`]; the synchronous `--resume` picker has no loader
+    /// and keeps this patch.)
     fn apply_rename(&mut self, path: &str, name: &str) {
         let patch = |rows: &mut Vec<SessionRow>| {
             if let Some(row) = rows.iter_mut().find(|r| r.path == path) {
@@ -472,7 +717,9 @@ impl SessionSelector {
                 }
             }
         };
-        patch(&mut self.current_rows);
+        if let Some(current) = self.current_rows.as_mut() {
+            patch(current);
+        }
         if let Some(all) = self.all_rows.as_mut() {
             patch(all);
         }
@@ -693,11 +940,20 @@ impl SessionSelector {
             SessionScope::Current => "Resume Session (Current Folder)",
             SessionScope::All => "Resume Session (All)",
         };
-        // `:144-148` — the scope radio. (pi's third branch, `:141-143`, reports an in-flight
-        // `Loading n/m`; cyrup's chrome hands the selector an already-loaded row list, so there is
-        // no loading state to report.)
+        // `:141-148` — the scope radio, or, while the shown scope loads, `Loading …` /
+        // `Loading loaded/total` in its place (TUI-121). Upstream's loading branch prints the muted
+        // `○ Current Folder | ` whichever scope is loading; kept verbatim.
         let (scope_spans, name_value, sort_value) = {
             let scope = match self.scope {
+                _ if self.header_loading => {
+                    let progress = self
+                        .load_progress
+                        .map_or_else(|| "...".to_string(), |(l, t)| format!("{l}/{t}"));
+                    vec![
+                        Span::styled("○ Current Folder | ", theme.muted_style()),
+                        Span::styled(format!("Loading {progress}"), theme.accent_style()),
+                    ]
+                }
                 SessionScope::Current => vec![
                     Span::styled("◉ Current Folder", theme.accent_style()),
                     Span::styled(" | ○ All", theme.muted_style()),
@@ -1027,6 +1283,12 @@ impl Selector for SessionSelector {
                     }
                 }
                 SessionAction::Rename => {
+                    // `onRenameSession`: `if (this.scope === "current" ? this.currentLoad :
+                    // this.allLoad) return;` (`session-selector.ts:820` @v0.87.1) — no rename
+                    // while the list under it is still loading.
+                    if self.is_loading(self.scope) {
+                        return SelectorOutcome::Redraw;
+                    }
                     if let Some(row) = self.current() {
                         self.renaming = Some((
                             row.path,
@@ -1038,6 +1300,9 @@ impl Selector for SessionSelector {
             return SelectorOutcome::Redraw;
         }
 
+        // `this.selectionTouched = true;` (`session-selector.ts:611` @v0.87.1) — every key that gets
+        // past the chords above, navigation and search alike.
+        self.selection_touched = true;
         // 5) Navigation / confirm / cancel.
         match keymap.action_for(key) {
             Some(SelectAction::Up) => {
@@ -1094,9 +1359,16 @@ impl Selector for SessionSelector {
             edit.paste(text);
             return SelectorOutcome::Redraw;
         }
+        // A bracketed paste reaches pi's `SessionList.handleInput` like any other key, past the
+        // chords, so it touches the selection too (`:611`).
+        self.selection_touched = true;
         self.input.paste(text);
         self.selected = 0;
         SelectorOutcome::Redraw
+    }
+
+    fn as_session_selector(&mut self) -> Option<&mut SessionSelector> {
+        Some(self)
     }
 }
 
@@ -1904,6 +2176,126 @@ mod tests {
         let text = row_text(&buf, find_row(&buf, "Resume Session"));
         assert!(text.starts_with("Resume Session (All)"), "{text:?}");
         assert!(text.contains("○ Current Folder | ◉ All"), "{text:?}");
+    }
+
+    // ------------------------------------------------------------------ TUI-121: async loaders
+
+    fn set_of(rows: Vec<SessionRow>) -> SessionRowSet {
+        SessionRowSet {
+            rows,
+            ..SessionRowSet::default()
+        }
+    }
+
+    /// `loadScope`'s prologue from the constructor (`session-selector.ts:869`, `:941-953`
+    /// @v0.87.1): the picker opens empty, reports `Loading ...`, and asks the host for the current
+    /// folder's load — once.
+    #[test]
+    fn an_async_picker_opens_empty_loading_and_asks_for_the_current_load() {
+        let mut sel = SessionSelector::new(Vec::new()).with_async_loaders();
+        assert_eq!(sel.visible_len(), 0);
+        assert_eq!(sel.load_status(), (true, None));
+        assert_eq!(sel.take_load_request(), Some(SessionScope::Current));
+        assert_eq!(sel.take_load_request(), None);
+        let buf = draw(&mut sel, 100, 20);
+        let text = row_text(&buf, find_row(&buf, "Resume Session"));
+        assert!(text.contains("○ Current Folder | Loading ..."), "{text:?}");
+    }
+
+    /// `onProgress` (`:956-970`): a partial set lands in the list and the header reads
+    /// `Loading loaded/total`; the resolved set ends the loading state.
+    #[test]
+    fn partial_sets_stream_in_and_the_header_counts_them() {
+        let mut sel = SessionSelector::new(Vec::new()).with_async_loaders();
+        sel.apply_load_progress(
+            SessionScope::Current,
+            1,
+            3,
+            Some(set_of(rows()[..1].to_vec())),
+        );
+        assert_eq!(sel.visible_len(), 1);
+        sel.apply_load_progress(SessionScope::Current, 2, 3, None);
+        assert_eq!(sel.load_status(), (true, Some((2, 3))));
+        let buf = draw(&mut sel, 100, 20);
+        let text = row_text(&buf, find_row(&buf, "Resume Session"));
+        assert!(text.contains("Loading 2/3"), "{text:?}");
+        sel.finish_load(SessionScope::Current, set_of(rows()));
+        assert_eq!(sel.load_status(), (false, None));
+        assert_eq!(sel.visible_len(), 3);
+        let buf = draw(&mut sel, 100, 20);
+        let text = row_text(&buf, find_row(&buf, "Resume Session"));
+        assert!(text.contains("◉ Current Folder | ○ All"), "{text:?}");
+    }
+
+    /// `SessionList.setSessions` (`:362-372`): a moved highlight follows its row when a batch
+    /// reorders the list; an untouched one stays on the top row.
+    #[test]
+    fn a_batch_keeps_a_moved_selection_on_its_row() {
+        let km = SelectKeymap::default();
+        let newer = row("/s/new.jsonl", Some("Newer"), "new", 9);
+        let mut untouched = SessionSelector::new(Vec::new()).with_async_loaders();
+        untouched.apply_load_progress(SessionScope::Current, 3, 4, Some(set_of(rows())));
+        let mut with_newer = vec![newer.clone()];
+        with_newer.extend(rows());
+        untouched.finish_load(SessionScope::Current, set_of(with_newer.clone()));
+        assert_eq!(untouched.current().unwrap().path, "/s/new.jsonl");
+
+        let mut touched = SessionSelector::new(Vec::new()).with_async_loaders();
+        touched.apply_load_progress(SessionScope::Current, 3, 4, Some(set_of(rows())));
+        touched.handle(&key(KeyCode::Down), &km);
+        assert_eq!(touched.current().unwrap().path, "/s/b.jsonl");
+        touched.finish_load(SessionScope::Current, set_of(with_newer));
+        assert_eq!(
+            touched.current().unwrap().path,
+            "/s/b.jsonl",
+            "the highlight stays on the row the user moved to"
+        );
+    }
+
+    /// `toggleScope` (`:1031-1040`): the all-projects load starts on the first `Tab`, not before,
+    /// and the header takes the target scope's loading state.
+    #[test]
+    fn tab_asks_for_the_all_scope_load_once() {
+        let km = SelectKeymap::default();
+        let mut sel = SessionSelector::new(Vec::new()).with_async_loaders();
+        assert_eq!(sel.take_load_request(), Some(SessionScope::Current));
+        sel.finish_load(SessionScope::Current, set_of(rows()));
+        sel.handle(&key(KeyCode::Tab), &km);
+        assert_eq!(sel.scope(), SessionScope::All);
+        assert_eq!(sel.take_load_request(), Some(SessionScope::All));
+        assert_eq!(sel.load_status(), (true, None));
+        sel.handle(&key(KeyCode::Tab), &km);
+        assert_eq!(sel.scope(), SessionScope::Current);
+        assert_eq!(
+            sel.load_status(),
+            (false, None),
+            "the current set is cached"
+        );
+        assert_eq!(sel.visible_len(), 3);
+        sel.handle(&key(KeyCode::Tab), &km);
+        assert_eq!(
+            sel.take_load_request(),
+            None,
+            "the all load is still in flight"
+        );
+    }
+
+    /// `onRenameSession` refuses while the list under it loads (`:820`); `cancelLoads` makes a
+    /// later report inert (`:872-883`, `isActive()`).
+    #[test]
+    fn rename_waits_for_the_load_and_a_cancelled_load_is_inert() {
+        let km = SelectKeymap::default();
+        let mut sel = SessionSelector::new(Vec::new()).with_async_loaders();
+        sel.apply_load_progress(SessionScope::Current, 1, 2, Some(set_of(rows())));
+        sel.handle(&ctrl('r'), &km);
+        assert!(!sel.is_renaming(), "no rename while loading");
+        sel.cancel_loads();
+        sel.finish_load(SessionScope::Current, set_of(Vec::new()));
+        assert_eq!(
+            sel.visible_len(),
+            3,
+            "the cancelled load's result is dropped"
+        );
     }
 
     /// **S13.** `session-selector.ts:738` and `:746` both build

@@ -68,7 +68,7 @@ impl App<InlineBackend<TuiStdout>> {
         // …and then ASK whether the push took, instead of assuming it did (Pi
         // `queryAndEnableKittyProtocol`, `tui/src/terminal.ts:213-226`). The query has to follow the
         // push — `CSI ? u` reports the top of the terminal's flag stack — and it has to run HERE:
-        // this is the one window where raw mode is on and no crossterm reader thread is competing
+        // this is the one window where raw mode is on and no input reader thread is competing
         // for the reply (see `crate::keyboard_protocol`'s module docs, and
         // `crate::terminal_query`'s for the read's timeout/input-safety contract). The recorded
         // outcome is what the re-entry paths below re-apply and what the startup diagnostics read.
@@ -150,7 +150,7 @@ impl App<InlineBackend<TuiStdout>> {
         }
         // Resumed (or non-unix): re-enter raw mode + flags, then redraw the live region. The flags
         // are re-pushed unconditionally, exactly as Pi's `start()` does (`terminal.ts:164-166`) —
-        // NOT re-negotiated: the crossterm reader thread is live by now, so a `CSI ? u` reply would
+        // NOT re-negotiated: the input reader thread is live by now, so a `CSI ? u` reply would
         // race it (`crate::keyboard_protocol` module docs). The startup decision still stands.
         enable_raw_mode()?;
         let mut out = crate::dead_terminal::terminal_stdout();

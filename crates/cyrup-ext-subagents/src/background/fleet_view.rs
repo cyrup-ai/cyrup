@@ -377,6 +377,9 @@ pub struct ForegroundFleetEntry {
     pub run_id: String,
     /// The live message-route agent, when a child step is active (pi `control.currentAgent`).
     pub current_agent: Option<String>,
+    /// SUBA-134 — the live child's session name (pi `control.sessionName`), which the row shows
+    /// over the agent (`fleet-view.ts:298,318` @v0.71.0).
+    pub session_name: Option<String>,
     /// The live child's flat index (pi `control.currentIndex`).
     pub current_index: Option<usize>,
     /// The run's live control activity state (pi `control.currentActivityState`).
@@ -404,15 +407,22 @@ fn format_foreground_fleet_lines(controls: &[ForegroundFleetEntry], now: i64) ->
             },
             now,
         );
+        // SUBA-134 — `control.sessionName?.trim() || control.currentAgent` (`fleet-view.ts:298,318`
+        // @v0.71.0).
+        let current_display_name = control
+            .session_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .or_else(|| control.current_agent.clone());
         // pi `foregroundModeName`: a single-mode run shows its current agent in the mode slot.
         // cyrup's foreground registry does not record the run mode, so the current agent (when
         // known) is the whole label, exactly as pi's `mode === "single"` branch renders it.
-        let mode = control
-            .current_agent
+        let mode = current_display_name
             .clone()
             .unwrap_or_else(|| "single".to_string());
-        let current = control
-            .current_agent
+        let current = current_display_name
             .as_ref()
             .map(|agent| match control.current_index {
                 Some(i) => format!(" | {agent} #{i}"),
@@ -438,6 +448,36 @@ fn format_foreground_fleet_lines(controls: &[ForegroundFleetEntry], now: i64) ->
 }
 
 /// pi `formatAsyncFleetLines` (`fleet-view.ts:257-293`).
+/// SUBA-141 — the step's external-CLI step and its live process receipt, when it is one (pi's
+/// `step.runner?.type === "external-cli"` gate, `fleet-view.ts:343,590` @v0.71.0).
+fn external_cli_step(
+    step: &StepStatus,
+) -> Option<Option<&crate::runner::status::ExternalProcessStatus>> {
+    step.runner
+        .as_ref()
+        .filter(|runner| runner.kind == "external-cli")
+        .map(|_| step.external_process.as_ref())
+}
+
+/// SUBA-141 — pi `externalCliStepFacts(step, now)` (`fleet-view.ts:342-349` @v0.71.0):
+/// `external-cli`, plus the process's elapsed time — its recorded duration once it closed, else
+/// the time since it started.
+fn external_cli_step_facts(step: &StepStatus, now: i64) -> Option<String> {
+    let process = external_cli_step(step)?;
+    let elapsed = process.map(|process| {
+        process
+            .duration_ms
+            .unwrap_or_else(|| (process.ended_at.unwrap_or(now) - process.started_at).max(0))
+    });
+    Some(match elapsed {
+        Some(ms) => format!(
+            "external-cli · {}",
+            crate::background::wait::format_duration(u64::try_from(ms).unwrap_or(0))
+        ),
+        None => "external-cli".to_string(),
+    })
+}
+
 fn format_async_fleet_lines(runs: &[ActiveRun], now: i64) -> Vec<String> {
     if runs.is_empty() {
         return Vec::new();
@@ -485,9 +525,14 @@ fn format_async_fleet_lines(runs: &[ActiveRun], now: i64) -> Vec<String> {
                 step.telemetry.thinking.as_deref(),
             );
             let mut parts = vec![
-                format!("{index}. {}", step.agent),
+                // SUBA-134 — pi `fleetStepDisplayName(step)` (`fleet-view.ts:364` @v0.71.0).
+                format!("{index}. {}", step.display_name()),
                 step_state_label(step.status).to_string(),
             ];
+            // SUBA-141 — `externalCliStepFacts(step, now)` (`fleet-view.ts:365` @v0.71.0).
+            if let Some(facts) = external_cli_step_facts(step, now) {
+                parts.push(facts);
+            }
             if let Some(a) = step_activity {
                 parts.push(a);
             }
@@ -641,7 +686,8 @@ fn select_transcript_step(
             steps
                 .iter()
                 .enumerate()
-                .map(|(i, s)| format!("{i}={}", s.agent))
+                // SUBA-134 — pi `fleetChildDisplayName(candidate)` (`fleet-view.ts:461`).
+                .map(|(i, s)| format!("{i}={}", s.child_display_name()))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -661,7 +707,8 @@ fn step_state_line(status: &RunStatus, index: Option<usize>, now: i64) -> Option
         "Step"
     };
     let mut parts = vec![
-        format!("{label}: {index} ({})", step.agent),
+        // SUBA-134 — pi `fleetChildDisplayName(step)` (`fleet-view.ts:471`).
+        format!("{label}: {index} ({})", step.child_display_name()),
         step_state_label(step.status).to_string(),
     ];
     if let Some(a) = format_activity_facts(&step_activity_facts(step), now) {
@@ -1054,8 +1101,26 @@ pub fn format_async_run_transcript(
     // pi's `outputPaths`: the selected child's own `output-<i>.log`, else the run-level output
     // artifact (delta 3 — cyrup keeps that per step, so the no-index form falls back to the step's
     // own recorded `output_file`).
+    // SUBA-141 — the selected external-CLI step's process receipt (`selected.step?.runner?.type ===
+    // "external-cli" ? selected.step.externalProcess : undefined`, `fleet-view.ts:590` @v0.71.0).
+    let selected_step = selected.and_then(|i| status.steps.get(i));
+    let external_process = selected_step.and_then(external_cli_step).flatten();
     let output_paths: Vec<PathBuf> = match selected {
-        Some(i) => vec![paths.step_output_log(i)],
+        // `uniqueStrings([selected.step?.externalProcess?.finalOutputPath, stepOutputPath, …])`
+        // (`fleet-view.ts:569`): an adapter's final-output artifact is read first.
+        Some(i) => {
+            let mut output_paths: Vec<PathBuf> = selected_step
+                .and_then(|step| step.external_process.as_ref())
+                .and_then(|process| process.final_output_path.as_ref())
+                .map(PathBuf::from)
+                .into_iter()
+                .collect();
+            let step_log = paths.step_output_log(i);
+            if !output_paths.contains(&step_log) {
+                output_paths.push(step_log);
+            }
+            output_paths
+        }
         None => status
             .steps
             .first()
@@ -1087,7 +1152,31 @@ pub fn format_async_run_transcript(
     let mut body: Vec<String> = Vec::new();
     let mut source = "Transcript tail".to_string();
     let mut truncated = false;
-    for output_path in &output_paths {
+    // SUBA-141 — pi's tail sources (`fleet-view.ts:591-599` @v0.71.0): an external-CLI step's two
+    // bounded stream logs, stderr first, ahead of the transcript while the step RUNS (its output
+    // log is written only at close) and behind it once it has settled.
+    let external_log_sources: Vec<(PathBuf, &str)> = external_process
+        .map(|process| {
+            vec![
+                (PathBuf::from(&process.stderr_path), "External stderr tail"),
+                (PathBuf::from(&process.stdout_path), "External stdout tail"),
+            ]
+        })
+        .unwrap_or_default();
+    let transcript_sources = output_paths
+        .iter()
+        .map(|output_path| (output_path.clone(), "Transcript tail"));
+    let running_external = external_process.is_some()
+        && selected_step.is_some_and(|step| step.status == super::StepState::Running);
+    let sources: Vec<(PathBuf, &str)> = if running_external {
+        external_log_sources
+            .into_iter()
+            .chain(transcript_sources)
+            .collect()
+    } else {
+        transcript_sources.chain(external_log_sources).collect()
+    };
+    for (output_path, label) in &sources {
         let tail = read_contained_text_tail(
             output_path,
             line_limit,
@@ -1100,10 +1189,11 @@ pub fn format_async_run_transcript(
                 tail.path.display()
             ));
         }
-        if tail.lines.is_empty() {
+        // `if (!tail.lines.some((line) => line.trim().length > 0)) continue;` (`:603`).
+        if !tail.lines.iter().any(|line| !line.trim().is_empty()) {
             continue;
         }
-        source = format!("Transcript tail from {}", tail.path.display());
+        source = format!("{label} from {}", tail.path.display());
         truncated = tail.truncated;
         body = tail.lines;
         break;
@@ -1208,6 +1298,170 @@ mod tests {
         );
     }
 
+    /// SUBA-134 — pi `fleetStepDisplayName(step)` (`fleet-view.ts:83-84,364` @v0.71.0): an async
+    /// run's step line names the child by its trimmed session name, else by its agent.
+    #[test]
+    fn fleet_step_lines_show_the_child_session_name_over_the_agent() {
+        let mut named = StepStatus::pending("worker");
+        named.session_name = Some(" worker: Lane A ".to_string());
+        let status = status_with(vec![named, StepStatus::pending("critic")]);
+        let text = format_fleet(
+            &[],
+            &[ActiveRun {
+                dir: std::path::PathBuf::from("/runs/run1234"),
+                status,
+            }],
+            false,
+            0,
+        )
+        .unwrap();
+        assert!(text.contains("  0. worker: Lane A | "), "{text}");
+        assert!(text.contains("  1. critic | "), "{text}");
+    }
+
+    /// An external-CLI step whose live process receipt names logs inside `run_dir`.
+    fn external_cli_step(
+        run_dir: &Path,
+        state: StepState,
+        process: crate::runner::status::ExternalProcessStatus,
+    ) -> StepStatus {
+        let launch = crate::exec::external_cli::resolve_generic_launch(
+            &crate::runner::ExternalCliRunner {
+                adapter: None,
+                command: "foreign".to_string(),
+                args: Vec::new(),
+                prompt_delivery_stdin: false,
+                capabilities: None,
+            },
+            &crate::exec::external_cli::ExternalCliLaunchContext::default(),
+        );
+        let mut step = StepStatus::pending("foreign");
+        step.status = state;
+        step.runner = Some(launch.status().clone());
+        step.external_process = Some(crate::runner::status::ExternalProcessStatus {
+            stdout_path: run_dir.join("external-0.stdout.log").display().to_string(),
+            stderr_path: run_dir.join("external-0.stderr.log").display().to_string(),
+            ..process
+        });
+        step
+    }
+
+    /// SUBA-141 — pi's Fleet reads an external-CLI step's live `externalProcess`
+    /// (`fleet-view.ts:342-349,590-599` @v0.71.0): the step row reads `external-cli · <elapsed>`
+    /// (the recorded duration once closed, else the time since start), and the transcript view
+    /// tails the external stderr log, then stdout, AHEAD of the transcript while the step runs, and
+    /// BEHIND it once it settled.
+    ///
+    /// *Gutted by*: the `external_cli_step_facts` push (no `external-cli` fact), or dropping the
+    /// external log sources (the running step reads `Transcript tail` / no lines).
+    #[test]
+    fn fleet_shows_an_external_cli_steps_elapsed_time_and_its_stream_tails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut status = status_with(Vec::new());
+        let paths = RunPaths::for_run(dir.path(), dir.path(), &status.run_id);
+        std::fs::create_dir_all(&paths.run_dir).expect("mkdir");
+        std::fs::write(paths.run_dir.join("external-0.stderr.log"), "warming up\n")
+            .expect("stderr log");
+        std::fs::write(paths.run_dir.join("external-0.stdout.log"), "partial\n")
+            .expect("stdout log");
+
+        // Running, 2.5s since spawn, no output log yet.
+        status.steps = vec![external_cli_step(
+            &paths.run_dir,
+            StepState::Running,
+            crate::runner::status::ExternalProcessStatus {
+                pid: Some(4242),
+                started_at: 10_000,
+                ..Default::default()
+            },
+        )];
+        let fleet = format_fleet(
+            &[],
+            &[ActiveRun {
+                dir: paths.run_dir.clone(),
+                status: status.clone(),
+            }],
+            false,
+            12_500,
+        )
+        .unwrap();
+        assert!(
+            fleet.contains("  0. foreign | running | external-cli · 2.5s"),
+            "{fleet}"
+        );
+        let text = format_async_run_transcript(&status, &paths, Some(0), None, &[]).unwrap();
+        assert!(
+            text.contains(&format!(
+                "External stderr tail from {}",
+                paths.run_dir.join("external-0.stderr.log").display()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("  warming up"), "{text}");
+
+        // Settled with a 1.5s duration and a transcript: the transcript comes first again.
+        status.steps = vec![external_cli_step(
+            &paths.run_dir,
+            StepState::Complete,
+            crate::runner::status::ExternalProcessStatus {
+                pid: Some(4242),
+                started_at: 10_000,
+                ended_at: Some(11_500),
+                duration_ms: Some(1_500),
+                exit_code: Some(0),
+                ..Default::default()
+            },
+        )];
+        std::fs::write(paths.step_output_log(0), "final answer\n").expect("output log");
+        let fleet = format_fleet(
+            &[],
+            &[ActiveRun {
+                dir: paths.run_dir.clone(),
+                status: status.clone(),
+            }],
+            false,
+            99_000,
+        )
+        .unwrap();
+        assert!(fleet.contains("| external-cli · 1.5s"), "{fleet}");
+        let text = format_async_run_transcript(&status, &paths, Some(0), None, &[]).unwrap();
+        assert!(text.contains("Transcript tail from"), "{text}");
+        assert!(text.contains("  final answer"), "{text}");
+
+        // A settled step with no transcript falls back to its external logs, stderr first.
+        std::fs::remove_file(paths.step_output_log(0)).expect("rm output log");
+        let text = format_async_run_transcript(&status, &paths, Some(0), None, &[]).unwrap();
+        assert!(text.contains("External stderr tail from"), "{text}");
+    }
+
+    /// SUBA-134 — a foreground row names its live child by `control.sessionName?.trim() ||
+    /// control.currentAgent`, in the mode slot and the current slot alike
+    /// (`fleet-view.ts:298,318` @v0.71.0).
+    #[test]
+    fn a_foreground_row_shows_the_live_childs_session_name_over_its_agent() {
+        let text = format_fleet(
+            &[ForegroundFleetEntry {
+                run_id: "fg0002".to_string(),
+                current_agent: Some("reviewer".to_string()),
+                session_name: Some(" reviewer: check the diff ".to_string()),
+                current_index: Some(0),
+                activity_state: None,
+                session_id: None,
+                parent_workflow_run_id: None,
+            }],
+            &[],
+            false,
+            0,
+        )
+        .unwrap();
+        assert!(
+            text.contains(
+                "- fg0002 | running | reviewer: check the diff | reviewer: check the diff #0"
+            ),
+            "{text}"
+        );
+    }
+
     #[test]
     fn empty_fleet_renders_pis_sentinel_and_child_safe_refuses() {
         assert_eq!(
@@ -1228,6 +1482,7 @@ mod tests {
             &[ForegroundFleetEntry {
                 run_id: "fg0001".to_string(),
                 current_agent: Some("reviewer".to_string()),
+                session_name: None,
                 current_index: Some(2),
                 activity_state: Some(ActivityState::NeedsAttention),
                 session_id: None,

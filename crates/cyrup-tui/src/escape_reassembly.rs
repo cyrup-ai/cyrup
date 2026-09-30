@@ -47,10 +47,14 @@
 //! crossterm. The reassembly therefore runs **after** crossterm on the shredded events, reconstructs
 //! the sequence's bytes from them, and decodes the result itself.
 //!
-//! The decoder below is consequently a mirror of crossterm's own `parse_csi` family
-//! (`parse.rs:137-214`, `:348-393`, `:497-616`, `:619-660`) so that a split sequence produces
-//! **byte-identical events** to the same sequence delivered in one read — that equality is what this
-//! module's own `tests` pin. Completeness, by contrast, is a direct port of Pi's
+//! **Windows only since 2026-09-30.** On unix cyrup owns the bytes (`crate::input`, the port of
+//! `stdin-buffer.ts` this module could only imitate), and this module is compiled out there. It
+//! stays for Windows, where crossterm's console reader is still the source.
+//!
+//! The decoder it uses — shared with the unix reader in `crate::input::decode` — mirrors crossterm's
+//! own `parse_csi` family (`parse.rs:137-214`, `:348-393`, `:497-616`, `:619-660`) so that a split
+//! sequence produces **byte-identical events** to the same sequence delivered in one read — that
+//! equality is what this module's own `tests` pin. Completeness, by contrast, is a direct port of Pi's
 //! `isCompleteSequence` / `isCompleteCsiSequence` (`stdin-buffer.ts:29-126`), including the
 //! `ESC [ M` six-byte rule (`:43-46`) and the SGR-mouse shape check (`:102-120`).
 //!
@@ -74,10 +78,10 @@
 //! driven by the reader thread's shortened poll) — replays the held prefix in order, degrading to
 //! today's behaviour rather than to lost input.
 
-use ratatui::crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MediaKeyCode,
-    ModifierKeyCode,
-};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::input::decode::{Decoded, decode_ss3};
+use crate::input::frame::is_complete_csi;
 
 /// Hard cap on how many events may be held while reassembling a non-paste sequence.
 ///
@@ -426,406 +430,19 @@ fn paste_char(key: KeyEvent) -> Option<char> {
     }
 }
 
-/// Is this CSI buffer a complete sequence? Port of Pi's `isCompleteCsiSequence`
-/// (`stdin-buffer.ts:84-126`) plus the old-style-mouse rule from its caller (`:43-46`).
-#[allow(clippy::indexing_slicing)] // every slice is guarded by the length checks above it
-fn is_complete_csi(buf: &[u8]) -> bool {
-    if !buf.starts_with(b"\x1b[") {
-        return true;
-    }
-    // `ESC [ M` + 3 bytes = 6 total (`stdin-buffer.ts:43-46`).
-    if buf.starts_with(b"\x1b[M") {
-        return buf.len() >= 6;
-    }
-    if buf.len() < 3 {
-        return false;
-    }
-    let payload = &buf[2..];
-    let Some(&last) = payload.last() else {
-        return false;
-    };
-    if !(0x40..=0x7e).contains(&last) {
-        return false;
-    }
-    // SGR mouse: `ESC [ < digits ; digits ; digits [Mm]` (`stdin-buffer.ts:102-120`). A final byte
-    // in range is not enough — the shape has to match, because `;` and digits are in no final-byte
-    // range but `<`'s payload can contain characters that are.
-    if payload.first() == Some(&b'<') {
-        if last != b'M' && last != b'm' {
-            return false;
-        }
-        let inner = &payload[1..payload.len() - 1];
-        let Ok(inner) = std::str::from_utf8(inner) else {
-            return false;
-        };
-        let parts: Vec<&str> = inner.split(';').collect();
-        return parts.len() == 3
-            && parts
-                .iter()
-                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-    }
-    true
-}
-
 /// Decode a complete CSI sequence into the event crossterm's `parse_csi` (`parse.rs:137-214`) would
-/// have produced for the same bytes delivered in one read.
+/// have produced for the same bytes delivered in one read — the shared decoder in
+/// [`crate::input::decode`], narrowed to this machine's contract.
 ///
-/// `Ok(None)` means "crossterm would not have surfaced a key here" — a mouse report (cyrup enables
-/// no mouse reporting and `map_event_on` drops `Event::Mouse`), a cursor-position report, a
-/// keyboard-enhancement-flags reply or a device-attributes reply, all of which crossterm consumes as
-/// internal events. `Err(())` means the bytes are not a sequence at all and must be replayed.
-#[allow(clippy::indexing_slicing)] // every index is guarded by an explicit length check
+/// `Ok(None)` means "crossterm would not have surfaced a key here" — a terminal reply, or a mouse
+/// report (this path predates the byte reader and has always dropped those). `Err(())` means the
+/// bytes are not a sequence at all and must be replayed.
 fn decode_csi(buf: &[u8]) -> Result<Option<Event>, ()> {
-    if !buf.starts_with(b"\x1b[") || buf.len() < 3 {
-        return Err(());
+    match crate::input::decode::parse_csi(buf)? {
+        Some(Decoded::Event(Event::Mouse(_)) | Decoded::Reply | Decoded::Ignored) => Ok(None),
+        Some(Decoded::Event(ev)) => Ok(Some(ev)),
+        None => Err(()),
     }
-    let key = |code: KeyCode| Ok(Some(Event::Key(KeyEvent::from(code))));
-    match buf[2] {
-        b'[' => {
-            if buf.len() < 4 {
-                return Err(());
-            }
-            match buf[3] {
-                val @ b'A'..=b'E' => key(KeyCode::F(1 + val - b'A')),
-                _ => Err(()),
-            }
-        }
-        b'D' => key(KeyCode::Left),
-        b'C' => key(KeyCode::Right),
-        b'A' => key(KeyCode::Up),
-        b'B' => key(KeyCode::Down),
-        b'H' => key(KeyCode::Home),
-        b'F' => key(KeyCode::End),
-        b'Z' => Ok(Some(Event::Key(KeyEvent::new_with_kind(
-            KeyCode::BackTab,
-            KeyModifiers::SHIFT,
-            KeyEventKind::Press,
-        )))),
-        // Mouse reports — normal, SGR and rxvt. Dropped, see the doc comment.
-        b'M' | b'<' => Ok(None),
-        b'I' => Ok(Some(Event::FocusGained)),
-        b'O' => Ok(Some(Event::FocusLost)),
-        b';' => decode_csi_modifier_key_code(buf),
-        // Kitty legacy functional keys omit the `1` when no modifier is held.
-        b'P' => key(KeyCode::F(1)),
-        b'Q' => key(KeyCode::F(2)),
-        b'S' => key(KeyCode::F(4)),
-        // `CSI ? … u` (keyboard flags) and `CSI ? … c` (device attributes) are internal events.
-        b'?' => Ok(None),
-        b'0'..=b'9' => match buf[buf.len() - 1] {
-            // rxvt mouse and a cursor-position report are both internal.
-            b'M' | b'R' => Ok(None),
-            b'~' => decode_csi_special_key_code(buf),
-            b'u' => decode_csi_u_encoded_key_code(buf),
-            _ => decode_csi_modifier_key_code(buf),
-        },
-        _ => Err(()),
-    }
-}
-
-/// `ESC O <final>` — crossterm's SS3 arm (`parse.rs:45-72`).
-fn decode_ss3(final_byte: u8) -> Option<Event> {
-    let code = match final_byte {
-        b'D' => KeyCode::Left,
-        b'C' => KeyCode::Right,
-        b'A' => KeyCode::Up,
-        b'B' => KeyCode::Down,
-        b'H' => KeyCode::Home,
-        b'F' => KeyCode::End,
-        val @ b'P'..=b'S' => KeyCode::F(1 + val - b'P'),
-        _ => return None,
-    };
-    Some(Event::Key(KeyEvent::from(code)))
-}
-
-/// `parse_modifiers` (`parse.rs:303-325`).
-fn parse_modifiers(mask: u8) -> KeyModifiers {
-    let m = mask.saturating_sub(1);
-    let mut out = KeyModifiers::empty();
-    if m & 1 != 0 {
-        out |= KeyModifiers::SHIFT;
-    }
-    if m & 2 != 0 {
-        out |= KeyModifiers::ALT;
-    }
-    if m & 4 != 0 {
-        out |= KeyModifiers::CONTROL;
-    }
-    if m & 8 != 0 {
-        out |= KeyModifiers::SUPER;
-    }
-    if m & 16 != 0 {
-        out |= KeyModifiers::HYPER;
-    }
-    if m & 32 != 0 {
-        out |= KeyModifiers::META;
-    }
-    out
-}
-
-/// `parse_modifiers_to_state` (`parse.rs:327-337`).
-fn parse_modifiers_to_state(mask: u8) -> KeyEventState {
-    let m = mask.saturating_sub(1);
-    let mut state = KeyEventState::empty();
-    if m & 64 != 0 {
-        state |= KeyEventState::CAPS_LOCK;
-    }
-    if m & 128 != 0 {
-        state |= KeyEventState::NUM_LOCK;
-    }
-    state
-}
-
-/// `parse_key_event_kind` (`parse.rs:339-346`).
-fn parse_key_event_kind(kind: u8) -> KeyEventKind {
-    match kind {
-        2 => KeyEventKind::Repeat,
-        3 => KeyEventKind::Release,
-        _ => KeyEventKind::Press,
-    }
-}
-
-/// `modifier_and_kind_parsed` (`parse.rs:226-239`).
-fn modifier_and_kind_parsed<'a>(iter: &mut impl Iterator<Item = &'a str>) -> Option<(u8, u8)> {
-    let mut sub = iter.next()?.split(':');
-    let mask = sub.next()?.parse::<u8>().ok()?;
-    let kind = sub.next().and_then(|k| k.parse::<u8>().ok()).unwrap_or(1);
-    Some((mask, kind))
-}
-
-/// `parse_csi_modifier_key_code` (`parse.rs:348-393`).
-#[allow(clippy::indexing_slicing)] // callers guarantee `buf.len() >= 3`
-fn decode_csi_modifier_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
-    let s = std::str::from_utf8(&buf[2..buf.len() - 1]).map_err(|_| ())?;
-    let mut split = s.split(';');
-    split.next();
-
-    let (modifiers, kind) = if let Some((mask, kind_code)) = modifier_and_kind_parsed(&mut split) {
-        (parse_modifiers(mask), parse_key_event_kind(kind_code))
-    } else if buf.len() > 3 {
-        let digit = char::from(buf[buf.len() - 2]).to_digit(10).ok_or(())?;
-        (
-            parse_modifiers(u8::try_from(digit).map_err(|_| ())?),
-            KeyEventKind::Press,
-        )
-    } else {
-        (KeyModifiers::NONE, KeyEventKind::Press)
-    };
-
-    let code = match buf[buf.len() - 1] {
-        b'A' => KeyCode::Up,
-        b'B' => KeyCode::Down,
-        b'C' => KeyCode::Right,
-        b'D' => KeyCode::Left,
-        b'F' => KeyCode::End,
-        b'H' => KeyCode::Home,
-        b'P' => KeyCode::F(1),
-        b'Q' => KeyCode::F(2),
-        b'R' => KeyCode::F(3),
-        b'S' => KeyCode::F(4),
-        _ => return Err(()),
-    };
-    Ok(Some(Event::Key(KeyEvent::new_with_kind(
-        code, modifiers, kind,
-    ))))
-}
-
-/// `parse_csi_special_key_code` (`parse.rs:619-660`).
-#[allow(clippy::indexing_slicing)] // callers guarantee `buf.len() >= 3`
-fn decode_csi_special_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
-    let s = std::str::from_utf8(&buf[2..buf.len() - 1]).map_err(|_| ())?;
-    let mut split = s.split(';');
-    let first = split.next().ok_or(())?.parse::<u8>().map_err(|_| ())?;
-
-    let (modifiers, kind, state) =
-        if let Some((mask, kind_code)) = modifier_and_kind_parsed(&mut split) {
-            (
-                parse_modifiers(mask),
-                parse_key_event_kind(kind_code),
-                parse_modifiers_to_state(mask),
-            )
-        } else {
-            (KeyModifiers::NONE, KeyEventKind::Press, KeyEventState::NONE)
-        };
-
-    let code = match first {
-        1 | 7 => KeyCode::Home,
-        2 => KeyCode::Insert,
-        3 => KeyCode::Delete,
-        4 | 8 => KeyCode::End,
-        5 => KeyCode::PageUp,
-        6 => KeyCode::PageDown,
-        v @ 11..=15 => KeyCode::F(v - 10),
-        v @ 17..=21 => KeyCode::F(v - 11),
-        v @ 23..=26 => KeyCode::F(v - 12),
-        v @ 28..=29 => KeyCode::F(v - 15),
-        v @ 31..=34 => KeyCode::F(v - 17),
-        _ => return Err(()),
-    };
-    Ok(Some(Event::Key(KeyEvent::new_with_kind_and_state(
-        code, modifiers, kind, state,
-    ))))
-}
-
-/// `translate_functional_key_code` (`parse.rs:396-495`).
-fn translate_functional_key_code(codepoint: u32) -> Option<(KeyCode, KeyEventState)> {
-    let keypad = match codepoint {
-        57399..=57408 => Some(KeyCode::Char(
-            char::from_u32(u32::from(b'0') + (codepoint - 57399)).unwrap_or('0'),
-        )),
-        57409 => Some(KeyCode::Char('.')),
-        57410 => Some(KeyCode::Char('/')),
-        57411 => Some(KeyCode::Char('*')),
-        57412 => Some(KeyCode::Char('-')),
-        57413 => Some(KeyCode::Char('+')),
-        57414 => Some(KeyCode::Enter),
-        57415 => Some(KeyCode::Char('=')),
-        57416 => Some(KeyCode::Char(',')),
-        57417 => Some(KeyCode::Left),
-        57418 => Some(KeyCode::Right),
-        57419 => Some(KeyCode::Up),
-        57420 => Some(KeyCode::Down),
-        57421 => Some(KeyCode::PageUp),
-        57422 => Some(KeyCode::PageDown),
-        57423 => Some(KeyCode::Home),
-        57424 => Some(KeyCode::End),
-        57425 => Some(KeyCode::Insert),
-        57426 => Some(KeyCode::Delete),
-        57427 => Some(KeyCode::KeypadBegin),
-        _ => None,
-    };
-    if let Some(code) = keypad {
-        return Some((code, KeyEventState::KEYPAD));
-    }
-    let other = match codepoint {
-        57358 => Some(KeyCode::CapsLock),
-        57359 => Some(KeyCode::ScrollLock),
-        57360 => Some(KeyCode::NumLock),
-        57361 => Some(KeyCode::PrintScreen),
-        57362 => Some(KeyCode::Pause),
-        57363 => Some(KeyCode::Menu),
-        57376..=57398 => u8::try_from(codepoint - 57376 + 13).ok().map(KeyCode::F),
-        57428 => Some(KeyCode::Media(MediaKeyCode::Play)),
-        57429 => Some(KeyCode::Media(MediaKeyCode::Pause)),
-        57430 => Some(KeyCode::Media(MediaKeyCode::PlayPause)),
-        57431 => Some(KeyCode::Media(MediaKeyCode::Reverse)),
-        57432 => Some(KeyCode::Media(MediaKeyCode::Stop)),
-        57433 => Some(KeyCode::Media(MediaKeyCode::FastForward)),
-        57434 => Some(KeyCode::Media(MediaKeyCode::Rewind)),
-        57435 => Some(KeyCode::Media(MediaKeyCode::TrackNext)),
-        57436 => Some(KeyCode::Media(MediaKeyCode::TrackPrevious)),
-        57437 => Some(KeyCode::Media(MediaKeyCode::Record)),
-        57438 => Some(KeyCode::Media(MediaKeyCode::LowerVolume)),
-        57439 => Some(KeyCode::Media(MediaKeyCode::RaiseVolume)),
-        57440 => Some(KeyCode::Media(MediaKeyCode::MuteVolume)),
-        57441 => Some(KeyCode::Modifier(ModifierKeyCode::LeftShift)),
-        57442 => Some(KeyCode::Modifier(ModifierKeyCode::LeftControl)),
-        57443 => Some(KeyCode::Modifier(ModifierKeyCode::LeftAlt)),
-        57444 => Some(KeyCode::Modifier(ModifierKeyCode::LeftSuper)),
-        57445 => Some(KeyCode::Modifier(ModifierKeyCode::LeftHyper)),
-        57446 => Some(KeyCode::Modifier(ModifierKeyCode::LeftMeta)),
-        57447 => Some(KeyCode::Modifier(ModifierKeyCode::RightShift)),
-        57448 => Some(KeyCode::Modifier(ModifierKeyCode::RightControl)),
-        57449 => Some(KeyCode::Modifier(ModifierKeyCode::RightAlt)),
-        57450 => Some(KeyCode::Modifier(ModifierKeyCode::RightSuper)),
-        57451 => Some(KeyCode::Modifier(ModifierKeyCode::RightHyper)),
-        57452 => Some(KeyCode::Modifier(ModifierKeyCode::RightMeta)),
-        57453 => Some(KeyCode::Modifier(ModifierKeyCode::IsoLevel3Shift)),
-        57454 => Some(KeyCode::Modifier(ModifierKeyCode::IsoLevel5Shift)),
-        _ => None,
-    };
-    other.map(|code| (code, KeyEventState::empty()))
-}
-
-/// `parse_csi_u_encoded_key_code` (`parse.rs:497-616`).
-///
-/// The one arm deliberately not mirrored is crossterm's `'\n' if !is_raw_mode_enabled()`
-/// (`parse.rs:552`): this path only ever runs from the reader thread, which exists only after
-/// `App::into_stdout` has enabled raw mode, so the guard is always false here.
-#[allow(clippy::indexing_slicing)] // callers guarantee `buf.len() >= 3`
-fn decode_csi_u_encoded_key_code(buf: &[u8]) -> Result<Option<Event>, ()> {
-    let s = std::str::from_utf8(&buf[2..buf.len() - 1]).map_err(|_| ())?;
-    let mut split = s.split(';');
-    let mut codepoints = split.next().ok_or(())?.split(':');
-    let codepoint = codepoints
-        .next()
-        .ok_or(())?
-        .parse::<u32>()
-        .map_err(|_| ())?;
-
-    let (mut modifiers, kind, state_from_modifiers) =
-        if let Some((mask, kind_code)) = modifier_and_kind_parsed(&mut split) {
-            (
-                parse_modifiers(mask),
-                parse_key_event_kind(kind_code),
-                parse_modifiers_to_state(mask),
-            )
-        } else {
-            (KeyModifiers::NONE, KeyEventKind::Press, KeyEventState::NONE)
-        };
-
-    let (mut code, state_from_keycode) =
-        if let Some((special, state)) = translate_functional_key_code(codepoint) {
-            (special, state)
-        } else if let Some(c) = char::from_u32(codepoint) {
-            let code = match c {
-                '\x1b' => KeyCode::Esc,
-                '\r' => KeyCode::Enter,
-                '\t' => {
-                    if modifiers.contains(KeyModifiers::SHIFT) {
-                        KeyCode::BackTab
-                    } else {
-                        KeyCode::Tab
-                    }
-                }
-                '\x7f' => KeyCode::Backspace,
-                _ => KeyCode::Char(c),
-            };
-            (code, KeyEventState::empty())
-        } else {
-            return Err(());
-        };
-
-    if let KeyCode::Modifier(m) = code {
-        match m {
-            ModifierKeyCode::LeftAlt | ModifierKeyCode::RightAlt => {
-                modifiers.set(KeyModifiers::ALT, true);
-            }
-            ModifierKeyCode::LeftControl | ModifierKeyCode::RightControl => {
-                modifiers.set(KeyModifiers::CONTROL, true);
-            }
-            ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift => {
-                modifiers.set(KeyModifiers::SHIFT, true);
-            }
-            ModifierKeyCode::LeftSuper | ModifierKeyCode::RightSuper => {
-                modifiers.set(KeyModifiers::SUPER, true);
-            }
-            ModifierKeyCode::LeftHyper | ModifierKeyCode::RightHyper => {
-                modifiers.set(KeyModifiers::HYPER, true);
-            }
-            ModifierKeyCode::LeftMeta | ModifierKeyCode::RightMeta => {
-                modifiers.set(KeyModifiers::META, true);
-            }
-            _ => {}
-        }
-    }
-
-    if modifiers.contains(KeyModifiers::SHIFT)
-        && let Some(shifted) = codepoints
-            .next()
-            .and_then(|c| c.parse::<u32>().ok())
-            .and_then(char::from_u32)
-    {
-        code = KeyCode::Char(shifted);
-        modifiers.set(KeyModifiers::SHIFT, false);
-    }
-
-    Ok(Some(Event::Key(KeyEvent::new_with_kind_and_state(
-        code,
-        modifiers,
-        kind,
-        state_from_keycode | state_from_modifiers,
-    ))))
 }
 
 #[cfg(test)]
@@ -981,7 +598,7 @@ mod tests {
                 KeyCode::Up,
                 KeyModifiers::NONE,
                 KeyEventKind::Press,
-                KeyEventState::KEYPAD,
+                ratatui::crossterm::event::KeyEventState::KEYPAD,
             ))]
         );
     }

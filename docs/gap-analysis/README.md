@@ -178,7 +178,11 @@ blast radius is recorded inside the item as scheduling information rather than a
 is never held down by an unverifiable justification: an in-source ADR or `R-NN-NNN` id that cannot be
 read from this workspace is not a decision of record.
 
-**Effort** — `S` under a day · `M` a few days · `L` a week+ or needs design.
+**Effort** — `S` under a day · `M` a few days · `L` a week+ or needs design. The unit is
+**human developer-days**, and it measures size and design risk, not what gets scheduled: agent-driven
+lanes routinely close `M` and `L` rows in hours. An `L` is never by itself a reason to defer a row —
+a real blocker is a named dependency (another open row) or an open design question, written into the
+row.
 
 **`tracker`** is not a severity and not a kind — it is a row proposing **no schedulable work**, either
 because it indexes items other files own or because it asks a scope question. A tracker keeps its id,

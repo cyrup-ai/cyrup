@@ -639,8 +639,10 @@ fn the_session_swap_arm_pushes_the_panel_after_the_shortcuts_and_before_the_repl
     let shortcuts = arm
         .find("self.install_extension_shortcuts(")
         .unwrap_or_else(|| panic!("the `session_swapped` arm must re-source extension shortcuts"));
+    // The replay is the first step of `render_initial_messages` (pi's `renderInitialMessages()`,
+    // shared with the boot host since TUI-003).
     let replay = arm
-        .find(".replay_items()")
+        .find("self.render_initial_messages(")
         .unwrap_or_else(|| panic!("the `session_swapped` arm must still replay the conversation"));
 
     assert!(

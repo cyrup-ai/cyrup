@@ -25,7 +25,8 @@ pub trait Component {
 /// Terminal input delivered to the app/run loop. A thin projection of `crossterm::event::Event`
 /// plus the bracketed-paste payload (arch-10 §3.7). The async crossterm `EventStream` feature is
 /// not enabled in this build, so the production reader (see [`crate::app`]) feeds these from a
-/// blocking `event::read()` task — the run loop is agnostic to the source.
+/// reader thread (cyrup's byte reader on unix, crossterm's `event::read()` elsewhere) — the run
+/// loop is agnostic to the source.
 #[derive(Clone, Debug)]
 pub enum InputEvent {
     /// A key press (already filtered to `Press`/`Repeat` kinds by the reader).

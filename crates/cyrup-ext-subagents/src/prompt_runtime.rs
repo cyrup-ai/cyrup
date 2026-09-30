@@ -1801,8 +1801,9 @@ pub struct SubagentPromptRuntime {
 /// (`subagent-prompt-runtime.ts:535-550` @v0.71.0).
 ///
 /// cyrup-intercom asks at session start for this session's intercom id
-/// (`intercom:session-identity`); claiming the routing name there frees the session name for the
-/// readable label. An intercom that never asks routes by name, so the route stays the name.
+/// ([`crate::tui::intercom::INTERCOM_SESSION_IDENTITY_EVENT`]); claiming the routing name there
+/// frees the session name for the readable label. An intercom that never asks routes by name, so
+/// the route stays the name.
 #[derive(Debug)]
 pub struct ChildSessionIdentity {
     /// pi `config.intercomSessionName` — the child's deterministic intercom target
@@ -1813,14 +1814,6 @@ pub struct ChildSessionIdentity {
     /// pi `intercomIdClaimed`.
     claimed: std::sync::atomic::AtomicBool,
 }
-
-/// cyrup-intercom's `INTERCOM_SESSION_IDENTITY_EVENT` (`cyrup-intercom/src/identity.rs`) — the
-/// request, `{ "version": 1 }`, emitted on the bus at session start.
-pub const INTERCOM_SESSION_IDENTITY_EVENT: &str = "intercom:session-identity";
-/// cyrup-intercom's `INTERCOM_SESSION_IDENTITY_CLAIM_EVENT` — the reply,
-/// `{ "version": 1, "stableId": <id> }`. cyrup's bus carries JSON, so upstream's
-/// `request.claim(id)` callback is a message on this topic, accepted until the first `agent_start`.
-pub const INTERCOM_SESSION_IDENTITY_CLAIM_EVENT: &str = "intercom:session-identity-claim";
 
 impl ChildSessionIdentity {
     /// Read both names from the child env; `None` when neither was handed down.
@@ -2403,7 +2396,7 @@ impl NativeExtension for SubagentPromptRuntime {
             .as_ref()
             .is_some_and(|identity| identity.routing_name.is_some())
         {
-            api.subscribe_bus(INTERCOM_SESSION_IDENTITY_EVENT);
+            api.subscribe_typed_bus(crate::tui::intercom::INTERCOM_SESSION_IDENTITY_EVENT);
         }
         // pi `registerToolBudget` subscribes `onRuntimeEvent("tool_call", …)` only when a budget
         // exists (`:172` returns early otherwise); `Dispatcher::no_subscribers` short-circuits an
@@ -2517,27 +2510,25 @@ impl NativeExtension for SubagentPromptRuntime {
         {
             acknowledgements.acknowledge(payload);
         }
-        // SUBA-134 — pi `request.claim(routingName); intercomIdClaimed = true` for a V1 request
-        // (`subagent-prompt-runtime.ts:538-542` @v0.71.0), answered on the claim topic.
-        if topic == INTERCOM_SESSION_IDENTITY_EVENT
-            && payload.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+        Ok(())
+    }
+
+    /// SUBA-134 — pi's `pi.events.on(INTERCOM_SESSION_IDENTITY_EVENT, (request) => {
+    /// request.claim(routingName); intercomIdClaimed = true; })` for a V1 request
+    /// (`subagent-prompt-runtime.ts:537-542` @v0.71.0), run inline inside intercom's emit so the
+    /// claim is settled before intercom picks the id it registers under.
+    fn on_typed_bus_event(&self, topic: &str, event: &dyn std::any::Any) {
+        if topic == crate::tui::intercom::INTERCOM_SESSION_IDENTITY_EVENT
+            && let Some(request) =
+                event.downcast_ref::<crate::tui::intercom::IntercomSessionIdentityRequestV1>()
             && let Some(identity) = &self.session_identity
             && let Some(routing_name) = &identity.routing_name
-            && let Some(services) = self
-                .services
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
         {
-            services.emit_event(
-                INTERCOM_SESSION_IDENTITY_CLAIM_EVENT,
-                &serde_json::json!({ "version": 1, "stableId": routing_name }),
-            );
+            request.claim(routing_name);
             identity
                 .claimed
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        Ok(())
     }
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
@@ -2759,7 +2750,7 @@ impl NativeExtension for SubagentPromptRuntime {
                         rewrite.is_some_and(|opts| opts.fanout_child),
                         rewrite.is_some_and(|opts| opts.structured_output),
                     )),
-                    inject: None,
+                    inject: Vec::new(),
                 })
             }
             HostEvent::BeforeAgentStart { system_prompt, .. } => {
@@ -2773,7 +2764,7 @@ impl NativeExtension for SubagentPromptRuntime {
                 } else {
                     HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
                         system: Some(rewritten),
-                        inject: None,
+                        inject: Vec::new(),
                     })
                 }
             }

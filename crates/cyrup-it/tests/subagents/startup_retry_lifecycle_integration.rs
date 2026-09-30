@@ -186,6 +186,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         // `build_attempt_spawn_plan` gates both env keys on presence (exec/mod.rs:2227-2250), so
         // `None` keeps the child's env overlay byte-identical to a real foreground child's.
         steer_ack_dir: None,
+        external_log_dir: None,
         steer_capability_path: None,
         control_config: None,
         on_control_event: None,

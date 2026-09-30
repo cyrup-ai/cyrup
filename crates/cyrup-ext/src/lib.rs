@@ -223,8 +223,8 @@ pub use provider::{
     ProviderRegistration, resolve_api_key,
 };
 pub use registry::{
-    CommandDescriptor, ExecModeWire, ExtensionConflict, ExtensionProvenance, ExtensionRegistry,
-    ResolvedCommand, ToolDescriptor,
+    CommandDescriptor, ExecModeWire, ExtensionConflict, ExtensionFlagDeclaration,
+    ExtensionProvenance, ExtensionRegistry, ResolvedCommand, ToolDescriptor,
 };
 pub use render::RenderOptions;
 pub use subscriber::ExtSubscriber;

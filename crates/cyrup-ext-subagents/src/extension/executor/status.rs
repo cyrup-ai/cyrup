@@ -608,6 +608,33 @@ impl SubagentExecutor {
                 return Ok(format_remembered_foreground_status(&run));
             }
 
+            // SUBA-134 — pi `resolveSubagentRunId(...).kind === "nested"` → `formatNestedExactStatus`
+            // (`run-status.ts:435-448`, `run-id-resolver.ts:152-161` @v0.71.0): an exact async run
+            // wins, then an exact nested descendant (ambiguous across registries is an error),
+            // and only then the async prefix fallback `inspect_status_by_id` owns.
+            if let Some(id) = resolved_id.as_deref()
+                && dir.is_none()
+                && !run_status::exact_async_run_exists(&async_root, &results_dir, id).await
+            {
+                let matches = self.nested_run_matches_by_id(id).await;
+                match matches.as_slice() {
+                    [] => {}
+                    [(root_run_id, run)] => {
+                        return Ok(run_status::format_nested_exact_status(
+                            root_run_id,
+                            run,
+                            crate::time::now_epoch_millis(),
+                        ));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Nested run id '{id}' is ambiguous across authorized registries. \
+                             Provide the full id after stale registries are cleaned up."
+                        ));
+                    }
+                }
+            }
+
             // S6 — the renderer is HANDED the two live registries it may not lock across an
             // `.await`; see `run_status::RunStatusRenderDeps`.
             let deps = self.run_status_render_deps();
@@ -861,6 +888,7 @@ impl SubagentExecutor {
                 |(run_id, entry)| crate::background::fleet_view::ForegroundFleetEntry {
                     run_id: run_id.clone(),
                     current_agent: entry.current_agent.clone(),
+                    session_name: entry.session_name.clone(),
                     current_index: entry.current_index,
                     activity_state: entry.current_activity_state,
                     session_id: entry.session_id.clone(),
@@ -1040,10 +1068,16 @@ fn format_remembered_foreground_status(run: &ForegroundHistoryRun) -> String {
             .lines()
             .find(|line| !line.trim().is_empty())
             .map(|line| line.chars().take(160).collect::<String>());
+        // SUBA-134 — `${child.sessionName?.trim() || child.agent}` (`run-status.ts:217` @v0.71.0).
+        let display_name = child
+            .session_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&child.agent);
         let mut parts = vec![format!(
-            "{}. {} {}",
+            "{}. {display_name} {}",
             child.index + 1,
-            child.agent,
             child.status
         )];
         if let Some(error) = child.error.as_ref() {
@@ -1514,7 +1548,10 @@ mod tests {
         assert!(text.contains("Run: fgdetached0001"), "{text}");
         assert!(text.contains("State: remembered foreground"), "{text}");
         assert!(text.contains("Mode: single"), "{text}");
-        assert!(text.contains("1. scout detached"), "{text}");
+        // SUBA-134 — the child line names the remembered child by its session name
+        // (`${child.sessionName?.trim() || child.agent}`, `run-status.ts:217` @v0.71.0), which the
+        // detach receipt carries and `compactChild` keeps (`foreground-history.ts:33`).
+        assert!(text.contains("1. scout: hold the line detached"), "{text}");
         // pi `:238` — the detached arm wins, and it names the REGISTERED wait tool.
         assert!(
             text.contains(&format!(
@@ -1546,6 +1583,86 @@ mod tests {
         assert_eq!(
             deps.foreground_controls[0].session_id,
             crate::identity::SessionId::parse("session-a")
+        );
+    }
+
+    /// SUBA-134 — pi `run-status.ts:435-448` @v0.71.0 (upstream test `run-status.test.ts:1373`):
+    /// an id that is no async run but a nested descendant in a projected registry renders the
+    /// nested exact-status view, named by the child's session name that rode the relayed event
+    /// through the sanitizer; the same id in two registries is upstream's ambiguity error.
+    #[tokio::test]
+    async fn status_by_id_renders_a_nested_run_by_its_child_session_name() {
+        use crate::spawn::nested_events::{
+            NestedEventInput, create_nested_route_in, sanitize_summary, write_nested_event_in,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = crate::paths::Roots::sandboxed(dir.path());
+        let events_root = roots.nested_events();
+        let executor =
+            SubagentExecutor::with_config(crate::registration::SubagentExtensionConfig {
+                roots,
+                ..crate::registration::SubagentExtensionConfig::default()
+            });
+        let relay = |root_run_id: &str| {
+            let route = create_nested_route_in(&events_root, root_run_id).expect("route");
+            let child = sanitize_summary(&serde_json::json!({
+                "id": "nested-exact-child",
+                "parentRunId": root_run_id,
+                "parentStepIndex": 0,
+                "depth": 1,
+                "path": [{ "runId": root_run_id, "stepIndex": 0, "agent": "orchestrator" }],
+                "state": "running",
+                "mode": "single",
+                "agent": "validator",
+                "sessionName": "validator: check the refresh path",
+                "steps": [{ "agent": "leaf", "sessionName": "leaf: grep", "status": "running" }],
+                "lastUpdate": 150,
+            }))
+            .expect("summary");
+            write_nested_event_in(
+                &events_root,
+                &route,
+                &NestedEventInput {
+                    event_type: "subagent.nested.updated".to_string(),
+                    ts: 150,
+                    parent_run_id: root_run_id.to_string(),
+                    parent_step_index: Some(0),
+                    child,
+                },
+            )
+            .expect("write event");
+        };
+        relay("run-nested-exact-root");
+
+        let text = executor
+            .control_status(dir.path(), Some("nested-exact-child"), None, false)
+            .await
+            .expect("a nested run's status");
+        assert!(
+            text.starts_with("Nested run: nested-exact-child\nRoot: run-nested-exact-root\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nAgent: validator: check the refresh path\n"),
+            "{text}"
+        );
+        assert!(text.contains("\n  1. leaf: grep running"), "{text}");
+        assert!(
+            text.ends_with(
+                "  Root status: subagent({ action: \"status\", id: \"run-nested-exact-root\" })"
+            ),
+            "{text}"
+        );
+
+        relay("run-nested-other-root");
+        let err = executor
+            .control_status(dir.path(), Some("nested-exact-child"), None, false)
+            .await
+            .expect_err("two registries hold the id");
+        assert_eq!(
+            err,
+            "Nested run id 'nested-exact-child' is ambiguous across authorized registries. \
+             Provide the full id after stale registries are cleaned up."
         );
     }
 }

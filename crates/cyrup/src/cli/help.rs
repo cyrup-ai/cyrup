@@ -1,10 +1,14 @@
-use super::argv::{ExtFlagValue, ExtensionFlag};
+use cyrup_session_svc::ExtensionFlagDeclaration;
 
-/// Render Pi's rich `--help` body (args.ts:212-389): usage, the package/config commands, the full
-/// option list, the registered-extension-flag block, examples, the environment-variable catalogue,
-/// and the built-in tool names. `extension_flags` are the flags loaded extensions registered; the bin
-/// passes an empty slice today (the loaded-extension flag tier is the outer extension layer,
-/// ledgered), but the injection point is preserved 1:1.
+/// Render Pi's rich `--help` body (`printHelp`, `cli/args.ts:261-449` @v0.87.1): usage, the
+/// package/config commands, the full option list, the registered-extension-flag block, examples,
+/// the environment-variable catalogue, and the built-in tool names. `extension_flags` are the flag
+/// DECLARATIONS the loaded extensions registered — pi's `ExtensionFlag[]`, which `main.ts:859-862`
+/// flat-maps out of the live resource loader after the runtime exists (SEAM-020).
+///
+/// Each declaration renders as pi's `` `  --${flag.name}${value}`.padEnd(30) + description ``, where
+/// `value` is ` <value>` for a `"string"` flag and `description` is the declared one or
+/// `Registered by <extension>` (`args.ts:262-270`).
 ///
 /// SEAM-111 — the Commands block had drifted from `args.ts:226-235` in three places, and **two of
 /// them understated what actually ships**:
@@ -16,7 +20,7 @@ use super::argv::{ExtFlagValue, ExtensionFlag};
 ///   `-l` is parsed at `subcommands.rs`'s config arm and Tab switches write scope in the picker. The
 ///   two least guessable parts of `config` were invisible from the top-level help and — until
 ///   SEAM-079 — from `config --help` as well.
-pub fn render_help(extension_flags: &[ExtensionFlag]) -> String {
+pub fn render_help(extension_flags: &[ExtensionFlagDeclaration]) -> String {
     const APP: &str = "cyrup";
     const CFG: &str = ".cyrup";
     // CFG-068 — the directory rows name the SAME strings the readers use, taken from
@@ -33,12 +37,20 @@ pub fn render_help(extension_flags: &[ExtensionFlag]) -> String {
         let lines: Vec<String> = extension_flags
             .iter()
             .map(|f| {
-                let value = if matches!(f.value, ExtFlagValue::Str(_)) {
+                // `flag.type === "string" ? " <value>" : ""` (`args.ts:266`).
+                let value = if f.flag_type.as_deref() == Some("string") {
                     " <value>"
                 } else {
                     ""
                 };
-                format!("  --{}{}", f.name, value)
+                // `flag.description ?? \`Registered by ${flag.extensionPath}\`` (`:267`).
+                let description = f
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("Registered by {}", f.extension));
+                // `.padEnd(30)` (`:268`): pad to 30 columns, never truncate — a longer head is
+                // followed directly by its description, as upstream's is.
+                format!("{:<30}{description}", format!("  --{}{value}", f.name))
             })
             .collect();
         format!("\nExtension CLI Flags:\n{}\n", lines.join("\n"))

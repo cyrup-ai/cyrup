@@ -116,10 +116,11 @@ fn collect_settings_diagnostics(mgr: &mut cyrup_config::SettingsManager) -> Vec<
 /// Experimental first-time setup — Pi main.ts:615-617 (`:663-664` @v0.84.1).
 ///
 /// pi's condition is `appMode === "interactive" && !parsed.help && parsed.listModels === undefined
-/// && shouldRunFirstTimeSetup()`. `!parsed.help` needs no conjunct — `main.rs` prints help and
-/// returns upstream of this gate — but `list_models` does: `resolve_app_mode` answers `Interactive`
-/// for `cyrup --list-models gpt` on a TTY and the listing exit is DOWNSTREAM, so without it the
-/// wizard would mount on a command pi answers with a model list.
+/// && shouldRunFirstTimeSetup()` (`main.ts:661` @v0.87.1), and both conjuncts are needed:
+/// `resolve_app_mode` answers `Interactive` for `cyrup --help` or `cyrup --list-models gpt` on a
+/// TTY, and both exits are DOWNSTREAM of this gate (the `--help` exit only once the runtime exists,
+/// SEAM-020), so without them the wizard would mount on a command pi answers with help text or a
+/// model list.
 ///
 /// `detected` is pi's own detection (`detectTerminalThemeForAuto({ ui, timeoutMs: 100 })`,
 /// startup-ui.ts:180) — the 100 ms bound is pi's. The theme is the detected polarity rather than
@@ -137,6 +138,7 @@ pub async fn maybe_run_first_time_setup(
     settings: &mut SettingsManager,
 ) -> anyhow::Result<bool> {
     if mode != AppMode::Interactive
+        || cli.help
         || cli.list_models.is_some()
         || !crate::startup::should_run_first_time_setup(
             &dirs.settings_path(),

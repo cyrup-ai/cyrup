@@ -891,7 +891,9 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             turn_budget_exceeded: false,
             wrap_up_requested: false,
             tool_budget_blocked: false,
-            session_name: None,
+            // SUBA-134 — `...(step.sessionName ? { sessionName: step.sessionName } : {})` on each
+            // synthesized child (`stale-run-reconciler.ts:278` @v0.71.0).
+            session_name: step.session_name.clone(),
             agent: step.agent.clone(),
             task: String::new(),
             exit_code: -1,
@@ -1036,12 +1038,12 @@ async fn read_optional_json<T: serde::de::DeserializeOwned>(
 /// Best-effort read of a bounded tail of the runner's captured stderr log, for the diagnostic
 /// context R-SA-092 asks a synthesized failure to include — pi `readRunnerStartupDiagnostics`
 /// (`stale-run-reconciler.ts:53-74` @v0.71.0): the last 64 KiB, trimmed, its last 30 lines, and
-/// at most the last 4 000 characters of those. Returns `None` (never an error) if the log is
+/// at most the last 4 000 UTF-16 code units of those (a JS string's `length`). Returns `None` (never an error) if the log is
 /// missing, empty or unreadable — diagnostics enrichment must never block failure synthesis.
 async fn read_stderr_tail(path: &Path) -> Option<String> {
     const MAX_BYTES: usize = 64 * 1024;
     const MAX_LINES: usize = 30;
-    const MAX_CHARS: usize = 4000;
+    const MAX_UTF16_UNITS: usize = 4000;
 
     let bytes = tokio::fs::read(path).await.ok()?;
     let start = bytes.len().saturating_sub(MAX_BYTES);
@@ -1059,9 +1061,18 @@ async fn read_stderr_tail(path: &Path) -> Option<String> {
         .get(lines.len().saturating_sub(MAX_LINES)..)
         .unwrap_or_default()
         .join("\n");
-    let length = tail.chars().count();
-    if length > MAX_CHARS {
-        let kept: String = tail.chars().skip(length - MAX_CHARS).collect();
+    // `lines.length > 4000 ? lines.slice(-4000) : lines` — a JS string's length and `slice` count
+    // UTF-16 code units, so the bound is in those units (an astral character is two).
+    let units: Vec<u16> = tail.encode_utf16().collect();
+    if units.len() > MAX_UTF16_UNITS {
+        // [CYRUP-DELTA] a cut through a surrogate pair leaves upstream holding a lone surrogate,
+        // which is not Unicode and which a strict JSON reader rejects; the lossy decode here
+        // renders that half-character as U+FFFD instead, and every other unit is kept as is.
+        let kept = String::from_utf16_lossy(
+            units
+                .get(units.len() - MAX_UTF16_UNITS..)
+                .unwrap_or_default(),
+        );
         return Some(format!("{kept}\n[stderr tail truncated]"));
     }
     Some(tail)
@@ -1591,6 +1602,8 @@ mod tests {
         // A real run carries its launching session; the reconciler writes the repaired result only
         // when it does (pi `stale-run-reconciler.ts:283`).
         status.session_id = crate::identity::SessionId::parse("test-session");
+        // SUBA-134 — the step's declared child session name rides onto its synthesized result.
+        status.steps[0].session_name = Some("researcher: map the auth flow".to_string());
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -1639,6 +1652,12 @@ mod tests {
         assert!(
             !reread_result.results.is_empty(),
             "a synthesized diagnostic result must be present"
+        );
+        // pi `...(step.sessionName ? { sessionName: step.sessionName } : {})`
+        // (`stale-run-reconciler.ts:278` @v0.71.0).
+        assert_eq!(
+            reread_result.results[0].session_name.as_deref(),
+            Some("researcher: map the auth flow")
         );
     }
 
@@ -2163,5 +2182,37 @@ mod tests {
         let now = SystemTime::now();
         let last_update = crate::time::epoch_millis(now + Duration::from_secs(60));
         assert!(!is_stale(last_update, now, DEFAULT_STALE_AFTER));
+    }
+
+    /// SUBA-141 — pi bounds the runner stderr tail with `lines.length > 4000 ?
+    /// lines.slice(-4000) : lines` (`stale-run-reconciler.ts:75` @v0.71.0): a JS string's length,
+    /// i.e. UTF-16 code units. 2 500 astral characters are 5 000 units, so upstream truncates to
+    /// the last 2 000 of them; a char-counted bound (2 500 <= 4 000) kept all of them.
+    #[tokio::test]
+    async fn the_stderr_tail_bound_counts_utf16_units_like_upstream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runner.stderr.log");
+        tokio::fs::write(&path, "\u{1F600}".repeat(2500))
+            .await
+            .expect("write log");
+        let tail = read_stderr_tail(&path).await.expect("a tail");
+        assert_eq!(
+            tail,
+            format!("{}\n[stderr tail truncated]", "\u{1F600}".repeat(2000))
+        );
+
+        // A cut through a surrogate pair: `y` plus 1 999 emoji are 3 999 units, so the 4 000th
+        // is the low half of the emoji before them, which renders as U+FFFD.
+        tokio::fs::write(&path, format!("{}y", "\u{1F600}".repeat(2001)))
+            .await
+            .expect("write log");
+        let tail = read_stderr_tail(&path).await.expect("a tail");
+        assert_eq!(
+            tail,
+            format!(
+                "\u{FFFD}{}y\n[stderr tail truncated]",
+                "\u{1F600}".repeat(1999)
+            )
+        );
     }
 }

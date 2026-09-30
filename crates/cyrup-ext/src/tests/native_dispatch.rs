@@ -2108,3 +2108,61 @@ fn the_gate_tracks_each_guard_individually() {
         assert!(gate.live_kinds().is_empty());
     });
 }
+
+/// A typed request whose listeners answer into it — the shape of pi-intercom's
+/// `IntercomSessionIdentityRequestV1 { claim(stableId) }`.
+#[derive(Default)]
+struct Ballot(Mutex<Vec<String>>);
+
+/// Listens on the typed `demo:typed` topic and signs every [`Ballot`] with its own id.
+struct TypedListener(&'static str);
+
+#[async_trait::async_trait]
+impl NativeExtension for TypedListener {
+    fn id(&self) -> ExtensionId {
+        self.0.into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.subscribe_typed_bus("demo:typed");
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+    fn on_typed_bus_event(&self, topic: &str, event: &dyn std::any::Any) {
+        assert_eq!(topic, "demo:typed");
+        if let Some(ballot) = event.downcast_ref::<Ballot>() {
+            ballot.0.lock().unwrap().push(self.0.to_string());
+        }
+    }
+}
+
+/// pi's `emit` runs every listener before it returns (`core/event-bus.ts:15-17` @v0.87.1), which is
+/// what lets pi-intercom read a claim right after emitting its identity request. The typed bus is
+/// that path for natives: every listener has answered the event, in load order, when `emit_typed`
+/// returns — with no drain and nothing queued. A payload of another type is handed over but not
+/// downcast, and an unloaded listener is no longer called.
+#[tokio::test]
+async fn a_typed_bus_emit_runs_every_listener_before_it_returns() {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(TypedListener("first")))
+        .await
+        .unwrap();
+    host.load_native(Arc::new(TypedListener("second")))
+        .await
+        .unwrap();
+
+    let ballot = Ballot::default();
+    host.bus().emit_typed("demo:typed", &ballot);
+    assert_eq!(*ballot.0.lock().unwrap(), ["first", "second"]);
+    assert_eq!(host.bus().pending_len(), 0, "nothing is queued");
+
+    host.bus().emit_typed("demo:typed", &"not a ballot");
+    host.bus().emit_typed("demo:other", &ballot);
+    assert_eq!(*ballot.0.lock().unwrap(), ["first", "second"]);
+
+    assert_eq!(host.bus().unsubscribe_all(&"first".into()), 1);
+    let after = Ballot::default();
+    host.bus().emit_typed("demo:typed", &after);
+    assert_eq!(*after.0.lock().unwrap(), ["second"]);
+}

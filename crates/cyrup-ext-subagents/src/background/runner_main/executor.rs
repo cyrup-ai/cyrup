@@ -124,6 +124,12 @@ pub(crate) struct ExecSingleStepExecutor {
     /// Caller-supplied additions to each dispatched step's child environment
     /// ([`RunnerOverrides::child_env`](super::RunnerOverrides::child_env)). Empty on the real detached runner.
     pub(crate) child_env: std::collections::HashMap<String, String>,
+    /// SUBA-134 — whether each dispatched step names its child session from the step itself
+    /// ([`SingleStepSpec::child_session_name`], label and launcher-assigned name included), as
+    /// pi's async runner does (`subagent-runner.ts:828` @v0.71.0). `false` on the FOREGROUND walk:
+    /// upstream's foreground `runSync` derives from the agent and task alone (`execution.ts:370`),
+    /// which is what `run_sync` does when no name is handed down.
+    pub(crate) names_child_sessions: bool,
     /// The live-telemetry channel (`None` for a foreground executor with no `status.json` to
     /// update): each dispatched step installs a [`RunOptions::live_events`] sink that forwards every
     /// raw child NDJSON line here, tagged with the dispatch's own
@@ -381,6 +387,7 @@ impl ExecSingleStepExecutor {
             spawn_command,
             // A foreground executor's child env comes from its own `RunOptions`, not from here.
             child_env: std::collections::HashMap::new(),
+            names_child_sessions: false,
             interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // A foreground run writes no process-terminal candidate: it has no detached runner
             // whose close anyone has to prove, and nothing would ever read the ledger.
@@ -713,6 +720,7 @@ impl ExecSingleStepExecutor {
     /// `ClarifyDispatch`, a control-notice sink, `steer_*: None`), and the two agree on the struct
     /// alone — a shared builder would have to reproduce both field-by-field with nothing left in
     /// common.
+    #[allow(clippy::too_many_arguments)]
     fn build_step_run_options(
         &self,
         step: &SingleStepSpec,
@@ -724,6 +732,9 @@ impl ExecSingleStepExecutor {
         // be told apart from a parent-inherited model once it has been returned.
         model_override_from_parent: bool,
         acceptance: Option<crate::exec::acceptance::AcceptanceContract>,
+        // The task after `{previous}`/`{outputs.*}` substitution — what pi's runner names the
+        // child from (`subagent-runner.ts:806-828` @v0.71.0).
+        resolved_task: &str,
     ) -> RunOptions {
         // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:1333,2002-2005,2069` @v0.34.0): clone the
         // run-wide SHARED interrupt token so an interrupt landing WHILE this child is running (the
@@ -772,14 +783,27 @@ impl ExecSingleStepExecutor {
             None
         } else {
             let telemetry = self.telemetry.clone();
+            let lines = telemetry.clone();
             let mut sink = crate::exec::LiveEventSink::new(move |raw: &str| {
-                if let Some(sender) = telemetry.as_ref() {
-                    let _ = sender.send(TelemetryMsg {
+                if let Some(sender) = lines.as_ref() {
+                    let _ = sender.send(TelemetryMsg::ChildLine {
                         flat_index,
                         raw: raw.to_string(),
                     });
                 }
             });
+            // SUBA-141 — pi `onExternalProcess` → `updateExternalProcess(index, process)`
+            // (`subagent-runner.ts:2247-2251` @v0.71.0): the external-CLI runner's live process
+            // reports reach the same telemetry task, which publishes them onto this step's
+            // `status.json` entry.
+            if let Some(sender) = telemetry {
+                sink = sink.with_external_process_sink(move |update| {
+                    let _ = sender.send(TelemetryMsg::ExternalProcess {
+                        flat_index,
+                        update: Box::new(update),
+                    });
+                });
+            }
             let ledgers = self.writer_ledgers.clone();
             let lease_writer = self.lease_writer.clone();
             if ledgers.is_some() || lease_writer.is_some() {
@@ -852,7 +876,22 @@ impl ExecSingleStepExecutor {
             // builder); this runner holds only the step, so it reads the result.
             fast: step.fast == Some(true),
             spawn_command: self.spawn_command.clone(),
-            child_env: self.child_env.clone(),
+            // SUBA-134 — pi's `childSessionName = step.sessionName ?? deriveChildSessionName({
+            // agent: step.agent, task, label: step.label })` (`subagent-runner.ts:828` @v0.71.0),
+            // handed to the child as its runtime config's `sessionName` (`:1126`) — here the env the
+            // child's prompt runtime reads, which `run_sync` also names the result from.
+            child_env: {
+                let mut env = self.child_env.clone();
+                if self.names_child_sessions
+                    && let Some(name) = step.child_session_name(resolved_task)
+                {
+                    env.insert(
+                        crate::exec::child_session_name::CHILD_SESSION_NAME_ENV.to_string(),
+                        name,
+                    );
+                }
+                env
+            },
             // SUBA-021 — the RUN-level usage budget applied per step, exactly as `turn_budget`
             // below is (pi applies one `AsyncExecutionParams.usageBudget` across the whole run
             // rather than giving each step a fresh one).
@@ -987,6 +1026,10 @@ impl ExecSingleStepExecutor {
             // SUBA-049: the return path, keyed off the SAME flat index as the inbox above — see
             // `steer_ack_dir_for`'s doc for why the derivation is shared rather than re-written.
             steer_ack_dir: self.steer_ack_dir_for(ctx.step_slot.index()),
+            // SUBA-141 — pi `asyncDir: path.dirname(ctx.outputFile)` (`subagent-runner.ts:924`
+            // @v0.71.0): an external-CLI step logs into the run's own directory, beside
+            // `output-<i>.log`, where Fleet tails it.
+            external_log_dir: self.run_dir.clone(),
             steer_capability_path: self.steer_capability_path_for(ctx.step_slot.index()),
             // SUBA-N05: the run's resolved live-control config, threaded from
             // [`RunnerConfig::control`] (background) or [`ExecSingleStepExecutor::with_control`]
@@ -1192,6 +1235,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             model_override,
             model_override_from_parent,
             acceptance,
+            resolved_task,
         );
 
         let artifact_paths =
@@ -1266,6 +1310,7 @@ fn build_step_result(
         native_machine,
         execution,
         tool_budget_blocked,
+        session_name,
         ..
     } = result;
     let mut step_result = if exit_code == 0 {
@@ -1326,6 +1371,10 @@ fn build_step_result(
     // SUBA-132 — pi's runner keeps `toolBudgetBlocked` on the step's result (`subagent-runner.ts:1077`,
     // published at `:1592`). Same trailing-`..` caveat as above.
     step_result.tool_budget_blocked = tool_budget_blocked;
+    // SUBA-134 — pi `sessionName: childSessionName` on the step's result (`subagent-runner.ts:972,
+    // 1043,1515` @v0.71.0) and `setOptionalProperty(requiredStatusStep(fi), "sessionName",
+    // singleResult.sessionName)` on its status (`:3759`). Same trailing-`..` caveat as above.
+    step_result.session_name = session_name;
     // SUBA-N05: carry the events this step's control monitor raised out of `run_sync` so
     // `step_result_to_single_result` can put them on the terminal `ResultFile`. Without this
     // hop the whole async control path is inert: the thresholds are honoured, the events are
@@ -1402,6 +1451,7 @@ mod tests {
                 base_args: Vec::new(),
             }),
             child_env: std::collections::HashMap::new(),
+            names_child_sessions: true,
             usage_budget: None,
             turn_budget: None,
             permission_rules: None,
@@ -1479,6 +1529,7 @@ mod tests {
             lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
+            names_child_sessions: true,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
@@ -1719,6 +1770,7 @@ mod tests {
             lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
+            names_child_sessions: true,
             usage_budget: None,
             turn_budget: None,
             permission_rules: None,
@@ -1744,6 +1796,188 @@ mod tests {
             include_progress: None,
             run_dir: None,
         }
+    }
+
+    /// A child that answers with the session name it was handed in its env, then settles.
+    fn session_name_echo_child(dir: &std::path::Path) -> crate::spawn::SpawnCommand {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = dir.join("echo-session-name.sh");
+        std::fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",",
+                "\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}\\n' ",
+                "\"$CYRUP_SUBAGENT_SESSION_NAME\"\n",
+                "printf '{\"type\":\"agent_settled\"}\\n'\n",
+                "exit 0\n",
+            ),
+        )
+        .expect("write child");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::spawn::SpawnCommand {
+            binary: script,
+            base_args: Vec::new(),
+        }
+    }
+
+    /// SUBA-134 — pi's async runner names each child `step.sessionName ?? deriveChildSessionName({
+    /// agent: step.agent, task, label: step.label })` and hands it down as the child's runtime
+    /// `sessionName` (`subagent-runner.ts:828,1126` @v0.71.0); its foreground `runSync` names the
+    /// child from the agent and task alone (`execution.ts:370`). Driven through `run_single` with a
+    /// REAL spawned child that answers with the name it received, so the assertion is on what the
+    /// child saw, and on the step result the runner settles from.
+    ///
+    /// GUT the `child_env` insert in `build_step_run_options` and the runner's child sees the
+    /// task derivation, not the label; GUT the `names_child_sessions` gate and the foreground child
+    /// sees the label; GUT the `step_result.session_name` hop and the step result carries none.
+    #[tokio::test]
+    async fn a_runner_step_names_its_child_from_its_label_and_the_foreground_walk_does_not() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let spawn = session_name_echo_child(dir.path());
+        let agents: Arc<BTreeMap<String, crate::exec::ResolvedAgentPersona>> = Arc::new(
+            [(
+                "worker".to_string(),
+                super::super::tests::resolved_persona("worker"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mut runner = runner_shaped(None, crate::artifacts::ArtifactConfig::default());
+        runner.spawn_command = Some(spawn.clone());
+        runner.resolved_agents = Arc::clone(&agents);
+        let heard = |result: &StepResult| {
+            result
+                .final_output
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_string)
+        };
+
+        let mut step = single_step("worker", "fix the auth refresh");
+        step.label = Some("Lane A".to_string());
+        let result = runner
+            .run_single(&step, "fix the auth refresh", &step_test_ctx(dir.path()))
+            .await
+            .expect("run_single");
+        assert!(result.success, "{result:?}");
+        assert_eq!(heard(&result).as_deref(), Some("worker: Lane A"));
+        assert_eq!(result.session_name.as_deref(), Some("worker: Lane A"));
+
+        // A launcher-assigned name wins over the derivation.
+        step.session_name = Some("worker: item 3".to_string());
+        let result = runner
+            .run_single(&step, "fix the auth refresh", &step_test_ctx(dir.path()))
+            .await
+            .expect("run_single");
+        assert_eq!(heard(&result).as_deref(), Some("worker: item 3"));
+
+        let foreground = ExecSingleStepExecutor::foreground(
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            agents,
+            Arc::new(BTreeMap::new()),
+            None,
+            None,
+            None,
+            None,
+            Some(spawn),
+        );
+        let result = foreground
+            .run_single(&step, "fix the auth refresh", &step_test_ctx(dir.path()))
+            .await
+            .expect("run_single");
+        assert_eq!(
+            heard(&result).as_deref(),
+            Some("worker: fix the auth refresh"),
+            "the foreground walk names the child from its agent and task only"
+        );
+        assert_eq!(
+            result.session_name.as_deref(),
+            Some("worker: fix the auth refresh")
+        );
+    }
+
+    /// SUBA-141 — pi's runner publishes the external runner's live process hook onto the step
+    /// (`onProcess: ctx.onExternalProcess` → `updateExternalProcess(index, process)`,
+    /// `subagent-runner.ts:936,2247-2251` @v0.71.0), and the external runner writes its two stream
+    /// logs into the run's own directory (`asyncDir: path.dirname(ctx.outputFile)`, `:924`), where
+    /// Fleet tails them. Driven through `run_single` with a REAL external-CLI agent (the generic
+    /// adapter over a shell script) and the runner's telemetry channel installed.
+    ///
+    /// GUT the spawn-time `hook.report` in `run_external_cli_process` and the first report is the
+    /// close one (it has an end); GUT the `with_external_process_sink` wiring and no report
+    /// arrives; GUT `external_log_dir: self.run_dir.clone()` and the logs land in the scratch dir.
+    #[tokio::test]
+    async fn an_external_cli_step_publishes_its_process_live_and_logs_into_the_run_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let script = dir.path().join("foreign.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\necho 'warming up' >&2\nsleep 0.2\necho done\n",
+        )
+        .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut persona = super::super::tests::resolved_persona("foreign");
+        persona.model = None;
+        persona.runner = Some(crate::runner::AgentRunnerConfig::ExternalCli(
+            crate::runner::ExternalCliRunner {
+                adapter: None,
+                command: script.display().to_string(),
+                args: Vec::new(),
+                prompt_delivery_stdin: false,
+                capabilities: None,
+            },
+        ));
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).expect("mkdir run dir");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TelemetryMsg>();
+        let mut runner = runner_shaped(None, crate::artifacts::ArtifactConfig::default());
+        runner.resolved_agents = Arc::new([("foreign".to_string(), persona)].into_iter().collect());
+        runner.telemetry = Some(tx);
+        runner.run_dir = Some(run_dir.clone());
+
+        let step = single_step("foreign", "do the foreign thing");
+        let result = runner
+            .run_single(&step, "do the foreign thing", &step_test_ctx(dir.path()))
+            .await
+            .expect("run_single");
+        assert!(result.success, "{result:?}");
+        drop(runner);
+
+        let mut reports = Vec::new();
+        while let Some(message) = rx.recv().await {
+            if let TelemetryMsg::ExternalProcess { flat_index, update } = message {
+                assert_eq!(flat_index, 0);
+                assert_eq!(update.runner.kind, "external-cli");
+                reports.push(update.process);
+            }
+        }
+        assert_eq!(
+            reports.len(),
+            2,
+            "one report at spawn, one at close: {reports:?}"
+        );
+        let (spawned, closed) = (&reports[0], &reports[1]);
+        assert!(spawned.pid.is_some(), "{spawned:?}");
+        assert_eq!(
+            spawned.ended_at, None,
+            "the spawn report precedes the close"
+        );
+        assert_eq!(closed.pid, spawned.pid);
+        assert_eq!(closed.exit_code, Some(0));
+        assert!(closed.ended_at.is_some() && closed.duration_ms.is_some());
+        assert_eq!(
+            std::path::Path::new(&spawned.stderr_path),
+            run_dir.join("external-0.stderr.log")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&closed.stderr_path).expect("stderr log"),
+            "warming up\n"
+        );
     }
 
     /// SUBA-119 — the operator-declared `config.modelResponseAliases` must reach every dispatched
@@ -1772,6 +2006,7 @@ mod tests {
             crate::exec::fallback::ModelOverride::Inherit,
             false,
             None,
+            &step.task,
         );
         assert_eq!(opts.model_response_aliases.as_ref(), Some(&aliases));
 
@@ -1797,6 +2032,7 @@ mod tests {
             crate::exec::fallback::ModelOverride::Inherit,
             false,
             None,
+            &step.task,
         );
         assert_eq!(opts.model_response_aliases.as_ref(), Some(&aliases));
 
@@ -1809,6 +2045,7 @@ mod tests {
             crate::exec::fallback::ModelOverride::Inherit,
             false,
             None,
+            &step.task,
         );
         assert_eq!(opts.model_response_aliases, None);
     }
@@ -1848,6 +2085,7 @@ mod tests {
             // SUBA-119: not a parent-inherited model in this fixture.
             false,
             None,
+            &step.task,
         );
         assert_eq!(
             opts.transcript,
@@ -1873,6 +2111,7 @@ mod tests {
             // SUBA-119: not a parent-inherited model in this fixture.
             false,
             None,
+            &step.task,
         );
         assert_eq!(opts.transcript, Some(TranscriptSource::Async));
         assert_eq!(opts.artifacts_dir.as_deref(), Some(dir.path()));
@@ -1893,6 +2132,7 @@ mod tests {
             // SUBA-119: not a parent-inherited model in this fixture.
             false,
             None,
+            &step.task,
         );
         assert_eq!(
             opts.transcript, None,

@@ -355,21 +355,33 @@ impl SubagentExecutor {
     /// only ever cost the caller the more specific sentence, never a spurious refusal of a genuinely
     /// stoppable run.
     pub(crate) async fn resolves_to_nested_run(&self, selector: &str) -> bool {
+        !self.nested_run_matches_by_id(selector).await.is_empty()
+    }
+
+    /// pi `findNestedRunMatchesById(id)` (`runs/shared/nested-events.ts:683-697` @v0.71.0), exact
+    /// form: every projected nested registry's run with this id, paired with its route's root run
+    /// id (pi `NestedRunMatch { rootRunId, run }`). An unreadable route contributes nothing
+    /// (upstream's `catch { continue; }`).
+    pub(crate) async fn nested_run_matches_by_id(
+        &self,
+        selector: &str,
+    ) -> Vec<(String, crate::spawn::nested_events::NestedRunSummary)> {
         // One resolved value, not a deferred one: `Roots::nested_events` is the SAME tree the
         // containment guards validate every route against, so a scoped run and its guard can no
         // longer disagree about where "nested events" is.
         let root = self.config_snapshot().await.roots.nested_events();
         let Ok(routes) = crate::spawn::nested_events::list_nested_routes_in(&root) else {
-            return false;
+            return Vec::new();
         };
-        routes.iter().any(|route| {
-            crate::spawn::nested_events::project_nested_events_in(&root, route)
-                .ok()
-                .is_some_and(|registry| {
-                    crate::spawn::nested_events::find_nested_run(&registry.children, selector)
-                        .is_some()
-                })
-        })
+        routes
+            .iter()
+            .filter_map(|route| {
+                let registry =
+                    crate::spawn::nested_events::project_nested_events_in(&root, route).ok()?;
+                crate::spawn::nested_events::find_nested_run(&registry.children, selector)
+                    .map(|run| (route.root_run_id.clone(), run))
+            })
+            .collect()
     }
 
     /// Resolve one nested control request against this executor's live `foreground_controls`

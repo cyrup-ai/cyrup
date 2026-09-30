@@ -200,6 +200,10 @@ pub struct CostSummary {
 pub struct NestedStepSummary {
     /// The step's agent.
     pub agent: String,
+    /// SUBA-134 — pi `NestedStepSummary.sessionName` (`shared/types.ts:1606` @v0.71.0): the
+    /// child session's human-readable display name, when derived at launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
     /// The step's status.
     pub status: String,
     /// Optional fields, omitted when absent, mirroring pi's conditional projection.
@@ -272,6 +276,11 @@ pub struct NestedRunSummary {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// SUBA-134 — pi `NestedRunSummary.sessionName` (`shared/types.ts:1659` @v0.71.0): the child
+    /// session's human-readable display name, when derived at launch. Named ahead of `agent` by
+    /// the nested exact-status view ([`crate::background::run_status::nested_run_display_name`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -487,6 +496,12 @@ fn sanitize_step_map(input: &Value, depth: i64) -> Option<Value> {
         "status".to_string(),
         Value::String(sanitize_step_status(obj.get("status"))),
     );
+    // SUBA-134 — pi `nested-events.ts:311` @v0.71.0.
+    set_if_some(
+        &mut map,
+        "sessionName",
+        string_value(obj.get("sessionName"), 256).map(Value::String),
+    );
     set_if_some(
         &mut map,
         "sessionFile",
@@ -578,6 +593,12 @@ fn sanitize_summary_map(input: &Value, depth: i64) -> Option<Value> {
     map.insert(
         "state".to_string(),
         Value::String(sanitize_state(obj.get("state"), "running")),
+    );
+    // SUBA-134 — pi `nested-events.ts:352` @v0.71.0.
+    set_if_some(
+        &mut map,
+        "sessionName",
+        string_value(obj.get("sessionName"), 256).map(Value::String),
     );
 
     set_if_some(
@@ -2140,6 +2161,7 @@ mod tests {
             mode: Some("single".to_string()),
             state: state.to_string(),
             agent: Some("reviewer".to_string()),
+            session_name: None,
             agents: Some(vec!["reviewer".to_string()]),
             current_step: None,
             chain_step_count: None,
@@ -2158,6 +2180,7 @@ mod tests {
             error: None,
             steps: Some(vec![NestedStepSummary {
                 agent: "leaf".to_string(),
+                session_name: None,
                 status: if state == "running" {
                     "running"
                 } else {

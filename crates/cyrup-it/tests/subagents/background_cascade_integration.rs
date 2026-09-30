@@ -112,6 +112,8 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     }
 }
 
@@ -133,6 +135,7 @@ fn register_live_descendant(roots: &Roots, route: &NestedRoute, child_id: &str) 
         async_dir: Some(async_dir.display().to_string()),
         pid: None,
         session_id: None,
+        session_name: None,
         session_file: None,
         intercom_target: None,
         owner_intercom_target: None,

@@ -486,13 +486,14 @@ pub fn send_incoming_message_at(
     let details = serde_json::to_value(&card).ok();
     // `{ triggerTurn: true }` vs `{ deliverAs: "steer" }` (`v0.14.0 index.ts:1236-1238`) — two
     // different host deliveries, so two different seam calls (ICOM-035). The steer goes through
-    // `HostServices::inject_message_steer`: the live host's injection pump (`cyrup-session-svc`
-    // `session/mod.rs` `drive_injections`) hands it to the running agent's steering queue the moment
-    // it arrives while a run is active — pi's `agent.steer(appMessage)` for a streaming session
-    // (`agent-session.ts:1949-1954` @v0.87.1) — and, when the session is idle (or the steer landed
-    // past the run's last steering poll), appends it to the session tree AND the agent transcript
-    // with no turn, pi's `_appendCustomMessage` (ICOM-068). Upstream takes the steer branch for every
-    // delivery that does not trigger, so an idle `inboundTrigger: "never"` delivery is one too.
+    // `HostServices::inject_message_steer`: while a run is active the live host steers it onto the
+    // running agent synchronously, inside this call — pi's `agent.steer(appMessage)` for a streaming
+    // session (`agent-session.ts:1949-1954` @v0.87.1; ICOM-063) — and its injection pump
+    // (`cyrup-session-svc` `session/mod.rs` `drive_injections`) owns the steer's fate. When the
+    // session is idle (or the steer landed past the run's last steering poll) the pump appends it to
+    // the session tree AND the agent transcript with no turn, pi's `_appendCustomMessage`
+    // (ICOM-068). Upstream takes the steer branch for every delivery that does not trigger, so an
+    // idle `inboundTrigger: "never"` delivery is one too.
     let trigger_turn = delivery == InboundDelivery::Trigger
         && should_trigger_inbound_message(state.config.inbound_trigger, message);
     deliver_card(
@@ -1910,5 +1911,366 @@ mod tests {
             &steer,
             &turn("assistant", "stop")
         ));
+    }
+
+    // ── ICOM-063: the held queue's receipts, one transition per test ─────────────────────────────
+    //
+    // Each test drives the queue through ONE transition with a real `IntercomClient` attached to a
+    // fake broker that records every frame the client writes, and asserts the exact
+    // `message_receipt` frames — status AND detail, upstream's literals — and what is left held.
+    // pi-intercom v0.14.0 is the reference: `dropHeldInboundMessage` (`index.ts:630-637`),
+    // `expireHeldInboundMessages` (`:638-643`), `dismissIncomingAsk` (`:651-654`),
+    // `handleMessageControl` (`:682-693`), `holdIncomingBrokerMessage` (`:1294-1301`).
+    //
+    // Unix-domain-socket specific (the recording broker is a `UnixListener`), like the client's own
+    // transport tests.
+    #[cfg(unix)]
+    mod held_transitions {
+        use super::*;
+
+        /// A broker that registers one client and then forwards every `message_receipt` receipt the
+        /// client writes, as `(messageId, status, detail)`.
+        struct ReceiptBroker {
+            _dir: tempfile::TempDir,
+            receipts: tokio::sync::mpsc::UnboundedReceiver<(String, String, Option<String>)>,
+        }
+
+        impl ReceiptBroker {
+            /// Everything received so far, after a round trip long enough for the client's writer
+            /// task
+            /// to flush what the transition queued (the writes are fire-and-forget).
+            async fn drain(&mut self) -> Vec<(String, String, Option<String>)> {
+                let mut out = Vec::new();
+                while let Ok(Some(r)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    self.receipts.recv(),
+                )
+                .await
+                {
+                    out.push(r);
+                }
+                out
+            }
+        }
+
+        async fn attach_receipt_broker(state: &SharedIntercomState) -> ReceiptBroker {
+            use crate::transport::framing::{FrameReader, encode_json};
+            use crate::transport::protocol::{BrokerMessage, SessionRegistration};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let dir = tempfile::tempdir().unwrap();
+            let socket_path = dir.path().join("broker.sock");
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let (tx, receipts) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut reader = FrameReader::new();
+                let mut buf = vec![0u8; 4096];
+                let mut registered = false;
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    for payload in reader.push(&buf[..n]).unwrap() {
+                        if !registered {
+                            let frame = encode_json(&BrokerMessage::Registered {
+                                session_id: "receiver".to_string(),
+                                features: None,
+                            })
+                            .unwrap();
+                            stream.write_all(&frame).await.unwrap();
+                            registered = true;
+                            continue;
+                        }
+                        let frame: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        if frame["type"] == "message_receipt" {
+                            let r = &frame["receipt"];
+                            let _ = tx.send((
+                                r["messageId"].as_str().unwrap().to_string(),
+                                r["status"].as_str().unwrap().to_string(),
+                                r.get("detail").map(|d| d.as_str().unwrap().to_string()),
+                            ));
+                        }
+                    }
+                }
+            });
+            let registration = SessionRegistration {
+                runtime_fallback_alias: None,
+                name: None,
+                cwd: "/w".to_string(),
+                model: "m".to_string(),
+                pid: 1u32.into(),
+                started_at: now_ms().into(),
+                last_activity: now_ms().into(),
+                status: None,
+                tmux_pane: None,
+                herdr_pane_id: None,
+                herdr_session_path: None,
+                extra: Default::default(),
+            };
+            let client = IntercomClient::connect(&socket_path, registration, None)
+                .await
+                .unwrap();
+            state.set_client(Some(Arc::new(client)));
+            ReceiptBroker {
+                _dir: dir,
+                receipts,
+            }
+        }
+
+        /// A receiver with a live runtime, a UI, busy without an agent run (so everything holds and
+        /// nothing flushes), and a recording broker attached. The runtime's generation is returned.
+        async fn held_receiver() -> (
+            tempfile::TempDir,
+            Arc<SharedIntercomState>,
+            Arc<FlippableHost>,
+            ReceiptBroker,
+            u64,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Arc::new(state(false));
+            let host = flippable(false);
+            s.set_host_services(host.clone());
+            s.set_has_ui(true);
+            crate::connect::begin_runtime(
+                &s,
+                crate::connect::ConnectParams {
+                    agent_dir: dir.path().join("agent"),
+                    metadata: None,
+                    model: None,
+                },
+            );
+            let generation = s.connect.generation();
+            let broker = attach_receipt_broker(&s).await;
+            (dir, s, host, broker, generation)
+        }
+
+        fn receipt(
+            id: &str,
+            status: &str,
+            detail: Option<&str>,
+        ) -> (String, String, Option<String>) {
+            (
+                id.to_string(),
+                status.to_string(),
+                detail.map(str::to_string),
+            )
+        }
+
+        fn control(
+            id: &str,
+            action: crate::transport::protocol::MessageControlAction,
+            superseded_by: Option<&str>,
+        ) -> crate::transport::protocol::MessageControl {
+            crate::transport::protocol::MessageControl {
+                message_id: id.to_string(),
+                action,
+                timestamp: 1u64.into(),
+                superseded_by: superseded_by.map(str::to_string),
+                detail: None,
+                extra: Default::default(),
+            }
+        }
+
+        /// hold → `queued` "held until delivery is safe" (`index.ts:1296`), FIFO, nothing injected.
+        #[tokio::test]
+        async fn held_transition_hold_emits_queued() {
+            let (_dir, s, host, mut broker, generation) = held_receiver().await;
+            hold_incoming_broker_message(&s, from(), msg("m1", "one"), generation);
+            hold_incoming_broker_message(&s, from(), msg("m2", "two"), generation);
+            assert_eq!(
+                broker.drain().await,
+                vec![
+                    receipt("m1", "queued", Some("held until delivery is safe")),
+                    receipt("m2", "queued", Some("held until delivery is safe")),
+                ]
+            );
+            assert_eq!(s.held_inbound_len(), 2);
+            assert!(host.injected.lock().unwrap().is_empty());
+        }
+
+        /// answered while held → `acknowledged` "answered before injection" (`index.ts:651-654`),
+        /// only
+        /// that message leaves the queue; an ask that is NOT held gets no receipt from this path.
+        #[tokio::test]
+        async fn held_transition_answer_emits_acknowledged() {
+            let (_dir, s, _host, mut broker, generation) = held_receiver().await;
+            hold_incoming_broker_message(&s, from(), msg("m1", "one"), generation);
+            hold_incoming_broker_message(&s, from(), msg("m2", "two"), generation);
+            broker.drain().await;
+            dismiss_incoming_ask(&s, "m1");
+            dismiss_incoming_ask(&s, "never-held");
+            assert_eq!(
+                broker.drain().await,
+                vec![receipt(
+                    "m1",
+                    "acknowledged",
+                    Some("answered before injection")
+                )]
+            );
+            assert_eq!(s.held_inbound_len(), 1);
+            assert_eq!(s.pop_held_inbound().unwrap().message.id, "m2");
+        }
+
+        /// cancel while held → `cancelled` "dropped before injection" (`index.ts:687`); cancel of a
+        /// message NOT held → `cancellation_requested` "message may already be injected or
+        /// processed"
+        /// (`:689-691`), and the queue is untouched.
+        #[tokio::test]
+        async fn held_transition_cancel_emits_cancelled() {
+            use crate::transport::protocol::MessageControlAction::Cancel;
+            let (_dir, s, _host, mut broker, generation) = held_receiver().await;
+            hold_incoming_broker_message(&s, from(), msg("m1", "one"), generation);
+            hold_incoming_broker_message(&s, from(), msg("m2", "two"), generation);
+            broker.drain().await;
+            s.handle_message_control(&control("m2", Cancel, None));
+            s.handle_message_control(&control("gone", Cancel, None));
+            assert_eq!(
+                broker.drain().await,
+                vec![
+                    receipt("m2", "cancelled", Some("dropped before injection")),
+                    receipt(
+                        "gone",
+                        "cancellation_requested",
+                        Some("message may already be injected or processed")
+                    ),
+                ]
+            );
+            assert_eq!(s.held_inbound_len(), 1);
+            assert_eq!(s.pop_held_inbound().unwrap().message.id, "m1");
+        }
+
+        /// supersede while held → `superseded` "superseded by <id>", or with NO detail key when the
+        /// control names no successor (`detail` undefined, `index.ts:684-688`); a supersede of a
+        /// message not held still answers `superseded` (`:692`) and leaves the queue alone.
+        #[tokio::test]
+        async fn held_transition_supersede_emits_superseded() {
+            use crate::transport::protocol::MessageControlAction::Supersede;
+            let (_dir, s, _host, mut broker, generation) = held_receiver().await;
+            for id in ["m1", "m2", "m3"] {
+                hold_incoming_broker_message(&s, from(), msg(id, id), generation);
+            }
+            broker.drain().await;
+            s.handle_message_control(&control("m1", Supersede, Some("m9")));
+            s.handle_message_control(&control("m2", Supersede, None));
+            s.handle_message_control(&control("gone", Supersede, Some("m9")));
+            assert_eq!(
+                broker.drain().await,
+                vec![
+                    receipt("m1", "superseded", Some("superseded by m9")),
+                    receipt("m2", "superseded", None),
+                    receipt("gone", "superseded", Some("superseded by m9")),
+                ]
+            );
+            assert_eq!(s.held_inbound_len(), 1);
+            assert_eq!(s.pop_held_inbound().unwrap().message.id, "m3");
+        }
+
+        /// session replaced / shut down → every held message `expired` with the edge's detail,
+        /// oldest
+        /// first (`index.ts:638-643`, `:1661`, `:1799`); the queue empties and a later flush — even
+        /// an
+        /// idle one — injects nothing.
+        #[tokio::test]
+        async fn held_transition_expiry_emits_expired_for_every_held_message() {
+            for detail in [
+                "session replaced before injection",
+                "session shut down before injection",
+            ] {
+                let (_dir, s, host, mut broker, generation) = held_receiver().await;
+                hold_incoming_broker_message(&s, from(), msg("m1", "one"), generation);
+                hold_incoming_broker_message(&s, from(), msg("m2", "two"), generation);
+                broker.drain().await;
+                s.expire_held_inbound(detail);
+                assert_eq!(
+                    broker.drain().await,
+                    vec![
+                        receipt("m1", "expired", Some(detail)),
+                        receipt("m2", "expired", Some(detail)),
+                    ]
+                );
+                assert_eq!(s.held_inbound_len(), 0);
+                host.idle.store(true, std::sync::atomic::Ordering::SeqCst);
+                flush_held_inbound_messages(&s, generation);
+                assert!(host.injected.lock().unwrap().is_empty(), "{detail}");
+                assert!(broker.drain().await.is_empty(), "{detail}");
+            }
+        }
+
+        /// release → `injected`, once, and only for the message actually handed to the host
+        /// (`sendIncomingBrokerMessage`, `index.ts:1230-1245`): the idle flush delivers everything
+        /// held
+        /// in order; a later answer or control for a delivered message no longer finds it held.
+        #[tokio::test]
+        async fn held_transition_flush_emits_injected_and_leaves_nothing_to_drop() {
+            use crate::transport::protocol::MessageControlAction::Cancel;
+            let (_dir, s, host, mut broker, generation) = held_receiver().await;
+            hold_incoming_broker_message(&s, from(), msg("m1", "one"), generation);
+            hold_incoming_broker_message(&s, from(), msg("m2", "two"), generation);
+            broker.drain().await;
+            host.idle.store(true, std::sync::atomic::Ordering::SeqCst);
+            flush_held_inbound_messages(&s, generation);
+            assert_eq!(host.injected.lock().unwrap().len(), 2);
+            assert_eq!(
+                broker.drain().await,
+                vec![
+                    receipt("m1", "injected", None),
+                    receipt("m2", "injected", None),
+                ]
+            );
+            dismiss_incoming_ask(&s, "m1");
+            s.handle_message_control(&control("m2", Cancel, None));
+            assert_eq!(
+                broker.drain().await,
+                vec![receipt(
+                    "m2",
+                    "cancellation_requested",
+                    Some("message may already be injected or processed")
+                )],
+                "no `acknowledged`/`cancelled` for a message that has already been injected"
+            );
+        }
+
+        /// `human-first` turn boundary → ONE held peer `injected` as a steer; the rest stay
+        /// `queued`
+        /// with no further receipt (`index.ts:1814-1822`).
+        #[tokio::test]
+        async fn held_transition_human_first_turn_end_release_emits_one_injected() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = IntercomConfig {
+                busy_delivery: BusyDelivery::HumanFirst,
+                ..IntercomConfig::default()
+            };
+            let s = Arc::new(SharedIntercomState::new(
+                config,
+                600_000,
+                PathBuf::from("/w"),
+            ));
+            let host = flippable(false);
+            s.set_host_services(host.clone());
+            s.set_has_ui(true);
+            crate::connect::begin_runtime(
+                &s,
+                crate::connect::ConnectParams {
+                    agent_dir: dir.path().join("agent"),
+                    metadata: None,
+                    model: None,
+                },
+            );
+            let generation = s.connect.generation();
+            let mut broker = attach_receipt_broker(&s).await;
+            s.set_agent_running(true);
+            hold_incoming_broker_message(&s, from(), msg("m1", "one"), generation);
+            hold_incoming_broker_message(&s, from(), msg("m2", "two"), generation);
+            broker.drain().await;
+            let turn = serde_json::json!({ "role": "assistant", "stopReason": "toolUse" });
+            assert!(release_held_inbound_at_turn_end(&s, &turn));
+            assert_eq!(broker.drain().await, vec![receipt("m1", "injected", None)]);
+            let injected = host.injected.lock().unwrap().clone();
+            assert_eq!(injected.len(), 1);
+            assert!(!injected[0].3, "a turn-boundary release is a steer");
+            assert_eq!(s.held_inbound_len(), 1);
+        }
     }
 }

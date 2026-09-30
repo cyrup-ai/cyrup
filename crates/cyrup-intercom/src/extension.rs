@@ -779,8 +779,6 @@ impl NativeExtension for IntercomExtension {
         // [`Self::on_bus_event`].
         api.subscribe_bus(crate::outbox::INTERCOM_EXTENSION_REGISTER_EVENT);
         api.subscribe_bus(crate::outbox::INTERCOM_OUTBOX_REQUEST_EVENT);
-        // ICOM-064: the answer to the `intercom:session-identity` request emitted at session start.
-        api.subscribe_bus(crate::identity::INTERCOM_SESSION_IDENTITY_CLAIM_EVENT);
         // `pi.events.emit(INTERCOM_EXTENSION_REGISTRY_READY_EVENT, { version: 1 })`
         // (`v0.12.0 index.ts:1700`) — UNCONDITIONAL, and immediately after the listeners so no
         // extension can ever observe "ready" before the request topic is live. This is the handshake
@@ -815,16 +813,6 @@ impl NativeExtension for IntercomExtension {
             // effects behind it are ICOM-016 and are deliberately not stubbed.
             crate::outbox::INTERCOM_EXTENSION_REGISTER_EVENT => {
                 crate::outbox::handle_extension_register(&self.state, payload);
-            }
-            // ICOM-064 — `claim(stableId)` (`v0.14.0 index.ts:1648-1650`): a `{ version: 1,
-            // stableId }` claim; anything else is not a V1 claim and is ignored.
-            crate::identity::INTERCOM_SESSION_IDENTITY_CLAIM_EVENT => {
-                if payload.get("version").and_then(serde_json::Value::as_u64) == Some(1)
-                    && let Some(stable_id) = payload.get("stableId").and_then(|v| v.as_str())
-                    && let Some(stale) = self.state.accept_identity_claim(stable_id)
-                {
-                    connect::reregister_under_claim(&self.state, &stale);
-                }
             }
             _ => {}
         }
@@ -911,17 +899,18 @@ impl NativeExtension for IntercomExtension {
                 // reset the backoff ladder.
                 connect::begin_runtime(&self.state, self.connect_params(ctx.model()));
                 // ICOM-064 — `pi.events.emit(INTERCOM_SESSION_IDENTITY_EVENT, identityRequest)`
-                // (`v0.14.0 index.ts:1645-1652`), after the runtime reset and before the id is
-                // chosen. The claims come back on the claim topic ([`Self::on_bus_event`]) when the
-                // host drains the bus at the end of this dispatch; the connect below reads the
-                // claim when it registers, and a claim that loses that race re-registers it.
-                self.state.open_identity_claim();
+                // (`v0.14.0 index.ts:1645-1653`), after the runtime reset and before the id is
+                // chosen. The typed emit runs every claimant before it returns, so the claim is
+                // settled here and the connect below registers under it from its first attempt.
+                let identity_request = crate::identity::IntercomSessionIdentityRequestV1::new();
                 if let Some(services) = self.state.host_services() {
-                    services.emit_event(
+                    services.emit_typed_event(
                         crate::identity::INTERCOM_SESSION_IDENTITY_EVENT,
-                        &serde_json::json!({ "version": 1 }),
+                        &identity_request,
                     );
                 }
+                self.state
+                    .set_claimed_intercom_session_id(identity_request.claimed());
                 // `startNamePoll()` (`v0.10.1 index.ts:1276`, inside `startSessionRuntime`): the
                 // third name-sync point. Cancelled in the `SessionShutdown` arm below.
                 self.state.start_name_poll();
@@ -952,7 +941,6 @@ impl NativeExtension for IntercomExtension {
                 // BEFORE the disconnect below, so the disconnect edge this triggers cannot arm a
                 // reconnect: a deliberate shutdown never reconnects.
                 connect::shutdown(&self.state);
-                self.state.close_identity_claim();
                 self.state.waiter.fail_pending("Session shutting down");
                 // `expireHeldInboundMessages("session shut down before injection")`
                 // (`v0.14.0 index.ts:1799`, ICOM-062) — before the disconnect below, so the
@@ -973,8 +961,6 @@ impl NativeExtension for IntercomExtension {
                 HookOutcome::Noop
             }
             HostEvent::AgentStart => {
-                // ICOM-064: the session's first run ends its identity-claim window.
-                self.state.close_identity_claim();
                 // `agentRunning = true; if (runtimeContext) flushHeldInboundMessages(runtimeContext,
                 // runtimeGeneration); activeTools.clear(); syncPresenceStatus()`
                 // (`v0.14.0 index.ts:1824-1832`). The flush is ICOM-062's `agent_start` edge: a
@@ -1066,17 +1052,11 @@ impl NativeExtension for IntercomExtension {
                     .end_turn();
                 // ICOM-063 — `busyDelivery: "human-first"` releases one held peer per turn
                 // boundary (`v0.14.0 index.ts:1814-1822`). This handler is awaited before the
-                // agent loop's next steering poll; upstream's `pi.sendMessage(…, {deliverAs:
-                // "steer"})` reaches `agent.steer` synchronously, so the peer rides this run.
-                // cyrup's steer goes through the live host's injection pump, a separate task this
-                // send has just woken, so yield once to let it hand the steer to the agent before
-                // the loop polls. That narrows the window; it does not close it: a steer that lands
-                // past both that poll and the post-run `has_queued_messages` check is appended with
-                // no turn (the pump's stranded-steer path). Closing it needs a synchronous steer on
-                // the host seam (`HostServices::inject_message_steer` while a run is active).
-                if crate::inbound::release_held_inbound_at_turn_end(&self.state, message) {
-                    tokio::task::yield_now().await;
-                }
+                // agent loop's next steering poll, and the live host's
+                // `HostServices::inject_message_steer` steers onto the running agent synchronously
+                // (pi's `agent.steer`), so the released peer is already queued when this returns
+                // and rides this run.
+                crate::inbound::release_held_inbound_at_turn_end(&self.state, message);
                 HookOutcome::Noop
             }
             // ICOM-004 — hand cyrup's resource discovery the bundled skill

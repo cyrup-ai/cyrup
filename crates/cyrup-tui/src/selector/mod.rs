@@ -707,6 +707,14 @@ pub trait Selector: Send {
     fn as_model_selector(&mut self) -> Option<&mut crate::model_selector::ModelSelector> {
         None
     }
+    /// Downcast to the `/resume` picker, if that is what occupies the slot — `None` (the default)
+    /// for every other selector. The THIRD selector mutated by something other than a key press:
+    /// the off-loop session listing streams its batches into it through
+    /// [`crate::app::App::apply_session_list_msg`] (TUI-121), as pi's `loadScope` `onProgress`
+    /// writes into the component that owns it (`session-selector.ts:956-970` @v0.87.1).
+    fn as_session_selector(&mut self) -> Option<&mut crate::session_selector::SessionSelector> {
+        None
+    }
     /// Adopt the live `tui.editor.*` table so an embedded [`crate::text_input::Input`] resolves word
     /// motion / kill ring / undo through the user's own bindings, exactly as pi's `Input` calls
     /// `getKeybindings()` on every key (`input.ts:86`). A no-op for pure-list selectors.

@@ -129,16 +129,11 @@ impl App<InlineBackend<TuiStdout>> {
         // `getContextUsage()` per frame (`footer.ts:108`), so a `/resume`d session shows its
         // occupancy on the very first frame rather than only after the next assistant message.
         self.refresh_context_usage(session).await;
-        // TUI-N04 — Pi's `renderInitialMessages()` runs `renderProjectTrustWarningIfNeeded()`
-        // straight after the replay (`interactive-mode.ts:3479-3485`). cyrup's replay is the
-        // caller's (`crates/cyrup/src/main.rs` for a `--resume`/`--continue` boot, the
-        // `session_swapped` arm below for a `/resume`/`/fork`/`/import`), so the check lands HERE
-        // rather than inside `replay_session_*`: pi's call is UNconditional, while cyrup's replay is
-        // skipped entirely when `raw_context_messages()` is empty — and a fresh session in an
-        // untrusted project is precisely the case that most needs the banner.
-        self.render_project_trust_warning_if_needed(session);
-        // TUI-003 — …and `renderInitialMessages()`'s last statement, the compaction count.
-        self.render_compaction_count_if_needed(session).await;
+        // (No `renderInitialMessages()` here. TUI-003 / TUI-N04: the trust banner and the
+        // compaction count used to be pushed from this seed, which runs inside `App::run` — after
+        // the host had already pushed the CLI's initial prompt. Pi renders them from `init()`
+        // (`interactive-mode.ts:1036` @v0.87.1), ahead of `run()`'s startup warnings and initial
+        // message, so the boot host calls `App::render_initial_messages` itself, in that position.)
     }
 
     /// Bind the UI to the runtime's currently-installed session — pi's awaited `rebindSession`
@@ -399,24 +394,13 @@ impl App<InlineBackend<TuiStdout>> {
         // swapped-in one brings its own tools, and the replay below is the only reader that cannot
         // ask the session itself.
         self.refresh_known_tool_definitions(&ctx.session);
-        // `replay_items` is `raw_context_messages` plus the derived cache-miss / compaction-cost
-        // notices pi re-derives on every rebuild (`interactive-mode.ts:3694-3696`, `:3788-3794`),
-        // which is why a resumed session keeps notices that were never persisted.
-        let restored = ctx.session.replay_items().await;
-        if !restored.is_empty() {
-            // X11 — with extensions: the swapped-in session brings its own host, and Pi resolves
-            // `getMessageRenderer` on the replay walk too (`interactive-mode.ts:3471`).
-            let ext_host = ctx.session.services().ext_host.clone();
-            self.replay_items_with_extensions(&restored, &ext_host)
-                .await;
-        }
-        // TUI-N04 — the same statement `renderInitialMessages()` runs after its replay
-        // (`interactive-mode.ts:3485`), and it must run here too: a `/resume` of a session recorded
-        // in a DIFFERENT project swaps the cwd and the trust decision with it, so the banner's
-        // answer changes on the swap.
-        self.render_project_trust_warning_if_needed(&ctx.session);
-        // TUI-003 — `renderInitialMessages()` then reports the swapped-in session's compactions.
-        self.render_compaction_count_if_needed(&ctx.session).await;
+        // Pi's `renderCurrentSessionState` ends in `renderInitialMessages()`
+        // (`interactive-mode.ts:2115-2124` @v0.87.1): the replay (the swapped-in session brings its
+        // own extension host, X11), then the trust banner — TUI-N04: a `/resume` of a session
+        // recorded in a DIFFERENT project swaps the cwd and the trust decision with it — then the
+        // swapped-in session's compaction count (TUI-003). One helper, shared with the boot host.
+        let session = Arc::clone(&ctx.session);
+        self.render_initial_messages(&session).await;
         // pi's re-entrancy guard, `interactive-mode.ts:1977-1979`
         // (`if (this.session !== session) return;`): a newer session landed while we awaited above,
         // so abandon this rebind without painting it — the `session_swapped` arm will fire again for
@@ -822,6 +806,17 @@ impl App<InlineBackend<TuiStdout>> {
         // `model-selector.ts:191-213`): write the status/error rows, rebuild the list from the
         // now-installed overlay, and re-apply the live search — picker still open.
         self.apply_model_refresh(&ctx.session, msg);
+        self.frames.request();
+        Ok(())
+    }
+
+    pub(crate) fn on_session_list_msg(
+        &mut self,
+        msg: crate::app::SessionListMsg,
+    ) -> Result<(), TuiError> {
+        // A spawned `/resume` load reported (TUI-121; pi's `onProgress` / resolved loader,
+        // `session-selector.ts:956-988` @v0.87.1): fold it into the open picker, then repaint.
+        self.apply_session_list_msg(msg);
         self.frames.request();
         Ok(())
     }

@@ -12,7 +12,7 @@ use super::store::SettingsStore;
 use super::types::{
     FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, SettingsScope, TuiMode,
 };
-use crate::error::{ConfigError, ScopedError};
+use crate::error::{ConfigError, ScopedError, SettingsLoadError};
 
 /// The layered settings facade (arch-07 §3.3). Holds the two layers + a memoized merge.
 ///
@@ -35,11 +35,11 @@ pub struct SettingsManager {
     /// settings-manager.ts:289). Distinct from `load_errors`, which accumulates across reloads and
     /// is drained once for display: this is the live per-scope latch every writer consults so a
     /// document cyrup could not read is never rewritten from the degraded in-memory view (CFG-001).
-    global_load_error: Option<String>,
+    global_load_error: Option<SettingsLoadError>,
     /// The LAST load's failure for the project scope (Pi `projectSettingsLoadError`,
     /// settings-manager.ts:290). Always `None` while the project is untrusted — that scope is not
     /// read at all, and its writes are already refused with [`ConfigError::Untrusted`].
-    project_load_error: Option<String>,
+    project_load_error: Option<SettingsLoadError>,
 }
 
 impl SettingsManager {
@@ -68,17 +68,13 @@ impl SettingsManager {
     /// hands the caught error straight to `globalSettingsLoadError`/`projectSettingsLoadError`. So a
     /// store READ failure latches here too — an unreadable file is exactly as unsafe to overwrite
     /// as an unparseable one.
-    fn record_load_error(&mut self, scope: SettingsScope, message: String) {
+    fn record_load_error(&mut self, scope: SettingsScope, error: SettingsLoadError) {
         match scope {
-            SettingsScope::Global => self.global_load_error = Some(message.clone()),
-            SettingsScope::Project => self.project_load_error = Some(message.clone()),
+            SettingsScope::Global => self.global_load_error = Some(error.clone()),
+            SettingsScope::Project => self.project_load_error = Some(error.clone()),
         }
         let path = self.store.location(scope);
-        self.load_errors.push(ScopedError {
-            scope,
-            path,
-            message,
-        });
+        self.load_errors.push(ScopedError { scope, path, error });
     }
 
     fn load_scope(&mut self, scope: SettingsScope) -> Settings {
@@ -86,13 +82,14 @@ impl SettingsManager {
             Ok(Some(text)) => match Settings::parse(&text) {
                 Ok(s) => s,
                 Err(e) => {
-                    self.record_load_error(scope, format!("parse error: {e}"));
+                    // CFG-088 — pi's `<msg>` is `JSON.parse`'s own message, with no prefix.
+                    self.record_load_error(scope, SettingsLoadError::parse(&text, &e));
                     Settings::default()
                 }
             },
             Ok(None) => Settings::default(),
             Err(e) => {
-                self.record_load_error(scope, e.to_string());
+                self.record_load_error(scope, SettingsLoadError::Read(e.to_string()));
                 Settings::default()
             }
         }
@@ -189,10 +186,10 @@ impl SettingsManager {
     ///
     /// A front-end can read this before offering an edit UI so it can explain the situation up
     /// front rather than after a refused write.
-    pub fn load_error(&self, scope: SettingsScope) -> Option<&str> {
+    pub fn load_error(&self, scope: SettingsScope) -> Option<&SettingsLoadError> {
         match scope {
-            SettingsScope::Global => self.global_load_error.as_deref(),
-            SettingsScope::Project => self.project_load_error.as_deref(),
+            SettingsScope::Global => self.global_load_error.as_ref(),
+            SettingsScope::Project => self.project_load_error.as_ref(),
         }
     }
 
@@ -205,9 +202,9 @@ impl SettingsManager {
     /// destroying every other setting the user had.
     fn ensure_scope_writable(&self, scope: SettingsScope) -> Result<(), ConfigError> {
         match self.load_error(scope) {
-            Some(message) => Err(ConfigError::SettingsWriteRefused {
+            Some(cause) => Err(ConfigError::SettingsWriteRefused {
                 scope,
-                message: message.to_string(),
+                cause: cause.clone(),
             }),
             None => Ok(()),
         }
@@ -235,18 +232,18 @@ impl SettingsManager {
         self.ensure_scope_writable(scope)?;
         let json = serde_json::to_value(value)?;
         let key_owned = key.to_string();
-        let mut corrupt: Option<String> = None;
+        let mut corrupt: Option<SettingsLoadError> = None;
         self.store
             .with_lock(scope, &mut |current| {
-                let mut doc = match current.map(Settings::parse) {
-                    Some(Ok(s)) => s,
+                let mut doc = match current.map(|text| (text, Settings::parse(text))) {
+                    Some((_, Ok(s))) => s,
                     // Absent file: create it. This is the ONLY branch that may start from an empty doc.
                     None => Settings::default(),
                     // Corruption that appeared BETWEEN the load and this locked write. Returning `None`
                     // leaves the file untouched; the message is surfaced below so the caller can tell
                     // the write did not happen (CFG-001).
-                    Some(Err(e)) => {
-                        corrupt = Some(format!("parse error: {e}"));
+                    Some((text, Err(e))) => {
+                        corrupt = Some(SettingsLoadError::parse(text, &e));
                         return None;
                     }
                 };
@@ -267,8 +264,8 @@ impl SettingsManager {
                 Some(doc.to_pretty())
             })
             .await?;
-        if let Some(message) = corrupt {
-            return Err(ConfigError::SettingsWriteRefused { scope, message });
+        if let Some(cause) = corrupt {
+            return Err(ConfigError::SettingsWriteRefused { scope, cause });
         }
         self.reload_internal();
         Ok(())
@@ -297,14 +294,14 @@ impl SettingsManager {
         }
         self.ensure_scope_writable(scope)?;
         let path_owned: Vec<String> = path.iter().map(|s| s.to_string()).collect();
-        let mut corrupt: Option<String> = None;
+        let mut corrupt: Option<SettingsLoadError> = None;
         self.store
             .with_lock(scope, &mut |current| {
-                let mut doc = match current.map(Settings::parse) {
-                    Some(Ok(s)) => s,
+                let mut doc = match current.map(|text| (text, Settings::parse(text))) {
+                    Some((_, Ok(s))) => s,
                     None => Settings::default(),
-                    Some(Err(e)) => {
-                        corrupt = Some(format!("parse error: {e}"));
+                    Some((text, Err(e))) => {
+                        corrupt = Some(SettingsLoadError::parse(text, &e));
                         return None;
                     }
                 };
@@ -312,8 +309,8 @@ impl SettingsManager {
                 Some(doc.to_pretty())
             })
             .await?;
-        if let Some(message) = corrupt {
-            return Err(ConfigError::SettingsWriteRefused { scope, message });
+        if let Some(cause) = corrupt {
+            return Err(ConfigError::SettingsWriteRefused { scope, cause });
         }
         self.reload_internal();
         Ok(())
@@ -345,14 +342,14 @@ impl SettingsManager {
         }
         self.ensure_scope_writable(scope)?;
         let path_owned: Vec<String> = path.iter().map(|s| s.to_string()).collect();
-        let mut corrupt: Option<String> = None;
+        let mut corrupt: Option<SettingsLoadError> = None;
         self.store
             .with_lock(scope, &mut |current| {
-                let mut doc = match current.map(Settings::parse) {
-                    Some(Ok(s)) => s,
+                let mut doc = match current.map(|text| (text, Settings::parse(text))) {
+                    Some((_, Ok(s))) => s,
                     None => Settings::default(),
-                    Some(Err(e)) => {
-                        corrupt = Some(format!("parse error: {e}"));
+                    Some((text, Err(e))) => {
+                        corrupt = Some(SettingsLoadError::parse(text, &e));
                         return None;
                     }
                 };
@@ -360,8 +357,8 @@ impl SettingsManager {
                 Some(doc.to_pretty())
             })
             .await?;
-        if let Some(message) = corrupt {
-            return Err(ConfigError::SettingsWriteRefused { scope, message });
+        if let Some(cause) = corrupt {
+            return Err(ConfigError::SettingsWriteRefused { scope, cause });
         }
         Ok(())
     }
@@ -510,14 +507,14 @@ impl SettingsManager {
     /// own copy of the CFG-001 guard.
     pub async fn set_enable_analytics(&mut self, enabled: bool) -> Result<(), ConfigError> {
         self.ensure_scope_writable(SettingsScope::Global)?;
-        let mut corrupt: Option<String> = None;
+        let mut corrupt: Option<SettingsLoadError> = None;
         self.store
             .with_lock(SettingsScope::Global, &mut |current| {
-                let mut doc = match current.map(Settings::parse) {
-                    Some(Ok(s)) => s,
+                let mut doc = match current.map(|text| (text, Settings::parse(text))) {
+                    Some((_, Ok(s))) => s,
                     None => Settings::default(),
-                    Some(Err(e)) => {
-                        corrupt = Some(format!("parse error: {e}"));
+                    Some((text, Err(e))) => {
+                        corrupt = Some(SettingsLoadError::parse(text, &e));
                         return None;
                     }
                 };
@@ -535,10 +532,10 @@ impl SettingsManager {
                 Some(doc.to_pretty())
             })
             .await?;
-        if let Some(message) = corrupt {
+        if let Some(cause) = corrupt {
             return Err(ConfigError::SettingsWriteRefused {
                 scope: SettingsScope::Global,
-                message,
+                cause,
             });
         }
         self.reload_internal();

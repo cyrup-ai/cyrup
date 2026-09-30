@@ -222,6 +222,7 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         // so `None` keeps `env_overlay` byte-identical to a real foreground child's — the overlay
         // these tests then apply verbatim to the spawned child.
         steer_ack_dir: None,
+        external_log_dir: None,
         steer_capability_path: None,
         // SUBA-003: no `subagents.modelScope` policy in this fixture — enforcement off.
         model_scope: None,

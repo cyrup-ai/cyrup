@@ -1731,7 +1731,12 @@ pub fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     #[test]
@@ -2075,6 +2080,78 @@ mod tests {
         .expect("the map shape a pi peer actually sends");
         serde_json::from_str::<ExtensionCapability>(r#"{"namespace":"ns","ownerEligible":true}"#)
             .expect("the map shape a pi peer actually sends");
+    }
+
+    /// ICOM-063 — the receipts a v0.14.0 receiver emits for a HELD message, as the exact frames it
+    /// writes: `emitMessageReceipt(id, status, detail)` → `{ messageId, status, timestamp,
+    /// ...(detail ? { detail } : {}) }` (`v0.14.0 index.ts:673-680`) inside `writeMessage(socket,
+    /// { type: "message_receipt", receipt })` (`v0.14.0 broker/client.ts:728-738`). The statuses
+    /// and details are upstream's literals: `queued` "held until delivery is safe" (`:1296`),
+    /// `acknowledged` "answered before injection" (`:653`), `cancelled` "dropped before injection"
+    /// and `superseded` "superseded by …" (`:687-690`), `expired` "session replaced/shut down
+    /// before injection" (`:1661`, `:1799`). Each must decode into the typed frame and re-encode to
+    /// the same JSON, so a pi peer and a cyrup peer read each other's held-message receipts.
+    #[test]
+    fn held_message_receipts_round_trip_against_upstreams_frames() {
+        let cases = [
+            (
+                r#"{"type":"message_receipt","receipt":{"messageId":"m1","status":"queued","timestamp":1727000000000,"detail":"held until delivery is safe"}}"#,
+                MessageReceiptStatus::Queued,
+                Some("held until delivery is safe"),
+            ),
+            (
+                r#"{"type":"message_receipt","receipt":{"messageId":"m1","status":"acknowledged","timestamp":1727000000000,"detail":"answered before injection"}}"#,
+                MessageReceiptStatus::Acknowledged,
+                Some("answered before injection"),
+            ),
+            (
+                r#"{"type":"message_receipt","receipt":{"messageId":"m1","status":"cancelled","timestamp":1727000000000,"detail":"dropped before injection"}}"#,
+                MessageReceiptStatus::Cancelled,
+                Some("dropped before injection"),
+            ),
+            (
+                r#"{"type":"message_receipt","receipt":{"messageId":"m1","status":"superseded","timestamp":1727000000000,"detail":"superseded by m2"}}"#,
+                MessageReceiptStatus::Superseded,
+                Some("superseded by m2"),
+            ),
+            // `supersededBy` absent → `detail` undefined → no key at all.
+            (
+                r#"{"type":"message_receipt","receipt":{"messageId":"m1","status":"superseded","timestamp":1727000000000}}"#,
+                MessageReceiptStatus::Superseded,
+                None,
+            ),
+            (
+                r#"{"type":"message_receipt","receipt":{"messageId":"m1","status":"expired","timestamp":1727000000000,"detail":"session replaced before injection"}}"#,
+                MessageReceiptStatus::Expired,
+                Some("session replaced before injection"),
+            ),
+            (
+                r#"{"type":"message_receipt","receipt":{"messageId":"m1","status":"expired","timestamp":1727000000000,"detail":"session shut down before injection"}}"#,
+                MessageReceiptStatus::Expired,
+                Some("session shut down before injection"),
+            ),
+        ];
+        for (wire, status, detail) in cases {
+            let frame: ClientMessage = serde_json::from_str(wire).expect(wire);
+            let ClientMessage::MessageReceipt { receipt } = &frame else {
+                panic!("{wire} decoded as {frame:?}");
+            };
+            assert_eq!(receipt.message_id, "m1");
+            assert_eq!(receipt.status, status, "{wire}");
+            assert_eq!(receipt.detail.as_deref(), detail, "{wire}");
+            let wire_value: serde_json::Value = serde_json::from_str(wire).unwrap();
+            assert_eq!(
+                serde_json::json!(receipt.status),
+                wire_value["receipt"]["status"],
+                "`wire_name` and serde agree"
+            );
+            assert_eq!(receipt.status.wire_name(), wire_value["receipt"]["status"]);
+            assert_eq!(
+                serde_json::to_value(&frame).unwrap(),
+                wire_value,
+                "re-encodes to upstream's frame"
+            );
+        }
     }
 
     /// `[NON-NULL]`. `undefined` is accepted, `null` is not — the distinction serde's `Option`

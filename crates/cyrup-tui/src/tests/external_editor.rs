@@ -6,6 +6,7 @@
     clippy::panic
 )]
 mod external_editor_tests {
+    #[cfg(unix)]
     use crate::app::*;
 
     /// Write a shell script into `dir` and return the multi-token editor command that runs it.

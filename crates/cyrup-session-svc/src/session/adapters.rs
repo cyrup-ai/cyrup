@@ -26,6 +26,14 @@ impl crate::host_services::SessionActivity for SessionActivityHandle {
             s.abort();
         }
     }
+
+    fn steer_onto_live_run(
+        &self,
+        message: &crate::host_services::InjectMessage,
+    ) -> Option<cyrup_agent::AgentMessage> {
+        // A dropped session has no run to steer into.
+        self.0.upgrade()?.steer_injection_now(message)
+    }
 }
 
 /// The live [`crate::host_services::SessionCatalog`] backing a guest's `getCommands()` and the

@@ -357,6 +357,7 @@ pub(super) fn child_stopped_step_result() -> StepResult {
     StepResult {
         execution: None,
         tool_budget_blocked: false,
+        session_name: None,
         native_machine: None,
         runtime_acknowledged_extensions: None,
         success: false,
@@ -399,6 +400,7 @@ pub(super) fn stopped_single_result(step: &RunnerStep) -> SingleResult {
         &StepResult {
             execution: None,
             tool_budget_blocked: false,
+            session_name: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,
             success: false,
@@ -526,6 +528,11 @@ pub(super) struct ResultIdentity {
     pub agent: String,
     /// The task prompt the step (or member) was given; empty where the shape has none.
     pub task: String,
+    /// SUBA-134 — the name the step's child session is declared under
+    /// ([`crate::spawn::chain_graph::SingleStepSpec::child_session_name`]); `None` for a group
+    /// aggregate, which is no child session. A settled child's own name, when it reported one,
+    /// wins over this in [`step_result_to_single_result_with`].
+    pub session_name: Option<String>,
 }
 
 /// The whole-step identity — the derivation [`step_result_to_single_result`] has always used,
@@ -546,7 +553,17 @@ fn identity_for_step(step: &RunnerStep) -> ResultIdentity {
         RunnerStep::ImportAsyncRoot(spec) => format!("Attach async root {}", spec.run_id),
         RunnerStep::ParallelGroup(_) | RunnerStep::DynamicGroup(_) => String::new(),
     };
-    ResultIdentity { agent, task }
+    let session_name = match step {
+        RunnerStep::SingleStep(spec) => spec.child_session_name(&spec.task),
+        RunnerStep::ParallelGroup(_)
+        | RunnerStep::DynamicGroup(_)
+        | RunnerStep::ImportAsyncRoot(_) => None,
+    };
+    ResultIdentity {
+        agent,
+        task,
+        session_name,
+    }
 }
 
 /// SCOPE_17 — one member of a static fan-out, addressed positionally (R-SA-051 order).
@@ -560,6 +577,7 @@ fn identity_for_member(group: &ParallelGroupSpec, offset: usize) -> ResultIdenti
         Some(spec) => ResultIdentity {
             agent: spec.agent.clone(),
             task: spec.task.clone(),
+            session_name: spec.child_session_name(&spec.task),
         },
         // Unreachable: `children` is pre-sized from `group.steps` by `run_bounded`. Degrade to a
         // positional label rather than dropping the member — a result that names itself oddly is
@@ -567,6 +585,7 @@ fn identity_for_member(group: &ParallelGroupSpec, offset: usize) -> ResultIdenti
         None => ResultIdentity {
             agent: format!("<member {offset}>"),
             task: String::new(),
+            session_name: None,
         },
     }
 }
@@ -599,12 +618,16 @@ pub(super) fn step_result_to_single_result_with(
     identity: ResultIdentity,
     result: &StepResult,
 ) -> SingleResult {
-    let ResultIdentity { agent, task } = identity;
+    let ResultIdentity {
+        agent,
+        task,
+        session_name,
+    } = identity;
     // SUBA-134 — pi's runner results carry `sessionName: childSessionName`
-    // (`subagent-runner.ts:828,972,1043,1515` @v0.71.0), derived from the same agent and task
-    // the child was launched with — the name the child gave its own session.
-    let session_name =
-        crate::exec::child_session_name::derive_child_session_name(Some(&agent), Some(&task), None);
+    // (`subagent-runner.ts:828,972,1043,1515` @v0.71.0): the name the child ran under, which the
+    // executor handed it and `run_sync` reported back; the step's declared name when no child
+    // reported one (a skipped or stopped member).
+    let session_name = result.session_name.clone().or(session_name);
     SingleResult {
         // SUBA-100 — the step's result carries both onto the terminal result payload
         // (`subagent-runner.ts:1579,928` @v0.68.0).

@@ -284,6 +284,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         child_index: None,
         steer_inbox_dir: None,
         steer_ack_dir: None,
+        external_log_dir: None,
         steer_capability_path: None,
         control_config: None,
         on_control_event: None,
@@ -350,6 +351,8 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         acceptance: None,
         context: None,
         agent_scope: None,
+        label: None,
+        session_name: None,
     }
 }
 

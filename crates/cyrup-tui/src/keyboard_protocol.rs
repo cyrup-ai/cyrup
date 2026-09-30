@@ -54,46 +54,26 @@
 //! `shift+t`, `Ctrl+Shift+O`, and every user `shift+<letter>` in `keybindings.json`. There is
 //! nothing to gain in exchange: the one use Pi makes of the shifted codepoint is text insertion,
 //! which crossterm has already resolved by the time an event reaches cyrup, while the base
-//! codepoint bit 4 destroys is precisely the value the matcher wants. Bit 4 goes in the moment
-//! cyrup owns the bytes ahead of crossterm's parser rather than the events behind it — the same
-//! condition bit 2 waits on.
+//! codepoint bit 4 destroys is precisely the value the matcher wants. cyrup's unix byte reader
+//! (`crate::input::decode`) keeps crossterm's substitution so that every consumer sees the events
+//! it always saw; bit 4 goes in once that decoder keeps the base code and the shifted key apart,
+//! as pi's `parseKittySequence` does.
 //!
-//! Bit 2 is withheld because its two upstream *guards* have no expressible form at cyrup's seam,
-//! while bit 2 itself buys cyrup nothing:
+//! Bit 2 is withheld because it buys cyrup nothing:
 //!
 //! * All bit 2 adds is `Repeat`/`Release` reports (crossterm `event.rs:296-299`), and
 //!   `App::map_event_on` (`crate::app::input_reader`) discards every `KeyEventKind::Release` — so no
 //!   cyrup code path consumes one.
-//! * Guard one, Pi's `pendingKittyPrintableCodepoint` (`stdin-buffer.ts:186-192`, `:399-408`,
-//!   commit `bdb416cbc`, pi issue #3780), drops a raw character that duplicates the Kitty CSI-u for
-//!   the same codepoint. Pi filters RAW BYTES, so it can see the difference; cyrup filters events,
-//!   and crossterm decodes `\x1b[224u` and a bare `à` into byte-identical
-//!   `KeyEvent { code: Char('à'), modifiers: NONE, kind: Press, state: NONE }` values
-//!   (`parse.rs:540-568` vs `:118-135`). At the event level the guard degenerates to "drop the
-//!   second of two identical printable presses", which would eat the second `l` of `hello`.
 //!
-//!   **Measured, not only read (2026-09-05).** crossterm 0.29's real `event::read()`, driven
-//!   through a pty: `\x1b[224u` followed by the UTF-8 bytes of `à` (pi's
-//!   `packages/tui/test/stdin-buffer.test.ts:284-287` @v0.84.4) — in one write, and again split
-//!   across two writes 350 ms apart, the shape of pi's cross-chunk case (`:289-293`) — yields two
-//!   `Char('à') / NONE / Press / NONE` events both times, and a bare `ll` yields two
-//!   `Char('l') / NONE / Press / NONE` events of exactly the same shape. The duplicate and the
-//!   ordinary double letter are the same bytes at this seam. The two cases pi's guard must NOT fire
-//!   on already behave correctly here with no guard at all: `\x1b[97u` + `b` gives `Char('a')` then
-//!   `Char('b')` (`:295-298`), and `\x1b[64;3u` + `@` gives `Char('@') + ALT` then
-//!   `Char('@') + NONE` (`:300-303`), distinguishable by codepoint and by modifier respectively.
-//! * Guard two, Pi's WezTerm split (`stdin-buffer.ts:207-232`), emits a lone `ESC` and restarts
-//!   when `\x1b\x1b` is followed by `[`/`]`/`O`/`P`/`_` — the shape WezTerm produces for the Escape
-//!   key once event types are reported (a raw `\x1b` press plus a `CSI 27 ; … : 3 u` release).
-//!   crossterm collapses `\x1b\x1b` into one `Esc` event before cyrup sees it (`parse.rs:77`), so
-//!   [`crate::escape_reassembly`] cannot tell that shape from the genuine split-at-`ESC` it exists
-//!   to repair.
-//!
-//! Withholding bit 2 does not merely leave those guards unported — it makes guard two's hazard
-//! **unreachable**, because the release report it keys off is only sent when event types are
-//! requested. Guard one's hazard is a terminal/layout quirk rather than a flag-gated one and stays
-//! a recorded residual on `TUI-046`. Bit 2 goes in under the same condition bit 4 does: when cyrup
-//! owns the bytes ahead of crossterm's parser rather than the events behind it.
+//! Its two upstream *guards* were once a second reason: they filter RAW BYTES, and cyrup used to
+//! see only crossterm's events, where `\x1b[224u` and a bare `à` are byte-identical `KeyEvent`s
+//! (measured through a pty on 2026-09-05) and `\x1b\x1b` has already collapsed into one `Esc`.
+//! That reason is gone on unix: cyrup's own byte reader (`crate::input`) ports both — pi's
+//! `pendingKittyPrintableCodepoint` dedup (`stdin-buffer.ts:186-192`, `:399-408`, pi issue #3780)
+//! and pi's WezTerm `ESC ESC [` split (`:207-232`) — in `crate::input::frame`, ahead of any
+//! decoding (`TUI-046`). Raising the pushed set to pi's 7 is a separate decision; nothing here
+//! stops it except the bit-4 argument above, which is about the decoder's crossterm-compatible
+//! keycode substitution, not about the seam.
 //!
 //! `[CYRUP-DELTA]` **`modifyOtherKeys` is negotiated but not enabled.** Pi hand-rolls its key parser
 //! (`tui/src/keys.ts`) and therefore understands xterm's `CSI 27 ; <mod> ; <code> ~` reports.
@@ -114,11 +94,11 @@
 //! # Why this may only run at startup
 //!
 //! [`negotiate`] reads stdin directly, so it is safe only in the window
-//! [`crate::terminal_query`]'s module docs describe: after raw mode is on and BEFORE the crossterm
+//! [`crate::terminal_query`]'s module docs describe: after raw mode is on and BEFORE the input
 //! reader thread exists. `App::suspend` and the external-editor round trip re-push the flags while
 //! that reader thread is live, so they must NOT re-query — they re-apply the decision this module
-//! already recorded. A late `CSI ? <flags> u` is harmless in any case: crossterm's `?`-parameter CSI
-//! arm terminates on `u` and yields an internal keyboard-enhancement event, not a keystroke.
+//! already recorded. A late `CSI ? <flags> u` is harmless in any case: the reader frames it as one
+//! sequence and decodes it as a terminal reply, not a keystroke (`crate::input::decode`).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;

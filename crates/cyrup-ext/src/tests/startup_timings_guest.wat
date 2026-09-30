@@ -1,4 +1,4 @@
-;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.12.0`
+;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.13.0`
 ;; `extension` world and whose `init` succeeds, so the host reaches its `${path} factory` timing mark.
 ;; It imports nothing and exports every `events` function plus `init`. Each export returns a
 ;; pointer to zeroed memory, which the canonical ABI reads as the first case / empty value
@@ -251,6 +251,6 @@
     (export "on-session-tree" (func $on-session-tree))
     (export "bus-deliver" (func $bus-deliver))
   )
-  (export "cyrup:ext/events@0.12.0" (instance $events))
+  (export "cyrup:ext/events@0.13.0" (instance $events))
   (export "init" (func $init))
 )

@@ -699,14 +699,46 @@ impl RawChildShape {
 /// (`workflow_detach/children.rs`), and `children.list`'s session rung
 /// ([`crate::background::retained_children`]) reads `step.session_file` — a row that left it
 /// empty answered `no persisted session file` for every settled child.
+///
+/// SUBA-134 — `session_name` is the name the child's session ran under, `results[0].sessionName`
+/// (pi overwrites the row's name with `launch.sessionName` / `progress.sessionName`,
+/// `subagent-executor.ts:5915,5942` @v0.71.0); a child that reported none keeps pi's placeholder,
+/// `deriveChildSessionName({ agent: entry.agent ?? entry.key, label: entryLabel })` (`:5774`),
+/// computed from the key's FIRST `run` trace entry (the one that creates the row, `:5770-5790`) —
+/// named from the explicit label only, never the key. A caller with no trace to hand (the live
+/// republish, whose children have all launched and so all report a name) passes `&[]`.
 #[must_use]
-pub fn workflow_step_statuses(children: &[WorkflowScriptChildResult]) -> Vec<StepStatus> {
+pub fn workflow_step_statuses(
+    children: &[WorkflowScriptChildResult],
+    trace: &[WorkflowScriptTraceEntry],
+) -> Vec<StepStatus> {
     children
         .iter()
         .map(|child| {
             let mut step =
                 StepStatus::pending(child.agent.clone().unwrap_or_else(|| child.key.clone()));
             let result = child.results.first().and_then(Value::as_object);
+            step.session_name = result
+                .and_then(|map| map.get("sessionName"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    let entry = trace.iter().find(|entry| {
+                        entry.operation == WorkflowScriptOperation::Run && entry.key == child.key
+                    });
+                    crate::exec::child_session_name::derive_child_session_name(
+                        Some(
+                            entry
+                                .and_then(|entry| entry.agent.as_deref())
+                                .unwrap_or(&child.key),
+                        ),
+                        None,
+                        entry
+                            .and_then(|entry| entry.label.as_deref())
+                            .map(str::trim)
+                            .filter(|label| !label.is_empty()),
+                    )
+                });
             step.session_file = result
                 .and_then(|map| map.get("sessionFile"))
                 .and_then(Value::as_str)
@@ -814,7 +846,7 @@ mod tests {
             ok: true,
             ..WorkflowScriptChildResult::default()
         };
-        let steps = workflow_step_statuses(&[child, bare]);
+        let steps = workflow_step_statuses(&[child, bare], &[]);
         assert_eq!(
             steps[0].session_file.as_deref(),
             Some(std::path::Path::new("/tmp/s/child.jsonl"))
@@ -829,6 +861,51 @@ mod tests {
         assert!(steps[1].session_file.is_none() && steps[1].model.is_none());
         assert!(steps[1].runner.is_none());
         assert_eq!(steps[1].usage, cyrup_core::Usage::default());
+    }
+
+    /// SUBA-134 — a row shows the name its child's session ran under (`launch.sessionName` /
+    /// `progress.sessionName` overwrite the row, `subagent-executor.ts:5915,5942` @v0.71.0); a
+    /// child that never launched keeps pi's placeholder, `deriveChildSessionName({ agent:
+    /// entry.agent ?? entry.key, label: entryLabel })` (`:5774`) off the key's first `run` trace
+    /// entry — named from the label only, never from the key, and just the agent (or key) when
+    /// there is no label.
+    #[test]
+    fn step_rows_are_named_by_their_child_session_else_by_the_trace_label() {
+        let launched = WorkflowScriptChildResult {
+            key: "review".to_string(),
+            ok: true,
+            agent: Some("reviewer".to_string()),
+            run_id: Some("run-1".to_string()),
+            results: vec![json!({ "sessionName": "reviewer: check the diff" })],
+            ..WorkflowScriptChildResult::default()
+        };
+        let never_launched = WorkflowScriptChildResult {
+            key: "lane.a".to_string(),
+            agent: Some("worker".to_string()),
+            ..WorkflowScriptChildResult::default()
+        };
+        let keyed_only = WorkflowScriptChildResult {
+            key: "lane.b".to_string(),
+            ..WorkflowScriptChildResult::default()
+        };
+        let mut first = run_entry("lane.a", WorkflowScriptTraceState::Started);
+        first.agent = Some("worker".to_string());
+        first.label = Some(" Lane A ".to_string());
+        let mut later = run_entry("lane.a", WorkflowScriptTraceState::Failed);
+        later.label = Some("Lane Z".to_string());
+        let mut unlabelled = run_entry("lane.b", WorkflowScriptTraceState::Started);
+        unlabelled.agent = None;
+        let trace = [first, later, unlabelled];
+        let steps = workflow_step_statuses(&[launched, never_launched, keyed_only], &trace);
+        let names: Vec<Option<&str>> = steps.iter().map(|s| s.session_name.as_deref()).collect();
+        assert_eq!(
+            names,
+            [
+                Some("reviewer: check the diff"),
+                Some("worker: Lane A"),
+                Some("lane.b"),
+            ]
+        );
     }
 
     /// `carry_step_settle_times`: a terminal row keeps its predecessor's stamp (matched by key,

@@ -600,10 +600,12 @@ fn all_33_event_kinds_are_registerable() {
     assert_eq!(kinds.last(), Some(&35));
 }
 
-/// EXT-080 — every `on_*` hands back pi's remover, naming the event it clears, so the guest glue
-/// can send exactly that kind over `registration.unsubscribe`.
+/// EXT-080 — every `on_*` hands back pi's remover for its own event, and running it removes that
+/// event and no other (pi `loader.ts:256-271` @v0.87.1: the remover splices its own handler out).
 #[test]
 fn every_subscriber_returns_the_remover_for_its_own_event() {
+    use crate::api::Removal;
+
     let mut api = ExtensionApi::new();
     let turn_end = api.on_turn_end(|_, _| {});
     let context = api.on_context(|_, _| Outcome::noop());
@@ -616,8 +618,237 @@ fn every_subscriber_returns_the_remover_for_its_own_event() {
         );
     }
     assert_ne!(turn_end, context);
-    // Host target: the import is not reachable, so dropping the subscription is a no-op there.
-    turn_end.unsubscribe();
+
+    assert_eq!(turn_end.remove(), Removal::InFactory);
+    let mut left = vec![context.event_kind(), prompt_end.event_kind()];
+    left.sort_unstable();
+    assert_eq!(
+        api.subscription_kinds(),
+        left,
+        "the remover drops exactly its own event"
+    );
+    assert_eq!(turn_end.remove(), Removal::AlreadyRemoved, "idempotent");
+}
+
+/// EXT-080 — `let off = pi.on(e, h); off();` inside the factory leaves `e` unsubscribed and `h`
+/// never called (pi's handler list for `e` is empty before the first dispatch). The bitset `init`
+/// declares is `subscription_kinds()`, so the removal must reach it.
+#[test]
+fn a_remover_run_inside_the_factory_leaves_the_event_unsubscribed() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let called = Rc::new(Cell::new(false));
+    let mut api = ExtensionApi::new();
+    let c = called.clone();
+    let off = api.on_turn_end(move |_, _| c.set(true));
+    api.on_agent_start(|_| {});
+    off.unsubscribe();
+
+    assert_eq!(
+        api.subscription_kinds(),
+        vec![7],
+        "turn_end (10) must not be declared once its remover ran in the factory"
+    );
+    api.dispatch(off.event_kind(), &["0", "{}", "[]"], &Ctx::new());
+    assert!(!called.get(), "a removed handler is never called");
+}
+
+/// EXT-080 + EXT-089 — each `on_*` is its own registration, and removing one leaves the others:
+/// pi's remover splices out only its own `registeredHandler` (`core/extensions/loader.ts:256-271`
+/// @v0.87.1). In the factory the event stays declared while a handler remains; after `init` only
+/// the LAST handler's remover reaches the host's `registration.unsubscribe`. Red before EXT-089:
+/// the second `on_turn_end` REPLACED the first, so there was nothing left to prove the first
+/// removal spared.
+#[test]
+fn removing_the_first_handler_leaves_the_second() {
+    use crate::api::Removal;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let calls: Rc<RefCell<Vec<&str>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let c = calls.clone();
+    let first = api.on_turn_end(move |_, _| c.borrow_mut().push("first"));
+    let c = calls.clone();
+    let second = api.on_turn_end(move |_, _| c.borrow_mut().push("second"));
+    assert_ne!(first, second, "two registrations, two identities");
+
+    api.dispatch(10, &["0", "{}", "[]"], &Ctx::new());
+    assert_eq!(*calls.borrow(), ["first", "second"], "both run, in order");
+
+    // In the factory.
+    calls.borrow_mut().clear();
+    first.unsubscribe();
+    assert_eq!(
+        api.subscription_kinds(),
+        vec![10],
+        "the second handler keeps the event declared"
+    );
+    api.dispatch(10, &["0", "{}", "[]"], &Ctx::new());
+    assert_eq!(
+        *calls.borrow(),
+        ["second"],
+        "only the removed handler stops"
+    );
+
+    // After `init`: the first removal keeps the host subscription; the last one drops it.
+    let mut api = ExtensionApi::new();
+    let earlier = api.on_agent_end(|_, _| {});
+    let later = api.on_agent_end(|_, _| {});
+    api.install_live();
+    assert_eq!(earlier.remove(), Removal::Remaining);
+    assert_eq!(later.remove(), Removal::Live);
+    assert_eq!(later.remove(), Removal::AlreadyRemoved);
+}
+
+/// EXT-089 — every handler an extension registers for an event runs, in registration order, and
+/// their results combine exactly as pi's runner combines them (`core/extensions/runner.ts`
+/// @v0.87.1): each chaining event hands the next handler the value the previous one produced, and
+/// the host receives the combined result as one outcome. Red before the fix: an `ExtensionApi`
+/// kept ONE handler per event, so the second `on_*` replaced the first, which never ran.
+#[test]
+fn two_handlers_for_one_event_both_run_in_order_with_pis_result_combination() {
+    use serde_json::{Value, json};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let ctx = Ctx::new();
+    let mutate = |o: RawOutcome| match o {
+        RawOutcome::Mutate(s) => serde_json::from_str::<Value>(&s).unwrap(),
+        other => panic!("expected a combined mutate, got {other:?}"),
+    };
+
+    // `context` (`emitContext`): the second handler is given the first one's messages, and the
+    // host gets the second one's list.
+    let seen: Rc<RefCell<Vec<Value>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let s = seen.clone();
+    api.on_context(move |e, _| {
+        s.borrow_mut().push(e.messages.clone());
+        let mut m = e.messages.as_array().cloned().unwrap_or_default();
+        m.push(json!({"role": "user", "content": "A"}));
+        Outcome::replace_messages(m)
+    });
+    let s = seen.clone();
+    api.on_context(move |e, _| {
+        s.borrow_mut().push(e.messages.clone());
+        let mut m = e.messages.as_array().cloned().unwrap_or_default();
+        m.push(json!({"role": "user", "content": "B"}));
+        Outcome::replace_messages(m)
+    });
+    let out = mutate(api.dispatch(2, &["[]"], &ctx));
+    assert_eq!(
+        *seen.borrow(),
+        [json!([]), json!([{"role": "user", "content": "A"}])],
+        "the second handler sees the first one's result"
+    );
+    assert_eq!(
+        out,
+        json!([{"role": "user", "content": "A"}, {"role": "user", "content": "B"}])
+    );
+
+    // `tool_call` (`emitToolCall`): the rewritten input chains, and the first block returns.
+    let seen: Rc<RefCell<Vec<Value>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let s = seen.clone();
+    api.on_tool_call(move |e, _| {
+        s.borrow_mut().push(e.input.clone());
+        Outcome::replace_tool_input(json!({"path": "b"}))
+    });
+    let s = seen.clone();
+    api.on_tool_call(move |e, _| {
+        s.borrow_mut().push(e.input.clone());
+        Outcome::block("no")
+    });
+    api.on_tool_call(|_, _| panic!("a handler after the first block must not run"));
+    assert_eq!(
+        api.dispatch(0, &["c1", "read", r#"{"path":"a"}"#], &ctx),
+        RawOutcome::Block(Some("no".into()), false)
+    );
+    assert_eq!(*seen.borrow(), [json!({"path": "a"}), json!({"path": "b"})]);
+
+    // `before_agent_start` (`emitBeforeAgentStart`): every message accumulates, the last system
+    // prompt wins, and the second handler reads the first one's prompt.
+    let seen: Rc<RefCell<Vec<String>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let s = seen.clone();
+    api.on_before_agent_start(move |e, _| {
+        s.borrow_mut().push(e.system_prompt.clone());
+        Outcome::mutate(json!({"systemPrompt": "one", "message": {"role": "custom", "n": 1}}))
+    });
+    let s = seen.clone();
+    api.on_before_agent_start(move |e, _| {
+        s.borrow_mut().push(e.system_prompt.clone());
+        Outcome::mutate(json!({"systemPrompt": "two", "message": {"role": "custom", "n": 2}}))
+    });
+    let out = mutate(api.dispatch(4, &["hi", "[]", "base", "{}"], &ctx));
+    assert_eq!(*seen.borrow(), ["base", "one"]);
+    assert_eq!(
+        out,
+        json!({"systemPrompt": "two", "messages": [{"role": "custom", "n": 1}, {"role": "custom", "n": 2}]})
+    );
+
+    // `tool_result` (`emitToolResult`): each returned field overwrites, key by key.
+    let mut api = ExtensionApi::new();
+    api.on_tool_result(|_, _| Outcome::mutate(json!({"isError": true, "details": {"a": 1}})));
+    api.on_tool_result(|e, _| {
+        assert!(
+            e.is_error,
+            "the second handler sees the first one's isError"
+        );
+        Outcome::mutate(json!({"details": {"b": 2}}))
+    });
+    let out = mutate(api.dispatch(1, &["c1", "read", "{}", "[]", "false", "", ""], &ctx));
+    assert_eq!(out, json!({"isError": true, "details": {"b": 2}}));
+
+    // `message_end` (`emitMessageEnd`): a different-role replacement is skipped, a same-role one
+    // chains.
+    let mut api = ExtensionApi::new();
+    api.on_message_end(|_, _| Outcome::replace_message(json!({"role": "user", "content": "x"})));
+    api.on_message_end(|e, _| {
+        assert_eq!(
+            e.message["content"], "orig",
+            "the wrong-role replacement was skipped"
+        );
+        Outcome::replace_message(json!({"role": "assistant", "content": "y"}))
+    });
+    let out = mutate(api.dispatch(3, &[r#"{"role":"assistant","content":"orig"}"#], &ctx));
+    assert_eq!(out, json!({"role": "assistant", "content": "y"}));
+
+    // `resources_discover` (`emitResourcesDiscover`): every handler's paths concatenate.
+    let mut api = ExtensionApi::new();
+    api.on_resources_discover(|_, _| Outcome::handled(json!({"skillPaths": ["s1"]})));
+    api.on_resources_discover(|_, _| {
+        Outcome::handled(json!({"skillPaths": ["s2"], "themePaths": ["t"]}))
+    });
+    let RawOutcome::Handled(h) = api.dispatch(5, &["/cwd", "startup"], &ctx) else {
+        panic!("resources combine into one handled result")
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(&h).unwrap(),
+        json!({"skillPaths": ["s1", "s2"], "promptPaths": [], "themePaths": ["t"]})
+    );
+
+    // `project_trust` (`emitProjectTrustEvent`): `undecided` falls through to the next handler.
+    let mut api = ExtensionApi::new();
+    api.on_project_trust(|_, _| Outcome::handled(json!({"trusted": "undecided"})));
+    api.on_project_trust(|_, _| Outcome::handled(json!({"trusted": "yes"})));
+    api.on_project_trust(|_, _| panic!("a decided handler ends the walk"));
+    let RawOutcome::Handled(h) = api.dispatch(6, &["/cwd"], &ctx) else {
+        panic!("the decided result is returned")
+    };
+    assert_eq!(serde_json::from_str::<Value>(&h).unwrap()["trusted"], "yes");
+
+    // A notify event: both run, in registration order.
+    let order: Rc<RefCell<Vec<u8>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let o = order.clone();
+    api.on_agent_start(move |_| o.borrow_mut().push(1));
+    let o = order.clone();
+    api.on_agent_start(move |_| o.borrow_mut().push(2));
+    assert_eq!(api.dispatch(7, &[], &ctx), RawOutcome::Noop);
+    assert_eq!(*order.borrow(), [1, 2]);
 }
 
 /// EXT-075 / EXT-079 — the three new events decode their ordered args into pi's payloads.
@@ -949,4 +1180,26 @@ fn the_demo_extension_declares_a_bash_backend_and_redirects_only_remote_commands
             .is_err(),
         "a backend failure is pi's `throw`, not an exit code"
     );
+}
+
+/// EXT-082 — a refused registration is pi's throw as a value: `?` ends a handler at it, with
+/// pi's message as the handler's `String` error, and nothing after the `?` runs.
+#[test]
+fn a_registration_error_propagates_out_of_a_handler_with_question_mark() {
+    use crate::api::RegistrationError;
+    use std::cell::Cell;
+
+    let reached = Cell::new(false);
+    let handler = || -> Result<Option<String>, String> {
+        Err(RegistrationError::new(
+            "Invalid default for flag \"x\": expected boolean, got string".into(),
+        ))?;
+        reached.set(true);
+        Ok(None)
+    };
+    assert_eq!(
+        handler(),
+        Err("Invalid default for flag \"x\": expected boolean, got string".to_string())
+    );
+    assert!(!reached.get(), "the rest of the handler did not run");
 }

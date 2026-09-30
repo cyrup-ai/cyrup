@@ -629,7 +629,10 @@ fn gap21_list_reports_progress_loaded_and_total() {
     write_header_only(&sdir, "2026-01-01T00-00-02_c.jsonl", "c", "/proj/gap21");
 
     let mut seen: Vec<(usize, usize)> = Vec::new();
-    let mut cb = |loaded: usize, total: usize| seen.push((loaded, total));
+    let mut cb = |loaded: usize, total: usize, _partial: Option<&[crate::SessionInfo]>| {
+        seen.push((loaded, total));
+        std::ops::ControlFlow::Continue(())
+    };
     let infos = list_in_dir(&sdir, None, Some(&mut cb));
 
     assert_eq!(infos.len(), 3);

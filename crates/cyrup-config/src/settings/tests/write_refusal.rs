@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::error::ConfigError;
+use crate::error::{ConfigError, SettingsLoadError};
 use crate::settings::*;
 #[test]
 fn apply_overrides_deep_merges_onto_effective() {
@@ -77,15 +77,56 @@ fn malformed_global() -> (Arc<InMemorySettingsStore>, SettingsManager) {
 fn assert_refused(result: Result<(), ConfigError>, expected_scope: SettingsScope) {
     let described = format!("{result:?}");
     // The refusal must name the scope it protected AND carry the underlying cause, so a
-    // `/config` toggle can tell the user which file to go fix.
+    // `/config` toggle can tell the user which file to go fix. The cause is TYPED (CFG-088): its
+    // text is `JSON.parse`'s own message now and carries no marker to match on.
     let matched = matches!(
         &result,
-        Err(ConfigError::SettingsWriteRefused { scope, message })
-            if *scope == expected_scope && message.contains("parse error")
+        Err(ConfigError::SettingsWriteRefused {
+            scope,
+            cause: SettingsLoadError::Parse(_),
+        }) if *scope == expected_scope
     );
     assert!(
         matched,
-        "expected SettingsWriteRefused{{{expected_scope:?}, ..parse error..}}, got {described}"
+        "expected SettingsWriteRefused{{{expected_scope:?}, Parse(..)}}, got {described}"
+    );
+}
+
+/// CFG-088 — the load failure's text is `JSON.parse`'s own message, as pi reports it
+/// (`Invalid settings file <path>: ${error.message}`, `core/settings-diagnostics.ts:4-9` @v0.87.1,
+/// the error thrown by `JSON.parse(stripBom(content))`, `settings-manager.ts:424`). Node 22's V8
+/// says this for [`MALFORMED`]'s trailing comma; cyrup said `parse error: key must be a string at
+/// line 5 column 1`.
+#[test]
+fn cfg088_a_parse_failure_carries_json_parses_message_and_still_latches() {
+    let (_store, mut mgr) = malformed_global();
+    let v8 = "Expected double-quoted property name in JSON at position 89 (line 5 column 1)";
+    assert_eq!(
+        mgr.load_error(SettingsScope::Global),
+        Some(&SettingsLoadError::Parse(v8.to_string()))
+    );
+    let errors = mgr.drain_load_errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].diagnostic_message(),
+        format!("Invalid global settings: {v8}")
+    );
+}
+
+/// CFG-088 — the refusal still names the scope and the cause, with the cause's text now being
+/// `JSON.parse`'s message rather than a `parse error:`-prefixed serde one.
+#[tokio::test]
+async fn cfg088_the_refusal_reports_the_parse_failure_it_latched() {
+    let (_store, mut mgr) = malformed_global();
+    let err = mgr
+        .set(SettingsScope::Global, "theme", "light")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "refusing to write Global settings: the file could not be parsed (Expected \
+         double-quoted property name in JSON at position 89 (line 5 column 1)); fix or remove \
+         it, then retry — the existing file was left unchanged"
     );
 }
 

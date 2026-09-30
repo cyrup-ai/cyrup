@@ -464,6 +464,10 @@ pub struct InitApi {
     /// reason as `terminal_input`: a native has exactly one
     /// [`NativeExtension::on_branch_change`].
     branch_change: bool,
+    /// Typed-bus topics ([`Self::subscribe_typed_bus`]), delivered synchronously to
+    /// [`NativeExtension::on_typed_bus_event`]. Taken by the facade with
+    /// [`Self::take_typed_bus_topics`] before [`Self::into_parts`].
+    typed_bus_topics: Vec<String>,
 }
 
 impl InitApi {
@@ -605,6 +609,25 @@ impl InitApi {
         self.bus_topics.push(topic.into());
     }
 
+    /// Listen on a TYPED bus topic: an event another native emits through
+    /// [`crate::SharedBus::emit_typed`] (a native reaches it with
+    /// [`crate::host::HostServices::emit_typed_event`]) is handed to
+    /// [`NativeExtension::on_typed_bus_event`] inline, before the emit returns.
+    ///
+    /// This is the half of pi's `pi.events` the JSON topics of [`Self::subscribe_bus`] do not
+    /// carry: an emit whose payload is a typed request the listeners answer synchronously, and whose
+    /// emitter reads the answer right after `emit` — pi-intercom's `IntercomSessionIdentityRequestV1
+    /// { version: 1; claim(stableId) }` (`v0.14.0 extension-api.ts:17-20`, emitted and read at
+    /// `index.ts:1645-1653`) is the case that needs it.
+    pub fn subscribe_typed_bus(&mut self, topic: impl Into<String>) {
+        self.typed_bus_topics.push(topic.into());
+    }
+
+    /// The typed-bus topics declared through [`Self::subscribe_typed_bus`], moved out.
+    pub(crate) fn take_typed_bus_topics(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.typed_bus_topics)
+    }
+
     pub fn subscriptions(&self) -> Subscriptions {
         self.subs
     }
@@ -667,6 +690,23 @@ pub trait NativeExtension: Send + Sync {
     ) -> Result<(), ExtError> {
         Ok(())
     }
+
+    /// Receive a TYPED bus event this extension subscribed to through
+    /// [`InitApi::subscribe_typed_bus`], inline inside the emitter's
+    /// [`crate::SharedBus::emit_typed`] call — pi's synchronous `emitter.emit(channel, data)`
+    /// (`core/event-bus.ts:15-17` @v0.87.1), where a listener answers `data` and the emitter reads
+    /// the answer as soon as `emit` returns.
+    ///
+    /// [CYRUP-DELTA] upstream's listener duck-types the payload (`typeof request.claim ===
+    /// "function"`); here the listener downcasts `event` to the concrete request type the topic's
+    /// owner publishes, so a payload of the wrong shape never reaches a listener that would answer
+    /// it, and the request's API is checked at compile time. Native-only: a WASM guest's store is
+    /// not re-enterable inside another extension's dispatch (see [`crate::bus`]), so a typed
+    /// request never crosses into a guest.
+    ///
+    /// Synchronous on purpose, so it must not block: it runs on the emitter's stack, which is the
+    /// point. Default: ignore.
+    fn on_typed_bus_event(&self, _topic: &str, _event: &dyn std::any::Any) {}
 
     /// Opt in to the PRE-TRUST bootstrap pass, where `project_trust` is asked (EXT-003). Default
     /// `false`, and that default is load-bearing.

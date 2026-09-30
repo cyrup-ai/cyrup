@@ -1,5 +1,8 @@
 //! Swallow a **late** terminal OSC 11 reply before it reaches the editor as keystrokes.
 //!
+//! **Windows only since 2026-09-30.** On unix the byte reader frames every OSC/DCS/APC reply whole
+//! and swallows it (`crate::input::decode`, `TUI-047`), and this module is compiled out there.
+//!
 //! This is the port of Pi's first line of defence in `handleTerminalInput`
 //! (`pi/packages/tui/src/tui.ts:788-794`), which begins every dispatch with
 //! `consumeOsc11BackgroundResponse(data)` / `consumeTerminalColorSchemeReport(data)` and returns

@@ -1663,7 +1663,7 @@ impl ThemeController {
     /// **[CYRUP-DELTA] vs `:62` and `:74`** — the two probing branches do **not** re-probe. Upstream
     /// asks the terminal again (DSR `?996` for an `auto` setting, OSC 11 for an unset one) because
     /// its own TUI owns the stdin demultiplexer and can route the reply back to the awaiting caller.
-    /// By the time cyrup can reach this seam the crossterm reader thread owns stdin
+    /// By the time cyrup can reach this seam the input reader thread owns stdin
     /// (`crates/cyrup/src/interactive.rs` starts it right after the boot probe, for exactly this
     /// reason), so a second query's reply bytes would be raced for and mis-decoded as keystrokes
     /// into the user's prompt — the same hazard [`Self::auto_sync`] records for mode `2031`. The
@@ -1710,10 +1710,12 @@ impl ThemeController {
     /// color-scheme notifications (mode `2031`) enabled and re-theme on every change.
     ///
     /// cyrup reports this but deliberately does **not** enable mode `2031`, and the reason is a
-    /// safety one rather than an oversight: crossterm surfaces no event for the unsolicited
-    /// `CSI ? 997 ; N n` notification, so every push the terminal sent would reach `event::read()`
-    /// and be mis-decoded as stray keystrokes into the user's prompt. Turning the notifications on
-    /// without a consumer is strictly worse than leaving them off. Independently, committed
+    /// safety one rather than an oversight: crossterm surfaced no event for the unsolicited
+    /// `CSI ? 997 ; N n` notification, so every push the terminal sent reached `event::read()` and
+    /// was mis-decoded as stray keystrokes into the user's prompt. On unix the byte reader now
+    /// frames the push as one terminal reply and swallows it (`crate::input::decode`), so it no
+    /// longer corrupts input — but nothing consumes it either, and turning the notifications on
+    /// without a consumer still buys nothing. Independently, committed
     /// transcript rows have already gone to `Terminal::insert_before` and live in the terminal's own
     /// scrollback, so a mid-session polarity flip could never recolor what is already on screen
     /// (ADR-0001). Detection therefore happens once, at boot.

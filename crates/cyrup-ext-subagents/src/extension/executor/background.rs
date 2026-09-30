@@ -292,6 +292,8 @@ impl SubagentExecutor {
             acceptance,
             context: Some(effective_context),
             agent_scope: None,
+            label: None,
+            session_name: None,
         };
 
         self.spawn_background_steps(
@@ -1088,6 +1090,10 @@ impl SubagentExecutor {
                 mode: Some(event_mode_str.to_string()),
                 state: "running".to_string(),
                 agent: event_agents.first().cloned(),
+                // SUBA-134 — upstream's start event carries no `sessionName`
+                // (`async-execution.ts:1598-1621,2173-2193` @v0.71.0); only the status-derived
+                // summaries (`nestedSummaryFromAsyncStatus`, `nested-events.ts:1015,1046`) do.
+                session_name: None,
                 agents: Some(event_agents.clone()),
                 current_step: None,
                 chain_step_count: Some(event_step_count),
@@ -4019,6 +4025,8 @@ mutationTools: apply_patch, notebook_edit\n",
                 session_dir: None,
                 context: Some(ContextMode::Fresh),
                 agent_scope: None,
+                label: None,
+                session_name: None,
             };
 
             let error = executor
@@ -4273,6 +4281,8 @@ mutationTools: apply_patch, notebook_edit\n",
                     session_dir: None,
                     context: Some(ContextMode::Fresh),
                     agent_scope: None,
+                    label: None,
+                    session_name: None,
                 })],
                 mode: RunMode::Single,
                 session_file: None,

@@ -44,8 +44,8 @@ pub use git_paths::{GitPaths, canonicalize_path, find_git_paths, resolve_path};
 pub use header::{CURRENT_VERSION, SessionHeader};
 pub use layout::{SessionLayout, SessionsRoot, encode_cwd};
 pub use listing::{
-    SessionInfo, SessionListProgress, SessionSelector, list, list_all, list_all_in_dir,
-    list_all_with_progress, list_in_dir, newest_session, resolve,
+    SessionInfo, SessionListProgress, SessionListing, SessionSelector, list, list_all,
+    list_all_in_dir, list_all_with_progress, list_in_dir, newest_session, resolve,
 };
 pub use manager::{NewSessionOpts, SessionManager, TreeNode};
 pub use prompt::{

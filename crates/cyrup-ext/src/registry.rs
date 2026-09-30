@@ -89,11 +89,13 @@ fn require_object_schema(
 /// by `f47faf459`, #8123): `options.default !== undefined && typeof options.default !== options.type`
 /// throws `Invalid default for flag "<name>": expected <type>, got <typeof default>`.
 ///
-/// A JSON `null` default is read as upstream's `undefined`: the wire has no `undefined`, the SDK's
-/// `FlagSpec` omits an absent default rather than sending `null`, and
-/// [`crate::host::GuestState::get_flag`] already treats a `null` default as "no default".
+/// Only an ABSENT `default` key is upstream's `undefined`. A JSON `null` is JS `null`, whose
+/// `typeof` is `"object"`, so `{"type":"boolean","default":null}` is refused as upstream refuses
+/// it (the SDK's `FlagSpec` omits an absent default, so a `null` only arrives when an author writes
+/// one). The comparison is strict: only a STRING `type` can equal a `typeof` result, and a
+/// non-string `type` is interpolated the way a JS template literal would (see [`js_string`]).
 fn require_typed_flag_default(name: &str, spec: &Value) -> Result<(), ExtError> {
-    let Some(default) = spec.get("default").filter(|d| !d.is_null()) else {
+    let Some(default) = spec.get("default") else {
         return Ok(());
     };
     let got = match default {
@@ -102,16 +104,83 @@ fn require_typed_flag_default(name: &str, spec: &Value) -> Result<(), ExtError> 
         Value::Number(_) => "number",
         Value::Null | Value::Array(_) | Value::Object(_) => "object",
     };
-    let expected = match spec.get("type") {
-        Some(Value::String(t)) => t.as_str(),
-        _ => "undefined",
-    };
-    if got == expected {
+    let ty = spec.get("type");
+    if matches!(ty, Some(Value::String(t)) if t == got) {
         return Ok(());
     }
+    let expected = ty.map_or_else(|| "undefined".to_string(), js_string);
     Err(ExtError::Registration(format!(
         "Invalid default for flag \"{name}\": expected {expected}, got {got}"
     )))
+}
+
+/// A JSON value as a JS template literal interpolates it (ECMAScript `ToString`): a string is
+/// itself, `null`/booleans their keyword, a number by `Number::toString`, an array its elements'
+/// `ToString` joined by `,` (a `null` element as the empty string), and an object
+/// `[object Object]`. EXT-082: pi's flag-default message interpolates `options.type` raw.
+fn js_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => js_number(n),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Null => String::new(),
+                other => js_string(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".to_string(),
+    }
+}
+
+/// ECMAScript `Number::toString(x)` (radix 10, ECMA-262 §6.1.6.1.20) for a JSON number: the
+/// shortest round-trip digits, positional between `1e-7` and `1e21`, exponential outside.
+fn js_number(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() {
+        return i.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return u.to_string();
+    }
+    let x = n.as_f64().unwrap_or(0.0);
+    if x == 0.0 {
+        return "0".to_string();
+    }
+    let sign = if x < 0.0 { "-" } else { "" };
+    // Rust's `{:e}` prints the shortest round-trip digits, as `d[.ddd]e<exp>`.
+    let sci = format!("{:e}", x.abs());
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let k = i64::try_from(digits.len()).unwrap_or(i64::MAX);
+    let point = exp.parse::<i64>().unwrap_or(0) + 1;
+    let body = if k <= point && point <= 21 {
+        format!(
+            "{digits}{}",
+            "0".repeat(usize::try_from(point - k).unwrap_or(0))
+        )
+    } else if 0 < point && point <= 21 {
+        let (int, frac) = digits.split_at(usize::try_from(point).unwrap_or(0));
+        format!("{int}.{frac}")
+    } else if -6 < point && point <= 0 {
+        format!(
+            "0.{}{digits}",
+            "0".repeat(usize::try_from(-point).unwrap_or(0))
+        )
+    } else {
+        let e = point - 1;
+        let e_sign = if e < 0 { '-' } else { '+' };
+        let (first, rest) = digits.split_at(1.min(digits.len()));
+        let rest = if rest.is_empty() {
+            String::new()
+        } else {
+            format!(".{rest}")
+        };
+        format!("{first}{rest}e{e_sign}{}", e.abs())
+    };
+    format!("{sign}{body}")
 }
 
 /// Wire form of `ExecMode` (serde camelCase).
@@ -205,6 +274,37 @@ pub struct ResolvedCommand {
     pub descriptor: CommandDescriptor,
 }
 
+/// One CLI flag an extension DECLARED — pi's `ExtensionFlag` (`core/extensions/types.ts:1737-1743`
+/// @v0.87.1): `{ name, description?, type, default?, extensionPath }`. This is the declaration
+/// `--help` lists (`printHelp(extensionFlags)`, `cli/args.ts:261-271`), not a flag value parsed off
+/// argv.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtensionFlagDeclaration {
+    pub name: String,
+    /// The `description` the extension gave, if any (pi's `description?`).
+    pub description: Option<String>,
+    /// The declared `type` — `"boolean"` or `"string"` for a well-formed declaration; kept as the
+    /// extension wrote it, like every other field of the registered spec.
+    pub flag_type: Option<String>,
+    pub default: Option<Value>,
+    /// The declaring extension — pi's `extensionPath`. A cyrup native built-in has no filesystem
+    /// path, so this is its [`ExtensionId`], as in [`ExtensionConflict::path`].
+    pub extension: ExtensionId,
+}
+
+impl ExtensionFlagDeclaration {
+    fn from_spec(extension: ExtensionId, name: String, spec: &Value) -> Self {
+        let text = |key: &str| spec.get(key).and_then(Value::as_str).map(str::to_string);
+        ExtensionFlagDeclaration {
+            name,
+            description: text("description"),
+            flag_type: text("type"),
+            default: spec.get("default").cloned(),
+            extension,
+        }
+    }
+}
+
 /// One extension-name collision, in Pi's `detectExtensionConflicts` shape
 /// (`coding-agent/src/core/resource-loader.ts:1059-1094`): `{path, message}`, where `path` is the
 /// extension whose registration LOST (the later one in load order) and `message` names the
@@ -281,6 +381,14 @@ struct RegistryInner {
     /// into the `[Extension issues]` startup panel (`interactive-mode.ts:1612-1618`).
     shortcut_diagnostics: Vec<ExtensionConflict>,
     flags: HashMap<String, Value>,
+    /// Every flag DECLARATION, in registration order — pi's
+    /// `resourceLoader.getExtensions().extensions.flatMap((e) => Array.from(e.flags.values()))`
+    /// (`main.ts:859-862` @v0.87.1): extension load order, then each extension's own declaration
+    /// order. Unlike [`Self::flags`] this keeps a declaration that LOST a name conflict, because pi
+    /// keeps every extension loaded and its per-extension `flags` map intact
+    /// (`resource-loader.ts:627-634`); `--help` lists both. A re-declaration by the same extension
+    /// replaces its entry in place, as `Map.set` on an existing key does.
+    flag_declarations: Vec<ExtensionFlagDeclaration>,
     /// Which extension owns each flag name. FIRST registration wins (Pi `getFlags`,
     /// runner.ts:473-483 — `if (!allFlags.has(name))` over `this.extensions` in load order).
     flag_owner: HashMap<String, ExtensionId>,
@@ -1351,6 +1459,9 @@ impl ExtensionRegistry {
             g.flags.remove(n);
             dropped += 1;
         }
+        // …and every declaration the owner made, conflict losers included (they are in no other
+        // table, so they are not counted twice).
+        g.flag_declarations.retain(|d| d.extension != *owner);
 
         // --- providers: the hub unregister is what makes the model registry drop the models this
         // owner upserted at `register_provider` ("immediate upsert if the model registry is bound").
@@ -1454,6 +1565,17 @@ impl ExtensionRegistry {
         let name = name.into();
         require_typed_flag_default(&name, &spec)?;
         let mut g = self.lock_write()?;
+        // The per-extension `extension.flags.set(name, …)` (`loader.ts:307-318` @v0.87.1) happens
+        // whatever another extension declared: a conflict is only diagnosed later, across the maps.
+        let declaration = ExtensionFlagDeclaration::from_spec(owner.clone(), name.clone(), &spec);
+        match g
+            .flag_declarations
+            .iter_mut()
+            .find(|d| d.extension == owner && d.name == name)
+        {
+            Some(existing) => *existing = declaration,
+            None => g.flag_declarations.push(declaration),
+        }
         if let Some(existing) = g.flag_owner.get(&name).cloned()
             && existing != owner
         {
@@ -1471,6 +1593,13 @@ impl ExtensionRegistry {
 
     pub fn get_flag(&self, name: &str) -> Result<Option<Value>, ExtError> {
         Ok(self.lock_read()?.flags.get(name).cloned())
+    }
+
+    /// Every flag extensions declared, in pi's `--help` order — extension load order, then each
+    /// extension's own declaration order, conflict losers included — the list `main.ts:859-862`
+    /// @v0.87.1 hands `printHelp`.
+    pub fn flag_declarations(&self) -> Result<Vec<ExtensionFlagDeclaration>, ExtError> {
+        Ok(self.lock_read()?.flag_declarations.clone())
     }
 
     /// Record a CLI-supplied flag override value (Pi `runtime.flagValues.set(name, value)`,
