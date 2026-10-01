@@ -143,6 +143,13 @@ impl AvailabilityFilter {
         }
     }
 
+    /// Drop the offline-faux accommodation, leaving pi's pure `configuredProviders` test — what
+    /// [`AgentSession::configured_model_catalog`](crate::AgentSession) needs.
+    pub(super) fn without_current_catalog(mut self) -> Self {
+        self.current_catalog.clear();
+        self
+    }
+
     /// Whether `model` is offered by the `/model` selector.
     pub(super) fn allows(&self, model: &Model) -> bool {
         self.configured.contains(&model.provider)

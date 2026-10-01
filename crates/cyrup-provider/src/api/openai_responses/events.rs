@@ -202,7 +202,18 @@ pub(super) async fn process_event(
                 }
                 ("function_call", SlotKind::Tool) => {
                     let raw = item.get("arguments").and_then(Value::as_str).unwrap_or("");
-                    if let Some(RBlock::Tool { partial_json, .. }) = dec.block_mut(ci) {
+                    if let Some(RBlock::Tool {
+                        partial_json,
+                        namespace,
+                        ..
+                    }) = dec.block_mut(ci)
+                    {
+                        // `if (item.namespace !== undefined) slot.block.namespace = item.namespace`
+                        // (`openai-responses-shared.ts:715`): the done item can carry a namespace
+                        // the `added` item did not, and it overrides one that did.
+                        if let Some(ns) = item.get("namespace").and_then(Value::as_str) {
+                            *namespace = Some(ns.to_string());
+                        }
                         // REPLACES the buffer rather than appending to it; the buffer is the
                         // block's only argument state, so nothing derived needs repairing after it
                         // (PERF-001).
@@ -221,6 +232,7 @@ pub(super) async fn process_event(
                             name: String::new(),
                             arguments: Map::new().into(),
                             thought_signature: None,
+                            namespace: None,
                         },
                     };
                     dec.slots.remove(&oi);

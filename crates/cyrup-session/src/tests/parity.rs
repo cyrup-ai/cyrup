@@ -441,6 +441,7 @@ fn gap17_serialize_separators_json_args_and_skips_empty() {
                     .unwrap()
                     .into(),
                 thought_signature: None,
+                namespace: None,
             }),
             Content::ToolCall(ToolCall {
                 id: "t2".into(),
@@ -451,6 +452,7 @@ fn gap17_serialize_separators_json_args_and_skips_empty() {
                     .unwrap()
                     .into(),
                 thought_signature: None,
+                namespace: None,
             }),
         ],
         provider: "faux".into(),
@@ -1012,6 +1014,7 @@ fn asst_toolcall(name: &str, key: &str, path: &str) -> Message {
             name: name.into(),
             arguments: json!({ key: path }).as_object().cloned().unwrap().into(),
             thought_signature: None,
+            namespace: None,
         })],
         provider: "faux".into(),
         model: "m".into(),
@@ -2144,4 +2147,64 @@ fn sess052_the_fallback_charges_the_replayed_system_message_once() {
         projected.trailing_tokens, 8,
         "the fallback reports its whole sum as trailing (`compaction.ts:282`)"
     );
+}
+
+#[test]
+fn drift058_tool_call_namespace_survives_the_session_file() {
+    // `ToolCall.namespace` (pi `types.ts:392-393`) is written after `thoughtSignature` and read
+    // back from the on-disk JSONL, so a namespaced Responses call replays on the next run.
+    use cyrup_core::ToolCall;
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/drift058");
+    let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    m.append_message(user("look it up")).unwrap();
+    let mut asst = cyrup_core::AssistantMessage::errored(
+        "openai".into(),
+        "gpt-5",
+        Some("openai-responses".into()),
+        StopReason::ToolUse,
+        "",
+    );
+    asst.error_message = None;
+    asst.content = vec![Content::ToolCall(ToolCall {
+        id: "call_test|fc_test".into(),
+        name: "lookup".into(),
+        arguments: json!({ "value": "hello" })
+            .as_object()
+            .cloned()
+            .unwrap()
+            .into(),
+        thought_signature: Some("sig".into()),
+        namespace: Some("dynamic_tools".into()),
+    })];
+    m.append_message(Message::Assistant(asst)).unwrap();
+
+    let mut buf: Vec<u8> = Vec::new();
+    m.export_jsonl(&mut buf).unwrap();
+    let jsonl = String::from_utf8(buf).unwrap();
+    assert!(
+        jsonl.contains(
+            r#""arguments":{"value":"hello"},"thoughtSignature":"sig","namespace":"dynamic_tools"}"#
+        ),
+        "namespace follows thoughtSignature on the wire: {jsonl}"
+    );
+
+    let reopened = SessionManager::open(m.session_file().unwrap()).unwrap();
+    let recovered = reopened
+        .entries()
+        .iter()
+        .find_map(|e| match e {
+            Entry::Known(KnownEntry::Message {
+                message: AgentMessage::Core(Message::Assistant(a)),
+                ..
+            }) => a.content.iter().find_map(|c| match c {
+                Content::ToolCall(tc) => Some(tc.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .expect("the tool call is on disk");
+    assert_eq!(recovered.namespace.as_deref(), Some("dynamic_tools"));
+    assert_eq!(recovered.thought_signature.as_deref(), Some("sig"));
 }

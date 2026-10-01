@@ -15,6 +15,7 @@
 //! `CrosstermBackend` event loop ([`run_resume_picker`]/[`run_trust_prompt`]) needs a real terminal and
 //! is exercised only from `main.rs` (like `run_interactive`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -22,10 +23,13 @@ use cyrup_config::trust::{
     TrustInputs, TrustOption, TrustOutcome, TrustStore, decide_trust, has_trust_requiring_resources,
 };
 use cyrup_config::{ConfigDirs, SettingsManager};
-use cyrup_session_svc::{AppMode, DefaultProjectTrust, SessionInfo, TrustDecision, TrustEntry};
+use cyrup_session_svc::{
+    AppMode, DefaultProjectTrust, SessionInfo, SessionListing, TrustDecision, TrustEntry,
+};
 use cyrup_tui::{
     ListSelector, SelectKeymap, SelectorOutcome, SessionKeymap, SessionRow, SessionSelector,
-    SessionSelectorOutcome, ThemeController, TrustSelector, UiTheme, run_startup_selector,
+    SessionSelectorOutcome, StartupSessionLoads, ThemeController, TrustSelector, UiTheme,
+    run_startup_selector, run_startup_session_selector,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -194,8 +198,21 @@ pub fn interpret_resume(outcome: &SelectorOutcome) -> ResumeChoice {
 }
 
 /// Run the `--resume` picker over a real terminal (Pi `selectSession`): mount a [`SessionSelector`]
-/// built from `sessions`, drive it to a confirm/cancel, and return the choice plus the status lines
-/// the mutations produced. TTY-only; not unit-tested (the pure halves it composes are).
+/// fed by the two session loaders, drive it to a confirm/cancel, and return the choice, the status
+/// lines the mutations produced, and every listed session's stored cwd (file path to cwd). TTY-only;
+/// not unit-tested (the pure halves it composes are, and the loop it drives is stepped over a
+/// `TestBackend` in `cyrup-tui`'s `startup_session_selector` tests).
+///
+/// SEAM-134 — the listing STREAMS. pi's `selectSession` hands the component two loaders
+/// (`cli/session-picker.ts:15-55`, `main.ts:372-373` @v0.87.1) and the component starts the
+/// current-folder load from its constructor (`session-selector.ts:869`): the picker is on screen,
+/// reading `Loading …`, before a session file is read, and partial sets replace the list as they
+/// arrive (`:956-988`). `current`/`all` are those loaders as owned [`SessionListing`]s; the
+/// all-projects one is not run until `Tab` first asks for it (`:1031-1040`). No session is running
+/// yet, so no row carries the `(current)` marker.
+///
+/// The returned cwd map is what lets the caller resolve the picked session's missing-cwd issue
+/// (`main.ts:321-332`) without a finished scan in hand.
 ///
 /// `keymaps` is the user's `keybindings.json` merge (Pi `setKeybindings(KeybindingsManager.create())`
 /// at `cli/startup-ui.ts:81` plus the manager threaded into the component at
@@ -210,6 +227,8 @@ pub fn interpret_resume(outcome: &SelectorOutcome) -> ResumeChoice {
 ///   sequence `AgentSession::rename_session_file` performs for the in-app `/resume`. It used to be
 ///   parsed, echoed on screen and dropped. SEAM-062.
 ///
+/// After either, the picker lists its scope again (`refreshSessionsAfterMutation`, `:1024-1029`).
+///
 /// CYRUP-DELTA — where the status lines land. pi shows them INSIDE the picker
 /// (`header.setStatusMessage(...)` with a 2 s / 3 s dwell, `session-selector.ts:847`, `:851`);
 /// `cyrup_tui::SessionSelector` has no status channel, so they are returned here and printed by the
@@ -217,52 +236,48 @@ pub fn interpret_resume(outcome: &SelectorOutcome) -> ResumeChoice {
 pub async fn run_resume_picker(
     theme: &UiTheme,
     keymaps: &(SelectKeymap, SessionKeymap),
-    current_sessions: &[SessionInfo],
-    all_sessions: &[SessionInfo],
-    current_id: Option<&str>,
-) -> anyhow::Result<(ResumeChoice, Vec<String>)> {
-    let rows = session_rows(current_sessions, current_id);
-    let mut selector =
-        SessionSelector::new(rows).with_keymaps(&keymaps.1, &cyrup_tui::EditorKeymap::default());
-    // SEAM-061 — pi hands `selectSession` BOTH loaders (`cli/session-picker.ts:15-19`), and `Tab`
-    // swaps the list between them (`session-selector.ts:551-556` → `:1003-1026`). Wiring only the
-    // current-folder set leaves the toggle with nowhere to go.
-    selector.set_all_rows(session_rows(all_sessions, current_id));
-    // The cwd column the `all` scope turns on (`:468-470`) — the only thing that says which project
-    // a row in the merged listing belongs to.
-    selector.set_session_cwds(
-        current_sessions
-            .iter()
-            .chain(all_sessions.iter())
-            .map(|s| (s.path.display().to_string(), s.cwd.clone())),
-    );
+    current: SessionListing,
+    all: SessionListing,
+) -> anyhow::Result<(ResumeChoice, Vec<String>, HashMap<String, String>)> {
+    // `with_async_loaders` is pi's constructor tail `void this.loadScope("current")` (`:869`): both
+    // scopes start unloaded, `Tab` is wired, and the current folder's load is requested.
+    let mut selector = SessionSelector::new(vec![])
+        .with_keymaps(&keymaps.1, &cyrup_tui::EditorKeymap::default())
+        .with_async_loaders();
     let mut status: Vec<String> = Vec::new();
-    let outcome = run_startup_selector(theme, &keymaps.0, &mut selector, async |payload: &str| {
-        // The session selector emits delete/rename via a tagged `Apply` payload; effect it on disk so
-        // the picker's optimistic row edit is not a lie (Pi's `SessionSelectorComponent` performs
-        // both through its loaders, `session-selector.ts:831-855` and `:857-880`).
-        match SessionSelectorOutcome::parse_apply(payload) {
-            Some(SessionSelectorOutcome::Delete(path)) => {
-                match cyrup_session_svc::delete_session_file_at(std::path::Path::new(&path)) {
-                    Ok(method) => status.push(method.status_message().to_string()),
-                    // Pi: `Failed to delete: ${errorMessage}` (session-selector.ts:849).
-                    Err(e) => status.push(format!("Failed to delete: {e}")),
+    let (outcome, cwds) = run_startup_session_selector(
+        theme,
+        &keymaps.0,
+        &mut selector,
+        StartupSessionLoads { current, all },
+        async |payload: &str| {
+            // The session selector emits delete/rename via a tagged `Apply` payload; effect it on disk so
+            // the picker's optimistic row edit is not a lie (Pi's `SessionSelectorComponent` performs
+            // both through its loaders, `session-selector.ts:831-855` and `:857-880`).
+            match SessionSelectorOutcome::parse_apply(payload) {
+                Some(SessionSelectorOutcome::Delete(path)) => {
+                    match cyrup_session_svc::delete_session_file_at(std::path::Path::new(&path)) {
+                        Ok(method) => status.push(method.status_message().to_string()),
+                        // Pi: `Failed to delete: ${errorMessage}` (session-selector.ts:849).
+                        Err(e) => status.push(format!("Failed to delete: {e}")),
+                    }
                 }
-            }
-            Some(SessionSelectorOutcome::Rename { path, name }) => {
-                if let Err(e) =
-                    cyrup_session_svc::rename_session_file_at(std::path::Path::new(&path), &name)
-                {
-                    status.push(format!("Failed to rename: {e}"));
+                Some(SessionSelectorOutcome::Rename { path, name }) => {
+                    if let Err(e) = cyrup_session_svc::rename_session_file_at(
+                        std::path::Path::new(&path),
+                        &name,
+                    ) {
+                        status.push(format!("Failed to rename: {e}"));
+                    }
                 }
+                // `Resume` is not an `Apply` payload (the picker confirms it as a `SelectorOutcome::
+                // Confirm`), and a non-session payload parses to `None` — neither is a mutation.
+                Some(SessionSelectorOutcome::Resume(_)) | None => {}
             }
-            // `Resume` is not an `Apply` payload (the picker confirms it as a `SelectorOutcome::
-            // Confirm`), and a non-session payload parses to `None` — neither is a mutation.
-            Some(SessionSelectorOutcome::Resume(_)) | None => {}
-        }
-    })
+        },
+    )
     .await?;
-    Ok((interpret_resume(&outcome), status))
+    Ok((interpret_resume(&outcome), status, cwds))
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -543,7 +543,7 @@ enum PatchCapture {
 ///
 /// This is the one place a plan build touches git with a WRITE-shaped command (`read-tree`,
 /// `add -A`), and it does so against a temporary `GIT_INDEX_FILE` — see
-/// [`crate::spawn::worktree::run_git_env`], which exists for exactly this reason. The worktree's
+/// [`crate::spawn::worktree::run_git_env_bounded`], which exists for exactly this reason. The worktree's
 /// real index is never touched.
 async fn is_patch_captured(
     record: &MetadataRecord,
@@ -591,6 +591,8 @@ async fn is_patch_captured(
         worktree_path,
         base_commit,
         &patch_path,
+        // The plan builder is operator-invoked and has no run: no deadline, no stop token.
+        &crate::spawn::worktree::GitBounds::unbounded(),
     )
     .await
     {

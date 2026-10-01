@@ -276,6 +276,50 @@ pub fn cache_scan_entries(
         .collect()
 }
 
+/// How many `thinking_dropped` input transformations the API reported for `message` (pi
+/// `InteractiveMode.countDroppedThinkingBlocks`, `interactive-mode.ts:3985-3998` @v0.87.1): the
+/// sum, over every `anthropic_input_transformations` diagnostic, of the `details.transformations`
+/// entries whose `type` is `"thinking_dropped"`. A diagnostic of another type, or one whose
+/// `details.transformations` is not an array, contributes nothing.
+#[must_use]
+pub fn dropped_thinking_blocks(message: &AssistantMessage) -> usize {
+    message
+        .diagnostics
+        .iter()
+        .flatten()
+        .filter(|d| d.r#type == "anthropic_input_transformations")
+        .filter_map(|d| d.details.as_ref()?.get("transformations")?.as_array())
+        .flatten()
+        .filter(|t| t.get("type").and_then(serde_json::Value::as_str) == Some("thinking_dropped"))
+        .count()
+}
+
+/// `(previous, current)` dropped-thinking-block counts over the LAST TWO assistant messages on
+/// `branch` (root to leaf), for the TUI-117 transcript warning. `previous` is `0` when only one
+/// assistant message exists; both are `0` when there is none.
+///
+/// **Why the last two and not "last" versus the live message.** Pi's `maybeShowThinkingDropNotice`
+/// compares the finishing message against the branch's last assistant entry, and notes
+/// *"message_end reaches the UI before the current message is persisted, so the branch's last
+/// assistant message is the previous response"* (`interactive-mode.ts:4010-4011`). cyrup persists
+/// FIRST and fans the event out after (see `AgentSession::last_cache_miss`), so the finishing
+/// message IS the last assistant entry and the previous response is the one before it. Taking the
+/// last entry as "previous" would compare a message against itself and the warning could never
+/// fire.
+#[must_use]
+pub fn thinking_drop_counts(branch: &[&Entry]) -> (usize, usize) {
+    let mut assistants = branch.iter().rev().filter_map(|entry| match entry {
+        Entry::Known(KnownEntry::Message {
+            message: AgentMessage::Core(Message::Assistant(a)),
+            ..
+        }) => Some(dropped_thinking_blocks(a)),
+        _ => None,
+    });
+    let current = assistants.next().unwrap_or(0);
+    let previous = assistants.next().unwrap_or(0);
+    (previous, current)
+}
+
 /// Context-window occupancy derived from the most recent assistant turn (Pi `getContextUsage`,
 /// agent-session.ts:2977): what the footer renders as "tokens used / window".
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -571,6 +615,105 @@ mod prov036_tests {
         assert!(
             matches!(scan[2], CacheScanEntry::Other),
             "a user message is ignored and specifically NOT a reset"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tui117_tests {
+    use super::*;
+    use cyrup_core::{
+        AssistantMessageDiagnostic, ProviderId, StopReason, append_assistant_message_diagnostic,
+    };
+    use cyrup_session::SessionManager;
+    use serde_json::json;
+
+    /// An assistant message carrying `dropped` `thinking_dropped` transformations (and one
+    /// unrelated transformation, which must not be counted).
+    fn assistant(dropped: usize) -> Message {
+        let mut a = AssistantMessage::errored(
+            ProviderId::from("anthropic"),
+            "m",
+            None,
+            StopReason::Stop,
+            "",
+        );
+        a.error_message = None;
+        a.stop_reason = StopReason::Stop;
+        if dropped > 0 {
+            let mut transformations: Vec<_> = (0..dropped)
+                .map(|i| json!({"type": "thinking_dropped", "path": format!("messages.{i}.content.0")}))
+                .collect();
+            transformations.push(json!({"type": "something_else"}));
+            append_assistant_message_diagnostic(
+                &mut a.diagnostics,
+                AssistantMessageDiagnostic {
+                    r#type: "anthropic_input_transformations".to_string(),
+                    timestamp: 1,
+                    error: None,
+                    details: Some(json!({ "transformations": transformations })),
+                },
+            );
+        }
+        Message::Assistant(a)
+    }
+
+    fn counts(mgr: &SessionManager) -> (usize, usize) {
+        thinking_drop_counts(&mgr.branch_path(None))
+    }
+
+    #[test]
+    fn counts_only_thinking_dropped_in_the_right_diagnostic_type() {
+        let Message::Assistant(mut a) = assistant(2) else {
+            unreachable!()
+        };
+        assert_eq!(dropped_thinking_blocks(&a), 2);
+        // Same payload under another diagnostic type, and a non-array `transformations`: ignored.
+        a.diagnostics.as_mut().unwrap()[0].r#type = "retry".to_string();
+        assert_eq!(dropped_thinking_blocks(&a), 0);
+        a.diagnostics.as_mut().unwrap()[0].r#type = "anthropic_input_transformations".to_string();
+        a.diagnostics.as_mut().unwrap()[0].details = Some(json!({"transformations": "x"}));
+        assert_eq!(dropped_thinking_blocks(&a), 0);
+    }
+
+    /// The accessor reads the LAST TWO assistant entries of a real persisted session, after a
+    /// reopen from disk — which also proves `diagnostics` survives the JSONL serde (the
+    /// hand-written `AssistantMessage` serializer and its `Deserialize`).
+    ///
+    /// **Red if the last entry is taken as "previous"** (pi's pre-persistence reading): the pair
+    /// comes out `(1, 1)` where `(0, 1)` is expected and the `(0 then 1)` assertion fails.
+    #[test]
+    fn last_two_assistants_of_a_reopened_jsonl_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut mgr = SessionManager::open(&path).unwrap();
+        assert_eq!(counts(&mgr), (0, 0), "no assistant yet");
+
+        mgr.append_message(assistant(0)).unwrap();
+        assert_eq!(counts(&mgr), (0, 0));
+        mgr.append_message(assistant(1)).unwrap();
+        assert_eq!(
+            counts(&mgr),
+            (0, 1),
+            "(0 then 1): previous is the one BEFORE the last"
+        );
+        mgr.append_message(assistant(1)).unwrap();
+        assert_eq!(counts(&mgr), (1, 1), "(1 then 1): the count did not rise");
+        mgr.append_message(assistant(2)).unwrap();
+        assert_eq!(counts(&mgr), (1, 2));
+
+        drop(mgr);
+        let reopened = SessionManager::open(&path).unwrap();
+        assert_eq!(
+            counts(&reopened),
+            (1, 2),
+            "diagnostics round-trip through the JSONL file"
         );
     }
 }

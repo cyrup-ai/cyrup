@@ -74,6 +74,7 @@ fn tool_call() -> Content {
         name: "bash".to_string(),
         arguments: serde_json::Map::new().into(),
         thought_signature: None,
+        namespace: None,
     })
 }
 

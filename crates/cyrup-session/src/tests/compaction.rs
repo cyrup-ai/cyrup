@@ -85,6 +85,7 @@ fn assistant_tool(name: &str, path: &str) -> Message {
                 .expect("object")
                 .into(),
             thought_signature: None,
+            namespace: None,
         })],
         provider: "faux".into(),
         model: "faux-1".into(),
@@ -3608,6 +3609,7 @@ async fn a_summarization_that_emits_a_tool_call_is_rejected_at_all_three_call_si
             .expect("object")
             .into(),
         thought_signature: None,
+        namespace: None,
     });
     let summarizer = ScriptedSummarizer {
         content: vec![faux_text("Let me look at that file first."), tool_call],
@@ -3659,6 +3661,7 @@ fn check_summarization_response_pins_pi_s_acceptance_rules() {
                 name: "bash".to_string(),
                 arguments: json!({}).as_object().cloned().expect("object").into(),
                 thought_signature: None,
+                namespace: None,
             }),
         ],
         StopReason::Stop,

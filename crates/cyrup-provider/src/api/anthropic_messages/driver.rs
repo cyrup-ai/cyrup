@@ -122,7 +122,7 @@ pub(crate) async fn decode_stream<S>(
     // `end_of_stream` turns it into the same `error` terminal Pi's throw produces
     // (anthropic-messages.ts:751-753) instead of the clean `stop` this used to default to.
     sink.send(StreamEvent::end_of_stream(
-        dec.snapshot_owned(model, api),
+        dec.terminal_snapshot(model, api),
         dec.stop_reason,
         "Anthropic stream ended without a stop reason",
     ))
@@ -179,6 +179,12 @@ async fn process_event(
                         })
                         .map(|f| f.cost.clone());
                 }
+                if let Some(transformations) = message
+                    .get("input_transformations")
+                    .and_then(Value::as_array)
+                {
+                    dec.input_transformations = Some(transformations.clone());
+                }
                 if let Some(usage) = message.get("usage") {
                     apply_message_start_usage(&mut dec.usage, usage);
                 }
@@ -189,6 +195,12 @@ async fn process_event(
         Some("content_block_delta") => process_block_delta(event, dec, model, api, sink).await,
         Some("content_block_stop") => process_block_stop(event, dec, model, api, sink).await,
         Some("message_delta") => {
+            // REPLACES the `message_start` list (pi `:753-754`): the delta carries the final one.
+            if let Some(transformations) =
+                event.get("input_transformations").and_then(Value::as_array)
+            {
+                dec.input_transformations = Some(transformations.clone());
+            }
             // pi guards with `if (event.delta.stop_reason)` (`v0.84.1
             // ai/src/api/anthropic-messages.ts:708`) — a JS truthiness test, so `""` leaves the
             // `"pending"` seed alone rather than mapping to `Unhandled stop reason: `.

@@ -964,6 +964,7 @@ async fn process_event(
                     name,
                     arguments: Map::new().into(),
                     thought_signature: None,
+                    namespace: None,
                 });
             }
             dec.tool_json.insert(index, SharedStr::new());
@@ -1034,6 +1035,9 @@ fn merge_tool_call(tc: &mut ToolCall, raw: Option<&Value>) {
     }
     if let Some(sig) = raw.get("thoughtSignature").and_then(Value::as_str) {
         tc.thought_signature = Some(sig.to_string());
+    }
+    if let Some(ns) = raw.get("namespace").and_then(Value::as_str) {
+        tc.namespace = Some(ns.to_string());
     }
 }
 
@@ -1491,6 +1495,35 @@ mod tests {
 
     /// A backend `toolcall_delta` stream is re-parsed on EVERY delta, so `partial` shows the
     /// best-effort arguments before the JSON is complete (Pi `parseStreamingJson`).
+    /// DRIFT-058: `Object.assign(partial.content[i], event.toolCall)` (pi-messages.ts:252)
+    /// carries the optional `namespace` exactly as it carries `thoughtSignature`.
+    #[tokio::test]
+    async fn toolcall_end_merges_the_namespace() {
+        let raw = concat!(
+            "data: {\"type\":\"start\"}\n\n",
+            "data: {\"type\":\"toolcall_start\",\"contentIndex\":0,\"id\":\"call_1\",\"toolName\":\"lookup\"}\n\n",
+            "data: {\"type\":\"toolcall_end\",\"contentIndex\":0,\"toolCall\":{\"type\":\"toolCall\",\"id\":\"call_1\",\"name\":\"lookup\",\"arguments\":{},\"namespace\":\"dynamic_tools\"}}\n\n",
+            "data: {\"type\":\"done\",\"reason\":\"toolUse\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = collect(raw, &model()).await;
+        let ended = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call.clone()),
+                _ => None,
+            })
+            .expect("toolcall_end");
+        assert_eq!(ended.namespace.as_deref(), Some("dynamic_tools"));
+        let StreamEvent::Done { message, .. } = events.last().unwrap() else {
+            panic!("expected done terminal");
+        };
+        let Content::ToolCall(tc) = &message.content[0] else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.namespace.as_deref(), Some("dynamic_tools"));
+    }
+
     #[tokio::test]
     async fn toolcall_partial_arguments_parse_incrementally() {
         let raw = concat!(

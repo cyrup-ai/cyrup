@@ -1484,6 +1484,7 @@ mod tests {
                 name: "search".to_string(),
                 arguments: serde_json::Map::new().into(),
                 thought_signature: None,
+                namespace: None,
             }),
         ]);
         let body = format_request_approval("s", "m", None, &[message]);

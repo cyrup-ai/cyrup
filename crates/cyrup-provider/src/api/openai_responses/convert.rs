@@ -108,8 +108,12 @@ pub(crate) fn convert_responses_messages(
                 messages.push(json!({ "role": "user", "content": parts }));
             }
             Message::Assistant(am) => {
-                let is_different_model =
-                    am.model != model_id && am.provider.as_str() == provider && am.api == api;
+                let is_same_provider_and_api = am.provider.as_str() == provider && am.api == api;
+                let is_different_model = am.model != model_id && is_same_provider_and_api;
+                // Pi `isSameModel` (`openai-responses-shared.ts:257`): provider, api AND model id.
+                // A namespace names a tool the load items of THAT model's session put in scope
+                // (DRIFT-058), so it is replayed only here.
+                let is_same_model = am.model == model_id && is_same_provider_and_api;
                 let mut output: Vec<Value> = Vec::new();
                 let mut text_block_index: i64 = 0;
                 for block in &am.content {
@@ -186,6 +190,11 @@ pub(crate) fn convert_responses_messages(
                                 "arguments".to_string(),
                                 json!(serde_json::to_string(&tc.arguments).unwrap_or_default()),
                             );
+                            // `...(isSameModel && toolCall.namespace !== undefined ? { namespace } : {})`
+                            // (`openai-responses-shared.ts:324`).
+                            if let (true, Some(ns)) = (is_same_model, &tc.namespace) {
+                                item.insert("namespace".to_string(), json!(ns));
+                            }
                             output.push(Value::Object(item));
                         }
                         Content::Image { .. } => {}

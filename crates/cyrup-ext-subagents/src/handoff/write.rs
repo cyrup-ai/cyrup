@@ -595,6 +595,10 @@ pub async fn discard_preserved(
         let report = crate::spawn::worktree::cleanup_worktrees(
             &setup,
             &WorktreeCleanupIntent::Discard { authorization },
+            // An operator-invoked discard has no run: no deadline and no stop token reach
+            // `discard_preserved` (upstream's `worktree.discard` is likewise unbounded `spawnSync`).
+            // It still gets the process-group kill and the output cap.
+            &crate::spawn::worktree::GitBounds::unbounded(),
         )
         .await;
 

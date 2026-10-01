@@ -106,7 +106,7 @@ pub(crate) struct TtyReader {
     tty: Tty,
     winch: Option<Winch>,
     bytes: ByteDecoder,
-    /// Events decoded but not yet handed out by [`Self::next_event`].
+    /// Events decoded but not yet handed out by [`Self::next_event_timeout`].
     ready: VecDeque<Event>,
     /// The terminal size a resize reports.
     size: fn() -> io::Result<(u16, u16)>,
@@ -229,17 +229,29 @@ impl TtyReader {
         Ok(true)
     }
 
-    /// Block until the next event (the startup selector's `event::read()`).
-    pub(crate) fn next_event(&mut self) -> io::Result<Event> {
+    /// Wait at most `wait` for the next event; `Ok(None)` if it elapsed with nothing to hand out.
+    ///
+    /// The startup selector's `event::poll` + `event::read`: it lets a loop that also serves a
+    /// channel (the `--resume` picker's streamed listing) come back and look at it.
+    pub(crate) fn next_event_timeout(&mut self, wait: Duration) -> io::Result<Option<Event>> {
+        if let Some(ev) = self.ready.pop_front() {
+            return Ok(Some(ev));
+        }
         let mut out = Vec::new();
+        if !self.pump(wait, &|| true, &mut out)? {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        self.ready.extend(out);
+        Ok(self.ready.pop_front())
+    }
+
+    /// Block until the next event.
+    #[cfg(test)]
+    pub(crate) fn next_event(&mut self) -> io::Result<Event> {
         loop {
-            if let Some(ev) = self.ready.pop_front() {
+            if let Some(ev) = self.next_event_timeout(Duration::from_secs(3600))? {
                 return Ok(ev);
             }
-            if !self.pump(Duration::from_secs(3600), &|| true, &mut out)? {
-                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-            }
-            self.ready.extend(out.drain(..));
         }
     }
 }

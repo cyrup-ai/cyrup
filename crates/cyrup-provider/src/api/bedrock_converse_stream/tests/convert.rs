@@ -94,6 +94,7 @@ fn blank_tool_result_content_becomes_the_empty_placeholder() {
                     name: "tool".to_string(),
                     arguments: Map::new().into(),
                     thought_signature: None,
+                    namespace: None,
                 })],
                 provider: "amazon-bedrock".into(),
                 model: "m".to_string(),
@@ -155,6 +156,7 @@ fn consecutive_tool_results_collapse_into_one_user_message() {
                         name: "tool".to_string(),
                         arguments: Map::new().into(),
                         thought_signature: None,
+                        namespace: None,
                     })
                 })
                 .collect(),
@@ -470,6 +472,7 @@ mod prov097_replay {
             name: "tool".to_string(),
             arguments: args.into(),
             thought_signature: None,
+            namespace: None,
         })]);
         assert_eq!(
             blocks[0]["toolUse"]["input"],

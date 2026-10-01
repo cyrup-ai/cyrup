@@ -84,6 +84,20 @@ impl AgentSession {
             .copied()
     }
 
+    /// `(previous, current)` counts of `thinking_dropped` input transformations on the current
+    /// branch's last two assistant messages — the input to pi's `maybeShowThinkingDropNotice`
+    /// (`interactive-mode.ts:4001-4025` @v0.87.1). TUI-117.
+    ///
+    /// The ordering trap is the one [`Self::last_cache_miss`] documents: pi's `message_end` fires
+    /// BEFORE persistence, so its "last assistant entry" is the previous response; cyrup persists
+    /// BEFORE fan-out, so the finishing message is already the last entry and the previous response
+    /// is the one before it. See [`crate::state::thinking_drop_counts`]. Walks the branch
+    /// (`getBranch()`), not every entry, so a `/tree` jump compares along the live path.
+    pub async fn thinking_drop_counts(&self) -> (usize, usize) {
+        let mgr = self.manager.lock().await;
+        crate::state::thinking_drop_counts(&mgr.branch_path(None))
+    }
+
     /// The `contextUsage` sub-object of [`Self::session_stats`], in Pi's `ContextUsage` shape
     /// (`{tokens, contextWindow, percent}`, extensions/types.ts:288-294). `None` when no model /
     /// no known context window — Pi's `getContextUsage` returns `undefined` there

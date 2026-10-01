@@ -47,6 +47,7 @@ fn tool_call_msg(
         name: tool_name.to_string(),
         arguments: arguments.into(),
         thought_signature: None,
+        namespace: None,
     };
     let msg = cyrup_core::AssistantMessage {
         content: vec![Content::ToolCall(tc.clone())],

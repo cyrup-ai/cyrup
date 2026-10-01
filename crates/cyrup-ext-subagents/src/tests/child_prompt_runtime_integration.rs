@@ -376,6 +376,7 @@ fn subagent_tool_call() -> Content {
         name: "subagent".to_string(),
         arguments: serde_json::Map::new().into(),
         thought_signature: None,
+        namespace: None,
     })
 }
 

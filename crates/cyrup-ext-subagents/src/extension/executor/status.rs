@@ -637,7 +637,11 @@ impl SubagentExecutor {
 
             // S6 — the renderer is HANDED the two live registries it may not lock across an
             // `.await`; see `run_status::RunStatusRenderDeps`.
-            let deps = self.run_status_render_deps();
+            let mut deps = self.run_status_render_deps();
+            // pi `run-status.ts:541-543` reads the nested registry from a process-global route
+            // lookup; here it is the SAME `Roots::nested_events` tree the nested exact-status
+            // lookup above and the containment guards use.
+            deps.nested_events_root = Some(roots.nested_events());
             return match (resolved_id.as_deref(), dir) {
                 (Some(id), None) => {
                     run_status::inspect_status_by_id(&async_root, &results_dir, id, &deps)
@@ -807,6 +811,7 @@ impl SubagentExecutor {
             ),
             live_workflow_run_ids: self.live_workflow_run_ids(),
             foreground_controls,
+            nested_events_root: None,
         }
     }
 

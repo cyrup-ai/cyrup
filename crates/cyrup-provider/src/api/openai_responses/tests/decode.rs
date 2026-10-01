@@ -190,3 +190,81 @@ async fn toolcall_arguments_done_reprojects_the_replaced_buffer() {
          deltas that preceded it"
     );
 }
+
+/// Decode a scripted stream and return the first tool call of the final message plus the
+/// `ToolCallEnd` event's tool call.
+async fn decode_tool_call(raw: &str) -> (ToolCall, ToolCall) {
+    let (sink, mut rx) = crate::api::channel(1024);
+    let frames = decode_sse_bytes(raw.as_bytes().to_vec());
+    let m = model();
+    let api = ApiId::from(API_ID);
+    decode_stream(frames, &m, &api, &sink).await;
+    drop(sink);
+    let mut ended = None;
+    let mut last_partial = None;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            crate::stream::StreamEvent::ToolCallEnd { tool_call, .. } => ended = Some(tool_call),
+            crate::stream::StreamEvent::Done { message, .. } => last_partial = Some(message),
+            _ => {}
+        }
+    }
+    let message = last_partial.expect("a terminal Done event");
+    let final_call = message
+        .content
+        .iter()
+        .find_map(|c| match c {
+            Content::ToolCall(tc) => Some(tc.clone()),
+            _ => None,
+        })
+        .expect("a tool call in the final message");
+    (final_call, ended.expect("a ToolCallEnd event"))
+}
+
+const COMPLETED: &str = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"status\":\"completed\"}}\n\n";
+
+#[tokio::test]
+async fn a_namespace_received_only_on_output_item_done_is_recorded() {
+    // Pi `openai-responses-namespace.test.ts` "round-trips a function namespace received only on
+    // output_item.done" (`openai-responses-shared.ts:715`).
+    let raw = format!(
+        "{}{}{COMPLETED}",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_test\",\"call_id\":\"call_test\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_test\",\"call_id\":\"call_test\",\"name\":\"lookup\",\"arguments\":\"{\\\"value\\\":\\\"hello\\\"}\",\"namespace\":\"dynamic_tools\"}}\n\n",
+    );
+    let (tc, ended) = decode_tool_call(&raw).await;
+    assert_eq!(tc.id.as_str(), "call_test|fc_test");
+    assert_eq!(tc.name, "lookup");
+    assert_eq!(tc.arguments.get("value"), Some(&json!("hello")));
+    assert_eq!(tc.namespace.as_deref(), Some("dynamic_tools"));
+    assert_eq!(
+        ended.namespace.as_deref(),
+        Some("dynamic_tools"),
+        "the streamed ToolCallEnd block carries it too"
+    );
+}
+
+#[tokio::test]
+async fn a_namespace_received_on_output_item_added_is_recorded_and_done_may_override_it() {
+    // `openai-responses-shared.ts:491`: read when the block starts. `:715`: replaced when the
+    // done item names one.
+    let added = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_test\",\"call_id\":\"call_test\",\"name\":\"lookup\",\"arguments\":\"\",\"namespace\":\"early\"}}\n\n";
+    let done_without = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_test\",\"call_id\":\"call_test\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n";
+    let done_with = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_test\",\"call_id\":\"call_test\",\"name\":\"lookup\",\"arguments\":\"{}\",\"namespace\":\"late\"}}\n\n";
+    let (tc, _) = decode_tool_call(&format!("{added}{done_without}{COMPLETED}")).await;
+    assert_eq!(tc.namespace.as_deref(), Some("early"));
+    let (tc, _) = decode_tool_call(&format!("{added}{done_with}{COMPLETED}")).await;
+    assert_eq!(tc.namespace.as_deref(), Some("late"));
+}
+
+#[tokio::test]
+async fn an_ordinary_function_call_has_no_namespace() {
+    let raw = format!(
+        "{}{}{COMPLETED}",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_test\",\"call_id\":\"call_test\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_test\",\"call_id\":\"call_test\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n",
+    );
+    let (tc, ended) = decode_tool_call(&raw).await;
+    assert_eq!(tc.namespace, None);
+    assert_eq!(ended.namespace, None);
+}

@@ -4645,6 +4645,7 @@ mod tests {
             name: name.to_string(),
             arguments: serde_json::Map::new().into(),
             thought_signature: None,
+            namespace: None,
         })
     }
 

@@ -26,7 +26,7 @@
 //!
 //! # Why it lives beside `spawn/worktree.rs`
 //!
-//! It is the only consumer of that file's private git helpers (`run_git`, `run_git_env`,
+//! It is the only consumer of that file's private git helpers (`run_git`, `run_git_env_bounded`,
 //! `GitResult`, `resolve_worktree_base_dir_path`, `lexical_normalize`,
 //! `normalize_comparable_cwd`), all of which are `pub(crate)` for it. Nothing outside the tool
 //! dispatch imports this module.

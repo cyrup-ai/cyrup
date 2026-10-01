@@ -924,6 +924,7 @@ mod tests {
                 name: "read".into(),
                 arguments: serde_json::Map::new().into(),
                 thought_signature: None,
+                namespace: None,
             },
             partial: empty_partial(),
         };

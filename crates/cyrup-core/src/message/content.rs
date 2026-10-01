@@ -292,6 +292,7 @@ mod tests {
             name: "n".into(),
             arguments: serde_json::Map::new().into(),
             thought_signature: Some("g".into()),
+            namespace: None,
         };
         let c = Content::ToolCall(tc);
         let s = serde_json::to_string(&c).expect("serialize");

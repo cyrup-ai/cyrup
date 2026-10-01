@@ -1144,7 +1144,7 @@ if [ -n "$fwd" ]; then
   exec sleep 3600
 fi
 cd '{home}' || exit 255
-HOME='{home}' TMPDIR='{tmp}' exec /bin/sh -c "$1"
+HOME='{home}' TMPDIR='{tmp}' PATH='{home}/.local/bin':"$PATH" exec /bin/sh -c "$1"
 "#,
                 home = home.display(),
                 tmp = remote_tmp.display(),
@@ -1633,6 +1633,164 @@ exec /bin/rm "$@"
         .map(|entry| entry.file_name())
         .collect();
     assert_eq!(left, Vec::<PathBuf>::new(), "still in it: {entries:?}");
+}
+
+/// Every process whose command line is the relay's remote script for THIS machine's runtime
+/// dirs (its text carries `relay-old`, its arguments the machine's temp dir). The local ssh
+/// stand-in that started it is a separate process whose command line also holds both, so a dead
+/// (or zombie: empty command line) wrapper does not count, but a live one would — callers only
+/// look after the local side has been killed.
+fn relay_processes(machine: &FakeMachine) -> Vec<u32> {
+    let needle = machine.remote_tmp.display().to_string().into_bytes();
+    let contains = |haystack: &[u8], needle: &[u8]| {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    };
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+            (contains(&cmdline, b"relay-old") && contains(&cmdline, &needle)).then_some(pid)
+        })
+        .collect()
+}
+
+/// HERDR-006: the relay's remote half outlives the local ssh client that started it (killing an
+/// ssh client ends no remote command), so a run that timed out used to leave it polling a removed
+/// runtime dir. After cleanup it must notice the dir is gone and end on its own, and nothing may
+/// bring the removed dir back.
+///
+/// Two rounds, because what ended the old loop by accident depends on the machine's `sh`. Under
+/// dash the failed `: > "$new"` aborts the shell. Under bash the script keeps looping, and only a
+/// diagnostic written to a dead stderr pipe would stop it — which is not something to rely on,
+/// since the remote end of a killed ssh session stays open until sshd notices the connection is
+/// gone. So the second round puts a bash `sh` first on the machine's `PATH` (the ssh stand-in
+/// starts every remote command with `$HOME/.local/bin` in front, as the relay's own `PATH` does)
+/// with its stderr discarded, leaving the directory check as the only thing that can end the
+/// relay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_placed_run_leaves_no_relay_running_on_the_machine() {
+    for bash_sh in [false, true] {
+        if bash_sh && !Path::new("/usr/bin/bash").exists() {
+            continue;
+        }
+        let machine = FakeMachine::start("#!/bin/sh\nexec sleep 30\n");
+        if bash_sh {
+            write_executable(
+                &machine.home.join(".local").join("bin").join("sh"),
+                "#!/usr/bin/bash\nexec /usr/bin/bash \"$@\" 2>/dev/null\n",
+            );
+        }
+        let local = tempfile::tempdir().unwrap();
+        let agent = crate::exec::testsupport::sample_agent_config("m1", &[]);
+        let mut opts = placed_opts(local.path(), &machine);
+        opts.timeout_ms = Some(3_000);
+        opts.deadline_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(3_000));
+        let result = crate::exec::run_sync(&agent, "Say hello", &opts).await;
+        assert!(result.timed_out, "{result:?}");
+        assert_eq!(machine.runtime_dirs(), Vec::<PathBuf>::new());
+
+        // The relay polls every 200 ms; give it a generous five polls' worth plus scheduling.
+        let mut survivors = relay_processes(&machine);
+        for _ in 0..30 {
+            if survivors.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            survivors = relay_processes(&machine);
+        }
+        for pid in &survivors {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status();
+        }
+        assert!(
+            survivors.is_empty(),
+            "bash sh={bash_sh}: the relay is still running after its run was cleaned up: {survivors:?}"
+        );
+        // And a relay that did outlive cleanup has not rebuilt the removed dir.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            machine.runtime_dirs(),
+            Vec::<PathBuf>::new(),
+            "bash sh={bash_sh}"
+        );
+    }
+}
+
+/// HERDR-006: `run.sh` never builds the runtime dir. A cleanup that beat a slow pane to it leaves
+/// nothing for the script to start in: it stops (status 66) before creating anything, instead of
+/// `mkdir -p` rebuilding the removed tree.
+#[test]
+fn the_run_script_refuses_to_recreate_a_removed_runtime_dir() {
+    let rt = "/tmp/cyrup-subagents-herdr-run-x-abcdefgh";
+    let script = super::native::render_run_script(
+        rt,
+        "/work",
+        &["--mode".to_string(), "json".to_string()],
+        &BTreeMap::new(),
+        "banner",
+    );
+    let guard = script
+        .find("[ -d \"$rt\" ] || exit 66\n")
+        .expect("the guard");
+    assert!(script.find("rt='/tmp/cyrup").unwrap() < guard);
+    assert!(
+        guard < script.find("echo $$ > \"$rt/pid\"").unwrap(),
+        "the guard precedes every write:\n{script}"
+    );
+    assert!(!script.contains("mkdir -p"), "{script}");
+
+    // Behaviour, under every shell installed: a missing dir is not recreated...
+    for shell in ["/bin/sh", "/usr/bin/bash"] {
+        if !Path::new(shell).exists() {
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path().join("cyrup-subagents-herdr-run-x-abcdefgh");
+        let script = super::native::render_run_script(
+            &rt.display().to_string(),
+            &dir.path().display().to_string(),
+            &[],
+            &BTreeMap::new(),
+            "banner",
+        );
+        let run = |script: &str| {
+            std::process::Command::new(shell)
+                .arg("-c")
+                .arg(script)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .output()
+                .unwrap()
+        };
+        let output = run(&script);
+        assert_eq!(output.status.code(), Some(66), "{shell}: {output:?}");
+        assert!(!rt.exists(), "{shell}: the removed runtime dir came back");
+
+        // ...and a live one still gets its four channel dirs and its `started` marker.
+        std::fs::create_dir(&rt).unwrap();
+        write_executable(&dir.path().join("cyrup"), "#!/bin/sh\nexit 0\n");
+        let output = run(&script);
+        assert_eq!(output.status.code(), Some(0), "{shell}: {output:?}");
+        for child in [
+            "supervisor/requests",
+            "supervisor/replies",
+            "steer-inbox",
+            "steer-acks",
+        ] {
+            assert!(rt.join(child).is_dir(), "{shell}: {child}");
+        }
+        assert!(rt.join("started").exists(), "{shell}");
+        // Running the script again (a retried pane) finds its dirs already there.
+        let again = run(&script);
+        assert_eq!(again.status.code(), Some(0), "{shell}: {again:?}");
+    }
 }
 
 /// The live channels of a placed child (pi's bridge `supervisor-request` / `supervisor-reply` /

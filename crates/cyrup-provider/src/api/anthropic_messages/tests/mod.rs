@@ -134,6 +134,7 @@ fn tc_assistant(calls: &[(&str, &str)]) -> Message {
                     name: (*name).to_string(),
                     arguments: Map::new().into(),
                     thought_signature: None,
+                    namespace: None,
                 })
             })
             .collect(),

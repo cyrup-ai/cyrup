@@ -204,6 +204,31 @@ impl TranscriptView {
         ));
     }
 
+    /// pi `maybeShowThinkingDropNotice`'s output half (`interactive-mode.ts:4001-4025` @v0.87.1):
+    /// `Anthropic dropped N thinking block(s) (details in session)`, only when the count ROSE over
+    /// the previous assistant message — a provider that keeps dropping the same blocks every turn
+    /// is reported once, at the turn it started. TUI-117.
+    ///
+    /// `previous`/`current` come from `AgentSession::thinking_drop_counts`, which reads the last two
+    /// assistant entries because cyrup persists BEFORE fan-out (pi reads "the last one" because its
+    /// `message_end` fires before persistence). The gates pi checks first
+    /// (`getShowCacheMissNotices()`, a clean stop) are the caller's: they are what raises
+    /// `cache_miss_check_pending`. Like the cache-miss notice this is a raw warning `Text` with no
+    /// `Warning: ` prefix.
+    pub fn push_thinking_drop_notice(&mut self, previous: usize, current: usize) {
+        if current == 0 || current <= previous {
+            return;
+        }
+        let noun = if current == 1 {
+            "thinking block"
+        } else {
+            "thinking blocks"
+        };
+        self.push_warning(format!(
+            "Anthropic dropped {current} {noun} (details in session)"
+        ));
+    }
+
     /// pi `addCompactionCostNotice` (`interactive-mode.ts:3802-3814` @v0.83.0) — what a compaction
     /// or a branch summarization cost, attributed at the point it happened instead of only landing
     /// unlabelled in the footer's cumulative `$`.

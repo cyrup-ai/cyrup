@@ -9,18 +9,23 @@
 //!
 //! # What this reproduces vs. pi (an honest, scoped delta)
 //!
-//! pi's status report carries a large live-telemetry surface — per-step activity glyphs,
-//! `currentTool`/`recentTools`/token counts, nested-run descendant trees, parallel-group
-//! normalization, model+thinking suffixes — most of which is fed by fields cyrup's
-//! [`RunStatus`]/[`StepStatus`] deliberately do not yet carry (the workflow-graph snapshot and
-//! live activity telemetry are tracked as separate net-new work in the gap analysis, not this
-//! tier's dispatch task). This module renders the faithful SUBSET cyrup's status schema supports:
-//! run identity/state/mode/progress, pending-append count, start/update timestamps, per-step
-//! agent+state(+model+error) lines, the reconciliation-repaired terminal `Result:` reference, the
-//! `Log`/`Events` artifact references, and — for a non-running run — the exact
-//! `formatResumeGuidance` shape (`run-status.ts:51-66`) an LLM reads to revive a child. Nested
-//! descendants, activity labels, and parallel-group step-index nesting are omitted here (they have
-//! no source fields), documented rather than silently faked.
+//! pi's status report carries a large live-telemetry surface; this module renders the part cyrup's
+//! [`RunStatus`]/[`StepStatus`] schema supports: run identity/state/mode/progress, the run-level
+//! `Activity:`/`Steering:` lines and each running step's `, <activity>` text
+//! (`run-status.ts:589-590,635`), pending-append count, start/update timestamps, per-step
+//! agent+state(+model+steering+error) lines, each step's nested descendants and the unattached
+//! tail (`:676,:693`, projected from [`RunStatusRenderDeps::nested_events_root`]), the running-step
+//! intercom/steer hints (`:678-683`) and the run-level `Steer running child:` hint (`:707`), the
+//! `Warning:` line for an unavailable nested registry or mission binding (`:703`), the
+//! reconciliation-repaired terminal `Result:` reference, the `Log`/`Events` artifact references,
+//! and — for a non-running run — the exact `formatResumeGuidance` shape (`run-status.ts:51-66`) an
+//! LLM reads to revive a child.
+//!
+//! Still omitted, for want of source fields or ports: parallel-group step-index nesting, the
+//! acceptance/turn-budget step suffixes, the `Session:` line (`:705`) and the all-external `Resume:`
+//! sentence (ledger row `SUBA-146`), and upstream's `reconcileNestedAsyncDescendants` pass before
+//! the nested projection (same row). `external-job` runners are unmodelled, so only
+//! `external-cli` steps take the external-runner branches.
 //!
 //! Every disk read runs through [`super::control::reconcile_before_control_op`] first (R-SA-079:
 //! never render a `status.json` that might be stale relative to an authoritative terminal
@@ -309,6 +314,14 @@ pub struct RunStatusRenderDeps {
     /// pi `[...deps.state.foregroundControls.values()]`, unfiltered. Both session comparisons
     /// happen HERE, in [`Self::live_workflow_controls`], so they stay in one expression.
     pub foreground_controls: Vec<LiveWorkflowControlCandidate>,
+    /// The nested-events tree ([`crate::paths::Roots::nested_events`]) the per-step nested tree
+    /// and the trailing unattached tail are projected from — pi's process-global
+    /// `findNestedRouteForRootId`/`projectNestedRegistryForRoot` lookup (`run-status.ts:541-543`),
+    /// made an explicit input.
+    ///
+    /// `None` (the default) means "no nested registry to consult": no nested lines, no warning.
+    /// The executor sets it from its config's roots; a test points it at a sandboxed tree.
+    pub nested_events_root: Option<PathBuf>,
 }
 
 impl RunStatusRenderDeps {
@@ -387,6 +400,11 @@ impl RunStatusRenderDeps {
     }
 }
 
+/// pi `run-status.ts:683` — the line a RUNNING external-runner step gets where a local child gets
+/// its intercom target and steer hint. Wire text; reproduced byte-for-byte.
+const EXTERNAL_RUNNER_STEER_UNAVAILABLE: &str =
+    "  Steer: unavailable; external runners do not accept live messages.";
+
 /// pi `run-status.ts:685` — the sentence a running workflow gets when no live foreground route
 /// survived the S6 filter. Wire text; reproduced byte-for-byte.
 const STEER_UNAVAILABLE_NOTICE: &str =
@@ -395,6 +413,40 @@ const STEER_UNAVAILABLE_NOTICE: &str =
 // =================================================================================================
 // Single-run status report (`inspectSubagentStatus`, run-status.ts:101-273)
 // =================================================================================================
+
+/// The nested-registry half of pi's `inspectSubagentStatus` (`run-status.ts:539-548`): the root
+/// run's projected nested children, and the `nestedWarning` a failed lookup leaves behind.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct NestedStatusInput {
+    /// pi `nestedChildren` — `projectNestedRegistryForRoot(status.runId)?.children ?? []`.
+    pub children: Vec<crate::spawn::nested_events::NestedRunSummary>,
+    /// pi `nestedWarning` — `Nested status unavailable: <error>` when the lookup threw.
+    pub warning: Option<String>,
+}
+
+/// pi `run-status.ts:539-548` — look the root's nested registry up under
+/// [`RunStatusRenderDeps::nested_events_root`]. A lookup that fails is a WARNING on the report
+/// (`Nested status unavailable: …`), never a failure of the report itself.
+fn project_nested_for_status(deps: &RunStatusRenderDeps, run_id: &RunId) -> NestedStatusInput {
+    let Some(events_root) = deps.nested_events_root.as_deref() else {
+        return NestedStatusInput::default();
+    };
+    match crate::spawn::nested_events::project_nested_registry_for_root_in(
+        events_root,
+        run_id.as_str(),
+    ) {
+        Ok(registry) => NestedStatusInput {
+            children: registry
+                .map(|registry| registry.children)
+                .unwrap_or_default(),
+            warning: None,
+        },
+        Err(error) => NestedStatusInput {
+            children: Vec::new(),
+            warning: Some(format!("Nested status unavailable: {error}")),
+        },
+    }
+}
 
 /// Renders one reconciled [`RunStatus`] as pi's full status report (`run-status.ts:202-243`) —
 /// run identity/state/mode/progress, pending appends, timestamps, dir, the authoritative terminal
@@ -406,17 +458,46 @@ const STEER_UNAVAILABLE_NOTICE: &str =
 /// live registries — see [`RunStatusRenderDeps`] for why this renderer is handed it rather than
 /// reading them. [`RunStatusRenderDeps::default`] is upstream's `deps.state === undefined`.
 async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRenderDeps) -> String {
+    let nested = project_nested_for_status(deps, &status.run_id);
+    format_status_with(
+        status,
+        paths,
+        deps,
+        &nested,
+        crate::time::now_epoch_millis(),
+    )
+    .await
+}
+
+/// [`format_status`] with its two ambient inputs — the projected nested registry and the clock
+/// behind every activity label — handed in, so a test can pin both.
+async fn format_status_with(
+    status: &RunStatus,
+    paths: &RunPaths,
+    deps: &RunStatusRenderDeps,
+    nested: &NestedStatusInput,
+    now: i64,
+) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("Run: {}", status.run_id));
     // pi `run-status.ts:373-385` @v0.43.0: the DURABLE MISSION this run is bound to, read back
     // from the `mission.json` binding its own async dir carries, rendered immediately after
     // `Run:` and omitted entirely when the run has no mission. An unreadable/invalid binding is a
-    // WARNING appended to the report (`nestedWarning`), never a failure of the status report
-    // itself.
+    // WARNING appended to the report (`nestedWarning`, joined to a failed nested lookup's with
+    // `"; "`, `run-status.ts:557`), never a failure of the status report itself.
+    let mut warning: Option<String> = nested.warning.clone();
     match crate::missions::read_mission_binding(&paths.run_dir) {
         Ok(Some(binding)) => lines.push(format!("Mission: {}", binding.mission_id)),
         Ok(None) => {}
-        Err(e) => lines.push(format!("Warning: Mission binding unavailable: {e}")),
+        Err(e) => {
+            warning = Some(format!(
+                "{}Mission binding unavailable: {e}",
+                warning
+                    .as_deref()
+                    .map(|existing| format!("{existing}; "))
+                    .unwrap_or_default()
+            ));
+        }
     }
     lines.push(format!("State: {}", run_state_label(status.state)));
     // pi `status.error ? \`Error: ${status.error}\` : undefined` (`run-status.ts:581`) — the
@@ -425,6 +506,23 @@ async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRen
     // §3b).
     if let Some(error) = status.error.as_deref() {
         lines.push(format!("Error: {error}"));
+    }
+    // pi `run-status.ts:589-590` (`statusActivityText` is computed only for a running run,
+    // `:559-560`): the run-level activity label and steering summary, between `Error:` and
+    // `Mode:`.
+    if status.state == RunState::Running
+        && let Some(activity) = super::fleet_view::format_activity_label(
+            status.telemetry.last_activity_at,
+            status.telemetry.activity_state,
+            now,
+        )
+    {
+        lines.push(format!("Activity: {activity}"));
+    }
+    if let Some(steering) =
+        format_steering_summary(status.telemetry.steer_count, status.telemetry.last_steer_at)
+    {
+        lines.push(format!("Steering: {steering}"));
     }
     lines.push(format!("Mode: {}", run_mode_label(status.mode)));
     lines.push(format!("Progress: {}", progress_label(status)));
@@ -453,6 +551,20 @@ async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRen
         lines.push(format!("Result: {}", paths.legacy_result_root.display()));
     }
 
+    // pi `attachRootChildrenToSteps(status.runId, status.steps, nestedChildren)`
+    // (`run-status.ts:543`): which nested children hang under which step. Upstream mutates
+    // `step.children`; here the attachment is a parallel vector (see the function's doc).
+    let step_children = crate::spawn::nested_events::attach_root_children_to_steps(
+        status.run_id.as_str(),
+        status.steps.len(),
+        &nested.children,
+    );
+    let is_external = |step: &StepStatus| {
+        step.runner
+            .as_ref()
+            .is_some_and(|runner| runner.kind == "external-cli")
+    };
+
     for (index, step) in status.steps.iter().enumerate() {
         let model_text = step
             .model
@@ -473,13 +585,27 @@ async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRen
         let steering_suffix = steering_text
             .map(|text| format!(", steering: {text}"))
             .unwrap_or_default();
+        // pi `stepActivityText` (`run-status.ts:624`, rendered at `:635`): only a RUNNING step
+        // has a live activity, and it sits between the model and the steering suffix.
+        let activity_text = (step.status == StepState::Running)
+            .then(|| {
+                super::fleet_view::format_activity_label(
+                    step.telemetry.last_activity_at,
+                    step.telemetry.activity_state,
+                    now,
+                )
+            })
+            .flatten()
+            .map(|activity| format!(", {activity}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "{}: {} {}{}{}{}",
+            "{}: {} {}{}{}{}{}",
             step_line_label(status, index),
             // SUBA-134 — pi `runStatusStepDisplayName(step)` (`run-status.ts:633` @v0.71.0).
             step.display_name(),
             step_state_label(step.status),
             model_text,
+            activity_text,
             steering_suffix,
             error_text
         ));
@@ -499,11 +625,70 @@ async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRen
             ),
         );
         lines.extend(format_external_cli_runner_lines(step));
+        // pi `run-status.ts:676` — this step's nested descendants, under its runner block.
+        if let Some(children) = step_children.get(index) {
+            lines.extend(crate::spawn::nested_render::format_nested_run_status_lines(
+                children,
+                crate::spawn::nested_render::NestedLinesOptions {
+                    indent: "  ",
+                    command_hints: true,
+                    max_lines: 20,
+                    ..crate::spawn::nested_render::NestedLinesOptions::default()
+                },
+                now,
+            ));
+        }
         let step_log = paths.step_output_log(index);
         if step_log.exists() {
             lines.push(format!("  Output: {}", step_log.display()));
         }
+        // pi `run-status.ts:678-683`: how to reach a RUNNING step. A local child is addressable by
+        // its deterministic intercom label and by `action: "steer"`; an external runner accepts
+        // no live message at all. A workflow step is steered through S6's hints below instead.
+        if step.status == StepState::Running {
+            if is_external(step) {
+                lines.push(EXTERNAL_RUNNER_STEER_UNAVAILABLE.to_string()); // `:683`
+            } else if status.mode != RunMode::Workflow {
+                lines.push(format!(
+                    "  Intercom target: {} (if registered)",
+                    crate::spawn::intercom_target::resolve_subagent_intercom_target(
+                        status.run_id.as_str(),
+                        &step.agent,
+                        index,
+                    )
+                )); // `:680`
+                lines.push(format!(
+                    "  Steer: subagent({{ action: \"steer\", id: \"{}\", index: {index}, \
+                     message: \"...\" }})",
+                    status.run_id
+                )); // `:681`
+            }
+        }
     }
+
+    // pi `run-status.ts:691-693` — descendants no step claimed (spawned by a nested run rather than
+    // by the root, or past a step's cap), flush-left, after the per-step lines.
+    let attached: std::collections::HashSet<&str> = step_children
+        .iter()
+        .flatten()
+        .map(|child| child.id.as_str())
+        .collect();
+    let unattached: Vec<crate::spawn::nested_events::NestedRunSummary> = nested
+        .children
+        .iter()
+        .filter(|child| !attached.contains(child.id.as_str()))
+        .cloned()
+        .collect();
+    lines.extend(crate::spawn::nested_render::format_nested_run_status_lines(
+        &unattached,
+        crate::spawn::nested_render::NestedLinesOptions {
+            indent: "",
+            command_hints: true,
+            max_lines: 20,
+            ..crate::spawn::nested_render::NestedLinesOptions::default()
+        },
+        now,
+    ));
 
     // S6 — pi `run-status.ts:684-691`, the CONSUMER of `:609-613`. Positioned by upstream's own
     // relative order, which is the transferable anchor (the same argument the `Workflow receipt:`
@@ -530,12 +715,27 @@ async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRen
         }
     }
 
+    // pi `if (nestedWarning) lines.push(\`Warning: ${nestedWarning}\`)` (`run-status.ts:703`).
+    if let Some(warning) = warning {
+        lines.push(format!("Warning: {warning}"));
+    }
+
     // pi `if (status.workflowReceiptPath) lines.push(\`Workflow receipt: ${...}\`)`
     // (`run-status.ts:697`) — immediately before `Session:` upstream, which cyrup's own report has
     // no equivalent line for; the transferable anchor is upstream's OWN relative order —
     // immediately before the resume-guidance line that follows (WORKFLOW_3 §3b).
     if let Some(path) = status.workflow_receipt_path.as_ref() {
         lines.push(format!("Workflow receipt: {}", path.display()));
+    }
+
+    // pi `run-status.ts:707` — the run-level steer hint for a running run that has at least one
+    // non-external step. A workflow steers through S6's per-child hints above instead.
+    let all_external = !status.steps.is_empty() && status.steps.iter().all(is_external);
+    if status.state == RunState::Running && !all_external && status.mode != RunMode::Workflow {
+        lines.push(format!(
+            "Steer running child: subagent({{ action: \"steer\", id: \"{}\", message: \"...\" }})",
+            status.run_id
+        ));
     }
 
     if status.state != RunState::Running {
@@ -1360,9 +1560,11 @@ mod tests {
     )]
 
     use super::*;
+    use crate::background::ActivityState;
     use crate::background::atomic::write_atomic_json;
     use crate::background::control::{self, InterruptOutcome, ResumeOutcome};
     use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
+    use crate::spawn::nested_events::NestedRunSummary;
 
     /// G90: the runner's accepted-steer counters must SURFACE in the report a user reads
     /// (pi `steeringSuffix`, `run-status.ts:413,419` @v0.43.0). Without this the tool would say
@@ -2300,6 +2502,7 @@ mod tests {
             current_session: SessionId::parse_opt(current),
             live_workflow_run_ids: live.iter().map(|id| (*id).clone()).collect(),
             foreground_controls: controls,
+            nested_events_root: None,
         }
     }
 
@@ -2541,7 +2744,21 @@ mod tests {
             ),
         )
         .await;
-        assert!(!single_report.contains("Steer"), "{single_report}");
+        // S6's hints and sentence are workflow-only. A running non-workflow run does get the
+        // ordinary run-level `Steer running child:` hint (`run-status.ts:707`) — and nothing from
+        // the live-control registry.
+        assert!(
+            !single_report.contains("Steer live foreground child")
+                && !single_report.contains("Steer: unavailable;"),
+            "{single_report}"
+        );
+        assert!(
+            single_report.ends_with(
+                "Steer running child: subagent({ action: \"steer\", id: \"run000000001\", \
+                 message: \"...\" })"
+            ),
+            "{single_report}"
+        );
     }
 
     /// SCOPE_13 — the async-root reaper renames a run tree onto `.deleting-run-<id>` IN PLACE,
@@ -2847,5 +3064,369 @@ mod tests {
         run.agent = None;
         run.agents = None;
         assert_eq!(nested_run_display_name(&run), "n1");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // SUBA-145 — `run-status` @v0.71.0: activity text, running-step steer hints, the per-step
+    // nested tree and the `Warning:` line. Every expected string is upstream's literal.
+    // ---------------------------------------------------------------------------------------------
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    /// A report for `status` with the clock pinned at [`NOW`] and no nested registry.
+    async fn report_at_now(status: &RunStatus) -> String {
+        let (_dir, async_root, results_dir) = roots();
+        let paths = RunPaths::for_run(&async_root, &results_dir, &status.run_id);
+        format_status_with(
+            status,
+            &paths,
+            &RunStatusRenderDeps::default(),
+            &NestedStatusInput::default(),
+            NOW,
+        )
+        .await
+    }
+
+    fn running_step(agent: &str) -> StepStatus {
+        let mut step = StepStatus::pending(agent);
+        step.status = StepState::Running;
+        step
+    }
+
+    /// pi `run-status.ts:678-681`: a RUNNING local step names its intercom target and the exact
+    /// steer call, directly under the step; a pending step gets neither; a running run gets the
+    /// run-level `Steer running child:` hint (`:707`).
+    #[tokio::test]
+    async fn a_running_local_step_gets_its_intercom_target_and_steer_hint() {
+        let run_id = RunId::from_token("run0steer001");
+        let status = running_status(
+            &run_id,
+            RunMode::Chain,
+            vec![running_step("Researcher"), StepStatus::pending("writer")],
+        );
+        let report = report_at_now(&status).await;
+        let expected = [
+            "Step 1/2: Researcher running",
+            "  Intercom target: subagent-researcher-run0steer001-1 (if registered)",
+            "  Steer: subagent({ action: \"steer\", id: \"run0steer001\", index: 0, message: \"...\" })",
+            "Step 2/2: writer pending",
+        ]
+        .join("\n");
+        assert!(report.contains(&expected), "{report}");
+        assert_eq!(
+            report.matches("Intercom target:").count(),
+            1,
+            "only the running step is addressable: {report}"
+        );
+        assert!(
+            report.ends_with(
+                "\nSteer running child: subagent({ action: \"steer\", id: \"run0steer001\", \
+                 message: \"...\" })"
+            ),
+            "{report}"
+        );
+    }
+
+    /// pi `run-status.ts:680-683`: a RUNNING external-runner step cannot be steered, and says so
+    /// instead of offering an intercom target; the run-level hint is withheld when EVERY step is
+    /// external (`allExternal`, `:706`).
+    #[tokio::test]
+    async fn a_running_external_runner_step_says_steer_is_unavailable() {
+        let run_id = RunId::from_token("run0steer002");
+        let status = running_status(
+            &run_id,
+            RunMode::Single,
+            vec![external_cli_step(Some(
+                crate::runner::contract::AdapterId::CodexExec,
+            ))],
+        );
+        let report = report_at_now(&status).await;
+        assert!(
+            report.contains(
+                "\n  Context handoff: fresh only (Native Pi fork context is not available without \
+                 an adapter-owned handoff artifact.)\n  Steer: unavailable; external runners do \
+                 not accept live messages."
+            ),
+            "{report}"
+        );
+        assert!(!report.contains("Intercom target"), "{report}");
+        assert!(!report.contains("action: \"steer\""), "{report}");
+
+        // A mixed run still offers the run-level hint for its local child.
+        let mixed = running_status(
+            &run_id,
+            RunMode::Chain,
+            vec![
+                external_cli_step(Some(crate::runner::contract::AdapterId::CodexExec)),
+                running_step("local"),
+            ],
+        );
+        let mixed_report = report_at_now(&mixed).await;
+        assert!(
+            mixed_report.contains("Steer running child: subagent("),
+            "{mixed_report}"
+        );
+        assert_eq!(
+            mixed_report
+                .matches("  Steer: unavailable; external runners")
+                .count(),
+            1,
+            "{mixed_report}"
+        );
+    }
+
+    /// `:678`'s `status.mode !== "workflow"` conjunct: a workflow's running child is steered via
+    /// S6's live-control hints, never via an intercom target of its own.
+    #[tokio::test]
+    async fn a_running_workflow_step_gets_no_intercom_target() {
+        let run_id = RunId::from_token("wf0000000002");
+        let mut status = workflow_status(&run_id, Some("session-a"), RunState::Running);
+        status.steps = vec![running_step("lane")];
+        let report = report_at_now(&status).await;
+        assert!(!report.contains("Intercom target"), "{report}");
+        assert!(!report.contains("Steer running child"), "{report}");
+    }
+
+    /// pi `run-status.ts:624,635,559,589`: a RUNNING step's activity rides its line between the
+    /// model and the steering suffix, and a running run leads with `Activity:` before `Mode:`. A
+    /// settled step or run prints none. `now` renders without `ago`.
+    #[tokio::test]
+    async fn activity_labels_ride_the_run_and_its_running_steps() {
+        let run_id = RunId::from_token("run0active01");
+        let mut step = running_step("worker");
+        step.model = Some(cyrup_core::ModelId::from("claude-sonnet"));
+        step.telemetry.last_activity_at = Some(NOW - 5_000);
+        step.telemetry.steer_count = Some(1);
+        let mut done = StepStatus::pending("done");
+        done.status = StepState::Complete;
+        done.telemetry.last_activity_at = Some(NOW - 5_000);
+        let mut status = running_status(&run_id, RunMode::Chain, vec![step, done]);
+        status.telemetry.last_activity_at = Some(NOW);
+        status.telemetry.activity_state = Some(ActivityState::ActiveLongRunning);
+        let report = report_at_now(&status).await;
+        let lines: Vec<&str> = report.lines().collect();
+        let at = |prefix: &str| lines.iter().position(|line| line.starts_with(prefix));
+        assert_eq!(
+            lines.get(at("State:").expect("State") + 1),
+            Some(&"Activity: active but long-running · last activity now"),
+            "{report}"
+        );
+        assert!(at("Activity:") < at("Mode:"), "{report}");
+        assert!(
+            report.contains(
+                "Step 1/2: worker running (claude-sonnet), active 5s ago, steering: 1 steer\n"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("Step 2/2: done complete\n"),
+            "a settled step has no activity text: {report}"
+        );
+
+        // A settled run has none of it, whatever its telemetry still says.
+        let mut settled = status.clone();
+        settled
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete");
+        settled.steps = vec![StepStatus::pending("done")];
+        settled.steps[0].status = StepState::Complete;
+        settled.steps[0].telemetry.last_activity_at = Some(NOW);
+        let settled_report = report_at_now(&settled).await;
+        assert!(!settled_report.contains("Activity:"), "{settled_report}");
+        assert!(!settled_report.contains("active "), "{settled_report}");
+    }
+
+    fn nested_child(id: &str, parent: &str, step: Option<i64>) -> NestedRunSummary {
+        let mut value = serde_json::json!({
+            "id": id, "parentRunId": parent, "depth": 1, "path": [],
+            "state": "complete", "agent": format!("agent-{id}"),
+        });
+        if let Some(step) = step {
+            value["parentStepIndex"] = serde_json::json!(step);
+        }
+        nested_summary(value)
+    }
+
+    /// pi `attachRootChildrenToSteps` (`nested-events.ts:964-975`): only the root's own children
+    /// with a step index attach; the step is the one at that position; a re-announced child
+    /// replaces its earlier copy; a step keeps at most 16 (`MAX_CHILDREN`).
+    #[test]
+    fn root_children_attach_to_the_step_they_name() {
+        use crate::spawn::nested_events::attach_root_children_to_steps;
+        let children = vec![
+            nested_child("a", "root", Some(1)),
+            nested_child("not-mine", "someone-else", Some(0)),
+            nested_child("no-step", "root", None),
+            nested_child("off-the-end", "root", Some(9)),
+            nested_child("negative", "root", Some(-1)),
+            nested_child("b", "root", Some(1)),
+        ];
+        let attached = attach_root_children_to_steps("root", 2, &children);
+        let ids = |step: usize| {
+            attached[step]
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(attached.len(), 2);
+        assert!(ids(0).is_empty());
+        assert_eq!(ids(1), ["a", "b"]);
+
+        // Re-announced: the old copy goes, the new one lands last.
+        let again = vec![
+            nested_child("a", "root", Some(0)),
+            nested_child("b", "root", Some(0)),
+            nested_child("a", "root", Some(0)),
+        ];
+        let attached = attach_root_children_to_steps("root", 1, &again);
+        assert_eq!(
+            attached[0]
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+
+        // The cap: 20 children, 16 kept, the first 16 in arrival order.
+        let many: Vec<_> = (0..20)
+            .map(|n| nested_child(&format!("c{n:02}"), "root", Some(0)))
+            .collect();
+        let attached = attach_root_children_to_steps("root", 1, &many);
+        assert_eq!(attached[0].len(), 16);
+        assert_eq!(attached[0][0].id, "c00");
+        assert_eq!(attached[0][15].id, "c15");
+    }
+
+    /// pi `run-status.ts:676,691-693`: a step's own nested runs hang under it (indent `"  "`, with
+    /// command hints); runs no step claimed follow the steps flush-left.
+    #[tokio::test]
+    async fn nested_runs_render_under_their_step_and_the_unattached_tail_after() {
+        let (_dir, async_root, results_dir) = roots();
+        let run_id = RunId::from_token("run0nested01");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let status = running_status(
+            &run_id,
+            RunMode::Chain,
+            vec![StepStatus::pending("first"), StepStatus::pending("second")],
+        );
+        let nested = NestedStatusInput {
+            children: vec![
+                nested_child("under-second", "run0nested01", Some(1)),
+                nested_child("grandchild", "under-second", Some(0)),
+            ],
+            warning: None,
+        };
+        let report = format_status_with(
+            &status,
+            &paths,
+            &RunStatusRenderDeps::default(),
+            &nested,
+            NOW,
+        )
+        .await;
+        let expected = [
+            "Step 1/2: first pending",
+            "Step 2/2: second pending",
+            "  ↳ agent-under-second [under-second] complete",
+            "    Status: subagent({ action: \"status\", id: \"under-second\" })",
+            "↳ agent-grandchild [grandchild] complete",
+            "  Status: subagent({ action: \"status\", id: \"grandchild\" })",
+        ]
+        .join("\n");
+        assert!(report.contains(&expected), "{report}");
+    }
+
+    /// pi `run-status.ts:703` and `:557`: a failed nested lookup, and an unreadable mission
+    /// binding, are one `Warning:` line — joined with `"; "`, after the steps and the steer
+    /// block, never a failure of the report.
+    #[tokio::test]
+    async fn a_nested_lookup_failure_and_a_bad_mission_binding_share_one_warning_line() {
+        let (_dir, async_root, results_dir) = roots();
+        let run_id = RunId::from_token("run0warn0001");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir");
+        let status = running_status(&run_id, RunMode::Single, vec![StepStatus::pending("w")]);
+        let nested = NestedStatusInput {
+            children: Vec::new(),
+            warning: Some("Nested status unavailable: boom".to_string()),
+        };
+
+        let lookup_only = format_status_with(
+            &status,
+            &paths,
+            &RunStatusRenderDeps::default(),
+            &nested,
+            NOW,
+        )
+        .await;
+        assert!(
+            lookup_only.contains("\nStep 1: w pending\nWarning: Nested status unavailable: boom\n"),
+            "{lookup_only}"
+        );
+
+        tokio::fs::write(paths.run_dir.join("mission.json"), "{ not json")
+            .await
+            .expect("write bad binding");
+        let both = format_status_with(
+            &status,
+            &paths,
+            &RunStatusRenderDeps::default(),
+            &nested,
+            NOW,
+        )
+        .await;
+        let warnings: Vec<&str> = both
+            .lines()
+            .filter(|line| line.starts_with("Warning:"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{both}");
+        assert!(
+            warnings[0].starts_with(
+                "Warning: Nested status unavailable: boom; Mission binding unavailable: "
+            ),
+            "{both}"
+        );
+    }
+
+    /// The lookup end to end: a nested event a child relayed into the sandboxed events tree shows
+    /// under its step of the ROOT'S report when the deps carry that tree, and nowhere when they
+    /// carry none (`nested_events_root: None`).
+    #[tokio::test]
+    async fn the_nested_registry_is_projected_from_the_deps_events_root() {
+        use crate::spawn::nested_events::{
+            NestedEventInput, create_nested_route_in, write_nested_event_in,
+        };
+        let (dir, async_root, results_dir) = roots();
+        let events_root = dir.path().join("nested-events");
+        let run_id = RunId::from_token("run0proj0001");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let route = create_nested_route_in(&events_root, "run0proj0001").expect("route");
+        write_nested_event_in(
+            &events_root,
+            &route,
+            &NestedEventInput {
+                event_type: "subagent.nested.updated".to_string(),
+                ts: 150,
+                parent_run_id: "run0proj0001".to_string(),
+                parent_step_index: Some(0),
+                child: nested_child("projected", "run0proj0001", Some(0)),
+            },
+        )
+        .expect("write event");
+        let status = running_status(&run_id, RunMode::Single, vec![StepStatus::pending("w")]);
+
+        let deps = RunStatusRenderDeps {
+            nested_events_root: Some(events_root),
+            ..RunStatusRenderDeps::default()
+        };
+        let with_root = format_status(&status, &paths, &deps).await;
+        assert!(
+            with_root.contains("\nStep 1: w pending\n  ↳ agent-projected [projected] complete\n"),
+            "{with_root}"
+        );
+        let without = format_status(&status, &paths, &RunStatusRenderDeps::default()).await;
+        assert!(!without.contains("projected"), "{without}");
     }
 }

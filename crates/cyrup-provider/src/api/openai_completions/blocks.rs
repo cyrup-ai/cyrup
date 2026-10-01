@@ -147,6 +147,7 @@ pub(super) fn project_block(block: &Block) -> Content {
                 // A handle on the buffer, not a parse of it (PERF-001).
                 arguments: LazyArgs::streaming(args.clone()),
                 thought_signature: thought_signature.clone(),
+                namespace: None,
             }),
         }
     }

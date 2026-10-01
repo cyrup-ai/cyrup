@@ -6,29 +6,34 @@
 //! This is the fixed, app-owned pre-launch surface Pi spins up BEFORE the agent runtime is built (the
 //! `--resume` picker, the project-trust prompt, the missing-session-cwd selector). It is intentionally
 //! *not* the in-app chrome ([`crate::App`]); it is a single modal selector with no transcript/editor.
-//! Like [`crate::App`] it needs a real terminal, so it is exercised from the bin, not unit-tested.
+//! The terminal and the key source are the only parts that need a real tty: the loop itself is
+//! [`crate::startup_loop::StartupLoop`], generic over the ratatui backend and the key source, and is
+//! what the tests step (SEAM-134).
 //!
 //! In-place `Apply` payloads (Pi's selectors that mutate a row in place — e.g. the resume picker's
 //! delete/rename) are routed to the caller's `on_apply` and the slot stays open (the selector already
 //! reflected the mutation in its own row list).
 
+use std::collections::HashMap;
 use std::io;
+use std::time::Duration;
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::ExecutableCommand;
 use ratatui::crossterm::cursor::Show;
-use ratatui::crossterm::event::{Event, KeyEventKind};
+use ratatui::crossterm::event::Event;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::Rect;
 
 use crate::error::TuiError;
 use crate::keymap::SelectKeymap;
 use crate::selector::{Selector, SelectorOutcome};
+use crate::session_selector::SessionSelector;
+use crate::startup_loop::{LoadDriver, StartupEvents, StartupLoop, StartupSessionLoads};
 use crate::theme::UiTheme;
-use crate::write_log::{TuiStdout, tui_stdout};
+use crate::write_log::tui_stdout;
 
 /// Restore the terminal on EVERY exit from [`run_startup_selector`] — the two setup errors, the
 /// loop's `?`, and (new with `async`) a **future-drop**: the loop now suspends at each
@@ -59,7 +64,7 @@ impl Drop for StartupTerminalRestore {
 ///
 /// `async` because [`SelectorOutcome::Apply`] is now AWAITED: `on_apply` persists the mutation
 /// before the loop repaints the row that shows it, so an in-place edit is durable before the frame
-/// that reflects it is painted. The **input** read is still a blocking read, so this parks its
+/// that reflects it is painted. The **input** wait is still a blocking one, so this parks its
 /// executor thread between keys — unchanged from the sync version every caller already blocked
 /// on, and NOT fixable in isolation: see the `.flux` task "unify the pre-launch input path with the
 /// app reader" for why a second background reader on stdin is unsafe while
@@ -67,13 +72,53 @@ impl Drop for StartupTerminalRestore {
 ///
 /// On unix that read is the app's own byte reader ([`crate::input::reader::TtyReader`]), so the
 /// selector frames and decodes keys exactly as the app will a moment later; elsewhere it is
-/// crossterm's `event::read()`.
+/// crossterm's `event::poll` + `event::read()`.
 pub async fn run_startup_selector(
     theme: &UiTheme,
     keymap: &SelectKeymap,
     inner: &mut dyn Selector,
     on_apply: impl AsyncFnMut(&str),
 ) -> Result<SelectorOutcome, TuiError> {
+    let (outcome, _) = run_on_terminal(theme, keymap, inner, None, on_apply).await?;
+    Ok(outcome)
+}
+
+/// [`run_startup_selector`] for the `--resume` picker, with its listing STREAMED (SEAM-134).
+///
+/// pi's `selectSession` mounts `SessionSelectorComponent` with two loaders and lets it fill itself
+/// (`cli/session-picker.ts:15-55`, `session-selector.ts:869`, `:956-988` @v0.87.1): the picker is on
+/// screen, reading `Loading …`, before the first session file has been read. `picker` must have been
+/// built with [`SessionSelector::with_async_loaders`]; `loads` are the two loaders it asks for. Each
+/// runs on the blocking pool, its batches are folded into the picker between keys, and whatever is
+/// still loading is cancelled when the picker confirms or cancels.
+///
+/// Besides the outcome this returns every session's stored cwd any batch carried (session file path
+/// to cwd): the caller has no finished scan to look the picked session's missing-cwd issue up in
+/// (`main.ts:321-332`).
+pub async fn run_startup_session_selector(
+    theme: &UiTheme,
+    keymap: &SelectKeymap,
+    picker: &mut SessionSelector,
+    loads: StartupSessionLoads,
+    on_apply: impl AsyncFnMut(&str),
+) -> Result<(SelectorOutcome, HashMap<String, String>), TuiError> {
+    run_on_terminal(
+        theme,
+        keymap,
+        picker,
+        Some(LoadDriver::new(loads)),
+        on_apply,
+    )
+    .await
+}
+
+async fn run_on_terminal(
+    theme: &UiTheme,
+    keymap: &SelectKeymap,
+    inner: &mut dyn Selector,
+    loads: Option<LoadDriver>,
+    on_apply: impl AsyncFnMut(&str),
+) -> Result<(SelectorOutcome, HashMap<String, String>), TuiError> {
     let mut stdout = io::stdout();
     enable_raw_mode().map_err(|e| TuiError::Backend(e.to_string()))?;
     // Armed the instant raw mode is on, so every exit below unwinds through `Drop`.
@@ -87,7 +132,16 @@ pub async fn run_startup_selector(
         .map_err(|e| TuiError::Backend(e.to_string()))?;
 
     let mut input = Input::open()?;
-    run_loop(&mut terminal, &mut input, theme, keymap, inner, on_apply).await
+    StartupLoop {
+        terminal: &mut terminal,
+        events: &mut input,
+        theme,
+        keymap,
+        inner,
+        loads,
+    }
+    .run(on_apply)
+    .await
 }
 
 /// The selector's key source.
@@ -102,10 +156,13 @@ impl Input {
             .map(Self)
             .map_err(|e| TuiError::Backend(e.to_string()))
     }
+}
 
-    fn read(&mut self) -> Result<Event, TuiError> {
+#[cfg(unix)]
+impl StartupEvents for Input {
+    fn next(&mut self, wait: Duration) -> Result<Option<Event>, TuiError> {
         self.0
-            .next_event()
+            .next_event_timeout(wait)
             .map_err(|e| TuiError::Backend(e.to_string()))
     }
 }
@@ -119,61 +176,15 @@ impl Input {
     fn open() -> Result<Self, TuiError> {
         Ok(Self)
     }
-
-    fn read(&mut self) -> Result<Event, TuiError> {
-        ratatui::crossterm::event::read().map_err(|e| TuiError::Backend(e.to_string()))
-    }
 }
 
-async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<TuiStdout>>,
-    input: &mut Input,
-    theme: &UiTheme,
-    keymap: &SelectKeymap,
-    inner: &mut dyn Selector,
-    mut on_apply: impl AsyncFnMut(&str),
-) -> Result<SelectorOutcome, TuiError> {
-    loop {
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                // Pi passes `ui.terminal.rows` into `ConfigSelectorComponent`
-                // (`cli/config-selector.ts:47`), which turns it into the body window
-                // (`config-selector.ts:266`). Doing it here rather than at construction keeps the
-                // window correct across a resize; it is a no-op for every other selector.
-                inner.set_terminal_height(area.height);
-                let height = inner.desired_height(area.width).min(area.height).max(1);
-                let slot = Rect {
-                    x: area.x,
-                    y: area.y,
-                    width: area.width,
-                    height,
-                };
-                inner.render(frame, slot, theme);
-            })
-            .map_err(|e| TuiError::Backend(e.to_string()))?;
-
-        match input.read()? {
-            // Ignore key-release events (Kitty protocol) so a single press is not double-counted.
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
-                match inner.handle(&key, keymap) {
-                    SelectorOutcome::Confirm(value) => return Ok(SelectorOutcome::Confirm(value)),
-                    SelectorOutcome::Cancel => return Ok(SelectorOutcome::Cancel),
-                    SelectorOutcome::Apply(payload) => on_apply(&payload).await,
-                    // Never produced by the startup selectors (`OpenExternalEditor` is only
-                    // `ExtensionEditorSelector`'s; `OpenSubmenu` is only the `/settings` grid's;
-                    // `ConfirmDefault` is only the model/thinking pickers', neither of which runs
-                    // pre-launch — and there is no session here to persist through anyway) —
-                    // treated as a no-op like `Redraw`'s siblings.
-                    SelectorOutcome::Preview(_)
-                    | SelectorOutcome::Redraw
-                    | SelectorOutcome::Ignored
-                    | SelectorOutcome::OpenExternalEditor
-                    | SelectorOutcome::ConfirmDefault(_)
-                    | SelectorOutcome::OpenSubmenu(_) => {}
-                }
-            }
-            _ => {}
+#[cfg(not(unix))]
+impl StartupEvents for Input {
+    fn next(&mut self, wait: Duration) -> Result<Option<Event>, TuiError> {
+        let backend = |e: io::Error| TuiError::Backend(e.to_string());
+        if !ratatui::crossterm::event::poll(wait).map_err(backend)? {
+            return Ok(None);
         }
+        ratatui::crossterm::event::read().map(Some).map_err(backend)
     }
 }

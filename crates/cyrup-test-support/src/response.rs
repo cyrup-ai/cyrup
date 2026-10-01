@@ -219,6 +219,7 @@ pub fn build_assistant_message(resp: &FauxResponse) -> AssistantMessage {
             name: tc.name.clone(),
             arguments: arguments.into(),
             thought_signature: None,
+            namespace: None,
         }));
     }
     if content.is_empty() && resp.error.is_none() {

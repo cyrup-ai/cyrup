@@ -589,6 +589,7 @@ mod tests {
             name: name.to_string(),
             arguments: LazyArgs::default(),
             thought_signature: None,
+            namespace: None,
         };
         let mut args = serde_json::json!({});
         policy

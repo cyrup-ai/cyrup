@@ -25,6 +25,7 @@
 //! (R-SA-049/050/051/066/069); [`chain_graph`] and [`worktree`] are siblings built on top of
 //! those same primitives.
 
+pub mod bounded_argv;
 pub mod chain_graph;
 pub mod cleanup_plan;
 pub mod depth;

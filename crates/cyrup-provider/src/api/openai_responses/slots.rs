@@ -62,12 +62,19 @@ pub(super) fn create_slot(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .into();
+            // `...(item.namespace !== undefined ? { namespace: item.namespace } : {})`
+            // (`openai-responses-shared.ts:491`).
+            let namespace = item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             (
                 RBlock::Tool {
                     call_id,
                     item_id,
                     name,
                     partial_json,
+                    namespace,
                 },
                 SlotKind::Tool,
             )

@@ -374,6 +374,7 @@ async fn handle_content_block_stop(
                 name: name.clone(),
                 arguments: parse_streaming_json_object(Some(partial_json)).into(),
                 thought_signature: None,
+                namespace: None,
             },
             partial: dec.snapshot(model, api),
         },

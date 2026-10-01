@@ -255,7 +255,33 @@ impl<B: Backend> App<B> {
         issues.extend(self.state.thinking_keymap.merge_json(json)?);
         issues.extend(self.state.models_keymap.merge_json(json)?);
         issues.extend(self.state.editor.merge_keybindings_json(json)?);
+        // TUI-109 — the `tui.altScreen.*` table was never merged, so `keybindings.json` could not
+        // rebind any of the eight ids (the gap `alt_keymap`'s doc recorded). The "Jump to latest
+        // message" label prints `tui.altScreen.bottom`, so a rebind has to reach both the key
+        // routing and the live label.
+        issues.extend(self.alt_keymap.merge_json(json)?);
+        self.push_scroll_to_end_key();
         Ok(issues)
+    }
+
+    /// Push the current `tui.altScreen.bottom` label into the live alternate screen — pi's
+    /// `keyDisplayText("tui.altScreen.bottom")` (`tui-renderer.ts:30`), which upstream re-reads on
+    /// every frame. [`AltScreen`] owns no keymap, so this is the same push `set_expand_hint` is for
+    /// the transcript. A no-op in inline mode; `adopt_fullscreen_renderer` pushes again when a
+    /// renderer is built.
+    pub(crate) fn push_scroll_to_end_key(&mut self) {
+        let key = self.scroll_to_end_key();
+        if let Some(alt) = self.altscreen.as_mut() {
+            alt.set_scroll_to_end_key(key);
+        }
+    }
+
+    /// `keyDisplayText("tui.altScreen.bottom")`: every bound key, title-cased and joined with `/`,
+    /// or `None` when the action is unbound.
+    pub(crate) fn scroll_to_end_key(&self) -> Option<String> {
+        self.alt_keymap
+            .keys_label(crate::keymap::AltScreenAction::Bottom)
+            .map(|label| crate::chrome::format_key_text(&label, true))
     }
 
     /// TUI-051 — re-read `<agent_dir>/keybindings.json` and re-apply it to every live map.
@@ -294,6 +320,7 @@ impl<B: Backend> App<B> {
         self.state.thinking_keymap = crate::keymap::ThinkingKeymap::default();
         self.state.models_keymap = crate::keymap::ModelsKeymap::default();
         self.state.editor.reset_keybindings_to_defaults();
+        self.alt_keymap = AltScreenKeymap::default();
         self.load_keybindings_json(&json)
     }
 

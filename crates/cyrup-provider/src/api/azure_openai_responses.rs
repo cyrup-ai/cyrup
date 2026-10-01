@@ -802,6 +802,7 @@ mod tests {
                         name: "base_tool".to_string(),
                         arguments: serde_json::Map::new().into(),
                         thought_signature: None,
+                        namespace: None,
                     })],
                     provider: "azure-openai-responses".into(),
                     model: "gpt-4".to_string(),

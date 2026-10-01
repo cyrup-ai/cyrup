@@ -237,6 +237,7 @@ async fn process_function_call(
         name,
         arguments: arguments.into(),
         thought_signature,
+        namespace: None,
     };
 
     dec.blocks.push(Content::ToolCall(tool_call.clone()));

@@ -541,12 +541,16 @@ pub struct Strip<'a> {
 /// Only kitty is tracked, which is upstream's gate too (`:1306-1309` calls `prepareKittyScreen`
 /// solely when `imageProtocol === "kitty"`): iterm2 is suppressed for the duration, and sixel —
 /// which `ratatui-image` re-sends in full on every draw — retains nothing between frames.
+///
+/// Returns how many rows from the top of `area` now hold a graphics-protocol image (`0` when the
+/// strip drew placeholders, or drew nothing). The scroll-to-end indicator reads it to leave an
+/// image row alone, which is upstream's `isImageLine` guard (`tui-alt-screen.ts:1631`).
 pub(super) fn place(
     lifecycle: &mut ImageLifecycle,
     frame: &mut Frame,
     area: Rect,
     strip: &Strip<'_>,
-) {
+) -> u16 {
     let generation = lifecycle.placements.begin_frame();
     let graphics = strip.show_images && lifecycle.allows_graphics();
     let track = graphics && lifecycle.protocol == Some(ImageProtocol::Kitty);
@@ -557,6 +561,9 @@ pub(super) fn place(
     let width = area.width.saturating_sub(2).min(max_cells).max(1);
     let bottom = area.y.saturating_add(area.height);
     let mut y = area.y;
+    // Only a block the renderer hands to a graphics protocol is an image line; with
+    // `!graphics` (or the half-block fallback) `ImageRenderer::render` writes text.
+    let imaged = graphics && strip.renderer.is_graphical();
     for block in strip.blocks {
         if y >= bottom {
             break;
@@ -587,4 +594,5 @@ pub(super) fn place(
     // `prepareKittyScreen`'s second pass (`:361-386`) — one eviction sweep per frame, over what the
     // walk above did not touch.
     lifecycle.placements.evict(generation);
+    if imaged { y.saturating_sub(area.y) } else { 0 }
 }

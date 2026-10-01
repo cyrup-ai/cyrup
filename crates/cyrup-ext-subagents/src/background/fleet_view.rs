@@ -277,7 +277,16 @@ pub fn format_activity_label(
     match activity_state {
         Some(ActivityState::NeedsAttention) => Some(format!("no activity for {age}")),
         Some(ActivityState::ActiveLongRunning) => {
-            Some(format!("active but long-running · last activity {age} ago"))
+            // `age === "now" ? "now" : `${age} ago`` (`status-format.ts:19-20`): "now" takes no
+            // "ago", exactly as the plain `active now` arm below does.
+            let activity_age = if age == "now" {
+                age
+            } else {
+                format!("{age} ago")
+            };
+            Some(format!(
+                "active but long-running · last activity {activity_age}"
+            ))
         }
         _ if age == "now" => Some("active now".to_string()),
         _ => Some(format!("active {age} ago")),
@@ -1295,6 +1304,17 @@ mod tests {
             )
             .as_deref(),
             Some("active but long-running · last activity 2m ago")
+        );
+        // The `now` age takes no "ago" (`status-format.ts:19-20`): `last activity now`, never
+        // `last activity now ago`.
+        assert_eq!(
+            format_activity_label(Some(now - 500), Some(ActivityState::ActiveLongRunning), now)
+                .as_deref(),
+            Some("active but long-running · last activity now")
+        );
+        assert_eq!(
+            format_activity_label(Some(now), Some(ActivityState::NeedsAttention), now).as_deref(),
+            Some("no activity for now")
         );
     }
 

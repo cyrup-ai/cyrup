@@ -92,6 +92,7 @@ mod session_search;
 mod session_selector;
 mod settings_selector;
 mod startup;
+mod startup_loop;
 mod startup_selector;
 mod status;
 mod status_indicator;
@@ -231,7 +232,8 @@ pub use startup::{
     StartupRole, StartupSpan, build_startup_lines, builtin_command_conflict_diagnostics,
     display_path, extension_diagnostics, resource_diagnostics, shortcut_diagnostics,
 };
-pub use startup_selector::run_startup_selector;
+pub use startup_loop::StartupSessionLoads;
+pub use startup_selector::{run_startup_selector, run_startup_session_selector};
 pub use status::{
     StatusLine, experimental_features_enabled, experimental_features_enabled_from, format_tokens,
 };

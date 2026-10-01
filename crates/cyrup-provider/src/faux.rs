@@ -508,6 +508,7 @@ fn build_events(message: &AssistantMessage, chunk: &ChunkConfig) -> Vec<StreamEv
                     name: tc.name.clone(),
                     arguments: serde_json::Map::new().into(),
                     thought_signature: None,
+                    namespace: None,
                 }));
                 events.push(StreamEvent::ToolCallStart {
                     content_index: i,
@@ -920,6 +921,7 @@ pub fn faux_tool_call_with_id(
         }
         .into(),
         thought_signature: None,
+        namespace: None,
     })
 }
 

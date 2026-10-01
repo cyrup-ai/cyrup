@@ -223,6 +223,7 @@ impl RunCtx {
                                     name: tool_name.clone(),
                                     arguments: serde_json::Map::new().into(),
                                     thought_signature: None,
+                                    namespace: None,
                                 },
                             )
                         });

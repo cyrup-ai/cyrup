@@ -759,6 +759,7 @@ fn replay_tool_call(id: &str, name: &str, args: Value) -> cyrup_core::Content {
         name: name.to_string(),
         arguments: args.as_object().cloned().unwrap_or_default().into(),
         thought_signature: None,
+        namespace: None,
     })
 }
 

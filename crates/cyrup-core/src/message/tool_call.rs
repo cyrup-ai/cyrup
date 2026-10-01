@@ -7,7 +7,7 @@ use crate::lazy_args::LazyArgs;
 ///
 /// Pi's `ToolCall` data type ALWAYS carries `type: "toolCall"` (types.ts:344-345). cyrup makes the
 /// bare struct self-tag via a manual [`serde::Serialize`] that emits `type` first, in Pi's
-/// declaration order (`type`, `id`, `name`, `arguments`, `thoughtSignature?`). This is the single
+/// declaration order (`type`, `id`, `name`, `arguments`, `thoughtSignature?`, `namespace?`). This is the single
 /// source of truth for the discriminant: [`crate::Content::ToolCall`] delegates here (so it does NOT
 /// inject a second `type` — no duplicate key), and `StreamEvent::ToolCallEnd.tool_call` serializes
 /// the bare struct directly. [`serde::Deserialize`] is derived (it tolerates the extra `type` key
@@ -28,12 +28,18 @@ pub struct ToolCall {
     /// Provider-opaque (Google); stripped on cross-provider handoff (func-01 R-01-030).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub thought_signature: Option<String>,
+    /// OpenAI Responses namespace for calls to dynamically loaded or namespaced tools (Pi
+    /// `ToolCall.namespace`, types.ts:392-393). Captured by the Responses decoder and replayed on
+    /// the wire only for the same provider, api and model (DRIFT-058); every other provider ignores
+    /// it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub namespace: Option<String>,
 }
 
 impl serde::Serialize for ToolCall {
     /// Self-tagging serializer: emits `type: "toolCall"` first (Pi `ToolCall.type`, types.ts:345),
-    /// then `id`, `name`, `arguments`, and `thoughtSignature` (only when present) — byte-1:1 with
-    /// Pi's `ToolCall` interface (types.ts:344-350). Single source of the discriminant: callers that
+    /// then `id`, `name`, `arguments`, `thoughtSignature` and `namespace` (each only when present)
+    /// — byte-1:1 with Pi's `ToolCall` interface (types.ts:387-394). Single source of the discriminant: callers that
     /// embed a `ToolCall` (the [`crate::Content::ToolCall`] variant, `StreamEvent::ToolCallEnd.tool_call`)
     /// delegate here rather than injecting their own `type`, so the key is never duplicated.
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -41,8 +47,9 @@ impl serde::Serialize for ToolCall {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct as _;
-        let has_sig = self.thought_signature.is_some();
-        let len = 4 + usize::from(has_sig);
+        let len = 4
+            + usize::from(self.thought_signature.is_some())
+            + usize::from(self.namespace.is_some());
         let mut st = serializer.serialize_struct("ToolCall", len)?;
         st.serialize_field("type", "toolCall")?;
         st.serialize_field("id", &self.id)?;
@@ -51,6 +58,10 @@ impl serde::Serialize for ToolCall {
         match &self.thought_signature {
             Some(sig) => st.serialize_field("thoughtSignature", sig)?,
             None => st.skip_field("thoughtSignature")?,
+        }
+        match &self.namespace {
+            Some(ns) => st.serialize_field("namespace", ns)?,
+            None => st.skip_field("namespace")?,
         }
         st.end()
     }
@@ -71,6 +82,7 @@ mod tests {
             name: "read".into(),
             arguments: serde_json::Map::new().into(),
             thought_signature: None,
+            namespace: None,
         };
         let s = serde_json::to_string(&tc).expect("serialize");
         assert_eq!(
@@ -103,6 +115,56 @@ mod tests {
             serde_json::from_value::<ToolCall>(vs).expect("deserialize"),
             tc_sig
         );
+    }
+
+    #[test]
+    fn namespace_serializes_after_thought_signature_and_round_trips() {
+        // DRIFT-058: Pi's `ToolCall` declares `namespace?` after `thoughtSignature?`
+        // (types.ts:392-393), so the JSONL key order is type, id, name, arguments,
+        // thoughtSignature, namespace.
+        let tc = ToolCall {
+            id: "tc1".into(),
+            name: "lookup".into(),
+            arguments: serde_json::Map::new().into(),
+            thought_signature: Some("sig".into()),
+            namespace: Some("dynamic_tools".into()),
+        };
+        let s = serde_json::to_string(&tc).expect("serialize");
+        assert_eq!(
+            s,
+            r#"{"type":"toolCall","id":"tc1","name":"lookup","arguments":{},"thoughtSignature":"sig","namespace":"dynamic_tools"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolCall>(&s).expect("round trip"),
+            tc
+        );
+        // Without a signature the namespace still follows `arguments` directly.
+        let no_sig = ToolCall {
+            thought_signature: None,
+            ..tc.clone()
+        };
+        let s = serde_json::to_string(&no_sig).expect("serialize");
+        assert_eq!(
+            s,
+            r#"{"type":"toolCall","id":"tc1","name":"lookup","arguments":{},"namespace":"dynamic_tools"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolCall>(&s).expect("round trip"),
+            no_sig
+        );
+        // Absent stays absent (no `"namespace":null`), and a namespaced call embedded in `Content`
+        // carries the key through the delegating serializer.
+        let plain = ToolCall {
+            namespace: None,
+            ..no_sig
+        };
+        assert!(
+            !serde_json::to_string(&plain)
+                .expect("serialize")
+                .contains("namespace")
+        );
+        let c = serde_json::to_value(Content::ToolCall(tc)).expect("serialize");
+        assert_eq!(c["namespace"], "dynamic_tools");
     }
 
     #[test]

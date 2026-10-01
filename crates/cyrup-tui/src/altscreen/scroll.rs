@@ -205,11 +205,8 @@ pub(super) fn content_height(scroll: &ScrollState) -> usize {
 }
 
 /// Whether the view is stuck to the tail — pi's `get isFollowingEnd()`
-/// (`components/scroll-view.ts:59-61`).
-/// `#[cfg(test)]`: pi's `get isFollowingEnd()` (`components/scroll-view.ts:59-61`), reached through
-/// `TuiAltScreen.isFollowingOutput`, whose every upstream reference is in
-/// `test/tui-alt-screen.test.ts`. The flag itself is maintained and read inside this module.
-#[cfg(test)]
+/// (`components/scroll-view.ts:59-61`). Read by the scroll-to-end indicator (TUI-109,
+/// `tui-alt-screen.ts:1626`) and, through `TuiAltScreen.isFollowingOutput`, by upstream's tests.
 pub(super) fn is_following_end(scroll: &ScrollState) -> bool {
     scroll.following_end
 }

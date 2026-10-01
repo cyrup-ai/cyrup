@@ -165,6 +165,7 @@ mod exit;
 mod flash;
 pub(crate) use flash::COPY_ERROR_FLASH_DURATION;
 mod images;
+mod indicator;
 mod keys;
 mod out;
 /// Escape-capture handles, re-exported for `crate::tests` — `mod out` is private and the test
@@ -339,8 +340,8 @@ use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{KeyEvent, MouseEvent};
-use ratatui::layout::Rect;
+use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 
@@ -388,6 +389,8 @@ pub struct AltScreen<B: Backend> {
     /// renderer is adopted and again when the `/settings` row is cycled, which is pi's constructor
     /// option (`interactive-mode.ts:378`) plus its `applyRuntimeSettings` write (`:1995`).
     copy_on_select: bool,
+    /// The "Jump to latest message" label and its click target (TUI-109).
+    indicator: indicator::Indicator,
     /// Transient overlay messages (§B-11).
     flashes: flash::FlashStack,
     /// Inline-image placements and their eviction (§B-12).
@@ -454,6 +457,7 @@ impl<B: Backend> AltScreen<B> {
             drag: scrollbar_drag::DragState::default(),
             selection: selection::SelectionState::default(),
             copy_on_select: true,
+            indicator: indicator::Indicator::default(),
             flashes: flash::FlashStack::default(),
             images,
             doc: Vec::new(),
@@ -731,6 +735,7 @@ impl<B: Backend> AltScreen<B> {
             scroll,
             bar,
             selection,
+            indicator,
             flashes,
             doc,
             images,
@@ -761,9 +766,13 @@ impl<B: Backend> AltScreen<B> {
                 selection::highlight(selection, scroll, doc, frame, viewport);
                 // §B-12 — place the attachment strip and reconcile the registry, BEFORE the
                 // scrollbar and the flash so neither is overpainted by a graphics escape.
-                if let Some(strip) = strip.as_ref() {
-                    images::place(images, frame, viewport, strip);
-                }
+                let image_rows = strip
+                    .as_ref()
+                    .map_or(0, |strip| images::place(images, frame, viewport, strip));
+                // TUI-109 — `compositeScrollToEndIndicator` (`tui-alt-screen.ts:1672`), BEFORE the
+                // flash (`:1676`) and clipped at the scrollbar column, which [`scroll::draw`] paints
+                // next so the bar is never the thing overpainted.
+                indicator::paint(indicator, bar, scroll, theme, frame, area, image_rows);
                 scroll::draw(bar, scroll, theme, frame, area);
                 flash::overlay(flashes, frame, area);
             })
@@ -792,6 +801,16 @@ impl<B: Backend> AltScreen<B> {
     /// shape — the flag is read at `:1035`, inside the release arm, and nowhere else.
     pub(crate) fn set_copy_on_select(&mut self, enabled: bool) {
         self.copy_on_select = enabled;
+    }
+
+    /// Install the "Jump to latest message" indicator and set the shortcut its label shows — pi's
+    /// `keyDisplayText("tui.altScreen.bottom")` (`modes/interactive/tui-renderer.ts:30`), `None`
+    /// when the action is unbound. This renderer owns no keymap, so the composition root pushes it
+    /// when the renderer is adopted and again whenever the bindings are reloaded. A renderer that
+    /// was never given one paints no indicator, as upstream's optional `scrollToEndIndicator`
+    /// constructor callback (`tui-alt-screen.ts:181`).
+    pub(crate) fn set_scroll_to_end_key(&mut self, key: Option<String>) {
+        indicator::set_key(&mut self.indicator, key);
     }
 
     pub(crate) fn handle_key(
@@ -826,6 +845,16 @@ impl<B: Backend> AltScreen<B> {
             width: content_width,
             ..area
         };
+        // `handleScrollToEndIndicatorMouseEvent` (`tui-alt-screen.ts:1018-1024`), tried ahead of the
+        // scrollbar and its hover (`:916`). Only an unreleased, undragged left press counts; its
+        // modifier bits are not tested upstream (`(button & 3) !== 0` masks just the button).
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+            && indicator::contains(&self.indicator, Position::new(ev.column, ev.row))
+        {
+            scroll::scroll_to_bottom(&mut self.scroll);
+            indicator::consume(&mut self.indicator);
+            return selection::PointerOutcome::Handled;
+        }
         scrollbar_drag::update_hover(&mut self.bar, &mut self.scroll, ev.column, ev.row, area);
         if scrollbar_drag::route(&mut self.drag, &mut self.bar, &mut self.scroll, ev, area) {
             // A report the scrollbar CLAIMED clears every selection field, which is upstream

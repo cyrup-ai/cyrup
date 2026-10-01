@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use cyrup_config::ConfigDirs;
 use cyrup_session_svc::{
-    SessionInfo, SessionLayout, SessionTarget, SessionsRoot, list_all, list_in_dir,
+    SessionInfo, SessionLayout, SessionListing, SessionTarget, SessionsRoot, list_in_dir,
 };
 
 /// The flag inputs the resolver reads (a narrow view of [`crate::Cli`] so the orchestration is
@@ -353,16 +353,10 @@ pub(crate) fn session_list_cwd_filter(dirs: &ConfigDirs) -> Option<&Path> {
 /// under the sessions root (:1667+). Handing an explicit `--session-dir` to the root walk instead
 /// would scan its SUBdirectories and return nothing for a flat shared dir.
 pub(crate) fn list_global_sessions(dirs: &ConfigDirs) -> Vec<SessionInfo> {
-    if dirs.session_dir_explicit {
-        // Pi's `listAll(sessionDir)` overload — an unfiltered single-directory scan, i.e.
-        // `cyrup_session::listing::list_all_in_dir`, which is `list_in_dir(dir, None, …)`.
-        list_in_dir(&dirs.session_dir, None, None)
-    } else {
-        list_all(&SessionsRoot(dirs.session_dir.clone()))
-    }
+    global_sessions_listing(dirs).run(None)
 }
 
-/// The `--resume` picker's TWO session sets, kept apart the way pi keeps them apart: `.0` is the
+/// The `--resume` picker's TWO loaders, kept apart the way pi keeps them apart: `.0` is the
 /// **current-folder** listing (Pi `SessionManager.list(cwd, sessionDir, onProgress)`,
 /// main.ts:372 = `session-picker.ts`'s `currentSessionsLoader`) and `.1` is the **all-projects**
 /// listing (`SessionManager.listAll(sessionDir, onProgress)`, main.ts:373 = `allSessionsLoader`).
@@ -371,10 +365,37 @@ pub(crate) fn list_global_sessions(dirs: &ConfigDirs) -> Vec<SessionInfo> {
 /// (Current Folder)", so the screen listed other projects' sessions with no cwd column and no way
 /// back; upstream never merges them, it swaps between them on `Tab` (`session-selector.ts:
 /// 1003-1026`) and turns the cwd column on for the `all` set (`:844`, `:923`).
-pub(crate) fn gather_session_scopes(dirs: &ConfigDirs) -> (Vec<SessionInfo>, Vec<SessionInfo>) {
+///
+/// SEAM-134 — returned as owned [`SessionListing`]s, not scanned: the picker runs them on the
+/// blocking pool and streams each one's progress, as pi's component does with the same two loaders.
+pub(crate) fn session_scope_listings(dirs: &ConfigDirs) -> (SessionListing, SessionListing) {
     let layout = session_list_layout(dirs);
-    let current = list_in_dir(&layout.dir(), session_list_cwd_filter(dirs), None);
-    (current, list_global_sessions(dirs))
+    let current = SessionListing::Dir {
+        dir: layout.dir(),
+        cwd_filter: session_list_cwd_filter(dirs).map(Path::to_path_buf),
+    };
+    (current, global_sessions_listing(dirs))
+}
+
+/// [`list_global_sessions`] as an owned [`SessionListing`] — the all-projects loader.
+fn global_sessions_listing(dirs: &ConfigDirs) -> SessionListing {
+    if dirs.session_dir_explicit {
+        // Pi's `listAll(sessionDir)` overload — an unfiltered single-directory scan.
+        SessionListing::Dir {
+            dir: dirs.session_dir.clone(),
+            cwd_filter: None,
+        }
+    } else {
+        SessionListing::AllProjects(SessionsRoot(dirs.session_dir.clone()))
+    }
+}
+
+/// Both [`session_scope_listings`] scanned to completion, on the calling thread. Only the tests
+/// want this: the picker streams the loaders instead.
+#[cfg(test)]
+pub(crate) fn gather_session_scopes(dirs: &ConfigDirs) -> (Vec<SessionInfo>, Vec<SessionInfo>) {
+    let (current, all) = session_scope_listings(dirs);
+    (current.run(None), all.run(None))
 }
 
 /// Scan the cwd's session listing and the global cross-project listing into [`SessionRef`]s (Pi

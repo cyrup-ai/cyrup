@@ -354,6 +354,7 @@ mod tests {
             name: "read".into(),
             arguments: args.clone().into(),
             thought_signature: None,
+            namespace: None,
         })];
         let json = serde_json::to_string(&serde_json::Value::Object(args)).unwrap();
         let expected = ceil_div(js_len("read") + js_len(&json));

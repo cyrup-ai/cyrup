@@ -621,11 +621,19 @@ pub fn render_run_script(
     script.push_str("#!/bin/sh\n");
     script.push_str("umask 077\n");
     script.push_str(&format!("rt={rt}\n"));
+    // HERDR-006: a cleanup that has already removed the runtime dir must stay removed. `run.sh`
+    // can start after it (a slow pane), and creating the dir's children would bring the whole
+    // tree back — so nothing below may create `$rt` or anything but its direct channel dirs, and
+    // none of it runs once `$rt` is gone. Upstream has no such script: its child is the Pi process
+    // itself, which owns no remote directory (`herdr-placed-run.ts` @v0.68.0).
+    script.push_str("[ -d \"$rt\" ] || exit 66\n");
     // The relay reads the pid to tell a child whose pane was closed (no `exit` will ever come)
     // from one that is still working; it is written BEFORE `started`.
     script.push_str("echo $$ > \"$rt/pid\"\n");
+    // One plain `mkdir` per level, parents first: unlike `mkdir -p` it cannot rebuild `$rt` if
+    // cleanup removes it between the guard above and here.
     script.push_str(&format!(
-        "mkdir -p \"$rt/{REMOTE_SUPERVISOR_DIR}/requests\" \"$rt/{REMOTE_SUPERVISOR_DIR}/replies\" \"$rt/{REMOTE_STEER_INBOX}\" \"$rt/{REMOTE_STEER_ACKS}\"\n"
+        "for d in {REMOTE_SUPERVISOR_DIR} {REMOTE_SUPERVISOR_DIR}/requests {REMOTE_SUPERVISOR_DIR}/replies {REMOTE_STEER_INBOX} {REMOTE_STEER_ACKS}; do [ -d \"$rt/$d\" ] || mkdir \"$rt/$d\" || exit 66; done\n"
     ));
     script.push_str(": > \"$rt/started\"\n");
     script.push_str(&format!(

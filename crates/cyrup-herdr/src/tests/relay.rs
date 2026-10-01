@@ -264,3 +264,174 @@ async fn a_lost_transport_is_unknown_and_a_foreign_run_is_refused() {
         )
     );
 }
+
+/// The remote relay shells under test: dash (`/bin/sh` here), and bash when it is installed —
+/// the script is written for any POSIX `sh`, and a machine's `sh` is whichever it ships.
+fn relay_shells() -> Vec<&'static str> {
+    ["/bin/sh", "/usr/bin/bash", "/bin/bash"]
+        .into_iter()
+        .filter(|shell| Path::new(shell).exists())
+        .collect()
+}
+
+/// HERDR-006: killing the local ssh client ends no remote command, so the relay's remote half
+/// outlives a run that was cleaned up — unless it notices that its runtime directory is gone.
+/// Here the "remote half" is started directly (as `sh -c`, exactly the command the ssh carries),
+/// against a child that never exits; the directory is then moved away the way the placed run's
+/// `REMOVE_SCRIPT` does, and the relay must end within two seconds (it polls every 200 ms), with
+/// the refusal status the script uses for a missing directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_remote_relay_ends_when_its_runtime_dir_is_removed() {
+    for shell in relay_shells() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = run_dir(dir.path(), "run-gone");
+        let mut child = start_child(&rt, "exec sleep 60");
+        let command = crate::remote::remote_shell_command(
+            crate::relay::RELAY_SCRIPT,
+            &[&rt.display().to_string(), "run-gone", "0"],
+        );
+        // The command is `sh -c '…' sh …`; run it under the shell being tested, `exec`ed so that
+        // the test's handle IS the relay (killing it on failure leaves nothing behind). stdout is
+        // a pipe held open by the test, so a broken pipe cannot end the loop by accident — the
+        // only thing left to end it is the directory check.
+        let mut remote = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(format!(
+                "exec {}",
+                command.replacen("sh -c", &format!("{shell} -c"), 1)
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // In its main loop once it has created its snapshot state file (`.relay-old.<its pid>`;
+        // the pid is the inner `sh`'s, not the `Child`'s, so look for the prefix).
+        let in_loop = |rt: &Path| {
+            std::fs::read_dir(rt)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".relay-old.")
+                })
+        };
+        for _ in 0..100 {
+            if in_loop(&rt) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(in_loop(&rt), "{shell}: the relay never reached its loop");
+
+        std::fs::rename(&rt, dir.path().join("removed")).unwrap();
+
+        let mut status = None;
+        for _ in 0..40 {
+            if let Some(done) = remote.try_wait().unwrap() {
+                status = Some(done);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = remote.kill();
+        let _ = remote.wait();
+        let _ = child.kill();
+        let _ = child.wait();
+        let status = status.unwrap_or_else(|| {
+            panic!("{shell}: the relay was still running 2 s after its runtime dir was removed")
+        });
+        assert_eq!(status.code(), Some(66), "{shell}: {status:?}");
+    }
+}
+
+/// The same check covers the wait for `started`: a run whose directory is removed before its child
+/// ever starts must not leave the relay counting down its 60 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_remote_relay_does_not_wait_out_the_start_deadline_for_a_removed_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = run_dir(dir.path(), "run-unstarted");
+    let command = crate::remote::remote_shell_command(
+        crate::relay::RELAY_SCRIPT,
+        &[&rt.display().to_string(), "run-unstarted", "0"],
+    );
+    let mut remote = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("exec {command}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        remote.try_wait().unwrap().is_none(),
+        "the relay waits for `started`"
+    );
+    std::fs::rename(&rt, dir.path().join("removed")).unwrap();
+    let mut status = None;
+    for _ in 0..40 {
+        if let Some(done) = remote.try_wait().unwrap() {
+            status = Some(done);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = remote.kill();
+    let _ = remote.wait();
+    assert_eq!(
+        status.expect("ended within 2 s").code(),
+        Some(66),
+        "the start wait ends on a removed dir"
+    );
+}
+
+/// HERDR-006: an upload never builds a runtime directory. Delivering into a channel of a removed
+/// run fails (and stays queued locally for the next poll) and leaves nothing behind on the
+/// machine; the same upload into a run that has its channel dir is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upload_into_a_removed_run_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = run_dir(dir.path(), "run-upload");
+    let outbox = dir.path().join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    std::fs::write(outbox.join("r1.json"), "\"yes\"").unwrap();
+    let mirror = UpMirror {
+        local: outbox.clone(),
+        remote: "supervisor/replies".to_string(),
+    };
+    let relay = RunRelay::new(
+        fake_ssh(dir.path(), None),
+        "me@box",
+        rt.display().to_string(),
+        "run-upload",
+    );
+
+    // The run is cleaned up, then the parent's reply is uploaded.
+    std::fs::rename(&rt, dir.path().join("removed")).unwrap();
+    relay.upload_dir(&mirror).await;
+    assert!(
+        !rt.exists(),
+        "the upload recreated the removed runtime dir: {:?}",
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        outbox.join("r1.json").exists(),
+        "a failed upload stays queued for the next poll"
+    );
+
+    // Control: a live run with its channel dir receives it, atomically, and the outbox drains.
+    std::fs::rename(dir.path().join("removed"), &rt).unwrap();
+    relay.upload_dir(&mirror).await;
+    assert_eq!(
+        std::fs::read_to_string(rt.join("supervisor/replies/r1.json")).unwrap(),
+        "\"yes\""
+    );
+    assert!(!outbox.join("r1.json").exists());
+}
