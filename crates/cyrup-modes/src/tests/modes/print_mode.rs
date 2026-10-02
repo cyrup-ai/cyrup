@@ -203,3 +203,166 @@ async fn print_mode_aborted_turn_without_message_uses_the_request_reason_fallbac
         "an aborted turn without an error_message falls back to `Request aborted` (G4)"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// SEAM-137 — a prompt an extension command services starts no run, so print mode must not wait
+// for one.
+// ---------------------------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use super::support::build_runtime_with_ext;
+use cyrup_core::ExtensionId;
+use cyrup_ext::{
+    CommandDescriptor, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
+};
+
+/// How long a print run may take before the test calls it a hang. The runs here are in-memory and
+/// finish in milliseconds; the pre-fix loop never finished at all.
+const HANG_DEADLINE: Duration = Duration::from_secs(20);
+
+/// A native extension whose `/ping` command handles the submission and starts no run (pi
+/// `_tryExecuteExtensionCommand`, agent-session.ts:1004-1013, which returns before any prompt is
+/// sent). `calls` counts how often the handler ran.
+struct PingExt {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for PingExt {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("ping-ext")
+    }
+
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.register_command(
+            "ping",
+            CommandDescriptor {
+                description: "handled by the extension, starts no run".into(),
+                completions: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+
+    async fn execute_command(
+        &self,
+        _name: &str,
+        _args: &str,
+        _ctx: &HostCtx,
+    ) -> Result<Option<String>, ExtError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(String::new()))
+    }
+}
+
+/// Drive `run_print` under [`HANG_DEADLINE`], returning its exit code and the bytes it wrote.
+async fn run_print_bounded(
+    runtime: &cyrup_session_svc::AgentSessionRuntime,
+    messages: Vec<UserInput>,
+) -> (i32, String, String) {
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let code = tokio::time::timeout(
+        HANG_DEADLINE,
+        run_print(
+            runtime,
+            messages,
+            &mut out,
+            &mut err,
+            PrintOptions::default(),
+        ),
+    )
+    .await
+    .expect("print mode hung: a prompt an extension command handled never settles a run")
+    .expect("print mode runs");
+    (
+        code,
+        String::from_utf8(out).expect("utf8 stdout"),
+        String::from_utf8(err).expect("utf8 stderr"),
+    )
+}
+
+/// `cyrup -p "/ping"`: the command runs, nothing is printed, the exit code is pi's 0, and the mode
+/// RETURNS. Pi's `await session.prompt(...)` resolves as soon as the command's handler has
+/// (print-mode.ts:121-127); cyrup used to drain the run-scoped stream, which for a handled prompt
+/// is never closed — so `cyrup -p "/mcp"` and `cyrup -p "/llama"` ran until killed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prompt_an_extension_command_handles_does_not_hang_print_mode() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = build_runtime_with_ext(
+        &fx,
+        faux,
+        Arc::new(PingExt {
+            calls: Arc::clone(&calls),
+        }),
+    )
+    .await;
+
+    let (code, out, err) =
+        run_print_bounded(&runtime, vec![UserInput::text("/ping", InputSource::Cli)]).await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the command handler ran once"
+    );
+    assert_eq!(
+        code, 0,
+        "a handled command is not a failed turn (print-mode.ts:35)"
+    );
+    assert!(out.is_empty(), "a handled command prints nothing:\n{out}");
+    assert!(
+        err.is_empty(),
+        "a handled command writes nothing to stderr:\n{err}"
+    );
+}
+
+/// The send loop CONTINUES after a handled prompt: a command followed by an ordinary prompt still
+/// runs that prompt to completion and prints its final assistant message. This pins that the fix
+/// skips only the settle wait, not the rest of the loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_send_loop_continues_after_a_handled_prompt() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("answer after the command")],
+        StopReason::Stop,
+    )]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = build_runtime_with_ext(
+        &fx,
+        faux,
+        Arc::new(PingExt {
+            calls: Arc::clone(&calls),
+        }),
+    )
+    .await;
+
+    let (code, out, _err) = run_print_bounded(
+        &runtime,
+        vec![
+            UserInput::text("/ping", InputSource::Cli),
+            UserInput::text("what now?", InputSource::Cli),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the command handler ran once"
+    );
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("answer after the command"),
+        "the prompt after the command must still run and print:\n{out}"
+    );
+}

@@ -95,6 +95,7 @@ mod list_models_overlay;
 mod one_shot_parity;
 mod package_update_check;
 mod piped_stdin_trim;
+mod print_extension_command;
 /// Real `SIGTERM`/`SIGHUP` delivery. The predicate was this file's own `#![cfg(unix)]` before the
 /// move; it lives here now so the inventory shows what is conditional.
 #[cfg(unix)]

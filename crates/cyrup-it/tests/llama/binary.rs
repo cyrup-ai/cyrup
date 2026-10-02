@@ -420,9 +420,9 @@ fn is_llama_warning(event: &Value) -> bool {
 /// `if (ctx.mode !== "tui") { ctx.ui.notify("/llama is available in interactive mode", "warning");
 /// return; }`). RPC mode is where a non-interactive notification is observable: print and json
 /// modes bind no UI and pi's `notify` there is a no-op, so there is nothing to read there. (A
-/// prompt that is only a slash command also left `--mode print` running past 60 s when this was
-/// tried by hand, with `/mcp` as well as `/llama`: a host defect, not an llama.cpp one, recorded in
-/// the lane report.)
+/// prompt that is only a slash command used to leave `--mode print` running forever, `/mcp` as well
+/// as `/llama`: a host defect, not a llama.cpp one, fixed as `SEAM-137`; its tests are
+/// `print_extension_command` in the `bin` target.)
 ///
 /// The command is consumed by the extension, so the model never sees it: no agent run starts.
 #[test]

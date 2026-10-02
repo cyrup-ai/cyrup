@@ -5,6 +5,18 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-02 — `SEAM-137` closed (print mode no longer hangs on a prompt an extension command handles)
+
+> **This block sits above the 2026-10-01 block and corrects its counts by one row.** The count is
+> whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints: on 2026-10-02 it prints
+> **84 open: 0 critical, 0 high, 0 medium, 84 low; 12 trackers; 823 closed** (the 2026-10-01 block:
+> 85 open, 1 medium, 822 closed). Arithmetic: 85 − 1 (`SEAM-137`) = 84; closed 822 + 1 = 823. No row was
+> filed. **There is no medium row left open.** The fix is `crates/cyrup-modes/src/print.rs` (the
+> handled-prompt guard `json.rs` already had); the evidence, including the red run against the pre-fix
+> binary, is in the `SEAM-137` row of `08-cyrup-session-svc-and-modes.md`.
+
+---
+
 # UPDATE 2026-10-01 — `EXT-027` and `DRIFT-032` closed (the llama.cpp port); `EXT-022` split; 38 rows filed that the port left open
 
 > **Read this block first; it sits above the fourteenth edition and corrects its counts.** It is a
@@ -16,7 +28,7 @@ next work item**.
 > `04` 0, `05` 4, `06` 22, `07` 17, `08` 10, `09` 2, `09b` 8, `10` 1, `11` 0, `12` 1, `14` 0, `16` 0,
 > `17` 0, `09a` 1. Arithmetic: 48 − 1 (`EXT-027`) + 38 filed = 85; closed 820 + 2 (`EXT-027`,
 > `DRIFT-032`) = 822; trackers 12 + 1 (`EXT-102`) − 1 (`DRIFT-032`, closed, so no longer a tracker row
-> the script counts) = 12. The one medium is `SEAM-137` (below).
+> the script counts) = 12. The one medium was `SEAM-137` (below; closed 2026-10-02, see the block above).
 >
 > ## Closed
 >
