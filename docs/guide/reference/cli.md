@@ -351,7 +351,8 @@ checking whether the value names an existing file. Multiple `--append-system-pro
 joined with a blank line.
 
 `--no-extensions` also turns off installed-package extensions and the three native extensions
-(subagents, the permission system, intercom). `-e` paths survive it. Relative resource paths resolve
+(subagents, the permission system, intercom), and removes the built-in [llama.cpp](../llama-cpp.md)
+provider and its `/llama` command. `-e` paths survive it. Relative resource paths resolve
 against the current directory.
 
 ```sh

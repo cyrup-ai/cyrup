@@ -11,6 +11,18 @@
 //! `auth-storage.ts:45+`) — a cross-process lock plus an atomic replace at 0600. So does this, via
 //! the sidecar-lock + temp-and-rename pair `crate::auth` already uses.
 //!
+//! # Classifier models (EXT-027)
+//!
+//! Pi persists a provider's chat models AND its classifier models in the entry's ONE `models` array
+//! (`ModelsStoreEntry.models: readonly AnyModel[]`, `models-store.ts:3-5` @v0.99.2-17; the llama.cpp
+//! provider writes `[...refreshed, ...refreshedClassifiers]`, `extensions/llama/provider.ts:251-253`).
+//! The file keeps exactly that shape: a classifier model is a member whose `type` is `"classifier"`
+//! (a chat model has no `type`). The two halves of the [`ModelsStore`] trait stay independent of one
+//! another, because `cyrup-provider`'s typed [`ModelsStoreEntry`] carries chat models only: `write`
+//! replaces the chat members and leaves the classifier members where they are,
+//! `write_classifier_models` does the converse, and `read` hands back the chat members alone. A file
+//! written before classifier models existed has no such member and reads as it always did.
+//!
 //! # Failure posture
 //!
 //! READS degrade, WRITES report. A missing file, a truncated file, a file full of JSON that is not
@@ -29,6 +41,7 @@
 
 use std::path::{Path, PathBuf};
 
+use cyrup_provider::ClassifierModel;
 use cyrup_provider::error::ProviderError;
 use cyrup_provider::models_store::{ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions};
 
@@ -116,6 +129,12 @@ impl<'de> serde::Deserialize<'de> for OrderedObject {
         }
         deserializer.deserialize_map(V)
     }
+}
+
+/// Whether a `models` array member is a classifier model (`type: "classifier"`, `ClassifierModel`'s
+/// wire tag); a chat model carries no `type`.
+fn is_classifier_member(model: &serde_json::Value) -> bool {
+    model.get("type").and_then(serde_json::Value::as_str) == Some("classifier")
 }
 
 /// The file name Pi uses, resolved beside `models.json` (`model-runtime.ts:141-144`,
@@ -275,6 +294,18 @@ impl FileModelsStore {
         if let Some(data) = self.current_snapshot() {
             return Ok(data);
         }
+        // No file, nothing to read, and nothing to lock against: a reader must not create the
+        // `<path>.lock` sidecar (which `FileLock` never unlinks) in an agent directory that has
+        // never held a catalog. Every session build restores the extension providers' stored
+        // catalogs, so without this a plain session that stores nothing would still create the
+        // sidecar, and take the cross-process lock, on every start. A writer creates the file under
+        // the lock, so a reader that races it sees the file on its next read.
+        if matches!(
+            std::fs::metadata(&self.path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return Ok(OrderedObject::default());
+        }
         // The lock is advisory and cross-process: a concurrent `cyrup update --models` in another
         // terminal must not be observed mid-rename. A lock we could not take is not a degraded
         // read — it is an unserialized one, so it reaches the caller rather than being `.ok()`-ed.
@@ -308,6 +339,20 @@ impl FileModelsStore {
         }
     }
 
+    /// The members of `entry`'s `models` array, by kind, as raw JSON: `(chat, classifier)`.
+    fn members(entry: &serde_json::Value) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        entry
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .map(|models| {
+                models
+                    .iter()
+                    .cloned()
+                    .partition(|model| !is_classifier_member(model))
+            })
+            .unwrap_or_default()
+    }
+
     fn write_all(&self, entries: &OrderedObject) -> Result<(), crate::error::ConfigError> {
         // `JSON.stringify(current, null, 2)` (models-store.ts:130, `:141`) in FILE order — CFG-042 —
         // plus the trailing newline every other cyrup config file gets (upstream writes none).
@@ -336,9 +381,18 @@ impl ModelsStore for FileModelsStore {
         // across the two checks and a caller can give up inside it. Nothing is returned to a
         // caller that has already given up.
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
-        Ok(latest
-            .get(provider_id)
-            .and_then(|v| serde_json::from_value::<ModelsStoreEntry>(v.clone()).ok()))
+        Ok(latest.get(provider_id).and_then(|value| {
+            // The chat half only: a classifier member is not a chat `Model`, and one of them left
+            // in the array would fail the whole entry's typed conversion.
+            let mut value = value.clone();
+            let (chat, _) = Self::members(&value);
+            if let Some(object) = value.as_object_mut()
+                && object.contains_key("models")
+            {
+                object.insert("models".to_string(), serde_json::Value::Array(chat));
+            }
+            serde_json::from_value::<ModelsStoreEntry>(value).ok()
+        }))
     }
 
     async fn write(
@@ -364,8 +418,20 @@ impl ModelsStore for FileModelsStore {
         // returned `Ok(())`, telling the caller a catalog update had persisted when nothing was
         // written. `store_err` takes a `ConfigError`, so the serde error is carried through
         // `ConfigError::Serde` (error.rs:52) rather than dropped.
-        let value = serde_json::to_value(&entry)
+        let mut value = serde_json::to_value(&entry)
             .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
+        // The classifier models already stored stay: `write` replaces the chat half only
+        // (`write_classifier_models` owns the other).
+        let kept = all
+            .get(provider_id)
+            .map_or_else(Vec::new, |stored| Self::members(stored).1);
+        if !kept.is_empty()
+            && let Some(models) = value
+                .get_mut("models")
+                .and_then(serde_json::Value::as_array_mut)
+        {
+            models.extend(kept);
+        }
         all.insert(provider_id.to_string(), value);
         self.write_all(&all).map_err(store_err)?;
         // `if (latest) this.updateReadState(this.readState, latest)` (models-store.ts:134).
@@ -389,6 +455,99 @@ impl ModelsStore for FileModelsStore {
             self.write_all(&all).map_err(store_err)?;
             self.update_read_state(&all, None);
         }
+        Ok(())
+    }
+
+    /// Replace the chat members AND the classifier members of the provider's `models` array in ONE
+    /// locked read-modify-write of the file (pi's single `write({ models: [...] })`,
+    /// `extensions/llama/provider.ts:251-253`): the file holds either the old pair or the new one,
+    /// never new chat models beside old classifier models.
+    async fn write_with_classifiers(
+        &self,
+        provider_id: &str,
+        entry: ModelsStoreEntry,
+        classifiers: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        let _guard =
+            crate::lock::FileLock::acquire(&self.path, options.and_then(|o| o.signal.as_ref()))
+                .await
+                .map_err(store_err)?;
+        let mut all = self.read_all();
+        let mut value = serde_json::to_value(&entry)
+            .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
+        let classifier_members = classifiers
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
+        if let Some(models) = value
+            .get_mut("models")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            models.extend(classifier_members);
+        }
+        all.insert(provider_id.to_string(), value);
+        self.write_all(&all).map_err(store_err)?;
+        self.update_read_state(&all, None);
+        Ok(())
+    }
+
+    /// The `type: "classifier"` members of the provider's `models` array (`models-store.ts:3-5`
+    /// @v0.99.2-17). A member that is not a well-formed classifier model is skipped, like a
+    /// malformed provider entry in [`Self::read`]: the cache degrades, it does not fail a start.
+    async fn read_classifier_models(
+        &self,
+        provider_id: &str,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<Vec<ClassifierModel>, ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        let latest = self.read_latest(options).await.map_err(store_err)?;
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        Ok(latest
+            .get(provider_id)
+            .map(|stored| Self::members(stored).1)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|member| serde_json::from_value::<ClassifierModel>(member).ok())
+            .collect())
+    }
+
+    /// Replace the classifier members of the provider's `models` array, leaving its chat members
+    /// and the entry's other fields as they are; an empty list removes them. Nothing is created for
+    /// an empty list when the provider has no entry. A non-empty list for a provider with no entry
+    /// creates one holding only those members, which reads back as an entry with no chat models.
+    async fn write_classifier_models(
+        &self,
+        provider_id: &str,
+        models: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        let _guard =
+            crate::lock::FileLock::acquire(&self.path, options.and_then(|o| o.signal.as_ref()))
+                .await
+                .map_err(store_err)?;
+        let mut all = self.read_all();
+        let classifiers = models
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
+        let mut entry = match all.get(provider_id) {
+            Some(stored) if stored.is_object() => stored.clone(),
+            _ if classifiers.is_empty() => return Ok(()),
+            _ => serde_json::json!({}),
+        };
+        let (mut members, _) = Self::members(&entry);
+        members.extend(classifiers);
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("models".to_string(), serde_json::Value::Array(members));
+        }
+        all.insert(provider_id.to_string(), entry);
+        self.write_all(&all).map_err(store_err)?;
+        self.update_read_state(&all, None);
         Ok(())
     }
 }
@@ -833,6 +992,49 @@ mod tests {
         // still reads the value written before the abort.
         assert_eq!(
             FileModelsStore::new(&path)
+                .read("groq", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
+            Some("\"v1\"")
+        );
+    }
+    /// Every session build restores the extension providers' stored catalogs, which READS this
+    /// store. A read of a store that does not exist yet must neither create the file nor the
+    /// `<path>.lock` sidecar (`FileLock` never unlinks it): a plain session that stores no catalog
+    /// would otherwise leave the sidecar in its agent directory on every start, and concurrent
+    /// subagent children would contend on a lock there is nothing to protect.
+    ///
+    /// **Red** if the read locks before it looks: the sidecar appears.
+    #[tokio::test]
+    async fn reading_a_store_that_does_not_exist_creates_no_lock_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_STORE_FILE_NAME);
+        let store = FileModelsStore::new(&path);
+
+        assert!(store.read("groq", None).await.unwrap().is_none());
+        assert!(
+            store
+                .read_classifier_models("groq", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(!path.exists(), "a read creates no store file");
+        assert!(
+            !dir.path()
+                .join(format!("{MODELS_STORE_FILE_NAME}.lock"))
+                .exists(),
+            "a read of a store that is not there takes no lock"
+        );
+
+        // Once a writer has created it, the same store reads it back as before.
+        store.write("groq", entry("\"v1\""), None).await.unwrap();
+        assert_eq!(
+            store
                 .read("groq", None)
                 .await
                 .unwrap()

@@ -15,6 +15,7 @@
 //! vendor-neutral `packages/ai` layer (here), while the locked, on-disk `FileModelsStore` lives in
 //! the agent layer (here: `cyrup-config`, which owns `FileLock`/`write_atomic`).
 
+use crate::classifier::ClassifierModel;
 use crate::error::ProviderError;
 use crate::model::Model;
 use cyrup_core::CancelToken;
@@ -116,6 +117,77 @@ pub trait ModelsStore: Send + Sync {
         provider_id: &str,
         options: Option<&ModelsStoreOperationOptions>,
     ) -> Result<(), ProviderError>;
+
+    /// The classifier models persisted for `provider_id` (the `type: "classifier"` members of
+    /// pi's one `models` array, `ModelsStoreEntry.models: readonly AnyModel[]`, `models-store.ts:3-5`
+    /// @v0.99.2-17; restored by `extensions/llama/provider.ts:203-221`). Empty when none were
+    /// written, which is also every store file that predates classifier models.
+    ///
+    /// **A store that does not override this and [`ModelsStore::write_classifier_models`] holds no
+    /// classifier models**, and says so on write rather than dropping them silently. A store that
+    /// does persist them also removes them in [`ModelsStore::delete`].
+    ///
+    /// **Why this is a pair of methods and not a `classifier_models` field on
+    /// [`ModelsStoreEntry`] (pi's single merged array).** The entry is built as a struct literal
+    /// of exactly its four members at every existing call site; a fifth member is not source
+    /// compatible with any of them, and those files belong to other owners. The sibling methods
+    /// persist the same data without touching a literal, and
+    /// [`ModelsStore::write_with_classifiers`] writes both halves as the one operation pi's single
+    /// array is. Folding them into one entry type remains an open EXT-027 follow-up.
+    async fn read_classifier_models(
+        &self,
+        _provider_id: &str,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<Vec<ClassifierModel>, ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        Ok(Vec::new())
+    }
+
+    /// Replace the chat entry AND the classifier models of `provider_id` as one operation: pi's one
+    /// `write({ models: [...refreshed, ...refreshedClassifiers] })` of one array
+    /// (`extensions/llama/provider.ts:251-253`). A store that persists both overrides this to write
+    /// them together, so no reader (this process after a crash, another process, the next restore)
+    /// can see the new chat models beside the old classifier models.
+    ///
+    /// The default composes the two independent writes, classifier half FIRST: a store that cannot
+    /// persist classifier models refuses a non-empty list (see
+    /// [`ModelsStore::write_classifier_models`]) before anything is written, instead of failing after
+    /// the chat half has already been replaced. It is NOT atomic across the two writes; a store whose
+    /// medium can do better must override it.
+    async fn write_with_classifiers(
+        &self,
+        provider_id: &str,
+        entry: ModelsStoreEntry,
+        classifiers: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        self.write_classifier_models(provider_id, classifiers, options)
+            .await?;
+        self.write(provider_id, entry, options).await
+    }
+
+    /// Replace the classifier models persisted for `provider_id`; an empty list clears them.
+    /// Independent of [`ModelsStore::write`]: neither call touches what the other wrote (pi's one
+    /// `write` replaces the whole array, so a caller persisting both writes both, ideally through
+    /// [`ModelsStore::write_with_classifiers`]).
+    ///
+    /// The default reports [`ProviderError::ModelSource`] for a non-empty list, because a store
+    /// without classifier support has nowhere to put it. Callers on the refresh path treat a store
+    /// failure as "not cached" (see the trait doc), which is the correct reading here too.
+    async fn write_classifier_models(
+        &self,
+        _provider_id: &str,
+        models: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        if models.is_empty() {
+            return Ok(());
+        }
+        Err(ProviderError::ModelSource(
+            "this models store does not persist classifier models".into(),
+        ))
+    }
 }
 
 /// A [`ModelsStore`] narrowed to a single provider id (Pi `ProviderModelsStore`,
@@ -168,6 +240,39 @@ impl ProviderModelsStore {
     ) -> Result<(), ProviderError> {
         self.store.delete(&self.provider_id, options).await
     }
+
+    /// [`ModelsStore::read_classifier_models`] for this provider.
+    pub async fn read_classifier_models(
+        &self,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<Vec<ClassifierModel>, ProviderError> {
+        self.store
+            .read_classifier_models(&self.provider_id, options)
+            .await
+    }
+
+    /// [`ModelsStore::write_with_classifiers`] for this provider.
+    pub async fn write_with_classifiers(
+        &self,
+        entry: ModelsStoreEntry,
+        classifiers: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        self.store
+            .write_with_classifiers(&self.provider_id, entry, classifiers, options)
+            .await
+    }
+
+    /// [`ModelsStore::write_classifier_models`] for this provider.
+    pub async fn write_classifier_models(
+        &self,
+        models: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        self.store
+            .write_classifier_models(&self.provider_id, models, options)
+            .await
+    }
 }
 
 /// Process-local store (Pi `InMemoryModelsStore`, `models-store.ts:30-45`). Used by tests and by
@@ -176,6 +281,7 @@ impl ProviderModelsStore {
 #[derive(Default)]
 pub struct InMemoryModelsStore {
     entries: Mutex<BTreeMap<String, ModelsStoreEntry>>,
+    classifiers: Mutex<BTreeMap<String, Vec<ClassifierModel>>>,
 }
 
 impl InMemoryModelsStore {
@@ -232,6 +338,63 @@ impl ModelsStore for InMemoryModelsStore {
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
         if let Ok(mut g) = self.entries.lock() {
             g.remove(provider_id);
+        }
+        // Pi's `entries.delete` removes the whole entry, classifier models included.
+        if let Ok(mut g) = self.classifiers.lock() {
+            g.remove(provider_id);
+        }
+        Ok(())
+    }
+
+    async fn write_with_classifiers(
+        &self,
+        provider_id: &str,
+        entry: ModelsStoreEntry,
+        classifiers: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        // Both maps are replaced while both locks are held, so a reader never sees the new chat
+        // entry with the old classifier models (or the reverse).
+        if let (Ok(mut entries), Ok(mut stored)) = (self.entries.lock(), self.classifiers.lock()) {
+            entries.insert(provider_id.to_string(), entry);
+            if classifiers.is_empty() {
+                stored.remove(provider_id);
+            } else {
+                stored.insert(provider_id.to_string(), classifiers);
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_classifier_models(
+        &self,
+        provider_id: &str,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<Vec<ClassifierModel>, ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        Ok(self
+            .classifiers
+            .lock()
+            .ok()
+            .and_then(|g| g.get(provider_id).cloned())
+            .unwrap_or_default())
+    }
+
+    async fn write_classifier_models(
+        &self,
+        provider_id: &str,
+        models: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        // Checked BEFORE the map is touched, like [`ModelsStore::write`] above.
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        if let Ok(mut g) = self.classifiers.lock() {
+            if models.is_empty() {
+                g.remove(provider_id);
+            } else {
+                g.insert(provider_id.to_string(), models);
+            }
         }
         Ok(())
     }

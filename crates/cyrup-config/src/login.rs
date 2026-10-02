@@ -26,6 +26,9 @@
 //! | [`start_provider_login`] | `.../interactive-mode.ts:4937-4945` |
 //! | [`resolve_auth_type_selector`] | `.../interactive-mode.ts:4947-4970` (`showLoginAuthTypeSelector`) |
 //! | [`provider_selector_empty_message`] | `.../interactive-mode.ts:5006-5016` |
+//! | [`live_provider_auth_check`] | `packages/ai/src/models.ts:504-517` (`Models.checkAuth`), for an extension's provider @v0.99.2-17 |
+//! | [`live_provider_auth_status`] | `.../model-runtime.ts:428-437`, with `snapshot.auth` from `:334-362` |
+//! | [`resolve_provider_auth_for`] | `.../model-registry.ts:180` (`getProviderAuth`) → `model-runtime.ts:547-553` |
 //!
 //! ## Mechanism divergences (behaviour is the upstream one)
 //!
@@ -781,6 +784,210 @@ pub async fn logout(store: &dyn LoginStore, provider_id: &ProviderId) -> Result<
             provider: provider_id.as_str().to_string(),
             message,
         })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Extension (live) providers
+//
+// pi's `ModelRuntime` composes a native extension's provider into the SAME `Models` collection the
+// built-ins live in (`nativeExtensionProviders.get(id)`, `core/model-runtime.ts:298` @v0.99.2-17), so
+// `/login`, `getProviderAuthStatus`, `checkAuth` and `getAuth` answer for it exactly as they do for
+// a built-in: through the provider's OWN `auth` strategy against the one credential store. cyrup
+// keeps the built-ins in `cyrup_provider::all_providers()` and a live provider in the session's
+// registry, so these helpers are the strategy-driven half of `provider_auth_status` that a
+// provider outside the built-in id table needs.
+// ---------------------------------------------------------------------------------------------
+
+/// The ambient [`cyrup_provider::AuthContext`] of an [`AuthStore`]: pi's `authContext` is the one object the
+/// runtime hands every strategy's `ctx.env(...)` (`core/model-runtime.ts`), and cyrup's equivalent
+/// is the environment tier the store already carries — the process environment, or the fixed map
+/// [`AuthStore::with_ambient_env`] pins. Reading the SAME tier as [`provider_auth_status`] keeps a
+/// strategy's `LLAMA_BASE_URL` lookup and the status line from disagreeing.
+///
+/// A blank value is absent and the value returned is not trimmed, as in
+/// [`cyrup_provider::EnvAuthContext`] (pi `auth/context.ts:24-25`).
+pub struct StoreAuthContext(pub std::sync::Arc<AuthStore>);
+
+#[async_trait::async_trait]
+impl cyrup_provider::AuthContext for StoreAuthContext {
+    async fn env(&self, name: &str) -> Option<String> {
+        let value = match self.0.ambient_tier() {
+            crate::env_keys::Ambient::Process => std::env::var(name).ok(),
+            crate::env_keys::Ambient::Fixed(map) => map.get(name).cloned(),
+        };
+        value.filter(|v| !v.trim().is_empty())
+    }
+
+    async fn file_exists(&self, path: &str) -> bool {
+        cyrup_provider::AuthContext::file_exists(&cyrup_provider::EnvAuthContext, path).await
+    }
+}
+
+/// The credential store with the runtime `--api-key` overlaid (pi `RuntimeCredentials`,
+/// `core/runtime-credentials.ts:5-28`): `read` answers the runtime key as an api-key credential
+/// when one is set, else the stored credential; every other operation is the store's.
+struct RuntimeKeyCredentials(std::sync::Arc<AuthStore>);
+
+#[async_trait::async_trait]
+impl cyrup_provider::CredentialStore for RuntimeKeyCredentials {
+    async fn read(
+        &self,
+        provider: &ProviderId,
+    ) -> Result<Option<cyrup_provider::Credential>, cyrup_provider::AuthError> {
+        if let Some(key) = self.0.runtime_api_key(provider) {
+            return Ok(Some(cyrup_provider::Credential::ApiKey {
+                key: Some(key),
+                env: None,
+            }));
+        }
+        cyrup_provider::CredentialStore::read(self.0.as_ref(), provider).await
+    }
+
+    async fn list(&self) -> Result<Vec<cyrup_provider::CredentialInfo>, cyrup_provider::AuthError> {
+        cyrup_provider::CredentialStore::list(self.0.as_ref()).await
+    }
+
+    async fn modify(
+        &self,
+        provider: &ProviderId,
+        f: cyrup_provider::ModifyFn,
+    ) -> Result<Option<cyrup_provider::Credential>, cyrup_provider::AuthError> {
+        cyrup_provider::CredentialStore::modify(self.0.as_ref(), provider, f).await
+    }
+
+    async fn delete(&self, provider: &ProviderId) -> Result<(), cyrup_provider::AuthError> {
+        cyrup_provider::CredentialStore::delete(self.0.as_ref(), provider).await
+    }
+}
+
+/// A minimal [`cyrup_provider::Model`] naming `provider`, for resolving a provider's auth when it
+/// has no catalog row to resolve against.
+///
+/// pi's `resolve` takes no model (`auth/types.ts`), but cyrup's
+/// [`cyrup_provider::ApiKeyAuth::resolve`] does — Cloudflare reads `model.base_url` — and a live
+/// provider whose catalog has not been listed yet (llama.cpp before its first `/llama` list) has
+/// none. The env-key, keyless and llama strategies read only the provider identity.
+pub fn auth_probe_model(provider: &ProviderId) -> cyrup_provider::Model {
+    cyrup_provider::Model {
+        id: provider.as_str().into(),
+        name: provider.as_str().to_string(),
+        api: cyrup_provider::known_api::OPENAI_COMPLETIONS.into(),
+        provider: provider.clone(),
+        base_url: String::new(),
+        reasoning: false,
+        input: vec![cyrup_provider::Modality::Text],
+        cost: cyrup_provider::ModelCost::default(),
+        context_window: 0,
+        max_tokens: 0,
+        sampling_params: None,
+        thinking_level_map: None,
+        compat: None,
+        headers: None,
+    }
+}
+
+/// `Models.checkAuth(providerId)` (`ai/src/models.ts:504-517`) for ONE provider over the file
+/// store: the provider's own strategy decides, and `Ok(None)` is "not configured".
+///
+/// Delegates to [`cyrup_provider::Models::check_auth`] — the port of exactly that function — over a
+/// one-provider collection, so the `check` hook (llama.cpp: "active only when a URL is known, from a
+/// stored credential or `LLAMA_BASE_URL`", `extensions/llama/provider.ts:181-186`) is consulted at
+/// pi's position and instead of resolution. A failure propagates, as upstream's
+/// `ModelsError("auth", …)` does.
+///
+/// The credentials the check sees are the store WITH its runtime `--api-key` overlaid, as pi's
+/// `RuntimeCredentials` wraps the store (`core/runtime-credentials.ts`): a provider given a key on
+/// the command line has a credential for its strategy to resolve, so the availability the
+/// `/model` selector reports agrees with the status row [`live_provider_auth_status`] shows.
+pub async fn live_provider_auth_check(
+    store: &std::sync::Arc<AuthStore>,
+    provider: &std::sync::Arc<dyn cyrup_provider::Provider>,
+) -> Result<Option<cyrup_provider::collection::AuthCheck>, cyrup_provider::ProviderError> {
+    let credentials: std::sync::Arc<dyn cyrup_provider::CredentialStore> =
+        std::sync::Arc::new(RuntimeKeyCredentials(store.clone()));
+    let mut models = cyrup_provider::create_models(cyrup_provider::CreateModelsOptions {
+        credentials: Some(credentials),
+        auth_context: Some(std::sync::Arc::new(StoreAuthContext(store.clone()))),
+        catalog_overlay: None,
+    });
+    models.set_provider(provider.clone());
+    models.check_auth(provider.id().as_str()).await
+}
+
+/// `ModelRuntime.getProviderAuthStatus` (`core/model-runtime.ts:428-437`) for a provider whose
+/// "environment" tier is its own strategy's check rather than the `env_keys` table:
+///
+/// ```ts
+/// if (this.credentials.hasRuntimeApiKey(providerId)) return { configured: true, source: "runtime" };
+/// if (this.snapshot.storedProviders.has(providerId)) return { configured: true, source: "stored" };
+/// const check = this.snapshot.auth.get(providerId);
+/// return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
+/// ```
+///
+/// `snapshot.auth` is filled from `models.checkAuth` (`:334-362`), which is
+/// [`live_provider_auth_check`]. A failing check reads as unconfigured here: pi records the failure
+/// on `getError()` and leaves the provider out of `snapshot.auth`.
+pub async fn live_provider_auth_status(
+    store: &std::sync::Arc<AuthStore>,
+    provider: &std::sync::Arc<dyn cyrup_provider::Provider>,
+) -> AuthStatus {
+    let id = provider.id();
+    if store.runtime_api_key(id).is_some() {
+        return AuthStatus {
+            configured: true,
+            source: Some(AuthSource::Runtime),
+            label: None,
+        };
+    }
+    if matches!(store.list(), Ok(ids) if ids.iter().any(|stored| stored == id.as_str())) {
+        return AuthStatus {
+            configured: true,
+            source: Some(AuthSource::Stored),
+            label: None,
+        };
+    }
+    match live_provider_auth_check(store, provider).await {
+        Ok(Some(check)) => AuthStatus {
+            configured: true,
+            source: Some(AuthSource::Environment),
+            label: check.source,
+        },
+        Ok(None) | Err(_) => AuthStatus {
+            configured: false,
+            source: None,
+            label: None,
+        },
+    }
+}
+
+/// `ModelRuntime.getAuth(providerId)` (`core/model-runtime.ts:547-553`, reached by
+/// `ModelRegistry.getProviderAuth`, `core/model-registry.ts:180`): the request auth the provider's
+/// strategy resolves for the stored credential, falling back to the ambient environment, with
+/// `Ok(None)` for "not configured".
+///
+/// pi's `resolve` is provider-scoped; cyrup's takes a model, so the provider's first catalog row
+/// stands in, or [`auth_probe_model`] when it has none (see there).
+pub async fn resolve_provider_auth_for(
+    store: &std::sync::Arc<AuthStore>,
+    provider: &dyn cyrup_provider::Provider,
+) -> Result<Option<cyrup_provider::AuthResult>, cyrup_provider::ProviderError> {
+    let Some(auth) = provider.provider_auth() else {
+        return Ok(None);
+    };
+    let subject = provider
+        .models()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| auth_probe_model(provider.id()));
+    Ok(cyrup_provider::resolve_provider_auth(
+        provider.id(),
+        auth,
+        &subject,
+        store.as_ref(),
+        &StoreAuthContext(store.clone()),
+        cyrup_provider::AuthOverrides::default(),
+    )
+    .await?)
 }
 
 #[cfg(test)]

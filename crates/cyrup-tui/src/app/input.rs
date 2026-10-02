@@ -201,6 +201,14 @@ impl<B: Backend> App<B> {
                 }
             }
             InputEvent::Paste(s) => {
+                // The topmost floating overlay captures input first, exactly as it does for a key
+                // (the `handle_overlay_key` check above; pi hands the focused overlay the raw
+                // terminal data, bracketed-paste markers and all, `tui.ts:892-897`). Without this a
+                // paste into the overlay's text field (the `/llama` Hugging Face search) would land
+                // in the editor underneath the modal.
+                if !self.state.overlays.is_empty() {
+                    return self.handle_overlay_paste(s);
+                }
                 // A selector owns the slot: offer the paste to its embedded `Input` first — pi's
                 // `Input.handleInput` bracketed-paste branch (`input.ts:54-84`) → `handlePaste`
                 // (`:362-372`). A pure-list selector owns no input and answers `Ignored`, which
@@ -542,6 +550,21 @@ impl<B: Backend> App<B> {
             return AppAction::None;
         };
         match top.handle(key) {
+            OverlayOutcome::Close => {
+                self.state.overlays.pop();
+                AppAction::Redraw
+            }
+            OverlayOutcome::Redraw | OverlayOutcome::Ignored => AppAction::Redraw,
+        }
+    }
+
+    /// Route a bracketed paste to the topmost overlay. As for a key, `Close` pops it and anything
+    /// else is swallowed: a paste never leaks to the editor beneath the modal.
+    fn handle_overlay_paste(&mut self, text: &str) -> AppAction {
+        let Some(top) = self.state.overlays.last_mut() else {
+            return AppAction::None;
+        };
+        match top.handle_paste(text) {
             OverlayOutcome::Close => {
                 self.state.overlays.pop();
                 AppAction::Redraw

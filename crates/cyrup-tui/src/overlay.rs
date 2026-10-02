@@ -55,6 +55,12 @@ pub trait Overlay: Send {
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme);
     /// Route one key, returning the outcome.
     fn handle(&mut self, key: &KeyEvent) -> OverlayOutcome;
+    /// Route one bracketed paste, returning the outcome. The default ignores it: an overlay with no
+    /// text field has nothing to paste into, and the host swallows the paste either way so it never
+    /// reaches the editor beneath the modal.
+    fn handle_paste(&mut self, _text: &str) -> OverlayOutcome {
+        OverlayOutcome::Ignored
+    }
     /// The overlay's own refresh cadence in milliseconds, `0` for "never" (the default). The run
     /// loop arms one shared timer at the smallest non-zero value across the open stack.
     fn refresh_ms(&self) -> u64 {
@@ -199,6 +205,14 @@ impl Overlay for ExtensionOverlay {
             return OverlayOutcome::Ignored;
         };
         match self.inner.handle_key(mapped) {
+            ExtOverlayOutcome::Ignored => OverlayOutcome::Ignored,
+            ExtOverlayOutcome::Redraw => OverlayOutcome::Redraw,
+            ExtOverlayOutcome::Close => OverlayOutcome::Close,
+        }
+    }
+
+    fn handle_paste(&mut self, text: &str) -> OverlayOutcome {
+        match self.inner.handle_paste(text) {
             ExtOverlayOutcome::Ignored => OverlayOutcome::Ignored,
             ExtOverlayOutcome::Redraw => OverlayOutcome::Redraw,
             ExtOverlayOutcome::Close => OverlayOutcome::Close,

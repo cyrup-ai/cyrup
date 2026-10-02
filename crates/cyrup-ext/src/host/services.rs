@@ -256,6 +256,218 @@ pub struct HumanInteractionGuard {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+// ---- provider catalog refresh (EXT-022, native flavour; EXT-M07) --------------------------------
+//
+// pi's `ModelRegistry.refresh({ providers, allowNetwork, signal })` hands a provider's
+// `refreshModels` a `RefreshModelsContext` — `credential`, a read-only `stored` snapshot, a
+// generation-checked `publish({ persist, update })`, `allowNetwork`, `force` and an always-present
+// `signal` (`packages/ai/src/models.ts:74-90` @v0.99.2-17). The types below are that contract; the
+// session service implements the registry half (`cyrup-session-svc`'s `GuestProviderRegistry`).
+
+/// What a provider asks the store to do with its persisted catalog — pi's
+/// `ModelsPublication.persist?: ModelsStoreEntry | null` (`models.ts:67-72`), minus the "omit" arm,
+/// which is an absent [`ModelsPublication::persist`].
+#[derive(Clone, Debug)]
+pub enum ModelsPersist {
+    /// `persist: entry` — replace the provider's stored entry (`modelsStore.write`, `models.ts:512`).
+    ///
+    /// `classifiers` is the `type: "classifier"` half of pi's ONE `models` array
+    /// (`ModelsStoreEntry.models: readonly AnyModel[]`, `models-store.ts:3-5`); cyrup's entry holds
+    /// chat models only and the classifier models travel through
+    /// [`cyrup_provider::ModelsStore::write_classifier_models`] (see that method for why).
+    Write {
+        entry: cyrup_provider::ModelsStoreEntry,
+        classifiers: Vec<cyrup_provider::ClassifierModel>,
+    },
+    /// `persist: null` — delete the provider's stored entry (`modelsStore.delete`, `models.ts:510`).
+    Delete,
+}
+
+/// pi `ModelsPublication` (`packages/ai/src/models.ts:67-72` @v0.99.2-17): the provider-chosen
+/// persistence plus an optional synchronous update of its own in-memory catalog.
+///
+/// The `update` runs only after the persistence step and only while the refresh is still the
+/// provider's current one, so a superseded refresh can neither write the store nor change the
+/// catalog. A cyrup provider's `models()` is a borrow of an immutable catalog, so "update" is
+/// typically a re-registration of a new provider value carrying the new catalog: the registry's
+/// replace path, which does not supersede the publishing refresh itself.
+#[derive(Default)]
+pub struct ModelsPublication {
+    /// pi `persist?`. `None` leaves storage unchanged.
+    pub persist: Option<ModelsPersist>,
+    /// pi `update?: () => void`.
+    pub update: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+/// The registry's side of [`ProviderRefreshContext::publish`].
+#[async_trait::async_trait]
+pub trait ModelsPublisher: Send + Sync {
+    /// pi `publish(publication): Promise<boolean>` (`models.ts:83`): `Ok(true)` when the publication
+    /// was applied, `Ok(false)` when this refresh was superseded or aborted first (pi's
+    /// generation/`signal.aborted` checks, `models.ts:507`, `:515`). A store failure is the error pi
+    /// would reject with.
+    async fn publish(
+        &self,
+        publication: ModelsPublication,
+    ) -> Result<bool, cyrup_provider::ProviderError>;
+}
+
+/// pi `RefreshModelsContext` (`packages/ai/src/models.ts:74-90` @v0.99.2-17) for a provider whose
+/// catalog the extension host refreshes.
+///
+/// Reached from inside [`cyrup_provider::Provider::refresh_models`] through
+/// [`ProviderRefreshContext::current`]. The registry sets it for exactly the duration of that call
+/// (a task-local), because [`cyrup_provider::RefreshModelsContext`] — the argument the trait method
+/// receives — carries only `allow_network`, `force` and the abort token, and `credential`,
+/// `stored` and `publish` have nowhere on it to travel. A provider that is not being refreshed
+/// through the registry finds `None` and has no store to restore from or publish to.
+#[derive(Clone)]
+pub struct ProviderRefreshContext {
+    /// pi `credential?` — the effective credential: the stored one for the cache-only phase, the
+    /// provider-auth-resolved one for the network phase (`models.ts:571`, `:575-577`).
+    pub credential: Option<cyrup_provider::Credential>,
+    /// pi `stored?` — the provider's persisted entry, snapshotted before this phase.
+    pub stored: Option<cyrup_provider::ModelsStoreEntry>,
+    /// The classifier models persisted beside `stored` (the `type: "classifier"` members of pi's
+    /// `stored.models`).
+    pub stored_classifiers: Vec<cyrup_provider::ClassifierModel>,
+    /// pi `allowNetwork` — `false` during the cache-only restore phase (`models.ts:84`).
+    pub allow_network: bool,
+    /// pi `force?` — undefined unless network is allowed (`models.ts:541`).
+    pub force: bool,
+    /// pi `signal` — cancelled by the caller's abort OR by a newer refresh of the same provider.
+    pub cancel: CancelToken,
+    publisher: Arc<dyn ModelsPublisher>,
+}
+
+tokio::task_local! {
+    static CURRENT_REFRESH: ProviderRefreshContext;
+}
+
+impl ProviderRefreshContext {
+    /// Assemble a context around a registry's publisher. Public so the session service (a different
+    /// crate) can build it; a provider never does.
+    pub fn new(
+        credential: Option<cyrup_provider::Credential>,
+        stored: Option<cyrup_provider::ModelsStoreEntry>,
+        stored_classifiers: Vec<cyrup_provider::ClassifierModel>,
+        allow_network: bool,
+        force: bool,
+        cancel: CancelToken,
+        publisher: Arc<dyn ModelsPublisher>,
+    ) -> Self {
+        Self {
+            credential,
+            stored,
+            stored_classifiers,
+            allow_network,
+            force,
+            cancel,
+            publisher,
+        }
+    }
+
+    /// pi `context.publish(publication)` (`models.ts:83`).
+    pub async fn publish(
+        &self,
+        publication: ModelsPublication,
+    ) -> Result<bool, cyrup_provider::ProviderError> {
+        self.publisher.publish(publication).await
+    }
+
+    /// The context of the refresh currently running this task, if the registry is running one.
+    pub fn current() -> Option<Self> {
+        CURRENT_REFRESH.try_with(Clone::clone).ok()
+    }
+
+    /// Run `fut` with `self` as the [`Self::current`] context. The registry's one call site; the
+    /// context does not cross a `tokio::spawn` made inside `fut`.
+    pub async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
+        CURRENT_REFRESH.scope(self, fut).await
+    }
+}
+
+/// One refresh request, pi's `ModelsRefreshOptions` (`models.ts:92-99`).
+#[derive(Clone, Debug)]
+pub struct ProviderRefreshRequest {
+    /// pi `providers?` — restrict the refresh to these ids; `None` refreshes every provider.
+    pub providers: Option<Vec<String>>,
+    /// pi `allowNetwork?`. `None` falls back to the host's model-network switch (pi
+    /// `options.allowNetwork ?? this.modelNetworkEnabled`, `core/model-runtime.ts:850`), which an
+    /// offline run turns off; `Some(_)` is explicit and overrides it either way.
+    pub allow_network: Option<bool>,
+    /// pi `force?`.
+    pub force: bool,
+    /// pi `signal?`.
+    pub cancel: CancelToken,
+}
+
+/// The host's catalog-refresh engine, the thing [`HostServices::refresh_provider`] reaches. Held by
+/// a live backend and implemented by the session's guest-provider registry.
+#[async_trait::async_trait]
+pub trait ProviderRefresher: Send + Sync {
+    /// pi `ModelRegistry.refresh(options)` (`models.ts:546-606`): each selected provider is
+    /// restored from its stored catalog, then (network allowed, credential resolved) refreshed; a
+    /// per-provider failure is recorded in the result, never thrown.
+    async fn refresh(&self, request: ProviderRefreshRequest)
+    -> cyrup_provider::ModelsRefreshResult;
+}
+
+/// The answer of a host with no model registry to refresh through: an abort is still an abort, and
+/// the one provider asked about reports why nothing happened. It is not a clean result, because an
+/// extension that asked for a refresh must not read "nothing failed" as "the catalog is current".
+pub fn no_refresh_backend(
+    provider_id: &str,
+    cancel: &CancelToken,
+) -> cyrup_provider::ModelsRefreshResult {
+    let mut result = cyrup_provider::ModelsRefreshResult {
+        aborted: cancel.is_cancelled(),
+        ..Default::default()
+    };
+    if !result.aborted {
+        result.errors.insert(
+            provider_id.to_string(),
+            cyrup_provider::ProviderError::ModelSource(
+                "this host has no model registry to refresh through".into(),
+            ),
+        );
+    }
+    result
+}
+
+/// What [`HostServices::provider_auth`] hands a native: pi's `AuthResult`
+/// (`packages/ai/src/auth/types.ts`, `{ auth: { apiKey?, baseUrl?, headers? }, env?, source? }`)
+/// flattened to the three members an extension reads — `result.auth.apiKey`,
+/// `result.auth.baseUrl` and `result.env` (`extensions/llama/index.ts:30-37` @v0.99.2-17). `source`
+/// is pi's `AuthResult.source`, the human label of where the credential came from.
+///
+/// `Debug` is hand-written because `api_key` is a secret: a derived one would print it into any log
+/// line that formats a result. `env` is the provider-scoped overlay, which for other providers
+/// carries secrets of its own (cloud keys, tokens, URLs with credentials), so only its variable
+/// NAMES are printed.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct HostProviderAuth {
+    /// pi `auth.apiKey`.
+    pub api_key: Option<String>,
+    /// pi `auth.baseUrl` — the request endpoint the strategy resolved, which replaces a model's own.
+    pub base_url: Option<String>,
+    /// pi `env` — the provider-scoped environment overlay (`{ LLAMA_BASE_URL: … }` for llama.cpp).
+    pub env: BTreeMap<String, String>,
+    /// pi `source` (`"stored credential"`, `"LLAMA_BASE_URL"`, …).
+    pub source: Option<String>,
+}
+
+impl std::fmt::Debug for HostProviderAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostProviderAuth")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
 /// The pluggable host backend for interactive capabilities (arch-08 §3.6). Every method defaults to
 /// "denied / empty" so the default host grants NO ambient authority; the session service overrides
 /// the ones it wants to expose. All methods are sync (the host runs them on its own executor; the
@@ -707,6 +919,80 @@ pub trait HostServices: Send + Sync {
     /// implementation and answers from the live [`cyrup_provider::Provider`] the session's agent
     /// loop streams through, so a mid-session cross-provider `/model` swap is honoured.
     fn registered_provider(&self, _provider_id: &str) -> Option<Arc<dyn cyrup_provider::Provider>> {
+        None
+    }
+
+    /// pi `ctx.modelRegistry.refresh({ providers: [id], allowNetwork, signal })`
+    /// (`packages/ai/src/models.ts:546-606`, surfaced by `core/model-runtime.ts:839`
+    /// @v0.99.2-17) for ONE registered provider — what the llama extension's `/llama` flow calls
+    /// after every server-side change (`extensions/llama/index.ts:54-59`).
+    ///
+    /// The provider is restored from its stored catalog first (cache-only), then — when
+    /// `allow_network` — refreshed from its source and its catalog persisted. `allow_network` is
+    /// EXPLICIT: `true` overrides the host's offline switch for this call, exactly as pi's
+    /// `/llama` passes `allowNetwork: true` so it "stays live even in PI_OFFLINE" (`index.ts:56`),
+    /// because the command already contacted the configured server; `false` never touches the
+    /// network. `cancel` is pi's `signal` (the extension's own timeout, `index.ts:51`).
+    ///
+    /// Like pi, a failure is never thrown: [`cyrup_provider::ModelsRefreshResult::aborted`] says
+    /// the caller's `cancel` fired and `errors` carries the provider's failure by id
+    /// (`index.ts:60-62` turns each into its own exception). An aborted provider records no error.
+    ///
+    /// Returns a boxed future where pi returns a `Promise`: this trait's methods are plain
+    /// synchronous `fn`s (a wasm guest is suspended across them), and a native extension's command
+    /// handler is already async, so it awaits the refresh directly. The default has no registry to
+    /// refresh through and answers with an error for `provider_id` rather than a clean result.
+    fn refresh_provider<'a>(
+        &'a self,
+        provider_id: &'a str,
+        _allow_network: bool,
+        cancel: CancelToken,
+    ) -> futures::future::BoxFuture<'a, cyrup_provider::ModelsRefreshResult> {
+        Box::pin(async move { no_refresh_backend(provider_id, &cancel) })
+    }
+
+    /// pi `ctx.modelRegistry.getProviderAuth(providerId)` (`core/model-registry.ts:180`, which is
+    /// `runtime.getAuth(providerId)`, `core/model-runtime.ts:547-553` @v0.99.2-17): the request
+    /// auth the provider's own strategy resolves for the stored credential and the ambient
+    /// environment — the thing `/llama` reads to learn the server URL and key
+    /// (`extensions/llama/index.ts:30-37`).
+    ///
+    /// `Ok(None)` is pi's `undefined`: the provider is not registered, has no auth strategy, or its
+    /// strategy answered "not configured" (for llama.cpp, no URL is known from a stored credential
+    /// or `LLAMA_BASE_URL`). `Err` is a strategy or credential-store failure, which pi lets reject.
+    ///
+    /// **Not scoped to the caller's own provider**, as pi's is not: `getProviderAuth` takes any
+    /// provider id, so any native extension can resolve the request auth (key and base URL) of any
+    /// provider, and for an OAuth credential that includes the locked refresh and write-back. The
+    /// isolation boundary is [`Self::provider_credentials`], which hands out the credential STORE
+    /// scoped to one provider; this method is the resolved-auth read pi gives every extension.
+    ///
+    /// Returns a boxed future where pi returns a `Promise`, for the reason
+    /// [`Self::refresh_provider`] does. Denied by default: a host with no credential store answers
+    /// `Ok(None)` rather than guessing.
+    fn provider_auth<'a>(
+        &'a self,
+        _provider_id: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<HostProviderAuth>, String>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// The session's credential store, scoped to ONE provider id, for a native that registered a
+    /// live provider and must let that provider resolve its own auth on every request.
+    ///
+    /// pi's `Models.stream` resolves the model's provider auth per call (`applyAuth`,
+    /// `packages/ai/src/models.ts:463-487`); cyrup's agent loop streams through
+    /// [`cyrup_provider::Provider::stream`] directly, so a live provider has to read the stored
+    /// credential itself — and must read the CURRENT one, not a key baked in at registration, which
+    /// is what a [`cyrup_provider::ConfigProvider`] does. This hands it a store that answers for
+    /// `provider_id` only: reads of any other id are `None`, and `list`, `modify` and `delete` of
+    /// another id are refused, so a native cannot reach another provider's credential.
+    ///
+    /// `None` on a host with no credential store (the default).
+    fn provider_credentials(
+        &self,
+        _provider_id: &str,
+    ) -> Option<Arc<dyn cyrup_provider::CredentialStore>> {
         None
     }
 
@@ -2876,6 +3162,36 @@ impl GuestState {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// A formatted result never prints the key, nor any value of the env overlay: the overlay of
+    /// another provider can hold its own secrets. The variable names are still there to debug by.
+    #[test]
+    fn host_provider_auth_debug_prints_no_secret() {
+        let auth = HostProviderAuth {
+            api_key: Some("sk-secret-key".to_string()),
+            base_url: Some("http://h:1/v1".to_string()),
+            env: BTreeMap::from([
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "aws-secret-value".to_string(),
+                ),
+                (
+                    "LLAMA_BASE_URL".to_string(),
+                    "http://u:pw-in-url@h:1".to_string(),
+                ),
+            ]),
+            source: Some("stored credential".to_string()),
+        };
+
+        let shown = format!("{auth:?}");
+
+        assert!(!shown.contains("sk-secret-key"), "{shown}");
+        assert!(!shown.contains("aws-secret-value"), "{shown}");
+        assert!(!shown.contains("pw-in-url"), "{shown}");
+        assert!(shown.contains("AWS_SECRET_ACCESS_KEY"), "{shown}");
+        assert!(shown.contains("LLAMA_BASE_URL"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
 
     fn state() -> GuestState {
         GuestState::new(

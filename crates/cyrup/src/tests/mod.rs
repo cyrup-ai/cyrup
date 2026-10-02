@@ -21,6 +21,7 @@
 mod boot_transcript_order;
 mod catalog_refresh_modes;
 mod dispatch;
+mod extension_provider_launch;
 mod footer_provider_count;
 mod image_auto_resize_file_args;
 mod image_bytecap;

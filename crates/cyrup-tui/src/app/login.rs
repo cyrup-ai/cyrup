@@ -87,6 +87,38 @@ impl<B: Backend> App<B> {
                 using_oauth,
             });
         }
+        // Extension providers. pi's `getLoginProviderOptions` reads ONE provider list — the
+        // composed registry, which holds a native extension's provider beside the built-ins
+        // (`this.session.modelRuntime.getProviders()`, `interactive-mode.ts:4943-4947`;
+        // `nativeExtensionProviders`, `core/model-runtime.ts:298` @v0.99.2-17) — so a live provider
+        // that carries an `auth` strategy gets its row exactly like a built-in: an api-key strategy
+        // with a `login` runs the normal prompt flow and the credential it returns is stored under
+        // the provider's id. cyrup keeps the two sets apart, so they are joined here.
+        //
+        // A live provider REPLACES a built-in of the same id (pi's registry holds one provider per
+        // id, and `registerProvider` "replaces all models"), and its status is its own strategy's
+        // `check` (`getProviderAuthStatus`, `core/model-runtime.ts:428-437`) — the `env_keys` table
+        // knows nothing of an id it does not list.
+        for provider in session.live_extension_providers() {
+            let Some(auth) = provider.provider_auth().cloned() else {
+                continue;
+            };
+            let id = provider.id().clone();
+            let using_oauth = stored
+                .iter()
+                .any(|(p, t)| p.as_str() == id.as_str() && *t == AuthType::Oauth);
+            let status = cyrup_config::login::live_provider_auth_status(store, &provider).await;
+            out.retain(|existing| existing.id.as_str() != id.as_str());
+            out.push(ProviderLoginInput {
+                // `provider.name` — an extension's provider carries its own display name, which
+                // the id title-caser cannot derive (`llama.cpp`).
+                name: provider.name().to_string(),
+                status,
+                id,
+                auth,
+                using_oauth,
+            });
+        }
         out
     }
 
@@ -358,11 +390,11 @@ impl<B: Backend> App<B> {
                 let cancel = CancelToken::new();
                 self.state.login_cancel = Some(cancel.clone());
                 let auth_type = option.auth_type;
-                // **TUI-105.** `const previousModel = this.session.model` (`:6004`, `:6135`) —
+                // **TUI-105.** `const previousModel = this.session.model` (`:6059`, `:6195`) —
                 // captured HERE, at the call site, before the dialog runs. `finish_login` must not
                 // re-read it: a `/model` issued while the browser tab was open would then look like
                 // the state the login started in, and pi's `session.model === previousModel` guard
-                // (`:5961`) exists to respect exactly that.
+                // (`:6016`) exists to respect exactly that.
                 self.state.login_previous_model = session.model();
                 let store = Arc::clone(&session.services().auth);
                 // `getAuthPath()` (`env.rs:236-238`): the path the success status names.
@@ -479,7 +511,7 @@ impl<B: Backend> App<B> {
                         .remove(&finished.provider_id);
                 }
                 self.refresh_subscription_marker();
-                // `actionLabel` (`:5885`): `Logged in to {name}` | `Saved API key for {name}`.
+                // `actionLabel` (`:5940`): `Logged in to {name}` | `Saved API key for {name}`.
                 let action = if finished.oauth {
                     format!("Logged in to {name}")
                 } else {
@@ -488,8 +520,8 @@ impl<B: Backend> App<B> {
                 let provider_id = finished.provider_id.clone();
                 let auth_path = finished.auth_path.clone();
                 let previous_model = self.state.login_previous_model.clone();
-                // `deferSelection` (`:5889-5895`) — "Dynamic catalogs may be empty until the first
-                // authenticated network refresh" (`:5888`): the credential exists now, but the
+                // `deferSelection` (`:5944-5949`) — "Dynamic catalogs may be empty until the first
+                // authenticated network refresh" (`:5943`): the credential exists now, but the
                 // provider's models may only arrive with the refresh below, so selecting the default
                 // this instant would report it missing.
                 let default_id = cyrup_config::default_model_per_provider(&provider_id);
@@ -500,14 +532,14 @@ impl<B: Backend> App<B> {
                     });
                 if defer {
                     // `` `${actionLabel}. Credentials saved to ${getAuthPath()}. Refreshing model
-                    // catalog…` `` (`:5948`) — the ONLY line emitted on this path; the selection and
+                    // catalog…` `` (`:6000`) — the ONLY line emitted on this path; the selection and
                     // its status come from the refresh continuation.
                     let path = auth_path.display();
                     self.state.transcript.push_status(format!(
                         "{action}. Credentials saved to {path}. Refreshing model catalog…"
                     ));
                 } else {
-                    // `await finishAuthentication()` (`:5950`).
+                    // `await finishAuthentication()` (`:6002`).
                     self.finish_provider_authentication(
                         session,
                         &action,
@@ -585,14 +617,20 @@ impl<B: Backend> App<B> {
         self.status_mut().set_provider_count(providers.len());
     }
 
-    /// **TUI-105.** `finishAuthentication` (`interactive-mode.ts:5896-5945`): select the provider's
+    /// **Citations in this block and in [`DefaultModelFailure`] / [`default_model_selection`] are
+    /// all against ONE revision of `interactive-mode.ts`: pi `@v0.99.2-17` (commit `70c036211`, see
+    /// the `cyrup-llama` crate docs), where the llama.cpp rung (`:5957-5958`) already exists, so the
+    /// rungs that follow it are cited at the lines they have after it. Other blocks of this file
+    /// predate it and cite `@v0.87.1`.**
+    ///
+    /// **TUI-105.** `finishAuthentication` (`interactive-mode.ts:5950-5998`): select the provider's
     /// curated default model when the session had none, recount providers, then report.
     ///
-    /// Returns the selected model id, which is what pi's `if (selectedModel)` (`:5931`) branches on.
+    /// Returns the selected model id, which is what pi's `if (selectedModel)` (`:5986`) branches on.
     ///
     /// Called twice on the deferred path — once from [`Self::finish_login`] when the default is
     /// already in the cached catalog, and once from [`Self::apply_login_refresh`] when it was not —
-    /// which is exactly upstream's closure being invoked from its two sites (`:5950`, `:5962`).
+    /// which is exactly upstream's closure being invoked from its two sites (`:6002`, `:6017`).
     async fn finish_provider_authentication(
         &mut self,
         session: &Arc<AgentSession>,
@@ -603,10 +641,10 @@ impl<B: Backend> App<B> {
     ) -> Option<cyrup_core::ModelId> {
         let mut selected: Option<cyrup_core::ModelId> = None;
         let mut selection_error: Option<String> = None;
-        // `if (isUnknownModel(previousModel))` (`:5898`) — a session that ALREADY has a model keeps
+        // `if (isUnknownModel(previousModel))` (`:5953`) — a session that ALREADY has a model keeps
         // it. Without this gate the fix would clobber a model the user chose before logging in.
         if previous_model_was_unknown {
-            // `getAvailableSnapshot().filter(model => model.provider === providerId)` (`:5899-5900`).
+            // `getAvailableSnapshot().filter(model => model.provider === providerId)` (`:5954-5955`).
             let provider_models: Vec<cyrup_provider::Model> = session
                 .available_model_catalog()
                 .into_iter()
@@ -615,10 +653,10 @@ impl<B: Backend> App<B> {
             match default_model_selection(provider_id, &provider_models) {
                 Ok(model) => {
                     let id = model.id.clone();
-                    // `await this.session.setModel(selectedModel, { persist: true })` (`:5918`).
+                    // `await this.session.setModel(selectedModel, { persist: true })` (`:5973`).
                     match session.set_model_resolved(model).await {
                         Ok(_) => selected = Some(id),
-                        // `catch` → `selectedModel = undefined` + the fourth message (`:5920-5923`).
+                        // `catch` → `selectedModel = undefined` + the fourth message (`:5974-5977`).
                         Err(e) => {
                             selection_error = Some(
                                 DefaultModelFailure::SetModelFailed(e.to_string())
@@ -631,13 +669,13 @@ impl<B: Backend> App<B> {
             }
         }
         // `await this.updateAvailableProviderCount(); this.footer.invalidate();` — unconditional, on
-        // both the selected and the errored paths (`:5928-5930`).
+        // both the selected and the errored paths (`:5983-5985`).
         self.refresh_provider_count(session);
         self.refresh_subscription_marker();
         let path = auth_path.display();
         match &selected {
             // `` `${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}` ``
-            // (`:5932`).
+            // (`:5987`).
             Some(id) => {
                 let id = id.as_str();
                 self.state.transcript.push_status(format!(
@@ -645,7 +683,7 @@ impl<B: Backend> App<B> {
                 ));
             }
             // `` `${actionLabel}. Credentials saved to ${getAuthPath()}` `` + `showError(selectionError)`
-            // (`:5937-5941`).
+            // (`:5990-5996`).
             None => {
                 self.state
                     .transcript
@@ -659,7 +697,7 @@ impl<B: Backend> App<B> {
     }
 
     /// Spawn the post-login catalog refresh — pi's `AbortController` + 15 s `setTimeout` +
-    /// `session.modelRuntime.refresh(...)` tail (`interactive-mode.ts:5951-5973`).
+    /// `session.modelRuntime.refresh(...)` tail (`interactive-mode.ts:6006-6028`).
     ///
     /// Shaped on [`Self::begin_model_catalog_refresh`] (`app/selectors.rs:348-389`) because it is the
     /// same upstream pattern: one [`CancelToken`] serving as the deadline, the cancel and the
@@ -667,16 +705,22 @@ impl<B: Backend> App<B> {
     ///
     /// SCOPED to the provider just authenticated, which is upstream's own shape: pi calls
     /// `session.modelRuntime.refresh({ providers: [providerId], signal: controller.signal })`
-    /// DIRECTLY (`:5953`), under the `AbortController` (`:5950`) and 15 s `setTimeout` (`:5951`).
+    /// DIRECTLY (`:6008`), under the `AbortController` (`:6005`) and 15 s `setTimeout` (`:6006`).
     /// It deliberately does NOT route this through `refreshModelCatalogs`
     /// (`modes/interactive/model-catalog-refresh.ts:46-51`), the shared coordinator it reserves for
-    /// WHOLE-catalog refreshes (`/model`, and `run()`'s startup refresh at `:1083`) — because a
+    /// WHOLE-catalog refreshes (`/model`, and `run()`'s startup refresh at `:1121`) — because a
     /// coordinated call may JOIN an in-flight operation, and a joined operation's provider list wins,
     /// which would discard this caller's scope outright. Hence
     /// [`cyrup_session_svc::AgentSession::refresh_provider_catalog`] rather than its whole-catalog
     /// neighbour `refresh_model_catalogs`: the whole 15 s budget is spent on the one provider, and a
     /// slow unrelated provider cannot eat it. The fetch list drops `radius` inside that call, per the
     /// fetch/overlay split `cyrup_provider::refresh_and_install` documents.
+    ///
+    /// A provider a native extension registered live (`llama.cpp`) is refreshed through the same
+    /// call: pi holds it in the one composed collection, so `refresh({ providers: [providerId] })`
+    /// reaches its `refreshModels` (`models.ts:546-606`), and
+    /// [`cyrup_session_svc::AgentSession::refresh_provider_catalog`] routes it to the guest registry's
+    /// engine. The models it publishes are what the continuation below counts and lists.
     fn begin_post_login_catalog_refresh(
         &mut self,
         session: &Arc<AgentSession>,
@@ -695,8 +739,8 @@ impl<B: Backend> App<B> {
         let epoch = self.state.login_refresh_epoch;
         let cancel = CancelToken::new();
         self.state.login_refresh_cancel = Some(cancel.clone());
-        // `setTimeout(() => controller.abort(), 15_000)` (`:5952`). The second arm is upstream's
-        // `finally { clearTimeout(timeout) }` (`:5973`): once the refresh settles this task exits
+        // `setTimeout(() => controller.abort(), 15_000)` (`:6006`). The second arm is upstream's
+        // `finally { clearTimeout(timeout) }` (`:6028`): once the refresh settles this task exits
         // instead of holding a timer for the full budget.
         let deadline = cancel.clone();
         tokio::spawn(async move {
@@ -724,7 +768,7 @@ impl<B: Backend> App<B> {
     }
 
     /// A settled post-login catalog refresh — pi's `.then` continuation
-    /// (`interactive-mode.ts:5956-5971`), in upstream's exact order: the two warnings, the deferred
+    /// (`interactive-mode.ts:6011-6026`), in upstream's exact order: the two warnings, the deferred
     /// selection under its guard, then the count and the repaint.
     ///
     /// `pub` for the same reason [`Self::apply_login_msg`] is: `tests/login_flow.rs` drives the
@@ -734,7 +778,7 @@ impl<B: Backend> App<B> {
         session: &Arc<AgentSession>,
         msg: crate::login_dialog::LoginRefreshMsg,
     ) {
-        // pi's `this.session === session` identity check (`:5961`), expressed as the epoch guard
+        // pi's `this.session === session` identity check (`:6016`), expressed as the epoch guard
         // `apply_model_refresh` already uses (`app/selectors.rs:406`): a refresh belonging to a login
         // that has since been superseded must not select on the current one's behalf.
         if msg.epoch != self.state.login_refresh_epoch {
@@ -744,7 +788,7 @@ impl<B: Backend> App<B> {
         let action = &msg.action;
         if msg.result.aborted || msg.result.timed_out {
             // `` `${actionLabel}, but its model catalog refresh timed out; using cached models.` ``
-            // (`:5957`). cyrup's coordinator distinguishes THIS caller's token firing (`timed_out`)
+            // (`:6012`). cyrup's coordinator distinguishes THIS caller's token firing (`timed_out`)
             // from the shared operation aborting (`aborted`, `catalog_refresh.rs:90-95`); pi has only
             // the one flag, and both are its `result.aborted`.
             self.state.transcript.show_warning(format!(
@@ -752,12 +796,12 @@ impl<B: Backend> App<B> {
             ));
         } else if !msg.result.errors.is_empty() {
             // `` `${actionLabel}, but its model catalog could not be refreshed; using cached models.` ``
-            // (`:5959`).
+            // (`:6014`).
             self.state.transcript.show_warning(format!(
                 "{action}, but its model catalog could not be refreshed; using cached models."
             ));
         }
-        // "Do not replace a model or session selected while the refresh was running" (`:5960-5963`):
+        // "Do not replace a model or session selected while the refresh was running" (`:6015-6018`):
         // a `/model` issued while the refresh was in flight WINS, which is why `previous_model` is the
         // value captured before the login rather than a re-read.
         if msg.defer && session.model() == msg.previous_model {
@@ -771,7 +815,7 @@ impl<B: Backend> App<B> {
             .await;
         }
         // `this.updateAvailableProviderCount(); this.footer.invalidate(); this.ui.requestRender();`
-        // (`:5964-5966`) — unconditional, so a refresh that installed a new provider's catalog moves
+        // (`:6019-6021`) — unconditional, so a refresh that installed a new provider's catalog moves
         // the footer even when no selection happened.
         self.refresh_provider_count(session);
         self.refresh_subscription_marker();
@@ -779,27 +823,32 @@ impl<B: Backend> App<B> {
     }
 }
 
+/// `"llama.cpp"` — matches `LLAMA_PROVIDER_ID` from `extensions/llama/provider.ts`, kept inline to
+/// avoid coupling interactive mode to the built-in extension (`interactive-mode.ts:5956`).
+const LLAMA_CPP_PROVIDER_ID: &str = "llama.cpp";
+
 /// Why no default model could be selected after a login — pi's `selectionError` ladder
-/// (`interactive-mode.ts:5901-5923`), as a value so the four messages are one table the tests compare
-/// byte-for-byte and so each rung is reachable without a live provider catalog.
+/// (`interactive-mode.ts:5957-5958` and the rungs after it), as a value so the messages are one table
+/// the tests compare byte-for-byte and so each rung is reachable without a live provider catalog.
 ///
-/// `[CYRUP-DELTA]` pi's FIRST rung, `providerId === "llama.cpp"` → `llamaCppPostLoginGuidance(...)`
-/// (`:5902-5903`, the helper at `:328-331`), is deliberately NOT ported: cyrup has no llama.cpp
-/// provider and no `/llama` command (`rg llama crates/cyrup-tui/src` is empty), so there is no
-/// reachable state for it, and porting it would advertise a command the product does not have.
+/// The FIRST rung is `providerId === "llama.cpp"` → `llamaCppPostLoginGuidance(actionLabel,
+/// providerModels.length)` (`:5957-5958`, the helper at `:349-353`). It is a rung, not a special
+/// case after the others: it runs before `hasDefaultModelProvider` is consulted, so a provider with
+/// no curated default and zero models still gets the llama.cpp text rather than the generic one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DefaultModelFailure {
-    /// `!hasDefaultModelProvider(providerId)` (`:5904-5905`) — cyrup's
-    /// [`cyrup_config::default_model_per_provider`] returning `None`
-    /// (`cyrup-config/src/model/defaults.rs:8`).
+    /// `providerId === "llama.cpp"` (`:5957-5958`): no default model is selected for it; the login
+    /// ends in `llamaCppPostLoginGuidance(actionLabel, providerModels.length)` (`:349-353`).
+    /// Carries `providerModels.length`, the only input the helper reads.
+    LlamaCppGuidance(usize),
     NoDefaultConfigured,
-    /// `providerModels.length === 0` (`:5906-5907`).
+    /// `providerModels.length === 0` (`:5961-5962`).
     NoModelsAvailable,
-    /// The default id is configured but absent from the provider's catalog (`:5915-5916`).
+    /// The default id is configured but absent from the provider's catalog (`:5969-5970`).
     DefaultNotAvailable(&'static str),
-    /// `setModel` threw (`:5919-5923`).
+    /// `setModel` threw (`:5974-5977`).
     ///
-    /// `[CYRUP-DELTA]` pi's `setModel(selectedModel, { persist: true })` (`:5918`) maps to
+    /// `[CYRUP-DELTA]` pi's `setModel(selectedModel, { persist: true })` (`:5973`) maps to
     /// [`cyrup_session_svc::AgentSession::set_model_resolved`]
     /// (`cyrup-session-svc/src/session/model.rs:43`), which appends the `model_change` entry itself —
     /// cyrup has no separate persist flag.
@@ -807,11 +856,19 @@ pub(crate) enum DefaultModelFailure {
 }
 
 impl DefaultModelFailure {
-    /// Pi's four `selectionError` templates, byte-for-byte (`interactive-mode.ts:5905`, `:5907`,
-    /// `:5916`, `:5922`). Every one of them ends in the same `Use /model to select a model.` nudge,
-    /// which is what makes the failure actionable rather than a dead end.
+    /// Pi's five `selectionError` templates, byte-for-byte (`interactive-mode.ts:349-353` for
+    /// the llama.cpp pair, then `:5960`, `:5962`, `:5970`, `:5977`). Every one of them points at
+    /// `/model` (the llama.cpp pair also at `/llama`), which is what makes the failure actionable
+    /// rather than a dead end.
     pub(crate) fn message(&self, action: &str, provider_id: &str) -> String {
         match self {
+            // `llamaCppPostLoginGuidance` (`:349-353`): zero loaded models vs. at least one.
+            Self::LlamaCppGuidance(0) => format!(
+                "{action}. No llama.cpp models are loaded. Use /llama to load a model, then /model to select it."
+            ),
+            Self::LlamaCppGuidance(_) => format!(
+                "{action}. Use /model to select a loaded llama.cpp model, or /llama to manage models."
+            ),
             Self::NoDefaultConfigured => format!(
                 "{action}, but no default model is configured for provider \"{provider_id}\". Use /model to select a model."
             ),
@@ -828,16 +885,23 @@ impl DefaultModelFailure {
     }
 }
 
-/// Pick the model a fresh login selects — pi's `selectedModel` expression (`:5913-5916`) with its
-/// two guard rungs (`:5904-5907`) folded in front.
+/// Pick the model a fresh login selects — pi's `selectedModel` expression (`:5966-5970`) with its
+/// guard rungs (`:5957-5958`, then `:5959-5962`) folded in front.
 ///
 /// The `radius` special case is upstream's, comment included: "Radius catalogs vary by account;
-/// prefer balanced, then use catalog order" (`:5912`), i.e. the default id first and the first
+/// prefer balanced, then use catalog order" (`:5965`), i.e. the default id first and the first
 /// catalog entry as that one provider's fallback.
 pub(crate) fn default_model_selection(
     provider_id: &str,
     provider_models: &[cyrup_provider::Model],
 ) -> Result<cyrup_provider::Model, DefaultModelFailure> {
+    // `if (providerId === "llama.cpp")` (`:5957-5958`), ahead of every other rung. The comment at
+    // `:5956` — "Matches LLAMA_PROVIDER_ID from extensions/llama/provider.ts; kept inline to avoid
+    // coupling interactive mode to the built-in extension" — applies unchanged: the id is spelled
+    // here rather than imported from the `cyrup-llama` crate.
+    if provider_id == LLAMA_CPP_PROVIDER_ID {
+        return Err(DefaultModelFailure::LlamaCppGuidance(provider_models.len()));
+    }
     let Some(default_id) = cyrup_config::default_model_per_provider(provider_id) else {
         return Err(DefaultModelFailure::NoDefaultConfigured);
     };

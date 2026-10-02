@@ -215,7 +215,7 @@ gets audited. `grep -rn "agent-loop.ts:226" crates` finds the code that answers 
 
 Rust is not TypeScript, so where the languages differ cyrup ports the behaviour and records the
 mechanism difference in a `CYRUP-DELTA` comment naming the upstream line and the reason. There are
-974 of them. For example:
+1104 of them. For example:
 
 - A JavaScript `async` function always settles. A Rust future can be dropped at any `.await`, so
   anything registered before an await and cleaned up only on the success path leaks forever. cyrup

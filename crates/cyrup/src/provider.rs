@@ -38,7 +38,6 @@
 
 use std::sync::{Arc, LazyLock};
 
-use anyhow::bail;
 use cyrup_config::ModelFile;
 use cyrup_config::models_store::FileModelsStore;
 use cyrup_config::policy::NetworkPolicy;
@@ -600,17 +599,150 @@ pub fn select_provider(
                         .map(|p| p.id().as_str().to_string())
                         .collect();
                     available.sort();
-                    bail!(
-                        "model targets provider '{id}', which is not a known provider. \
-                         Available providers: {}. \
-                         (Declare a custom one under \"providers\" in <agent-dir>/models.json; \
-                         there is intentionally no silent fallback.)",
-                        available.join(", ")
-                    )
+                    Err(UnknownProvider {
+                        id: id.to_string(),
+                        available: available.join(", "),
+                    }
+                    .into())
                 }
             }
         }
     }
+}
+
+/// [`select_provider`]'s refusal of a provider id nothing declares. A type of its own, so the launch
+/// path can tell THIS refusal (an extension may still register the id) from any other selection
+/// failure, which it must never defer.
+#[derive(Debug)]
+pub struct UnknownProvider {
+    /// The id the launch named.
+    pub id: String,
+    /// The known providers, sorted and comma separated.
+    pub available: String,
+}
+
+impl std::fmt::Display for UnknownProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model targets provider '{}', which is not a known provider. \
+             Available providers: {}. \
+             (Declare a custom one under \"providers\" in <agent-dir>/models.json; \
+             there is intentionally no silent fallback.)",
+            self.id, self.available
+        )
+    }
+}
+
+impl std::error::Error for UnknownProvider {}
+
+/// The provider id a launch names: an explicit `--provider`, else the `provider/` prefix of
+/// `--model` (Pi `resolveCliModel`'s precedence), or `None` when neither is given.
+pub fn requested_provider_id<'a>(
+    provider_override: Option<&'a str>,
+    model_pattern: Option<&'a str>,
+) -> Option<&'a str> {
+    resolve_provider_id(provider_override, model_pattern)
+}
+
+/// [`select_provider`] for the launch path, which may NAME a provider only an extension registers.
+///
+/// **Architectural gap, not a language or host constraint (ledger: EXT-027).** pi has no such step:
+/// its runtime holds the extension providers before `--model` is resolved (`main.ts:468-479`), so
+/// there is nothing to defer. cyrup builds a session around ONE provider the caller picks before it
+/// loads any extension (`main.rs`), so the resolution moves into the session builder. The result is
+/// the same resolution, later, until a session holds every provider at once as pi's runtime does.
+///
+/// pi resolves `--provider`/`--model` after the extensions loaded and their providers are
+/// registered (`buildSessionOptions`, `main.ts:468-479`, after `createAgentSessionServices`,
+/// `core/agent-session-services.ts:190-206` @v0.99.2-17), so `--model llama.cpp/qwen3` is valid
+/// with the built-in llama.cpp extension, which registers that provider. cyrup selects its provider
+/// before any extension is loaded, so a provider id that no built-in and no `models.json` block
+/// declares is not an error HERE when a `--model` is given: the zero-model
+/// [`UnconfiguredProvider`] stands in, the second element is `true`, and the session builder
+/// resolves the pattern once the extension providers exist
+/// (`SessionBuilder::build`, step 3b) — failing it with the same unknown-provider message when
+/// nothing registered the id. With no `--model` there is nothing to resolve later, so the
+/// original error stands.
+///
+/// ONLY the unknown-provider refusal ([`UnknownProvider`]) is deferred: any other selection failure
+/// is returned as it is, with its own message, whether or not a `--model` is given.
+///
+/// The `bool` is whether the choice was left to the session.
+pub fn select_launch_provider(
+    provider_override: Option<&str>,
+    model_pattern: Option<&str>,
+    api_key: Option<&str>,
+    models_json: &ModelFile,
+) -> anyhow::Result<(Arc<dyn Provider>, bool)> {
+    match select_provider(provider_override, model_pattern, api_key, models_json) {
+        Ok(provider) => Ok((provider, false)),
+        Err(error) if model_pattern.is_some() && error.is::<UnknownProvider>() => {
+            Ok((Arc::new(UnconfiguredProvider::new()), true))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The `--model` pattern a deferred launch hands the session: an explicit `--provider` that the
+/// pattern does not already carry is folded in as its `provider/` prefix, because the session
+/// resolves the pattern against every extension provider's catalog and has no `--provider` to
+/// narrow it (Pi `resolveCliModel` strips a matching prefix and otherwise uses `provider` as given,
+/// `model-resolver.ts:475-501`).
+pub fn qualify_deferred_pattern(provider_override: Option<&str>, pattern: &str) -> String {
+    match provider_override.filter(|provider| !provider.is_empty()) {
+        Some(provider)
+            if !pattern
+                .to_ascii_lowercase()
+                .starts_with(&format!("{}/", provider.to_ascii_lowercase())) =>
+        {
+            format!("{provider}/{pattern}")
+        }
+        _ => pattern.to_string(),
+    }
+}
+
+/// How long the startup refresh of the extension providers' catalogs may run before it is aborted:
+/// pi's `setTimeout(() => controller.abort(), 15_000)` at both of its trigger sites
+/// (`main.ts:933`, `interactive-mode.ts:1119`).
+const EXTENSION_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// **The startup refresh of the extension providers' catalogs — fire and forget.**
+///
+/// pi's `void modelRuntime.refresh()` refreshes EVERY provider of its one registry, an
+/// extension's included, in the same two mode-gated places [`spawn_model_catalog_refresh`] mirrors
+/// for the pi.dev catalogs: rpc, after the runtime exists (`main.ts:931-936`), and interactive, once
+/// its UI is up (`interactive-mode.ts:1115-1126`). The session's own restore already ran, cache
+/// only, when it was built; this is the network half, so a configured llama.cpp server's catalog is
+/// current by the time a person looks at `/model`. cyrup keeps the extension providers in the
+/// session's [`cyrup_session_svc::GuestProviderRegistry`], which is what this refreshes, so the
+/// gate is the one [`spawn_model_catalog_refresh_with`] applies: [`mode_refreshes_catalogs`] and
+/// [`NetworkPolicy::allow_model_catalog_refresh`]. Nothing is awaited and every failure is dropped,
+/// as upstream's `.catch(() => {})`: the worst case is the catalog the cache held.
+///
+/// Returns the task's handle when one was spawned and `None` when the gate declined, so a test can
+/// await it rather than sleep.
+pub fn spawn_extension_provider_refresh(
+    providers: Arc<cyrup_session_svc::GuestProviderRegistry>,
+    policy: NetworkPolicy,
+    mode: cyrup_config::trust::AppMode,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !mode_refreshes_catalogs(mode) || !policy.allow_model_catalog_refresh() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let cancel = cyrup_sdk::core::CancelToken::new();
+        let refresh = providers.refresh_all(cancel.clone());
+        tokio::pin!(refresh);
+        tokio::select! {
+            _ = &mut refresh => {}
+            () = tokio::time::sleep(EXTENSION_REFRESH_TIMEOUT) => {
+                // The abort: the engine stops at its next checkpoint and reports nothing.
+                cancel.cancel();
+                let _ = refresh.await;
+            }
+        }
+    }))
 }
 
 /// The Pi `resolveCliModel` **unknown-model diagnostic**

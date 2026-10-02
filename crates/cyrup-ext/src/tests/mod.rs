@@ -24,6 +24,7 @@ mod ext_fail_closed;
 mod extension_flag_diagnostics;
 mod extension_name_conflicts;
 mod failed_load_is_transactional;
+mod live_provider;
 mod loader;
 mod loader_direct_file;
 mod malformed_manifest;
@@ -34,6 +35,8 @@ mod payload_and_seam_parity;
 mod post_baseline_events;
 mod project_trust_shortcircuit;
 mod provider;
+#[cfg(feature = "wasm-host")]
+mod provider_refresh;
 mod registration_validation;
 mod seam_liveness;
 mod startup_timings;

@@ -226,9 +226,11 @@ impl StartupReport {
                 .iter()
                 .map(|p| format!("/{}", p.name))
                 .collect(),
+            // Pi lists `getExtensions().extensions.filter((extension) => !extension.hidden)`
+            // (`interactive-mode.ts:1778`); a hidden built-in is loaded but not listed.
             extensions: services
                 .ext_host
-                .loaded_ids()
+                .loaded_visible_ids()
                 .iter()
                 .map(|id| id.to_string())
                 .collect(),
@@ -790,5 +792,74 @@ mod tests {
                 .any(|l| l.contains("✗ package/review (skipped)")),
             "{lines:?}"
         );
+    }
+
+    /// A built-in that declares itself hidden is loaded — `loaded_ids()` has it — but the startup
+    /// `[Extensions]` list does not: pi lists `extensions.filter((extension) => !extension.hidden)`
+    /// (`interactive-mode.ts:1778`) and sets `hidden` on every `builtin:` extension
+    /// (`resource-loader.ts:729`).
+    #[tokio::test]
+    async fn a_hidden_extension_is_loaded_but_not_listed_at_startup() {
+        use cyrup_core::ExtensionId;
+        use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+        use cyrup_provider::Provider;
+        use cyrup_provider::faux::FauxProvider;
+        use cyrup_session_svc::{SessionBuilder, SessionConfig};
+        use std::sync::Arc;
+
+        struct Ext {
+            id: &'static str,
+            hidden: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl NativeExtension for Ext {
+            fn id(&self) -> ExtensionId {
+                ExtensionId::from(self.id)
+            }
+            async fn init(&self, _api: &mut InitApi) -> Result<(), ExtError> {
+                Ok(())
+            }
+            async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+                HookOutcome::Noop
+            }
+            fn is_hidden(&self) -> bool {
+                self.hidden
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let mut config = SessionConfig::new(cwd, agent_dir);
+        config.trust_override = Some(true);
+        config.no_extensions = true;
+        let session =
+            SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, config)
+                .with_native_extension(Arc::new(Ext {
+                    id: "listed-ext",
+                    hidden: false,
+                }) as Arc<dyn NativeExtension>)
+                .with_native_extension(Arc::new(Ext {
+                    id: "hidden-ext",
+                    hidden: true,
+                }) as Arc<dyn NativeExtension>)
+                .build()
+                .await
+                .unwrap();
+
+        let loaded: Vec<String> = session
+            .services()
+            .ext_host
+            .loaded_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(loaded.contains(&"hidden-ext".to_string()), "{loaded:?}");
+
+        let report = StartupReport::from_session(&session, false);
+        assert_eq!(report.extensions, vec!["listed-ext".to_string()]);
     }
 }

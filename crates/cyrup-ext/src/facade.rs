@@ -241,6 +241,19 @@ impl crate::native::LateRegistrar for HostLateRegistrar {
             .register_tool_renderer(self.owner.clone(), tool_name)
     }
 
+    fn register_provider_live(
+        &self,
+        id: String,
+        provider: Arc<dyn cyrup_provider::Provider>,
+    ) -> Result<(), ExtError> {
+        self.registry
+            .register_provider_live(self.owner.clone(), id, provider)
+    }
+
+    fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
+        self.registry.unregister_provider_owned(&self.owner, id)
+    }
+
     fn owner(&self) -> ExtensionId {
         self.owner.clone()
     }
@@ -561,6 +574,7 @@ impl ExtensionHost {
         let mut api = InitApi::new();
         ext.init(&mut api).await?;
         let typed_bus_topics = api.take_typed_bus_topics();
+        let live_providers = api.take_live_providers();
         let (
             subs,
             tools,
@@ -636,6 +650,13 @@ impl ExtensionHost {
         for (provider_id, config) in providers {
             self.registry
                 .register_provider(id.clone(), provider_id, config)?;
+        }
+        // LIVE providers: the extension's own `Arc<dyn Provider>`, stored as given (not rebuilt into
+        // a `ConfigProvider`). A failure here is a failed load, so `discard_registrations` purges
+        // whatever this owner already registered, live providers included.
+        for (provider_id, provider) in live_providers {
+            self.registry
+                .register_provider_live(id.clone(), provider_id, provider)?;
         }
         for command in autocomplete {
             self.registry
@@ -2150,6 +2171,28 @@ impl ExtensionHost {
     /// Ids of loaded extensions in load order.
     pub fn loaded_ids(&self) -> Vec<ExtensionId> {
         self.loaded.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Whether the loaded extension `id` is a HIDDEN native ([`NativeExtension::is_hidden`]).
+    /// Anything that is not a loaded native — a guest, an unknown id — is not hidden: pi sets
+    /// `hidden` only on the `builtin:` extensions it loads itself (`resource-loader.ts:729`).
+    pub fn is_extension_hidden(&self, id: &ExtensionId) -> bool {
+        self.native
+            .read()
+            .ok()
+            .and_then(|g| g.get(id).map(|ext| ext.is_hidden()))
+            .unwrap_or(false)
+    }
+
+    /// [`Self::loaded_ids`] minus the hidden ones, in load order: the list the startup
+    /// `[Extensions]` panel shows (pi `getExtensions().extensions.filter((extension) =>
+    /// !extension.hidden)`, `modes/interactive/interactive-mode.ts:1778`). A hidden extension is
+    /// loaded and dispatched like any other — only this listing omits it.
+    pub fn loaded_visible_ids(&self) -> Vec<ExtensionId> {
+        self.loaded_ids()
+            .into_iter()
+            .filter(|id| !self.is_extension_hidden(id))
+            .collect()
     }
 
     /// Build a host with the Wasmtime runtime spun up (engine + instance pool + epoch driver).

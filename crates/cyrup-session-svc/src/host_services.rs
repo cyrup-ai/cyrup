@@ -971,6 +971,92 @@ pub struct LiveHostServices {
     /// blocking prompts open the window here. A WASM guest's prompt already opened it in its `ui.*`
     /// import, so the call arriving here nests and emits nothing more. `None` on the default host.
     ui_prompts: Mutex<Option<Arc<cyrup_ext::UiPromptTracker>>>,
+    /// The catalog-refresh engine behind [`HostServices::refresh_provider`] — the session's
+    /// [`crate::GuestProviderRegistry`], attached by the builder via
+    /// [`Self::attach_provider_refresher`] (it is constructed after this backend, like
+    /// [`Self::event_bus`]). `None` on the default host, where the verb reports that it has no
+    /// registry rather than a clean result.
+    provider_refresher: Mutex<Option<Arc<dyn cyrup_ext::host::services::ProviderRefresher>>>,
+    /// The credential store and provider registry behind [`HostServices::provider_auth`] and
+    /// [`HostServices::provider_credentials`], attached by the builder via
+    /// [`Self::attach_provider_auth`] (the registry is constructed after this backend, like
+    /// [`Self::provider_refresher`]). `None` on the default host, where both verbs keep their trait
+    /// defaults.
+    provider_auth_source: Mutex<Option<ProviderAuthSource>>,
+}
+
+/// What [`LiveHostServices`] resolves a provider's auth against: the session's credential store and
+/// the registry of providers the extensions registered.
+#[derive(Clone)]
+struct ProviderAuthSource {
+    auth: Arc<cyrup_config::AuthStore>,
+    providers: Arc<crate::GuestProviderRegistry>,
+}
+
+/// The session's credential store seen through ONE provider id (see
+/// [`HostServices::provider_credentials`]). Reads of another provider answer `None`; `list` is
+/// filtered to the provider and `modify` / `delete` of another provider are refused, so a native
+/// cannot reach a credential that is not its own THROUGH THIS STORE.
+///
+/// The isolation covers the store, not the resolved auth: [`HostServices::provider_auth`] is pi's
+/// unscoped `getProviderAuth(providerId)` (`core/model-registry.ts:180`) and answers for any
+/// provider id a native names, including the locked refresh and write-back of an OAuth credential.
+struct ScopedCredentialStore {
+    inner: Arc<cyrup_config::AuthStore>,
+    provider: cyrup_core::ProviderId,
+}
+
+impl ScopedCredentialStore {
+    fn refuse(&self, other: &cyrup_core::ProviderId) -> cyrup_provider::AuthError {
+        cyrup_provider::AuthError::store(
+            other.clone(),
+            format!(
+                "this credential store is scoped to `{}` and cannot touch `{}`",
+                self.provider.as_str(),
+                other.as_str()
+            ),
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl cyrup_provider::CredentialStore for ScopedCredentialStore {
+    async fn read(
+        &self,
+        provider: &cyrup_core::ProviderId,
+    ) -> Result<Option<cyrup_provider::Credential>, cyrup_provider::AuthError> {
+        if *provider != self.provider {
+            return Ok(None);
+        }
+        cyrup_provider::CredentialStore::read(self.inner.as_ref(), provider).await
+    }
+
+    async fn list(&self) -> Result<Vec<cyrup_provider::CredentialInfo>, cyrup_provider::AuthError> {
+        let mut all = cyrup_provider::CredentialStore::list(self.inner.as_ref()).await?;
+        all.retain(|info| info.provider == self.provider);
+        Ok(all)
+    }
+
+    async fn modify(
+        &self,
+        provider: &cyrup_core::ProviderId,
+        f: cyrup_provider::ModifyFn,
+    ) -> Result<Option<cyrup_provider::Credential>, cyrup_provider::AuthError> {
+        if *provider != self.provider {
+            return Err(self.refuse(provider));
+        }
+        cyrup_provider::CredentialStore::modify(self.inner.as_ref(), provider, f).await
+    }
+
+    async fn delete(
+        &self,
+        provider: &cyrup_core::ProviderId,
+    ) -> Result<(), cyrup_provider::AuthError> {
+        if *provider != self.provider {
+            return Err(self.refuse(provider));
+        }
+        cyrup_provider::CredentialStore::delete(self.inner.as_ref(), provider).await
+    }
 }
 
 impl LiveHostServices {
@@ -1007,7 +1093,30 @@ impl LiveHostServices {
             event_bus: Mutex::new(None),
             provider_swap: Mutex::new(None),
             ui_prompts: Mutex::new(None),
+            provider_refresher: Mutex::new(None),
+            provider_auth_source: Mutex::new(None),
         }
+    }
+
+    /// Attach the credential store and provider registry [`HostServices::provider_auth`] and
+    /// [`HostServices::provider_credentials`] answer from. Called by the builder with the session's
+    /// own `AuthStore` and [`crate::GuestProviderRegistry`], before any native's command can run.
+    pub fn attach_provider_auth(
+        &self,
+        auth: Arc<cyrup_config::AuthStore>,
+        providers: Arc<crate::GuestProviderRegistry>,
+    ) {
+        *Self::lock(&self.provider_auth_source) = Some(ProviderAuthSource { auth, providers });
+    }
+
+    /// Attach the catalog-refresh engine [`HostServices::refresh_provider`] drives (EXT-022 native
+    /// flavour). Called by the builder with the session's [`crate::GuestProviderRegistry`], before
+    /// any native's command can run.
+    pub fn attach_provider_refresher(
+        &self,
+        refresher: Arc<dyn cyrup_ext::host::services::ProviderRefresher>,
+    ) {
+        *Self::lock(&self.provider_refresher) = Some(refresher);
     }
 
     /// Attach the extension host's UI-prompt window (EXT-075). Called by the builder with the
@@ -1814,6 +1923,90 @@ impl HostServices for LiveHostServices {
             .as_ref()
             .map_or_else(|| Arc::clone(&self.provider), |swap| swap.current());
         (current.id().as_str() == provider_id).then_some(current)
+    }
+
+    /// pi `ctx.modelRegistry.refresh({ providers: [id], allowNetwork, signal })` (see the trait
+    /// method). `allow_network` is always passed explicitly, so the registry's offline switch is
+    /// never consulted: a `true` here reaches the network under an offline run, which is what pi's
+    /// `/llama` relies on (`extensions/llama/index.ts:56`).
+    fn refresh_provider<'a>(
+        &'a self,
+        provider_id: &'a str,
+        allow_network: bool,
+        cancel: CancelToken,
+    ) -> futures::future::BoxFuture<'a, cyrup_provider::ModelsRefreshResult> {
+        let refresher = Self::lock(&self.provider_refresher).clone();
+        Box::pin(async move {
+            let Some(refresher) = refresher else {
+                return cyrup_ext::host::services::no_refresh_backend(provider_id, &cancel);
+            };
+            refresher
+                .refresh(cyrup_ext::host::services::ProviderRefreshRequest {
+                    providers: Some(vec![provider_id.to_string()]),
+                    allow_network: Some(allow_network),
+                    force: false,
+                    cancel,
+                })
+                .await
+        })
+    }
+
+    /// pi `ctx.modelRegistry.getProviderAuth(providerId)` (see the trait method): the provider's
+    /// own `ApiKeyAuth` strategy resolved against the session's credential store and ambient
+    /// environment ([`cyrup_config::login::resolve_provider_auth_for`]).
+    ///
+    /// The provider is found where pi's `ModelRuntime.getAuth` finds it — in the one collection that
+    /// holds every provider: an extension-registered one first (a live provider or a JSON
+    /// registration), then the session's installed provider, then the built-ins.
+    fn provider_auth<'a>(
+        &'a self,
+        provider_id: &'a str,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Option<cyrup_ext::host::services::HostProviderAuth>, String>,
+    > {
+        let source = Self::lock(&self.provider_auth_source).clone();
+        let installed = self.registered_provider(provider_id);
+        Box::pin(async move {
+            let Some(source) = source else {
+                return Ok(None);
+            };
+            let provider = source
+                .providers
+                .provider(provider_id)
+                .or(installed)
+                .or_else(|| {
+                    cyrup_provider::all_providers()
+                        .into_iter()
+                        .find(|p| p.id().as_str() == provider_id)
+                });
+            let Some(provider) = provider else {
+                return Ok(None);
+            };
+            let resolved =
+                cyrup_config::login::resolve_provider_auth_for(&source.auth, provider.as_ref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            Ok(
+                resolved.map(|r| cyrup_ext::host::services::HostProviderAuth {
+                    api_key: r.auth.api_key,
+                    base_url: r.auth.base_url,
+                    env: r.env.unwrap_or_default(),
+                    source: r.source,
+                }),
+            )
+        })
+    }
+
+    fn provider_credentials(
+        &self,
+        provider_id: &str,
+    ) -> Option<Arc<dyn cyrup_provider::CredentialStore>> {
+        let source = Self::lock(&self.provider_auth_source).clone()?;
+        Some(Arc::new(ScopedCredentialStore {
+            inner: source.auth,
+            provider: cyrup_core::ProviderId::from(provider_id),
+        }))
     }
 
     fn context_usage(&self) -> Value {
