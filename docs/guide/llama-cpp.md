@@ -117,9 +117,9 @@ load a model through `/llama` before selecting it.
 ```
 
 `/llama` is interactive only. In RPC mode it answers with a warning ("/llama is available in
-interactive mode") and does nothing else. Do not send it as the whole prompt of a print-mode run
-(`cyrup -p "/llama"`): print mode currently waits forever on any prompt that an extension command
-handles (ledger row `SEAM-137`).
+interactive mode") and does nothing else. In print mode (`cyrup -p "/llama"`) the command is
+handled and the run exits 0 with nothing printed; print mode used to wait forever on any prompt an
+extension command handled (ledger row `SEAM-137`, closed).
 
 - Select an unloaded model to **load** it.
 - Select a loaded model to **unload** it, after a confirmation.

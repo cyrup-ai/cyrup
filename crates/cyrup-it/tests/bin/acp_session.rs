@@ -235,6 +235,27 @@ impl Acp {
         }
     }
 
+    /// [`Self::update`], but FIRST looks through the frames already received since `mark` (an
+    /// index into `seen`, taken before the request was sent).
+    ///
+    /// For a request whose pump pushes updates concurrently with the response, the two can arrive
+    /// in either order: `answer` discards (into `seen`) every frame that precedes the response, so
+    /// an update that beat the response is already behind the read cursor and a plain `update` would
+    /// wait for one that never comes. Under the load of the feature matrix the pump did win that
+    /// race (`current_mode_update` and `config_option_update` arrived before the `set_mode` response)
+    /// and the test timed out; run alone it never did.
+    fn update_since(&mut self, mark: usize, kind: &str) -> Value {
+        if let Some(frame) = self
+            .seen
+            .iter()
+            .skip(mark)
+            .find(|f| f["params"]["update"]["sessionUpdate"] == kind)
+        {
+            return frame["params"]["update"].clone();
+        }
+        self.update(kind)
+    }
+
     /// Drain whatever has already arrived, without waiting. Used to settle the tail of a turn
     /// before an ordering assertion so `seen` is complete.
     fn drain(&mut self, grace: Duration) {
@@ -618,6 +639,8 @@ fn set_mode_answers_empty_and_the_pump_reports_the_applied_level() {
     let mut acp = Acp::start_with_reasoning_model();
     let session = acp.new_session(2);
 
+    // The pump's updates may arrive before OR after the response (see `update_since`).
+    let mark = acp.seen.len();
     acp.send(json!({
         "jsonrpc": "2.0", "id": 3, "method": "session/set_mode",
         "params": {"sessionId": session, "modeId": "high"}
@@ -629,13 +652,13 @@ fn set_mode_answers_empty_and_the_pump_reports_the_applied_level() {
         "ACP-072: the response is `{{}}`"
     );
 
-    let mode = acp.update("current_mode_update");
+    let mode = acp.update_since(mark, "current_mode_update");
     let applied = mode["currentModeId"]
         .as_str()
         .expect("currentModeId")
         .to_owned();
 
-    let config = acp.update("config_option_update");
+    let config = acp.update_since(mark, "config_option_update");
     let options = config["configOptions"].as_array().expect("configOptions");
     let thinking = options
         .iter()

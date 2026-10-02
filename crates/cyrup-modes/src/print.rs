@@ -12,7 +12,9 @@
 use std::io::Write;
 
 use cyrup_core::{Content, Message, StopReason};
-use cyrup_session_svc::{AgentSessionEvent, AgentSessionRuntime, BindOptions, UserInput};
+use cyrup_session_svc::{
+    AgentSessionEvent, AgentSessionRuntime, BindOptions, PromptAccepted, UserInput,
+};
 use futures::StreamExt;
 
 use crate::error::ModesError;
@@ -90,13 +92,29 @@ where
         .await;
 
     // Send loop (Pi print-mode.ts:121-127): prompt each message to completion, in order, producing
-    // no assistant output. Each run stream terminates at `agent_end`; `wait_for_idle` then confirms
-    // the agent is settled before the next prompt is submitted.
+    // no assistant output. A run's stream terminates at `agent_end`; `wait_for_idle` then confirms
+    // the agent is settled before the next prompt is submitted. A prompt an extension handles
+    // starts no run and has no such stream end, so it is told apart below (SEAM-137).
     for input in messages {
         // Pi's `rebindSession` (print-mode.ts:71-72) — re-read the runtime's active session, so a
         // message submitted after an extension replaced it addresses the NEW session.
         let session = runtime.session().await;
-        let mut stream = session.prompt(input).await?;
+        // SEAM-137: `prompt_run` rather than `prompt`, because only `prompt_run` reports whether a
+        // run was started (the hazard is documented on `prompt_run` itself, ACP-153).
+        let (accepted, mut stream) = session.prompt_run(input).await?;
+        if matches!(accepted, PromptAccepted::Handled) {
+            // An extension command or an `input` handler serviced the submission and NO run was
+            // started, so the run-scoped stream is never closed and no `agent_settled` will
+            // arrive: draining it would wait forever (`cyrup -p "/mcp"`). Pi's
+            // `await session.prompt(...)` resolves as soon as the handler has
+            // (print-mode.ts:121-127), so fall through to the next message — `json.rs` guards the
+            // same way. `wait_for_idle` still runs, as it does at the end of every iteration: it
+            // returns at once when nothing is in flight, and per SEAM-125 it also waits out a
+            // compaction a command started. No test here exercises that second case (a command's
+            // own follow-on work starts on the host's pump, so a test of it would race).
+            session.wait_for_idle().await;
+            continue;
+        }
         while let Some(ev) = stream.next().await {
             if opts.show_tools
                 && let AgentSessionEvent::ToolExecutionStart { tool_name, .. } = &ev
