@@ -448,6 +448,11 @@ pub struct InitApi {
     shortcuts: Vec<(String, Option<String>)>,
     flags: Vec<(String, serde_json::Value)>,
     providers: Vec<(String, serde_json::Value)>,
+    /// LIVE providers ([`Self::register_provider_live`]): the extension's own
+    /// `Arc<dyn Provider>`, kept apart from the JSON `providers` because it cannot ride in
+    /// [`InitParts`]' `serde_json::Value`. Taken by the facade with
+    /// [`Self::take_live_providers`] before [`Self::into_parts`].
+    live_providers: Vec<(String, Arc<dyn cyrup_provider::Provider>)>,
     autocomplete: Vec<String>,
     autocomplete_providers: u32,
     /// EXT-018: bus topics, pi's `events` on the same one API object.
@@ -582,6 +587,24 @@ impl InitApi {
         self.providers.push((id.into(), config));
     }
 
+    /// Contribute a LIVE provider: the extension's own `Arc<dyn cyrup_provider::Provider>`, stored
+    /// by the registry as given instead of being rebuilt from a JSON config into a
+    /// `ConfigProvider`. pi's `registerProvider(provider: Provider)` overload takes exactly that — a
+    /// finished provider object the `ModelRegistry` holds and calls (`extensions/types.ts:1803`
+    /// @v0.99.2-17; the `(name, config)` form is `:1804`).
+    ///
+    /// `id` must equal `provider.id()`; a mismatch fails the extension's load. Registering the same
+    /// id again, from here or later through [`LateRegistrar::register_provider_live`], REPLACES the
+    /// provider — pi's "replaces all models" (`model-registry.ts:919` @v0.84.1) — and the model lists
+    /// see the replacement's catalog.
+    pub fn register_provider_live(
+        &mut self,
+        id: impl Into<String>,
+        provider: Arc<dyn cyrup_provider::Provider>,
+    ) {
+        self.live_providers.push((id.into(), provider));
+    }
+
     /// Opt a registered command into argument autocomplete (EXT-035; the native analog of the
     /// guest's `registration.add-autocomplete` import).
     ///
@@ -630,6 +653,13 @@ impl InitApi {
 
     pub fn subscriptions(&self) -> Subscriptions {
         self.subs
+    }
+
+    /// The live providers declared through [`Self::register_provider_live`], moved out.
+    pub(crate) fn take_live_providers(
+        &mut self,
+    ) -> Vec<(String, Arc<dyn cyrup_provider::Provider>)> {
+        std::mem::take(&mut self.live_providers)
     }
 
     pub(crate) fn into_parts(self) -> InitParts {
@@ -758,6 +788,22 @@ pub trait NativeExtension: Send + Sync {
     /// upstream INSTALLED PACKAGE — cyrup compiles in what pi installs — must override this to
     /// `true` so `--no-extensions` means the same thing in both products.
     fn is_ambient(&self) -> bool {
+        false
+    }
+
+    /// Whether this built-in is **hidden** from the startup `[Extensions]` listing. It is still
+    /// loaded, still in [`crate::ExtensionHost::loaded_ids`], and still dispatched; only the list
+    /// the user is shown leaves it out.
+    ///
+    /// pi marks every `builtin:<name>` extension `hidden` when it loads it
+    /// (`extension.hidden = true`, `core/resource-loader.ts:729` @v0.99.2-17) and the interactive
+    /// startup panel lists only `!extension.hidden`
+    /// (`modes/interactive/interactive-mode.ts:1778`) — the `builtin` flag's own doc says it "is
+    /// hidden from the startup Extensions list" (`core/extensions/types.ts:2015`). Hidden is a
+    /// property of HOW the extension was loaded upstream; a compiled-in cyrup native has one load
+    /// path, so the native declares it. Default `false`: an embedder-supplied inline factory is
+    /// listed (`<inline>`), as in pi.
+    fn is_hidden(&self) -> bool {
         false
     }
 
@@ -1157,6 +1203,34 @@ pub trait LateRegistrar: Send + Sync {
     /// [`Self::register_tool`] for the same reason [`InitApi`] splits them: a native tool is an
     /// already-executable `Arc<dyn Tool>` with no descriptor to carry `has_renderer`.
     fn register_tool_renderer(&self, tool_name: String) -> Result<(), ExtError>;
+
+    /// pi `api.registerProvider` from a live handler or background task, with the provider object
+    /// itself ([`InitApi::register_provider_live`] is the `init`-time form). Lands in the model
+    /// registry immediately; registering an id that is already registered REPLACES it and bumps the
+    /// registry generation, so the model lists see the new catalog on their next read.
+    ///
+    /// The default refuses: a registrar that cannot reach a model registry must say so rather
+    /// than report a registration it did not make.
+    fn register_provider_live(
+        &self,
+        id: String,
+        provider: Arc<dyn cyrup_provider::Provider>,
+    ) -> Result<(), ExtError> {
+        let _ = (id, provider);
+        Err(ExtError::Component(
+            "this registrar does not support live provider registration".to_string(),
+        ))
+    }
+
+    /// pi `api.unregisterProvider(name)` (`extensions/types.ts:1819` @v0.99.2-17), for a provider THIS extension
+    /// registered (live or JSON): removes it from the model registry and returns whether it was
+    /// present. A provider another extension owns is left alone and reads as `false`.
+    fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
+        let _ = id;
+        Err(ExtError::Component(
+            "this registrar does not support provider unregistration".to_string(),
+        ))
+    }
 
     /// The extension this handle registers on behalf of. The host binds it at construction, so an
     /// extension holding the handle cannot register under another extension's id — the reason this

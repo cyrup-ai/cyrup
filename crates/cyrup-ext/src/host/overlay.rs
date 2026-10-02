@@ -340,6 +340,17 @@ pub trait InteractiveOverlay: Send {
     /// Route one keystroke.
     fn handle_key(&mut self, key: OverlayKey) -> OverlayOutcome;
 
+    /// Route one bracketed paste (the `\x1b[200~ ... \x1b[201~` payload, markers removed).
+    ///
+    /// pi hands the raw terminal data to the focused component's `handleInput`, and an `Input`
+    /// buffers a paste there and inserts it (`input.ts:62-87`). The host decodes pastes before the
+    /// overlay sees them, so they arrive here instead of as keys. Defaulted to
+    /// [`OverlayOutcome::Ignored`] — a component with no text field has nothing to paste into —
+    /// and the host still keeps the paste away from the editor beneath the modal.
+    fn handle_paste(&mut self, _text: &str) -> OverlayOutcome {
+        OverlayOutcome::Ignored
+    }
+
     /// The self-refresh cadence in milliseconds, or `0` for "never tick me" (the default).
     fn refresh_ms(&self) -> u64 {
         0

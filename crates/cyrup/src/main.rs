@@ -506,13 +506,19 @@ async fn run() -> anyhow::Result<i32> {
     // `main.ts:468-479` @v0.87.1), reported only after the `--help` / `--list-models` exits — so under
     // either it must not stop the run before the output is printed (`--provider bogus --list-models`
     // still lists). Both need a runtime, not a model.
-    let mut provider = match select_provider(
+    //
+    // EXT-027 — a provider no built-in and no `models.json` block names may be one a loaded
+    // extension registers (`--model llama.cpp/<id>`): pi resolves after the extensions load, so the
+    // launch selection defers that case to the session builder ([`cyrup::provider::select_launch_provider`]).
+    let (mut provider, provider_deferred) = match cyrup::provider::select_launch_provider(
         cli.provider.as_deref(),
         cli.model.as_deref(),
         cli.api_key.as_deref(),
         &models_json,
     ) {
-        Err(_) if cli.exits_after_runtime() => select_provider(None, None, None, &models_json)?,
+        Err(_) if cli.exits_after_runtime() => {
+            (select_provider(None, None, None, &models_json)?, false)
+        }
         selected => selected?,
     };
 
@@ -547,6 +553,11 @@ async fn run() -> anyhow::Result<i32> {
     // already folded into `overrides.offline` above. It is the ONLY gate upstream has, so no
     // settings key or extra flag is invented for it.
     config.install_missing_packages = !overrides.offline;
+    // pi `modelNetworkEnabled` (`core/model-runtime.ts:161,182`): the same single gate for the
+    // runtime catalog refresh of the providers extensions registered. The interactive startup
+    // refresh and the post-`/login` refresh leave `allowNetwork` unsaid, so `--offline` /
+    // `CYRUP_OFFLINE` must turn it off here or `/login llama.cpp` reaches the network anyway.
+    config.model_network_enabled = !overrides.offline;
     // `--help` and `--list-models` run on an in-memory session — pi's `createSessionManager` opens with `if
     // (parsed.noSession || parsed.help || parsed.listModels !== undefined) return
     // SessionManager.inMemory(cwd, …)` (`main.ts:363-365` @v0.87.1) — so no session is looked up,
@@ -556,6 +567,19 @@ async fn run() -> anyhow::Result<i32> {
     if cli.exits_after_runtime() {
         config.target = cyrup_session_svc::SessionTarget::New;
         config.persist = false;
+    }
+
+    // A provider left to the session (above) is resolved from the pattern alone, so an explicit
+    // `--provider` becomes its prefix. A `--help` / `--list-models` run resolves no model at all, so
+    // an id nothing registers must not fail it either (`--provider bogus --list-models` lists).
+    if provider_deferred {
+        config.model_pattern = match (cli.exits_after_runtime(), config.model_pattern.as_deref()) {
+            (false, Some(pattern)) => Some(cyrup::provider::qualify_deferred_pattern(
+                cli.provider.as_deref(),
+                pattern,
+            )),
+            _ => None,
+        };
     }
 
     // Non-interactive session-resolution depth (Pi `createSessionManager`, main.ts:254-350): a
@@ -624,7 +648,15 @@ async fn run() -> anyhow::Result<i32> {
     // runs only when all three are absent.
     let auth_store = Arc::new(AuthStore::at(dirs.agent_dir.join("auth.json")));
     if let Some(api_key) = cli.api_key.as_deref() {
-        auth_store.set_runtime_api_key(provider.id().clone(), api_key.to_string());
+        // The provider a deferred launch names, not the placeholder standing in for it.
+        let key_provider = match cyrup::provider::requested_provider_id(
+            cli.provider.as_deref(),
+            cli.model.as_deref(),
+        ) {
+            Some(id) if provider_deferred => cyrup_sdk::core::ProviderId::from(id),
+            _ => provider.id().clone(),
+        };
+        auth_store.set_runtime_api_key(key_provider, api_key.to_string());
     }
 
     // Interactive mode drives the **multi-session** `AgentSessionRuntime` (arch-11 §3.4) so the
@@ -679,6 +711,19 @@ async fn run() -> anyhow::Result<i32> {
         // does it (its own `bindExtensions` inside `InteractiveMode`, the sibling of
         // print-mode.ts:73 / rpc-mode.ts:319). Idempotent per session.
         session.bind_extensions().await;
+        // EXT-027 — the interactive host's startup catalog refresh (`interactive-mode.ts:1115-1126`
+        // `run()`, `void refreshModelCatalogs(modelRuntime, signal)`), for the providers extensions
+        // registered. Detached, offline-gated, and (as pi's `run()` is) after the extensions are
+        // bound and before the first frame; nothing awaits it.
+        cyrup::provider::spawn_extension_provider_refresh(
+            session.services().guest_providers.clone(),
+            cyrup_config::policy::NetworkPolicy::resolve(
+                session.services().settings.effective(),
+                &env,
+                &overrides,
+            ),
+            mode,
+        );
         // (The migrated-credential notice and the `modelFallbackMessage` warning are NOT printed
         // here — pi renders both INSIDE the running UI, interactive-mode.ts:874-876 and :883-884. A
         // pre-TUI `eprintln!` put them exactly where the first frame paints over them. See
@@ -886,6 +931,18 @@ async fn run() -> anyhow::Result<i32> {
 
     match mode {
         AppMode::Rpc => {
+            // EXT-027 — rpc's detached startup refresh, once the runtime exists and before the
+            // mode's loop (`main.ts:931-936`), for the providers extensions registered; the
+            // pi.dev catalogs have their own trigger above. Nothing awaits it.
+            cyrup::provider::spawn_extension_provider_refresh(
+                session.services().guest_providers.clone(),
+                cyrup_config::policy::NetworkPolicy::resolve(
+                    session.services().settings.effective(),
+                    &env,
+                    &overrides,
+                ),
+                mode,
+            );
             timings::print_timings();
             let _signals = spawn_abort_on_signal(runtime.clone(), cancel.clone(), AppMode::Rpc);
             let reader = tokio::io::BufReader::new(tokio::io::stdin());

@@ -25,6 +25,14 @@
 //! there is nothing to wire there and everything to wire here. **The fix site is
 //! `crates/cyrup-session-svc/src/guest_providers.rs` (plus whatever credential store the refresh
 //! writes back to) — not this crate**, which already exposes every call it needs.
+//!
+//! # Live providers
+//!
+//! A NATIVE extension is not limited to that static description: [`ProviderHub::register_live`]
+//! (reached through `InitApi::register_provider_live` and, after `init`, `LateRegistrar::
+//! register_provider_live`) stores the extension's own `Arc<dyn Provider>` and hands it to
+//! [`ModelRegistrySink::upsert_live_provider`] as is — no `ConfigProvider` is rebuilt, so its
+//! transport, catalog and (re-registered) replacement are the extension's own.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -418,6 +426,15 @@ fn interpolate_env(s: &str) -> String {
 pub trait ModelRegistrySink: Send + Sync {
     /// Register (or replace) a provider's models (Pi `registerProvider` → ModelRegistry).
     fn upsert_provider(&self, reg: &ProviderRegistration);
+    /// Register (or replace) a LIVE provider: the sink stores `provider` as given instead of
+    /// realizing a [`cyrup_provider::ConfigProvider`] from a [`ProviderRegistration`]. Replacing an
+    /// existing id swaps the `Arc`, so the next catalog read sees the replacement's models.
+    ///
+    /// Pi's `registerProvider(provider: Provider)` overload takes a finished provider object
+    /// (`extensions/types.ts:1803` @v0.99.2-17) and `ModelRegistry` holds it; cyrup's JSON
+    /// registration can describe only the static half (`ProviderConfig`, `:1804`), so a native that
+    /// owns its own transport and catalog hands the realized provider over here.
+    fn upsert_live_provider(&self, id: &str, provider: Arc<dyn cyrup_provider::Provider>);
     /// Remove a provider's models, restoring any built-ins it overrode (Pi `unregisterProvider`).
     fn remove_provider(&self, id: &str);
 }
@@ -427,6 +444,10 @@ pub trait ModelRegistrySink: Send + Sync {
 #[derive(Default)]
 pub struct ProviderHub {
     registrations: Vec<ProviderRegistration>,
+    /// LIVE providers (a native's own `Arc<dyn Provider>`, see [`Self::register_live`]), keyed by
+    /// id. An id lives in at most one of this map and `registrations`: registering through either
+    /// door replaces whatever the other held under that id (Pi "replaces all models").
+    live: BTreeMap<String, Arc<dyn cyrup_provider::Provider>>,
     /// Ids registered before a sink was bound — flushed in order at [`Self::bind`].
     pending: Vec<String>,
     sink: Option<Arc<dyn ModelRegistrySink>>,
@@ -452,7 +473,9 @@ impl ProviderHub {
             resolved_api_key,
         };
 
-        // Replace an existing registration with the same id (Pi "replaces all models").
+        // Replace an existing registration with the same id (Pi "replaces all models"), whichever
+        // door it came through.
+        self.live.remove(&id);
         self.registrations.retain(|r| r.id != id);
         self.registrations.push(reg.clone());
 
@@ -466,11 +489,42 @@ impl ProviderHub {
         Ok(())
     }
 
+    /// Register a LIVE provider under `id`: store the `Arc` as given and either hand it to the
+    /// bound sink now or queue it for the next [`Self::bind`], exactly like [`Self::register`].
+    /// Re-registering an id (live or JSON) REPLACES it.
+    ///
+    /// Refuses a provider whose own [`cyrup_provider::Provider::id`] is not `id`: the session finds
+    /// the provider that owns a model by `model.provider`, so a registry key that disagreed with the
+    /// provider's identity would list models nothing could stream.
+    pub fn register_live(
+        &mut self,
+        id: String,
+        provider: Arc<dyn cyrup_provider::Provider>,
+    ) -> Result<(), String> {
+        if provider.id().as_str() != id {
+            return Err(format!(
+                "live provider registered as `{id}` identifies itself as `{}`",
+                provider.id().as_str()
+            ));
+        }
+        self.registrations.retain(|r| r.id != id);
+        self.live.insert(id.clone(), Arc::clone(&provider));
+        match &self.sink {
+            Some(sink) => sink.upsert_live_provider(&id, provider),
+            None => {
+                self.pending.retain(|p| p != &id);
+                self.pending.push(id);
+            }
+        }
+        Ok(())
+    }
+
     /// Unregister a provider (Pi `unregisterProvider`): drop it + notify the sink. Returns whether it
     /// was present.
     pub fn unregister(&mut self, id: &str) -> bool {
-        let had = self.registrations.iter().any(|r| r.id == id);
+        let had = self.registrations.iter().any(|r| r.id == id) || self.live.contains_key(id);
         self.registrations.retain(|r| r.id != id);
+        self.live.remove(id);
         self.pending.retain(|p| p != id);
         if had && let Some(sink) = &self.sink {
             sink.remove_provider(id);
@@ -483,6 +537,8 @@ impl ProviderHub {
         for id in std::mem::take(&mut self.pending) {
             if let Some(reg) = self.registrations.iter().find(|r| r.id == id) {
                 sink.upsert_provider(reg);
+            } else if let Some(provider) = self.live.get(&id) {
+                sink.upsert_live_provider(&id, Arc::clone(provider));
             }
         }
         self.sink = Some(sink);
@@ -500,7 +556,16 @@ impl ProviderHub {
 
     /// All registered provider ids (Pi `getRegisteredProviders`).
     pub fn ids(&self) -> Vec<String> {
-        self.registrations.iter().map(|r| r.id.clone()).collect()
+        self.registrations
+            .iter()
+            .map(|r| r.id.clone())
+            .chain(self.live.keys().cloned())
+            .collect()
+    }
+
+    /// The live provider registered under `id` ([`Self::register_live`]), if any.
+    pub fn live_provider(&self, id: &str) -> Option<Arc<dyn cyrup_provider::Provider>> {
+        self.live.get(id).cloned()
     }
 
     /// Look up a resolved registration by id.

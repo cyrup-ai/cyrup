@@ -1,0 +1,39 @@
+[package]
+name = "cyrup-llama"
+description = "llama.cpp router support: provider, model discovery, Hugging Face search and the /llama manager (native cyrup-ext extension; port of pi's bundled llama.cpp extension)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# NB: no `default-features = false` on cyrup-ext — `HostServices`, `InteractiveOverlay` and the
+# overlay value types are `wasm-host`-gated re-exports, the same requirement cyrup-flux states.
+cyrup-config = { workspace = true }
+cyrup-core = { workspace = true }
+cyrup-ext = { workspace = true }
+cyrup-provider = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+regex = "1.12.4"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+# `ui.rs` measures and cuts terminal columns the way pi-tui's `visibleWidth`/`truncateToWidth` do
+# (grapheme-atomic, East-Asian width) and must not depend on `cyrup-tui`, so it carries the two
+# primitives itself.
+unicode-segmentation = { workspace = true }
+unicode-width = "0.2"
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

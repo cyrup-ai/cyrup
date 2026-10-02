@@ -1319,6 +1319,28 @@ impl ExtensionRegistry {
         Ok(())
     }
 
+    /// Register a LIVE custom provider: the owner's own `Arc<dyn Provider>`, stored as given
+    /// ([`ProviderHub::register_live`]) instead of being rebuilt from a JSON config into a
+    /// `ConfigProvider`. Same routing and the same ownership rule as [`Self::register_provider`] —
+    /// immediate upsert if the model registry is bound, else queued for the next bind, and the id's
+    /// owner becomes `owner` (last registration wins, exactly as the JSON door does) — so
+    /// [`Self::purge_owner`] drops it with the rest of the owner's registrations. Re-registering an
+    /// id REPLACES the previous provider, which is how a native swaps a catalog after startup.
+    pub fn register_provider_live(
+        &self,
+        owner: ExtensionId,
+        id: impl Into<String>,
+        provider: Arc<dyn cyrup_provider::Provider>,
+    ) -> Result<(), ExtError> {
+        let id = id.into();
+        let mut g = self.lock_write()?;
+        g.provider_hub
+            .register_live(id.clone(), provider)
+            .map_err(ExtError::Component)?;
+        g.provider_owner.insert(id, owner);
+        Ok(())
+    }
+
     /// Opt a registered command into argument autocomplete — the registry table behind BOTH tiers'
     /// `add-autocomplete` (the native `InitApi` call and, since EXT-065's neighbouring fix, the
     /// guest's `registration.add-autocomplete` import).
@@ -1464,7 +1486,9 @@ impl ExtensionRegistry {
         g.flag_declarations.retain(|d| d.extension != *owner);
 
         // --- providers: the hub unregister is what makes the model registry drop the models this
-        // owner upserted at `register_provider` ("immediate upsert if the model registry is bound").
+        // owner upserted at `register_provider` ("immediate upsert if the model registry is bound")
+        // — and the LIVE provider it handed over at `register_provider_live`, which the same
+        // `unregister` removes from the hub and from the sink.
         let ids: Vec<String> = g
             .provider_owner
             .iter()
@@ -1515,6 +1539,23 @@ impl ExtensionRegistry {
 
     pub fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
         let mut g = self.lock_write()?;
+        g.provider_owner.remove(id);
+        Ok(g.provider_hub.unregister(id))
+    }
+
+    /// [`Self::unregister_provider`], but only when `owner` is the id's CURRENT owner; a provider
+    /// someone else (re)registered is left alone and the answer is `false`. This is the verb the
+    /// post-`init` `LateRegistrar` exposes: its owner is bound by the host, so a handle can retract
+    /// what it registered and nothing else.
+    pub fn unregister_provider_owned(
+        &self,
+        owner: &ExtensionId,
+        id: &str,
+    ) -> Result<bool, ExtError> {
+        let mut g = self.lock_write()?;
+        if g.provider_owner.get(id) != Some(owner) {
+            return Ok(false);
+        }
         g.provider_owner.remove(id);
         Ok(g.provider_hub.unregister(id))
     }

@@ -10,7 +10,10 @@
 use crate::api::channel;
 use crate::auth::{
     AuthContext, AuthOverrides, AuthResult, CredentialStore, EnvAuthContext,
-    InMemoryCredentialStore, resolve_provider_auth,
+    InMemoryCredentialStore, ProviderEnv, resolve_provider_auth,
+};
+use crate::classifier::{
+    AnyModel, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, ModelType,
 };
 use crate::context::Context;
 use crate::error::ProviderError;
@@ -208,6 +211,68 @@ impl Models {
             .find(|m| m.id.as_str() == id)
     }
 
+    // ---- multi-type reads (Pi `getAllModels` `models.ts:446-463`, `getModelsOfType` `:468-470`,
+    // `getModelOfType` `:476-478` @v0.99.2-17). `ModelType::Image` is not ported; see
+    // [`crate::classifier`]. ----
+
+    /// Last-known models of every type from one provider, or all providers (Pi `getAllModels`).
+    /// Each provider contributes [`Provider::get_all_models`], whose default is its chat catalog
+    /// (`entry.getAllModels?.() ?? entry.getModels()`, `:451`, `:460`).
+    pub fn get_all_models(&self, provider: Option<&str>) -> Vec<AnyModel> {
+        match provider {
+            Some(id) => self
+                .providers
+                .get(id)
+                .map(|p| p.get_all_models())
+                .unwrap_or_default(),
+            None => self
+                .providers
+                .values()
+                .flat_map(|p| p.get_all_models())
+                .collect(),
+        }
+    }
+
+    /// The models of one type (Pi `getModelsOfType`, `:468-470`).
+    pub fn get_models_of_type(
+        &self,
+        model_type: ModelType,
+        provider: Option<&str>,
+    ) -> Vec<AnyModel> {
+        self.get_all_models(provider)
+            .into_iter()
+            .filter(|m| m.model_type() == model_type)
+            .collect()
+    }
+
+    /// One model of a type by provider and id (Pi `getModelOfType`, `:476-478`). Ids are unique
+    /// within a type, not across types.
+    pub fn get_model_of_type(
+        &self,
+        model_type: ModelType,
+        provider: &str,
+        id: &str,
+    ) -> Option<AnyModel> {
+        self.get_models_of_type(model_type, Some(provider))
+            .into_iter()
+            .find(|m| m.id() == id)
+    }
+
+    /// The classifier models of one provider, or all providers (Pi `getModelsOfType("classifier")`).
+    pub fn get_classifier_models(&self, provider: Option<&str>) -> Vec<ClassifierModel> {
+        self.get_all_models(provider)
+            .into_iter()
+            .filter_map(AnyModel::into_classifier)
+            .collect()
+    }
+
+    /// One classifier model by provider and id (Pi `getModelOfType("classifier", ...)`).
+    pub fn get_classifier_model(&self, provider: &str, id: &str) -> Option<ClassifierModel> {
+        self.get_classifier_models(Some(provider))
+            .into_iter()
+            .find(|m| m.id.as_str() == id)
+    }
+
     // ---- auth (Pi `getAuth` declared `models.ts:164-165`, implemented `:411-429` @v0.83.0;
     // PROV-041 corrected `:216`, the closing brace of `mergeHeaders`) ----
 
@@ -395,6 +460,132 @@ impl Models {
         options: &SimpleStreamOptions,
     ) -> AssistantMessage {
         collect_message(self.stream_simple(model, context, options)).await
+    }
+
+    /// Classify structured state through the owning provider, applying request auth first (Pi
+    /// `Models.classify`, `models.ts:966-982` @v0.99.2-17; the registry's pass-through,
+    /// `core/model-registry.ts:168-173`).
+    ///
+    /// **Never fails as a call**: an unknown provider (`Unknown provider: ${model.provider}`,
+    /// `:824-829`), a provider that is not configured (`Provider is not configured: ...`,
+    /// `:853-855`), a failed auth resolution, and a provider without classification
+    /// ([`Provider::classify`]'s default) all come back as an error [`ClassifierResult`], marked
+    /// `aborted` when the request was cancelled (`classifierErrorResult(model, error,
+    /// options?.signal?.aborted)`, `:980`).
+    ///
+    /// Support is checked BEFORE auth, as pi does (`:974-977`): a provider that cannot classify
+    /// ([`Provider::supports_classification`]) is answered without a credential read.
+    ///
+    /// Auth is applied the way pi's `applyAuth` does for any operation (`:837-869`): the explicit
+    /// `api_key` wins over the resolved one, the model's own headers fold over the resolved ones
+    /// (`getAuth`, `:746-752`), `headers` and `env` merge per key with the request
+    /// side winning, a resolved base URL replaces the model's, `transform_headers` runs last over
+    /// the merged headers and is then stripped from what the provider receives. A provider that
+    /// returns no [`Provider::provider_auth`] encapsulates its own auth: nothing is resolved or
+    /// required, and the request options pass through (still with the transform applied and
+    /// stripped).
+    pub async fn classify(
+        &self,
+        model: &ClassifierModel,
+        context: &ClassifierContext,
+        options: &ClassifierOptions,
+    ) -> ClassifierResult {
+        let Some(provider) = self.providers.get(model.provider.as_str()) else {
+            return ClassifierResult::errored(
+                model,
+                format!("Unknown provider: {}", model.provider),
+                options.is_aborted(),
+            );
+        };
+        // `if (!provider.classify) throw ...` precedes `applyAuth` (`models.ts:974-977`), so a
+        // provider that cannot classify answers this without a credential read or OAuth refresh.
+        if !provider.supports_classification() {
+            return ClassifierResult::errored(
+                model,
+                format!(
+                    "Provider {} does not support classification",
+                    model.provider
+                ),
+                options.is_aborted(),
+            );
+        }
+        let (request_model, request_options) = match self
+            .apply_classifier_auth(provider.as_ref(), model, options)
+            .await
+        {
+            Ok(request) => request,
+            Err(message) => {
+                return ClassifierResult::errored(model, message, options.is_aborted());
+            }
+        };
+        provider
+            .classify(&request_model, context, &request_options)
+            .await
+    }
+
+    /// Pi `applyAuth` (`models.ts:837-869`) for a classifier request; the `Err` string is the
+    /// error result's message.
+    async fn apply_classifier_auth(
+        &self,
+        provider: &dyn Provider,
+        model: &ClassifierModel,
+        options: &ClassifierOptions,
+    ) -> Result<(ClassifierModel, ClassifierOptions), String> {
+        let resolution = match provider.provider_auth() {
+            Some(auth_strategy) => {
+                let resolved = resolve_provider_auth(
+                    &model.provider,
+                    auth_strategy,
+                    &model.to_auth_model(),
+                    self.credentials.as_ref(),
+                    self.auth_context.as_ref(),
+                    AuthOverrides {
+                        api_key: options.api_key.as_deref(),
+                        env: options.env.as_ref(),
+                        min_oauth_validity_ms: None,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                // `if (!resolution) throw new ModelsError("auth", "Provider is not configured: ...")`
+                // (`:853-855`).
+                Some(
+                    resolved
+                        .ok_or_else(|| format!("Provider is not configured: {}", model.provider))?,
+                )
+            }
+            None => None,
+        };
+        let (auth, resolution_env) = match &resolution {
+            Some(r) => (Some(&r.auth), r.env.as_ref()),
+            None => (None, None),
+        };
+
+        let mut request_model = model.clone();
+        if let Some(base_url) = auth.and_then(|a| a.base_url.as_ref()) {
+            request_model.base_url = base_url.clone();
+        }
+        let mut request_options = options.clone();
+        request_options.api_key = options
+            .api_key
+            .clone()
+            .or_else(|| auth.and_then(|a| a.api_key.clone()));
+        // `getAuth(model, ...)` folds the model's own headers over the resolved ones
+        // (`auth.headers = mergeHeaders(result.auth.headers, model.headers)`, `models.ts:746-752`)
+        // BEFORE `applyAuth` merges the request's and runs `transformHeaders`, so the transform
+        // sees (and can rewrite) the model's headers. The no-strategy arm gets the same base.
+        let auth_headers = merge_headers(
+            auth.and_then(|a| a.headers.as_ref()),
+            model.headers.as_ref(),
+        );
+        let mut headers = merge_headers(auth_headers.as_ref(), options.headers.as_ref());
+        if let Some(transform) = &options.transform_headers {
+            headers = Some(transform(headers.unwrap_or_default()).await);
+        }
+        request_options.headers = headers;
+        request_options.transform_headers = None;
+        request_options.env = merge_env(resolution_env, options.env.as_ref());
+        Ok((request_model, request_options))
     }
 
     /// Ask dynamic providers to re-fetch their model lists — **the full port** of Pi
@@ -789,6 +980,23 @@ fn merge_headers(
         for (k, v) in h {
             merged.insert(k.clone(), v.clone());
         }
+    }
+    Some(merged)
+}
+
+/// Merge a resolution's env with the request's; the request wins per key (Pi
+/// `{ ...(resolution.env ?? {}), ...(options?.env ?? {}) }`, `models.ts:862`). `None` when
+/// neither side has any.
+fn merge_env(
+    resolution_env: Option<&ProviderEnv>,
+    option_env: Option<&ProviderEnv>,
+) -> Option<ProviderEnv> {
+    if resolution_env.is_none() && option_env.is_none() {
+        return None;
+    }
+    let mut merged = ProviderEnv::new();
+    for env in [resolution_env, option_env].into_iter().flatten() {
+        merged.extend(env.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
     Some(merged)
 }

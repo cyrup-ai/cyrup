@@ -26,6 +26,7 @@ members = [
     "crates/cyrup-flux",
     "crates/cyrup-mcp",
     "crates/cyrup-acp",
+    "crates/cyrup-llama",
     "crates/cyrup-it",
     "xtask",
 ]
@@ -86,6 +87,7 @@ default-members = [
     "crates/cyrup-flux",
     "crates/cyrup-mcp",
     "crates/cyrup-acp",
+    "crates/cyrup-llama",
 ]
 
 [workspace.package]
@@ -148,6 +150,7 @@ cyrup-herdr        = { path = "crates/cyrup-herdr",        version = "0.0.0" }
 cyrup-flux         = { path = "crates/cyrup-flux",         version = "0.0.0" }
 cyrup-mcp          = { path = "crates/cyrup-mcp",          version = "0.0.0" }
 cyrup-acp          = { path = "crates/cyrup-acp",          version = "0.0.0" }
+cyrup-llama        = { path = "crates/cyrup-llama",        version = "0.0.0" }
 
 # --- standardized external deps (arch-00 §7). Versions are inert until a crate
 #     references them via `dep.workspace = true`; verify/bump on first use. ---

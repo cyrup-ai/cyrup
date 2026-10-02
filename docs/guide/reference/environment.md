@@ -210,6 +210,23 @@ Two of them, `QWEN_TOKEN_PLAN_API_KEY` and `QWEN_TOKEN_PLAN_CN_API_KEY`, are lis
 --help`'s environment block. That block is pinned to the resolver's table, which does read them —
 it is not a claim that a provider exists to use them.
 
+## llama.cpp
+
+The built-in [llama.cpp support](../llama-cpp.md) reads these. All are optional; `/login llama.cpp`
+stores the first two instead.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LLAMA_BASE_URL` | none | URL of a llama.cpp router (`http://127.0.0.1:8080`). Setting it is enough to make the `llama.cpp` provider available. A stored login's URL wins |
+| `LLAMA_API_KEY` | `local` | Key sent to the router when no key is stored |
+| `HF_TOKEN` | none | Hugging Face token for `/llama` model search |
+| `HF_TOKEN_PATH` | none | Token file, read when `HF_TOKEN` is unset |
+| `HF_HOME` | none | Read as `$HF_HOME/token` after `HF_TOKEN_PATH` |
+| `XDG_CACHE_HOME` | none | Read as `$XDG_CACHE_HOME/huggingface/token` after `HF_HOME` (cyrup also uses it to site the WASM build cache; the two uses are unrelated) |
+
+The token search ends at `~/.cache/huggingface/token`. Search works without a token at lower rate
+limits.
+
 ## Subagents
 
 Read only when the [subagents](../extensions/subagents.md) extension is installed.

@@ -1170,7 +1170,7 @@ fn tui105_login_reports_the_missing_default_by_name() {
 
     let action = "Logged in to Deepseek";
 
-    // Rung 2: `!hasDefaultModelProvider(providerId)` (`:5904-5905`). `"stub"` is absent from
+    // Rung 2 (after llama.cpp's, pinned by `tui105_llama_cpp_login_ends_in_guidance_not_a_default`): `!hasDefaultModelProvider(providerId)` (`:5904-5905`). `"stub"` is absent from
     // `default_model_per_provider`, which is why the other tests log in to `deepseek`.
     assert_eq!(
         default_model_selection("stub", &[]),
@@ -1473,5 +1473,1262 @@ async fn tui105_post_login_refresh_fetches_only_the_provider_logged_into() {
         fetched.len(),
         1,
         "exactly one provider is fetched by a scoped post-login refresh, saw {fetched:?}"
+    );
+}
+
+// ================================================================ EXT-027 (H3): extension providers
+
+// An extension's LIVE provider is a first-class `/login` target. pi's `getLoginProviderOptions`
+// reads the ONE composed provider list (`this.session.modelRuntime.getProviders()`,
+// `interactive-mode.ts:4943-4947`), which holds a native extension's provider beside the built-ins
+// (`nativeExtensionProviders.get(id)`, `core/model-runtime.ts:298` @v0.99.2-17); cyrup keeps the two
+// apart, so `build_login_inputs` joins them. The strategy below is shaped like pi's llama.cpp one
+// (`extensions/llama/provider.ts:156-196`): a two-prompt login (URL, optional key) that returns
+// `{ type: "api_key", key, env: { LLAMA_BASE_URL } }`, and a `check` active only when a URL is known.
+//
+// No network: the login flow does not call the server (pi's does, `provider.ts:174`; that probe is
+// the real strategy's, not what is under test here).
+
+const LLAMA_ID: &str = "llama.cpp";
+const LLAMA_URL_ENV: &str = "LLAMA_BASE_URL";
+const LLAMA_URL: &str = "http://127.0.0.1:9";
+
+async fn llama_server_url(
+    ctx: &dyn cyrup_provider::AuthContext,
+    cred: Option<&Credential>,
+) -> Option<String> {
+    let stored = cred
+        .and_then(Credential::env)
+        .and_then(|env| env.get(LLAMA_URL_ENV))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    match stored {
+        Some(url) => Some(url),
+        None => ctx.env(LLAMA_URL_ENV).await.map(|v| v.trim().to_string()),
+    }
+}
+
+struct LlamaLikeAuth;
+
+#[async_trait::async_trait]
+impl ApiKeyAuth for LlamaLikeAuth {
+    fn name(&self) -> &str {
+        "llama.cpp server"
+    }
+    fn supports_login(&self) -> bool {
+        true
+    }
+    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+        let entered = interaction
+            .prompt(AuthPrompt::text("llama.cpp server URL"))
+            .await?;
+        let key = interaction
+            .prompt(AuthPrompt::secret("API key (optional)"))
+            .await?;
+        let key = Some(key.trim().to_string()).filter(|k| !k.is_empty());
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(LLAMA_URL_ENV.to_string(), entered.trim().to_string());
+        Ok(Credential::ApiKey {
+            key,
+            env: Some(env),
+        })
+    }
+    fn supports_check(&self) -> bool {
+        true
+    }
+    async fn check(
+        &self,
+        ctx: &dyn cyrup_provider::AuthContext,
+        cred: Option<&Credential>,
+    ) -> Result<Option<cyrup_provider::collection::AuthCheck>, ProviderAuthError> {
+        Ok(llama_server_url(ctx, cred)
+            .await
+            .map(|_| cyrup_provider::collection::AuthCheck {
+                auth_type: cyrup_provider::collection::AuthType::ApiKey,
+                source: Some(if cred.is_some() {
+                    "stored credential".to_string()
+                } else {
+                    LLAMA_URL_ENV.to_string()
+                }),
+            }))
+    }
+    async fn resolve(
+        &self,
+        _model: &Model,
+        ctx: &dyn cyrup_provider::AuthContext,
+        cred: Option<&Credential>,
+    ) -> Result<Option<cyrup_provider::AuthResult>, ProviderAuthError> {
+        Ok(llama_server_url(ctx, cred)
+            .await
+            .map(|url| cyrup_provider::AuthResult::from_key("local", url)))
+    }
+}
+
+/// A native whose `init` registers one LIVE provider under `id` with the llama-like strategy.
+struct LiveProviderNative {
+    id: &'static str,
+    provider: Arc<dyn Provider>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for LiveProviderNative {
+    fn id(&self) -> cyrup_core::ExtensionId {
+        cyrup_core::ExtensionId::from("live-provider-ext")
+    }
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.register_provider_live(self.id, Arc::clone(&self.provider));
+        Ok(())
+    }
+    async fn on_event(
+        &self,
+        _ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        cyrup_ext::HookOutcome::Noop
+    }
+}
+
+fn llama_like_provider(id: &'static str, display: &str) -> Arc<dyn Provider> {
+    llama_like_provider_with(id, display, vec![model_named(id, "tiny")])
+}
+
+/// [`llama_like_provider`] over an explicit model list — the llama.cpp post-login guidance counts
+/// the provider's models (`interactive-mode.ts:5958`), so its tests need both zero and several.
+fn llama_like_provider_with(
+    id: &'static str,
+    display: &str,
+    models: Vec<Model>,
+) -> Arc<dyn Provider> {
+    struct Named {
+        inner: StubProvider,
+        display: String,
+    }
+    #[async_trait::async_trait]
+    impl Provider for Named {
+        fn id(&self) -> &ProviderId {
+            self.inner.id()
+        }
+        fn name(&self) -> &str {
+            &self.display
+        }
+        fn models(&self) -> &[Model] {
+            self.inner.models()
+        }
+        fn provider_auth(&self) -> Option<&ProviderAuth> {
+            self.inner.provider_auth()
+        }
+        fn stream(
+            &self,
+            model: &Model,
+            context: &Context,
+            options: &StreamOptions,
+        ) -> EventStream<StreamEvent> {
+            self.inner.stream(model, context, options)
+        }
+    }
+    Arc::new(Named {
+        inner: StubProvider {
+            id: ProviderId::from(id),
+            auth: ProviderAuth::with_api_key(Arc::new(LlamaLikeAuth)),
+            models,
+        },
+        display: display.to_string(),
+    })
+}
+
+/// A session with `provider` registered LIVE under `id`, over a credential store whose ambient
+/// environment is `env` and nothing else.
+async fn live_provider_fixture(
+    id: &'static str,
+    provider: Arc<dyn Provider>,
+    env: &[(&str, &str)],
+) -> Fixture {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut config = SessionConfig::new(cwd, agent_dir.clone());
+    config.trust_override = Some(true);
+    config.no_extensions = true;
+    let ambient: std::collections::HashMap<String, String> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    let auth = Arc::new(
+        cyrup_config::AuthStore::at(agent_dir.join("auth.json")).with_ambient_env(ambient),
+    );
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, config)
+        .auth(auth)
+        .with_native_extension(
+            Arc::new(LiveProviderNative { id, provider }) as Arc<dyn cyrup_ext::NativeExtension>
+        )
+        .build()
+        .await
+        .unwrap();
+    Fixture {
+        _tmp: tmp,
+        agent_dir,
+        session: Arc::new(session),
+    }
+}
+
+/// An empty built-in registry, so the live provider is the only row and a flow cannot be confused by
+/// a built-in of the same name.
+fn no_builtin_providers() -> LoginProviderSource {
+    Arc::new(Vec::new)
+}
+
+/// **The picker half.** A live provider carrying an api-key strategy with a `login` appears in the
+/// `/login` inputs and options beside the built-ins, with its OWN display name and the normal
+/// two-prompt api-key flow; a static JSON-registered guest provider does NOT (it has no login of its
+/// own, and its key is baked at registration).
+///
+/// **Red without the change:** `build_login_inputs` iterates `all_providers()` alone, so there is no
+/// `llama.cpp` row at all.
+#[tokio::test]
+async fn a_live_extension_provider_appears_in_the_login_picker() {
+    let fx = live_provider_fixture(LLAMA_ID, llama_like_provider(LLAMA_ID, "llama.cpp"), &[]).await;
+    fx.session
+        .services()
+        .ext_host
+        .registry()
+        .register_provider(
+            cyrup_core::ExtensionId::from("acme-ext"),
+            "acme",
+            serde_json::json!({
+                "name": "Acme",
+                "baseUrl": "http://127.0.0.1:1/v1",
+                "api": "openai-completions",
+                "models": [{ "id": "acme-fast" }],
+            }),
+        )
+        .unwrap();
+    // The DEFAULT registry: the built-ins are there too.
+    let app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+
+    let inputs = app.login_provider_inputs(&fx.session).await;
+
+    let row = inputs
+        .iter()
+        .find(|p| p.id.as_str() == LLAMA_ID)
+        .expect("the live provider has a /login row");
+    assert_eq!(row.name, "llama.cpp", "the provider's own display name");
+    assert!(!row.status.configured, "nothing is configured yet");
+    assert!(
+        inputs.iter().any(|p| p.id.as_str() == "anthropic"),
+        "the built-ins are still listed"
+    );
+    assert!(
+        inputs.iter().all(|p| p.id.as_str() != "acme"),
+        "a static JSON registration is not a /login target"
+    );
+
+    let options = cyrup_config::login::login_provider_options(&inputs, None);
+    let option = options
+        .iter()
+        .find(|o| o.id.as_str() == LLAMA_ID)
+        .expect("the live provider has a picker option");
+    assert_eq!(option.auth_type, AuthType::ApiKey);
+    assert!(
+        option.supports_login,
+        "the strategy has a `login`, so the normal prompt flow runs rather than the ambient dialog"
+    );
+    assert_eq!(option.method_name.as_deref(), Some("llama.cpp server"));
+}
+
+/// A live provider registered under a BUILT-IN id replaces that row (pi's registry holds one
+/// provider per id and `registerProvider` "replaces all models"), so `/login anthropic` runs the
+/// extension's strategy rather than listing the id twice.
+#[tokio::test]
+async fn a_live_provider_replaces_the_builtin_row_of_the_same_id() {
+    let fx = live_provider_fixture(
+        "anthropic",
+        llama_like_provider("anthropic", "Proxy Anthropic"),
+        &[],
+    )
+    .await;
+    let app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+
+    let inputs = app.login_provider_inputs(&fx.session).await;
+
+    let rows: Vec<_> = inputs
+        .iter()
+        .filter(|p| p.id.as_str() == "anthropic")
+        .collect();
+    assert_eq!(rows.len(), 1, "one row per provider id");
+    assert_eq!(rows[0].name, "Proxy Anthropic");
+    assert!(
+        rows[0].auth.oauth.is_none(),
+        "the extension's strategy replaced the built-in's subscription login"
+    );
+}
+
+/// **The login half.** `/login llama.cpp` runs the strategy's own two-prompt flow with the scripted
+/// answers, stores `Credential::ApiKey { key, env: { LLAMA_BASE_URL } }` under the provider's id, and
+/// the credential makes the provider's models available — the end-to-end of the whole lane.
+///
+/// **Red without the change:** the picker has no such provider, so `/login llama.cpp` opens the
+/// provider selector and no flow ever runs.
+#[tokio::test]
+async fn logging_in_to_a_live_provider_stores_the_api_key_and_env_credential() {
+    let fx = live_provider_fixture(LLAMA_ID, llama_like_provider(LLAMA_ID, "llama.cpp"), &[]).await;
+    let mut app = app_with(no_builtin_providers());
+    let mut rx = app.install_login_channel();
+    assert!(
+        fx.session
+            .available_model_catalog()
+            .iter()
+            .all(|m| m.provider.as_str() != LLAMA_ID),
+        "unavailable before the login"
+    );
+
+    app.execute_command(
+        AppCommand::LoginCommand(Some(LLAMA_ID.to_string())),
+        &fx.session,
+        None,
+    )
+    .await;
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::LoginDialog),
+        "`/login llama.cpp` starts the flow directly"
+    );
+
+    // Prompt 1: the server URL.
+    let msg = next_msg(&mut rx).await;
+    assert!(matches!(msg, LoginUiMsg::Prompt { .. }), "got {msg:?}");
+    app.apply_login_msg(&fx.session, msg).await;
+    assert!(
+        app.login_dialog_body()
+            .unwrap()
+            .contains("llama.cpp server URL"),
+        "{}",
+        app.login_dialog_body().unwrap()
+    );
+    type_text(&mut app, LLAMA_URL);
+    app.handle_input(&key(KeyCode::Enter));
+
+    // Prompt 2: the optional key.
+    let msg = next_msg(&mut rx).await;
+    assert!(matches!(msg, LoginUiMsg::Prompt { .. }), "got {msg:?}");
+    app.apply_login_msg(&fx.session, msg).await;
+    assert!(
+        app.login_dialog_body()
+            .unwrap()
+            .contains("API key (optional)"),
+        "{}",
+        app.login_dialog_body().unwrap()
+    );
+    type_text(&mut app, "sk-llama");
+    app.handle_input(&key(KeyCode::Enter));
+
+    let finished = next_msg(&mut rx).await;
+    match &finished {
+        LoginUiMsg::Finished(f) => assert!(f.result.is_ok(), "login failed: {:?}", f.result),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+    app.apply_login_msg(&fx.session, finished).await;
+
+    match fx
+        .session
+        .services()
+        .auth
+        .read(&ProviderId::from(LLAMA_ID))
+        .await
+        .unwrap()
+        .expect("credential persisted")
+    {
+        cyrup_config::auth::Credential::ApiKey { key, env } => {
+            assert_eq!(key.as_deref(), Some("sk-llama"));
+            assert_eq!(
+                env.as_ref()
+                    .and_then(|e| e.get(LLAMA_URL_ENV))
+                    .map(String::as_str),
+                Some(LLAMA_URL),
+                "the server URL rides in the credential's env, which is how it reaches the provider"
+            );
+        }
+        other => panic!("expected an api-key credential, got {other:?}"),
+    }
+    assert!(
+        fx.session
+            .available_model_catalog()
+            .iter()
+            .any(|m| m.provider.as_str() == LLAMA_ID),
+        "the stored credential makes the provider's models available"
+    );
+    let text = transcript_text(&app);
+    assert!(text.contains("Saved API key for llama.cpp"), "{text}");
+}
+
+/// The picker's status line for a live provider is its strategy's `check`
+/// (`getProviderAuthStatus`, `core/model-runtime.ts:428-437`): unconfigured with nothing, the
+/// environment arm (labelled with the check's source) when only `LLAMA_BASE_URL` is set, and
+/// `stored` once a credential is on disk. The `env_keys` table knows nothing of this provider id, so
+/// without the strategy the environment case could never read as configured.
+#[tokio::test]
+async fn a_live_providers_login_status_is_its_strategys_check() {
+    let app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+
+    let bare =
+        live_provider_fixture(LLAMA_ID, llama_like_provider(LLAMA_ID, "llama.cpp"), &[]).await;
+    let inputs = app.login_provider_inputs(&bare.session).await;
+    let status = &inputs
+        .iter()
+        .find(|p| p.id.as_str() == LLAMA_ID)
+        .unwrap()
+        .status;
+    assert!(!status.configured);
+
+    let env = live_provider_fixture(
+        LLAMA_ID,
+        llama_like_provider(LLAMA_ID, "llama.cpp"),
+        &[(LLAMA_URL_ENV, LLAMA_URL)],
+    )
+    .await;
+    let inputs = app.login_provider_inputs(&env.session).await;
+    let status = &inputs
+        .iter()
+        .find(|p| p.id.as_str() == LLAMA_ID)
+        .unwrap()
+        .status;
+    assert!(status.configured);
+    assert_eq!(
+        status.source,
+        Some(cyrup_config::auth::AuthSource::Environment)
+    );
+    assert_eq!(status.label.as_deref(), Some(LLAMA_URL_ENV));
+
+    env.session
+        .services()
+        .auth
+        .modify(&ProviderId::from(LLAMA_ID), |_| async {
+            Ok(Some(cyrup_config::auth::Credential::api_key("sk")))
+        })
+        .await
+        .unwrap();
+    let inputs = app.login_provider_inputs(&env.session).await;
+    let status = &inputs
+        .iter()
+        .find(|p| p.id.as_str() == LLAMA_ID)
+        .unwrap()
+        .status;
+    assert_eq!(status.source, Some(cyrup_config::auth::AuthSource::Stored));
+}
+
+/// `isUsingOAuth(id)` (`interactive-mode.ts:4863`) is the STORED credential's kind, for a live
+/// provider as for a built-in: an OAuth credential stored under the live provider's id marks its row
+/// `using_oauth` (and the picker option's status `oauth`), while an api-key credential does not.
+///
+/// **Red without the change:** a live row hard-coded to `using_oauth: false` reports the stored OAuth
+/// login as an api key.
+#[tokio::test]
+async fn a_live_providers_row_reports_a_stored_oauth_credential_as_oauth() {
+    let app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+    let fx = live_provider_fixture(LLAMA_ID, llama_like_provider(LLAMA_ID, "llama.cpp"), &[]).await;
+    let option_status_kind = |inputs: &[cyrup_config::login::ProviderLoginInput]| {
+        cyrup_config::login::login_provider_options(inputs, None)
+            .into_iter()
+            .find(|o| o.id.as_str() == LLAMA_ID)
+            .and_then(|o| o.status)
+            .map(|s| s.auth_type)
+    };
+
+    fx.session
+        .services()
+        .auth
+        .modify(&ProviderId::from(LLAMA_ID), |_| async {
+            Ok(Some(cyrup_config::auth::Credential::api_key("sk")))
+        })
+        .await
+        .unwrap();
+    let inputs = app.login_provider_inputs(&fx.session).await;
+    let row = inputs.iter().find(|p| p.id.as_str() == LLAMA_ID).unwrap();
+    assert!(!row.using_oauth, "an api-key credential is not oauth");
+    assert_eq!(option_status_kind(&inputs), Some(AuthType::ApiKey));
+
+    fx.session
+        .services()
+        .auth
+        .modify(&ProviderId::from(LLAMA_ID), |_| async {
+            Ok(Some(cyrup_config::auth::Credential::Oauth {
+                refresh: "rt".to_string(),
+                access: "at".to_string(),
+                expires: i64::MAX,
+                ext: Default::default(),
+            }))
+        })
+        .await
+        .unwrap();
+    let inputs = app.login_provider_inputs(&fx.session).await;
+    let row = inputs.iter().find(|p| p.id.as_str() == LLAMA_ID).unwrap();
+    assert!(row.using_oauth, "a stored oauth credential marks the row");
+    assert_eq!(option_status_kind(&inputs), Some(AuthType::Oauth));
+}
+
+// ================================================ EXT-027 — llama.cpp post-login guidance
+//
+// `llamaCppPostLoginGuidance` (`interactive-mode.ts:349-353`), reached from `finishAuthentication`
+// as its FIRST rung (`:5957-5958`) and only when the session had no model (`isUnknownModel`,
+// `:5953`).
+
+/// Both guidance templates byte-for-byte, the rung's priority over every other rung, and the
+/// provider gate: only the exact id `llama.cpp` takes it.
+///
+/// **Red without the change:** `DefaultModelFailure::LlamaCppGuidance` does not exist, and without
+/// the first rung `llama.cpp` (absent from `default_model_per_provider`) falls to
+/// `NoDefaultConfigured` / `NoModelsAvailable`.
+#[test]
+fn tui105_llama_cpp_login_ends_in_guidance_not_a_default() {
+    use crate::app::login::{DefaultModelFailure, default_model_selection};
+
+    let action = "Saved API key for llama.cpp";
+
+    // `loadedModelCount === 0` (`:350-351`).
+    assert_eq!(
+        default_model_selection(LLAMA_ID, &[]),
+        Err(DefaultModelFailure::LlamaCppGuidance(0)),
+        "FIRST rung: ahead of both `hasDefaultModelProvider` (`:5959`) and the empty-catalog rung"
+    );
+    assert_eq!(
+        DefaultModelFailure::LlamaCppGuidance(0).message(action, LLAMA_ID),
+        "Saved API key for llama.cpp. No llama.cpp models are loaded. \
+         Use /llama to load a model, then /model to select it."
+    );
+
+    // Otherwise (`:352`): the count is `providerModels.length`, any positive number.
+    let two = [model_named(LLAMA_ID, "a"), model_named(LLAMA_ID, "b")];
+    assert_eq!(
+        default_model_selection(LLAMA_ID, &two),
+        Err(DefaultModelFailure::LlamaCppGuidance(2)),
+        "loaded models do NOT make the login select one: pi never picks a llama.cpp default"
+    );
+    for count in [1, 2, 40] {
+        assert_eq!(
+            DefaultModelFailure::LlamaCppGuidance(count).message(action, LLAMA_ID),
+            "Saved API key for llama.cpp. Use /model to select a loaded llama.cpp model, \
+             or /llama to manage models."
+        );
+    }
+
+    // Other providers are unaffected: the gate is `providerId === "llama.cpp"` exactly.
+    assert_eq!(
+        default_model_selection("stub", &[]),
+        Err(DefaultModelFailure::NoDefaultConfigured)
+    );
+    assert_eq!(
+        default_model_selection("llama.cpp-2", &two),
+        Err(DefaultModelFailure::NoDefaultConfigured),
+        "a different id, even one that starts with `llama.cpp`, is not the llama.cpp provider"
+    );
+    assert_eq!(
+        default_model_selection(DEFAULTED_PROVIDER, &[]),
+        Err(DefaultModelFailure::NoModelsAvailable)
+    );
+    let want = model_named(DEFAULTED_PROVIDER, DEFAULTED_MODEL);
+    assert_eq!(
+        default_model_selection(DEFAULTED_PROVIDER, std::slice::from_ref(&want))
+            .unwrap()
+            .id
+            .as_str(),
+        DEFAULTED_MODEL
+    );
+}
+
+/// A credential-less first run (`session.model() == None`, pi's `isUnknownModel`) with `models`
+/// registered LIVE under `llama.cpp`, the same way the `cyrup-llama` extension does.
+async fn first_run_llama_fixture(models: Vec<Model>) -> Fixture {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut config = SessionConfig::new(cwd, agent_dir.clone());
+    config.trust_override = Some(true);
+    config.no_extensions = true;
+    let provider: Arc<dyn Provider> = Arc::new(ModellessProvider(ProviderId::from("none")));
+    let session = SessionBuilder::new(provider, config)
+        .auth(hermetic_auth(&agent_dir))
+        .with_native_extension(Arc::new(LiveProviderNative {
+            id: LLAMA_ID,
+            provider: llama_like_provider_with(LLAMA_ID, "llama.cpp", models),
+        }) as Arc<dyn cyrup_ext::NativeExtension>)
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(session.model(), None, "pi's isUnknownModel state");
+    Fixture {
+        _tmp: tmp,
+        agent_dir,
+        session: Arc::new(session),
+    }
+}
+
+/// Run `/login llama.cpp` through its two prompts and apply the `Finished`.
+async fn login_to_llama(
+    app: &mut App<TestBackend>,
+    session: &Arc<AgentSession>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<LoginUiMsg>,
+) {
+    app.execute_command(
+        AppCommand::LoginCommand(Some(LLAMA_ID.to_string())),
+        session,
+        None,
+    )
+    .await;
+    for answer in [LLAMA_URL, "sk-llama"] {
+        let msg = next_msg(rx).await;
+        assert!(matches!(msg, LoginUiMsg::Prompt { .. }), "got {msg:?}");
+        app.apply_login_msg(session, msg).await;
+        type_text(app, answer);
+        app.handle_input(&key(KeyCode::Enter));
+    }
+    let finished = next_msg(rx).await;
+    match &finished {
+        LoginUiMsg::Finished(f) => assert!(f.result.is_ok(), "login failed: {:?}", f.result),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+    app.apply_login_msg(session, finished).await;
+}
+
+/// End to end, zero models: a first-run `/login llama.cpp` reports the "no models are loaded"
+/// guidance as an error line after the credentials line, selects nothing, and is NOT deferred —
+/// `llama.cpp` has no curated default, so `deferSelection` (`:5944-5949`) is false and the
+/// guidance is produced by the inline `finishAuthentication()` call, not by the refresh.
+///
+/// **Red without the change:** the transcript carries the generic `no default model is configured
+/// for provider "llama.cpp"` line instead.
+#[tokio::test]
+async fn tui105_first_run_llama_cpp_login_with_no_models_says_to_load_one() {
+    let fx = first_run_llama_fixture(Vec::new()).await;
+    let mut app = app_with(no_builtin_providers());
+    let mut rx = app.install_login_channel();
+    let mut refresh_rx = app.install_login_refresh_channel();
+
+    login_to_llama(&mut app, &fx.session, &mut rx).await;
+
+    let path = fx.agent_dir.join("auth.json").display().to_string();
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(&format!(
+            "Saved API key for llama.cpp. Credentials saved to {path}"
+        )),
+        "`:5991`; got:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "Saved API key for llama.cpp. No llama.cpp models are loaded. \
+             Use /llama to load a model, then /model to select it."
+        ),
+        "`llamaCppPostLoginGuidance(_, 0)` (`:350-351`); got:\n{text}"
+    );
+    assert!(
+        !text.contains("no default model is configured"),
+        "the llama.cpp rung precedes the generic one:\n{text}"
+    );
+    assert!(
+        !text.contains("Refreshing model catalog"),
+        "llama.cpp is not a `hasDefaultModelProvider`, so `deferSelection` is false:\n{text}"
+    );
+    assert_eq!(
+        fx.session.model(),
+        None,
+        "the guidance path selects nothing"
+    );
+
+    let refresh = tokio::time::timeout(Duration::from_secs(5), refresh_rx.recv())
+        .await
+        .expect("the post-login refresh must settle")
+        .expect("the refresh channel stays open");
+    assert!(
+        !refresh.defer,
+        "`deferSelection` (`:5944-5949`) is false for llama.cpp"
+    );
+}
+
+/// End to end, models loaded: the other template, and still no model selected.
+///
+/// **Red without the change:** a loaded `llama.cpp` model is neither selected (no curated default)
+/// nor guided to, so the transcript has the generic `no default model is configured` line.
+#[tokio::test]
+async fn tui105_first_run_llama_cpp_login_with_models_points_at_model_and_llama() {
+    let fx = first_run_llama_fixture(vec![
+        model_named(LLAMA_ID, "tiny"),
+        model_named(LLAMA_ID, "big"),
+    ])
+    .await;
+    let mut app = app_with(no_builtin_providers());
+    let mut rx = app.install_login_channel();
+
+    login_to_llama(&mut app, &fx.session, &mut rx).await;
+
+    assert!(
+        fx.session
+            .available_model_catalog()
+            .iter()
+            .filter(|m| m.provider.as_str() == LLAMA_ID)
+            .count()
+            == 2,
+        "the credential must have made both models available"
+    );
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(
+            "Saved API key for llama.cpp. Use /model to select a loaded llama.cpp model, \
+             or /llama to manage models."
+        ),
+        "`llamaCppPostLoginGuidance(_, n > 0)` (`:352`); got:\n{text}"
+    );
+    assert!(
+        !text.contains("No llama.cpp models are loaded"),
+        "the zero-model template must not be used when models are loaded:\n{text}"
+    );
+    assert_eq!(
+        fx.session.model(),
+        None,
+        "pi never selects a llama.cpp model on login"
+    );
+}
+
+/// The guidance only exists when the previous model is unknown (`isUnknownModel(previousModel)`,
+/// `:5953`): a session that already has a model logs in to llama.cpp with the bare credentials line
+/// and no advice.
+///
+/// **Red without the change:** a rung placed outside the `isUnknownModel` gate would print the
+/// guidance to every user who logs in with a model already chosen.
+#[tokio::test]
+async fn tui105_llama_cpp_guidance_is_only_for_an_unknown_previous_model() {
+    let fx = live_provider_fixture(LLAMA_ID, llama_like_provider(LLAMA_ID, "llama.cpp"), &[]).await;
+    let before = fx.session.model().expect("the faux fixture has a model");
+    let mut app = app_with(no_builtin_providers());
+    let mut rx = app.install_login_channel();
+
+    login_to_llama(&mut app, &fx.session, &mut rx).await;
+
+    let path = fx.agent_dir.join("auth.json").display().to_string();
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(&format!(
+            "Saved API key for llama.cpp. Credentials saved to {path}"
+        )),
+        "got:\n{text}"
+    );
+    assert!(
+        !text.contains("/llama") && !text.contains("llama.cpp models"),
+        "a session that already has a model gets no llama.cpp guidance:\n{text}"
+    );
+    assert_eq!(fx.session.model(), Some(before));
+}
+
+/// Other providers are unaffected end to end: a first-run login to a curated-default provider still
+/// selects its default and says nothing about `/llama`.
+///
+/// **Red without the change:** a rung that fired for every provider (or lost its id gate) would
+/// replace the `Selected …` line with the llama.cpp advice.
+#[tokio::test]
+async fn tui105_other_providers_never_get_the_llama_cpp_guidance() {
+    let fx = first_run_fixture().await;
+    credential(&fx.session, DEFAULTED_PROVIDER);
+    let mut app = app_with(registry_for(
+        DEFAULTED_PROVIDER,
+        ProviderAuth::with_oauth(Arc::new(ScriptedOauth)),
+    ));
+    let mut rx = app.install_login_channel();
+
+    let (action, msg) =
+        drive_login_to_finished(&mut app, &fx.session, &mut rx, DEFAULTED_PROVIDER).await;
+    app.apply_login_msg(&fx.session, msg).await;
+
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(&format!("{action}. Selected {DEFAULTED_MODEL}.")),
+        "got:\n{text}"
+    );
+    assert!(
+        !text.contains("/llama") && !text.contains("llama.cpp"),
+        "{text}"
+    );
+}
+
+// ================================================ EXT-027 — the post-login refresh reaches a LIVE provider
+//
+// pi's `completeProviderAuthentication` ends in `session.modelRuntime.refresh({ providers:
+// [providerId], signal })` (`interactive-mode.ts:5953`). pi holds a native extension's provider in
+// the SAME composed collection as the built-ins (`nativeExtensionProviders`,
+// `core/model-runtime.ts:298` @v0.99.2-17), so that call reaches the provider's own `refreshModels`
+// (`models.ts:546-606`) and the models it publishes are what `/model` lists afterwards. cyrup keeps
+// such a provider in the guest registry, which the pi.dev catalog service behind
+// `AgentSession::refresh_provider_catalog` never touched: after `/login llama.cpp` nothing was
+// refreshed and the models appeared only after a restart or `/llama`.
+//
+// **No network.** The provider's "refresh" is a scripted in-memory publication; the credential
+// strategy is the same pure-function `LlamaLikeAuth` the tests above use.
+
+/// What a [`Refreshable`] does when the host runs its NETWORK-phase `refresh_models`.
+#[derive(Clone)]
+enum RefreshPlan {
+    /// Publish a catalog of these model ids, by re-registering the provider live (the way the
+    /// `cyrup-llama` controller swaps its provider, `cyrup-llama/src/provider.rs`).
+    Publish(Vec<&'static str>),
+    /// Fail with this message (pi's `refreshModels` throwing).
+    Fail(&'static str),
+    /// Block until the caller aborts (`context.signal`).
+    Hang,
+}
+
+type RegistrarSlot = Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::LateRegistrar>>>>;
+
+/// A live provider with a scripted `refresh_models`. `seen` records the `allow_network` flag of every
+/// refresh the host drove through it, `models` is what the registry exposes until a publication swaps
+/// the provider for a fresh one.
+struct Refreshable {
+    id: ProviderId,
+    models: Vec<Model>,
+    plan: RefreshPlan,
+    registrar: RegistrarSlot,
+    seen: Arc<std::sync::Mutex<Vec<bool>>>,
+    auth: ProviderAuth,
+}
+
+impl Refreshable {
+    fn new(
+        id: &str,
+        cached: &[&'static str],
+        plan: RefreshPlan,
+        registrar: RegistrarSlot,
+        seen: Arc<std::sync::Mutex<Vec<bool>>>,
+    ) -> Self {
+        Self {
+            id: ProviderId::from(id),
+            models: cached.iter().map(|m| model_named(id, m)).collect(),
+            plan,
+            registrar,
+            seen,
+            auth: ProviderAuth::with_api_key(Arc::new(LlamaLikeAuth)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for Refreshable {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+    fn name(&self) -> &str {
+        "llama.cpp"
+    }
+    fn models(&self) -> &[Model] {
+        &self.models
+    }
+    fn provider_auth(&self) -> Option<&ProviderAuth> {
+        Some(&self.auth)
+    }
+    async fn refresh_models(
+        &self,
+        ctx: &cyrup_provider::RefreshModelsContext,
+    ) -> Option<Result<(), cyrup_provider::ProviderError>> {
+        self.seen.lock().unwrap().push(ctx.allow_network);
+        // The cache-only restore the startup performs has nothing persisted to restore here.
+        if !ctx.allow_network {
+            return Some(Ok(()));
+        }
+        match &self.plan {
+            RefreshPlan::Fail(message) => Some(Err(cyrup_provider::ProviderError::ModelSource(
+                (*message).into(),
+            ))),
+            RefreshPlan::Hang => {
+                ctx.cancelled().await;
+                Some(Ok(()))
+            }
+            RefreshPlan::Publish(ids) => {
+                let refresh = cyrup_ext::host::services::ProviderRefreshContext::current()?;
+                let next: Arc<dyn Provider> = Arc::new(Refreshable::new(
+                    self.id.as_str(),
+                    ids,
+                    self.plan.clone(),
+                    Arc::clone(&self.registrar),
+                    Arc::clone(&self.seen),
+                ));
+                let registrar = self.registrar.lock().unwrap().clone();
+                let id = self.id.as_str().to_string();
+                let published = refresh
+                    .publish(cyrup_ext::host::services::ModelsPublication {
+                        persist: None,
+                        update: Some(Box::new(move || {
+                            if let Some(registrar) = registrar {
+                                let _ = registrar.register_provider_live(id, next);
+                            }
+                        })),
+                    })
+                    .await;
+                Some(published.map(|_| ()))
+            }
+        }
+    }
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: &Context,
+        _options: &StreamOptions,
+    ) -> EventStream<StreamEvent> {
+        Box::pin(futures::stream::empty())
+    }
+}
+
+/// The native that registers a [`Refreshable`] live and keeps the late registrar the host hands it.
+struct RefreshableNative {
+    provider: Arc<dyn Provider>,
+    registrar: RegistrarSlot,
+}
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for RefreshableNative {
+    fn id(&self) -> cyrup_core::ExtensionId {
+        cyrup_core::ExtensionId::from("refreshable-ext")
+    }
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.register_provider_live(self.provider.id().as_str(), Arc::clone(&self.provider));
+        Ok(())
+    }
+    async fn on_event(
+        &self,
+        _ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        cyrup_ext::HookOutcome::Noop
+    }
+    fn set_late_registrar(&self, registrar: Arc<dyn cyrup_ext::LateRegistrar>) {
+        *self.registrar.lock().unwrap() = Some(registrar);
+    }
+}
+
+/// A credential-less first run (`session.model() == None`) with a [`Refreshable`] registered live
+/// under `id`, holding `cached` as the catalog the registry already knows. Returns the session and
+/// the `allow_network` log of its refreshes.
+async fn first_run_refreshable_fixture(
+    id: &'static str,
+    cached: &[&'static str],
+    plan: RefreshPlan,
+) -> (Fixture, Arc<std::sync::Mutex<Vec<bool>>>) {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut config = SessionConfig::new(cwd, agent_dir.clone());
+    config.trust_override = Some(true);
+    config.no_extensions = true;
+    let registrar: RegistrarSlot = Arc::default();
+    let seen: Arc<std::sync::Mutex<Vec<bool>>> = Arc::default();
+    let provider: Arc<dyn Provider> = Arc::new(Refreshable::new(
+        id,
+        cached,
+        plan,
+        Arc::clone(&registrar),
+        Arc::clone(&seen),
+    ));
+    let session = SessionBuilder::new(
+        Arc::new(ModellessProvider(ProviderId::from("none"))) as Arc<dyn Provider>,
+        config,
+    )
+    .auth(hermetic_auth(&agent_dir))
+    .with_native_extension(Arc::new(RefreshableNative {
+        provider,
+        registrar,
+    }) as Arc<dyn cyrup_ext::NativeExtension>)
+    .build()
+    .await
+    .unwrap();
+    assert_eq!(session.model(), None, "pi's isUnknownModel state");
+    (
+        Fixture {
+            _tmp: tmp,
+            agent_dir,
+            session: Arc::new(session),
+        },
+        seen,
+    )
+}
+
+/// `/login <id>` through the llama-like strategy's two prompts, applying the `Finished`.
+async fn login_to_live(
+    app: &mut App<TestBackend>,
+    session: &Arc<AgentSession>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<LoginUiMsg>,
+    id: &str,
+) {
+    app.execute_command(
+        AppCommand::LoginCommand(Some(id.to_string())),
+        session,
+        None,
+    )
+    .await;
+    for answer in [LLAMA_URL, "sk-live"] {
+        let msg = next_msg(rx).await;
+        assert!(matches!(msg, LoginUiMsg::Prompt { .. }), "got {msg:?}");
+        app.apply_login_msg(session, msg).await;
+        type_text(app, answer);
+        app.handle_input(&key(KeyCode::Enter));
+    }
+    let finished = next_msg(rx).await;
+    match &finished {
+        LoginUiMsg::Finished(f) => assert!(f.result.is_ok(), "login failed: {:?}", f.result),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+    app.apply_login_msg(session, finished).await;
+}
+
+/// The next settled post-login refresh, failing loudly rather than hanging.
+async fn next_refresh(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::login_dialog::LoginRefreshMsg>,
+) -> crate::login_dialog::LoginRefreshMsg {
+    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the post-login refresh must settle")
+        .expect("the refresh channel stays open")
+}
+
+fn live_models(session: &Arc<AgentSession>, id: &str) -> Vec<String> {
+    let mut ids: Vec<String> = session
+        .available_model_catalog()
+        .iter()
+        .filter(|m| m.provider.as_str() == id)
+        .map(|m| m.id.as_str().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// **The headline.** `/login llama.cpp` refreshes the LIVE provider's catalog, so the models its
+/// refresh publishes are listed once the post-login refresh settles — pi's
+/// `modelRuntime.refresh({ providers: ["llama.cpp"], signal })` (`interactive-mode.ts:5953`) reaching
+/// the extension provider's `refreshModels`.
+///
+/// The guidance printed at login is computed BEFORE the refresh, from the cached catalog, exactly as
+/// pi orders it: `llama.cpp` has no curated default so `deferSelection` is false and
+/// `await finishAuthentication()` (`:5950`) runs ahead of the refresh (`:5951-5973`). The refresh
+/// then moves the count (`:5964`), which is what `/model` and the footer read.
+///
+/// **Red without the change:** `refresh_provider_catalog` consults only the pi.dev catalog service,
+/// which a fixture session does not even wire, so the result is a clean no-op, the provider's
+/// `refresh_models` is never called and `available_model_catalog()` still holds no llama.cpp model.
+#[tokio::test]
+async fn ext027_login_to_a_live_provider_refreshes_its_catalog() {
+    let (fx, seen) =
+        first_run_refreshable_fixture(LLAMA_ID, &[], RefreshPlan::Publish(vec!["tiny", "big"]))
+            .await;
+    let mut app = app_with(no_builtin_providers());
+    let mut rx = app.install_login_channel();
+    let mut refresh_rx = app.install_login_refresh_channel();
+
+    login_to_live(&mut app, &fx.session, &mut rx, LLAMA_ID).await;
+    assert!(
+        live_models(&fx.session, LLAMA_ID).is_empty(),
+        "nothing is cached, so nothing is listed before the refresh lands"
+    );
+    assert!(
+        transcript_text(&app).contains("No llama.cpp models are loaded."),
+        "the guidance counts the catalog as it stood at `finishAuthentication` (`:5950`)"
+    );
+
+    let refresh = next_refresh(&mut refresh_rx).await;
+    assert!(refresh.result.is_clean(), "{:?}", refresh.result);
+    app.apply_login_refresh(&fx.session, refresh).await;
+
+    assert_eq!(
+        live_models(&fx.session, LLAMA_ID),
+        vec!["big".to_string(), "tiny".to_string()],
+        "the models the provider's refresh published must be listed after the login refresh"
+    );
+    assert!(
+        seen.lock().unwrap().contains(&true),
+        "the provider's NETWORK phase must have run (`models.ts:573-576`): {:?}",
+        seen.lock().unwrap()
+    );
+    let text = transcript_text(&app);
+    assert!(
+        !text.contains("could not be refreshed") && !text.contains("timed out"),
+        "a clean refresh warns about nothing:\n{text}"
+    );
+    assert_eq!(
+        fx.session.model(),
+        None,
+        "pi never selects a llama.cpp model on login (`:5957-5958`)"
+    );
+}
+
+/// The DEFERRED shape on a live provider: the curated default is absent until the refresh publishes
+/// it, so `finishAuthentication` runs from the refresh continuation (`:5958-5963`) and its
+/// `providerModels.length` — the count the guidance and every other rung read — is the REAL one.
+///
+/// **Red without the change:** the refresh publishes nothing, the continuation finds zero models
+/// and reports `no models are available for that provider`, selecting nothing.
+#[tokio::test]
+async fn ext027_a_deferred_live_login_selects_from_the_refreshed_catalog() {
+    let (fx, _seen) = first_run_refreshable_fixture(
+        DYNAMIC_PROVIDER,
+        &[],
+        RefreshPlan::Publish(vec![DYNAMIC_MODEL]),
+    )
+    .await;
+    let mut app = app_with(no_builtin_providers());
+    let mut rx = app.install_login_channel();
+    let mut refresh_rx = app.install_login_refresh_channel();
+
+    login_to_live(&mut app, &fx.session, &mut rx, DYNAMIC_PROVIDER).await;
+    let before = transcript_text(&app);
+    assert!(
+        before.contains("Refreshing model catalog…"),
+        "`deferSelection` (`:5944-5949`) postpones the selection:\n{before}"
+    );
+    assert_eq!(fx.session.model(), None);
+
+    let refresh = next_refresh(&mut refresh_rx).await;
+    assert!(refresh.defer);
+    app.apply_login_refresh(&fx.session, refresh).await;
+
+    let model = fx.session.model().expect("the continuation must select");
+    assert_eq!(
+        (model.provider.as_str(), model.model.as_str()),
+        (DYNAMIC_PROVIDER, DYNAMIC_MODEL)
+    );
+    let text = transcript_text(&app);
+    assert!(
+        text.contains(&format!("Selected {DYNAMIC_MODEL}.")),
+        "got:\n{text}"
+    );
+    assert!(!text.contains("no models are available"), "{text}");
+}
+
+/// A refresh that FAILS is surfaced the way pi surfaces it for any provider
+/// (`` `${actionLabel}, but its model catalog could not be refreshed; using cached models.` ``,
+/// `interactive-mode.ts:5959`), and the cached catalog stays usable.
+///
+/// **Red without the change:** the live provider is never refreshed, so no failure exists to report
+/// and the transcript carries no warning.
+#[tokio::test]
+async fn ext027_a_failed_live_refresh_warns_and_keeps_the_cached_models() {
+    let (fx, seen) =
+        first_run_refreshable_fixture(LLAMA_ID, &["cached"], RefreshPlan::Fail("server down"))
+            .await;
+    let mut app = app_with(no_builtin_providers());
+    let mut rx = app.install_login_channel();
+    let mut refresh_rx = app.install_login_refresh_channel();
+
+    login_to_live(&mut app, &fx.session, &mut rx, LLAMA_ID).await;
+    let refresh = next_refresh(&mut refresh_rx).await;
+    assert!(
+        refresh.result.errors.contains_key(LLAMA_ID),
+        "the provider's failure is reported under its id: {:?}",
+        refresh.result
+    );
+    assert!(
+        refresh
+            .result
+            .errors
+            .get(LLAMA_ID)
+            .is_some_and(|e| e.contains("server down")),
+        "{:?}",
+        refresh.result
+    );
+    app.apply_login_refresh(&fx.session, refresh).await;
+
+    assert!(
+        transcript_text(&app).contains(
+            "Saved API key for llama.cpp, but its model catalog could not be refreshed; \
+             using cached models."
+        ),
+        "got:\n{}",
+        transcript_text(&app)
+    );
+    assert_eq!(
+        live_models(&fx.session, LLAMA_ID),
+        vec!["cached".to_string()],
+        "a failed refresh leaves the cached catalog in place"
+    );
+    assert!(seen.lock().unwrap().contains(&true));
+}
+
+/// Cancellation reaches the provider: a refresh blocked on the server returns as soon as the
+/// caller's token fires (the login's 15 s deadline, `:5951-5952`), reported as THIS caller's timeout
+/// so the continuation prints pi's `timed out` warning (`:5957`).
+///
+/// **Red without the change:** the live provider is never asked, the call settles clean at once and
+/// `timed_out` is false.
+#[tokio::test]
+async fn ext027_cancelling_the_login_refresh_stops_a_blocked_live_provider() {
+    let (fx, seen) = first_run_refreshable_fixture(LLAMA_ID, &[], RefreshPlan::Hang).await;
+    // The credential the login would have stored, so the network phase resolves one.
+    let mut cred_env = std::collections::BTreeMap::new();
+    cred_env.insert(LLAMA_URL_ENV.to_string(), LLAMA_URL.to_string());
+    fx.session
+        .services()
+        .auth
+        .modify(&ProviderId::from(LLAMA_ID), |_| async move {
+            Ok::<_, cyrup_config::AuthError>(Some(cyrup_config::Credential::ApiKey {
+                key: None,
+                env: Some(cred_env),
+            }))
+        })
+        .await
+        .unwrap();
+
+    let cancel = cyrup_core::CancelToken::new();
+    let trip = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        trip.cancel();
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        fx.session.refresh_provider_catalog(cancel, LLAMA_ID),
+    )
+    .await
+    .expect("a cancelled refresh must return, not hang on the provider");
+
+    assert!(
+        seen.lock().unwrap().contains(&true),
+        "the provider was blocked in its network phase: {:?}",
+        seen.lock().unwrap()
+    );
+    assert!(result.timed_out, "the caller's token fired: {result:?}");
+    assert!(
+        result.errors.is_empty(),
+        "an abort is not a failure: {result:?}"
+    );
+}
+
+/// pi passes no `allowNetwork` on the login refresh, so the runtime's own switch decides
+/// (`options.allowNetwork ?? this.modelNetworkEnabled`, `core/model-runtime.ts:850`): an offline
+/// session's login refresh restores the cache and touches no network.
+///
+/// **Red without the change:** a refresh that forced `allow_network: true` would run the provider's
+/// network phase under an offline run.
+#[tokio::test]
+async fn ext027_the_login_refresh_honours_the_offline_switch() {
+    let (fx, seen) =
+        first_run_refreshable_fixture(LLAMA_ID, &[], RefreshPlan::Publish(vec!["tiny"])).await;
+    fx.session
+        .services()
+        .guest_providers
+        .set_network_enabled(false);
+    let mut app = app_with(no_builtin_providers());
+    let mut rx = app.install_login_channel();
+    let mut refresh_rx = app.install_login_refresh_channel();
+
+    login_to_live(&mut app, &fx.session, &mut rx, LLAMA_ID).await;
+    let refresh = next_refresh(&mut refresh_rx).await;
+    app.apply_login_refresh(&fx.session, refresh).await;
+
+    assert!(
+        !seen.lock().unwrap().contains(&true),
+        "no network phase under the offline switch: {:?}",
+        seen.lock().unwrap()
+    );
+    assert!(
+        live_models(&fx.session, LLAMA_ID).is_empty(),
+        "nothing was fetched, so nothing is listed"
     );
 }

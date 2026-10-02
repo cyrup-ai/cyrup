@@ -231,3 +231,12 @@ required-features = ["it"]
 name              = "misc"
 path              = "tests/misc/main.rs"
 required-features = ["it"]
+
+[[test]]
+# `crates/cyrup-llama`'s seam (EXT-027): the llama.cpp built-in against a loopback fake
+# `llama-server`, through a real assembled session and the real `cyrup` binary. Its own target so
+# the loopback server's sockets and the spawned RPC children cannot take another subsystem's
+# report down with them.
+name              = "llama"
+path              = "tests/llama/main.rs"
+required-features = ["it"]

@@ -1,6 +1,9 @@
 //! The `Provider` abstraction (arch-01 §6 / func-01 §6).
 
 use crate::auth::{Credential, ProviderAuth};
+use crate::classifier::{
+    AnyModel, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult,
+};
 use crate::collection::clamp_thinking_level;
 use crate::context::Context;
 use crate::error::ProviderError;
@@ -104,6 +107,18 @@ pub trait Provider: Send + Sync {
     /// Last-known catalog; synchronous and non-throwing (func-01 R-01-001).
     fn models(&self) -> &[Model];
 
+    /// Every model the provider lists, of every type (Pi `Provider.getAllModels?`,
+    /// `models.ts:174`: "Complete synchronous catalog across every model type"). The default is the
+    /// chat catalog wrapped as [`AnyModel::Chat`], which is what pi falls back to at every call
+    /// site (`entry.getAllModels?.() ?? entry.getModels()`, `models.ts:451`, `:460`, `:723`). A
+    /// provider that lists classifier models overrides this and returns them after its chat
+    /// models, as pi's llama provider does (`getAllModels: () => [...models, ...classifiers]`,
+    /// `extensions/llama/provider.ts:200`). Returns an owned list because such a catalog can sit
+    /// behind a lock.
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        self.models().iter().cloned().map(AnyModel::Chat).collect()
+    }
+
     /// Optional provider policy for credential-specific model availability (Pi
     /// `Provider.filterModels?`, `models.ts:111` @v0.83.0, documented at `:105-110`).
     ///
@@ -149,6 +164,54 @@ pub trait Provider: Send + Sync {
         _ctx: &RefreshModelsContext,
     ) -> Option<Result<(), ProviderError>> {
         None
+    }
+
+    /// Classify structured state with one of this provider's classifier models (Pi
+    /// `Provider.classify?`, `models.ts:227-232`: "Present when the provider supports structured
+    /// classifier models. Never rejects.").
+    ///
+    /// Pi's member is optional and [`crate::collection::Models::classify`] turns its absence into
+    /// `Provider ${model.provider} does not support classification` (`models.ts:974-976`). A Rust
+    /// trait method cannot be absent, so the default IS that absent case: an error result with that
+    /// message. A provider with classifier models overrides this, typically by delegating to a
+    /// [`crate::classifier::ClassifierApiRegistry`] (pi's `createProvider({ classifiers })`
+    /// dispatch on `model.api`, `models.ts:1161-1171`).
+    ///
+    /// Like [`Provider::stream`], this never fails as a call: every failure is an error
+    /// [`ClassifierResult`].
+    ///
+    /// The default is `models.ts:973-980` end to end: the `throw` sits inside pi's `try`, whose
+    /// `catch` is `classifierErrorResult(model, error, options?.signal?.aborted)`, so the result is
+    /// `aborted` (not `error`) when the request was already cancelled.
+    async fn classify(
+        &self,
+        model: &ClassifierModel,
+        _context: &ClassifierContext,
+        options: &ClassifierOptions,
+    ) -> ClassifierResult {
+        ClassifierResult::errored(
+            model,
+            format!(
+                "Provider {} does not support classification",
+                model.provider
+            ),
+            options.is_aborted(),
+        )
+    }
+
+    /// Whether [`Provider::classify`] is more than the absent-member default (pi's
+    /// `if (!provider.classify)` presence test, `models.ts:974`).
+    ///
+    /// [`crate::collection::Models::classify`] asks this BEFORE it applies request auth, because pi
+    /// throws `does not support classification` ahead of `applyAuth` (`models.ts:972-977`): a
+    /// provider that cannot classify must neither need a credential nor trigger an OAuth refresh.
+    /// The default is "this provider lists a classifier model" (pi attaches `classify` exactly when
+    /// the provider was created with classifier implementations, `models.ts:1161`). A provider
+    /// that overrides [`Provider::classify`] without listing classifier models overrides this too.
+    fn supports_classification(&self) -> bool {
+        self.get_all_models()
+            .iter()
+            .any(|m| matches!(m, AnyModel::Classifier(_)))
     }
 
     /// Construct the response stream. Returns immediately; setup happens behind the stream and

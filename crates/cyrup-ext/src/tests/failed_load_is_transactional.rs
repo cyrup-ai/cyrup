@@ -144,6 +144,11 @@ impl crate::provider::ModelRegistrySink for SinkLog {
             g.push(format!("upsert:{}", reg.id));
         }
     }
+    fn upsert_live_provider(&self, id: &str, _provider: Arc<dyn cyrup_provider::Provider>) {
+        if let Ok(mut g) = self.0.lock() {
+            g.push(format!("upsert-live:{id}"));
+        }
+    }
     fn remove_provider(&self, id: &str) {
         if let Ok(mut g) = self.0.lock() {
             g.push(format!("remove:{id}"));

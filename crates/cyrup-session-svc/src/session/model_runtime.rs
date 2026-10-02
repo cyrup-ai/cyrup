@@ -24,11 +24,17 @@
 //!
 //! 1. **The installed provider** — `ProviderSwap::current()`. Compared by `Arc` IDENTITY.
 //!    [`crate::ProviderSwap::store`] (`provider_swap.rs:60`) is its only writer, and it *replaces*
-//!    the `Arc`, so a different provider is always a different pointer.
+//!    the `Arc`, so a different provider is always a different pointer. A guest provider that is
+//!    replaced while it is the installed one reaches the swap in the same operation that replaces
+//!    it in the registry ([`crate::guest_providers::GuestProviderRegistry::follow_installed`]),
+//!    so the installed provider never goes stale behind the registry.
 //! 2. **The guest-provider registry** — mutated in place behind one long-lived `Arc`, so identity
 //!    says nothing; it carries its own monotonic counter instead
-//!    ([`crate::guest_providers::GuestProviderRegistry::generation`]), bumped by the only two
-//!    writers, `upsert_provider` and `remove_provider`.
+//!    ([`crate::guest_providers::GuestProviderRegistry::generation`]), bumped by each of the three
+//!    writers, `upsert_provider`, `upsert_live_provider` and `remove_provider`. A new writer MUST
+//!    bump it, or the snapshot cache serves a registry that no longer exists. That includes a
+//!    replacement published by a running catalog refresh, which deliberately skips the
+//!    supersede step (the thread-local `PUBLISHING`) but still replaces the entry and bumps.
 //! 3. **The live pi.dev catalog overlay** — `CatalogOverlaySlot::load()`. Compared by `Arc`
 //!    identity for the same reason as (1): `CatalogOverlaySlot::install`
 //!    (`cyrup-provider/src/catalog_refresh.rs:70`) is its only writer and it replaces the `Arc`.
@@ -38,7 +44,8 @@
 //! (`cyrup-provider/src/provider.rs:105`), a borrow of `&self`, so no implementation can swap its
 //! catalog behind a shared reference — a dynamic provider's `refresh_models` writes a
 //! [`cyrup_provider::models_store::ModelsStore`] and reaches the registry through a NEW provider
-//! instance or through the overlay slot, both of which are key changes. Same for `CatalogOverlay`,
+//! instance (installed provider included, see (1)) or through the overlay slot, both of which are
+//! key changes. Same for `CatalogOverlay`,
 //! which is immutable once built (`remote_catalog.rs`, `from_entries` and read-only accessors).
 //!
 //! A fourth input exists and is deliberately absent: `services.model_config`, the `models.json`

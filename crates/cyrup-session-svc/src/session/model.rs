@@ -19,6 +19,11 @@ use super::AgentSession;
 use super::model_runtime::{AvailabilityFilter, RegistrySnapshot};
 use super::types::{ModelCycleResult, ScopedModel};
 
+/// The longest a live provider's own auth check may take to answer the synchronous availability
+/// predicate before the provider reads as unavailable (see
+/// [`AgentSession::live_provider_is_configured`]).
+const LIVE_AUTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl AgentSession {
     /// Switch the active model by pattern (`provider/id[:level]`), updating the agent, the
     /// compaction model, and recording a model-change entry (R-11-014 `set_model`).
@@ -127,6 +132,19 @@ impl AgentSession {
     /// `checkAuth` per provider (model-runtime.ts:302-311). Splitting it changes no answer: the two
     /// arms are the first two arms of `has_configured_auth`, in the same order.
     fn provider_is_available(&self, provider: &ProviderId) -> bool {
+        // A LIVE extension provider that carries an auth strategy is available exactly when that
+        // strategy says so — pi's `snapshot.configuredProviders` is filled by `models.checkAuth`
+        // for EVERY composed provider (`model-runtime.ts:334-362`, `checkAuth` at `:342`), and a native
+        // extension's provider is composed like any other (`nativeExtensionProviders.get(id)`,
+        // `:298`). The
+        // strategy is authoritative, so this arm is NOT or-ed with the generic predicate below: a
+        // stored credential that names no server does not configure llama.cpp
+        // (`extensions/llama/provider.ts:181-186`, `check`).
+        if let Some(live) = self.live_extension_provider(provider)
+            && live.provider_auth().is_some()
+        {
+            return self.live_provider_is_configured(&live);
+        }
         if self.provider_has_configured_auth(provider) {
             return true;
         }
@@ -137,6 +155,81 @@ impl AgentSession {
         self.services
             .guest_providers
             .has_provider(provider.as_str())
+    }
+
+    /// The provider a native extension registered LIVE under `id` (`register_provider_live`), as
+    /// opposed to a static JSON registration (`register_provider`).
+    ///
+    /// The extension registry keeps the two apart — a JSON registration has a
+    /// `ProviderRegistration`, a live one has none — while the session's guest registry holds both
+    /// as plain `Arc<dyn Provider>`s, so the distinction is read from the registry and the provider
+    /// itself from the guest registry.
+    fn live_extension_provider(&self, id: &ProviderId) -> Option<Arc<dyn Provider>> {
+        let registry = self.services.ext_host.registry();
+        if !registry
+            .provider_ids()
+            .ok()?
+            .iter()
+            .any(|p| p == id.as_str())
+        {
+            return None;
+        }
+        if registry.provider_registration(id.as_str()).ok()?.is_some() {
+            return None;
+        }
+        self.services.guest_providers.provider(id.as_str())
+    }
+
+    /// Every provider a native extension registered live, in registry order. `/login` lists these
+    /// beside the built-ins (pi's `getLoginProviderOptions` reads the one composed provider list,
+    /// `interactive-mode.ts:4857-4887`), and a provider without an `auth` strategy simply
+    /// contributes no row there.
+    pub fn live_extension_providers(&self) -> Vec<Arc<dyn Provider>> {
+        let registry = self.services.ext_host.registry();
+        let Ok(ids) = registry.provider_ids() else {
+            return Vec::new();
+        };
+        ids.into_iter()
+            .filter_map(|id| self.live_extension_provider(&ProviderId::from(id)))
+            .collect()
+    }
+
+    /// Run the live provider's own auth check (`Models.checkAuth`, `models.ts:504-517`) to
+    /// completion from this synchronous predicate.
+    ///
+    /// `[CYRUP-DELTA]` mechanism (pi `core/model-runtime.ts:334-362`): pi computes
+    /// `configuredProviders` in an async `runAvailabilityRefresh` and every reader sees the cached
+    /// `Set`; cyrup's availability predicate is synchronous and rebuilt per call (so a mid-session
+    /// `/login` is seen at once), so the async check is driven in place. Owned by EXT-027.
+    ///
+    /// The check is provider-supplied async code: llama.cpp's reads the credential-store snapshot
+    /// and the environment, but nothing in the trait stops another strategy from awaiting a timer, a
+    /// file or a task. Driving it with `block_on` on the calling thread would park a tokio worker
+    /// (a deadlock on a current-thread runtime, where nothing is left to drive what the check
+    /// awaits). So it runs on its own short-lived thread, entered into the caller's runtime so a
+    /// timer or a task the check awaits is driven by the runtime's other threads, and the caller
+    /// waits for it for at most [`LIVE_AUTH_CHECK_TIMEOUT`]. A check that panics, fails or does not
+    /// answer in time reads as unavailable: pi records a failing check on `getError()` and leaves
+    /// the provider out of `configuredProviders` (`model-runtime.ts:373-374`, surfaced by
+    /// `getError`, `:510`).
+    fn live_provider_is_configured(&self, provider: &Arc<dyn Provider>) -> bool {
+        let auth = Arc::clone(&self.services.auth);
+        let provider = Arc::clone(provider);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let (answer, answered) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("live-provider-auth-check".to_string())
+            .spawn(move || {
+                let _entered = runtime.as_ref().map(tokio::runtime::Handle::enter);
+                let outcome = futures::executor::block_on(
+                    cyrup_config::login::live_provider_auth_check(&auth, &provider),
+                );
+                let _ = answer.send(matches!(outcome, Ok(Some(_))));
+            });
+        spawned.is_ok()
+            && answered
+                .recv_timeout(LIVE_AUTH_CHECK_TIMEOUT)
+                .unwrap_or(false)
     }
 
     /// Whether `provider` has configured auth in the Pi sense — a stored credential / runtime
@@ -435,6 +528,20 @@ impl AgentSession {
         cancel: cyrup_core::CancelToken,
         provider_id: &str,
     ) -> cyrup_provider::CatalogRefreshResult {
+        // A provider a native extension registered LIVE is composed into pi's one `Models`
+        // collection like any other (`nativeExtensionProviders`, `core/model-runtime.ts:298`), so
+        // the same `refresh({ providers: [providerId] })` reaches ITS `refreshModels`
+        // (`models.ts:546-606`). cyrup keeps that provider in the guest registry, which the pi.dev
+        // catalog service below knows nothing of: without this arm `/login llama.cpp` refreshed
+        // nothing and its models only appeared after a restart or `/llama`.
+        if self
+            .live_extension_provider(&ProviderId::from(provider_id))
+            .is_some()
+        {
+            return self
+                .refresh_live_provider_catalog(cancel, provider_id)
+                .await;
+        }
         let Some(svc) = self.services.model_catalog.as_ref() else {
             return cyrup_provider::CatalogRefreshResult::default();
         };
@@ -444,6 +551,46 @@ impl AgentSession {
             vec![provider_id.to_string()]
         };
         svc.refresh_scoped(cancel, fetch).await
+    }
+
+    /// [`Self::refresh_provider_catalog`] for a provider a native extension registered live: pi's
+    /// `session.modelRuntime.refresh({ providers: [providerId], signal })`
+    /// (`interactive-mode.ts:5953`) over the composed collection, driven through the guest
+    /// registry's own refresh engine ([`crate::GuestProviderRegistry::refresh`]).
+    ///
+    /// `allow_network` is left `None`, as pi leaves it: the engine answers
+    /// `options.allowNetwork ?? this.modelNetworkEnabled` (`core/model-runtime.ts:850`), so the
+    /// registry's network switch decides, exactly as it does for the interactive startup refresh.
+    ///
+    /// The engine's [`cyrup_provider::ModelsRefreshResult`] is folded into the result the login
+    /// continuation reads. Its `aborted` is `signal.aborted` read after every provider settled
+    /// (`model-runtime.ts:878`), i.e. THIS caller's token having fired, which is what
+    /// [`cyrup_provider::CatalogRefreshResult::timed_out`] records; the shared-operation `aborted`
+    /// flag has no counterpart here because a scoped refresh joins nothing.
+    async fn refresh_live_provider_catalog(
+        &self,
+        cancel: cyrup_core::CancelToken,
+        provider_id: &str,
+    ) -> cyrup_provider::CatalogRefreshResult {
+        let result = self
+            .services
+            .guest_providers
+            .refresh(cyrup_ext::host::services::ProviderRefreshRequest {
+                providers: Some(vec![provider_id.to_string()]),
+                allow_network: None,
+                force: false,
+                cancel,
+            })
+            .await;
+        cyrup_provider::CatalogRefreshResult {
+            timed_out: result.aborted,
+            aborted: false,
+            errors: result
+                .errors
+                .into_iter()
+                .map(|(id, error)| (id, error.to_string()))
+                .collect(),
+        }
     }
 
     /// The provider-attribution + session-affinity headers this session attaches to provider requests

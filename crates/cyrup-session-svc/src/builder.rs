@@ -100,6 +100,20 @@ pub struct SessionConfig {
     /// for. The bin sets it to `!(--offline || CYRUP_OFFLINE)` (`main.rs`), which is
     /// pi's own gate — `isOfflineModeEnabled()`, package-manager.ts:42-46, consulted at `:1261`.
     pub install_missing_packages: bool,
+    /// pi `modelNetworkEnabled` (`core/model-runtime.ts:182`): whether a catalog refresh that does
+    /// not say `allowNetwork` may use the network, for the providers extensions registered. Both
+    /// the interactive startup refresh and the post-`/login` refresh leave it unsaid
+    /// (`options.allowNetwork ?? this.modelNetworkEnabled`, `model-runtime.ts:850`), so with this
+    /// off an offline run's `/login llama.cpp` restores the stored catalog and makes no request.
+    ///
+    /// Defaults to `true` for an SDK embedder. The bin sets it to `!(--offline || CYRUP_OFFLINE)`
+    /// (`main.rs`), pi's own and only gate for the runtime catalog refresh.
+    pub model_network_enabled: bool,
+    /// How long the cache-only restore of the extension providers' stored catalogs may take at
+    /// build before it is abandoned (the session then starts with what was restored so far). It is
+    /// a local file read, so this only ever bites a provider that does slow work in a phase that is
+    /// told it has no network.
+    pub provider_restore_timeout: std::time::Duration,
     /// Runtime mode (drives non-prompting trust + the extension `ctx.mode`/`ctx.hasUI`).
     pub app_mode: AppMode,
     /// Model selection pattern (`provider/id[:level]`); `None` ⇒ settings default ⇒ first catalog.
@@ -221,6 +235,8 @@ impl SessionConfig {
             home: agent_dir.clone(),
             package_dir: agent_dir.join("packages"),
             install_missing_packages: false,
+            model_network_enabled: true,
+            provider_restore_timeout: std::time::Duration::from_secs(10),
             agent_dir,
             session_dir: None,
             app_mode: AppMode::Print,
@@ -995,14 +1011,47 @@ impl SessionBuilder {
         // ---- 3. model resolution (cyrup-config + cyrup-provider) -------------------------------
         // Restore the model + thinking level from the resumed session, seeding a fallback message
         // when the saved model is no longer resolvable (Pi sdk.ts:191-242).
-        let (resolved_model, model_ref, thinking, model_fallback_message) = resolve_model(
-            &*self.provider,
-            &cfg,
-            &settings,
-            &existing,
-            has_existing_session,
-            has_thinking_entry,
-        )?;
+        //
+        // EXT-027, an architectural gap (not a language or host constraint; the ledger owns it) —
+        // an explicit `--model` the INSTALLED provider cannot resolve is not yet an error: pi resolves it only after every extension's provider is registered and
+        // its persisted catalog restored (`buildSessionOptions` runs after
+        // `createAgentSessionServices`, whose `modelRuntime.refresh({ allowNetwork: false })` is
+        // `agent-session-services.ts:190-206` @v0.99.2-17), so `--model llama.cpp/<id>` names a
+        // provider only the loaded built-in registers. cyrup resolves here, before any native is
+        // loaded (this session is built around ONE provider the caller chose up front, where pi's
+        // runtime holds every provider at once), so the pattern is set aside and resolved again at
+        // "3b" below, once the extension providers exist; until then the session is seeded as if
+        // no `--model` had been given. A pattern that still resolves nowhere at 3b fails with the
+        // same `ModelNotFound` this arm used to return, carrying the launch path's own
+        // unknown-provider text when a resolver is wired. Same resolution, later.
+        let mut deferred_model_pattern: Option<String> = None;
+        let (mut resolved_model, mut model_ref, mut thinking, mut model_fallback_message) =
+            match resolve_model(
+                &*self.provider,
+                &cfg,
+                &settings,
+                &existing,
+                has_existing_session,
+                has_thinking_entry,
+            ) {
+                Err(SessionServiceError::ModelNotFound(pattern)) if cfg.model_pattern.is_some() => {
+                    let mut without_pattern = cfg.clone();
+                    without_pattern.model_pattern = None;
+                    deferred_model_pattern = Some(pattern);
+                    resolve_model(
+                        &*self.provider,
+                        &without_pattern,
+                        &settings,
+                        &existing,
+                        has_existing_session,
+                        has_thinking_entry,
+                    )?
+                }
+                resolved => resolved?,
+            };
+        // The provider the session starts on: the injected one, replaced at 3b when the extension
+        // provider that owns a deferred `--model` takes over.
+        let mut initial_provider: Arc<dyn Provider> = self.provider.clone();
 
         // ---- 4. tools + isolation + policy (cyrup-tools) --------------------------------------
         // `shellPath`/`shellCommandPrefix` settings (Pi `getShellPath`/`getShellCommandPrefix`,
@@ -1473,9 +1522,116 @@ impl SessionBuilder {
         // `Arc` is the `ext_host` sink (future `registerProvider`s upsert live) and the session's read
         // view (its catalog is UNIONed into the model registry, and its provider installed on select).
         let guest_providers = Arc::new(crate::guest_providers::GuestProviderRegistry::new());
+        // pi `modelNetworkEnabled`: what a refresh that does not say `allowNetwork` gets. Set before
+        // anything can refresh, so an offline run never reaches the network by leaving it unsaid.
+        guest_providers.set_network_enabled(cfg.model_network_enabled);
+        // EXT-027 — what a native provider's catalog refresh needs, all of it the session's own
+        // (pi's `ModelRuntime` holds the same four as constructor arguments, `modelsStore`,
+        // `credentials`, `authContext` and the registry behind `ctx.modelRegistry`,
+        // `core/model-runtime.ts`). None of it was attached by anything but tests, so a production
+        // session never read or wrote `models-store.json`, resolved no credential for the refresh
+        // engine, and answered `/llama`'s `provider_auth` with "nothing" and its `refresh_provider`
+        // with "no refresh backend". Attached BEFORE the bind and the restore below, so neither
+        // runs against the process-local defaults.
+        guest_providers.attach_models_store(Arc::new(
+            cyrup_config::models_store::FileModelsStore::new(
+                cfg.agent_dir
+                    .join(cyrup_config::models_store::MODELS_STORE_FILE_NAME),
+            ),
+        ));
+        guest_providers.attach_refresh_auth(
+            auth.clone(),
+            Arc::new(cyrup_config::login::StoreAuthContext(auth.clone())),
+        );
+        host_services.attach_provider_refresher(guest_providers.clone());
+        host_services.attach_provider_auth(auth.clone(), guest_providers.clone());
         ext_host
             .registry()
             .bind_model_registry(guest_providers.clone())?;
+        // The startup restore: every provider's PERSISTED catalog is handed to its `refresh_models`
+        // with no network, now that the extensions' providers are registered (pi
+        // `await modelRuntime.refresh({ allowNetwork: false })`, `agent-session-services.ts:206`
+        // @v0.99.2-17). A single local file read; the network refresh a mode performs afterwards is
+        // the caller's (`main.ts:931-936` for rpc, the interactive host's `run()`). Without it a
+        // configured install lists no extension-provider models until something refreshes.
+        // Failures stay inside the engine's own result: a broken cache is a cold one, never a
+        // failed start.
+        {
+            // Bounded: this runs inline in `build`, and a provider that does slow work in a phase it
+            // was told has no network must not stall session construction. On the deadline the
+            // engine is cancelled and the session starts with what was restored.
+            let restore_cancel = cancel.token().child_token();
+            let restore = guest_providers.restore_cached(restore_cancel.clone());
+            tokio::pin!(restore);
+            tokio::select! {
+                _ = &mut restore => {}
+                () = tokio::time::sleep(cfg.provider_restore_timeout) => {
+                    restore_cancel.cancel();
+                    let _ = restore.await;
+                }
+            }
+        }
+        // 3b. A `--model` set aside at step 3, resolved against the extension providers now
+        // registered and restored. The model is looked up across their catalogs like `/model`
+        // does (`AgentSession::set_model`); the provider owning it becomes the session's provider,
+        // and the seeds taken from the step-3 resolution are replaced with its values.
+        if let Some(pattern) = deferred_model_pattern {
+            let owner = {
+                let candidates = guest_providers.models();
+                cyrup_config::ModelResolver::new(&candidates)
+                    .parse_pattern(&pattern, true)
+                    .model
+                    .and_then(|model| guest_providers.provider(model.provider.as_str()))
+            }
+            .or_else(|| {
+                // A custom id on a provider whose catalog does not list it
+                // (`resolveCliModel`'s fallback, `model-resolver.ts:475-501`).
+                pattern
+                    .split_once('/')
+                    .and_then(|(prefix, _)| guest_providers.provider(prefix))
+            });
+            let Some(owner) = owner else {
+                // Nothing registered the provider either: report what the launch path used to say
+                // for a provider nothing knows.
+                let unknown = pattern.split_once('/').and_then(|(prefix, _)| {
+                    self.provider_resolver
+                        .as_ref()
+                        .and_then(|resolver| resolver.resolve(prefix).err())
+                });
+                return Err(SessionServiceError::ModelNotFound(match unknown {
+                    Some(message) => format!("{pattern}: {message}"),
+                    None => pattern,
+                }));
+            };
+            let (model, reference, level, fallback) = resolve_model(
+                &*owner,
+                &cfg,
+                &settings,
+                &existing,
+                has_existing_session,
+                has_thinking_entry,
+            )?;
+            read_model_vision.set(
+                model
+                    .as_ref()
+                    .is_none_or(cyrup_provider::Model::supports_image_input),
+            );
+            if let Some(reference) = reference.as_ref() {
+                bash_session_env
+                    .set_model(reference.provider.to_string(), reference.model.to_string());
+            }
+            bash_session_env.set_reasoning_level(thinking_level_to_str(level));
+            if let (Some(reference), Some(model)) = (reference.as_ref(), model.as_ref()) {
+                host_services.update_model(
+                    reference.clone(),
+                    model.context_window,
+                    Some(thinking_level_to_str(level)),
+                );
+            }
+            (resolved_model, model_ref, thinking, model_fallback_message) =
+                (model, reference, level, fallback);
+            initial_provider = owner;
+        }
         // extendResourcesFromExtensions("startup") (Pi agent-session.ts:2109-2135): fold every
         // `resources_discover` handler's contributed skill/prompt/theme paths into the registry
         // BEFORE the skill pointers + system prompt are derived. An empty aggregate (no handlers, or
@@ -1812,9 +1968,13 @@ impl SessionBuilder {
         // provider in place without rebuilding the agent (Pi live model+provider switch). The SAME
         // `Arc` is handed to the agent (as its `StreamFn`) and to the session (to mutate on select).
         let provider_swap = Arc::new(ProviderSwap::new(
-            self.provider.clone(),
+            initial_provider,
             self.provider_resolver.clone(),
         ));
+        // A provider the extensions replace LATER under the id this slot holds (`/llama`, a catalog
+        // refresh) is stored into the slot too, so the session streams through, lists and filters by
+        // the replacement and not by the `Arc` it started on.
+        guest_providers.follow_installed(&provider_swap);
         // Transport selection (Pi `AgentOptions.streamFn`, sdk.ts:301): an embedder-supplied custom
         // `StreamFn` (e.g. `ProxyStreamFn`) becomes THE transport the agent loop streams through;
         // absent one, the provider-backed `ProviderSwap` is used (the default live-swappable path).

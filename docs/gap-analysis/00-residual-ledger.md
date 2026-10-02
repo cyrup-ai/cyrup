@@ -5,6 +5,92 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-01 — `EXT-027` and `DRIFT-032` closed (the llama.cpp port); `EXT-022` split; 38 rows filed that the port left open
+
+> **Read this block first; it sits above the fourteenth edition and corrects its counts.** It is a
+> record of one landing, not a re-measurement: nothing here re-read an upstream window.
+>
+> **THE COUNT is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints.** On
+> 2026-10-01, after this landing, it prints **85 open: 0 critical, 0 high, 1 medium, 84 low; 12
+> trackers; 822 closed** (before: 48 open, 12 trackers, 820 closed). By area: `01` 15, `02` 1, `03` 3,
+> `04` 0, `05` 4, `06` 22, `07` 17, `08` 10, `09` 2, `09b` 8, `10` 1, `11` 0, `12` 1, `14` 0, `16` 0,
+> `17` 0, `09a` 1. Arithmetic: 48 − 1 (`EXT-027`) + 38 filed = 85; closed 820 + 2 (`EXT-027`,
+> `DRIFT-032`) = 822; trackers 12 + 1 (`EXT-102`) − 1 (`DRIFT-032`, closed, so no longer a tracker row
+> the script counts) = 12. The one medium is `SEAM-137` (below).
+>
+> ## Closed
+>
+> * **`EXT-027`** (`06-cyrup-ext.md`) — pi's bundled llama.cpp router extension. Ported as the new
+>   crate `crates/cyrup-llama` with its host seams in `cyrup-ext`, `cyrup-provider`, `cyrup-config`,
+>   `cyrup-session-svc`, `cyrup-tui` and the binary; attached first in every mode by
+>   `crates/cyrup/src/session_launch.rs`. The row carries the evidence (files, tests by name, the
+>   `cargo test -p cyrup-it --test llama` target) and the **corrected facts**: the baseline is pi
+>   **v0.99.2**, not v0.83.0; pi marks the extension `builtin: true` and the `builtin:` loader hides
+>   it, the table entry is not `hidden: true`; and the classifier models are part of the same
+>   extension and are ported.
+> * **`DRIFT-032`** (`12-upstream-drift-pi-core.md`) — the tracker duplicate of `EXT-027`, closed with it.
+>
+> ## Narrowed
+>
+> * **`EXT-022`** (`06-cyrup-ext.md`) is split. The **native flavour** — live provider registration,
+>   cache-only restore, network refresh, generation-checked publish, persistence — is CLOSED with
+>   `EXT-027`; the **WIT / guest half** (`refreshModels` export, `models.publish` import for WASM
+>   guests) stays open and says so in the row. **`EXT-M07`** (the dynamic half of a guest provider,
+>   declared everywhere and invoked nowhere, `crates/cyrup-ext/src/provider.rs:8`) is closed for the
+>   native flavour for the same reason and stays open for guests; it has no row of its own and is
+>   tracked inside `EXT-022`.
+>
+> ## Filed (all `NEW 2026-10-01`; counters updated in each area file)
+>
+> * **06:** `EXT-090`…`EXT-104` (`EXT-102` is a tracker: an upstream quirk replicated on purpose).
+>   Next free id `EXT-105`.
+> * **01:** `PROV-102`…`PROV-111` — the pi 0.99 multi-type model surface parts not ported (image
+>   unification, array catalogs and the classifier group, System One apis, `getAllAvailable` /
+>   `filterAllModels`, request `fetch` / `telemetryContext`), the sibling-method classifier store,
+>   `classify` versus `stream` on an unconfigured provider, `apply_auth` not merging the resolution
+>   env, the classifier's JS-semantics differences, and the task-local refresh context. Next free id `PROV-112`.
+> * **05:** `CFG-094` — launch-time provider choice precedes extension load. Next free id `CFG-095`.
+> * **07:** `TUI-123`…`TUI-128` — overlay cursor marker, mouse, theme roles, live keymap, the `(sub)`
+>   marker for a live OAuth provider, and a citation re-pin. Next free id `TUI-129`.
+> * **08:** `SEAM-137`…`SEAM-143`. **`SEAM-137` is a medium host defect that is not llama-specific:
+>   print mode hangs on any prompt an extension command handles** (`crates/cyrup-modes/src/print.rs:99`;
+>   `json.rs` already guards it). Next free id `SEAM-144`.
+> * Unchanged counters: `SUBA-149`, `MCP-586`, `HERDR-007`.
+>
+> ## Candidate rows the lanes reported that the tree contradicts — NOT filed, with the reason
+>
+> The lane reports were written before the last wiring wave. Each of these was re-checked against the
+> tree at `4203636f` and is already fixed, so filing it would put a closed defect on the open list:
+>
+> * A live-provider **replacement while the session runs on that provider id** did not reach the
+>   session: fixed by `GuestProviderRegistry::follow_installed` (`guest_providers.rs:121`,
+>   `builder.rs:1977`), test `a_provider_replaced_while_installed_replaces_the_installed_provider`.
+> * `FileModelsStore` **does not persist classifier models** (and its "blocking for production"
+>   twin): it does, as `type:"classifier"` members of the one `models` array
+>   (`cyrup-config/src/models_store.rs:461-545`); the open remainder is `PROV-107`.
+> * The post-login catalog refresh **does not reach a live provider**: it does
+>   (`session/model.rs:526`, test `ext027_login_to_a_live_provider_refreshes_its_catalog`).
+> * `--offline` / `set_network_enabled` **has no production caller**: `main.rs:560` and
+>   `builder.rs:1527` wire it.
+> * `crates/cyrup-llama` **is not attached by the binary**: `session_launch.rs:111`.
+> * **Input bracketed paste** and **progress-merge semantics** in the `/llama` overlay: ported
+>   (`InteractiveOverlay::handle_paste`, `ProgressField`).
+> * The `list-models` e2e expectation **4K/8K vs 4.1K/8.2K**: fixed in `3c60177f`.
+> * `probe_model` duplicated in `guest_providers.rs`; the store error in `ContextRefreshHost` ending the
+>   refresh as superseded; `block_on` on the availability predicate: each fixed or bounded in the tree.
+> * "Guest (WASM) extensions are never hidden" is **parity**, not a gap, and is recorded in the
+>   `EXT-027` row instead.
+> * No CLI flag or `cyrup-sdk` method exposes `Models::classify`, and pi's `classify` has none
+>   either, so no row is opened; open one only if an SDK or CLI classify entry is wanted.
+>
+> ## Falsification
+>
+> The closure of `EXT-027` rests on code and tests that were READ, not run, by the closing pass (the
+> branch's last code commit `4203636f` reports the gates green). It reopens if
+> `cargo test -p cyrup-it --test llama` is red on the branch tip.
+
+---
+
 # RE-MEASURED 2026-09-24, second pass (fourteenth edition) — every window the first pass left unread is now read; the set above medium grows from three rows to ten
 
 > **Read this block first. It supersedes the thirteenth edition below and every count beneath it.**

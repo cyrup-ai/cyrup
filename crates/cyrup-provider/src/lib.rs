@@ -17,6 +17,7 @@ pub mod auth;
 pub mod cache_stats;
 pub mod catalog;
 pub mod catalog_refresh;
+pub mod classifier;
 pub mod collection;
 pub mod config_provider;
 pub mod context;
@@ -68,6 +69,12 @@ pub use catalog::{builtin_catalog, load_catalog};
 pub use catalog_refresh::{
     CatalogOverlaySlot, CatalogRefreshCoordinator, CatalogRefreshResult, ModelCatalogService,
     refresh_and_install,
+};
+pub use classifier::{
+    AnyModel, BoolCriteria, ClassifierAnswer, ClassifierApiRegistry, ClassifierContext,
+    ClassifierModel, ClassifierOnPayload, ClassifierOnResponse, ClassifierOptions,
+    ClassifierQuestion, ClassifierResult, ClassifierStopReason, DEFAULT_MAX_RETRIES,
+    DEFAULT_TEMPERATURE, KnownClassifierApi, ModelType, OrderedMap, ProviderClassifier,
 };
 pub use collection::{
     CreateModelsOptions, EXTENDED_THINKING_LEVELS, Models, ModelsRefreshOptions,

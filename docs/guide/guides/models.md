@@ -6,6 +6,9 @@ the command line, switching mid-session, and setting how hard the model thinks b
 If you have not connected a provider yet, do that first —
 [Connect a provider](../getting-started/authenticate.md).
 
+To run models on your own machine, see [Local models with llama.cpp](../llama-cpp.md): the
+`llama.cpp` provider is built in and talks to a llama.cpp router server.
+
 ## Picking a model
 
 ```sh

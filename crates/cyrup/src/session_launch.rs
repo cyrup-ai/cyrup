@@ -45,8 +45,17 @@ use crate::timings;
 /// Attach the native built-in extensions to `builder`, in pi's load order.
 ///
 /// This is the ONE copy of a sequence that used to exist verbatim in all three mode arms. The
-/// order is load-bearing and unchanged:
+/// order is load-bearing:
 ///
+/// 0. **llama.cpp** (EXT-027) goes FIRST, because pi loads its `builtInExtensions` ahead of
+///    everything else: `extensionFactories = [...builtInExtensions, ...(options?.extensionFactories
+///    ?? [])]` (`main.ts:569`) with `llama.cpp` the head of `builtInExtensions`
+///    (`extensions/index.ts:7-8`). Attached unconditionally, in every mode and inside a subagent
+///    child, exactly as upstream has it in every session: `llama_extension_for_env` never gates.
+///    `--no-extensions` switches it off through `NativeExtension::is_ambient() -> true` (a child
+///    is NOT among the natives its launcher re-injects, so it loses it too), and it stays out of
+///    the startup `[Extensions]` list through `is_hidden` (`resource-loader.ts:729`,
+///    `interactive-mode.ts:1778`) while remaining in `loaded_ids`.
 /// 1. **Intercom** is BUILT first (`_concrete`) so its broker-backed delivery/clarify/steer seam
 ///    channels can be handed to the SubAgents extension via `with_channels` (the port doc §8.4
 ///    item 1 / P5 handoff — CLOSING R-SA-037/119/120/123/124/125). Child-mode gated: a subagent
@@ -98,6 +107,9 @@ fn attach_native_extensions(
     session_cwd: PathBuf,
 ) -> anyhow::Result<SessionFactory> {
     let agent_dir: &Path = &dirs.agent_dir;
+    if let Some(ext) = cyrup_llama::llama_extension_for_env(agent_dir) {
+        builder = builder.with_native_extension(ext);
+    }
     let intercom_ext = cyrup_intercom::intercom_extension_for_env_concrete(
         agent_dir.to_path_buf(),
         session_cwd.clone(),
@@ -711,6 +723,271 @@ mod tests {
             model,
             thinking_level: None,
         }
+    }
+
+    // ============================================================================================
+    // EXT-027 — the llama.cpp built-in is attached by `attach_native_extensions`.
+    //
+    // Every test drives the production seam, `build_factory` (the one caller of
+    // `attach_native_extensions`), then builds a REAL session off the factory and reads what the
+    // extension host actually loaded. Nothing here constructs the extension by hand, so removing the
+    // `with_native_extension` line in `attach_native_extensions` fails every one of them.
+    // ============================================================================================
+
+    use std::sync::Arc;
+
+    use cyrup_provider::Provider;
+    use cyrup_provider::faux::FauxProvider;
+    use cyrup_session_svc::{AgentSession, SessionConfig, TrustPromptFn};
+
+    use super::build_factory;
+
+    /// The id both [`cyrup_llama::LlamaExtension`] and the provider it registers carry
+    /// (`provider.ts` `LLAMA_PROVIDER_ID`).
+    const LLAMA_ID: &str = cyrup_llama::LLAMA_PROVIDER_ID;
+
+    /// The always-attached sibling that follows llama.cpp in pi's order (`extensions/index.ts:7-12`
+    /// lists llama.cpp before `mcp`); cyrup's MCP adapter is `ambient` like it.
+    const MCP_ID: &str = cyrup_mcp::EXTENSION_ID;
+
+    /// Environment marker: when set, [`llama_child_probe`] is the BODY of a probe run inside a
+    /// re-executed test binary rather than a no-op. Its value is `keep` or `no-extensions`.
+    const PROBE_ENV: &str = "CYRUP_LLAMA_ATTACH_PROBE";
+
+    /// The subagent-child marker `SessionBuilder` reads (`cyrup_ext_subagents::spawn::nested_events::CHILD_ENV`).
+    const CHILD_ENV: &str = "CYRUP_SUBAGENT_CHILD";
+
+    /// A trust prompt that is never consulted (`trust_override` answers first) — it exists so the
+    /// interactive arm's `Some(prompt)` shape is the one under test (pi's `hasUI` gate,
+    /// project-trust.ts:86-88).
+    fn never_asked_trust_prompt() -> TrustPromptFn {
+        Arc::new(|_, _| Box::pin(async { Some(true) }))
+    }
+
+    /// What a session built through `build_factory` reports: every id the host loaded (in load
+    /// order) and the ids the startup `[Extensions]` panel lists.
+    struct Loaded {
+        loaded: Vec<String>,
+        listed: Vec<String>,
+    }
+
+    /// Build a session exactly as a mode arm does — through `build_factory` — over the faux
+    /// provider in a hermetic temp home. `interactive` selects the one thing the three arms differ
+    /// by in this function: whether a `trust_prompt` is supplied.
+    async fn session_through_build_factory(interactive: bool, no_extensions: bool) -> Loaded {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let env = cyrup_config::EnvVars {
+            home: Some(agent_dir.clone()),
+            ..cyrup_config::EnvVars::default()
+        };
+        let overrides = cyrup_config::CliConfigOverrides {
+            agent_dir: Some(agent_dir.clone()),
+            cwd: Some(cwd.clone()),
+            ..Default::default()
+        };
+        let dirs = cyrup_config::ConfigDirs::resolve(&overrides, &env).unwrap();
+
+        let mut config = SessionConfig::new(cwd, agent_dir.clone());
+        config.persist = false;
+        config.trust_override = Some(true);
+        config.no_extensions = no_extensions;
+        let target = config.target.clone();
+
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let factory = build_factory(
+            provider,
+            config,
+            crate::file_settings_store(&dirs),
+            Arc::new(cyrup_config::AuthStore::at(agent_dir.join("auth.json"))),
+            &dirs,
+            Arc::new(cyrup_config::ModelFile::default()),
+            interactive.then(never_asked_trust_prompt),
+        )
+        .unwrap();
+        let session: AgentSession = factory.build(target, None).await.unwrap();
+
+        let loaded = session
+            .services()
+            .ext_host
+            .loaded_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let listed = cyrup_tui::StartupReport::from_session(&session, false).extensions;
+        Loaded { loaded, listed }
+    }
+
+    /// The position of `id` in `ids`, failing loudly (with the whole list) when absent.
+    fn position(ids: &[String], id: &str) -> usize {
+        ids.iter()
+            .position(|i| i == id)
+            .unwrap_or_else(|| panic!("{id} is not loaded; got {ids:?}"))
+    }
+
+    /// Attached in all three modes `attach_native_extensions` serves — interactive (a trust prompt
+    /// is supplied) and RPC / print / json (it is not) — and FIRST in the order, ahead of the
+    /// always-attached MCP adapter (pi `main.ts:569`: `[...builtInExtensions, ...user factories]`,
+    /// `extensions/index.ts:7-12`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn llama_is_attached_first_in_every_mode() {
+        for (mode, interactive) in [("interactive", true), ("rpc/print/json", false)] {
+            let Loaded { loaded, .. } = session_through_build_factory(interactive, false).await;
+            assert_eq!(
+                loaded.first().map(String::as_str),
+                Some(LLAMA_ID),
+                "{mode}: llama.cpp is loaded before every other native (pi main.ts:569); got {loaded:?}"
+            );
+            assert!(
+                position(&loaded, LLAMA_ID) < position(&loaded, MCP_ID),
+                "{mode}: llama.cpp precedes the MCP adapter (extensions/index.ts:7-12); got {loaded:?}"
+            );
+        }
+    }
+
+    /// Hidden at startup, loaded regardless: pi lists `extensions.filter((e) => !e.hidden)`
+    /// (`interactive-mode.ts:1778`) and marks every `builtin:` extension hidden
+    /// (`resource-loader.ts:729`). The MCP adapter in the same breath proves the list is not simply
+    /// empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn llama_is_loaded_but_absent_from_the_startup_extensions_list() {
+        let Loaded { loaded, listed } = session_through_build_factory(true, false).await;
+        assert!(
+            loaded.iter().any(|i| i == LLAMA_ID),
+            "llama.cpp is in loaded_ids; got {loaded:?}"
+        );
+        assert!(
+            !listed.iter().any(|i| i == LLAMA_ID),
+            "llama.cpp is hidden from the startup [Extensions] list; got {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|i| i == MCP_ID),
+            "a non-hidden native IS listed, so the list is not trivially empty; got {listed:?}"
+        );
+    }
+
+    /// `--no-extensions` drops it: pi's `builtin:llama.cpp` is a path in the tier the flag collapses
+    /// (`package-manager.ts:972-974`, `resource-loader.ts:569-571`), which cyrup spells
+    /// `is_ambient() -> true` (builder.rs:2647-2657). The same flag-off session keeps it, so this
+    /// is the flag's effect and not a session that never had it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_extensions_drops_llama_in_every_mode() {
+        for (mode, interactive) in [("interactive", true), ("rpc/print/json", false)] {
+            let kept = session_through_build_factory(interactive, false)
+                .await
+                .loaded;
+            assert!(kept.iter().any(|i| i == LLAMA_ID), "{mode}: {kept:?}");
+            let dropped = session_through_build_factory(interactive, true)
+                .await
+                .loaded;
+            assert!(
+                !dropped.iter().any(|i| i == LLAMA_ID),
+                "{mode}: --no-extensions drops the ambient llama.cpp built-in; got {dropped:?}"
+            );
+        }
+    }
+
+    /// A subagent CHILD, `CYRUP_SUBAGENT_CHILD` set, treats llama.cpp like the other ambient natives
+    /// (builder.rs:2629-2633): attached without the flag, dropped under `--no-extensions` — it is
+    /// not one of the three runtime natives a child's launcher re-injects, so the child carve-out
+    /// does not rescue it. The MCP adapter (ambient too) is asserted in the same states to pin
+    /// "like the other ambient natives".
+    ///
+    /// The environment is process-global and `std::env::set_var` is `unsafe` (forbidden in this
+    /// workspace), so the child state is established the way a real child gets it: by re-executing
+    /// this test binary with the variable in its environment, running [`llama_child_probe`] as the
+    /// body. The child runs under a deadline and is killed when it passes it, so a wedged child
+    /// fails this test instead of hanging the suite.
+    #[test]
+    fn a_subagent_child_treats_llama_like_the_other_ambient_natives() {
+        use std::io::Read as _;
+        use std::process::Stdio;
+
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+        for probe in ["keep", "no-extensions"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "--ignored",
+                    "session_launch::tests::llama_child_probe",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .env(PROBE_ENV, probe)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Drained on their own threads, so a chatty child cannot fill a pipe and stall.
+            let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+                std::thread::spawn(move || {
+                    let mut text = String::new();
+                    let _ = pipe.read_to_string(&mut text);
+                    text
+                })
+            };
+            let stdout = drain(Box::new(child.stdout.take().unwrap()));
+            let stderr = drain(Box::new(child.stderr.take().unwrap()));
+            let started = std::time::Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if started.elapsed() > DEADLINE {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let stdout = stdout.join().unwrap();
+            let stderr = stderr.join().unwrap();
+            assert!(
+                status.is_some(),
+                "child probe `{probe}` did not finish within {DEADLINE:?} and was killed\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            assert!(
+                status.is_some_and(|s| s.success())
+                    && stdout.contains(&format!("llama-probe-ok:{probe}")),
+                "child probe `{probe}` failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+        }
+    }
+
+    /// The body of the child probe above. `#[ignore]`d, so an ordinary run does not count a vacuous
+    /// pass: only the parent test runs it (it passes `--ignored`), in a re-executed binary with the
+    /// child marker in its environment. It is still a no-op unless [`PROBE_ENV`] is set (a person
+    /// running the ignored tests by hand), and the parent insists on the success marker this prints,
+    /// so a filter that matched nothing cannot pass for a probe that ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "re-executed by a_subagent_child_treats_llama_like_the_other_ambient_natives"]
+    async fn llama_child_probe() {
+        let Ok(probe) = std::env::var(PROBE_ENV) else {
+            return;
+        };
+        assert!(
+            std::env::var_os(CHILD_ENV).is_some(),
+            "the probe must run as a subagent child"
+        );
+        let no_extensions = probe == "no-extensions";
+        let Loaded { loaded, .. } = session_through_build_factory(false, no_extensions).await;
+        let llama = loaded.iter().any(|i| i == LLAMA_ID);
+        let mcp = loaded.iter().any(|i| i == MCP_ID);
+        assert_eq!(
+            llama, !no_extensions,
+            "child, no_extensions={no_extensions}: llama.cpp is attached unless the flag drops it; \
+             got {loaded:?}"
+        );
+        assert_eq!(
+            llama, mcp,
+            "child: llama.cpp follows the MCP adapter's ambient treatment; got {loaded:?}"
+        );
+        println!("llama-probe-ok:{probe}");
     }
 
     #[test]

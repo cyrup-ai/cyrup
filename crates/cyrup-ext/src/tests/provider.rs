@@ -21,6 +21,9 @@ impl ModelRegistrySink for FakeSink {
     fn upsert_provider(&self, reg: &ProviderRegistration) {
         self.upserts.lock().unwrap().push(reg.id.clone());
     }
+    fn upsert_live_provider(&self, id: &str, _provider: Arc<dyn cyrup_provider::Provider>) {
+        self.upserts.lock().unwrap().push(format!("live:{id}"));
+    }
     fn remove_provider(&self, id: &str) {
         self.removes.lock().unwrap().push(id.to_string());
     }
