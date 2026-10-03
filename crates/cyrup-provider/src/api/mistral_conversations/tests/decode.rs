@@ -258,3 +258,203 @@ async fn prov084_the_live_run_path_flushes_a_reply_cut_after_the_finish_reason_c
     assert_eq!(message.response_id.as_deref(), Some("resp_eof"));
     assert_eq!(message.usage.total_tokens, 7);
 }
+
+/// PROV-115 — upstream-drift. `8930b9ec0` ("ignore empty Mistral content deltas") guards both of
+/// pi's text branches (`mistral-conversations.ts:636`, `:678` @v1.0.0) with `if (!textDelta)
+/// continue;` and says why: *"GLM models on Mistral send empty content deltas around thinking and
+/// tool calls. Opening a block for them splits thinking into multiple blocks, which Mistral rejects
+/// on replay."* cyrup's `push_text` opened a block for ANY delta, empty included — `close_current`
+/// first emitted `ThinkingEnd`, then a fresh `text:""` block started — so a turn on `zai-glm-5-3`
+/// (shipped in `providers/catalog/mistral.json`) landed `thinking / text:"" / thinking` instead of
+/// one thinking block. The thinking branch already skipped empties (`content.rs:117`), so the split
+/// came entirely from the text path.
+#[tokio::test]
+async fn prov115_an_empty_text_delta_does_not_split_thinking_into_two_blocks() {
+    let m = model_with("zai-glm-5-3", true);
+
+    // The shape GLM-on-Mistral sends: a thinking delta, an EMPTY content delta, a thinking delta.
+    let raw = concat!(
+        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"a\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"b\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let events = collect(raw.as_bytes().to_vec(), &m).await;
+    let msg = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("done terminal");
+    assert_eq!(
+        msg.content.len(),
+        1,
+        "the empty delta must not open a text block: {:?}",
+        msg.content
+    );
+    let Content::Thinking { thinking, .. } = &msg.content[0] else {
+        panic!("expected one thinking block, got {:?}", msg.content);
+    };
+    assert_eq!(thinking, "ab", "both thinking deltas land in ONE block");
+    // No block was ever opened for the empty delta, so no text event was emitted either.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            StreamEvent::TextStart { .. } | StreamEvent::TextDelta { .. }
+        )),
+        "no text events expected, got {events:?}"
+    );
+
+    // MIRROR: the `{type:"text"}` item form of the same empty delta — pi's second guarded site
+    // (`:678`). An array item `{"type":"text","text":""}` between two thinking deltas splits the
+    // same way through the same `push_text`.
+    let raw = concat!(
+        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"a\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"b\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let events = collect(raw.as_bytes().to_vec(), &m).await;
+    let msg = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("done terminal");
+    assert_eq!(
+        msg.content.len(),
+        1,
+        "an empty `text` item must not open a block either: {:?}",
+        msg.content
+    );
+
+    // MIRROR: the bare-string array item — cyrup's third site, which pi reaches through the same
+    // guarded branch because it normalizes string content to `[delta.content]` (`:630`).
+    let raw = concat!(
+        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"a\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[\"\"]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"b\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let events = collect(raw.as_bytes().to_vec(), &m).await;
+    let msg = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("done terminal");
+    assert_eq!(
+        msg.content.len(),
+        1,
+        "an empty string array item must not open a block either: {:?}",
+        msg.content
+    );
+
+    // NEGATIVE: a NON-empty text delta between two thinking deltas still splits — that is upstream's
+    // behaviour and the guard must not widen into dropping real text. This arm fails if the fix
+    // suppressed the block unconditionally instead of only for an empty delta.
+    let raw = concat!(
+        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"a\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"mid\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"b\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let events = collect(raw.as_bytes().to_vec(), &m).await;
+    let msg = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("done terminal");
+    assert_eq!(
+        msg.content.len(),
+        3,
+        "real text still splits: {:?}",
+        msg.content
+    );
+    assert!(matches!(&msg.content[1], Content::Text { text, .. } if text == "mid"));
+}
+
+/// PROV-115, the consequence half. The split only matters because it survives into the REQUEST:
+/// `to_chat_messages` emits one `{"type":"thinking","thinking":[…]}` entry per thinking block
+/// (`messages.rs:61-68`), and the empty text block between them is dropped by its own
+/// `!text.trim().is_empty()` test (`:55`) — so the replayed assistant message carries TWO thinking
+/// entries, which is the body Mistral rejects. This test replays the message a GLM turn produces and
+/// asserts a single thinking entry; at HEAD the decoder handed it two blocks and it was two.
+#[tokio::test]
+async fn prov115_a_glm_turn_replays_as_one_assistant_thinking_entry() {
+    let m = model_with("zai-glm-5-3", true);
+    let raw = concat!(
+        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"step one \"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"step two\"}]}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]},\"finishReason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let events = collect(raw.as_bytes().to_vec(), &m).await;
+    let msg = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Done { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("done terminal");
+
+    // Second turn: that assistant message goes back on the wire.
+    let replayed = to_chat_messages(
+        &[
+            Message::User {
+                content: vec![Content::text("hi")],
+                timestamp: 0,
+            },
+            Message::Assistant((*msg).clone()),
+            Message::User {
+                content: vec![Content::text("and now?")],
+                timestamp: 0,
+            },
+        ],
+        false,
+    );
+    let assistant = replayed
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .expect("an assistant message");
+    let parts = assistant
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("content parts");
+    let thinking: Vec<&Value> = parts
+        .iter()
+        .filter(|p| p.get("type").and_then(Value::as_str) == Some("thinking"))
+        .collect();
+    assert_eq!(
+        thinking.len(),
+        1,
+        "Mistral rejects a replay with two thinking entries: {parts:?}"
+    );
+    assert_eq!(
+        thinking[0]
+            .get("thinking")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|p| p.get("text"))
+            .and_then(Value::as_str),
+        Some("step one step two")
+    );
+    // The real text still rides along as its own entry.
+    assert!(
+        parts
+            .iter()
+            .any(|p| p.get("type").and_then(Value::as_str) == Some("text")
+                && p.get("text").and_then(Value::as_str) == Some("done")),
+        "the real text must survive: {parts:?}"
+    );
+}
