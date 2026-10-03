@@ -244,7 +244,7 @@ impl McpExtension {
         let config = self
             .programmatic_config
             .clone()
-            .unwrap_or_else(|| self.config_context().load().config);
+            .unwrap_or_else(|| self.load_time_config());
 
         // Seed the sink with what the model is CURRENTLY shown, so the pass registers only
         // differences. These three slots are the extension's memory of the last pass.
@@ -551,6 +551,22 @@ impl McpExtension {
     /// the next read without invalidating a cache.
     ///
     /// Returns the **context**, not the loaded config, because the two existing callers want
+    /// `excludeProjectServersAtLoadTime(loadMcpConfig(earlyConfigPath))` (`index.ts:370`,
+    /// `init.ts:149`) — the config for a pass that runs **before any session exists** (MCP-591).
+    ///
+    /// `4ed656e` (#714). Registration and surface-sync both happen outside `session_start`, so
+    /// there is no `cwd`-scoped approval to consult and no UI to prompt with; a project server's
+    /// tools must not be put in front of the model there. They reappear at `session_start`, where
+    /// [`crate::project_server_trust::apply_project_server_trust`] either admits them or blocks
+    /// them with a reason.
+    fn load_time_config(&self) -> crate::config::McpConfig {
+        let loaded = self.config_context().load();
+        crate::project_server_trust::exclude_project_servers_at_load_time(
+            &loaded.config,
+            &loaded.project_servers,
+        )
+    }
+
     /// `.load().config` while `/mcp disable` and `cyrup mcp init` want the context's own writers.
     #[must_use]
     pub(crate) fn config_context(&self) -> crate::config::ConfigContext {
@@ -2133,7 +2149,7 @@ impl NativeExtension for McpExtension {
         let config = self
             .programmatic_config
             .clone()
-            .unwrap_or_else(|| self.config_context().load().config);
+            .unwrap_or_else(|| self.load_time_config());
 
         // A NEW generation gets a NEW executor: this pass mints fresh tool objects, and the
         // dispatch they read is installed once this generation's `McpState` exists.
@@ -3375,6 +3391,7 @@ done
             ui: services,
             open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
             send_message: Arc::new(|_| {}),
+            blocked_project_servers: IndexMap::new(),
         }))
     }
 
@@ -3752,6 +3769,7 @@ done
             ui: None,
             open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
             send_message: Arc::new(|_| {}),
+            blocked_project_servers: IndexMap::new(),
         }))
     }
 

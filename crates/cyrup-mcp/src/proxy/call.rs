@@ -159,12 +159,14 @@ fn spread(map: &mut JsonMap<String, Value>, identity: &[(String, Value)]) {
 /// resource tool reports `{server, resourceUri}`, a normal tool `{server, tool: originalName}`, and
 /// an unresolved name falls back to `{server, requestedTool}`.
 fn disabled_call_result(
+    blocked: &indexmap::IndexMap<String, crate::project_server_trust::ProjectServerBlock>,
     disabled_server: &str,
     tool_name: &str,
     metadata: Option<&ToolMetadata>,
 ) -> ToolResult {
     let message = format!(
-        "Server \"{disabled_server}\" is disabled. Run /mcp enable {disabled_server} and /reload to enable it."
+        "Server \"{disabled_server}\" is {}",
+        crate::project_server_trust::disabled_server_reason(Some(blocked), disabled_server)
     );
     let mut map = details_err("call", McpErrorCode::ServerDisabled);
     match metadata {
@@ -244,7 +246,12 @@ pub async fn execute_call(
         }
         // The disabled check runs AFTER resolution so the error can name the resolved tool.
         if ctx.is_disabled(&hint) {
-            return Ok(disabled_call_result(&hint, tool_name, tool_meta.as_ref()));
+            return Ok(disabled_call_result(
+                ctx.blocked_project_servers(),
+                &hint,
+                tool_name,
+                tool_meta.as_ref(),
+            ));
         }
     } else {
         // ---- Phase 2 — no hint: the ambiguity gate, then two ordered scans -----------------------
@@ -317,7 +324,12 @@ pub async fn execute_call(
                 tool_meta = Some(found);
             }
             (None, Some((disabled, found))) => {
-                return Ok(disabled_call_result(&disabled, tool_name, Some(&found)));
+                return Ok(disabled_call_result(
+                    ctx.blocked_project_servers(),
+                    &disabled,
+                    tool_name,
+                    Some(&found),
+                ));
             }
             (None, None) => {}
         }
@@ -767,6 +779,7 @@ pub async fn execute_call(
     // The definition may have been swapped under a live connection.
     if ctx.is_disabled(&server_name) {
         return Ok(disabled_call_result(
+            ctx.blocked_project_servers(),
             &server_name,
             tool_name,
             Some(&tool_meta),

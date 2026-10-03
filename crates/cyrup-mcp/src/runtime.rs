@@ -147,10 +147,20 @@ pub async fn initialize_mcp(
     options: InitializeOptions,
 ) -> McpResult<Arc<McpState>> {
     // Step 1 — the config this generation runs. `loadMcpConfig` cannot fail (MCP-003).
-    let config = options
-        .programmatic_config
-        .clone()
-        .unwrap_or_else(|| crate::config::load_mcp_config(&dirs, snapshot.config_path.as_deref()));
+    //
+    // `loadMcpConfigWithSources` rather than `loadMcpConfig`, because the project-server trust gate
+    // below needs to know which servers came from the checkout (MCP-591). A **programmatic** config
+    // has no project source at all — the embedder supplied it — so it runs no gate, exactly as
+    // upstream's `options.config !== undefined` arm does.
+    let loaded = options.programmatic_config.clone().map_or_else(
+        || crate::config::load_mcp_config_with_sources(&dirs, snapshot.config_path.as_deref()),
+        |config| crate::config::LoadedConfig {
+            config,
+            diagnostics: Vec::new(),
+            project_servers: indexmap::IndexMap::new(),
+            project_server_policy: crate::config::ProjectServerPolicy::default(),
+        },
+    );
 
     // MCP-015's two derivations. The fenced handle is built BEFORE anything asynchronous can hold
     // it, which is the whole point: what crosses the await is already inert-on-stop.
@@ -166,6 +176,57 @@ pub async fn initialize_mcp(
         .flatten()
         .map(|services| Arc::new(OwnedServices::new(services, Arc::clone(&owner))));
     let runtime_signal = crate::abort::combine(&owner.token(), snapshot.initial_signal.as_ref());
+
+    // `const trustResult = … await applyProjectServerTrustToConfig(loadMcpConfig(configPath, cwd),
+    // ctx)` (`init.ts:146-151`) — MCP-591, and it runs HERE: after `ui` exists, because the prompt
+    // needs it, and before anything reads `config`, because a blocked server must never be
+    // connected, registered or offered to the model.
+    //
+    // `a6cfeea` (#701) is the reason the placement is not negotiable: the approval has to happen
+    // *inside* `session_start`. Earlier there is no session to ask in; later the server has already
+    // started.
+    let dialog = ui.as_ref().map(crate::owner::McpDialog::fenced);
+    let trust = crate::project_server_trust::apply_project_server_trust(
+        &loaded.config,
+        &loaded.project_servers,
+        &crate::project_server_trust::ProjectTrustContext {
+            cwd: &snapshot.cwd,
+            dirs: &dirs,
+            // `try { ctx.isProjectTrusted() } catch { false }` — a host that cannot answer is
+            // untrusted. `HostServices::is_project_trusted` defaults to `false`, so the `catch`
+            // arm and the no-host arm are the same value here.
+            project_trusted: snapshot
+                .services
+                .as_ref()
+                .is_some_and(|services| services.is_project_trusted()),
+            has_ui: snapshot.has_ui,
+            policy: loaded.config.settings_or_default().project_servers_policy(),
+            ui: dialog.as_ref(),
+        },
+    )
+    .await;
+    let blocked_project_servers = trust.blocked_servers;
+    let config = trust.config;
+
+    // `if (trustResult.blockedServers.size > 0)` (`init.ts:287-291`) — one line, either as a
+    // warning toast or on stderr, so a blocked server is never silently absent.
+    if !blocked_project_servers.is_empty() {
+        let summary = blocked_project_servers
+            .iter()
+            .map(|(name, block)| {
+                format!(
+                    "{name} ({})",
+                    crate::project_server_trust::describe_project_server_block(block.reason)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!("MCP: Project servers blocked: {summary}");
+        match ui.as_ref() {
+            Some(ui) if snapshot.has_ui => ui.notify(&message, cyrup_ext::NotifyKind::Warning),
+            _ => tracing::warn!("{message}"),
+        }
+    }
 
     // Steps 2-4. `getAuthStorageOptions(settings.oauthDir, cwd)` — and **only** `settings.oauthDir`:
     // `$MCP_OAUTH_DIR` and the `<agent_dir>/mcp-oauth` default are the store's own precedence ladder
@@ -438,6 +499,7 @@ pub async fn initialize_mcp(
         ui,
         open_browser,
         send_message,
+        blocked_project_servers,
     }));
 
     // The hooks minted above can now resolve the generation's dialog. Bound AFTER the state exists

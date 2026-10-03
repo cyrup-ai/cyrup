@@ -2279,6 +2279,7 @@ done
             ui: None,
             open_browser: Arc::new(|_| Box::pin(async { Ok(()) })),
             send_message: Arc::new(|_| {}),
+            blocked_project_servers: indexmap::IndexMap::new(),
         }));
         let connection = state
             .manager

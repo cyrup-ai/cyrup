@@ -2672,6 +2672,7 @@ mod tests {
             ui: None,
             open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
             send_message: Arc::new(|_| {}),
+            blocked_project_servers: IndexMap::new(),
         }))
     }
 

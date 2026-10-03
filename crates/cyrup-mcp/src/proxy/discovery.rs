@@ -178,7 +178,7 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
         );
     }
     if ctx.is_disabled(server) {
-        return disabled_result("list", server);
+        return disabled_result(ctx.blocked_project_servers(), "list", server);
     }
 
     let metadata: Option<Vec<ToolMetadata>> = ctx.with_metadata(|map| map.get(server).cloned());
@@ -301,7 +301,7 @@ pub fn execute_instructions(ctx: &ProxyCtx, server: &str) -> ToolResult {
         return not_found_result("instructions", server);
     }
     if ctx.is_disabled(server) {
-        return disabled_result("instructions", server);
+        return disabled_result(ctx.blocked_project_servers(), "instructions", server);
     }
 
     if let Some(instructions) = ctx
@@ -397,7 +397,7 @@ pub fn execute_describe(ctx: &ProxyCtx, tool_name: &str) -> ToolResult {
 
     let (Some(server_name), Some(tool_meta)) = (server_name, tool_meta) else {
         if let Some(disabled) = disabled_match {
-            return disabled_result("describe", &disabled);
+            return disabled_result(ctx.blocked_project_servers(), "describe", &disabled);
         }
         let suggestions = ctx.suggestions(tool_name, 5);
         let suggestion_text = if suggestions.is_empty() {
@@ -508,7 +508,7 @@ pub fn execute_search(
     if let Some(server) = server
         && ctx.is_disabled(server)
     {
-        return disabled_result("search", server);
+        return disabled_result(ctx.blocked_project_servers(), "search", server);
     }
 
     let global_prefix = ctx.config().tool_prefix();

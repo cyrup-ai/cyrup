@@ -66,11 +66,22 @@ pub fn ambiguous_tool_result(mode: &str, tool_name: &str) -> ToolResult {
     text_result(message, map)
 }
 
-/// `proxy-modes.ts:69` `disabledResult(mode, serverName)` — shared by every mode.
+/// `proxy-modes.ts:214` `disabledResult(state, mode, serverName)` — shared by every mode.
+///
+/// The tail is [`crate::project_server_trust::disabled_server_reason`]'s since MCP-591: for an
+/// ordinary disabled server it is still *"disabled. Run /mcp enable … and /reload to enable it."*,
+/// and for one the project-server trust gate refused it is the block reason instead — because
+/// `/mcp enable` would not help, the entry being disabled by the gate rather than by any file the
+/// user can edit.
 #[must_use]
-pub fn disabled_result(mode: &str, server_name: &str) -> ToolResult {
+pub fn disabled_result(
+    blocked: &indexmap::IndexMap<String, crate::project_server_trust::ProjectServerBlock>,
+    mode: &str,
+    server_name: &str,
+) -> ToolResult {
     let message = format!(
-        "Server \"{server_name}\" is disabled. Run /mcp enable {server_name} and /reload to enable it."
+        "Server \"{server_name}\" is {}",
+        crate::project_server_trust::disabled_server_reason(Some(blocked), server_name)
     );
     let mut map = details_err(mode, McpErrorCode::ServerDisabled);
     map.insert("server".to_string(), Value::String(server_name.to_string()));
@@ -308,7 +319,7 @@ mod tests {
             json!("Tool \"create_issue\" matches multiple servers. Specify a server.")
         );
 
-        let disabled = disabled_result("list", "gh");
+        let disabled = disabled_result(&indexmap::IndexMap::new(), "list", "gh");
         let details = disabled.details.expect("details");
         assert_eq!(details["error"], json!("server_disabled"));
         assert_eq!(

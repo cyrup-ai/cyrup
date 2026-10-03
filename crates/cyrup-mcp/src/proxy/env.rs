@@ -492,6 +492,17 @@ impl ProxyCtx {
             .map(|mut guard| f(&mut guard))
     }
 
+    /// `state.blockedProjectServers` — the project servers the trust gate refused (MCP-591).
+    ///
+    /// Read by every "that server is disabled" message, through
+    /// [`crate::project_server_trust::disabled_server_reason`], so a blocked server explains the
+    /// gate instead of pointing at `/mcp enable`.
+    pub(crate) fn blocked_project_servers(
+        &self,
+    ) -> &indexmap::IndexMap<String, crate::project_server_trust::ProjectServerBlock> {
+        &self.state.blocked_project_servers
+    }
+
     /// The resolved configuration this generation is running.
     pub(crate) fn config(&self) -> &McpConfig {
         &self.state.config

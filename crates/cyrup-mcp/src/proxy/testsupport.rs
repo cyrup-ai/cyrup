@@ -273,6 +273,7 @@ pub(crate) fn ctx_with(
         ui: None,
         open_browser: Arc::new(|_| Box::pin(async { Ok(()) })),
         send_message: Arc::new(|_| {}),
+        blocked_project_servers: IndexMap::new(),
     }));
     {
         let mut slot = state.server_instructions.lock().unwrap();

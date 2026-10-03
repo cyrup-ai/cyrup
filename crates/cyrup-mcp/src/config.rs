@@ -654,6 +654,7 @@ pub struct McpConfig {
 /// The all-`None` settings block every accessor falls back to, so
 /// [`McpConfig::settings_or_default`] can hand out a reference without allocating.
 static EMPTY_SETTINGS: McpSettings = McpSettings {
+    project_servers: None,
     tool_prefix: None,
     show_status_icon: None,
     mcp_footer_status: None,
@@ -1096,6 +1097,18 @@ impl ServerEntry {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpSettings {
+    /// `settings.projectServers` (`types.ts:605` @ v5.0.0, `5d645df` / #681) — the admission policy
+    /// for project-local MCP servers that have not been approved (MCP-591).
+    ///
+    /// Default `"ask"`. **User-global config only:** [`ConfigContext::load`] strips the key from a
+    /// project-scoped source with upstream's own warning, because a policy a project file could set
+    /// would let the project approve itself.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub project_servers: Option<ProjectServerPolicy>,
     /// Default `"server"`. How every direct tool is named.
     #[serde(
         default,
@@ -1530,6 +1543,14 @@ impl McpSettings {
             self.trace.as_ref().and_then(|t| t.max_events),
             DEFAULT_MCP_TRACE_MAX_EVENTS,
         )
+    }
+
+    /// `settings?.projectServers ?? "ask"` — the admission policy for unapproved project servers
+    /// (MCP-591). `"ask"` is the default and is also what an unrecognised value degrades to,
+    /// because [`lenient`] drops it: a typo must not widen the gate.
+    #[must_use]
+    pub fn project_servers_policy(&self) -> ProjectServerPolicy {
+        self.project_servers.unwrap_or_default()
     }
 
     /// `settings?.authRequiredMessage` — the template, not the formatted text. Formatting is
@@ -2256,6 +2277,38 @@ pub struct LoadedConfig {
     pub config: McpConfig,
     /// Named diagnostics, in discovery order.
     pub diagnostics: Vec<ConfigDiagnostic>,
+    /// `LoadedMcpConfig.projectServers` (`config.ts:426`) — every server whose definition came from
+    /// a **project** source, with the file it came from (MCP-591).
+    ///
+    /// This is the input to [`crate::project_server_trust::apply_project_server_trust`], and the
+    /// only thing that distinguishes a server the user put in their own config from one a cloned
+    /// repository put in the checkout. Five routes populate it: a project-scoped host config under
+    /// `hostConfigDiscovery`, a project-scoped ladder rung's own servers, that rung's **imports**
+    /// (project-scoped even when they read home-level files), a user rung's import that resolved to
+    /// a cwd-relative candidate, and the Agent Plugins a project source's `agentPluginPaths` named.
+    ///
+    /// `[CYRUP-DELTA]` — upstream smuggles this past `loadMcpConfig`'s `McpConfig` return type on a
+    /// non-enumerable `Symbol.for("pi-mcp-adapter/config-source-metadata")` property and reads it
+    /// back with `asLoadedConfig`, so a caller holding only an `McpConfig` can still recover it.
+    /// Rust has no such back channel and needs none: this is a typed field on the load's own
+    /// return, [`load_mcp_config_with_sources`] is the accessor, and `asLoadedConfig`'s
+    /// `?? new Map()` fallback — the case where the metadata was lost — is unrepresentable rather
+    /// than merely unused. Full parity: every upstream read of the symbol is a read of this field.
+    pub project_servers: IndexMap<String, ProjectServerSource>,
+    /// `LoadedMcpConfig.projectServerPolicy` — the merged `settings.projectServers`, which only a
+    /// user-global source may set.
+    pub project_server_policy: ProjectServerPolicy,
+}
+
+/// `ProjectServerSource` (`config.ts:420`) — which project file a server came from.
+///
+/// Carried into the approval prompt (`Project config: ${source.path}`) and into every
+/// [`crate::project_server_trust::ProjectServerBlock`], so a blocked server can say *which* file
+/// asked for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectServerSource {
+    /// The file the definition was read from.
+    pub path: PathBuf,
 }
 
 /// `getConfigPathFromArgv(argv)` — `utils.ts`.
@@ -2813,6 +2866,7 @@ pub fn merge_settings(
     };
     let base = base.cloned().unwrap_or_default();
     Some(McpSettings {
+        project_servers: next.project_servers.or(base.project_servers),
         tool_prefix: next.tool_prefix.or(base.tool_prefix),
         show_status_icon: next.show_status_icon.or(base.show_status_icon),
         mcp_footer_status: next.mcp_footer_status.or(base.mcp_footer_status),
@@ -2868,6 +2922,14 @@ pub struct ImportedDocument {
     pub path: PathBuf,
     /// The parsed document.
     pub value: RawJson,
+    /// Whether the winning candidate is a **project** path (MCP-591).
+    ///
+    /// `const scope = candidate.startsWith(".") ? "project" : "user"`
+    /// (`config.ts:1002`) — a cwd-relative candidate is project-scoped, a home-relative one is
+    /// not. It decides whether the servers this document contributes need project-server approval,
+    /// and it is why the `opencode` family can be either: its two candidates differ in scope and
+    /// the one that won is the one that counts.
+    pub scope: SourceScope,
 }
 
 /// `IMPORT_PATHS[kind]`, resolved against a home directory and a cwd (`resolveImportCandidates`).
@@ -2877,31 +2939,66 @@ pub struct ImportedDocument {
 /// [`resolve_opencode_project_candidate`].
 #[must_use]
 pub fn resolve_import_candidates(kind: ImportKind, home: &Path, cwd: &Path) -> Vec<PathBuf> {
+    resolve_import_candidates_scoped(kind, home, cwd)
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect()
+}
+
+/// One candidate path and whether it is project-scoped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCandidate {
+    /// The resolved path.
+    pub path: PathBuf,
+    /// `candidate.startsWith(".") ? "project" : "user"` (`config.ts:1002`).
+    pub scope: SourceScope,
+}
+
+/// [`resolve_import_candidates`] with each candidate's scope (MCP-591).
+///
+/// The scope is a property of the **template**, not of the resolved path: upstream tests the raw
+/// `IMPORT_PATHS` entry for a leading `.`, so exactly the cwd-relative candidates — `vscode`'s
+/// `.vscode/mcp.json` and `opencode`'s `./opencode.json` — are project-scoped, and a home that
+/// happens to equal the cwd does not change that.
+#[must_use]
+pub fn resolve_import_candidates_scoped(
+    kind: ImportKind,
+    home: &Path,
+    cwd: &Path,
+) -> Vec<ImportCandidate> {
+    let user = |path: PathBuf| ImportCandidate {
+        path,
+        scope: SourceScope::Global,
+    };
+    let project = |path: PathBuf| ImportCandidate {
+        path,
+        scope: SourceScope::Project,
+    };
     match kind {
-        ImportKind::Cursor => vec![home.join(".cursor").join("mcp.json")],
+        ImportKind::Cursor => vec![user(home.join(".cursor").join("mcp.json"))],
         ImportKind::ClaudeCode => vec![
-            home.join(".claude").join("mcp.json"),
-            home.join(".claude.json"),
-            home.join(".claude").join("claude_desktop_config.json"),
+            user(home.join(".claude").join("mcp.json")),
+            user(home.join(".claude.json")),
+            user(home.join(".claude").join("claude_desktop_config.json")),
         ],
-        ImportKind::ClaudeDesktop => vec![
+        ImportKind::ClaudeDesktop => vec![user(
             home.join("Library")
                 .join("Application Support")
                 .join("Claude")
                 .join("claude_desktop_config.json"),
-        ],
+        )],
         ImportKind::Codex => {
             vec![
-                home.join(".codex").join("config.toml"),
-                home.join(".codex").join("config.json"),
+                user(home.join(".codex").join("config.toml")),
+                user(home.join(".codex").join("config.json")),
             ]
         }
         ImportKind::Opencode => vec![
-            home.join(".config").join("opencode").join("opencode.json"),
-            resolve_opencode_project_candidate(cwd),
+            user(home.join(".config").join("opencode").join("opencode.json")),
+            project(resolve_opencode_project_candidate(cwd)),
         ],
-        ImportKind::Windsurf => vec![home.join(".windsurf").join("mcp.json")],
-        ImportKind::Vscode => vec![resolve_from(cwd, ".vscode/mcp.json")],
+        ImportKind::Windsurf => vec![user(home.join(".windsurf").join("mcp.json"))],
+        ImportKind::Vscode => vec![project(resolve_from(cwd, ".vscode/mcp.json"))],
     }
 }
 
@@ -2973,38 +3070,50 @@ pub fn load_imported_config(
     warning_prefix: &str,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Option<ImportedDocument> {
-    let candidates = resolve_import_candidates(kind, home, cwd);
+    let candidates = resolve_import_candidates_scoped(kind, home, cwd);
 
     if kind == ImportKind::Opencode {
         let mut merged = IndexMap::new();
-        let mut highest: Option<PathBuf> = None;
-        for path in candidates {
-            if !path.exists() {
+        let mut highest: Option<ImportCandidate> = None;
+        for candidate in candidates {
+            if !candidate.path.exists() {
                 continue;
             }
-            match read_imported_config(&path) {
+            match read_imported_config(&candidate.path) {
                 Ok(value) => {
                     if let Some(entries) = value.as_object() {
                         merged = merge_opencode_configs(&merged, entries);
-                        highest = Some(path);
+                        highest = Some(candidate);
                     }
                 }
-                Err(error) => push_import_warning(&path, warning_prefix, &error, diagnostics),
+                Err(error) => {
+                    push_import_warning(&candidate.path, warning_prefix, &error, diagnostics);
+                }
             }
         }
-        return highest.map(|path| ImportedDocument {
-            path,
+        // The scope is the WINNING candidate's, which for `opencode` is the last existing one — so
+        // a project `./opencode.json` beside a home one makes the merged document project-scoped,
+        // and a home-only one does not (MCP-591).
+        return highest.map(|candidate| ImportedDocument {
+            path: candidate.path,
             value: RawJson::Object(merged),
+            scope: candidate.scope,
         });
     }
 
-    for path in candidates {
-        if !path.exists() {
+    for candidate in candidates {
+        if !candidate.path.exists() {
             continue;
         }
-        match read_imported_config(&path) {
-            Ok(value) => return Some(ImportedDocument { path, value }),
-            Err(error) => push_import_warning(&path, warning_prefix, &error, diagnostics),
+        match read_imported_config(&candidate.path) {
+            Ok(value) => {
+                return Some(ImportedDocument {
+                    path: candidate.path,
+                    value,
+                    scope: candidate.scope,
+                });
+            }
+            Err(error) => push_import_warning(&candidate.path, warning_prefix, &error, diagnostics),
         }
     }
     None
@@ -3323,10 +3432,48 @@ pub fn expand_imports(
     cwd: &Path,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> McpConfig {
+    expand_imports_with_sources(config, home, cwd, diagnostics).config
+}
+
+/// `expandImports(config, cwd)`'s **whole** return — the config and where each imported server
+/// came from (`config.ts:971`, MCP-591).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpandedImports {
+    /// What [`expand_imports`] returns on its own.
+    pub config: McpConfig,
+    /// One entry per server this expansion contributed, keyed by server name.
+    pub server_sources: IndexMap<String, ImportedServerSource>,
+}
+
+/// `ImportedServerSource` (`config.ts:430`) — the file one server was read from, and its scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedServerSource {
+    /// The document the entry was read from.
+    pub path: PathBuf,
+    /// [`SourceScope::Project`] when the winning candidate was cwd-relative.
+    pub scope: SourceScope,
+}
+
+/// [`expand_imports`] with the per-server provenance (MCP-591).
+///
+/// The map records **first writer wins**, exactly as `importedServers[name]` does: a server named
+/// by two import families is attributed to the first family that supplied it, which is the one
+/// whose definition survives.
+#[must_use]
+pub fn expand_imports_with_sources(
+    config: &McpConfig,
+    home: &Path,
+    cwd: &Path,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> ExpandedImports {
     if config.imports.is_empty() {
-        return config.clone();
+        return ExpandedImports {
+            config: config.clone(),
+            server_sources: IndexMap::new(),
+        };
     }
     let mut imported: IndexMap<String, ServerEntry> = IndexMap::new();
+    let mut server_sources: IndexMap<String, ImportedServerSource> = IndexMap::new();
     for raw_kind in &config.imports {
         let Some(kind) = ImportKind::parse(raw_kind) else {
             continue;
@@ -3341,13 +3488,26 @@ pub fn expand_imports(
             continue;
         };
         for (name, entry) in extract_servers(&document.value, kind, &document.path, diagnostics) {
-            imported.entry(name).or_insert(entry);
+            if imported.contains_key(&name) {
+                continue;
+            }
+            let _ = server_sources.insert(
+                name.clone(),
+                ImportedServerSource {
+                    path: document.path.clone(),
+                    scope: document.scope,
+                },
+            );
+            let _ = imported.insert(name, entry);
         }
     }
-    McpConfig {
-        mcp_servers: merge_server_maps(&imported, &config.mcp_servers),
-        settings: config.settings.clone(),
-        imports: config.imports.clone(),
+    ExpandedImports {
+        config: McpConfig {
+            mcp_servers: merge_server_maps(&imported, &config.mcp_servers),
+            settings: config.settings.clone(),
+            imports: config.imports.clone(),
+        },
+        server_sources,
     }
 }
 
@@ -3364,7 +3524,26 @@ pub fn load_discovered_host_configs(
     cwd: &Path,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> McpConfig {
+    load_discovered_host_configs_with_sources(home, cwd, diagnostics).config
+}
+
+/// [`load_discovered_host_configs`] with the per-server provenance (MCP-591).
+///
+/// `loadDiscoveredHostConfigs` returns `{ config, serverSources }` and `loadMcpConfigWithSources`
+/// walks the map keeping the **project**-scoped entries, which is the first of the five routes a
+/// server can take into the project-server set.
+///
+/// LAST writer wins here, not first: the fold is `mergeConfigs(config, discovered)` in
+/// [`ImportKind::ALL`] order, so a later family's definition replaces an earlier one and the
+/// provenance has to follow it.
+#[must_use]
+pub fn load_discovered_host_configs_with_sources(
+    home: &Path,
+    cwd: &Path,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> ExpandedImports {
     let mut config = McpConfig::default();
+    let mut server_sources: IndexMap<String, ImportedServerSource> = IndexMap::new();
     for kind in ImportKind::ALL {
         let Some(document) = load_imported_config(
             kind,
@@ -3376,6 +3555,15 @@ pub fn load_discovered_host_configs(
             continue;
         };
         let servers = extract_servers(&document.value, kind, &document.path, diagnostics);
+        for name in servers.keys() {
+            let _ = server_sources.insert(
+                name.clone(),
+                ImportedServerSource {
+                    path: document.path.clone(),
+                    scope: document.scope,
+                },
+            );
+        }
         config = merge_configs(
             &config,
             &McpConfig {
@@ -3384,7 +3572,10 @@ pub fn load_discovered_host_configs(
             },
         );
     }
-    config
+    ExpandedImports {
+        config,
+        server_sources,
+    }
 }
 
 // ===================================================================================================
@@ -3436,6 +3627,20 @@ pub enum SourceKind {
     Project,
     /// A shared file the adapter reads but never writes — its writes are redirected to `userPath`.
     Import,
+}
+
+/// `settings.projectServers: "ask" | "allow"` (`types.ts:605`) — MCP-591.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectServerPolicy {
+    /// The default: an unapproved project server is admitted only after the user approves it in a
+    /// trusted interactive session.
+    #[default]
+    Ask,
+    /// A **non-interactive** trusted session admits project servers without a prompt. Note the
+    /// `!ctx.hasUI` in upstream's gate (`project-server-trust.ts:204`): an interactive session
+    /// still asks, because there a human is there to be asked.
+    Allow,
 }
 
 /// `ConfigSourceSpec["scope"]`.
@@ -3748,15 +3953,44 @@ impl ConfigContext {
     /// Every read is defensive: a missing file is skipped, a malformed file warns and is skipped, a
     /// malformed entry is dropped while the file survives. That is what lets
     /// [`crate::extension::McpExtension`]'s `init` be infallible (MCP-003).
+    /// 4. **Project-server provenance** is recorded as the ladder runs (MCP-591) — see
+    ///    [`LoadedConfig::project_servers`] for the five routes. It is collected here and nowhere
+    ///    else, because only the loader knows which file a surviving definition came from; by the
+    ///    time the merge is done that information is gone.
     #[must_use]
     pub fn load(&self) -> LoadedConfig {
         let mut diagnostics = Vec::new();
+        let mut project_servers: IndexMap<String, ProjectServerSource> = IndexMap::new();
+        let mut project_server_policy = ProjectServerPolicy::Ask;
         let discovery = self.host_config_discovery(&mut diagnostics);
         let mut config = if discovery == HostConfigDiscovery::On {
-            load_discovered_host_configs(&self.home, self.dirs.cwd(), &mut diagnostics)
+            let discovered = load_discovered_host_configs_with_sources(
+                &self.home,
+                self.dirs.cwd(),
+                &mut diagnostics,
+            );
+            // Route 1. `for (const [name, source] of discoveredHost.serverSources) if (source.scope
+            // === "project") projectServers.set(name, { path: source.path })`.
+            for (name, source) in &discovered.server_sources {
+                if source.scope == SourceScope::Project {
+                    let _ = project_servers.insert(
+                        name.clone(),
+                        ProjectServerSource {
+                            path: source.path.clone(),
+                        },
+                    );
+                }
+            }
+            discovered.config
         } else {
             McpConfig::default()
         };
+
+        // `projectAgentPluginSource` — the project file that named `agentPluginPaths`, if any. Only
+        // the LAST such source counts, and a user-scoped source that names the key clears it:
+        // upstream's assignment is unconditional (`source.scope === "project" ? sourceRef :
+        // undefined`), so a user-global override of the paths makes the plugins user-scoped again.
+        let mut project_plugin_source: Option<ProjectServerSource> = None;
 
         for source in self.sources() {
             if !self.source_contributes(&source) {
@@ -3765,16 +3999,92 @@ impl ConfigContext {
             let Some(loaded) = read_validated_config(&source.read_path, &mut diagnostics) else {
                 continue;
             };
-            let expanded = expand_imports(&loaded, &self.home, self.dirs.cwd(), &mut diagnostics);
-            config = merge_configs(&config, &expanded);
+            let mut expanded =
+                expand_imports_with_sources(&loaded, &self.home, self.dirs.cwd(), &mut diagnostics);
+            let source_ref = ProjectServerSource {
+                path: source.read_path.clone(),
+            };
+            if expanded
+                .config
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings.agent_plugin_paths.is_some())
+            {
+                project_plugin_source =
+                    (source.scope == SourceScope::Project).then(|| source_ref.clone());
+            }
+            if source.scope == SourceScope::Project {
+                // Route 2 and route 3 at once: `for (const name of Object.keys(expanded.mcpServers))
+                // projectServers.set(name, sourceRef)` runs over the EXPANDED table, so a project
+                // file's imports are project-scoped even when they read home-level files.
+                for name in expanded.config.mcp_servers.keys() {
+                    let _ = project_servers.insert(name.clone(), source_ref.clone());
+                }
+                // `settings.projectServers` in a project config is ignored, with upstream's own
+                // warning: a policy the project could set would let the project approve itself.
+                if let Some(settings) = expanded.config.settings.as_mut()
+                    && settings.project_servers.take().is_some()
+                {
+                    let message = format!(
+                        "Ignoring settings.projectServers in project config {}; set it in the \
+                         user-global MCP config instead",
+                        source.read_path.display()
+                    );
+                    tracing::warn!("{message}");
+                    diagnostics.push(ConfigDiagnostic {
+                        path: source.read_path.clone(),
+                        server: None,
+                        message,
+                    });
+                }
+            } else if let Some(policy) = expanded
+                .config
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.project_servers)
+            {
+                project_server_policy = policy;
+            }
+            // Route 4. A **user**-scoped rung whose import resolved to a cwd-relative candidate
+            // still contributed a project server, and this is the only loop that sees it. It runs
+            // for a project rung too, where it is a no-op: route 2 already named every one of them.
+            for (name, imported) in &expanded.server_sources {
+                if imported.scope == SourceScope::Project {
+                    let _ = project_servers.insert(
+                        name.clone(),
+                        ProjectServerSource {
+                            path: imported.path.clone(),
+                        },
+                    );
+                }
+            }
+            config = merge_configs(&config, &expanded.config);
         }
 
         let plugin_config = self.load_plugin_config(&config, &mut diagnostics);
+        // Route 5. `if (projectAgentPluginSource) for (const name of
+        // Object.keys(pluginConfig.mcpServers)) projectServers.set(name, projectAgentPluginSource)`
+        // — an Agent Plugin the *project* pointed at is a project server, however the plugin
+        // directory itself is laid out.
+        if let Some(plugin_source) = project_plugin_source {
+            for name in plugin_config.mcp_servers.keys() {
+                let _ = project_servers.insert(name.clone(), plugin_source.clone());
+            }
+        }
         config = merge_configs(&plugin_config, &config);
+
+        // A name that is in the project set but not in the merged table was outranked by a
+        // higher-precedence definition and is no longer a project server. Upstream has the same
+        // property by construction — `applyProjectServerTrust` skips a name with no definition
+        // (`project-server-trust.ts:200`) — and pruning here makes `project_servers` an accurate
+        // answer to "which of these servers came from the project" for every other reader too.
+        project_servers.retain(|name, _| config.mcp_servers.contains_key(name));
 
         LoadedConfig {
             config,
             diagnostics,
+            project_servers,
+            project_server_policy,
         }
     }
 
@@ -3839,9 +4149,20 @@ impl ConfigContext {
 /// **This function cannot fail** — see [`ConfigContext::load`] and MCP-003.
 #[must_use]
 pub fn load_mcp_config(dirs: &McpDirs, explicit_path: Option<&Path>) -> McpConfig {
-    ConfigContext::new(dirs.clone(), explicit_path)
-        .load()
-        .config
+    load_mcp_config_with_sources(dirs, explicit_path).config
+}
+
+/// `loadMcpConfigWithSources(overridePath, cwd)` (`config.ts:450`) — the load **with** its
+/// project-server provenance (MCP-591).
+///
+/// Upstream's two entry points exist for a language reason: `loadMcpConfig` returns an `McpConfig`
+/// because every old caller expects one, and smuggles the provenance past the type on a
+/// non-enumerable `Symbol` property. In Rust the metadata is a field on [`LoadedConfig`], so this
+/// is the whole function and [`load_mcp_config`] is the projection — see
+/// [`LoadedConfig::project_servers`] for the `[CYRUP-DELTA]` that records it.
+#[must_use]
+pub fn load_mcp_config_with_sources(dirs: &McpDirs, explicit_path: Option<&Path>) -> LoadedConfig {
+    ConfigContext::new(dirs.clone(), explicit_path).load()
 }
 
 // ===================================================================================================
@@ -5799,6 +6120,11 @@ mod tests {
                 .join(PROJECT_OVERRIDE_DIR)
                 .join(crate::dirs::MCP_CONFIG_FILE)
         }
+
+        /// `<cwd>/.mcp.json` — the project standard rung (MCP-591's fixtures).
+        fn project_path(&self) -> PathBuf {
+            self.context().project_path()
+        }
     }
 
     fn config_message(error: &McpError) -> String {
@@ -5851,6 +6177,216 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "the temp file is renamed away, never left behind"
+        );
+    }
+
+    // -- MCP-591 -----------------------------------------------------------------------------
+
+    #[test]
+    fn the_loader_records_which_servers_came_from_the_project() {
+        let fixture = Fixture::new();
+        // A user-global rung and a project rung, each naming one server.
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{"mine":{"command":"a"}}}"#,
+        );
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"mcpServers":{"theirs":{"command":"b"}}}"#,
+        );
+        let loaded = fixture.context().load();
+
+        assert_eq!(loaded.config.mcp_servers.len(), 2);
+        assert_eq!(
+            loaded.project_servers.keys().collect::<Vec<_>>(),
+            vec!["theirs"],
+            "only the project rung's server is a project server"
+        );
+        assert_eq!(
+            loaded.project_servers.get("theirs").expect("tracked").path,
+            fixture.project_path(),
+            "and it names the file that asked for it"
+        );
+        assert_eq!(loaded.project_server_policy, ProjectServerPolicy::Ask);
+    }
+
+    #[test]
+    fn a_project_rungs_imports_are_project_scoped_even_from_home() {
+        let fixture = Fixture::new();
+        // `cursor` resolves under HOME, so the file itself is not project-scoped…
+        fixture.write(
+            &fixture.home.join(".cursor").join("mcp.json"),
+            r#"{"mcpServers":{"imported":{"command":"c"}}}"#,
+        );
+        // …but a PROJECT config importing it makes the servers it contributes project-scoped,
+        // because the project decided to pull them in.
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"mcpServers":{},"imports":["cursor"]}"#,
+        );
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("imported"));
+        assert_eq!(
+            loaded
+                .project_servers
+                .get("imported")
+                .expect("tracked")
+                .path,
+            fixture.project_path(),
+            "attributed to the project file, which is what upstream's `sourceRef` is"
+        );
+    }
+
+    #[test]
+    fn a_user_rungs_cwd_relative_import_is_still_a_project_server() {
+        let fixture = Fixture::new();
+        // `vscode` is `.vscode/mcp.json` under the CWD — a project path by the template test.
+        fixture.write(
+            &fixture.cwd.join(".vscode").join("mcp.json"),
+            r#"{"mcpServers":{"vs":{"command":"d"}}}"#,
+        );
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{},"imports":["vscode"]}"#,
+        );
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("vs"));
+        assert_eq!(
+            loaded.project_servers.get("vs").expect("tracked").path,
+            fixture.cwd.join(".vscode").join("mcp.json"),
+            "a user config importing a cwd-relative file still read it out of the checkout"
+        );
+    }
+
+    #[test]
+    fn host_discovery_records_only_its_project_scoped_families() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &fixture.cwd.join(".vscode").join("mcp.json"),
+            r#"{"mcpServers":{"vs":{"command":"d"}}}"#,
+        );
+        fixture.write(
+            &fixture.home.join(".cursor").join("mcp.json"),
+            r#"{"mcpServers":{"cur":{"command":"e"}}}"#,
+        );
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"settings":{"hostConfigDiscovery":"on"},"mcpServers":{}}"#,
+        );
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("vs"));
+        assert!(loaded.config.mcp_servers.contains_key("cur"));
+        assert_eq!(
+            loaded.project_servers.keys().collect::<Vec<_>>(),
+            vec!["vs"],
+            "`.vscode/mcp.json` is in the checkout; `~/.cursor/mcp.json` is not"
+        );
+    }
+
+    #[test]
+    fn project_servers_settings_is_user_global_only() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"settings":{"projectServers":"allow"},"mcpServers":{}}"#,
+        );
+        assert_eq!(
+            fixture.context().load().project_server_policy,
+            ProjectServerPolicy::Allow,
+            "a user-global source may set it"
+        );
+
+        // A PROJECT source may not: the key is ignored with upstream's own warning, and the merged
+        // settings must not carry it either — a policy the project could set would let the project
+        // approve itself.
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"settings":{"projectServers":"allow"},"mcpServers":{}}"#,
+        );
+        fixture.write(&fixture.user_path(), r#"{"mcpServers":{}}"#);
+        let loaded = fixture.context().load();
+        assert_eq!(loaded.project_server_policy, ProjectServerPolicy::Ask);
+        assert_eq!(
+            loaded.config.settings_or_default().project_servers_policy(),
+            ProjectServerPolicy::Ask
+        );
+        let shown = fixture.project_path().display().to_string();
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == format!(
+                        "Ignoring settings.projectServers in project config {shown}; set it in the \
+                     user-global MCP config instead"
+                    )),
+            "{:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_project_server_outranked_by_a_user_definition_is_no_longer_one() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"mcpServers":{"both":{"command":"project"}}}"#,
+        );
+        // `<agent_dir>/mcp.json` is the adapter-owned rung and outranks the project standard file.
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{"both":{"command":"user"}}}"#,
+        );
+        let loaded = fixture.context().load();
+        // The merge is per-field, so the project rung's definition can still be the one that wins
+        // its `command`; what the assertion pins is that the provenance follows the table.
+        assert!(loaded.config.mcp_servers.contains_key("both"));
+        assert!(
+            loaded.project_servers.contains_key("both"),
+            "still present in the table, so still a project server"
+        );
+
+        // A name the project asked for and that nothing kept is pruned.
+        let mut loaded = fixture.context().load();
+        let _ = loaded.config.mcp_servers.shift_remove("both");
+        loaded
+            .project_servers
+            .retain(|name, _| loaded.config.mcp_servers.contains_key(name));
+        assert!(loaded.project_servers.is_empty());
+    }
+
+    #[test]
+    fn an_import_candidates_scope_follows_the_template_not_the_resolved_path() {
+        let home = Path::new("/h");
+        let cwd = Path::new("/c");
+        for (kind, expected) in [
+            (ImportKind::Cursor, SourceScope::Global),
+            (ImportKind::ClaudeCode, SourceScope::Global),
+            (ImportKind::ClaudeDesktop, SourceScope::Global),
+            (ImportKind::Codex, SourceScope::Global),
+            (ImportKind::Windsurf, SourceScope::Global),
+            (ImportKind::Vscode, SourceScope::Project),
+        ] {
+            for candidate in resolve_import_candidates_scoped(kind, home, cwd) {
+                assert_eq!(candidate.scope, expected, "{kind}");
+            }
+        }
+        // `opencode` is the one family with BOTH: the home file and the `./opencode.json`.
+        let opencode = resolve_import_candidates_scoped(ImportKind::Opencode, home, cwd);
+        assert_eq!(
+            opencode
+                .iter()
+                .map(|candidate| candidate.scope)
+                .collect::<Vec<_>>(),
+            vec![SourceScope::Global, SourceScope::Project]
+        );
+        // The path-only accessor still answers exactly what it did before.
+        assert_eq!(
+            resolve_import_candidates(ImportKind::Opencode, home, cwd),
+            opencode
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect::<Vec<_>>()
         );
     }
 

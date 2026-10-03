@@ -99,7 +99,11 @@ pub async fn execute_auth_start(
         return Ok(not_found_result("auth-start", server_name));
     };
     if definition.is_disabled() {
-        return Ok(disabled_result("auth-start", server_name));
+        return Ok(disabled_result(
+            ctx.blocked_project_servers(),
+            "auth-start",
+            server_name,
+        ));
     }
 
     let started = async {
@@ -181,7 +185,11 @@ pub async fn execute_auth_complete(
         return Ok(not_found_result("auth-complete", server_name));
     };
     if definition.is_disabled() {
-        return Ok(disabled_result("auth-complete", server_name));
+        return Ok(disabled_result(
+            ctx.blocked_project_servers(),
+            "auth-complete",
+            server_name,
+        ));
     }
 
     match ctx
@@ -348,7 +356,11 @@ pub async fn execute_connect(
         ));
     }
     if ctx.is_disabled(server_name) {
-        return Ok(disabled_result("connect", server_name));
+        return Ok(disabled_result(
+            ctx.blocked_project_servers(),
+            "connect",
+            server_name,
+        ));
     }
 
     let outcome: McpResult<ConnectOutcome> = async {
