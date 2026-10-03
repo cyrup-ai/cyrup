@@ -47,6 +47,9 @@ impl Provider for Recorder {
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         self.inner.provider_auth()
     }
+    fn has_refresh_models(&self) -> bool {
+        true
+    }
     async fn refresh_models(
         &self,
         ctx: &RefreshModelsContext,

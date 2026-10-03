@@ -32,11 +32,11 @@ use crate::client::{LlamaModelInfo, LlamaProgress, ProgressField};
 use crate::error::LlamaError;
 use crate::huggingface::HuggingFaceModel;
 use crate::ui::{
-    Binding, Clock, ConnectionChoice, KeySpec, LlamaKeys, LlamaManagerAction, LlamaUi,
-    LlamaUiOutcome, LlamaView, ProgressOptions, ProgressOutcome, ProgressState, SearchFn,
-    TextInput, compact_count, context_label, fuzzy_filter, fuzzy_match, llama_overlay,
-    locale_compare, model_description, progress_bar, run_with_progress, search_fn, show_llama_ui,
-    to_fixed, truncate_to_width, visible_width, wrap_ranges,
+    Binding, Clock, ConnectionChoice, LlamaKeys, LlamaManagerAction, LlamaUi, LlamaUiOutcome,
+    LlamaView, ProgressOptions, ProgressOutcome, ProgressState, SearchFn, TextInput, compact_count,
+    context_label, fuzzy_filter, fuzzy_match, llama_overlay, locale_compare, model_description,
+    progress_bar, run_with_progress, search_fn, show_llama_ui, to_fixed, truncate_to_width,
+    visible_width, wrap_ranges,
 };
 
 // ------------------------------------------------------------------------------------- helpers --
@@ -685,36 +685,6 @@ fn keys_load_from_the_agent_dir() {
         LlamaKeys::from_agent_dir(dir.path())
             .matches(Binding::SelectUp, &press(OverlayKeyCode::Up))
     );
-}
-
-/// `KeySpec` grammar: modifiers, aliases, camelCase page keys, function keys, and specs that name
-/// no key.
-#[test]
-fn key_spec_matching() {
-    let spec = |s: &str| KeySpec::parse(s).unwrap();
-    assert!(spec("ctrl+c").matches(&ctrl('c')));
-    assert!(!spec("ctrl+c").matches(&chr('c')));
-    assert!(!spec("c").matches(&ctrl('c')));
-    assert!(spec("enter").matches(&enter()));
-    assert!(spec("return").matches(&enter()));
-    assert!(spec("esc").matches(&escape()));
-    assert!(spec("pageUp").matches(&press(OverlayKeyCode::PageUp)));
-    assert!(spec("f5").matches(&press(OverlayKeyCode::F(5))));
-    assert!(spec("ctrl+-").matches(&ctrl('-')));
-    assert!(spec("alt+backspace").matches(&OverlayKey {
-        code: OverlayKeyCode::Backspace,
-        ctrl: false,
-        alt: true,
-        shift: false
-    }));
-    assert!(
-        spec("shift+tab").matches(&press(OverlayKeyCode::BackTab)),
-        "BackTab is Tab with shift"
-    );
-    assert!(KeySpec::parse("super+x").is_none());
-    assert!(KeySpec::parse("f13").is_none());
-    assert!(KeySpec::parse("").is_none());
-    assert!(KeySpec::parse("nonsense").is_none());
 }
 
 // =================================================================================================

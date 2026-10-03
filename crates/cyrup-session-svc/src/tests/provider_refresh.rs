@@ -26,8 +26,7 @@ use std::time::Duration;
 use cyrup_core::{CancelToken, EventStream, ProviderId};
 use cyrup_ext::host::HostServices;
 use cyrup_ext::host::services::{
-    ModelsPersist, ModelsPublication, ProviderRefreshContext, ProviderRefreshRequest,
-    ProviderRefresher,
+    ModelsPersist, ModelsPublication, ProviderRefreshRequest, ProviderRefresher,
 };
 use cyrup_ext::provider::ModelRegistrySink;
 use cyrup_provider::{
@@ -45,7 +44,7 @@ use crate::host_services::LiveHostServices;
 const LLAMA: &str = "llama.cpp";
 
 type Script = Arc<
-    dyn Fn(ProviderRefreshContext) -> BoxFuture<'static, Result<(), ProviderError>> + Send + Sync,
+    dyn Fn(RefreshModelsContext) -> BoxFuture<'static, Result<(), ProviderError>> + Send + Sync,
 >;
 
 /// What one `refresh_models` call observed.
@@ -53,7 +52,7 @@ type Script = Arc<
 struct Seen {
     /// The trait argument's `allow_network`.
     allow_network: bool,
-    /// `ProviderRefreshContext::allow_network` — must agree with the argument.
+    /// The `allow_network` of the context clone handed to the script — must agree with the argument.
     context_network: Option<bool>,
     /// The trait argument's `force` and the context's — must agree.
     force: bool,
@@ -85,11 +84,14 @@ impl Provider for Scripted {
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         self.auth.as_ref()
     }
+    fn has_refresh_models(&self) -> bool {
+        true
+    }
     async fn refresh_models(
         &self,
         ctx: &RefreshModelsContext,
     ) -> Option<Result<(), ProviderError>> {
-        let context = ProviderRefreshContext::current().expect("called through the registry");
+        let context = ctx.clone();
         self.seen.lock().unwrap().push(Seen {
             allow_network: ctx.allow_network,
             context_network: Some(context.allow_network),
@@ -178,7 +180,7 @@ fn scripted(
 
 fn script<F>(f: F) -> Script
 where
-    F: Fn(ProviderRefreshContext) -> BoxFuture<'static, Result<(), ProviderError>>
+    F: Fn(RefreshModelsContext) -> BoxFuture<'static, Result<(), ProviderError>>
         + Send
         + Sync
         + 'static,
@@ -1445,14 +1447,14 @@ async fn the_host_verb_overrides_the_offline_switch_only_with_an_explicit_allow_
     let services = live_services(Some(&registry));
 
     let result = services
-        .refresh_provider(LLAMA, false, CancelToken::new())
+        .refresh_provider(LLAMA, false, false, CancelToken::new())
         .await;
     assert!(result.is_clean(), "{result:?}");
     assert_eq!(phases(&llama_seen), vec![false]);
 
     llama_seen.lock().unwrap().clear();
     let result = services
-        .refresh_provider(LLAMA, true, CancelToken::new())
+        .refresh_provider(LLAMA, true, false, CancelToken::new())
         .await;
     assert!(result.is_clean(), "{result:?}");
     assert_eq!(
@@ -1464,6 +1466,54 @@ async fn the_host_verb_overrides_the_offline_switch_only_with_an_explicit_allow_
         other_seen.lock().unwrap().is_empty(),
         "only the named provider was refreshed"
     );
+}
+
+/// EXT-104: the verb carries pi's `force` (`ModelsRefreshOptions.force`, `models.ts:91-98`): a native
+/// asking for a forced refresh reaches the provider's context with `force` set, in the network phase
+/// only (`models.ts:541`); a refresh that does not ask for it, or asks without the network, does not.
+#[tokio::test]
+async fn the_host_verb_carries_force_to_the_providers_network_phase() {
+    let registry = registry_over(Arc::new(InMemoryModelsStore::new()));
+    registry.attach_refresh_auth(
+        Arc::new(InMemoryCredentialStore::new()),
+        Arc::new(MapCtx(BTreeMap::from([(
+            "LLAMA_BASE_URL".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        )]))),
+    );
+    let (llama, seen) = scripted(
+        LLAMA,
+        &["boot"],
+        Some(url_auth()),
+        script(|_| Box::pin(async { Ok(()) })),
+    );
+    register(&registry, llama);
+    let services = live_services(Some(&registry));
+    let phases = |seen: &Arc<Mutex<Vec<Seen>>>| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|c| (c.allow_network, c.force))
+            .collect::<Vec<_>>()
+    };
+
+    let result = services
+        .refresh_provider(LLAMA, true, true, CancelToken::new())
+        .await;
+    assert!(result.is_clean(), "{result:?}");
+    assert_eq!(phases(&seen), vec![(false, false), (true, true)]);
+
+    seen.lock().unwrap().clear();
+    services
+        .refresh_provider(LLAMA, true, false, CancelToken::new())
+        .await;
+    assert!(phases(&seen).iter().all(|(_, force)| !force));
+
+    seen.lock().unwrap().clear();
+    services
+        .refresh_provider(LLAMA, false, true, CancelToken::new())
+        .await;
+    assert!(phases(&seen).iter().all(|(_, force)| !force));
 }
 
 /// The verb reports abort and the per-provider error in pi's result shape (`index.ts:60-62` reads
@@ -1495,7 +1545,7 @@ async fn the_host_verb_reports_abort_and_per_provider_errors() {
     let services = live_services(Some(&registry));
 
     let failed = services
-        .refresh_provider(LLAMA, true, CancelToken::new())
+        .refresh_provider(LLAMA, true, false, CancelToken::new())
         .await;
     assert!(!failed.aborted);
     assert!(
@@ -1508,7 +1558,7 @@ async fn the_host_verb_reports_abort_and_per_provider_errors() {
 
     let cancel = CancelToken::new();
     cancel.cancel();
-    let aborted = services.refresh_provider(LLAMA, true, cancel).await;
+    let aborted = services.refresh_provider(LLAMA, true, false, cancel).await;
     assert!(aborted.aborted);
     assert!(aborted.errors.is_empty());
 }
@@ -1520,7 +1570,7 @@ async fn the_host_verb_without_an_attached_registry_reports_an_error() {
     let services = live_services(None);
 
     let result = services
-        .refresh_provider(LLAMA, true, CancelToken::new())
+        .refresh_provider(LLAMA, true, false, CancelToken::new())
         .await;
 
     assert!(!result.aborted);
@@ -2209,4 +2259,397 @@ async fn dropping_a_refresh_cancels_its_detached_operation_so_nothing_publishes(
         store.read(LLAMA, None).await.unwrap().is_none(),
         "nothing was persisted for a refresh nobody waited for"
     );
+}
+
+// -------------------------------------------------------------------------------------------------
+// PROV-111: the refresh context is the argument, so it survives a spawned task
+// -------------------------------------------------------------------------------------------------
+
+/// What the task a [`Spawning`] provider spawns saw on its clone of the context.
+#[derive(Clone, Debug, Default)]
+struct SpawnedSaw {
+    credential: Option<Credential>,
+    stored_ids: Option<Vec<String>>,
+    published: Option<bool>,
+}
+
+/// A provider that does all its work in a task it `tokio::spawn`s, handing the task a clone of the
+/// context — the shape that the task-local `ProviderRefreshContext` could not serve, because a
+/// task-local does not cross a spawn.
+struct Spawning {
+    id: ProviderId,
+    inner: Arc<dyn Provider>,
+    saw: Arc<Mutex<Vec<SpawnedSaw>>>,
+    updates: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Provider for Spawning {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+    fn models(&self) -> &[Model] {
+        self.inner.models()
+    }
+    fn has_refresh_models(&self) -> bool {
+        true
+    }
+    async fn refresh_models(
+        &self,
+        ctx: &RefreshModelsContext,
+    ) -> Option<Result<(), ProviderError>> {
+        let ctx = ctx.clone();
+        let updates = Arc::clone(&self.updates);
+        let saw = tokio::spawn(async move {
+            let published = ctx
+                .publish(ModelsPublication {
+                    persist: None,
+                    update: Some(Box::new(move || {
+                        updates.fetch_add(1, Ordering::SeqCst);
+                    })),
+                })
+                .await
+                .ok();
+            SpawnedSaw {
+                credential: ctx.credential.clone(),
+                stored_ids: ctx
+                    .stored
+                    .as_ref()
+                    .map(|e| e.models.iter().map(|m| m.id.as_str().to_string()).collect()),
+                published,
+            }
+        })
+        .await
+        .expect("the spawned task ran");
+        self.saw.lock().unwrap().push(saw);
+        Some(Ok(()))
+    }
+    fn stream(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: &StreamOptions,
+    ) -> EventStream<StreamEvent> {
+        self.inner.stream(model, context, options)
+    }
+}
+
+/// PROV-111: a `refresh_models` that spawns a task still sees its credential, its stored catalog and
+/// its publisher. Before the context was the argument these travelled in a tokio task-local, which
+/// the spawned task did not inherit: `ProviderRefreshContext::current()` answered `None` there
+/// (red run: "the spawned task saw None").
+#[tokio::test]
+async fn a_refresh_models_that_spawns_a_task_still_sees_its_credential_and_can_publish() {
+    let store = Arc::new(InMemoryModelsStore::new());
+    store
+        .write(
+            LLAMA,
+            ModelsStoreEntry {
+                models: catalog(LLAMA, &["cached"]),
+                checked_at: Some(5),
+                ..ModelsStoreEntry::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let registry = registry_over(store);
+    let credentials = Arc::new(InMemoryCredentialStore::new());
+    credentials.insert(ProviderId::from(LLAMA), Credential::api_key("stored-key"));
+    registry.attach_refresh_auth(credentials, Arc::new(MapCtx(BTreeMap::new())));
+    let saw = Arc::new(Mutex::new(Vec::new()));
+    let updates = Arc::new(AtomicUsize::new(0));
+    registry.upsert_live_provider(
+        LLAMA,
+        Arc::new(Spawning {
+            id: LLAMA.into(),
+            inner: plain_provider(LLAMA, &["boot"]),
+            saw: Arc::clone(&saw),
+            updates: Arc::clone(&updates),
+        }),
+    );
+
+    let result = registry.refresh(request(Some(&[LLAMA]), Some(false))).await;
+
+    assert!(result.is_clean(), "{result:?}");
+    let saw = saw.lock().unwrap().clone();
+    assert_eq!(saw.len(), 1, "{saw:?}");
+    assert!(
+        matches!(&saw[0].credential, Some(Credential::ApiKey { key: Some(k), .. }) if k == "stored-key"),
+        "the spawned task saw {:?}",
+        saw[0].credential
+    );
+    assert_eq!(saw[0].stored_ids, Some(vec!["cached".to_string()]));
+    assert_eq!(
+        saw[0].published,
+        Some(true),
+        "the spawned task's publication was applied"
+    );
+    assert_eq!(updates.load(Ordering::SeqCst), 1, "and its update ran");
+}
+
+// -------------------------------------------------------------------------------------------------
+// SEAM-142: a static provider is filtered BEFORE a refresh begins
+// -------------------------------------------------------------------------------------------------
+
+/// pi filters `refreshModels === undefined` BEFORE `beginProviderRefresh` (`models.ts:552-559`), so
+/// refreshing a static provider's id cannot supersede a refresh of that id that is still running.
+///
+/// Here the id's provider becomes static in the middle of a refresh: the cache-only phase publishes
+/// an `update` that swaps a static provider in under the id (the registry's own replace path, which
+/// does not supersede the publishing refresh), and the refresh is then held in its network phase.
+/// A refresh request for the id must find the static provider and do nothing — the held refresh
+/// still publishes its catalog afterwards. Before `Provider::has_refresh_models` the engine began a
+/// refresh first and only then learned the provider answered `None`, which cancelled the held one.
+#[tokio::test]
+async fn refreshing_a_static_providers_id_leaves_an_in_flight_refresh_running() {
+    let store = Arc::new(InMemoryModelsStore::new());
+    let registry = registry_over(store.clone());
+    registry.attach_refresh_auth(
+        Arc::new(InMemoryCredentialStore::new()),
+        Arc::new(MapCtx(BTreeMap::from([(
+            "LLAMA_BASE_URL".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        )]))),
+    );
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (provider, _) = scripted(LLAMA, &["boot"], Some(url_auth()), {
+        let (registry, entered, release, log) = (
+            Arc::clone(&registry),
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&log),
+        );
+        script(move |ctx| {
+            let (registry, entered, release, log) = (
+                Arc::clone(&registry),
+                Arc::clone(&entered),
+                Arc::clone(&release),
+                Arc::clone(&log),
+            );
+            Box::pin(async move {
+                if !ctx.allow_network {
+                    // The restore swaps a STATIC provider in under the id.
+                    ctx.publish(ModelsPublication {
+                        persist: None,
+                        update: Some(Box::new(move || {
+                            registry
+                                .upsert_live_provider(LLAMA, plain_provider(LLAMA, &["swapped"]));
+                        })),
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                entered.notify_one();
+                release.notified().await;
+                let published = ctx
+                    .publish(ModelsPublication {
+                        persist: Some(ModelsPersist::Write {
+                            entry: ModelsStoreEntry {
+                                models: catalog(LLAMA, &["fresh"]),
+                                checked_at: Some(7),
+                                ..ModelsStoreEntry::default()
+                            },
+                            classifiers: Vec::new(),
+                        }),
+                        update: Some(Box::new(move || {
+                            log.lock().unwrap().push("update:fresh".to_string());
+                        })),
+                    })
+                    .await?;
+                assert!(published, "the held refresh was not superseded");
+                Ok(())
+            })
+        })
+    });
+    register(&registry, provider);
+
+    let held = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { registry.refresh(request(Some(&[LLAMA]), Some(true))).await })
+    };
+    entered.notified().await;
+    assert_eq!(
+        ids(&registry.models()),
+        vec!["swapped".to_string()],
+        "the id now holds the static provider"
+    );
+
+    let static_refresh = registry.refresh(request(Some(&[LLAMA]), Some(true))).await;
+    assert!(static_refresh.is_clean(), "{static_refresh:?}");
+
+    release.notify_one();
+    let held = held.await.unwrap();
+    assert!(held.is_clean(), "{held:?}");
+    settle(&registry).await;
+    assert_eq!(
+        ids(&store.read(LLAMA, None).await.unwrap().unwrap().models),
+        vec!["fresh".to_string()],
+        "the held refresh's network publication landed"
+    );
+    assert_eq!(*log.lock().unwrap(), vec!["update:fresh".to_string()]);
+}
+
+// -------------------------------------------------------------------------------------------------
+// SEAM-141: a provider registered after startup restores its cached catalog
+// -------------------------------------------------------------------------------------------------
+
+/// A script that does what the llama provider does in its cache-only phase: the stored catalog
+/// becomes the live one, through an `update` that swaps a new provider in under the id.
+fn restore_stored_catalog(registry: &Arc<GuestProviderRegistry>, id: &'static str) -> Script {
+    let registry = Arc::clone(registry);
+    script(move |ctx| {
+        let registry = Arc::clone(&registry);
+        Box::pin(async move {
+            let Some(stored) = ctx.stored.clone() else {
+                return Ok(());
+            };
+            let stored_ids = ids(&stored.models);
+            ctx.publish(ModelsPublication {
+                persist: None,
+                update: Some(Box::new(move || {
+                    let refs: Vec<&str> = stored_ids.iter().map(String::as_str).collect();
+                    registry.upsert_live_provider(id, plain_provider(id, &refs));
+                })),
+            })
+            .await?;
+            Ok(())
+        })
+    })
+}
+
+async fn store_with(id: &str, models: &[&str]) -> Arc<InMemoryModelsStore> {
+    let store = Arc::new(InMemoryModelsStore::new());
+    store
+        .write(
+            id,
+            ModelsStoreEntry {
+                models: catalog(id, models),
+                checked_at: Some(5),
+                ..ModelsStoreEntry::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    store
+}
+
+/// pi `registerNativeProvider` / `registerProvider` end in `void this.refresh({ allowNetwork:
+/// false })` (`core/model-runtime.ts:893`, `:939`), so a provider registered after startup lists its
+/// cached catalog at once. Here: the startup restore has run (over nothing), and then a provider
+/// whose id has a stored entry registers. With no refresh requested by anyone, its models are the
+/// cached ones, and nothing touched the network.
+#[tokio::test]
+async fn a_provider_registered_late_with_a_stored_entry_lists_its_cached_models_without_a_refresh()
+{
+    let registry = registry_over(store_with(LLAMA, &["cached"]).await);
+    registry.restore_cached(CancelToken::new()).await;
+    let (provider, seen) = scripted(
+        LLAMA,
+        &["boot"],
+        Some(url_auth()),
+        restore_stored_catalog(&registry, LLAMA),
+    );
+
+    register(&registry, provider);
+    settle(&registry).await;
+
+    assert_eq!(ids(&registry.models()), vec!["cached".to_string()]);
+    assert_eq!(
+        phases(&seen),
+        vec![false],
+        "one cache-only phase, no network"
+    );
+}
+
+/// The caution behind the id restriction: a catalog change IS a re-registration here, so a
+/// registration of an id that already has a provider must not restore. A `/llama` `set_catalog`
+/// swaps in the live router catalog this way; restoring the stored one over it would be a clobber.
+#[tokio::test]
+async fn re_registering_an_id_does_not_restore_the_stored_catalog_over_the_new_one() {
+    let registry = registry_over(store_with(LLAMA, &["cached"]).await);
+    registry.restore_cached(CancelToken::new()).await;
+    let (first, _) = scripted(
+        LLAMA,
+        &["boot"],
+        Some(url_auth()),
+        restore_stored_catalog(&registry, LLAMA),
+    );
+    register(&registry, first);
+    settle(&registry).await;
+    assert_eq!(ids(&registry.models()), vec!["cached".to_string()]);
+
+    // The provider's own catalog change: a new value under the same id, carrying the live catalog.
+    let (live, live_seen) = scripted(
+        LLAMA,
+        &["live"],
+        Some(url_auth()),
+        restore_stored_catalog(&registry, LLAMA),
+    );
+    register(&registry, live);
+    settle(&registry).await;
+
+    assert_eq!(ids(&registry.models()), vec!["live".to_string()]);
+    assert!(
+        phases(&live_seen).is_empty(),
+        "no refresh was begun for a re-registration"
+    );
+}
+
+/// Before the startup restore has begun nothing restores on registration: the startup restore is
+/// what covers every provider registered up to then, and it must do so exactly once.
+#[tokio::test]
+async fn a_provider_registered_before_the_startup_restore_is_restored_once_by_it() {
+    let registry = registry_over(store_with(LLAMA, &["cached"]).await);
+    let (provider, seen) = scripted(
+        LLAMA,
+        &["boot"],
+        Some(url_auth()),
+        restore_stored_catalog(&registry, LLAMA),
+    );
+
+    register(&registry, provider);
+    settle(&registry).await;
+    assert!(
+        phases(&seen).is_empty(),
+        "registration alone restores nothing yet"
+    );
+
+    registry.restore_cached(CancelToken::new()).await;
+    settle(&registry).await;
+
+    assert_eq!(phases(&seen), vec![false]);
+    assert_eq!(ids(&registry.models()), vec!["cached".to_string()]);
+}
+
+/// A provider that is static is not restored (and begins nothing), and an id removed and
+/// registered again is a new id: it restores again.
+#[tokio::test]
+async fn a_static_late_provider_begins_nothing_and_a_re_registered_removed_id_restores_again() {
+    let registry = registry_over(store_with(LLAMA, &["cached"]).await);
+    registry.restore_cached(CancelToken::new()).await;
+
+    registry.upsert_live_provider(LLAMA, plain_provider(LLAMA, &["static"]));
+    assert_eq!(
+        registry.refresh_tasks_in_flight(),
+        0,
+        "a static provider begins nothing"
+    );
+    assert_eq!(ids(&registry.models()), vec!["static".to_string()]);
+
+    registry.remove_provider(LLAMA);
+    let (provider, seen) = scripted(
+        LLAMA,
+        &["boot"],
+        Some(url_auth()),
+        restore_stored_catalog(&registry, LLAMA),
+    );
+    register(&registry, provider);
+    settle(&registry).await;
+
+    assert_eq!(phases(&seen), vec![false]);
+    assert_eq!(ids(&registry.models()), vec!["cached".to_string()]);
 }

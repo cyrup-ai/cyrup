@@ -23,9 +23,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use cyrup_core::CancelToken;
 use cyrup_ext::host::HostServices;
-use cyrup_ext::host::services::{ModelsPublication, ModelsPublisher, ProviderRefreshContext};
+use cyrup_ext::host::services::{ModelsPublication, ModelsPublisher};
 use cyrup_provider::auth::{Credential, CredentialStore, InMemoryCredentialStore};
 use cyrup_provider::{Provider, ProviderError, RefreshModelsContext};
 use serde_json::json;
@@ -33,7 +32,9 @@ use serde_json::json;
 use crate::LLAMA_PROVIDER_ID;
 use crate::error::LlamaError;
 use crate::extension::{ContextRefreshHost, HostCredentials};
-use crate::provider::{LlamaController, LlamaControllerOptions, LlamaRefreshHost};
+use crate::provider::{
+    CatalogEntry, CatalogPublication, LlamaController, LlamaControllerOptions, LlamaRefreshHost,
+};
 use crate::tests::fake_server::{FakeLlamaServer, model_with};
 
 // ------------------------------------------------------------------------------ the host's store
@@ -224,8 +225,25 @@ impl ModelsPublisher for Recorder {
     }
 }
 
+/// The context the host engine hands `refresh_models`: the credential, the stored catalog and the
+/// publisher are all on the argument (PROV-111).
+fn refresh_context(
+    credential: Option<Credential>,
+    stored: Option<cyrup_provider::ModelsStoreEntry>,
+    stored_classifiers: Vec<cyrup_provider::ClassifierModel>,
+    publisher: Arc<dyn ModelsPublisher>,
+) -> RefreshModelsContext {
+    RefreshModelsContext {
+        credential,
+        stored,
+        stored_classifiers,
+        publisher: Some(publisher),
+        ..RefreshModelsContext::default()
+    }
+}
+
 /// One refresh through the extension's own publisher ([`ContextRefreshHost`]), the way the host
-/// engine runs it: the provider's `refresh_models` inside a [`ProviderRefreshContext`] whose
+/// engine runs it: the provider's `refresh_models` over a [`RefreshModelsContext`] whose
 /// credential names the fake router.
 async fn refresh_through_the_host(
     server: &FakeLlamaServer,
@@ -240,30 +258,17 @@ async fn refresh_through_the_host(
     );
     let mut env = BTreeMap::new();
     env.insert("LLAMA_BASE_URL".to_string(), server.url().to_string());
-    let cancel = CancelToken::new();
-    let context = ProviderRefreshContext::new(
+    let context = refresh_context(
         Some(Credential::ApiKey {
             key: None,
             env: Some(env),
         }),
         None,
         Vec::new(),
-        true,
-        false,
-        cancel.clone(),
         recorder,
     );
     let provider = controller.provider();
-    let outcome = context
-        .scope(Provider::refresh_models(
-            provider.as_ref(),
-            &RefreshModelsContext {
-                allow_network: true,
-                force: false,
-                cancel,
-            },
-        ))
-        .await;
+    let outcome = Provider::refresh_models(provider.as_ref(), &context).await;
     (outcome, controller)
 }
 
@@ -324,21 +329,11 @@ async fn a_catalog_the_store_accepts_is_persisted_and_installed() {
 /// not folded into the `false` that means "superseded".
 #[tokio::test]
 async fn publish_reports_the_stores_failure() {
-    use crate::provider::{CatalogEntry, CatalogPublication, CatalogPublisher};
-
     let recorder = Arc::new(Recorder {
         failure: Some("read-only file system"),
         persisted: Mutex::new(Vec::new()),
     });
-    let context = ProviderRefreshContext::new(
-        None,
-        None,
-        Vec::new(),
-        true,
-        false,
-        CancelToken::new(),
-        recorder,
-    );
+    let context = refresh_context(None, None, Vec::new(), recorder);
     let publication = || CatalogPublication {
         persist: Some(CatalogEntry {
             models: Vec::new(),
@@ -347,9 +342,7 @@ async fn publish_reports_the_stores_failure() {
         update: None,
     };
 
-    let published = context
-        .scope(ContextRefreshHost.publish(publication()))
-        .await;
+    let published = ContextRefreshHost.publish(&context, publication()).await;
 
     match published {
         Err(LlamaError::Message(text)) => assert!(text.contains("read-only"), "{text}"),
@@ -361,8 +354,6 @@ async fn publish_reports_the_stores_failure() {
 /// refresh the user stopped is not reported as a failed write.
 #[tokio::test]
 async fn an_aborted_publication_is_a_cancellation_not_a_failure() {
-    use crate::provider::{CatalogPublication, CatalogPublisher};
-
     struct Aborts;
     #[async_trait::async_trait]
     impl ModelsPublisher for Aborts {
@@ -370,21 +361,16 @@ async fn an_aborted_publication_is_a_cancellation_not_a_failure() {
             Err(ProviderError::Aborted)
         }
     }
-    let context = ProviderRefreshContext::new(
-        None,
-        None,
-        Vec::new(),
-        true,
-        false,
-        CancelToken::new(),
-        Arc::new(Aborts),
-    );
+    let context = refresh_context(None, None, Vec::new(), Arc::new(Aborts));
 
-    let published = context
-        .scope(ContextRefreshHost.publish(CatalogPublication {
-            persist: None,
-            update: None,
-        }))
+    let published = ContextRefreshHost
+        .publish(
+            &context,
+            CatalogPublication {
+                persist: None,
+                update: None,
+            },
+        )
         .await;
 
     assert!(
@@ -393,11 +379,11 @@ async fn an_aborted_publication_is_a_cancellation_not_a_failure() {
     );
 }
 
-/// Called outside a host-run refresh there is no store: nothing is applied, neither the write nor
-/// the `update`, and it answers "do not continue" (`false`), as a superseded refresh does.
+/// Given a context with no publisher (a refresh no host-run engine made) there is no store:
+/// nothing is applied, neither the write nor the `update`, and it answers "do not continue"
+/// (`false`), as a superseded refresh does.
 #[tokio::test]
 async fn publishing_outside_a_host_run_refresh_applies_nothing() {
-    use crate::provider::{CatalogPublication, CatalogPublisher};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let ran = Arc::new(AtomicBool::new(false));
@@ -409,11 +395,12 @@ async fn publishing_outside_a_host_run_refresh_applies_nothing() {
         }
     };
 
-    let published = ContextRefreshHost.publish(publication(&ran)).await;
+    let bare = RefreshModelsContext::default();
+    let published = ContextRefreshHost.publish(&bare, publication(&ran)).await;
     assert!(matches!(published, Ok(false)), "{published:?}");
     assert!(!ran.load(Ordering::SeqCst), "the update never ran");
-    assert!(ContextRefreshHost.credential().await.is_none());
-    assert!(ContextRefreshHost.stored().await.is_none());
+    assert!(ContextRefreshHost.credential(&bare).await.is_none());
+    assert!(ContextRefreshHost.stored(&bare).await.is_none());
 }
 
 /// The persisted entry the host snapshots is read back as chat models followed by the classifier
@@ -433,7 +420,7 @@ async fn the_stored_catalog_is_the_chat_models_then_the_classifiers() {
     let chat = to_model(&info, "http://127.0.0.1:8080", None, None).unwrap();
     let classifier = to_classifier_model(&info, "http://127.0.0.1:8080", None);
     let stored = |checked_at| {
-        ProviderRefreshContext::new(
+        refresh_context(
             None,
             Some(ModelsStoreEntry {
                 models: vec![chat.clone()],
@@ -441,9 +428,6 @@ async fn the_stored_catalog_is_the_chat_models_then_the_classifiers() {
                 ..ModelsStoreEntry::default()
             }),
             vec![classifier.clone()],
-            true,
-            false,
-            CancelToken::new(),
             Arc::new(Recorder {
                 failure: None,
                 persisted: Mutex::new(Vec::new()),
@@ -451,8 +435,8 @@ async fn the_stored_catalog_is_the_chat_models_then_the_classifiers() {
         )
     };
 
-    let entry = stored(Some(1234))
-        .scope(async { ContextRefreshHost.stored().await })
+    let entry = ContextRefreshHost
+        .stored(&stored(Some(1234)))
         .await
         .expect("a snapshot was taken");
     assert_eq!(
@@ -464,8 +448,8 @@ async fn the_stored_catalog_is_the_chat_models_then_the_classifiers() {
     );
     assert_eq!(entry.checked_at, 1234);
 
-    let unchecked = stored(None)
-        .scope(async { ContextRefreshHost.stored().await })
+    let unchecked = ContextRefreshHost
+        .stored(&stored(None))
         .await
         .expect("a snapshot was taken");
     assert_eq!(unchecked.checked_at, 0, "no check time reads as 0");

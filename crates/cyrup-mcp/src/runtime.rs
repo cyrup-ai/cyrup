@@ -62,8 +62,8 @@ use crate::state::{
 /// is what actually crosses the await.
 #[derive(Clone)]
 pub struct ContextSnapshot {
-    /// `--mcp-config`'s value, if the user passed one. Read from argv, not the flag store — see
-    /// [`crate::config::config_path_from_argv`].
+    /// `--mcp-config`'s value, if the user passed one: the flag store, else argv — see
+    /// `McpExtension::config_flag_path`.
     pub config_path: Option<PathBuf>,
     /// The session working directory. `resolveConfigPath`'s base.
     pub cwd: PathBuf,

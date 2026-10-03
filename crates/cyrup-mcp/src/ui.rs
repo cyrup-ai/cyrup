@@ -59,6 +59,7 @@ use indexmap::{IndexMap, IndexSet};
 use ratatui::style::Style as RtStyle;
 use ratatui::text::Span as RtSpan;
 
+use cyrup_ext::host::{KeySpec, key_ids, read_user_bindings};
 use cyrup_ext::{
     InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome,
     OverlaySpan,
@@ -914,113 +915,10 @@ pub fn truncate_spans(
 // =================================================================================================
 // 3 · `panel-keys.ts` — the three canonical ids plus the adapter-defined `mcp.panel.save`
 // =================================================================================================
-
-/// One `KeyId` spec, parsed from the same `"ctrl+p"` / `"up"` / `"return"` grammar pi's `matchesKey`
-/// accepts.
-///
-/// Reimplemented here rather than imported: `cyrup-mcp` must not depend on `cyrup-tui`, whose
-/// `Key::parse` this mirrors token for token (`crates/cyrup-tui/src/keymap.rs`). Every token pi
-/// spells is accepted, including the `enter`/`return` and `esc`/`escape` aliases.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeySpec {
-    /// The key itself.
-    pub code: OverlayKeyCode,
-    /// Control held.
-    pub ctrl: bool,
-    /// Alt / Meta held.
-    pub alt: bool,
-    /// Shift explicitly requested by the spec.
-    pub shift: bool,
-}
-
-impl KeySpec {
-    /// Parse one `KeyId`. Returns `None` for a spec naming no key, which upstream's `matchesKey`
-    /// treats as never matching.
-    #[must_use]
-    pub fn parse(spec: &str) -> Option<KeySpec> {
-        let mut ctrl = false;
-        let mut alt = false;
-        let mut shift = false;
-        let mut code: Option<OverlayKeyCode> = None;
-        for part in spec.split('+') {
-            let token = part.trim();
-            if token.is_empty() {
-                continue;
-            }
-            match token.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" => ctrl = true,
-                "shift" => shift = true,
-                "alt" | "option" | "meta" => alt = true,
-                // `super`/`cmd` has no `OverlayKey` bit; a spec naming it can never match, which is
-                // the same outcome as pi's on a terminal that does not report it.
-                "super" | "cmd" | "command" => return None,
-                "enter" | "return" => code = Some(OverlayKeyCode::Enter),
-                "tab" => code = Some(OverlayKeyCode::Tab),
-                "backtab" => code = Some(OverlayKeyCode::BackTab),
-                "esc" | "escape" => code = Some(OverlayKeyCode::Escape),
-                "space" => code = Some(OverlayKeyCode::Char(' ')),
-                "up" => code = Some(OverlayKeyCode::Up),
-                "down" => code = Some(OverlayKeyCode::Down),
-                "left" => code = Some(OverlayKeyCode::Left),
-                "right" => code = Some(OverlayKeyCode::Right),
-                "home" => code = Some(OverlayKeyCode::Home),
-                "end" => code = Some(OverlayKeyCode::End),
-                "backspace" => code = Some(OverlayKeyCode::Backspace),
-                "delete" | "del" => code = Some(OverlayKeyCode::Delete),
-                "pageup" | "pgup" => code = Some(OverlayKeyCode::PageUp),
-                "pagedown" | "pgdn" => code = Some(OverlayKeyCode::PageDown),
-                "insert" | "ins" => code = Some(OverlayKeyCode::Insert),
-                other
-                    if other.len() >= 2
-                        && other.starts_with('f')
-                        && other.get(1..).is_some_and(|d| {
-                            !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
-                        }) =>
-                {
-                    match other.get(1..).and_then(|d| d.parse::<u8>().ok()) {
-                        Some(n @ 1..=12) => code = Some(OverlayKeyCode::F(n)),
-                        _ => return None,
-                    }
-                }
-                other => {
-                    let mut chars = other.chars();
-                    match (chars.next(), chars.next()) {
-                        (Some(c), None) => code = Some(OverlayKeyCode::Char(c)),
-                        _ => return None,
-                    }
-                }
-            }
-        }
-        code.map(|code| KeySpec {
-            code,
-            ctrl,
-            alt,
-            shift,
-        })
-    }
-
-    /// Does `key` satisfy this spec?
-    ///
-    /// `shift` is compared only when the spec asks for it, because the host delivers a printable
-    /// character already shift-resolved (`Shift+k` arrives as `Char('K')`) — pi distinguishes `K`
-    /// from `k` off the raw byte for exactly the same reason.
-    #[must_use]
-    pub fn matches(&self, key: &OverlayKey) -> bool {
-        if self.ctrl != key.ctrl || self.alt != key.alt {
-            return false;
-        }
-        match (self.code, key.code) {
-            (OverlayKeyCode::Char(want), OverlayKeyCode::Char(got)) => {
-                if self.shift {
-                    got.eq_ignore_ascii_case(&want) && (key.shift || got.is_uppercase())
-                } else {
-                    want == got || (!key.shift && want.eq_ignore_ascii_case(&got))
-                }
-            }
-            (a, b) => a == b && (!self.shift || key.shift),
-        }
-    }
-}
+//
+// The `matchesKey` grammar ([`KeySpec`]) and the `keybindings.json` reader are `cyrup_ext::host`'s
+// (EXT-103), shared with `cyrup-llama`'s overlay keys; this module owns only the ids the panels
+// read, their defaults, and the adapter-defined `mcp.panel.save`.
 
 /// `panel-keys.ts` `PanelKeys` — the five members both panels resolve every keystroke through.
 ///
@@ -1082,20 +980,6 @@ impl Default for PanelKeys {
     }
 }
 
-/// A `KeyId | KeyId[]` value from the user's document, as the list upstream's
-/// `Array.isArray(explicit) ? explicit : [explicit]` produces.
-fn key_ids(value: &serde_json::Value) -> Option<Vec<String>> {
-    match value {
-        serde_json::Value::String(one) => Some(vec![one.clone()]),
-        serde_json::Value::Array(many) => Some(
-            many.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
 impl PanelKeys {
     /// `createPanelKeys(keybindings)` over an already-read, already-migrated bindings document.
     ///
@@ -1151,7 +1035,8 @@ impl PanelKeys {
 
     /// Read `<agent_dir>/keybindings.json` and resolve from it.
     ///
-    /// The document is run through `cyrup_config::migrate_keybindings_config` first, so a user who
+    /// The document is read by `cyrup_ext::host::read_user_bindings`, which runs it through
+    /// `cyrup_config::migrate_keybindings_config` first, so a user who
     /// still has a legacy id spelled the old way gets the same answer the TUI gives — the two
     /// readers cannot disagree about what `tui.select.up` means. Every failure mode (absent,
     /// unreadable, malformed, non-object) falls back to [`PanelKeys::default`], which is pi's
@@ -1163,16 +1048,9 @@ impl PanelKeys {
     /// only this module's tests reach it.
     #[must_use]
     pub fn from_agent_dir(agent_dir: &Path) -> Self {
-        let path = agent_dir.join("keybindings.json");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&raw)
-        else {
-            return Self::default();
-        };
-        let (migrated, _) = cyrup_config::migrate_keybindings_config(&map);
-        Self::from_user_bindings(&migrated)
+        read_user_bindings(agent_dir).map_or_else(Self::default, |migrated| {
+            Self::from_user_bindings(&migrated)
+        })
     }
 
     /// `keys.selectUp(data)`.
@@ -5478,6 +5356,29 @@ mod tests {
         // The other two keep their defaults.
         assert!(keys.select_down(&key(OverlayKeyCode::Down)));
         assert!(keys.select_confirm(&key(OverlayKeyCode::Enter)));
+    }
+
+    #[test]
+    fn panel_keys_load_from_the_agent_dir_through_the_shared_reader() {
+        // The grammar and the reader are `cyrup_ext::host`'s and tested there; this pins only that
+        // this panel resolves through them (legacy id migrated, bad document -> defaults).
+        let dir = tempfile::tempdir().unwrap();
+        assert!(PanelKeys::from_agent_dir(dir.path()).select_up(&key(OverlayKeyCode::Up)));
+
+        std::fs::write(
+            dir.path().join("keybindings.json"),
+            r#"{"selectUp": "ctrl+p", "mcp.panel.save": ["ctrl+x"]}"#,
+        )
+        .unwrap();
+        let keys = PanelKeys::from_agent_dir(dir.path());
+        assert!(keys.select_up(&OverlayKey::ctrl(OverlayKeyCode::Char('p'))));
+        assert!(!keys.select_up(&key(OverlayKeyCode::Up)));
+        assert_eq!(keys.save_label(), Some("ctrl+x"));
+
+        std::fs::write(dir.path().join("keybindings.json"), "[1, 2]").unwrap();
+        let keys = PanelKeys::from_agent_dir(dir.path());
+        assert!(keys.select_up(&key(OverlayKeyCode::Up)));
+        assert_eq!(keys.save_label(), Some("ctrl+s"));
     }
 
     #[test]

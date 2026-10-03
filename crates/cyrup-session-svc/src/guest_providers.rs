@@ -29,15 +29,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use cyrup_core::{CancelToken, ProviderId};
-use cyrup_ext::host::services::{
-    ModelsPersist, ModelsPublication, ModelsPublisher, ProviderRefreshContext,
-    ProviderRefreshRequest, ProviderRefresher,
-};
+use cyrup_ext::host::services::{ProviderRefreshRequest, ProviderRefresher};
 use cyrup_ext::provider::{ModelRegistrySink, ProviderRegistration};
 use cyrup_provider::{
     AuthContext, Credential, CredentialStore, EnvAuthContext, InMemoryCredentialStore,
-    InMemoryModelsStore, Model, ModelsRefreshResult, ModelsStore, ModelsStoreOperationOptions,
-    Provider, ProviderError, RefreshModelsContext,
+    InMemoryModelsStore, Model, ModelsPersist, ModelsPublication, ModelsPublisher,
+    ModelsRefreshResult, ModelsStore, ModelsStoreOperationOptions, Provider, ProviderError,
+    RefreshModelsContext,
 };
 
 use crate::provider_swap::ProviderSwap;
@@ -70,6 +68,11 @@ pub struct GuestProviderRegistry {
     /// session streams through, lists and filters by the replacement, not by the `Arc` it was
     /// installed as (pi keeps ONE registry, so there is no second copy to go stale).
     installed: Mutex<Option<Weak<ProviderSwap>>>,
+    /// Whether the startup restore ([`GuestProviderRegistry::restore_cached`]) has begun. Only
+    /// after it does a provider registered under a new id restore its own cached catalog (see
+    /// [`GuestProviderRegistry::begin_late_restore`]): everything registered before is covered by
+    /// the startup restore, which would only supersede a second one.
+    restore_started: AtomicBool,
 }
 
 impl GuestProviderRegistry {
@@ -399,29 +402,23 @@ impl RefreshInner {
         };
         let stored = store.read(id, Some(&options)).await?;
         let stored_classifiers = store.read_classifier_models(id, Some(&options)).await?;
-        let context = ProviderRefreshContext::new(
+        // Everything the provider needs is ON the argument, so it survives a `tokio::spawn` inside
+        // `refresh_models` (the provider hands the task a clone). PROV-111.
+        let context = RefreshModelsContext {
             credential,
             stored,
             stored_classifiers,
-            allow_network,
-            force,
-            signal.clone(),
-            Arc::new(PhasePublisher {
+            publisher: Some(Arc::new(PhasePublisher {
                 inner: Arc::clone(self),
                 id: id.to_string(),
                 generation,
                 signal: signal.clone(),
-            }),
-        );
-        let provider_context = RefreshModelsContext {
+            })),
             allow_network,
             force,
             cancel: signal.clone(),
         };
-        match context
-            .scope(provider.refresh_models(&provider_context))
-            .await
-        {
+        match provider.refresh_models(&context).await {
             None => Ok(false),
             Some(result) => result.map(|()| true),
         }
@@ -549,7 +546,20 @@ impl RefreshInner {
         force: bool,
         caller: CancelToken,
     ) -> Option<(String, ProviderError)> {
-        let (generation, signal) = self.begin(&id, &caller);
+        let begun = self.begin(&id, &caller);
+        self.drive(id, provider, begun, allow_network, force).await
+    }
+
+    /// [`Self::refresh_one`] after its `begin`. Split out so a caller can begin SYNCHRONOUSLY and
+    /// drive later: whatever begins afterwards supersedes this refresh, never the other way round.
+    async fn drive(
+        self: Arc<Self>,
+        id: String,
+        provider: Arc<dyn Provider>,
+        (generation, signal): (u64, CancelToken),
+        allow_network: bool,
+        force: bool,
+    ) -> Option<(String, ProviderError)> {
         let mut settle = RefreshSettle {
             inner: Arc::clone(&self),
             id: id.clone(),
@@ -631,7 +641,78 @@ impl ModelsPublisher for PhasePublisher {
     }
 }
 
+/// A cache-only refresh of a provider registered after startup, begun but not yet running.
+struct LateRestore {
+    inner: Arc<RefreshInner>,
+    id: String,
+    provider: Arc<dyn Provider>,
+    begun: (u64, CancelToken),
+    ticket: TaskTicket,
+    runtime: tokio::runtime::Handle,
+}
+
+impl LateRestore {
+    /// Run it detached, as pi's `void this.refresh({ allowNetwork: false })` does
+    /// (`core/model-runtime.ts:893`, `:939`): its outcome is nobody's to read, and a failing
+    /// restore leaves the provider as it registered.
+    fn spawn(self) {
+        let Self {
+            inner,
+            id,
+            provider,
+            begun,
+            ticket,
+            runtime,
+        } = self;
+        runtime.spawn(async move {
+            let _ticket = ticket;
+            let _ = inner.drive(id, provider, begun, false, false).await;
+        });
+    }
+}
+
 impl GuestProviderRegistry {
+    /// pi's registration-time restore (SEAM-141): `registerNativeProvider` / `registerProvider`
+    /// end in `void this.refresh({ allowNetwork: false })` (`core/model-runtime.ts:893`, `:939`
+    /// @v0.99.2-17, same lines at v1.0.0-25), so a provider that registers after startup lists its
+    /// cached catalog at once. `None` when nothing is to be restored.
+    ///
+    /// `[CYRUP-DELTA]` pi restores on EVERY registration, because a pi provider changes its own
+    /// catalog in place and no re-registration is involved. Here a catalog change IS a
+    /// re-registration (the provider's `update` swaps a new provider value in, and `/llama`'s
+    /// `set_catalog` does the same), so restoring on every registration would replace a
+    /// just-published or just-set catalog with the stored one, and would supersede the very
+    /// refresh that is publishing it. It restores only for an id that had NO provider (the caller
+    /// checks), which is the only registration that has no catalog of its own to protect, and never
+    /// for the engine's own re-registration of an id it is publishing ([`PUBLISHING`]). The
+    /// functionality is the same: a provider registered late with a stored catalog lists it.
+    ///
+    /// Also skipped before the startup restore has begun (it covers everything registered until
+    /// then), for a static provider (pi's `refreshModels === undefined` filter), and when there is
+    /// no tokio runtime to run it on (a registration made from outside one has nothing to spawn on;
+    /// such a provider is covered by the startup restore if it registered before it).
+    fn begin_late_restore(&self, id: &str, provider: &Arc<dyn Provider>) -> Option<LateRestore> {
+        if !self.restore_started.load(Ordering::SeqCst)
+            || !provider.has_refresh_models()
+            || PUBLISHING.with(|slot| slot.borrow().as_deref() == Some(id))
+        {
+            return None;
+        }
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let inner = Arc::clone(&self.refresh);
+        // The caller token is one nobody cancels: there is no caller to abort it.
+        let begun = inner.begin(id, &CancelToken::new());
+        let ticket = TaskTicket::new(&inner);
+        Some(LateRestore {
+            inner,
+            id: id.to_string(),
+            provider: Arc::clone(provider),
+            begun,
+            ticket,
+            runtime,
+        })
+    }
+
     /// Invalidate the in-flight refresh of `id` (pi `setProvider` / `deleteProvider`, which both
     /// start with `supersedeProviderRefresh`, `models.ts:399-407`) — unless this IS the update a
     /// refresh is publishing for `id`, see [`PUBLISHING`].
@@ -690,8 +771,8 @@ impl GuestProviderRegistry {
     /// 2. when the request allows the network, nobody aborted, and the provider's auth resolves to
     ///    a credential (`:573-576`), `refresh_models` runs again with `allow_network: true`.
     ///
-    /// A provider reaches its [`ProviderRefreshContext`] through [`ProviderRefreshContext::current`]
-    /// and publishes `{ persist, update }` through it; a publication of a refresh that was aborted
+    /// A provider reads its credential and stored catalog from, and publishes `{ persist, update }`
+    /// through, the [`RefreshModelsContext`] it is handed; a publication of a refresh that was aborted
     /// or superseded by a newer one (a later `refresh`, or a re-registration of the provider)
     /// writes nothing and runs no update — pi 0.84.0's "stale catalog refreshes could publish
     /// after a newer refresh" fix (`coding-agent` CHANGELOG:760).
@@ -716,10 +797,14 @@ impl GuestProviderRegistry {
         let targets: Vec<(String, Arc<dyn Provider>)> = self
             .lock()
             .iter()
-            .filter(|(id, _)| {
-                selected
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(id.as_str()))
+            // pi `provider.refreshModels !== undefined && (!selected || selected.has(id))`
+            // (`models.ts:553-554`) — BEFORE `beginProviderRefresh`, so a static provider never
+            // supersedes an in-flight refresh of its id (SEAM-142).
+            .filter(|(id, provider)| {
+                provider.has_refresh_models()
+                    && selected
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(id.as_str()))
             })
             .map(|(id, provider)| (id.clone(), Arc::clone(provider)))
             .collect();
@@ -762,6 +847,9 @@ impl GuestProviderRegistry {
     /// no network (pi `modelRuntime.refresh({ allowNetwork: false })` after the extensions'
     /// providers are registered, `core/agent-session-services.ts:190-206` @v0.99.2-17).
     pub async fn restore_cached(&self, cancel: CancelToken) -> ModelsRefreshResult {
+        // Set BEFORE the targets are snapshotted: a provider registered from here on either is in
+        // the snapshot or restores itself, and one registered a moment earlier is in the snapshot.
+        self.restore_started.store(true, Ordering::SeqCst);
         self.refresh(ProviderRefreshRequest {
             providers: None,
             allow_network: Some(false),
@@ -793,10 +881,27 @@ impl ModelRegistrySink for GuestProviderRegistry {
         // A native's own provider, stored as given — no `ConfigProvider` is rebuilt. Replacing the
         // id swaps the `Arc` (Pi "replaces all models", model-registry.ts:919), and the bump is what
         // makes `full_model_registry()` recompose so the replacement's catalog is what `/model` lists.
-        self.supersede_refresh(id);
-        self.lock().insert(id.to_string(), Arc::clone(&provider));
+        let late_restore = {
+            // Supersede, replace and (for a new id) begin the restore under ONE hold of the map, so
+            // two concurrent registrations of an id cannot interleave the three.
+            let mut providers = self.lock();
+            self.supersede_refresh(id);
+            let is_new = providers
+                .insert(id.to_string(), Arc::clone(&provider))
+                .is_none();
+            if is_new {
+                self.begin_late_restore(id, &provider)
+            } else {
+                None
+            }
+        };
         self.replace_installed(id, &provider);
         self.generation.fetch_add(1, Ordering::Relaxed);
+        // Spawned LAST: the restore's own `update` re-registers the provider, and must land after
+        // this registration has finished installing, not before it.
+        if let Some(restore) = late_restore {
+            restore.spawn();
+        }
     }
 
     fn remove_provider(&self, id: &str) {

@@ -166,6 +166,9 @@ impl Provider for PhaseRecorder {
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         self.inner.provider_auth()
     }
+    fn has_refresh_models(&self) -> bool {
+        true
+    }
     async fn refresh_models(
         &self,
         ctx: &RefreshModelsContext,
@@ -268,6 +271,9 @@ async fn a_restore_that_never_answers_does_not_stall_the_build() {
         }
         fn models(&self) -> &[Model] {
             self.inner.models()
+        }
+        fn has_refresh_models(&self) -> bool {
+            true
         }
         async fn refresh_models(
             &self,

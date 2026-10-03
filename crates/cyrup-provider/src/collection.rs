@@ -610,9 +610,10 @@ impl Models {
     ///   `crates/cyrup/src/provider.rs` restricts the fetch set by id. `Some(id)` refreshes exactly
     ///   that provider and is a clean no-op for an unknown id (pi's
     ///   `if (!entry?.refreshModels) return`).
-    /// * **No `credential` / `store` are threaded.** See [`crate::provider::RefreshModelsContext`]'s `[CYRUP-DELTA]`:
-    ///   the persisting fetcher owns both, so pi's `resolveRefreshCredential` bail (`:296`) is
-    ///   reproduced at the trigger site rather than here.
+    /// * **No `credential` / `stored` / `publisher` are threaded.** See
+    ///   [`crate::provider::RefreshModelsContext`]'s `[CYRUP-DELTA]`: the persisting fetcher owns
+    ///   all three, so pi's `resolveRefreshCredential` bail (`:296`) is reproduced at the trigger
+    ///   site rather than here.
     ///
     /// **The abort is real, not advisory.** A provider that has not started when `cancel` fires is
     /// never called; a provider that is mid-flight is cut off only if it honours the token it was
@@ -636,6 +637,7 @@ impl Models {
             allow_network: options.allow_network,
             force: options.force,
             cancel: options.cancel.clone(),
+            ..crate::provider::RefreshModelsContext::default()
         };
 
         let refreshes = targets.into_iter().map(|entry| {
@@ -667,6 +669,7 @@ impl Models {
                     allow_network: false,
                     force: false,
                     cancel: ctx.cancel.clone(),
+                    ..crate::provider::RefreshModelsContext::default()
                 };
                 let _ = entry.refresh_models(&restore).await;
                 recorded
@@ -1523,6 +1526,9 @@ mod tests {
             });
             Box::pin(ReceiverStream::new(rx))
         }
+        fn has_refresh_models(&self) -> bool {
+            true
+        }
         /// PROV-S05: shaped like pi's `createProvider` `refreshModels` (`models.ts:566-616`
         /// @v0.83.0) — it honours `allowNetwork` by returning without fetching, which is what makes
         /// the post-failure cache restore (`:313-322`) a restore rather than a second attempt, and
@@ -1758,6 +1764,9 @@ mod tests {
             ) -> EventStream<StreamEvent> {
                 let (_tx, rx) = tokio::sync::mpsc::channel(1);
                 Box::pin(ReceiverStream::new(rx))
+            }
+            fn has_refresh_models(&self) -> bool {
+                true
             }
             async fn refresh_models(
                 &self,

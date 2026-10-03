@@ -2043,11 +2043,10 @@ pub struct LoadedConfig {
 /// including its limitation: `--mcp-config=path` is **not** supported and yields `None`, and a
 /// trailing `--mcp-config` with nothing after it likewise yields `None`.
 ///
-/// This is read from argv directly rather than through the flag store, and that is not a
-/// workaround: `ExtensionHost::apply_extension_flag_values` runs *after* the native-load loop on
-/// both sides, so `init` cannot see the flag store on either. The flag is still *registered*
-/// through `InitApi::register_flag` — an unreconciled `--flag` is itself a startup diagnostic
-/// (MCP-002).
+/// This is the init-time read (`index.ts:367`): `ExtensionHost::apply_extension_flag_values` runs
+/// *after* the native-load loop on both sides, so `init` cannot see the flag store yet. Everything
+/// after init reads the flag through `HostServices::flag_value` (pi's `pi.getFlag`) via
+/// `McpExtension::config_flag_path`, which falls back to this.
 #[must_use]
 pub fn config_path_from_argv<I, S>(argv: I) -> Option<String>
 where

@@ -983,6 +983,11 @@ pub struct LiveHostServices {
     /// [`Self::provider_refresher`]). `None` on the default host, where both verbs keep their trait
     /// defaults.
     provider_auth_source: Mutex<Option<ProviderAuthSource>>,
+    /// The extension host whose registry answers [`HostServices::flag_value`], attached by the
+    /// builder via [`Self::attach_flag_source`]. `Weak` because the host holds this backend (it is
+    /// handed to every loaded extension), so a strong handle back would be a cycle. `None` on the
+    /// default host, where the verb keeps its trait default (`None`).
+    flag_source: Mutex<Option<std::sync::Weak<cyrup_ext::ExtensionHost>>>,
 }
 
 /// What [`LiveHostServices`] resolves a provider's auth against: the session's credential store and
@@ -1095,7 +1100,14 @@ impl LiveHostServices {
             ui_prompts: Mutex::new(None),
             provider_refresher: Mutex::new(None),
             provider_auth_source: Mutex::new(None),
+            flag_source: Mutex::new(None),
         }
+    }
+
+    /// Attach the extension host [`HostServices::flag_value`] reads its registry from. Called by the
+    /// builder with the session's `ExtensionHost`, before any native's command can run.
+    pub fn attach_flag_source(&self, host: std::sync::Weak<cyrup_ext::ExtensionHost>) {
+        *Self::lock(&self.flag_source) = Some(host);
     }
 
     /// Attach the credential store and provider registry [`HostServices::provider_auth`] and
@@ -1925,14 +1937,16 @@ impl HostServices for LiveHostServices {
         (current.id().as_str() == provider_id).then_some(current)
     }
 
-    /// pi `ctx.modelRegistry.refresh({ providers: [id], allowNetwork, signal })` (see the trait
-    /// method). `allow_network` is always passed explicitly, so the registry's offline switch is
-    /// never consulted: a `true` here reaches the network under an offline run, which is what pi's
-    /// `/llama` relies on (`extensions/llama/index.ts:56`).
+    /// pi `ctx.modelRegistry.refresh({ providers: [id], allowNetwork, force, signal })` (see the
+    /// trait method). `allow_network` is always passed explicitly, so the registry's offline switch
+    /// is never consulted: a `true` here reaches the network under an offline run, which is what
+    /// pi's `/llama` relies on (`extensions/llama/index.ts:56`). `force` is carried to the
+    /// registry unchanged; it only reaches a provider's network phase.
     fn refresh_provider<'a>(
         &'a self,
         provider_id: &'a str,
         allow_network: bool,
+        force: bool,
         cancel: CancelToken,
     ) -> futures::future::BoxFuture<'a, cyrup_provider::ModelsRefreshResult> {
         let refresher = Self::lock(&self.provider_refresher).clone();
@@ -1944,11 +1958,19 @@ impl HostServices for LiveHostServices {
                 .refresh(cyrup_ext::host::services::ProviderRefreshRequest {
                     providers: Some(vec![provider_id.to_string()]),
                     allow_network: Some(allow_network),
-                    force: false,
+                    force,
                     cancel,
                 })
                 .await
         })
+    }
+
+    /// pi `pi.getFlag(name)` (see the trait method): the registry's CLI override, else the
+    /// registered default, for a flag some extension registered.
+    fn flag_value(&self, name: &str) -> Option<Value> {
+        let host = Self::lock(&self.flag_source).as_ref()?.upgrade()?;
+        let spec = host.registry().get_flag(name).ok()??;
+        cyrup_ext::host::services::resolve_flag_value(host.registry(), name, &spec)
     }
 
     /// pi `ctx.modelRegistry.getProviderAuth(providerId)` (see the trait method): the provider's

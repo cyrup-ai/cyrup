@@ -5,6 +5,48 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-03 (batch 6) — seven rows closed, seven filed (`claude/lows-batch6`)
+
+> **This block sits above the 2026-10-02 pi 1.0 block and corrects its counts by this batch.** The count is
+> whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints: on 2026-10-03, after this batch
+> rebased onto the pi 1.0 survey, it prints **162 open: 0 critical, 1 high, 24 medium, 137 low; 17 trackers;
+> 841 closed; 3 duplicates not counted** (the pi 1.0 block: 162 open, 23 medium, 138 low, 834 closed).
+> Arithmetic: open 162 − 7 closed + 7 filed = 162; medium 23 + 1 (`SUBA-149`) = 24; low 138 − 7 closed +
+> 6 filed = 137; closed 834 + 7 = 841; trackers and duplicates unchanged.
+>
+> ## Closed (each row carries its own evidence)
+>
+> * **`EXT-093`**, **`EXT-104`**, **`EXT-103`** (`06`) — `HostServices::flag_value` (and `cyrup-mcp` reading its
+>   flag through it); `force` on `HostServices::refresh_provider`; one shared key parser and `keybindings.json`
+>   reader in `cyrup-ext` (the Tab / Shift+Tab rule now follows pi, a deliberate behaviour change the row records).
+> * **`PROV-111`** (`01`), **`SEAM-142`**, **`SEAM-141`** (`08`) — the refresh context carries its credential,
+>   stored catalog and publisher itself (the task-local is gone); static providers are filtered before a refresh
+>   begins; a provider registered late with a stored entry restores its cached catalog. `SEAM-141` carries a
+>   `[CYRUP-DELTA]` (restore only for a new id) backed by a proven clobber, and two corners filed below.
+> * **`SUBA-147`** (`09b`) — closed as a **wrong premise**, no code change: upstream's admission probe has two
+>   call sites, not the row's description, and cyrup never gives a single run or workflow child a worktree, so
+>   there is nothing for it to guard. The real gap is `SUBA-149`.
+>
+> ## Filed (all `NEW 2026-10-03`; counters updated in each area file)
+>
+>   **Ids:** all seven new ids sit outside the blocks the pi 1.0 pass allocated, so nothing collides. `PROV-112`
+>   and `SUBA-149` are exactly the two gap ids that block's text said were never allocated; `EXT-105` and
+>   `SEAM-144` were the counters it called unchanged.
+> * **09b:** `SUBA-149` (medium, L) — single-agent and workflow-child `worktree: true` isolation is unported;
+>   established by reading source, not by running it. Next free id stays `SUBA-164`.
+> * **06:** `EXT-105` (`flag_value` not scoped to the caller's flags), `EXT-106` (`KeySpec::matches` ignores extra
+>   Shift on non-character keys). Next free id `EXT-107` (the pi 1.0 block's `EXT-105` moved).
+> * **08:** `SEAM-144` (removals and virtual models fire no cache-only restore), `SEAM-145` (the `is_current` to
+>   `update()` window), `SEAM-146` (no late restore when registering outside a tokio runtime). Next free id
+>   `SEAM-147` (the pi 1.0 block's `SEAM-144` moved).
+> * **01:** `PROV-112` (`ImagesProvider::refresh_models` has no static filter or context). Next free id stays `PROV-130`.
+>
+> **Citation pins.** The ledger's `@v0.99.2-17` is not a tag in the `tmp/pi` checkout; lanes verified at HEAD
+> (`v1.0.0-25`) and, where the lines mattered, at tag `v0.99.2`, and the rows cite the version actually read.
+> `EXT-104`'s `models.ts:74-90` cite was stale (the lines are `91-98`).
+
+---
+
 # UPDATE 2026-10-02 — pi 1.0: 89 rows filed, a new area 18, nothing closed
 
 > **Read this block first; it sits above the 2026-10-01 block and corrects its counts.** It records
@@ -66,6 +108,8 @@ next work item**.
 > gained `replaceable: true` at v1.0.0, recorded in `04-cyrup-tools.md`'s *Read in scope and
 > deliberately NOT filed*. The pre-existing `UNCLASSIFIED` line the counter prints for area 10's
 > `PERM-032` predates this pass and is untouched.
+
+---
 
 # UPDATE 2026-10-02 (batch 5) — eleven low rows closed, `SUBA-146` re-scoped (`claude/lows-batch5`)
 

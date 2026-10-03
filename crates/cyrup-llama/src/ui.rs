@@ -66,8 +66,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use cyrup_ext::host::{
-    HostServices, InteractiveOverlay, NotifyKind, OverlayColor, OverlayKey, OverlayKeyCode,
-    OverlayLine, OverlayOutcome, OverlaySpan,
+    HostServices, InteractiveOverlay, KeySpec, NotifyKind, OverlayColor, OverlayKey,
+    OverlayKeyCode, OverlayLine, OverlayOutcome, OverlaySpan, key_ids, read_user_bindings,
 };
 use futures::future::BoxFuture;
 use tokio::runtime::Handle;
@@ -395,111 +395,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // =================================================================================================
 // Key bindings (`KeybindingsManager.matches`, `keyHint`)
 // =================================================================================================
-
-/// One `KeyId` spec, parsed from the grammar pi's `matchesKey` accepts (`"ctrl+c"`, `"up"`,
-/// `"enter"`, `"pageUp"`).
-///
-/// Reimplemented because `cyrup-llama` must not depend on `cyrup-tui`, whose `Key::parse` this
-/// mirrors token for token (`crates/cyrup-tui/src/keymap.rs`), nor on `cyrup-mcp`, whose
-/// `KeySpec` it copies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeySpec {
-    code: OverlayKeyCode,
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-}
-
-impl KeySpec {
-    /// Parse one `KeyId`; `None` for a spec naming no key (which never matches, as upstream).
-    #[must_use]
-    pub fn parse(spec: &str) -> Option<Self> {
-        let mut ctrl = false;
-        let mut alt = false;
-        let mut shift = false;
-        let mut code: Option<OverlayKeyCode> = None;
-        for part in spec.split('+') {
-            let token = part.trim();
-            if token.is_empty() {
-                continue;
-            }
-            match token.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" => ctrl = true,
-                "shift" => shift = true,
-                "alt" | "option" | "meta" => alt = true,
-                // No `OverlayKey` bit exists for super, so such a spec can never match.
-                "super" | "cmd" | "command" => return None,
-                "enter" | "return" => code = Some(OverlayKeyCode::Enter),
-                "tab" => code = Some(OverlayKeyCode::Tab),
-                "backtab" => code = Some(OverlayKeyCode::BackTab),
-                "esc" | "escape" => code = Some(OverlayKeyCode::Escape),
-                "space" => code = Some(OverlayKeyCode::Char(' ')),
-                "up" => code = Some(OverlayKeyCode::Up),
-                "down" => code = Some(OverlayKeyCode::Down),
-                "left" => code = Some(OverlayKeyCode::Left),
-                "right" => code = Some(OverlayKeyCode::Right),
-                "home" => code = Some(OverlayKeyCode::Home),
-                "end" => code = Some(OverlayKeyCode::End),
-                "backspace" => code = Some(OverlayKeyCode::Backspace),
-                "delete" | "del" => code = Some(OverlayKeyCode::Delete),
-                "pageup" | "pgup" => code = Some(OverlayKeyCode::PageUp),
-                "pagedown" | "pgdn" => code = Some(OverlayKeyCode::PageDown),
-                "insert" | "ins" => code = Some(OverlayKeyCode::Insert),
-                other => {
-                    if let Some(number) = other.strip_prefix('f').filter(|digits| {
-                        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
-                    }) {
-                        match number.parse::<u8>() {
-                            Ok(n @ 1..=12) => code = Some(OverlayKeyCode::F(n)),
-                            _ => return None,
-                        }
-                        continue;
-                    }
-                    let mut chars = other.chars();
-                    match (chars.next(), chars.next()) {
-                        (Some(c), None) => code = Some(OverlayKeyCode::Char(c)),
-                        _ => return None,
-                    }
-                }
-            }
-        }
-        code.map(|code| Self {
-            code,
-            ctrl,
-            alt,
-            shift,
-        })
-    }
-
-    /// Does `key` satisfy this spec? `shift` is compared only when the spec asks for it: a
-    /// printable character arrives already shift-resolved (`Shift+k` is `Char('K')`), and a
-    /// `BackTab` is `Tab` + shift.
-    #[must_use]
-    pub fn matches(&self, key: &OverlayKey) -> bool {
-        if self.ctrl != key.ctrl || self.alt != key.alt {
-            return false;
-        }
-        let (want, want_shift) = fold_backtab(self.code, self.shift);
-        let (got, got_shift) = fold_backtab(key.code, key.shift);
-        match (want, got) {
-            (OverlayKeyCode::Char(want), OverlayKeyCode::Char(got)) => {
-                if self.shift {
-                    got.eq_ignore_ascii_case(&want) && (key.shift || got.is_uppercase())
-                } else {
-                    want == got || (!key.shift && want.eq_ignore_ascii_case(&got))
-                }
-            }
-            (a, b) => a == b && (!want_shift || got_shift),
-        }
-    }
-}
-
-fn fold_backtab(code: OverlayKeyCode, shift: bool) -> (OverlayKeyCode, bool) {
-    match code {
-        OverlayKeyCode::BackTab => (OverlayKeyCode::Tab, true),
-        other => (other, shift),
-    }
-}
+//
+// The `matchesKey` grammar ([`KeySpec`]) and the `keybindings.json` reader are
+// `cyrup_ext::host`'s (EXT-103), shared with `cyrup-mcp`'s panel keys; this module owns only the
+// ids `ui.ts` reads and their defaults.
 
 /// The keybinding ids `ui.ts` and the components it builds read through
 /// `KeybindingsManager.matches` / `keyHint`.
@@ -648,19 +547,6 @@ impl Default for LlamaKeys {
     }
 }
 
-/// A `KeyId | KeyId[]` value from the user's document.
-fn key_ids(value: &serde_json::Value) -> Option<Vec<String>> {
-    match value {
-        serde_json::Value::String(one) => Some(vec![one.clone()]),
-        serde_json::Value::Array(many) => Some(
-            many.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
 impl LlamaKeys {
     /// Resolve over the user's raw (already migrated) bindings: a present id, including an empty
     /// list, replaces the default outright; an absent one keeps it.
@@ -695,15 +581,9 @@ impl LlamaKeys {
     /// failure (absent, unreadable, malformed, not an object) yields the defaults.
     #[must_use]
     pub fn from_agent_dir(agent_dir: &Path) -> Self {
-        let Ok(raw) = std::fs::read_to_string(agent_dir.join("keybindings.json")) else {
-            return Self::default();
-        };
-        let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&raw)
-        else {
-            return Self::default();
-        };
-        let (migrated, _) = cyrup_config::migrate_keybindings_config(&map);
-        Self::from_user_bindings(&migrated)
+        read_user_bindings(agent_dir).map_or_else(Self::default, |migrated| {
+            Self::from_user_bindings(&migrated)
+        })
     }
 
     /// `keybindings.matches(data, id)`.

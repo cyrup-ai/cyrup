@@ -632,6 +632,12 @@ impl Provider for RadiusProvider {
         Some(&self.auth)
     }
 
+    /// `refreshModels` is defined only with a store (`radius.ts:35-78`), which is also what
+    /// [`RadiusProvider::refresh_models`] answers `None` for (SEAM-142).
+    fn has_refresh_models(&self) -> bool {
+        self.models_store.is_some()
+    }
+
     /// `refreshModels` (`radius.ts:35-78`). `None` when no [`ModelsStore`] is attached (static);
     /// otherwise one deduplicated [`RadiusProvider::refresh_once`].
     async fn refresh_models(

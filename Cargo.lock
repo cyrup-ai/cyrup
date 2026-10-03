@@ -1753,7 +1753,6 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
- "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
  "cyrup-provider",

@@ -98,12 +98,20 @@ impl CatalogPublisher for TestHost {
 
 #[async_trait::async_trait]
 impl LlamaRefreshHost for TestHost {
-    async fn credential(&self) -> Option<Credential> {
+    async fn credential(&self, _ctx: &RefreshModelsContext) -> Option<Credential> {
         lock(&self.credential).clone()
     }
 
-    async fn stored(&self) -> Option<CatalogEntry> {
+    async fn stored(&self, _ctx: &RefreshModelsContext) -> Option<CatalogEntry> {
         self.entry()
+    }
+
+    async fn publish(
+        &self,
+        _ctx: &RefreshModelsContext,
+        publication: CatalogPublication,
+    ) -> Result<bool, LlamaError> {
+        CatalogPublisher::publish(self, publication).await
     }
 }
 

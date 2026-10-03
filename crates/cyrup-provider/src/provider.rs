@@ -12,28 +12,89 @@ use crate::stream::{StreamEvent, StreamOptions};
 use crate::utils::simple_options::{SimpleStreamOptions, build_base_options};
 use cyrup_core::{CancelToken, EventStream, ProviderId};
 
-/// The per-refresh context a dynamic provider's [`Provider::refresh_models`] receives — pi
-/// `RefreshModelsContext` (`packages/ai/src/models.ts:34-44` @v0.83.0), threaded from
-/// [`crate::collection::Models::refresh_with`] exactly as pi threads it from `Models.refresh`
-/// (`models.ts:297-303`). PROV-S05.
-///
-/// `[CYRUP-DELTA]` **two of pi's five members are absent, and both by construction.** pi carries
-/// `credential` (`:36`) and `store` (`:38`) because `Models.refresh` resolves the effective
-/// credential (`resolveRefreshCredential`, `models.ts:330-354`) and builds a provider-scoped
-/// `ProviderModelsStore` (`:287-291`) before calling in. In cyrup the persisting fetcher is
-/// [`crate::remote_catalog::RemoteCatalog`], which owns its own [`crate::models_store::ModelsStore`]
-/// and its own auth context, and the configured-provider restriction lives at the trigger site
-/// (`crates/cyrup/src/provider.rs`) — so neither value has anywhere useful to arrive here. The three
-/// that DO change a provider's behaviour per call are all present.
+/// What a provider asks the store to do with its persisted catalog — pi's
+/// `ModelsPublication.persist?: ModelsStoreEntry | null` (`packages/ai/src/models.ts:67-72`
+/// @v0.99.2-17), minus the "omit" arm, which is an absent [`ModelsPublication::persist`].
 #[derive(Clone, Debug)]
+pub enum ModelsPersist {
+    /// `persist: entry` — replace the provider's stored entry (`modelsStore.write`, `models.ts:512`).
+    ///
+    /// `classifiers` is the `type: "classifier"` half of pi's ONE `models` array
+    /// (`ModelsStoreEntry.models: readonly AnyModel[]`, `models-store.ts:3-5`); cyrup's entry holds
+    /// chat models only and the classifier models travel through
+    /// [`crate::ModelsStore::write_classifier_models`] (see that method for why).
+    Write {
+        entry: crate::ModelsStoreEntry,
+        classifiers: Vec<ClassifierModel>,
+    },
+    /// `persist: null` — delete the provider's stored entry (`modelsStore.delete`, `models.ts:510`).
+    Delete,
+}
+
+/// pi `ModelsPublication` (`packages/ai/src/models.ts:67-72` @v0.99.2-17): the provider-chosen
+/// persistence plus an optional synchronous update of its own in-memory catalog.
+///
+/// The `update` runs only after the persistence step and only while the refresh is still the
+/// provider's current one, so a superseded refresh can neither write the store nor change the
+/// catalog. A cyrup provider's `models()` is a borrow of an immutable catalog, so "update" is
+/// typically a re-registration of a new provider value carrying the new catalog: the registry's
+/// replace path, which does not supersede the publishing refresh itself.
+#[derive(Default)]
+pub struct ModelsPublication {
+    /// pi `persist?`. `None` leaves storage unchanged.
+    pub persist: Option<ModelsPersist>,
+    /// pi `update?: () => void`.
+    pub update: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+/// The registry's side of [`RefreshModelsContext::publish`].
+#[async_trait::async_trait]
+pub trait ModelsPublisher: Send + Sync {
+    /// pi `publish(publication): Promise<boolean>` (`models.ts:83`): `Ok(true)` when the publication
+    /// was applied, `Ok(false)` when this refresh was superseded or aborted first (pi's
+    /// generation/`signal.aborted` checks, `models.ts:507`, `:515`). A store failure is the error pi
+    /// would reject with.
+    async fn publish(&self, publication: ModelsPublication) -> Result<bool, ProviderError>;
+}
+
+/// The per-refresh context a dynamic provider's [`Provider::refresh_models`] receives — pi
+/// `RefreshModelsContext` (`packages/ai/src/models.ts:74-90` @v0.99.2-17), threaded from the
+/// refresh engine exactly as pi threads it from `Models.refresh` (`models.ts:527-544`).
+///
+/// It is an owned, `Clone` value, so a provider that does its work in a spawned task hands that
+/// task a clone and the task sees the same credential, stored catalog and publisher. (Until
+/// PROV-111 the credential, stored catalog and `publish` travelled through a tokio task-local
+/// instead, which did not cross a `tokio::spawn`.)
+///
+/// `[CYRUP-DELTA]` **the three host-supplied members are optional.** pi's engine is the only
+/// caller of `refreshModels` and always provides `credential?`, `stored?` and `publish`. Here two
+/// engines call [`Provider::refresh_models`]: the session's extension-provider registry
+/// (`cyrup-session-svc`'s `GuestProviderRegistry`), which fills all of them, and
+/// [`crate::collection::Models::refresh_with`], whose persisting fetcher is
+/// [`crate::remote_catalog::RemoteCatalog`] — it owns its own [`crate::models_store::ModelsStore`]
+/// and auth context, so there `credential` and `stored` are `None` and `publisher` is `None`
+/// (`publish` then answers `Ok(false)`: nothing was applied). pi's `store` member of the older
+/// v0.83.0 shape (`:38`) has no counterpart: v0.99.2 replaced it with `stored` + `publish`.
+#[derive(Clone)]
 pub struct RefreshModelsContext {
-    /// `false` during offline / cache-only initialization (pi `:40`). A provider MUST restore its
-    /// persisted catalog and perform no network I/O.
+    /// pi `credential?` — the effective credential: the stored one for the cache-only phase, the
+    /// provider-auth-resolved one for the network phase (`models.ts:571`, `:575-577`).
+    pub credential: Option<Credential>,
+    /// pi `stored?` — the provider's persisted entry, snapshotted before this phase.
+    pub stored: Option<crate::ModelsStoreEntry>,
+    /// The classifier models persisted beside `stored` (the `type: "classifier"` members of pi's
+    /// `stored.models`).
+    pub stored_classifiers: Vec<ClassifierModel>,
+    /// pi `publish` — the generation-checked publisher of this phase. `None` when the engine that
+    /// called has no store to publish to; see the type's `[CYRUP-DELTA]`.
+    pub publisher: Option<std::sync::Arc<dyn ModelsPublisher>>,
+    /// `false` during offline / cache-only initialization (pi `allowNetwork`). A provider MUST
+    /// restore its persisted catalog and perform no network I/O.
     pub allow_network: bool,
     /// Bypass provider freshness checks and fetch immediately when network access is allowed
-    /// (pi `:42`).
+    /// (pi `force`).
     pub force: bool,
-    /// pi's `signal?: AbortSignal` (`:43`). **This is not advisory** — an implementation that can
+    /// pi's `signal: AbortSignal`. **This is not advisory** — an implementation that can
     /// block MUST select on [`RefreshModelsContext::cancelled`] or check
     /// [`RefreshModelsContext::is_aborted`], because that is the only thing that makes
     /// [`crate::collection::ModelsRefreshResult::aborted`] mean anything. `Models::refresh_with`
@@ -42,11 +103,33 @@ pub struct RefreshModelsContext {
     pub cancel: CancelToken,
 }
 
+impl std::fmt::Debug for RefreshModelsContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshModelsContext")
+            // A credential carries the secret: say whether there is one, never what it is.
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
+            .field("stored", &self.stored)
+            .field("stored_classifiers", &self.stored_classifiers)
+            .field("publisher", &self.publisher.as_ref().map(|_| "<publisher>"))
+            .field("allow_network", &self.allow_network)
+            .field("force", &self.force)
+            .field("cancel", &self.cancel)
+            .finish()
+    }
+}
+
 impl Default for RefreshModelsContext {
     /// pi's defaults for a bare `refresh()`: `allowNetwork = options.allowNetwork ?? true`
     /// (`models.ts:277`), `force` undefined ⇒ falsy, no signal.
     fn default() -> Self {
         Self {
+            credential: None,
+            stored: None,
+            stored_classifiers: Vec::new(),
+            publisher: None,
             allow_network: true,
             force: false,
             cancel: CancelToken::new(),
@@ -62,6 +145,20 @@ impl RefreshModelsContext {
         Self {
             allow_network: false,
             ..Self::default()
+        }
+    }
+
+    /// pi `context.publish(publication)` (`models.ts:83`): hand a publication to this phase's
+    /// publisher. `Ok(false)` — nothing applied, the caller should stop — when the refresh was
+    /// superseded or aborted, and also when the engine supplied no publisher at all.
+    ///
+    /// # Errors
+    ///
+    /// The publisher's own failure (a store write that failed, an aborted wait).
+    pub async fn publish(&self, publication: ModelsPublication) -> Result<bool, ProviderError> {
+        match &self.publisher {
+            Some(publisher) => publisher.publish(publication).await,
+            None => Ok(false),
         }
     }
 
@@ -164,6 +261,21 @@ pub trait Provider: Send + Sync {
         _ctx: &RefreshModelsContext,
     ) -> Option<Result<(), ProviderError>> {
         None
+    }
+
+    /// Whether [`Provider::refresh_models`] does anything — pi's `refreshModels !== undefined`
+    /// (`packages/ai/src/models.ts:552-554`, identical at v0.99.2 and v1.0.0-25). pi's
+    /// engine filters static providers out BEFORE it begins a refresh (`beginProviderRefresh`,
+    /// `:559`), because beginning one supersedes whatever refresh of the same id is still in
+    /// flight. A Rust trait method cannot be absent, and answering `None` is only knowable by
+    /// calling it, so this is the member that carries the filter (SEAM-142).
+    ///
+    /// **Every provider whose `refresh_models` can answer `Some` MUST override this to `true`**
+    /// (and a wrapper must forward it with `refresh_models`): the registry never calls
+    /// `refresh_models` on a provider that answers `false`. A provider whose answer depends on its
+    /// construction (an optional store) answers for that state.
+    fn has_refresh_models(&self) -> bool {
+        false
     }
 
     /// Classify structured state with one of this provider's classifier models (Pi

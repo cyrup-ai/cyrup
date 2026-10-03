@@ -611,6 +611,7 @@ impl McpExtension {
             self.home().cloned(),
             discovery.fingerprint.clone(),
             include_host_configs,
+            self.config_flag_path(),
         ));
         let model = crate::ui::McpSetupPanelModel::new(
             discovery,

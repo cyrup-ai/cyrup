@@ -21,10 +21,11 @@
 //!
 //! [`LlamaProvider::refresh`] is `refreshModels` (`:201-259`): it takes pi's
 //! `RefreshModelsContext` as [`LlamaRefreshContext`] (credential, stored catalog, `publish`,
-//! `allowNetwork`, abort signal). `cyrup_provider::RefreshModelsContext` does not carry the
-//! credential, the stored catalog or `publish`, so [`Provider::refresh_models`] gets them from the
-//! [`LlamaRefreshHost`] the controller was built with and answers `None` (a static provider, like
-//! `RadiusProvider` without a models store) when there is none.
+//! `allowNetwork`, abort signal). `cyrup_provider::RefreshModelsContext` carries all of them
+//! (PROV-111), and the [`LlamaRefreshHost`] the controller was built with reads them from that
+//! argument; without a host [`Provider::refresh_models`] answers `None` and
+//! [`Provider::has_refresh_models`] `false` (a static provider, like `RadiusProvider` without a
+//! models store).
 //!
 //! Upstream reads the server URL differently in two places: `refreshModels` takes it only from the
 //! credential's `env.LLAMA_BASE_URL` (`:228-230`, `credentialServerUrl`, `:24-27`), while `check`
@@ -341,14 +342,42 @@ pub trait CatalogPublisher: Send + Sync {
     async fn publish(&self, publication: CatalogPublication) -> Result<bool, LlamaError>;
 }
 
-/// What a refresh needs from its host: pi's `RefreshModelsContext.credential` and `.stored`
-/// (`models.ts:36-39`) plus the publisher.
+/// What a refresh needs from its host: pi's `RefreshModelsContext.credential`, `.stored` and
+/// `.publish` (`models.ts:74-90`).
+///
+/// Each method is handed the [`RefreshModelsContext`] the engine passed to
+/// [`Provider::refresh_models`], which carries all three (PROV-111): the host reads them from that
+/// argument, not from ambient state, so they are there for any task the refresh spawns.
 #[async_trait::async_trait]
-pub trait LlamaRefreshHost: CatalogPublisher {
+pub trait LlamaRefreshHost: Send + Sync {
     /// The effective configured credential, if any (`context.credential`).
-    async fn credential(&self) -> Option<Credential>;
+    async fn credential(&self, ctx: &RefreshModelsContext) -> Option<Credential>;
     /// The persisted catalog (`context.stored`), if one was written.
-    async fn stored(&self) -> Option<CatalogEntry>;
+    async fn stored(&self, ctx: &RefreshModelsContext) -> Option<CatalogEntry>;
+    /// `context.publish(publication)`: see [`CatalogPublisher::publish`].
+    ///
+    /// # Errors
+    ///
+    /// As [`CatalogPublisher::publish`].
+    async fn publish(
+        &self,
+        ctx: &RefreshModelsContext,
+        publication: CatalogPublication,
+    ) -> Result<bool, LlamaError>;
+}
+
+/// A [`LlamaRefreshHost`] bound to one refresh's context: the [`CatalogPublisher`] a
+/// [`LlamaRefreshContext`] carries.
+struct BoundPublisher<'a> {
+    host: &'a dyn LlamaRefreshHost,
+    ctx: &'a RefreshModelsContext,
+}
+
+#[async_trait::async_trait]
+impl CatalogPublisher for BoundPublisher<'_> {
+    async fn publish(&self, publication: CatalogPublication) -> Result<bool, LlamaError> {
+        self.host.publish(self.ctx, publication).await
+    }
 }
 
 /// pi's `RefreshModelsContext` (`models.ts:34-53`), as `refreshModels` reads it.
@@ -627,6 +656,12 @@ impl Provider for LlamaProvider {
         Some(&self.parts.auth)
     }
 
+    /// `refreshModels` is defined exactly when a [`LlamaRefreshHost`] is attached
+    /// (`provider.ts:201`; SEAM-142).
+    fn has_refresh_models(&self) -> bool {
+        self.parts.host.is_some()
+    }
+
     /// `refreshModels` (`provider.ts:201`): [`LlamaProvider::refresh`] with the credential, stored
     /// catalog and publisher of the [`LlamaRefreshHost`]; `None` (a static provider) without one.
     async fn refresh_models(
@@ -634,13 +669,17 @@ impl Provider for LlamaProvider {
         ctx: &RefreshModelsContext,
     ) -> Option<Result<(), ProviderError>> {
         let host = self.parts.host.clone()?;
-        let credential = host.credential().await;
-        let stored = host.stored().await;
+        let credential = host.credential(ctx).await;
+        let stored = host.stored(ctx).await;
+        let publisher = BoundPublisher {
+            host: host.as_ref(),
+            ctx,
+        };
         let outcome = self
             .refresh(&LlamaRefreshContext {
                 credential: credential.as_ref(),
                 stored: stored.as_ref(),
-                publisher: host.as_ref(),
+                publisher: &publisher,
                 allow_network: ctx.allow_network,
                 cancel: &ctx.cancel,
             })

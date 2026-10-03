@@ -5,7 +5,8 @@
 //!
 //! The registry that implements the verb is `cyrup-session-svc`'s `GuestProviderRegistry`, tested
 //! there. What this crate owns, and pins here, is the default answer of a host with no registry, the
-//! object safety of the verb on `Arc<dyn HostServices>`, and the scoping of the per-refresh context.
+//! object safety of the verb on `Arc<dyn HostServices>`, and the publication types that cross it
+//! (re-exported from `cyrup-provider`, where the per-refresh context lives, PROV-111).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -19,10 +20,10 @@ use std::sync::{Arc, Mutex};
 use crate::host::HostServices;
 use crate::host::services::{
     CannedResponses, DenyServices, ModelsPersist, ModelsPublication, ModelsPublisher,
-    ProviderRefreshContext, RecordingServices,
+    RecordingServices,
 };
 use cyrup_core::CancelToken;
-use cyrup_provider::{ModelsStoreEntry, ProviderError};
+use cyrup_provider::{Credential, ModelsStoreEntry, ProviderError, RefreshModelsContext};
 
 /// A publisher that records what it is handed and answers a fixed verdict.
 struct Recording {
@@ -47,16 +48,14 @@ impl ModelsPublisher for Recording {
     }
 }
 
-fn context(publisher: Arc<dyn ModelsPublisher>, allow_network: bool) -> ProviderRefreshContext {
-    ProviderRefreshContext::new(
-        None,
-        Some(ModelsStoreEntry::default()),
-        Vec::new(),
+fn context(publisher: Arc<dyn ModelsPublisher>, allow_network: bool) -> RefreshModelsContext {
+    RefreshModelsContext {
+        credential: Some(Credential::api_key("sk-secret")),
+        stored: Some(ModelsStoreEntry::default()),
+        publisher: Some(publisher),
         allow_network,
-        false,
-        CancelToken::new(),
-        publisher,
-    )
+        ..RefreshModelsContext::default()
+    }
 }
 
 /// A host with no model registry must not answer `refresh_provider` with a clean result: an
@@ -71,7 +70,7 @@ async fn a_host_without_a_registry_reports_the_provider_as_failed() {
     ];
     for services in backends {
         let result = services
-            .refresh_provider("llama.cpp", true, CancelToken::new())
+            .refresh_provider("llama.cpp", true, false, CancelToken::new())
             .await;
 
         assert!(!result.aborted);
@@ -92,57 +91,77 @@ async fn a_host_without_a_registry_still_reports_an_abort_as_an_abort() {
     cancel.cancel();
 
     let result = DenyServices
-        .refresh_provider("llama.cpp", true, cancel)
+        .refresh_provider("llama.cpp", true, false, cancel)
         .await;
 
     assert!(result.aborted);
     assert!(result.errors.is_empty(), "{result:?}");
 }
 
-/// The context exists only for the duration of the refresh the registry runs: outside a scope a
-/// provider finds none (so it has nothing to restore from or publish to), inside it finds exactly the
-/// one it was given, and after the scope it is gone again.
+/// The context is a plain owned value: a provider that does its work in a spawned task hands the
+/// task a clone and the task sees the same credential, stored snapshot, phase flag and publisher
+/// (PROV-111; the task-local it replaced did not cross a `tokio::spawn`).
 #[tokio::test]
-async fn the_refresh_context_is_visible_only_inside_its_scope() {
-    assert!(ProviderRefreshContext::current().is_none());
+async fn a_clone_of_the_refresh_context_carries_everything_into_a_spawned_task() {
     let publisher = Arc::new(Recording {
         verdict: Ok(true),
         persisted: Mutex::new(Vec::new()),
         updates: AtomicUsize::new(0),
     });
+    let ctx = context(Arc::clone(&publisher) as Arc<dyn ModelsPublisher>, true);
 
-    let seen = context(publisher, true)
-        .scope(async {
-            ProviderRefreshContext::current().map(|c| (c.allow_network, c.stored.is_some()))
+    let seen = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            let published = ctx.publish(ModelsPublication::default()).await;
+            (
+                ctx.allow_network,
+                ctx.stored.is_some(),
+                matches!(ctx.credential, Some(Credential::ApiKey { .. })),
+                published.ok(),
+            )
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(seen, (true, true, true, Some(true)));
+    assert_eq!(publisher.persisted.lock().unwrap().len(), 1);
+}
+
+/// Without a publisher (an engine with no store, such as `Models::refresh_with`) a publication is
+/// not applied and the answer is `Ok(false)` — "stop", as for a superseded refresh — rather than a
+/// panic or a silent success; the `update` never runs.
+#[tokio::test]
+async fn publishing_without_a_publisher_applies_nothing() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let flag = Arc::clone(&ran);
+    let verdict = RefreshModelsContext::default()
+        .publish(ModelsPublication {
+            persist: None,
+            update: Some(Box::new(move || {
+                flag.fetch_add(1, Ordering::SeqCst);
+            })),
         })
         .await;
 
-    assert_eq!(seen, Some((true, true)));
-    assert!(ProviderRefreshContext::current().is_none());
+    assert!(matches!(verdict, Ok(false)), "{verdict:?}");
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
 }
 
-/// Two refreshes running at once on one runtime each see THEIR OWN context (the registry refreshes
-/// providers concurrently): the scope is per task, not per thread or process.
-#[tokio::test]
-async fn concurrent_refresh_contexts_do_not_leak_into_each_other() {
+/// The context's `Debug` says whether a credential is present, never what it is.
+#[test]
+fn the_refresh_contexts_debug_output_does_not_leak_the_credential() {
     let publisher: Arc<dyn ModelsPublisher> = Arc::new(Recording {
         verdict: Ok(true),
         persisted: Mutex::new(Vec::new()),
         updates: AtomicUsize::new(0),
     });
-    let network = context(Arc::clone(&publisher), true).scope(async {
-        tokio::task::yield_now().await;
-        ProviderRefreshContext::current().map(|c| c.allow_network)
-    });
-    let cache = context(publisher, false).scope(async {
-        tokio::task::yield_now().await;
-        ProviderRefreshContext::current().map(|c| c.allow_network)
-    });
 
-    let (network, cache) = tokio::join!(network, cache);
+    let shown = format!("{:?}", context(publisher, true));
 
-    assert_eq!(network, Some(true));
-    assert_eq!(cache, Some(false));
+    assert!(!shown.contains("sk-secret"), "{shown}");
+    assert!(shown.contains("credential"), "{shown}");
 }
 
 /// `publish` is the registry's publisher: the publication reaches it unchanged and its verdict —

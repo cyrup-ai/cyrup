@@ -355,6 +355,12 @@ impl Provider for RemoteCatalogProvider {
         self.inner.provider_auth()
     }
 
+    /// SEAM-142 — forwarded with [`Provider::refresh_models`], so the wrapper is as dynamic as the
+    /// provider it overlays (pi's spread carries `refreshModels` or its absence through).
+    fn has_refresh_models(&self) -> bool {
+        self.inner.has_refresh_models()
+    }
+
     /// PROV-S05 — the context is forwarded UNCHANGED. pi's spread carries `refreshModels` through
     /// with its argument intact (`remote-catalog-provider.ts:54` @v0.83.0); dropping `allow_network`,
     /// `force` or the abort token here would make an overlaid provider silently un-cancellable.

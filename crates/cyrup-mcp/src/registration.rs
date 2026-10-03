@@ -80,10 +80,12 @@ use crate::proxy::constants::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 // Constants
 // ---------------------------------------------------------------------------------------------
 
-/// The `--mcp-config` flag. Registered for `--help` even though its value is read from argv:
-/// `ExtensionHost::apply_extension_flag_values` runs *after* the native-load loop, so `init` cannot
-/// see the flag store — but an unreconciled `--flag` is itself a startup diagnostic, so registering
-/// it is not optional (MCP-002).
+/// The `--mcp-config` flag. Registered for `--help` and so the CLI can reconcile it (an unreconciled
+/// `--flag` is itself a startup diagnostic, MCP-002). Its value is read through
+/// `HostServices::flag_value` (pi's `pi.getFlag`) by `McpExtension::config_flag_path`, which falls
+/// back to argv for `init`: `ExtensionHost::apply_extension_flag_values` runs *after* the
+/// native-load loop, so `init` cannot see the override yet — as in pi, whose `index.ts:367` also
+/// reads argv at init.
 pub const MCP_CONFIG_FLAG: &str = "mcp-config";
 
 /// The gateway tool. On a cold cache this is the **only** model-facing MCP surface, which is why
