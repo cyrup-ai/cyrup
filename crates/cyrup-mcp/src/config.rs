@@ -942,13 +942,15 @@ pub struct ServerEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub search_keywords: Option<IndexMap<String, Vec<String>>>,
-    /// Which of this server's tools skip the approval prompt. Present beats the global.
+    /// Which of this server's tools prompt before they run. Present beats the global — including
+    /// a present `false`. See [`ApproveTools`]; an unparseable value lands in
+    /// [`ApproveTools::Other`] and makes the gate answer `true` (MCP-602).
     #[serde(
         default,
         deserialize_with = "lenient",
         skip_serializing_if = "Option::is_none"
     )]
-    pub approve_tools: Option<BoolOrList>,
+    pub approve_tools: Option<ApproveTools>,
     /// `true` ⇒ the child's stderr is **inherited** (visible in the terminal); `false`/absent ⇒
     /// piped. rmcp's `TokioChildProcessBuilder` defaults to `Stdio::inherit()`, so the port sets
     /// `.stderr(Stdio::piped())` on the `false` arm rather than the other way round.
@@ -1157,13 +1159,13 @@ pub struct McpSettings {
         skip_serializing_if = "Option::is_none"
     )]
     pub collapsed_result_lines: Option<u8>,
-    /// Global approval policy; a present per-server value wins.
+    /// Global approval policy; a present per-server value wins. See [`ApproveTools`] (MCP-602).
     #[serde(
         default,
         deserialize_with = "lenient",
         skip_serializing_if = "Option::is_none"
     )]
-    pub approve_tools: Option<BoolOrList>,
+    pub approve_tools: Option<ApproveTools>,
     /// Default `false`, tested `!== true` — the proxy tool survives unless this is literally
     /// `true`. **If HA-1 (late tool registration) is not built, this must be treated as
     /// unsupported**: on a cold cache the proxy tool is the *only* model-facing surface.
@@ -1409,7 +1411,7 @@ impl McpSettings {
     /// `definition.approveTools !== undefined ? definition.approveTools : settings.approveTools`
     /// and *presence* is what wins.
     #[must_use]
-    pub fn approve_tools(&self) -> Option<&BoolOrList> {
+    pub fn approve_tools(&self) -> Option<&ApproveTools> {
         self.approve_tools.as_ref()
     }
 
@@ -1832,8 +1834,11 @@ pub enum OAuthGrantType {
     ClientCredentials,
 }
 
-/// `boolean | string[]` — `directTools` and `approveTools`. The distinction that matters is
-/// *presence*, not truthiness: a per-server value that exists at all overrides the global.
+/// `boolean | string[]` — `directTools`. The distinction that matters is *presence*, not
+/// truthiness: a per-server value that exists at all overrides the global.
+///
+/// `approveTools` shared this type until MCP-602 and now has its own, [`ApproveTools`]; that type's
+/// documentation says why the two cannot be one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BoolOrList {
@@ -1841,6 +1846,103 @@ pub enum BoolOrList {
     All(bool),
     /// An explicit name list.
     Named(Vec<String>),
+}
+
+/// `approveTools: boolean | "destructive" | string[]`, plus a catch-all that fails **closed**
+/// (MCP-602).
+///
+/// `types.ts:495` (per server) and `types.ts:670` (global) `@v5.0.0`, read as
+/// `isToolCallApprovalRequired` (`tool-approval.ts:25-44 @v5.0.0`) consumes them.
+///
+/// # Why this is not [`BoolOrList`]
+///
+/// Upstream's two types are not the same type — `directTools` is `boolean | string[] | "search"`
+/// and `approveTools` is `boolean | "destructive" | string[]` — and, the half that matters, the two
+/// consumers answer an unparseable value in **opposite directions**. `approveTools` feeds a security
+/// gate whose unparseable arm is upstream's `if (!Array.isArray(approval)) return true;`, while
+/// `directTools` feeds `resolve_direct_tool_filter`, where the same value is an ordinary
+/// `ToolFilter::Off`. Folding a `Destructive` and a catch-all into [`BoolOrList`] would hand both
+/// variants to `directTools`, where neither has a meaning, and would make that filter's exhaustive
+/// match pick one by accident.
+///
+/// # The catch-all is the fix, and keeping [`lenient`] is the constraint
+///
+/// Every field in this module is read through [`lenient`], which degrades a type mismatch to `None`
+/// because upstream's `validateConfig` *cannot* fail a file on a wrong-typed field — see that
+/// function's own documentation. For `approveTools` that degradation was a fail-**open**: `None` is
+/// indistinguishable from absent, and absent means "never ask". So `"approveTools": "destructive"`,
+/// the value v5.0.0's README documents for precisely the user who wants to be asked, matched neither
+/// the bool nor the list variant and switched approval **off** for every tool on that server. A typo
+/// such as `"approveTools": "all"` did the same thing, silently.
+///
+/// [`ApproveTools::Other`] keeps [`lenient`]'s guarantee — the file still loads and every other
+/// server survives — while making the mismatch *visible* to the gate, which is what lets the gate
+/// answer `true`. [`validate_config`] additionally names the key in a [`ConfigDiagnostic`], which is
+/// the port's form of upstream's compile-time rejection of such a value in an adapter config file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApproveTools {
+    /// `true` — ask before every tool on this scope. `false` — never ask, and a per-server `false`
+    /// beats a global `true` because presence is what wins.
+    All(bool),
+    /// `"destructive"` — ask unless the tool is a resource read or the server marked it harmless.
+    Destructive,
+    /// A glob-or-exact name list. A non-string member is dropped rather than poisoning the whole
+    /// value, which is `matchesToolPattern`'s own
+    /// `if (typeof pattern !== "string") continue;` (`types.ts:1049 @v5.0.0`) — upstream still
+    /// treats such an array as an array, so it must not reach [`Self::Other`].
+    Named(Vec<String>),
+    /// Anything else: a typo'd string, a number, an object, an explicit `null`. Upstream's
+    /// `if (!Array.isArray(approval)) return true;` requires approval for every one of these, and
+    /// the raw value is kept so a config rewrite gives the user's bytes back unchanged.
+    Other(RawJson),
+}
+
+impl ApproveTools {
+    /// The one string literal the type admits.
+    pub const DESTRUCTIVE: &'static str = "destructive";
+
+    /// Classify a parsed JSON value. Total by construction: every shape upstream's type does not
+    /// admit lands in [`Self::Other`].
+    #[must_use]
+    pub fn from_raw(raw: RawJson) -> Self {
+        match raw {
+            RawJson::Bool(value) => Self::All(value),
+            RawJson::String(text) if text == Self::DESTRUCTIVE => Self::Destructive,
+            RawJson::Array(items) => Self::Named(
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect(),
+            ),
+            other => Self::Other(other),
+        }
+    }
+
+    /// `false` only for [`Self::Other`] — the values that earn a load-time diagnostic and require
+    /// approval.
+    #[must_use]
+    pub fn is_recognized(&self) -> bool {
+        !matches!(self, Self::Other(_))
+    }
+}
+
+impl Serialize for ApproveTools {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::All(value) => serializer.serialize_bool(*value),
+            Self::Destructive => serializer.serialize_str(Self::DESTRUCTIVE),
+            Self::Named(list) => list.serialize(serializer),
+            Self::Other(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ApproveTools {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Through [`RawJson`] rather than an `untagged` derive: the derive has no way to pin the
+        // `"destructive"` literal, and its failure mode is an error, not a catch-all.
+        Ok(Self::from_raw(RawJson::deserialize(deserializer)?))
+    }
 }
 
 /// `outputGuard: boolean | {maxBytes, maxLines, detailsMaxBytes}`.
@@ -2129,7 +2231,11 @@ pub fn validate_config(
                 .collect()
         })
         .unwrap_or_default();
-    let settings = root.get("settings").and_then(raw_to::<McpSettings>);
+    let raw_settings = root.get("settings");
+    let settings = raw_settings.and_then(raw_to::<McpSettings>);
+    if let Some(raw_settings) = raw_settings {
+        warn_unrecognized_approve_tools(raw_settings, "`settings`", path, None, diagnostics);
+    }
     McpConfig {
         mcp_servers: servers,
         settings,
@@ -2210,12 +2316,63 @@ pub fn to_server_entries(
             });
             continue;
         }
+        warn_unrecognized_approve_tools(
+            raw_entry,
+            &format!("MCP server \"{name}\""),
+            path,
+            Some(name),
+            diagnostics,
+        );
         // Cannot fail: the root is an object and every field is `lenient`.
         if let Some(entry) = raw_to::<ServerEntry>(raw_entry) {
             out.insert(name.clone(), entry);
         }
     }
     out
+}
+
+/// `approveTools` carries a value this build cannot read — name the key (MCP-602).
+///
+/// Upstream rejects such a value in an adapter config file at the type level: `approveTools` is
+/// `boolean | "destructive" | string[]`, so a config file carrying anything else fails to compile
+/// with an error naming the key, and the commit that widened the type
+/// (`a4b3e90`, #731, `pi-mcp-adapter` v3.3.0; still the shape at the v5.0.0 pin) records exactly
+/// that — "Adapter config files with one
+/// are now rejected with a warning naming the key, and such values from other sources require
+/// approval." A JSONC file has no compiler, so the port says the same thing at load.
+///
+/// The entry is **not** dropped, which is the difference from the `socket` and `oauth` arms above.
+/// Upstream keeps the value and lets `isToolCallApprovalRequired` fail closed on it; dropping the
+/// entry here would instead let a lower-precedence definition of that server win, and that
+/// definition may carry no `approveTools` at all — turning a loud mistake back into a silent
+/// fail-open.
+fn warn_unrecognized_approve_tools(
+    raw: &RawJson,
+    scope: &str,
+    path: &Path,
+    server: Option<&str>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let Some(value) = raw.get("approveTools") else {
+        return;
+    };
+    if ApproveTools::from_raw(value.clone()).is_recognized() {
+        return;
+    }
+    let rendered =
+        serde_json::to_string(value).unwrap_or_else(|_| "an unprintable value".to_string());
+    let message = format!(
+        "{scope} in {} sets `approveTools` to {rendered}, which is not `true`, `false`, \
+         \"destructive\", or a list of tool-name patterns; every tool in that scope now requires \
+         approval until it is corrected.",
+        path.display()
+    );
+    tracing::warn!("{message}");
+    diagnostics.push(ConfigDiagnostic {
+        path: path.to_path_buf(),
+        server: server.map(str::to_string),
+        message,
+    });
 }
 
 /// `readValidatedConfig(path, label)` — non-existent ⇒ `None`; a parse throw ⇒
@@ -6098,6 +6255,142 @@ mod tests {
             typed.idle_timeout.is_none(),
             "a wrong-typed FIELD degrades to None, not to an error"
         );
+    }
+
+    // -- MCP-602 -------------------------------------------------------------------------------
+
+    /// `approveTools` must pin every value `types.ts:495`/`:670 @v5.0.0` documents — `true`,
+    /// `false`, `"destructive"`, a pattern list — and must **remember** anything else instead of
+    /// degrading it to `None`. `None` is indistinguishable from absent, and absent means "never
+    /// ask", so the old `lenient`-over-`BoolOrList` reading turned `"destructive"` into the exact
+    /// opposite of what the user asked for.
+    #[test]
+    fn approve_tools_pins_every_documented_value_and_remembers_an_unreadable_one() {
+        let mut diagnostics = Vec::new();
+        let document = parse_json_config(
+            "{\"settings\":{\"approveTools\":\"destructive\"},\
+             \"mcpServers\":{\
+             \"asks\":{\"command\":\"a\",\"approveTools\":true},\
+             \"never\":{\"command\":\"n\",\"approveTools\":false},\
+             \"listed\":{\"command\":\"l\",\"approveTools\":[\"delete_*\",7]},\
+             \"typo\":{\"command\":\"t\",\"approveTools\":\"all\"}}}",
+            "test",
+        )
+        .unwrap();
+        let config = validate_config(&document, Path::new("test"), &mut diagnostics);
+
+        assert_eq!(
+            config.settings.as_ref().unwrap().approve_tools,
+            Some(ApproveTools::Destructive),
+            "`\"destructive\"` is a documented value; reading it as `None` disabled approval"
+        );
+        let value = |name: &str| {
+            config
+                .mcp_servers
+                .get(name)
+                .unwrap()
+                .approve_tools
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(value("asks"), ApproveTools::All(true));
+        assert_eq!(value("never"), ApproveTools::All(false));
+        assert_eq!(
+            value("listed"),
+            ApproveTools::Named(vec!["delete_*".to_string()]),
+            "an array stays an array with its non-string members dropped, because \
+             `matchesToolPattern` skips a non-string pattern and still treats the value as a list"
+        );
+        assert_eq!(
+            value("typo"),
+            ApproveTools::Other(RawJson::String("all".to_string())),
+            "an unreadable value is remembered so the gate can fail CLOSED on it"
+        );
+        assert!(
+            config.mcp_servers.contains_key("typo"),
+            "the entry survives: dropping it would let a lower-precedence definition carrying no \
+             `approveTools` win, which is the fail-open all over again"
+        );
+    }
+
+    /// The load-time diagnostic names the key, names the value, and names the server (MCP-602) —
+    /// the port's stand-in for upstream rejecting such a value in an adapter config file at the
+    /// type level.
+    #[test]
+    fn an_unreadable_approve_tools_value_is_named_at_load() {
+        let mut diagnostics = Vec::new();
+        let document = parse_json_config(
+            "{\"settings\":{\"approveTools\":{\"ask\":true}},\
+             \"mcpServers\":{\
+             \"typo\":{\"command\":\"t\",\"approveTools\":\"all\"},\
+             \"fine\":{\"command\":\"f\",\"approveTools\":\"destructive\"}}}",
+            "test",
+        )
+        .unwrap();
+        let config = validate_config(&document, Path::new("test"), &mut diagnostics);
+        assert_eq!(
+            config
+                .mcp_servers
+                .get("fine")
+                .unwrap()
+                .approve_tools
+                .clone()
+                .unwrap(),
+            ApproveTools::Destructive,
+            "a readable value on a sibling server is untouched by the complaint"
+        );
+
+        let named: Vec<&ConfigDiagnostic> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("approveTools"))
+            .collect();
+        assert_eq!(
+            named.len(),
+            2,
+            "one per unreadable scope, and `\"destructive\"` is not one of them: {diagnostics:?}"
+        );
+        let per_server = named
+            .iter()
+            .find(|diagnostic| diagnostic.server.as_deref() == Some("typo"))
+            .unwrap();
+        assert!(
+            per_server.message.contains("\"all\""),
+            "the offending value is quoted back: {}",
+            per_server.message
+        );
+        let global = named
+            .iter()
+            .find(|diagnostic| diagnostic.server.is_none())
+            .unwrap();
+        assert!(
+            global.message.contains("`settings`"),
+            "the global scope is named too: {}",
+            global.message
+        );
+    }
+
+    /// Every shape round-trips, [`ApproveTools::Other`] included — a `/mcp` config rewrite must
+    /// hand the user's own bytes back rather than silently normalising a value it could not read.
+    #[test]
+    fn approve_tools_round_trips_including_the_unreadable_value() {
+        for (value, json) in [
+            (ApproveTools::All(true), "true"),
+            (ApproveTools::All(false), "false"),
+            (ApproveTools::Destructive, "\"destructive\""),
+            (ApproveTools::Named(Vec::new()), "[]"),
+            (
+                ApproveTools::Named(vec!["delete_*".to_string()]),
+                "[\"delete_*\"]",
+            ),
+            (
+                ApproveTools::Other(RawJson::String("all".to_string())),
+                "\"all\"",
+            ),
+            (ApproveTools::Other(RawJson::Null), "null"),
+        ] {
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+            assert_eq!(serde_json::from_str::<ApproveTools>(json).unwrap(), value);
+        }
     }
 
     #[test]

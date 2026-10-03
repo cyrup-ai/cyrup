@@ -8,7 +8,7 @@ use serde_json::{Map as JsonMap, Value};
 
 use cyrup_core::CancelToken;
 
-use crate::config::{BoolOrList, McpConfig, ToolPrefix};
+use crate::config::{ApproveTools, McpConfig, ToolPrefix};
 use crate::proxy::constants::{
     APPROVAL_OPTIONS, APPROVAL_PREVIEW_LENGTH, APPROVE_FOR_SESSION_OPTION, APPROVE_ONCE_OPTION,
 };
@@ -37,14 +37,20 @@ use crate::state::McpState;
 // forwards to it in two lines. Anything else would put the gate somewhere a direct tool
 // (`direct-tools.ts:432`, which has no `ProxyEnv` at all) cannot reach it.
 
-/// `tool-approval.ts:35-93 @v2.26.1` `isToolCallApprovalRequired(config, serverName, toolMeta,
-/// toolMetadata?)` — does this tool prompt before it runs? (MCP-231)
+/// `tool-approval.ts:25-93 @v5.0.0` (was `:35-93 @v2.26.1`)
+/// `isToolCallApprovalRequired(config, serverName, toolMeta, toolMetadata?)` — does this tool
+/// prompt before it runs? (MCP-231, MCP-602)
 ///
-/// # The ladder
+/// # The ladder, and which way it fails
 ///
 /// A per-server `approveTools` wins on **presence**, not on truthiness: `approveTools: false` on a
-/// server switches approval off for it even when the global setting is `true`. `true` always
-/// requires; anything that is not a non-empty list never does.
+/// server switches approval off for it even when the global setting is `true`. Only `undefined`,
+/// `false` and an empty list switch the gate off; `true` and `"destructive"` are the two values that
+/// ask, and **everything else asks too** — upstream's `if (!Array.isArray(approval)) return true;`
+/// (MCP-602). That arm is the whole point of [`ApproveTools::Other`]: a value this build cannot
+/// read must not read as "never ask", which is what it did while `approveTools` shared
+/// `BoolOrList` and went through `lenient` — `"approveTools": "destructive"`, copied from
+/// upstream's README, silently disabled approval for the server it was written on.
 ///
 /// # The legacy arm, and the collision test that makes it safe
 ///
@@ -86,13 +92,19 @@ pub fn is_tool_call_approval_required(
         Some(value) => Some(value),
         None => config.settings_or_default().approve_tools(),
     };
+    // Upstream's ladder, in upstream's order, and the order is the security property — the
+    // default direction is to ask (`tool-approval.ts:34-43 @v5.0.0`).
     let patterns: &[String] = match approval {
-        // `if (approval === true) return true;`
-        Some(BoolOrList::All(true)) => return true,
-        Some(BoolOrList::Named(list)) if !list.is_empty() => list.as_slice(),
-        // `if (!Array.isArray(approval) || approval.length === 0) return false;` — which is
-        // `false`, an empty list, and an absent value alike.
-        _ => return false,
+        // `if (approval === undefined || approval === false) return false;`
+        None | Some(ApproveTools::All(false)) => return false,
+        // `if (approval === "destructive") { ... }`
+        Some(ApproveTools::Destructive) => return destructive_gate(tool),
+        // `if (!Array.isArray(approval)) return true;` — `true` and every value this build
+        // could not read, together, because neither is an array. Fail CLOSED.
+        Some(ApproveTools::All(true) | ApproveTools::Other(_)) => return true,
+        // `if (approval.length === 0) return false;`
+        Some(ApproveTools::Named(list)) if list.is_empty() => return false,
+        Some(ApproveTools::Named(list)) => list.as_slice(),
     };
 
     let prefix = resolve_tool_prefix(definition, config.tool_prefix());
@@ -157,6 +169,33 @@ pub fn is_tool_call_approval_required(
         &current,
         other_current,
     )
+}
+
+/// `approveTools: "destructive"` — `tool-approval.ts:36-40 @v5.0.0`.
+///
+/// ```text
+/// return toolMeta.resourceUri === undefined
+///   && toolMeta.annotations?.readOnlyHint !== true
+///   && toolMeta.annotations?.destructiveHint !== false;
+/// ```
+///
+/// Upstream's comment is the specification: "MCP treats a tool as possibly destructive unless it
+/// says otherwise; reading a resource never is." So an **unannotated** tool is gated — the two hint
+/// tests are `!== true` and `!== false`, not `=== false` and `=== true`, and both pass when
+/// `annotations` is absent. Resource reads are the one exemption.
+///
+/// # The two hint terms are MCP-601's data, and both are vacuous here
+///
+/// `ToolMetadata` carries no `annotations` yet — that field, `extractToolAnnotations`, and its
+/// cache round-trip are MCP-601 (`2bc904f`, #728, `pi-mcp-adapter` v3.3.0), which is not ported.
+/// Every tool this build knows is therefore unannotated, which is the case both hint terms are
+/// written to pass, so this function is upstream's expression with its two always-true conjuncts
+/// elided rather than an approximation of it. The residual is MCP-601's, not this gate's: a server
+/// that marks a tool `readOnlyHint: true` or `destructiveHint: false` is prompted for here and is
+/// not upstream, because the hint never reaches cyrup to be read. When MCP-601 lands, the two terms
+/// come back here verbatim and this doc comment goes away.
+fn destructive_gate(tool: &ToolMetadata) -> bool {
+    tool.resource_uri.is_none()
 }
 
 /// The tail both scopes of [`is_tool_call_approval_required`] share (`tool-approval.ts:53-67 @v2.26.1`,
@@ -494,7 +533,7 @@ mod tests {
     }
 
     /// `{ mcpServers: { demo: { command: "demo", approveTools } } }`.
-    fn demo_config(approve: Option<BoolOrList>) -> McpConfig {
+    fn demo_config(approve: Option<ApproveTools>) -> McpConfig {
         let mut config = config_with(&[("demo", stdio("demo"))]);
         if let Some(entry) = config.mcp_servers.get_mut("demo") {
             entry.approve_tools = approve;
@@ -504,7 +543,7 @@ mod tests {
 
     fn settings_approving(patterns: &[&str]) -> Option<McpSettings> {
         Some(McpSettings {
-            approve_tools: Some(BoolOrList::Named(
+            approve_tools: Some(ApproveTools::Named(
                 patterns.iter().map(|p| (*p).to_string()).collect(),
             )),
             ..McpSettings::default()
@@ -517,7 +556,9 @@ mod tests {
     /// **no** `toolMetadata`, which is also the only path that reaches the `None` asymmetry.
     #[test]
     fn approval_matches_original_prefixed_and_resource_tool_names() {
-        let by_original = demo_config(Some(BoolOrList::Named(vec!["search-records".to_string()])));
+        let by_original = demo_config(Some(ApproveTools::Named(vec![
+            "search-records".to_string(),
+        ])));
         assert!(is_tool_call_approval_required(
             &by_original,
             "demo",
@@ -525,7 +566,7 @@ mod tests {
             None
         ));
 
-        let by_prefixed = demo_config(Some(BoolOrList::Named(vec![
+        let by_prefixed = demo_config(Some(ApproveTools::Named(vec![
             "demo_search-records".to_string(),
         ])));
         assert!(is_tool_call_approval_required(
@@ -591,7 +632,7 @@ mod tests {
 
         let mut server_scope = config_with(&[("my-server", stdio("demo"))]);
         if let Some(entry) = server_scope.mcp_servers.get_mut("my-server") {
-            entry.approve_tools = Some(BoolOrList::Named(vec!["my_server_do_thing".to_string()]));
+            entry.approve_tools = Some(ApproveTools::Named(vec!["my_server_do_thing".to_string()]));
         }
         assert!(is_tool_call_approval_required(
             &server_scope,
@@ -641,12 +682,12 @@ mod tests {
     #[test]
     fn the_approval_ladder_reads_presence_not_truthiness() {
         let tool = demo_tool();
-        let always = demo_config(Some(BoolOrList::All(true)));
+        let always = demo_config(Some(ApproveTools::All(true)));
         assert!(is_tool_call_approval_required(&always, "demo", &tool, None));
 
-        let mut server_off = demo_config(Some(BoolOrList::All(false)));
+        let mut server_off = demo_config(Some(ApproveTools::All(false)));
         server_off.settings = Some(McpSettings {
-            approve_tools: Some(BoolOrList::All(true)),
+            approve_tools: Some(ApproveTools::All(true)),
             ..McpSettings::default()
         });
         assert!(
@@ -654,7 +695,7 @@ mod tests {
             "a per-server `false` overrides a global `true` — presence wins, not truthiness"
         );
 
-        let empty = demo_config(Some(BoolOrList::Named(Vec::new())));
+        let empty = demo_config(Some(ApproveTools::Named(Vec::new())));
         assert!(!is_tool_call_approval_required(&empty, "demo", &tool, None));
         assert!(!is_tool_call_approval_required(
             &demo_config(None),
@@ -662,6 +703,109 @@ mod tests {
             &tool,
             None
         ));
+    }
+
+    // -- MCP-602 -------------------------------------------------------------------------------
+
+    /// `tool-approval.ts:34-43 @v5.0.0`, one row per value, and the last two rows are the bug:
+    /// anything that is neither `undefined`, `false`, `"destructive"` nor an array is **not an
+    /// array**, so upstream's `if (!Array.isArray(approval)) return true;` requires approval for it.
+    /// Before MCP-602 these values went through `lenient` to `None` and read as absent — the gate
+    /// answered `false` and every tool on the server ran unprompted, which is a fail-OPEN produced
+    /// by copying a documented value out of upstream's README.
+    ///
+    /// Each value is parsed from JSON rather than constructed, so the deserialiser is on the hook
+    /// too: a variant that cannot be *reached* from `mcp.json` would make the gate untestable from
+    /// a user's file.
+    #[test]
+    fn approve_tools_fails_closed_on_a_value_it_cannot_read() {
+        let tool = demo_tool();
+        for (json, expected, why) in [
+            ("true", true, "`true` gates every tool"),
+            ("false", false, "`false` is one of the three off values"),
+            ("[]", false, "`approval.length === 0` returns false"),
+            (
+                "[\"demo_search-records\"]",
+                true,
+                "a matching pattern gates its tool",
+            ),
+            ("[\"other_tool\"]", false, "a non-matching pattern does not"),
+            (
+                "\"destructive\"",
+                true,
+                "the v5.0.0 value: an unannotated, non-resource tool is gated",
+            ),
+            (
+                "\"all\"",
+                true,
+                "a plausible typo is not an array, so it must FAIL CLOSED — this is MCP-602",
+            ),
+            (
+                "\"Destructive\"",
+                true,
+                "the literal is case-sensitive upstream, and the near miss fails closed",
+            ),
+            ("42", true, "a number is not an array"),
+            ("{\"ask\":true}", true, "an object is not an array"),
+            (
+                "null",
+                true,
+                "an explicit null is not `undefined`, so it is not the off value",
+            ),
+        ] {
+            let parsed: ApproveTools = serde_json::from_str(json).unwrap();
+            let config = demo_config(Some(parsed));
+            assert_eq!(
+                is_tool_call_approval_required(&config, "demo", &tool, None),
+                expected,
+                "approveTools {json}: {why}"
+            );
+        }
+    }
+
+    /// The same ladder read off `settings.approveTools` rather than the server entry, because the
+    /// README documents `"destructive"` globally first and the global rung is the one a user reaches
+    /// for.
+    #[test]
+    fn the_global_scope_fails_closed_on_the_same_values() {
+        let tool = demo_tool();
+        for (json, expected) in [
+            ("\"destructive\"", true),
+            ("\"all\"", true),
+            ("false", false),
+            ("[]", false),
+        ] {
+            let mut config = demo_config(None);
+            config.settings = Some(McpSettings {
+                approve_tools: Some(serde_json::from_str(json).unwrap()),
+                ..McpSettings::default()
+            });
+            assert_eq!(
+                is_tool_call_approval_required(&config, "demo", &tool, None),
+                expected,
+                "settings.approveTools {json}"
+            );
+        }
+    }
+
+    /// `"destructive"`'s one exemption: "reading a resource never is" (`tool-approval.ts:35`).
+    /// A resource tool carries a `resourceUri`; an ordinary tool does not and is gated even with no
+    /// annotations at all, because upstream's two hint tests are `!== true` and `!== false` and both
+    /// pass when `annotations` is absent.
+    #[test]
+    fn approve_tools_destructive_exempts_a_resource_read_only() {
+        let config = demo_config(Some(ApproveTools::Destructive));
+        let mut resource = demo_tool();
+        resource.resource_uri = Some("file:///notes.md".to_string());
+        assert!(
+            !is_tool_call_approval_required(&config, "demo", &resource, None),
+            "a resource read is never gated by `\"destructive\"`"
+        );
+        assert!(
+            is_tool_call_approval_required(&config, "demo", &demo_tool(), None),
+            "an unannotated tool IS gated — MCP treats a tool as possibly destructive unless the \
+             server says otherwise"
+        );
     }
 
     /// The `tool_metadata == None` asymmetry 13e names: with no collision context the **server**
@@ -672,7 +816,7 @@ mod tests {
 
         let mut server_scope = config_with(&[("my-server", stdio("demo"))]);
         if let Some(entry) = server_scope.mcp_servers.get_mut("my-server") {
-            entry.approve_tools = Some(BoolOrList::Named(vec!["my_server_do_thing".to_string()]));
+            entry.approve_tools = Some(ApproveTools::Named(vec!["my_server_do_thing".to_string()]));
         }
         assert!(is_tool_call_approval_required(
             &server_scope,
@@ -703,7 +847,7 @@ mod tests {
         let args = json!({ "query": "private" });
 
         // `createState({approveTools: true, interactive: false})`.
-        let headless = approval_state(demo_config(Some(BoolOrList::All(true))), None);
+        let headless = approval_state(demo_config(Some(ApproveTools::All(true))), None);
         assert_eq!(
             ensure_tool_call_approved(
                 &headless,
@@ -722,7 +866,7 @@ mod tests {
         // `undefined`.
         let ui = ScriptedUi::answering(None);
         let interactive = approval_state(
-            demo_config(Some(BoolOrList::All(true))),
+            demo_config(Some(ApproveTools::All(true))),
             Some(Arc::clone(&ui)),
         );
         assert_eq!(
@@ -754,7 +898,7 @@ mod tests {
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(APPROVE_FOR_SESSION_OPTION));
         let state = approval_state(
-            demo_config(Some(BoolOrList::All(true))),
+            demo_config(Some(ApproveTools::All(true))),
             Some(Arc::clone(&ui)),
         );
 
@@ -794,7 +938,7 @@ mod tests {
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(APPROVE_ONCE_OPTION));
         let state = approval_state(
-            demo_config(Some(BoolOrList::All(true))),
+            demo_config(Some(ApproveTools::All(true))),
             Some(Arc::clone(&ui)),
         );
 
@@ -826,7 +970,7 @@ mod tests {
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         for answer in [DENY_OPTION, "Allow", "allow once", ""] {
             let ui = ScriptedUi::answering(Some(answer));
-            let state = approval_state(demo_config(Some(BoolOrList::All(true))), Some(ui));
+            let state = approval_state(demo_config(Some(ApproveTools::All(true))), Some(ui));
             assert_eq!(
                 ensure_tool_call_approved(
                     &state,
@@ -891,7 +1035,7 @@ mod tests {
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(APPROVE_ONCE_OPTION));
         let state = approval_state(
-            demo_config(Some(BoolOrList::All(true))),
+            demo_config(Some(ApproveTools::All(true))),
             Some(Arc::clone(&ui)),
         );
         let cancel = CancelToken::new();
@@ -914,7 +1058,7 @@ mod tests {
 
         // The generation's own token is the other half of `combineAbortSignals(state.owner.signal,
         // signal)`: a stopped generation denies just as an aborted caller does.
-        let stopped = approval_state(demo_config(Some(BoolOrList::All(true))), Some(ui));
+        let stopped = approval_state(demo_config(Some(ApproveTools::All(true))), Some(ui));
         let _ = stopped.owner.stop(None).await;
         assert_eq!(
             ensure_tool_call_approved(
@@ -938,7 +1082,7 @@ mod tests {
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(APPROVE_ONCE_OPTION));
         let state = approval_state(
-            demo_config(Some(BoolOrList::All(true))),
+            demo_config(Some(ApproveTools::All(true))),
             Some(Arc::clone(&ui)),
         );
 
@@ -985,7 +1129,7 @@ mod tests {
         let metadata = metadata_with(&[("evil\u{7}server", vec![tool.clone()])]);
         let mut config = config_with(&[("evil\u{7}server", stdio("demo"))]);
         if let Some(entry) = config.mcp_servers.get_mut("evil\u{7}server") {
-            entry.approve_tools = Some(BoolOrList::All(true));
+            entry.approve_tools = Some(ApproveTools::All(true));
         }
         let ui = ScriptedUi::answering(Some(DENY_OPTION));
         let state = approval_state(config, Some(Arc::clone(&ui)));
@@ -1032,7 +1176,7 @@ mod tests {
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(DENY_OPTION));
         let state = approval_state(
-            demo_config(Some(BoolOrList::All(true))),
+            demo_config(Some(ApproveTools::All(true))),
             Some(Arc::clone(&ui)),
         );
 
@@ -1081,7 +1225,7 @@ mod tests {
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::watching(Some(DENY_OPTION), Arc::clone(&gate));
         let state = approval_state(
-            demo_config(Some(BoolOrList::All(true))),
+            demo_config(Some(ApproveTools::All(true))),
             Some(Arc::clone(&ui)),
         );
 
@@ -1129,7 +1273,7 @@ mod tests {
         let tool = demo_tool();
         let ui = ScriptedUi::answering(Some(DENY_OPTION));
         let state = approval_state(
-            demo_config(Some(BoolOrList::All(true))),
+            demo_config(Some(ApproveTools::All(true))),
             Some(Arc::clone(&ui)),
         );
         let ctx = Arc::new(ProxyCtx::new(
