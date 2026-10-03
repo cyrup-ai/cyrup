@@ -1,0 +1,47 @@
+error[E0308]: mismatched types
+  --> tests/compile-fail/seq_is_not_an_id.rs:15:20
+   |
+15 |     needs_an_entry(seq);
+   |     -------------- ^^^ expected `Id<Entry>`, found `Seq`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected struct `Id<cyrup_pico_store::Entry>`
+              found struct `Seq`
+note: function defined here
+  --> tests/compile-fail/seq_is_not_an_id.rs:8:4
+   |
+ 8 | fn needs_an_entry(_id: EntryId) {}
+   |    ^^^^^^^^^^^^^^ ------------
+
+error[E0308]: mismatched types
+  --> tests/compile-fail/seq_is_not_an_id.rs:16:22
+   |
+16 |     needs_a_sequence(id);
+   |     ---------------- ^^ expected `Seq`, found `Id<Entry>`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected struct `Seq`
+              found struct `Id<cyrup_pico_store::Entry>`
+note: function defined here
+  --> tests/compile-fail/seq_is_not_an_id.rs:9:4
+   |
+ 9 | fn needs_a_sequence(_seq: Seq) {}
+   |    ^^^^^^^^^^^^^^^^ ---------
+
+error[E0308]: mismatched types
+  --> tests/compile-fail/seq_is_not_an_id.rs:19:51
+   |
+19 |     let _point: DocumentPoint = DocumentPoint::At(id);
+   |                                 ----------------- ^^ expected `Seq`, found `Id<Entry>`
+   |                                 |
+   |                                 arguments to this enum variant are incorrect
+   |
+   = note: expected struct `Seq`
+              found struct `Id<cyrup_pico_store::Entry>`
+note: tuple variant defined here
+  --> src/seq.rs
+   |
+   |     At(Seq),
+   |     ^^

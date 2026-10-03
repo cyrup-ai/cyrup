@@ -1,0 +1,20 @@
+error[E0599]: no method named `session` found for struct `UncertainCommit` in the current scope
+  --> tests/compile-fail/a_session_mut_cannot_be_obtained_from_an_uncertain_outcome.rs:18:11
+   |
+18 |     fatal.session()
+   |           ^^^^^^^ method not found in `UncertainCommit`
+
+error[E0026]: variant `Uncertain` does not have a field named `session`
+  --> tests/compile-fail/a_session_mut_cannot_be_obtained_from_an_uncertain_outcome.rs:24:36
+   |
+24 |         CommitOutcome::Uncertain { session, .. } => session,
+   |                                    ^^^^^^^
+   |                                    |
+   |                                    variant `Uncertain` does not have this field
+   |                                    help: `Uncertain` has a field named `0`
+
+error[E0599]: no method named `into_session` found for struct `UncertainCommit` in the current scope
+  --> tests/compile-fail/a_session_mut_cannot_be_obtained_from_an_uncertain_outcome.rs:35:29
+   |
+35 |         Err(fatal) => fatal.into_session(),
+   |                             ^^^^^^^^^^^^ method not found in `UncertainCommit`

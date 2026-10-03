@@ -1,0 +1,5 @@
+error[E0596]: cannot borrow data in a `&` reference as mutable
+  --> tests/compile-fail/a_built_batch_cannot_take_a_second_command.rs:25:5
+   |
+25 |     batch.documents().insert(id, DocumentCommand::RetireOnly);
+   |     ^^^^^^^^^^^^^^^^^ cannot borrow as mutable

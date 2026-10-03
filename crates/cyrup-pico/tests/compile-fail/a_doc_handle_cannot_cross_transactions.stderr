@@ -1,0 +1,12 @@
+error: lifetime may not live long enough
+  --> tests/compile-fail/a_doc_handle_cannot_cross_transactions.rs:38:36
+   |
+38 |           .commit(cx, async |mut tx| {
+   |  ____________________________-------_^
+   | |                            |     |
+   | |                            |     return type of async closure `{async closure body@$DIR/tests/compile-fail/a_doc_handle_cannot_cross_transactions.rs:38:36: 41:10}` contains a lifetime `'2`
+   | |                            has type `cyrup_pico::Tx<'1, Reading>`
+39 | |             let handle = tx.doc(&address, ()).await?;
+40 | |             Ok((handle, tx.writing()))
+41 | |         })
+   | |_________^ returning this value requires that `'1` must outlive `'2`

@@ -28,6 +28,38 @@ members = [
     "crates/cyrup-acp",
     "crates/cyrup-llama",
     "crates/cyrup-it",
+    # PICO5-PLAN S1: the durability kernel's identity and value newtypes, and (from S3) the
+    # storage contract. A plain library -- no C, no build script -- so it is in default-members
+    # too. The SQLite backend is the one crate in ADR-0030 §8 that must stay OUT of
+    # default-members, and it is not written yet.
+    "crates/cyrup-pico-store",
+    # PICO5-PLAN S2: the durability kernel's FUNCTIONAL CORE -- `DocValue`, the operation applier,
+    # the replay planner, checkpoint selection and version classification. ADR-0030 §8 gives it no
+    # `tokio` edge and no storage edge on purpose: everything in it is a total function over
+    # explicit inputs, unit-testable with literal values, and the crate boundary is what keeps it
+    # that way. A plain library with no C and no build script, so it is in default-members too.
+    #
+    # DEPENDENCY DIRECTION, and it is load-bearing (ADR-0030 §8): `cyrup-pico-store` depends on
+    # THIS crate, never the reverse, because S3's `DocumentBase` takes `DocRoot` and
+    # `DocumentContent::Delta` takes `StoredVersion`. `DefVersion` therefore lives here and
+    # `cyrup-pico-store` re-exports it -- see that crate's `lib.rs`.
+    "crates/cyrup-pico-doc",
+    # PICO5-PLAN S7: the durability kernel's JSONL backend -- the store lock, §11.3's marker
+    # protocol and recovery. A plain library: no C, no build script, one small new dependency
+    # (`fs4`), so it is in default-members too. ADR-0030 §8's one crate that must stay OUT of
+    # default-members is the SQLite backend, and it is not written yet.
+    "crates/cyrup-pico-store-jsonl",
+    # PICO5-PLAN S4: the durability kernel's IMPERATIVE SHELL -- the session line, the mutation
+    # transaction, drafts and the durability witnesses. ADR-0030 §8 gives it `tokio`, and only the
+    # `sync` feature: the line is an actor over an mpsc channel and this crate spawns nothing. A
+    # plain library with no C and no build script, so it is in default-members too.
+    #
+    # DEPENDENCY DIRECTION (ADR-0030 §8): this crate depends on `cyrup-pico-store` and
+    # `cyrup-pico-doc`, never the reverse. `Durable` lives HERE and not in the store crate, because
+    # `Storage::commit` is implemented OUTSIDE the kernel -- a backend returns a `Seq` and this
+    # crate's one call site turns it into the unforgeable witness, so a backend cannot be made to
+    # produce one (§8's third load-bearing reason for the split).
+    "crates/cyrup-pico",
     "xtask",
 ]
 # cyrup-it is the workspace's ONE integration-test crate (docs/TEST-ARCHITECTURE.md §2): it holds
@@ -88,6 +120,10 @@ default-members = [
     "crates/cyrup-mcp",
     "crates/cyrup-acp",
     "crates/cyrup-llama",
+    "crates/cyrup-pico-store",
+    "crates/cyrup-pico-doc",
+    "crates/cyrup-pico-store-jsonl",
+    "crates/cyrup-pico",
 ]
 
 [workspace.package]
@@ -151,6 +187,27 @@ cyrup-flux         = { path = "crates/cyrup-flux",         version = "0.0.0" }
 cyrup-mcp          = { path = "crates/cyrup-mcp",          version = "0.0.0" }
 cyrup-acp          = { path = "crates/cyrup-acp",          version = "0.0.0" }
 cyrup-llama        = { path = "crates/cyrup-llama",        version = "0.0.0" }
+# The Pico5 durability kernel's storage layer (ADR-0030 §8). NOTE for every future consumer: this
+# crate exports `EntryId` as `Id<Entry>`, a minted number, while `cyrup_core::EntryId` is an
+# `Arc<str>` session token. Importing both unqualified is E0252; alias at the import rather than
+# widening either type (ADR-0030 open question 8, resolved in `crates/cyrup-pico-store/src/lib.rs`,
+# which is also why this crate must never take an edge to `cyrup-core`).
+cyrup-pico-store   = { path = "crates/cyrup-pico-store",   version = "0.0.0" }
+# The Pico5 durability kernel's FUNCTIONAL CORE (ADR-0030 §8): `DocValue`, the operation applier,
+# the replay planner, checkpoint selection, version classification. No `tokio`, no storage, no
+# `Session`, no `async`. The edge runs store -> doc and never the reverse, which is why `DefVersion`
+# lives in this crate and `cyrup-pico-store` re-exports it (see that crate's `lib.rs`).
+cyrup-pico-doc     = { path = "crates/cyrup-pico-doc",     version = "0.0.0" }
+# The Pico5 durability kernel's JSONL backend (ADR-0030 §8, §9; PICO5-PLAN S7). Declared here so the
+# kernel (S4) and the fault-injection and fork slices (S8, S9) take it the way every other in-workspace
+# crate is taken. Its only non-workspace dependency is `fs4` -- never `cyrup-session`, whose private
+# `SESSION_SYNCER` and `durable_rename` it lifts rather than imports (see that crate's `Cargo.toml`).
+cyrup-pico-store-jsonl = { path = "crates/cyrup-pico-store-jsonl", version = "0.0.0" }
+# The Pico5 durability kernel's IMPERATIVE SHELL (ADR-0030 §8): `Session`, `SessionMut`, `Committer`,
+# `Tx<S>`, `Draft`, the `Durable`/`Publication` witnesses, adoption and publication. Its eventual
+# consumer is `cyrup-session-svc`, which is NOT extended in place: that crate is the `AgentSession`
+# facade and this kernel's home is its own crate (ADR-0030 §8).
+cyrup-pico         = { path = "crates/cyrup-pico",         version = "0.0.0" }
 
 # --- standardized external deps (arch-00 §7). Versions are inert until a crate
 #     references them via `dep.workspace = true`; verify/bump on first use. ---
@@ -161,6 +218,10 @@ futures      = { version = "0.3" }
 futures-core = { version = "0.3" }
 async-trait  = { version = "0.1" }
 thiserror    = { version = "2" }
+# Compile-fail testing. ADR-0028 §7 and ADR-0030 §7 both make the same ruling: a guarantee carried
+# only by a signature needs a case proving the invalid program is rejected, because deleting the
+# signature is invisible in a diff. Consumers: the four `cyrup-pico*` crates, 54 cases between them.
+trybuild     = { version = "1" }
 serde        = { version = "1",   features = ["derive", "rc"] }
 # `preserve_order` is declared HERE, deliberately, and not inherited from an edge.
 #
@@ -190,6 +251,15 @@ serde        = { version = "1",   features = ["derive", "rc"] }
 # `preserve_order_is_declared_workspace_wide` in `crates/cyrup-core/src/tests/` pins this so a
 # future dependency change cannot revert it silently. This is `ACP-Q1`, decided: accept, and own it.
 serde_json   = { version = "1", features = ["preserve_order"] }
+
+# Insertion-ordered map. arch-00 §7.1 listed it as "added when first used"; PICO5-PLAN S2 is the
+# first use. `DocMap = IndexMap<Arc<str>, DocValue>` is the persisted document object, and the
+# choice is not about convenience: `IndexMap`'s `PartialEq` is ORDER-INSENSITIVE
+# (`indexmap-2/src/map.rs`), which is exactly Chord's *"equality ignores key order"*
+# (`packages/chord/src/delta/README.md`), so Pico5's no-op normalisation rule comes free from the
+# container rather than from a hand-written deep-equality walk (ADR-0030 §2.3, §4). Insertion order
+# is preserved in the bytes by `serde_json/preserve_order` above.
+indexmap     = { version = "2" }
 
 # arch-00 §7.1 ratified — first used by cyrup-tools (arch-03).
 ignore               = { version = "0.4.26" }
@@ -427,7 +497,7 @@ toml                 = { version = "1.1.2" }
 #   wasmtime(component-model,async,epoch,pooling-allocator), wasmtime-wasi, wit-bindgen,
 #   ignore, globset, grep/grep-searcher/grep-regex, clap, tracing, tracing-subscriber,
 #   time, uuid, fs4, oauth2, sha2, base64, parking_lot, dashmap,
-#   indexmap, similar, image, smallvec, rustc-hash, directories, blake3,
+#   similar, image, smallvec, rustc-hash, directories, blake3,
 #   toml, serde_yml, gix, notify, slotmap, pulldown-cmark, syntect, camino, bytes, memchr,
 #   landlock, seccompiler.
 

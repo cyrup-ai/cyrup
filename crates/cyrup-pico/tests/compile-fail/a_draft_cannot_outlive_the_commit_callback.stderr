@@ -1,0 +1,48 @@
+error[E0521]: borrowed data escapes outside of async closure
+  --> tests/compile-fail/a_draft_cannot_outlive_the_commit_callback.rs:42:13
+   |
+38 |     let mut escaped: Option<Draft<'_, Empty>> = None;
+   |         ----------- `escaped` declared here, outside of the async closure body
+...
+42 |             escaped = Some(tx.draft(handle)?);
+   |             ^^^^^^^^^^^^^^^--^^^^^^^^^^^^^^^^
+   |             |              |
+   |             |              borrow is only valid in the async closure body
+   |             reference to `tx` escapes the async closure body here
+
+error[E0505]: cannot move out of `tx` because it is borrowed
+  --> tests/compile-fail/a_draft_cannot_outlive_the_commit_callback.rs:43:21
+   |
+38 |     let mut escaped: Option<Draft<'_, Empty>> = None;
+   |         ----------- lifetime `'1` appears in the type of `escaped`
+39 |     let _ = session
+40 |         .commit(cx, async |mut tx| {
+   |                            ------ binding `tx` declared here
+41 |             let handle = tx.doc(&address, ()).await?;
+42 |             escaped = Some(tx.draft(handle)?);
+   |             ---------------------------------
+   |             |              |
+   |             |              borrow of `tx` occurs here
+   |             assignment requires that `tx` is borrowed for `'1`
+43 |             Ok(((), tx.writing()))
+   |                     ^^ move out of `tx` occurs here
+
+error: lifetime may not live long enough
+  --> tests/compile-fail/a_draft_cannot_outlive_the_commit_callback.rs:40:36
+   |
+38 |       let mut escaped: Option<Draft<'_, Empty>> = None;
+   |           ----------- lifetime `'2` appears in the type of `escaped`
+39 |       let _ = session
+40 |           .commit(cx, async |mut tx| {
+   |  ____________________________------__^
+   | |                            |
+   | |                            has type `cyrup_pico::Tx<'1, Reading>`
+41 | |             let handle = tx.doc(&address, ()).await?;
+42 | |             escaped = Some(tx.draft(handle)?);
+43 | |             Ok(((), tx.writing()))
+44 | |         })
+   | |_________^ returning this value requires that `'1` must outlive `'2`
+   |
+   = note: requirement occurs because of a mutable reference to `std::option::Option<Draft<'_, Empty>>`
+   = note: mutable references are invariant over their type parameter
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

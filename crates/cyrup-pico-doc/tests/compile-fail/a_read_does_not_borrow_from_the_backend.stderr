@@ -1,0 +1,8 @@
+error[E0515]: cannot return value referencing local variable `plan`
+  --> tests/compile-fail/a_read_does_not_borrow_from_the_backend.rs:18:5
+   |
+18 |     plan.value()
+   |     ----^^^^^^^^
+   |     |
+   |     returns a value referencing data owned by the current function
+   |     `plan` is borrowed here

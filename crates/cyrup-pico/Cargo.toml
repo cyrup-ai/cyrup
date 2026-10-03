@@ -1,0 +1,77 @@
+[package]
+name = "cyrup-pico"
+description = "Pico5 durability kernel: the session line, the mutation transaction, drafts and the durability witnesses (ADR-0030 §8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# DELIBERATELY NOT a dependency, for the same structural reason `cyrup-pico-store` refuses it
+# (ADR-0030 open question 8): `cyrup_core::EntryId` is an `Arc<str>` session token and this kernel's
+# `EntryId` is a minted number. A consumer that needs both -- `cyrup-session-svc`, eventually --
+# aliases at the import and is forced by E0252 to say which it means.
+#
+#   cyrup-core = { workspace = true }   # <-- never
+
+[lints]
+workspace = true
+
+[features]
+# PICO5-PLAN S8's seam, used by two of S4's own tests. ADR-0030 §7 requires fault injection at
+# THREE points and the third -- committed-then-adoption-failed -- is unreachable from outside by
+# design, so the window is opened behind a feature a production build never turns on. See
+# `src/fault.rs` for the argument.
+fault-injection = []
+
+[dependencies]
+# The functional core (ADR-0030 §8). `Tracker`/`OpenChange`/`Prepared` are what `Draft` borrows and
+# what adoption swaps; `DocValue::parse` is the one strict-JSON boundary.
+cyrup-pico-doc = { workspace = true }
+# The storage contract. `Box<dyn Storage>` is what `SessionMut` owns, and `commit(&mut self, ..)` is
+# why owning it exclusively is the whole of `G-SINGLE-COMMITTER`.
+cyrup-pico-store = { workspace = true }
+# `sync` ONLY: the line is an actor over an `mpsc` channel and a ticket awaits a `oneshot`. No `rt`,
+# no `time`, no `fs`: this crate spawns nothing and sleeps nowhere -- the host drives the loop
+# (see `committer`'s documentation for why the loop's future is `!Send`).
+tokio = { workspace = true, features = ["sync"] }
+# PICO5-PLAN S6's typed projection, `Revision::typed()`, and NOTHING else. ADR-0030 §4 forbids
+# `serde_json::to_value` on the document *write* path, because its `serialize_f64` turns a `NaN` into
+# a silent `null`; this is the read direction, where a `DocValue::Num` is already a finite
+# `serde_json::Number` and the one lossy case therefore cannot arise. The codec is kept out of
+# `BrokenDocument`, so replacing the bridge with a `Deserializer` written directly over `&DocValue` is
+# not a semver event. The document write path still goes through `DocValue::parse` alone.
+serde_json = { workspace = true }
+# `Serialize` for the diagnostic types ADR-0030 §10's serde table marks "yes, only":
+# `UncertainCommit`, `UncertainKind`, `RollbackReason`.
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# A dev-dependency on THIS package, which is the supported way to turn a feature on for test
+# targets only: the behaviour suite needs `fault-injection` while `cargo build -p cyrup-pico` must
+# not compile it.
+cyrup-pico = { path = ".", features = ["fault-injection"] }
+# The storage double in `src/tests/store_double.rs` implements `Storage`, which is `#[async_trait]`
+# because ADR-0030 §8 requires it to be dyn-compatible. An implementor needs the same attribute, so
+# this is a DEV-dependency only: the kernel itself holds `Box<dyn Storage>` and implements nothing.
+async-trait = { workspace = true }
+# `MemoryStore` is §11.1's reference semantics and the only backend that exists in this slice.
+cyrup-pico-store = { workspace = true, features = ["conformance"] }
+serde_json = { workspace = true }
+# The behaviour tests drive the line actor. `rt` + `macros` for a current-thread runtime and
+# `#[tokio::test]`; `time` for the line-hold budget cases. The loop's future is `!Send`, so the
+# multi-thread `spawn` is not usable and the tests drive it on a `LocalSet` or inline.
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
+# ADR-0030 §7's four compile-fail cases, plus the nested-commit canary.
+trybuild = { workspace = true }
+# PICO5-PLAN S8's suite, and a DEV-dependency only: the kernel itself depends on the storage
+# CONTRACT and must never link a backend. Two of S8's three injection points make a claim about a
+# MEDIUM -- "nothing durable happened", and "the batch is there on a reopen" -- and ADR-0030 §11.1
+# makes `MemoryStore` the reference SEMANTICS, which has no medium to reopen. So the fault-injection
+# suite opens a real directory through the JSONL backend. The edge is backend -> contract <- kernel
+# with no cycle: `cyrup-pico-store-jsonl` does not and cannot depend on this crate (ADR-0030 §8).
+cyrup-pico-store-jsonl = { workspace = true }
+# A real store directory per case, deleted when the case ends.
+tempfile = { workspace = true }

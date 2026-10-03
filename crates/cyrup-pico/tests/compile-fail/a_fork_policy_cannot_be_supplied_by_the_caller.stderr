@@ -1,0 +1,20 @@
+error[E0061]: this method takes 2 arguments but 3 arguments were supplied
+  --> tests/compile-fail/a_fork_policy_cannot_be_supplied_by_the_caller.rs:25:18
+   |
+25 |                 .fork_conversation(
+   |                  ^^^^^^^^^^^^^^^^^
+...
+28 |                     RewindableFork::Current,
+   |                     ----------------------- unexpected argument #3 of type `RewindableFork`
+   |
+note: method defined here
+  --> src/tx.rs
+   |
+   |     pub async fn fork_conversation(
+   |                  ^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+   |
+27 -                     parent,
+28 -                     RewindableFork::Current,
+27 +                     parent,
+   |

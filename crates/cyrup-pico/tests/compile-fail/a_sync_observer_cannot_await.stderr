@@ -1,0 +1,8 @@
+error[E0053]: method `observe` has an incompatible type for trait
+  --> tests/compile-fail/a_sync_observer_cannot_await.rs:16:56
+   |
+16 |     async fn observe(&self, _publication: &Publication) {
+   |                                                        ^ expected `()`, found future
+   |
+   = note: expected signature `fn(&Patient, &Publication) -> ()`
+              found signature `fn(&Patient, &Publication) -> impl Future<Output = ()>`

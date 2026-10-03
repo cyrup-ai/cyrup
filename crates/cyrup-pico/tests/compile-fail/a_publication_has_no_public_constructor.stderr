@@ -1,0 +1,16 @@
+error[E0624]: associated function `new` is private
+  --> tests/compile-fail/a_publication_has_no_public_constructor.rs:25:26
+   |
+25 |     let _ = Publication::new(seq, changes, copies);
+   |                          ^^^ private associated function
+   |
+  ::: src/witness.rs
+   |
+   |     pub(crate) const fn new(seq: Seq, changes: Arc<[Change]>, copies: Arc<[Copied]>) -> Self {
+   |     ---------------------------------------------------------------------------------------- private associated function defined here
+
+error[E0599]: no associated function or constant named `default` found for struct `Publication` in the current scope
+  --> tests/compile-fail/a_publication_has_no_public_constructor.rs:26:26
+   |
+26 |     let _ = Publication::default();
+   |                          ^^^^^^^ associated function or constant not found in `Publication`

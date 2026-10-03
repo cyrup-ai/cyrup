@@ -1,0 +1,25 @@
+error: cannot construct `ReplayPlan` with struct literal syntax due to private fields
+  --> tests/compile-fail/replay_plan_cannot_be_forged.rs:13:18
+   |
+13 |     let forged = ReplayPlan {
+   |                  ^^^^^^^^^^
+14 |         value: DocRoot::empty(),
+   |         ----------------------- private field
+   |
+   = note: ...and other private fields `version` and `deltas_since_base` that were not provided
+
+error[E0308]: mismatched types
+  --> tests/compile-fail/replay_plan_cannot_be_forged.rs:19:25
+   |
+19 |     let _ = materialize(records);
+   |             ----------- ^^^^^^^ expected `&ReplayPlan`, found `&[StoredContent]`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected reference `&ReplayPlan`
+              found reference `&[StoredContent]`
+note: function defined here
+  --> src/replay.rs
+   |
+   | pub fn materialize(plan: &ReplayPlan) -> DocRoot {
+   |        ^^^^^^^^^^^

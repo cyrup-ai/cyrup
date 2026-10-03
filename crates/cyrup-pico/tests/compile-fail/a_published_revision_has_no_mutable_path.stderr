@@ -1,0 +1,17 @@
+error[E0599]: no method named `as_map_mut` found for reference `&cyrup_pico_doc::value::DocRoot` in the current scope
+  --> tests/compile-fail/a_published_revision_has_no_mutable_path.rs:18:39
+   |
+18 |     let _mutable_map = revision.raw().as_map_mut();
+   |                                       ^^^^^^^^^^
+   |
+help: there is a method `as_map` with a similar name
+   |
+18 -     let _mutable_map = revision.raw().as_map_mut();
+18 +     let _mutable_map = revision.raw().as_map();
+   |
+
+error[E0599]: no method named `get_mut` found for reference `&cyrup_pico_doc::value::DocRoot` in the current scope
+  --> tests/compile-fail/a_published_revision_has_no_mutable_path.rs:19:42
+   |
+19 |     let _mutable_member = revision.raw().get_mut("tools");
+   |                                          ^^^^^^^ method not found in `&cyrup_pico_doc::value::DocRoot`

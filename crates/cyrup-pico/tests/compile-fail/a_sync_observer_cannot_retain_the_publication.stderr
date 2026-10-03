@@ -1,0 +1,11 @@
+error[E0507]: cannot move out of `*publication` which is behind a shared reference
+  --> tests/compile-fail/a_sync_observer_cannot_retain_the_publication.rs:16:30
+   |
+16 |     let _kept: Publication = *publication;
+   |                              ^^^^^^^^^^^^ move occurs because `*publication` has type `Publication`, which does not implement the `Copy` trait
+   |
+help: consider removing the dereference here
+   |
+16 -     let _kept: Publication = *publication;
+16 +     let _kept: Publication = publication;
+   |

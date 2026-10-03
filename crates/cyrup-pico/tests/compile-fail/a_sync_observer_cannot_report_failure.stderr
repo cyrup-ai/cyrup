@@ -1,0 +1,13 @@
+error[E0053]: method `observe` has an incompatible type for trait
+  --> tests/compile-fail/a_sync_observer_cannot_report_failure.rs:16:54
+   |
+16 |     fn observe(&self, _publication: &Publication) -> Result<(), String> {
+   |                                                      ^^^^^^^^^^^^^^^^^^ expected `()`, found `Result<(), String>`
+   |
+   = note: expected signature `fn(&Fussy, &Publication) -> ()`
+              found signature `fn(&Fussy, &Publication) -> Result<(), String>`
+help: change the output type to match the trait
+   |
+16 -     fn observe(&self, _publication: &Publication) -> Result<(), String> {
+16 +     fn observe(&self, _publication: &Publication) -> () {
+   |

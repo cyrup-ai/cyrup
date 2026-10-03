@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `StoreLock` in the current scope
+  --> tests/compile-fail/a_store_lock_cannot_be_cloned.rs:10:24
+   |
+10 |     let _second = lock.clone();
+   |                        ^^^^^ method not found in `StoreLock`

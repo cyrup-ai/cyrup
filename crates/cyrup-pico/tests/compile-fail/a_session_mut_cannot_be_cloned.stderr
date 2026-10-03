@@ -1,0 +1,31 @@
+error[E0599]: no method named `clone` found for struct `SessionMut` in the current scope
+  --> tests/compile-fail/a_session_mut_cannot_be_cloned.rs:19:38
+   |
+19 |     let second: SessionMut = session.clone();
+   |                                      ^^^^^
+   |
+help: there is a method `close` with a similar name, but with different arguments
+  --> src/session.rs
+   |
+   |     pub async fn close(&mut self, cx: &Cx) -> Result<(), StorageFailure> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `SessionMut: Clone` is not satisfied
+  --> tests/compile-fail/a_session_mut_cannot_be_cloned.rs:28:23
+   |
+28 |     let _ = duplicate(session);
+   |             --------- ^^^^^^^ the trait `Clone` is not implemented for `SessionMut`
+   |             |
+   |             required by a bound introduced by this call
+   |
+note: required by a bound in `duplicate`
+  --> tests/compile-fail/a_session_mut_cannot_be_cloned.rs:25:21
+   |
+25 |     fn duplicate<T: Clone>(t: &T) -> T {
+   |                     ^^^^^ required by this bound in `duplicate`
+
+error[E0599]: no method named `into_session_mut` found for struct `Session` in the current scope
+  --> tests/compile-fail/a_session_mut_cannot_be_cloned.rs:33:21
+   |
+33 |     session.clone().into_session_mut()
+   |                     ^^^^^^^^^^^^^^^^ method not found in `Session`

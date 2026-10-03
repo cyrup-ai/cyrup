@@ -1,0 +1,11 @@
+error[E0599]: the method `in_conversation` exists for reference `&DocToken<Pinned>`, but its trait bounds were not satisfied
+  --> tests/compile-fail/a_task_document_cannot_be_addressed_in_a_conversation.rs:35:19
+   |
+16 | struct Pinned;
+   | ------------- doesn't satisfy `<Pinned as DocDef>::Place = ConversationScoped`
+...
+35 |     let _ = token.in_conversation(ROOT_CONVERSATION_ID);
+   |                   ^^^^^^^^^^^^^^^ method cannot be called on `&DocToken<Pinned>` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `<Pinned as DocDef>::Place = ConversationScoped`

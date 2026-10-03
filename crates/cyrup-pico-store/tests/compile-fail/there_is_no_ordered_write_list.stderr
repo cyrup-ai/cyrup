@@ -1,0 +1,29 @@
+error[E0599]: no method named `writes` found for struct `Batch` in the current scope
+  --> tests/compile-fail/there_is_no_ordered_write_list.rs:28:25
+   |
+28 |     let _writes = batch.writes();
+   |                         ^^^^^^ method not found in `Batch`
+
+error[E0599]: no method named `into_writes` found for struct `Batch` in the current scope
+  --> tests/compile-fail/there_is_no_ordered_write_list.rs:29:24
+   |
+29 |     let _owned = batch.into_writes();
+   |                        ^^^^^^^^^^^
+   |
+help: there is a method `entries` with a similar name
+   |
+29 -     let _owned = batch.into_writes();
+29 +     let _owned = batch.entries();
+   |
+
+error[E0599]: no method named `documents_mut` found for struct `Batch` in the current scope
+  --> tests/compile-fail/there_is_no_ordered_write_list.rs:32:19
+   |
+32 |     let _ = batch.documents_mut();
+   |                   ^^^^^^^^^^^^^
+   |
+help: there is a method `documents` with a similar name
+   |
+32 -     let _ = batch.documents_mut();
+32 +     let _ = batch.documents();
+   |

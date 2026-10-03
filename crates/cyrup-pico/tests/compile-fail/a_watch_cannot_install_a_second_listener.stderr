@@ -1,0 +1,15 @@
+error[E0382]: use of moved value: `watch`
+  --> tests/compile-fail/a_watch_cannot_install_a_second_listener.rs:18:29
+   |
+16 | fn canary(watch: DocWatch<Live>) {
+   |           ----- move occurs because `watch` has type `DocWatch<Live>`, which does not implement the `Copy` trait
+17 |     let (_first, _delivery) = watch.start(nothing);
+   |                                     -------------- `watch` moved due to this method call
+18 |     let (_second, _again) = watch.start(nothing);
+   |                             ^^^^^ value used here after move
+   |
+note: `DocWatch::<T>::start` takes ownership of the receiver `self`, which moves `watch`
+  --> src/watch.rs
+   |
+   |     pub fn start<L, Fut>(self, mut listener: L) -> (Watching<T>, impl Future<Output = WatchEnd>)
+   |                          ^^^^

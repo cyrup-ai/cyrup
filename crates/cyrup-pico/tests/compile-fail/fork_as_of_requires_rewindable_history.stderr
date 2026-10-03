@@ -1,0 +1,5 @@
+error[E0599]: no variant, associated function, or constant named `AsOf` found for enum `LatestFork` in the current scope
+  --> tests/compile-fail/fork_as_of_requires_rewindable_history.rs:31:27
+   |
+31 |         fork: LatestFork::AsOf,
+   |                           ^^^^ variant, associated function, or constant not found in `LatestFork`

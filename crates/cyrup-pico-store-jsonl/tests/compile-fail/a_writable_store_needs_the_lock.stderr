@@ -1,0 +1,15 @@
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+  --> tests/compile-fail/a_writable_store_needs_the_lock.rs:14:18
+   |
+14 |     let _store = JsonlStore::open_for_write(dir, JsonlOptions::new(Durability::PowerLoss));
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^      ---------------------------------------- argument #2 of type `StoreLock` is missing
+   |
+note: associated function defined here
+  --> src/store.rs
+   |
+   |     pub fn open_for_write(
+   |            ^^^^^^^^^^^^^^
+help: provide the argument
+   |
+14 |     let _store = JsonlStore::open_for_write(dir, /* StoreLock */, JsonlOptions::new(Durability::PowerLoss));
+   |                                                  ++++++++++++++++

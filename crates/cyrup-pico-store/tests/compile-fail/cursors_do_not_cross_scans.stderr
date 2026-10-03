@@ -1,0 +1,37 @@
+error[E0308]: mismatched types
+  --> tests/compile-fail/cursors_do_not_cross_scans.rs:23:65
+   |
+23 |     let _ = store.scan_tasks(&TaskQuery::default(), limit, Some(forged), &cx);
+   |                                                            ---- ^^^^^^ expected `TaskCursor`, found `EntryCursor`
+   |                                                            |
+   |                                                            arguments to this enum variant are incorrect
+   |
+help: the type constructed contains `EntryCursor` due to the type of the argument passed
+  --> tests/compile-fail/cursors_do_not_cross_scans.rs:23:60
+   |
+23 |     let _ = store.scan_tasks(&TaskQuery::default(), limit, Some(forged), &cx);
+   |                                                            ^^^^^------^
+   |                                                                 |
+   |                                                                 this argument influences the type of `Some`
+note: tuple variant defined here
+  --> $RUST/core/src/option.rs
+
+error[E0599]: no method named `payload` found for struct `EntryCursor` in the current scope
+  --> tests/compile-fail/cursors_do_not_cross_scans.rs:27:24
+   |
+27 |     let _bytes = other.payload();
+   |                        ^^^^^^^
+   |
+help: there is a method `payload_for` with a similar name, but with different arguments
+  --> src/cursor.rs
+   |
+   |               pub fn payload_for(&self, store: StoreId) -> Result<&[u8], WrongStore> {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   | / scan_cursor!(
+   | |     /// A position in an entry scan.
+   | |     EntryCursor,
+   | |     "Storage::scan_entries"
+   | | );
+   | |_- in this macro invocation
+   = note: this error originates in the macro `scan_cursor` (in Nightly builds, run with -Z macro-backtrace for more info)

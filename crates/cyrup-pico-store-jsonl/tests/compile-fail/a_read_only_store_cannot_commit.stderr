@@ -1,0 +1,11 @@
+error[E0599]: no method named `commit` found for struct `ReadOnlyStore` in the current scope
+  --> tests/compile-fail/a_read_only_store_cannot_commit.rs:23:19
+   |
+23 |     let _ = store.commit(batch, &Cx::detached());
+   |                   ^^^^^^
+   |
+help: there is a method `last_commit` with a similar name, but with different arguments
+  --> src/read.rs
+   |
+   |     pub const fn last_commit(&self) -> Option<Seq> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

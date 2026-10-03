@@ -1,0 +1,9 @@
+error[E0451]: fields `dir` and `file` of struct `StoreLock` are private
+  --> tests/compile-fail/a_store_lock_cannot_be_struct_literalled.rs:15:9
+   |
+14 |     let _forged = StoreLock {
+   |                   --------- in this type
+15 |         dir,
+   |         ^^^ private field
+16 |         file: std::fs::File::open("/dev/null").unwrap(),
+   |         ^^^^ private field

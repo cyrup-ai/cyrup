@@ -1,0 +1,72 @@
+[package]
+name = "cyrup-pico-store"
+description = "Pico5 durability kernel: identity, sequence and value newtypes; the storage contract (ADR-0030 §8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# DELIBERATELY NOT a dependency of this crate, and it must stay that way (ADR-0030 §8, open
+# question 8): `cyrup_core::EntryId` is an `Arc<str>` 8-hex session token with a PUBLIC field and
+# `From<&str>`/`From<String>`, while this crate's `EntryId` is a minted number in one global
+# namespace. With no edge to `cyrup-core` there is no import under which the two can be confused
+# into one another, and a module that wants both is forced by E0252 to name which it means.
+#
+#   cyrup-core = { workspace = true }   # <-- never
+
+[lints]
+workspace = true
+
+[features]
+# PICO5-PLAN S3's conformance suite. Off by default, because a crate that only wants the storage
+# CONTRACT should not compile the cases that judge an implementation of it. A backend crate turns it
+# on as a DEV-dependency:
+#
+#   [dev-dependencies]
+#   cyrup-pico-store = { workspace = true, features = ["conformance"] }
+#
+# ADR-0030 §10:4369 makes the suite -- not the trait -- what makes backends swappable, which is why it
+# ships here in the same slice as the trait rather than with the first backend.
+conformance = ["dep:serde_json"]
+
+[dependencies]
+# The functional core (ADR-0030 §8). The edge runs THIS WAY and never the reverse: S3's
+# `DocumentBase` takes `DocRoot` and `DocumentContent::Delta` takes `StoredVersion`, so a doc -> store
+# edge would be a cycle. `DefVersion` therefore lives in `cyrup-pico-doc` and is re-exported here.
+cyrup-pico-doc = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+# `Storage` is async AND must be dyn-compatible: ADR-0030 §8's first load-bearing reason for the crate
+# split is that the conformance suite drives a backend with NO `Session`, and it drives it as
+# `&mut dyn Storage`. A native `async fn` in a trait is not dyn-compatible, so the boxed-future
+# desugaring is not a style choice here -- without it the suite would need a generic parameter threaded
+# through every case, which is the shape that lets a `cyrup-pico` edge creep back in.
+async-trait = { workspace = true }
+# For `Cx` ONLY. ADR-0030 §8 lists this crate's dependencies as `cyrup-pico-doc` alone, and this is the
+# one addition: §10 gives every `Storage` method a `cx: &Cx`, and open question 6 records that cyrup has
+# nothing to build a context out of except `tokio_util::sync::CancellationToken` -- the same type
+# `cyrup-core/src/cancel.rs:9` aliases as the workspace's one `AbortSignal` equivalent, which this
+# crate cannot name through that alias because it must not depend on `cyrup-core`.
+tokio-util = { workspace = true }
+# Enabled by the `conformance` feature only. The suite needs a decode boundary: `spec.md:4274-4275`'s
+# ownership case has to present one number as two kinds of id, and ADR-0030 F6 §A is explicit that
+# in-process that is impossible -- so the case crosses the only construction path there is, which is
+# exactly the path a damaged record takes.
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# `MemoryStore` is async, so its unit tests and the conformance runner need an executor. `rt` and
+# `macros` only: nothing here touches the filesystem, the network or a timer.
+tokio = { workspace = true, features = ["rt", "macros"] }
+# A dev-dependency on THIS package, which is the supported way to turn a feature on for test targets
+# only: `tests/conformance.rs` must see the `conformance` module, while `cargo build -p
+# cyrup-pico-store` must not compile it. Cargo permits a dev-dependency cycle on self for exactly this.
+cyrup-pico-store = { path = ".", features = ["conformance"] }
+# Compile-fail proof for the ADR-0030 §2 rows this crate classifies `unrepresentable`: seq-as-id,
+# cross-kind confusion, and forged construction. A dev-dependency only, so it is absent from the
+# `cargo build` graph entirely. Declared in the workspace by PICO5-PLAN S0, which needs it for the
+# same reason.
+trybuild = { workspace = true }

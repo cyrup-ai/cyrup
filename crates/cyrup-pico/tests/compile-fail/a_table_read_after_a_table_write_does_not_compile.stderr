@@ -1,0 +1,74 @@
+error[E0599]: no method named `conversation` found for struct `cyrup_pico::Tx<'_, Writing>` in the current scope
+  --> tests/compile-fail/a_table_read_after_a_table_write_does_not_compile.rs:32:24
+   |
+32 |             let a = tx.conversation(conversation).await?;
+   |                        ^^^^^^^^^^^^
+   |
+note: there's an earlier shadowed binding `tx` of type `cyrup_pico::Tx<'_, Reading>` that has method `conversation` available
+  --> tests/compile-fail/a_table_read_after_a_table_write_does_not_compile.rs:28:28
+   |
+28 |         .commit(cx, async |tx| {
+   |                            ^^ `tx` of type `cyrup_pico::Tx<'_, Reading>` that has method `conversation` defined earlier here
+...
+31 |             let mut tx = tx.writing();
+   |                 ------ earlier `tx` shadowed here with type `cyrup_pico::Tx<'_, Writing>`
+help: there is a method `fork_conversation` with a similar name, but with different arguments
+  --> src/tx.rs
+   |
+   | /     pub async fn fork_conversation(
+   | |         &mut self,
+   | |         ownership: ConversationOwnership,
+   | |         parent: ConversationParent,
+   | |     ) -> Result<Fork, TxError> {
+   | |______________________________^
+
+error[E0599]: no method named `entry` found for struct `cyrup_pico::Tx<'_, Writing>` in the current scope
+  --> tests/compile-fail/a_table_read_after_a_table_write_does_not_compile.rs:33:24
+   |
+33 |             let b = tx.entry(entry).await?;
+   |                        ^^^^^ method not found in `cyrup_pico::Tx<'_, Writing>`
+   |
+note: there's an earlier shadowed binding `tx` of type `cyrup_pico::Tx<'_, Reading>` that has method `entry` available
+  --> tests/compile-fail/a_table_read_after_a_table_write_does_not_compile.rs:28:28
+   |
+28 |         .commit(cx, async |tx| {
+   |                            ^^ `tx` of type `cyrup_pico::Tx<'_, Reading>` that has method `entry` defined earlier here
+...
+31 |             let mut tx = tx.writing();
+   |                 ------ earlier `tx` shadowed here with type `cyrup_pico::Tx<'_, Writing>`
+   = note: the method was found for `cyrup_pico::Tx<'tx, Reading>`
+
+error[E0599]: no method named `task` found for struct `cyrup_pico::Tx<'_, Writing>` in the current scope
+  --> tests/compile-fail/a_table_read_after_a_table_write_does_not_compile.rs:34:24
+   |
+34 |             let c = tx.task(task).await?;
+   |                        ^^^^ method not found in `cyrup_pico::Tx<'_, Writing>`
+   |
+note: there's an earlier shadowed binding `tx` of type `cyrup_pico::Tx<'_, Reading>` that has method `task` available
+  --> tests/compile-fail/a_table_read_after_a_table_write_does_not_compile.rs:28:28
+   |
+28 |         .commit(cx, async |tx| {
+   |                            ^^ `tx` of type `cyrup_pico::Tx<'_, Reading>` that has method `task` defined earlier here
+...
+31 |             let mut tx = tx.writing();
+   |                 ------ earlier `tx` shadowed here with type `cyrup_pico::Tx<'_, Writing>`
+   = note: the method was found for `cyrup_pico::Tx<'tx, Reading>`
+
+error[E0599]: no method named `submission` found for struct `cyrup_pico::Tx<'_, Writing>` in the current scope
+  --> tests/compile-fail/a_table_read_after_a_table_write_does_not_compile.rs:35:24
+   |
+35 |             let d = tx.submission(submission).await?;
+   |                        ^^^^^^^^^^
+   |
+note: there's an earlier shadowed binding `tx` of type `cyrup_pico::Tx<'_, Reading>` that has method `submission` available
+  --> tests/compile-fail/a_table_read_after_a_table_write_does_not_compile.rs:28:28
+   |
+28 |         .commit(cx, async |tx| {
+   |                            ^^ `tx` of type `cyrup_pico::Tx<'_, Reading>` that has method `submission` defined earlier here
+...
+31 |             let mut tx = tx.writing();
+   |                 ------ earlier `tx` shadowed here with type `cyrup_pico::Tx<'_, Writing>`
+help: there is a method `stage_submission` with a similar name
+   |
+35 |             let d = tx.stage_submission(submission).await?;
+   |                        ++++++

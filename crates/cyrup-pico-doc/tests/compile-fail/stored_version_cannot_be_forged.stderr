@@ -1,0 +1,77 @@
+error[E0624]: associated function `mint` is private
+  --> tests/compile-fail/stored_version_cannot_be_forged.rs:20:33
+   |
+20 |     let minted = StoredVersion::mint(DefVersion::FIRST);
+   |                                 ^^^^ private associated function
+   |
+  ::: src/version.rs
+   |
+   |     pub(crate) const fn mint(version: DefVersion) -> Self {
+   |     ----------------------------------------------------- private associated function defined here
+
+error[E0277]: the trait bound `StoredVersion: serde::Deserialize<'de>` is not satisfied
+  --> tests/compile-fail/stored_version_cannot_be_forged.rs:23:34
+   |
+23 |     let decoded: StoredVersion = serde_json::from_str("1").expect("no Deserialize impl exists");
+   |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `serde_core::de::Deserialize<'_>` is not implemented for `StoredVersion`
+   |
+   = note: for local types consider adding `#[derive(serde::Deserialize)]` to your `StoredVersion` type
+   = note: for types from other crates check whether the crate offers a `serde` feature flag
+   = help: the following other types implement trait `serde_core::de::Deserialize<'de>`:
+             &'a [u8]
+             &'a std::path::Path
+             &'a str
+             ()
+             (T,)
+             (T0, T1)
+             (T0, T1, T2)
+             (T0, T1, T2, T3)
+           and $N others
+note: required by a bound in `serde_json::from_str`
+  --> $CARGO/serde_json-$VERSION/src/de.rs
+   |
+   | pub fn from_str<'a, T>(s: &'a str) -> Result<T>
+   |        -------- required by a bound in this function
+   | where
+   |     T: de::Deserialize<'a>,
+   |        ^^^^^^^^^^^^^^^^^^^ required by this bound in `from_str`
+
+error[E0624]: associated function `mint` is private
+  --> tests/compile-fail/stored_version_cannot_be_forged.rs:26:57
+   |
+26 |     let encoded = serde_json::to_string(&StoredVersion::mint(DefVersion::FIRST));
+   |                                                         ^^^^ private associated function
+   |
+  ::: src/version.rs
+   |
+   |     pub(crate) const fn mint(version: DefVersion) -> Self {
+   |     ----------------------------------------------------- private associated function defined here
+
+error[E0277]: the trait bound `StoredVersion: serde::Serialize` is not satisfied
+  --> tests/compile-fail/stored_version_cannot_be_forged.rs:26:41
+   |
+26 |     let encoded = serde_json::to_string(&StoredVersion::mint(DefVersion::FIRST));
+   |                   --------------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `serde_core::ser::Serialize` is not implemented for `StoredVersion`
+   |                   |
+   |                   required by a bound introduced by this call
+   |
+   = note: for local types consider adding `#[derive(serde::Serialize)]` to your `StoredVersion` type
+   = note: for types from other crates check whether the crate offers a `serde` feature flag
+   = help: the following other types implement trait `serde_core::ser::Serialize`:
+             &'a T
+             &'a mut T
+             ()
+             (T,)
+             (T0, T1)
+             (T0, T1, T2)
+             (T0, T1, T2, T3)
+             (T0, T1, T2, T3, T4)
+           and $N others
+note: required by a bound in `serde_json::to_string`
+  --> $CARGO/serde_json-$VERSION/src/ser.rs
+   |
+   | pub fn to_string<T>(value: &T) -> Result<String>
+   |        --------- required by a bound in this function
+   | where
+   |     T: ?Sized + Serialize,
+   |                 ^^^^^^^^^ required by this bound in `to_string`

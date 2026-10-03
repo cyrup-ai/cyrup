@@ -1,0 +1,16 @@
+error[E0624]: method `doc_at` is private
+  --> tests/compile-fail/only_the_typed_acquisition_creates_a_document.rs:22:24
+   |
+22 |               let _ = tx.doc_at(&address, ());
+   |                          ^^^^^^ private method
+   |
+  ::: src/tx.rs
+   |
+   | /     pub(crate) async fn doc_at<T, I>(
+   | |         &mut self,
+   | |         address: &DocumentAddress,
+   | |         seed: Seed<I>,
+   | |     ) -> Result<DocHandle<'tx, T>, TxError>
+   | |     where
+   | |         I: FnOnce() -> Result<DocRoot, TxError>,
+   | |________________________________________________- private method defined here

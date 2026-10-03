@@ -1,0 +1,11 @@
+error[E0599]: the method `at` exists for reference `&DocToken<Members>`, but its trait bounds were not satisfied
+  --> tests/compile-fail/a_family_cannot_be_addressed_without_a_key.rs:34:19
+   |
+14 | struct Members;
+   | -------------- doesn't satisfy `<Members as DocDef>::Shape = Singleton`
+...
+34 |     let _ = token.at();
+   |                   ^^ method cannot be called on `&DocToken<Members>` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `<Members as DocDef>::Shape = Singleton`

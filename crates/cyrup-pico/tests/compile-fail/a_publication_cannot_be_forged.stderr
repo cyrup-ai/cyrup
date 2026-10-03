@@ -1,0 +1,13 @@
+error[E0451]: fields `seq`, `changes`, `copies` and `_seal` of struct `Publication` are private
+  --> tests/compile-fail/a_publication_cannot_be_forged.rs:34:9
+   |
+33 |     let _ = Publication {
+   |             ----------- in this type
+34 |         seq,
+   |         ^^^ private field
+35 |         changes,
+   |         ^^^^^^^ private field
+36 |         copies,
+   |         ^^^^^^ private field
+37 |         _seal: (),
+   |         ^^^^^ private field

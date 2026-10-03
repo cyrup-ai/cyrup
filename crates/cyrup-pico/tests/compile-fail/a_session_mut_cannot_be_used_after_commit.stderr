@@ -1,0 +1,39 @@
+error[E0382]: use of moved value: `session`
+  --> tests/compile-fail/a_session_mut_cannot_be_used_after_commit.rs:25:18
+   |
+21 |   async fn two_commits(session: SessionMut, cx: &Cx) {
+   |                        ------- move occurs because `session` has type `SessionMut`, which does not implement the `Copy` trait
+22 |       let first = session.commit(cx, async |_tx| {
+   |  _________________________-
+23 | |         Err::<((), _), _>(CallbackError::Abandoned("not reached".into()))
+24 | |     });
+   | |______- `session` moved due to this method call
+25 |       let second = session.commit(cx, async |_tx| {
+   |                    ^^^^^^^ value used here after move
+   |
+note: `SessionMut::commit` takes ownership of the receiver `self`, which moves `session`
+  --> src/session.rs
+   |
+   |     pub async fn commit<R, F>(mut self, cx: &Cx, change: F) -> CommitOutcome<R>
+   |                                   ^^^^
+
+error[E0382]: use of moved value: `session`
+  --> tests/compile-fail/a_session_mut_cannot_be_used_after_commit.rs:40:13
+   |
+34 |   async fn reuse_after_settling(session: SessionMut, cx: &Cx) {
+   |                                 ------- move occurs because `session` has type `SessionMut`, which does not implement the `Copy` trait
+35 |       let _ = session
+36 |           .commit(cx, async |_tx| {
+   |  __________-
+37 | |             Err::<((), _), _>(CallbackError::Abandoned("not reached".into()))
+38 | |         })
+   | |__________- `session` moved due to this method call
+39 |           .await;
+40 |       let _ = session
+   |               ^^^^^^^ value used here after move
+   |
+note: `SessionMut::commit` takes ownership of the receiver `self`, which moves `session`
+  --> src/session.rs
+   |
+   |     pub async fn commit<R, F>(mut self, cx: &Cx, change: F) -> CommitOutcome<R>
+   |                                   ^^^^
