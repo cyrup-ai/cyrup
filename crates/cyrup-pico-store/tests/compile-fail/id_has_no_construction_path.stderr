@@ -1,0 +1,56 @@
+error[E0624]: associated function `new` is private
+  --> tests/compile-fail/id_has_no_construction_path.rs:13:26
+   |
+13 |     let _ = Id::<Entry>::new(n);
+   |                          ^^^ private associated function
+   |
+  ::: src/id.rs
+   |
+   |     pub(crate) const fn new(n: NonZeroU64) -> Self {
+   |     ---------------------------------------------- private associated function defined here
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/compile-fail/id_has_no_construction_path.rs:14:13
+   |
+14 |     let _ = Id::<Entry>(n, core::marker::PhantomData);
+   |             ^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/id.rs
+   |
+   | pub struct Id<K: IdKind>(NonZeroU64, PhantomData<fn() -> K>);
+   |                          ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^ private field
+   |                          |
+   |                          private field
+help: you might have meant to use the `new` associated function
+   |
+14 -     let _ = Id::<Entry>(n, core::marker::PhantomData);
+14 +     let _ = Id::<Entry>::new(_);
+   |
+
+error[E0308]: mismatched types
+  --> tests/compile-fail/id_has_no_construction_path.rs:15:27
+   |
+15 |     let _ = EntryId::from(41_u64);
+   |             ------------- ^^^^^^ expected `Id<Entry>`, found `u64`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected struct `Id<cyrup_pico_store::Entry>`
+                found type `u64`
+note: associated function defined here
+  --> $RUST/core/src/convert/mod.rs
+
+error[E0599]: no associated function or constant named `default` found for struct `Id<K>` in the current scope
+  --> tests/compile-fail/id_has_no_construction_path.rs:16:22
+   |
+16 |     let _ = EntryId::default();
+   |                      ^^^^^^^ associated function or constant not found in `Id<cyrup_pico_store::Entry>`
+
+error[E0277]: the trait bound `Id<cyrup_pico_store::Entry>: From<u64>` is not satisfied
+  --> tests/compile-fail/id_has_no_construction_path.rs:17:29
+   |
+17 |     let _: EntryId = 41_u64.into();
+   |                             ^^^^ the trait `From<u64>` is not implemented for `Id<cyrup_pico_store::Entry>`
+   |
+   = note: required for `u64` to implement `Into<Id<cyrup_pico_store::Entry>>`

@@ -319,9 +319,14 @@ impl SessionStore for DiskStore {
             let mut f = File::create(&tmp)?;
             f.write_all(buf.as_bytes())?;
             f.flush()?;
-            f.sync_data()?;
         }
-        std::fs::rename(&tmp, &self.path)?;
+        // The payload fsync lives inside `durable_rename`, which owns the whole three-step sequence
+        // (fsync the temp file, rename, **fsync the parent directory**). Before S11 this line was a
+        // bare `std::fs::rename` after a local `sync_data`, which made the new inode durable and the
+        // directory entry naming it only page-cache-resident — so power loss here could legally
+        // restore the pre-rewrite entry while reporting `Ok(())`. See `crate::durable` for the full
+        // statement, and ADR-0030 §14 open question 1 for the Windows arm, which is still open.
+        crate::durable::durable_rename(&tmp, &self.path)?;
         Ok(())
     }
 

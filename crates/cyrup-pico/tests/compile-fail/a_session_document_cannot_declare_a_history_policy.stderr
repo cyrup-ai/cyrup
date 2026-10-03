@@ -1,0 +1,5 @@
+error[E0326]: implemented const `POLICY` has an incompatible type for trait
+  --> tests/compile-fail/a_session_document_cannot_declare_a_history_policy.rs:27:19
+   |
+27 |     const POLICY: ConversationSemantics = ConversationSemantics::Rewindable {
+   |                   ^^^^^^^^^^^^^^^^^^^^^ expected `()`, found `ConversationSemantics`

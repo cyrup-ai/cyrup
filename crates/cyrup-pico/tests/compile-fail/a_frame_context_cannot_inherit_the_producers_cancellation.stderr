@@ -1,0 +1,11 @@
+error[E0599]: no method named `token` found for reference `&FrameContext` in the current scope
+  --> tests/compile-fail/a_frame_context_cannot_inherit_the_producers_cancellation.rs:16:26
+   |
+16 |     let _token = context.token();
+   |                          ^^^^^ method not found in `&FrameContext`
+
+error[E0599]: no method named `is_cancelled` found for reference `&FrameContext` in the current scope
+  --> tests/compile-fail/a_frame_context_cannot_inherit_the_producers_cancellation.rs:17:28
+   |
+17 |     let _gave_up = context.is_cancelled();
+   |                            ^^^^^^^^^^^^ method not found in `&FrameContext`

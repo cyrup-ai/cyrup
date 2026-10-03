@@ -1,0 +1,16 @@
+error: cannot construct `ForkedDocument` with struct literal syntax due to private fields
+  --> tests/compile-fail/a_forked_document_cannot_be_forged.rs:20:5
+   |
+20 |     ForkedDocument {
+   |     ^^^^^^^^^^^^^^
+21 |         policy: RewindableFork::AsOf,
+   |         ---------------------------- private field
+   |
+   = note: ...and other private fields `source`, `address` and `child` that were not provided
+help: you might have meant to use the `new` associated function
+   |
+20 -     ForkedDocument {
+21 -         policy: RewindableFork::AsOf,
+22 -     }
+20 +     ForkedDocument::new(_, _, _, _)
+   |

@@ -1,0 +1,29 @@
+error[E0277]: the trait bound `Ledger: cyrup_pico_store::id::private::Sealed` is not satisfied
+ --> tests/compile-fail/id_kind_is_sealed.rs:8:17
+  |
+8 | impl IdKind for Ledger {
+  |                 ^^^^^^ unsatisfied trait bound
+  |
+help: the trait `cyrup_pico_store::id::private::Sealed` is not implemented for `Ledger`
+ --> tests/compile-fail/id_kind_is_sealed.rs:6:1
+  |
+6 | struct Ledger;
+  | ^^^^^^^^^^^^^
+  = help: the following other types implement trait `cyrup_pico_store::id::private::Sealed`:
+            cyrup_pico_store::Conversation
+            cyrup_pico_store::Document
+            cyrup_pico_store::Entry
+            cyrup_pico_store::Submission
+            cyrup_pico_store::Task
+note: required by a bound in `IdKind`
+ --> src/id.rs
+  |
+  | pub trait IdKind: private::Sealed + 'static {
+  |                   ^^^^^^^^^^^^^^^ required by this bound in `IdKind`
+  = note: `IdKind` is a "sealed trait", because to implement it you also need to implement `cyrup_pico_store::id::private::Sealed`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+  = help: the following types implement the trait:
+            cyrup_pico_store::Conversation
+            cyrup_pico_store::Entry
+            cyrup_pico_store::Task
+            cyrup_pico_store::Submission
+            cyrup_pico_store::Document

@@ -1,0 +1,60 @@
+[package]
+name = "cyrup-pico-store-jsonl"
+description = "Pico5 durability kernel: the JSONL backend — store lock, marker protocol, recovery (ADR-0030 §8, §9, F6 §D)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# DELIBERATELY NOT a dependency of this crate (ADR-0030 §8): `cyrup-session`.
+#
+# PICO5-PLAN S7 words one deliverable as `Durability::{ProcessCrash, PowerLoss}` "wired to
+# `cyrup-session`'s existing `SESSION_SYNCER` (`store.rs:65-182`)". That static is private to that
+# crate, and ADR-0030 §8 overrides the wording in two places: it lists this crate's dependencies as
+# "One new dependency: fs4", and it rules that "`cyrup-session` is not extended in place … What is
+# reused is the primitive BENEATH that trait, not the trait (§9)". An edge from the durability kernel
+# to the session crate it is eventually meant to replace would also invert the layering and drag
+# `cyrup-core` in behind it. So the mechanism is LIFTED (`src/syncer.rs`), with attribution, not
+# imported, and `src/durable.rs` does the same for S11's `durable_rename` helper — which is
+# `pub(crate)` there for the same reason.
+#
+#   cyrup-session = { workspace = true }   # <-- never
+
+[lints]
+workspace = true
+
+[dependencies]
+# The storage contract this crate implements (PICO5-PLAN S3).
+cyrup-pico-store = { workspace = true }
+# The functional core: `StoredContent`, `ReplayPlan::parse`, `materialize`, `DocRoot`. Every
+# document value this backend writes or reads passes through it, and nothing in this crate parses a
+# document value itself (ADR-0030 F4).
+cyrup-pico-doc = { workspace = true }
+serde = { workspace = true }
+# The medium. `preserve_order` is on workspace-wide (`Cargo.toml:232`), which this backend depends on
+# for byte-reproducible lines: a `DocMap` is an `IndexMap`, so re-serialising a decoded record
+# reproduces its key order.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+# ADR-0030 F6 §D's one new dependency, chosen there over `nix` because
+# `docs/adr/ADR-0007-windows-scope.md` notes `nix` compiles to an empty crate on the Windows target.
+# `flock(LOCK_EX|LOCK_NB)` on unix, `LockFileEx` on Windows, pure Rust over `libc`/`windows-sys`.
+# Version pinned to match the two crates already carrying it (`cyrup-config`, `cyrup-flux`) so the
+# lockfile keeps one copy.
+fs4 = "1.1.0"
+
+[dev-dependencies]
+# The suite that is the contract (`spec.md:4369`). A dev-dependency on an already-declared
+# dependency, which is the supported way to turn a feature on for test targets only: a plain
+# `cargo build -p cyrup-pico-store-jsonl` must not compile the conformance cases.
+cyrup-pico-store = { workspace = true, features = ["conformance"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
+# Every test in this crate opens a real store in a real directory. There is no filesystem double
+# here on purpose: the slice's whole subject is what the medium does.
+tempfile = { workspace = true }
+# Compile-fail proof for ADR-0030 F6 §D's "a writable backend cannot be built without the proof, so
+# 'forgot to lock' is a compile error", and for the read-only store having no `commit`.
+trybuild = { workspace = true }

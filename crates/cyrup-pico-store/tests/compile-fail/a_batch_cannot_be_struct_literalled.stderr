@@ -1,0 +1,15 @@
+error[E0451]: fields `conversations`, `entries`, `tasks`, `submissions` and `documents` of struct `Batch` are private
+  --> tests/compile-fail/a_batch_cannot_be_struct_literalled.rs:16:9
+   |
+15 |     let _forged = Batch {
+   |                   ----- in this type
+16 |         conversations: BTreeMap::new(),
+   |         ^^^^^^^^^^^^^ private field
+17 |         entries: BTreeMap::new(),
+   |         ^^^^^^^ private field
+18 |         tasks: BTreeMap::new(),
+   |         ^^^^^ private field
+19 |         submissions: BTreeMap::new(),
+   |         ^^^^^^^^^^^ private field
+20 |         documents: BTreeMap::new(),
+   |         ^^^^^^^^^ private field

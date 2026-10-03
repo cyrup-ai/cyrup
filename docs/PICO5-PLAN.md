@@ -37,29 +37,38 @@ them is the expensive direction.
 
 ## The slices
 
-| # | slice | size | depends on | implements | discharges |
-|---|---|---|---|---|---|
-| S0 | Transaction-signature spike | S | — | F2 | nothing durable; de-risks S4 |
-| S1 | Identity and value newtypes | S | — | F6 §A | `G-IDS-DISTINCT`, `G-SEQ`, `G-LIFETIME-HALF-OPEN` |
-| S2 | The pure document core | L | S1 | F4, F6 §C | `G-INV-6` (value half), `G-TRUSTED-IMMUTABLE`, `G-OWNERSHIP-BOUNDARY`, `G-CORRUPTION-NOT-ABSENCE`, `G-VERSION-PER-RECORD` |
-| S3 | Storage contract + memory backend + conformance harness | L | S1, S2 | F3, F6 §B | `G-INV-1` (shape), `G-ONE-CONTENT-COMMAND`, `G-RETIRE-ORDER-FREE`, `G-SINGLE-COMMITTER`, `G-CURSORS-BACKEND-OWNED`, `G-MEMORY-IS-REFERENCE` |
-| S4 | The session kernel: line, transaction, drafts, witnesses | L | S0, S2, S3 | F1, F2, F5 | `G-INV-2`, `G-INV-3`, `G-INV-4`, `G-INV-6`, `G-INV-7`, `G-INV-8`, `G-READ-BEFORE-FIRST-TABLE-WRITE`, `G-PRE-ADMISSION-ROLLBACK` |
-| S5 | Documents in the session: definitions, scope, migration, checkpoints | M | S4 | — | `G-SCOPE-DETERMINES-LIFETIME`, `G-TOKEN-AGREES-WITH-RECORD`, `G-ONLY-TYPED-ACQUISITION-CREATES`, `G-CHECKPOINT-ONCE`, `G-MIGRATION-ACCESS-DRIVEN`, `G-FIRST-WRITE-AFTER-MIGRATION-IS-BASE` |
-| S6 | Observation and publication | M | S4 | F1 (observer half), F5 | `G-INV-3`, `G-SYNC-OBSERVERS-CAPTURE-ONLY`, `G-DOC-SOURCE-NO-MUTABLE-OBJECT` |
-| S7 | The JSONL backend: store lock, marker protocol, recovery | L | S3 | F6 §D | `G-INV-1` (in the medium), `G-JSONL-MARKER-PROTOCOL`, `G-JSONL-DURABILITY-TIERS`, `G-JSONL-RECOVERY-AND-POISON`, `G-ONE-WRITER-PER-STORE` |
-| S8 | Fault injection at three points | M | S4, S7 | — | verifies `G-INV-8`, `G-REJECTED-NO-DURABLE-EFFECT` |
-| S9 | Forks and copy-source isolation | M | S5, S7 | — | `G-COPY-SOURCE-SNAPSHOT-ISOLATION`, `G-FORK-POINT-ONE-ENTRY`, `G-FORK-POLICY-PERSISTED` |
-| S10 | Kernel indexes and query paths | L | S3, S7 | — | `G-KERNEL-INDEXES-REQUIRED`, `G-COMMIT-VISIBLE-TO-LATER-READS` |
-| S11 | `durable_rename` fix in `cyrup-session` | S | — | F6 §D (half) | pre-existing defect; precondition for S7's reclamation |
-| S12 | The SQLite backend | L | S3, S10, **trigger** | — | `G-BACKEND-PARITY-BY-CONFORMANCE`, `G-SQLITE-ONE-TX-PER-COMMIT` |
+| # | slice | size | depends on | implements | discharges | status |
+|---|---|---|---|---|---|---|
+| S0 | Transaction-signature spike | S | — | F2 | nothing durable; de-risks S4 | **retired.** The answer was yes on all three counts; the crate is deleted and its nine compile-fail cases are accounted for in ADR-0030 §2.5 — four were already duplicated against the shipped types, four were folded into `cyrup-pico`'s suite, and one was dropped with its reason. |
+| S1 | Identity and value newtypes | S | — | F6 §A | `G-IDS-DISTINCT`, `G-SEQ`, `G-LIFETIME-HALF-OPEN` | landed |
+| S2 | The pure document core | L | S1 | F4, F6 §C | `G-INV-6` (value half), `G-TRUSTED-IMMUTABLE`, `G-OWNERSHIP-BOUNDARY`, `G-CORRUPTION-NOT-ABSENCE`, `G-VERSION-PER-RECORD` | landed |
+| S3 | Storage contract + memory backend + conformance harness | L | S1, S2 | F3, F6 §B | `G-INV-1` (shape), `G-ONE-CONTENT-COMMAND`, `G-RETIRE-ORDER-FREE`, `G-SINGLE-COMMITTER`, `G-CURSORS-BACKEND-OWNED`, `G-MEMORY-IS-REFERENCE` | landed |
+| S4 | The session kernel: line, transaction, drafts, witnesses | L | S0, S2, S3 | F1, F2, F5 | `G-INV-2`, `G-INV-3`, `G-INV-4`, `G-INV-6`, `G-INV-7`, `G-INV-8`, `G-READ-BEFORE-FIRST-TABLE-WRITE`, `G-PRE-ADMISSION-ROLLBACK` | landed |
+| S5 | Documents in the session: definitions, scope, migration, checkpoints | M | S4 | — | `G-SCOPE-DETERMINES-LIFETIME`, `G-TOKEN-AGREES-WITH-RECORD`, `G-ONLY-TYPED-ACQUISITION-CREATES`, `G-CHECKPOINT-ONCE`, `G-MIGRATION-ACCESS-DRIVEN`, `G-FIRST-WRITE-AFTER-MIGRATION-IS-BASE` | landed |
+| S6 | Observation and publication | M | S4 | F1 (observer half), F5 | `G-INV-3`, `G-SYNC-OBSERVERS-CAPTURE-ONLY`, `G-DOC-SOURCE-NO-MUTABLE-OBJECT` | landed — **minus the `G-INV-2` / `G-INV-3`-emitter compile-fail case** the crate's own guarantee table cites by a name (`a_publication_cannot_be_forged`) that no file carries. See ADR-0030 §2.5. |
+| S7 | The JSONL backend: store lock, marker protocol, recovery | L | S3 | F6 §D | `G-INV-1` (in the medium), `G-JSONL-MARKER-PROTOCOL`, `G-JSONL-DURABILITY-TIERS`, `G-JSONL-RECOVERY-AND-POISON`, `G-ONE-WRITER-PER-STORE` | landed |
+| S8 | Fault injection at three points | M | S4, S7 | — | verifies `G-INV-8`, `G-REJECTED-NO-DURABLE-EFFECT` | landed |
+| S9 | Forks and copy-source isolation | M | S5, S7 | — | `G-COPY-SOURCE-SNAPSHOT-ISOLATION`, `G-FORK-POINT-ONE-ENTRY`, `G-FORK-POLICY-PERSISTED` | landed |
+| S10 | Kernel indexes and query paths | L | S3, S7 | — | `G-KERNEL-INDEXES-REQUIRED`, `G-COMMIT-VISIBLE-TO-LATER-READS` | landed — measured: p95 open **29.5 ms** and resident index **0.045 MB** at 601 commits / 613 table records, against triggers of 200 ms and 64 MB. **The trigger does not fire.** |
+| S11 | `durable_rename` fix in `cyrup-session` | S | — | F6 §D (half) | pre-existing defect; precondition for S7's reclamation | landed — unix arm only; the Windows arm is ADR-0030 §14 item 1 and is still open. |
+| S12 | The SQLite backend | L | S3, S10, **trigger** | — | `G-BACKEND-PARITY-BY-CONFORMANCE`, `G-SQLITE-ONE-TX-PER-COMMIT` | not started, correctly — its trigger has not fired (see S10). |
 
 **Totals: twelve slices** — ten unconditional, one spike, one conditional on a measurement.
+
+**Where this stands.** Eleven slices have landed and S12's trigger has not fired, so the plan is
+complete as scoped. The workspace is green: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings` (0 warnings over all 31 members) and
+`cargo nextest run --workspace` (**13 026 tests, 13 026 passed, 10 skipped**, 189 s), of which 313
+are the five pico crates'. 55 `trybuild` compile-fail cases back the `unrepresentable` and
+`typestate` rows of ADR-0030 §2 — and **ADR-0030 §2.5 lists the five rows they do not reach**, which
+is the outstanding work this plan does not yet have a slice for.
 
 ---
 
 ### S0 — Transaction-signature spike · **S** · depends on nothing
 
-A throwaway crate, deleted or folded into `cyrup-pico` when it answers its question.
+A throwaway crate, deleted or folded into `cyrup-pico` when it answers its question. It has, and it
+was: see the closing note below.
 
 Write ADR-0030 F2's signature and prove, against a real borrow checker, that:
 
@@ -78,6 +87,18 @@ which needs S4), and a one-paragraph verdict on ergonomics. **If the primary for
 record the fallback (`&'tx mut Tx<'tx, Reading>` plus an internal flag) and downgrade `G-INV-4` and
 `G-READ-BEFORE-FIRST-TABLE-WRITE` from `typestate` to `checked` in ADR-0030 §2 before S4 starts.
 This is ADR-0030 open question 4, and nothing else in the plan depends on its answer.
+
+**Answered, and retired.** The primary form holds, is callable with a plain `async |tx| { .. }`, and
+rejects all five programs with readable errors — so `G-INV-4` and `G-READ-BEFORE-FIRST-TABLE-WRITE`
+stay `typestate` and the fallback is not needed. One sub-answer constrains F2: the error type in the
+bound must be **concrete**, because an unconstrained `E` turns six of the negative cases into
+`E0282 type annotations needed`; F2 already writes `CallbackError`, so this confirms the ADR. One
+finding goes the other way: §10's `_not_send` marker on `Tx` is not what rejects a spawned
+`Tx`-borrowing future — `'static` alone does that — and what the marker actually buys is a `!Send`
+`commit` future, which is what F1's actor needs. `cyrup-pico`'s
+`a_future_borrowing_the_transaction_cannot_be_spawned` and `the_commit_future_is_not_send` carry both
+halves against the shipped types. The spike crate is deleted; ADR-0030 §2.5 records case by case where
+each of its nine went.
 
 ---
 

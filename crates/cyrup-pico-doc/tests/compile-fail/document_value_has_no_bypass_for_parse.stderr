@@ -1,0 +1,38 @@
+error[E0277]: the trait bound `DocValue: From<Value>` is not satisfied
+  --> tests/compile-fail/document_value_has_no_bypass_for_parse.rs:17:52
+   |
+17 |     let forged: DocValue = serde_json::Value::Null.into();
+   |                                                    ^^^^ the trait `From<Value>` is not implemented for `DocValue`
+   |
+   = note: required for `Value` to implement `Into<DocValue>`
+
+error[E0277]: the trait bound `DocValue: From<f64>` is not satisfied
+  --> tests/compile-fail/document_value_has_no_bypass_for_parse.rs:20:41
+   |
+20 |     let from_float: DocValue = f64::NAN.into();
+   |                                         ^^^^ the trait `From<f64>` is not implemented for `DocValue`
+   |
+   = note: required for `f64` to implement `Into<DocValue>`
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/compile-fail/document_value_has_no_bypass_for_parse.rs:23:19
+   |
+23 |     let literal = DocRoot(Arc::new(DocMap::new()));
+   |                   ^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/value.rs
+   |
+   | pub struct DocRoot(Arc<DocMap>);
+   |                    ^^^^^^^^^^^ private field
+help: you might have meant to use an associated function to build this type
+   |
+23 -     let literal = DocRoot(Arc::new(DocMap::new()));
+23 +     let literal = DocRoot::empty();
+   |
+23 -     let literal = DocRoot(Arc::new(DocMap::new()));
+23 +     let literal = DocRoot::from_map(_);
+   |
+23 -     let literal = DocRoot(Arc::new(DocMap::new()));
+23 +     let literal = DocRoot::from_arc(_);
+   |

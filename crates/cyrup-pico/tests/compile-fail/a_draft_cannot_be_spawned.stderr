@@ -1,0 +1,22 @@
+error: future cannot be sent between threads safely
+  --> tests/compile-fail/a_draft_cannot_be_spawned.rs:40:13
+   |
+40 | /             tokio::spawn(async move {
+41 | |                 let _ = draft.delete(&cyrup_pico_doc::Path::root());
+42 | |             });
+   | |______________^ future created by async block is not `Send`
+   |
+   = help: within `{async block@$DIR/tests/compile-fail/a_draft_cannot_be_spawned.rs:40:26: 40:36}`, the trait `Send` is not implemented for `*const ()`
+note: captured value is not `Send`
+  --> tests/compile-fail/a_draft_cannot_be_spawned.rs:41:25
+   |
+41 |                 let _ = draft.delete(&cyrup_pico_doc::Path::root());
+   |                         ^^^^^ has type `Draft<'_, Empty>` which is not `Send`
+note: required by a bound in `tokio::spawn`
+  --> $CARGO/tokio-$VERSION/src/task/spawn.rs
+   |
+   |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+   |            ----- required by a bound in this function
+   |     where
+   |         F: Future + Send + 'static,
+   |                     ^^^^ required by this bound in `spawn`

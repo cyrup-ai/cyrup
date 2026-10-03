@@ -1,0 +1,9 @@
+error[E0451]: fields `created_at` and `retired_at` of struct `cyrup_pico_store::Lifetime` are private
+  --> tests/compile-fail/lifetime_cannot_be_struct_literalled.rs:13:9
+   |
+12 |     let _ = Lifetime {
+   |             -------- in this type
+13 |         created_at: Seq::FIRST,
+   |         ^^^^^^^^^^ private field
+14 |         retired_at: None,
+   |         ^^^^^^^^^^ private field

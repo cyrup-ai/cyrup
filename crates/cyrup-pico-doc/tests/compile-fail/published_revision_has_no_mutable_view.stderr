@@ -1,0 +1,17 @@
+error[E0425]: cannot find function `at_mut` in crate `cyrup_pico_doc`
+  --> tests/compile-fail/published_revision_has_no_mutable_view.rs:28:33
+   |
+28 |     let _slot = cyrup_pico_doc::at_mut(&mut value, &cyrup_pico_doc::Path::root());
+   |                                 ^^^^^^ not found in `cyrup_pico_doc`
+
+error[E0599]: no method named `as_map_mut` found for struct `DocRoot` in the current scope
+  --> tests/compile-fail/published_revision_has_no_mutable_view.rs:24:24
+   |
+24 |     let members = root.as_map_mut();
+   |                        ^^^^^^^^^^
+   |
+help: there is a method `as_map` with a similar name
+   |
+24 -     let members = root.as_map_mut();
+24 +     let members = root.as_map();
+   |

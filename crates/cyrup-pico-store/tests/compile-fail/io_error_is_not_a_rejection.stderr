@@ -1,0 +1,40 @@
+error[E0277]: `?` couldn't convert the error to `CommitError`
+  --> tests/compile-fail/io_error_is_not_a_rejection.rs:20:32
+   |
+18 | fn commit_the_batch() -> Result<(), CommitError> {
+   |                          ----------------------- expected `CommitError` because of this
+19 |     // A backend's write path. `?` must not be able to classify this.
+20 |     let _: () = failing_write()?;
+   |                 ---------------^ the trait `From<std::io::Error>` is not implemented for `CommitError`
+   |                 |
+   |                 this can't be annotated with `?` because it has type `Result<_, std::io::Error>`
+   |
+   = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+help: the trait `From<std::io::Error>` is not implemented for `CommitError`
+      but trait `From<RejectedReason>` is implemented for it
+  --> src/error.rs
+   |
+   |     Rejected(#[from] RejectedReason),
+   |                ^^^^
+   = help: for that trait implementation, expected `RejectedReason`, found `std::io::Error`
+
+error[E0277]: the trait bound `CommitError: From<std::io::Error>` is not satisfied
+  --> tests/compile-fail/io_error_is_not_a_rejection.rs:32:58
+   |
+32 |     let _converted: CommitError = io::Error::other("no").into();
+   |                                                          ^^^^ the trait `From<std::io::Error>` is not implemented for `CommitError`
+   |
+help: the trait `From<std::io::Error>` is not implemented for `CommitError`
+      but trait `From<RejectedReason>` is implemented for it
+  --> src/error.rs
+   |
+   |     Rejected(#[from] RejectedReason),
+   |                ^^^^
+   = help: for that trait implementation, expected `RejectedReason`, found `std::io::Error`
+   = note: required for `std::io::Error` to implement `Into<CommitError>`
+
+error[E0599]: no variant, associated function, or constant named `Other` found for enum `RejectedReason` in the current scope
+  --> tests/compile-fail/io_error_is_not_a_rejection.rs:35:37
+   |
+35 |     let _invented = RejectedReason::Other("something went wrong".to_owned());
+   |                                     ^^^^^ variant, associated function, or constant not found in `RejectedReason`

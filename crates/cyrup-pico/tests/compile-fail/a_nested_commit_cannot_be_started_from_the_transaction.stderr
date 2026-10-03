@@ -1,0 +1,11 @@
+error[E0599]: no method named `commit` found for struct `cyrup_pico::Tx<'tx, S>` in the current scope
+  --> tests/compile-fail/a_nested_commit_cannot_be_started_from_the_transaction.rs:22:24
+   |
+22 |             let _ = tx.commit(cx, async |inner| Ok(((), inner.writing()))).await;
+   |                        ^^^^^^ method not found in `cyrup_pico::Tx<'_, Reading>`
+
+error[E0599]: no method named `session` found for struct `cyrup_pico::Tx<'tx, S>` in the current scope
+  --> tests/compile-fail/a_nested_commit_cannot_be_started_from_the_transaction.rs:23:24
+   |
+23 |             let _ = tx.session();
+   |                        ^^^^^^^ method not found in `cyrup_pico::Tx<'_, Reading>`

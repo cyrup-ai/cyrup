@@ -1,0 +1,20 @@
+error[E0499]: cannot borrow `store` as mutable more than once at a time
+  --> tests/compile-fail/one_committer_at_a_time.rs:39:13
+   |
+38 |     let a = store.commit(one, &cx);
+   |             ----- first mutable borrow occurs here
+39 |     let b = store.commit(two, &cx);
+   |             ^^^^^ second mutable borrow occurs here
+40 |     drop((a, b));
+   |           - first borrow later used here
+
+error[E0596]: cannot borrow `*shared` as mutable, as it is behind a `&` reference
+  --> tests/compile-fail/one_committer_at_a_time.rs:52:13
+   |
+52 |     let _ = shared.commit(third.build().unwrap(), &cx);
+   |             ^^^^^^ `shared` is a `&` reference, so it cannot be borrowed as mutable
+   |
+help: consider changing this to be a mutable reference
+   |
+43 |     let shared: &MemoryStore = &mut MemoryStore::new();
+   |                                 +++

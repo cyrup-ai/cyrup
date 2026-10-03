@@ -1,0 +1,15 @@
+error[E0596]: cannot borrow data in an `Arc` as mutable
+  --> tests/compile-fail/a_published_container_cannot_be_mutated.rs:26:9
+   |
+26 |         items.sort_by(|_, _| core::cmp::Ordering::Equal);
+   |         ^^^^^ cannot borrow as mutable
+   |
+   = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `Arc<Vec<DocValue>>`
+
+error[E0596]: cannot borrow data in an `Arc` as mutable
+  --> tests/compile-fail/a_published_container_cannot_be_mutated.rs:27:9
+   |
+27 |         items.push(DocValue::Null);
+   |         ^^^^^ cannot borrow as mutable
+   |
+   = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `Arc<Vec<DocValue>>`

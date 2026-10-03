@@ -1,0 +1,5 @@
+error[E0599]: no method named `session` found for reference `&Publication` in the current scope
+  --> tests/compile-fail/a_sync_observer_cannot_reach_a_session_handle.rs:14:34
+   |
+14 |     let _reentrant = publication.session();
+   |                                  ^^^^^^^ method not found in `&Publication`

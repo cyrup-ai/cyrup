@@ -1,0 +1,40 @@
+[package]
+name = "cyrup-pico-doc"
+description = "Pico5 durability kernel: the pure document core -- DocValue, the operation applier, the replay planner (ADR-0030 §8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# DELIBERATELY ABSENT, and the absences are the crate's contract (ADR-0030 §8):
+#
+#   tokio            = ...   # <-- never. Everything here is a total function; no runtime.
+#   cyrup-core       = ...   # <-- never. `cyrup_core::EntryId` is an `Arc<str>` session token and
+#                            #     this kernel's `EntryId` is a minted number. With no edge, the
+#                            #     two cannot be confused into one another (open question 8).
+#   cyrup-pico-store = ...   # <-- never. The edge runs the OTHER way: S3's `DocumentBase` takes
+#                            #     `DocRoot` and `DocumentContent::Delta` takes `StoredVersion`.
+#                            #     That is why `DefVersion` lives HERE and `cyrup-pico-store`
+#                            #     re-exports it.
+[lints]
+workspace = true
+
+[dependencies]
+# `serde` for the custom `Serializer` that IS `DocValue::parse`, and for the wire form of the
+# persisted records. The `rc` feature (on workspace-wide) is what lets `Arc<str>` and
+# `Arc<Vec<_>>` fields serialize at all.
+serde = { workspace = true }
+# `serde_json` for `Number` ONLY, plus the wire form. `serde_json::to_value` MUST NOT appear on the
+# document write path: its `serialize_f64` is `Ok(Value::from(float))` and `From<f64> for Value` is
+# `Number::from_f64(f).map_or(Value::Null, ..)`, so a `NaN` becomes a silent `null` (ADR-0030 F4).
+# `DocValue` is not built from `serde_json::Value` anywhere in this crate.
+serde_json = { workspace = true }
+# The persisted document object. Chosen for its ORDER-INSENSITIVE `PartialEq` (ADR-0030 §2.3).
+indexmap = { workspace = true, features = ["serde"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Compile-fail proof for the ADR-0030 §2 rows this crate classifies `unrepresentable`.
+trybuild = { workspace = true }

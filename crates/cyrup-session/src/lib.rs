@@ -17,6 +17,9 @@
 pub mod agent_message;
 pub mod compaction;
 pub mod context;
+/// Durable replace-by-rename (PICO5-PLAN S11 / ADR-0030 F6 §D). Private: the pico-store crates
+/// must not depend on `cyrup-session`, so S7 carries its own copy of the same sequence.
+mod durable;
 pub mod entry;
 pub mod error;
 pub mod git_paths;

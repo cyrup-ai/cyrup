@@ -1,0 +1,15 @@
+error[E0382]: use of moved value: `attachment`
+  --> tests/compile-fail/an_attachment_cannot_be_activated_twice.rs:15:18
+   |
+13 | fn canary(attachment: Attachment<Live>) {
+   |           ---------- move occurs because `attachment` has type `Attachment<Live>`, which does not implement the `Copy` trait
+14 |     let _state = attachment.activate();
+   |                             ---------- `attachment` moved due to this method call
+15 |     let _twice = attachment.activate();
+   |                  ^^^^^^^^^^ value used here after move
+   |
+note: `Attachment::<T>::activate` takes ownership of the receiver `self`, which moves `attachment`
+  --> src/state.rs
+   |
+   |     pub fn activate(self) -> DocState<T> {
+   |                     ^^^^

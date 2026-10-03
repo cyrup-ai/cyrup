@@ -5,6 +5,7 @@ mod area03_repairs;
 mod branch_provenance_and_export;
 mod compaction;
 mod deferred_context;
+mod durable_rewrite;
 mod estimator_prefix_timestamp_parity;
 mod listing_progress;
 mod listing_unparseable_message;

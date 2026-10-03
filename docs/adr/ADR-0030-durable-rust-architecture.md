@@ -147,8 +147,8 @@ with the reason it cannot be lifted).
 | `spec.md:1112-1114` | incarnation membership is the half-open interval `createdAt <= at < retiredAt` | two `Seq` fields and the interval test written at each read site (two sites) | retire-then-create at one address overlaps or gaps at the boundary sequence | `Lifetime` newtype, private fields, `contains()` the only accessor; empty lifetime legal, inverted rejected | **guarded** (one implementation of `<=`/`<`) |
 | `spec.md:99-100`, `memory.ts:253`, `jsonl/storage.ts:543-546` | commit sequences strictly increase across the store's life, including reopen; gaps permitted | runtime checks at the write and recovery boundaries | a non-increasing sequence makes lifetime intervals and delta ordering meaningless | `Seq` newtype + the backend's check at both boundaries | **checked** — crosses a process boundary and cannot be lifted |
 | `spec.md:4282`, `memory.ts:410-413` | ids come from one durable monotone global namespace | `mintId()` is a storage method; exhaustion checked with `Number.isSafeInteger` | an in-memory fast path or a stale cached high-water mark reissues ids | `mint<K>(&mut self)` on the storage handle only — no free function, no `Default` allocator, no public `Id` constructor; fallible, not wrapping | **guarded**; **checked** for high-water-mark durability (reopen suite) |
-| `spec.md:4274-4275`, `memory.ts:689-695` | one number is owned by one record of one type | per-backend checks against committed state | id 41 is written as two record types, or re-points an existing record | per-table `BTreeMap<Id<K>, _>` kills the in-table and in-process cross-table cases; ownership against **already-committed** records stays a backend check | **unrepresentable** in-process; **checked** cross-batch |
-| `spec.md:4362-4367`, `memory.ts:716-759` | one batch holds at most one content command per incarnation, plus an optional retirement; a delta needs a base; a version transition must be a base | a flat `readonly StorageWrite[]` that can express all five illegal states, re-validated by hand in all three backends | two content commands have no defined meaning; a delta across a version boundary makes the document permanently unreadable | keyed `Batch` + `DocumentCommand` carrying content *and* an optional retirement as one value (F3) | **unrepresentable** for four of five; **checked** for "address already has a current incarnation" (cross-batch) |
+| `spec.md:4274-4275`, `memory.ts:689-695` | one number is owned by one record of one type | per-backend checks against committed state | id 41 is written as two record types, or re-points an existing record | per-table `BTreeMap<Id<K>, _>` kills the in-table duplicate; ownership against **already-committed** records, and across tables, stays a backend check | **checked** — `RejectedReason::IdAlreadyOwned` plus the conformance case `one_number_is_owned_by_one_record_type`. *Kind confusion* is what the types make `unrepresentable`, and that is the row above, proved by `kinds_do_not_interconvert.rs`; `Id<Entry>(41)` and `Id<Task>(41)` are both legitimate values, so single ownership of the **number** is not a type property |
+| `spec.md:4362-4367`, `memory.ts:716-759` | one batch holds at most one content command per incarnation, plus an optional retirement; a delta needs a base; a version transition must be a base | a flat `readonly StorageWrite[]` that can express all five illegal states, re-validated by hand in all three backends | two content commands have no defined meaning; a delta across a version boundary makes the document permanently unreadable | keyed `Batch` + `DocumentCommand` carrying content *and* an optional retirement as one value (F3) | **unrepresentable** for three of five — two content commands and a double retirement (`a_built_batch_cannot_take_a_second_command`), and a delta without a base (`stored_version_cannot_be_forged`); **checked** for the other two: "address already has a current incarnation" (cross-batch) and "a version transition must be a base" (`RejectedReason::VersionTransitionRequiresBase`) |
 | `spec.md:4363-4364` | storage applies content before retirement, independent of write-array order | a prose rule each backend implements by hand after normalising the array | a retire listed before its content discards a terminal task's final state — exactly the document the user cares about most — and the bug reproduces on one backend only | no array: order is not expressible (F3). Order **within** one incarnation's delta tail stays a sequence (`spec.md:4350`) | **unrepresentable** |
 | `spec.md:4307-4311`, `errors.ts:12-18` | "rejected, nothing durable happened" is distinguishable from "uncertain" | an exception subclass each backend chooses by hand, and one `instanceof` test | classified wrong one way, a bad fork source costs the user the whole live session; wrong the other way, the Session runs on a baseline that already disagrees with the disk | `CommitError::{Rejected(RejectedReason), Uncertain(..)}` where `RejectedReason` is a **closed** enum with no string arm and no `From<io::Error>` (F1) | **unrepresentable** to omit the choice or to classify I/O as recoverable; **checked** for whether the claim is true |
 | `spec.md:1560-1566`, `memory.ts:92-100, 216`, `spec.md:4375-4378, 4402-4405` | storage and the Session never alias caller memory | explicit deep copying at every boundary, which §11.1 says outright exists to *simulate* the boundary SQLite and JSONL get free | a caller mutates something it already committed, or a backend's index shares a container with a reader's value: committed history changes under a user who is reading it, with no write and no event | ownership. `commit(batch)` by value; reads return owned or `Arc<immutable>`; no `#[serde(borrow)]`, no `Cow` in persisted records (F4) | **unrepresentable** — `CYRUP-DELTA`: same guarantee, mechanism deleted |
@@ -191,6 +191,91 @@ representation is already decided and nobody reaches for typestate.
 | `spec.md:1596, 1600-1604` | ownership is conversation-or-task, on both conversations and tasks | two-variant unions; the caller cannot omit the choice | an implicit or guessed owner silently changes which conversations an Escape cancels | two-variant enums, caller supplies a typed id, the Session derives the persisted pair. Attribution only — **not** an access-control capability, and nothing enforces that half | **enum**; the not-a-capability half is prose, as upstream |
 | `spec.md:3168-3176` | the built-in task kinds are a closed set of **three** | three `TaskDefinition`s named `pi.generation`, `pi.tool`, `pi.compaction` | — | a closed enum of three, not five — area 17 says five; see ADR-0029 Measurement 1 | **enum** |
 | `spec.md:1869-1884` | a run invocation may not commit after its durable abort mark appears; an abort handler cannot create owned work (§12:4553) | runtime rejection; the abort invocation's task is abort-marked | compensation logic in an abort handler creates work that is immediately marked, or never drains | the abort handler receives a **context type without the create-owned-work capability** — the one place in §5 where a capability-shaped type beats a check | **unrepresentable**, when §5 is built |
+
+### 2.5 Enforcement audit — what the compile-fail suite proves
+
+§2.1–§2.3 classify **23 rows `unrepresentable`** and **one row (§1.8) `typestate`**, over and above
+§1's framing of three typestate *sites*. §7's rule is that a guarantee carried only by a signature
+needs a `trybuild` case, because deleting the signature is invisible in a diff and no runtime test
+turns red. This subsection records which rows have one.
+
+**Measured coverage.** 54 `trybuild` cases exist across `cyrup-pico` (30), `cyrup-pico-store` (14),
+`cyrup-pico-doc` (6) and `cyrup-pico-store-jsonl` (4). **All 23 `unrepresentable` rows and the one
+`typestate` row are proved by at least one case.** One row's proof spans two crates: invariant 7 is
+*one committer*, and its two halves are two signatures in two places — the kernel's non-`Clone`,
+consuming `SessionMut` in `cyrup-pico`'s suite, and `Storage::commit(&mut self, ..)` in
+`cyrup-pico-store`'s. Each case lives with the signature it pins, which is the only arrangement under
+which deleting that signature turns a case red.
+
+The suite is load-bearing rather than decorative: re-adding a handle to the fatal commit arm, the
+mutation that deletes §1.8's guarantee, turns
+`a_session_mut_cannot_be_obtained_from_an_uncertain_outcome` red and nothing else, so the case detects
+the thing it exists to detect.
+
+#### The three gaps closed by cases
+
+| row | claim | the case, and the error it pins |
+|---|---|---|
+| §2.1 invariant 2 | *"no document update is visible before its commit succeeded"* — **unrepresentable** | `a_publication_cannot_be_forged` (`E0451` on `Publication { .. }`, which is what `_seal: ()` is for) and `a_publication_has_no_public_constructor` (`E0624` on `Publication::new`, plus `E0599` on `Publication::default`). It takes **two** files rather than one: `E0624` is a type-check error and `E0451` comes from the privacy pass, which does not run once type-checking has failed, so a single file would pin only the constructor half and leave `_seal` unproved. `Publication`'s name is `pub` — §10 writes the type `pub(crate)` and in the same block puts it in a public trait's method signature, which is `E0446` — so the type is nameable from a `trybuild` file and both invalid programs are writable. `Durable` is the type that genuinely has no constructor to name, because it is `pub(crate)`; its half of F5's chain is carried by the privacy boundary itself. |
+| §2.1 invariant 3 (emitter half) | a second emitter *"has no `Publication` and cannot construct one"* — **unrepresentable** | the same two files. The observer half was already proved by `a_sync_observer_cannot_retain_the_publication` (`E0507`). |
+| §2.1 invariant 7 (*one committer*) | **unrepresentable** | the **storage** seam was already proved by `one_committer_at_a_time` (`E0499`/`E0596` on `Storage::commit(&mut self, ..)`). The **kernel** seam now has `a_session_mut_cannot_be_cloned` (`E0599` on `SessionMut::clone`, plus `E0277` on a `T: Clone` bound and `E0599` on a second handle asked of the read view) and `a_session_mut_cannot_be_used_after_commit` (`E0382`, twice: two commits in flight, and one after the other). The mutation those two catch is `commit(&mut self, ..)`, which compiles, reads as a convenience, and silently re-admits every overlapping-commit program the move forbids. |
+
+#### The two rows corrected instead
+
+Neither could be proved, because neither was true as written. A reclassification is the outcome §7 asks
+for in that case, not a weaker one.
+
+| row | what it claimed | what it says now |
+|---|---|---|
+| §2.2 `spec.md:4274-4275` | *"one number is owned by one record of one type"* — **unrepresentable in-process** | **checked.** What the types make unrepresentable is *kind confusion* — passing an `Id<Task>` where an `Id<Entry>` belongs — and that is already the row above it, proved by `kinds_do_not_interconvert.rs`. The number itself legitimately exists as both `Id<Entry>(41)` and `Id<Task>(41)`, so single ownership of the *number* is not a type property at all: it is `RejectedReason::IdAlreadyOwned` plus the conformance case `one_number_is_owned_by_one_record_type`. |
+| §2.2 `spec.md:4362-4367` | **unrepresentable** for *four* of five | **three of five.** Two content commands and a double retirement are unrepresentable (`a_built_batch_cannot_take_a_second_command`, `E0596`); a delta without a base is unrepresentable because `DocumentContent::Delta` needs a `StoredVersion` and only `ReplayPlan::version()` mints one (`stored_version_cannot_be_forged`). The remaining two ship as runtime rejections: *"an address already has a current incarnation"* was always `checked`, and *"a version transition must be a base"* is `RejectedReason::VersionTransitionRequiresBase`. |
+
+**Two smaller items, recorded so they are not read as gaps.** §2.3's migration row says `Arc<DocValue>`
+makes *"a migration received a live revision"* unrepresentable; there is no dedicated case, and the
+property follows from the immutability rows' cases (`a_published_container_cannot_be_mutated`,
+`a_published_revision_has_no_mutable_path`) rather than needing its own. §2.4's abort-handler row is
+`unrepresentable` *"when §5 is built"*, and §5 is out of scope per ADR-0029, so its absence is correct.
+
+#### `G-PRE-ADMISSION-ROLLBACK`, the one claim a case cannot state
+
+`crates/cyrup-pico/src/lib.rs` asserted *"Each `unrepresentable`/`typestate` claim carries a `trybuild`
+case in `tests/compile-fail/`"* while four of its own rows did not. Three of the four now do, by the
+cases above. The fourth cannot, and is reclassified **`guarded`**: invariant 8's second sentence claims
+the handle **is** in the rollback arm, a compile error only ever proves an absence, and removing
+`session` from `CommitOutcome::RolledBack` breaks every caller's `match` loudly rather than silently.
+What can go wrong quietly there is an *uncertain* failure arriving as a rollback, and that is closed in
+the type: `RollbackReason::Rejected` carries a closed `RejectedReason` with no string arm and no
+`From<std::io::Error>`, which `io_error_is_not_a_rejection` pins. §2.1's invariant-8 row keeps
+`typestate` for its first sentence — the consuming `SessionMut::commit` — which is the one
+`a_session_mut_cannot_be_obtained_from_an_uncertain_outcome` proves. The sentence in `lib.rs` now names
+where each proof lives and no longer claims they are all in one directory.
+
+#### The S0 spike's nine cases
+
+PICO5-PLAN S0 says `cyrup-pico-txspike` is *"a throwaway crate, deleted or folded into `cyrup-pico` when
+it answers its question"*. It has answered, so the crate is gone and its nine cases are accounted for
+one by one rather than deleted in bulk:
+
+* **Four were already duplicated** against the shipped types and needed nothing:
+  `table_read_after_table_write` → `a_table_read_after_a_table_write_does_not_compile`,
+  `draft_escapes_to_outer_binding` → `a_draft_cannot_outlive_the_commit_callback`,
+  `spawn_tx_future` → `a_future_borrowing_the_transaction_cannot_be_spawned`, and
+  `nested_commit` → `a_nested_commit_cannot_be_started_from_the_transaction`.
+* **Four were folded into `cyrup-pico`'s suite**, because each proves something about a shipped type
+  that no case covered: `a_draft_cannot_be_returned_from_the_commit_callback` (`E0515`,
+  `spec.md:1368-1381`'s own footgun), `a_draft_cannot_be_spawned` (`E0277`; `Send` is reported before
+  `'static`, and either bound alone closes it), `a_doc_handle_cannot_cross_transactions` (the bare
+  `lifetime may not live long enough` S0 singled out as its one poor diagnostic — the committed stderr
+  is the message `DocHandle`'s own documentation quotes and supplies the fix for), and
+  `the_commit_future_is_not_send` (`E0277` on `*const ()`, which is what §10's `_not_send` marker
+  *costs* rather than a guarantee it buys).
+* **One was dropped, with the reason.** `spawn_tx_future_send_variant` is written against
+  `send_variant::Tx`, the spike's own copy of §10's field list **minus** `_not_send`. It existed to make
+  the §10 objection falsifiable — to show that `'static` alone rejects the spawn — and that finding is
+  settled and now recorded in `a_future_borrowing_the_transaction_cannot_be_spawned`'s own header. No
+  shipped type lacks the marker, so keeping the case would mean re-creating a throwaway type to hold a
+  test about a throwaway type.
+
 
 ---
 ## 3. Findings
@@ -1706,21 +1791,138 @@ like features.
    reclamation path depends on the rename being durable before the authorising marker is trusted.
    Does cyrup take a `windows-sys` dependency in the JSONL backend to call `MoveFileEx` directly,
    accept NTFS metadata journalling as sufficient, or state the Windows reclamation envelope as
-   weaker? `docs/adr/ADR-0007-windows-scope.md` puts Windows in scope, so this needs an answer rather
    than a `cfg`-gated TODO.
+
+   **Still open after slice S11, deliberately, and now localised to one function body.** The unix arm
+   is implemented and traced (fdatasync the payload, rename, fsync the parent directory); the
+   non-unix arm of `fsync_parent_dir` in `crates/cyrup-session/src/durable.rs` is an explicitly
+   labelled interim no-op, so Windows is no weaker than before the module existed. Two facts the
+   decision no longer has to re-establish: `MOVEFILE_WRITE_THROUGH` is the only documented route to
+   step 3 and costs `cyrup-session` its **first** platform dependency; and there is no
+   directory-fsync to substitute, because `File::open` cannot open a directory on Windows without
+   `FILE_FLAG_BACKUP_SEMANTICS` via `CreateFileW`, and `FlushFileBuffers` on a directory handle is
+   not a documented metadata flush. So §14's three candidates differ by a dependency and a durability
+   claim, not by an implementation detail. **This becomes load-bearing at §11.3's reclamation, so it
+   should be answered before the JSONL backend is shipped on Windows, not before S12.**
+
+   *`docs/PICO5-PLAN.md` S11 and this section disagreed about whether S11 answers this.* The plan
+   said *"this is an answer, not a `cfg`-gated TODO"*; §3 says the Windows arm *"is an open question
+   (§14), not a solved problem"*. The implementation followed §3. The disagreement is recorded rather
+   than edited away on either side.
 2. **The SQLite trigger budget needs a measurement.** §9 states 200 ms open / 64 MB resident index
    at p95 as a placeholder. Nobody has measured real `~/.cyrup` session sizes — total commit count
    and table-record count are the two numbers that matter, because open is
    O(commits + table records). Measure before the threshold is treated as decided.
+
+   **Measured in slice S10. The trigger does not fire for any real session that exists, and the
+   64 MB half, read literally, cannot ever fire for this backend.** Four findings, in the order
+   they matter.
+
+   *The corpus, and what `~/.cyrup` turned out to be.* No `~/.cyrup` exists on the machine the
+   slice ran on — no cyrup session has been run there — so there was no cyrup session corpus to
+   measure, and saying so is part of the answer. What does exist is **399 real agent-session
+   transcripts over this repository**, append-only JSONL, one file per session, one record per
+   line: the same medium and the same workload, written by a different agent. Their record counts
+   are **p50 116, p90 339, p95 535, p99 1 292, max 5 276**, with a mean record size of
+   **3 385 bytes** and a p95 session of **1.48 MB** on disk. One transcript record is one Pico5
+   commit under the conservative mapping (a turn that batches several records into one commit makes
+   the real count *lower*), so **a p95 real session is ~535 commits and ~540 table records.**
+
+   *At that size the open is 7 ms, not 200.* `tests/storage_benchmark.rs` at 601 commits and 613
+   table records, release build: **p95 open 7.3 ms**, resident index **0.045 MB**, resident records
+   **2.06 MB**. At the **largest session the corpus holds** — 5 301 commits, 5 407 records, 18.5 MB
+   on disk — **p95 open 52.5 ms**, resident index 0.39 MB, resident records 18.2 MB. The open-time
+   half of the trigger crosses 200 ms at **~24 000 commits** (170 ms at 20 001, 255 ms at 30 001),
+   which is **forty-five times the measured p95 session and four and a half times the largest one**.
+
+   *The 64 MB resident-index half is the wrong quantity, and §9's own model says why.* §9 predicts
+   *"the indexes are id→offset maps plus small key tuples, tens of bytes per record"*, and that
+   prediction is **exactly right**: the measured index is 45 KB at 613 records, 1.5 MB at 20 401 and
+   2.2 MB at 30 601 — so 64 MB of *index* needs roughly **870 000 commits**, which the open-time half
+   crosses thirty-six times earlier. What §9's model leaves out is that a file backend answers
+   `spec.md:4325-4351`'s access paths from memory, so the **records** are resident too, with their
+   payloads: 68.8 MB at 20 401 records, 103 MB at 30 601. The resident figure that crosses 64 MB
+   does so at **~18 600 commits** — *before* the open crosses 200 ms. So the two halves of the
+   trigger are not independent after all; they are the same event, reached through the quantity §9
+   does not name. `Footprint` reports both halves separately for that reason, and the threshold is
+   worth re-stating as **"64 MB resident, records included"**, which is a tightening of ~46× over the
+   literal reading and the only reading under which the second half of the trigger ever fires.
+
+   *A debug build fires where a release build does not, by 5.4×.* The same 5 301-commit store opens
+   in **283 ms** unoptimised against 52.5 ms optimised. The trigger is a statement about shipped
+   behaviour, so the figures above are the release ones; the debug gap is recorded because a
+   developer measuring their own session will hit it and should not read it as the trigger firing.
+
+   **So S12 is not triggered, and the number that would trigger it is now a measurement rather than
+   a placeholder.** What re-opens the question is a session an order of magnitude past anything the
+   corpus holds — which `tests/storage_benchmark.rs` will say out loud, because its final assertion
+   *is* the trigger evaluation and it runs on every green tree.
 3. **Does the marker-carries-sidecar-offsets design survive a second look?** It depends on the
    exclusive lock making byte offsets knowable for an `O_APPEND` fd, which is sound for a single
    appender but means the offsets are only as trustworthy as the lock. Recovery must validate every
    offset against actual sidecar length and treat a past-EOF offset as corruption. Is that validation
    cheap enough to keep the open-time saving it exists to buy?
+
+   **Resolved in slice S7: the design survives, the validation is `stat`-bounded, and the real price is
+   paid by reclamation rather than by the open.** Three findings, in the order they matter.
+
+   *The validation costs one `metadata()` per incarnation that has content, and reads no payload byte.*
+   `crates/cyrup-pico-store-jsonl/src/recover.rs`'s `check_sidecars` compares each incarnation's
+   confirmed end — the maximum offset its surviving markers carry — against the file's length: shorter is
+   `Corruption::MissingConfirmedData` and fails the open (`spec.md:4433`), longer is an unconfirmed tail
+   to remove (`spec.md:4429`), equal is the ordinary case. So the cost is bounded by the **number** of
+   documents while the saving is bounded by their **size**, and the gap widens as documents grow. It is
+   pinned by `the_open_pass_validates_offsets_without_reading_a_payload`, which replaces a sidecar's
+   bytes with rubbish of the same length and asserts that the store still **opens** and only the
+   document *read* fails — a test that would go red the day the open pass started parsing sidecars.
+
+   *The offsets are only as trustworthy as the lock, and that residue is now a named check rather than an
+   assumption.* The append handle verifies a sidecar's real length against the confirmed layout **once**,
+   when it first opens it (`crates/cyrup-pico-store-jsonl/src/store.rs`'s `sidecar`), so a stale
+   generation file that somehow survived the open sweep cannot receive an `O_APPEND` write at an offset
+   this process believes is zero. That is the one way the mechanism could have lied.
+
+   *The price is `spec.md:4443-4446`'s reclamation, and it is not free.* Renaming a replacement **over**
+   the live sidecar is sound for pi, whose markers list records; it is not sound once a marker carries
+   byte offsets, because a crash between that rename and the line authorising it leaves surviving markers
+   describing a file that is now shorter — which recovery must, and does, treat as corruption. The JSONL
+   backend therefore renames to the **next generation's name** (`doc-<id>-g<gen>.jsonl`) and appends one
+   `reclaim` line naming the generation that becomes authoritative, after the replacement is durable.
+   Every crash point is then safe: before that line the old generation is intact and authoritative and
+   the new one is an orphan the open sweep removes, after it the roles are exactly reversed. The cost is
+   one extra file name, one extra log line per reclamation, and the sweep — paid in one function, and in
+   exchange it closes a crash window the in-place rename leaves open even for a backend that carries no
+   offsets at all.
+
+   **So the fall-back to pi's marker shape is not taken, and the open-time saving stands.**
 4. **Is `for<'tx> AsyncFnOnce(Tx<'tx, Reading>) -> Result<(R, Tx<'tx, Writing>), _>` ergonomic in
    practice?** This is the sharpest edge in the design and it has not been written against a real
    borrow checker. Slice S0 of `docs/PICO5-PLAN.md` exists to answer it before anything is built on
    it. The fallback loses the consuming transition and is recommended against.
+
+   **Answered yes in slice S0, and the fallback is not adopted.** The primary form compiles and is
+   callable with a bare `async |tx| { .. }` — no annotation on the parameter, no turbofish, no
+   boxing — with `Tx<'tx, S>` holding `&'tx mut TxInner<'tx>` plus §10's `PhantomData` fields; a
+   named `async fn change<'tx>(..)` satisfies the same bound, `?` converts through it, `R` may borrow
+   the environment, and a `Draft` may be held across an `await`. **`G-INV-4` and
+   `G-READ-BEFORE-FIRST-TABLE-WRITE` therefore stay `typestate` in §2; no downgrade is applied.**
+
+   *One sub-answer the spike had to settle, which this section does not state and which constrains
+   the implementation:* **the error type in the bound must be concrete, not a third generic
+   parameter.** With `commit<R, E, F>` and `E` free, a callback that cannot fail leaves `E`
+   unconstrained, and six negative programs stop failing for their own reason and begin failing with
+   `E0282`. §3's F2 already writes the bound with a named `CallbackError`, so the spike confirms the
+   design as written — but the concreteness is load-bearing rather than incidental and must not be
+   generalised later.
+
+   *One prediction in F2's "Migration cost" paragraph is wrong in a way worth fixing.* It expects the
+   spawn case to be *"the error we want, with a poor message"* and prescribes a doc example for it.
+   Measured, the spawn case reads well (`Tx<'_, Reading> which is not Send`, with tokio's bound
+   cited), as do draft escape (`E0521`, naming the outer binding), draft return (`E0515`), nested
+   commit (`E0499`) and read-after-write (`E0599`, with rustc volunteering *"the method was found for
+   `Tx<'tx, Reading>`"*). The one opaque message belongs to a case F2 does not mention — a
+   `DocHandle` crossing transactions, which gets only *"lifetime may not live long enough"* and names
+   neither handles nor transactions. **The prescribed doc example should be retargeted there.**
 5. **Does the harness ever legitimately need a commit callback to await something that is not a
    storage read?** If the answer is a clean no, invariant 4's residual shrinks a great deal and the
    debug line-hold budget can be tight. If some hook path genuinely needs to await an in-memory
@@ -1737,15 +1939,152 @@ like features.
    settled *once* because it is persisted. Only matters if cyrup ever exchanges operation batches
    with a chord peer; ADR-0029's scope says it does not, so byte offsets are the provisional answer
    with the incompatibility recorded.
+
+   **Resolved in slice S2: byte offsets, which is this question's own provisional answer.** Two
+   reasons, the first this question's and the second not: `Op`'s wire form is cyrup's own persisted
+   format, written and read by cyrup alone, so UTF-16 buys compatibility with nothing that exists;
+   and every trim op in this design is *produced* by `OpenChange::trim_str_front`, called from cyrup
+   or from an extension across ADR-0002's serde boundary, both of which count bytes naturally —
+   UTF-16 would turn an O(1) `str` slice into a walk and would put a lone-surrogate case into a type
+   that cannot hold one. **The incompatibility, recorded as this question asks:** a batch produced by
+   a chord peer and replayed here would mis-trim any string containing a non-ASCII character, and a
+   batch produced here would mis-trim on such a peer. Nothing in ADR-0029's scope exchanges batches
+   with one; if that changes, this is the single operation whose wire meaning differs, and it changes
+   by migration rather than in place, because the number is persisted. A count landing inside a
+   multi-byte character is `PathError::TrimNotACharBoundary` — a real arm, because the count is
+   persisted and a damaged record can name any offset. The decision, its reasoning and the unit are
+   recorded on `apply::trim_str_front` in `crates/cyrup-pico-doc/src/apply.rs` and pinned by
+   `a_trim_counts_bytes_not_characters_and_not_utf16_code_units`, so it cannot be reverted silently.
 8. **The `EntryId` collision.** `cyrup_core::EntryId` is an `Arc<str>` 8-hex token; Pico5's is a
    number in one global namespace. Reusing or widening the existing type would let session-level
    string ids flow where a mintable numeric id belongs. Decide the name before the first signature:
    a distinct `cyrup_pico_store::EntryId`, or a rename on one side.
+
+   **Resolved in slice S1: a distinct `cyrup_pico_store::EntryId`, and neither side is renamed.**
+   The two types share no construction path — `cyrup_core::EntryId` is
+   `pub struct EntryId(pub Arc<str>)` with `From<&str>`/`From<String>` (`cyrup-core/src/lib.rs:93`),
+   this one is a private `NonZeroU64` with no `From<u64>` and no public constructor — so no
+   coercion exists in either direction whatever the names are. A module that imports both
+   unqualified is rejected by `E0252` and must say which it means, which is a stronger outcome than
+   a rename, where the import would be silent and correct-looking. And `EntryId` has 325 uses
+   across 30-plus files, almost all `cyrup-session` and `cyrup-tui` session-tree code with no Pico5
+   involvement, so renaming it buys nothing the compiler does not already give. The load-bearing
+   half is structural rather than lexical and is enforced in the manifest: **`cyrup-pico-store`
+   does not depend on `cyrup-core`**, so there is no module in which both names are in scope by
+   accident. The decision and its reasoning are recorded in `crates/cyrup-pico-store/src/lib.rs`.
 9. **Do cyrup's existing file sessions migrate into a Pico5 store, or coexist?** §13:4599 declines a
    compatibility layer for pi's own removed prototypes, so cyrup owes nothing *upstream* — but
    cyrup's existing sessions are real user data. Migrating means synthesising ids and sequences for
    records that have neither; not migrating means two session formats in the tree. A product
    decision, flagged rather than resolved.
+
+10. **Does the `_not_send` marker on `Tx` stay, given what it costs F1?** §10's field list carries
+    `_not_send: PhantomData<*const ()>` and F2 credits it with *"additionally prevent[ing] spawning
+    the whole callback future"*. Measured, that credit is misplaced and the field has a price §10
+    does not state. It is not what carries the guarantee: a `Tx`-borrowing future spawned from a `Tx`
+    that **is** `Send` is still rejected, by `'static` rather than by `Send`. And it propagates
+    outward — `commit`'s own future becomes `!Send`, so F1's single-committer **actor** cannot be
+    `tokio::spawn`ed and needs a `LocalSet` or a thread-pinned current-thread runtime. That is an
+    architectural consequence for F1 decided by a field in F2. The marker is implemented as written
+    and the compile-fail case proving the guarantee survives either choice is committed, so this is a
+    reversible decision: keep the marker and accept the `LocalSet`, or drop it and keep the guarantee
+    on `'static`.
+
+11. **`create_exclusive` has `rewrite`'s defect and nothing in scope covered it.**
+    `crates/cyrup-session/src/store.rs`'s `create_exclusive` ends at `f.sync_data()?` with no
+    parent-directory fsync, so a session it returned `Ok(())` for can come back **absent entirely**
+    after power loss — arguably worse than `rewrite`'s pre-fix failure mode, which at least left both
+    inodes linked. §3 and `docs/PICO5-PLAN.md` S11 both name only `rewrite`, so only `rewrite` was
+    changed. The fix is not free in the way `rewrite`'s was: `rewrite` runs twice in a session's
+    life, `create_exclusive` is on the session-creation path, and a ~200 µs directory fsync there is
+    a first-flush-budget decision rather than a bug fix.
+
+12. **One `durable_rename` or two?** §3 describes *"a `durable_rename` helper that `cyrup-session`'s
+    `rewrite` should also adopt"*, and *also* implies one helper with two users. §8's layering forbids
+    that: `cyrup-pico-store-jsonl` must not depend on `cyrup-session`. So the helper is `pub(crate)`
+    in `cyrup-session` and the JSONL backend carries its own copy. Two copies of a durability
+    sequence is the kind of duplication that drifts. Sharing one means a small new crate or a
+    `cyrup-core` fs module, which is a §8 decision.
+
+13. **`StorageFailure` and `SessionError` cannot express §9 obligation (6)'s two-class contract at
+    the fsync boundary.** A parent-directory fsync failure is squarely *uncertain* — the rename has
+    already taken effect for every reader in every process, and only its survival across power loss
+    is unknown — but it surfaces as a plain I/O error, indistinguishable from the *rejected*
+    `NotFound` a missing temp file produces. In `cyrup-session` that is pre-existing. The forward
+    question is whether §10's `StorageFailure` inherits the same shape, and it should be checked
+    before another backend is written against it.
+
+14. **§3's `RejectedReason` sketch is not implementable as written.** It gives
+    `IdAlreadyOwned { id: RawId, by: IdKind }`, but §10 makes `IdKind` a *trait*, which cannot be a
+    struct field. The shipped form is §10's value type, `IdKindTag` — a closed five-variant enum,
+    `Serialize` only. A sketch typo rather than a design disagreement, recorded because it changes a
+    signature.
+
+15. **`ReplayPlan` is a result, not a plan, and the name now oversells the laziness.** §10 requires
+    `materialize(plan: &ReplayPlan) -> DocRoot` to be pure and **total**. Whether an operation
+    applies cannot be known without applying it, so the only way both hold is for `parse` to replay
+    eagerly and hold the materialized root, leaving `materialize` to hand out an `Arc` share. That is
+    what shipped, and it is what makes `Corruption` genuinely the complete failure set. The
+    alternative is `materialize` returning a `Result` and `G-CORRUPTION-NOT-ABSENCE` weakening from
+    `unrepresentable` to *checked at two sites*.
+
+16. **F6 §C and §10 under-count the corruption rules: it is three, not two.** Both say
+    `ReplayPlan::parse` is where *"the two corruption rules"* live — missing required base, and a
+    version change inside a delta tail. `spec.md:4357-4359` names three: those two *"or an operation
+    that cannot be applied inside an addressable lifetime"*. The shipped enum has three arms, because
+    dropping the third would make an inapplicable operation either a panic or a silent wrong value.
+    A wording gap, but it changes a signature.
+
+17. **Three numbers and one wire form are cyrup choices with no specification basis, and should be
+    confirmed rather than inherited.** `PageLimit::MAX = 10_000` (§2.2 asks for *"a `MAX`"* and names
+    no number; `spec.md` caps `limit` nowhere). `StoreId`'s wire form as a 32-digit lowercase hex
+    string rather than a `u128` number (§10 gives it none; a `u128` is outside IEEE-754's exact
+    integer range, so a consumer parsing JSON numbers as doubles would corrupt the low bits of a
+    value whose entire purpose is exact equality). `MAX_KIND_LEN`. And `RESERVED_PREFIX`, which ships
+    as `"cyrup."` where §2.3's row speaks of *"the `pi.` prefix"* — correct for a kernel that is not a
+    port, and the reason a third-party `pi.system` kind is harmless here, but a difference from the
+    row as written.
+
+18. **Minting from a separate backend crate has no path yet.** F6 §A says *"no public `Id`
+    constructor"*, so `Id::new` is `pub(crate)` in `cyrup-pico-store`. `MemoryStore` is in that crate
+    and unaffected; the JSONL backend is a **separate** crate, so its only route to an `Id<K>` is the
+    hand-written `Deserialize`, which is not a minting path. Whatever the kernel's minting authority
+    turns out to be — a sealed-trait-gated allocator, or `mint` as a provided method over a numeric
+    high-water mark — it is a §8/§10 shape, not a backend's private business.
+
+19. **§10's `Publication` cannot be `pub(crate)` as written.** §10 writes
+    `pub(crate) struct Publication` and, in the same block, `trait CommitObserver` as a **public**
+    trait taking `&Publication<'_>`. Those two cannot both hold: a `pub(crate)` type in a public
+    trait's method signature is `E0446`. The shipped type is `pub` with private fields, a `_seal: ()`
+    and a crate-private constructor, so nothing outside the module can construct one — which is the
+    guarantee F5 actually needs. §2.5 records the consequence: because the type **is** nameable, the
+    compile-fail case F5's claim needs is writable, and it is written — in two files, because `E0624`
+    on the constructor and `E0451` on the struct literal cannot be collected from one compilation.
+
+20. **§10's serde table claims `Serialize` for `UncertainCommit`; it cannot have one.** The row reads
+    *"yes, only"*. The shipped type holds the erased source error (`Arc<dyn Error + Send + Sync>`,
+    because §10's own `StorageFailure` field type is wrong for `AdoptionFailedAfterCommit` — storage
+    succeeded, so filling a `StorageFailure` there would mean fabricating one). An erased error is
+    not `Serialize`. The table should say so; the diagnostic reaches a log through `Display`.
+
+21. **§10 lists `DefVersion` in its identity block, and §8 puts it in the other crate.** §10 writes
+    `pub struct DefVersion(NonZeroU32)` beside `Id<K>` and `Seq` — the `cyrup-pico-store` block — while
+    §8 states the dependency direction twice (`cyrup-pico-store` *"Deps: cyrup-pico-doc"*;
+    `cyrup-pico-doc` *"Deps: serde, serde_json, indexmap"*). `StoredContent` carries a `DefVersion` in
+    both arms and lives in `cyrup-pico-doc`, so a `DefVersion` defined in the store crate makes the two
+    a cycle Cargo refuses. §8 won: it lives in `cyrup-pico-doc`, and `cyrup-pico-store` re-exports it so
+    `cyrup_pico_store::DefVersion` still resolves. §10's listing should move it, or say it is re-exported.
+
+22. **§7's *"exactly four guarantees"* is not the rule that was followed, and the gap is worth closing
+    one way or the other.** §7 warrants compile-fail tests for four guarantees and adds *"not for the
+    newtypes — their constructors are private and ordinary unit tests cover them"*;
+    `docs/PICO5-PLAN.md` S1 repeats it. But §2.2's first row and §1.5 both classify id/kind confusion
+    **unrepresentable**, and that is carried by a signature alone, which is §7's own stated criterion.
+    54 cases shipped against §7's four. Either §7's count is stale and should be replaced by its
+    criterion — *every `unrepresentable`/`typestate` row gets a case* — or the extra cases are
+    unwarranted and should go. The present state is that the criterion was followed and the count was
+    not: §2.5 records that every `unrepresentable` and `typestate` row now has a case, and that two rows
+    reached that state by being reclassified to what the types actually do rather than by gaining one.
 
 ---
 

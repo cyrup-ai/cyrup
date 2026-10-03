@@ -1,0 +1,37 @@
+error[E0515]: cannot return value referencing local variable `tx`
+  --> tests/compile-fail/a_draft_cannot_be_returned_from_the_commit_callback.rs:41:13
+   |
+40 |             let draft = tx.draft(handle)?;
+   |                         -- `tx` is borrowed here
+41 |             Ok((draft, tx.writing()))
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^ returns a value referencing data owned by the current function
+
+error[E0505]: cannot move out of `tx` because it is borrowed
+  --> tests/compile-fail/a_draft_cannot_be_returned_from_the_commit_callback.rs:41:24
+   |
+38 |         .commit(cx, async |mut tx| {
+   |                            ------- return type of async closure is Result<(Draft<'1, Empty>, cyrup_pico::Tx<'_, Writing>), CallbackError>
+   |                            |
+   |                            binding `tx` declared here
+39 |             let handle = tx.doc(&address, ()).await?;
+40 |             let draft = tx.draft(handle)?;
+   |                         -- borrow of `tx` occurs here
+41 |             Ok((draft, tx.writing()))
+   |             -----------^^------------
+   |             |          |
+   |             |          move out of `tx` occurs here
+   |             returning this value requires that `tx` is borrowed for `'1`
+
+error: lifetime may not live long enough
+  --> tests/compile-fail/a_draft_cannot_be_returned_from_the_commit_callback.rs:38:36
+   |
+38 |           .commit(cx, async |mut tx| {
+   |  ____________________________-------_^
+   | |                            |     |
+   | |                            |     return type of async closure `{async closure body@$DIR/tests/compile-fail/a_draft_cannot_be_returned_from_the_commit_callback.rs:38:36: 42:10}` contains a lifetime `'2`
+   | |                            has type `cyrup_pico::Tx<'1, Reading>`
+39 | |             let handle = tx.doc(&address, ()).await?;
+40 | |             let draft = tx.draft(handle)?;
+41 | |             Ok((draft, tx.writing()))
+42 | |         })
+   | |_________^ returning this value requires that `'1` must outlive `'2`

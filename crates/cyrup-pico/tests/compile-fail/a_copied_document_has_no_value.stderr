@@ -1,0 +1,11 @@
+error[E0599]: no method named `value` found for reference `&cyrup_pico::Copied` in the current scope
+  --> tests/compile-fail/a_copied_document_has_no_value.rs:20:25
+   |
+20 |     let _value = copied.value();
+   |                         ^^^^^ method not found in `&cyrup_pico::Copied`
+
+error[E0599]: no method named `ops` found for reference `&cyrup_pico::Copied` in the current scope
+  --> tests/compile-fail/a_copied_document_has_no_value.rs:21:23
+   |
+21 |     let _ops = copied.ops();
+   |                       ^^^ method not found in `&cyrup_pico::Copied`

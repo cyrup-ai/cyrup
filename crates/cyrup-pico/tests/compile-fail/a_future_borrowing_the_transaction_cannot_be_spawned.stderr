@@ -1,0 +1,22 @@
+error: future cannot be sent between threads safely
+  --> tests/compile-fail/a_future_borrowing_the_transaction_cannot_be_spawned.rs:17:13
+   |
+17 | /             tokio::spawn(async move {
+18 | |                 let _ = tx.conversation(conversation).await;
+19 | |             });
+   | |______________^ future created by async block is not `Send`
+   |
+   = help: within `{async block@$DIR/tests/compile-fail/a_future_borrowing_the_transaction_cannot_be_spawned.rs:17:26: 17:36}`, the trait `Send` is not implemented for `*const ()`
+note: captured value is not `Send`
+  --> tests/compile-fail/a_future_borrowing_the_transaction_cannot_be_spawned.rs:18:25
+   |
+18 |                 let _ = tx.conversation(conversation).await;
+   |                         ^^ has type `cyrup_pico::Tx<'_, Reading>` which is not `Send`
+note: required by a bound in `tokio::spawn`
+  --> $CARGO/tokio-$VERSION/src/task/spawn.rs
+   |
+   |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+   |            ----- required by a bound in this function
+   |     where
+   |         F: Future + Send + 'static,
+   |                     ^^^^ required by this bound in `spawn`
