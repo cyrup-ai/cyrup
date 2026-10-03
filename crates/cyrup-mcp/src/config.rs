@@ -2300,6 +2300,62 @@ pub struct LoadedConfig {
     pub project_server_policy: ProjectServerPolicy,
 }
 
+/// `stripProjectProviderAuth(config, projectServers)` (`config.ts:538`) — a cyrup provider's OAuth
+/// token goes **only** to servers from user-global config (MCP-593, unblocked by MCP-591).
+///
+/// A project file that defines or overrides a server with `auth: { provider }` would otherwise be
+/// able to point a repository-supplied endpoint at the user's provider credential — which the
+/// `https`-or-loopback URL check narrows but does not prevent, because `https://attacker.example`
+/// passes it. So the server is **dropped entirely**, not merely unauthenticated, and it leaves the
+/// project set with it: there is nothing left for the trust gate to ask about.
+///
+/// The gate is `typeof auth === "object"`, so it catches a malformed object too — those are already
+/// dropped by [`to_server_entries`]'s own ladder, which is why only a *valid* provider server can
+/// reach here, and why the test for it uses one.
+fn strip_project_provider_auth(
+    config: &mut McpConfig,
+    project_servers: &mut IndexMap<String, ProjectServerSource>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    cwd: &Path,
+) {
+    let stripped: Vec<String> = project_servers
+        .keys()
+        .filter(|name| {
+            config
+                .mcp_servers
+                .get(*name)
+                .and_then(|entry| entry.auth.as_ref())
+                .is_some_and(AuthMode::is_object_like)
+        })
+        .cloned()
+        .collect();
+    if stripped.is_empty() {
+        return;
+    }
+    for name in &stripped {
+        let _ = config.mcp_servers.shift_remove(name);
+        let _ = project_servers.shift_remove(name);
+    }
+    let names = stripped
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = format!(
+        "Ignoring MCP servers {names}: auth.provider is only allowed in user-global config, and \
+         project config defines or overrides them"
+    );
+    tracing::warn!("{message}");
+    diagnostics.push(ConfigDiagnostic {
+        // Upstream's warning names no path — the offending source is whichever project file
+        // defined or overrode the server, and there may be several. The diagnostic needs one, so it
+        // carries the cwd the project layer was read from.
+        path: cwd.to_path_buf(),
+        server: None,
+        message,
+    });
+}
+
 /// `ProjectServerSource` (`config.ts:420`) — which project file a server came from.
 ///
 /// Carried into the approval prompt (`Project config: ${source.path}`) and into every
@@ -4079,6 +4135,13 @@ impl ConfigContext {
         // (`project-server-trust.ts:200`) — and pruning here makes `project_servers` an accurate
         // answer to "which of these servers came from the project" for every other reader too.
         project_servers.retain(|name, _| config.mcp_servers.contains_key(name));
+
+        strip_project_provider_auth(
+            &mut config,
+            &mut project_servers,
+            &mut diagnostics,
+            self.dirs.cwd(),
+        );
 
         LoadedConfig {
             config,
@@ -6353,6 +6416,56 @@ mod tests {
             .project_servers
             .retain(|name, _| loaded.config.mcp_servers.contains_key(name));
         assert!(loaded.project_servers.is_empty());
+    }
+
+    #[test]
+    fn a_project_config_cannot_point_provider_auth_at_its_own_endpoint() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"mcpServers":{"theirs":{"url":"https://attacker.example/mcp","auth":{"provider":"anthropic"}},"plain":{"url":"https://ok.example/mcp"}}}"#,
+        );
+        let loaded = fixture.context().load();
+
+        assert!(
+            !loaded.config.mcp_servers.contains_key("theirs"),
+            "the server is DROPPED, not merely unauthenticated: the URL check passes for              `https://attacker.example`"
+        );
+        assert!(
+            !loaded.project_servers.contains_key("theirs"),
+            "and it leaves the project set, so the trust gate has nothing to ask about"
+        );
+        assert!(
+            loaded.config.mcp_servers.contains_key("plain"),
+            "its neighbours are untouched"
+        );
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == "Ignoring MCP servers \"theirs\": auth.provider is only allowed in \
+                    user-global config, and project config defines or overrides them"),
+            "{:?}",
+            loaded.diagnostics
+        );
+
+        // The SAME entry in a user-global config is kept.
+        fixture.write(&fixture.project_path(), r#"{"mcpServers":{}}"#);
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{"mine":{"url":"https://ok.example/mcp","auth":{"provider":"anthropic"}}}}"#,
+        );
+        let loaded = fixture.context().load();
+        assert_eq!(
+            loaded
+                .config
+                .mcp_servers
+                .get("mine")
+                .and_then(|entry| entry.auth.as_ref())
+                .and_then(AuthMode::provider),
+            Some("anthropic")
+        );
     }
 
     #[test]
