@@ -211,6 +211,9 @@ impl Provider for Recording {
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         Some(&self.auth)
     }
+    fn has_refresh_models(&self) -> bool {
+        true
+    }
     async fn refresh_models(
         &self,
         ctx: &RefreshModelsContext,
@@ -311,6 +314,9 @@ impl Provider for BlockedUntilAborted {
     }
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         Some(&self.auth)
+    }
+    fn has_refresh_models(&self) -> bool {
+        true
     }
     async fn refresh_models(
         &self,

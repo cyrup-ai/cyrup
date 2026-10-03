@@ -14,6 +14,7 @@ pub mod epoch;
 pub mod limits;
 pub mod live;
 pub mod overlay;
+pub mod overlay_keys;
 pub mod services;
 pub mod store_state;
 pub mod testkit;
@@ -26,6 +27,7 @@ pub use overlay::{
     CustomOption, CustomSpec, InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode,
     OverlayLine, OverlayOptions, OverlayOutcome, OverlaySpan, SpecOverlay,
 };
+pub use overlay_keys::{KeySpec, key_ids, parse_user_bindings, read_user_bindings};
 pub use services::{
     CannedResponses, ControlOp, DENIED_EXEC, DENIED_NET, DENIED_UI, DenyServices, DialogOptions,
     ExecOutput, FsCaps, GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse,

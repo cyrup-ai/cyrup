@@ -2325,6 +2325,9 @@ impl Provider for Refreshable {
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         Some(&self.auth)
     }
+    fn has_refresh_models(&self) -> bool {
+        true
+    }
     async fn refresh_models(
         &self,
         ctx: &cyrup_provider::RefreshModelsContext,
@@ -2343,7 +2346,7 @@ impl Provider for Refreshable {
                 Some(Ok(()))
             }
             RefreshPlan::Publish(ids) => {
-                let refresh = cyrup_ext::host::services::ProviderRefreshContext::current()?;
+                let refresh = ctx.clone();
                 let next: Arc<dyn Provider> = Arc::new(Refreshable::new(
                     self.id.as_str(),
                     ids,

@@ -14,7 +14,6 @@ workspace = true
 [dependencies]
 # NB: no `default-features = false` on cyrup-ext — `HostServices`, `InteractiveOverlay` and the
 # overlay value types are `wasm-host`-gated re-exports, the same requirement cyrup-flux states.
-cyrup-config = { workspace = true }
 cyrup-core = { workspace = true }
 cyrup-ext = { workspace = true }
 cyrup-provider = { workspace = true }

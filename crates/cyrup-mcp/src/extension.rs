@@ -526,7 +526,23 @@ impl McpExtension {
         self.state.lock().ok().and_then(|slot| slot.clone())
     }
 
-    /// The config context this generation reads and writes through — `--mcp-config` from argv, the
+    /// `--mcp-config`'s value: pi's `pi.getFlag("mcp-config")` (`init.ts:122`, `commands.ts:796`),
+    /// read through [`cyrup_ext::host::HostServices::flag_value`] once the host has applied the CLI
+    /// overrides, else from argv — which is what pi's `index.ts:367` does at init, before the
+    /// override is visible (`apply_extension_flag_values` runs after every native `init`). An
+    /// unbound host (SDK embedding, unit test) has only argv.
+    ///
+    /// Not memoised, for the same reason as [`Self::config_context`].
+    #[must_use]
+    pub(crate) fn config_flag_path(&self) -> Option<PathBuf> {
+        self.host_services()
+            .and_then(|services| services.flag_value(crate::registration::MCP_CONFIG_FLAG))
+            .and_then(|value| value.as_str().map(PathBuf::from))
+            .or_else(|| crate::config::config_path_from_argv(std::env::args()).map(PathBuf::from))
+    }
+
+    /// The config context this generation reads and writes through — `--mcp-config` from the flag
+    /// store (argv before it is applied), the
     /// resolved [`crate::dirs::McpDirs`], and the pinned test home.
     ///
     /// Built per call rather than memoised because `config_path_from_argv` reads the process
@@ -538,7 +554,7 @@ impl McpExtension {
     /// `.load().config` while `/mcp disable` and `cyrup mcp init` want the context's own writers.
     #[must_use]
     pub(crate) fn config_context(&self) -> crate::config::ConfigContext {
-        let explicit = crate::config::config_path_from_argv(std::env::args()).map(PathBuf::from);
+        let explicit = self.config_flag_path();
         let mut ctx = crate::config::ConfigContext::new(self.dirs.clone(), explicit.as_deref());
         if let Some(home) = self.home.clone() {
             ctx = ctx.with_home(home);
@@ -622,7 +638,7 @@ impl McpExtension {
             // The same expression `init` and `sync_tool_surface` resolve the config from. Read
             // unconditionally: `initialize_mcp` consults it only on the arm where no programmatic
             // config replaced discovery, so gating it would change nothing but the reading.
-            config_path: crate::config::config_path_from_argv(std::env::args()).map(PathBuf::from),
+            config_path: self.config_flag_path(),
             cwd: self.dirs.cwd().to_path_buf(),
             has_ui: ctx.has_ui,
             mode: mode_str(ctx.mode).to_string(),
@@ -3737,5 +3753,50 @@ done
             open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
             send_message: Arc::new(|_| {}),
         }))
+    }
+
+    /// A host whose flag store holds `--mcp-config`, the way `apply_extension_flag_values` leaves it
+    /// after the CLI set the flag.
+    struct FlagServices(Option<serde_json::Value>);
+
+    impl cyrup_ext::host::HostServices for FlagServices {
+        fn flag_value(&self, name: &str) -> Option<serde_json::Value> {
+            assert_eq!(name, crate::registration::MCP_CONFIG_FLAG);
+            self.0.clone()
+        }
+    }
+
+    /// EXT-093: once the host has applied the CLI overrides, the config the extension reads is the
+    /// one `--mcp-config` names — read through `HostServices::flag_value` (pi's `pi.getFlag`,
+    /// `init.ts:122`), not argv, which this test process does not carry.
+    #[test]
+    fn the_mcp_config_flag_is_read_from_the_host_flag_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let chosen = dir.path().join("chosen.json");
+        std::fs::write(&chosen, r#"{"mcpServers":{"flagged":{"command":"x"}}}"#).unwrap();
+        let ext = McpExtension::new(McpDirs::new(
+            dir.path().join("agent"),
+            dir.path().to_path_buf(),
+        ))
+        .with_home(dir.path().to_path_buf());
+        let value = serde_json::Value::String(chosen.to_string_lossy().into_owned());
+        ext.set_host_services(Arc::new(FlagServices(Some(value))));
+
+        assert_eq!(ext.config_flag_path().as_deref(), Some(chosen.as_path()));
+        let config = ext.config_context().load().config;
+        assert!(
+            config.mcp_servers.contains_key("flagged"),
+            "{:?}",
+            config.mcp_servers.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// With the flag unset the host store answers `None` and the argv fallback (empty here) applies.
+    #[test]
+    fn an_unset_mcp_config_flag_is_no_explicit_path() {
+        let ext = extension();
+        ext.set_host_services(Arc::new(FlagServices(None)));
+
+        assert_eq!(ext.config_flag_path(), None);
     }
 }

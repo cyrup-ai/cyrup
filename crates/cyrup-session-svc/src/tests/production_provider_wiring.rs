@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use cyrup_core::{CancelToken, EventStream, ExtensionId, ModelThinkingLevel, ProviderId};
 use cyrup_ext::host::HostServices;
-use cyrup_ext::host::services::{ModelsPersist, ModelsPublication, ProviderRefreshContext};
+use cyrup_ext::host::services::{ModelsPersist, ModelsPublication};
 use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
 use cyrup_provider::collection::{AuthCheck, AuthType};
 use cyrup_provider::faux::FauxProvider;
@@ -121,11 +121,14 @@ impl Provider for Scripted {
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         Some(&self.auth)
     }
+    fn has_refresh_models(&self) -> bool {
+        true
+    }
     async fn refresh_models(
         &self,
         ctx: &RefreshModelsContext,
     ) -> Option<Result<(), ProviderError>> {
-        let context = ProviderRefreshContext::current().expect("called through the registry");
+        let context = ctx;
         self.seen.lock().unwrap().push(Seen {
             allow_network: ctx.allow_network,
             credential: context.credential.clone(),
@@ -401,7 +404,7 @@ async fn the_refresh_provider_verb_of_a_built_session_drives_the_engine() {
     let result = session
         .services()
         .host_services
-        .refresh_provider(LLAMA, true, CancelToken::new())
+        .refresh_provider(LLAMA, true, false, CancelToken::new())
         .await;
 
     assert!(result.is_clean(), "{result:?}");
@@ -485,6 +488,9 @@ impl Provider for Failing {
     }
     fn models(&self) -> &[Model] {
         &[]
+    }
+    fn has_refresh_models(&self) -> bool {
+        true
     }
     async fn refresh_models(
         &self,

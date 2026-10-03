@@ -206,6 +206,7 @@ impl HostServices for FakeHost {
         &'a self,
         provider_id: &'a str,
         allow_network: bool,
+        _force: bool,
         cancel: CancelToken,
     ) -> BoxFuture<'a, ModelsRefreshResult> {
         Box::pin(async move {

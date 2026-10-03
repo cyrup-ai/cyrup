@@ -32,6 +32,7 @@ mod ext_087_send_from_event;
 mod fork_non_persisted;
 mod fork_parent_and_unsaved_guard;
 mod get_commands_source_info;
+mod host_flag_value;
 mod inject_message_details;
 mod inject_message_display;
 mod inject_pump_redrain;

@@ -114,6 +114,11 @@ impl Provider for ConfigProvider {
         self.inner.provider_auth()
     }
 
+    /// SEAM-142 — delegated with [`Provider::refresh_models`], for the same reason.
+    fn has_refresh_models(&self) -> bool {
+        self.inner.has_refresh_models()
+    }
+
     /// PROV-M01 — trait default is `None` ("static provider"). Delegated so the answer tracks the
     /// inner rather than this wrapper's knowledge of what the inner currently implements.
     async fn refresh_models(

@@ -104,7 +104,9 @@ pub use models_store::{
     InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions,
     ProviderModelsStore,
 };
-pub use provider::{Provider, RefreshModelsContext};
+pub use provider::{
+    ModelsPersist, ModelsPublication, ModelsPublisher, Provider, RefreshModelsContext,
+};
 pub use providers::all::{
     BUILTIN_CATALOG_MANIFEST_JSON, all_images_providers, all_providers, all_providers_with,
     all_providers_with_overlay, builtin_model_data_generated_at,

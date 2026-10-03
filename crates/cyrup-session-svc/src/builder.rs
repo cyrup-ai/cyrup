@@ -1544,6 +1544,9 @@ impl SessionBuilder {
             Arc::new(cyrup_config::login::StoreAuthContext(auth.clone())),
         );
         host_services.attach_provider_refresher(guest_providers.clone());
+        // EXT-093 — `HostServices::flag_value` answers from the extension host's registry (the CLI
+        // overrides applied above, then the registered default). Weak: the host holds `host_services`.
+        host_services.attach_flag_source(Arc::downgrade(&ext_host));
         host_services.attach_provider_auth(auth.clone(), guest_providers.clone());
         ext_host
             .registry()

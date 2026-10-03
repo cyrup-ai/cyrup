@@ -49,9 +49,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cyrup_core::ExtensionId;
 use cyrup_core::ProviderId;
-use cyrup_ext::host::services::{
-    HostProviderAuth, ModelsPersist, ModelsPublication, ProviderRefreshContext,
-};
+use cyrup_ext::host::services::{HostProviderAuth, ModelsPersist, ModelsPublication};
 use cyrup_ext::registry::CommandDescriptor;
 use cyrup_ext::{
     ExtError, ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, InitApi, LateRegistrar,
@@ -62,6 +60,7 @@ use cyrup_provider::auth::{
 };
 use cyrup_provider::{
     AnyModel, AuthError, ClassifierModel, Model, ModelsStoreEntry, Provider, ProviderError,
+    RefreshModelsContext,
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -74,8 +73,8 @@ use crate::huggingface::{
     process_environment,
 };
 use crate::provider::{
-    CatalogEntry, CatalogPublication, CatalogPublisher, LlamaController, LlamaControllerOptions,
-    LlamaRefreshHost, RegisterProviderFn, SetCatalogOptions,
+    CatalogEntry, CatalogPublication, LlamaController, LlamaControllerOptions, LlamaRefreshHost,
+    RegisterProviderFn, SetCatalogOptions,
 };
 use crate::ui::{
     ConnectionChoice, LlamaKeys, LlamaManagerAction, LlamaUi, ProgressOptions, ProgressOutcome,
@@ -261,11 +260,12 @@ fn never() -> CancellationToken {
 /// the refresh the host is running.
 ///
 /// Pi hands `refreshModels` a `RefreshModelsContext` carrying the credential, the stored catalog
-/// and `publish` (`models.ts:74-90`). A cyrup provider's `refresh_models` receives only
-/// `allow_network`, `force` and the abort token, so the host publishes the rest as
-/// [`ProviderRefreshContext::current`] for the duration of the call; this reads it back. Called
-/// outside a host-run refresh there is no store, so `credential` and `stored` are `None` and
-/// `publish` answers `false` (the refresh ends, as a superseded one does).
+/// and `publish` (`models.ts:74-90`). So does `cyrup_provider::RefreshModelsContext` (PROV-111),
+/// and this reads them from the argument it is given: they are values of the call, not ambient
+/// state, so a task the refresh spawns still sees them. Given a context with no publisher (a
+/// refresh that no host-run engine made) there is no store, so `credential` and `stored` are
+/// whatever the context says (`None`) and `publish` answers `false` (the refresh ends, as a
+/// superseded one does).
 pub(crate) struct ContextRefreshHost;
 
 /// A [`CatalogEntry`] as the host's models store holds it: the chat models in the entry and the
@@ -290,50 +290,44 @@ fn persist_of(entry: CatalogEntry) -> ModelsPersist {
 }
 
 #[async_trait]
-impl CatalogPublisher for ContextRefreshHost {
-    /// pi's `context.publish`, whose rejection fails the refresh (`models.ts:498-518`): the
-    /// host's publisher is asked, and its error is the refresh's error.
-    async fn publish(&self, publication: CatalogPublication) -> Result<bool, LlamaError> {
-        let Some(context) = ProviderRefreshContext::current() else {
-            return Ok(false);
-        };
-        let publication = ModelsPublication {
-            persist: publication.persist.map(persist_of),
-            update: publication.update,
-        };
-        context
-            .publish(publication)
-            .await
-            .map_err(|error| match error {
-                ProviderError::Aborted => LlamaError::Cancelled,
-                other => LlamaError::Message(other.to_string()),
-            })
-    }
-}
-
-#[async_trait]
 impl LlamaRefreshHost for ContextRefreshHost {
-    async fn credential(&self) -> Option<Credential> {
-        ProviderRefreshContext::current()?.credential
+    async fn credential(&self, ctx: &RefreshModelsContext) -> Option<Credential> {
+        ctx.credential.clone()
     }
 
-    async fn stored(&self) -> Option<CatalogEntry> {
-        let context = ProviderRefreshContext::current()?;
-        let stored = context.stored?;
+    async fn stored(&self, ctx: &RefreshModelsContext) -> Option<CatalogEntry> {
+        let stored = ctx.stored.clone()?;
         let models = stored
             .models
             .into_iter()
             .map(AnyModel::Chat)
             .chain(
-                context
-                    .stored_classifiers
-                    .into_iter()
+                ctx.stored_classifiers
+                    .iter()
+                    .cloned()
                     .map(AnyModel::Classifier),
             )
             .collect();
         Some(CatalogEntry {
             models,
             checked_at: stored.checked_at.unwrap_or(0),
+        })
+    }
+
+    /// pi's `context.publish`, whose rejection fails the refresh (`models.ts:498-518`): the
+    /// host's publisher is asked, and its error is the refresh's error.
+    async fn publish(
+        &self,
+        ctx: &RefreshModelsContext,
+        publication: CatalogPublication,
+    ) -> Result<bool, LlamaError> {
+        let publication = ModelsPublication {
+            persist: publication.persist.map(persist_of),
+            update: publication.update,
+        };
+        ctx.publish(publication).await.map_err(|error| match error {
+            ProviderError::Aborted => LlamaError::Cancelled,
+            other => LlamaError::Message(other.to_string()),
         })
     }
 }
@@ -463,7 +457,7 @@ impl Flow {
             .map_err(FlowError::from)?;
         let result = self
             .host
-            .refresh_provider(LLAMA_PROVIDER_ID, true, signal.token.clone())
+            .refresh_provider(LLAMA_PROVIDER_ID, true, false, signal.token.clone())
             .await;
         if result.aborted {
             return Err(FlowError::plain("Model catalog refresh timed out."));

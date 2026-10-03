@@ -261,131 +261,15 @@ pub struct HumanInteractionGuard {
 // pi's `ModelRegistry.refresh({ providers, allowNetwork, signal })` hands a provider's
 // `refreshModels` a `RefreshModelsContext` — `credential`, a read-only `stored` snapshot, a
 // generation-checked `publish({ persist, update })`, `allowNetwork`, `force` and an always-present
-// `signal` (`packages/ai/src/models.ts:74-90` @v0.99.2-17). The types below are that contract; the
-// session service implements the registry half (`cyrup-session-svc`'s `GuestProviderRegistry`).
+// `signal` (`packages/ai/src/models.ts:74-90` @v0.99.2-17). That contract is
+// `cyrup_provider::RefreshModelsContext` — the argument `Provider::refresh_models` receives
+// carries all of it (PROV-111); the types below are the host's request side of it, and the session
+// service implements the registry half (`cyrup-session-svc`'s `GuestProviderRegistry`).
 
-/// What a provider asks the store to do with its persisted catalog — pi's
-/// `ModelsPublication.persist?: ModelsStoreEntry | null` (`models.ts:67-72`), minus the "omit" arm,
-/// which is an absent [`ModelsPublication::persist`].
-#[derive(Clone, Debug)]
-pub enum ModelsPersist {
-    /// `persist: entry` — replace the provider's stored entry (`modelsStore.write`, `models.ts:512`).
-    ///
-    /// `classifiers` is the `type: "classifier"` half of pi's ONE `models` array
-    /// (`ModelsStoreEntry.models: readonly AnyModel[]`, `models-store.ts:3-5`); cyrup's entry holds
-    /// chat models only and the classifier models travel through
-    /// [`cyrup_provider::ModelsStore::write_classifier_models`] (see that method for why).
-    Write {
-        entry: cyrup_provider::ModelsStoreEntry,
-        classifiers: Vec<cyrup_provider::ClassifierModel>,
-    },
-    /// `persist: null` — delete the provider's stored entry (`modelsStore.delete`, `models.ts:510`).
-    Delete,
-}
-
-/// pi `ModelsPublication` (`packages/ai/src/models.ts:67-72` @v0.99.2-17): the provider-chosen
-/// persistence plus an optional synchronous update of its own in-memory catalog.
-///
-/// The `update` runs only after the persistence step and only while the refresh is still the
-/// provider's current one, so a superseded refresh can neither write the store nor change the
-/// catalog. A cyrup provider's `models()` is a borrow of an immutable catalog, so "update" is
-/// typically a re-registration of a new provider value carrying the new catalog: the registry's
-/// replace path, which does not supersede the publishing refresh itself.
-#[derive(Default)]
-pub struct ModelsPublication {
-    /// pi `persist?`. `None` leaves storage unchanged.
-    pub persist: Option<ModelsPersist>,
-    /// pi `update?: () => void`.
-    pub update: Option<Box<dyn FnOnce() + Send + 'static>>,
-}
-
-/// The registry's side of [`ProviderRefreshContext::publish`].
-#[async_trait::async_trait]
-pub trait ModelsPublisher: Send + Sync {
-    /// pi `publish(publication): Promise<boolean>` (`models.ts:83`): `Ok(true)` when the publication
-    /// was applied, `Ok(false)` when this refresh was superseded or aborted first (pi's
-    /// generation/`signal.aborted` checks, `models.ts:507`, `:515`). A store failure is the error pi
-    /// would reject with.
-    async fn publish(
-        &self,
-        publication: ModelsPublication,
-    ) -> Result<bool, cyrup_provider::ProviderError>;
-}
-
-/// pi `RefreshModelsContext` (`packages/ai/src/models.ts:74-90` @v0.99.2-17) for a provider whose
-/// catalog the extension host refreshes.
-///
-/// Reached from inside [`cyrup_provider::Provider::refresh_models`] through
-/// [`ProviderRefreshContext::current`]. The registry sets it for exactly the duration of that call
-/// (a task-local), because [`cyrup_provider::RefreshModelsContext`] — the argument the trait method
-/// receives — carries only `allow_network`, `force` and the abort token, and `credential`,
-/// `stored` and `publish` have nowhere on it to travel. A provider that is not being refreshed
-/// through the registry finds `None` and has no store to restore from or publish to.
-#[derive(Clone)]
-pub struct ProviderRefreshContext {
-    /// pi `credential?` — the effective credential: the stored one for the cache-only phase, the
-    /// provider-auth-resolved one for the network phase (`models.ts:571`, `:575-577`).
-    pub credential: Option<cyrup_provider::Credential>,
-    /// pi `stored?` — the provider's persisted entry, snapshotted before this phase.
-    pub stored: Option<cyrup_provider::ModelsStoreEntry>,
-    /// The classifier models persisted beside `stored` (the `type: "classifier"` members of pi's
-    /// `stored.models`).
-    pub stored_classifiers: Vec<cyrup_provider::ClassifierModel>,
-    /// pi `allowNetwork` — `false` during the cache-only restore phase (`models.ts:84`).
-    pub allow_network: bool,
-    /// pi `force?` — undefined unless network is allowed (`models.ts:541`).
-    pub force: bool,
-    /// pi `signal` — cancelled by the caller's abort OR by a newer refresh of the same provider.
-    pub cancel: CancelToken,
-    publisher: Arc<dyn ModelsPublisher>,
-}
-
-tokio::task_local! {
-    static CURRENT_REFRESH: ProviderRefreshContext;
-}
-
-impl ProviderRefreshContext {
-    /// Assemble a context around a registry's publisher. Public so the session service (a different
-    /// crate) can build it; a provider never does.
-    pub fn new(
-        credential: Option<cyrup_provider::Credential>,
-        stored: Option<cyrup_provider::ModelsStoreEntry>,
-        stored_classifiers: Vec<cyrup_provider::ClassifierModel>,
-        allow_network: bool,
-        force: bool,
-        cancel: CancelToken,
-        publisher: Arc<dyn ModelsPublisher>,
-    ) -> Self {
-        Self {
-            credential,
-            stored,
-            stored_classifiers,
-            allow_network,
-            force,
-            cancel,
-            publisher,
-        }
-    }
-
-    /// pi `context.publish(publication)` (`models.ts:83`).
-    pub async fn publish(
-        &self,
-        publication: ModelsPublication,
-    ) -> Result<bool, cyrup_provider::ProviderError> {
-        self.publisher.publish(publication).await
-    }
-
-    /// The context of the refresh currently running this task, if the registry is running one.
-    pub fn current() -> Option<Self> {
-        CURRENT_REFRESH.try_with(Clone::clone).ok()
-    }
-
-    /// Run `fut` with `self` as the [`Self::current`] context. The registry's one call site; the
-    /// context does not cross a `tokio::spawn` made inside `fut`.
-    pub async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
-        CURRENT_REFRESH.scope(self, fut).await
-    }
-}
+// The publication types are `cyrup-provider`'s, because they are part of the argument
+// `Provider::refresh_models` receives (`cyrup_provider::RefreshModelsContext`, PROV-111); they are
+// re-exported here so the host-side paths keep working.
+pub use cyrup_provider::{ModelsPersist, ModelsPublication, ModelsPublisher};
 
 /// One refresh request, pi's `ModelsRefreshOptions` (`models.ts:92-99`).
 #[derive(Clone, Debug)]
@@ -411,6 +295,32 @@ pub trait ProviderRefresher: Send + Sync {
     /// per-provider failure is recorded in the result, never thrown.
     async fn refresh(&self, request: ProviderRefreshRequest)
     -> cyrup_provider::ModelsRefreshResult;
+}
+
+/// The value of a registered flag, given its registered `spec`: the CLI override the registry holds
+/// for `name` (pi `runtime.flagValues`, filled by `applyExtensionFlagValues`) when there is one,
+/// else the spec's `default` (pi seeds `flagValues` from `options.default`,
+/// `core/extensions/loader.ts:259`). A `null` override or default is pi's `undefined`, so `None`.
+///
+/// The two steps `GuestState::get_flag` (a WASM guest) and `HostServices::flag_value` (a native)
+/// both take; the caller decides the ownership gate (pi `extension.flags.has(name)`, `:368`) and
+/// supplies the spec it found.
+pub fn resolve_flag_value(
+    registry: &ExtensionRegistry,
+    name: &str,
+    spec: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    // `flag_values` is keyed by flag name and shared across extensions, like pi's single
+    // `runtime.flagValues` map.
+    if let Ok(Some(override_value)) = registry.flag_value(name) {
+        return (!override_value.is_null()).then_some(override_value);
+    }
+    // A bare (non-object) stored value is itself the resolved value (defensive).
+    let value = match spec.as_object() {
+        Some(_) => spec.get("default")?,
+        None => spec,
+    };
+    (!value.is_null()).then(|| value.clone())
 }
 
 /// The answer of a host with no model registry to refresh through: an abort is still an abort, and
@@ -922,7 +832,7 @@ pub trait HostServices: Send + Sync {
         None
     }
 
-    /// pi `ctx.modelRegistry.refresh({ providers: [id], allowNetwork, signal })`
+    /// pi `ctx.modelRegistry.refresh({ providers: [id], allowNetwork, force, signal })`
     /// (`packages/ai/src/models.ts:546-606`, surfaced by `core/model-runtime.ts:839`
     /// @v0.99.2-17) for ONE registered provider — what the llama extension's `/llama` flow calls
     /// after every server-side change (`extensions/llama/index.ts:54-59`).
@@ -932,7 +842,10 @@ pub trait HostServices: Send + Sync {
     /// EXPLICIT: `true` overrides the host's offline switch for this call, exactly as pi's
     /// `/llama` passes `allowNetwork: true` so it "stays live even in PI_OFFLINE" (`index.ts:56`),
     /// because the command already contacted the configured server; `false` never touches the
-    /// network. `cancel` is pi's `signal` (the extension's own timeout, `index.ts:51`).
+    /// network. `force` is pi's `force` (`models.ts:91-98` @v1.0.0-25, same at v0.99.2): bypass the
+    /// provider's freshness checks and fetch now. As in pi (`models.ts:541`) it reaches a provider
+    /// only in its network phase, so `force` with `allow_network == false` is dropped, not forwarded.
+    /// `cancel` is pi's `signal` (the extension's own timeout, `index.ts:51`).
     ///
     /// Like pi, a failure is never thrown: [`cyrup_provider::ModelsRefreshResult::aborted`] says
     /// the caller's `cancel` fired and `errors` carries the provider's failure by id
@@ -946,9 +859,32 @@ pub trait HostServices: Send + Sync {
         &'a self,
         provider_id: &'a str,
         _allow_network: bool,
+        _force: bool,
         cancel: CancelToken,
     ) -> futures::future::BoxFuture<'a, cyrup_provider::ModelsRefreshResult> {
         Box::pin(async move { no_refresh_backend(provider_id, &cancel) })
+    }
+
+    /// pi `pi.getFlag(name)` (`core/extensions/loader.ts:366-370` @v1.0.0-25, same at tag v0.99.2):
+    /// the value of a registered CLI flag — the CLI override when `apply_extension_flag_values` has
+    /// recorded one, else the default the flag was registered with. `None` is pi's `undefined`: no
+    /// extension registered the flag, or it was registered without a default and the CLI did not
+    /// set it. A boolean flag reads `Value::Bool`, a string flag `Value::String`.
+    ///
+    /// This is what lets a NATIVE extension read a flag it declared with
+    /// `InitApi::register_flag`: a WASM guest has `GuestState::get_flag`, and a native has no
+    /// guest state. It must be called from a handler, not from `init` — the CLI overrides are
+    /// applied once every extension has loaded, so during `init` only the default is visible, as in
+    /// pi (`runtime.flagValues` is filled after the load).
+    ///
+    /// Unlike pi's per-extension `getFlag`, the answer is not scoped to the flags the CALLER
+    /// registered: the backend has no notion of who is asking, so any registered flag name reads.
+    /// The value is the same one the CLI printed in `--help`, so nothing secret is exposed.
+    ///
+    /// Synchronous: a lock-and-clone of the registry, nothing awaited. The default has no registry
+    /// to read, so it answers `None`.
+    fn flag_value(&self, _name: &str) -> Option<serde_json::Value> {
+        None
     }
 
     /// pi `ctx.modelRegistry.getProviderAuth(providerId)` (`core/model-registry.ts:180`, which is
@@ -2616,26 +2552,9 @@ impl GuestState {
         // Pi's gate (`getFlag`, loader.ts:282): return `undefined` unless THIS extension registered
         // the flag. The per-guest `flags` map IS that `extension.flags.has(name)` check.
         let spec = g.get(name)?;
-        // Pi `runtime.flagValues.get(name)` (loader.ts:283): a CLI-supplied override (applied by
-        // `applyExtensionFlagValues` into the SHARED store) wins over the registered default — this
-        // is the step that was missing, so `getFlag` used to only ever see the static default
-        // (gap-08 §5.6). `flag_values` is keyed by flag name and shared across guests, matching Pi's
-        // single `runtime.flagValues` map.
-        if let Ok(Some(override_value)) = self.registry.flag_value(name) {
-            if override_value.is_null() {
-                return None;
-            }
-            return Some(override_value.to_string());
-        }
-        // A bare (non-object) stored value is itself the resolved value (defensive).
-        let value = match spec.as_object() {
-            Some(_) => spec.get("default")?,
-            None => spec,
-        };
-        if value.is_null() {
-            return None;
-        }
-        Some(value.to_string())
+        // Pi `runtime.flagValues.get(name)` (loader.ts:283): the CLI override wins over the
+        // registered default. The two steps are shared with `HostServices::flag_value`.
+        resolve_flag_value(&self.registry, name, spec).map(|value| value.to_string())
     }
 
     pub fn add_autocomplete(&self, command: String) {

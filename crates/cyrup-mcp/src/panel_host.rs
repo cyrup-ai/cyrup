@@ -276,6 +276,10 @@ pub(crate) struct SetupCallbacks {
     /// `/mcp` turns it off, and the two re-reads below must use the same value the panel opened
     /// with or the RepoPrompt proposal could change under the cursor.
     include_host_configs: bool,
+    /// `--mcp-config` as `McpExtension::config_flag_path` resolved it when the panel opened. The
+    /// flag cannot change mid-session, so this is pi's per-call `pi.getFlag("mcp-config")`
+    /// (`commands.ts:796`, `:907`) without a handle back to the extension (see [`Self::context`]).
+    explicit_config: Option<PathBuf>,
     /// Upstream's `let configChanged = false`, closed over by the callbacks and read by
     /// `openMcpSetup` after the panel resolves.
     ///
@@ -290,12 +294,14 @@ impl SetupCallbacks {
         home: Option<PathBuf>,
         fingerprint: String,
         include_host_configs: bool,
+        explicit_config: Option<PathBuf>,
     ) -> Self {
         Self {
             dirs,
             home,
             fingerprint,
             include_host_configs,
+            explicit_config,
             config_changed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -307,11 +313,11 @@ impl SetupCallbacks {
     /// this object owns outright. Owning them is what lets every member below be infallible —
     /// there is no extension handle to upgrade, so the four synchronous `preview_*` members, which
     /// run from inside `render` on every frame and have nowhere to report a failure, cannot have
-    /// one. Rebuilding rather than caching preserves the re-read `--mcp-config` semantics
-    /// (upstream's `pi.getFlag("mcp-config")`, re-read per call).
+    /// one. The ladder is rebuilt so the files are re-read; the `--mcp-config` path is the one
+    /// the extension resolved when the panel opened ([`Self::explicit_config`]).
     fn context(&self) -> crate::config::ConfigContext {
-        let explicit = crate::config::config_path_from_argv(std::env::args()).map(PathBuf::from);
-        let mut context = crate::config::ConfigContext::new(self.dirs.clone(), explicit.as_deref());
+        let mut context =
+            crate::config::ConfigContext::new(self.dirs.clone(), self.explicit_config.as_deref());
         if let Some(home) = self.home.clone() {
             context = context.with_home(home);
         }
