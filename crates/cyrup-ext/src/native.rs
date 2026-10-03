@@ -839,9 +839,13 @@ pub trait NativeExtension: Send + Sync {
     /// are silent here, which is correct in both cases.
     ///
     /// Reserve `Err` for the command genuinely FAILING (bad routing, a panic, an unserviceable
-    /// name). A user-facing error the handler expects and wants to phrase itself is better sent as
-    /// a self-issued `Error` notify plus `Ok(None)`, which keeps the wording under the handler's
-    /// control instead of wrapping it in the `command:<name>: ` prefix.
+    /// name, or a handler that in pi would THROW). pi shows a thrown handler as `command:<name>`
+    /// plus its message (`agent-session.ts:2087`), and the runner formats `Err` the same way, so a
+    /// handler that mirrors a throw returns [`ExtError::CommandFailed`] (which prints its message
+    /// bare) and issues no notice of its own. A user-facing error pi's handler REPORTS rather than
+    /// throws is better sent as a self-issued `Error` notify plus `Ok(None)`, which keeps the
+    /// wording under the handler's control instead of wrapping it in the `command:<name>: `
+    /// prefix.
     async fn execute_command(
         &self,
         name: &str,
@@ -1209,28 +1213,20 @@ pub trait LateRegistrar: Send + Sync {
     /// registry immediately; registering an id that is already registered REPLACES it and bumps the
     /// registry generation, so the model lists see the new catalog on their next read.
     ///
-    /// The default refuses: a registrar that cannot reach a model registry must say so rather
-    /// than report a registration it did not make.
+    /// Required, like every other method here: pi's `registerProvider` always reaches the model
+    /// registry (`loader.ts:449-462`), so an implementor either does the registration or returns
+    /// an `Err` of its own. There is no default that would let a registrar compile and then refuse.
     fn register_provider_live(
         &self,
         id: String,
         provider: Arc<dyn cyrup_provider::Provider>,
-    ) -> Result<(), ExtError> {
-        let _ = (id, provider);
-        Err(ExtError::Component(
-            "this registrar does not support live provider registration".to_string(),
-        ))
-    }
+    ) -> Result<(), ExtError>;
 
     /// pi `api.unregisterProvider(name)` (`extensions/types.ts:1819` @v0.99.2-17), for a provider THIS extension
     /// registered (live or JSON): removes it from the model registry and returns whether it was
-    /// present. A provider another extension owns is left alone and reads as `false`.
-    fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
-        let _ = id;
-        Err(ExtError::Component(
-            "this registrar does not support provider unregistration".to_string(),
-        ))
-    }
+    /// present. A provider another extension owns is left alone and reads as `false`. Required for
+    /// the same reason as [`Self::register_provider_live`].
+    fn unregister_provider(&self, id: &str) -> Result<bool, ExtError>;
 
     /// The extension this handle registers on behalf of. The host binds it at construction, so an
     /// extension holding the handle cannot register under another extension's id — the reason this

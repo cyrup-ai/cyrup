@@ -21,6 +21,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{BodyRead, MAX_BODY_BYTES, read_capped_body};
+use crate::error::LlamaError;
 use cyrup_provider::stream::sse::build_client_for_target;
 use cyrup_provider::{EnvAuthContext, ProviderEnv};
 
@@ -48,53 +49,6 @@ static QUANTIZATION: LazyLock<regex::Regex> = LazyLock::new(|| literal_regex(QUA
 static SHARD_SUFFIX: LazyLock<regex::Regex> = LazyLock::new(|| literal_regex(SHARD_SUFFIX_PATTERN));
 static RATE_LIMIT_DELAY: LazyLock<regex::Regex> =
     LazyLock::new(|| literal_regex(RATE_LIMIT_DELAY_PATTERN));
-
-// ---------------------------------------------------------------------------------------- errors --
-
-/// Failure of a Hugging Face call.
-///
-/// Upstream throws plain `Error`s whose `message` is shown to the user (`index.ts` and `ui.ts`
-/// print it), so every variant's [`Display`](std::fmt::Display) text is the text the JS runtime
-/// would put in that message.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum HuggingFaceError {
-    /// The caller's cancellation token fired. Upstream surfaces the `AbortSignal`'s reason, which
-    /// for a bare `abort()` is the DOMException "This operation was aborted".
-    #[error("This operation was aborted")]
-    Cancelled,
-    /// The 15 s request timeout elapsed (`huggingface.ts:75`); Node's `TimeoutError` message.
-    #[error("The operation was aborted due to timeout")]
-    Timeout,
-    /// The request never produced a response (refused, reset, DNS, TLS). Node's `fetch` rejects
-    /// with `TypeError: fetch failed`; the underlying cause is appended for diagnosis.
-    #[error("{0}")]
-    Transport(String),
-    /// A server-reported or validation error whose text is the whole message
-    /// (`huggingface.ts:88-95`, `:109`, `:122`).
-    #[error("{0}")]
-    Message(String),
-}
-
-impl HuggingFaceError {
-    /// A `reqwest` failure with its URL left out (its `Display` embeds the request URL).
-    fn from_reqwest(error: reqwest::Error) -> Self {
-        Self::transport(&error.without_url())
-    }
-
-    fn transport(error: &(dyn std::error::Error + 'static)) -> Self {
-        let mut text = String::from("fetch failed");
-        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-        while let Some(cause) = source {
-            let part = cause.to_string();
-            if !part.is_empty() && !text.contains(&part) {
-                text.push_str(": ");
-                text.push_str(&part);
-            }
-            source = cause.source();
-        }
-        Self::Transport(text)
-    }
-}
 
 // ----------------------------------------------------------------------------------------- types --
 
@@ -437,13 +391,13 @@ impl HuggingFaceClient {
         token: Option<String>,
         base_url: Option<&str>,
         env: Option<&ProviderEnv>,
-    ) -> Result<Self, HuggingFaceError> {
+    ) -> Result<Self, LlamaError> {
         let target = base_url
             .unwrap_or(DEFAULT_HUGGING_FACE_URL)
             .trim_end_matches('/');
         let http = build_client_for_target(target, &EnvAuthContext, env, None)
             .await
-            .map_err(|error| HuggingFaceError::transport(&error))?;
+            .map_err(|error| LlamaError::transport(&error))?;
         Ok(Self::with_http_client(token, base_url, http))
     }
 
@@ -487,23 +441,20 @@ impl HuggingFaceClient {
         &self,
         path: &str,
         cancel: &CancellationToken,
-    ) -> Result<Option<Value>, HuggingFaceError> {
+    ) -> Result<Option<Value>, LlamaError> {
         let work = async {
             let mut request = self.http.get(format!("{}{path}", self.base_url));
             if let Some(token) = &self.token {
                 request = request.bearer_auth(token);
             }
-            let response = request
-                .send()
-                .await
-                .map_err(HuggingFaceError::from_reqwest)?;
+            let response = request.send().await.map_err(LlamaError::from_reqwest)?;
             let status = response.status();
             let headers = response.headers().clone();
             let payload = match read_capped_body(response, MAX_BODY_BYTES).await {
                 BodyRead::Complete(bytes) => serde_json::from_slice::<Value>(&bytes).ok(),
                 BodyRead::Unreadable => None,
                 BodyRead::TooLarge => {
-                    return Err(HuggingFaceError::Message(format!(
+                    return Err(LlamaError::Message(format!(
                         "Hugging Face response exceeds {MAX_BODY_BYTES} bytes"
                     )));
                 }
@@ -517,7 +468,7 @@ impl HuggingFaceClient {
                             parse_rate_limit_delay(header_text(&headers, "ratelimit").as_deref())
                                 .filter(|delay| *delay != 0.0)
                         });
-                    return Err(HuggingFaceError::Message(match delay {
+                    return Err(LlamaError::Message(match delay {
                         Some(delay) => format!(
                             "Hugging Face rate limit reached; retry in {}s",
                             js_number_text(delay)
@@ -525,7 +476,7 @@ impl HuggingFaceClient {
                         None => "Hugging Face rate limit reached".to_string(),
                     }));
                 }
-                return Err(HuggingFaceError::Message(payload_error(
+                return Err(LlamaError::Message(payload_error(
                     payload.as_ref(),
                     &format!("Hugging Face returned HTTP {}", status.as_u16()),
                 )));
@@ -534,9 +485,9 @@ impl HuggingFaceClient {
         };
         tokio::select! {
             biased;
-            () = cancel.cancelled() => Err(HuggingFaceError::Cancelled),
+            () = cancel.cancelled() => Err(LlamaError::Cancelled),
             out = tokio::time::timeout(self.timeout, work) => {
-                out.map_err(|_| HuggingFaceError::Timeout)?
+                out.map_err(|_| LlamaError::Timeout)?
             }
         }
     }
@@ -552,7 +503,7 @@ impl HuggingFaceClient {
         &self,
         query: &str,
         cancel: &CancellationToken,
-    ) -> Result<Vec<HuggingFaceModel>, HuggingFaceError> {
+    ) -> Result<Vec<HuggingFaceModel>, LlamaError> {
         let params = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("search", query)
             .append_pair("filter", "gguf")
@@ -564,7 +515,7 @@ impl HuggingFaceClient {
             .request(&format!("/api/models?{params}"), cancel)
             .await?;
         let Some(Value::Array(entries)) = payload else {
-            return Err(HuggingFaceError::Message(
+            return Err(LlamaError::Message(
                 "Hugging Face returned invalid search results".to_string(),
             ));
         };
@@ -594,7 +545,7 @@ impl HuggingFaceClient {
         &self,
         id: &str,
         cancel: &CancellationToken,
-    ) -> Result<HuggingFaceModelDetails, HuggingFaceError> {
+    ) -> Result<HuggingFaceModelDetails, LlamaError> {
         let encoded_id = id
             .split('/')
             .map(encode_uri_component)
@@ -605,7 +556,7 @@ impl HuggingFaceClient {
             .await?;
         // `typeof payload !== "object" || payload === null` (`:121`): an array passes.
         let Some(model @ (Value::Object(_) | Value::Array(_))) = payload else {
-            return Err(HuggingFaceError::Message(
+            return Err(LlamaError::Message(
                 "Hugging Face returned invalid model details".to_string(),
             ));
         };

@@ -479,10 +479,33 @@ impl AgentSession {
     /// [`Self::available_model_catalog`] read reflects it — including models released since this
     /// binary was built.
     ///
-    /// `Ok`-shaped by construction: a session with no wired service (an embedder, the SDK, a test)
-    /// gets a clean empty result, because "this host does not refresh catalogs" is a configuration,
-    /// not a failure.
+    /// The pi.dev catalog service and the guest registry (every provider a native extension
+    /// registered live, and the JSON-registered ones) are refreshed together, as pi's
+    /// `refreshModelCatalogs` refreshes its one composed collection
+    /// (`modes/interactive/model-catalog-refresh.ts:46-51` @v0.99.2-17); the two results are merged
+    /// (`timed_out` if either caller gave up, the failures of both). A session with no wired
+    /// catalog service (an embedder, the SDK, a test) contributes a clean empty catalog half, because
+    /// "this host does not refresh catalogs" is a configuration, not a failure.
     pub async fn refresh_model_catalogs(
+        &self,
+        cancel: cyrup_core::CancelToken,
+    ) -> cyrup_provider::CatalogRefreshResult {
+        // pi's `/model` refresh is ONE `modelRuntime.refresh({ signal })` over the composed
+        // collection (`modes/interactive/model-catalog-refresh.ts:46-51` @v0.99.2-17), which holds
+        // the pi.dev catalogs AND every extension provider. cyrup keeps the two apart, so the two
+        // halves run side by side under the same token and their results are merged: a session
+        // with no catalog service still refreshes its live providers (SEAM-138).
+        let (catalog, live) = tokio::join!(
+            self.refresh_pi_dev_catalogs(cancel.clone()),
+            self.services.guest_providers.refresh_all(cancel),
+        );
+        Self::merge_refresh_results(catalog, Self::fold_guest_refresh(live))
+    }
+
+    /// The pi.dev half of [`Self::refresh_model_catalogs`]: a clean empty result when this session
+    /// has no catalog service wired (an embedder, the SDK, a test), because "this host does not
+    /// refresh catalogs" is a configuration, not a failure.
+    async fn refresh_pi_dev_catalogs(
         &self,
         cancel: cyrup_core::CancelToken,
     ) -> cyrup_provider::CatalogRefreshResult {
@@ -497,6 +520,41 @@ impl AgentSession {
             .map(|p| p.id().as_str().to_string())
             .collect();
         svc.refresh(cancel, configured).await
+    }
+
+    /// The guest registry's [`cyrup_provider::ModelsRefreshResult`] in the shape the callers of
+    /// the catalog refreshes read. Its `aborted` is `signal.aborted` read after every provider
+    /// settled (`model-runtime.ts:878`), i.e. THIS caller's token having fired, which is what
+    /// [`cyrup_provider::CatalogRefreshResult::timed_out`] records; the shared-operation `aborted`
+    /// flag has no counterpart here because the registry joins nothing.
+    fn fold_guest_refresh(
+        result: cyrup_provider::ModelsRefreshResult,
+    ) -> cyrup_provider::CatalogRefreshResult {
+        cyrup_provider::CatalogRefreshResult {
+            timed_out: result.aborted,
+            aborted: false,
+            errors: result
+                .errors
+                .into_iter()
+                .map(|(id, error)| (id, error.to_string()))
+                .collect(),
+        }
+    }
+
+    /// One result for the two halves of a refresh: `timed_out` if either half's caller gave up,
+    /// `aborted` as the catalog service's shared operation reported it (the registry has none), and
+    /// the failures of both, keyed by provider id.
+    fn merge_refresh_results(
+        catalog: cyrup_provider::CatalogRefreshResult,
+        live: cyrup_provider::CatalogRefreshResult,
+    ) -> cyrup_provider::CatalogRefreshResult {
+        let mut errors = catalog.errors;
+        errors.extend(live.errors);
+        cyrup_provider::CatalogRefreshResult {
+            timed_out: catalog.timed_out || live.timed_out,
+            aborted: catalog.aborted,
+            errors,
+        }
     }
 
     /// Refresh ONE provider's catalog, bounded by `cancel` — pi's post-login
@@ -582,15 +640,7 @@ impl AgentSession {
                 cancel,
             })
             .await;
-        cyrup_provider::CatalogRefreshResult {
-            timed_out: result.aborted,
-            aborted: false,
-            errors: result
-                .errors
-                .into_iter()
-                .map(|(id, error)| (id, error.to_string()))
-                .collect(),
-        }
+        Self::fold_guest_refresh(result)
     }
 
     /// The provider-attribution + session-affinity headers this session attaches to provider requests

@@ -25,10 +25,11 @@ use super::fake_server::{
     FakeLlamaServer, Reply, Step, event, model, model_with, model_with_status,
 };
 use crate::client::{
-    LlamaClient, LlamaError, LlamaModelInfo, LlamaModelStatus, LlamaModelStatusInfo, LlamaProgress,
+    LlamaClient, LlamaModelInfo, LlamaModelStatus, LlamaModelStatusInfo, LlamaProgress,
     ProgressField, format_bytes, llama_inference_url, normalize_llama_server_url,
     parse_download_progress, parse_load_progress,
 };
+use crate::error::LlamaError;
 
 fn http() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()

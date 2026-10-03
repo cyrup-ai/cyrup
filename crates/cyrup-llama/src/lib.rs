@@ -8,6 +8,8 @@
 //!
 //! Modules:
 //!   * [`client`]      — the router HTTP client and its SSE reader (`client.ts`)
+//!   * [`error`]       — the one failure type both clients return (`Error` in `client.ts` and
+//!     `huggingface.ts`)
 //!   * [`huggingface`] — Hugging Face search, quantization parsing, token lookup (`huggingface.ts`)
 //!   * [`model`]       — router catalog entry → cyrup `Model` mapping (`provider.ts` `toPiModel`)
 //!   * [`provider`]    — the `Provider` and its API-key login (`provider.ts`)
@@ -29,12 +31,14 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod error;
 pub mod extension;
 pub mod huggingface;
 pub mod model;
 pub mod provider;
 pub mod ui;
 
+pub use error::LlamaError;
 pub use extension::LlamaExtension;
 
 /// The llama.cpp extension as the host loads it, mirroring the other `*_extension_for_env`

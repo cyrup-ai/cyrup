@@ -131,6 +131,7 @@ mod share_url;
 mod show_warning_prefix;
 mod sigint_double_tap;
 mod startup_resources_panel;
+mod startup_selector_pty;
 mod startup_session_selector;
 mod status_indicator;
 mod stop_reason;

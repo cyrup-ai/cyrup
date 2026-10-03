@@ -931,7 +931,9 @@ impl AuthHelper {
             self.auth_context.as_ref(),
             AuthOverrides {
                 api_key: options.api_key.as_deref(),
-                env: None,
+                // Pi `getAuth(model, { apiKey, env: options?.env, ... })` (`models.ts:850-851`):
+                // the request's env participates in resolution, as in `apply_classifier_auth`.
+                env: options.env.as_ref(),
                 min_oauth_validity_ms: None,
             },
         )
@@ -957,6 +959,9 @@ impl AuthHelper {
         }
         request_options.headers = headers;
         request_options.transform_headers = None;
+        // PROV-109. `env = { ...(resolution.env ?? {}), ...(options?.env ?? {}) }` (Pi
+        // `models.ts:862`): the resolution's env first, the request's env wins per key.
+        request_options.env = merge_env(resolution.env.as_ref(), options.env.as_ref());
         Ok((request_model, request_options))
     }
 }
@@ -2016,6 +2021,92 @@ mod tests {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
             Box::pin(ReceiverStream::new(rx))
         }
+    }
+
+    /// An api-key strategy whose resolution yields a provider-scoped `env` (and no key), the
+    /// shape llama.cpp's re-resolution has.
+    struct FixedEnvAuth(crate::stream::ProviderEnv);
+
+    #[async_trait::async_trait]
+    impl crate::auth::ApiKeyAuth for FixedEnvAuth {
+        fn name(&self) -> &str {
+            "fixed-env"
+        }
+        async fn resolve(
+            &self,
+            _model: &Model,
+            _ctx: &dyn AuthContext,
+            _cred: Option<&crate::auth::Credential>,
+        ) -> Result<Option<AuthResult>, crate::error::AuthError> {
+            Ok(Some(AuthResult {
+                auth: crate::auth::types::ModelAuth {
+                    api_key: None,
+                    headers: None,
+                    base_url: None,
+                },
+                env: Some(self.0.clone()),
+                source: Some("test".to_string()),
+            }))
+        }
+    }
+
+    fn env_helper(resolution_env: crate::stream::ProviderEnv) -> AuthHelper {
+        AuthHelper {
+            provider: Arc::new(HeaderAuthProvider {
+                id: "p".into(),
+                models: vec![header_model()],
+                auth: crate::auth::ProviderAuth::with_api_key(Arc::new(FixedEnvAuth(
+                    resolution_env,
+                ))),
+            }),
+            credentials: Arc::new(InMemoryCredentialStore::new()),
+            auth_context: Arc::new(EnvAuthContext),
+        }
+    }
+
+    /// PROV-109. `applyAuth` folds the resolution's `env` into the request options:
+    /// `env = { ...(resolution.env ?? {}), ...(options?.env ?? {}) }` (pi `models.ts:862`
+    /// @v0.99.2-17), the same merge `Models::classify` does. `Models::stream` used to drop it.
+    #[tokio::test]
+    async fn apply_auth_merges_the_resolution_env_into_the_request_options() {
+        let helper = env_helper(BTreeMap::from([
+            ("LLAMA_BASE_URL".to_string(), "http://resolved".to_string()),
+            ("SHARED".to_string(), "from-resolution".to_string()),
+        ]));
+
+        // No request env: the resolution's env reaches the provider unchanged.
+        let (_model, out) = helper
+            .apply_auth(&header_model(), &StreamOptions::default())
+            .await
+            .expect("apply_auth");
+        assert_eq!(
+            out.env,
+            Some(BTreeMap::from([
+                ("LLAMA_BASE_URL".to_string(), "http://resolved".to_string()),
+                ("SHARED".to_string(), "from-resolution".to_string()),
+            ]))
+        );
+
+        // An explicit request env wins per key; keys only the resolution has survive.
+        let options = StreamOptions {
+            env: Some(BTreeMap::from([
+                ("SHARED".to_string(), "from-options".to_string()),
+                ("ONLY_OPTION".to_string(), "o".to_string()),
+            ])),
+            ..Default::default()
+        };
+        let (_model, out) = helper
+            .apply_auth(&header_model(), &options)
+            .await
+            .expect("apply_auth");
+        assert_eq!(
+            out.env,
+            Some(BTreeMap::from([
+                ("LLAMA_BASE_URL".to_string(), "http://resolved".to_string()),
+                ("SHARED".to_string(), "from-options".to_string()),
+                ("ONLY_OPTION".to_string(), "o".to_string()),
+            ]))
+        );
     }
 
     // ---- CFG-020c: the optional `ApiKeyAuth.check` hook ----

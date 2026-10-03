@@ -524,3 +524,91 @@ async fn an_extension_oauth_provider_declaring_is_subscription_lights_the_marker
         "an OAuth block without `isSubscription` is metered:\n{t}"
     );
 }
+
+// ================================================================ TUI-127
+
+/// A native extension registering two LIVE providers (`register_provider_live`, no JSON
+/// registration): `live-sub` carries a subscription OAuth strategy, `live-metered` a metered one.
+struct LiveOauthProviders;
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for LiveOauthProviders {
+    fn id(&self) -> cyrup_core::ExtensionId {
+        cyrup_core::ExtensionId::from("live-oauth-providers")
+    }
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        let sub: Arc<dyn Provider> = Arc::new(StubProvider {
+            id: ProviderId::from("live-sub"),
+            auth: ProviderAuth::with_oauth(Arc::new(ScriptedOauth::<true>)),
+            models: Vec::new(),
+        });
+        let metered: Arc<dyn Provider> = Arc::new(StubProvider {
+            id: ProviderId::from("live-metered"),
+            auth: ProviderAuth::with_oauth(Arc::new(ScriptedOauth::<false>)),
+            models: Vec::new(),
+        });
+        api.register_provider_live("live-sub", sub);
+        api.register_provider_live("live-metered", metered);
+        Ok(())
+    }
+    async fn on_event(
+        &self,
+        _ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        cyrup_ext::HookOutcome::Noop
+    }
+}
+
+/// TUI-127 — pi's `isUsingSubscription` reads `auth.oauth.isSubscription` off the composed
+/// provider for ANY provider, a native extension's live provider included
+/// (`core/model-runtime.ts:463-465`; footer `footer.ts:190-194`). A live provider whose OAuth
+/// strategy is a subscription, signed in through the real `/login`, prints `(sub)`; one whose
+/// strategy is metered, signed in the same way, does not.
+///
+/// RED before the change: `refresh_auth_snapshot` filled the subscription map from JSON
+/// registrations alone, and the built-in/`login_providers` fallback does not hold a live provider,
+/// so `live-sub` never lit the marker.
+#[tokio::test]
+async fn a_live_extension_provider_with_subscription_oauth_lights_the_marker() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut config = SessionConfig::new(cwd, agent_dir);
+    config.trust_override = Some(true);
+    config.no_extensions = true;
+    let session = Arc::new(
+        SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, config)
+            .with_native_extension(
+                Arc::new(LiveOauthProviders) as Arc<dyn cyrup_ext::NativeExtension>
+            )
+            .build()
+            .await
+            .unwrap(),
+    );
+
+    // The built-in registry knows neither id: only the live registration can answer.
+    let mut app = app_with(Arc::new(Vec::new));
+    // Session start (`run_arms.rs:127`) reads the registry once, before any login.
+    app.refresh_auth_snapshot(&session).await;
+
+    select_model(&mut app, "live-sub", "m");
+    run_login(&mut app, &session, "live-sub").await;
+    app.draw().unwrap();
+    let t = buf_text(&app);
+    assert!(
+        t.contains("$0.000 (sub)"),
+        "a live provider with a subscription OAuth strategy, signed in, must show `(sub)`:\n{t}"
+    );
+
+    select_model(&mut app, "live-metered", "m");
+    run_login(&mut app, &session, "live-metered").await;
+    app.draw().unwrap();
+    let t = buf_text(&app);
+    assert!(
+        !t.contains("(sub)"),
+        "a live provider whose OAuth strategy is metered must not be labelled a subscription:\n{t}"
+    );
+}

@@ -67,11 +67,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::LLAMA_PROVIDER_ID;
-use crate::client::{
-    LlamaClient, LlamaError, LlamaModelInfo, LlamaModelStatus, LlamaProgress, format_bytes,
-};
+use crate::client::{LlamaClient, LlamaModelInfo, LlamaModelStatus, LlamaProgress, format_bytes};
+use crate::error::LlamaError;
 use crate::huggingface::{
-    HuggingFaceClient, HuggingFaceError, find_huggingface_token, find_huggingface_token_with_home,
+    HuggingFaceClient, find_huggingface_token, find_huggingface_token_with_home,
     process_environment,
 };
 use crate::provider::{
@@ -108,10 +107,10 @@ const BASE_URL_ENV: &str = crate::provider::LLAMA_BASE_URL_ENV;
 ///
 /// Upstream's `isConnectionError` reads `${error.name} ${error.message}` (`index.ts:12-13`). The
 /// names Node gives the errors a `fetch` or an `AbortSignal` produces (`TypeError`, `TimeoutError`,
-/// `AbortError`) add nothing the messages do not already carry: [`LlamaError`] and
-/// [`HuggingFaceError`] document that each `Display` text is the message the JS runtime would put
-/// there (`fetch failed...`, `The operation was aborted due to timeout`), and a plain `Error`'s name
-/// matches none of the three words. So only the message is kept.
+/// `AbortError`) add nothing the messages do not already carry: [`LlamaError`] documents that
+/// each `Display` text is the message the JS runtime would put there (`fetch failed...`, `The
+/// operation was aborted due to timeout`), and a plain `Error`'s name matches none of the three
+/// words. So only the message is kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowError {
     message: String,
@@ -142,12 +141,6 @@ impl std::error::Error for FlowError {}
 
 impl From<LlamaError> for FlowError {
     fn from(error: LlamaError) -> Self {
-        Self::plain(error.to_string())
-    }
-}
-
-impl From<HuggingFaceError> for FlowError {
-    fn from(error: HuggingFaceError) -> Self {
         Self::plain(error.to_string())
     }
 }
@@ -298,15 +291,9 @@ fn persist_of(entry: CatalogEntry) -> ModelsPersist {
 
 #[async_trait]
 impl CatalogPublisher for ContextRefreshHost {
-    /// The `bool` form of [`Self::try_publish`], which is the one a refresh uses: a failure is
-    /// `false` here, "do not continue".
-    async fn publish(&self, publication: CatalogPublication) -> bool {
-        self.try_publish(publication).await.unwrap_or(false)
-    }
-
     /// pi's `context.publish`, whose rejection fails the refresh (`models.ts:498-518`): the
     /// host's publisher is asked, and its error is the refresh's error.
-    async fn try_publish(&self, publication: CatalogPublication) -> Result<bool, LlamaError> {
+    async fn publish(&self, publication: CatalogPublication) -> Result<bool, LlamaError> {
         let Some(context) = ProviderRefreshContext::current() else {
             return Ok(false);
         };
@@ -384,7 +371,7 @@ impl Endpoints {
         }
     }
 
-    async fn hugging_face_client(&self) -> Result<HuggingFaceClient, HuggingFaceError> {
+    async fn hugging_face_client(&self) -> Result<HuggingFaceClient, LlamaError> {
         let token = match &self.environment {
             Some(environment) => find_huggingface_token_with_home(environment, None).await,
             None => find_huggingface_token(&process_environment()).await,
@@ -1036,12 +1023,9 @@ impl NativeExtension for LlamaExtension {
         let client = match self.configured_client(&host).await {
             Ok(Some(client)) => client,
             Ok(None) => return Ok(None),
-            // pi lets this reject out of the handler; a self-issued error keeps the message
-            // under this handler's control (`NativeExtension::execute_command`).
-            Err(error) => {
-                host.notify(error.message(), NotifyKind::Error);
-                return Ok(None);
-            }
+            // pi lets this reject out of the handler (`index.ts:30-40`); the command runner shows
+            // the message as `command:llama: <message>`.
+            Err(error) => return Err(ExtError::CommandFailed(error.message().to_string())),
         };
         let flow = Flow::new(
             Arc::clone(&host),

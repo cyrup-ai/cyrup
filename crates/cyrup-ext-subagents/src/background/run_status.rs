@@ -22,10 +22,10 @@
 //! LLM reads to revive a child.
 //!
 //! Still omitted, for want of source fields or ports: parallel-group step-index nesting, the
-//! acceptance/turn-budget step suffixes, the `Session:` line (`:705`) and the all-external `Resume:`
-//! sentence (ledger row `SUBA-146`), and upstream's `reconcileNestedAsyncDescendants` pass before
-//! the nested projection (same row). `external-job` runners are unmodelled, so only
-//! `external-cli` steps take the external-runner branches.
+//! acceptance/turn-budget step suffixes, and upstream's `reconcileNestedAsyncDescendants` pass
+//! before the nested projection (ledger row `SUBA-146`, parts (a) and (d)). `external-job` runners
+//! are unmodelled, so only `external-cli` steps take the external-runner branches, and the
+//! `external-job` follow-up hint of the all-external `Resume:` line is not rendered (same row).
 //!
 //! Every disk read runs through [`super::control::reconcile_before_control_op`] first (R-SA-079:
 //! never render a `status.json` that might be stale relative to an authoritative terminal
@@ -178,6 +178,13 @@ fn format_steering_summary(steer_count: Option<u64>, last_steer_at: Option<i64>)
 /// string rather than three drifting copies.
 pub const STOPPED_NOT_RESUMABLE_GUIDANCE: &str =
     "Resume: unavailable; stopped runs are not resumable. Start a new run instead.";
+
+/// pi `run-status.ts:716` @v0.75.0: what a NON-running run whose every step is an external runner prints in
+/// place of `formatResumeGuidance` — external runners persist no Pi session, so there is nothing to
+/// resume. (The `external-job` follow-up variant on the same line needs the unmodelled `external-job`
+/// runner: ledger row `SUBA-146`.)
+const EXTERNAL_RUNNERS_NOT_RESUMABLE: &str =
+    "Resume: unavailable; external runners do not persist Pi sessions.";
 
 /// Whether `session_file` points at an on-disk file that currently exists (pi's
 /// `hasExistingSessionFile`, `run-status.ts:42-44`).
@@ -721,11 +728,19 @@ async fn format_status_with(
     }
 
     // pi `if (status.workflowReceiptPath) lines.push(\`Workflow receipt: ${...}\`)`
-    // (`run-status.ts:697`) — immediately before `Session:` upstream, which cyrup's own report has
-    // no equivalent line for; the transferable anchor is upstream's OWN relative order —
-    // immediately before the resume-guidance line that follows (WORKFLOW_3 §3b).
+    // (`run-status.ts:710` @v0.75.0) — immediately before `Session:` (WORKFLOW_3 §3b).
     if let Some(path) = status.workflow_receipt_path.as_ref() {
         lines.push(format!("Workflow receipt: {}", path.display()));
+    }
+
+    // pi `if (status.sessionFile) lines.push(\`Session: ${status.sessionFile}\`)`
+    // (`run-status.ts:711` @v0.75.0). JS truthiness: an empty path prints no line.
+    if let Some(path) = status
+        .session_file
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        lines.push(format!("Session: {}", path.display()));
     }
 
     // pi `run-status.ts:707` — the run-level steer hint for a running run that has at least one
@@ -739,15 +754,20 @@ async fn format_status_with(
     }
 
     if status.state != RunState::Running {
-        lines.push(format_resume_guidance(
-            status.run_id.as_str(),
-            &status.steps,
-            // G77 — pi `formatResumeGuidance(…, { stopped: status.state === "stopped" ||
-            // status.stopped === true })` (`run-status.ts:445`). cyrup carries the stop verdict on
-            // `state` alone (no redundant `stopped` boolean on `RunStatus`), so this is the whole
-            // predicate.
-            status.state == RunState::Stopped,
-        ));
+        lines.push(if all_external {
+            // pi `run-status.ts:714-716` @v0.75.0: no Pi session exists to resume.
+            EXTERNAL_RUNNERS_NOT_RESUMABLE.to_string()
+        } else {
+            format_resume_guidance(
+                status.run_id.as_str(),
+                &status.steps,
+                // G77 — pi `formatResumeGuidance(…, { stopped: status.state === "stopped" ||
+                // status.stopped === true })` (`run-status.ts:445`). cyrup carries the stop verdict
+                // on `state` alone (no redundant `stopped` boolean on `RunStatus`), so this is the
+                // whole predicate.
+                status.state == RunState::Stopped,
+            )
+        });
     }
     if paths.run_log_md.exists() {
         lines.push(format!("Log: {}", paths.run_log_md.display()));
@@ -2618,8 +2638,7 @@ mod tests {
     }
 
     /// `:685`'s exact sentence, and its position: after the per-step lines and immediately before
-    /// `Workflow receipt:`. The relative order is the transferable anchor (upstream's own
-    /// `Session:` line has no cyrup counterpart).
+    /// `Workflow receipt:` (which `Session:` now follows: SUBA-146).
     #[tokio::test]
     async fn a_running_workflow_with_no_live_route_renders_the_unavailable_sentence() {
         let (_dir, async_root, results_dir) = roots();
@@ -3173,6 +3192,119 @@ mod tests {
             1,
             "{mixed_report}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-146 (b) and (c): the `Session:` line and the all-external `Resume:` sentence.
+    // ---------------------------------------------------------------------------------------
+
+    /// pi `run-status.ts:711` @v0.75.0: `if (status.sessionFile) lines.push(`Session: ${status.sessionFile}`)`
+    /// — directly after `Workflow receipt:` and before the run-level steer hint (`:712-714`).
+    #[tokio::test]
+    async fn a_report_names_the_session_file_after_the_receipt_and_before_the_steer_hint() {
+        let run_id = RunId::from_token("run0sessn001");
+        let mut status = running_status(&run_id, RunMode::Chain, vec![running_step("worker")]);
+        status.workflow_receipt_path = Some(std::path::PathBuf::from("/tmp/async/receipt.json"));
+        status.session_file = Some(std::path::PathBuf::from("/tmp/sessions/child-1.jsonl"));
+        let report = report_at_now(&status).await;
+
+        assert!(
+            report.contains("\nSession: /tmp/sessions/child-1.jsonl"),
+            "{report}"
+        );
+        let receipt = report
+            .find("Workflow receipt:")
+            .expect("the receipt line is present");
+        let session = report
+            .find("\nSession: ")
+            .expect("the session line is present");
+        let steer = report
+            .find("\nSteer running child:")
+            .expect("the steer hint is present");
+        assert!(receipt < session && session < steer, "{report}");
+    }
+
+    /// The guard is JS truthiness (`if (status.sessionFile)`): no session file, or an empty one,
+    /// prints no line.
+    #[tokio::test]
+    async fn a_report_has_no_session_line_without_a_session_file() {
+        let run_id = RunId::from_token("run0sessn002");
+        let mut status = running_status(&run_id, RunMode::Chain, vec![running_step("worker")]);
+        assert!(status.session_file.is_none());
+        assert!(
+            !report_at_now(&status).await.contains("\nSession:"),
+            "no session file, no line"
+        );
+
+        status.session_file = Some(std::path::PathBuf::new());
+        assert!(
+            !report_at_now(&status).await.contains("\nSession:"),
+            "an empty path is falsy in pi, so it prints no line either"
+        );
+    }
+
+    /// pi `run-status.ts:716` @v0.75.0: a NON-running run whose every step is an external runner has no Pi
+    /// session to resume, and the report says exactly that instead of `formatResumeGuidance`'s text.
+    /// (The `external-job` follow-up variant on the same line needs the unmodelled `external-job` runner and
+    /// stays out: ledger row `SUBA-146`.)
+    #[tokio::test]
+    async fn a_finished_all_external_run_says_external_runners_do_not_persist_sessions() {
+        for end in [RunState::Complete, RunState::Stopped] {
+            let run_id = RunId::from_token("run0extrn001");
+            let mut status = running_status(
+                &run_id,
+                RunMode::Single,
+                vec![external_cli_step(Some(
+                    crate::runner::contract::AdapterId::CodexExec,
+                ))],
+            );
+            status.advance_state(end).expect("Running -> the end state");
+            let report = report_at_now(&status).await;
+
+            assert!(
+                report.contains(
+                    "\nResume: unavailable; external runners do not persist Pi sessions."
+                ),
+                "{end:?}: {report}"
+            );
+            assert!(
+                !report.contains("stopped runs are not resumable"),
+                "{end:?}: the generic guidance must not also print: {report}"
+            );
+        }
+    }
+
+    /// The neighbours of the all-external branch stay as they were: a still-RUNNING all-external run
+    /// prints no `Resume:` line at all (`:713` gates on `state !== "running"`), and a run with ANY
+    /// local step keeps `formatResumeGuidance`'s text.
+    #[tokio::test]
+    async fn the_external_resume_sentence_needs_every_step_external_and_a_non_running_run() {
+        let adapter = Some(crate::runner::contract::AdapterId::CodexExec);
+
+        let running = running_status(
+            &RunId::from_token("run0extrn002"),
+            RunMode::Single,
+            vec![external_cli_step(adapter)],
+        );
+        assert!(
+            !report_at_now(&running).await.contains("\nResume:"),
+            "a running run has no resume line"
+        );
+
+        let mut mixed = running_status(
+            &RunId::from_token("run0extrn003"),
+            RunMode::Chain,
+            vec![external_cli_step(adapter), running_step("local")],
+        );
+        mixed
+            .advance_state(RunState::Stopped)
+            .expect("Running -> Stopped");
+        let report = report_at_now(&mixed).await;
+        assert!(
+            !report.contains("external runners do not persist Pi sessions"),
+            "one local step means the generic guidance applies: {report}"
+        );
+        assert!(report.contains("Resume:"), "{report}");
     }
 
     /// `:678`'s `status.mode !== "workflow"` conjunct: a workflow's running child is steered via

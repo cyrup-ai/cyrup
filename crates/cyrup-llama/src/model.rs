@@ -13,9 +13,8 @@ use cyrup_provider::known_api::OPENAI_COMPLETIONS;
 use cyrup_provider::{ClassifierModel, KnownClassifierApi, Modality, Model, ModelCost};
 
 use crate::LLAMA_PROVIDER_ID;
-use crate::client::{
-    LlamaError, LlamaModelInfo, LlamaModelStatus, LlamaServerProps, llama_inference_url,
-};
+use crate::client::{LlamaModelInfo, LlamaModelStatus, LlamaServerProps, llama_inference_url};
+use crate::error::LlamaError;
 
 /// The context window of a model that reports none (`: 128000`, `provider.ts:76`).
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;

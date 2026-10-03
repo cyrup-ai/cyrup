@@ -42,6 +42,7 @@ mod live_provider_auth;
 mod live_provider_host_wiring;
 mod live_providers;
 mod mid_run_tool_anchoring;
+mod model_refresh_reaches_live_providers;
 mod model_runtime_snapshot;
 mod modelless_launch;
 mod native_host_services;

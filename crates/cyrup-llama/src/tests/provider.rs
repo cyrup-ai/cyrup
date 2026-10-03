@@ -38,7 +38,8 @@ use cyrup_provider::{
 };
 
 use crate::LLAMA_PROVIDER_ID;
-use crate::client::{LlamaError, LlamaModelInfo, llama_inference_url};
+use crate::client::{LlamaModelInfo, llama_inference_url};
+use crate::error::LlamaError;
 use crate::provider::{
     CatalogEntry, CatalogPublication, CatalogPublisher, DEFAULT_LLAMA_BASE_URL,
     DEFAULT_LLAMA_SERVER_URL, LlamaApiKeyAuth, LlamaController, LlamaControllerOptions,
@@ -80,9 +81,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[async_trait::async_trait]
 impl CatalogPublisher for TestHost {
-    async fn publish(&self, publication: CatalogPublication) -> bool {
+    async fn publish(&self, publication: CatalogPublication) -> Result<bool, LlamaError> {
         if self.refuse.load(Ordering::SeqCst) {
-            return false;
+            return Ok(false);
         }
         if let Some(entry) = publication.persist {
             *lock(&self.entry) = Some(entry);
@@ -91,7 +92,7 @@ impl CatalogPublisher for TestHost {
             update();
             self.updates.fetch_add(1, Ordering::SeqCst);
         }
-        true
+        Ok(true)
     }
 }
 

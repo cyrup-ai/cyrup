@@ -2769,6 +2769,21 @@ mod tests {
         fn register_tool_renderer(&self, _tool_name: String) -> Result<(), ExtError> {
             Ok(())
         }
+        // The MCP extension registers no provider, so a call here is a bug the test must see.
+        fn register_provider_live(
+            &self,
+            id: String,
+            _provider: Arc<dyn cyrup_provider::Provider>,
+        ) -> Result<(), ExtError> {
+            Err(ExtError::Component(format!(
+                "RecordingRegistrar was asked to register provider `{id}`"
+            )))
+        }
+        fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
+            Err(ExtError::Component(format!(
+                "RecordingRegistrar was asked to unregister provider `{id}`"
+            )))
+        }
         fn owner(&self) -> ExtensionId {
             ExtensionId::from(EXTENSION_ID)
         }
