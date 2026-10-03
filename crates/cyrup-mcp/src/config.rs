@@ -3672,27 +3672,94 @@ fn compact_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
-/// `readRawConfigObject(filePath)` — missing ⇒ `{}`, unparseable ⇒ `{}`, non-object root ⇒ `{}`.
+/// `readRawConfigObject(filePath)` — absent ⇒ `{}`, empty ⇒ `{}`, **anything else that will not
+/// parse into an object is an error** (MCP-589).
 ///
-/// **Silently.** This is a *writer* helper, and upstream's bare `catch {}` here is deliberate:
-/// clobbering an unparseable file is the accepted cost of being able to write one at all. The user
-/// still sees what is about to happen, because [`build_config_write_preview`] renders the diff from
-/// `{}` — it announces the clobber rather than hiding it (MCP-099).
+/// **This reader fails closed, and it did not always.** Upstream's original was a bare
+/// `catch { return {} }`, on the reasoning that clobbering an unparseable file is the accepted cost
+/// of being able to write one at all; `319b161` (#693) reversed that decision, because the writer
+/// merges one change into the `{}` it was handed and then *renames the result over the original* —
+/// a hand-edited `mcp.json` with one bad escape loses every server, setting, import and comment in
+/// it, atomically, with nothing left to recover from. The mitigation the old doc comment cited —
+/// [`build_config_write_preview`] rendering the diff from `{}` (MCP-099) — is a preview the user has
+/// to read and recognise, and the non-interactive writers do not render it at all.
+///
+/// The existence gate is `lstat`, not `stat`: a **dangling symlink** must reach the read and fail
+/// there rather than be reported absent and then silently replaced by a regular file.
 ///
 /// Note this is *not* [`read_validated_config`]: no typing, no diagnostics, no `mcp-servers`
-/// normalisation. The two exist side by side on purpose.
-#[must_use]
-pub fn read_raw_config_object(path: &Path) -> RawObject {
-    if !path.exists() {
-        return RawObject::new();
+/// normalisation. The two exist side by side on purpose, and only this one may fail — module rule 4
+/// (`init` must never `Err`) is a constraint on the *read* ladder, not on the writers.
+///
+/// # Errors
+///
+/// [`McpError::Config`] carrying `Failed to read MCP config at <path>: <reason>`, where the reason
+/// is the I/O failure, the JSONC parse failure, or `top-level value must be an object`.
+pub fn read_raw_config_object(path: &Path) -> McpResult<RawObject> {
+    // `lstatSync(filePath, { throwIfNoEntry: false })` — `symlink_metadata` is the `lstat` of the
+    // pair, so it does not follow and a broken link reports present.
+    if std::fs::symlink_metadata(path).is_err() {
+        return Ok(RawObject::new());
     }
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return RawObject::new();
-    };
-    match parse_json_config(&text, &path.to_string_lossy()) {
-        Ok(RawJson::Object(entries)) => entries,
-        _ => RawObject::new(),
+    let text = std::fs::read_to_string(path).map_err(|error| config_read_error(path, &error))?;
+    if text.trim().is_empty() {
+        return Ok(RawObject::new());
     }
+    let parsed = parse_json_config(&text, &path.to_string_lossy())
+        .map_err(|error| config_read_error(path, &error))?;
+    match parsed {
+        RawJson::Object(entries) => Ok(entries),
+        _ => Err(config_read_error(
+            path,
+            &"top-level value must be an object",
+        )),
+    }
+}
+
+/// `` `Failed to read MCP config at ${filePath}: ${message}` `` — the wrapper
+/// [`read_raw_config_object`] puts around every one of its failures.
+///
+/// Upstream attaches the original as `cause`; [`McpError::Config`] has no source slot, so the inner
+/// text is interpolated instead. Nothing upstream reads `cause` off this error — it is rendered
+/// through `formatTerminalError`, which walks to the same text.
+fn config_read_error(path: &Path, message: &dyn std::fmt::Display) -> McpError {
+    McpError::Config(format!(
+        "Failed to read MCP config at {}: {message}",
+        path.display()
+    ))
+}
+
+/// `` `Failed to update MCP config at ${filePath}: ${detail}` `` — [`get_servers_object`] and
+/// [`get_config_imports`]'s shared head.
+///
+/// Note the verb: a malformed *document* is a read failure, a malformed `mcpServers` or `imports`
+/// **inside** a well-formed document is an update failure. Upstream splits them the same way, and
+/// the split is what tells the user whether the file parses at all.
+fn config_update_error(path: &Path, detail: &str) -> McpError {
+    McpError::Config(format!(
+        "Failed to update MCP config at {}: {detail}",
+        path.display()
+    ))
+}
+
+/// `assertScaffoldTargetAbsent(filePath)` — `319b161` (#693).
+///
+/// The scaffold writers do not read the file they are about to write, so [`read_raw_config_object`]
+/// cannot protect them: `{ "mcpServers": {} }` is written from a literal. This is the guard that
+/// stops a scaffold from being the one write that still clobbers. `lstat` again, so a symlink —
+/// dangling or not — counts as present.
+///
+/// # Errors
+///
+/// [`McpError::Config`] carrying `Cannot scaffold MCP config at <path>: file already exists`.
+fn assert_scaffold_target_absent(path: &Path) -> McpResult<()> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Err(McpError::Config(format!(
+            "Cannot scaffold MCP config at {}: file already exists",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// `writeRawConfigObject(filePath, raw)` — `mkdirSync(recursive)`, write `<path>.<pid>.tmp`, then
@@ -3735,18 +3802,79 @@ pub fn write_raw_config_object(path: &Path, raw: &RawObject) -> McpResult<()> {
     Ok(())
 }
 
-/// `getServersObject(raw)` — `raw.mcpServers ?? raw["mcp-servers"] ?? {}`, and `{}` again for any
-/// non-object value.
+/// `getServersObject(raw, filePath)` — `raw.mcpServers ?? raw["mcp-servers"] ?? {}`, and an **error**
+/// for a present-but-non-object value under either spelling (MCP-589).
+///
+/// It used to answer `{}` there, which meant a file whose `"mcpServers"` was a string, a list or an
+/// explicit `null` had its whole server table silently replaced by the one entry the writer was
+/// adding. `319b161` (#693) made it throw.
+///
+/// The test is presence, not truthiness — upstream's `Object.hasOwn(raw, key) && !isRecord(raw[key])`
+/// — so an explicit `"mcpServers": null` is reported rather than treated as absent. **Both** keys
+/// are checked, even though only the first present one is read, because `set_servers_object` deletes
+/// the hyphenated key on write: a bad `mcp-servers` beside a good `mcpServers` would otherwise be
+/// dropped without a word.
 ///
 /// Returns an owned map where upstream returns the live reference. Every caller's next move is
 /// `setServersObject(raw, servers)`, so the end state is identical; the clone is what makes the
 /// mutation explicit instead of spooky.
-#[must_use]
-pub fn get_servers_object(raw: &RawObject) -> RawObject {
-    match raw.get(SERVERS_KEY).or_else(|| raw.get(LEGACY_SERVERS_KEY)) {
-        Some(RawJson::Object(servers)) => servers.clone(),
-        _ => RawObject::new(),
+///
+/// # Errors
+///
+/// [`McpError::Config`] carrying `Failed to update MCP config at <path>: <key> must be an object`.
+pub fn get_servers_object(raw: &RawObject, path: &Path) -> McpResult<RawObject> {
+    for key in [SERVERS_KEY, LEGACY_SERVERS_KEY] {
+        match raw.get(key) {
+            None | Some(RawJson::Object(_)) => {}
+            Some(_) => {
+                return Err(config_update_error(
+                    path,
+                    &format!("{key} must be an object"),
+                ));
+            }
+        }
     }
+    Ok(
+        match raw.get(SERVERS_KEY).or_else(|| raw.get(LEGACY_SERVERS_KEY)) {
+            Some(RawJson::Object(servers)) => servers.clone(),
+            _ => RawObject::new(),
+        },
+    )
+}
+
+/// `getConfigImports(raw, filePath)` — `[]` for an absent `imports`, an **error** for anything that
+/// is not an array of strings (MCP-589).
+///
+/// The predecessor filtered non-strings out and carried on, so `"imports": "cursor"` and
+/// `"imports": [1]` both read as "no imports" and were then overwritten by the merged list — the
+/// user's own value destroyed without a message. `319b161` (#693) made it throw.
+///
+/// An *unknown* kind is still preserved, not rejected: the type test is `typeof value === "string"`
+/// and nothing more, so a config naming a host this build does not know round-trips through the
+/// writer untouched.
+///
+/// # Errors
+///
+/// [`McpError::Config`] carrying
+/// `Failed to update MCP config at <path>: imports must be an array of strings`.
+fn get_config_imports(raw: &RawObject, path: &Path) -> McpResult<Vec<String>> {
+    let Some(value) = raw.get("imports") else {
+        return Ok(Vec::new());
+    };
+    let RawJson::Array(items) = value else {
+        return Err(config_update_error(
+            path,
+            "imports must be an array of strings",
+        ));
+    };
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| config_update_error(path, "imports must be an array of strings"))
+        })
+        .collect()
 }
 
 /// `setServersObject(raw, servers)` — `delete raw["mcp-servers"]; raw.mcpServers = servers;`.
@@ -3898,24 +4026,34 @@ pub fn build_unified_diff(before_text: &str, after_text: &str) -> String {
 ///
 /// That is not a bug to fix in the port: the writer really does normalise the file, and a
 /// byte-accurate "before" would under-report what the write is about to do.
-#[must_use]
-pub fn build_config_write_preview(path: &Path, next_raw: &RawObject) -> ConfigWritePreview {
+///
+/// Since MCP-589 it can fail, because [`read_raw_config_object`] can: an unparseable file has no
+/// "before" side to render, and the panel says so through
+/// [`crate::ui::SetupPanel`]'s `Preview unavailable:` arm rather than previewing a diff from `{}`.
+///
+/// # Errors
+///
+/// Whatever [`read_raw_config_object`] returns for the existing file.
+pub fn build_config_write_preview(
+    path: &Path,
+    next_raw: &RawObject,
+) -> McpResult<ConfigWritePreview> {
     let existed = path.exists();
-    let before_raw = read_raw_config_object(path);
+    let before_raw = read_raw_config_object(path)?;
     let before_text = if existed {
         serialize_raw_object(&before_raw)
     } else {
         String::new()
     };
     let after_text = serialize_raw_object(next_raw);
-    ConfigWritePreview {
+    Ok(ConfigWritePreview {
         path: path.to_path_buf(),
         existed,
         changed: before_text != after_text,
         diff_text: build_unified_diff(&before_text, &after_text),
         before_text,
         after_text,
-    }
+    })
 }
 
 // ===================================================================================================
@@ -3980,14 +4118,17 @@ fn starter_raw() -> RawObject {
 /// server to an arbitrary shared file (a preset, or the RepoPrompt proposal).
 ///
 /// Called by [`crate::panel_host::SetupCallbacks`] for the RepoPrompt and known-server rows.
-#[must_use]
+///
+/// # Errors
+///
+/// Whatever [`read_raw_config_object`] or [`get_servers_object`] return for the target file.
 pub fn preview_shared_server_entry(
     path: &Path,
     server_name: &str,
     entry: &ServerEntry,
-) -> ConfigWritePreview {
-    let mut next_raw = read_raw_config_object(path);
-    let mut servers = get_servers_object(&next_raw);
+) -> McpResult<ConfigWritePreview> {
+    let mut next_raw = read_raw_config_object(path)?;
+    let mut servers = get_servers_object(&next_raw, path)?;
     servers.insert(server_name.to_string(), raw_from(entry));
     set_servers_object(&mut next_raw, servers);
     build_config_write_preview(path, &next_raw)
@@ -4005,8 +4146,8 @@ pub fn write_shared_server_entry(
     server_name: &str,
     entry: &ServerEntry,
 ) -> McpResult<PathBuf> {
-    let mut raw = read_raw_config_object(path);
-    let mut servers = get_servers_object(&raw);
+    let mut raw = read_raw_config_object(path)?;
+    let mut servers = get_servers_object(&raw, path)?;
     servers.insert(server_name.to_string(), raw_from(entry));
     set_servers_object(&mut raw, servers);
     write_raw_config_object(path, &raw)?;
@@ -4045,9 +4186,18 @@ pub fn write_direct_tools_config(
         ));
     }
 
+    // `for (const filePath of byPath.keys()) getServersObject(readRawConfigObject(filePath), filePath)`
+    // — `d3389d9` (#707). Every target is validated before **any** of them is written, so a second
+    // unparseable file cannot leave the first one already rewritten. The per-file read then happens
+    // again inside the write loop rather than being cached from this pass: two provenance paths can
+    // alias one file, and a stale copy would undo the earlier change.
+    for path in by_path.keys() {
+        get_servers_object(&read_raw_config_object(path)?, path)?;
+    }
+
     for (path, entries) in by_path {
-        let mut raw = read_raw_config_object(&path);
-        let mut servers = get_servers_object(&raw);
+        let mut raw = read_raw_config_object(&path)?;
+        let mut servers = get_servers_object(&raw, &path)?;
 
         for (name, value, prov) in entries {
             if prov.kind == SourceKind::Import {
@@ -4097,26 +4247,12 @@ impl ConfigContext {
     ) -> McpResult<ServerDisabledOverrideResult> {
         let file_path = self.project_override_path();
         let shown = file_path.display().to_string();
-        let mut raw = RawObject::new();
-
-        if file_path.exists() {
-            let text = std::fs::read_to_string(&file_path).map_err(|error| {
-                McpError::Config(format!(
-                    "Failed to read project MCP override at {shown}: {error}"
-                ))
-            })?;
-            let parsed = parse_json_config(&text, &shown).map_err(|error| {
-                McpError::Config(format!(
-                    "Failed to read project MCP override at {shown}: {error}"
-                ))
-            })?;
-            let Some(entries) = parsed.as_object() else {
-                return Err(McpError::Config(format!(
-                    "Failed to read project MCP override at {shown}: root value must be an object"
-                )));
-            };
-            raw = entries.clone();
-        }
+        // `d3389d9` (#707) deleted this writer's own `parseWritableConfigObject` try/catch and
+        // routed it through the shared reader, so an unparseable override now reports
+        // `Failed to read MCP config at …` and no longer has its own
+        // `Failed to read project MCP override at …` head. The two `Failed to UPDATE project MCP
+        // override at …` strings below are this writer's and stayed.
+        let mut raw = read_raw_config_object(&file_path)?;
 
         // `raw.mcpServers !== undefined ? "mcpServers" : raw["mcp-servers"] !== undefined ? … `.
         // Presence, not truthiness: an explicit `"mcpServers": null` selects that key and then fails
@@ -4360,16 +4496,23 @@ impl ConfigContext {
     ///
     /// Called by [`crate::ui::SetupPanelCallbacks::preview_imports`], from inside the setup
     /// panel's `render` on every frame.
-    #[must_use]
-    pub fn preview_compatibility_imports(&self, import_kinds: &[ImportKind]) -> ConfigWritePreview {
+    /// # Errors
+    ///
+    /// Whatever [`read_raw_config_object`], [`get_config_imports`] or [`get_servers_object`] return
+    /// for the adapter-owned global file.
+    pub fn preview_compatibility_imports(
+        &self,
+        import_kinds: &[ImportKind],
+    ) -> McpResult<ConfigWritePreview> {
         let target = self.user_path();
-        let mut next_raw = read_raw_config_object(&target);
-        let merged = merged_import_list(&next_raw, import_kinds);
+        let mut next_raw = read_raw_config_object(&target)?;
+        let current = get_config_imports(&next_raw, &target)?;
+        let merged = merged_import_list(&current, import_kinds);
         next_raw.insert(
             "imports".to_string(),
             RawJson::Array(merged.into_iter().map(RawJson::String).collect()),
         );
-        let servers = get_servers_object(&next_raw);
+        let servers = get_servers_object(&next_raw, &target)?;
         set_servers_object(&mut next_raw, servers);
         build_config_write_preview(&target, &next_raw)
     }
@@ -4387,9 +4530,9 @@ impl ConfigContext {
         import_kinds: &[ImportKind],
     ) -> McpResult<CompatibilityImportsResult> {
         let target = self.user_path();
-        let mut raw = read_raw_config_object(&target);
-        let current = current_import_list(&raw);
-        let merged = merged_import_list(&raw, import_kinds);
+        let mut raw = read_raw_config_object(&target)?;
+        let current = get_config_imports(&raw, &target)?;
+        let merged = merged_import_list(&current, import_kinds);
         // `merged.filter(kind => !currentImports.includes(kind))` — computed off the **deduped**
         // merged list, so a caller passing the same kind twice gets one entry back, not two.
         let mut added: Vec<ImportKind> = Vec::new();
@@ -4410,7 +4553,7 @@ impl ConfigContext {
             "imports".to_string(),
             RawJson::Array(merged.into_iter().map(RawJson::String).collect()),
         );
-        let servers = get_servers_object(&raw);
+        let servers = get_servers_object(&raw, &target)?;
         set_servers_object(&mut raw, servers);
         write_raw_config_object(&target, &raw)?;
         Ok(CompatibilityImportsResult {
@@ -4436,10 +4579,11 @@ impl ConfigContext {
     ///
     /// # Errors
     ///
-    /// Whatever [`write_raw_config_object`] returns for an unwritable target.
+    /// Whatever [`read_raw_config_object`] returns for an unparseable target, and whatever
+    /// [`write_raw_config_object`] returns for an unwritable one.
     pub fn enable_host_config_discovery(&self) -> McpResult<bool> {
         let target = self.user_path();
-        let mut raw = read_raw_config_object(&target);
+        let mut raw = read_raw_config_object(&target)?;
         let mut settings = match raw.get("settings") {
             Some(RawJson::Object(existing)) => existing.clone(),
             // A non-object `settings` is REPLACED, matching upstream's spread of a non-object into
@@ -4462,44 +4606,47 @@ impl ConfigContext {
         Ok(true)
     }
 
-    #[must_use]
-    pub fn preview_starter_project_config(&self) -> ConfigWritePreview {
-        build_config_write_preview(&self.project_path(), &starter_raw())
+    /// # Errors
+    ///
+    /// [`assert_scaffold_target_absent`]'s `Cannot scaffold MCP config at <path>: file already
+    /// exists`.
+    pub fn preview_starter_project_config(&self) -> McpResult<ConfigWritePreview> {
+        let target = self.project_path();
+        assert_scaffold_target_absent(&target)?;
+        build_config_write_preview(&target, &starter_raw())
     }
 
-    /// `writeStarterProjectConfig(cwd)` — writes `<cwd>/.mcp.json`, **clobbering** whatever was
-    /// there. Upstream does not merge here and neither does this: the caller is the setup panel,
-    /// which only offers the action when the file does not exist.
+    /// `writeStarterProjectConfig(cwd)` — writes `<cwd>/.mcp.json` from a literal, never a merge.
+    ///
+    /// Because it does not read the file, [`read_raw_config_object`] cannot protect it; since
+    /// `319b161` (#693) the protection is [`assert_scaffold_target_absent`] instead. The setup panel
+    /// only offers the action when the file does not exist, but that is the panel's judgement taken
+    /// a frame earlier, and this is the writer's own.
     ///
     /// Called by [`crate::ui::SetupPanelCallbacks::scaffold_project_config`].
+    ///
+    /// # Errors
+    ///
+    /// [`assert_scaffold_target_absent`]'s message, or whatever [`write_raw_config_object`] returns.
     pub fn write_starter_project_config(&self) -> McpResult<PathBuf> {
         let target = self.project_path();
+        assert_scaffold_target_absent(&target)?;
         write_raw_config_object(&target, &starter_raw())?;
         Ok(target)
     }
 }
 
-/// `Array.isArray(raw.imports) ? raw.imports.filter(isString) : []` — the file's current list,
-/// unvalidated (an unknown kind is preserved, exactly as upstream preserves it).
-fn current_import_list(raw: &RawObject) -> Vec<String> {
-    raw.get("imports")
-        .and_then(RawJson::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// `[...new Set([...currentImports, ...importKinds])]` — first-seen order, deduplicated.
-fn merged_import_list(raw: &RawObject, import_kinds: &[ImportKind]) -> Vec<String> {
+///
+/// Takes the current list rather than the raw object since MCP-589: reading `imports` out of the
+/// document is [`get_config_imports`]'s job now, and it can fail, so the two callers do it once and
+/// pass the result in.
+fn merged_import_list(current: &[String], import_kinds: &[ImportKind]) -> Vec<String> {
     let requested: Vec<String> = import_kinds
         .iter()
         .map(|kind| kind.as_str().to_string())
         .collect();
-    merge_imports(&current_import_list(raw), &requested)
+    merge_imports(current, &requested)
 }
 
 // ===================================================================================================
@@ -5457,8 +5604,8 @@ mod tests {
             "{\n  \"$schema\": \"https://example/schema.json\",\n  \"mcp-servers\": {\"a\": {\"command\": \"x\"}}\n}\n",
         );
 
-        let mut raw = read_raw_config_object(&path);
-        let servers = get_servers_object(&raw);
+        let mut raw = read_raw_config_object(&path).unwrap();
+        let servers = get_servers_object(&raw, &path).unwrap();
         assert!(servers.contains_key("a"), "the legacy key is still READ");
         set_servers_object(&mut raw, servers);
         write_raw_config_object(&path, &raw).unwrap();
@@ -5492,20 +5639,272 @@ mod tests {
         );
     }
 
+    // -- MCP-589 -----------------------------------------------------------------------------
+    //
+    // `319b161` (#693) and `d3389d9` (#707). The predecessor of this block asserted
+    // `"unparseable ⇒ {}, silently"`; upstream reversed that decision and these pin the reversal.
+
     #[test]
-    fn unparseable_and_missing_files_read_as_empty_objects() {
+    fn absent_and_empty_files_read_as_empty_objects_but_nothing_else_does() {
         let fixture = Fixture::new();
         let path = fixture.user_path();
-        assert!(read_raw_config_object(&path).is_empty(), "missing ⇒ {{}}");
-        fixture.write(&path, "{{{");
         assert!(
-            read_raw_config_object(&path).is_empty(),
-            "unparseable ⇒ {{}}, silently"
+            read_raw_config_object(&path).unwrap().is_empty(),
+            "absent ⇒ {{}}"
         );
-        fixture.write(&path, "[1, 2]");
+        fixture.write(&path, "   \n\t\n");
         assert!(
-            read_raw_config_object(&path).is_empty(),
-            "a non-object root ⇒ {{}}"
+            read_raw_config_object(&path).unwrap().is_empty(),
+            "`text.trim() === \"\"` ⇒ {{}}, and whitespace counts as empty"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_config_is_reported_and_left_byte_identical() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        let original = "{\n  \"mcpServers\": {\"keep\": {\"command\": \"x\"}},\n  // a comment\n  \"trailing\": {{{\n";
+        fixture.write(&path, original);
+
+        let error = config_message(&read_raw_config_object(&path).unwrap_err());
+        assert!(
+            error.starts_with(&format!(
+                "Failed to read MCP config at {}: ",
+                path.display()
+            )),
+            "upstream's head, verbatim: {error}"
+        );
+
+        // The point of the row: every writer refuses rather than merging its one change into `{}`
+        // and renaming the result over the user's file.
+        let entry = ServerEntry {
+            command: Some("new".to_string()),
+            ..ServerEntry::default()
+        };
+        assert!(write_shared_server_entry(&path, "added", &entry).is_err());
+        assert!(fixture.context().enable_host_config_discovery().is_err());
+        assert!(
+            fixture
+                .context()
+                .ensure_compatibility_imports(&[ImportKind::Cursor])
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the file on disk is byte-identical after every refused write"
+        );
+    }
+
+    #[test]
+    fn a_non_object_root_names_the_top_level_value() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        fixture.write(&path, "[1, 2]");
+        assert_eq!(
+            config_message(&read_raw_config_object(&path).unwrap_err()),
+            format!(
+                "Failed to read MCP config at {}: top-level value must be an object",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_non_object_server_table_is_an_update_failure_under_either_spelling() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        let entry = ServerEntry {
+            command: Some("x".to_string()),
+            ..ServerEntry::default()
+        };
+
+        for (text, key) in [
+            ("{\"mcpServers\": \"nope\"}", SERVERS_KEY),
+            ("{\"mcpServers\": null}", SERVERS_KEY),
+            ("{\"mcpServers\": [1]}", SERVERS_KEY),
+            ("{\"mcp-servers\": 7}", LEGACY_SERVERS_KEY),
+        ] {
+            fixture.write(&path, text);
+            assert_eq!(
+                config_message(&write_shared_server_entry(&path, "added", &entry).unwrap_err()),
+                format!(
+                    "Failed to update MCP config at {}: {key} must be an object",
+                    path.display()
+                ),
+                "for {text}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                text,
+                "the server table is not silently replaced: {text}"
+            );
+        }
+
+        // A bad `mcp-servers` BESIDE a good `mcpServers` is still reported, because the write
+        // deletes the hyphenated key and would otherwise drop it without a word.
+        fixture.write(&path, "{\"mcpServers\": {}, \"mcp-servers\": 7}");
+        assert_eq!(
+            config_message(&write_shared_server_entry(&path, "added", &entry).unwrap_err()),
+            format!(
+                "Failed to update MCP config at {}: mcp-servers must be an object",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_non_string_imports_list_is_an_update_failure() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        let expected = format!(
+            "Failed to update MCP config at {}: imports must be an array of strings",
+            path.display()
+        );
+
+        for text in [
+            "{\"imports\": \"cursor\"}",
+            "{\"imports\": [1]}",
+            "{\"imports\": null}",
+            "{\"imports\": {}}",
+        ] {
+            fixture.write(&path, text);
+            let error = fixture
+                .context()
+                .ensure_compatibility_imports(&[ImportKind::Cursor])
+                .unwrap_err();
+            assert_eq!(config_message(&error), expected, "for {text}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                text,
+                "the user's own imports value is not overwritten: {text}"
+            );
+            assert!(
+                fixture
+                    .context()
+                    .preview_compatibility_imports(&[ImportKind::Cursor])
+                    .is_err(),
+                "the preview refuses on the same ground: {text}"
+            );
+        }
+
+        // An UNKNOWN kind is a string and stays legal, preserved through the write.
+        fixture.write(&path, "{\"imports\": [\"some-future-host\"]}");
+        fixture
+            .context()
+            .ensure_compatibility_imports(&[ImportKind::Cursor])
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("some-future-host"),
+            "an unknown kind is preserved, not rejected"
+        );
+    }
+
+    #[test]
+    fn the_project_override_writer_reports_the_shared_read_failure() {
+        let fixture = Fixture::new();
+        let path = fixture.project_override();
+        fixture.write(&path, "{{{");
+        // `d3389d9` (#707) deleted this writer's own `Failed to read project MCP override at …`
+        // head and routed it through the shared reader.
+        let error = config_message(
+            &fixture
+                .context()
+                .write_project_server_disabled_override("a", true)
+                .unwrap_err(),
+        );
+        assert!(
+            error.starts_with(&format!(
+                "Failed to read MCP config at {}: ",
+                path.display()
+            )),
+            "got {error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{{{");
+    }
+
+    #[test]
+    fn a_dangling_symlink_reaches_the_read_instead_of_reporting_absent() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        // `existsSync` → `lstatSync(filePath, { throwIfNoEntry: false })`: `stat` follows and would
+        // call this absent, which is how a dotfiles symlink whose target is gone used to be
+        // replaced by a regular file without a word.
+        std::os::unix::fs::symlink(fixture.agent_dir.join("gone.json"), &path).unwrap();
+        assert!(!path.exists(), "`stat` says absent");
+        let error = config_message(&read_raw_config_object(&path).unwrap_err());
+        assert!(
+            error.starts_with(&format!(
+                "Failed to read MCP config at {}: ",
+                path.display()
+            )),
+            "but `lstat` says present and the read reports the failure: {error}"
+        );
+    }
+
+    #[test]
+    fn a_scaffold_refuses_a_target_that_already_exists() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let target = context.project_path();
+
+        // Absent: the preview and the write both work, and the write is what creates the file.
+        assert!(context.preview_starter_project_config().is_ok());
+        assert_eq!(context.write_starter_project_config().unwrap(), target);
+
+        let expected = format!(
+            "Cannot scaffold MCP config at {}: file already exists",
+            target.display()
+        );
+        assert_eq!(
+            config_message(&context.write_starter_project_config().unwrap_err()),
+            expected,
+            "the scaffold writes from a literal, so the reader cannot protect it"
+        );
+        assert_eq!(
+            config_message(&context.preview_starter_project_config().unwrap_err()),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_direct_tools_write_validates_every_target_before_writing_any() {
+        let fixture = Fixture::new();
+        let good = fixture.user_path();
+        let bad = fixture.shared_global();
+        fixture.write(&good, "{\"mcpServers\": {\"a\": {\"command\": \"x\"}}}");
+        fixture.write(&bad, "{{{");
+
+        let mut changes: IndexMap<String, BoolOrList> = IndexMap::new();
+        changes.insert("a".to_string(), BoolOrList::All(true));
+        changes.insert("b".to_string(), BoolOrList::All(true));
+        let mut provenance: IndexMap<String, ServerProvenance> = IndexMap::new();
+        provenance.insert(
+            "a".to_string(),
+            ServerProvenance {
+                path: good.clone(),
+                kind: SourceKind::User,
+                import_kind: None,
+            },
+        );
+        provenance.insert(
+            "b".to_string(),
+            ServerProvenance {
+                path: bad.clone(),
+                kind: SourceKind::User,
+                import_kind: None,
+            },
+        );
+
+        assert!(
+            write_direct_tools_config(&changes, &provenance, &McpConfig::default()).is_err(),
+            "the unparseable second target refuses the whole write"
+        );
+        assert!(
+            !std::fs::read_to_string(&good).unwrap().contains("direct"),
+            "and the FIRST target is untouched, because every target is validated up front"
         );
     }
 
@@ -5546,7 +5945,7 @@ mod tests {
 
         let mut next = RawObject::new();
         next.insert(SERVERS_KEY.to_string(), RawJson::Object(RawObject::new()));
-        let preview = build_config_write_preview(&path, &next);
+        let preview = build_config_write_preview(&path, &next).unwrap();
 
         assert!(preview.existed);
         assert!(
@@ -5564,7 +5963,7 @@ mod tests {
 
         // A hyphenated key IS a change, because `setServersObject` normalises it.
         fixture.write(&path, "{\n  \"mcp-servers\": {}\n}\n");
-        let preview = build_config_write_preview(&path, &next);
+        let preview = build_config_write_preview(&path, &next).unwrap();
         assert!(preview.changed);
         assert!(preview.diff_text.contains("- ") && preview.diff_text.contains("+ "));
     }
@@ -5598,8 +5997,9 @@ mod tests {
             .write_project_server_disabled_override("foo", false)
             .unwrap();
         assert!(enabled.changed);
-        let raw = read_raw_config_object(&fixture.project_override());
-        let servers = get_servers_object(&raw);
+        let override_path = fixture.project_override();
+        let raw = read_raw_config_object(&override_path).unwrap();
+        let servers = get_servers_object(&raw, &override_path).unwrap();
         assert!(
             !servers.contains_key("foo"),
             "an empty entry is removed, not left as a husk"
@@ -5639,6 +6039,10 @@ mod tests {
         let path = fixture.project_override();
         let shown = path.display().to_string();
 
+        // The READ failure is no longer this writer's own: `d3389d9` (#707) routed it through
+        // `readRawConfigObject`, so the head is the shared one and the detail is
+        // `top-level value must be an object`, not `root value must be an object` (MCP-589). The
+        // three `… update project MCP override …` strings below are still this writer's.
         fixture.write(&path, "[]");
         assert_eq!(
             config_message(
@@ -5646,7 +6050,7 @@ mod tests {
                     .write_project_server_disabled_override("foo", true)
                     .unwrap_err()
             ),
-            format!("Failed to read project MCP override at {shown}: root value must be an object")
+            format!("Failed to read MCP config at {shown}: top-level value must be an object")
         );
 
         fixture.write(&path, "{\"mcpServers\": 5}");
@@ -5800,7 +6204,7 @@ mod tests {
             url: Some("https://x.example/mcp".to_string()),
             ..ServerEntry::default()
         };
-        let preview = preview_shared_server_entry(&starter, "x", &entry);
+        let preview = preview_shared_server_entry(&starter, "x", &entry).unwrap();
         assert!(preview.changed);
         write_shared_server_entry(&starter, "x", &entry).unwrap();
         let text = std::fs::read_to_string(&starter).unwrap();
