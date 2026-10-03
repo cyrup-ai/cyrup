@@ -91,6 +91,51 @@ over existing host verbs.
 > | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
 > | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
 
+### Items filed 2026-10-02 — `pi-mcp-adapter` `v2.38.0..v5.0.0` and pi `v0.87.1..v1.0.0`
+
+> **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
+> `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
+> **Next free id: `MCP-609`.** Upstream was read only through
+> `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
+> `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
+> `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
+> **Architecture is not in question and no row below proposes restructuring `cyrup-mcp`:** pi moving
+> MCP into its monorepo as a first-class package is pi arriving where cyrup already is, and `MCP-587`
+> records what that means for citations and nothing else.
+
+One row: MCP prompt *argument names* get no completions.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| MCP-608 | low | not-ported | S | **MCP prompt *argument names* get no completions** — `4e702f1` (#733) adds a branch to `getArgumentCompletions`, skipping disabled servers; extends `MCP-041` / `MCP-382`, which cover the `/mcp` subcommands only. **FILED 2026-10-02**; body below. |
+
+#### MCP-608 — completions for MCP prompt argument names
+
+**upstream** — `4e702f1` (#733, v3.3.0): the argument-completion path gains a branch that completes
+an MCP **prompt's** argument names on its generated slash command, and a follow-up in the same commit
+skips prompt-argument completions for **disabled** servers. The argument metadata is already carried:
+`PromptMetadata.arguments: McpPromptArgument[]` (`types.ts:760` onward), each
+`{ name, description?, required? }`.
+
+**cyrup at HEAD** — `commands.rs:853` is headed "MCP-041 — HA-2's dynamic argument completions" and
+`argument_completions(ext, command, prefix)` (`:887`) implements both branches of upstream's
+`getArgumentCompletions` **as it stood at the ported tag**: the eight `/mcp` subcommands and the
+`/mcp-auth` server list. Its tests (`:988`, `:996`, `:1007`) cover exactly those. `prompts.rs` has no
+completion function — `grep -n 'complet' crates/cyrup-mcp/src/prompts.rs` is empty — so typing an
+argument name on a generated prompt command offers nothing.
+
+**Dependency, and why this is `S` and not blocked.** `MCP-041` is the host-addition leg (extension
+slash commands have no argument completions, for natives or in the TUI) and `MCP-382` is the same gap
+seen from the TUI; both are named in `MCP-PORT-METHODOLOGY.md` as **HA-2**, "real and secondary."
+This row is **one more branch inside the function `MCP-041` already builds**, plus the
+disabled-server filter. It should be closed by whoever closes `MCP-041`, and is filed separately only
+so the branch is not lost — `argument_completions`' doc cites `index.ts:470-497` as "both branches",
+which is no longer the whole function at v5.0.0.
+
+`verify` — a completion test on a generated prompt command offering its argument names and filtering
+by prefix; a test that a disabled server's prompt offers none.
+
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
 > **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** panel theme → **`MCP-560`**; `logoutServer` ordering → **`MCP-555`** (v2.37.0 keeps close-first but restores two distinct failure messages, not the single v2.33.0 one); `hasCachedData` scope → **`MCP-556`**. The non-theme hunks of the two panel files remain sampled rather than read line by line; nothing in them was found to change behaviour. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.

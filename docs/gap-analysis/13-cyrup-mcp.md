@@ -91,6 +91,77 @@ exists.
 > | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
 > | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
 
+## Items filed 2026-10-02 — `pi-mcp-adapter` `v2.38.0..v5.0.0` and pi `v0.87.1..v1.0.0`
+
+> **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
+> `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
+> **Next free id: `MCP-609`.** Upstream was read only through
+> `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
+> `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
+> `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
+> **Architecture is not in question and no row below proposes restructuring `cyrup-mcp`:** pi moving
+> MCP into its monorepo as a first-class package is pi arriving where cyrup already is, and `MCP-587`
+> records what that means for citations and nothing else.
+
+One row, and it is a bookkeeping ruling rather than a port unit: which upstream this area's
+citations resolve against now that `pi-mcp-adapter` has taken a major bump *and* pi has grown its
+own in-monorepo MCP package and its own built-in MCP extension. The short answer is that all three
+are different things and the adapter is still the authoritative one.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| MCP-587 | low | tooling | S | **Area 13's `pi-mcp-adapter` citations stay authoritative at v5.0.0, and pi's new in-monorepo MCP is a *second*, non-authoritative source** — the adapter is still independent (`package.json` at v5.0.0 depends on `@modelcontextprotocol/client` 2.0.0, not on `@earendil-works/pi-mcp`). **FILED 2026-10-02**; body below. |
+
+### MCP-587 — which upstream to diff area 13 against, from v5.0.0 onward
+
+**The question this settles.** `packages/mcp` is new in the pi monorepo at v1.0.0 and
+`pi-mcp-adapter` took a major bump in the same window, so a reader could reasonably conclude that
+area 13's `pi-mcp-adapter` citations now point at a shim and that future comparisons should be made
+against the monorepo package instead. They should not. This row exists so nobody re-derives that.
+
+**upstream, measured at the new tags.**
+
+1. **`pi-mcp-adapter` v5.0.0 is still independent of the pi monorepo.** `package.json` at v5.0.0
+   lists `@modelcontextprotocol/client` `2.0.0` and `@modelcontextprotocol/core` `2.0.0` as
+   dependencies and `@earendil-works/pi-ai` / `@earendil-works/pi-tui` as *optional* peers. There is
+   no `@earendil-works/pi-mcp` dependency, no re-export of it, and no file in the `files` array that
+   wraps it. The 93 production modules area 13 cites (`server-manager.ts`, `config.ts`,
+   `metadata-cache.ts`, `proxy-modes.ts`, `tool-approval.ts`, `mcp-oauth-provider.ts`, …) are all
+   still present and still carry the behaviour. **Every citation in `13-cyrup-mcp.md` and `13a`–`13i`
+   remains resolvable at a `pi-mcp-adapter` tag, and `v5.0.0` is the tag to use.**
+2. **`packages/mcp` is not the adapter.** `packages/mcp/README.md` at `v1.0.0` opens "A small,
+   standalone Model Context Protocol client. It does not depend on the official MCP SDK or other pi
+   packages." Its 13 source files are a transport-neutral client core, stdio / Streamable-HTTP /
+   in-memory transports, a `protocol/` layer and an `oauth/` subset. **It is pi's answer to `rmcp`,
+   not to the adapter** — cyrup's equivalent is the `rmcp` dependency, which is why the port plan's
+   `rmcp` section, not area 13's unit table, is where a `packages/mcp` comparison would belong.
+3. **pi now also ships its own built-in MCP *extension*, and it is a third thing again.** It is
+   `packages/coding-agent/src/extensions/mcp/` (12 files: `index.ts`, `config.ts`, `runtime.ts`,
+   `tools.ts`, `oauth.ts`, `resources.ts`, `cli.ts`, `ui.ts`, `log.ts`, plus two `.lazy.ts`
+   shims), loaded at the extension path `builtin:mcp`, built on `packages/mcp`, and documented at
+   `packages/coding-agent/docs/mcp.md`. The adapter's v5.0.0 window is largely about *coexisting
+   with it*: `c455a84` detects it by its `builtin:mcp` path, `9bb2ebf` (`feat!`) replaces it in
+   sessions, `8843e8a` turns it off on install or update, `873dc36` offers to import its sign-ins,
+   `603ac81` reads its `mcp.json`, and `d5e952a` (`feat!`) renames the adapter's own config file to
+   stop colliding with it.
+
+**What this means for cyrup, and it is the whole point of the row.** cyrup is both the host *and*
+the MCP implementation; it ships MCP by default as the workspace crate `crates/cyrup-mcp`. There is
+no second MCP owner in the binary to coexist with, so **the entire coexistence cluster above is
+inapplicable, not unported** — see *Already covered / not owed* at the foot of this file, where each
+of those six commits is named and ruled. The one place the rename leaks into a genuine parity
+question is `MCP-588`.
+
+**Rule for the next pass, stated so it can be applied mechanically.** Diff `pi-mcp-adapter`
+`v5.0.0..<next>` for every area-13 unit. Consult `packages/coding-agent/src/extensions/mcp/` only
+to *rule out* a commit as coexistence plumbing, and `packages/mcp` only when an `rmcp` capability
+question is open. Neither is a source of parity obligations for area 13.
+
+`verify` — `git -C tmp/pi-mcp-adapter show v5.0.0:package.json | grep -c 'earendil-works/pi-mcp"'`
+is `0`; falsification condition: a later adapter tag that adds that dependency moves the
+authoritative source and voids this row.
+
 ## UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not items)
 
 > **RESOLVED 2026-09-24.** The three self-corrections below were re-checked: `13-cyrup-mcp.md:237`'s

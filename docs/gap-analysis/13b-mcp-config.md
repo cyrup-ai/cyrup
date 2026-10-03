@@ -75,6 +75,225 @@ non-obvious obligation in this section.
 > | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
 > | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
 
+### Items filed 2026-10-02 — `pi-mcp-adapter` `v2.38.0..v5.0.0` and pi `v0.87.1..v1.0.0`
+
+> **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
+> `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
+> **Next free id: `MCP-609`.** Upstream was read only through
+> `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
+> `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
+> `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
+> **Architecture is not in question and no row below proposes restructuring `cyrup-mcp`:** pi moving
+> MCP into its monorepo as a first-class package is pi arriving where cyrup already is, and `MCP-587`
+> records what that means for citations and nothing else.
+
+Five rows. The adapter vacated the `mcp.json` filename because pi's own built-in MCP took it
+(`MCP-588`, a decision rather than work — cyrup has no second MCP owner to collide with), and the
+other four are ordinary config drift: a reversed clobber-on-write decision, a missing BOM strip, the
+settlement of `MCP-096`'s open project-trust question, and one unported `ServerEntry` field.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| MCP-588 | low | upstream-drift | S | **The adapter's own config file moved to `mcp-adapter.json` at both scopes, and three config-source labels changed with it** — `config.ts:23`, `:202`, `:223` at v5.0.0; cyrup keeps `mcp.json` **by decision**, recorded here so no pass re-derives it. **FILED 2026-10-02**; body below. |
+| MCP-589 | medium | upstream-drift | S | **`read_raw_config_object` still clobbers an unparseable config on write; upstream reversed that decision** — `config.ts:1620` now throws `Failed to read MCP config at …`. **FILED 2026-10-02**; body below. |
+| MCP-590 | low | upstream-drift | S | **A UTF-8 BOM is not stripped before the JSONC or TOML parse, so a BOM-prefixed config reads as empty** — `utils.ts:9 stripUtf8Bom` at v5.0.0. **FILED 2026-10-02**; body below. |
+| MCP-591 | medium | upstream-drift | L | **`MCP-096`'s open decision is settled: upstream now gates project-scoped servers on trust *and* per-definition approval** — new `project-server-trust.ts` (242 lines) and `settings.projectServers` (`types.ts:605`). **FILED 2026-10-02**; body below. |
+| MCP-592 | low | not-ported | S | **`ServerEntry.description` is unported** — `types.ts:440` at v5.0.0, a one-line human summary ranked by `mcp({ search })` and shown by `mcp({ server })` and the panel. **FILED 2026-10-02**; body below. |
+
+#### MCP-588 — the adapter config file rename, and why cyrup does not follow it
+
+**upstream** — `d5e952a` (`feat!`, v3.0.0). `config.ts:23` adds
+`const ADAPTER_CONFIG_NAME = "mcp-adapter.json"` beside the retained
+`PI_MCP_CONFIG_NAME = "mcp.json"`. `getPiGlobalConfigPath` (`:202`) now resolves
+`getAgentPath("mcp-adapter.json")` and `getProjectPiConfigPath` (`:223`) resolves
+`<cwd>/<configDir>/mcp-adapter.json`. Two legacy readers are added —
+`getLegacyPiMcpGlobalConfigPath` and `getLegacyProjectPiMcpConfigPath` — and
+`getLegacyMcpMigrationNotices(cwd, overridePath, piOwnsServers)` (`:259`) emits one diagnostic per
+scope whose legacy file still holds adapter-only content (`mcpServers` when pi does not own them, the
+legacy `mcp-servers` key, `settings`, `imports`, `claudePlugins`), with two message forms: the
+`mv`/merge form, and, when pi's built-in MCP owns `mcpServers`, `"<source> contains pi-mcp-adapter
+settings that neither Pi nor the adapter reads. Move settings, imports, and claudePlugins into
+<target>, and put any \"mcp-servers\" entries under its \"mcpServers\" key."` Three config-source
+labels change in `getConfigSources`: `"Pi global override"` → `"MCP adapter global override"`,
+`"project Pi override"` → `"project MCP adapter override"`, `"ancestor Pi override"` →
+`"ancestor MCP adapter override"`.
+
+**cyrup at HEAD** — `config.rs:116` `PROJECT_CONFIG_NAME = ".mcp.json"`, `:120`
+`PROJECT_OVERRIDE_DIR = ".cyrup"`; `SourceId::PiGlobal` renders id `"pi-global"` (`:3050`) and label
+`"Pi global override"` (`:3286`), and `:3311` carries `"project Pi override"`. The project override
+path is documented at `:3218` as `<cwd>/.cyrup/mcp.json`. `grep -rn 'mcp-adapter.json'
+crates/cyrup-mcp/src` is empty.
+
+**The ruling, and it is a decision rather than work.** The rename exists for exactly one reason: at
+v5.0.0 `mcp.json` is owned by pi's own built-in MCP extension and the adapter had to vacate the name
+(`MCP-587`). **cyrup has no second MCP owner** — `crates/cyrup-mcp` *is* the built-in — so the
+collision the rename avoids cannot occur, and renaming cyrup's file would break every existing
+user's config to no end. **cyrup keeps `mcp.json` at both scopes**, and
+`getLegacyMcpMigrationNotices` is **not owed**: it is a migration off a name cyrup never left.
+
+**What *is* owed, and it is small.** The three source labels are user-visible strings in `/mcp
+status` and the setup panel, and `"Pi global override"` names pi in cyrup's own UI, which is a
+cyrup-ism independent of this rename. Relabel to `"MCP adapter global override"` /
+`"project MCP adapter override"` / `"ancestor MCP adapter override"` — or to a cyrup-appropriate
+wording — and record the path divergence as a two-part `[CYRUP-DELTA]` at `config.rs:116` and at
+`SourceId::PiGlobal`, so the next reader diffing `config.ts`'s path constants finds the answer at the
+site instead of re-opening it.
+
+`verify` — a test asserting the three labels, and a `[CYRUP-DELTA]` naming `ADAPTER_CONFIG_NAME`
+and the reason it is not adopted.
+
+#### MCP-589 — an unparseable config is still silently clobbered by any `/mcp` write
+
+**upstream** — `319b161` (#693, v3.0.0). The writer's read-back was a bare `catch {}` returning
+`{}`; it now parses through `parseWritableConfigObject` (empty text ⇒ `{}`, non-object root ⇒
+`throw new Error("top-level value must be an object")`) and **rethrows**:
+`config.ts:1620` — `` `Failed to read MCP config at ${filePath}: ${message}` ``, with `cause` set.
+Three further hardenings land in the same commit, all on the write path:
+- `existsSync` → `lstatSync(filePath, { throwIfNoEntry: false })`, and when the write fails on a path
+  that `lstat` reports as a symlink, `config.ts:1632` —
+  `` `Cannot write MCP config at ${originalPath}: symbolic link target is unavailable` ``.
+- `getServersObject(raw, filePath)` now **throws** when `mcpServers` or `mcp-servers` is present but
+  not an object: `` `Failed to update MCP config at ${filePath}: ${key} must be an object` `` —
+  previously such a file had its server map silently replaced.
+- `getConfigImports(raw, filePath)` throws `` `… imports must be an array of strings` ``.
+
+**cyrup at HEAD** — `config.rs:3529 read_raw_config_object` returns an empty `RawObject` for a
+missing file, an unreadable file, an unparseable file *and* a non-object root, and its doc comment at
+`:3520` states the position explicitly: *"**Silently.** This is a *writer* helper, and upstream's
+bare `catch {}` here is deliberate: clobbering an unparseable file is the accepted cost of being able
+to write one at all."* `config.rs:5341
+unparseable_and_missing_files_read_as_empty_objects` pins it, asserting `"unparseable ⇒ {}, silently"`.
+Every writer in the module opens with it: `:3748`, `:3833`, `:3852`, `:3893`, `:4210`, `:4234`,
+`:4286`, `:5304`.
+
+**The failure.** A user hand-edits `~/.cyrup/mcp.json`, leaves a trailing brace or a bad escape, then
+runs any `/mcp` action that writes — `/mcp setup`, enable/disable, a direct-tools save, an OAuth
+record. `read_raw_config_object` hands the writer `{}`, the writer merges its one change into `{}`,
+and `write_raw_config_object` renames the result over the original. **Every server, setting, import
+and comment in the file is gone, and the rename is atomic, so there is no partial file to recover
+from.** The mitigation cyrup records — `build_config_write_preview` renders the diff from `{}` and so
+"announces the clobber" (MCP-099) — is real but is a preview the user must read and recognise; it does
+not fire on the non-interactive write paths at all. Severity is held at `medium` rather than `high`
+on the strength of that preview; the body states the reasoning so a reviewer can disagree with it
+knowingly.
+
+**Work.** Add a fallible sibling to `read_raw_config_object` carrying upstream's four messages
+byte-for-byte, route all nine writer call sites through it, keep the infallible reader for the
+*read* ladder (module rule 4 — `init` must never `Err` — applies to `read_validated_config`, not to
+the writer), and rewrite the doc comment at `:3520` and the test at `:5341`, both of which assert the
+reversed decision.
+
+`verify` — a test writing `{{{` then asserting the writer errors with
+`Failed to read MCP config at <path>: …` **and that the file on disk is byte-identical afterwards**;
+one test per further message (non-object root, symlink, `mcpServers must be an object`,
+`imports must be an array of strings`).
+
+#### MCP-590 — a UTF-8 BOM is not stripped before the config parse
+
+**upstream** — `1416386` (#697, v3.0.0). `utils.ts:9` —
+`export function stripUtf8Bom(raw: string): string { return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw }`
+— applied in `parseJsonWithComments` (`utils.ts:14`,
+`JSON.parse(stripJsonComments(stripUtf8Bom(raw), { trailingCommas: true }))`) and on the TOML leg
+(`parseToml(stripUtf8Bom(raw))`).
+
+**cyrup at HEAD** — `grep -n 'BOM\|feff' crates/cyrup-mcp/src/config.rs` is empty. The crate's
+JSONC entry point is `parse_json_config`, and `cyrup-resources`/`cyrup-provider` strip a BOM
+elsewhere in the tree (`crates/cyrup-resources/src/skill.rs`,
+`crates/cyrup-provider/src/stream/framer.rs`), so the idiom exists; it just is not on this path.
+
+**The failure.** A BOM is what Windows PowerShell's `>` redirection and several editors write by
+default. `serde_json` rejects `\u{feff}` before `{`, so module rule 4 degrades the file to
+`{ mcpServers: {} }` with a warning — **every server in a BOM-prefixed config disappears silently**,
+and the warning does not name the BOM, so the user has no path to the cause. Low severity because it
+takes a specific editor, `S` because it is one helper applied at two call sites.
+
+`verify` — a fixture whose bytes begin `EF BB BF` followed by a one-server config, asserting the
+server loads; the same for a `.toml` import.
+
+#### MCP-591 — project-scoped MCP servers: `MCP-096`'s open decision, now settled upstream
+
+**Why this is not a new proposal.** `13-cyrup-mcp.md:1434` and `13b-mcp-config.md:1863` carry
+`MCP-096` as an **open decision**: "upstream applies **no gate**; cyrup's `SettingsManager` skips
+the whole project layer for an untrusted project … Recommendation: gate (option b), record the
+divergence." At v5.0.0 upstream gates, in the same direction, with a concrete mechanism. The
+decision is closed; what remains is a port, and upstream now supplies the strings.
+
+**upstream, new at `5d645df` (#681, v3.0.0) and refined six times since.** `project-server-trust.ts`
+is a new 242-line module:
+- `hashProjectServerDefinition(definition)` (`:77`) — SHA-256 over a `canonicalize`d definition
+  (recursive key sort, `undefined` members dropped), so **editing an approved server re-prompts**.
+- An approval store at `getAgentPath("mcp-project-approvals.json")`, `APPROVALS_VERSION = 1`, records
+  of `{ projectRoot, serverName, definitionHash, approvedAt }`; `canonicalProjectRoot(cwd)` (`:81`)
+  is `realpathSync` with a `resolve` fallback.
+- `approveProjectServer` (`:163`), `applyProjectServerTrustToConfig` (`:227`),
+  `excludeProjectServersAtLoadTime` (`:235`), `hasProjectServerDefinitions` (`:64`).
+- Three block reasons with exact agent-facing strings in `describeProjectServerBlock` (`:35`):
+  `untrusted` → `"blocked by project trust — trust the project to review and approve this server"`;
+  `approval-required` → `"blocked: project server approval required — approve it in a trusted
+  interactive session or set user-global settings.projectServers to \"allow\""`; `denied` →
+  `"blocked: project server approval denied — reload in a trusted interactive session to approve
+  it"`. `disabledServerReason` (`:46`) substitutes these for the ordinary disabled text.
+- `settings.projectServers?: "ask" | "allow"` (`types.ts:605`), **user-global only**, default `ask`.
+- The prompt is two choices, `["Don't allow", "Allow"]` in that order, with the comment
+  *"Pi preselects the first option, so a stray Enter denies"* (`:13-14`) — hardened again by
+  `67fcdf9` (#797), the last functional commit before the v5.0.0 release.
+
+Six follow-ups belong to the same unit and must land with it: `7dc3d28` (#688) no trust prompt for a
+**disabled** project server; `a6cfeea` (#701) the approval must happen **inside** `session_start`;
+`eaaa3c1` (#699) the prompt labels the path as *project config*; `4ed656e` (#714) project servers are
+skipped in the **load-time** runtime; `1f540b9` (#709) worktrees of one repository **share** approvals
+by a repo-relative key, with a bare repository stored as a `.git` file getting its own key; `67fcdf9`
+(#797) the default choice is deny.
+
+**cyrup at HEAD** — `grep -rn 'project_servers\|ProjectServerBlock\|mcp-project-approvals'
+crates/cyrup-mcp/src` finds only `write_project_server_disabled_override` (`config.rs:3937`), which
+is the unrelated enable/disable override. There is no approval store, no definition hash, no
+`projectServers` setting (it is not among `McpSettings`' 23 fields — `MCP-549`), and no block-reason
+vocabulary. `HostServices::is_project_trusted` exists, which is the half `MCP-096` already noted
+makes the *trust* leg one call; the **approval** leg is entirely new.
+
+**What a project-local config can do today, which is why this is not cosmetic.** `.mcp.json` and
+`.cyrup/mcp.json` are read from the checkout. An entry may name an arbitrary stdio `command`, and an
+`!`-prefixed `env` value runs a shell command at connect (`secrets.rs`). Cloning a repository and
+starting cyrup in it is therefore enough to run attacker-chosen code, which is exactly the hazard
+`MCP-096` recorded and upstream has now closed.
+
+**Sizing.** `L`, and it needs splitting: (a) the config loader must surface *which* servers came
+from a project source and a `projectServerPolicy`, which upstream carries on `LoadedMcpConfig` and
+passes through a `Symbol.for("pi-mcp-adapter/config-source-metadata")` registry key —
+cyrup should pass it as a typed field, recorded as a `[CYRUP-DELTA]`; (b) the store, the hash and the
+worktree key; (c) the `session_start` prompt and the deny-by-default ordering; (d) the three block
+strings threaded into `/mcp status`, the panel and the agent-facing blocked-call text.
+
+**Dependency.** `MCP-549` (the `McpSettings` key) is a prerequisite for the `projectServers` leg.
+
+`verify` — a test per block reason asserting the exact string; a test that editing an approved
+server's definition re-prompts; a test that two worktrees of one repository share an approval and a
+bare-`.git`-file worktree does not; a test that a stray Enter denies.
+
+#### MCP-592 — `ServerEntry.description` is unported
+
+**upstream** — `e12ef73` (#760, v5.0.0). `types.ts:440`, the **first** field of `ServerEntry`:
+`/** Short human summary shown by mcp({ server }) and the /mcp-adapter panel, and ranked by
+mcp({ search }). */ description?: string`. The follow-up in the same commit checks imported
+servers' descriptions and keeps listing descriptions to one line.
+
+**cyrup at HEAD** — `ServerEntry` (`config.rs:787` onward) has no `description`; `grep -n 'pub
+description' crates/cyrup-mcp/src/config.rs` returns nothing on `ServerEntry` (the only hits are the
+setup-panel row struct at `:5020`). An unknown key round-trips through `RawJson` (module rule 3), so
+a config carrying `description` is preserved on write but the value reaches no reader.
+
+**Not a digest change.** `computeServerHash`'s identity object at `metadata-cache.ts:109` does
+**not** include `description`, so adding the field does not move any golden vector. Contrast
+`MCP-594`, which does.
+
+**Work.** The field, plus three readers: the `mcp({ server })` listing, the `/mcp` panel row, and
+`mcp({ search })`'s ranking input (`proxy/ranking.rs`), each collapsing the value to one line.
+
+`verify` — a search test ranking a server matched only through its `description`; a golden-vector
+test asserting the hash is unchanged by adding the field.
+
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
 > **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** `claudePlugins` + `claude-plugin-loader.ts` + `normalizeProgrammaticConfig` → **`MCP-565`**; `caFile` (config half) → **`MCP-566`**, with `MCP-500` to land at six; the exclusive-mode override → **`MCP-552`** — reading the cyrup side showed the **whole** exclusive mode (`v2.28.0`, `5088b4e`) is absent, not only the v2.33.0 override; `getConfigPathFromArgv` → **`MCP-551`**; `directTools: "search"` type widening → **`MCP-561`** (`lenient` reads `"search"` as absent). From v2.34–v2.37: `ancestorConfigRoots` → **`MCP-573`**; `allowInstall` → folded into `MCP-563`. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.

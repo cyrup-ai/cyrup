@@ -62,7 +62,8 @@ covers.
 | [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline |
 | [`14-cyrup-flux.md`](14-cyrup-flux.md) | the Flux pipeline — the fifth ported upstream, and the first that is neither pi nor TypeScript |
 | [`16-cyrup-herdr.md`](16-cyrup-herdr.md) | **client conformance, not a port** — `crates/cyrup-herdr`, cyrup's own client of herdr's socket API and CLI, checked against herdr v0.9.1. Its kinds (`client-bug`, `protocol-drift`) describe the client, not parity; the counting script folds them into Port bug / Version lag and says so |
-| [`17-pi-harness-and-durable.md`](17-pi-harness-and-durable.md) | pi's experimental `packages/agent/src/harness/**` (incl. `pico3`) and the new `packages/durable`, `v0.85.1..v0.87.1`. pi ships none of it to users, so both rows are trackers; it names the existing item that covers each shipped overlap |
+| [`17-pi-harness-and-durable.md`](17-pi-harness-and-durable.md) | pi's durable harness over `v0.85.1..v1.0.0`: `packages/durable`, and the `packages/agent/src/harness/**` tree (incl. `pico3`) that **v1.0.0 deleted** after absorbing it into that package. pi still ships none of it to a user of its published binary, so six of its seven rows are trackers; it names the existing item that covers each shipped overlap. Two id series, `HARN-NNN` and `DUR-NNN` |
+| [`18-pi-codemode.md`](18-pi-codemode.md) | **new 2026-10-02** — pi's `packages/codemode` and the `codemode` tool, new at v1.0.0: model-written JavaScript run in a QuickJS-on-wasm sandbox whose nested tool calls never enter the LLM context. Unlike area 17 this one **is** on pi's shipped path (the tool is registered inactive and a user enables it), and at v1.0.0 MCP's default tool exposure routes through it, so its rows are ordinary parity gaps. Ids are `CODE-NNN`. `CODE-001` is the owner decision ADR-0012 Cut 4 does not settle |
 | [`15-cyrup-acp.md`](15-cyrup-acp.md) | **the `cyrup-acp` port plan** — the Agent Client Protocol adapter, following `svkozak/pi-acp`. Like area 13 it began as a spec for code that did not exist yet and tracks port units rather than defects, so it is **counted separately from the twelve** for the same structural reason; its own tables are the authority for its unit inventory |
 
 ## Reading the area tables
@@ -194,11 +195,64 @@ standard than an item.
 **IDs are never renumbered or deleted.** Closed items keep theirs so a closure can be re-audited, and
 an item changing class keeps its number and moves section. A gap in a number range is not evidence of
 a deletion — `SEAM-035`…`SEAM-046` never existed, and area 08 records the check that establishes it.
+Several single-id gaps were left by the 2026-10-02 pass, where a reserved block started one past the
+id the file's own counter named: `PROV-112`, `CFG-095`, `TUI-129`, `SUBA-149` and `MCP-586` were never
+allocated and are still free. Each file's *Next free id* note says so.
+
+**`duplicate-of: <ID>` is how one finding filed twice is reconciled.** Two files reading overlapping
+ground can file the same defect under different prefixes, and counting both books one fix twice. The
+remedy is never to delete a row: the row stays, with its id and its body, and carries
+`duplicate-of: <canonical id>` in a **`Dedup`** column, which `scripts/count_open_items.py` reads by
+name and drops from every open tally when the named id is itself an open counted row. The canonical
+row is the one in the better-fitting area — in practice the one whose body carries the complete fix —
+and it says which row it absorbs. Areas **12**, **05** and **07** carry a `Dedup` column; area 12's
+sits between `Effort` and `Title`, areas 05's and 07's are **last**, because those two tables were
+already written without it and a trailing column leaves every existing row valid. A five-cell row in
+a six-column table is an empty `Dedup`, which is what "not a duplicate" means.
 
 ## Baselines measured against
 
-Re-measured **2026-09-24**, every figure below from `git diff --shortstat` / `git rev-list --no-merges --count`
-run in `tmp/<repo>`. Earlier values are in `git log -p -- docs/gap-analysis/README.md`.
+> ### CURRENT PINS — re-pinned 2026-10-02, pi 1.0
+>
+> **cyrup code pin: `592bf2c3`** (2026-10-02; was `ea23ca2`) — the last commit that touches `crates/`.
+> Every cyrup claim filed on 2026-10-02 was read at `fe875569`, the docs HEAD at the time, and
+> `git diff 592bf2c3..fe875569` is **docs-only**, so the two name the same code; where a row says
+> `fe875569` read it as `592bf2c3`'s `crates/`. pi released **1.0** on 2026-10-01 and four of the seven
+> upstreams moved with it. These are the tags every claim filed on 2026-10-02 is pinned to, and the
+> tags the next pass must diff from.
+>
+> | repo | was | now | non-merge commits in the window |
+> |---|---|---|---|
+> | `pi/` | v0.87.1 | **v1.0.0** (2026-10-01) | 180 |
+> | `pi-subagents/` | v0.71.0 | **v0.74.0** | 88 |
+> | `pi-mcp-adapter/` | v2.38.0 | **v5.0.0** — a major bump, three `feat!` | 99 |
+> | `pi-intercom/` | v0.14.0 | **v0.16.0** | 25 |
+> | `pi-acp/` | v0.0.34 | **v0.0.34**, unchanged | 0 |
+> | `pi-permission-system/` | v0.8.0 | **v0.8.0**, unchanged | 0 |
+>
+> **Three structural changes in the pi monorepo**, each with an owner now:
+> **new `packages/codemode`** → the new area [`18`](18-pi-codemode.md);
+> **new `packages/mcp`** → *not* the adapter and *not* area 13's subject — it is pi's answer to `rmcp`
+> (`MCP-587`), and pi additionally grew its own built-in MCP *extension* at `builtin:mcp`;
+> **`packages/session-backends` removed** → `SESS-038`'s subject, recorded in `HARN-003` ([`17`](17-pi-harness-and-durable.md)).
+> `packages/agent/src/harness/**` was **deleted** in the same window and `packages/durable` absorbed it
+> as a complete Pico5 runtime at published `1.0.0` (`HARN-003`, `HARN-004`).
+>
+> **`pi-mcp-adapter` v5.0.0 is still the authoritative upstream for area 13.** It carries no
+> dependency on pi's in-monorepo `packages/mcp`, and every citation in `13` and `13a`–`13i` resolves
+> at that tag (`MCP-587`). Much of its own window is about coexisting with pi's new built-in MCP
+> owner, which cyrup — host *and* MCP implementation, shipping `crates/cyrup-mcp` by default — does not
+> have, so that cluster is inapplicable rather than unported; each commit is named and ruled in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02*.
+>
+> **pi's session, mode and interactive code is under `packages/coding-agent/src/`, not
+> `packages/agent/`.** The shortstat figures per package in the table below were not re-run for this
+> window; what was re-read, and what was not, is each area file's own pin block.
+
+The table below was re-measured **2026-09-24**, every figure from `git diff --shortstat` /
+`git rev-list --no-merges --count` run in `tmp/<repo>`. Its *latest tag* column is superseded by the
+pins above; its deltas remain correct for the windows they name. Earlier values are in
+`git log -p -- docs/gap-analysis/README.md`.
 
 | repo | HEAD | cyrup ported baseline | latest tag | delta |
 |---|---|---|---|---|
@@ -231,6 +285,29 @@ those blocks, collected on 2026-09-24. Older pins stay in each file's header and
 opinion; it is not a backlog and it is not a count. **Where an area file states its own per-module
 range, that range wins over the single tag in this column.** Nothing in this table re-verifies any
 file; it only says how old each one is.
+
+> **Re-pinned 2026-10-02 (pi 1.0).** The table below is the 2026-09-24 collection and is kept as
+> written. These areas were re-read against the new tags on 2026-10-02 and their own pin blocks are
+> now newer than the row below; where the two disagree, the file wins.
+>
+> | area file(s) | re-pinned at | filed 2026-10-02 |
+> |---|---|---|
+> | `01` · `12` | cyrup `fe875569` × pi **v1.0.0** | `PROV-113`…`PROV-129` (next id `PROV-130`), `DRIFT-060` (next id `DRIFT-061`) |
+> | `02` | cyrup `fe875569` × pi **v1.0.0** | `AGENT-045`…`AGENT-047` (next id `AGENT-048`) |
+> | `03` | cyrup `fe875569` × pi **v1.0.0** | `SESS-064`…`SESS-069` (next id `SESS-070`) |
+> | `04` | cyrup `fe875569` × pi **v1.0.0** | `TOOL-052`…`TOOL-056` (next id `TOOL-057`). The built-in tool set is byte-identical in the window — recorded in the file, nothing filed for it |
+> | `05` | cyrup `fe875569` × pi **v1.0.0** | `CFG-096`…`CFG-101` (next id `CFG-102`); `CFG-098` and `CFG-100` are `duplicate-of` area 07 and are not counted |
+> | `07` | cyrup `fe875569` × pi **v1.0.0** | `TUI-130`…`TUI-144` (next id `TUI-145`); `TUI-135` is `duplicate-of` `CFG-096` and is not counted |
+> | `09b` | cyrup `fe875569` × pi-subagents **v0.74.0** (window is now `v0.57.0..v0.74.0`) | `SUBA-150`…`SUBA-163` (next id `SUBA-164`) |
+> | `11` | cyrup `fe875569` × pi-intercom **v0.16.0** | `ICOM-071`…`ICOM-081` (next id `ICOM-082`) |
+> | `13` · `13a`–`13i` · `13-cyrup-mcp-STATUS.md` | cyrup `fe875569` × pi-mcp-adapter **v5.0.0** (× pi **v1.0.0** for the two new in-monorepo MCP surfaces) | `MCP-587`…`MCP-608` (next id `MCP-609`); census 523 → 545 units. Still counted in its own file |
+> | `17` | cyrup `fe875569` × pi **v1.0.0** | `HARN-003`, `HARN-004`, `DUR-001`…`DUR-004` (next ids `HARN-005`, `DUR-005`) |
+> | `18` (**new**) | cyrup `fe875569` × pi **v1.0.0** | `CODE-001`…`CODE-013` (next id `CODE-014`); added to `STANDARD_AREAS` in `scripts/count_open_items.py` in the same change |
+>
+> **Not re-read on 2026-10-02**, so their 2026-09-24 rows below stand unqualified: `06`, `08`, `09`,
+> `09a`, `10`, `14`, `15`, `16`. Area 06 has one named lead waiting for it — `builtInExtensions`
+> gained `replaceable: true` at v1.0.0 (`extensions/index.ts:9-13`), recorded in `04`'s *Read in scope
+> and deliberately NOT filed*.
 
 | area file(s) | pinned at (2026-09-24) | still unread after the second pass | 2026-09-24 second pass |
 |---|---|---|---|

@@ -446,6 +446,8 @@ Part 0 and Appendix B of nine parts were read.
 
 ## Open items
 
+> **Next free id: `AGENT-048`** (2026-10-02, after the pi v1.0.0 pass filed `AGENT-045`…`AGENT-047`).
+
 > **This table is now the COMPLETE open set for this area**, including the `-S` (surface-sweep)
 > ids, which previously lived in a second table further down and caused this area to be undercounted
 > by 4 — the miss recorded as structural defect A in `00-residual-ledger.md`. The
@@ -556,6 +558,9 @@ Part 0 and Appendix B of nine parts were read.
 | ~~AGENT-042~~ | ~~low~~ **CLOSED 2026-09-27** | upstream-drift | S | **CLOSED 2026-09-27** (on `claude/agent-lows`): ports pi v0.85.0's guard (`afda4d620`, `agent-loop.ts:617-625` @v0.87.1). Each spawned prepared call checks the run signal when its turn to start comes (`crates/cyrup-agent/src/agent/run/tools/exec.rs:125-133`); if the run is aborted the tool is never executed and the call reports `ToolRuntimeMsg::Aborted` (`tools/mod.rs:36-38`), which settles it as `createErrorToolResult("Operation aborted")` through `RunCtx::immediate_error` (`exec.rs:238-255`): `isError` true, `details: {}`, no `terminate` key, only `tool_execution_end` emitted (no update), no `after_tool_call`, and its tool-result message still goes into the transcript in source order. The phase-two comment (`exec.rs:84-87`) and the doc comment (`:36`) now cite the v0.85.0 guard. Verify: `tests::prepared_call_abort::{agent042_call_prepared_before_an_abort_is_finalized_unexecuted, agent042_abort_while_an_earlier_call_starts_skips_the_later_call}` — both fail with the guard disabled (mutation-checked). **Ledger corrections to the Fix sketch:** (1) the check is not made in the main loop before spawning; it runs inside each spawned call once the previous call has reached its first suspension point. That matches pi, where `Promise.all`'s `map` invokes each closure in order and each checks `signal.aborted` when invoked, so an abort raised while an earlier call runs its synchronous prefix also stops the later calls (the second test pins this). (2) The result is not built through the ordinary `ToolError`/finalize path, which would run `after_tool_call`; it is `createErrorToolResult`'s shape via `immediate_error`. In the body's Verify scenario (abort in call #2's `before_tool_call`), call #2 settles through the existing post-hook abort check in `tools/preflight.rs` and call #1 through the new guard; both read `Operation aborted`. — *Original:* **NEW 2026-09-24 (second pass)** — promoted from the 2026-09-14 census. pi v0.85.0 (`afda4d620`) makes each deferred parallel-batch closure check `signal.aborted` first and finalize with `Operation aborted` without executing; cyrup's `execute_parallel` phase two still starts every call prepared before the abort (its own comment says so) and runs `after_tool_call` on it. Built-in tools early-exit on a cancelled token; an extension/MCP tool that does not check first runs its effect. See body. |
 | ~~AGENT-043~~ | ~~low~~ **CLOSED 2026-09-27** | upstream-drift | S | **CLOSED 2026-09-27** (on `claude/agent-lows`): `PendingQueue::peek` (`crates/cyrup-agent/src/queue.rs:73`) returns the batch the next `drain` would take (the first message in one-at-a-time mode, all of them in all mode) without removing anything, and `Agent::peek_queued_messages` (`agent/facade.rs:290`) returns steering's peek if non-empty, else follow-up's, as pi's `peekQueuedMessages` (`agent.ts:326-330` @v0.87.1). Public host/extension API with no in-tree production caller yet. Verify: `tests::turn_hooks::{peek_queued_messages_previews_the_next_batch_without_consuming_it, a_rejected_continue_leaves_the_queued_preview_intact}`; `finish_turn_end_stops_after_turn_end_without_polling_or_preparing` and `finish_turn_runs_on_an_errored_turn_and_cannot_continue_it` also use it to show the queues are kept. **Ledger correction:** the body's "no consumer in `packages/coding-agent` at v0.87.1" is wrong — `agent-session.ts:788` `_getPendingBoundaryMessages` returns `[...this.agent.peekQueuedMessages(), ...this._pendingCustomMessages]` and feeds `_buildBoundaryContext` for the actionable `turn_end`/`agent_before_settle` boundaries (`EXT-078`, unported); the `facade.rs` doc comment records this. — *Original:* **NEW 2026-09-24 (second pass).** pi v0.87.0 `Agent.peekQueuedMessages()` — a non-consuming, mode-respecting preview of the next queue-selected batch; cyrup's `Agent` exposes only `has_queued_messages` and the consuming drains. See body. |
 | ~~AGENT-044~~ | ~~low~~ **CLOSED 2026-09-27** | cyrup-original | S | **CLOSED 2026-09-27 — kept as a deliberate cyrup divergence** (on `claude/agent-lows`; ledger-only, no behaviour change). Do not revert to `{}`: `cyrup-acp`'s `bash_exit_code` (`crates/cyrup-acp/src/translate.rs:1027`, called at `translate.rs:703` and `sessions.rs:731`) probes `details.exitCode` first to fill the `terminal_exit._meta.exit_code` it sends to the client, so reverting would make `sh -c 'exit 42'` report 1 again and reopen the closed `ACP-141`. The row's own Fix is done: `AGENT-009`'s Fix and Verify are amended in its body, and a pin test runs through the real `Agent` — `tests::agent_loop::agent044_tool_error_details_are_opt_in` (`crates/cyrup-agent/src/tests/agent_loop.rs:1947`: a plain `ToolError::new` persists `details == {}`; a `ToolError::with_details({exitCode: 42})` persists exactly that), alongside the existing `tests::area02_backlog::agent009_error_result_has_empty_details_object_and_no_terminate_key` and `crates/cyrup-tools/src/tests/tools.rs:2018`, `:2046`. **Ledger correction:** bash's non-zero exit is not "the one opt-in". There are four production `ToolError::with_details` call sites: `crates/cyrup-tools/src/tools/bash.rs:636` (`ExitStatus::Exited(code)` → `{exitCode, truncation?, fullOutputPath?}`), `bash.rs:660` (`ExitStatus::Signaled` with no exit code, only when output was truncated → `{truncation, fullOutputPath}`, no `exitCode`), `crates/cyrup-ext-subagents/src/extension/executor/workflow_launch.rs:587` (a workflow launch failure's details and `reconciledFromDetachedChildren`) and `crates/cyrup-ext-subagents/src/extension/tool/routing.rs:1828` (a schedule-action refusal's `schedules` payload). The last two are faithful to upstream pi-subagents, whose error results (e.g. `src/runs/background/scheduled-runs.ts:421-427`, `textResult(..., isError=true)`) keep `details`. The pi cite in `ToolError::details` and `finalize.rs` (`agent-loop.ts:700-703 @v0.83.0`) is `:863-868` at v0.87.1. — *Original:* **NEW 2026-09-24 (second pass)** — promoted from the 2026-09-14 census. A failing `bash` persists `details: {exitCode, truncation?, fullOutputPath?}` (`ACP-141`, `ToolError::with_details`); pi's `createErrorToolResult` still writes `details: {}` at v0.87.1. The closed `AGENT-009`'s Fix and Verify assert `{}` and are now false for one tool. See body. |
+| AGENT-045 | medium | not-ported | M | **`AgentTool.outputSchema` and `AgentToolResult.structuredContent` carry a machine-readable tool result that is never sent to the model; cyrup's `ToolResult` has no such field** — pi `packages/agent/src/types.ts:433` and `:476` @v1.0.0, threaded through `agent-loop.ts:888` and declared on the shipped path by `coding-agent/src/core/tools/bash.ts:259`. cyrup `crates/cyrup-core/src/tool.rs:25-43` has `content`, `details`, `usage`, `added_tool_names`, `terminate` and nothing else. Blocks `CODE-006`/`CODE-008`. **FILED 2026-10-02**; body below. |
+| AGENT-046 | low | not-ported | S | **A tool cannot report failure without throwing: pi added `AgentToolResult.isError`, which keeps `details` and `structuredContent` for the UI while the model still sees an error** — `types.ts:440` @v1.0.0, honoured at `agent-loop.ts:840` (`isError: result.isError === true`). cyrup's contract forbids it by design — `crates/cyrup-core/src/tool.rs:4-5` says *"Tools signal failure by returning `Err(ToolError)` (never error text)"* — and `run/tools/finalize.rs:29` hardcodes `is_error: false` on every `Ok`. **FILED 2026-10-02**; body below. |
+| AGENT-047 | medium | not-ported | M | **`runToolCall()` is exported so a tool can call another tool through the same pipeline, hooks and validation; cyrup's tool pipeline has no single-call entry** — pi `packages/agent/src/agent-loop.ts:810` @v1.0.0 with `RunToolCallOptions` `:790`, `ToolCallHooks` `:683` and `ToolUpdateSink` `:685`; the README's new *MCP and Codemode* section and `examples/mcp-codemode/tools.ts:91` make it the documented seam. cyrup's `prepare`/`execute`/`finalize` are `pub(super)` inside `RunCtx` and reachable only from a model-issued batch. Agent-core half of `CODE-006`. **FILED 2026-10-02**; body below. |
 
 ## AGENT-020 — `continue_run` drains the steering/follow-up queue before the run-active check
 
@@ -2044,6 +2049,245 @@ the opt-in cannot silently spread to every error path.
 row's is `{}`.
 
 ---
+
+## Findings filed 2026-10-02 — the `v0.87.1..v1.0.0` window in `packages/agent`
+
+pi v1.0.0 (`2026-10-01`), read at the tag only. All three rows are one contract change: pi gave the
+agent tool surface a machine-readable result that never reaches the model, and a way to fail without
+throwing. They are the agent-side prerequisite for `TOOL-054` (`04-…`) and for `CODE-002`/`CODE-006`
+(`18-…`).
+
+## AGENT-045 — `outputSchema` and `structuredContent` are unported, so a tool has no machine-readable result
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed (both sides read)
+
+**upstream** — `git -C tmp/pi show v1.0.0:packages/agent/src/types.ts`. Two new declarations on the
+agent tool contract:
+
+- `AgentTool.outputSchema?: TSchema` at `:476`, documented at `:473-475` as *"JSON Schema of
+  `structuredContent` in successful results. Tools that declare it should always set
+  `structuredContent`."*
+- `AgentToolResult.structuredContent?: JsonValue` at `:433`, documented at `:429-432` as
+  *"Machine-readable result matching the tool's `outputSchema`, for programmatic callers. **Not sent
+  to the model**; `content` remains the model-facing result."*
+
+The hook contract gains a matching field and one non-obvious rule. `AfterToolCallResult`
+(`:92`) gains `structuredContent?: JsonValue` at `:95`, and its doc at `:85-88` states: *"if
+provided, replaces the structured content. **If `content` is provided without it, the structured
+content is dropped, because it may no longer match the content.** Return it along with `content` to
+keep it."* `finalizeExecutedToolCall` implements exactly that at `agent-loop.ts:877-889`:
+
+```ts
+const structuredContent =
+    afterResult.structuredContent ?? (afterResult.content ? undefined : result.structuredContent);
+…
+if (structuredContent === undefined) delete result.structuredContent;
+else result.structuredContent = structuredContent;
+```
+
+Note the `delete` rather than an assignment of `undefined`: the key is removed, not set to null.
+
+**This is on pi's shipped path, not an experiment.** `coding-agent/src/core/tools/bash.ts:259`
+declares `outputSchema: bashOutputSchema` and returns `structuredContent` at `:391` and `:408`, with
+its own output limit at `:23` *"Output limit of `structuredContent.output`, which programmatic
+callers such as codemode scripts receive."* `core/agent-session.ts:670` spreads it onto the
+transcript message only when defined and `:692` lets the hook replace it;
+`core/extensions/types.ts:587` and `:1227` put it on the extension tool surface;
+`core/extensions/runner.ts:1188-1196` reimplements the same drop rule for extension handlers;
+`core/tools/tool-definition-wrapper.ts:17,52` propagates it; and `extensions/mcp/tools.ts:274`
+wraps an MCP tool's advertised schema with `createMcpResultSchema(tool.outputSchema)`. The consumer
+that gives it its point is codemode: `extensions/codemode/execute.ts:310` —
+`if (tool.outputSchema && result.structuredContent !== undefined) return result.structuredContent;`
+— so a script calling `tools.bash(...)` receives a typed object, and only a tool without an output
+schema falls back to text.
+
+**cyrup at HEAD (`fe875569`)** — `crates/cyrup-core/src/tool.rs:25-43` declares `ToolResult` with
+`content`, `details`, `usage`, `added_tool_names`, `terminate`. There is no structured-content field
+and no schema field on the tool trait. `crates/cyrup-agent/src/hooks.rs:114-125` — the
+`after_tool_call` override struct — carries `content`, `details`, `usage`, `is_error`, `terminate`,
+so there is nothing for the drop rule to apply to either. `grep -rn 'structured_content' crates/
+--include='*.rs'` matches only `crates/cyrup-mcp/` (`renderers.rs:771`, `live.rs:2080`), which is a
+different surface: MCP's own `CallToolResult.structuredContent`, consulted **only as a fallback when
+the transformed block list is empty** (`renderers.rs:756-757`) and otherwise discarded. So today an
+MCP server's structured half reaches cyrup and is thrown away.
+
+**Impact** — nothing breaks today, because cyrup has no programmatic tool caller yet. It is filed
+`medium` for two reasons. First, it is a **blocking prerequisite** for area 18: `CODE-006`
+(nested tool calls) and `CODE-008` (the script `models`/`tools` globals) both assume a tool call
+resolves to a typed value, and `extensions/codemode/execute.ts:310` is where that resolution reads
+the field this row adds. Without it, a cyrup codemode port can only ever hand scripts text. Second,
+`ToolResult` is a public type in `cyrup-core` that every built-in and extension tool constructs, so
+the widening is cheapest done once and alongside `AGENT-046`, which touches the same struct.
+
+**Related, do not merge** — `13e-mcp-tools.md:180` carries a lead *"`outputSchema` carried end to
+end for `structuredContent`"* with the same words and a different subject: that one is
+`pi-mcp-adapter`'s `McpTool.outputSchema` / `ToolMetadata.outputSchema` metadata-and-disk-cache
+plumbing (`MCP-207`/`MCP-217`/`MCP-139`), in another repo. This row is the pi-monorepo agent tool
+contract. The two must land together to be useful — a server-advertised schema cached by 13e has
+nowhere to go until this field exists — but they are separate work in separate crates.
+
+**Fix** — add `structured_content: Option<serde_json::Value>` to `cyrup_core::ToolResult` (the
+struct's own doc at `tool.rs:21-24` already anticipates the widening: *"build with
+`..Default::default()` so a later widening stays source-compatible"*), and an `output_schema`
+accessor on the `Tool` trait. Thread it through
+`crates/cyrup-agent/src/agent/run/tools/finalize.rs` and add `structured_content: Option<Value>` to
+`hooks.rs`'s override struct. **Port the drop rule literally**: replace only when the hook returns
+it; drop it when the hook returns `content` without it; keep it when the hook returns neither. Then
+decide, with area 13's owner, whether `cyrup-mcp`'s `resolve_mcp_result_content` should stop discarding
+the server's structured half and set this field instead — that is the change `MCP-542` and
+`MCP-222` would be re-scoped by.
+
+**Verify** — a tool declaring an output schema and returning both halves: the model-facing request
+contains `content` and never the structured value; the transcript message omits the key entirely
+when the tool returns none. Three hook cases: returns `structured_content` → replaced; returns
+`content` alone → key **absent**, not null; returns neither → original preserved.
+
+## AGENT-046 — a tool cannot report failure without throwing
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+**upstream** — `packages/agent/src/types.ts:440` @v1.0.0 adds `isError?: boolean` to
+`AgentToolResult`, documented at `:436-439`: *"Report a failure without throwing. The model sees
+`content` as an error result, like a thrown error, but `details` and `structuredContent` are kept
+for the UI and programmatic callers."* The tool-trait doc at `:470-472` was rewritten to match:
+*"Execute the tool call. Throw on failure, **or return a result with `isError: true`**; do not only
+describe the failure in `content`."* At v0.87.1 the same comment read *"Throw on failure instead of
+encoding errors in `content`."*
+
+One line honours it. `executePreparedToolCall`'s success return at `agent-loop.ts:840` changed from
+`return { result, isError: false }` to `return { result, isError: result.isError === true }`. The
+third value of the pair is new too: `AgentToolCallOutcome` (`types.ts:449`) is now a named,
+exported interface — `{ toolCall, result, isError }` — where it used to be the private
+`FinalizedToolCallOutcome` type alias; `agent-loop.ts:681` keeps the old name as an alias of it.
+
+The point is the asymmetry. A thrown error goes through `createErrorToolResult`, which discards
+`details` and `usage`; an `Ok` with `isError: true` keeps them. `examples/mcp-codemode/tools.ts:63`
+shows the case this was added for — an MCP tool that fails *with* structured error data:
+`if (result.isError && content.length === 0) …`, then `:69-71` returns
+`structuredContent: result.structuredContent, isError: result.isError === true`. And
+`extensions/codemode/execute.ts:304` documents the consequence: a tool with an output schema *"resolves
+to its `structuredContent`, **also for error results that carry one**"*.
+
+**cyrup at HEAD** — the contract forbids this path explicitly. `crates/cyrup-core/src/tool.rs:4-5`:
+*"Tools signal failure by returning `Err(ToolError)` (never error text — func-02 R-02-024)."*
+`ToolResult` (`:25-43`) has no `is_error`. In
+`crates/cyrup-agent/src/agent/run/tools/finalize.rs` the normalisation is two-valued:
+`:29` sets `is_error: false` for every `Ok(result)`, and `:44` sets `is_error: true` only on the
+`Err` branch, where `:38-42` also replaces `details` with `empty_details()` and nulls `usage` —
+cyrup's faithful port of `createErrorToolResult`. So the failure-with-data case is unrepresentable:
+a cyrup tool that has structured error data must either throw it away or lie about succeeding.
+
+cyrup's `after_tool_call` hook *can* flip the flag — `hooks.rs:120` has `is_error: Option<bool>` and
+`finalize.rs:140-142` applies it — so the *hook* side of this is already ported. Only the *tool*
+side is missing.
+
+**Impact** — small and self-contained. No cyrup tool needs it today, and `Err(ToolError)` remains
+correct for every failure that carries nothing but a message. It matters once `AGENT-045` lands,
+because the two together are what make a failed structured call useful to a programmatic caller;
+filed separately because it is a one-field change with its own semantics and `S` effort, and because
+the crate's stated invariant has to be amended deliberately rather than in passing.
+
+**Fix** — add `is_error: bool` (default `false`) to `cyrup_core::ToolResult`; amend the module doc at
+`tool.rs:4-5` to state the second path; change `finalize.rs:29` from `is_error: false` to
+`is_error: result.is_error`. Leave the `Err` branch exactly as it is — it must keep clearing
+`details` and `usage`, because that is what upstream's `createErrorToolResult` does and the whole
+distinction is that `Ok`-with-`is_error` does **not**. Re-check `func-02 R-02-024` and record the
+amendment there, or the next conformance pass will read the new field as a violation.
+
+**Verify** — a tool returning `Ok` with `is_error: true`, `details: Some(…)` and
+`structured_content: Some(…)`: the tool-result message is an error result to the model, and both
+`details` and the structured value survive to the transcript. The same tool returning
+`Err(ToolError)` with details: `details` is `{}` and `usage` is absent, as today.
+
+## AGENT-047 — `runToolCall()` has no cyrup counterpart, so a tool cannot call a tool
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed (both sides read)
+
+**upstream** — `packages/agent/src/agent-loop.ts:810` @v1.0.0 exports
+
+```ts
+export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallOptions): Promise<AgentToolCallOutcome>
+```
+
+with the contract in its doc comment at `:797-807`: *"Run one tool call through the same steps as a
+model-issued call: argument preparation, schema validation, `beforeToolCall`, execution, and
+`afterToolCall`. **Emits no events and adds no messages.** Tools that call other tools use this so
+the hooks (for example permission checks) apply to those calls too. **Never rejects** for tool
+failures: unknown tools, validation errors, blocked calls, and thrown errors come back as
+`isError: true`."* `RunToolCallOptions` (`:790`) is `{ tools, assistantMessage, context, signal?,
+onUpdate? }` plus the hooks.
+
+Getting there took three refactors of the existing pipeline, and they are the actual porting work:
+
+- `prepareToolCall` (`:708`) now takes `config: ToolCallHooks` instead of the whole
+  `AgentLoopConfig`, where `ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall">`
+  (`:683`, exported). `finalizeExecutedToolCall` (`:855`) took the same narrowing.
+- `prepareToolCall` gained a `tools` parameter (`:714`, defaulting to `currentContext.tools ?? []`)
+  and resolves against it at `:715` instead of reaching into the context. A nested call can
+  therefore run against a different tool set than the turn's.
+- `executePreparedToolCall` (`:822`) now takes `onUpdate: ToolUpdateSink` —
+  `(partialResult: AgentToolResult<any>) => Promise<void> | void` (`:685`) — instead of an
+  `AgentEventSink`. The event construction moved out into `emitToolExecutionUpdate(toolCall, emit)`
+  (`:778`), which both batch runtimes now wrap their `emit` in (`:558`, `:629`). That is what makes
+  "emits no events" possible: the sink is a plain callback, and `runToolCall` passes
+  `options.onUpdate ?? (() => {})`.
+
+pi documents this as a first-class seam, not an internal. `packages/agent/README.md` gains a section
+*MCP and Codemode*: *"`@earendil-works/pi-mcp` connects to MCP servers and
+`@earendil-works/pi-codemode` runs model-written JavaScript that calls tools.
+[examples/mcp-codemode](examples/mcp-codemode) wraps both as `AgentTool`s: one tool per MCP tool, and
+a `codemode` tool whose scripts call the agent's tools **through `runToolCall()`**, so
+`beforeToolCall` and `afterToolCall` apply to those calls too."* The example is the other two new
+files in this diff (`examples/mcp-codemode/{main,tools}.ts`, +222); `tools.ts:91` is the call,
+`:127-134` is the resolution — `structuredContent` when the tool declares a schema, otherwise text,
+and `if (outcome.isError) throw`.
+
+**cyrup at HEAD** — `grep -rn 'run_tool_call' crates/ --include='*.rs'` matches nothing but
+`cyrup-ext-subagents`' unrelated `read_active_run_tool_call_index`. cyrup's pipeline is the right
+shape but is sealed: `crates/cyrup-agent/src/agent/run/tools/` splits into `preflight.rs`,
+`exec.rs`, `finalize.rs`, `finalized.rs`, and every stage is a `pub(super)` method on `RunCtx`
+(`exec.rs:43 execute_parallel`, `finalize.rs:51`), reachable only from a model-issued batch. The two
+runtimes in `exec.rs` thread an `AgentEventSink` straight into the tool body: the update closure at
+`exec.rs:~110` pushes `ToolRuntimeMsg` onto the batch's `mpsc::unbounded_channel`, so there is no
+`ToolUpdateSink` equivalent and no way to execute a call without emitting its events. There is also
+no re-entrant direction: `crates/cyrup-ext/src/host/live.rs:1720 execute_tool` is the host calling
+**into** a guest, the opposite of what this needs.
+
+**Impact** — this is the agent-core primitive under area 18's `CODE-006` (nested tool
+calls), and it is filed here rather than there because `cyrup-agent` owns the pipeline and because
+the two halves are genuinely separable. `CODE-006` specifies the coding-agent surface:
+`ExtensionToolContext.executeTool`, the `<parent id>/<n>` id scheme, `parentToolCallId` on three
+event families, `NestedCallRecorder` with its four limits, `nestedCalls` on the tool-result message,
+and compaction's consumer. **All of that needs this function to exist first**, and `CODE-006`'s *Fix*
+line — *"the re-entrant execute on the tool context (through the same validation, hooks and
+permission checks as a model-issued call)"* — is this row. Whoever takes `CODE-006` should take this
+first; whoever takes this should not also build the recorder.
+
+Nothing breaks today: cyrup has no tool that calls a tool. `medium` because it is a prerequisite for
+a headline feature (codemode) and because the refactor touches both batch runtimes, where the
+event-ordering invariants in `exec.rs` are delicate — `tool_execution_start` in source order,
+`tool_execution_end` in completion order, and the LIFO-inversion workaround at `exec.rs:~105-120`
+that keeps `tokio::spawn` from starting the batch's last call first. A careless extraction of the
+update sink would break `AGENT-003`'s unbounded-update guarantee.
+
+**Fix** — three steps, in order, mirroring upstream's own sequence. (1) Narrow the hook parameter:
+give `prepare` and `finalize` a hooks-only argument instead of the full `RunCtx` config, so neither
+needs a live run. (2) Replace the `AgentEventSink` inside the tool body with a
+`ToolUpdateSink`-equivalent callback, and move event construction into a wrapper the two batch
+runtimes apply — keeping the unbounded channel and the `accepting` flag exactly as they are, since
+those are `AGENT-003`'s and pi's only drop rule. (3) Add a public
+`run_tool_call(call, RunToolCallOptions) -> ToolCallOutcome` that composes prepare → execute →
+finalize with an explicit `tools` slice, emits nothing, adds no message, and returns
+`is_error: true` for every failure class instead of propagating `Err`. Name the outcome type
+publicly, as upstream promoted `AgentToolCallOutcome` from a private alias to an exported interface
+(`types.ts:449`).
+
+**Verify** — four cases, all returning rather than erroring: an unknown tool name; arguments that
+fail schema validation; a call a `before_tool_call` hook blocks; and a tool body that returns
+`Err`. In each, `is_error` is `true` and no `ToolExecution*` event reaches the subscriber and no
+message is appended to the transcript. Then: a nested call against a `tools` slice that excludes the
+turn's tools resolves against the slice; and a successful nested call still runs both hooks, which an
+`after_tool_call` that rewrites `content` can prove.
 
 ## Surface-sweep findings (provenance: 2026-08-03 sweep, HEAD `9219dcd`; re-audited 2026-08-12)
 

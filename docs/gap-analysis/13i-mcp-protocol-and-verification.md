@@ -82,6 +82,110 @@ port starts from an empty baseline and writes it from observed failures.
 > | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
 > | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
 
+### Items filed 2026-10-02 — `pi-mcp-adapter` `v2.38.0..v5.0.0` and pi `v0.87.1..v1.0.0`
+
+> **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
+> `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
+> **Next free id: `MCP-609`.** Upstream was read only through
+> `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
+> `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
+> `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
+> **Architecture is not in question and no row below proposes restructuring `cyrup-mcp`:** pi moving
+> MCP into its monorepo as a first-class package is pi arriving where cyrup already is, and `MCP-587`
+> records what that means for citations and nothing else.
+
+Two rows on the call deadline: it cannot be paused while an elicitation prompt is open, and one
+doc comment's claim that `resetTimeoutOnProgress` has no upstream analogue is no longer true.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| MCP-606 | medium | not-ported | M | **A tool call's deadline is not pausable, so an elicitation prompt burns the call's own timeout and the call dies while the user is answering** — `elicitation-handler.ts:38-58`, `:89-121` at v5.0.0. **FILED 2026-10-02**; body below. |
+| MCP-607 | medium | stale-port | S | **`build_request_options`' doc claims `resetTimeoutOnProgress` "has no upstream analogue"; at v5.0.0 every `callTool` sets it** — `elicitation-handler.ts:72-83`. **FILED 2026-10-02**; body below. |
+
+#### MCP-606 — the call deadline must pause while an elicitation prompt is open
+
+**upstream** — `53cdc0b` (#729, v3.3.0). `elicitation-handler.ts` gains a pause registry shared by
+every call in flight on one client:
+
+```text
+// :38  pauses the deadline of every tool call in flight on that client.
+interface PromptPause { open: number; deadlines: Set<{ pause(): void; resume(): void }> }
+// :54  if (state.open++ === 0) for (const deadline of state.deadlines) deadline.pause();
+// :58  if (--state.open === 0) for (const deadline of state.deadlines) deadline.resume();
+```
+
+and a wrapper around `client.callTool` (`:89-121`) that registers a `{ pause, resume }` pair per
+call, resumes it immediately if no prompt is open (`:105`), and deletes and pauses it in the
+`finally` (`:120-121`). `direct-tools.ts`, `proxy-modes.ts` and `ui-server.ts` route their calls
+through the wrapper. The doc comment at `:68-70` records the one case it cannot cover — a deadline
+already elapsed "is pushed out of the way and the deadline aborts the call" — and the commit's test
+half covers cancellation while a form is open.
+
+**cyrup at HEAD** — the deadline is a single rmcp request timeout with no pause seam:
+`runtime.rs:286 set_default_request_timeout_ms`, `:3241 normalize_request_timeout_ms`, `:3262`
+resolving per-server over global, and `build_request_options` (`:3277`) returning
+`PeerRequestOptions::with_timeout`. Elicitation is handled in `runtime.rs` (69 matches) but holds no
+registry of in-flight deadlines, and `proxy/call.rs` has **no** `timeout` reference at all — the
+timeout lives entirely inside the rmcp request.
+
+**The failure.** A server issues `elicitation/create` during a tool call — a credential, a
+confirmation, a form. cyrup draws the prompt; the user takes two minutes; the call's
+`requestTimeoutMs` (default per server) expires while the prompt is open; the user submits and the
+call has already been abandoned. The user-visible shape is a form that accepts input and then
+reports a timeout, which reads as a cyrup bug rather than as a timeout.
+
+**Work.** `M`. The registry and the two counters are small; the substance is that rmcp's timeout is
+owned by the request future, so pausing it means either driving the deadline cyrup-side (a
+`tokio::time` deadline the elicitation handler can pause, with the rmcp timeout left as a looser
+outer bound) or extending the seam. Decide and record which, because the choice is visible in the
+error the expired path produces. Note `43768d3`'s third leg — an accepted URL elicitation counts as
+server *use* for the idle sweep — belongs with this unit rather than with `MCP-600`.
+
+`verify` — a test that a call whose server elicits, with the prompt held open past the call's
+`requestTimeoutMs`, succeeds on submit; a test that a cancel while the form is open aborts cleanly;
+a test that a deadline already elapsed still aborts.
+
+#### MCP-607 — `resetTimeoutOnProgress` now has an upstream analogue, and the doc says it does not
+
+**upstream** — `b61c6ef` (#763, v5.0.0). `elicitation-handler.ts:72-74` —
+"Every call requests progress, and each progress notification restarts the timeout, as in Pi's
+built-in MCP. The SDK only sends a progress token when `onprogress` is set, so a caller without one
+gets a no-op handler." The mechanism is two lines: `const onprogress = options?.onprogress ?? (() => {})`
+(`:81`) and, on the no-pause path, `return client.callTool(params, { ...options, onprogress,
+resetTimeoutOnProgress: true })` (`:83`). On the pausable path (`MCP-606`) the progress handler
+additionally pauses, bumps and resumes the deadline (`:111-116`). The commit's docs note the one
+exception: a task-augmented call does not restart the timeout on progress.
+
+**cyrup at HEAD — the citation is the finding.** `runtime.rs:3091-3092` documents, as divergence 2
+of `build_request_options`' contract:
+
+> **`maxTotalTimeout` / `resetTimeoutOnProgress`** have no upstream analogue in
+> `buildRequestOptions` and are not applied.
+
+and `:3276` repeats it: "`reset_timeout_on_progress` and `max_total_timeout` have no upstream
+analogue and stay at their defaults." At v5.0.0 the first half of that sentence is **false** —
+upstream sets `resetTimeoutOnProgress: true` on every `callTool`. (`maxTotalTimeout` remains
+unported and un-analogued; the sentence should be split, not deleted.) `grep -rn 'progress_token\|
+ProgressNotification' crates/cyrup-mcp/src` is empty, so cyrup also requests no progress token.
+
+**Why this is cheap and why it still matters.** rmcp's `PeerRequestOptions` **already carries**
+`reset_timeout_on_progress`; cyrup leaves it at its default because the doc says there is nothing to
+mirror. Setting it, and requesting a progress token so the server actually sends notifications, is
+`S`. Without it a legitimately long-running tool that reports progress every few seconds is still
+killed at `requestTimeoutMs` — which is the bug upstream fixed and the reason progress exists in the
+protocol. Classified `stale-port` rather than `not-ported` because the divergence **is** recorded at
+the site; it is the record that went wrong, and leaving it is worse than the missing flag, since the
+next reader will trust it.
+
+**Order.** Land after or with `MCP-606`: on the pausable path the progress handler is a
+pause/bump/resume on the same deadline, so building the flag twice is avoidable.
+
+`verify` — an integration test against a fixture server that emits progress past the configured
+timeout and asserts the call completes (upstream's own
+`__tests__/progress-timeout-sdk-integration.test.ts` and `fixtures/progress-server.mjs` are the
+shape); a doc-comment correction at `runtime.rs:3091` and `:3276` splitting the two flags.
+
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
 > **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** sampling via `ModelRegistry.complete` → **`MCP-557`** (`stale-port`, low; needs a follow-or-diverge ruling). `MCP-452`'s row is untouched. From v2.34–v2.37: nothing further for this section beyond the already-filed `MCP-546`. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.

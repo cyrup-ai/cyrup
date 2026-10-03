@@ -115,7 +115,9 @@ happened to settle.
 > 3. **The ten untagged commits `v0.71.0..6f1027f7`**, read as post-tag leads (`## Post-tag leads`).
 >
 > **Filed:** `SUBA-114`…`SUBA-143` (two high, eleven medium, sixteen low, one tracker). **Closed:**
-> none. **Next free id: `SUBA-144`.** `SUBA-113`'s tracker escalated two of its keys
+> none. `SUBA-144`…`SUBA-148` were filed later by the low-severity batches, and the
+> `v0.71.0..v0.74.0` pass filed `SUBA-150`…`SUBA-163` (`SUBA-149` was never allocated and is still
+> free). **Next free id: `SUBA-164`.** `SUBA-113`'s tracker escalated two of its keys
 > (`checkpointBeforeDeadlineMs` → `SUBA-128`, `modelResponseAliases` → `SUBA-119`).
 >
 > **Still unread, stated exactly.** (a) The **`v0.57.0..v0.67.0` `src/` diff was NOT read line by
@@ -248,6 +250,20 @@ v0.70.1 and v0.71.0.
 | SUBA-146 | low | upstream-drift | S | **NEW 2026-09-30** (filed while closing `SUBA-145` on `claude/lows-batch4`). **RE-SCOPED 2026-10-02** (`claude/lows-batch5`): parts (b) and (c) are DONE and no longer open — see below; (a) and (d) remain. `run-status` @v0.71.0 differences left after `SUBA-145` (line numbers in (b)/(c) are @v0.71.0; the closure below cites @v0.75.0, where they are `:711` and `:716`): (a) `reconcileNestedAsyncDescendants(route, { resultsDir, kill, now })` (`stale-run-reconciler.ts:325`) runs before the nested projection in the main report (`run-status.ts:541`) and before the nested exact-status view (`:436`); cyrup projects the registry as-is, so a nested async descendant whose runner died still shows `running`. (b) ~~The `Session: <status.sessionFile>` line (`run-status.ts:705`) is not rendered (`RunStatus::session_file` is carried); the stale comment at the `Workflow receipt:` site says cyrup has no such line.~~ **DONE 2026-10-02.** (c) ~~For an all-external run (every step external-cli/external-job) a non-running report ends in `Resume: unavailable; external runners do not persist Pi sessions.` (`:709-710`) instead of cyrup's `formatResumeGuidance` result; the external-job follow-up variant needs the unmodelled `external-job` runner.~~ **DONE 2026-10-02**, except the external-job follow-up variant, which still needs that runner and stays open under this row. (d) Per-step `, acceptance: <status>` and `, turn budget: n/m+g (outcome)` suffixes (`:631-632`) and the run-level `Turn budget:` line have no source field on `StepStatus`/`RunStatus`. Fix direction: port (a) beside `cascade.rs`'s registry walk, add (b) and (c), and decide whether (d) waits on the turn-budget/acceptance status fields. **(b)+(c) closure evidence:** `run_status.rs` now pushes `Session: <path>` right after `Workflow receipt:` (an empty path prints no line, as JS truthiness does) and, for a non-running run whose every step is `external-cli`, `Resume: unavailable; external runners do not persist Pi sessions.` (`EXTERNAL_RUNNERS_NOT_RESUMABLE`) in place of `format_resume_guidance` (`run-status.ts:711`, `:714-716` @v0.75.0). The module doc and the stale comment at the `Workflow receipt:` site were corrected. Tests (`background::run_status::tests`): `a_report_names_the_session_file_after_the_receipt_and_before_the_steer_hint` and `a_finished_all_external_run_says_external_runners_do_not_persist_sessions` (both FAILED before the fix, committed red in `d2d1bc68`), plus the guards `a_report_has_no_session_line_without_a_session_file` and `the_external_resume_sentence_needs_every_step_external_and_a_non_running_run` (pass before and after: they pin what must not change). Not verified: the `external-job` variant, and the mixed-runner and running cases beyond those guards. Remaining fix direction: port (a) beside `cascade.rs`'s registry walk, and decide whether (d) waits on the turn-budget/acceptance status fields. |
 | SUBA-147 | low | not-ported | M | **NEW 2026-09-30** (filed while closing `SUBA-130` on `claude/lows-batch4`). `preflightWorktreeSource(cwd, { signal, deadlineAt })` (`worktree.ts:359-368`) is unported: upstream's executor runs a read-only admission probe of every distinct `worktree: true` source cwd BEFORE launch (`subagent-executor.ts:4739` for workflows, `:7120` for a plain call) and fails the whole launch with `Worktree admission failed for '<key>' at <cwd>: <reason> Select the correct cwd or arrange an operator-approved commit/stash.`; cyrup discovers a dirty or non-git source only inside `create_worktrees`, after earlier group members may have run. The probe's git calls are the same bounded ones `SUBA-130` added (`resolve_repo_state` with a `GitBounds`), so the port is the admission loop plus the error text. |
 | SUBA-148 | low | not-ported | S | **NEW 2026-09-30** (filed while closing `SUBA-130` on `claude/lows-batch4`). Three places where worktree git still has no stop or deadline because the caller has no run context: `handoff::discard_preserved` (`worktree.discard`), the `worktree.cleanup` plan builder (`spawn/cleanup_plan/git.rs::run`, `classify.rs::is_patch_captured`) and `resolve_expected_worktree_agent_cwd` take `GitBounds::unbounded()`; and `create_worktrees` / the harvest wait on `worktree_turn()` (an unbounded `tokio::sync::Mutex`) without honouring stop or deadline, so a hung discard holding the turn blocks every later launch. Upstream v0.71.0 is equally unbounded in the git calls (`spawnSync`), so this is not drift; it is room to do better. Fix direction: thread the tool call's cancel token into `discard_preserved` and the plan builder, and race the turn lock against the run's stop/deadline. |
+| SUBA-150 | medium | upstream-drift | L | **`workflow: true` reply-fenced scripts replaced `workflowScript`/`workflowScriptPath`, which v0.74.0 deleted from the tool** — one `workflow` field now takes `true` \| a path \| a resource name (`src/extension/schemas.ts:221` @v0.74.0, `src/extension/reply-workflow-script.ts:14`); cyrup still advertises both removed params at `extension/tool/schema.rs:345`. **FILED 2026-10-02**; body below. |
+| SUBA-151 | medium | upstream-drift | L | **`chain`, `tasks` and the whole dynamic-fanout schema are gone from v0.74.0's default tool** — they survive only in the reduced schema used when `disabledFeatures` lists `workflow-scripts`, and are lowered into package-owned scripts (`src/workflows/structured-workflow-scripts.ts:175`, `src/extension/schemas.ts:286,299`); cyrup advertises the full v0.71.0 shape (`extension/tool/schema.rs:259,520,527`). **FILED 2026-10-02**; body below. |
+| SUBA-152 | low | not-ported | M | **`config.disabledFeatures` is unported** — 15 named feature groups an operator removes from the `subagent` tool, each mapping actions and params to the setting that disabled them (`src/shared/disabled-features.ts:8,82,98` @v0.74.0, validated `src/extension/config.ts:182`); `disabled_features` has zero hits in `crates/`. **FILED 2026-10-02**; body below. |
+| SUBA-153 | low | upstream-drift | M | **`SUBA-139`'s port target moved: the loader now has three `config.toolActivation` modes and a per-API cache-miss gate** — `auto`/`dynamic`/`eager` plus `addsToolsWithoutCheckpoint` (`src/extension/tool-activation.ts:36,85` @v0.74.0, `src/shared/types.ts:2595,2672`); cyrup has neither the loader (`SUBA-139`, open) nor the key. **FILED 2026-10-02**; body below. |
+| SUBA-154 | medium | upstream-drift | S | **`--default-prefix` in cyrup's worktree diff/patch options needs git ≥ 2.43, and a failed capture destroys the child's work** — upstream replaced it with `--src-prefix=a/ --dst-prefix=b/` (`src/runs/shared/worktree.ts:23` @v0.74.0, `1cf63c18`/#2527); cyrup still passes it at `spawn/worktree.rs:79,95`. **FILED 2026-10-02**; body below. |
+| SUBA-155 | medium | upstream-drift | M | **`modelScope` is still the three-key v0.33 shape: no `agents.<name>` rules, no `inherit`, no `scoped`** — so an operator copying pi's documented `allow: ["inherit"]` under `enforce` has every model rejected (`src/runs/shared/model-scope.ts:51,53,93` and `resolveModelScopesForAgent` @v0.74.0; cyrup `exec/model_scope.rs:40`). **FILED 2026-10-02**; body below. |
+| SUBA-156 | medium | parity-bug | S | **The MCP direct-tool reader models no `literalEnv`, so every agent-plugin MCP server's identity hash disagrees with the writer's and its `mcp:` selectors silently resolve to nothing** — upstream put `literalEnv`/`inheritEnv` into the identity at `src/runs/shared/mcp-direct-tool-allowlist.ts:470` @v0.74.0 (`847ee4de`/#2539); cyrup's reader is `exec/mcp_direct_tools.rs:1012`, its writer `cyrup-mcp/src/dirs.rs:1294`. **FILED 2026-10-02**; body below. |
+| SUBA-157 | low | upstream-drift | S | **`subagents.agentOverrides.<name>.advertise` is unported** — v0.74.0 lets settings opt a builtin or custom agent into the parent-prompt catalog without editing its file (`src/agents/agents.ts:88,141`, `8dc90dca`/#2534); cyrup has `AgentDefinition::advertise` (`discovery/types.rs:1352`, `SUBA-133`) but `AgentOverrideConfig` (`discovery/types.rs:686`) has no such field. **FILED 2026-10-02**; body below. |
+| SUBA-158 | medium | not-ported | S | **A spawned subagent child does not follow the parent session's project trust**, so a child in a session-trusted project loads it as untrusted and drops its project-level config — upstream threads `projectTrusted` into the child's settings manager (`src/runs/shared/child-session.ts:59,373` @v0.74.0, `b2718fb8`/#2570); cyrup's child argv carries no trust (`exec/spawn_plan.rs:317`) and a fresh `cyrup` boots `project_trusted: false` (`crates/cyrup/src/bootstrap.rs:93`). **FILED 2026-10-02**; body below. |
+| SUBA-159 | low | upstream-drift | S | **Runner liveness probes are not scoped to the PID namespace, so an observer in another namespace reads `ESRCH` and fails a live run** — upstream records `pidNamespaceScope` and downgrades a cross-namespace `dead` to `unknown` (`src/runs/background/pid-namespace.ts:7`, `src/runs/background/stale-run-reconciler.ts:439,441` @v0.74.0); cyrup's probe is a bare `kill(pid, 0)` and `Dead` fails immediately (`background/reconcile.rs:144,383`). **FILED 2026-10-02**; body below. |
+| SUBA-160 | low | upstream-drift | S | **`timeoutMs`/`maxRuntimeMs` accept any `u64` although `toolTimeoutMs` and `checkpointBeforeDeadlineMs` are capped at `MAX_TIMER_DELAY_MS`** — upstream now rejects an oversized value on launch and on `action: "resume"` (`src/runs/foreground/subagent-executor.ts:2948,2950` @v0.74.0, `5655f9bb`/#2517); cyrup's `resolve_foreground_timeout` (`extension/tool/params.rs:566`) checks only `0` and the alias clash. **FILED 2026-10-02**; body below. |
+| SUBA-161 | low | not-ported | S | **The `council` guide topic and the multi-file guide body are unported** — v0.74.0 adds an eleventh topic that concatenates three bundled files behind `<!-- path -->` markers so `/council` survives `--no-skills` (`src/extension/subagent-guide.ts:16,25,39`, `a0fd73df`/#2469); cyrup's `SUBAGENT_GUIDE_TOPICS` is ten (`registration/guide.rs:44`) and `council` has zero hits in `crates/` or the ledger. **FILED 2026-10-02**; body below. |
+| SUBA-162 | low | not-ported | M | **The progressive async-widget tier is unported: no height lock, no workflow lane rows, and no running-agent header count** — upstream's widget locks the card to the rows its content fills and counts leaf agents the way Fleet does (`src/tui/render.ts:2635,2648,2704` @v0.74.0, `9a5a2d5e`/#2583 and `7e07a22d`/#2584); cyrup renders one full block per run with no header line (`tui/render.rs:386`, `tui/events.rs:874`). **FILED 2026-10-02**; body below. |
+| SUBA-163 | low | stale-port | S | **`/subagent-cost` reports no child usage for an async single, chain or parallel launch** — `SUBA-138` ported v0.71.0's collector, and `d556bb01`/#2490 (v0.72.0) then added the `asyncId`-with-empty-`results` and `completions` arms (`src/slash/subagent-cost.ts:163,164` @v0.74.0); cyrup's collector tracks only `workflow_run_ids` (`registration/cost.rs:1002`). **FILED 2026-10-02**; body below. |
 
 ---
 
@@ -1334,6 +1350,690 @@ ownership fixes (`child-session.ts`). `SUBA-110`'s scrub applies only where upst
 parked features is shown to change a result for a spawned cyrup child.
 
 ---
+
+## Findings filed 2026-10-02 — the `v0.71.0..v0.74.0` window
+
+`pi-subagents` **v0.74.0** (88 commits since v0.71.0), read only through `git -C tmp/pi-subagents
+show v0.74.0:<path>` and `git diff v0.71.0..v0.74.0`; cyrup read at `fe875569`. This file's window
+is therefore now `v0.57.0..v0.74.0`, and its title's `v0.64` is the tag the first drift pass opened
+against, not the current one.
+
+## SUBA-150 — `workflow: true` reply-fenced scripts; `workflowScript` / `workflowScriptPath` are gone from the tool
+
+**Kind** upstream-drift · **Severity** medium · **Effort** L · **Confidence** confirmed (both sides read)
+
+**upstream** — `0538e14d` (#2588, `feat(workflows)!`, v0.74.0) is a declared breaking change to the
+tool surface. The `subagent` tool now has exactly one workflow field
+(`src/extension/schemas.ts:221` @v0.74.0):
+
+- `workflow: true` runs the single ` ```js workflow ` fenced block in the **same assistant reply**
+  that issued the tool call. `readReplyWorkflowScript`
+  (`src/extension/reply-workflow-script.ts:14`) walks `sessionManager.getBranch()` backwards for the
+  assistant message carrying this `toolCallId` and reads the script out of its text blocks. Pi
+  persists the whole assistant message before running its tool calls, which is what makes this
+  work.
+- a string containing `/` or `\` is a script **file** read from the request cwd.
+- any other string is a named workflow **resource**.
+
+`workflowScript` and `workflowScriptPath` were **removed from the tool**; RPC spawn takes inline
+text as `script` (`src/extension/rpc.ts`). The fence scanner (`workflowBlocks`,
+`reply-workflow-script.ts:41`) skips the bodies of other fences, accepts ``` and `~~~` markers of
+three or more characters, and has four distinct refusals: no `workflow: true` outside a model tool
+call, more than one `workflow: true` call in one reply, an unclosed block, and a block count that is
+not exactly one. `src/extension/public-execution.ts` and `src/runs/background/scheduled-runs.ts`
+were rewritten around the single field; `workflowScript` survives only as the package's internal
+carrier (`disabled-features.ts:106-110` names it as such).
+
+**cyrup** — `extension/tool/schema.rs:345` advertises `workflowScript` with its own long description,
+and `extension/tool/mod.rs:190` records that `SubagentToolParams` carries "neither
+`workflowScriptPath`, nor `workflow`, nor the marker key". The whole scripted-workflow engine is
+built around the name: `workflows/scripted/engine.rs:259` ("The workflowScript body"), `:1505`
+(`params.contains_key("workflowScript")`), `:2160` (`NESTED_WORKFLOW_REFUSAL`, whose text says
+`workflowScript cannot be started from inside a workflow child.`), `:2184`. Zero hits in `crates/`
+for `js workflow`, `reply_workflow` or `readReplyWorkflowScript`, and zero in
+`docs/gap-analysis/` — this is not filed anywhere.
+
+**Impact** — Two things, and the second is the reason this is `medium` rather than `low`. (1) A model
+trained on or prompted from pi's current tool reference will call `workflow: true` and cyrup will
+reject it as an unknown parameter with no hint. (2) The reason upstream made the change is that a
+script passed as a JSON string has every quote and newline escaped, which is a real authoring tax on
+the model and a real source of malformed scripts; cyrup has that tax today.
+
+**Fix** — This is `L` and should be split. (a) Add `workflow: true | string` and keep
+`workflowScript` as the internal carrier, exactly as upstream does, so the engine's internals and
+`NESTED_WORKFLOW_REFUSAL` need no rename. (b) Port `workflowBlocks` and `scriptFromReply` as a pure
+function over the branch's assistant content, with upstream's four refusal strings verbatim — the
+fence grammar is the load-bearing part and is pure, so it tests without a session. (c) Decide
+whether to remove `workflowScript`/`workflowScriptPath` from the advertised schema. Removing them is
+a breaking change to cyrup's own tool; keeping them is an advertise-vs-pi divergence. Either way the
+decision belongs in a `[CYRUP-DELTA]`, because this crate's rule is that the schema and the dispatch
+agree, and both would still dispatch.
+
+**Verify** — A reply containing one ` ```js workflow ` block and a `subagent({ workflow: true })`
+call runs that script; a reply with two such calls, with two blocks, with an unclosed block, and a
+non-model caller each get upstream's distinct message; a ` ```js ` block without the ` workflow `
+tag is ignored; a `~~~~`-fenced block closes only on four or more `~`.
+
+## SUBA-151 — `chain`, `tasks` and the dynamic-fanout schema left the default tool; they are now lowered into package-owned workflow scripts
+
+**Kind** upstream-drift · **Severity** medium · **Effort** L · **Confidence** confirmed (both sides read)
+
+**upstream** — `71d042f0` (#2596, v0.74.0) finished what #2588 started. At v0.71.0
+`SubagentParamProperties` carried `chain` (built from `ChainItem`), `tasks`, `ParallelTaskSchema`,
+`DynamicExpandSchema`, `DynamicParallelTemplateSchema`, `DynamicCollectSchema`, `OutputOverride`,
+`ReadsOverride` and `ChainGateOverride`. **At v0.74.0 every one of those is deleted**
+(`git -C tmp/pi-subagents diff v0.71.0..v0.74.0 -- src/extension/schemas.ts`), and
+`git -C tmp/pi-subagents show v0.74.0:src/extension/schemas.ts | grep -n 'chain'` finds `chain` only
+inside `StructuredWorkflowProperties` (`:286`) and `createSubagentParamsSchema` (`:299,305,308`).
+
+The data-shaped surface now exists in exactly one place: when `disabledFeatures` lists
+`workflow-scripts`, `createSubagentParamsSchema` drops the `workflow` family and substitutes a
+deliberately small `tasks` / `chain` pair — `{agent, task}` items, and steps that are
+`{agent, task?, as?}` or `{parallel: [{agent, task}]}`, with `additionalProperties: false` and no
+`phase`, `label`, `cwd`, `machine`, `count`, `output`, `reads`, `progress`, `skill`, `model`,
+`fast`, `toolBudget`, `acceptance`, `agentContract`, `gateOn`, `expand`, `collect`, `concurrency`,
+`failFast` or `worktree`. Those inputs are then **compiled into a package-owned workflow script**
+(`buildStructuredWorkflowScript`, `src/workflows/structured-workflow-scripts.ts:175`): every caller
+string is embedded through `JSON.stringify` and never becomes code, `{task}`/`{previous}`/
+`{outputs.<name>}` compile to string concatenation over script variables in a single
+non-rescanning pass, and the generated script runs on the ordinary workflow runtime with a `settle`
+/`failure` prelude. Three narrowings landed in the same diff: `usageBudget` gained
+`minProperties: 1`, `toolBudget`'s description now states `soft <= hard`, and the `timeoutMs`
+description says the aliases "must agree".
+
+**cyrup** — `extension/tool/schema.rs` is a faithful port of the **v0.71.0** shape: `sj_chain_item`
+(`:259`, whose doc cites `schemas.ts:190-229`), `sj_parallel_task` (`:166`, citing `:133-152`),
+`sj_dynamic_parallel_template` (`:194`), `tasks` (`:520`), `concurrency` (`:525`), `worktree`
+(`:526`), `chain` (`:527`), `chainDir` (`:537`). `buildStructuredWorkflowScript`,
+`structured_workflow` and `StructuredWorkflow` have zero hits in `crates/`, and
+`structured-workflow-scripts` has zero hits in `docs/gap-analysis/`. cyrup's chain/parallel
+orchestration is native (`spawn/chain_graph.rs`, `extension/executor/chain.rs`), not a lowering.
+
+**Impact** — This is the largest single piece of pi-subagents drift in the window, and it is a
+**design** divergence, not a missing feature: upstream has decided that one execution engine
+(workflow scripts) runs everything, and that the data-shaped `chain`/`tasks` surface is a
+reduced-capability fallback for operators who turn scripts off. cyrup has two engines. Severity is
+`medium` and not higher because cyrup's surface works and is a superset of upstream's reduced one —
+nothing breaks for a cyrup user. What breaks is parity reasoning: every future `chain`/`tasks`
+upstream change now lands in a generated script, so a line-for-line comparison of the two
+`chain` paths stops being meaningful.
+
+**Fix** — Needs a decision of record before any code. The options, with what each costs: (a) follow
+upstream — lower `chain`/`tasks` into generated scripts and keep the native graph only as the
+script runtime's executor. This is the only option that restores line-level parity, and it is a
+large, risky change to the most heavily tested code in the crate. (b) Keep the native engine and the
+full schema, and record a `[CYRUP-DELTA]` saying so — then the schema narrowings in this diff
+(`usageBudget.minProperties`, the two descriptions) are still worth porting on their own, and future
+upstream `chain` work has to be back-translated by hand. (c) Keep the native engine but port
+`createSubagentParamsSchema`'s reduction so `disabledFeatures: ["workflow-scripts"]` behaves as
+upstream does — this depends on `SUBA-152` and is the cheapest way to stop the surfaces diverging
+further. Recommend (b) plus (c), and say so in the file rather than leaving it implied.
+
+**Verify** — For (c): with `workflow-scripts` disabled the advertised schema has `tasks`/`chain` in
+upstream's reduced shape and no `workflow`/`args`/`preflight`/`globalConcurrencyLimit`/
+`maxSubagentSpawnsPerRun`; with it enabled the schema is unchanged. For the narrowings: an empty
+`usageBudget: {}` is refused.
+
+## SUBA-152 — `config.disabledFeatures` is unported, so an operator cannot trim the `subagent` tool
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read)
+
+**upstream** — `60905d10` (#2543, v0.73.0) added `src/shared/disabled-features.ts`.
+`SUBAGENT_FEATURES` (`:8` @v0.74.0) is 15 groups, each owning the actions and the params that only
+it needs: `agent-management`, `watchdog`, `panes`, `missions`, `lane-management`,
+`spawn-budget-grants`, `preflight`, `lane-metadata`, `gates`, `usage-budgets`, `tool-budgets`,
+`control-overrides`, `extension-bindings`, `external-machines`, `workflow-scripts`.
+`resolveDisabledFeatureSurface` (`:82`) builds the disabled param/action maps and folds
+`scheduledRuns.enabled: false` in as a sixteenth pseudo-feature `schedules`;
+`disabledFeatureUseError` (`:98`) rejects a request that uses a disabled action or param with
+`subagent action '<a>' is disabled by config disabledFeatures "<f>".` /
+`subagent option '<p>' is disabled by config …`; `disabledFeatureNotice` (`:115`) prepends a
+"Disabled by config in this session" block to the static reference docs. `validateDisabledFeatures`
+(`:51`) refuses a non-array, an unknown name (listing all 15), a duplicate, and the literal
+`"schedules"` with a message naming `scheduledRuns.enabled` instead. `disabledFeatures` is in
+`FAIL_CLOSED_CONFIG_KEYS` (`src/extension/config.ts:17`) and validated at `:182`. The surface
+reaches the tool at `src/extension/index.ts:705,711,715,720,721` and the executor at `:803`
+(`workflowScriptsDisabled`). Declared at `src/shared/types.ts:2674`.
+
+**cyrup** — `grep -rn 'disabled_features\|disabledFeatures\|DisabledFeature' crates/ --include='*.rs'`
+is empty, and so is the same grep over `docs/gap-analysis/`. The key is not in
+`UNPORTED_CONFIG_KEYS` (`registration/mod.rs:572`, 10 entries) either, so
+`SubagentExtensionConfig`'s `#[serde(default)]` with no `deny_unknown_fields` accepts it and drops it
+with no warning — the same advertise-and-ignore shape `SUBA-061` was filed for.
+
+**Impact** — Low on its own: an operator who sets the key gets the full tool and no error. It is
+listed because it is the hinge for `SUBA-151`'s option (c) — upstream's reduced `chain`/`tasks`
+schema exists only when this key disables `workflow-scripts` — and because the `subagent` tool
+description is the single largest prompt cost this crate imposes, so letting an operator cut 15
+groups out of it is a real context win.
+
+**Fix** — `S` for the data and the validator, `M` for the wiring. Port `SUBAGENT_FEATURES` as a
+`const` table with upstream's names and member lists verbatim; add `disabled_features: Option<Vec<String>>`
+to `SubagentExtensionConfig` with `validate_disabled_features` in `validate_raw_config` beside
+`validate_missions`; build the surface once per session and consult it in three places — the
+advertised schema (`extension/tool/schema.rs`), the tool description
+(`registration/tool_description.rs`, prepending the notice) and the dispatch boundary
+(`extension/tool/routing.rs`, before any action runs). The `workflow-scripts`-owns-`preflight` rule
+at `disabled-features.ts:91` is load-bearing: a param shared with `workflow-scripts` is always
+attributed to it whatever order the config lists features in.
+
+**Verify** — Each of the 15 names disables exactly its own actions and params and nothing else; a
+disabled action and a disabled param each get upstream's message; `"schedules"` in the array is
+refused by name; a duplicate and an unknown name are refused; `scheduledRuns.enabled: false` alone
+disables the nine `schedule.*` actions and their ten params.
+
+## SUBA-153 — `SUBA-139`'s port target moved: three activation modes and a per-API cache-miss gate
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read)
+
+**This row does not duplicate `SUBA-139`.** `SUBA-139` (open, low, `09b:242`) says the
+`subagents_enable` lazy loader is unported and cyrup behaves as upstream's unsupported-host
+fallback. That is still true. This row records that the thing `SUBA-139` asks to be ported **changed
+shape** in this window, so anyone picking `SUBA-139` up now would port a surface that no longer
+exists. Close them together.
+
+**upstream** — `92a8a1f5` (#2595, v0.74.0) adds `config.toolActivation`
+(`src/shared/types.ts:2595,2672`; validated at `src/extension/config.ts:175-176` with
+`config.toolActivation must be "auto", "dynamic", or "eager"`, and listed in
+`FAIL_CLOSED_CONFIG_KEYS` at `:17`):
+
+- `eager` returns immediately from `registerSubagentToolActivation`
+  (`src/extension/tool-activation.ts:85-87`) — no loader at all, `subagent` always active. Upstream
+  says this equals `--exclude-tools subagents_enable`.
+- `dynamic` always selects the loader.
+- `auto` (the default) goes eager **only** for an empty session **and only when the model cannot add
+  tools mid-conversation without a cache checkpoint**. That last predicate is
+  `addsToolsWithoutCheckpoint` (`:36-53`), a per-API read of the model's compat flags:
+  `anthropic-messages` needs `supportsMidConvoToolChanges`, `openai-completions` needs
+  `supportsMidConvoToolAdditions`, the three Responses APIs need `supportsAdditionalTools ||
+  supportsToolSearch`, and all of them first need `supportsMidConvoSystemMessages`; any other API is
+  `false`. The point is stated in the comment: without those flags a mid-conversation tool change
+  makes Pi resend the conversation under a new leading system message and miss the prompt cache.
+
+Three further changes in the same file: `setSelection` now takes `includeLoader` as well as
+`includeSubagent` and can deselect the loader; the recorded-selection replay tracks the whole
+recorded tool set rather than `subagent`'s membership alone, so `auto` never adds the loader to a
+transcript that did not declare it; and the decision is taken at `session_start`/`session_tree`
+only, so switching models mid-session keeps the session's tools. Earlier commits in the window round
+the loader out: `3bd1892f`/#2525 (tell the model to check its tool list instead of waiting),
+`32ceaab0`/#2492 (accept stray `subagents_enable` arguments), `2f39ae2c`/#2531 (enable on in-process
+hosts), `2f8c55a5`/#2514 (tell the model when enabled tools arrive on bridged providers).
+
+**cyrup** — `toolActivation`, `tool_activation`, `ToolActivationMode` and `subagents_enable` all have
+zero hits in `crates/`. The compat flags the gate reads **do** exist port-side
+(`crates/cyrup-provider/src/api/compat.rs:456` `supports_mid_convo_system_messages`, `:466`
+`supports_mid_convo_tool_additions`, `:520` `supports_mid_convo_tool_changes`, plus
+`supports_tool_search`/`supports_additional_tools`), so the predicate is portable today.
+
+**Impact** — Low, and it is `SUBA-139`'s impact: the full `subagent` tool is always in the prompt.
+The addition here is that the fix is now three-valued, and that the `auto` arm's whole purpose is a
+prompt-cache property — which is also what the v1.0.0 release post calls "deferred tool loading"
+and "cache warming". A port that implements only the v0.71.0 two-state loader would cost cyrup the
+cache on exactly the providers upstream protects.
+
+**Fix** — Port with `SUBA-139`, not after it. Add `toolActivation` to `SubagentExtensionConfig` with
+upstream's validator message; port `addsToolsWithoutCheckpoint` against
+`crates/cyrup-provider/src/api/compat.rs`'s fields, keeping the per-API switch and the
+`supportsMidConvoSystemMessages` precondition; register the loader only for `auto`/`dynamic`.
+
+**Verify** — `eager` registers no loader; `dynamic` always selects it; `auto` on an empty session
+with a model whose compat says it can add tools mid-conversation selects the loader, and with a
+model that cannot, goes eager; `auto` on a session with history keeps whatever the transcript
+declared; a model switch mid-session changes nothing.
+
+## SUBA-154 — `--default-prefix` needs git ≥ 2.43, and a failed worktree capture destroys the child's work
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read)
+
+**upstream** — `1cf63c18` (#2527, v0.73.1) changed `MACHINE_DIFF_OPTIONS`
+(`src/runs/shared/worktree.ts:23` @v0.74.0) from
+`["--no-color","--no-ext-diff","--no-textconv","--default-prefix","--line-prefix=","--no-relative"]`
+to `["--no-color","--no-ext-diff","--no-textconv","--src-prefix=a/","--dst-prefix=b/","--line-prefix=","--no-relative"]`.
+The changelog entry says why: explicit `a/`/`b/` prefixes "work on older Git releases while still
+overriding `diff.noprefix`". `MACHINE_PATCH_OPTIONS` is `[...MACHINE_DIFF_OPTIONS, "--binary"]`, so
+both move together.
+
+**cyrup** — `spawn/worktree.rs` has the v0.68.0 list twice, spelled out rather than composed:
+`MACHINE_DIFF_OPTIONS` at `:75-82` and `MACHINE_PATCH_OPTIONS` at `:89-97`, both containing
+`"--default-prefix"` (`:79`, `:95`). `git diff --default-prefix` was added in git **2.43**
+(Nov 2023); older git exits non-zero with `error: unknown option 'default-prefix'` and writes no
+diff. `--src-prefix=`/`--dst-prefix=` have been accepted for well over a decade.
+
+**Impact** — This is `medium`, not `low`, and the reason is in cyrup's own doc at
+`spawn/worktree.rs:71-74`: "a harvested worktree is REMOVED right after capture
+([`crate::spawn::chain_graph`]'s `publish_worktree_handoff`), so the patch is all that survives".
+On git < 2.43 every managed-worktree child's diff and patch capture fails, and then the worktree is
+removed — the child's work is gone with no patch to recover it. `SUBA-130`'s closure added a 256 MiB
+`PATCH_CAPTURE_MAX_BYTES` rule precisely so that an overflow **fails the capture and preserves the
+worktree**; an `unknown option` failure needs the same treatment and, better, should not happen.
+`validate_worktree_patch_represents_current_worktree`'s byte-for-byte re-capture comparison also
+fails on both sides, so the failure mode is total rather than partial.
+
+**Fix** — Two one-line edits in `spawn/worktree.rs` (`:79` and `:95`) replacing `--default-prefix`
+with `--src-prefix=a/` and `--dst-prefix=b/`, and the doc comment at `:67` updated (it currently
+explains `--default-prefix` as the answer to `diff.mnemonicPrefix`/`diff.noPrefix`; the explicit
+pair answers both as well, and the doc should say so). While there, check that a capture failure
+preserves the worktree rather than letting `publish_worktree_handoff` proceed to cleanup.
+
+**Verify** — A repo with `diff.noprefix=true` and `diff.mnemonicPrefix=true` still produces a
+`-p1`-applicable patch; the argv contains no `--default-prefix`; a capture failure (any cause)
+leaves the worktree on disk. The existing `spawn::worktree::tests` harvest cases cover the first.
+
+## SUBA-155 — `modelScope` is the three-key v0.33 shape: no per-agent rules, no `inherit`, no `scoped`
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed (both sides read)
+
+**Not in-baseline, and not previously filed.** `git -C tmp/pi-subagents show v0.43.0:src/runs/shared/model-scope.ts`
+has neither `agents` nor an `inherit` expansion, so none of this belongs to `09`. The ledger's
+`modelScope` rows are `SUBA-003` (closed, "ported and enforced"), `SUBA-035` (closed, the doctor and
+models surfaces) and `SUBA-050` (closed, `strict`); none of them mentions `agents`, `inherit` or
+`scoped`. The `agents`/`inherit` half is therefore pre-v0.74.0 drift this file's earlier passes
+missed; `scoped` is new in this window.
+
+**upstream** — At v0.74.0 `ModelScopeConfig extends ModelScopeRule` with
+`agents?: Record<string, ModelScopeRule>` — "Additional restrictions keyed by canonical agent name"
+— and `resolveModelScopesForAgent(config, agentName, parentModel, scopedModelIds)` returns a global
+scope plus, when present, an `modelScope.agents.<name>` scope whose `enforce`/`strict` fall back to
+the global ones. Allow patterns go through `expandReservedPatterns`: `inherit` becomes the parent
+session's `provider/id`, and `scoped` (`SCOPED_PATTERN`, `src/runs/shared/model-scope.ts:51`,
+added by `c305d4bb`/#2538, v0.73.0) becomes the parent session's scoped-model snapshot — pi's
+`/scoped-models` — degrading to `inherit` semantics when the parent is unscoped. A token that
+cannot be expanded is returned unexpanded so the enforced-inherit path in `model-resolution.ts`
+fails **closed**. `checkModelScope` also gained a render cap: more than `MAX_RENDERED_PATTERNS = 8`
+(`:53`) patterns render as `a, b, …, h, … (N patterns total)` (`:93`). Every launch path passes the
+snapshot; background runs keep the set captured at start.
+
+**cyrup** — `exec/model_scope.rs:40` `ModelScopeConfig` has exactly three fields: `enforce`,
+`strict`, `allow`. There is no `agents`, no `resolve_model_scopes_for_agent`, no reserved-token
+expansion (`grep -n 'inherit\|agents' exec/model_scope.rs` finds only prose and test names) and no
+render cap. `allow` is matched literally with only `*` special (field doc at `:58-59`).
+`settings.json`'s `subagents.modelScope.agents` is accepted by serde and dropped.
+
+**Impact** — Two concrete failures, which is why this is `medium`. (1) An operator who copies pi's
+documented `"modelScope": {"enforce": true, "allow": ["inherit"]}` gets a cyrup that matches the
+literal string `inherit` against `provider/id`, matches nothing, and **rejects every explicit
+model** — the run is refused with `SubagentError::ModelOutOfScope` naming an allowlist of one
+meaningless pattern. (2) `modelScope.agents.<name>` is silently dropped, so a per-agent restriction
+an operator believes is in force is not; that is the failure direction that matters for a policy
+knob.
+
+**Fix** — `M`. Add `agents: Option<BTreeMap<String, ModelScopeRule>>` and split the three shared
+fields into a `ModelScopeRule` as upstream does; port `resolve_model_scopes_for_agent` with
+upstream's `enforce`/`strict` fallback and its two origins (`modelScope`,
+`modelScope.agents.<name>`); port `expand_reserved_patterns` for `inherit` and `scoped`, keeping the
+unexpanded-token-fails-closed rule; add the 8-pattern render cap to the violation message. The
+`scoped` arm needs the parent session's scoped-model set threaded to each launch and captured at
+start for background runs — cyrup already has the set (`cyrup-tui/src/app/selectors.rs:225`
+`CheckboxSelector::scoped_models`, `event_extract.rs:355`), but `RunnerConfig` does not carry it,
+which is the one non-trivial piece.
+
+**Verify** — `allow: ["inherit"]` with `enforce` admits the parent session's model and refuses
+another; `allow: ["scoped"]` admits every scoped model and, with no scoping configured, behaves as
+`inherit`; an enforced `scoped`/`inherit` with no parent model fails closed; `agents.<name>` adds a
+restriction and inherits `enforce`/`strict` from the global block; a nine-pattern allowlist renders
+eight plus `… (9 patterns total)`.
+
+## SUBA-156 — the MCP direct-tool reader models no `literalEnv`, so agent-plugin servers' digests diverge and their `mcp:` selectors resolve to nothing
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read)
+
+**Scope note.** Upstream's `847ee4de` (#2539) and `14dcf975`/`fa1de042` (#2573/#2576) together move
+pi-subagents onto pi-mcp-adapter 3.x and onto Pi's own built-in MCP: `getConfigPaths` now reads
+`mcp-adapter.json` instead of `mcp.json`, and `usesBuiltinMcp`/`resolveBuiltinMcpSelections`/
+`extensionOnlyMcpServers` add a second resolution path for when the adapter is not loaded. **None of
+that is filed here**: cyrup ships its MCP port as the default and has no adapter-versus-built-in
+split (`EXT-092` records the one place the distinction surfaces), so there is no second path to
+resolve against and no file to rename. What is filed is the one half of `#2539` that is a defect in
+cyrup on its own terms.
+
+**upstream** — `computeMcpServerHash` (`src/runs/shared/mcp-direct-tool-allowlist.ts:470` @v0.74.0)
+now makes `literalEnv` part of the server identity, and skips env interpolation when it is set:
+
+    const isStdio = definition.command !== undefined;
+    const literalEnv = isStdio && definition.literalEnv === true;
+    … env: literalEnv ? definition.env : interpolateEnvRecord(definition.env),
+      ...(isStdio ? { inheritEnv: definition.inheritEnv !== false, literalEnv } : {}),
+
+with the comment "A mismatch leaves that server's cached direct-tool selectors unresolved." It also
+hashes `resolveConfigPath(definition.command)` rather than the raw command.
+
+**cyrup** — the reader is `exec/mcp_direct_tools.rs::server_identity_pre_image_with` (`:1012`); the
+writer is `cyrup-mcp/src/dirs.rs::server_identity_pre_image` (`:1294`). Both emit the same 15 keys
+and **neither** has `inheritEnv` or `literalEnv`, so for an ordinary server they agree — that is why
+this is not already broken everywhere. They diverge for `literalEnv` servers:
+
+- `cyrup-mcp` sets `literal_env: Some(true)` on every agent-plugin stdio server
+  (`cyrup-mcp/src/agent_plugin.rs:883`, and `runtime.rs:5733`), and its resolver takes those env
+  values **verbatim** — no `$VAR` interpolation and no `!secret` resolution
+  (`cyrup-mcp/src/secrets.rs:341,355-359,388`). The writer hashes `resolved.env`, i.e. the verbatim
+  values.
+- the reader's `ServerEntry` has no `literal_env` field at all
+  (`grep -n 'literal_env\|inherit_env' exec/mcp_direct_tools.rs` is empty), so it always runs
+  `interpolate_env_record(definition.env, env)` (`:1028`).
+
+**Impact** — Any agent-plugin MCP server whose `env` values contain a `$` sequence or a `!`/`!!`
+secret token hashes differently on the two sides. The reader's `is_server_cache_valid` then rejects
+that server's cache entry, and the agent's `mcp:<plugin>__<server>/<tool>` selectors resolve to
+nothing — **silently**, with no diagnostic. This is exactly the failure the module header at
+`exec/mcp_direct_tools.rs:32` was written about ("the two disagreed **silently**: every cached entry
+failed hash validation (so `mcp:` selectors resolved to nothing)"), reintroduced through a field the
+reader does not model. The secondary divergence is `command`: the writer hashes the plugin's
+already-absolutised `resolved_command` (`agent_plugin.rs:871`), the reader hashes
+`definition.command` unresolved (`:1020`), and upstream now resolves it on both sides.
+
+**Fix** — `S`, and it is a reader-side change plus one shared test. Add `literal_env` and
+`inherit_env` to the reader's `ServerEntry`; gate `interpolate_env_record` on `literal_env`; add the
+`inheritEnv`/`literalEnv` pair to the stdio identity on **both** sides in the same commit so they
+cannot drift again; hash the resolved command on both sides. The crate already has the right place
+for the guard: extend
+`mcp_direct_tools`' `reader_and_writer_agree_once_every_resolver_actually_runs` (named in the module
+header at `:60`) to cover a `literalEnv` server.
+
+**Verify** — A plugin-registered stdio server with `env: { TOKEN: "$HOME/x" }` produces the same
+digest from `cyrup_mcp::dirs::compute_server_hash` and
+`cyrup_ext_subagents::exec::mcp_direct_tools::compute_mcp_server_hash`, and an agent selecting
+`mcp:<plugin>__<server>/<tool>` resolves it; the same server with `literalEnv` honoured only on one
+side is red.
+
+---
+
+**Paired with `MCP-594` (reconciled 2026-10-02).** The writer side of the same digest contract is
+filed as **`MCP-594`** (`13c-…`, medium, `upstream-drift`): `cyrup-mcp`'s
+`server_identity_pre_image` is missing the same two stdio keys and hashes an interpolated `env` for a
+`literalEnv: true` entry. It also names the cost this row does not: adding the keys invalidates every
+stdio server's metadata-cache entry once, and voids the golden pre-image vectors pinned at
+`cyrup-mcp/src/dirs.rs:1694`, `:1734` and `:1808`, which must be regenerated from `v5.0.0` rather than
+hand-edited. **Land both sides in one commit**, as both rows require.
+
+## SUBA-157 — `subagents.agentOverrides.<name>.advertise` is unported
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+**upstream** — `8dc90dca` (#2534, v0.73.0) adds `advertise?: boolean` to
+`BuiltinAgentOverrideConfig` (`src/agents/agents.ts:88` @v0.74.0; the agent's own frontmatter field
+is `:141`), parsed in `parseBuiltinOverrideEntry` with
+`Builtin override '<name>' in '<file>' has invalid 'advertise'; expected a boolean.` and applied in
+`applyBuiltinOverride` (`if (override.advertise !== undefined) next.advertise = override.advertise;`).
+The commit message states the boundary: settings can now opt a builtin **or custom** agent into the
+parent-prompt catalog without copying the agent file, and runtime-registered agents still cannot be
+advertised.
+
+**cyrup** — the frontmatter half is in: `AgentDefinition::advertise` at `discovery/types.rs:1352`,
+cited to `agents.ts:140` @v0.71.0, feeding `discovery::advertised::build_advertised_agent_prompt`
+(`SUBA-133`, closed 2026-09-28). The override half is not: `AgentOverrideConfig`
+(`discovery/types.rs:686`) has 20 fields and no `advertise` (`grep -n advertise` over
+`discovery/types.rs` and `discovery/merge.rs` finds only `AgentDefinition::advertise` and two
+`advertise: None` literals in fixtures).
+
+**Impact** — Low. A setting pi documents is accepted and dropped, so the only way to advertise a
+bundled agent in cyrup is to eject and edit it. `SUBA-096` is this row's neighbour: it carries the
+three override fields (`acceptance_role`, `output_mode`, `fast`) that `SUBA-081`'s partial closure
+left, and `advertise` is a fourth of the same kind. If `SUBA-096` is picked up, do both in one pass.
+
+**Fix** — One `OverrideField<bool>` on `AgentOverrideConfig` beside `description`, parsed with
+upstream's message verbatim and applied in `discovery/merge.rs` where the other booleans are.
+
+**Verify** — `subagents.agentOverrides.reviewer.advertise = true` puts a bundled agent in the
+`<advertised_subagents>` block; `= "yes"` is refused with upstream's message; a runtime-registered
+agent is still not advertised.
+
+## SUBA-158 — a spawned subagent child does not follow the parent session's project trust
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read)
+
+**This escalates `SUBA-142`, by that tracker's own rule.** `SUBA-142` (tracker, `09b:245`) parks
+upstream's in-process-child features and says it "escalates to an item … when one of the parked
+features is shown to change a result for a spawned cyrup child". Project trust is such a feature:
+upstream's fix is in-process (`SettingsManager.create(..., { projectTrusted })`), but the *result*
+it corrects — the child loading the project as untrusted while the parent has it trusted — is
+reproduced by cyrup's spawned child. The same applies to `4cd43cae`/#2541's `skillsOverride`, which
+is **not** filed here because it corrects a Pi-internal path (`extendResources` merging
+`resources_discover` skill paths past `noSkills`) that a cyrup child, launched with `--no-skills`
+(`exec/spawn_plan.rs:862`), does not take.
+
+**upstream** — `b2718fb8` (#2570, v0.73.1) threads the launching session's trust to every child:
+`ChildSessionLaunch.projectTrusted` (`src/runs/shared/child-session.ts:59` @v0.74.0) reaches
+`pi.SettingsManager.create(launch.cwd, agentDir, { projectTrusted: launch.projectTrusted })` (`:373`),
+and `sessionProjectTrust(ctx)` (`src/runs/foreground/subagent-executor.ts:645`,
+`typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : undefined`) is passed at
+every launch site — `runSinglePath`, `runAsyncPath`, `resumeAsyncRun` (both arms) and
+`resumeExternalJobFollowUp`. `undefined` keeps Pi's default for a host with no trust concept.
+
+**cyrup** — nothing trust-shaped reaches the child. `exec/spawn_plan.rs:300-340` documents the whole
+argv and env overlay and names no trust flag; `grep -n trust exec/spawn_plan.rs` finds one unrelated
+comment at `:490`. The `cyrup` binary's own startup posture is
+`project_trusted: false` (`crates/cyrup/src/bootstrap.rs:93`, "cyrup's standing pre-trust posture
+(R-07-002)"), and the only override is the CLI `--approve`/`-a` pair
+(`crates/cyrup/src/subcommands.rs:57-67`), which the child is not given.
+
+**Impact** — A parent session whose project trust was granted in-session (the ordinary interactive
+path — `crates/cyrup/src/interactive.rs:197-198` carries `auto_trust_on_reload_cwd` precisely
+because that grant is not yet persisted; `TUI-037` is open for the same reason) spawns children that
+load the project as **untrusted**. The child therefore resolves a different settings and
+project-resource set than the parent: project-local settings and project extension discovery are
+suppressed where the parent has them, and `mcp-direct-tool-allowlist.ts`' own comment in this window
+("the project file is read only when the project is trusted") shows upstream treating the project
+MCP file the same way. A child quietly running under a narrower configuration than its parent is a
+behaviour divergence a user cannot see, which is why this is `medium` and not `low`.
+
+**Fix** — `S`. Decide the channel — a `--approve`-shaped argv flag is the smallest, an env var
+beside the existing `INHERIT_PROJECT_CONTEXT_ENV`/`INHERIT_SKILLS_ENV` pair is the most consistent
+with how every other inherit flag reaches a cyrup child — then set it from the parent's
+`AgentSessionServices::project_trusted` (the field `crates/cyrup-tui/src/app/session_bind.rs:131`
+reads) at each launch site, with "absent means the child decides for itself" as the default so a
+host with no trust state is unchanged. Record the decision as a `[CYRUP-DELTA]` against
+`child-session.ts:373`, since the mechanism differs even though the result must not.
+
+**Verify** — In a project trusted only in the parent session, a foreground child, an async child and
+a resumed async child each load the project's local settings; with the parent untrusted, none of
+them does; a launch with no trust information behaves exactly as today.
+
+## SUBA-159 — runner liveness probes are not scoped to the PID namespace, so a cross-namespace observer fails a live run
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+**upstream** — `d5d3b9ff` (#2498, v0.72.0) adds `src/runs/background/pid-namespace.ts:7`
+`currentPidNamespaceScope()` — the `readlink("/proc/self/ns/pid")` value on Linux, cached,
+`undefined` elsewhere — stamps it on `AsyncStatus.pidNamespaceScope`
+(`src/shared/types.ts`, "Linux PID namespace identity used to scope liveness probes") at both
+status-writing sites (`spawnRunner`, `buildStartedStatus`), and consults it in
+`reconcileAsyncRun`:
+
+    const pidScopeMismatch = effectiveStatus.pidNamespaceScope !== undefined && effectiveStatus.pidNamespaceScope !== observedScope;
+    const liveness = observedLiveness === "dead" && pidScopeMismatch ? "unknown" : observedLiveness;
+
+(`src/runs/background/stale-run-reconciler.ts:439,441` @v0.74.0). A cross-namespace `dead` becomes
+`unknown`, which falls through to the existing 24-hour stale rule instead of failing the run, and the
+failure sentence gained a second probe text: `could not be probed from this process` where the
+observed liveness was not `alive`. The commit names the two shapes it fixes: another container, and
+a macOS/Windows host sharing a container's `PI_SUBAGENTS_TEMP_ROOT`.
+
+**cyrup** — `background/reconcile.rs:144` `check_pid_liveness` is a bare `kill(pid, 0)` with
+`ESRCH => Liveness::Dead`, and the decision at `:383` is `Liveness::Dead => true` — fail
+immediately, no stale window. `AsyncStatus` has no `pidNamespaceScope`
+(`grep -rn 'pidNamespaceScope\|pid_namespace\|/proc/self/ns/pid' crates/` is empty), and the
+`Liveness::Alive | Liveness::Unknown` arm still prints only `still has a live PID` (`:406`), so
+upstream's second sentence has no counterpart. cyrup does have `processDemonstrablyGone`'s
+start-identity check (`:166-174`) against PID **reuse**, which is a different hazard: a PID that
+does not exist in this namespace has no start identity to compare.
+
+**Impact** — `low`, honestly scoped: cyrup exposes no documented shared-temp-root env (the run tree
+hangs off cyrup's own `TEMP_ROOT_DIR`, `exec/mod.rs:1365`), so reaching this needs a deployment that
+shares the state directory across PID namespaces by mount. In that deployment the consequence is not
+cosmetic — a **live** run is marked failed and a `synthesize_failure` record is written over it. The
+row is worth having because the fix is small and because the reconciler's "dead means dead" rule is
+the one place cyrup is strictly less careful than upstream about a probe it cannot trust.
+
+**Fix** — `S`. Add `pid_namespace_scope: Option<String>` to the async status record, populated from a
+cached `readlink("/proc/self/ns/pid")` on Linux and `None` elsewhere; stamp it wherever `pid` is
+stamped; in `reconcile`, downgrade `Dead` to `Unknown` when a recorded scope is present and differs
+from the observed one (including when the observer has none), and add upstream's second probe
+sentence.
+
+**Verify** — A status carrying a recorded scope that differs from the observer's, with a PID that is
+absent locally, is **not** failed until the stale window elapses, and then fails with the
+`could not be probed from this process` sentence; a matching scope, and an absent recorded scope,
+both behave exactly as today.
+
+## SUBA-160 — `timeoutMs`/`maxRuntimeMs` have no timer-delay cap although two neighbouring params do
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+**upstream** — `5655f9bb` (#2517, v0.73.0) added `timerDelayOverflowError`
+(`src/runs/foreground/subagent-executor.ts:2950` @v0.74.0, over
+`MAX_TIMER_DELAY_MS = 2_147_483_647` at `:2948`) returning
+`<name> must be a positive integer no larger than 2147483647.`, and applies it in three places: in
+`resolveForegroundTimeout`, at the executor entry for both `timeoutMs` and `maxRuntimeMs`, and in
+`resumeAsyncRun` for `action: "resume"`'s own `timeoutMs`. The changelog states Node's failure mode:
+a larger delay was shortened to about 1 ms, so the run timed out almost immediately.
+
+**cyrup** — the constant and the message already exist, for other params:
+`exec/tool_timeout.rs:24` `MAX_TIMER_DELAY_MS`, its error at `:221`
+(`{label} must be a positive integer no larger than {MAX_TIMER_DELAY_MS}.`, upstream's string), and
+`registration/mod.rs:588` `MAX_CHECKPOINT_BEFORE_DEADLINE_MS` with `SUBA-128`. But
+`resolve_foreground_timeout` (`extension/tool/params.rs:566-588`) checks only `value == Some(0)` and
+the `timeoutMs`/`maxRuntimeMs` alias clash; both fields are `Option<u64>`
+(`extension/tool/params.rs:222-223`), so any value is accepted. `action: "resume"` has no such
+check either.
+
+**Impact** — Node's specific corruption does not reproduce: a Rust/tokio deadline built from a huge
+`u64` saturates rather than wrapping to ~1 ms, so the practical effect is "no deadline" rather than
+"instant timeout". The defect is the inconsistency: the tool refuses an oversized `toolTimeoutMs`
+and `checkpointBeforeDeadlineMs` with a specific message and accepts an oversized `timeoutMs`, which
+is the opposite of this crate's advertise-and-dispatch-agree rule. `low`, and it is worth doing
+only because it is three lines against a constant that is already in the tree.
+
+**Fix** — Apply `exec::tool_timeout`'s existing overflow check to `timeout_ms` and `max_runtime_ms`
+in `resolve_foreground_timeout`, and to the `resume` arm's `timeoutMs` in
+`extension/executor/background.rs` beside the existing `checkpointBeforeDeadlineMs` check. Reuse the
+existing message builder rather than restating the string.
+
+**Verify** — `timeoutMs: 2_147_483_648` and `maxRuntimeMs: 2_147_483_648` are each refused with
+upstream's message before any launch; `action: "resume"` with the same value is refused;
+`2_147_483_647` is accepted.
+
+## SUBA-161 — the `council` guide topic and the multi-file guide body are unported
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+**upstream** — `a0fd73df` (#2469, v0.72.0) makes `council` an eleventh guide topic
+(`src/extension/subagent-guide.ts:16` @v0.74.0) and gives `readSubagentGuide` a multi-file arm
+(`:39`): a topic may name several files, and when it does the body is their contents joined with a
+`<!-- <path> -->` marker before each. `COUNCIL_FILES` (`:25`) is
+`skills/council-mode/SKILL.md`, `skills/council-mode/references/pass-contracts.md` and
+`skills/pi-subagents/references/execution-controls.md`, and the comment says why the topic exists at
+all: "`/council` must work under `pi --no-skills`, which drops the package skills from context, so
+this topic serves the council skill together with the references it tells the model to read."
+
+**cyrup** — `registration/guide.rs:44` `SUBAGENT_GUIDE_TOPICS` is the ten-topic v0.47.1 list, and the
+doc above it records that the order is load-bearing twice (the unknown-topic message joins it, and
+`overview` first makes it the default). `council` has **zero** hits in `crates/` and zero in
+`docs/gap-analysis/` — neither the topic nor the `council-mode` skill it serves has ever been filed.
+
+**Impact** — Low and bounded: `guide topic: "council"` answers
+`Unknown subagents guide topic 'council'. Valid topics: …`. Behind it is the larger question of
+whether cyrup ships pi-subagents' bundled skills at all — upstream carries nine files under
+`skills/` at v0.74.0 — which is a bundled-asset decision, not this row's work.
+
+**Fix** — `S` for the mechanism, and the mechanism is what to port: add the multi-file arm and its
+`<!-- path -->` marker to the guide reader, since that is reusable, and add `council` as the
+eleventh topic **last** in the list, preserving the order rule. Whether the three files ship is a
+separate decision; if they do not, the topic should not be advertised, because this crate does not
+advertise a topic it cannot answer.
+
+**Verify** — `guide` with `topic: "council"` returns the three files in order, each preceded by its
+`<!-- path -->` marker; the unknown-topic message lists eleven topics in upstream's order;
+`overview` is still the default.
+
+## SUBA-162 — the progressive async-widget tier is unported: no height lock, no lane rows, no running-agent header count
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read)
+
+**upstream** — `src/tui/render.ts` at v0.74.0 has a progressive widget tier that cyrup's port does
+not: `buildProgressiveWidgetLines` (`:2704`) locks the card height to the rows its content fills at
+lock time, never shrinks between relocks, grows up to the compact cap when a job starts while jobs
+are hidden, and fills the rows left after the visible job lines with the visible **workflows' lane
+rows** (`9a5a2d5e`/#2583 — before it, the tier padded with blank rows and a workflow's lanes stayed
+hidden). `progressiveHeaderLine` (`:2648`) prints a running/queued/failed summary line, and
+`runningLeafAgentCount` (`:2635`, `7e07a22d`/#2584) makes its count agree with FleetView's
+"N active agents": a workflow counts its loaded child runs recursively, any other running job counts
+its active steps, synthesised from `agents` when it has no step detail, with a sequential chain's
+non-current `pending` steps excluded. Before the fix a four-lane workflow beside one other run read
+"2 agents running" next to "5 active agents".
+
+**cyrup** — `tui/render.rs` is 841 lines against upstream's ~2 700 and is a port of the earlier
+shape: `render_background_region` (`:386`) renders one full header-plus-nested block per run up to a
+cap and folds the overflow into an aggregate line (`background_region_details_up_to_cap_then_folds_overflow`),
+`render_progress_header` (`:356`) is the per-run block, and `render_async_jobs_widget`
+(`tui/events.rs:874`) is a thin wrapper that maps snapshots and calls it. There is no header summary
+line (`grep -rn 'agents running' crates/cyrup-ext-subagents/src/` is empty), no height lock, no
+progressive tier and no lane rows. `SUBA-061`'s closure wired the `asyncWidget` config key to this
+renderer, so the slot and its plumbing exist; the tier does not.
+
+**Impact** — Low: a cosmetic difference in an under-editor widget. It is filed because the two
+upstream fixes in this window both describe the symptom in user terms (blank rows where a
+workflow's lanes belong; a count that disagrees with the Fleet view a key away), and because the
+leaf-counting rule is the kind of thing that is cheap to port with the fix in hand and expensive to
+re-derive later.
+
+**Fix** — `M`, and splittable. The `runningLeafAgentCount` rule is pure and portable on its own
+against cyrup's `AsyncJobSnapshot`/`StepStatus`, and is the half worth doing first: it makes the
+widget and `tui/fleet_view.rs` agree. The height lock and lane rows need a locked-rows value
+threaded through `render_async_jobs_widget`, which cyrup's `data in -> Vec<Line>` contract
+(`tui/render.rs:7`) can carry as a parameter without giving the module state.
+
+**Verify** — A four-lane workflow beside one single run reports the same agent count in the widget
+header as `tui/fleet_view.rs` reports active agents; a sequential chain counts one; a job with no
+step detail counts its agents; the locked card keeps its height as jobs finish and grows, up to the
+cap, when a job starts while jobs are hidden.
+
+## SUBA-163 — `/subagent-cost` reports no child usage for an async single, chain or parallel launch
+
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read)
+
+**Why `stale-port`.** `SUBA-138` (closed 2026-09-28, `09b:241`) ported v0.71.0's
+`collectSubagentCost` as `registration/cost.rs:995`, and that port is faithful to its tag.
+`d556bb01` (#2490) landed in **v0.72.0**, one tag later, and fixes a hole the v0.71.0 collector has.
+So this is not a defect in `SUBA-138`'s work; it is the port being measured against a tag that has
+moved.
+
+**upstream** — `collectSubagentCost` at v0.74.0 tracks three id sets, not one
+(`src/slash/subagent-cost.ts:162-164`): `workflowRunIds`, and the new `asyncRunIds` (`:163`) and
+`completedRunIds` (`:164`). The new arm is
+
+    if (details.mode === "workflow" && details.runId) workflowRunIds.add(details.runId);
+    // An async launch result has no child results; its usage lands in run artifacts.
+    else if (details.asyncId && details.results.length === 0) asyncRunIds.add(details.asyncId);
+
+plus `completedRunIds.add(completion.runId)` for every `bg_wait` completion, an `identity` override
+on `addChild` so a step's usage dedupes by its own identity, and an `indexes` parameter on
+`metadataUsage` so a run's per-step artifact metadata is read rather than only index `0` and the
+unindexed form. The changelog states the symptom: `/subagent-cost` "only read child usage from
+workflow receipts and returned results, so an async `subagent` call with an empty `results` list
+reported no child usage".
+
+**cyrup** — `registration/cost.rs:1002` declares `workflow_run_ids` and nothing else;
+`add_workflow_run_id` is called at `:1022` and `:1052`, the resolution loop at `:1087` walks
+`workflow_run_ids` alone, and `unresolved_async_children` (`:1086`) counts only failures inside that
+loop. `grep -n 'async_run_ids\|completed_run_ids' registration/cost.rs` is empty. The artifact
+metadata read is likewise the two-index form the pre-fix upstream had.
+
+**Impact** — `low`, because it is a report rather than an execution path, but it is a wrong number
+shown to the user, not a missing feature: an `async: true` single, chain or parallel launch is the
+common case, its tool result carries an `asyncId` and an empty `results` array, and
+`/subagent-cost` attributes zero child usage to it. The run's usage is on disk in its artifact
+metadata the whole time.
+
+**Fix** — `S`. Add the `asyncId`-with-empty-`results` arm and the `completions` id set to the
+collector's transcript walk, resolve those run ids through the same run-dir status / artifact
+`_meta.json` path `SUBA-138` already built (the status's steps give the indices), and add the
+`indexes` parameter so per-step metadata is read. Keep the existing `run:`/`session:` dedupe and add
+upstream's `identity` override so a step does not collide with its run.
+
+**Verify** — An `async: true` single launch, an async chain and an async parallel launch each
+contribute their children's usage to `/subagent-cost` and to the RPC `cost` report; a `bg_wait`
+completion for the same run does not double-count it; a workflow run still resolves through its
+receipt exactly as it does today.
 
 ## Items in this window held by `09a`
 

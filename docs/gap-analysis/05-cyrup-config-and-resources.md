@@ -534,7 +534,14 @@ above opened nothing, closed nothing and re-severitied nothing.
 
 ## Open items
 
-> **Next free id: `CFG-095`** (2026-10-01, after the `EXT-027` closure filed `CFG-094`).
+> **Next free id: `CFG-102`** (2026-10-02, after the pi v1.0.0 pass filed `CFG-096`…`CFG-101`; `CFG-095` was never allocated and is still free).
+
+> **This table carries a trailing `Dedup` column (added 2026-10-02).** It holds
+> `duplicate-of: <ID>` for a row whose finding another area owns, exactly as area 12's does, and
+> `scripts/count_open_items.py` drops such a row from every open tally while the named id is open. It
+> is **last** rather than area 12's between-`Effort`-and-`Title` position so that every row written
+> before it stays valid: a five-cell row simply has an empty `Dedup`, which is what "not a duplicate"
+> means. See README's *Item format*.
 
 > **⚠ COUNT THIS TABLE ONLY — but do not assume the `-S` ids are gone.** All four surface-sweep items
 > (`CFG-S01`…`CFG-S04`) closed this pass, so the second table under `## Surface-sweep findings` is now
@@ -729,8 +736,8 @@ above opened nothing, closed nothing and re-severitied nothing.
 > reads like a closure and **is not one** — the row's claim is about whether the NATIVE backend is
 > constructed, and `app/event_extract.rs:108` still calls `arboard::Clipboard::new()` ungated. A grep
 > that goes from 0 hits to N hits is a prompt to re-read the row, not a closure.
-| ID | Severity | Kind | Effort | Title |
-|---|---|---|---|---|
+| ID | Severity | Kind | Effort | Title | Dedup |
+|---|---|---|---|---|---|
 | ~~CFG-035~~ | ~~high~~ **CLOSED 2026-08-14** | not-ported | M | `.cyrup/SYSTEM.md` and `APPEND_SYSTEM.md` are never discovered — the trust-gated project system-prompt override is inert — **CLOSED 2026-08-14**: sweep 2 — the area's only `high`. The DISCOVERY half landed in `crates/cyrup-resources/src/discovery.rs` (`discover_system_prompt_file` / `discover_append_system_prompt_file` over a shared `discover_prompt_override`, both on `DiscoveryReport`), so `grep -rn 'SYSTEM\.md' crates/` no longer returns five hits none of which read a file; trust gates the PROJECT candidate only, so an untrusted project falls through to `<agent_dir>/SYSTEM.md` rather than to nothing. The WIRING half landed CONCURRENTLY in area 08 (`cyrup-session-svc/src/builder.rs:1219-1258`), including pi's REPLACE-not-accumulate rule for the append leg. **The one residual — the doc line at `cyrup-session/src/prompt/overrides.rs:15-16` — is re-filed against area 03 as SESS-035's residual rather than holding this item open.** |
 | ~~CFG-023~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `find_initial_model` step 3 accepts a saved default whose provider has no configured auth — **CLOSED 2026-08-14**: sweep 1. |
 | ~~CFG-025~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Settings-declared paths and local package sources do not expand `~` or `file://` — **CLOSED 2026-08-14**: sweep 1 — closed by one shared util, `crates/cyrup-config/src/paths.rs`, creating a new `cyrup-resources → cyrup-config` dependency edge (a second copy is what the `encode_cwd` handoff warns against). The util does NOT resolve relative paths — it is `normalizePath`, not `resolvePath`. **Sweep 2 amendment:** the module now ALSO carries the v0.84.1 `normalizeWindowsShellPath` step (paths.ts:66-73, applied at :83-85), so it is measured against v0.84.1 for that one function — a future auditor must not read the win32 branch as an invention. See DRIFT-046. |
@@ -812,6 +819,12 @@ above opened nothing, closed nothing and re-severitied nothing.
 | ~~CFG-092~~ | ~~medium~~ **CLOSED 2026-09-27** | upstream-drift | S | **NEW 2026-09-24 (second pass; was a 2026-09-14 lead).** A models.json model declared under an existing provider inherits `api`/`baseUrl` from the provider's FIRST model; pi v0.85.0 `findModelDefaults` prefers the same id, then the same `api`, then `openai-completions` — see the body. — **CLOSED 2026-09-27**: `find_model_defaults` is ported verbatim with `definition.api.or(config.api)` (`crates/cyrup-config/src/model/compose.rs:184-189`, `:220`). Verify: `cyrup-config model::compose::tests::{rung_1_same_id_still_beats_the_api_match,rung_2_a_declared_model_inherits_from_the_model_with_the_same_wire_api,rung_2_reads_the_provider_blocks_api_when_the_definition_has_none,rung_3_falls_back_to_the_first_openai_completions_model_not_to_models_0}`. |
 | CFG-093 | low | upstream-drift | S | **PARTIALLY CLOSED 2026-09-28** (on `claude/lows-next`): the config half landed. `CacheWarmingMode` (off/streaming/idle, `crates/cyrup-config/src/settings/types.rs:48`) and `EffectiveSettings::cache_warming_mode()` (`settings/effective.rs:514`) port pi's validated getter, which falls back to `streaming`. `cacheWarming` is in `GLOBAL_ONLY_KEYS` (`settings/layer.rs:27`), so a project value is ignored. The verifier found that `CacheWarmingMode::as_str` had no caller and that its doc cited a `setCacheWarmingMode` cyrup did not have, so pi's setter is ported as `SettingsManager::set_cache_warming_mode` (`settings/manager.rs:444`), which writes the global scope (`settings-manager.ts:954-963` @v0.87.1). Verify: `cyrup-config settings::tests::merge_and_scope::cache_warming_is_global_only_and_defaults_to_streaming` and `set_cache_warming_mode_writes_the_global_scope` (new; the setter round-trips through the global-only reader while a trusted project's own `cacheWarming` is ignored); red without the fix. **Remaining:** nothing reads the mode yet (`grep -rn 'cache_warming_mode\|CacheWarmingMode' crates/` hits only `cyrup-config`). Its consumers, the CacheWarmer, `AgentSession.setCacheWarmingMode`, the `/settings` row and the `/session` line, are area 08's open `SEAM-131`, and the `Fix` says to ship with it. *Original text:* **NEW 2026-09-24 (second pass; was a header lead).** The global-only `cacheWarming` setting (`off`/`streaming`/`idle`, default `streaming`, pi v0.86.0) is not modelled — the config half of `SEAM-131` — see the body. |
 | CFG-094 | low | port-divergence | M | **NEW 2026-10-01** (filed by the `EXT-027` closure, `claude/llama-cpp-port`). The launch-time provider choice is made BEFORE any extension loads, and `--model` resolution for an extension provider is deferred to the session builder's step 3b: `select_launch_provider` (`crates/cyrup/src/provider.rs:672`) stands in an `UnconfiguredProvider` when `--model` names an id no built-in or `models.json` block declares, and `SessionBuilder::build` resolves the pattern once the extension providers exist (`crates/cyrup-session-svc/src/builder.rs`, step 3b). pi has no such step: its runtime holds the extension providers before `--model` is resolved (`buildSessionOptions`, `main.ts:468-479`, after `createAgentSessionServices`, `core/agent-session-services.ts:190-206` @v0.99.2-17). The source calls this an architectural gap, not a language constraint, and names this item as its owner. Consequences that remain: `--provider <extension provider>` WITHOUT `--model` is still refused as an unknown provider, because there is no pattern to resolve later (test `an_unknown_provider_without_a_model_keeps_its_error`, `crates/cyrup/src/tests/extension_provider_launch.rs`); and a session is built around ONE provider the caller picks, with the rest swapped in on `/model`. **Fix** — hold every provider in the session from the start, as pi's `ModelRuntime` does, and resolve `--provider` / `--model` against that set after extension load; then delete `select_launch_provider` and `qualify_deferred_pattern`. **Verify** — `cyrup --provider llama.cpp` starts on that provider's first available model. |
+| CFG-096 | medium | upstream-drift | S | **`tuiMode` now defaults to `fullscreen`, not `regular`** — pi `core/settings-manager.ts:1348` inverted the getter (`=== "regular" ? "regular" : "fullscreen"`) and `cli/args.ts:326` now reads "fullscreen (default) or regular"; cyrup's `EffectiveSettings::tui_mode()` and help text still default to regular, which also makes all four `fullscreen*` keys no-ops out of the box. **FILED 2026-10-02**; body below. |
+| CFG-097 | medium | upstream-drift | M | **`defaultTools` gained `+name`/`-name` modifiers, a `DEFAULT_TOOL_NAMES` baseline and a special layer-merge; cyrup reads the raw array** — pi `core/settings-manager.ts:215`, `:225`, `:236`, `:250`, `:1434`. pi's own docs now tell users to write `"defaultTools": ["+codemode"]`, which in cyrup selects a tool literally named `+codemode` and so disables every built-in. **FILED 2026-10-02**; body below. |
+| CFG-098 | low | upstream-drift | S | **`quietStartup` widened from `boolean` to `boolean \| "header"`** — pi `core/settings-manager.ts:112`, `:150`, `:1089`; `"header"` keeps the startup header and hides only the model scope line and the resource listing. cyrup's `EffectiveSettings::quiet_startup()` is `get_bool(..).unwrap_or(false)`, so `"header"` reads as `false`. **FILED 2026-10-02**; body below. | duplicate-of: `TUI-137` |
+| CFG-099 | low | not-ported | S | **The global-only `deviceId` setting and `getOrCreateDeviceId()` are not modelled** — pi `core/settings-manager.ts:158`, `:1175` (a `randomUUID` minted on first use, project settings deliberately ignored "so a committed project settings file cannot give every clone the same ID") and its redaction at `core/bug-report.ts:62`. **FILED 2026-10-02**; body below. |
+| CFG-100 | low | upstream-drift | S | **`fullscreenWheelScrollLines` is not modelled; cyrup's wheel step is hard-coded** — pi `core/settings-manager.ts:188`, getter/setter `:1389`/`:1399` (`"auto"` or a value clamped to 1–100); cyrup's `wheel_scroll_lines` is a constant table in `crates/cyrup-tui/src/altscreen/wheel.rs:71`. **FILED 2026-10-02**; body below. | duplicate-of: `TUI-136` |
+| CFG-101 | low | upstream-drift | S | **`mcp.json` was added to the resources that make a project require trust; cyrup's probe list omits it** — pi `core/trust-manager.ts:32`; cyrup's `CYRUP_MARKERS` (`crates/cyrup-config/src/trust.rs:211-219`) has seven entries and no `mcp.json`, so a repo whose only project config is `.cyrup/mcp.json` is never offered the trust prompt and its servers stay silently unloaded. **FILED 2026-10-02**; body below. |
 
 ## CFG-081 — `retry.maxAgentDelayMs` is not modelled, so agent-level retry backoff is uncapped
 
@@ -2477,6 +2490,276 @@ inserted as a NEW section rather than in front of this one, leaving the file wit
 
 **Verify** — child-side test: `CYRUP_SUBAGENT_TOOL_BUDGET={"hard":0}` with `CYRUP_SUBAGENT_TOOL_BUDGET_ZERO_AUTH` unset → the child refuses to start (a) or runs with a `hard: 1` budget (b), never with `None`; keep `a_zero_budget_is_honoured_only_with_the_parents_authorisation` green for the authorised path.
 
+
+## Findings filed 2026-10-02 — the `v0.87.1..v1.0.0` window in `settings-manager.ts` and `trust-manager.ts`
+
+pi v1.0.0 (`2026-10-01`), read at the tag only; cyrup read at `fe875569`. Two of the six rows filed
+here are reconciled against area 07, which measured the same three settings from the renderer side:
+`CFG-098` and `CFG-100` carry a `duplicate-of` marker and are not counted, and `CFG-096` absorbs
+`TUI-135`. The arithmetic for this window is therefore **four** counted rows, not six.
+
+## CFG-096 — `tuiMode` defaults to `fullscreen` upstream and to `regular` in cyrup
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+The release post's "full-screen mode by default". The upstream change is `88ff80b98` "make fullscreen the
+default TUI mode", and its CHANGELOG entry @v1.0.0 is the user-facing contract: *"Changed the default TUI
+mode to fullscreen. Set `tuiMode` to `"regular"` or pass `--tui-mode regular` to keep the terminal's normal
+scrollback."* It is eight lines of production code across four surfaces.
+
+**upstream** @v1.0.0 — `core/settings-manager.ts:1348`: `getTuiMode()` is now
+`return this.settings.tuiMode === "regular" ? "regular" : "fullscreen";` — the sense of the test is
+inverted, so an unset, misspelled or non-string value resolves to `fullscreen`. `cli/args.ts:326`:
+`--tui-mode <mode>  TUI mode: fullscreen (default) or regular`. `docs/settings.md:94` documents the
+default as `"fullscreen"`. The `/settings` selector's row moved with it
+(`modes/interactive/components/settings-selector.ts`).
+
+**cyrup at HEAD** — `crates/cyrup-config/src/settings/effective.rs:611-616`:
+
+    pub fn tui_mode(&self) -> TuiMode {
+        match self.merged.get_str("tuiMode").as_deref() {
+            Some("fullscreen") => TuiMode::Fullscreen,
+            _ => TuiMode::Regular,
+        }
+    }
+
+i.e. pi's pre-v1.0.0 polarity, including the same degrade-don't-reject contract for a bad value — it just
+degrades the other way now. The shipped help string is `crates/cyrup/src/cli/help.rs:113`:
+`--tui-mode <mode>              TUI mode: regular (default) or fullscreen`. The flag's own plumbing is
+fine (`crates/cyrup/src/cli/args.rs:178`, `cli/enums.rs:59`); only the default and the two strings are
+wrong.
+
+**Impact** — every cyrup session launches in a different mode from every pi session, and the divergence is
+not only cosmetic: `fullscreenExitOutput`, `fullscreenScrollbar`, `fullscreenCopyOnSelect` and `CFG-100`'s
+`fullscreenWheelScrollLines` are all documented "no effect in regular TUI mode", so out of the box cyrup
+ships four settings that do nothing and pi ships four that do. `medium` and not higher because the escape
+hatch is one settings key and the flag already works; not `low` because it is the default path of the main
+surface.
+
+**Fix** — invert `tui_mode()` to match `:1348` exactly (test for `"regular"`, fall through to
+`Fullscreen`), reword `help.rs:113` to pi's new sentence, and check the `/settings` row's displayed default.
+`crates/cyrup-it/tests/bin/tui_mode_flag.rs` asserts the current default and must be updated in the same
+change, not after it.
+
+**Verify** — the existing getter tests inverted: no `tuiMode` key → `Fullscreen`; `"regular"` → `Regular`;
+`"nonsense"` and a non-string → `Fullscreen` (the degrade case, which is the one a mutant gets wrong). Plus
+the launch-path assertion in `tui_mode_flag.rs` that a bare `cyrup` enters fullscreen.
+
+**Absorbs `TUI-135` (reconciled 2026-10-02).** Area 07 filed the same flip from the renderer
+side. That row is marked **duplicate-of: `CFG-096`** and is not counted; read it for the two
+consequences this row does not state — `crates/cyrup-tui/src/app/mod.rs:251`'s now-false comment,
+and the fullscreen-only area-07 rows (`TUI-102`, `TUI-107`, `TUI-110`, `TUI-136`) the flip moves onto
+the default path. Both must be addressed by whoever lands this.
+
+## CFG-097 — `defaultTools` modifiers, baseline and layer-merge are unported
+
+**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `core/settings-manager.ts` @v1.0.0, from `30a1d1849` "support +name/-name in defaultTools"
+plus `db6cc71dc`. Four pieces, all new in this window:
+
+* `DEFAULT_TOOL_NAMES = ["read", "bash", "edit", "write"]` (`:215`) is now an exported constant and the single source of the baseline; `core/sdk.ts:267` deleted its local `defaultActiveToolNames` copy and imports it.
+* `isToolModifier` (`:217`) — an entry starting with `+` or `-`.
+* `mergeDefaultTools(base, overrides)` (`:225`), called from `deepMergeSettings` (`:250`) as a **special case over the generic deep merge**: a list containing any plain name REPLACES the inherited list, but a list of **only** modifiers is APPENDED, so a project file can modify the global selection instead of replacing it. A malformed value replaces, deliberately: "Settings files are not validated; a malformed value replaces instead of throwing here."
+* `resolveDefaultTools(entries)` (`:236`) — plain names replace `DEFAULT_TOOL_NAMES`; then each `+name`/`-name` is applied **in list order** against the result (`+` appends only when absent and the name is non-empty; `-` removes by index). Note `:238`'s exact condition — `plain.length > 0 || entries.length === 0 ? plain : [...DEFAULT_TOOL_NAMES]` — so `[]` stays empty (all built-ins off) while a modifier-only list starts from the four defaults. `getDefaultTools()` (`:1434`) now returns the RESOLVED list and drops non-string entries first.
+
+`docs/settings.md:40` is the user-facing form ("Plain names replace the defaults; `+name` adds a tool and
+`-name` removes one"), `:50` the worked example `"defaultTools": ["+codemode"]`, and `:56` the reload rule:
+"`/reload` enables tools newly added to `defaultTools`. It does not disable tools removed from it or
+re-enable unchanged tools you turned off."
+
+**cyrup at HEAD** — `crates/cyrup-config/src/settings/effective.rs:200-211`: `default_tools()` returns the
+array's string entries verbatim, with no baseline, no modifier parsing and no resolution. The merge is the
+generic one (`crates/cyrup-config/src/settings/layer.rs`, `deep_merge`), so a project `defaultTools` always
+replaces the global one; `defaultTools` is not in `GLOBAL_ONLY_KEYS` (`layer.rs:27`) and should not be.
+The consumer is `select_active_tools` (`crates/cyrup-session-svc/src/builder.rs:400`, called at `:1177`),
+which treats the value as a literal allowlist of tool names — see `builder.rs:3181`
+`the_default_tools_setting_replaces_pis_four_built_ins`, which pins the pre-modifier semantics.
+
+**Impact** — a user following pi's current documentation writes `"defaultTools": ["+codemode"]`. In pi that
+adds one tool to `read, bash, edit, write`. In cyrup `select_active_tools` looks for a tool named
+`+codemode`, finds none, and the session starts with **no built-in tools at all** — a silent, total loss of
+the default loadout from a documented config line, with no diagnostic. The modifier-only project-layer
+merge is the same class of surprise one level up. That reachable break is why this is `medium`.
+
+**Fix** — in `cyrup-config`: a `DEFAULT_TOOL_NAMES` constant, an `is_tool_modifier` helper, and
+`resolve_default_tools` applied inside `default_tools()`, porting `:236-245` including the `:238`
+edge condition. Then the merge: `deep_merge` needs a `defaultTools` special case mirroring
+`mergeDefaultTools` — appending when the override list is all-modifier, replacing otherwise, replacing when
+either side is not an array. `builder.rs:3181`'s expectations change and must be updated in the same
+change. The `/reload` activation rule at `docs/settings.md:56` is a SEPARATE, area-08 concern and is NOT
+part of this row: pi carries it with a `usesDefaultTools` flag (`core/sdk.ts:448`, `core/agent-session.ts:267`,
+`:3617-3630`) and preserves the live active set across reload, whereas cyrup's `reload`
+(`crates/cyrup-session-svc/src/runtime.rs:847-867`) rebuilds the session through
+`self.factory.build(..)` from a fixed `base_config`, re-deriving the active set from settings. That
+difference predates v1.0.0 and is a boundary of this row rather than part of it: it is recorded here and
+not filed, because it is `cyrup-session-svc`'s reload contract (area 08) and not a `defaultTools` gap.
+
+**Verify** — table-driven tests on `default_tools()`: `["+codemode"]` → the four defaults plus `codemode`;
+`["read","+grep","-read"]` → `["grep"]` (order matters); `[]` → `[]`; `["+"]` → the four defaults unchanged
+(the empty-name guard); a non-array → `Some(vec![])`. Then a merge test: global `["read","bash"]` with
+project `["+grep"]` → `["read","bash","+grep"]` pre-resolution and `["read","bash","grep"]` after, while
+project `["grep"]` replaces outright.
+
+## CFG-098 — `quietStartup` is `boolean | "header"` upstream and a plain bool in cyrup
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `f29ea3deb` "add header-only quietStartup mode", in this window.
+`core/settings-manager.ts:112` `export type QuietStartup = boolean | "header";` with the comment "true
+hides all startup output, `"header"` keeps only the startup header"; the field at `:150`
+(`quietStartup?: QuietStartup; // default: false`); the getter at `:1089` validating to one of the three
+values (`value === true || value === "header" ? value : false`) and the setter at `:1094` taking the widened
+type and writing GLOBAL scope. `docs/settings.md:93`: `true` hides the startup header and the
+loaded-resource listing; `"header"` keeps the header (version and key hints) but hides the model scope line
+and the loaded-resource listing.
+
+**cyrup at HEAD** — `crates/cyrup-config/src/settings/effective.rs:459-461`:
+`self.merged.get_bool("quietStartup").unwrap_or(false)`. A document containing `"quietStartup": "header"`
+therefore reads as `false` — full verbose startup, the opposite end of the three-way scale from the two the
+user might have meant. The consumers are the `/settings` toggle row
+(`crates/cyrup-tui/src/app/settings_rows.rs:183`) and the startup resources panel, whose tests
+(`crates/cyrup-tui/src/tests/startup_resources_panel.rs:104`, `:142`, `:157`) pin the `true` and
+`--verbose`-override behaviour and would carry the new middle case.
+
+**Impact** — small but not nil: the value on disk survives the round-trip (unknown-shape keys are
+preserved), so nothing is corrupted, but the setting is silently misread, and the `/settings` row is a
+two-state toggle over a three-state key — flipping it writes a bool and destroys a `"header"` value the user
+set by hand.
+
+**Fix** — a three-variant `QuietStartup { Off, Header, All }` in `settings/types.rs` with pi's validation
+(`true`/`"header"` accepted, everything else `Off`), `quiet_startup()` returning it, and the startup panel
+splitting its suppression into "header" and "everything below the header". The `/settings` row becomes a
+cycle rather than a toggle, as upstream's selector does. `--verbose` must keep overriding all three.
+
+**Verify** — getter tests for `true`, `false`, `"header"`, `"nonsense"` and a number; then a panel test that
+`"header"` prints the version/hint header and suppresses the model scope line and the resource inventory,
+with `--verbose` restoring both.
+
+**Reconciled 2026-10-02 — **duplicate-of: `TUI-137`**.** `TUI-137` (`07-…`, low) carries the same
+widening with the whole of it: the tri-state getter, *both* of upstream's new predicates
+(`shouldShowStartupHeader` = `verbose || getQuietStartup() !== true`, `shouldShowStartupDetails` =
+`verbose || getQuietStartup() === false`), the three consumer sites the details gate now guards, the
+dropped " and loaded resources" clause, and the `/settings` row's change from toggle to choice. This
+row is the config-model half of that one fix and is not counted separately; the `QuietStartup` enum
+it specifies is `TUI-137`'s first step.
+
+## CFG-099 — The global-only `deviceId` setting and its lazy minting are unported
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed (cyrup absence by grep; upstream read) · **Filed** 2026-10-02
+
+**upstream** — `core/settings-manager.ts:158` @v1.0.0:
+`deviceId?: string; // stable UUID of this installation, created when a login first needs it; global setting only`.
+`getOrCreateDeviceId()` (`:1175`) mints a `randomUUID()` into `globalSettings` on first use, calls
+`markModified("deviceId")` and `save()`, and returns it; its doc comment states both halves of the
+contract — "Stable ID of this installation, e.g. sent to OpenAI as its agent host ID. Created on first use.
+Project settings are ignored so a committed project settings file cannot give every clone the same ID."
+`core/bug-report.ts:62` adds it to the destructure that strips identifiers before a report is written:
+`const { trackingId: _trackingId, deviceId: _deviceId, ...rest } = settings;`.
+
+**cyrup at HEAD** — `grep -rn 'device_id\|deviceId' crates/ --include='*.rs'` is **0**: no field, no getter,
+and `deviceId` is absent from `GLOBAL_ONLY_KEYS` (`crates/cyrup-config/src/settings/layer.rs:27`, which
+holds `defaultProjectTrust`, `httpProxy`, `cacheWarming`).
+
+**Impact** — low and mostly latent. The one consumer upstream names is the OpenAI alternative sign-in added
+in the same window (`02eed88fd`), which sends the id as an agent host identifier — area 01's surface, not
+filed here. Two things make the row worth keeping now rather than deriving later: the key must be
+**global-only**, which is a property of cyrup's merge layer and is cheap to get wrong (a committed project
+`deviceId` giving every clone of a repo the same installation id is exactly what pi's comment warns about);
+and it must be redacted from bug reports, which is a privacy property that is easy to omit when the field
+is added for its consumer.
+
+**Fix** — add the field, add `"deviceId"` to `GLOBAL_ONLY_KEYS`, and add
+`SettingsManager::get_or_create_device_id()` writing the GLOBAL scope on first call (the pattern
+`set_cache_warming_mode` already uses, `crates/cyrup-config/src/settings/manager.rs:441`). Add it to
+whatever cyrup's bug-report redaction strips alongside `trackingId` in the same change.
+
+**Verify** — `get_or_create_device_id()` is stable across calls and across a reload, writes only the global
+document, and a project `deviceId` does not change what it returns; a generated bug report contains neither
+`trackingId` nor `deviceId`.
+
+## CFG-100 — `fullscreenWheelScrollLines` is not modelled
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `f1927c2d5` "configurable fullscreen wheel scrolling with auto acceleration", in this
+window. `core/settings-manager.ts:188`:
+`fullscreenWheelScrollLines?: WheelScrollLines; // default: "auto"; lines per wheel event, 1-100`, with
+`WheelScrollLines` imported from `@earendil-works/pi-tui`. `getFullscreenWheelScrollLines()` (`:1389`)
+returns `"auto"` for anything non-finite and otherwise
+`Math.max(1, Math.min(100, Math.floor(lines)))`; the setter (`:1399`) clamps identically before writing the
+GLOBAL scope. `docs/settings.md:98` documents `"auto"` as: one line per event in local macOS terminals,
+which already accelerate wheel and trackpad input; elsewhere, and over SSH, fast wheel spins are sped up to
+at most 6 lines per event — and Alt+wheel moves five times as far.
+
+**cyrup at HEAD** — `grep -rn 'wheel_scroll\|WheelScroll\|fullscreenWheel' crates/ --include='*.rs'` finds
+only the hard-coded path: `crates/cyrup-tui/src/altscreen/wheel.rs:71` `fn wheel_scroll_lines(modifiers)`
+returns a constant per modifier set, cited to pi's pre-v1.0.0 `getWheelScrollLines(button)`, and
+`routeWheel`'s port at `:81-91` consumes it. `crates/cyrup-tui/src/tests/alt_screen.rs:304`
+`alt_wheel_scrolls_five_lines_per_notch` pins the constant. No settings key exists.
+
+**Impact** — low on its own, and today it is dead weight besides: with `CFG-096` open, cyrup is not in
+fullscreen by default, so the key would have no effect for most users. It is filed as a sibling of `CFG-096`
+so the fullscreen settings group closes as a set rather than in halves, and because the `"auto"` behaviour
+is a measured platform heuristic that a later porter would otherwise have to re-derive from
+`packages/tui`.
+
+**Fix** — a `WheelScrollLines { Auto, Lines(u8) }` in `settings/types.rs` with pi's clamp applied on BOTH
+read and write (`:1389` and `:1399` clamp independently — a hand-edited `500` must read as 100, not be
+rejected), the getter/setter pair, and then `wheel.rs` consulting it with the `auto` heuristic from
+`packages/tui`. Land after `CFG-096`.
+
+**Verify** — getter tests for unset, `"auto"`, `0`, `1`, `100`, `500`, `3.7` (floors to 3) and a string;
+the setter round-tripping a clamped value; and a wheel test that an explicit `1` overrides the
+five-lines-per-notch constant the current test pins.
+
+**Reconciled 2026-10-02 — **duplicate-of: `TUI-136`**.** `TUI-136` (`07-…`, low) owns this: the
+setting *and* the `WheelScrollAccelerator` it feeds, which is the substance — the velocity ladder
+(100 ms → 1 line, 50 ms → 2, 20 ms → 5, `MAX_AUTO_LINES` 6), the 5 ms burst floor, the 200 ms gesture
+gap, the fractional carry, and `terminalAcceleratesWheel()`'s darwin-and-no-SSH condition. This row is
+the settings-key half and is not counted separately. Its one addition, which the fix must keep: pi
+clamps on **read** (`:1389`) and on **write** (`:1399`) independently, so a hand-edited `500` reads
+back as `100` rather than being rejected.
+
+## CFG-101 — `mcp.json` is missing from the resources that make a project require trust
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `core/trust-manager.ts` @v1.0.0, `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES`:
+`"settings.json"`, **`"mcp.json"`** (`:32`, added in this window), `"extensions"`, `"skills"`, `"prompts"`,
+… — the list that decides whether a project has anything worth asking the user to trust, and therefore
+whether the trust prompt is shown at all.
+
+**cyrup at HEAD** — `crates/cyrup-config/src/trust.rs:211-219`, `has_trust_requiring_resources`:
+
+    const CYRUP_MARKERS: &[&str] = &[
+        "settings.json", "extensions", "skills", "prompts", "themes", "SYSTEM.md", "APPEND_SYSTEM.md",
+    ];
+
+probed under `<cwd>/.cyrup`, plus the `.agents/skills` ancestor walk. No `mcp.json`. The callers are
+`crates/cyrup-tui/src/app/session_bind.rs:132` and `app/reload_trust.rs:132`, which skip the prompt
+entirely when it returns false.
+
+**Impact** — fail-closed, not a hole, and that is why it is `low`. cyrup DOES read project MCP config
+(`<cwd>/.mcp.json` and `<cwd>/.cyrup/mcp.json`, `crates/cyrup-mcp/src/config.rs:3036-3038`) and DOES gate
+it on trust — `config.rs:3146` records that when the project is untrusted both files contribute "zero
+servers" (`MCP-096`). So the consequence of the missing marker is the benign direction: a repository whose
+only project config is `.cyrup/mcp.json` never triggers the prompt, so it is never trusted, so its servers
+are silently ignored with nothing in the UI explaining why. pi asks, and the user can say yes.
+
+**Not a duplicate of area 13's rows.** `MCP-096` and `MCP-591` are about what the MCP
+layer DOES with a project server once trust is known (gating, and v3.0.0's per-definition approval). This
+row is one entry in `cyrup-config`'s probe list that decides whether trust is ever ASKED about. Different
+file, different owner, no overlap.
+
+**Fix** — add `"mcp.json"` to `CYRUP_MARKERS`. Note the asymmetry deliberately: pi's list is relative to its
+project config dir, so pi's entry covers `.pi/mcp.json`; cyrup's bare `<cwd>/.mcp.json` (the shared,
+non-cyrup-specific file) is NOT under `.cyrup` and is not covered by this list on either side — do not add
+it, or every repository with a `.mcp.json` for any other agent starts prompting for cyrup trust.
+
+**Verify** — `has_trust_requiring_resources` returns true for a cwd containing only `.cyrup/mcp.json` and
+still false for a cwd containing only a bare `.mcp.json`; plus the TUI-side assertion that the trust prompt
+is offered in the first case.
 
 ## Coverage
 

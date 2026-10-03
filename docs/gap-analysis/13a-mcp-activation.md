@@ -92,6 +92,106 @@ else in these eleven files ports.
 > | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
 > | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
 
+### Items filed 2026-10-02 — `pi-mcp-adapter` `v2.38.0..v5.0.0` and pi `v0.87.1..v1.0.0`
+
+> **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
+> `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
+> **Next free id: `MCP-609`.** Upstream was read only through
+> `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
+> `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
+> `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
+> **Architecture is not in question and no row below proposes restructuring `cyrup-mcp`:** pi moving
+> MCP into its monorepo as a first-class package is pi arriving where cyrup already is, and `MCP-587`
+> records what that means for citations and nothing else.
+
+Two rows on startup discovery and the runtime event bus. Neither changes the activation seam; both
+are refinements of behaviour this file already owns.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| MCP-598 | medium | upstream-drift | M | **Startup discovery is still all-or-nothing on the cache *file*, so a server added after the first session is never discovered and first-run servers stay connected until idle-out** — `init.ts` at v5.0.0 decides per server and closes after discovery. **FILED 2026-10-02**; body below. |
+| MCP-599 | low | not-ported | S | **`MCP_RUNTIME_TOOL_CALL_EVENT`, the third event on the runtime bus, is unported** — `dc0d06c` (#735); extends `MCP-510`, which already owns the other two. **FILED 2026-10-02**; body below. |
+
+#### MCP-598 — startup discovery should be per server, and should close what it opened
+
+**upstream** — `149fdf1` (#788, v5.0.0), the last perf commit before release. `initializeMcp`
+(`init.ts:112`) previously computed a single `bootstrapAll` from `existsSync(cachePath)` and either
+connected every enabled server or only the `keep-alive` / `eager` ones. It now builds two sets per
+server before choosing a startup set:
+
+```text
+} else if (cachedEntry?.discoveryFailed && cachedEntry.configHash === tryComputeServerHash(definition)) {
+  failedDiscovery.add(name);          // startup tries a config once; retried on first use
+} else if (cachedEntry?.cacheScope !== "private") {
+  needsDiscovery.add(name);           // missing / changed-hash / corrupt / past server TTL
+}
+…
+const startupServers = serverEntries.filter(([name, definition]) => {
+  const mode = definition.lifecycle ?? "lazy";
+  return mode === "keep-alive" || mode === "eager" || needsDiscovery.has(name);
+})
+```
+
+and each startup entry carries
+`resident = (definition.lifecycle ?? "lazy") !== "lazy" || getEffectiveIdleTimeoutMinutes(state, name) === 0`,
+so a **non-resident** server discovered only to read its catalogue is **closed** once its catalogue is
+captured into the session. The whole-file `saveMetadataCache({version:1,servers:{}})` bootstrap is
+dropped, and the cache is written **once** at the end instead of once per discovered server.
+
+**cyrup at HEAD** — `runtime.rs:526-530` sets `bootstrap_all = true` only when
+`!cache_file_exists`, explicitly *not* when the file exists but does not parse ("a corrupt cache must
+stay cheap rather than becoming a connect storm", `:533`), and `:582` filters
+`bootstrap_all || definition.lifecycle_mode().is_prewarmed()`. Nothing consults the per-entry
+validity, nothing closes a server after discovery, and `MCP-021`'s rehydration path writes per
+server.
+
+**The three failures, in order of how likely a user is to hit them.**
+1. **A server added after the first session is never discovered.** The cache file exists, so
+   `bootstrap_all` is false, and a `lazy` server is not prewarmed — it is absent from search and from
+   the direct-tool surface until the model happens to call it by name. With `MCP-595` the entry never
+   expires either, so there is no eventual self-correction.
+2. **A first run connects every enabled server and leaves them all running** until the idle sweep
+   starts, because idle checks begin after initialization.
+3. **Each discovered server rereads and rewrites the whole cache file**, which upstream measures in
+   seconds with many large catalogues.
+
+**Work.** `M`. Replace the file-existence test with a per-server `cached_entry_if_valid` decision,
+add the `resident` test and a close-after-capture step, and move the cache write to a single flush.
+`MCP-596` supplies `discovery_failed` and `cache_scope`, which the `failedDiscovery` arm needs;
+without them that arm degrades to "always rediscover", which is safe but loses the once-per-config
+property — record that as the interim behaviour rather than silently approximating it.
+Land with `MCP-595`.
+
+`verify` — a test that a server added to the config after a cache file exists is discovered at the
+next startup; a test that a `lazy` server with a non-zero idle timeout is **closed** after startup
+discovery while a `keep-alive` one is not; an assertion that the cache file is written once for N
+discovered servers.
+
+#### MCP-599 — `MCP_RUNTIME_TOOL_CALL_EVENT`
+
+**upstream** — `dc0d06c` (#735, v3.3.0). One new event on the existing `pi.events` bus, letting a
+sibling extension invoke an already-configured MCP tool from its own backend code, with no model
+turn. The commit states the gap it fills: the bus already carried `MCP_RUNTIME_REGISTER_EVENT`
+(register a server at runtime) and `MCP_RUNTIME_SNAPSHOT_EVENT` (read one back), but the only two
+invocation paths were the model-facing `mcp` proxy and the direct tools.
+
+**cyrup at HEAD** — `grep -rn 'MCP_RUNTIME' crates/ docs/gap-analysis/` finds nothing in the crates.
+`MCP-510` (`13-cyrup-mcp-STATUS.md:760`, **high**, **missing**) already owns the surface:
+"`registerMcpServer({pi, name, definition})` — session-scoped runtime registration … cross-extension
+through a versioned shared event contract; plus fail-closed runtime server snapshots", i.e. the other
+two events.
+
+**Why a row at all.** `MCP-510`'s obligation names two events; this is a third, and it is the one
+with a security shape of its own — it lets a sibling extension call an MCP tool **without a model
+turn and therefore outside the model-facing approval path**. Whoever builds `MCP-510` must decide
+whether such a call goes through `ensure_tool_call_approved`; upstream routes it through the normal
+invocation path, which is the answer to copy. Filed at `low`/`S` as an **amendment to `MCP-510`**,
+not independent work, and it should be closed by whoever closes that unit.
+
+`verify` — covered by `MCP-510`'s verification, plus one assertion that a bus-initiated call is
+subject to the same approval gate as a proxy call.
+
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
 > **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** `resources_discover` plugin skills → **`MCP-565`** (the host event exists: `cyrup-ext` `HostEvent`/`EventKind::ResourcesDiscover`, so the seam is `host-verb`); `provisionalInstalls` → folded into **`MCP-563`** (install); the `getConfigPathFromArgv` narration → **`MCP-551`**; the agent-dir ladder correction **confirmed** at `ea23ca2` (`cyrup-config/src/paths.rs` `ENV_AGENT_DIR_KEYS = ["CYRUP_AGENT_DIR", "CYRUP_CODING_AGENT_DIR"]`, no `PI_*` rung); `MCP-027a` as prerequisite stands, recorded on **`MCP-564`**. From v2.34–v2.37: `deferWithMissingMetadata` → **`MCP-572`**. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.

@@ -72,6 +72,245 @@ unfiltered text entering the model's context under either system.
 > | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
 > | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
 
+### Items filed 2026-10-02 — `pi-mcp-adapter` `v2.38.0..v5.0.0` and pi `v0.87.1..v1.0.0`
+
+> **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
+> `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
+> **Next free id: `MCP-609`.** Upstream was read only through
+> `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
+> `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
+> `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
+> **Architecture is not in question and no row below proposes restructuring `cyrup-mcp`:** pi moving
+> MCP into its monorepo as a first-class package is pi arriving where cyrup already is, and `MCP-587`
+> records what that means for citations and nothing else.
+
+Five rows, and one of them is this pass's only `high`: `approveTools` fails **open** on any value
+cyrup cannot parse, and `"destructive"` — newly documented upstream — is such a value, so a
+config written for pi 1.0 auto-approves the tools it meant to gate.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| MCP-600 | medium | parity-bug | S | **A tool call is marked in flight only *after* approval, so an approval dialog left open past the idle timeout lets the idle sweep close the server and the approved call fails** — upstream moved the mark before the gate at `proxy-modes.ts:1587-1590` and `direct-tools.ts:252-255`. **FILED 2026-10-02**; body below. |
+| MCP-601 | medium | not-ported | M | **MCP tool annotations are dropped end to end, so neither the model nor the user can tell a read-only tool from one that deletes data** — `utils.ts:500 extractToolAnnotations`, `types.ts:752 McpToolAnnotations`. **FILED 2026-10-02**; body below. |
+| MCP-602 | high | not-ported | M | **`approveTools` fails *open* on any value cyrup cannot parse, and the new documented value `"destructive"` is one of them — copying it from upstream's docs silently disables MCP tool approval** — `tool-approval.ts:35-44`, `types.ts:495`/`:670`. **FILED 2026-10-02**; body below. |
+| MCP-603 | low | not-ported | M | **Observed output shapes for tools that declare no `outputSchema` are unported** — new `output-shape.ts` at v5.0.0 (`:13`, `:53`, `:97`). **FILED 2026-10-02**; body below. |
+| MCP-604 | low | not-ported | S | **Search-mode direct tools are not registered at the `deferred` exposure** — `59d6041` (#772); the MCP-side consumer of the release post's "deferred tool loading", whose host half is `CODE-005`. **FILED 2026-10-02**; body below. |
+
+#### MCP-600 — in-flight must be raised before the approval gate, not after it
+
+**upstream** — `43768d3` (#786, v5.0.0). The commit body names three kinds of use the idle check
+could not see, the first of which is the one that applies to cyrup: "Tool calls marked the server in
+flight only after approval, so an approval dialog left open past the idle timeout let the check close
+the server and the approved call failed (proxy, direct tools, and MCP UI app calls)." The fix moves
+the mark to immediately after the final connected check, inside the existing `try`/`finally` so the
+approval wait is covered, and re-raises approval errors unchanged:
+
+```text
+// proxy-modes.ts:1587-1590        // direct-tools.ts:252-255
+// In flight from here so an idle check cannot close the server while the approval dialog is open.
+state.manager.incrementInFlight(serverName);
+approval = await ensureToolCallApproved(…)
+```
+
+(The other two kinds of use — a UI page heartbeat and an accepted URL elicitation — are Cut 2 and a
+`13i` concern respectively; neither is owed here.)
+
+**cyrup at HEAD** — `proxy/call.rs` runs the gate at **Phase 8 — approval** (`:777` comment,
+`ensure_tool_call_approved` at `:787`) and raises in flight **59 lines later**, at `:845-846`:
+
+```text
+// try { touch; incrementInFlight; … } finally { decrementInFlight; touch }
+ctx.env.touch(&server_name);
+ctx.env.increment_in_flight(&server_name);
+```
+
+The idle sweep's predicate is `McpServerManager::is_idle` (`server_manager.rs:1801`), which is
+`false` while in-flight work exists (`:3978`) — so the window between the gate and `:846` is exactly
+the window in which an idle server can be reaped.
+
+**The failure, concretely.** A server with the default idle timeout (10 minutes) and an
+approval-gated tool. The model calls the tool, the approval dialog opens, the user is away for eleven
+minutes, and then clicks Allow. `is_idle` was true for the last minute with no in-flight work, the
+sweep closed the connection, and the approved call fails on a closed connection — after the user
+explicitly approved it. `medium` rather than `high` because it needs the dialog to outlive the idle
+timeout; `S` because the fix is moving two lines above the gate and widening the existing
+`try`/`finally` equivalent so `decrement_in_flight` still runs on the denied and errored paths.
+
+**Two things not to get wrong.** The `touch` at `:845` must move with the increment, or the
+server is in flight but its `last_used_at` still predates the dialog. And the denied/`approval_required`
+early returns at `:800` onward currently return **before** any decrement exists; after the move each
+must decrement, which is what upstream's `finally` gives it for free.
+
+`verify` — a test that holds the approval prompt open past the idle timeout, runs the idle sweep, and
+asserts the server is **not** closed and the approved call succeeds; a test that a **denied** call
+still decrements in flight and the server becomes idle afterwards.
+
+#### MCP-601 — MCP tool annotations are dropped
+
+**upstream** — `2bc904f` (#728, v3.3.0). The commit body states the gap in the same terms this row
+needs: "Servers declare read-only, destructive, idempotent, and open-world hints on their tools. The
+adapter dropped them, so neither the model nor the user could tell a read-only tool from one that
+deletes data."
+- `types.ts:752` — `interface McpToolAnnotations { title?, readOnlyHint?, destructiveHint?,
+  idempotentHint?, openWorldHint? }`, documented "Hints, not guarantees."
+- `utils.ts:500 extractToolAnnotations(annotations: unknown)` — keeps `title` only when it is a
+  string and each of the four hints only when it is a boolean, returns `undefined` when nothing
+  survives. The doc comment gives the reason: "Server and cache input is untrusted, so a malformed
+  field is dropped instead of failing the tool list."
+- Carried on **both** `ToolMetadata` (`types.ts:748`) and `CachedTool` (`types.ts:803`), so a hint
+  survives a cold start.
+- Shown **only where a decision is made**: `mcp({ describe })`, and the approval prompt
+  (`tool-approval.ts:191-193` appends "The server marks this tool as destructive: it may delete or
+  overwrite data." or the read-only counterpart). Search results and direct-tool descriptions are
+  deliberately **unchanged** — porting the hints into those would be a divergence.
+- The commit's second half is the subtle part: a direct tool's spec is fixed at registration, often
+  from the cache, and with `freezeDirectTools` it is never re-registered — so approval reads the
+  hints from the **live** metadata that lazy connect refreshes, and `annotations` is **removed** from
+  `DirectToolSpec` and from its re-registration fingerprint. A server that newly marks a tool
+  destructive must prompt with the warning. Server tool titles are escaped in describe hints.
+
+**cyrup at HEAD** — `grep -rln 'annotation' crates/cyrup-mcp/src` matches only `schema.rs`, which is
+`appendSchemaAnnotations` — JSON-Schema annotations in the parameter renderer
+(`13e-mcp-tools.md:410`), an unrelated surface. `ToolMetadata` (`proxy/tool_metadata.rs:35`) has
+`name`, `original_name`, `description`, `resource_uri`, `ui_visibility`, `input_schema` and no
+annotations field; so do `CachedTool` (`registration.rs:889`) and its `dirs.rs:507` sibling.
+
+**Dependency.** This is the data `MCP-602` consumes; `"destructive"` cannot be implemented without
+it. Land this first.
+
+**Digest note.** `annotations` is not part of `computeServerHash`'s identity object, so no golden
+vector moves.
+
+`verify` — a test that a malformed `annotations` member is dropped and the rest kept; a test that a
+hint survives a cache round-trip; a test that the approval prompt carries the destructive line; a
+test that `DirectToolSpec`'s fingerprint is **unchanged** by a hint change and that approval reads
+the live value anyway.
+
+#### MCP-602 — `approveTools` fails open, and `"destructive"` is the value that makes it bite
+
+**upstream** — `a4b3e90` (#731, v3.3.0). `types.ts:495` and `:670` widen both the per-server and the
+global field to `boolean | "destructive" | string[]`, and `isToolCallApprovalRequired`
+(`tool-approval.ts:25`) is restructured so that the *default* direction is to ask:
+
+```text
+if (approval === undefined || approval === false) return false;
+// MCP treats a tool as possibly destructive unless it says otherwise; reading a resource never is.
+if (approval === "destructive") {
+  return toolMeta.resourceUri === undefined
+    && toolMeta.annotations?.readOnlyHint !== true
+    && toolMeta.annotations?.destructiveHint !== false;
+}
+// Values from unvalidated sources (imports, runtime registration) fail closed.
+if (!Array.isArray(approval)) return true;
+if (approval.length === 0) return false;
+```
+
+Two behaviours, and the second is the one that matters here. (1) `"destructive"` gates every tool
+except a resource read and a tool the server marks `readOnlyHint: true` or `destructiveHint: false` —
+**unannotated tools are gated**. (2) Anything that is neither `undefined`, `false`, `"destructive"`
+nor an array now **requires** approval; the commit body names the old behaviour as the bug: "An
+unknown `approveTools` value used to turn approval off silently. Adapter config files with one are
+now rejected with a warning naming the key, and such values from other sources require approval."
+
+**cyrup at HEAD, and this is the finding.** `BoolOrList` (`config.rs:1839`) is
+`All(bool) | Named(Vec<String>)` — **no string variant and no catch-all** — and both
+`ServerEntry::approve_tools` (`:951`) and `McpSettings::approve_tools` (`:1166`) are declared
+`#[serde(default, deserialize_with = "lenient", …)]`. `lenient` degrades a type mismatch to `None`.
+`proxy/approval.rs:89-96` then reads:
+
+```text
+let patterns: &[String] = match approval {
+    Some(BoolOrList::All(true)) => return true,
+    Some(BoolOrList::Named(list)) if !list.is_empty() => list.as_slice(),
+    _ => return false,
+};
+```
+
+So the chain for `"approveTools": "destructive"` is: not a bool, not an array ⇒ `lenient` ⇒ `None`
+⇒ `_ => return false` ⇒ **no approval prompt for any tool on that server**. The same holds for a
+typo (`"approveTool"` is an unknown key, but `"approveTools": "all"` or `"approveTools": "true"` hits
+this path exactly), and no diagnostic is emitted because `lenient`'s whole purpose is to not fail the
+file.
+
+**Why `high`.** `"destructive"` is now the documented way to ask before data-changing tools, it is in
+upstream's README, and a user copying it into cyrup's `mcp.json` gets the **opposite** of what they
+asked for: every MCP tool on that server runs unprompted, silently, with no warning anywhere. That is
+a user-visible security break on a path cyrup runs, produced by following the documentation. It is
+the only `high` this pass files.
+
+**Work.** `M`, in three parts, and the order matters. (a) Give `BoolOrList` a `Destructive` variant
+and an `Other(RawJson)` catch-all, and **stop using `lenient` here** — or keep `lenient` and have the
+`None`-from-mismatch case fail closed, which needs the mismatch to be distinguishable from absent, so
+the catch-all variant is the cleaner route. (b) Restructure `is_tool_call_approval_required` to
+upstream's order, with `Other(_) => return true` and a diagnostic naming the key at config load.
+(c) The `"destructive"` arm itself needs `MCP-601`'s annotations; until that lands, `"destructive"`
+must gate **everything** except resource reads, which is the fail-closed approximation and must be
+recorded as a `[CYRUP-DELTA]` with its removal condition.
+
+`verify` — a test per value (`true`, `false`, `[]`, a name list, `"destructive"`, and a garbage
+string) asserting the gate's answer, with the garbage string asserting **`true`**; a test that a
+garbage value produces a named load-time diagnostic; once `MCP-601` lands, a test that
+`readOnlyHint: true` skips the prompt under `"destructive"` and an unannotated tool does not.
+
+#### MCP-603 — observed output shapes
+
+**upstream** — `f345701` (#730, v3.3.0), new module `output-shape.ts`. After a successful call to a
+tool that declares no `outputSchema`, a bounded shape — **field names and JSON types only, never
+values** — is inferred from the result's `structuredContent` or its single JSON text block and kept
+**in memory for the session**: `interface OutputShape` (`:13`), `interface ObservedOutput` (`:22`),
+`observedOutputRecorder(state, serverName, toolName)` (`:53`), `seedObservedOutputs(state,
+serverName, entry)` (`:97`). It is shown by `mcp({ describe })`, labelled as observed and explicitly
+not a contract. The commit's follow-up keeps data-shaped keys out of the inferred shape. No new
+config key. `0ff0b85` later ties shape persistence to the cache scope — a shape observed under a
+private listing is session-only and never saved, and a cache rewrite does not carry shapes out of an
+entry marked private (see `MCP-596`).
+
+**cyrup at HEAD** — `grep -rn 'output_shape\|observed' crates/cyrup-mcp/src` finds nothing on this
+surface; the only `output-shape` match in the tree is an unrelated identifier in
+`request_headers_command.rs`. `mcp({ describe })` renders `input_schema` and, where the server
+supplied one, `output_schema`, and says nothing when there is no output schema.
+
+**Scope note.** Upstream shows the shape in two places: `mcp({ describe })` and `mcpScript`'s
+`tools.describe`. The second is **Cut 4** and is not owed; port the describe leg only and say so at
+the site, so a later reader does not file the missing half.
+
+**`low` because** it is a describe-only affordance on a brand-new upstream surface with no
+correctness consequence, and `M` because the inference needs the bounded-shape rules, the
+data-shaped-key exclusion, and the session-only storage with the private-scope rule from `MCP-596`.
+
+`verify` — a test that a result with `structuredContent` yields field names and types and **no
+values**; a test that a data-shaped key (a map keyed by ids) is excluded; a test that the shape is
+labelled observed in describe output and is not persisted.
+
+#### MCP-604 — register search-mode direct tools at the `deferred` exposure
+
+**upstream** — `59d6041` (#772, v5.0.0): search-mode tools are registered as pi **deferred tools** on
+pi 0.99+, and the direct tool's `execute` stays in place. The host mechanism is pi's
+`ToolExposure = "direct" | "model-only" | "codemode" | "deferred" | "hidden"`
+(`packages/coding-agent/src/core/extensions/types.ts:509` at `v1.0.0`), documented at `:503`:
+"`deferred`: like `codemode`, but codemode tools do not list it; tool search can find and activate
+it." This is the MCP-side consumer of the release post's "deferred tool loading" headline.
+
+**cyrup at HEAD** — the host half does not exist: area 18's `CODE-005` records 0 hits
+for `ToolExposure`, `ToolLoadout`, `ToolNamespace` and `prepare_loadout` across the tree, and names
+itself a shared prerequisite of this area and of `TOOL-052` (`04-…`). cyrup's search-mode direct tools
+are registered through the ordinary lazy/inactive path (`DirectToolSpec::lazy`,
+`registration.rs`), activated by a successful `mcp({ search })` or `mcp({ tool })` call.
+
+**Why a separate row rather than nothing.** `CODE-005` owns the exposure model; it does not name the
+MCP consumer, and without this row the MCP side of the headline feature has no home. Filed `low`/`S`
+as the **dependent** half: when `CODE-005` lands, register search-mode direct tools with the
+`deferred` exposure instead of the lazy-inactive path, and decide explicitly whether cyrup's
+lazy-inactive mechanism is then redundant or kept as the pre-`CODE-005` fallback — `CODE-005`'s body
+already flags "`direct` or `deferred` as cyrup's default" as a `[CYRUP-DELTA]` decision.
+
+**Do not duplicate.** No part of the `ToolExposure` / `ToolLoadout` / `prepareLoadout` port belongs
+to this row.
+
+`verify` — once `CODE-005` lands: a test that a search-mode MCP tool is findable by tool search while
+inactive and is activated by it, and that its `execute` is unchanged.
+
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
 > **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** search-mode lazy registration → **`MCP-561`**; `connectAndReport` → **`MCP-562`**; `session-approvals.ts` half (b) → **`MCP-559`** (half (a) was already `MCP-232`'s 2026-09-14 re-ruling); brokers-before-grants → **struck, not applicable** (cyrup's broker is the `before_tool_call` gate, which runs before `execute` and so before the cache); `formatServerNamespace` → already `MCP-513`; `outputSchema` → **struck** (only reader at v2.37.0 is `mcp-code.ts`, Cut 4); host truncation → **`MCP-558`** (inverts `MCP-226`'s premise; row untouched). From v2.34–v2.37: #612 and #603 amend `MCP-516`; the large-tools advisory (#634) → **`MCP-581`**. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
