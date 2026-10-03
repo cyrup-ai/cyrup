@@ -7,6 +7,25 @@
 > `HARN-004` measures what `packages/durable` became. Ids are `HARN-NNN` for pi's harness and
 > `DUR-NNN` for `packages/durable` and the packages around it.
 
+> **CORRECTED 2026-10-03 (file-level; ledger corrections after PR #173 and ADR-0029/ADR-0030).**
+> This file was written before cyrup built a Pico5 durability kernel. Since then
+> `docs/adr/ADR-0029-durable-pico5-scope.md` (accepted 2026-10-02, "decided by default under the
+> parity rule — overridable") decided the scope question this file's trackers deferred: design to
+> the Pico5 specification, build the durability kernel (spec §1–§4 and §10–§11) as Rust-native code,
+> do **not** build §5–§9 (scheduler, durable task machine, `ExecutionEnv`, `CodingTools`), and do not
+> port the implementation. `docs/adr/ADR-0030-durable-rust-architecture.md` sets the Rust design.
+> The ADRs do not use the id "OQ-7", but the question they decide is the harness-scope question this
+> file calls OQ-7 (`AGENT-028` / `SESS-038` / `DRIFT-040`), so every "OQ-7 is open / deferred" sentence
+> below is stale; ADR-0029 records the decision and names itself owner of `HARN-002` and `HARN-004`.
+> The kernel landed in the tree with PR #173 (merge `6bd82cb2`, build commit `d9fe2b05`): crates
+> `cyrup-pico`, `cyrup-pico-doc`, `cyrup-pico-store` and `cyrup-pico-store-jsonl`. Consequence: the
+> cyrup-side sentences "no durable-task ... concept anywhere in `crates/`" (`HARN-001`), "no
+> versioned-document store, no task or submission tables" (`HARN-002`, `HARN-004`) and the
+> "`grep -rli 'pico3\|pico5\|pi-durable\|packages/durable' crates` returns 0" claim (`HARN-003`) are
+> no longer true; see the CORRECTED notes on those rows. Also corrected below: the sentence that
+> "Six of the seven rows are `tracker`s" (there are eight rows and seven trackers), `HARN-004`'s
+> "~18 600 lines" and "five task kinds", and the dead `docs/pico-v5.md` path (`DUR-003`).
+
 **This file is new (2026-09-24).** Until now README's pin table said that two things in pi were owned
 by no area file: `packages/agent/src/harness/**` in the new window, and the new `packages/durable`.
 This file owns both, for the window **`v0.85.1..v0.87.1`**, and it adds the ids **`HARN-001`…`HARN-002`**.
@@ -115,7 +134,7 @@ Negative results, recorded so the next pass does not repeat them: `grep -rli
 
 ## Open items
 
-> **Next free ids: `HARN-005` and `DUR-005`** (2026-10-02, after the pi v1.0.0 pass filed `HARN-003`, `HARN-004` and `DUR-001`…`DUR-004`).
+> **Next free ids: `HARN-005` and `DUR-006`** (2026-10-02, after the pi v1.0.0 pass filed `HARN-003`, `HARN-004` and `DUR-001`…`DUR-004`). **2026-10-03:** `DUR-005` was filed and closed (cyrup-original, the `cyrup-session` rename-durability fix landed with PR #173; it is the only closed row in this table) — `DUR-006` is next; `HARN-005` is unallocated.
 
 > The standard `ID | Severity | Kind | Effort | Title` table, as README's *Item format* requires and
 > as `09b` uses. Two id series: `HARN-NNN` for pi's harness, `DUR-NNN` for `packages/durable` and the
@@ -124,17 +143,24 @@ Negative results, recorded so the next pass does not repeat them: `grep -rli
 > tally until their escalation condition fires. The one severity-bearing row is `DUR-003`, which is a
 > citation defect in this file and in `HARN-002`, not a port gap.
 > `scripts/count_open_items.py` lists this file (added by the 2026-09-24 synthesis pass).
+>
+> **CORRECTED 2026-10-03:** "Six of the seven rows are `tracker`s" is wrong. The table had eight rows
+> (`HARN-001`…`HARN-004`, `DUR-001`…`DUR-004`), of which **seven** are `tracker`s (every row but
+> `DUR-003`). It now has nine: `DUR-005` is a closed `cyrup-original` row, filed 2026-10-03 (below the
+> `DUR-004` row). Counted set (`count_open_items.py`): 0 critical · 0 high · 0 medium · 1 low = 1 open,
+> 7 trackers, 1 closed.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| HARN-001 | tracker | not-ported | L | pi's experimental Pico3 durable harness kernel (`@earendil-works/pi-agent-core/experimental/pico3`, new at v0.86.0, 8 016 lines) has no cyrup counterpart. It is library-only: its one consumer is the unpublished `coding-agent/src/experimental/micro` |
-| HARN-002 | tracker | not-ported | L | The new `@earendil-works/pi-durable` package (v0.86.0; SQLite backend at v0.87.1) has no cyrup counterpart. At v0.87.1 it is a storage layer with zero `src` consumers anywhere in pi |
-| HARN-003 | tracker | upstream-drift | S | **pi v1.0.0 deleted `packages/agent/src/harness/**` outright, so `HARN-001`'s subject and four rows' upstream pin no longer exist** — `7fd478a2e`, a declared Breaking Change in `packages/agent/CHANGELOG.md:6` @v1.0.0; `git ls-tree v1.0.0 -- packages/agent/src/` has six entries and no `harness`. All four `HARN-001`/`HARN-002` escalation conditions re-tested at v1.0.0 and still negative. **FILED 2026-10-02**; body below. |
-| HARN-004 | tracker | upstream-drift | L | **`packages/durable` became the harness: 8 files and 2 087 lines at v0.87.1, 60 files and ~18 600 lines of complete Pico5 runtime at published `1.0.0`** — so `HARN-002`'s recorded premise, "a storage layer with zero `src` consumers", is stale in both halves. Scheduler, five task kinds, session transactions, forks, live view, prompt extensions, `CodingTools`, an `ExecutionEnv` and three storage backends are all now implemented, and two unshipped frontends consume them. **FILED 2026-10-02**; body below. |
-| DUR-001 | tracker | upstream-drift | S | **`@earendil-works/chord` reached published `1.0.0` and deleted its `src/state/` layer, but all four of `EXT-088`'s escalation conditions are still negative** — `src/state/{diff,draft,value}.ts` (997 lines) are gone, `src/delta/` is canonical, and `ReplicatedState` gained a source/attachment contract; `packages/chord/PLANNING.md:3` still reads "not a stable public API contract yet" verbatim, and no shipped `coding-agent/src` file imports chord. `EXT-088` stays the owner; this row is area 17's chord pin. **FILED 2026-10-02**; body below. |
+| HARN-001 | tracker | not-ported | L | pi's experimental Pico3 durable harness kernel (`@earendil-works/pi-agent-core/experimental/pico3`, new at v0.86.0, 8 016 lines) has no cyrup counterpart. It is library-only: its one consumer is the unpublished `coding-agent/src/experimental/micro` **CORRECTED 2026-10-03:** the cyrup-side sentence "There is no durable-task, checkpoint, scheduler, owned-conversation or replicated-view concept anywhere in `crates/`" (body, **cyrup**) is no longer true. PR #173 (build commit `d9fe2b05`, merge `6bd82cb2`) added `crates/cyrup-pico-store/src/records/{task,submission,conversation}.rs` (task/submission/conversation records), `crates/cyrup-pico/src/fork.rs` (forks) and `crates/cyrup-pico/src/observe.rs` (observation/publication). What is still true: there is no scheduler and no durable task machine, because `docs/adr/ADR-0029-durable-pico5-scope.md` decided not to build spec §5-§9 (`crates/cyrup-pico/src/lib.rs:145-146`: "§5's durable task machine — out of build scope entirely (ADR-0029)"). The subject here (Pico3) is deleted upstream (`HARN-003`) and ADR-0029 records that Pico3 is out of scope (spec §13). Tracker status unchanged. |
+| HARN-002 | tracker | not-ported | L | The new `@earendil-works/pi-durable` package (v0.86.0; SQLite backend at v0.87.1) has no cyrup counterpart. At v0.87.1 it is a storage layer with zero `src` consumers anywhere in pi **CORRECTED 2026-10-03:** (1) "No versioned-document store. No task or submission tables" (body, **cyrup**) is no longer true: `crates/cyrup-pico-doc` is a versioned-document core and `crates/cyrup-pico-store/src/records/{task,submission}.rs` define the task and submission records (PR #173, `d9fe2b05`). "No embedded database" is still true (`grep -rE '^(sqlx|rusqlite|redb|sled|libsql) *=' Cargo.toml crates/*/Cargo.toml` matches nothing at `6823f35b`); the storage backend that was built is the JSONL one (`crates/cyrup-pico-store-jsonl`), and ADR-0029 decision 5 defers any engine choice to a measured trigger. (2) The scope question this row defers was decided by `docs/adr/ADR-0029-durable-pico5-scope.md`, which names itself owner of this row; the row stays a tracker. (3) The Fix's `docs/pico-v5.md` path is dead at v1.0.0; read `packages/durable/docs/spec.md` §10 *Storage contract* (line 4188 @v1.0.0) (see `DUR-003`). |
+| HARN-003 | tracker | upstream-drift | S | **pi v1.0.0 deleted `packages/agent/src/harness/**` outright, so `HARN-001`'s subject and four rows' upstream pin no longer exist** — `7fd478a2e`, a declared Breaking Change in `packages/agent/CHANGELOG.md:6` @v1.0.0; `git ls-tree v1.0.0 -- packages/agent/src/` has six entries and no `harness`. All four `HARN-001`/`HARN-002` escalation conditions re-tested at v1.0.0 and still negative. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the body's cyrup reading "`grep -rli 'pico3\|pico5\|pi-durable\|packages/durable' crates --include=*.rs` returns 0" is stale: it returns 66 files at `6823f35b` (30 in `cyrup-pico`, 15 in `cyrup-pico-store-jsonl`, 13 in `cyrup-pico-store`, 5 in `cyrup-pico-doc`, 3 in `cyrup-session`), all from PR #173. The upstream half (deletion `7fd478a2e`, `packages/agent/CHANGELOG.md:6`, six files in `packages/agent/src`, `packages/session-backends` absent, 280 files +484/-97 141) was re-run and holds. The four re-pin edits in the body's **Fix** are not applied anywhere in this file. OQ-7, which the body says upstream answered, was decided for cyrup by `docs/adr/ADR-0029-durable-pico5-scope.md`. |
+| HARN-004 | tracker | upstream-drift | L | **`packages/durable` became the harness: 8 files and 2 087 lines at v0.87.1, 60 files and ~18 600 lines of complete Pico5 runtime at published `1.0.0`** — so `HARN-002`'s recorded premise, "a storage layer with zero `src` consumers", is stale in both halves. Scheduler, five task kinds, session transactions, forks, live view, prompt extensions, `CodingTools`, an `ExecutionEnv` and three storage backends are all now implemented, and two unshipped frontends consume them. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** (1) "~18 600 lines" should read **17 662** (`git -C tmp/pi ls-tree -r --name-only v1.0.0 packages/durable/src` = 60 files; `git show v1.0.0:<path> | wc -l` summed = 17 662); the 60-file count and per-file counts hold. (2) "five task kinds" should read **three**: `git -C tmp/pi grep -n 'name: "pi\.' v1.0.0 -- packages/durable/src/` returns only `pi.compaction` (`harness/compaction.ts:103`), `pi.generation` (`harness/generation.ts:116`) and `pi.tool` (`harness/tool.ts:51`); five is the number of `TaskState` statuses. Both corrections are also stated in ADR-0029 (Measurement 1). (3) The cyrup reading "no versioned-document store, no task or submission tables" is stale after PR #173 (see `HARN-002`'s note); "no embedded database" still holds. (4) The Fix's "re-word HARN-002" and "fold HARN-001 ... into it" are overtaken by ADR-0029, which names itself owner of this row and `HARN-002`. (5) Impact point 1 cites `docs/pico-v5.md` §10, a dead path; read `docs/spec.md` §10 (see `DUR-003`). |
+| DUR-001 | tracker | upstream-drift | S | **`@earendil-works/chord` reached published `1.0.0` and deleted its `src/state/` layer, but all four of `EXT-088`'s escalation conditions are still negative** — `src/state/{diff,draft,value}.ts` (997 lines) are gone, `src/delta/` is canonical, and `ReplicatedState` gained a source/attachment contract; `packages/chord/PLANNING.md:3` still reads "not a stable public API contract yet" verbatim, and no shipped `coding-agent/src` file imports chord. `EXT-088` stays the owner; this row is area 17's chord pin. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** two stale cites in the body: the README table citation `README:360` should be `README:437`, and `EXT-088`'s body is at `:2510`, not `:2508` (the upstream claims, `PLANNING.md:3` unchanged at v1.0.1 and no chord CHANGELOG, re-held). Also, the body's cyrup sentence that chord ("TUI chords only") has no counterpart is false for `crates/cyrup-pico-doc`, which reimplements Chord's change/delta model (`crates/cyrup-pico-doc/src/change.rs:3`; ADR-0029 decision 2: "Chord's seven operation tuples"); that is a document-core reimplementation, not a TUI chord, and `EXT-088` is still the owner of the escalation conditions. Both line cites re-checked: `README.md:437` carries the "pi `packages/chord` line by line" row and `06-cyrup-ext.md:2510` is the `## EXT-088` heading. |
 | DUR-002 | tracker | upstream-drift | S | **pi's experimental `client`/`server` tree — `SEAM-058`'s subject — was re-founded on `@earendil-works/pi-durable` at v1.0.0 and now keeps no reducer of its own** — `48dd1e2f0`; `experimental/services/transcript.ts` fell to 9 lines serving `ConversationView` straight from the durable harness, `transcript-provider.ts` −125, `session-worker.ts` 206 changed lines. `SEAM-058`'s own escalation (pi's `main()` referencing `experimentalCli`) is still negative. **FILED 2026-10-02**; body below. |
-| DUR-003 | low | upstream-drift | S | **`packages/durable/docs/pico-v5.md` does not exist at v1.0.0 — it is `docs/spec.md` — so `HARN-002`'s Fix and `HARN-004`'s Fix both route the OQ-7 reader to a dead path** — `git cat-file -e v1.0.0:packages/durable/docs/pico-v5.md` fails; `docs/spec.md` is 4 601 lines with §10 *Storage contract* at line 4188. The acceptance artifacts to cite instead are named below. **FILED 2026-10-02**; body below. |
+| DUR-003 | low | upstream-drift | S | **`packages/durable/docs/pico-v5.md` does not exist at v1.0.0 — it is `docs/spec.md` — so `HARN-002`'s Fix and `HARN-004`'s Fix both route the OQ-7 reader to a dead path** — `git cat-file -e v1.0.0:packages/durable/docs/pico-v5.md` fails; `docs/spec.md` is 4 601 lines with §10 *Storage contract* at line 4188. The acceptance artifacts to cite instead are named below. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the row's Fix edits 1 and 2 are now applied as CORRECTED notes at the dead cites (`HARN-002` Fix and `HARN-004` Impact point 1 point to `docs/spec.md` §10, line 4188 @v1.0.0, verified with `git -C tmp/pi show v1.0.0:packages/durable/docs/spec.md`); the original sentences are kept per the ledger's no-rewrite rule, so a grep of `pico-v5\.md` still hits them. `pico-v5.md` is absent at v1.0.0 (`cat-file -e` fails). `docs/adr/ADR-0029-durable-pico5-scope.md` and `ADR-0030-durable-rust-architecture.md` cite `spec.md` throughout. Edit 3 (name `spec-usage.test.ts`, `test/examples/**` and `./testing` as acceptance artifacts) is not applied. Row left open. |
 | DUR-004 | tracker | upstream-drift | S | **The release post's "Pi Durable ships `pi-durable`, `pi-ai` and `chord`" is a re-announcement of three packages already publishable at `v0.87.1`, and `pi-ai` is `packages/ai` itself, not a repackaging** — all three carried `"version": "0.87.1"`, `files`, `prepublishOnly`, no `private`, and a root-`README.md` table entry at the old pin. Recorded as a negative result so no later pass re-derives it, with the three genuinely new packaging surfaces named. **FILED 2026-10-02**; body below. |
+| ~~DUR-005~~ | ~~low~~ **CLOSED 2026-10-03** | cyrup-original | S | **Filed and closed 2026-10-03** (fixed outside any ledger batch, in PR #173's build commit `d9fe2b05`, merge `6bd82cb2`; slice S11 of `docs/PICO5-PLAN.md`, ADR-0029 decision 6, ADR-0030 §3). `DiskStore::rewrite` (`crates/cyrup-session/src/store.rs`) replaced a session file by temp-file-and-rename but never fsynced the parent directory: at `d9fe2b05^` it did `f.sync_data()?` then `std::fs::rename(&tmp, &self.path)?` (`store.rs:322-324`), which makes the new inode durable and leaves the directory entry naming it in the page cache, so after power loss a unix filesystem could legally restore the pre-rewrite entry while `rewrite` had returned `Ok(())`. `rewrite` is reached only to persist a format migration or an eager clone seed (`manager/lifecycle.rs`, `manager/branched_session.rs`), i.e. when the only copy of the history is rebuilt from memory; the old file stays intact, so this is a silent lost-rewrite, not lost history (rated low on that basis; the README rubric rates on consequence when reached). No pi basis: pi's `_rewriteFile` truncates in place (`session-manager.ts:979-988` @v0.83.0, already recorded in `03-cyrup-session.md` as `VL-P22` partially addressed), so this is not a parity row. Fixed: `store.rs:329` now calls `crate::durable::durable_rename(&tmp, &self.path)` (`crates/cyrup-session/src/durable.rs:71`: fsync the temp payload, rename, fsync the parent directory; unix arm only, the Windows arm is open as ADR-0030 §14 item 1). Verify: `cyrup-session` `tests::durable_rewrite::{rewrite_fsyncs_the_directory_its_rename_rewrote,rewrite_replaces_a_live_file_and_leaves_no_temp_sibling,rewrite_creates_a_missing_parent_chain}` (the first asserts the syscall-level parent-directory fsync; the power-loss outcome itself cannot be asserted in-process, per `durable.rs`'s module doc). Not re-run here (docs-only pass). |
 
 ---
 
@@ -230,6 +256,10 @@ first was `packages/session-backends/sqlite-node` (`SESS-038`).
 **Fix** — Do not port. Decide it with `HARN-001` / OQ-7. If cyrup ever adopts a durable store, the
 contract to follow is `packages/durable/src/types.ts` together with `docs/pico-v5.md` §10 *Storage
 contract*, and not Pico3's `Storage` in `harness/pico3/types.ts`, which the handoff doc supersedes.
+**CORRECTED 2026-10-03:** `docs/pico-v5.md` does not exist at v1.0.0; read `packages/durable/docs/spec.md`
+§10 *Storage contract* (line 4188 @v1.0.0) (`DUR-003`). The "if cyrup ever adopts a durable store" and
+"decide it with OQ-7" clauses are overtaken by `docs/adr/ADR-0029-durable-pico5-scope.md`, which
+adopted the Pico5 contract's guarantees and built the JSONL-backed kernel (PR #173).
 
 **Escalation** — `git -C tmp/pi grep -l '@earendil-works/pi-durable' <tag> -- 'packages/*/src'`
 matches a file outside `packages/durable` and outside any `experimental/` directory, or a
@@ -309,7 +339,8 @@ published coding-agent tarball could not load that code even if `dist/experiment
 
 **cyrup** — nothing is owed, and that is the point of this row. cyrup never ported the harness:
 `grep -rli 'pico3\|pico5\|pi-durable\|packages/durable' crates --include=*.rs` returns 0 at
-`fe875569`, as it did at `ea23ca2`. cyrup's session, skills, compaction and system-prompt ports come
+`fe875569`, as it did at `ea23ca2`. **CORRECTED 2026-10-03:** it returns 66 files at `6823f35b`
+(PR #173 built the Pico5 durability kernel, ADR-0029); the deleted harness is still not ported. cyrup's session, skills, compaction and system-prompt ports come
 from `packages/coding-agent/src/core/**`, which this commit does not touch — so the deletion
 invalidates no cyrup code. The crates that would have been at risk are unaffected:
 `crates/cyrup-session/src/store.rs` writes coding-agent v3 JSONL, and `crates/cyrup-tools/src/truncate.rs`
@@ -369,7 +400,7 @@ consumers. A reader who takes `HARN-002` at face value will size the port agains
 
 **upstream** — `git -C tmp/pi ls-tree -r --name-only v1.0.0 -- packages/durable/src` is **60
 files**; at v0.87.1 it was 8. Summed with `git show v1.0.0:<path> | wc -l`, `src/**` is ~18 600
-lines against 2 087. `packages/durable/package.json` @v1.0.0 is `"version": "1.0.0"` with a
+lines against 2 087. **CORRECTED 2026-10-03:** the measured sum is 17 662 lines (60 files). (The table row's "five task kinds" is three: `pi.generation`, `pi.tool`, `pi.compaction`.) `packages/durable/package.json` @v1.0.0 is `"version": "1.0.0"` with a
 `prepublishOnly`, ten subpath exports and `"files": ["dist", …]`, and its description changed from
 record contracts to *"Durable conversation, task, and document runtime for Pi"*. What is implemented
 now that was not at v0.87.1:
@@ -423,7 +454,7 @@ for cyrup, both strategic:
 
 1. **The port target is now concrete and versioned.** `HARN-002`'s *Fix* says that if cyrup ever
    adopts a durable store the contract to follow is `packages/durable/src/types.ts` plus
-   `docs/pico-v5.md` §10. That is now a published `1.0.0` package with a stable export surface and
+   `docs/pico-v5.md` §10 (**CORRECTED 2026-10-03:** dead path; use `docs/spec.md` §10, `DUR-003`). That is now a published `1.0.0` package with a stable export surface and
    an **exported conformance suite** (`./testing`, `storage-conformance.ts`, 1 583 lines) — so the
    decision OQ-7 defers is cheaper to act on than it was, and the spec is executable rather than
    prose.
@@ -437,7 +468,7 @@ for cyrup, both strategic:
    coding-agent twin, not the durable one, or it will file phantom drift.
 
 **Fix** — no code. Re-word `HARN-002` so its premise matches v1.0.0: it is a published `1.0.0`
-runtime of ~18 600 lines, not a 2 087-line storage layer, and it has two experimental frontends, not
+runtime of ~18 600 lines (**CORRECTED 2026-10-03:** 17 662, see this row's table note), not a 2 087-line storage layer, and it has two experimental frontends, not
 zero consumers. Keep it a `tracker` — the escalation condition is unchanged and still unfired — and
 fold `HARN-001`, `AGENT-028`, `SESS-038` and `DRIFT-040` into it per `HARN-003`'s fix, so OQ-7 has
 one target. If the decision is ever "track", the reading order is

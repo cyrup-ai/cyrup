@@ -70,7 +70,9 @@ upstream conformance cases that transfer verbatim.
 > **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
 > `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
 > [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
-> **Next free id: `MCP-609`.** Upstream was read only through
+> **Next free id: `MCP-612`.** (It was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
+> from the post-pin triage: `MCP-609` in `13e`, `MCP-610` in `13d`, `MCP-611` in `13h`.)
+> Upstream was read only through
 > `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
 > `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
 > `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
@@ -84,6 +86,7 @@ stores, so the model is told a server is unavailable without being told why.
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | MCP-605 | low | upstream-drift | S | **The three agent-facing "not available" messages still omit the failure reason cyrup already stores** — `failure-backoff.ts:22 describeFailure` at v5.0.0 renders `failed Ns ago: <reason>`, truncated to 300 chars. **FILED 2026-10-02**; body below. |
+| MCP-610 | low | not-ported | S | **Repeated query tokens are not deduplicated, so a query with a repeated word fails the coverage gate** — `c9eca7e` (#686, v3.1.0); `search-ranking.ts:92-112 tokenize` ends `[...new Set(tokens)]` at v5.0.0, while `proxy/ranking.rs:82 tokenize` returns every run and `:259` divides by `query_tokens.len()`. Filed 2026-10-03 from the post-pin triage (pi v1.0.1 / pi-mcp-adapter v5.0.0 + `d6ffcca`); reverses the "Already ported" ruling for `c9eca7e` in `13-cyrup-mcp-STATUS.md`; land with `MCP-580` (same function). Body below. |
 
 #### MCP-605 — the failure reason belongs in the agent-facing backoff messages
 
@@ -124,6 +127,39 @@ the TUI surface and stays as it is — do not unify them).
 `verify` — a test per call site asserting `failed Ns ago: <reason>`; a test that a reason longer than
 300 characters is truncated at a word boundary; a test that an empty stored reason falls back to
 `failed Ns ago` with no colon.
+
+#### MCP-610 — repeated query tokens must be deduplicated before the coverage gate
+
+Filed 2026-10-03 from the post-pin triage (pi v1.0.1 / pi-mcp-adapter v5.0.0). The 2026-10-02 pass
+ruled `c9eca7e` "Already ported; verified on both sides" on the evidence of
+`proxy/ranking.rs:300` and the test `resolve_search_keywords_unions_and_dedupes` (`:743`); those are
+`resolveSearchKeywords`' union of matching keyword keys, a different feature, and the ruling does not
+hold for query tokens.
+
+**upstream** — `c9eca7e` (#686, first in `v3.1.0`: `git tag --contains c9eca7e`) wrapped the two
+`tokenize(query)` call sites in `[...new Set(…)]`. At v5.0.0 the dedupe lives in the function itself:
+`search-ranking.ts:92-112` `tokenize` ends `return [...new Set(tokens)];`, so it applies to the query
+(`:226`, `:279`) and to the per-field tokens (`:130`). Effect: `queryTokens.length` is the number of
+*distinct* tokens, which is the denominator of the coverage gate.
+
+**cyrup at HEAD** — `proxy/ranking.rs:82` `tokenize` pushes every run and returns the vector with no
+dedupe. `score_tool_match` takes `query_tokens = tokenize(query)` (`:182`) and gates on
+`matched_tokens.len()` — an `IndexSet` (`:202`), so distinct — against `query_tokens.len()` (`:259`),
+which counts repeats. Read by hand: a query such as `"search search"` has two tokens and at most one
+matched, so `matched == total` fails and the 1-2 token rule ("must match **all** its tokens") rejects
+a tool that `"search"` alone would rank; a longer query with repeats has its 0.6 coverage ratio
+depressed the same way. Upstream's changelog entry for the fix reads "Repeated words in MCP
+tool-search queries no longer reduce token coverage and hide otherwise matching tools", and its test
+`does not penalize repeated query tokens` asserts that `"search search"` still ranks `search_records`.
+
+**Fix, S, low.** Dedupe inside `tokenize`, preserving first-seen order, as upstream does — not at the
+two call sites, so field tokens match too. `MCP-580` rewrites the same function (non-ASCII bigram
+runs); land the dedupe with it or immediately after, since upstream's `return [...new Set(tokens)]`
+is the last line of the function `MCP-580` ports.
+
+`verify` — a ranking test that `"search search"` scores and ranks the same tool as `"search"`, and
+one that a repeated token does not change a longer query's coverage ratio; upstream's own
+`__tests__/search-ranking.test.ts` case from `c9eca7e` is the shape.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 

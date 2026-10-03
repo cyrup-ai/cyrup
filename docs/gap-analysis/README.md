@@ -63,7 +63,7 @@ covers.
 | [`14-cyrup-flux.md`](14-cyrup-flux.md) | the Flux pipeline — the fifth ported upstream, and the first that is neither pi nor TypeScript |
 | [`16-cyrup-herdr.md`](16-cyrup-herdr.md) | **client conformance, not a port** — `crates/cyrup-herdr`, cyrup's own client of herdr's socket API and CLI, checked against herdr v0.9.1. Its kinds (`client-bug`, `protocol-drift`) describe the client, not parity; the counting script folds them into Port bug / Version lag and says so |
 | [`17-pi-harness-and-durable.md`](17-pi-harness-and-durable.md) | pi's durable harness over `v0.85.1..v1.0.0`: `packages/durable`, and the `packages/agent/src/harness/**` tree (incl. `pico3`) that **v1.0.0 deleted** after absorbing it into that package. pi still ships none of it to a user of its published binary, so six of its seven rows are trackers; it names the existing item that covers each shipped overlap. Two id series, `HARN-NNN` and `DUR-NNN` |
-| [`18-pi-codemode.md`](18-pi-codemode.md) | **new 2026-10-02** — pi's `packages/codemode` and the `codemode` tool, new at v1.0.0: model-written JavaScript run in a QuickJS-on-wasm sandbox whose nested tool calls never enter the LLM context. Unlike area 17 this one **is** on pi's shipped path (the tool is registered inactive and a user enables it), and at v1.0.0 MCP's default tool exposure routes through it, so its rows are ordinary parity gaps. Ids are `CODE-NNN`. `CODE-001` is the owner decision ADR-0012 Cut 4 does not settle |
+| [`18-pi-codemode.md`](18-pi-codemode.md) | **new 2026-10-02** — pi's `packages/codemode` and the `codemode` tool, new at v1.0.0: model-written JavaScript run in a QuickJS-on-wasm sandbox whose nested tool calls never enter the LLM context. Unlike area 17 this one **is** on pi's shipped path (the tool is registered inactive and a user enables it), and at v1.0.0 MCP's default tool exposure routes through it, so its rows are ordinary parity gaps. Ids are `CODE-NNN`. `CODE-001` is the owner decision on whether to build it at all; the *engine* is settled by [`ADR-0031`](../adr/ADR-0031-one-javascript-engine-deno-core.md) (`deno_core`, already in the tree) |
 | [`15-cyrup-acp.md`](15-cyrup-acp.md) | **the `cyrup-acp` port plan** — the Agent Client Protocol adapter, following `svkozak/pi-acp`. Like area 13 it began as a spec for code that did not exist yet and tracks port units rather than defects, so it is **counted separately from the twelve** for the same structural reason; its own tables are the authority for its unit inventory |
 
 ## Reading the area tables
@@ -248,6 +248,41 @@ a six-column table is an empty `Dedup`, which is what "not a duplicate" means.
 > **pi's session, mode and interactive code is under `packages/coding-agent/src/`, not
 > `packages/agent/`.** The shortstat figures per package in the table below were not re-run for this
 > window; what was re-read, and what was not, is each area file's own pin block.
+
+> ### Post-pin review, 2026-10-03 — what moved after the pins, and what was and was not read
+>
+> The pins above are **unchanged**: a full read of an upstream is still at pi **v1.0.0**, pi-subagents
+> **v0.74.0** and pi-mcp-adapter **v5.0.0**, and the next full pass must diff from those tags. This is *not* a
+> re-pin. On 2026-10-03 the upstream checkouts in `./tmp` were fast-forwarded and the movement after the pins
+> was **triaged by commit message and spot-read at the tag**, nothing more:
+>
+> | repo | pin | reached | read how |
+> |---|---|---|---|
+> | `pi/` | v1.0.0 | **v1.0.1** (+1 commit) | 30 non-merge commits / 136 files triaged; rows filed below; no row's upstream claim was refuted, only line numbers moved |
+> | `pi-subagents/` | v0.74.0 | **v0.75.0** | 31 commits / 98 files triaged; `09b` rows `SUBA-164`…`SUBA-173` and fold-ins |
+> | `pi-mcp-adapter/` | v5.0.0 | v5.0.0 + `d6ffcca` | one commit (keyless Tavily preset); noted on `MCP-529`, no row |
+> | `herdr` | v0.9.1 | **v0.9.3** | two protocol-drift rows in `16` (`HERDR-007`, `HERDR-008`); `pane.graphics.*` removal recorded |
+> | `pi-intercom` · `pi-acp` · `pi-permission-system` | unchanged | unchanged | nothing moved |
+>
+> **Known blind spots, stated so nobody assumes otherwise.** `code_puppy_core_plugins` is at v0.0.76 against
+> the ledger's v0.0.62 (39 commits; the ported surface is byte-identical, the rest unread) and `code_puppy`
+> is at v0.0.890 against a v0.0.720 baseline (**576 commits unswept**). Neither window has been triaged.
+>
+> **The same day, the pi-1.0 rows were reviewed** (about 121 rows, six independent reads). About 90 held as
+> written; about 30 were partly wrong in their cyrup-side text or their fix instruction, and none of the
+> upstream claims was refuted. Every correction is an inline `**CORRECTED 2026-10-03**` note on the row it
+> corrects; **no severity, kind or effort column was edited** — where the review recommends a different one the
+> note says `Recommended re-rating (not applied)` and the owner decides. Rows filed: `PROV-130`…`PROV-133`,
+> `CFG-102`, `EXT-107`, `TUI-145`, `TUI-146`, `SEAM-147`, `SUBA-164`…`SUBA-173`, `MCP-609`…`MCP-611`,
+> `HERDR-007`, `HERDR-008`, and `DUR-005` (closed). **Next free ids now:** `PROV-134`, `CFG-103`, `EXT-108`,
+> `TUI-147`, `SEAM-148`, `SUBA-174`, `MCP-612`, `HERDR-009`, `DUR-006` (`HARN-005`, `CODE-014`, `AGENT-048`,
+> `SESS-070`, `TOOL-057`, `ICOM-082`, `DRIFT-061` unchanged). The 2026-10-02 table further down quotes the
+> counters as they were that day.
+>
+> **ADR-0012 does not exist.** Several rows and `MCP-PORT-METHODOLOGY.md` cited it; no such file was ever
+> written (the number was reserved for the MCP port, whose cuts live in the methodology's §1.2 table). The
+> current JavaScript-engine rule is [`ADR-0031`](../adr/ADR-0031-one-javascript-engine-deno-core.md): if cyrup
+> embeds JS it is `deno_core`, already in the tree for `workflowScript`.
 
 The table below was re-measured **2026-09-24**, every figure from `git diff --shortstat` /
 `git rev-list --no-merges --count` run in `tmp/<repo>`. Its *latest tag* column is superseded by the

@@ -11,7 +11,7 @@
 >
 > | | measured at | window read this pass | window still unread |
 > |---|---|---|---|
-> | `pi-mcp-adapter` | **v5.0.0** | `v2.38.0..v5.0.0` = 99 non-merge commits, three `feat!`, read commit by commit. 22 units filed (`MCP-587`–`MCP-608`), each read on both sides — see *Fourth pass — 2026-10-02* | `v5.0.0..HEAD` not measured. `packages/mcp` read at README/file-census level only; pi's own `builtin:mcp` extension read only far enough to rule its coexistence commits inapplicable |
+> | `pi-mcp-adapter` | **v5.0.0** | `v2.38.0..v5.0.0` = 99 non-merge commits, three `feat!`, read commit by commit. 22 units filed (`MCP-587`–`MCP-608`), each read on both sides — see *Fourth pass — 2026-10-02* | `v5.0.0..HEAD` not measured. **Update 2026-10-03:** `git describe` of the clone is `v5.0.0-1-gd6ffcca`, so the window is exactly one commit, `d6ffcca` (#800, "keyless Tavily Search setup preset", `config.ts` +11): a new `tavily-search` entry in `KNOWN_SERVER_PRESETS` (`url: https://mcp.tavily.com/mcp/`, header `X-Tavily-Access-Mode: keyless`, `directTools: ["tavily_search","tavily_extract"]`). It is a vendor preset of the `MCP-529` class and files no row. `packages/mcp` read at README/file-census level only; pi's own `builtin:mcp` extension read only far enough to rule its coexistence commits inapplicable |
 > | `pi` | **v1.0.0** (2026-10-01) | `v0.87.1..v1.0.0` for the two new in-monorepo MCP surfaces (`packages/mcp`, `packages/coding-agent/src/extensions/mcp/`) | the rest of pi is other areas' scope |
 > | `cyrup` | **`fe875569`** | `crates/cyrup-mcp` re-read at every symbol the 22 units name | the crate was not re-read as a whole; the 2026-09-24 passes' `implemented` rows are not re-verified against v5.0.0 |
 >
@@ -19,8 +19,8 @@
 > dependency on pi's in-monorepo `packages/mcp`, and every citation in `13-cyrup-mcp.md` and
 > `13a`–`13i` resolves at that tag. `MCP-587` records the rule.
 >
-> Numbering resumes from **`MCP-609`** (table F, *Fourth pass*, took `MCP-587`–`MCP-608`;
-> `MCP-586` was never allocated and is still free).
+> Numbering resumes from **`MCP-612`** (table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
+> *Post-pin triage 2026-10-03*, took `MCP-609`–`MCP-611`; `MCP-586` was never allocated and is still free).
 
 > ### PIN — 2026-09-24 (superseded by the 2026-10-02 pin above). cyrup **`ea23ca2`** · `pi-mcp-adapter` **v2.37.0** (`28049de`)
 >
@@ -435,7 +435,7 @@ at `fe875569`.
 Status is read off each row's own cyrup-side paragraph, not inferred from its kind: **`partial`**
 where the cyrup surface exists and diverges, **`missing`** where there is no counterpart,
 **`not-applicable`** for the one row that is a citation ruling rather than a port obligation.
-Numbering resumes from **`MCP-609`**.
+Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-612`, see table G below)*.
 
 | id | sev | § | kind | status | eff | title | body |
 |---|---|---|---|---|---|---|---|
@@ -479,6 +479,44 @@ pass, and no status cell outside Table F was touched.
 above-medium row this pass filed, and it is a fail-open: `approveTools` degrades any value cyrup
 cannot parse to "approve everything", and `"destructive"` — which v5.0.0 documents — is such a
 value, so a config written for pi 1.0 auto-approves the tools it meant to gate.
+
+### Post-pin triage — 2026-10-03 (cyrup `fe875569` code unchanged; `pi-mcp-adapter` v5.0.0, clone at `v5.0.0-1-gd6ffcca`; pi v1.0.1)
+
+A review of the 22 rows above, with each cited fact re-verified on both sides before anything was written.
+It found three "Already ported" rulings in *Already covered / not owed* below that do not hold, filed
+as table G, and a set of text corrections appended in place to the rows that carry them. **No severity,
+kind, effort or status cell of any existing row was changed**; where a re-rating is recommended it is
+written in the row's `CORRECTED 2026-10-03` note as "Recommended re-rating (not applied)".
+
+#### Table G — both sides read
+
+Numbering resumes from **`MCP-612`**.
+
+| id | sev | § | kind | status | eff | title | body |
+|---|---|---|---|---|---|---|---|
+| `MCP-609` | low | 13e | `not-ported` | **missing** | S | pi's tool-call id is received and dropped; never sent as `_meta["pi-mcp-adapter/toolCallId"]` (`4b7e310`) | [`13e`](13e-mcp-tools.md) |
+| `MCP-610` | low | 13d | `not-ported` | **partial** | S | repeated query tokens are not deduplicated, so the coverage gate rejects `"search search"` (`c9eca7e`) | [`13d`](13d-mcp-proxy-modes.md) |
+| `MCP-611` | low | 13h | `not-ported` | **partial** | S | the setup panel reports "Added" for a preset that will not take effect (`c362b08`'s `ignoredBecause`) | [`13h`](13h-mcp-tui.md) |
+
+**Census after table G (arithmetic, not a re-count):** the fourth pass counted **545**; table G adds 3,
+none of which existed before, so the counted set is **548**: `implemented` 347, `partial` 67 + 2 = **69**,
+`missing` 97 + 1 = **98**, `not-applicable` 34. Severity of the three new rows: 3 low. Table F's own
+census above is left as filed.
+
+**Corrections appended 2026-10-03 (text only; each note is in the row's own file):**
+
+| id | file | what was wrong |
+|---|---|---|
+| `MCP-588` | `13b` | `getLegacyMcpMigrationNotices` has two parameters at v5.0.0, not three; the quoted "neither Pi nor the adapter reads" message does not exist; cyrup cites off by one |
+| `MCP-589`, `MCP-590` | `13b` | `319b161` and `1416386` first appear in `v3.1.0`, not `v3.0.0` |
+| `MCP-591` | `13b` | `MCP-096` is `not-applicable` in this file, not an open decision; `with_project_trusted` has no production caller; severity raise to high recommended, not applied |
+| `MCP-594` | `13c` | `ServerEntry` has no `inherit_env` (`MCP-553`), so the `inheritEnv` half is vacuous today; effort note |
+| `MCP-602` | `13e` | the quoted commit-body "rejected with a warning" is not in upstream's code; effort splits (fail-closed plus `Destructive` is S); verified fail-open chain |
+| `MCP-603` | `13e` | `output_schema` is not rendered by `describe` in cyrup; the claim was false |
+| `MCP-604` | `13e` | pi's `ToolExposure` doc quote was altered ("find it", not "find and activate it") |
+| `MCP-607` | `13i` | `buildRequestOptions` still has no such field at v5.0.0; the flag is set in `callToolPausingForElicitation`; kind should be `not-ported` (recommended, not applied) |
+| `MCP-608` | `13h` | the change is in `prompts.ts`, not the `/mcp` completer; cyrup has no `/mcp-auth` completer; depends on `MCP-398`; status `missing` recommended, not applied |
+| `MCP-529` | this file | note: `d6ffcca` (keyless Tavily preset) is the same class, no new row |
 
 ### Already covered / not owed — read before filing anything from this window again
 
@@ -540,15 +578,26 @@ host and MCP implementation, so there is no second owner to detect, replace, dis
 - `4e9f9df` (#710) an opt-in Serply preset for `/mcp setup`, **reverted** by `3e00bc7` (#723);
   `71280b1` (#750) make Figma desktop the easy path, and `c362b08` (#755) explain refused Figma
   connections and keep desktop servers global — vendor presets, ruled with `MCP-529` (the Parallel
-  Search preset). The Serply one does not exist at v5.0.0 at all.
+  Search preset). The Serply one does not exist at v5.0.0 at all. **CORRECTED 2026-10-03:** the
+  `c362b08` ruling is right only for its Figma-desktop reachability half. The `ignoredBecause`
+  warning it adds to `addKnownServer` (`commands.ts:667-680`, `mcp-setup-panel.ts:950-959`) is
+  vendor-neutral and applies to cyrup's five presets; filed as **`MCP-611`** (`13h`).
 
 **Already ported; verified on both sides, nothing owed.**
 - `4b7e310` (#674) forward pi tool call IDs to MCP requests — cyrup threads a tool call id through
   the call path: `grep -rln 'tool_call_id' crates/cyrup-mcp/src` matches `registration.rs`,
-  `dispatch.rs`, `proxy/tool.rs` and `owner.rs`.
+  `dispatch.rs`, `proxy/tool.rs` and `owner.rs`. **CORRECTED 2026-10-03:** this ruling is wrong.
+  Those matches are the `ToolCallId` type in trait signatures; `dispatch.rs:312` and
+  `proxy/tool.rs:351` name the parameter `_call_id` and drop it, `live.rs:1478` builds the
+  `tools/call` params with no `_meta`, and nothing sends `_meta["pi-mcp-adapter/toolCallId"]`
+  (`utils.ts:350-358` at v5.0.0). Filed as **`MCP-609`** (`13e`). The tag is `v3.0.0` (verified).
 - `c9eca7e` (#686) dedupe repeated query tokens in ranked search — cyrup's ranking already unions
   **and dedupes**: `proxy/ranking.rs:300` ("all matching entries are unioned, deduped") with the
-  test `resolve_search_keywords_unions_and_dedupes` at `:743`.
+  test `resolve_search_keywords_unions_and_dedupes` at `:743`. **CORRECTED 2026-10-03:** this ruling
+  is wrong. The cited evidence is `resolve_search_keywords`' union of keyword keys, a different
+  feature. Upstream's `tokenize` ends `[...new Set(tokens)]` (`search-ranking.ts:112` at v5.0.0;
+  `c9eca7e` is first in `v3.1.0`), whereas `proxy/ranking.rs:82` `tokenize` does not dedupe and
+  `:259` divides by `query_tokens.len()`. Filed as **`MCP-610`** (`13d`).
 - `b8b576f` (#785) build the direct-tool selector index once per resolve, and `76cc80b` (#781/#784)
   import materialized-resource cleanup statically — a memoisation and a JS module-loading change.
   cyrup memoises the selector candidate index already (`registration.rs:528`, "The two memo tables
@@ -590,7 +639,7 @@ host and MCP implementation, so there is no second owner to detect, replace, dis
   is a consumer of `packages/mcp`, not of the adapter.
 - **The 347 `implemented` rows were not re-read as a regression set** against v5.0.0. That caveat has
   stood since the third pass and still stands.
-- **`v5.0.0..HEAD` was not measured.** Every claim here is pinned to the tag.
+- **`v5.0.0..HEAD` was not measured.** Every claim here is pinned to the tag. **Update 2026-10-03:** the window is the single commit `d6ffcca` (#800, keyless Tavily Search preset); see the pin block above and `MCP-529`.
 
 ## Third pass — 2026-09-24, every open row re-checked (cyrup `ea23ca2`, `pi-mcp-adapter` v2.37.0)
 
@@ -987,7 +1036,7 @@ these without first reading its upstream file at `v2.32.1` and rewriting the row
 | `MCP-526` | medium | 13h | `host-verb` | **missing** | `/pi-mcp` as an alias for `/mcp` when the host reserves `/mcp` | `c59698e` (#398), `#391` |
 | `MCP-527` | medium | 13h | `hand-written` | **missing** | ctrl+d on a panel server row toggles enabled/disabled; saving persists `disabled` to the project layer and reloads, matching `/mcp disable` (cyrup already has `write_project_server_disabled` — this is the panel half) | `f94a3a7` (#479) |
 | `MCP-528` | medium | 13h | `hand-written` | **missing** | `/mcp setup` offers project `.mcp.json` vs global `~/.config/mcp/mcp.json` as the write target, keeps Pi-owned files in the advanced flow, and says where a server will be saved | `c893a3d` (#478), `#477` |
-| `MCP-529` | low | 13h | `open-decision` | **not-applicable** | the opt-in Parallel Search preset | `d936570` (#448) — a vendor preset, not a parity obligation. Ruled `open-decision` pending a product call, exactly as `MCP-048` was |
+| `MCP-529` | low | 13h | `open-decision` | **not-applicable** | the opt-in Parallel Search preset | `d936570` (#448) — a vendor preset, not a parity obligation. Ruled `open-decision` pending a product call, exactly as `MCP-048` was **Note 2026-10-03:** `d6ffcca` (#800, untagged: `v5.0.0-1`) adds a keyless `tavily-search` entry to `KNOWN_SERVER_PRESETS` (`config.ts` +11) — the same class, ruled the same way, no new row. v5.0.0 already has seven presets (deepwiki, context7, parallel-search, notion, github, chrome-devtools, figma); cyrup's `known_server_presets` (`config.rs:5034`) has five. |
 | `MCP-530` | low | 13h | `hand-written` | **missing** | per-server proxy lists distinguish cached lazy tools from servers needing auth, while preserving active failure backoff | `824b137` (#474) |
 | `MCP-531` | low | 13h | `hand-written` | **missing** | status updates fall back to plain text when a host supplies a theme with no styling methods, and non-callable UI themes are guarded | `7736c84` (#451), `bb10169` (#450), `#449` |
 | `MCP-532` | medium | 13c | `hand-written` | **missing** | HTTP 202 and unauthenticated 401 probes report an ambiguous endpoint shape instead of "not MCP" — an **extension of the still-`missing` `MCP-132`**, so schedule them together | `0b76154` (#419), `#415` |

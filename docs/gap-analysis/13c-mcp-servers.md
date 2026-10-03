@@ -81,7 +81,9 @@ reports the six places it has fallen behind rather than restating the algorithm.
 > **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
 > `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
 > [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
-> **Next free id: `MCP-609`.** Upstream was read only through
+> **Next free id: `MCP-612`.** (It was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
+> from the post-pin triage: `MCP-609` in `13e`, `MCP-610` in `13d`, `MCP-611` in `13h`.)
+> Upstream was read only through
 > `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
 > `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
 > `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
@@ -97,7 +99,7 @@ applies is gone upstream (`MCP-595`).
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | MCP-593 | medium | not-ported | M | **`auth: { provider: "<name>" }` is unported — a cyrup provider's OAuth token is never sent to an HTTP MCP server** — `types.ts:464` at v5.0.0; cyrup's `AuthMode` has no object variant and the value lands in `AuthMode::Other`. **FILED 2026-10-02**; body below. |
-| MCP-594 | medium | upstream-drift | S | **`compute_server_hash`'s pre-image is stale: stdio servers gained `inheritEnv` and `literalEnv`, and `literalEnv` now governs the `env` leg** — `metadata-cache.ts:109-120` at v5.0.0; cyrup's 15 identity keys and its golden vectors predate it. **FILED 2026-10-02**; body below. |
+| MCP-594 | medium | upstream-drift | S | **`compute_server_hash`'s pre-image is stale: stdio servers gained `inheritEnv` and `literalEnv`, and `literalEnv` now governs the `env` leg** — `metadata-cache.ts:109-120` at v5.0.0; cyrup's 15 identity keys and its golden vectors predate it. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the `inheritEnv` half is not live at HEAD: `grep -rniE 'inherit_env|inheritEnv' crates/cyrup-mcp/src` is empty — `ServerEntry` has no such field (that absence is `MCP-553`, high, missing, which the row does not name), so "flipping `inheritEnv` does not move the digest" is vacuous today and `MCP-553` is a prerequisite for adding the `inheritEnv` identity key. Only the `literalEnv` half (the `literalEnv` key and failure (2)) can land on its own. Recommended re-rating (not applied): effort S→M if this row is taken together with `MCP-553` (new field, `resolve_env` gating, SDK default-variable set, plus the `SUBA-156` writer in the same commit); S stays right for the `literalEnv` half alone. |
 | MCP-595 | medium | upstream-drift | S | **cyrup still expires cached tool metadata after seven days; upstream removed the age limit** — `metadata-cache.ts:187-190`, `maxAgeMs` default `7 days` → `0`. **FILED 2026-10-02**; body below. |
 | MCP-596 | medium | not-ported | M | **`cacheScope: "private"` and `discoveryFailed` are unported, so metadata discovered under one session's credentials can be served to another** — `metadata-cache.ts:202-203` at v5.0.0. **FILED 2026-10-02**; body below. |
 | MCP-597 | low | upstream-drift | S | **HTTP header validation is still gated on command-derived values and its message is the superseded one** — `server-manager.ts` at v5.0.0 validates every header one at a time and names only the header. **FILED 2026-10-02**; body below. |

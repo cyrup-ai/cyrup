@@ -77,7 +77,9 @@ unfiltered text entering the model's context under either system.
 > **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
 > `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
 > [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
-> **Next free id: `MCP-609`.** Upstream was read only through
+> **Next free id: `MCP-612`.** (It was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
+> from the post-pin triage: `MCP-609` in `13e`, `MCP-610` in `13d`, `MCP-611` in `13h`.)
+> Upstream was read only through
 > `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
 > `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
 > `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
@@ -93,9 +95,10 @@ config written for pi 1.0 auto-approves the tools it meant to gate.
 |---|---|---|---|---|
 | MCP-600 | medium | parity-bug | S | **A tool call is marked in flight only *after* approval, so an approval dialog left open past the idle timeout lets the idle sweep close the server and the approved call fails** — upstream moved the mark before the gate at `proxy-modes.ts:1587-1590` and `direct-tools.ts:252-255`. **FILED 2026-10-02**; body below. |
 | MCP-601 | medium | not-ported | M | **MCP tool annotations are dropped end to end, so neither the model nor the user can tell a read-only tool from one that deletes data** — `utils.ts:500 extractToolAnnotations`, `types.ts:752 McpToolAnnotations`. **FILED 2026-10-02**; body below. |
-| MCP-602 | high | not-ported | M | **`approveTools` fails *open* on any value cyrup cannot parse, and the new documented value `"destructive"` is one of them — copying it from upstream's docs silently disables MCP tool approval** — `tool-approval.ts:35-44`, `types.ts:495`/`:670`. **FILED 2026-10-02**; body below. |
-| MCP-603 | low | not-ported | M | **Observed output shapes for tools that declare no `outputSchema` are unported** — new `output-shape.ts` at v5.0.0 (`:13`, `:53`, `:97`). **FILED 2026-10-02**; body below. |
-| MCP-604 | low | not-ported | S | **Search-mode direct tools are not registered at the `deferred` exposure** — `59d6041` (#772); the MCP-side consumer of the release post's "deferred tool loading", whose host half is `CODE-005`. **FILED 2026-10-02**; body below. |
+| MCP-602 | high | not-ported | M | **`approveTools` fails *open* on any value cyrup cannot parse, and the new documented value `"destructive"` is one of them — copying it from upstream's docs silently disables MCP tool approval** — `tool-approval.ts:35-44`, `types.ts:495`/`:670`. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the fail-open verified on both sides. Upstream @v5.0.0: `tool-approval.ts:35` (`undefined`/`false` => no prompt), `:37-41` (`"destructive"` prompts unless `resourceUri` is set, `readOnlyHint === true` or `destructiveHint === false`), `:43` (`if (!Array.isArray(approval)) return true;`); first in `v3.3.0` (`a4b3e90`). cyrup: `config.rs:951` and `:1166` are `deserialize_with = "lenient"`, `lenient` (`config.rs:465`) goes through `raw_to` (`:438`) which yields `None` on any type mismatch, and `proxy/approval.rs:89-96` has `_ => return false` for `None`; `grep -rn destructive crates/cyrup-mcp/src` finds no approval use. Two wording fixes: (1) the body quotes the `a4b3e90` commit message ("Adapter config files with one are now rejected with a warning naming the key"), but the diff touches only `tool-approval.ts`, `types.ts`, README/CHANGELOG and tests and `config.ts` at v5.0.0 has no `approveTools` validation, so upstream's behaviour is "prompt on every tool" with **no** load-time warning; a cyrup load-time diagnostic would be an addition, not a port. (2) The M effort bundles two units. The security fix alone — a dedicated approve-setting type with `Destructive` and `Other` variants (not `BoolOrList`, which `directTools` also uses and `MCP-561` widens separately), `Other => true`, and `Destructive` gating everything except resource reads until `MCP-601` supplies annotations — is S; the annotation-aware `"destructive"` arm is `MCP-601`'s dependency. Recommended re-rating (not applied): effort M→S for the fail-closed plus `Destructive` part, the annotation-dependent part tracked under `MCP-601`. |
+| MCP-603 | low | not-ported | M | **Observed output shapes for tools that declare no `outputSchema` are unported** — new `output-shape.ts` at v5.0.0 (`:13`, `:53`, `:97`). **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the body's claim that "`mcp({ describe })` renders `input_schema` and, where the server supplied one, `output_schema`" is false at HEAD: `grep -rn 'output_schema' crates/cyrup-mcp/src` is empty (the only `outputSchema` mention is a doc comment at `schema.rs:6`), and `execute_describe` (`proxy/discovery.rs:354`) renders no output schema. The gap itself stands, and upstream cites verify at v5.0.0 (`output-shape.ts:13` `OutputShape`, `:22` `ObservedOutput`, `:53` `observedOutputRecorder`, `:97` `seedObservedOutputs`). |
+| MCP-604 | low | not-ported | S | **Search-mode direct tools are not registered at the `deferred` exposure** — `59d6041` (#772); the MCP-side consumer of the release post's "deferred tool loading", whose host half is `CODE-005`. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the body's quotation of pi's `ToolExposure` doc is altered. The text at `packages/coding-agent/src/core/extensions/types.ts:503` is "`deferred`: like `codemode`, but codemode tools do not list it; tool search can find it." (identical at `v1.0.0` and `v1.0.1`), not "…can find and activate it". The type itself is at `:509`. The `CODE-005` dependency stands. |
+| MCP-609 | low | not-ported | S | **pi's tool-call id is received and dropped: it is never forwarded to the MCP server as `_meta["pi-mcp-adapter/toolCallId"]`** — `4b7e310` (#674, v3.0.0), `utils.ts:350-358 withToolCallIdMeta` at v5.0.0; cyrup names the parameter `_call_id` at `dispatch.rs:312` and `proxy/tool.rs:351`. Filed 2026-10-03 from the post-pin triage (pi v1.0.1 / pi-mcp-adapter v5.0.0 + `d6ffcca`); reverses the "Already ported" ruling for `4b7e310` in `13-cyrup-mcp-STATUS.md`. Body below. |
 
 #### MCP-600 — in-flight must be raised before the approval gate, not after it
 
@@ -310,6 +313,43 @@ to this row.
 
 `verify` — once `CODE-005` lands: a test that a search-mode MCP tool is findable by tool search while
 inactive and is activated by it, and that its `execute` is unchanged.
+
+#### MCP-609 — forward pi's tool-call id as the request `_meta` correlation key
+
+Filed 2026-10-03 from the post-pin triage (pi v1.0.1 / pi-mcp-adapter v5.0.0). The 2026-10-02 pass
+ruled `4b7e310` "Already ported; verified on both sides" on the evidence that
+`grep -rln 'tool_call_id' crates/cyrup-mcp/src` matches `registration.rs`, `dispatch.rs`,
+`proxy/tool.rs` and `owner.rs`; those matches are the `ToolCallId` type in trait signatures, not a
+forwarded value, and the ruling does not hold.
+
+**upstream** — `4b7e310` (#674, first in `v3.0.0`: `git tag --contains 4b7e310`). `utils.ts:350`
+`TOOL_CALL_ID_REQUEST_META_KEY = "pi-mcp-adapter/toolCallId"` and `:353-358`
+`withToolCallIdMeta(meta, toolCallId)`, which returns `{ ...meta, [KEY]: toolCallId }` (or `meta`
+unchanged when there is no id). It is applied on every execution path that has one:
+`proxy-modes.ts:1658` (`requestMeta`, sent as `_meta` of the `callTool` params at `:1682` and as
+`meta` to `callToolViaTaskSession` at `:1674`), `direct-tools.ts:321`, `namespace-tools.ts`, and
+`index.ts:2218` threads the `toolCallId` of the `mcp` tool into `executeCall`. Purpose: an MCP server
+can correlate a request with the pi tool call that made it.
+
+**cyrup at HEAD** — `dispatch.rs:312` (`call_direct`, parameter `_call_id: ToolCallId`; the doc above
+it says no phase of the path "streams or reads a call id") and `proxy/tool.rs:351` (`execute`,
+`_call_id: ToolCallId`) both discard the id. `execute_call` (`proxy/call.rs:205`) has no id
+parameter, `ProxyEnv::call_tool` (`proxy/env.rs:269`) takes `server, tool, arguments, recovery,
+cancel`, and `live.rs:1478` builds `CallToolRequestParams::new(tool).with_arguments(arguments)` with
+no `meta`. `grep -rn 'pi-mcp-adapter/' crates/cyrup-mcp/src` matches only
+`STREAM_RESULT_PATCH_METHOD` (`runtime.rs:2587`), so the key is nowhere.
+
+**Fix, S.** Thread an optional call id from the two `execute` entry points through `execute_call` and
+`ProxyEnv::call_tool` (its `live.rs:1467` implementor and the `proxy/testsupport.rs:133` one), and
+set `CallToolRequestParams.meta` (rmcp 3.1.4 `model.rs:4057`, `Option<RequestMetaObject>`) to
+`{"pi-mcp-adapter/toolCallId": <id>}` — merging, not replacing, if `MCP-607` later adds a progress
+token to the same object. Omit the key when the id is empty, as upstream does. The task-session leg
+(`callToolViaTaskSession`) and the MCP Apps `uiSession.requestMeta` merge are Cut 2/3 surfaces and are
+not owed. This is a plain wire-format key; no config.
+
+`verify` — a test with a fixture server that records the `tools/call` request and asserts
+`_meta["pi-mcp-adapter/toolCallId"]` equals the id the host passed, on both the `mcp({ tool })`
+proxy path and a direct tool; a test that an empty id produces no `_meta`.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 

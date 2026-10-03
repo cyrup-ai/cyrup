@@ -96,7 +96,9 @@ exists.
 > **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
 > `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
 > [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
-> **Next free id: `MCP-609`.** Upstream was read only through
+> **Next free id: `MCP-612`.** (It was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
+> from the post-pin triage: `MCP-609` in `13e`, `MCP-610` in `13d`, `MCP-611` in `13h`.)
+> Upstream was read only through
 > `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
 > `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
 > `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.

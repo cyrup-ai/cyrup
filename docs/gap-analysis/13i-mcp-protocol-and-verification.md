@@ -87,7 +87,9 @@ port starts from an empty baseline and writes it from observed failures.
 > **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
 > `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
 > [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
-> **Next free id: `MCP-609`.** Upstream was read only through
+> **Next free id: `MCP-612`.** (It was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
+> from the post-pin triage: `MCP-609` in `13e`, `MCP-610` in `13d`, `MCP-611` in `13h`.)
+> Upstream was read only through
 > `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
 > `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
 > `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
@@ -101,7 +103,7 @@ doc comment's claim that `resetTimeoutOnProgress` has no upstream analogue is no
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | MCP-606 | medium | not-ported | M | **A tool call's deadline is not pausable, so an elicitation prompt burns the call's own timeout and the call dies while the user is answering** — `elicitation-handler.ts:38-58`, `:89-121` at v5.0.0. **FILED 2026-10-02**; body below. |
-| MCP-607 | medium | stale-port | S | **`build_request_options`' doc claims `resetTimeoutOnProgress` "has no upstream analogue"; at v5.0.0 every `callTool` sets it** — `elicitation-handler.ts:72-83`. **FILED 2026-10-02**; body below. |
+| MCP-607 | medium | stale-port | S | **`build_request_options`' doc claims `resetTimeoutOnProgress` "has no upstream analogue"; at v5.0.0 every `callTool` sets it** — `elicitation-handler.ts:72-83`. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the title and body overstate the doc error. At v5.0.0 `buildRequestOptions` (`server-manager.ts:431`) still has no `resetTimeoutOnProgress` or `maxTotalTimeout` field (`git grep resetTimeoutOnProgress v5.0.0 -- '*.ts'` outside tests matches only `elicitation-handler.ts:83`), so the `runtime.rs:3091` / `:3276` sentence "no upstream analogue in `buildRequestOptions`" is still literally true. The flag is set one layer up, in `callToolPausingForElicitation` (`elicitation-handler.ts:76-83`, on the no-pause path; on the pausable path the `onprogress` handler restarts the deadline instead, `:111-116`), which `direct-tools.ts:342`, `proxy-modes.ts:1679` and `ui-server.ts:548` call. The real gap is that cyrup tool calls neither reset the timeout on progress nor request a progress token (`grep -rn 'ProgressToken\|progress_token\|reset_timeout' crates/cyrup-mcp/src` matches only two doc comments, `runtime.rs:3276` and `live.rs:1080`, the latter recording that `build_request_options` only sets `timeout`); the doc comments should say the analogue lives in the call wrapper, not that it is absent. Recommended re-rating (not applied): kind `stale-port`→`not-ported` (severity and effort stand). |
 
 #### MCP-606 — the call deadline must pause while an elicitation prompt is open
 

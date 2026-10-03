@@ -96,7 +96,9 @@ over existing host verbs.
 > **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
 > `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
 > [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
-> **Next free id: `MCP-609`.** Upstream was read only through
+> **Next free id: `MCP-612`.** (It was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
+> from the post-pin triage: `MCP-609` in `13e`, `MCP-610` in `13d`, `MCP-611` in `13h`.)
+> Upstream was read only through
 > `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
 > `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
 > `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
@@ -108,7 +110,8 @@ One row: MCP prompt *argument names* get no completions.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| MCP-608 | low | not-ported | S | **MCP prompt *argument names* get no completions** — `4e702f1` (#733) adds a branch to `getArgumentCompletions`, skipping disabled servers; extends `MCP-041` / `MCP-382`, which cover the `/mcp` subcommands only. **FILED 2026-10-02**; body below. |
+| MCP-608 | low | not-ported | S | **MCP prompt *argument names* get no completions** — `4e702f1` (#733) adds a branch to `getArgumentCompletions`, skipping disabled servers; extends `MCP-041` / `MCP-382`, which cover the `/mcp` subcommands only. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** (1) the upstream change is not inside the `/mcp` completion function: at v5.0.0 it is `completePromptArgs` (`prompts.ts:154`) plus a per-prompt-command `getArgumentCompletions` (`prompts.ts:310-318`), while the `/mcp` completer is `index.ts:1472`. (2) The body says cyrup's `argument_completions` covers "the eight `/mcp` subcommands and the `/mcp-auth` server list"; it does not — `crates/cyrup-mcp/src/commands.rs:888-893` returns an empty list for every command other than `/mcp` (`/mcp-auth` has no completer, as upstream), and its second branch is server-name completion after `reconnect`/`logout`/`disable`/`enable`. The function is at `:888`, not `:887`. (3) The "one more branch, S, not blocked" sizing is understated: generated prompt commands cannot run at all today (`MCP-398`, high, missing — no `prompts/get` anywhere), so there is no prompt command whose arguments could be completed, and the row needs a new completer registered per prompt command rather than a branch in the `/mcp` function. Recommended re-rating (not applied): status `partial`→`missing` (Table F), effort S stands only once `MCP-398` has landed; depends on `MCP-398`. |
+| MCP-611 | low | not-ported | S | **The setup panel reports "Added" for a preset that will not take effect** — `c362b08` (#755, v5.0.0) `commands.ts:667-680` computes `ignoredBecause` (not read by this config mode / another file defines it / another file disables it) and `mcp-setup-panel.ts:950-959` warns; cyrup's `AddServerOutcome` (`ui.rs:3488`) has no such field and `ui.rs:4020-4032` always shows a success notice. Filed 2026-10-03 from the post-pin triage (pi v1.0.1 / pi-mcp-adapter v5.0.0 + `d6ffcca`); the Figma-desktop half of `c362b08` stays under `MCP-529`. Body below. |
 
 #### MCP-608 — completions for MCP prompt argument names
 
@@ -135,6 +138,44 @@ which is no longer the whole function at v5.0.0.
 
 `verify` — a completion test on a generated prompt command offering its argument names and filtering
 by prefix; a test that a disabled server's prompt offers none.
+
+#### MCP-611 — the setup panel must say when an added preset will not take effect
+
+Filed 2026-10-03 from the post-pin triage (pi v1.0.1 / pi-mcp-adapter v5.0.0). The 2026-10-02 pass
+lumped `c362b08` (#755) with the vendor presets ruled under `MCP-529`
+(`13-cyrup-mcp-STATUS.md`, §*Already filed, open*). Its Figma-specific half (desktop-app
+reachability, `preset.desktopApp`) is vendor-specific and stays unowed; this half is vendor-neutral
+and applies to all five presets cyrup has.
+
+**upstream** — `c362b08` (#755, first in `v5.0.0`: `git tag --contains c362b08`). `commands.ts:667-680`
+`addKnownServer`: after `writeSharedServerEntry`, it reloads the merged config
+(`loadMcpConfig(configOverridePath, ctx.cwd).mcpServers[preset.id]`) and computes `ignoredBecause`
+(`:672-676`): the entry is absent (`the current config mode doesn't read <path>`), or a field of the
+preset differs from the merged result (`another config file also defines <id> and takes
+precedence`), or the merged entry is disabled (`another config file disables <id>`). The result
+carries `ignoredBecause` (`:677`), and `mcp-setup-panel.ts:950-951,959` renders
+`Pi won't use it: <reason>.` with a `warning` tone instead of the success notice
+(`AddServerOutcome` type at `mcp-setup-panel.ts:118`).
+
+**cyrup at HEAD** — `crates/cyrup-mcp/src/ui.rs:3488` `AddServerOutcome` is `{ path, server_name }`
+only; `panel_host.rs:434-450` `add_known_server` writes the entry through `write_shared_server_entry`
+and returns it without re-resolving the merged config; and `ui.rs:4020-4032` always renders the
+`Success`-toned `Added {} to {}. Pi will reload after this panel closes.` notice. `grep -rn
+"takes precedence\|doesn't read\|won't use" crates/cyrup-mcp/src` is empty. cyrup has five presets
+(`config.rs:5025-5034`), so a user whose config layers disagree about the id, or who has the server
+disabled in another layer, is told "Added" for an entry that has no effect.
+
+**Fix, S, low.** Add `ignored_because: Option<String>` to `AddServerOutcome`; in
+`SetupCallbacks::add_known_server` (and `add_repo_prompt`, which upstream does not check — keep it
+unchanged) reload the merged config for `preset.id` through the same `ConfigContext` and compute the
+three reasons in upstream's order; render the warning tone when set. Wording: keep upstream's
+reasons but name the cyrup file, not "Pi". The `reachable` field and the `desktopApp` preset
+property are not owed (no cyrup preset has them).
+
+`verify` — three panel-host tests, one per reason (a second config layer defining the id with a
+different value; one disabling it; a config mode that does not read the written file), each
+asserting the notice tone is `Warning` and the reason is shown; one that the unconflicted case still
+reports success.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 

@@ -617,12 +617,12 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 | ~~SESS-061~~ | ~~medium~~ **CLOSED 2026-09-27** | upstream-drift | S | **NEW 2026-09-24 (second pass).** When the trailing entries alone exceed `keepRecentTokens` and no valid cut point lies at or after the crossing, `find_cut_point` keeps the default first cut point — compacting nothing — where pi v0.86.0 (#9740) falls back to the LAST valid cut point. See body. — **CLOSED 2026-09-27**: the snap falls back to the LAST valid cut point when none is at or after the crossing entry (`compaction/cutpoint.rs:155-168`). Verify: `cyrup-session tests::compaction::sess061_trailing_tool_result_over_budget_cuts_at_the_last_valid_point`. |
 | ~~SESS-062~~ | ~~medium~~ **CLOSED 2026-09-27** | upstream-drift | M | **NEW 2026-09-24 (second pass).** `AgentSession::abort()` is `abort_retry()` + `agent.abort()`; pi v0.85.0 also aborts compaction and branch summarization, and v0.86.0 latches `_agentRunAbortRequested` so the post-run loop stops retrying, compacting and continuing. An RPC/ACP/SIGINT abort during an overflow-recovery compaction lets it finish and the run continue. See body. — **CLOSED 2026-09-27**: all five Fix legs are in the tree with tests: `abort_compaction()` + `abort_branch_summary()` in `queue.rs::abort` (`:112-113`), the latch set under `is_run_active()` (`:108-110`), the latch cleared at both run entry points (`run.rs:195`, `:258`), the loop condition plus pi's four inner checks and its tail (`run.rs:323,423,434,440,454,462,466`), `will_retry_after_agent_end` refusing while latched (`retry.rs:92`), and the `settle_run` close-out guard (`run.rs:366`). Verify: `cyrup-session-svc tests::compact_refusals::sess062_*` (5). |
 | ~~SESS-063~~ | ~~low~~ **CLOSED 2026-09-28** | upstream-drift | S | **CLOSED 2026-09-28** (on `claude/lows-next`): `branch_with_summary` captures `from_id = leaf ?? "root"` BEFORE moving the leaf (`crates/cyrup-session/src/manager/navigate.rs:29-52`), as pi has done since v0.84.3 (`session-manager.ts:1593-1615` @v0.87.1). Both the SDK path (`crates/cyrup-session/src/compaction/mod.rs:444-456`) and `/tree`'s `navigate_tree` route through it, and at both call sites the leaf is still the pre-navigation one, as at pi's `agent-session.ts:3731` (`:3727-3749`). Verify (the lane showed the row red without its fix): `cyrup-session tests::branch_provenance_and_export::{a_branch_summary_names_the_leaf_it_left_as_from_id, a_branch_summary_from_an_empty_leaf_names_root}`, `tests::compaction::{a05_7_branch_summary_appended_at_nav_abandoned_intact, g3_empty_branch_appends_no_content_placeholder}`. — *Original:* **NEW 2026-09-24 (second pass).** `branch_with_summary` records the navigation DESTINATION as `fromId`; pi v0.84.3 (`d711bd5f0`) records the pre-navigation leaf. The closed `SESS-017` aligned cyrup with the pre-v0.84.3 rule, which upstream then reversed. See body. |
-| SESS-064 | medium | upstream-drift | S | **A session file is now created at the first USER message, not the first assistant message** — pi `core/session-manager.ts:1166` `_hasConversation()` (#10000: "keeps the prompt on disk if the first turn never completes"); cyrup still gates both the first flush and `create_branched_session` on `has_assistant_message()`. **FILED 2026-10-02**; body below. |
+| SESS-064 | medium | upstream-drift | S | **A session file is now created at the first USER message, not the first assistant message** — pi `core/session-manager.ts:1166` `_hasConversation()` (#10000: "keeps the prompt on disk if the first turn never completes"); cyrup still gates both the first flush and `create_branched_session` on `has_assistant_message()`. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the site list is incomplete. (1) `crates/cyrup-session/src/manager/branched_session.rs:173` also gates on `entries_have_assistant(&retained)` (imported at `:16`; comment `:172`), so renaming `has_assistant_message`/`entries_have_assistant` (`manager/mod.rs:171,180,187`) misses it. (2) The v0.87.1 sentence "Wait for the first assistant response before cloning or forking it." is not only quoted in area 08: it is the live error text at `crates/cyrup-session-svc/src/error.rs:168` and is asserted by `crates/cyrup-session-svc/src/tests/fork_parent_and_unsaved_guard.rs:176` (module doc `:18`), so the change is to pi's "This session has not been saved yet. Send a message before cloning or forking it." in both. (3) Other stale "first assistant message" prose or references to update: `crates/cyrup-session/src/manager/lifecycle.rs:26,97`, `crates/cyrup-session/src/store.rs:7`, `branched_session.rs:172`, `crates/cyrup-core/src/message/stop_reason.rs:70` (names `entries_have_assistant`), and `crates/cyrup-it/tests/bin/acp_session.rs:18,361,959`. (4) Cite: pi `agent-session-runtime.ts` throws the "not been saved" error at `:313` @v1.0.0 (the body says `:312`). The `S` effort counts only the logic change; the extra sites are mechanical prose/test edits. |
 | SESS-065 | low | upstream-drift | S | **`/session` hides the cost breakdown when its single row names a model other than the selected one** — pi widened the gate to `usageBreakdown.length > 1 \|\| usageBreakdown[0]?.key !== selectedModelKey` (`modes/interactive/interactive-mode.ts:6671`); cyrup has the bare `breakdown.len() > 1`. **FILED 2026-10-02**; body below. |
-| SESS-066 | low | upstream-drift | S | **v1.0.0 rewrote `_restoreToolsFromTranscript` around a pending-tool set, so `SESS-051`'s Fix would land a stale port** — restored names are no longer filtered through `_toolRegistry` at restore time; they are held in `_pendingToolNames` until the tool registers (`core/agent-session.ts:1762-1769`, `:3542`, `:3632`). Growth on the open `SESS-051`; do not port v0.87.1's shape. **FILED 2026-10-02**; body below. |
-| SESS-067 | low | not-ported | M | **The session half of virtual models / `router/auto` is unported: the `pi.virtual-model-state` custom entry and the `getBranchSelection` hold rule** — `core/virtual-models.ts:32`, `:128-145`, `:159-167` and `core/sdk.ts:203` @v1.0.0; cyrup resolves a branch's model by a forward last-wins walk (`manager/context.rs:27-50`) with no virtual-model concept. **FILED 2026-10-02**; body below. |
-| SESS-068 | medium | parity-bug | S | **In an exported HTML session, every `/tree` navigation silently resets the thinking and tool-output toggles** — `renderEntryToNode` returns `cloneNode(true)` of the cached node, which carries its INITIAL presentation; pi v1.0.0 reapplies both toggles after appending the fragment (`core/export-html/template.js:1546-1548`), cyrup's `navigateTo` does not. **FILED 2026-10-02**; body below. |
-| SESS-069 | low | upstream-drift | S | **The HTML export drops `custom_message` entries with `display: false`; pi renders them hidden behind an `H` toggle** — `core/export-html/template.js:1330-1336`, `:1409`, `:1413`, CSS `template.css:795`, plus the auto-reveal when a deep link targets one (`:1521-1523`). cyrup's template has `if (entry.type === 'custom_message' && entry.display)` and no third toggle. **FILED 2026-10-02**; body below. |
+| SESS-066 | low | upstream-drift | S | **v1.0.0 rewrote `_restoreToolsFromTranscript` around a pending-tool set, so `SESS-051`'s Fix would land a stale port** — restored names are no longer filtered through `_toolRegistry` at restore time; they are held in `_pendingToolNames` until the tool registers (`core/agent-session.ts:1762-1769`, `:3542`, `:3632`). Growth on the open `SESS-051`; do not port v0.87.1's shape. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the body's measurement "`grep -rn 'tools_added\|pending_tool_names\|restore_tools_from_transcript' crates/ --include='*.rs'` is **0**" is false for the `tools_added` alternative: it hits `crates/cyrup-core/src/message/system.rs:55` (`SystemMessage.tools_added`, serialized as `toolsAdded` at `:99`), `crates/cyrup-session/src/compaction/tokens.rs`, `crates/cyrup-provider/src/utils/{transcript,estimate}.rs` and tests, i.e. the system-role message and its transcript projection have landed. Only the restore side is absent: `pending_tool_names` and `restore_tools_from_transcript` still match nothing, so the conclusion (nothing to re-pin in cyrup; amend `SESS-051`'s Fix to the pending-set form) stands. |
+| SESS-067 | low | not-ported | M | **The session half of virtual models / `router/auto` is unported: the `pi.virtual-model-state` custom entry and the `getBranchSelection` hold rule** — `core/virtual-models.ts:32`, `:128-145`, `:159-167` and `core/sdk.ts:203` @v1.0.0; cyrup resolves a branch's model by a forward last-wins walk (`manager/context.rs:27-50`) with no virtual-model concept. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** cite drift only: `fn resolve_model` is at `crates/cyrup-session-svc/src/builder.rs:2418` (the body says `:2415`) and its third call site is at `:1609` (the body says `:1606`). Note for the severity rubric: this row files `low` on the same "blocker, nothing breaks today" reasoning that `AGENT-045`/`AGENT-047` file `medium`; the rubric should be applied one way across the pi-1.0 rows (see the recommended re-ratings on those rows). |
+| SESS-068 | medium | parity-bug | S | **In an exported HTML session, every `/tree` navigation silently resets the thinking and tool-output toggles** — `renderEntryToNode` returns `cloneNode(true)` of the cached node, which carries its INITIAL presentation; pi v1.0.0 reapplies both toggles after appending the fragment (`core/export-html/template.js:1546-1548`), cyrup's `navigateTo` does not. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the Fix as written ("turn `toggleThinking`/`toggleToolOutputs` into setters", edit the template) cannot be applied in place: `crates/cyrup-session-svc/src/export/assets/template.js` and `template.css` are byte-identical copies of pi **v0.84.4**, pinned by SHA-256 in `crates/cyrup-session-svc/src/tests/export_html.rs` (`embedded_assets_are_byte_identical_to_pi_v0_84_4`, pins at about `:604-620`; `export/mod.rs:27-33` says the same), so a local edit fails that test by design. The fix is to **re-vendor pi v1.0.0's `template.js` and `template.css`** (`git -C tmp/pi show v1.0.0:packages/coding-agent/src/core/export-html/<file>`) and update those two pins and the test name; `template.html` and `vendor/*` are unchanged between v0.84.4 and v1.0.0 (`git diff --stat` over the directory lists only the two files), so their pins stay. Re-vendoring covers `SESS-068` and `SESS-069` in one change. Be aware the v0.84.4 to v1.0.0 diff of those two files (+82/-18) carries more than these two rows: it also brings `context_edit` entry handling (`template.js:360,391,702` @v1.0.0), `renderNestedCalls` (`:934,1081`) and a Ctrl/Alt/Meta key guard. Cite: pi's cache-and-clone `cloneNode(true)` is at `template.js:1500` @v1.0.0 (the body says `:1497-1501`). Recommended re-rating (not applied): medium→low, because it is a cosmetic state loss (toggle state resets on tree click), not data loss; the review leaned low-medium. |
+| SESS-069 | low | upstream-drift | S | **The HTML export drops `custom_message` entries with `display: false`; pi renders them hidden behind an `H` toggle** — `core/export-html/template.js:1330-1336`, `:1409`, `:1413`, CSS `template.css:795`, plus the auto-reveal when a deep link targets one (`:1521-1523`). cyrup's template has `if (entry.type === 'custom_message' && entry.display)` and no third toggle. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** same defect in the Fix as `SESS-068`: the three "coupled edits in the template" cannot be made by hand because `template.js`/`template.css` are SHA-pinned byte-identical v0.84.4 copies (`crates/cyrup-session-svc/src/tests/export_html.rs` about `:604-620`; `export/mod.rs:27-33`). The fix is the same single re-vendor of pi v1.0.0's `template.js` and `template.css` (which already contain `setHiddenMessagesVisible`, `hook-message-hidden` and the `navigateTo` auto-reveal at v1.0.0) plus new pins, shared with `SESS-068`. |
 
 ## SESS-040 — Compaction cannot be cancelled from the shipped binary: the Escape rebind was never ported, `AbortCompaction` has zero callers, and the indicator advertises "(esc to cancel)"
 
@@ -1823,7 +1823,7 @@ predicate, `_hasConversation()` at `:1166`:
 `_persist` (`:1172`) consults it once, at `:1176`, immediately before the `openSync(file, "wx")` first
 flush; the pre-v1.0.0 "not flushed yet, so append anyway" arm is gone. `createBranchedSession` uses the
 same predicate at `:1719` under the comment "Use the same rule as `_persist()`". The user-facing error on
-the fork/clone path moved with it: `core/agent-session-runtime.ts:312` now reads **"This session has not
+the fork/clone path moved with it: `core/agent-session-runtime.ts:312` (**CORRECTED 2026-10-03:** `:313`) now reads **"This session has not
 been saved yet. Send a message before cloning or forking it."**, where v0.87.1 said "Wait for the first
 assistant response before cloning or forking it."
 
@@ -1845,6 +1845,15 @@ plus `crates/cyrup-acp/tests/wire_gaps.rs:51` all document ACP's `session/new` b
 **Fix** — rename the predicate to `has_conversation()` and widen it to `user || assistant` core messages,
 then leave `persist_last`'s two arms as they are (cyrup already has no equivalent of the arm pi deleted).
 Update the three `cyrup-acp` prose sites and area 08's quoted sentence in the same change.
+
+**CORRECTED 2026-10-03:** also (a) `manager/branched_session.rs:173` (`entries_have_assistant(&retained)`
+decides `flushed` for a branched session; widen it with the same predicate, and fix its comment at `:172`),
+(b) the live error string at `crates/cyrup-session-svc/src/error.rs:168` and its assertion at
+`tests/fork_parent_and_unsaved_guard.rs:176` (not just area 08's quotation), and (c) the stale prose at
+`lifecycle.rs:26,97`, `store.rs:7`, `stop_reason.rs:70` and `crates/cyrup-it/tests/bin/acp_session.rs:18,361,959`.
+The body's `Impact` sentence that only "area 08's `/fork`-before-save row quotes" the old sentence is
+incomplete for the same reason. Not verified: that the session service persists the user message at
+`message_end` before the turn ends.
 
 **Verify** — a red-before test: append a `session` + `model_change` + a core `user` message to a persisted
 `SessionManager`, drop it, and assert the file exists and holds the user line. The companion negative must
@@ -1914,7 +1923,10 @@ resume and reload": a tool the transcript declares but whose extension has not r
 case for an MCP or `tool_search` tool at resume — was silently dropped by the old registry filter.
 
 **cyrup at HEAD** — nothing to re-pin, because the subject does not exist yet: `grep -rn 'tools_added\|pending_tool_names\|restore_tools_from_transcript' crates/ --include='*.rs'`
-is **0**, which is the same measurement `SESS-051` records.
+is **0**, which is the same measurement `SESS-051` records. **CORRECTED 2026-10-03:** that count is not 0:
+`tools_added` matches `cyrup-core/src/message/system.rs:55`, `cyrup-session/src/compaction/tokens.rs` and
+`cyrup-provider/src/utils/{transcript,estimate}.rs`. `pending_tool_names` and
+`restore_tools_from_transcript` do match nothing, which is the part that matters here.
 
 **Fix** — amend `SESS-051`'s Fix: the restore path to port is v1.0.0's pending-set form, not v0.87.1's
 registry filter. One further v1.0.0 projection belongs to a different owner and must not be re-derived here:
@@ -1948,7 +1960,7 @@ is **0**. The branch's model is resolved by `SessionManager::build_context`
 (`crates/cyrup-session/src/manager/context.rs:27-50`): a single FORWARD pass over `branch_path(None)` where
 both `KnownEntry::ModelChange` and an assistant `Message` overwrite `model`, i.e. unconditional last-wins —
 pi's pre-v1.0.0 rule. That value is what `resolve_model` restores from
-(`crates/cyrup-session-svc/src/builder.rs:2415`, called at `:1029`/`:1041`/`:1606` with `&existing`).
+(`crates/cyrup-session-svc/src/builder.rs:2415` (**CORRECTED 2026-10-03:** `:2418`), called at `:1029`/`:1041`/`:1606` (**CORRECTED:** `:1609`) with `&existing`).
 The container for the state entry already exists and needs no new shape: `KnownEntry::Custom { custom_type, data: Option<Value> }`
 (`crates/cyrup-session/src/entry.rs:129-135`).
 
@@ -1987,7 +1999,7 @@ re-render, so after any `/tree` click every row reverts to `thinking: shown`, `t
 while the two module-level booleans still claim the user's choice — so the NEXT keypress toggles the wrong
 way.
 
-**upstream** — pi had the identical cache and clone (`core/export-html/template.js:1497-1501` @v1.0.0) and
+**upstream** — pi had the identical cache and clone (`core/export-html/template.js:1497-1501` @v1.0.0; **CORRECTED 2026-10-03:** the `cloneNode(true)` is at `:1500`) and
 fixed the consequence in this window. The toggles were refactored into idempotent setters,
 `setThinkingExpanded(expanded)` (`:1834`) and `setToolOutputsExpanded(expanded)` (`:1845`), which also
 write `aria-pressed` on their header buttons; `navigateTo` calls both right after appending the fragment
@@ -2001,6 +2013,12 @@ HTML sibling), and `/tree` navigation inside it is the main reason a reader open
 Collapsing every tool output the reader had expanded, on every branch click, with the keyboard shortcut then
 inverted, is a straightforward state-loss bug. It is not a correctness failure in the agent, so it is
 `medium` rather than `high`.
+
+**CORRECTED 2026-10-03:** the `Fix` below must be carried out by re-vendoring v1.0.0's `template.js` and
+`template.css` and bumping their SHA-256 pins in `crates/cyrup-session-svc/src/tests/export_html.rs`
+(`embedded_assets_are_byte_identical_to_pi_v0_84_4`), not by editing the template: the assets are
+pinned byte-identical copies of v0.84.4 (`export/mod.rs:27-33`) and a hand edit fails that test. See the
+table row for what else the v0.84.4 to v1.0.0 re-vendor brings.
 
 **Fix** — port the refactor rather than patching the symptom: turn `toggleThinking`/`toggleToolOutputs` into
 `setThinkingExpanded`/`setToolOutputsExpanded` taking the desired state, have the click handlers at `:1816-1817`
@@ -2039,6 +2057,10 @@ on that file is **0**.
 the terminal, so these are exactly the entries a reader of a shared export may need (an extension's audit
 note, a hook's record). cyrup silently discards them where pi hides them one keypress away. Low: the data is
 still in the JSONL the export's `↓ JSONL` button downloads, so nothing is unrecoverable.
+
+**CORRECTED 2026-10-03:** do not make these edits by hand; re-vendor v1.0.0's `template.js` and
+`template.css` and bump the SHA-256 pins (see `SESS-068`'s correction). The text below describes what the
+re-vendor brings.
 
 **Fix** — three coupled edits in the template, best taken together with `SESS-068` since both touch the same
 toggle machinery and header: render the hidden variant with its class and the `· Hidden in terminal` suffix;
