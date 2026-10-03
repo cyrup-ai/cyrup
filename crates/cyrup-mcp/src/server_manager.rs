@@ -1312,6 +1312,23 @@ pub struct NewConnection {
 pub trait ConnectionFactory: Send + Sync + 'static {
     /// Build one connection, or fail.
     fn create(&self, request: CreateConnection) -> BoxFuture<'static, McpResult<NewConnection>>;
+
+    /// `validateCaFile(definition); this.validateProviderAuth(name, definition)` — the synchronous
+    /// pre-flight both `connect` (`server-manager.ts:479-480`) and `reconnect` (`:578-579`) run
+    /// **before** the disabled guard, and therefore before any teardown.
+    ///
+    /// It lives on the factory rather than the manager because the facts it judges — the resolved
+    /// environment, and whether a provider-token lookup was installed — belong to the thing that
+    /// builds connections. The default answers `Ok(())`, which is what every definition that does
+    /// not use `auth: { provider }` gets.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the implementation refuses the definition with, reported to the caller of
+    /// `connect`/`reconnect` unchanged.
+    fn validate_definition(&self, _name: &str, _definition: &ServerEntry) -> McpResult<()> {
+        Ok(())
+    }
 }
 
 /// The default factory: fail loudly, naming the units that would build a connection.
@@ -1997,6 +2014,11 @@ impl McpServerManager {
     ) -> ManagerResult<Arc<ServerConnection>> {
         // MEASURED: both guards fire before anything else, including before the single-flight map is
         // consulted, and `connect` and `reconnect` carry the identical two strings.
+        // `validateCaFile` / `validateProviderAuth` run FIRST, ahead of the disabled guard
+        // (`server-manager.ts:479-480`, `:578-579`).
+        self.factory
+            .validate_definition(name, definition)
+            .map_err(ManagerError::mcp)?;
         if definition.is_disabled() {
             return Err(ManagerError::other(server_disabled_message(name)));
         }
@@ -2292,6 +2314,11 @@ impl McpServerManager {
     ) -> ManagerResult<Arc<ServerConnection>> {
         // Both guards are load-bearing and are *not* inherited from `connect`: a reconnect on a
         // just-disabled server must fail **before any teardown happens** (§3.11).
+        // `validateCaFile` / `validateProviderAuth` run FIRST, ahead of the disabled guard
+        // (`server-manager.ts:479-480`, `:578-579`).
+        self.factory
+            .validate_definition(name, definition)
+            .map_err(ManagerError::mcp)?;
         if definition.is_disabled() {
             return Err(ManagerError::other(server_disabled_message(name)));
         }
@@ -5078,8 +5105,14 @@ mod tests {
         let _ = running.await;
         gate.open();
 
+        // Both conditions, not just the first: the orphaned reconnect publishes the replacement
+        // and *then* runs its identity-matched `finally`, so polling only for the connection
+        // leaves the slot assertion below racing the clear under load. The loop is still bounded,
+        // so a slot that never clears fails the assertion rather than hanging.
         for _ in 0..400 {
-            if manager.get_connection("s").is_some() {
+            if manager.get_connection("s").is_some()
+                && manager.tables().reconnect_promises.is_empty()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

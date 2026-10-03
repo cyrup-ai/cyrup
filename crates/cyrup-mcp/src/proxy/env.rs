@@ -571,15 +571,29 @@ impl ProxyCtx {
 // both the owner's and the literal signature. This is its re-export.
 pub use crate::ui::format_mcp_status;
 
-/// `utils.ts:330` `formatAuthRequiredMessage(config, serverName, defaultMessage)` — a configured
+/// `utils.ts:438` `formatAuthRequiredMessage(config, serverName, defaultMessage)` — a configured
 /// `settings.authRequiredMessage` template wins, with `${server}` replaced everywhere.
+///
+/// **Takes the whole config since MCP-593**, because upstream's parameter is
+/// `Pick<McpConfig, "settings" | "mcpServers">` and its first act is to read the server's `auth`:
+/// an `auth: { provider }` server is told to `/login <provider>` and the template is never
+/// consulted. That ordering is the point — a template written for the OAuth flow would send the
+/// user to `/mcp-auth`, which cannot sign a provider server in.
 #[must_use]
 pub fn format_auth_required_message(
-    settings: &McpSettings,
+    config: &McpConfig,
     server_name: &str,
     default_message: &str,
 ) -> String {
-    match settings.auth_required_message() {
+    if let Some(provider) = config
+        .mcp_servers
+        .get(server_name)
+        .and_then(|entry| entry.auth.as_ref())
+        .and_then(crate::config::AuthMode::provider)
+    {
+        return crate::config::provider_sign_in_message(server_name, provider);
+    }
+    match config.settings_or_default().auth_required_message() {
         Some(template) => template.replace("${server}", server_name),
         None => default_message.to_string(),
     }

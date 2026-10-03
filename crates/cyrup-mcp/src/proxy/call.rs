@@ -400,7 +400,7 @@ pub async fn execute_call(
                 if tool_meta.is_none()
                     && ctx.env.get_connection(&hint) == Some(ConnectionStatus::NeedsAuth)
                 {
-                    let message = get_auth_required_message(ctx.settings(), &hint);
+                    let message = get_auth_required_message(ctx.config(), &hint);
                     let mut map = details_err("call", McpErrorCode::AuthRequired);
                     map.insert("server".to_string(), Value::String(hint.clone()));
                     map.insert(
@@ -629,7 +629,7 @@ pub async fn execute_call(
             }
         }
         if connection == Some(ConnectionStatus::NeedsAuth) {
-            let message = get_auth_required_message(ctx.settings(), &server_name);
+            let message = get_auth_required_message(ctx.config(), &server_name);
             let mut map = details_err("call", McpErrorCode::AuthRequired);
             spread(&mut map, &identity);
             map.insert("message".to_string(), Value::String(message.clone()));
@@ -675,7 +675,7 @@ pub async fn execute_call(
                     }
                 }
                 if outcome.needs_auth() {
-                    let message = get_auth_required_message(ctx.settings(), &server_name);
+                    let message = get_auth_required_message(ctx.config(), &server_name);
                     let mut map = details_err("call", McpErrorCode::AuthRequired);
                     spread(&mut map, &identity);
                     map.insert("message".to_string(), Value::String(message.clone()));
@@ -1034,7 +1034,7 @@ async fn catch_arm(
     match error {
         ProxyCallError::SessionRecoveryAuthRequired { auth_message, .. } => {
             let message = auth_message
-                .unwrap_or_else(|| get_auth_required_message(ctx.settings(), server_name));
+                .unwrap_or_else(|| get_auth_required_message(ctx.config(), server_name));
             let mut map = details_err("call", McpErrorCode::AuthRequired);
             spread(&mut map, identity);
             map.insert("message".to_string(), Value::String(message.clone()));

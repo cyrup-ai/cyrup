@@ -1397,7 +1397,7 @@ use rmcp::transport::{
 use rmcp::{ClientHandler, ErrorData};
 use tokio::process::ChildStderr;
 
-use crate::config::{HttpTransport, ProtocolVersionSetting, ServerEntry};
+use crate::config::{AuthMode, HttpTransport, ProtocolVersionSetting, ServerEntry};
 use crate::errors::McpError;
 use crate::lifecycle::ConnectionStatus;
 use crate::server_manager::{
@@ -1922,6 +1922,215 @@ impl<C> SessionIdProbe<C> {
             // awaited to completion, and that await is the happens-before edge.
             self.seen.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+}
+
+/// `createProviderTokenFetch(serverUrl, provider, providerToken, delegate)`
+/// (`server-manager.ts:284`) — MCP-593.
+///
+/// Wraps a [`StreamableHttpClient`] so each request to the server's own origin carries the named
+/// cyrup provider's **current** token. Three properties, each load-bearing and each upstream's:
+///
+/// * **Per request, not per connection.** The token is read on every call rather than resolved once
+///   into rmcp's `auth_header`, because a provider token expires or is revoked mid-session and the
+///   next request has to see that. It is also what makes the needs-sign-in classification work: a
+///   revoked token becomes `None`, becomes a 401, becomes `needs-auth` — never a transport failure.
+/// * **Same origin only.** `if (new URL(request.url).origin !== origin) return innerFetch(request)`
+///   — another origin gets no token at all. Combined with `redirect: "error"` (rmcp's client is
+///   already built with redirects off, `build_http_client`) the user's provider credential cannot be
+///   walked off the configured host.
+/// * **No token ⇒ no request.** Upstream synthesises `new Response(null, { status: 401 })` rather
+///   than sending an unauthenticated request, and its comment says why: *"Without a token the
+///   request is not sent; the 401 marks the server as needing sign-in."* The rmcp equivalent is
+///   [`StreamableHttpError::AuthRequired`] with an empty challenge, which is exactly what
+///   [`UnauthorizedProbe`] produces for a bare 401 and what [`unauthorized_challenge`] already
+///   reads.
+///
+/// # Position in the client stack
+///
+/// Upstream's chain is `providerTokenFetch(…, commandFetch)` — the provider **outside**, the
+/// request-headers command **inside** — under the comment *"requestHeadersCommand stays last in the
+/// header chain."* In a `StreamableHttpClient` stack the outermost wrapper writes its headers
+/// first, so the same precedence means this type wraps
+/// [`crate::request_headers_command::RequestHeadersCommandClient`] and not the other way round: a
+/// signing command that derives its own `Authorization` still wins.
+#[derive(Debug, Clone)]
+pub struct ProviderTokenClient<C> {
+    inner: C,
+    /// `new URL(serverUrl).origin` — scheme + host + port, compared verbatim.
+    origin: String,
+    provider: Arc<str>,
+    source: Arc<dyn ProviderTokenSource>,
+}
+
+impl<C> ProviderTokenClient<C> {
+    /// Build the wrapper for one connection.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Config`] when `server_url` does not parse — `new URL(serverUrl).origin` throws
+    /// there, and the connect has already proven it parses, so this is the unreachable arm made
+    /// explicit rather than an `unwrap`.
+    pub fn new(
+        inner: C,
+        server_url: &str,
+        provider: &str,
+        source: Arc<dyn ProviderTokenSource>,
+    ) -> McpResult<Self> {
+        let parsed = url::Url::parse(server_url)
+            .map_err(|error| McpError::Config(format!("Invalid MCP server URL: {error}")))?;
+        Ok(Self {
+            inner,
+            origin: parsed.origin().ascii_serialization(),
+            provider: Arc::from(provider),
+            source,
+        })
+    }
+
+    /// Whether this request goes to the server's own origin, and therefore may carry the token.
+    fn same_origin(&self, uri: &str) -> bool {
+        url::Url::parse(uri)
+            .is_ok_and(|parsed| parsed.origin().ascii_serialization() == self.origin)
+    }
+
+    /// The token for one request, or the 401 that stands in for *not signed in*.
+    ///
+    /// `Ok(None)` is the other-origin case: no token, and the request still goes out.
+    async fn authorization<E>(&self, uri: &str) -> Result<Option<String>, StreamableHttpError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        if !self.same_origin(uri) {
+            return Ok(None);
+        }
+        let Some(token) = self.source.token(&self.provider).await else {
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                String::new(),
+            )));
+        };
+        // `headers.set("Authorization", \`Bearer ${token}\`)`'s throw, with upstream's own sentence
+        // — and upstream's reason for catching it at all: *"The Headers error quotes the value, so
+        // it must not surface."* A token with a newline in it must not be echoed into a log.
+        if HeaderValue::try_from(format!("Bearer {token}")).is_err() {
+            return Err(StreamableHttpError::Io(std::io::Error::other(format!(
+                "cyrup provider \"{}\" returned a token that is not a valid header value",
+                self.provider
+            ))));
+        }
+        Ok(Some(token))
+    }
+}
+
+/// Install the provider's bearer on one request, clearing any `Authorization` already in the map.
+///
+/// The same two-channel hazard `request_headers_command::apply_derived` documents: rmcp carries the
+/// bearer in `auth_header` and custom headers in a map, and **both append**, so a producer of one
+/// has to clear the other or the server sees two `Authorization` values.
+fn apply_provider_token(
+    custom_headers: &mut HashMap<HeaderName, HeaderValue>,
+    auth_header: &mut Option<String>,
+    token: Option<String>,
+) {
+    if let Some(token) = token {
+        let _ = custom_headers.remove(&http::header::AUTHORIZATION);
+        *auth_header = Some(token);
+    }
+}
+
+impl<C> StreamableHttpClient for ProviderTokenClient<C>
+where
+    C: StreamableHttpClient + Sync,
+{
+    type Error = C::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .post_message(uri, message, session_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .post_message_with_max_sse_event_size(
+                uri,
+                message,
+                session_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .delete_session(uri, session_id, auth_header, custom_headers)
+            .await
     }
 }
 
@@ -3344,6 +3553,23 @@ pub trait HttpAuthProvider: Send + Sync + std::fmt::Debug + 'static {
     fn invalidate_auth_entry_cache(&self, server: &str);
 }
 
+/// `setProviderToken(provider => Promise<string | undefined>)` (`server-manager.ts:401`) — the
+/// token lookup an `auth: { provider }` server's requests go through (MCP-593).
+///
+/// Upstream's comment on the setter is the whole contract: *"only a Pi session's model registry
+/// provides one."* The adapter does not reach into the provider's credential store itself; the host
+/// installs a lookup, and a build with no host — a load-time run, a bare library embedding — has
+/// none, which is what makes [`ConnectionBuilder::validate_provider_auth`]'s second sentence
+/// reachable rather than defensive.
+///
+/// `None` means *not signed in*, and it is not an error: the request is not sent at all and the
+/// server is marked as needing sign-in. An error would be a transport failure, which is exactly the
+/// misclassification `c524196` set out to avoid.
+pub trait ProviderTokenSource: Send + Sync + std::fmt::Debug + 'static {
+    /// The named provider's current access token, or `None` when there is no usable one.
+    fn token<'a>(&'a self, provider: &'a str) -> BoxFuture<'a, Option<String>>;
+}
+
 /// The default [`HttpAuthProvider`]: no credential is available, ever.
 ///
 /// See [`HttpAuthProvider`] for why this is upstream-faithful rather than inert — it reproduces the
@@ -3936,6 +4162,8 @@ pub struct ConnectionBuilder {
     home: PathBuf,
     handler: HandlerFactory,
     auth: Arc<dyn HttpAuthProvider>,
+    /// `this.providerToken` — `None` until a host installs one (MCP-593).
+    provider_token: Option<Arc<dyn ProviderTokenSource>>,
 }
 
 impl std::fmt::Debug for ConnectionBuilder {
@@ -3962,7 +4190,60 @@ impl ConnectionBuilder {
             home: crate::dirs::home_dir(),
             handler: bare_handler_factory(),
             auth: Arc::new(NoStoredCredentials),
+            provider_token: None,
         }
+    }
+
+    /// `setProviderToken(providerToken)` (`server-manager.ts:401`) — install the lookup an
+    /// `auth: { provider }` server's requests read their bearer credential from (MCP-593).
+    ///
+    /// Without it such a server does not connect: [`Self::validate_provider_auth`] refuses it by
+    /// name rather than letting it reach the endpoint unauthenticated, which is what cyrup did
+    /// before the variant existed.
+    #[must_use]
+    pub fn with_provider_token(mut self, source: Arc<dyn ProviderTokenSource>) -> Self {
+        self.provider_token = Some(source);
+        self
+    }
+
+    /// `validateProviderAuth(name, definition)` (`server-manager.ts:406`) — MCP-593.
+    ///
+    /// Upstream's own comment says what it is for: *"Covers config that bypassed file validation
+    /// (runtime registrations, env-resolved URLs)."* [`crate::config::to_server_entries`] already
+    /// refuses a provider server whose URL is unsafe, but it **exempts** a URL still carrying
+    /// `${VAR}` — so this is the check that sees `https://${MCP_HOST}/mcp` after `MCP_HOST` has
+    /// resolved to `evil.example` over plain HTTP, and it is the only one that does.
+    ///
+    /// Note the order: the URL is judged **before** the token source is looked for, so a server
+    /// that is both unsafe and unsupported reports the unsafe URL. That is upstream's order and the
+    /// more useful one — the URL is the user's mistake, the missing lookup is the embedding's.
+    ///
+    /// # Errors
+    ///
+    /// `` MCP server "<name>": auth.provider requires an https URL, … `` or
+    /// `` MCP server "<name>": auth.provider isn't available here; … ``.
+    pub fn validate_provider_auth(&self, name: &str, entry: &ServerEntry) -> McpResult<()> {
+        if entry.auth.as_ref().and_then(AuthMode::provider).is_none() {
+            return Ok(());
+        }
+        // `providerAuthUrlError(resolveServerUrl(definition) ?? "")` — the `?? ""` matters: a
+        // definition whose URL cannot resolve is judged as the empty string, which is unparseable
+        // and therefore refused, rather than skipping the check.
+        let resolved = crate::credentials::resolve_server_url(entry.url.as_deref(), &self.env)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if let Some(url_error) = crate::config::provider_auth_url_error(&resolved) {
+            return Err(McpError::Config(format!(
+                "MCP server \"{name}\": {url_error}"
+            )));
+        }
+        if self.provider_token.is_none() {
+            return Err(McpError::Config(format!(
+                "MCP server \"{name}\": auth.provider isn't available here; it needs a cyrup session whose provider registry provides provider tokens"
+            )));
+        }
+        Ok(())
     }
 
     /// Install the manager's `createClient` — the hooks of §3.5, §3.10 and §3.16.
@@ -4305,6 +4586,34 @@ impl ConnectionBuilder {
             None => None,
         };
 
+        // `provider !== undefined ? createProviderTokenFetch(serverUrl, provider, …, commandFetch)`
+        // (`server-manager.ts:1690`) — built once per connect beside the signing client, for the
+        // same reason: what has to be fresh per attempt is the MCP client, not the HTTP one.
+        //
+        // `validate_definition` has already refused a provider server with no token source, so the
+        // `and_then` below cannot drop one silently; it is written this way rather than with an
+        // `expect` because the builder can be used without the manager.
+        let provider_client = match (
+            entry.auth.as_ref().and_then(AuthMode::provider),
+            self.provider_token.as_ref(),
+        ) {
+            (Some(provider), Some(source)) => Some(match signing_client.clone() {
+                Some(signing) => ProviderHttpClient::Signing(ProviderTokenClient::new(
+                    signing,
+                    &server_url,
+                    provider,
+                    Arc::clone(source),
+                )?),
+                None => ProviderHttpClient::Plain(ProviderTokenClient::new(
+                    http_client.clone(),
+                    &server_url,
+                    provider,
+                    Arc::clone(source),
+                )?),
+            }),
+            _ => None,
+        };
+
         // `let authState: HttpAuthProviderState = supportsOAuth(definition) ? … : { disabled }`.
         let mut auth_state = crate::oauth::initial_http_auth_state(entry);
         let mut invalidated = request.credentials_invalidated;
@@ -4332,8 +4641,11 @@ impl ConnectionBuilder {
                     request,
                     &spec,
                     entry,
-                    &http_client,
-                    signing_client.as_ref(),
+                    &HttpClientStack {
+                        http_client: &http_client,
+                        signing_client: signing_client.as_ref(),
+                        provider_client: provider_client.as_ref(),
+                    },
                     oauth_token,
                 )
                 .await?;
@@ -4372,7 +4684,14 @@ impl ConnectionBuilder {
                 // Arm 6 is Cut 1; arm 7 — `throw result.error`.
                 return Err(initialize_error(name, &error, None));
             };
-            match crate::oauth::on_unauthorized(&auth_state, Some(challenge)) {
+            // `supportsOAuth(definition) || provider !== undefined` — the second half is MCP-593's
+            // and `provider_client.is_some()` is exactly it: it exists only when the definition
+            // named a provider and a lookup was installed.
+            match crate::oauth::on_unauthorized(
+                &auth_state,
+                Some(challenge),
+                provider_client.is_some(),
+            ) {
                 crate::oauth::UnauthorizedAction::RetryOnce(next) => {
                     auth_state = next;
                     continue;
@@ -4415,12 +4734,14 @@ impl ConnectionBuilder {
         request: &CreateConnection,
         spec: &HttpTransportSpec,
         entry: &ServerEntry,
-        http_client: &UnauthorizedProbe,
-        signing_client: Option<
-            &crate::request_headers_command::RequestHeadersCommandClient<UnauthorizedProbe>,
-        >,
+        clients: &HttpClientStack<'_>,
         oauth_token: Option<String>,
     ) -> McpResult<HttpAttempt> {
+        let HttpClientStack {
+            http_client,
+            signing_client,
+            provider_client,
+        } = *clients;
         let name = request.name.as_str();
         let mut config = build_http_transport_config(spec)?;
 
@@ -4500,46 +4821,35 @@ impl ConnectionBuilder {
         // [`SessionIdProbe`] wraps whichever client this attempt uses, so `has_session_id` below is
         // a read of what the server actually sent rather than a constant. The flag is cloned out
         // BEFORE the probe is handed to the transport, which takes its client by value.
-        let (outcome, session_id) = match signing_client {
-            Some(signing) => {
-                let probe = SessionIdProbe::new(signing.clone());
-                let session_id = probe.flag();
-                (
-                    connect_client_bounded(
-                        handler,
-                        crate::trace::maybe_traced(
-                            http_transport_with_client(probe, config),
-                            &request.name,
-                            crate::trace::TraceTransportKind::StreamableHttp,
-                            request.trace.clone(),
-                        ),
-                        lifecycle,
-                        request.attempt.clone(),
-                        budget,
-                    )
-                    .await,
-                    session_id,
+        // Four shapes, one driver. The provider wrapper is OUTSIDE the signing client because
+        // upstream's chain is `providerTokenFetch(…, commandFetch)` — see [`ProviderTokenClient`]
+        // for why that order is the one that keeps a signing command's `Authorization` winning.
+        let (outcome, session_id) = match (provider_client, signing_client) {
+            (Some(provider), _) => {
+                drive_http_attempt(
+                    provider.clone(),
+                    config,
+                    handler,
+                    request,
+                    lifecycle,
+                    budget,
                 )
+                .await
             }
-            None => {
-                let probe = SessionIdProbe::new(http_client.clone());
-                let session_id = probe.flag();
-                (
-                    connect_client_bounded(
-                        handler,
-                        crate::trace::maybe_traced(
-                            http_transport_with_client(probe, config),
-                            &request.name,
-                            crate::trace::TraceTransportKind::StreamableHttp,
-                            request.trace.clone(),
-                        ),
-                        lifecycle,
-                        request.attempt.clone(),
-                        budget,
-                    )
-                    .await,
-                    session_id,
+            (None, Some(signing)) => {
+                drive_http_attempt(signing.clone(), config, handler, request, lifecycle, budget)
+                    .await
+            }
+            (None, None) => {
+                drive_http_attempt(
+                    http_client.clone(),
+                    config,
+                    handler,
+                    request,
+                    lifecycle,
+                    budget,
                 )
+                .await
             }
         };
 
@@ -4564,6 +4874,227 @@ impl ConnectionBuilder {
             Err(error) => HttpAttempt::Failed(error),
         })
     }
+}
+
+/// Whichever client stack an `auth: { provider }` connection uses: the provider wrapper over the
+/// signing client when both are configured, over the bare client otherwise (MCP-593).
+///
+/// An enum rather than a boxed `dyn StreamableHttpClient` because the trait's methods are
+/// `async fn`, so it is not object-safe; and two concrete arms rather than a generic parameter on
+/// `connect_http_client` because the shape is decided per definition, not per call site.
+#[derive(Debug, Clone)]
+pub enum ProviderHttpClient {
+    /// No `requestHeadersCommand`: the provider wrapper sits directly on the HTTP client.
+    Plain(ProviderTokenClient<UnauthorizedProbe>),
+    /// With one: the provider wrapper is outside the signing client, so the command's headers are
+    /// applied last and win.
+    Signing(
+        ProviderTokenClient<
+            crate::request_headers_command::RequestHeadersCommandClient<UnauthorizedProbe>,
+        >,
+    ),
+}
+
+impl StreamableHttpClient for ProviderHttpClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .post_message(uri, message, session_id, auth_header, custom_headers)
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .post_message(uri, message, session_id, auth_header, custom_headers)
+                    .await
+            }
+        }
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .post_message_with_max_sse_event_size(
+                        uri,
+                        message,
+                        session_id,
+                        auth_header,
+                        custom_headers,
+                        max_sse_event_size,
+                    )
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .post_message_with_max_sse_event_size(
+                        uri,
+                        message,
+                        session_id,
+                        auth_header,
+                        custom_headers,
+                        max_sse_event_size,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+                    .await
+            }
+        }
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .get_stream_with_max_sse_event_size(
+                        uri,
+                        session_id,
+                        last_event_id,
+                        auth_header,
+                        custom_headers,
+                        max_sse_event_size,
+                    )
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .get_stream_with_max_sse_event_size(
+                        uri,
+                        session_id,
+                        last_event_id,
+                        auth_header,
+                        custom_headers,
+                        max_sse_event_size,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .delete_session(uri, session_id, auth_header, custom_headers)
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .delete_session(uri, session_id, auth_header, custom_headers)
+                    .await
+            }
+        }
+    }
+}
+
+/// The three HTTP client shapes one connect may have built, passed as one value.
+///
+/// Grouped rather than listed: `attempt(kind)` is a closure upstream and closes over all of them,
+/// and a Rust method taking them positionally crossed the argument-count lint the moment MCP-593
+/// added the third. Which one is used is [`ConnectionBuilder::http_attempt`]'s decision, not the
+/// caller's.
+#[derive(Debug, Clone, Copy)]
+struct HttpClientStack<'a> {
+    /// Always present: the tuned `reqwest` client under its 401 probe.
+    http_client: &'a UnauthorizedProbe,
+    /// `createRequestHeadersCommandFetch(definition.requestHeadersCommand, …)`.
+    signing_client:
+        Option<&'a crate::request_headers_command::RequestHeadersCommandClient<UnauthorizedProbe>>,
+    /// `createProviderTokenFetch(serverUrl, provider, …)` — MCP-593, and outermost when present.
+    provider_client: Option<&'a ProviderHttpClient>,
+}
+
+/// One turn of the ladder's transport half, over whichever client stack the definition selected.
+///
+/// Extracted when MCP-593 added a third stack: the body was duplicated per arm of a two-arm match,
+/// and a fourth copy is how a transport option quietly stops applying to one shape of server.
+/// [`SessionIdProbe`] wraps the client here, so `has_session_id` is a read of what the server
+/// actually sent; the flag is cloned out BEFORE the probe is handed to the transport, which takes
+/// its client by value.
+async fn drive_http_attempt<C>(
+    client: C,
+    config: StreamableHttpClientTransportConfig,
+    handler: McpClientHandler,
+    request: &CreateConnection,
+    lifecycle: ClientLifecycleMode,
+    budget: Option<Duration>,
+) -> (
+    Result<
+        Result<RunningService<RoleClient, McpClientHandler>, Box<ClientInitializeError>>,
+        Duration,
+    >,
+    Arc<std::sync::atomic::AtomicBool>,
+)
+where
+    C: StreamableHttpClient + Clone + Send + Sync + 'static,
+{
+    let probe = SessionIdProbe::new(client);
+    let session_id = probe.flag();
+    let outcome = connect_client_bounded(
+        handler,
+        crate::trace::maybe_traced(
+            http_transport_with_client(probe, config),
+            &request.name,
+            crate::trace::TraceTransportKind::StreamableHttp,
+            request.trace.clone(),
+        ),
+        lifecycle,
+        request.attempt.clone(),
+        budget,
+    )
+    .await;
+    (outcome, session_id)
 }
 
 /// `definition.oauth !== false && definition.oauth?.skipIssuerMetadataValidation === true` —
@@ -4897,8 +5428,18 @@ impl ConnectionFactory for ConnectionBuilder {
             home: self.home.clone(),
             handler: Arc::clone(&self.handler),
             auth: Arc::clone(&self.auth),
+            provider_token: self.provider_token.clone(),
         };
         Box::pin(async move { builder.create_connection(request).await })
+    }
+
+    /// `validateProviderAuth(name, definition)` — see
+    /// [`ConnectionBuilder::validate_provider_auth`]. The manager calls this in upstream's exact
+    /// position: before the disabled guard in both `connect` and `reconnect`
+    /// (`server-manager.ts:480`, `:579`), so a reconnect on a misconfigured provider server fails
+    /// **before any teardown happens**.
+    fn validate_definition(&self, name: &str, definition: &ServerEntry) -> McpResult<()> {
+        self.validate_provider_auth(name, definition)
     }
 }
 
@@ -7189,6 +7730,253 @@ done
             )),
             ..http_entry(url)
         }
+    }
+
+    // ── MCP-593 · `auth: { provider: "<name>" }` ──────────────────────────────────────────────
+
+    /// A [`ProviderTokenSource`] that answers one provider and counts the lookups.
+    #[derive(Debug)]
+    struct ScriptedProviderToken {
+        provider: &'static str,
+        token: std::sync::Mutex<Option<String>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ScriptedProviderToken {
+        fn new(provider: &'static str, token: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                provider,
+                token: std::sync::Mutex::new(token.map(str::to_string)),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+        }
+    }
+
+    impl ProviderTokenSource for ScriptedProviderToken {
+        fn token<'a>(&'a self, provider: &'a str) -> BoxFuture<'a, Option<String>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Another provider's token is never handed out: the lookup is keyed, not global.
+            let answer = (provider == self.provider)
+                .then(|| {
+                    self.token
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                })
+                .flatten();
+            Box::pin(async move { answer })
+        }
+    }
+
+    fn provider_entry(url: &str, provider: &str) -> ServerEntry {
+        let entry: ServerEntry = serde_json::from_str(&format!(
+            "{{\"url\":\"{url}\",\"auth\":{{\"provider\":\"{provider}\"}}}}"
+        ))
+        .expect("the entry parses");
+        assert_eq!(
+            entry.auth.as_ref().and_then(AuthMode::provider),
+            Some(provider),
+            "`auth: {{ provider }}` must reach `AuthMode::Provider`, not `Other`"
+        );
+        entry
+    }
+
+    /// The row's headline: a provider server's requests carry that provider's token as their
+    /// bearer credential, and the lookup happens **per request** rather than once per connection.
+    ///
+    /// The fixture's only gate is the bearer, so this cannot pass without the token actually being
+    /// sent — which is what cyrup did before the variant existed, `{ provider }` having landed in
+    /// `AuthMode::Other` and reached no reader at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_auth_server_sends_the_providers_token() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            require_bearer: Some("provider-token"),
+            ..FixtureOptions::default()
+        })
+        .await;
+        let source = ScriptedProviderToken::new("anthropic", Some("provider-token"));
+        let calls = Arc::clone(&source.calls);
+
+        let connection = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", provider_entry(&fixture.url, "anthropic")))
+            .await
+            .expect("the provider's token authorizes the connect");
+
+        assert_eq!(connection.status, ConnectionStatus::Connected);
+        let requests = fixture.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|recorded| recorded.body.contains("\"method\":\"tools/list\"")),
+            "discovery ran, so the token authorized more than the handshake"
+        );
+        for recorded in &requests {
+            assert_eq!(
+                recorded.all("authorization"),
+                vec!["Bearer provider-token"],
+                "exactly one Authorization value, carrying the provider token: {}",
+                recorded.method
+            );
+        }
+        assert!(
+            calls.load(std::sync::atomic::Ordering::Relaxed) >= requests.len(),
+            "the lookup is per REQUEST, not once per connection: {} lookups for {} requests",
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            requests.len()
+        );
+
+        // Neither the source nor the builder may print a token.
+        let rendered = format!("{:?}", builder().with_provider_token(source));
+        assert!(!rendered.contains("provider-token"), "{rendered}");
+    }
+
+    /// Not signed in: upstream does **not** send the request, it synthesises a 401 — *"the 401 marks
+    /// the server as needing sign-in"* — so the outcome is `needs-auth`, never a transport failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_with_no_token_is_needs_auth_and_sends_nothing() {
+        let fixture = HttpFixture::start_with(FixtureOptions::default()).await;
+        let source = ScriptedProviderToken::new("anthropic", None);
+
+        let connection = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", provider_entry(&fixture.url, "anthropic")))
+            .await
+            .expect("a missing token is not an error, it is needs-auth");
+
+        assert_eq!(connection.status, ConnectionStatus::NeedsAuth);
+        assert!(
+            fixture.requests().is_empty(),
+            "without a token the request is not sent at all: {:?}",
+            fixture.requests()
+        );
+    }
+
+    /// A token that stops working mid-session: the next request's lookup answers `None`, so the
+    /// request is refused locally and the server reads as needing sign-in rather than as a broken
+    /// transport. The fixture would have accepted the first token forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_revoked_mid_session_becomes_needs_auth_not_a_transport_failure() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            require_bearer: Some("provider-token"),
+            ..FixtureOptions::default()
+        })
+        .await;
+        let source = ScriptedProviderToken::new("anthropic", Some("provider-token"));
+        let entry = provider_entry(&fixture.url, "anthropic");
+
+        let first = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", entry.clone()))
+            .await
+            .expect("the first connect is authorized");
+        assert_eq!(first.status, ConnectionStatus::Connected);
+
+        // `/login` expired, or the provider revoked it.
+        *source
+            .token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let before = fixture.requests().len();
+
+        let second = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", entry))
+            .await
+            .expect("a revoked token is needs-auth");
+        assert_eq!(second.status, ConnectionStatus::NeedsAuth);
+        assert_eq!(
+            fixture.requests().len(),
+            before,
+            "and nothing was put on the wire with a dead credential"
+        );
+    }
+
+    /// The provider's token goes to the server's own origin and nowhere else, and a different
+    /// provider's name gets no token at all — the lookup is keyed, not a global credential.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_token_is_scoped_to_one_origin_and_one_provider() {
+        let fixture = HttpFixture::start_with(FixtureOptions::default()).await;
+        let source = ScriptedProviderToken::new("anthropic", Some("provider-token"));
+        let client = ProviderTokenClient::new(
+            UnauthorizedProbe::new(build_http_client().expect("client")),
+            &fixture.url,
+            "anthropic",
+            Arc::clone(&source) as Arc<dyn ProviderTokenSource>,
+        )
+        .expect("the fixture URL parses");
+
+        assert!(client.same_origin(&fixture.url));
+        assert!(
+            !client.same_origin("https://evil.example/mcp"),
+            "another origin is not this server's"
+        );
+        // Same host, different port: a distinct origin, so still no token.
+        let other_port = fixture.url.replace("127.0.0.1:", "127.0.0.1:1");
+        assert!(!client.same_origin(&other_port), "{other_port}");
+
+        // A connection configured for a provider the source does not hold gets `None`, which is
+        // needs-auth — not somebody else's token.
+        let mismatched = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", provider_entry(&fixture.url, "openai")))
+            .await
+            .expect("needs-auth, not an error");
+        assert_eq!(mismatched.status, ConnectionStatus::NeedsAuth);
+    }
+
+    /// `validateProviderAuth` (`server-manager.ts:406`), both sentences, and the order between them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_provider_auth_refuses_before_the_endpoint_is_touched() {
+        let source = ScriptedProviderToken::new("anthropic", Some("t"));
+        let with_source =
+            builder().with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>);
+
+        // Leg 1 — the URL. This is the case `to_server_entries` deliberately EXEMPTS, because the
+        // URL still held `${VAR}` when the file was read; the check only exists here.
+        let interpolated = ServerEntry {
+            url: Some("http://${PROVIDER_HOST}/mcp".to_string()),
+            ..provider_entry("http://placeholder.example/mcp", "anthropic")
+        };
+        let env: crate::credentials::EnvFn =
+            Arc::new(|name: &str| (name == "PROVIDER_HOST").then(|| "evil.example".to_string()));
+        let error = ConnectionBuilder::new(None)
+            .with_environment(env, base_env(), PathBuf::from("/home/fixture"))
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .validate_provider_auth("api", &interpolated)
+            .expect_err("plain http to a remote host must be refused");
+        assert_eq!(
+            error.to_string(),
+            "MCP server \"api\": auth.provider requires an https URL, or http on localhost, 127.0.0.1, or [::1]"
+        );
+
+        // …and the same definition resolving to loopback is allowed.
+        let loopback: crate::credentials::EnvFn =
+            Arc::new(|name: &str| (name == "PROVIDER_HOST").then(|| "127.0.0.1:9".to_string()));
+        ConnectionBuilder::new(None)
+            .with_environment(loopback, base_env(), PathBuf::from("/home/fixture"))
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .validate_provider_auth("api", &interpolated)
+            .expect("http on 127.0.0.1 is the allowed cleartext case");
+
+        // Leg 2 — no lookup installed. Reported only once the URL is cleared, which is upstream's
+        // order: the URL is the user's mistake, a missing lookup is the embedding's.
+        let error = builder()
+            .validate_provider_auth(
+                "api",
+                &provider_entry("https://api.example/mcp", "anthropic"),
+            )
+            .expect_err("no provider-token source means no provider auth");
+        assert_eq!(
+            error.to_string(),
+            "MCP server \"api\": auth.provider isn't available here; it needs a cyrup session whose provider registry provides provider tokens"
+        );
+
+        // A server that does not use provider auth is untouched by either leg.
+        with_source
+            .validate_provider_auth("api", &http_entry("http://plain.example/mcp"))
+            .expect("no `auth.provider`, nothing to validate");
     }
 
     /// **Journey A.** A credential is already in the vault; the server connects on attempt one,

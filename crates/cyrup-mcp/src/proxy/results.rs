@@ -7,7 +7,7 @@ use serde_json::{Map as JsonMap, Value};
 
 use cyrup_core::{Content, ToolResult};
 
-use crate::config::{McpConfig, McpSettings, ServerEntry};
+use crate::config::{McpConfig, ServerEntry};
 use crate::proxy::env::format_auth_required_message;
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::tool_metadata::ToolMetadata;
@@ -95,9 +95,9 @@ pub(crate) fn not_found_result(mode: &str, server_name: &str) -> ToolResult {
 /// which is why the caller-supplied default in [`crate::proxy::attempt_auto_auth`] step 4 also routes through
 /// here rather than being returned directly.
 #[must_use]
-pub fn get_auth_required_message(settings: &McpSettings, server_name: &str) -> String {
+pub fn get_auth_required_message(config: &McpConfig, server_name: &str) -> String {
     format_auth_required_message(
-        settings,
+        config,
         server_name,
         &default_auth_required_message(server_name),
     )
@@ -116,11 +116,15 @@ pub(crate) fn default_auth_required_message(server_name: &str) -> String {
 /// [`get_auth_required_message`]; without one the default guidance is inlined literally. Both spell
 /// the same sentence, but the template arm renders the user's text.
 #[must_use]
-pub fn get_auth_failed_message(settings: &McpSettings, server_name: &str, message: &str) -> String {
-    if settings.auth_required_message().is_some() {
+pub fn get_auth_failed_message(config: &McpConfig, server_name: &str, message: &str) -> String {
+    if config
+        .settings_or_default()
+        .auth_required_message()
+        .is_some()
+    {
         format!(
             "OAuth authentication failed for \"{server_name}\": {message}. {}",
-            get_auth_required_message(settings, server_name)
+            get_auth_required_message(config, server_name)
         )
     } else {
         format!(

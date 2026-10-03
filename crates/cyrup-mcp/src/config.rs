@@ -1713,8 +1713,9 @@ impl<'de> Deserialize<'de> for ProtocolVersionSetting {
     }
 }
 
-/// `auth: "oauth" | "bearer" | false`. Untagged with a `bool` arm because only the literal `false`
-/// is legal — `true` is not a variant, it is a value the entry simply never satisfies.
+/// `auth: "oauth" | "bearer" | false | { provider: string }` (`types.ts:464` @ v5.0.0). Untagged
+/// with a `bool` arm because only the literal `false` is legal — `true` is not a variant, it is a
+/// value the entry simply never satisfies.
 ///
 /// # The third arm exists for the digest, and for nothing else
 ///
@@ -1738,8 +1739,98 @@ pub enum AuthMode {
     /// The literal `false` — and `true`, which is tolerated exactly as TypeScript's structural cast
     /// tolerates it and satisfies no read site.
     Disabled(bool),
+    /// `{ provider: "<name>" }` — send the named cyrup provider's OAuth token as this HTTP server's
+    /// bearer credential on every request (`c524196`, #767, v5.0.0; MCP-593).
+    ///
+    /// Listed **before** [`Other`](Self::Other) so an object carrying a non-empty string `provider`
+    /// lands here; every other object-shaped `auth` still falls through, and
+    /// [`to_server_entries`] is what turns such a value into the dropped-server warning upstream
+    /// produces for it.
+    Provider(ProviderAuth),
     /// Anything else the file contained, held **verbatim** for the digest and matched by nothing.
     Other(RawJson),
+}
+
+impl AuthMode {
+    /// `typeof auth === "object"` — **including `null` and an array**, as JS does.
+    ///
+    /// This is the gate `toServerEntries` (`config.ts:1341`) opens its provider ladder with, and the
+    /// `null` case is the one that makes the distinction load-bearing: `auth: null` is `typeof
+    /// "object"`, so upstream drops that server with `auth.provider must be a provider name`, while
+    /// `auth: "basic"` and `auth: 5` are kept and simply match nothing.
+    #[must_use]
+    pub fn is_object_like(&self) -> bool {
+        match self {
+            AuthMode::Provider(_) => true,
+            AuthMode::Other(raw) => {
+                matches!(raw, RawJson::Object(_) | RawJson::Array(_) | RawJson::Null)
+            }
+            AuthMode::Named(_) | AuthMode::Disabled(_) => false,
+        }
+    }
+
+    /// `typeof definition.auth === "object" ? definition.auth.provider : undefined`
+    /// (`server-manager.ts:1577`).
+    #[must_use]
+    pub fn provider(&self) -> Option<&str> {
+        match self {
+            AuthMode::Provider(auth) => Some(auth.provider()),
+            _ => None,
+        }
+    }
+}
+
+/// `{ provider: string }` — the object arm of [`AuthMode`], keeping the **whole** block beside the
+/// extracted name.
+///
+/// # Why the raw object is retained
+///
+/// `computeServerHash` folds `definition.auth` into the identity object verbatim
+/// (`metadata-cache.ts:132`), and `toServerEntries` stores the entry as it was written — so an
+/// `auth` object carrying a key this build does not read still reaches the digest. A variant holding
+/// only `provider` would re-serialise as `{"provider":"x"}` and move the digest of every such
+/// server off upstream's. This is [`StringRecord`]'s arrangement, for the same reason.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderAuth {
+    /// The non-empty provider name — `auth.provider`.
+    provider: String,
+    /// The block exactly as written, so [`Serialize`] is lossless and the digest is upstream's.
+    raw: RawObject,
+}
+
+impl ProviderAuth {
+    /// The provider name `/login <provider>` signs into.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+}
+
+impl Serialize for ProviderAuth {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderAuth {
+    /// An object whose `provider` is a **non-empty string**; everything else is an error, which in
+    /// an untagged position means the next variant gets its turn.
+    ///
+    /// `typeof auth.provider !== "string" || !auth.provider` (`config.ts:1207`, `:1343`) — the
+    /// emptiness test is upstream's own, and it is why `{ "provider": "" }` is not a provider
+    /// server but a dropped one.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawObject::deserialize(deserializer)?;
+        let provider = raw
+            .get("provider")
+            .and_then(RawJson::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                serde::de::Error::custom("auth.provider must be a non-empty provider name")
+            })?
+            .to_string();
+        Ok(Self { provider, raw })
+    }
 }
 
 /// The two named `auth` values.
@@ -2353,10 +2444,102 @@ pub fn to_server_entries(
         );
         // Cannot fail: the root is an object and every field is `lenient`.
         if let Some(entry) = raw_to::<ServerEntry>(raw_entry) {
+            if let Some(error) = provider_auth_entry_error(&entry) {
+                // `console.warn(\`Ignoring MCP server "${name}": ${error}\`)` (`config.ts:1348`) —
+                // and `continue`, so the server is gone rather than silently unauthenticated.
+                let message = format!(
+                    "Ignoring MCP server \"{name}\" in {}: {error}",
+                    path.display()
+                );
+                tracing::warn!("{message}");
+                diagnostics.push(ConfigDiagnostic {
+                    path: path.to_path_buf(),
+                    server: Some(name.clone()),
+                    message,
+                });
+                continue;
+            }
             out.insert(name.clone(), entry);
         }
     }
     out
+}
+
+/// `toServerEntries`' `auth.provider` ladder (`config.ts:1341-1350`) — `Some(reason)` when the
+/// entry must be **dropped**, in upstream's order (MCP-593).
+///
+/// 1. `typeof provider !== "string" || !provider` ⇒ `auth.provider must be a provider name`. The
+///    gate above it is `typeof auth === "object"`, which is true of `null` and of an array too, so
+///    those reach this first rung rather than being ignored.
+/// 2. `typeof entry.url !== "string"` ⇒ `auth.provider requires a url`. A provider token is an HTTP
+///    credential; there is nowhere to put it on a stdio server.
+/// 3. A URL still carrying an unresolved `${VAR}` is **exempt** — upstream's comment: *"A URL with
+///    env references is checked once resolved, when it connects."* The connect-time re-check is
+///    [`crate::runtime::validate_provider_auth`], and it is not optional: without it an
+///    `http://evil.example` hidden behind `${MCP_HOST}` would never be checked at all.
+/// 4. Otherwise [`provider_auth_url_error`].
+fn provider_auth_entry_error(entry: &ServerEntry) -> Option<String> {
+    if !entry.auth.as_ref().is_some_and(AuthMode::is_object_like) {
+        return None;
+    }
+    if entry.auth.as_ref().and_then(AuthMode::provider).is_none() {
+        return Some("auth.provider must be a provider name".to_string());
+    }
+    let Some(url) = entry.url.as_deref() else {
+        return Some("auth.provider requires a url".to_string());
+    };
+    if !crate::credentials::missing_env_vars(url, &crate::credentials::process_env()).is_empty() {
+        return None;
+    }
+    provider_auth_url_error(url).map(str::to_string)
+}
+
+/// `providerAuthUrlError(url)` (`utils.ts:455`) — why a server must **not** receive its
+/// `auth.provider` token at `url`, or `None` when it may (MCP-593).
+///
+/// `https` anywhere, or `http` on exactly `localhost`, `127.0.0.1` or `[::1]`. Everything else —
+/// plain `http` to a remote host, a non-HTTP scheme, an unparseable URL — is refused, because the
+/// token being sent is the user's *provider* credential and a cleartext hop would disclose it.
+///
+/// The host comparison is against upstream's three literals and nothing else: `::1` unbracketed is
+/// not in the list, and neither is `127.0.0.2`, even though both are loopback. Widening it would be
+/// a security decision upstream has not made.
+#[must_use]
+pub fn provider_auth_url_error(url: &str) -> Option<&'static str> {
+    const REFUSED: &str =
+        "auth.provider requires an https URL, or http on localhost, 127.0.0.1, or [::1]";
+    let Ok(parsed) = url::Url::parse(url) else {
+        return Some(REFUSED);
+    };
+    if parsed.scheme() == "https" {
+        return None;
+    }
+    // `new URL(...).hostname` leaves an IPv6 literal BRACKETED, which is why `[::1]` and not
+    // `::1` is the spelling upstream compares against — and `url::Url::host_str` brackets it the
+    // same way, so the three literals transfer verbatim with no normalisation in between.
+    if parsed.scheme() == "http"
+        && parsed
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]"))
+    {
+        return None;
+    }
+    Some(REFUSED)
+}
+
+/// `providerSignInMessage(serverName, provider)` (`utils.ts:450`) — the needs-sign-in text a
+/// provider-auth server gets **instead** of the MCP-OAuth one (MCP-593).
+///
+/// A provider server never signs in through MCP OAuth, so neither `/mcp-auth` nor
+/// `mcp({ action: "auth-start" })` can help it; the only route is `/login <provider>` followed by a
+/// reconnect. That is why this bypasses `settings.authRequiredMessage` entirely
+/// (`utils.ts:444` returns before the template is read): a template written for the OAuth flow would
+/// send the user somewhere that cannot work.
+#[must_use]
+pub fn provider_sign_in_message(server_name: &str, provider: &str) -> String {
+    format!(
+        "MCP server \"{server_name}\" needs sign-in. Run /login {provider}, then /mcp-adapter reconnect {server_name}."
+    )
 }
 
 /// `approveTools` carries a value this build cannot read — name the key (MCP-602).
@@ -5668,6 +5851,192 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "the temp file is renamed away, never left behind"
+        );
+    }
+
+    // -- MCP-593 -----------------------------------------------------------------------------
+
+    #[test]
+    fn provider_auth_parses_into_its_own_variant_and_keeps_the_block_whole() {
+        let entry: ServerEntry = serde_json::from_str(
+            r#"{"url":"https://api.example/mcp","auth":{"provider":"anthropic","future":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.auth.as_ref().and_then(AuthMode::provider),
+            Some("anthropic")
+        );
+        // The digest folds `definition.auth` in VERBATIM, so an unread key has to survive the
+        // round trip or every such server's hash moves off upstream's.
+        assert_eq!(
+            serde_json::to_string(&entry.auth).unwrap(),
+            r#"{"provider":"anthropic","future":1}"#
+        );
+
+        // `auth: { provider }` is NOT OAuth: `supportsOAuth` ends at `auth === undefined`.
+        assert!(!crate::oauth::supports_oauth(&entry));
+
+        // Everything that is not an object with a non-empty string `provider` still lands on
+        // `Other`, where it matches nothing.
+        for json in [
+            r#"{"auth":{"provider":""}}"#,
+            r#"{"auth":{"provider":5}}"#,
+            r#"{"auth":{}}"#,
+            r#"{"auth":null}"#,
+            r#"{"auth":[]}"#,
+            r#"{"auth":"basic"}"#,
+        ] {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            assert!(
+                entry.auth.as_ref().and_then(AuthMode::provider).is_none(),
+                "{json}"
+            );
+        }
+
+        // `typeof auth === "object"` is JS's test, so `null` and an array ARE object-like and a
+        // string is not — which is what decides whether the server is dropped below.
+        for (json, object_like) in [
+            (r#"{"auth":{"provider":"x"}}"#, true),
+            (r#"{"auth":null}"#, true),
+            (r#"{"auth":[]}"#, true),
+            (r#"{"auth":{}}"#, true),
+            (r#"{"auth":"basic"}"#, false),
+            (r#"{"auth":"oauth"}"#, false),
+            (r#"{"auth":false}"#, false),
+            (r#"{"auth":5}"#, false),
+        ] {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                entry.auth.as_ref().is_some_and(AuthMode::is_object_like),
+                object_like,
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_auth_url_error_is_https_or_loopback_http() {
+        for url in [
+            "https://api.example/mcp",
+            "https://127.0.0.1:8443/mcp",
+            "http://localhost:3000/mcp",
+            "http://127.0.0.1:3000/mcp",
+            "http://[::1]:3000/mcp",
+        ] {
+            assert_eq!(provider_auth_url_error(url), None, "{url}");
+        }
+        for url in [
+            "http://api.example/mcp",
+            "http://127.0.0.2:3000/mcp",
+            "http://sub.localhost/mcp",
+            "ws://localhost/mcp",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(
+                provider_auth_url_error(url),
+                Some(
+                    "auth.provider requires an https URL, or http on localhost, 127.0.0.1, or [::1]"
+                ),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn to_server_entries_drops_a_misconfigured_provider_server() {
+        for (json, reason) in [
+            (
+                r#"{"url":"https://api.example/mcp","auth":{}}"#,
+                "auth.provider must be a provider name",
+            ),
+            (
+                r#"{"url":"https://api.example/mcp","auth":null}"#,
+                "auth.provider must be a provider name",
+            ),
+            (
+                r#"{"url":"https://api.example/mcp","auth":{"provider":""}}"#,
+                "auth.provider must be a provider name",
+            ),
+            (
+                r#"{"command":"x","auth":{"provider":"anthropic"}}"#,
+                "auth.provider requires a url",
+            ),
+            (
+                r#"{"url":"http://api.example/mcp","auth":{"provider":"anthropic"}}"#,
+                "auth.provider requires an https URL, or http on localhost, 127.0.0.1, or [::1]",
+            ),
+        ] {
+            let servers = parse_json_config(&format!("{{\"a\": {json}}}"), "mcp.json").unwrap();
+            let mut diagnostics = Vec::new();
+            let entries = to_server_entries(&servers, Path::new("/x/mcp.json"), &mut diagnostics);
+            assert!(entries.is_empty(), "the server must be dropped: {json}");
+            let diagnostic = diagnostics.first().expect("one diagnostic");
+            assert_eq!(diagnostics.len(), 1, "{json}");
+            assert_eq!(
+                diagnostic.message,
+                format!("Ignoring MCP server \"a\" in /x/mcp.json: {reason}"),
+                "{json}"
+            );
+        }
+
+        // Kept: a valid provider server, and one whose URL still holds `${VAR}` — upstream defers
+        // that one to connect time ("A URL with env references is checked once resolved").
+        for json in [
+            r#"{"url":"https://api.example/mcp","auth":{"provider":"anthropic"}}"#,
+            r#"{"url":"http://${MCP_HOST}/mcp","auth":{"provider":"anthropic"}}"#,
+            // Not object-like, so the ladder does not open at all.
+            r#"{"url":"http://api.example/mcp","auth":"basic"}"#,
+            r#"{"command":"x","auth":"bearer"}"#,
+        ] {
+            let servers = parse_json_config(&format!("{{\"a\": {json}}}"), "mcp.json").unwrap();
+            let mut diagnostics = Vec::new();
+            let entries = to_server_entries(&servers, Path::new("/x/mcp.json"), &mut diagnostics);
+            assert_eq!(entries.len(), 1, "the server must be kept: {json}");
+            assert!(
+                diagnostics.is_empty(),
+                "and reported clean: {json} -> {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_server_is_told_to_login_not_to_run_mcp_auth() {
+        assert_eq!(
+            provider_sign_in_message("linear", "anthropic"),
+            "MCP server \"linear\" needs sign-in. Run /login anthropic, then /mcp-adapter reconnect linear."
+        );
+
+        let mut servers = IndexMap::new();
+        let _ = servers.insert(
+            "linear".to_string(),
+            serde_json::from_str::<ServerEntry>(
+                r#"{"url":"https://api.example/mcp","auth":{"provider":"anthropic"}}"#,
+            )
+            .unwrap(),
+        );
+        let _ = servers.insert(
+            "other".to_string(),
+            serde_json::from_str::<ServerEntry>(r#"{"url":"https://b.example/mcp"}"#).unwrap(),
+        );
+        // A configured template must NOT win for a provider server: it would point at a flow that
+        // cannot sign one in. `formatAuthRequiredMessage` returns before the template is read.
+        let config = McpConfig {
+            mcp_servers: servers,
+            settings: Some(McpSettings {
+                auth_required_message: Some("custom for ${server}".to_string()),
+                ..McpSettings::default()
+            }),
+            ..McpConfig::default()
+        };
+        assert_eq!(
+            crate::proxy::env::format_auth_required_message(&config, "linear", "the default"),
+            "MCP server \"linear\" needs sign-in. Run /login anthropic, then /mcp-adapter reconnect linear."
+        );
+        assert_eq!(
+            crate::proxy::env::format_auth_required_message(&config, "other", "the default"),
+            "custom for other",
+            "and every other server still reads the template"
         );
     }
 

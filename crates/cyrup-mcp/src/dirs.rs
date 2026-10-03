@@ -1862,6 +1862,40 @@ mod tests {
         );
     }
 
+    /// `MCP-593` — adding the [`crate::config::AuthMode::Provider`] variant must not move a digest.
+    ///
+    /// `computeServerHash`'s identity carries `auth: definition.auth` **verbatim**
+    /// (`metadata-cache.ts:132`), so the test that matters is that cyrup's typed variant
+    /// re-serialises to the same object upstream hashes — including a key this build does not read.
+    /// The three constants are upstream's own at `v5.0.0`, and the natural assumption is the
+    /// opposite one, so it is pinned rather than argued.
+    #[test]
+    fn golden_vector_provider_auth_moves_nothing() {
+        for (json, upstream_digest) in [
+            (
+                r#"{"url":"https://api.example/mcp","auth":{"provider":"anthropic"}}"#,
+                "4526c3c613c6ed34e40774241427547d6c26d378cd15a4999da04a143167ac41",
+            ),
+            (
+                r#"{"url":"https://api.example/mcp","auth":{"provider":"anthropic","future":1}}"#,
+                "04bba1307c6893cb57a64d0af94550ccf9f73e3ab1aa5550e340a8c7e26d2646",
+            ),
+            (
+                r#"{"url":"https://api.example/mcp"}"#,
+                "2db31687b0b59d5c92a24ec3f4a9b4082947160f8ea5de861b1af10a3687e87b",
+            ),
+        ] {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            let resolved = ResolvedIdentity::verbatim(&entry);
+            assert_eq!(
+                compute_server_hash(&entry, &resolved),
+                upstream_digest,
+                "{json}\n  pre-image: {}",
+                server_identity_pre_image(&entry, &resolved)
+            );
+        }
+    }
+
     /// `MCP-594` — the two stdio-only members `34df4ed` (#687) spread into the identity.
     ///
     /// Every constant here is upstream's own, produced by running `v5.0.0`'s

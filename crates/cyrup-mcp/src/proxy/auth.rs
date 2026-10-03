@@ -274,7 +274,7 @@ pub async fn attempt_auto_auth(
     let server_url = match ctx.env.resolve_server_url(&definition) {
         Err(error) => {
             return Ok(AutoAuthResult::Failed(get_auth_failed_message(
-                ctx.settings(),
+                ctx.config(),
                 server_name,
                 &error.to_string(),
             )));
@@ -293,7 +293,7 @@ pub async fn attempt_auto_auth(
     };
     if !ctx.has_ui() && grant_type != OAuthGrantType::ClientCredentials {
         return Ok(AutoAuthResult::Failed(get_auth_required_message(
-            ctx.settings(),
+            ctx.config(),
             server_name,
         )));
     }
@@ -309,7 +309,7 @@ pub async fn attempt_auto_auth(
                 return Err(error);
             }
             Ok(AutoAuthResult::Failed(get_auth_failed_message(
-                ctx.settings(),
+                ctx.config(),
                 server_name,
                 &error.to_string(),
             )))
@@ -375,7 +375,7 @@ pub async fn execute_connect(
                 AutoAuthResult::Skipped => {}
             }
             if connection.needs_auth() {
-                let message = get_auth_required_message(ctx.settings(), server_name);
+                let message = get_auth_required_message(ctx.config(), server_name);
                 return Err(McpError::Other(format!("\u{0}auth_required\u{0}{message}")));
             }
         }
