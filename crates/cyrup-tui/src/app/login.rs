@@ -153,6 +153,17 @@ impl<B: Backend> App<B> {
                 reg.has_oauth().then(|| (id, reg.oauth_is_subscription()))
             })
             .collect();
+        // TUI-127: a LIVE extension provider (`register_provider_live`) is the same composed
+        // provider to pi, so its strategy's `isSubscription` answers too
+        // (`isUsingSubscription`, `core/model-runtime.ts:463-465` @v0.87.1). `live_extension_provider`
+        // skips ids that have a JSON registration, so these entries never shadow the ones above.
+        for provider in session.live_extension_providers() {
+            if let Some(oauth) = provider.provider_auth().and_then(|a| a.oauth.as_ref()) {
+                self.state
+                    .extension_oauth_subscription
+                    .insert(provider.id().as_str().to_string(), oauth.is_subscription());
+            }
+        }
         self.refresh_subscription_marker();
         // `available_model_catalog()` is auth-FILTERED (`cyrup-session-svc/src/session/model.rs:235-237`),
         // so a login or a logout changes which models `/model ` may offer. This is the seam every

@@ -23,6 +23,7 @@ mod llama_cpp_classify;
 mod llama_cpp_classify_fake_server;
 mod llama_cpp_classify_render;
 mod llama_cpp_classify_wire;
+mod openrouter_anthropic_route;
 mod overflow_estimate_parity;
 mod remote_catalog;
 mod sampling_params;

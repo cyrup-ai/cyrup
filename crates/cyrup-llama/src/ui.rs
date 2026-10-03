@@ -77,7 +77,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::client::{LlamaModelInfo, LlamaModelStatus, LlamaProgress};
-use crate::huggingface::{HuggingFaceError, HuggingFaceModel};
+use crate::error::LlamaError;
+use crate::huggingface::HuggingFaceModel;
 
 /// `DOWNLOAD_VALUE` (`ui.ts:23`): the sentinel value of the trailing "Download model…" row.
 const DOWNLOAD_VALUE: &str = "\0download";
@@ -165,7 +166,7 @@ pub type SearchFn = Arc<
     dyn Fn(
             String,
             CancellationToken,
-        ) -> BoxFuture<'static, Result<Vec<HuggingFaceModel>, HuggingFaceError>>
+        ) -> BoxFuture<'static, Result<Vec<HuggingFaceModel>, LlamaError>>
         + Send
         + Sync,
 >;
@@ -174,7 +175,7 @@ pub type SearchFn = Arc<
 pub fn search_fn<F, Fut>(search: F) -> SearchFn
 where
     F: Fn(String, CancellationToken) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Vec<HuggingFaceModel>, HuggingFaceError>> + Send + 'static,
+    Fut: Future<Output = Result<Vec<HuggingFaceModel>, LlamaError>> + Send + 'static,
 {
     Arc::new(move |query, signal| Box::pin(search(query, signal)))
 }
@@ -2201,7 +2202,7 @@ struct Completion {
     id: u64,
     query: String,
     token: CancellationToken,
-    result: Result<Vec<HuggingFaceModel>, HuggingFaceError>,
+    result: Result<Vec<HuggingFaceModel>, LlamaError>,
 }
 
 /// `HuggingFaceSearch` (`ui.ts:96-274`): a query box over a results list. Typing starts a

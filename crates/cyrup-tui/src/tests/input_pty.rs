@@ -31,28 +31,41 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::InputEvent;
 
 /// Set in the child's environment; its value names the child's behaviour.
-const CHILD_ENV: &str = "CYRUP_TUI_PTY_CHILD";
+pub(super) const CHILD_ENV: &str = "CYRUP_TUI_PTY_CHILD";
 
 /// Which side of the test this process is. `None` in the parent.
-fn child_mode() -> Option<String> {
+pub(super) fn child_mode() -> Option<String> {
     std::env::var(CHILD_ENV).ok()
 }
 
 // ------------------------------------------------------------------------------ parent -------
 
 /// A child process reading a pty whose master this holds.
-struct PtyChild {
-    master: std::fs::File,
+pub(super) struct PtyChild {
+    pub(super) master: std::fs::File,
     child: Child,
     lines: mpsc::Receiver<String>,
     /// Every stderr line that was not a report, for the failure message.
-    noise: Vec<String>,
+    pub(super) noise: Vec<String>,
+    /// What the child wrote to its stdout, which is then the pty too; `None` when stdout is
+    /// `/dev/null` (the default).
+    screen: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
 impl PtyChild {
     /// Spawn `test` (its full libtest path) as a child in `mode`, on an 80×24 pty, and wait for it
     /// to report `ready`.
-    fn spawn(test: &str, mode: &str, env: &[(&str, &str)]) -> Self {
+    pub(super) fn spawn(test: &str, mode: &str, env: &[(&str, &str)]) -> Self {
+        Self::spawn_with(test, mode, env, false)
+    }
+
+    /// [`PtyChild::spawn`] with the child's stdout on the pty as well, readable through
+    /// [`PtyChild::screen_until`]: what a terminal would be sent.
+    pub(super) fn spawn_capturing(test: &str, mode: &str, env: &[(&str, &str)]) -> Self {
+        Self::spawn_with(test, mode, env, true)
+    }
+
+    fn spawn_with(test: &str, mode: &str, env: &[(&str, &str)], capture: bool) -> Self {
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
         let master =
             openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC).unwrap();
@@ -66,13 +79,18 @@ impl PtyChild {
             .custom_flags(rustix::fs::OFlags::NOCTTY.bits() as i32)
             .open(path.to_str().unwrap())
             .unwrap();
+        let stdout = if capture {
+            Stdio::from(slave.try_clone().unwrap())
+        } else {
+            Stdio::null()
+        };
         let mut cmd = Command::new("setsid");
         cmd.arg("-c")
             .arg(std::env::current_exe().unwrap())
             .args([test, "--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, mode)
             .stdin(slave)
-            .stdout(Stdio::null())
+            .stdout(stdout)
             .stderr(Stdio::piped());
         for (k, v) in env {
             cmd.env(k, v);
@@ -87,18 +105,35 @@ impl PtyChild {
                 }
             }
         });
+        let master = std::fs::File::from(master);
+        let screen = capture.then(|| {
+            let (tx, rx) = mpsc::channel();
+            let mut reader = master.try_clone().unwrap();
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut chunk = [0u8; 4096];
+                // Ends with `EIO` once the child and every other slave holder are gone.
+                while let Ok(n) = reader.read(&mut chunk) {
+                    if n == 0 || tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            });
+            rx
+        });
         let mut me = Self {
-            master: std::fs::File::from(master),
+            master,
             child,
             lines,
             noise: Vec::new(),
+            screen,
         };
         me.expect("ready");
         me
     }
 
     /// The next report line, or `None` once `timeout` passes.
-    fn next(&mut self, timeout: Duration) -> Option<String> {
+    pub(super) fn next(&mut self, timeout: Duration) -> Option<String> {
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -112,7 +147,7 @@ impl PtyChild {
         }
     }
 
-    fn expect(&mut self, want: &str) {
+    pub(super) fn expect(&mut self, want: &str) {
         let got = self.next(Duration::from_secs(20));
         assert_eq!(
             got.as_deref(),
@@ -137,9 +172,31 @@ impl PtyChild {
         }
     }
 
-    fn write(&mut self, bytes: &[u8]) {
+    pub(super) fn write(&mut self, bytes: &[u8]) {
         self.master.write_all(bytes).unwrap();
         self.master.flush().unwrap();
+    }
+
+    /// Read what the child writes to the terminal into `seen` until `needle` is in it, and say
+    /// whether it was before `timeout` passed. `seen` accumulates across calls.
+    pub(super) fn screen_until(
+        &mut self,
+        seen: &mut Vec<u8>,
+        needle: &str,
+        timeout: Duration,
+    ) -> bool {
+        let rx = self.screen.as_ref().expect("spawned with spawn_capturing");
+        let deadline = Instant::now() + timeout;
+        loop {
+            if String::from_utf8_lossy(seen).contains(needle) {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(bytes) => seen.extend_from_slice(&bytes),
+                Err(_) => return false,
+            }
+        }
     }
 
     /// Write each chunk, pausing after it.
@@ -151,7 +208,7 @@ impl PtyChild {
     }
 
     /// Wait for the child to exit, returning its exit code.
-    fn exit_code(&mut self, timeout: Duration) -> Option<i32> {
+    pub(super) fn exit_code(&mut self, timeout: Duration) -> Option<i32> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -185,7 +242,7 @@ fn set_size(master: &impl std::os::fd::AsFd, cols: u16, rows: u16) {
 
 // ------------------------------------------------------------------------------- child -------
 
-fn report(line: impl std::fmt::Display) {
+pub(super) fn report(line: impl std::fmt::Display) {
     eprintln!("@@ {line}");
 }
 

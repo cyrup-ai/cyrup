@@ -31,7 +31,7 @@ use cyrup_provider::{Provider, ProviderError, RefreshModelsContext};
 use serde_json::json;
 
 use crate::LLAMA_PROVIDER_ID;
-use crate::client::LlamaError;
+use crate::error::LlamaError;
 use crate::extension::{ContextRefreshHost, HostCredentials};
 use crate::provider::{LlamaController, LlamaControllerOptions, LlamaRefreshHost};
 use crate::tests::fake_server::{FakeLlamaServer, model_with};
@@ -319,10 +319,11 @@ async fn a_catalog_the_store_accepts_is_persisted_and_installed() {
     assert_eq!(controller.provider().models().len(), 1);
 }
 
-/// The error survives as a [`LlamaError`] on the trait-level seam too: `try_publish` is where the
-/// host's failure is reported, `publish` is only its `bool` form.
+/// The error survives as a [`LlamaError`] on the trait-level seam too: `publish` is where the
+/// host's failure is reported, as pi's `context.publish` rejects (`models.ts:498-518`), and it is
+/// not folded into the `false` that means "superseded".
 #[tokio::test]
-async fn try_publish_reports_the_failure_and_publish_folds_it_to_false() {
+async fn publish_reports_the_stores_failure() {
     use crate::provider::{CatalogEntry, CatalogPublication, CatalogPublisher};
 
     let recorder = Arc::new(Recorder {
@@ -346,20 +347,14 @@ async fn try_publish_reports_the_failure_and_publish_folds_it_to_false() {
         update: None,
     };
 
-    let (tried, folded) = context
-        .scope(async {
-            (
-                ContextRefreshHost.try_publish(publication()).await,
-                ContextRefreshHost.publish(publication()).await,
-            )
-        })
+    let published = context
+        .scope(ContextRefreshHost.publish(publication()))
         .await;
 
-    match tried {
+    match published {
         Err(LlamaError::Message(text)) => assert!(text.contains("read-only"), "{text}"),
         other => panic!("expected the store's failure, got {other:?}"),
     }
-    assert!(!folded);
 }
 
 /// An aborted publication stays an abort: `ProviderError::Aborted` is `LlamaError::Cancelled`, so a
@@ -385,18 +380,21 @@ async fn an_aborted_publication_is_a_cancellation_not_a_failure() {
         Arc::new(Aborts),
     );
 
-    let tried = context
-        .scope(ContextRefreshHost.try_publish(CatalogPublication {
+    let published = context
+        .scope(ContextRefreshHost.publish(CatalogPublication {
             persist: None,
             update: None,
         }))
         .await;
 
-    assert!(matches!(tried, Err(LlamaError::Cancelled)), "{tried:?}");
+    assert!(
+        matches!(published, Err(LlamaError::Cancelled)),
+        "{published:?}"
+    );
 }
 
 /// Called outside a host-run refresh there is no store: nothing is applied, neither the write nor
-/// the `update`, and both forms answer "do not continue" (`false`), as a superseded refresh does.
+/// the `update`, and it answers "do not continue" (`false`), as a superseded refresh does.
 #[tokio::test]
 async fn publishing_outside_a_host_run_refresh_applies_nothing() {
     use crate::provider::{CatalogPublication, CatalogPublisher};
@@ -411,9 +409,8 @@ async fn publishing_outside_a_host_run_refresh_applies_nothing() {
         }
     };
 
-    let tried = ContextRefreshHost.try_publish(publication(&ran)).await;
-    assert!(matches!(tried, Ok(false)), "{tried:?}");
-    assert!(!ContextRefreshHost.publish(publication(&ran)).await);
+    let published = ContextRefreshHost.publish(publication(&ran)).await;
+    assert!(matches!(published, Ok(false)), "{published:?}");
     assert!(!ran.load(Ordering::SeqCst), "the update never ran");
     assert!(ContextRefreshHost.credential().await.is_none());
     assert!(ContextRefreshHost.stored().await.is_none());

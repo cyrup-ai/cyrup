@@ -22,10 +22,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use crate::error::LlamaError;
 use crate::huggingface::{
-    HuggingFaceClient, HuggingFaceError, HuggingFaceGated, HuggingFaceModel,
-    HuggingFaceModelDetails, HuggingFaceQuantization, find_huggingface_token_with_home,
-    quantization_of_file,
+    HuggingFaceClient, HuggingFaceGated, HuggingFaceModel, HuggingFaceModelDetails,
+    HuggingFaceQuantization, find_huggingface_token_with_home, quantization_of_file,
 };
 
 // ------------------------------------------------------------------------------ loopback server --
@@ -164,7 +164,7 @@ fn quant(name: &str, size: Option<f64>) -> HuggingFaceQuantization {
     }
 }
 
-fn error_text(error: HuggingFaceError) -> String {
+fn error_text(error: LlamaError) -> String {
     error.to_string()
 }
 
@@ -722,7 +722,7 @@ async fn a_server_that_never_answers_times_out() {
         .client(None)
         .with_request_timeout(Duration::from_millis(150));
     let error = client.search("q", &never()).await.unwrap_err();
-    assert_eq!(error, HuggingFaceError::Timeout);
+    assert_eq!(error, LlamaError::Timeout);
     assert_eq!(
         error.to_string(),
         "The operation was aborted due to timeout"
@@ -744,11 +744,11 @@ async fn cancellation_aborts_the_request() {
         .details("a/b", &cancel)
         .await
         .unwrap_err();
-    assert_eq!(error, HuggingFaceError::Cancelled);
+    assert_eq!(error, LlamaError::Cancelled);
 
     // Already cancelled: no hang, no success.
     let error = server.client(None).search("q", &cancel).await.unwrap_err();
-    assert_eq!(error, HuggingFaceError::Cancelled);
+    assert_eq!(error, LlamaError::Cancelled);
 }
 
 /// A refused connection is a transport failure with Node's `fetch failed` text.
@@ -761,7 +761,7 @@ async fn a_refused_connection_is_a_fetch_failure() {
     let client = client_for(&format!("http://127.0.0.1:{port}"), None);
     let error = client.search("q", &never()).await.unwrap_err();
     assert!(
-        matches!(&error, HuggingFaceError::Transport(text) if text.starts_with("fetch failed")),
+        matches!(&error, LlamaError::Transport(text) if text.starts_with("fetch failed")),
         "{error:?}"
     );
 }

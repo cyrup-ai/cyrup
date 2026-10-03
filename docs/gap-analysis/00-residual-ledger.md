@@ -5,6 +5,43 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-02 (batch 5) — eleven low rows closed, `SUBA-146` re-scoped (`claude/lows-batch5`)
+
+> **This block sits above the `SEAM-137` block and corrects its counts.** The count is whatever
+> `python3 docs/gap-analysis/scripts/count_open_items.py` prints: on 2026-10-02, after this batch, it
+> prints **73 open: 0 critical, 0 high, 0 medium, 73 low; 12 trackers; 834 closed** (the `SEAM-137`
+> block: 84 open, 823 closed). By area: `01` 13, `02` 1, `03` 3, `04` 0, `05` 4, `06` 18, `07` 16, `08` 5,
+> `09` 2, `09b` 8, `10` 1, `11` 0, `12` 1, `14` 0, `16` 0, `17` 0, `09a` 1. Arithmetic: 84 − 11 = 73;
+> closed 823 + 11 = 834; trackers unchanged at 12. **No row was filed, so no `Next free id` counter moved.**
+>
+> ## Closed (each row carries its own evidence)
+>
+> * **`SEAM-136`** (`08`) — the startup session selector now has real-pty tests
+>   (`cyrup-tui/src/tests/startup_selector_pty.rs`), proven red by three gutting mutations.
+> * **`SEAM-138`** (`08`) — `/model` refresh now reaches live providers.
+> * **`SEAM-143`** (`08`) — the OAuth arm's missing half (the store holds the refreshed credential) is asserted.
+> * **`SEAM-140`** (`08`) — closed as a **wrong premise**, no code change: pi discards the startup restore's
+>   result (`agent-session-services.ts:194`), and cyrup already does too. A lane implemented a diagnostic
+>   pi does not have; it was reverted rather than kept as a deviation.
+> * **`PROV-099`**, **`PROV-109`** (`01`) — `PROV-099` was stale (the catalog already routes `anthropic/*`
+>   over `anthropic-messages`; now guarded by two tests); `PROV-109` merges the auth resolution's `env` in
+>   `apply_auth`.
+> * **`EXT-091`**, **`EXT-095`**, **`EXT-096`**, **`EXT-097`** (`06`) — required `LateRegistrar` provider
+>   methods; one `CatalogPublisher::publish`; `ExtError::CommandFailed` for a failed `/llama` command; one
+>   `LlamaError` type.
+> * **`TUI-127`** (`07`) — a live provider's subscription OAuth now lights the footer `(sub)` marker.
+>
+> ## Re-scoped, still open
+>
+> * **`SUBA-146`** (`09b`) — parts (b) (the `Session:` line) and (c) (the all-external `Resume:` sentence) are
+>   done; (a) (`reconcileNestedAsyncDescendants`), (d) (acceptance and turn-budget suffixes) and the
+>   `external-job` follow-up variant stay open and say so in the row.
+>
+> **Citation pins.** New code in this batch cites pi `run-status.ts` @v0.75.0 (the `tmp/pi-subagents`
+> checkout); the `SUBA-146` row's older line numbers are @v0.71.0, and the row says so.
+
+---
+
 # UPDATE 2026-10-02 — `SEAM-137` closed (print mode no longer hangs on a prompt an extension command handles)
 
 > **This block sits above the 2026-10-01 block and corrects its counts by one row.** The count is

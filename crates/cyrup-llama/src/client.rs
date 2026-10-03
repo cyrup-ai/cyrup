@@ -29,6 +29,8 @@ use url::Url;
 use cyrup_provider::stream::sse::build_client_for_target;
 use cyrup_provider::{EnvAuthContext, ProviderEnv};
 
+use crate::error::LlamaError;
+
 /// Per-request timeout (`client.ts:174`, `AbortSignal.timeout(15_000)`): covers connecting, the
 /// response head and reading the body, as the fetch signal does.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -45,59 +47,6 @@ pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// The most one SSE frame may buffer while waiting for its blank line (`client.ts:241-259` buffers
 /// without limit).
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
-
-// ---------------------------------------------------------------------------------------- errors --
-
-/// Failure of a llama-server call.
-///
-/// Upstream throws plain `Error`s whose `message` the `/llama` command inspects
-/// (`index.ts:14` matches `fetch failed`, `timeout` and `network` to classify a connection error),
-/// so every variant's [`Display`](std::fmt::Display) text matches what the JS runtime would put in
-/// that message.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum LlamaError {
-    /// The caller's cancellation token fired. Upstream surfaces the `AbortSignal`'s reason, which
-    /// for a bare `abort()` is the DOMException "This operation was aborted".
-    #[error("This operation was aborted")]
-    Cancelled,
-    /// The 15 s request timeout elapsed (`client.ts:174`); Node's `TimeoutError` message.
-    #[error("The operation was aborted due to timeout")]
-    Timeout,
-    /// The request never produced a response (refused, reset, DNS, TLS). Node's `fetch` rejects
-    /// with `TypeError: fetch failed`; the underlying cause is appended for diagnosis.
-    #[error("{0}")]
-    Transport(String),
-    /// A server-reported or validation error whose text is the whole message (`client.ts:48-54`,
-    /// `:183`, `:190`, `:193`, `:233`, `:293`).
-    #[error("{0}")]
-    Message(String),
-}
-
-impl LlamaError {
-    fn message(text: impl Into<String>) -> Self {
-        Self::Message(text.into())
-    }
-
-    /// A `reqwest` failure with its URL left out: the error's `Display` embeds the request URL, and
-    /// that text reaches `/login` failures and `/llama` notifications.
-    fn from_reqwest(error: reqwest::Error) -> Self {
-        Self::transport(&error.without_url())
-    }
-
-    fn transport(error: &(dyn std::error::Error + 'static)) -> Self {
-        let mut text = String::from("fetch failed");
-        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-        while let Some(cause) = source {
-            let part = cause.to_string();
-            if !part.is_empty() && !text.contains(&part) {
-                text.push_str(": ");
-                text.push_str(&part);
-            }
-            source = cause.source();
-        }
-        Self::Transport(text)
-    }
-}
 
 // ----------------------------------------------------------------------------------------- types --
 

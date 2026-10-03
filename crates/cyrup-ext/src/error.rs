@@ -48,6 +48,12 @@ pub enum ExtError {
     /// pi's own `Error` message. EXT-082.
     #[error("{0}")]
     Registration(String),
+    /// A slash-command handler's own failure, carrying the message pi's handler threw. Displayed
+    /// verbatim: `cyrup-session-svc`'s command runner already prefixes `command:{name}: ` (pi's
+    /// `extensionPath: command:${commandName}`, `agent-session.ts:2087`), so a variant with a
+    /// prefix of its own (`Component`'s `component load failed: `) would double it. EXT-096.
+    #[error("{0}")]
+    CommandFailed(String),
     /// A duplicate extension id was loaded.
     #[error("duplicate extension id: {0}")]
     DuplicateId(String),

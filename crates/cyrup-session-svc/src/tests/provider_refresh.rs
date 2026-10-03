@@ -1886,11 +1886,12 @@ impl cyrup_provider::OAuthAuth for CountingOauth {
 }
 
 /// Run one network refresh of `LLAMA` whose provider authenticates with `auth` and whose store
-/// holds `stored`; return the credential the network phase was handed and the phases that ran.
+/// holds `stored`; return the credential the network phase was handed, the phases that ran, and
+/// the credential store (so a caller can read back what the refresh left in it).
 async fn network_credential_for(
     auth: ProviderAuth,
     stored: Credential,
-) -> (Option<Credential>, Vec<bool>) {
+) -> (Option<Credential>, Vec<bool>, Arc<InMemoryCredentialStore>) {
     let credentials = Arc::new(InMemoryCredentialStore::new());
     credentials
         .modify(
@@ -1900,7 +1901,10 @@ async fn network_credential_for(
         .await
         .unwrap();
     let registry = registry_over(Arc::new(InMemoryModelsStore::new()));
-    registry.attach_refresh_auth(credentials, Arc::new(MapCtx(BTreeMap::new())));
+    registry.attach_refresh_auth(
+        Arc::clone(&credentials) as Arc<dyn CredentialStore>,
+        Arc::new(MapCtx(BTreeMap::new())),
+    );
     let (provider, seen) = scripted(
         LLAMA,
         &["boot"],
@@ -1918,7 +1922,7 @@ async fn network_credential_for(
         .iter()
         .find(|s| s.allow_network)
         .and_then(|s| s.credential.clone());
-    (credential, phases(&seen))
+    (credential, phases(&seen), credentials)
 }
 
 fn access_of(credential: Option<&Credential>) -> Option<&str> {
@@ -1935,7 +1939,7 @@ fn access_of(credential: Option<&Credential>) -> Option<&str> {
 #[tokio::test]
 async fn a_valid_stored_oauth_credential_reaches_the_network_phase_unrefreshed() {
     let refreshes = Arc::new(AtomicUsize::new(0));
-    let (credential, phases) = network_credential_for(
+    let (credential, phases, credentials) = network_credential_for(
         ProviderAuth::with_oauth(Arc::new(CountingOauth {
             refreshes: Arc::clone(&refreshes),
         })),
@@ -1946,6 +1950,12 @@ async fn a_valid_stored_oauth_credential_reaches_the_network_phase_unrefreshed()
     assert_eq!(phases, vec![false, true]);
     assert_eq!(access_of(credential.as_ref()), Some("stored-access"));
     assert_eq!(refreshes.load(Ordering::SeqCst), 0, "nothing was refreshed");
+    let kept = credentials.read(&LLAMA.into()).await.unwrap();
+    assert_eq!(
+        access_of(kept.as_ref()),
+        Some("stored-access"),
+        "the store still holds the untouched credential"
+    );
 }
 
 /// The same resolution for an EXPIRED stored OAuth credential: it is refreshed first (the strategy's
@@ -1955,7 +1965,7 @@ async fn a_valid_stored_oauth_credential_reaches_the_network_phase_unrefreshed()
 #[tokio::test]
 async fn an_expired_stored_oauth_credential_is_refreshed_before_the_network_phase() {
     let refreshes = Arc::new(AtomicUsize::new(0));
-    let (credential, phases) = network_credential_for(
+    let (credential, phases, credentials) = network_credential_for(
         ProviderAuth::with_oauth(Arc::new(CountingOauth {
             refreshes: Arc::clone(&refreshes),
         })),
@@ -1966,6 +1976,12 @@ async fn an_expired_stored_oauth_credential_is_refreshed_before_the_network_phas
     assert_eq!(phases, vec![false, true]);
     assert_eq!(access_of(credential.as_ref()), Some("refreshed-access"));
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    let kept = credentials.read(&LLAMA.into()).await.unwrap();
+    assert_eq!(
+        access_of(kept.as_ref()),
+        Some("refreshed-access"),
+        "the store holds the refreshed credential, not the stale one"
+    );
 }
 
 /// A stored OAuth credential for a provider whose auth has no OAuth strategy cannot authenticate the
@@ -1975,7 +1991,7 @@ async fn an_expired_stored_oauth_credential_is_refreshed_before_the_network_phas
 /// **Red** if that guard is removed: the unexpired credential is handed to the network phase anyway.
 #[tokio::test]
 async fn a_stored_oauth_credential_without_an_oauth_strategy_skips_the_network_phase() {
-    let (credential, phases) = network_credential_for(
+    let (credential, phases, credentials) = network_credential_for(
         url_auth(),
         oauth_credential("stored-access", unix_ms(3_600_000)),
     )
@@ -1983,6 +1999,8 @@ async fn a_stored_oauth_credential_without_an_oauth_strategy_skips_the_network_p
 
     assert_eq!(phases, vec![false], "only the cache-only restore ran");
     assert!(credential.is_none());
+    let kept = credentials.read(&LLAMA.into()).await.unwrap();
+    assert_eq!(access_of(kept.as_ref()), Some("stored-access"));
 }
 
 // -------------------------------------------------------------------------------------------------

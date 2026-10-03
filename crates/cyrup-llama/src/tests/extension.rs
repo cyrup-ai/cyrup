@@ -39,12 +39,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::fake_server::{FakeLlamaServer, Reply, Step, event, model, model_with_status};
 use crate::LLAMA_PROVIDER_ID;
-use crate::client::{LlamaClient, LlamaError, LlamaModelInfo};
+use crate::client::{LlamaClient, LlamaModelInfo};
+use crate::error::LlamaError;
 use crate::extension::{
     Endpoints, Flow, FlowError, LlamaExtension, connection_error_message, is_connection_error,
     model_is_loaded, parse_huggingface_model,
 };
-use crate::huggingface::{HuggingFaceError, HuggingFaceModel};
+use crate::huggingface::HuggingFaceModel;
 use crate::llama_extension_for_env;
 use crate::provider::{LlamaController, LlamaControllerOptions};
 use crate::ui::{LlamaManagerAction, LlamaUi, ProgressState, SearchFn};
@@ -315,6 +316,14 @@ impl LateRegistrar for FakeRegistrar {
         Ok(())
     }
 
+    /// The extension never unregisters its provider; a call is a bug the test must see, not a
+    /// retraction the fake pretends to have made.
+    fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
+        Err(ExtError::Component(format!(
+            "FakeRegistrar was asked to unregister `{id}`"
+        )))
+    }
+
     fn owner(&self) -> ExtensionId {
         self.owner.clone()
     }
@@ -327,7 +336,7 @@ struct ScriptedUi {
     selects: Mutex<VecDeque<Option<String>>>,
     search_answer: Mutex<Option<String>>,
     search_query: Mutex<Option<String>>,
-    search_result: Mutex<Option<Result<Vec<HuggingFaceModel>, HuggingFaceError>>>,
+    search_result: Mutex<Option<Result<Vec<HuggingFaceModel>, LlamaError>>>,
     search_calls: AtomicUsize,
     stop_once: AtomicBool,
     shown: Mutex<Vec<ShownList>>,
@@ -666,8 +675,8 @@ fn classifies_connection_errors_by_message() {
         FlowError::from(LlamaError::Transport("fetch failed: refused".to_string())),
         FlowError::from(LlamaError::Timeout),
         FlowError::from(LlamaError::Message("Network is unreachable".to_string())),
-        FlowError::from(HuggingFaceError::Timeout),
-        FlowError::from(HuggingFaceError::Transport("fetch failed".to_string())),
+        FlowError::from(LlamaError::Timeout),
+        FlowError::from(LlamaError::Transport("fetch failed".to_string())),
     ];
     for error in &connection {
         assert!(is_connection_error(error), "{error:?}");
@@ -679,7 +688,7 @@ fn classifies_connection_errors_by_message() {
     let other = [
         FlowError::from(LlamaError::Cancelled),
         FlowError::from(LlamaError::Message("out of memory".to_string())),
-        FlowError::from(HuggingFaceError::Message(
+        FlowError::from(LlamaError::Message(
             "Hugging Face returned HTTP 500".to_string(),
         )),
     ];
@@ -1972,18 +1981,22 @@ async fn the_command_asks_to_configure_when_the_provider_has_no_auth() {
     assert!(!host.opened.load(Ordering::SeqCst));
 }
 
-/// A failure reading the auth is reported as an error.
+/// A failure reading the auth leaves the handler as an error (`await ctx.modelRegistry
+/// .getProviderAuth(..)` rejects, `index.ts:30`); the command runner reports it as
+/// `command:llama: <message>`. The handler issues no notice of its own, and `Display` is the bare
+/// message, so the runner's text is pi's.
 #[tokio::test]
 async fn the_command_reports_an_auth_failure() {
     let host = FakeHost::standalone();
     *host.auth.lock().unwrap() = Err("credential store exploded".to_string());
     let ext = extension(endpoints());
     ext.set_host_services(host.clone());
-    ext.execute_command("llama", "", &tui_ctx()).await.unwrap();
-    assert_eq!(
-        host.messages(),
-        vec![("credential store exploded".to_string(), NotifyKind::Error)]
-    );
+    let error = ext
+        .execute_command("llama", "", &tui_ctx())
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "credential store exploded");
+    assert!(host.messages().is_empty(), "the handler notifies nothing");
     assert!(!host.opened.load(Ordering::SeqCst));
 }
 
@@ -2041,7 +2054,8 @@ async fn the_command_falls_back_to_the_auth_base_url() {
     );
 }
 
-/// A server URL that cannot be used is reported, and no overlay opens.
+/// A server URL that cannot be used leaves the handler as an error (`normalizeLlamaServerUrl`
+/// throws, `index.ts:30-40`), and no overlay opens.
 #[tokio::test]
 async fn the_command_reports_an_unusable_server_url() {
     let host = FakeHost::standalone();
@@ -2053,14 +2067,12 @@ async fn the_command_reports_an_unusable_server_url() {
     });
     let ext = extension(endpoints());
     ext.set_host_services(host.clone());
-    ext.execute_command("llama", "", &tui_ctx()).await.unwrap();
-    assert_eq!(
-        host.messages(),
-        vec![(
-            "Server URL must use http or https".to_string(),
-            NotifyKind::Error
-        )]
-    );
+    let error = ext
+        .execute_command("llama", "", &tui_ctx())
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Server URL must use http or https");
+    assert!(host.messages().is_empty(), "the handler notifies nothing");
     assert!(!host.opened.load(Ordering::SeqCst));
 }
 

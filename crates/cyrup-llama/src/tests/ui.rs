@@ -29,7 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::fake_server::{model_with, model_with_status};
 use crate::client::{LlamaModelInfo, LlamaProgress, ProgressField};
-use crate::huggingface::{HuggingFaceError, HuggingFaceModel};
+use crate::error::LlamaError;
+use crate::huggingface::HuggingFaceModel;
 use crate::ui::{
     Binding, Clock, ConnectionChoice, KeySpec, LlamaKeys, LlamaManagerAction, LlamaUi,
     LlamaUiOutcome, LlamaView, ProgressOptions, ProgressOutcome, ProgressState, SearchFn,
@@ -165,7 +166,7 @@ async fn settle(view: &mut LlamaView) -> bool {
     changed
 }
 
-type SearchReply = Result<Vec<HuggingFaceModel>, HuggingFaceError>;
+type SearchReply = Result<Vec<HuggingFaceModel>, LlamaError>;
 
 enum Reply {
     Now(SearchReply),
@@ -215,9 +216,7 @@ impl FakeSearch {
             async move {
                 match reply {
                     Some(Reply::Now(result)) => result,
-                    Some(Reply::Gate(gate)) => {
-                        gate.await.unwrap_or(Err(HuggingFaceError::Cancelled))
-                    }
+                    Some(Reply::Gate(gate)) => gate.await.unwrap_or(Err(LlamaError::Cancelled)),
                     None => Ok(Vec::new()),
                 }
             }
@@ -2480,7 +2479,7 @@ async fn search_error_and_empty_status() {
     let (mut view, clock) = new_view();
     let search = FakeSearch::new();
     search.reply_ok(vec![hf("ab/ok", 1.0)]);
-    search.reply(Reply::Now(Err(HuggingFaceError::Message(
+    search.reply(Reply::Now(Err(LlamaError::Message(
         "Hugging Face rate limit reached".into(),
     ))));
     search.reply_ok(Vec::new());

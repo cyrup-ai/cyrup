@@ -57,9 +57,9 @@ use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{
-    LlamaClient, LlamaError, LlamaModelInfo, LlamaModelStatus, llama_inference_url,
-    normalize_llama_server_url,
+    LlamaClient, LlamaModelInfo, LlamaModelStatus, llama_inference_url, normalize_llama_server_url,
 };
+use crate::error::LlamaError;
 use crate::model::{model_is_selectable, to_classifier_model, to_model};
 
 pub use crate::LLAMA_PROVIDER_ID;
@@ -328,18 +328,17 @@ pub struct CatalogPublication {
 pub trait CatalogPublisher: Send + Sync {
     /// Persist `publication.persist`, then run `publication.update`. Answers `false`, with neither
     /// done, when the refresh was superseded or aborted: the caller must stop.
-    async fn publish(&self, publication: CatalogPublication) -> bool;
-
-    /// [`Self::publish`] with a persistence failure REPORTED. pi's `context.publish` rejects when
-    /// the store write does and the refresh fails with it (`provider.ts:213-222`, `:251-258`;
-    /// `ModelsImpl.publishProviderModels`, `models.ts:498-518`), which is how `/llama` learns the
-    /// catalog was not saved (`index.ts:61-62`). `publish` can answer only `bool`, and a host that
-    /// folds a failed write into `false` makes the refresh end quietly with nothing installed.
     ///
-    /// The default is a publisher that cannot fail.
-    async fn try_publish(&self, publication: CatalogPublication) -> Result<bool, LlamaError> {
-        Ok(self.publish(publication).await)
-    }
+    /// A persistence failure is REPORTED, not folded into `false`: pi's `context.publish` rejects
+    /// when the store write does and the refresh fails with it (`provider.ts:213-222`,
+    /// `:251-258`; `ModelsImpl.publishProviderModels`, `models.ts:498-518`), which is how `/llama`
+    /// learns the catalog was not saved (`index.ts:61-62`). A host that folded a failed write into
+    /// `false` would make the refresh end quietly with nothing installed.
+    ///
+    /// # Errors
+    ///
+    /// The host's failure to persist, or an abort of the publication.
+    async fn publish(&self, publication: CatalogPublication) -> Result<bool, LlamaError>;
 }
 
 /// What a refresh needs from its host: pi's `RefreshModelsContext.credential` and `.stored`
@@ -511,7 +510,7 @@ impl LlamaProvider {
             }
             let published = ctx
                 .publisher
-                .try_publish(CatalogPublication {
+                .publish(CatalogPublication {
                     persist: None,
                     update: Some(self.catalog_update(restored, restored_classifiers)),
                 })
@@ -581,7 +580,7 @@ impl LlamaProvider {
             )
             .collect();
         ctx.publisher
-            .try_publish(CatalogPublication {
+            .publish(CatalogPublication {
                 persist: Some(CatalogEntry {
                     models: persisted,
                     checked_at: cyrup_provider::auth::oauth::now_ms(),
