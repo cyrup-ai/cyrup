@@ -76,6 +76,224 @@ reports the six places it has fallen behind rather than restating the algorithm.
 > | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
 > | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
 
+### Items filed 2026-10-02 — `pi-mcp-adapter` `v2.38.0..v5.0.0` and pi `v0.87.1..v1.0.0`
+
+> **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
+> `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
+> **Next free id: `MCP-609`.** Upstream was read only through
+> `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
+> `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
+> `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
+> **Architecture is not in question and no row below proposes restructuring `cyrup-mcp`:** pi moving
+> MCP into its monorepo as a first-class package is pi arriving where cyrup already is, and `MCP-587`
+> records what that means for citations and nothing else.
+
+Five rows, and the heaviest of them are about the `<agent_dir>/mcp-cache.json` identity contract:
+the digest pre-image gained two stdio keys (`MCP-594`, which must land in one commit with
+`SUBA-156`, the other writer of that file), and the seven-day metadata expiry that cyrup still
+applies is gone upstream (`MCP-595`).
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| MCP-593 | medium | not-ported | M | **`auth: { provider: "<name>" }` is unported — a cyrup provider's OAuth token is never sent to an HTTP MCP server** — `types.ts:464` at v5.0.0; cyrup's `AuthMode` has no object variant and the value lands in `AuthMode::Other`. **FILED 2026-10-02**; body below. |
+| MCP-594 | medium | upstream-drift | S | **`compute_server_hash`'s pre-image is stale: stdio servers gained `inheritEnv` and `literalEnv`, and `literalEnv` now governs the `env` leg** — `metadata-cache.ts:109-120` at v5.0.0; cyrup's 15 identity keys and its golden vectors predate it. **FILED 2026-10-02**; body below. |
+| MCP-595 | medium | upstream-drift | S | **cyrup still expires cached tool metadata after seven days; upstream removed the age limit** — `metadata-cache.ts:187-190`, `maxAgeMs` default `7 days` → `0`. **FILED 2026-10-02**; body below. |
+| MCP-596 | medium | not-ported | M | **`cacheScope: "private"` and `discoveryFailed` are unported, so metadata discovered under one session's credentials can be served to another** — `metadata-cache.ts:202-203` at v5.0.0. **FILED 2026-10-02**; body below. |
+| MCP-597 | low | upstream-drift | S | **HTTP header validation is still gated on command-derived values and its message is the superseded one** — `server-manager.ts` at v5.0.0 validates every header one at a time and names only the header. **FILED 2026-10-02**; body below. |
+
+#### MCP-593 — `auth: { provider: "<name>" }` for HTTP MCP servers
+
+**upstream** — `c524196` (#767, v5.0.0). `types.ts:464` widens the field to
+`auth?: "oauth" | "bearer" | false | { provider: string }`. `server-manager.ts` resolves the named
+pi provider's access token and sends it as the HTTP server's bearer credential; the commit's four
+follow-ups are load-bearing and part of the unit: a malformed provider token is kept **out** of
+connection errors (the same hazard as `MCP-597`), a provider token that stops working mid-session is
+reported as **needs sign-in** rather than as a transport failure, and an env-interpolated
+`auth.provider` URL is re-checked **after** resolution. `session-recovery.ts` participates in the
+mid-session leg.
+
+**cyrup at HEAD** — `config.rs:1705 AuthMode` is
+`Named(AuthKind) | Disabled(bool) | Other(RawJson)`, with `AuthKind` = `Oauth | Bearer` (`:1716`).
+`{ "provider": "x" }` therefore deserialises into `Other(RawJson)`, whose doc says it is "held
+**verbatim** for the digest and matched by nothing" — so the config loads, the server appears
+configured, and it connects **unauthenticated**. `grep -rn 'auth.*provider' crates/cyrup-mcp/src`
+finds no reader.
+
+**Why the port is cheap on the credential side and not on the plumbing side.** cyrup already holds
+provider OAuth tokens — `crates/cyrup-provider/src/auth/oauth/`, `builtin_oauth.rs`,
+`github_copilot.rs` — so there is a token source to read. The work is the `AuthMode` variant, the
+resolution site in `runtime.rs`'s HTTP connect path beside the existing bearer legs, the
+needs-sign-in classification (which must reuse the byte-exact `/mcp-auth` line the existing
+needs-auth envelope carries), and the post-interpolation URL re-check.
+
+**Digest note.** `metadata-cache.ts:109`'s identity object carries `auth: definition.auth` verbatim,
+and cyrup's `AuthMode::Other(RawJson)` already hashes the object faithfully, so **no golden vector
+moves** when the variant is added. Say so at the site; the opposite assumption would be the natural
+one.
+
+`verify` — an HTTP server with `auth: { provider: "anthropic" }` reaching a fake endpoint with the
+provider's token as `Authorization`; a test that a revoked token mid-session produces the needs-auth
+envelope and not a transport error; a golden-vector test that the hash is unchanged.
+
+#### MCP-594 — the metadata-cache digest pre-image gained two stdio keys
+
+**upstream** — `34df4ed` (#687, v3.0.0). `computeServerHash` (`metadata-cache.ts:109`) now computes
+`const isStdio = !!definition.command` and
+`const literalEnv = isBuiltInAgentPlugin(definition, "env") || (isStdio && definition.literalEnv === true)`,
+and the identity object changes in two ways (`:117-120`):
+- `env: literalEnv ? definition.env : interpolateEnvRecord(definition.env, environment)` — previously
+  the `literalEnv` test was `isBuiltInAgentPlugin(definition, "env")` alone, so a user entry with
+  `literalEnv: true` had its `env` interpolated **into the digest** while the live connection took it
+  verbatim;
+- `...(isStdio ? { inheritEnv: definition.inheritEnv !== false, literalEnv } : {})` — two new keys,
+  present only for stdio servers, each a resolved boolean rather than the raw field.
+
+**cyrup at HEAD** — the pre-image is built at `dirs.rs:1296` onward: `command`, `args`, `socket`,
+`env`, `cwd`, `url`, `headers`, `requestHeadersCommand`, `auth`, `protocolVersion`, `bearerToken`,
+`bearerTokenEnv`, `exposeResources`, `includeTools`, `excludeTools` — 15 keys, no `inheritEnv`, no
+`literalEnv`. `secrets.rs:355` honours `literal_env` for the **live** env resolution but
+`dirs.rs:1298`'s `opt_string_map(resolved.env.as_ref())` takes the interpolated map unconditionally.
+`13-cyrup-mcp-STATUS.md:707` records "The **15 identity keys are unchanged**" — **that sentence is
+now stale and should be corrected when this lands.**
+
+**Two distinct failures.** (1) Flipping `inheritEnv` or `literalEnv` on a stdio server does not move
+the digest, so `is_server_cache_valid` keeps serving tools discovered under the old environment — and
+with `MCP-595` removing the age limit, nothing else will ever refresh them. (2) For an entry with
+`literalEnv: true`, the digest is computed over an interpolated `env` the server never sees, so two
+configs that behave differently can hash the same.
+
+**Scheduling, and the reason this is `S` but not free.** Adding two keys changes the digest for
+**every stdio server**, which invalidates the whole metadata cache once on upgrade (acceptable, and
+upstream's own cost) and **voids every golden-vector fixture** in `dirs.rs` — the pinned pre-image
+strings at `:1694`, `:1734`, `:1808` must be regenerated from upstream at v5.0.0, not hand-edited.
+`cyrup_ext_subagents::exec::mcp_direct_tools::compute_mcp_server_hash` reads and writes the same
+file (`dirs.rs:49`, `:101`) and **must change in the same commit** or the two writers will disagree
+and thrash the cache.
+
+`verify` — golden vectors regenerated from `v5.0.0`, including one stdio and one HTTP entry (the
+latter must be **unchanged**, proving the keys are stdio-only); a test that flipping `inheritEnv`
+invalidates the entry; a test that `literalEnv: true` keeps `$VAR` unexpanded in the pre-image.
+
+**Paired with `SUBA-156` (reconciled 2026-10-02).** `<agent_dir>/mcp-cache.json` has two writers
+in cyrup, and the other one is filed separately: **`SUBA-156`** (`09b-…`, medium, `parity-bug`) owns
+the reader/writer in `cyrup_ext_subagents::exec::mcp_direct_tools`, whose `ServerEntry` models
+neither `literal_env` nor `inherit_env` and therefore interpolates an env the agent-plugin path takes
+verbatim. **The two rows are one commit**: adding `inheritEnv`/`literalEnv` to the stdio identity on
+only one side makes the digests disagree and leaves `mcp:` selectors resolving to nothing, which is
+the failure `exec/mcp_direct_tools.rs:32`'s module header was written about. They are counted
+separately because they sit in different crates and in two censuses — this file's and the main
+area count — not because the work is separable.
+
+#### MCP-595 — the seven-day metadata expiry is gone upstream
+
+**upstream** — `2632013` (#787, v5.0.0). `isServerCacheValid`'s `maxAgeMs` parameter default moves
+from `CACHE_MAX_AGE_MS` to **`0`** (`metadata-cache.ts:190`), with the comment "0 means no age limit:
+without a server-declared TTL, an entry stays valid until the next connect refreshes it." The
+commit body states the symptom precisely: the first session stamps every server's entry with the same
+time, only servers you use get restamped, so a week later every unused server's entry expires
+together, "and nothing rediscovered plain lazy servers, so rarely used servers dropped out of search
+for good." Validity is now bounded by the config hash, a server-declared `ttlMs`, and the private
+scope — the parameter is kept so an explicit cap still applies.
+
+**cyrup at HEAD** — `registration.rs:152-153`
+`METADATA_CACHE_MAX_AGE_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0`, passed at `:1100`
+(`cached_entry_if_valid`) and `:2651`. `is_server_cache_valid` (`:1061`) applies it at `:1081`, and
+its doc at `:1058` documents the age check as rejection 4 of 4.
+
+**The failure in cyrup is the same one upstream names, and worse.** cyrup's startup set is
+`bootstrap_all || is_prewarmed()` (`runtime.rs:582`), where `bootstrap_all` is set **only when the
+cache file does not exist at all** (`:526-530`). So once the file exists, a plain `lazy` server is
+never rediscovered at startup — and after seven days its entry is invalid, its tools leave the
+direct-tool and search surfaces, and the only way back is to call it by name or delete the cache
+file. `MCP-598` is the other half of this and the two should land together.
+
+**Work.** Default the parameter to `0`, keep the positive-cap branch, and update the doc at
+`:1058` and the fixtures at `:3444`, `:3462`, `:3477` that construct deliberately-stale entries.
+`MCP-505` (the `ttlMs` hint) is the mechanism that *replaces* the age limit and should land first or
+with it; landing this alone removes the only bound on a stale entry.
+
+`verify` — a test that a year-old entry whose `configHash` still matches is **valid**; the existing
+stale-entry tests retargeted to a positive explicit cap.
+
+#### MCP-596 — private metadata scope and `discoveryFailed` are unported
+
+**upstream** — `0ff0b85` (#743, v3.2.0), with three follow-ups in the same commit.
+`isServerCacheValid` gains two rejections (`metadata-cache.ts:202-203`), bringing it to seven gates:
+
+```text
+if (entry.cacheScope === "private") return false;   // the persistent cache is not partitioned by authorization context
+if (entry.discoveryFailed) return false;
+```
+
+and the commit's follow-ups extend the scope rule through the write path: a shape or listing observed
+under a private tool listing is used **in the current session only** and never saved, including after
+the listing turns public; a cache-entry rewrite does not carry shapes out of an entry marked private;
+and `updateMetadataCache`'s fallback — filling a new entry from the current session's metadata when
+prompt or resource discovery fails — now only fills a **private** entry from a private session entry,
+because the reconnected listing's scope may differ from the one the in-memory metadata came from.
+`149fdf1` then uses both flags at startup: a `discoveryFailed` entry whose config hash still matches
+is **not** retried at startup (tried once per config, retried on first use), and an entry with
+`cacheScope: "private"` is never discovered at startup at all (`init.ts`, the `needsDiscovery` /
+`failedDiscovery` split).
+
+**cyrup at HEAD** — `grep -rn 'cache_scope\|discovery_failed' crates/cyrup-mcp/src` finds only
+`prompt_discovery_failed`, which is a per-connection flag on the live discovery result
+(`runtime.rs:4845`, `:4867`) and **not** a cache-entry field. `is_server_cache_valid`
+(`registration.rs:1061`) has four gates — the hash throw, the hash mismatch, a falsy/non-numeric
+`cachedAt`, and the age limit — and `ServerCacheEntry` (`dirs.rs:596` onward) carries neither field.
+
+**The failure.** `<agent_dir>/mcp-cache.json` is a single shared file with no authorization
+partition. A server whose `tools/list` response depends on who is signed in — the common case for an
+HTTP server behind OAuth — has that listing written to the shared cache, and a later session with
+different or no credentials reads it back and registers a direct-tool surface advertising tools that
+session cannot call. The `discoveryFailed` half is a smaller, adjacent problem: an entry written
+after a failed discovery is indistinguishable from a good one, so a half-empty catalogue is served
+as authoritative and, with `MCP-595`'s age limit gone, is served indefinitely.
+
+**Work.** Two `ServerCacheEntry` fields and the two rejections are the easy part. The substance is
+deciding and recording *what makes a listing private* in cyrup's terms — upstream's scope is set
+where the connection's authorization context is known, so the flag must be plumbed from the connect
+result through `capture_metadata` to the writer — and then enforcing it on the write side, not only
+the read side. Note that the output-shape half of upstream's follow-ups is moot until `MCP-603`
+exists; say so at the site rather than porting dead plumbing.
+
+`verify` — a test that an entry written with `cacheScope: "private"` is rejected by
+`is_server_cache_valid`; a test that a private session's prompts do not reach a public entry through
+the discovery-failure fallback; a test that a `discoveryFailed` entry with a matching hash is not
+retried at startup but is on first use.
+
+#### MCP-597 — HTTP header validation scope, and the superseded error message
+
+**upstream** — `79ad588` (#770, v5.0.0). Two changes in `server-manager.ts`:
+- the bearer-token set is wrapped — `try { headers.set("Authorization", \`Bearer ${token}\`) } catch
+  { throw new TypeError("bearerTokenCommand returned a token that is not a valid header value") }` —
+  with the comment "The `Headers` error quotes the value, so it must not surface";
+- the validation loop no longer runs only when `hasCommandHeader || commandBearer`. It iterates
+  **every** entry of the resolved header map, constructs `new Headers({ [name]: value })` one at a
+  time, and on failure throws
+  `` `MCP server "${serverName}" HTTP header "${name}" has an invalid name or value` ``, replacing
+  `` `Failed to resolve MCP server "${serverName}" HTTP command secret: command returned an invalid
+  header value` ``. The comment again: "The `Headers` error quotes the value, which is often a
+  secret."
+
+**cyrup at HEAD** — `secrets.rs:438` documents, and `:533` emits, the **superseded** message:
+`Failed to resolve MCP server "{server_name}" HTTP command secret: command returned an invalid
+header value`, pinned at `:768`, `:784` and `runtime.rs:6934`. The validation is on the
+command-secret path only, matching upstream's pre-fix gate.
+
+**Two consequences, and only one of them is a leak.** cyrup is not exposed to the quoting hazard:
+`http::HeaderValue::from_str`'s error does not echo the value, so **no secret reaches a cyrup
+connection error today** — the privacy half of upstream's fix is already satisfied by the Rust API
+and should be recorded as such, not ported. What cyrup lacks is the widened **scope**: a malformed
+*literal* header (a stray newline in a hand-written `headers` entry) is not caught at resolve time
+and surfaces later as a transport error naming no header. Low severity for that reason, and the
+message change is byte-for-byte parity on a string that is already pinned by three tests.
+
+`verify` — a server with a literal `headers` value containing `\n` failing at resolve with
+`MCP server "srv" HTTP header "X-Thing" has an invalid name or value`; a test asserting the error
+string does **not** contain the value; the three existing pins retargeted.
+
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
 > **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** `http-ca.ts` → **`MCP-566`**; macOS Local Network Privacy → **`MCP-567`** (the SSE cause-capture half is Cut 1, not owed); `inheritEnv` → **`MCP-553`** (high: `secrets.rs` `resolve_env` always starts from the full parent environment, and `lenient` drops the key silently); `directToolCount` → **`MCP-554`**, and `MCP-137` itself re-ruled `implemented` (`live.rs` `create_mcp_status_snapshot` exists). The `13c:1003` ladder correction is confirmed. From v2.34–v2.37: command-backed bearer TTL + 401 reconnect → **`MCP-576`** (high); atomic reconnect (#629) → **`MCP-578`**. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.

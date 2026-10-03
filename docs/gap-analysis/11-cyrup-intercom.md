@@ -345,6 +345,8 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 
 ## Open items
 
+> **Next free id: `ICOM-082`** (2026-10-02, after the pi v1.0.0 pass filed `ICOM-071`…`ICOM-081`).
+
 > ### BATCH 2 — 2026-09-04 (ledger audit): **2 closed, 5 open** — counted set **0 critical, 0 high, 2 medium, 3 low = 5**, 49 closed (`scripts/count_open_items.py`); authoritative over every block below.
 >
 > **`ICOM-053`** CLOSED at `1d2b4418` (the feature-matrix gate now RUNS the `cyrup-it` seam suite instead of type-checking it; two seam targets that had stopped compiling were fixed on the way) and **`ICOM-060`** CLOSED at `a91e3c41` (pi-intercom v0.12.1 `5fe0ee3`'s misdirected-reply guard, line for line). The two remaining mediums are `ICOM-054` (broker-owned endpoint epochs, v0.11.0) and `ICOM-055` (scoped routing, v0.12.0). **`ICOM-055` CLOSED later the same day at `c440c038`** (see its row), leaving `ICOM-054` as the only open medium in this area. **`ICOM-054` CLOSED 2026-09-05 at `87421cd7`** (see its row), which leaves **0 medium** open here: `docs/gap-analysis/scripts/count_open_items.py` at that sha reads area 11 as `0 critical, 0 high, 0 medium, 3 low = 3` open (`ICOM-016`, `ICOM-052`, `ICOM-057`) and **51 closed**. Note for the next pass: no `cyrup-it --features it` run happened after `ICOM-053`'s own; `SUBA-072`/`088`/`090` edited ~30 `cyrup-it` test files later the same day and were `cargo check`ed only (disk).
@@ -624,6 +626,17 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 | ~~ICOM-047~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | Broker startup failures discard the broker's stderr — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-049~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | M | Inbound delivery carries no runtime-generation guard — **CLOSED 2026-08-14**: sweep 2 — pi's `getLiveContext` fence ported into the inbound delivery path: `ConnectSupervisor.runtime_session_id` (pi's `currentSessionId`) captured by `begin_runtime` and cleared by `shutdown`, a new `runtime_ever_started` latch, `generation()`/`runtime_ever_started()` accessors and `is_live_at(state, generation)`; the inbound loop head stamps `message_generation` and re-checks liveness BEFORE the waiter match / record / surface, again at the head of the delivery decision, and a third time in the Trigger arm; the busy auto-reply's `dismissIncomingAsk` is gated on liveness AFTER its `await`. The FLUSH half is moot — ICOM-035 deleted the queue, exactly as the item's last line predicted. **A NEW LATCH WAS REQUIRED and the reason is on the record: pi's `runtimeStarted` (index.ts:522, set at :1253) is never cleared, whereas cyrup's `started` is cleared by `shutdown` because the reconnect ladder needs "is a runtime active right now". Reusing `started` makes `runtimeStarted &&` false after shutdown, which SKIPS the fence and lets a stale delivery through — the inverse of the guard. The pre-existing doc comment on `started` asserting it WAS pi's `runtimeStarted` is what made the wrong mapping look right, and is corrected.** |
 | ~~ICOM-050~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `intercom_received` audit entry drops `messageId` and `attachments` — **CLOSED 2026-08-14**: sweep 1. |
+| ICOM-071 | low | not-ported | S | **`Message.crossMachine` (`CrossMachineProvenance`) is neither modelled nor validated** — upstream's v1 relay provenance envelope, `types.ts:67-78,:93` and `broker/protocol.ts:104-114,:151-153` at v0.16.0. cyrup's `Message` ends at `provenance` (`transport/protocol.rs:613`); the key survives only in `#[serde(flatten)] extra`. **FILED 2026-10-02**; body below. |
+| ICOM-072 | medium | parity-bug | S | **`DeliveryFingerprint` omits `provenance`, so the replay guard replays a re-send that changed it** — upstream has had `provenance` in the fingerprint since v0.12.0 (`broker/protocol.ts:164-176` at v0.16.0, where it also gains `crossMachine`); `broker/delivery.rs:41-54` lists seven fields and its own doc at `:26` claims "The FIELD SET is upstream's exactly." **FILED 2026-10-02**; body below. |
+| ICOM-073 | low | not-ported | S | **The `crossMachine` config object (`machineName`, `remoteCommand`) is absent** — `config.ts:31-36,:67,:82-85,:189-207` at v0.16.0, with per-key non-empty-string validation. `config.rs:53-76` has ten fields and no `cross_machine`. **FILED 2026-10-02**; body below. |
+| ICOM-074 | medium | not-ported | L | **The explicit cross-machine SSH relay send path is unported** — `cross-machine-envelope.ts`, `cross-machine-discovery.ts`, `cross-machine-transport.ts` and `index.ts:143-159,:1650-1730` at v0.16.0 route a `name@machine` target through an enabled Herdr saved machine over `ssh`. cyrup has no `name@machine` arm; `tools/intercom/send.rs` resolves every target locally. **FILED 2026-10-02**; body below. |
+| ICOM-075 | low | not-ported | M | **`cyrup-intercom-cli` has no `relay --envelope-stdin` subcommand, so a cyrup host cannot RECEIVE a pi relay** — `cli.ts:63-70,:109-113,:181-186,:215-230` at v0.16.0. cyrup's parser accepts exactly `list`/`send`/`ask` (`bin/cyrup-intercom-cli.rs:113-116`). **FILED 2026-10-02**; body below. |
+| ICOM-076 | low | not-ported | S | **Inbound cross-machine messages get no `· unverified cross-machine` attribution and no `send`-back hint** — `index.ts:1277-1280,:1379-1383` and `ui/inline-message.ts:40-47,:72,:98` at v0.16.0. cyrup's `sender_display` (`ui/inline_message.rs:79-86`) is name-or-8-char-id only. **FILED 2026-10-02**; body below. |
+| ICOM-077 | medium | not-ported | L | **`intercom({ action: "handover" })` is unported** — the model-generated session handover added at v0.16.0 (`handover.ts:38-115`, `index.ts:2627-2654`, action enum at `:2447`). cyrup's action enum ends at `"status"`/`"cancel"` (`tools/intercom/mod.rs:464,:709`). **FILED 2026-10-02**; body below. |
+| ICOM-078 | low | not-ported | M | **`/handover`, the handover picker and the session list's `h` key are unported** — `index.ts:3007-3119,:3169-3178,:3222-3225`, `ui/handover-picker.ts` (318 lines) and `ui/session-list.ts:52-55,:103-109,:119` at v0.16.0. cyrup's `SessionListAction` has no handover variant (`ui/session_list.rs:68-82`) and its footer is `"{}: Message • {}: Close"` (`:171-173`). **FILED 2026-10-02**; body below. |
+| ICOM-079 | low | not-ported | S | **The bundled skill and the config/keybinding docs do not mention handover or `crossMachine`** — `skills/pi-intercom/SKILL.md:163-181` ("Pattern 6b: Hand Over Your Session") at v0.16.0. cyrup's `resources/skills/pi-intercom/SKILL.md` jumps Pattern 6 → Pattern 7. **FILED 2026-10-02**; body below. |
+| ICOM-080 | low | upstream-drift | S | **The Herdr pane-run command is still pre-quoted; upstream deleted that quoting as a bug** — `e3a5258` (#143) removed `shellQuote` and passes a plain token (`project-agent.ts:240-241` at v0.16.0). cyrup still does `shell_quote(&self.agent_command)` at `project_pane.rs:542`. **FILED 2026-10-02**; body below. |
+| ICOM-081 | low | upstream-drift | S | **The detached broker inherits the session's cwd; upstream moved it to the intercom runtime dir** — `ac9cc1a` (#140) sets `cwd: getIntercomDirPath(agentDir)` (`broker/spawn.ts:115-124` at v0.16.0). `transport/spawn.rs:186-196` calls no `.current_dir()`. **FILED 2026-10-02**; body below. |
 
 ---
 
@@ -1783,6 +1796,363 @@ test that pins them the way `prompt_guidelines` is pinned.
 
 **Verify** — string-equality test against the upstream text at the pinned tag (after the
 product-name substitution).
+
+## Findings filed 2026-10-02 — the `v0.14.0..v0.16.0` window
+
+`pi-intercom` **v0.16.0** (25 commits since v0.14.0), read only at the tags; cyrup read at
+`fe875569`. The window adds two features and both are unported in full: cross-machine relay over
+SSH (`ICOM-071`…`ICOM-076`) and model-driven session handover (`ICOM-077`…`ICOM-079`).
+
+## ICOM-071 — `Message.crossMachine` is neither modelled nor validated
+
+**Upstream at v0.16.0.** `types.ts:67-78` adds two interfaces:
+
+```ts
+export interface CrossMachineOrigin { name: string; sessionId: string; machine: string; }
+export interface CrossMachineProvenance {
+  type: "ssh-relay"; version: 1; origin: CrossMachineOrigin; trust: "ssh-asserted";
+}
+```
+
+and `types.ts:93` adds `crossMachine?: CrossMachineProvenance` to `Message`, beside the existing
+`provenance`. `broker/protocol.ts:104-114` validates it strictly — `type === "ssh-relay"`,
+`version === 1`, `trust === "ssh-asserted"`, and all three `origin` fields present and strings —
+and `:151-153` makes `isMessage` return `false` for a present-but-malformed value, which the broker
+answers with its ordinary invalid-message refusal. `b92d945` is the commit that added the `version`
+discriminant specifically so a future envelope shape is rejected rather than silently misread.
+
+**cyrup at HEAD.** `transport/protocol.rs:607-620`: `Message` carries `provenance:
+Option<MessageProvenance>` at `:613` and then `#[serde(flatten)] extra: UnknownFields` at `:620`.
+`grep -rn 'crossMachine\|cross_machine' crates/cyrup-intercom/` returns nothing. Consequences:
+
+- **No interop break.** The `extra` capture round-trips the key, exactly as the file's own
+  v0.12.0 note describes for `provenance`/`endpointEpoch`/`tmuxPane`, so a pi v0.16.0 peer relaying
+  through a cyrup broker is tolerated.
+- **But cyrup is laxer than pi on a frame pi refuses.** A malformed `crossMachine` — wrong `type`,
+  `version: 2`, a missing `origin.machine` — lands in `extra` and is delivered. pi kills that
+  message with `E_INVALID_MESSAGE`. This is the same class of asymmetry ICOM-054 recorded as a
+  deliberate design decision for `ExactTarget`, except here cyrup is on the *permissive* side.
+- It blocks ICOM-072 (the fingerprint field), ICOM-075 (the relay CLI must emit it) and ICOM-076
+  (the UI must read it).
+
+**Scope.** Two serde structs, the `Option` field on `Message`, and a deserialize-side validator that
+matches pi's refusal rather than a type-guard throw.
+
+## ICOM-072 — `DeliveryFingerprint` omits `provenance`, so the replay guard replays a changed re-send
+
+**Upstream at v0.16.0.** `580233a` lifted the broker's private `deliveryFingerprint` into an exported
+`messageDeliveryFingerprint` (`broker/protocol.ts:164-176`) so the relay path shares it; the field
+list there is `targetId, text, attachments, replyTo, expectsReply, supersedes, retryOf, provenance,
+crossMachine`. The `provenance` entry is **not new at v0.16.0** — `git show v0.13.0:broker/broker.ts`
+and `git show v0.14.0:broker/broker.ts` both contain it inside `private deliveryFingerprint`, so it
+has been there since `provenance` itself landed at v0.12.0.
+
+**cyrup at HEAD.** `broker/delivery.rs:30-54`:
+
+```rust
+pub(super) struct DeliveryFingerprint {
+    target_id: String, text: String, attachments: Option<Vec<Attachment>>,
+    reply_to: Option<String>, expects_reply: Option<bool>,
+    supersedes: Option<String>, retry_of: Option<String>,
+}
+```
+
+Seven fields. `provenance` is absent, and `DeliveryFingerprint::of` (`:43-54`) never reads
+`message.provenance`. The doc comment at `:26` states "The FIELD SET is upstream's exactly" — that
+claim is **false at v0.13.0, the tag it cites**, and the `v0.13.0 broker/broker.ts:1043-1053`
+citation at `:19` points at the very function that has the field.
+
+**Why this is a correctness gap and not cosmetics.** `BrokerState::replay_or_reject`
+(`broker/send.rs:646-665`) refuses a re-used message id with `E_MESSAGE_ID_REUSE` only when
+`&record.fingerprint != fingerprint`; a fingerprint match **replays the recorded ack without
+re-injecting the message**. So a sender that re-uses a message id with identical text but a
+*different* `provenance` — a different extension claiming authorship of the same text — gets the
+first send's ack replayed, the second provenance is silently discarded, and the receiver is never
+told. cyrup genuinely produces provenance-bearing messages on this path: `outbox.rs:594` sets
+`provenance: Some(MessageProvenance { … })`.
+
+**The test does not cover it.** `broker/delivery.rs:266-288`
+`the_fingerprint_covers_authored_content_only` asserts only that broker timestamps are excluded, that
+`reply_to` is included, and that `target_id` is included. Adding `provenance` to the struct, and
+`crossMachine` once ICOM-071 lands, needs two more `assert_ne!` arms.
+
+**Effort S** — two struct fields, two lines in `of`, two assertions, and a corrected doc comment.
+Do ICOM-071 first or the `crossMachine` half has nothing to read.
+
+## ICOM-073 — the `crossMachine` config object is absent
+
+**Upstream at v0.16.0.** `config.ts:31-36` declares `CrossMachineConfig { machineName: string;
+remoteCommand: string }`, `:67` adds it to `IntercomConfig`, and `:82-85` defaults it to
+`{ machineName: defaultMachineName(hostname()), remoteCommand: "pi-intercom" }`, where
+`defaultMachineName` (`cross-machine-envelope.ts:34-36`) is the lowercased first dot-segment of the
+hostname. `:189-207` parses it: a non-object `crossMachine` throws `"crossMachine" must be an
+object`, and each key throws `"crossMachine.<key>" must be a non-empty string` and is `.trim()`ed.
+`dd0580b` is the commit that narrowed this to exactly two keys. Note `:91` and `:104` clone the
+nested default object rather than sharing it — a shared-mutable-default bug upstream avoided.
+
+**cyrup at HEAD.** `config.rs:53-76` — `broker_command`, `broker_args`, `confirm_send`,
+`inbound_trigger`, `busy_delivery`, `status`, `stable_id`, `enabled`, `reply_hint`. No
+`cross_machine`. `grep -o '"[a-zA-Z]\+"' crates/cyrup-intercom/src/config.rs | sort -u` lists no
+`crossMachine`. An unknown top-level key is ignored, so a user who writes the pi config block gets
+silence rather than an error.
+
+**Note on the existing refusal contract.** ICOM-044 is still open for cyrup failing closed silently
+on a malformed config instead of erroring with the path; the two per-key messages this row needs
+should be written against whatever that item settles, not independently.
+
+**Blocks** ICOM-074 and ICOM-075, both of which read these two keys.
+
+## ICOM-074 — the explicit cross-machine SSH relay send path is unported
+
+**Upstream at v0.15.0/v0.16.0** — 13 commits (`276771d`…`580233a`), three new modules plus an
+`index.ts` arm. The shape:
+
+1. **`cross-machine-envelope.ts`** — `CrossMachineEnvelope { version: 1, target, text, origin, trust:
+   "ssh-asserted" }`; `parseRelayEnvelope` (`:56-84`, hardened by `023fa84`) enforces byte caps
+   (`MAX_RELAY_ENVELOPE_BYTES` 1 MiB, `MAX_RELAY_TEXT_BYTES` 256 KiB, `MAX_RELAY_TARGET_BYTES` and
+   `MAX_RELAY_ORIGIN_FIELD_BYTES` 1 KiB), **exact** key sets on both the envelope and `origin`
+   (`hasExactlyFields`), and distinct errors for a bad version vs a bad trust;
+   `relaySenderName` is `` `${name}@${machine}` ``; `relayMessage` prefixes the body with
+   `[Unverified cross-machine origin]`; `resolveOrigin` (`:38-54`) picks the origin session from
+   `PI_INTERCOM_SESSION_ID`/`PI_SESSION_ID` or by name, skipping `runtimeFallbackAlias` rows.
+2. **`cross-machine-discovery.ts`** — `parseSavedMachines`/`parseRemoteAgents` over `herdr machine
+   list --json` and `herdr --machine <label> agent list`; `parseCrossMachineTarget` splits
+   `name@machine` and refuses anything else; `discoverRemoteAgent` (`:111-140`, tightened by
+   `747326b`) requires **exactly one** enabled saved machine matching the label and **exactly one**
+   agent matching the name or full session UUID, with a distinct error for zero and for many.
+   `93c5a01` added the `_<uuid>.jsonl` session-id extraction so an *unnamed* remote session is
+   addressable by id, and `:95-101` unwraps herdr's Rust `Custom { … error: "…" }` debug string into
+   a readable reason plus a "your Herdr server is too old" hint.
+3. **`cross-machine-transport.ts`** — `runCommand` (`:34-66`, the process contract `53580c2`
+   hardened: single-settle, `SIGKILL` on timeout, exit code 124 and a `timedOut` flag);
+   `sendCrossMachine` (`:72-110`) rejects an empty or control-character `remoteCommand`, then runs
+   `ssh <target> "<remoteCommand> relay --envelope-stdin --json"` with the envelope on stdin under a
+   15 s timeout (discovery 5 s), and treats a non-JSON or version-mismatched reply as
+   "needs upgrading" rather than a delivery failure.
+4. **`index.ts:143-159`** — `explicitCrossMachineSendRestriction` refuses `cwd`,
+   `openProjectPaneIfMissing`, `replyTo`, `supersedes`, `retryOf` and attachments for a
+   `name@machine` target; `:1650-1730` is the arm inside the new shared `deliverMessage`, which
+   confirms the send when `confirmSend`, appends an `intercom_sent` entry with `crossMachine: true`,
+   and returns `details: { delivered, crossMachine, machine, target, trust: "ssh-asserted" }`.
+   `ask` is refused for a remote target.
+
+**cyrup at HEAD.** Nothing. `grep -rni 'cross.machine' crates/cyrup-intercom/` is empty.
+`tools/intercom/send.rs` resolves every `to` through the local broker, so `reviewer@workstation` is
+simply a session name that does not exist.
+
+**What cyrup already has, and should reuse rather than restate.** `cyrup-herdr/src/machine.rs`
+already ports a saved-machine catalog reader — `parse_machine_catalog` returns
+`MachineProfile { id, label, target, session, enabled }` from `herdr machine list --json`, bounded by
+`MACHINE_LIST_TIMEOUT` and `MAX_MACHINE_LIST_BYTES`. It was ported for a *different* pi surface
+(`herdr-machine.ts`), and it keys on `id` where intercom's `parseSavedMachines` keys on `label`, so
+the overlap needs settling rather than assuming. Genuinely missing: `--machine <label> agent list`
+forwarding (`grep -rn '"--machine"' crates/cyrup-herdr/src/` is empty), the `agent: "pi"` filter and
+`agent_session` path parsing, and all three new modules.
+
+**Severity `medium`, not higher.** No path cyrup runs today breaks; the capability is absent. It is
+the largest single item in this window and should be split at the module boundary above — hence `L`.
+
+## ICOM-075 — `cyrup-intercom-cli` has no `relay` subcommand, so a cyrup host cannot receive a pi relay
+
+**Upstream at v0.16.0.** `cli.ts` grows a fourth command. `:63-70` and `:109-113` enforce that
+`relay` takes **only** `--envelope-stdin` and an optional `--json`, each at most once, with no other
+argument at all — so `--to`, `--text`, `--name` and `--timeout-ms` are usage errors. `:181-186`
+parses the envelope off stdin before connecting and refuses a `target` containing `@` (no
+relay-of-a-relay). `:215-230` sends `relayMessage(envelope)` with the `crossMachine` provenance
+attached, and prints `{ ok: true, delivered: true, id, origin, trust }` under `--json` — the exact
+object `sendCrossMachine` parses on the other end. The relay connection registers under
+`relaySenderName(origin)` with `runtimeFallbackAlias: true` (`:188-191`,
+`buildCliRegistration(name, now, true)`) so the transient relay session never wins a name lookup.
+`runMain`/`cli.mjs` were added in the same window so the package exposes a `pi-intercom` binary.
+
+**cyrup at HEAD.** `bin/cyrup-intercom-cli.rs:113-116` maps exactly `"list"`/`"send"`/`"ask"` and
+returns `unknown command: {other}` otherwise; `CLI_USAGE` at `:56-58` lists the same three.
+`:184` already passes `runtime_fallback_alias: None` on the CLI registration and the wire field is
+modelled (`transport/protocol.rs:376,:943`), so the `true` case is a one-line change.
+
+**Why it matters on its own.** ICOM-074 is the *sending* half. This is the *receiving* half: without
+it, a pi v0.16.0 session that targets a cyrup machine gets `relaySupportError` — "Remote pi-intercom
+on "…" has no compatible relay support and needs upgrading" — which is a confusing message for a
+host that is not running pi-intercom at all. Depends on ICOM-071 (the provenance to attach) and
+ICOM-073 (`machineName` for `resolveOrigin`).
+
+## ICOM-076 — inbound cross-machine messages get no attribution and no send-back hint
+
+**Upstream at v0.16.0** (`0541788`, "clarify cross-machine message affordance"). Three places read
+`message.crossMachine`:
+
+- `index.ts:1277-1280` — the injected text's sender becomes
+  `` `${relaySenderName(origin)} · unverified cross-machine` `` instead of the broker-side name,
+  because the broker-side name is the transient relay CLI session, not the real author.
+- `index.ts:1379-1383` — the reply hint flips from `intercom({ action: "reply", … })` to
+  `intercom({ action: "send", to: "<name>@<machine>", … })`, since there is no reply edge back
+  across the relay.
+- `ui/inline-message.ts:40-47,:72,:98` — the card header carries the same suffix and the footer label
+  becomes `To send a new message to <name>@<machine>:` instead of `To reply:`.
+
+**cyrup at HEAD.** `ui/inline_message.rs:79-86` `sender_display` is
+`self.from.name … .unwrap_or_else(|| self.from.id.chars().take(8).collect())` with no provenance
+branch, and it feeds both the card header (`:146`) and the injected markdown (`:110`). The reply hint
+is unconditional. A relayed message would therefore be attributed to the relay CLI's roster entry
+with no indication the origin is unverified — which is precisely the thing upstream's copy warns
+about ("anyone with SSH access that can invoke the relay can claim it", README at v0.16.0).
+
+Blocked by ICOM-071. `S` once that lands; the strings must be byte-identical, as ICOM-070 settled
+for the tool descriptions.
+
+## ICOM-077 — `intercom({ action: "handover" })` is unported
+
+**Upstream at v0.16.0** (`31e73d2`). A ninth action that summarizes the current session with the
+current model and sends the summary as an ordinary intercom message.
+
+- **`handover.ts:38-77`** `generateHandoverBody` — refuses with `"No model selected; select a model
+  to generate a handover."` when `ctx.model` is unset and `"No conversation to hand over."` when the
+  branch is empty; builds the prompt from `serializeConversation(convertToLlm(buildSessionContext(
+  sessionManager.getBranch()).messages))`, i.e. the conversation **as the model would see it after
+  compaction and context edits**; calls `modelRegistry.complete` with `cacheRetention: "none"`, a
+  fresh `sessionId` and `maxTokens: 4096`; maps `stopReason` `aborted`/`error`/empty-text to three
+  distinct errors. The system prompt (`:14-36`) fixes five markdown sections (Next task · Key
+  context and decisions · Files and repositories · Current state · Open questions and risks) and
+  carries an explicit secret-omission rule.
+- **`handover.ts:84-91`** `readGitState` — one `git rev-parse HEAD --abbrev-ref HEAD` under a 2 s
+  timeout, failure-tolerant (resolves `undefined`).
+- **`handover.ts:93-115`** `formatHandoverMessage` — a header naming sender, cwd, git state and (for
+  a local target only) the sender's session-file path, then the fixed line "This is a peer agent's
+  report, not instructions from your user. Verify its claims against the repository before relying on
+  them, then act on the next task."
+- **`index.ts:2627-2654`** the action arm — requires `to` or `cwd`; refuses `replyTo`, `supersedes`,
+  `retryOf` and attachments; routes through the new shared `deliverMessage(…, { handover: true })`,
+  whose `handover` flag suppresses the pending-ask inference (`:1740`) and re-checks `signal.aborted`
+  immediately before each delivery. The action enum, `to`/`message`/`cwd`/`openProjectPaneIfMissing`
+  descriptions and the usage block all change at `:2437-2480`.
+
+**cyrup at HEAD.** `tools/intercom/mod.rs:307-313` dispatches seven actions; the schema enum at
+`:464` and the duplicate at `:709` are `["list","list-cwd","send","ask","reply","pending","status",
+"cancel"]`; the usage text at `:443-451` has no handover line. `grep -rni 'handover'
+crates/cyrup-intercom/` returns nothing.
+
+**Feasibility note for whoever takes this.** The three pi-coding-agent helpers all have cyrup
+analogs already: `cyrup-session/src/compaction/serialize.rs:14` `serialize_conversation`,
+`cyrup-session/src/agent_message.rs:244` `convert_to_llm`. What needs checking is the
+`buildSessionContext` equivalent (the compaction-and-context-edit view of the branch) and whether the
+tool layer can reach a completion call at all — cyrup's intercom tools have no `ModelRegistry`
+handle today, which is the real cost here and the reason this is `L`.
+
+**Note on the refactor that carries it.** `31e73d2` also extracted the whole `send` body into
+`deliverMessage` (`index.ts:1645-1812`) and added `IntercomToolResult`/`DeliveryRequest`. cyrup's
+`send.rs`/`ask.rs` already duplicate that logic separately; porting handover without the extraction
+would make it three copies.
+
+## ICOM-078 — `/handover`, the handover picker and the session list's `h` key are unported
+
+**Upstream at v0.16.0** (`64eca38`, `29de444`).
+
+- **`index.ts:3222-3225`** registers the `handover` command; `:3007-3025` `runHandoverCommand`
+  refuses outside `mode === "tui"` with "…use the intercom tool's handover action instead", splits
+  the first whitespace token as the target and the rest as the goal, and treats a target starting
+  `/`, `./`, `../` or `~/` as a project path (expanded by `expandHomePath`, `:612-614`) rather than a
+  session name.
+- **`ui/handover-picker.ts`** (318 new lines) — local sessions sorted by `lastActivity` descending,
+  with the current session and **subagent children filtered out** (`isSubagentChild`: `id` starts
+  with `subagent-`, `:52-54` — that filter is `29de444`); a "+ New session in a project path…" row;
+  a lazily-triggered "Fetch sessions from other machines" row that lists each enabled saved machine's
+  agents or the readable reason it was unreachable; a `Tab`-focusable next-task `Input`; context use
+  highlighted at ≥ 80 %.
+- **`index.ts:3081-3119`** `performHandover` — generates inside a `BorderedLoader` whose `onAbort`
+  cancels the completion, then opens the text in `ctx.ui.editor` for review, then delivers,
+  re-`ensureConnected`ing on both sides of the editor because the session may have reconnected.
+- **`ui/session-list.ts:52-55,:103-109,:119`** — the overlay now returns
+  `SessionListSelection { session, action: "message" | "handover" }`, `matchesKey(data, "h")` yields
+  the handover action, and the footer gains `• h: Hand over`. `middleTruncate`, `shortSessionId` and
+  `herdrLocationText` were exported for the picker to reuse.
+
+**cyrup at HEAD.** `ui/session_list.rs:68-82` — `SessionListAction` is
+`Redraw | Ignore | Cancel | Select(Box<SessionInfo>)`, with no handover variant; `handle_input`
+(`:111-140`) handles cancel/up/down/confirm only; the footer at `:171-173` is
+`"{}: Message • {}: Close"`. `extension.rs` registers `intercom` and `intercom-id` and no third
+command. There is no picker component.
+
+Depends on ICOM-077 for the body it sends. Rated `low` because it is the interactive front door to a
+capability cyrup does not have yet.
+
+## ICOM-079 — the bundled skill and config docs do not mention handover or `crossMachine`
+
+**Upstream at v0.16.0.** `skills/pi-intercom/SKILL.md:163-181` adds "Pattern 6b: Hand Over Your
+Session" with a worked `intercom({ action: "handover", cwd, openProjectPaneIfMissing, message })`
+call and a line pointing humans at `/handover`. `README.md` adds the "Workflow: Handing Over a
+Session" section, the `crossMachine.machineName` / `crossMachine.remoteCommand` rows in the config
+table, the `h` row in the keybindings table, the `handover` row in the `intercom` parameter table,
+and rewrites "Scripting and Remote Machines" around the `pi-intercom` binary and the relay's trust
+model.
+
+**cyrup at HEAD.** `resources/skills/pi-intercom/SKILL.md` goes `### Pattern 6: Cross-Codebase Peer
+Messages` (`:150`) straight to `### Pattern 7: Handle Subagent Escalations` (`:187`) — no 6b.
+
+**This is the skill text the agent actually reads**, shipped as a crate resource and discovered
+through `ResourcesDiscover` (ICOM-004's closure). Keep it with the code: file it, but land it in the
+same change as ICOM-077, because a skill advertising an action the tool does not accept is worse than
+no documentation. Pin the text to v0.16.0 exactly, per the rule ICOM-070 established.
+
+## ICOM-080 — the Herdr pane-run command is still pre-quoted, which upstream deleted as a bug
+
+**Upstream at v0.16.0** (`e3a5258`, #143). The commit body: "herdr pane run takes variadic argv
+directly, so pre-quoting the pi command injected literal quote characters into the pane's terminal
+(e.g. `"pi"` on Windows), preventing pi from launching and causing `openProjectPaneIfMissing` to time
+out waiting for the new session. Drop the `shellQuote` helper (only used at this call site) and pass
+the command as a plain argv token." `project-agent.ts:240-241` at v0.16.0 is now
+
+```ts
+const command = process.env.PI_INTERCOM_PI_BIN?.trim() || process.env.PI_BIN?.trim() || "pi";
+const started = await client.run(["pane", "run", paneId, command], { … });
+```
+
+**cyrup at HEAD.** `project_pane.rs:542-546`:
+
+```rust
+let command = shell_quote(&self.agent_command);
+… .run(&["pane", "run", &pane_id, &command], …)
+```
+
+`shell_quote` is `cyrup-herdr/src/cli.rs:464-470` — `'…'` on unix, `"…"` on Windows — and
+`project_pane.rs:542` is now its **only** non-test caller in the workspace, exactly as upstream found
+it. The path is live: `tools/intercom/send.rs:40` and `ask.rs:37` read
+`open_project_pane_if_missing` and reach it.
+
+**What actually happens, measured against herdr itself** (`tmp/herdr/src/cli/pane.rs:1039-1052`):
+`pane run` joins `args[1..]` with spaces and sends the result as `PaneSendInput { text, keys:
+["Enter"] }` — it is typed into the pane's shell. So on unix the pane's shell strips the single
+quotes and cyrup works **by accident**; on Windows the `"cyrup"` form is what upstream reported as a
+launch failure. Rated `low` for that reason, not because the code is right — the quoting is wrong on
+both platforms and only one of them forgives it. `S`: delete the call and the import, and update
+`shell_quote_wraps_and_escapes_for_the_host_platform` (`project_pane.rs:660-665`), which currently
+pins the behaviour being removed. Check whether `shell_quote` has any remaining caller before
+deleting it from `cyrup-herdr`.
+
+## ICOM-081 — the detached broker inherits the session's cwd
+
+**Upstream at v0.16.0** (`ac9cc1a`, #140, "avoid locking the package directory on Windows").
+`getBrokerSpawnOptions` dropped its `extensionDir` parameter and now sets
+`cwd: getIntercomDirPath(agentDir)` (`broker/spawn.ts:115-124`), with the reason inline: "Windows
+locks a process's cwd against renames, so keep it outside the package." The README at v0.16.0 states
+the resulting contract — "The broker also runs from this runtime directory so its working directory
+does not lock the installed package against updates on Windows. Custom broker commands can use
+executables on `PATH` or absolute paths; relative file paths in commands and arguments resolve from
+the runtime directory."
+
+**cyrup at HEAD.** `transport/spawn.rs:186-196` builds the detached broker with
+`tokio::process::Command::new(&binary)` and sets `.args`, `.env(ENV_CODING_AGENT_DIR, …)` and the
+three stdio handles, plus `process_group(0)` / `creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)`.
+There is no `.current_dir()` anywhere in the file, so the long-lived detached broker inherits the
+**session's project directory**. On Windows that holds the user's repository against rename and
+delete for the broker's lifetime; on unix it keeps a deleted project directory alive. cyrup is not
+exposed to upstream's *specific* symptom — it re-execs its own binary rather than running from an
+npm package dir, which is also why the whole VBScript-launcher half of this window is a no-op here —
+but the general hazard is the same and the fix is the same one line.
+
+**Note the second half of the contract.** Upstream's README sentence makes the runtime dir the
+resolution base for relative paths in a custom `brokerCommand`/`brokerArgs`. cyrup honours a custom
+command verbatim (`resolve_broker_command`, `:157-173`), so setting `current_dir` changes how a
+relative custom command resolves. Decide that deliberately and record it; `S` either way.
 
 ## Coverage
 

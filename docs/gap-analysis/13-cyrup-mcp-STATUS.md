@@ -7,7 +7,22 @@
 
 ## Provenance
 
-> ### CURRENT PIN — 2026-09-24. cyrup **`ea23ca2`** · `pi-mcp-adapter` **v2.37.0** (`28049de`)
+> ### CURRENT PIN — 2026-10-02. cyrup **`fe875569`** · `pi-mcp-adapter` **v5.0.0** · pi **v1.0.0**
+>
+> | | measured at | window read this pass | window still unread |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **v5.0.0** | `v2.38.0..v5.0.0` = 99 non-merge commits, three `feat!`, read commit by commit. 22 units filed (`MCP-587`–`MCP-608`), each read on both sides — see *Fourth pass — 2026-10-02* | `v5.0.0..HEAD` not measured. `packages/mcp` read at README/file-census level only; pi's own `builtin:mcp` extension read only far enough to rule its coexistence commits inapplicable |
+> | `pi` | **v1.0.0** (2026-10-01) | `v0.87.1..v1.0.0` for the two new in-monorepo MCP surfaces (`packages/mcp`, `packages/coding-agent/src/extensions/mcp/`) | the rest of pi is other areas' scope |
+> | `cyrup` | **`fe875569`** | `crates/cyrup-mcp` re-read at every symbol the 22 units name | the crate was not re-read as a whole; the 2026-09-24 passes' `implemented` rows are not re-verified against v5.0.0 |
+>
+> **Authoritative upstream for this area is still `pi-mcp-adapter`, now at `v5.0.0`** — it carries no
+> dependency on pi's in-monorepo `packages/mcp`, and every citation in `13-cyrup-mcp.md` and
+> `13a`–`13i` resolves at that tag. `MCP-587` records the rule.
+>
+> Numbering resumes from **`MCP-609`** (table F, *Fourth pass*, took `MCP-587`–`MCP-608`;
+> `MCP-586` was never allocated and is still free).
+
+> ### PIN — 2026-09-24 (superseded by the 2026-10-02 pin above). cyrup **`ea23ca2`** · `pi-mcp-adapter` **v2.37.0** (`28049de`)
 >
 > | | measured at | window read this pass | window still unread |
 > |---|---|---|---|
@@ -380,6 +395,202 @@ Nothing in `v2.32.1..v2.37.0` that touches a ported or planned surface. Explicit
 line: the non-theme hunks of `mcp-panel.ts` / `mcp-setup-panel.ts` in `977577f` (sampled; the diff is
 almost wholly `fg(t.x, …)` → `this.theme.x(…)`), and `dist/`, `__tests__/`, `package-lock.json`
 everywhere — no runtime effect, provenance recorded by the commit list above.
+
+## Fourth pass — 2026-10-02, the `v2.38.0..v5.0.0` window (cyrup `fe875569`, `pi-mcp-adapter` v5.0.0, pi v1.0.0)
+
+**What this pass read.** `pi-mcp-adapter` **v2.38.0 → v5.0.0** — 99 non-merge commits and three
+`feat!` — commit by commit, plus pi **v0.87.1 → v1.0.0** for the two MCP surfaces pi grew in its own
+monorepo: the new `packages/mcp` (13 source files, a standalone client core) and the new
+`packages/coding-agent/src/extensions/mcp/` (12 files, pi's own built-in MCP extension at the
+extension path `builtin:mcp`). Upstream was read only through
+`git -C tmp/pi-mcp-adapter show v5.0.0:<path>`, `git diff v2.38.0..v5.0.0 -- <path>` and
+`git -C tmp/pi show v1.0.0:<path>`; never a working tree. cyrup was read at `fe875569`. No build, no
+test, no clippy.
+
+**The architectural question this window raises, and its answer.** `pi-mcp-adapter` took a major bump
+in the same window that pi grew its own in-monorepo MCP package, so a reader could conclude that area
+13's citations now point at a shim. They do not: at v5.0.0 the adapter's `package.json` depends on
+`@modelcontextprotocol/client` 2.0.0 and carries **no** `@earendil-works/pi-mcp` dependency, and all
+93 production modules area 13 cites are still present and still carry the behaviour. **`v5.0.0` is
+the tag to diff area 13 against**, `packages/mcp` is pi's answer to `rmcp` (not to the adapter), and
+pi's `builtin:mcp` extension is a third thing again. `MCP-587` records the rule so no pass
+re-derives it, and **no row in this pass proposes restructuring `cyrup-mcp`**: pi moving MCP into its
+monorepo as a first-class package is pi arriving where cyrup already is. Much of the adapter's own
+window is about *coexisting* with that new owner — detecting it, replacing it, disabling it,
+importing its sign-ins, reading its `mcp.json`, and vacating the `mcp.json` filename — and cyrup,
+which ships MCP by default as the workspace crate `crates/cyrup-mcp`, has no second MCP owner to
+coexist with. That whole cluster is **inapplicable, not unported**; each commit is named and ruled
+under *Already covered / not owed* below.
+
+**22 units filed, `MCP-587`–`MCP-608`, no gaps** (`MCP-586` was never allocated and is still free).
+Each was read on both sides. Every unit's body lives in the file its `§` column names, under that
+file's *Items filed 2026-10-02* section; this table is the canonical status row.
+
+**Falsification.** Any row here is void if its cited upstream symbol is absent at `v5.0.0`
+(`git -C tmp/pi-mcp-adapter show v5.0.0:<file>`) or if the cyrup symbol it names behaves as upstream's
+at `fe875569`.
+
+### Table F — both sides read
+
+Status is read off each row's own cyrup-side paragraph, not inferred from its kind: **`partial`**
+where the cyrup surface exists and diverges, **`missing`** where there is no counterpart,
+**`not-applicable`** for the one row that is a citation ruling rather than a port obligation.
+Numbering resumes from **`MCP-609`**.
+
+| id | sev | § | kind | status | eff | title | body |
+|---|---|---|---|---|---|---|---|
+| `MCP-587` | low | 13 | `tooling` | **not-applicable** | S | which upstream to diff area 13 against, from v5.0.0 onward | [`13`](13-cyrup-mcp.md) |
+| `MCP-588` | low | 13b | `upstream-drift` | **partial** | S | the adapter config file rename, and why cyrup does not follow it | [`13b`](13b-mcp-config.md) |
+| `MCP-589` | medium | 13b | `upstream-drift` | **missing** | S | an unparseable config is still silently clobbered by any `/mcp` write | [`13b`](13b-mcp-config.md) |
+| `MCP-590` | low | 13b | `upstream-drift` | **missing** | S | a UTF-8 BOM is not stripped before the config parse | [`13b`](13b-mcp-config.md) |
+| `MCP-591` | medium | 13b | `upstream-drift` | **missing** | L | project-scoped MCP servers: `MCP-096`'s open decision, now settled upstream | [`13b`](13b-mcp-config.md) |
+| `MCP-592` | low | 13b | `not-ported` | **missing** | S | `ServerEntry.description` is unported | [`13b`](13b-mcp-config.md) |
+| `MCP-593` | medium | 13c | `not-ported` | **missing** | M | `auth: { provider: "<name>" }` for HTTP MCP servers | [`13c`](13c-mcp-servers.md) |
+| `MCP-594` | medium | 13c | `upstream-drift` | **partial** | S | the metadata-cache digest pre-image gained two stdio keys | [`13c`](13c-mcp-servers.md) |
+| `MCP-595` | medium | 13c | `upstream-drift` | **partial** | S | the seven-day metadata expiry is gone upstream | [`13c`](13c-mcp-servers.md) |
+| `MCP-596` | medium | 13c | `not-ported` | **missing** | M | private metadata scope and `discoveryFailed` are unported | [`13c`](13c-mcp-servers.md) |
+| `MCP-597` | low | 13c | `upstream-drift` | **partial** | S | HTTP header validation scope, and the superseded error message | [`13c`](13c-mcp-servers.md) |
+| `MCP-598` | medium | 13a | `upstream-drift` | **partial** | M | startup discovery should be per server, and should close what it opened | [`13a`](13a-mcp-activation.md) |
+| `MCP-599` | low | 13a | `not-ported` | **missing** | S | `MCP_RUNTIME_TOOL_CALL_EVENT` | [`13a`](13a-mcp-activation.md) |
+| `MCP-600` | medium | 13e | `parity-bug` | **partial** | S | in-flight must be raised before the approval gate, not after it | [`13e`](13e-mcp-tools.md) |
+| `MCP-601` | medium | 13e | `not-ported` | **missing** | M | MCP tool annotations are dropped | [`13e`](13e-mcp-tools.md) |
+| `MCP-602` | **high** | 13e | `not-ported` | **partial** | M | `approveTools` fails open, and `"destructive"` is the value that makes it bite | [`13e`](13e-mcp-tools.md) |
+| `MCP-603` | low | 13e | `not-ported` | **missing** | M | observed output shapes | [`13e`](13e-mcp-tools.md) |
+| `MCP-604` | low | 13e | `not-ported` | **missing** | S | register search-mode direct tools at the `deferred` exposure | [`13e`](13e-mcp-tools.md) |
+| `MCP-605` | low | 13d | `upstream-drift` | **partial** | S | the failure reason belongs in the agent-facing backoff messages | [`13d`](13d-mcp-proxy-modes.md) |
+| `MCP-606` | medium | 13i | `not-ported` | **missing** | M | the call deadline must pause while an elicitation prompt is open | [`13i`](13i-mcp-protocol-and-verification.md) |
+| `MCP-607` | medium | 13i | `stale-port` | **partial** | S | `resetTimeoutOnProgress` now has an upstream analogue, and the doc says it does not | [`13i`](13i-mcp-protocol-and-verification.md) |
+| `MCP-608` | low | 13h | `not-ported` | **partial** | S | completions for MCP prompt argument names | [`13h`](13h-mcp-tui.md) |
+
+### Census after this pass (arithmetic, not a re-count)
+
+The third pass counted **523** units. Table F adds 22, none of which existed before, so the counted
+set is **545**. Nothing else moves: no pre-existing row was re-ruled, re-ranked or closed by this
+pass, and no status cell outside Table F was touched.
+
+| status | third pass (523) | Table F (22) | **fourth pass (545)** |
+|---|---:|---:|---:|
+| `implemented` | 347 | 0 | **347** |
+| `partial` | 57 | 10 | **67** |
+| `missing` | 86 | 11 | **97** |
+| `not-applicable` | 33 | 1 | **34** |
+
+**Severity of the new rows:** 1 high (`MCP-602`), 11 medium, 10 low. `MCP-602` is the only
+above-medium row this pass filed, and it is a fail-open: `approveTools` degrades any value cyrup
+cannot parse to "approve everything", and `"destructive"` — which v5.0.0 documents — is such a
+value, so a config written for pi 1.0 auto-approves the tools it meant to gate.
+
+### Already covered / not owed — read before filing anything from this window again
+
+Each entry names the upstream commit, what it does, and the evidence for not filing it. These were
+checked on both sides.
+
+**Inapplicable: pi's built-in MCP extension does not exist in cyrup (see `MCP-587`).** cyrup is both
+host and MCP implementation, so there is no second owner to detect, replace, disable or import from.
+- `c455a84` (#737) detect pi's built-in MCP by its `builtin:mcp` path — nothing to detect.
+- `9bb2ebf` (#771, `feat!`) replace pi's built-in MCP extension in sessions — nothing to replace.
+- `8843e8a` (#780) turn off pi's built-in MCP on install or update — nothing to turn off.
+- `873dc36` (#766) offer to import sign-ins from pi's built-in MCP, and `6e066fb` (#769) never
+  replace adapter credentials saved while the pi sign-in prompt was open — no foreign credential
+  store to import from.
+- `603ac81` (#762) read pi's own `mcp.json` files on pi 0.99+, and `8b3001f` (#768) connect an
+  overridden pi server once the adapter registration is disposed — cyrup's `mcp.json` **is** the
+  one file (`MCP-588`).
+- `0fd7b7c` (#765) connect servers registered with pi's own `pi.registerMcpServer()` host API — a
+  different API from the adapter's own `registerMcpServer`, which is `MCP-510`.
+- `190dfbc` (#747) accept pi 0.99 in the `pi-ai` peer range — an npm range.
+
+**Cut by owner decision (`MCP-PORT-METHODOLOGY.md` §1.2); recorded so no pass re-derives them.**
+- **Cut 4, `mcpScript` / the JavaScript worker:** `c04a24b` (#744, `feat!`) make `mcpScript` opt-in
+  and fix its result guidance; `5f7ce89` (#679) run `mcpScript` in a QuickJS sandbox (and the
+  `quickjs-wasi` 3.6.2 dependency and `mcp-script-wasm.ts` added in this window); `60450fc` (#722)
+  load `quickjs-wasi` from a resolved file URL; `02b6102` (#775) `mcpScript` deadline tests;
+  `af94780` (#752) keep the server in output-shape examples for shared tool names; `caa7f87` (#666)
+  title compact `mcpScript` rows; `5a816dd` (#664) stop directing models to the hidden script skill.
+  `169910a` (#749) shares one search core between `mcp search` and `mcpScript` — the `mcp search`
+  half is cyrup's existing `proxy/ranking.rs` and the refactor is upstream-internal.
+- **Cut 2, MCP Apps / the UI extension:** `c72ae7b` (#726) drop the unused
+  `@modelcontextprotocol/ext-apps` dependency — cyrup never took it; `8e92d3f` (#660) Orca browser
+  viewer support and `1d56d42` (#662) suppressed-viewer console output; the UI-heartbeat leg of
+  `43768d3` (#786) — see `MCP-600`, which ports the approval leg only.
+- **Cut 3, raw unix-socket transport:** `b33382a` (#732) normalize Unix socket text chunks.
+
+**Already filed, open, under an id to reference rather than duplicate.**
+- `7649142` (#721) re-activate namespace proxy tools after failure backoff — the fix threads
+  `fallbackDeactivatedNames` into `namespace-tools.ts`. cyrup **has** the set
+  (`extension.rs:123 fallback_deactivated_tools`, written at `:367`/`:380`, with `reactivate_tool`
+  at `:392`) but has **no namespace tools at all**: `grep -rn 'namespace_proxy\|namespace_tools\|
+  NamespaceTool' crates/cyrup-mcp/src` is empty. `13-cyrup-mcp-STATUS.md:711` assigns
+  `namespace-tools.ts` to **`MCP-513`**, and `settings.namespaceProxyTools` is one of the seven keys
+  in **`MCP-549`**. Downstream of two open units; filing it would send someone to re-derive them.
+- `104982e` (#718) retain discovered MCP catalogues per runtime, and preserve runtime resources when
+  rediscovery fails — both are about **runtime-registered** servers, which is **`MCP-510`**
+  (**high**, **missing**). No runtime registration, no catalogue to retain.
+- `5b64f92` (#719) a host-managed MCP adapter for embedding apps (new `host-managed.ts`, new
+  `./host-managed` export) — the embedding-host surface of the same runtime-registration contract,
+  **`MCP-510`**. cyrup is the binary, not an embedder.
+- The `ttlMs` leg of `isServerCacheValid` is **`MCP-505`** (medium, missing) — already filed from the
+  v2.33–v2.37 window and a prerequisite of `MCP-595`. `MCP-595` files only the `maxAgeMs` default
+  change; `MCP-596` only `cacheScope` and `discoveryFailed`.
+- `a6c4b25` (#698) keep Jev fallback search within allowed servers, and `bdd37dc` (#727) use
+  `OPENROUTER_API_KEY` for the Jev OpenRouter endpoint — Jev is **`MCP-550`**, ruled
+  `open-decision` / `not-applicable` ("a third-party hosted ranking service with its own credential
+  store"), on the same basis as `MCP-529` and `MCP-048`. `grep -rln 'jev' crates/cyrup-mcp/src` is
+  empty, as expected.
+- `4e9f9df` (#710) an opt-in Serply preset for `/mcp setup`, **reverted** by `3e00bc7` (#723);
+  `71280b1` (#750) make Figma desktop the easy path, and `c362b08` (#755) explain refused Figma
+  connections and keep desktop servers global — vendor presets, ruled with `MCP-529` (the Parallel
+  Search preset). The Serply one does not exist at v5.0.0 at all.
+
+**Already ported; verified on both sides, nothing owed.**
+- `4b7e310` (#674) forward pi tool call IDs to MCP requests — cyrup threads a tool call id through
+  the call path: `grep -rln 'tool_call_id' crates/cyrup-mcp/src` matches `registration.rs`,
+  `dispatch.rs`, `proxy/tool.rs` and `owner.rs`.
+- `c9eca7e` (#686) dedupe repeated query tokens in ranked search — cyrup's ranking already unions
+  **and dedupes**: `proxy/ranking.rs:300` ("all matching entries are unioned, deduped") with the
+  test `resolve_search_keywords_unions_and_dedupes` at `:743`.
+- `b8b576f` (#785) build the direct-tool selector index once per resolve, and `76cc80b` (#781/#784)
+  import materialized-resource cleanup statically — a memoisation and a JS module-loading change.
+  cyrup memoises the selector candidate index already (`registration.rs:528`, "The two memo tables
+  stay private"), and static linking makes the second meaningless in Rust.
+- `b2c682f` (#748) find git packages installed at a ref containing a slash, and `8f10e49` (#746)
+  find git packages installed from URLs with a port or user — both are npm/`node_modules` path
+  resolution inside `package-mcp-loader.ts`, which has no Rust analogue.
+- `ce74163` (#661) expand home-relative paths in MCP servers, and `13c2e4b` (#663) reuse OAuth
+  keyring entries — both land in **v2.38.0**, i.e. at or before this window's baseline tag, and are
+  out of scope for this pass.
+
+**Measured and deliberately not filed.**
+- `3ef6952` (#761) / `b169cfb` (#764) a `pi-mcp-adapter doctor` CLI subcommand — cyrup ships no
+  separate adapter binary; the diagnostic content is `/mcp status`, which is ported. Filing a row
+  would propose a surface cyrup has no place for. Noted here instead.
+- `24f4080` (#753) give `/mcp-adapter setup` a fixed-size two-pane layout, and `5636b07` (#700) keep
+  name-matched servers without cached tools in panel search — panel-geometry and panel-search
+  refinements on the setup panel. `13h`'s open rows already carry that panel's layout work
+  (**HA-3** / `MCP-368` owns the overlay geometry seam); these are not independently actionable
+  until it lands, and neither changes a model- or agent-visible result.
+- `32212a1` (#742) retry failed `list_changed` metadata publication — cyrup handles
+  `list_changed` extensively (`runtime.rs`, 38 matches) and the retry is a refinement of the
+  publication path; it needs a read of cyrup's publication site to state an obligation and was **not
+  resolved on the cyrup side** this pass. Recorded as a **lead**, not filed, per the methodology's
+  rule that a unit is filed only where both sides were opened.
+- `f763ada` (#682) / `5bab885` (#754) / `d3389d9` (#707) / `9fe43d9` (#705) / `28d1609` (#689) /
+  `5c3f057` (#796) — "deslop"/trim refactors of unreleased code in the same window, with no
+  behaviour reaching a tag boundary. `0abd5c4` (#704), `b8ed5a0` (#738), `187c4be` (#703) — test
+  isolation and CI timing. `406f5ca` (#694) — `npm audit fix`. `cb333d9` (#793) — CI skip.
+  `d38f6f4` (#725) / `96aff3f` (#724) and the sixteen README/docs commits — upstream documentation.
+
+### Still unread after this pass
+
+- **`packages/mcp` was read at the README and file-census level only.** It is pi's `rmcp` equivalent,
+  so a capability comparison belongs in the port plan's `rmcp` section rather than in a unit row
+  (`MCP-587`), and none was made here.
+- **`packages/coding-agent/src/extensions/mcp/` was read only far enough to rule commits
+  inapplicable.** Its 12 files were not compared against `crates/cyrup-mcp` unit by unit, because it
+  is a consumer of `packages/mcp`, not of the adapter.
+- **The 347 `implemented` rows were not re-read as a regression set** against v5.0.0. That caveat has
+  stood since the third pass and still stands.
+- **`v5.0.0..HEAD` was not measured.** Every claim here is pinned to the tag.
 
 ## Third pass — 2026-09-24, every open row re-checked (cyrup `ea23ca2`, `pi-mcp-adapter` v2.37.0)
 

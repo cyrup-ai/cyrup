@@ -5,6 +5,68 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-02 — pi 1.0: 89 rows filed, a new area 18, nothing closed
+
+> **Read this block first; it sits above the 2026-10-01 block and corrects its counts.** It records
+> one upstream re-read, not a landing: **no row was closed and no code moved.** pi released **1.0** on
+> 2026-10-01 and four upstreams moved with it — pi `v0.87.1 → v1.0.0`, `pi-subagents`
+> `v0.71.0 → v0.74.0`, `pi-mcp-adapter` `v2.38.0 → v5.0.0`, `pi-intercom` `v0.14.0 → v0.16.0`;
+> `pi-acp` v0.0.34 and `pi-permission-system` v0.8.0 unchanged. The cyrup code pin is **`592bf2c3`**
+> (the last commit touching `crates/`); every claim was read at `fe875569`, the docs HEAD, and
+> `git diff 592bf2c3..fe875569` is docs-only, so the two name the same code. README's
+> *Baselines measured against* carries the pins.
+>
+> **THE COUNT is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints.** On
+> 2026-10-03 it prints **162 open: 0 critical, 1 high, 23 medium, 138 low; 17 trackers; 834 closed;
+> 3 duplicates not counted**. Two closing passes landed between this block's filing and this count and
+> are both absorbed here: `SEAM-137` and batch 5's eleven low rows, recorded in the two blocks below.
+> Every one of the 23 open mediums was filed by this pass — `SEAM-137` was the last medium predating
+> it. By area: `01` 30, `02` 4, `03` 9, `04` 5, `05` 8, `06` 18, `07` 30, `08` 5, `09` 2,
+> `09b` 22, `10` 1, `11` 11, `12` 2, `14` 0, `16` 0, `17` 1, **`18` 13**, `09a` 1. Arithmetic:
+> 73 open after batch 5 + 89 counted rows = 162; closed 834, unchanged by this pass; trackers 12 + 5
+> (area 17's `HARN-003`, `HARN-004`, `DUR-001`, `DUR-002`, `DUR-004`) = 17.
+>
+> **The one high is `PROV-115`** — an empty Mistral text delta opens a text block and splits thinking
+> into two blocks, which Mistral rejects when the transcript is replayed; `zai-glm-5-2` and
+> `zai-glm-5-3` ship in cyrup's Mistral catalog, so it is reachable. Area 13, counted in its own file,
+> filed a second high: **`MCP-602`**, `approveTools` failing **open** on a value cyrup cannot parse,
+> `"destructive"` among them.
+>
+> **119 rows were filed in all; 89 of them count here.** The other 30: 22 are area 13's
+> (`MCP-587`…`MCP-608`, counted in `13-cyrup-mcp-STATUS.md`, whose census moves 523 → 545 units),
+> 5 are area 17 trackers, and **3 are duplicates reconciled across areas** and deliberately not
+> counted twice — `TUI-135` → `CFG-096` (the `tuiMode` default flip, one getter in `cyrup-config`),
+> `CFG-098` → `TUI-137` (`quietStartup: "header"`), `CFG-100` → `TUI-136`
+> (`fullscreenWheelScrollLines` and its accelerator). Each duplicate keeps its id and body and carries
+> `duplicate-of: <id>` in a `Dedup` column; the canonical row says what it absorbs. See README's
+> *Item format*.
+>
+> **Area 18 is new** — [`18-pi-codemode.md`](18-pi-codemode.md), pi's `packages/codemode` and the
+> `codemode` tool, 13 rows (`CODE-001`…`CODE-013`). It was added to `STANDARD_AREAS` in
+> `scripts/count_open_items.py` in the same change, because an area the counter does not know is an
+> area whose rows are missing from every total. `CODE-001` is the owner decision **ADR-0012 Cut 4 does
+> not settle**: Cut 4 ruled out a JavaScript engine for `pi-mcp-adapter`'s `mcpScript`, two files and
+> 2 % of that package, and at pi 1.0 codemode is a first-party package the coding agent registers as a
+> built-in *and* the default route to every MCP tool.
+>
+> **Structural moves in the pi monorepo, each now owned:** new `packages/codemode` → area 18; new
+> `packages/mcp` → not the adapter and not area 13's subject (`MCP-587`); `packages/session-backends`
+> **removed** → `SESS-038`'s subject, recorded in `HARN-003`; and `packages/agent/src/harness/**`
+> **deleted**, absorbed into `packages/durable` as a complete Pico5 runtime at published `1.0.0`
+> (`HARN-003`, `HARN-004`).
+>
+> **Next free ids after this pass:** `PROV-130`, `AGENT-048`, `SESS-070`, `TOOL-057`, `CFG-102`,
+> `TUI-145`, `SUBA-164`, `ICOM-082`, `DRIFT-061`, `MCP-609`, `HARN-005`, `DUR-005`, `CODE-014`.
+> Unchanged: `EXT-105`, `SEAM-144`, `HERDR-007`. Five single-id gaps were left where a reserved block
+> started one past the counter the file named — `PROV-112`, `CFG-095`, `TUI-129`, `SUBA-149`,
+> `MCP-586` were never allocated and are still free.
+>
+> **Not re-read against the new tags**, so their counts are carried unchanged: `06`, `08`, `09`,
+> `09a`, `10`, `14`, `15`, `16`. Area 06 has one named lead waiting for it — `builtInExtensions`
+> gained `replaceable: true` at v1.0.0, recorded in `04-cyrup-tools.md`'s *Read in scope and
+> deliberately NOT filed*. The pre-existing `UNCLASSIFIED` line the counter prints for area 10's
+> `PERM-032` predates this pass and is untouched.
+
 # UPDATE 2026-10-02 (batch 5) — eleven low rows closed, `SUBA-146` re-scoped (`claude/lows-batch5`)
 
 > **This block sits above the `SEAM-137` block and corrects its counts.** The count is whatever
@@ -51,6 +113,7 @@ next work item**.
 > filed. **There is no medium row left open.** The fix is `crates/cyrup-modes/src/print.rs` (the
 > handled-prompt guard `json.rs` already had); the evidence, including the red run against the pre-fix
 > binary, is in the `SEAM-137` row of `08-cyrup-session-svc-and-modes.md`.
+
 
 ---
 

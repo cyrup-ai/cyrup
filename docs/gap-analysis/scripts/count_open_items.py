@@ -110,6 +110,12 @@ STANDARD_AREAS = [
     # 17 records pi's experimental harness (pico3) and packages/durable, which
     # pi ships to no user; at the time of writing every row is a tracker.
     ("17", "17-pi-harness-and-durable.md"),
+    # 18 records pi's `packages/codemode` and the `codemode` tool (new at
+    # v1.0.0): model-written JavaScript run in a QuickJS-on-wasm sandbox whose
+    # nested tool calls never enter the LLM context. Unlike 17, this one IS on
+    # pi's shipped path -- the tool is registered inactive and a user enables it
+    # -- so its rows are ordinary severity-bearing parity gaps, not trackers.
+    ("18", "18-pi-codemode.md"),
 ]
 AREA_09A = ("09a", "09a-cyrup-ext-subagents-v0.57-drift.md")
 

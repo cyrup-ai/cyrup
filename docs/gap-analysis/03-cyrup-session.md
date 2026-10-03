@@ -475,6 +475,8 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 
 ## Open items
 
+> **Next free id: `SESS-070`** (2026-10-02, after the pi v1.0.0 pass filed `SESS-064`…`SESS-069`).
+
 > **✅ THIS TABLE IS NOW THE COMPLETE OPEN SET FOR THIS AREA.** The last `-S` item (`SESS-S05`) was
 > moved here from the second table in the 2026-08-12 repair pass and that second table is deleted —
 > this area was the final instance of structural defect A in `00-residual-ledger.md`, and all twelve
@@ -615,6 +617,12 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 | ~~SESS-061~~ | ~~medium~~ **CLOSED 2026-09-27** | upstream-drift | S | **NEW 2026-09-24 (second pass).** When the trailing entries alone exceed `keepRecentTokens` and no valid cut point lies at or after the crossing, `find_cut_point` keeps the default first cut point — compacting nothing — where pi v0.86.0 (#9740) falls back to the LAST valid cut point. See body. — **CLOSED 2026-09-27**: the snap falls back to the LAST valid cut point when none is at or after the crossing entry (`compaction/cutpoint.rs:155-168`). Verify: `cyrup-session tests::compaction::sess061_trailing_tool_result_over_budget_cuts_at_the_last_valid_point`. |
 | ~~SESS-062~~ | ~~medium~~ **CLOSED 2026-09-27** | upstream-drift | M | **NEW 2026-09-24 (second pass).** `AgentSession::abort()` is `abort_retry()` + `agent.abort()`; pi v0.85.0 also aborts compaction and branch summarization, and v0.86.0 latches `_agentRunAbortRequested` so the post-run loop stops retrying, compacting and continuing. An RPC/ACP/SIGINT abort during an overflow-recovery compaction lets it finish and the run continue. See body. — **CLOSED 2026-09-27**: all five Fix legs are in the tree with tests: `abort_compaction()` + `abort_branch_summary()` in `queue.rs::abort` (`:112-113`), the latch set under `is_run_active()` (`:108-110`), the latch cleared at both run entry points (`run.rs:195`, `:258`), the loop condition plus pi's four inner checks and its tail (`run.rs:323,423,434,440,454,462,466`), `will_retry_after_agent_end` refusing while latched (`retry.rs:92`), and the `settle_run` close-out guard (`run.rs:366`). Verify: `cyrup-session-svc tests::compact_refusals::sess062_*` (5). |
 | ~~SESS-063~~ | ~~low~~ **CLOSED 2026-09-28** | upstream-drift | S | **CLOSED 2026-09-28** (on `claude/lows-next`): `branch_with_summary` captures `from_id = leaf ?? "root"` BEFORE moving the leaf (`crates/cyrup-session/src/manager/navigate.rs:29-52`), as pi has done since v0.84.3 (`session-manager.ts:1593-1615` @v0.87.1). Both the SDK path (`crates/cyrup-session/src/compaction/mod.rs:444-456`) and `/tree`'s `navigate_tree` route through it, and at both call sites the leaf is still the pre-navigation one, as at pi's `agent-session.ts:3731` (`:3727-3749`). Verify (the lane showed the row red without its fix): `cyrup-session tests::branch_provenance_and_export::{a_branch_summary_names_the_leaf_it_left_as_from_id, a_branch_summary_from_an_empty_leaf_names_root}`, `tests::compaction::{a05_7_branch_summary_appended_at_nav_abandoned_intact, g3_empty_branch_appends_no_content_placeholder}`. — *Original:* **NEW 2026-09-24 (second pass).** `branch_with_summary` records the navigation DESTINATION as `fromId`; pi v0.84.3 (`d711bd5f0`) records the pre-navigation leaf. The closed `SESS-017` aligned cyrup with the pre-v0.84.3 rule, which upstream then reversed. See body. |
+| SESS-064 | medium | upstream-drift | S | **A session file is now created at the first USER message, not the first assistant message** — pi `core/session-manager.ts:1166` `_hasConversation()` (#10000: "keeps the prompt on disk if the first turn never completes"); cyrup still gates both the first flush and `create_branched_session` on `has_assistant_message()`. **FILED 2026-10-02**; body below. |
+| SESS-065 | low | upstream-drift | S | **`/session` hides the cost breakdown when its single row names a model other than the selected one** — pi widened the gate to `usageBreakdown.length > 1 \|\| usageBreakdown[0]?.key !== selectedModelKey` (`modes/interactive/interactive-mode.ts:6671`); cyrup has the bare `breakdown.len() > 1`. **FILED 2026-10-02**; body below. |
+| SESS-066 | low | upstream-drift | S | **v1.0.0 rewrote `_restoreToolsFromTranscript` around a pending-tool set, so `SESS-051`'s Fix would land a stale port** — restored names are no longer filtered through `_toolRegistry` at restore time; they are held in `_pendingToolNames` until the tool registers (`core/agent-session.ts:1762-1769`, `:3542`, `:3632`). Growth on the open `SESS-051`; do not port v0.87.1's shape. **FILED 2026-10-02**; body below. |
+| SESS-067 | low | not-ported | M | **The session half of virtual models / `router/auto` is unported: the `pi.virtual-model-state` custom entry and the `getBranchSelection` hold rule** — `core/virtual-models.ts:32`, `:128-145`, `:159-167` and `core/sdk.ts:203` @v1.0.0; cyrup resolves a branch's model by a forward last-wins walk (`manager/context.rs:27-50`) with no virtual-model concept. **FILED 2026-10-02**; body below. |
+| SESS-068 | medium | parity-bug | S | **In an exported HTML session, every `/tree` navigation silently resets the thinking and tool-output toggles** — `renderEntryToNode` returns `cloneNode(true)` of the cached node, which carries its INITIAL presentation; pi v1.0.0 reapplies both toggles after appending the fragment (`core/export-html/template.js:1546-1548`), cyrup's `navigateTo` does not. **FILED 2026-10-02**; body below. |
+| SESS-069 | low | upstream-drift | S | **The HTML export drops `custom_message` entries with `display: false`; pi renders them hidden behind an `H` toggle** — `core/export-html/template.js:1330-1336`, `:1409`, `:1413`, CSS `template.css:795`, plus the auto-reveal when a deep link targets one (`:1521-1523`). cyrup's template has `if (entry.type === 'custom_message' && entry.display)` and no third toggle. **FILED 2026-10-02**; body below. |
 
 ## SESS-040 — Compaction cannot be cancelled from the shipped binary: the Escape rebind was never ported, `AbortCompaction` has zero callers, and the indicator advertises "(esc to cancel)"
 
@@ -1792,6 +1800,255 @@ the same navigation. Context projection is unaffected — neither side feeds `fr
 **Verify** — Leaf at `B`, navigate to `A` with a summary: the new entry's `from_id` is `B`.
 
 ---
+
+## Findings filed 2026-10-02 — the `v0.87.1..v1.0.0` window in `packages/coding-agent/src/core`
+
+pi v1.0.0 (`2026-10-01`), read at the tag only; cyrup read at `fe875569`. Note that pi's session,
+mode and interactive code lives under `packages/coding-agent/src/`, not `packages/agent/`, and that
+`packages/session-backends` — `SESS-038`'s subject — was **deleted** in this window (see `HARN-003`,
+`17-…`).
+
+## SESS-064 — The session file is created at the first user message upstream, at the first assistant message in cyrup
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `packages/coding-agent/src/core/session-manager.ts` @**v1.0.0**. The gate is now a named
+predicate, `_hasConversation()` at `:1166`:
+
+> A new session file is created only once the session contains a user or assistant message. Setup
+> entries alone (model, thinking level, system prompt) stay in memory so opening and closing pi
+> without chatting leaves no file behind. Starting at the user message (not the first assistant
+> reply) keeps the prompt on disk if the first turn never completes (#10000).
+
+`_persist` (`:1172`) consults it once, at `:1176`, immediately before the `openSync(file, "wx")` first
+flush; the pre-v1.0.0 "not flushed yet, so append anyway" arm is gone. `createBranchedSession` uses the
+same predicate at `:1719` under the comment "Use the same rule as `_persist()`". The user-facing error on
+the fork/clone path moved with it: `core/agent-session-runtime.ts:312` now reads **"This session has not
+been saved yet. Send a message before cloning or forking it."**, where v0.87.1 said "Wait for the first
+assistant response before cloning or forking it."
+
+**cyrup at HEAD** — `crates/cyrup-session/src/manager/mod.rs`. `persist_last` (`:162`) has two arms: append
+when `self.flushed`, else `else if self.has_assistant_message()` (`:171`) → `store.create_exclusive(..)`,
+with the doc comment pinning it to pi's old shape ("First assistant message → exclusive-create the
+file"). `has_assistant_message` (`:180`) delegates to `entries_have_assistant` (`:186`), which matches
+only `message.is_core_assistant()`. Nothing in `crates/` mentions a user-message gate:
+`grep -rn 'has_conversation' crates/ --include='*.rs'` is **0**.
+
+**Impact** — the window pi's #10000 closed is open in cyrup. A user types a prompt, the turn fails or the
+process dies before any assistant message is appended, and the prompt was never on disk: there is no file
+to resume and the text is gone. Two dependents also read the old rule and will need the same word change
+when this lands: area 08's `/fork`-before-save row quotes the v0.87.1 error sentence verbatim
+(`08-cyrup-session-svc-and-modes.md:1899-1903`), and `crates/cyrup-acp/src/sessions.rs:409` and `:1755`
+plus `crates/cyrup-acp/tests/wire_gaps.rs:51` all document ACP's `session/new` behaviour in terms of
+`has_assistant_message()` being true.
+
+**Fix** — rename the predicate to `has_conversation()` and widen it to `user || assistant` core messages,
+then leave `persist_last`'s two arms as they are (cyrup already has no equivalent of the arm pi deleted).
+Update the three `cyrup-acp` prose sites and area 08's quoted sentence in the same change.
+
+**Verify** — a red-before test: append a `session` + `model_change` + a core `user` message to a persisted
+`SessionManager`, drop it, and assert the file exists and holds the user line. The companion negative must
+stay green: setup entries alone (`session`, `model_change`, `thinking_level_change`) still write nothing.
+
+## SESS-065 — `/session`'s cost breakdown is suppressed when its one row is not the selected model
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `packages/coding-agent/src/modes/interactive/interactive-mode.ts` @v1.0.0 snapshots
+`selectedModelKey = \`${model?.provider}/${model?.id}\`` at `:6627` and gates the per-key rows at `:6671`:
+`if (usageBreakdown.length > 1 || usageBreakdown[0]?.key !== selectedModelKey)`, under the comment "A
+single entry repeats the total, unless it names a model other than the selected one."
+
+**cyrup at HEAD** — `crates/cyrup-tui/src/app/execute_session.rs:215`: `if breakdown.len() > 1`, with a doc
+comment citing pi's old `:5699` ("a single-model session shows the total only, because a one-row breakdown
+restates it"). `usage_cost_breakdown` itself (`crates/cyrup-session-svc/src/state.rs:192`) is a faithful
+port and needs no change.
+
+**Impact** — whenever the whole session's spend lands on exactly one key that is **not** the current
+selection, cyrup prints `cost` with no attribution and pi prints the model that was billed. The reachable
+cases are ordinary: `/model`-switch away from the model that answered; an OpenRouter route whose
+`responseModel` differs from the selected id (the breakdown keys on `responseModel ?? model`, `state.rs:166`);
+and a session whose only billed usage is the `Tools/summaries` bucket — a compaction or branch summary with
+no assistant turn yet, where cyrup shows a bare total and pi names the bucket.
+
+**Fix** — thread the selected `ModelRef` into the `C::SessionInfo` arm (the session already exposes it) and
+widen the condition to `breakdown.len() > 1 || breakdown.first().is_some_and(|e| e.key != selected_key)`.
+Note pi's `?.` short-circuit: an EMPTY breakdown satisfies `usageBreakdown[0]?.key !== selectedModelKey`
+(`undefined !== key`) and enters the loop, which then emits nothing — so a Rust `is_some_and` is
+behaviour-identical and the empty case needs no special arm.
+
+**Verify** — build a session whose single assistant message carries `responseModel` different from the
+selected model and a non-zero cost; assert the breakdown row is printed. Keep a negative: one row whose key
+IS the selected model still prints the total alone.
+
+**Scope, reconciled 2026-10-02.** `TUI-143` (`07-…`, low) reaches the same guard from the footer
+side while filing virtual models' UI half. That row is narrowed to the footer; **this row owns the
+`/session` guard**, and it needs nothing from the virtual-model port — it is reachable today through
+a `/model` switch or an OpenRouter route.
+
+## SESS-066 — `SESS-051`'s Fix now describes a shape upstream replaced: transcript tool restore is pending-set based at v1.0.0
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+This row exists so the open `SESS-051` is not closed against v0.87.1. It schedules no independent work:
+it is the delta a reviewer must fold into `SESS-051` before porting it.
+
+**What did NOT move.** The transcript half of pi's mid-conversation system messages is stable across this
+window, and that was measured rather than assumed: `packages/ai/src/utils/transcript.ts` is **byte-unchanged**
+`v0.87.1..v1.0.0`; `core/session-manager.ts`'s diff over the same range touches only `_hasConversation`
+(`SESS-064`), `getEntryCount` and `getSessionName`, so `UsageEntry` (`:80-89`), `CompactionEntry.systemMessage`
+and the `role:"system"` `message` entry are exactly as `SESS-051` records them; and `core/compaction/compaction.ts`
+loses only the `combineUsage` body to `core/usage-totals.ts:31` (already ported, see `PROV-083`'s
+closure). So `PROV-083`'s closure plus `SESS-051` still describe v1.0.0 correctly.
+
+**What DID move** — `core/agent-session.ts` @v1.0.0. `_restoreToolsFromTranscript` (`:1762`) no longer
+filters the transcript's `toolsAdded` through `_toolRegistry` and no longer calls `_rebuildSystemPrompt`
+with the surviving names. It clears `_pendingToolNames` (`:1763`), sets it to the allowed subset of the
+declared names (`:1767`, `_isAllowedTool`) and calls `_setActiveTools(names)` with the **full** declared
+list, under a new comment: "Tools reachable only from other tools are never declared, but they do not
+depend on the active set, so the transcript's declarations are the whole loadout." The pending set is then
+drained at the next runtime build (`:3542` `nextActiveToolNames.push(...this._pendingToolNames)`), cleared
+when a run starts (`:1782`, "restored tools that did not register by now are dropped"), and reused by
+`reload()` (`:3632`). The motivating commit is `c662ec7e3` "restore MCP tools loaded by tool_search on
+resume and reload": a tool the transcript declares but whose extension has not registered yet — the normal
+case for an MCP or `tool_search` tool at resume — was silently dropped by the old registry filter.
+
+**cyrup at HEAD** — nothing to re-pin, because the subject does not exist yet: `grep -rn 'tools_added\|pending_tool_names\|restore_tools_from_transcript' crates/ --include='*.rs'`
+is **0**, which is the same measurement `SESS-051` records.
+
+**Fix** — amend `SESS-051`'s Fix: the restore path to port is v1.0.0's pending-set form, not v0.87.1's
+registry filter. One further v1.0.0 projection belongs to a different owner and must not be re-derived here:
+`_installHiddenDeclarationsProjection` (`:1715-1735`) strips `hidden`-exposure tools out of every transcript
+system message's `toolsAdded`/`toolsRemoved`, which is `CODE-005`'s `hiddenDeclarations` surface.
+
+**Verify** — once `SESS-051` lands: resume a transcript declaring a tool whose extension registers after the
+session is built, and assert the tool is active on the first request rather than dropped.
+
+## SESS-067 — The session half of virtual models is unported: the `pi.virtual-model-state` entry and the branch-selection hold rule
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+The release post's "`router/auto` multi-model routing" is pi's **virtual models** feature
+(`540e174c7`, #10035); `router/auto` is a virtual model id, not a built-in — at v1.0.0 it occurs only in
+`packages/coding-agent/test/virtual-models.test.ts:86`. Two of its three parts are session state, and
+that is this row. The catalog/provider part (`VIRTUAL_MODEL_API`, `withVirtualModels`, the routing step in
+`core/model-runtime.ts`) is area 01's and is **not** opened here; the extension registration seam
+(`pendingVirtualModelRegistrations`, `core/agent-session-services.ts:182-192`, `registerVirtualModel`) is
+area 06's. Neither has an owner yet, and this row does not claim them.
+
+**upstream** — `packages/coding-agent/src/core/virtual-models.ts` (new file, 238 lines) @v1.0.0.
+
+* `VIRTUAL_MODEL_STATE_ENTRY = "pi.virtual-model-state"` (`:32`) with `VirtualModelStateData { provider, modelId, state }` (`:36-40`): a router's state is persisted as a `custom` session entry, so it survives resume and is scoped to a branch.
+* `getVirtualModelState(branch, provider, modelId)` (`:159`) reads the LATEST matching entry by walking the branch backwards and matching on `customType`, then on `provider` **and** `modelId` inside `data`.
+* `getBranchSelection(branch, getModel)` (`:128`) replaces "the latest model wins" with a hold rule, in its own words: "A virtual `model_change` holds until the next `model_change`, because responses name the physical models it routed to. Otherwise the latest physical response wins … A virtual model that is no longer registered does not hold." It walks backwards, returns a `model_change` immediately, and on the first **non-virtual** assistant message looks back for the last preceding `model_change` (`findLastModelChange`, `:147`) and prefers it when that model resolves AND is virtual.
+* `core/sdk.ts:203` is the consumer that matters for restore: the embedder-level "restore the model from the session" step now reads `getBranchSelection(sessionManager.getBranch(), …)` where v0.87.1 read `existingSession.model`, and the `Could not restore model …` message is built from it. `cacheContextIsCurrent` (`:343`) gained a matching comment — warming is skipped for a request a virtual selection routed, because the next request may not repeat it.
+
+**cyrup at HEAD** — no virtual-model concept anywhere: `grep -rn 'virtual_model\|VirtualModel\|pi.virtual-model-state' crates/ --include='*.rs'`
+is **0**. The branch's model is resolved by `SessionManager::build_context`
+(`crates/cyrup-session/src/manager/context.rs:27-50`): a single FORWARD pass over `branch_path(None)` where
+both `KnownEntry::ModelChange` and an assistant `Message` overwrite `model`, i.e. unconditional last-wins —
+pi's pre-v1.0.0 rule. That value is what `resolve_model` restores from
+(`crates/cyrup-session-svc/src/builder.rs:2415`, called at `:1029`/`:1041`/`:1606` with `&existing`).
+The container for the state entry already exists and needs no new shape: `KnownEntry::Custom { custom_type, data: Option<Value> }`
+(`crates/cyrup-session/src/entry.rs:129-135`).
+
+**Impact** — nothing is lost today, because cyrup cannot produce a virtual model: a pi-written session's
+`pi.virtual-model-state` entries land in `KnownEntry::Custom` and round-trip untouched. It is a blocker,
+not a defect: area 01 cannot land routing without a branch-scoped state store and a selection rule, and
+porting routing while `build_context` keeps last-wins would mis-restore a routed session — the virtual
+selection would be replaced by whichever physical model answered last.
+
+**Fix** — in `cyrup-session`: a `virtual_model_state(branch, provider, model_id) -> Option<&Value>`
+reader over `KnownEntry::Custom` keyed on the `pi.virtual-model-state` literal, and a `branch_selection`
+function implementing the backwards walk with the hold rule, taking a `Fn(&str,&str) -> Option<Model>`
+lookup so `cyrup-session` does not gain a catalog dependency. Then switch `build_context`'s `model` and
+`resolve_model`'s session arm to it. Land with area 01's routing step, not before: on a session with no
+virtual models the new rule is provably identical to the current one (the `is_virtual` test fails and the
+physical response is returned), so landing it alone is unobservable.
+
+**Verify** — a fixture branch of `model_change(router/auto)` → assistant(`anthropic/claude-opus-5`) and a
+lookup that reports `router/auto` as virtual: the selection must be `router/auto`. With a lookup that does
+not know `router/auto`, it must fall back to `anthropic/claude-opus-5`. And two `pi.virtual-model-state`
+entries for the same provider/model on one branch: the later one wins; one on an abandoned branch is
+invisible after `/tree` navigation.
+
+## SESS-068 — Exported HTML: a tree navigation silently resets the thinking and tool-output toggles
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read; mechanism identical on both) · **Filed** 2026-10-02
+
+**cyrup at HEAD** — `crates/cyrup-session-svc/src/export/assets/template.js`. `renderEntryToNode`
+(`:1474`) returns `entryCache.get(entry.id).cloneNode(true)` (`:1476-1477`) on a cache hit, so the node
+handed back is a **fresh clone carrying the HTML the entry was first rendered to** — not the node the
+toggles mutated. `navigateTo` (`:1495`) rebuilds `#messages` from those clones (`:1505-1521`) and then
+attaches only the copy-link handlers (`:1523`). The toggles are DOM mutations with no persistent model:
+`toggleThinking` (`:1792`) and `toggleToolOutputs` (`:1803`) flip `thinkingExpanded` / `toolOutputsExpanded`
+and immediately `querySelectorAll(...).forEach` over the live document. Nothing reapplies them after a
+re-render, so after any `/tree` click every row reverts to `thinking: shown`, `tool output: collapsed`,
+while the two module-level booleans still claim the user's choice — so the NEXT keypress toggles the wrong
+way.
+
+**upstream** — pi had the identical cache and clone (`core/export-html/template.js:1497-1501` @v1.0.0) and
+fixed the consequence in this window. The toggles were refactored into idempotent setters,
+`setThinkingExpanded(expanded)` (`:1834`) and `setToolOutputsExpanded(expanded)` (`:1845`), which also
+write `aria-pressed` on their header buttons; `navigateTo` calls both right after appending the fragment
+(`:1546-1548`) under the comment "Cached nodes contain their initial presentation; reapply the viewer's
+toggle states." The header buttons are rendered with `aria-pressed="${thinkingExpanded}"` /
+`"${toolOutputsExpanded}"` (`:1411-1412`) and styled as pressed (`template.css:303-307`), so the button
+state is no longer derived from nothing.
+
+**Impact** — the HTML export is cyrup's share/handoff artifact (`/export`, `/share`, RPC `export_jsonl`'s
+HTML sibling), and `/tree` navigation inside it is the main reason a reader opens a multi-branch export.
+Collapsing every tool output the reader had expanded, on every branch click, with the keyboard shortcut then
+inverted, is a straightforward state-loss bug. It is not a correctness failure in the agent, so it is
+`medium` rather than `high`.
+
+**Fix** — port the refactor rather than patching the symptom: turn `toggleThinking`/`toggleToolOutputs` into
+`setThinkingExpanded`/`setToolOutputsExpanded` taking the desired state, have the click handlers at `:1816-1817`
+pass the negation, and call both at the end of `navigateTo`'s fragment swap. Take `aria-pressed` and the
+`.header-toggle-btn[aria-pressed="true"]` rule with it — the exports are compared against pi's byte-for-byte
+in review, and splitting the two halves guarantees a second diff.
+
+**Verify** — a DOM-level test over a generated export (cyrup already drives this template from
+`crates/cyrup-tui/src/tests/export.rs`): render a two-branch session, press `O` to expand tool outputs,
+navigate to the other branch, and assert `.tool-output.expandable` still carries `expanded`. Red before the
+fix. Add the `aria-pressed` assertion on the header button in the same test.
+
+## SESS-069 — Exported HTML: `custom_message` entries hidden in the terminal are dropped instead of toggleable
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `b2bd111f2` "add hidden-message toggle to HTML exports" (#10020), in this window.
+`core/export-html/template.js:1330-1336` @v1.0.0 renders EVERY `custom_message`, marking the
+`display === false` ones with a `hook-message-hidden` class and appending `· Hidden in terminal` to the
+type label; `template.css:795` hides them with `body:not(.show-hidden-messages) .hook-message-hidden { display: none }`.
+A third header button and key, `H`, flips `showHiddenMessages` through `setHiddenMessagesVisible(visible)`
+(`:1824`), which toggles the body class, rewrites the button text between "Show hidden messages" and
+"Hide hidden messages" and sets its `aria-pressed`; the help hint at `:1409` becomes
+"T toggle thinking · O toggle tools · H toggle hidden messages". `navigateTo` reveals them automatically
+when a deep link targets one (`:1521-1523`): "`scrollMode === 'target'` and the target is a
+`custom_message` with `display === false`" → `setHiddenMessagesVisible(true)`.
+
+**cyrup at HEAD** — `crates/cyrup-session-svc/src/export/assets/template.js:1309`:
+`if (entry.type === 'custom_message' && entry.display)` returns the `hook-message` block, and the
+`display: false` case falls through to the end of `renderEntry` and produces **nothing**. The entry is
+therefore absent from the export, from the tree and from any deep link to it; a shared permalink pointing
+at a hidden custom message scrolls nowhere. `grep -n 'show-hidden-messages\|hook-message-hidden\|toggle-hidden-messages' `
+on that file is **0**.
+
+**Impact** — `display: false` is how an extension records a message for the transcript without showing it in
+the terminal, so these are exactly the entries a reader of a shared export may need (an extension's audit
+note, a hook's record). cyrup silently discards them where pi hides them one keypress away. Low: the data is
+still in the JSONL the export's `↓ JSONL` button downloads, so nothing is unrecoverable.
+
+**Fix** — three coupled edits in the template, best taken together with `SESS-068` since both touch the same
+toggle machinery and header: render the hidden variant with its class and the `· Hidden in terminal` suffix;
+add the CSS rule and the `H` button/key wired to a `setHiddenMessagesVisible` setter; and add the
+`navigateTo` auto-reveal. Keep pi's strings verbatim — the label, the button's two captions and the help
+hint are all user-visible and are compared against pi's output.
+
+**Verify** — export a session containing one `custom_message` with `display: false` and one with `display: true`:
+both nodes are present, the hidden one is `display: none` until `H`, and a deep link to the hidden entry's id
+reveals it without a keypress. Red before the fix on the first assertion (the node does not exist at all).
 
 ## Coverage
 

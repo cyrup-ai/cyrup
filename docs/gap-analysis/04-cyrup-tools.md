@@ -416,6 +416,8 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 
 ## Open items
 
+> **Next free id: `TOOL-057`** (2026-10-02, after the pi v1.0.0 pass filed `TOOL-052`…`TOOL-056`).
+
 > **⚠ THIS TABLE IS NOW THE COMPLETE OPEN SET FOR THIS AREA.** The separate `-S` table under
 > `## Surface-sweep findings` is retained for traceability but every item in it is **closed** as of
 > this pass, so it no longer adds to the count. Do not delete it: the `-S` ids are load-bearing and
@@ -489,6 +491,11 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 | ~~TOOL-049~~ | ~~low~~ **CLOSED 2026-09-28** | upstream-drift | S | **CLOSED 2026-09-28** (on `claude/lows-next`): `write` now returns exactly `Successfully wrote to {path}` with `details: None` (`crates/cyrup-tools/src/tools/write.rs:130-141`), matching `write.ts:86-87` @v0.87.1, which was re-read at the tag. `len_utf16` is gone. Pinned by `cyrup-tools tests::tools::write_result_carries_no_count` (non-ASCII `"é𝄞"`, the case the old count got wrong, plus `details.is_none()`), `tests::tools::write_creates_dirs_and_holds_one_mutator_per_path` and `tests::isolation::backend_swap_retargets_tools_without_contract_change`, all three asserting the exact string; the verifier showed them red without the fix. No other emitter or consumer of the old string exists outside `cyrup-tools`. Residual, not this row: the abort-bracket comment above it (`write.rs:116-125`) still cites `write.ts:213-224` from an older tag (`:72-83` at v0.87.1). *Filed text:* **NEW 2026-09-24.** `write`'s result text still carries the UTF-16 count (`Successfully wrote N bytes to …`); pi v0.85.0 removed the count — see the body. |
 | ~~TOOL-050~~ | ~~low~~ **CLOSED 2026-09-28** | upstream-drift | S | **CLOSED 2026-09-28** (on `claude/lows-next`): the `bash`/`powershell` `Took`/`Elapsed` footer now uses a port of pi's `formatDuration` (`renderers/bash.ts:32-42` @v0.87.1): under 60 s it is `toFixed(1)` + `s`, then `Xm Ys`, then `Xh Ym Zs`, with whole seconds by floor (`crates/cyrup-tui/src/transcript/tool_result.rs:133-163`, `format_duration` and `to_fixed_1`). The stale `Took/Elapsed {d}s` doc on `render_bash_result` is corrected (`tool_builtin.rs:320-322`), and so is the `started_at` field doc (`entry.rs:365-370`). Tests: `cyrup-tui transcript::tests::bash_duration::{a_minute_or_more_renders_minutes_and_whole_seconds, an_hour_or_more_renders_hours_minutes_and_seconds, exact_ties_round_up_as_to_fixed_does, under_a_minute_keeps_one_decimal}`; the last is a mirror that holds either way. A scratch comparison over every ms value from 0 to 59 999 gave output byte-identical to node's `(ms/1000).toFixed(1)`. **Red-without-fix was NOT run** (disk below the 4 GB stop line). By reading, the old `{:.1}s` body fails the other three tests, but that has not been observed. **Ledger correction:** the row missed a second divergence in the same function. Rust's `{:.1}` breaks an exact binary tie toward even, while `toFixed` goes up, so 250 ms rendered `0.2s` where pi renders `0.3s`. That is fixed here too. *Filed text:* **NEW 2026-09-24.** `bash`/`powershell` durations always render as `N.Ns`; pi v0.86.0 renders `Xm Ys` / `Xh Ym Zs` from one minute up — **FIX SITE `crates/cyrup-tui`** — see the body. |
 | ~~TOOL-051~~ | ~~low~~ **CLOSED 2026-09-28** | upstream-drift | S | **CLOSED 2026-09-28** (on `claude/lows-next`): `cyrup_tools::ops::taskkill_program()` (`crates/cyrup-tools/src/ops/win.rs:16-39`, re-exported at `ops/mod.rs:26`) builds pi's `join(SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe")` (`utils/shell.ts:218-230` @v0.87.1). An unset `SystemRoot` falls back, a set-but-empty one is kept as `path.join` keeps it, and no separator is doubled. All three `cyrup-tools` sites spawn it (`ops/local/signal.rs:43`, `:81`, `:153`), and so does `cyrup-ext-subagents`' stage-3 `send_sigkill` (`crates/cyrup-ext-subagents/src/spawn/signal.rs:407-443`), which ports coding-agent's `killProcessTree`. Tests: `cyrup-tools ops::win::tests::{taskkill_is_resolved_under_system_root_not_by_name, an_unset_system_root_falls_back_to_c_windows, an_empty_system_root_is_kept_not_defaulted}`. These test the pure join and are new, so there is no red-before state. The call sites are `cfg(not(unix))` and were not run. The row's Verify (a `taskkill.exe` stub beside the binary is not executed) still needs a Windows host. **Ledger correction:** the row's Fix asked for all five sites. The `cyrup-mcp` site (`request_headers_command.rs:546`) ports pi-mcp-adapter's bare `spawnSync("taskkill")` (`request-headers-command.ts:91`), so it correctly stays bare as upstream parity; `MCP-533` owns that function. pi-subagents v0.71.0 also spawns a bare `taskkill` (`external-cli-runner.ts:149`, `worktree-setup-command.ts:14`, `host-command.ts:147`). The ext-subagents site that changed ports coding-agent, not those. Lead for area 09, not filed: `send_sigkill` still sets no `CREATE_NO_WINDOW`, where pi passes `windowsHide: true` (`windows_hide` is `pub(crate)` in `cyrup-tools`). *Filed text:* **NEW 2026-09-24 (second pass; was a 2026-09-14 lead).** On Windows every process-tree kill spawns the bare name `taskkill`; pi v0.84.4 spawns `%SystemRoot%\\System32\\taskkill.exe` so cleanup does not depend on the search path — see the body. |
+| TOOL-052 | low | not-ported | M | **The `tool_search` tool — the release post's "deferred tool loading" — is unported** — new `extensions/tool-search/{index,tool}.ts` at v1.0.0, registered inactive as a replaceable built-in extension (`extensions/index.ts:12`). Loading is an active-set change, so it is transcript-recorded and survives resume. Prereqs `CODE-005` (exposure) and `CODE-010` (ranker). **FILED 2026-10-02**; body below. |
+| TOOL-053 | low | not-ported | S | **`ToolDefinition.defaultActive` and the two declarability predicates are unported, so cyrup cannot register a tool inactive** — `core/extensions/types.ts:608`, `agent-session.ts:3548` `_isDeclarable` and `:3554` `_isActivatedOnRegistration`. This is the glue `TOOL-052` and `CODE-007` both need: without it `tool_search` and `codemode` cannot exist off-by-default. **FILED 2026-10-02**; body below. |
+| TOOL-054 | low | upstream-drift | M | **`bash` declares no `outputSchema` and returns no `structuredContent`, and its non-zero-exit arm still throws where pi v1.0.0 returns `isError: true` carrying the structured result** — `core/tools/bash.ts:56`, `:259`, `:389-406` and `output-accumulator.ts:156` `readFullOutput` (1 MiB head/tail window). Blocked on `AGENT-045` and `AGENT-046`. **FILED 2026-10-02**; body below. |
+| TOOL-055 | low | not-ported | S | **`truncateMiddle` is unported — cyrup's truncation model has head and tail only, and middle truncation is now the shape MCP tool output takes** — `core/tools/truncate.ts:292` (`MiddleTruncationResult` `:278`), consumed by `extensions/mcp/tools.ts:127` at a cap pi lowered to 20 KiB. **FILED 2026-10-02**; body below. |
+| TOOL-056 | low | upstream-drift | S | **`read`'s line-range header renders `:10-9` for `{"offset":10,"limit":null}`** — v1.0.0 changed two of `formatReadLineRange`'s four JS rules from `undefined`-presence to nullish (`core/tools/renderers/read.ts:30`, `:32`, under a new comment naming strict tool schemas as the cause); cyrup ported the v0.87.1 rules faithfully at `crates/cyrup-tui/src/transcript/tool_args.rs:337`. **FILED 2026-10-02**; body below. |
 
 ## TOOL-046 — Built-in tools declare `constrainedSampling` only under the experimental flag; pi v0.86.0 declares it unconditionally
 
@@ -1436,6 +1443,408 @@ what reaches the session file; and it re-asserts the truncated case still report
 
 **Verify** — Extend `crates/cyrup-tools/src/tests/pi_tool_semantics.rs`: assert `label() == Some(name())` for all seven (RED today — all seven are `None`). Separately, and more valuable, assert in `cyrup-ext`'s wrapper tests that a tool whose `label` differs from its `name` has that label survive to the consumer — the `Fixed` fixture's "every value DISTINCT and non-default" invariant `TOOL-024` established.
 
+
+## Findings filed 2026-10-02 — the `v0.87.1..v1.0.0` window in the built-in tools
+
+pi v1.0.0 (`2026-10-01`), read at the tag only; cyrup read at `fe875569`. Scope: `git diff
+v0.87.1..v1.0.0 -- packages/coding-agent/src/core/tools/` (7 files, +176/−49) and the new
+`packages/coding-agent/src/extensions/tool-search/`, which did not exist at v0.87.1.
+
+## TOOL-052 — the `tool_search` tool is unported
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `packages/coding-agent/src/extensions/tool-search/` is new at v1.0.0
+(`git ls-tree v0.87.1:packages/coding-agent/src/extensions/tool-search/` → *"Not a valid object
+name"*). Two files. `index.ts:12-16` is the whole extension: it registers one tool with
+`defaultActive: false`, handing the tool the `ExtensionAPI` itself as its `tools` option. `tool.ts`
+is the tool, plus the ranker `CODE-010` owns. The parts this row covers:
+
+* `TOOL_SEARCH_TOOL_NAME = "tool_search"` (`:20`) and `DEFAULT_TOOL_SEARCH_LIMIT = 8` (`:21`).
+* `toolSearchSchema` (`:159`) — `query: string` (required, described *"Search query for deferred
+  tools."*) and `limit?: number`, whose description interpolates the default.
+* `exposure: "model-only"` on the definition (`:239`), under the comment *"Searching is not something
+  scripts need; it changes what the model sees"* — a codemode script must not call it; scripts use
+  `searchTools()` instead (`CODE-010`).
+* `TOOL_SEARCH_DESCRIPTION` (`:220`) — a verbatim four-line markdown string, `# Tool discovery`
+  then the BM25 sentence, then *"Some of the tools, such as tools of MCP servers, may not have been
+  provided to you upfront… For MCP tool discovery, always use `tool_search`."* It is asserted
+  verbatim by two upstream tests (`test/suite/agent-session-mcp.test.ts:479`, `:838`), so it is a
+  pinned string, not prose.
+* `promptSnippet: "Search for tools that are not loaded yet and load the matches"` (`:238`).
+* `isSearchable(exposure)` (`:192`) — `codemode` or `deferred`, and nothing else. `direct`,
+  `model-only` and `hidden` tools are never search results.
+* `searchAndLoad` (`:200`) — candidates are the searchable tools **minus the currently active ones**;
+  documents are `createToolSearchDocument(tool, tool.namespace)`; matches are appended to the active
+  set with `setActiveTools`, and only when `matches.length > 0`.
+* The two input validations in `execute` (`:241-245`): an empty/whitespace `query` throws
+  `"query must not be empty"`; a `limit` that is not a positive integer throws
+  `"limit must be a positive integer"`.
+* The result contract (`:247-252`): `"No matching tools found."` when empty, otherwise
+  `` `Loaded ${n} tool${n === 1 ? "" : "s"}. They are available from your next call:` `` followed by
+  one `- <name>: <first line of description>` per match; `details: { loaded: string[] }`
+  (`ToolSearchToolDetails`, `:181`).
+* `isToolSearchTool(tool)` (`:169`) — the identity predicate the MCP extension uses to decide whether
+  the active `tool_search` is *this* one before auto-activating it (`extensions/mcp/index.ts:464`).
+  Upstream implements it as **reference identity on the schema object**
+  (`tool.parameters === toolSearchSchema`), which has no Rust analogue and needs a deliberate
+  decision (a marker on the registry entry, or the tool's source id) rather than a structural
+  schema comparison.
+* Registration and export: `extensions/index.ts:12`
+  `{ name: "tool-search", factory: toolSearchExtension, replaceable: true, builtin: true }`, and the
+  SDK export `createToolSearchExtension` at `src/index.ts:409`.
+
+**cyrup at HEAD `fe875569`** — absent. `grep -rn 'tool_search\|Bm25\|ToolRanker' crates/
+--include='*.rs'`, excluding the provider `supports_tool_search` / `tool_search_call` family and
+cyrup-tui's unrelated markdown tokenizer, is **0 hits**. The substrate is partly there and partly
+not: `HostServices::all_tools()` (`crates/cyrup-ext/src/host/services.rs:1224`) already returns the
+full registry as `ToolInfo`-shaped `Value` rows and `set_active_tools` (`:1205`) already restricts
+the live set, so an extension *can* read the registry and change the active set today — but those
+rows carry no `exposure` and no `namespace` field, so there is nothing to filter `isSearchable` on
+and nothing to feed the namespace half of `createToolSearchDocument`. That is `CODE-005`.
+
+**Impact** — low, and deliberately so. With no `deferred`-exposure tools in cyrup there is nothing
+for the tool to find, so the user-visible loss today is zero. It becomes load-bearing the moment
+`MCP-604` lands (search-mode MCP tools registered at `deferred` exposure have **no other** way to
+reach the model) and it is the surface the release post advertises, so a reader looking for
+"deferred tool loading" in the ledger must find it.
+
+**Fix** — the tool definition over `CODE-010`'s ranker, in `cyrup-tools` beside the built-ins or as
+a native extension in its own crate; the two validations; the exact description and result strings;
+`details.loaded`. Three things are easy to get wrong: (a) candidates exclude the **active** set, not
+the declared set, so a tool activated by an earlier search is not re-offered; (b) activation must go
+through the same path a user's `/tools` change takes, or the transcript will not record it and resume
+will lose it — the transcript half is `SESS-051` as amended by `SESS-066`; (c) `isToolSearchTool`'s
+reference identity needs an explicit Rust answer. Do **not** port the ranker here — `CODE-010` owns
+it; whichever lands first should place `Bm25Ranker` where both reach it.
+
+**Verify** — a registry holding one tool of each of the five exposures: a query matching all five
+loads only the `codemode` and `deferred` ones; a second identical query returns no matches because
+they are now active; `limit` caps the count; `query: "   "` and `limit: 0` each error with the exact
+message; the loaded names appear in `details.loaded` and in the next request's tool array but not in
+the current one; the description is byte-equal to `TOOL_SEARCH_DESCRIPTION`; and the tool is absent
+from the model's tool list unless `defaultTools` names it.
+
+## TOOL-053 — `defaultActive` and the declarability predicates are unported
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `core/extensions/types.ts:603-608` adds `defaultActive?: boolean` to
+`ToolDefinition`, documented as *"Whether registering the tool activates it. Default: `true` for
+`direct` and `model-only` tools; other exposures are never activated on registration. A tool with
+`defaultActive: false` is activated by naming it in `--tools` or the `defaultTools` setting, or with
+`setActiveTools()`."* It is read by exactly two predicates in `core/agent-session.ts`:
+
+```ts
+private _isDeclarable(name: string): boolean {                       // :3548
+  const exposure = this._getToolExposure(name);
+  return exposure === "direct" || exposure === "model-only";
+}
+private _isActivatedOnRegistration(name: string): boolean {          // :3554
+  return this._isDeclarable(name) && this._toolDefinitions.get(name)?.definition.defaultActive !== false;
+}
+```
+
+`_isDeclarable` gates the `--tools` arm of `_buildRuntime` (`:3527`, *"Naming a tool activates it
+even when it is not active by default"*); `_isActivatedOnRegistration` gates the other two arms
+(`:3533`, `:3539`). `git show v0.87.1:…/types.ts | grep -c defaultActive` is **0** — the field is new
+in this window. Both shipped off-by-default tools rely on it: `tool_search`
+(`extensions/tool-search/index.ts:14`) and `codemode` (`extensions/codemode/index.ts:33`).
+
+**cyrup at HEAD** — `grep -rn 'fn default_active\|is_declarable\|activated_on_registration' crates/
+--include='*.rs'` is **0 hits**. `cyrup_core::Tool` (`crates/cyrup-core/src/tool.rs:184`) has no such
+accessor; `ToolRegistry::visible` (`crates/cyrup-tools/src/registry.rs:167`) knows only
+`Availability::{All, Allow, Exclude, NoBuiltins, NoTools}` (`:34`), all of which are name filters,
+and `select_active_tools` (`crates/cyrup-session-svc/src/builder.rs:397`) derives the active set
+purely from `cfg.tools` / `cfg.no_tools` / `default_tools`. There is no way to express "registered,
+enable-able, but not active until named" — every registered tool is either name-selected or not.
+
+**Impact** — low on its own, but it blocks `TOOL-052` and `CODE-007`: both tools must be registered
+*and* inactive, and today registering them in cyrup would declare them to every model on every turn.
+
+**Fix** — `fn default_active(&self) -> bool { true }` on `cyrup_core::Tool` (the same shape as the
+existing `label` / `prompt_snippet` / `render_kind` accessors, which is the precedent `TOOL-021` and
+`TOOL-022` set), the two predicates at the activation seam, and the `--tools`-names-it-anyway rule.
+`_isDeclarable`'s exposure half depends on `CODE-005`; until that lands, `default_active` alone is
+enough to register a tool inactive and is worth landing first since it is the smaller half.
+
+**Verify** — a tool registered with `default_active() == false` is absent from the first request's
+tool array; naming it in `--tools` or `defaultTools` activates it; `set_active_tools` activates it;
+and a `default_active() == true` tool is unaffected in all three cases.
+
+## TOOL-054 — `bash` has no structured result, and its failure arm diverges
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `core/tools/bash.ts` @v1.0.0 (`1ff5b6fdd` *"return up to 1 MiB of bash output to
+codemode scripts"*). Four changes, all new in this window:
+
+* `bashOutputSchema` (`:56`) — `{ output: string, truncated: boolean, full_output_path?: string,
+  exit_code: number, wall_time_seconds: number }`, with the comment *"`output` is not limited like
+  the model-facing output: callers decide how much of it reaches the model."* Declared on the
+  definition as `outputSchema: bashOutputSchema` (`:259`), so it reaches the runtime through
+  `wrapToolDefinition` (`tool-definition-wrapper.ts:16`, also new) and is advertised to scripts.
+* `STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024` (`:24`) and `OutputAccumulator.readFullOutput(maxBytes)`
+  (`output-accumulator.ts:156`): the full spill file, or when it exceeds the cap, its first and last
+  `maxBytes / 2` bytes around `` `\n\n[... ${omitted} bytes omitted ...]\n\n` ``. The cut is at
+  character boundaries in both directions — the head uses a streaming `TextDecoder` so an incomplete
+  trailing sequence is held back, and the tail skips leading `0x80`-masked continuation bytes.
+* `wall_time_seconds` (`:389`) — `Math.round((performance.now() - startedAt) / 100) / 10`, i.e.
+  tenths of a second, from a `startedAt` taken just before the spawn (`:359`).
+* **The failure arm changed shape** (`:399-406`). A non-zero exit no longer throws: it returns
+  `{ content: [{ type: "text", text: appendStatus(outputText, "Command exited with code N") }],
+  details, structuredContent, isError: true }`. The model's text is unchanged; what changed is that
+  `details` and the structured value now survive a failing command, and a codemode script calling
+  `bash` resolves to the structured value instead of rejecting.
+
+**cyrup at HEAD** — `crates/cyrup-tools/src/tools/bash.rs:615-637`: the non-zero arm builds
+`error::invalid(append_status(&body, &format!("Command exited with code {code}")))`, attaches
+`BashDetails` via `ToolError::with_details`, and returns `Err(failure)`. That is a faithful port of
+v0.87.1 and of the model-facing text at v1.0.0 — the **text** is right. What is absent is the
+structured half: `grep -rn 'structured_content\|output_schema' crates/cyrup-core crates/cyrup-tools
+--include='*.rs'` is 0 (the `structured_output_schema` hits are
+`cyrup-ext-subagents`' unrelated subagent-contract field), `cyrup_core::ToolResult`
+(`crates/cyrup-core/src/tool.rs:25-43`) has `content`, `details`, `usage`, `added_tool_names`,
+`terminate` and nothing else, and `crates/cyrup-tools/src/output.rs` has no `read_full_output`
+counterpart — the accumulator exposes only the display snapshot.
+
+**Already filed, do not duplicate.** The **type-level** prerequisites are
+`AGENT-045` (`AgentTool.outputSchema` / `AgentToolResult.structuredContent`) and `AGENT-046`
+(`AgentToolResult.isError`), both in area 02 (`02-cyrup-agent.md`). This
+row is the **`bash`-tool half** and is worthless before them: the schema's five fields, the 1 MiB
+head/tail reader, the tenths-of-a-second wall time, and the switch of the non-zero arm from `Err` to
+an `is_error` result.
+
+**Impact** — low today: with no codemode and no structured-content plumbing, nothing in cyrup can
+consume the value, and the model sees identical text either way. It is a prerequisite for
+`CODE-002`/`CODE-006` (a script calling `bash` is upstream's motivating case) and, once `AGENT-046`
+lands, the `Err`-vs-`is_error` difference becomes observable: in cyrup a failing command loses its
+`truncation` / `full_output_path` side-channel to the error path, where upstream keeps them on a
+normal result.
+
+**Fix** — after `AGENT-045`/`AGENT-046`: a `bash_output_schema()` on the tool, `read_full_output`
+on `crates/cyrup-tools/src/output.rs`'s accumulator with the two-sided UTF-8 boundary walk, the
+`startedAt` clock, and the failure arm rewritten to return `Ok` with `is_error`. Keep
+`ToolError::with_details`' behaviour for the timeout and `exitCode: null` arms, which upstream still
+throws (`:388`).
+
+**Verify** — a 3 MiB output yields exactly 512 KiB of head, the `[... N bytes omitted ...]` marker
+with the right `N`, and 512 KiB of tail, with no replacement characters at either seam on
+multi-byte input; a command exiting 7 returns a result (not an error) whose text ends
+`Command exited with code 7`, whose `is_error` is set, and whose structured `exit_code` is `7`;
+`wall_time_seconds` for a 1.25 s command is `1.3`; a timeout still errors.
+
+## TOOL-055 — `truncateMiddle` is unported
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `core/tools/truncate.ts:278-313` is new at v1.0.0: `MiddleTruncationResult`
+(`content`, `truncated`, `removedChars`, `totalBytes`, `totalLines`) and `truncateMiddle(content,
+maxBytes)`, documented *"Keep the start and the end of `content`, half of `maxBytes` each, and
+replace the middle with a `…N chars truncated…` marker, like Codex does for tool output. Cuts only at
+character boundaries."* The marker counts **characters** (`Array.from(...).length` over the removed
+byte range), not bytes, while the budget is in bytes; both cut points walk off `0x80`-masked
+continuation bytes.
+
+Its one consumer is `limitMcpContent` (`extensions/mcp/tools.ts:123-143`), which at v1.0.0 wraps the
+result as `Warning: truncated output (original token count: <totalBytes/4 ceil>)` + `Total output
+lines: <totalLines>` + the middle-truncated body + `[Full output: <path> (read it with
+offset/limit)]`, at `MCP_OUTPUT_MAX_BYTES = 20 * 1024` (`tools.ts:46`).
+
+**cyrup at HEAD** — `crates/cyrup-tools/src/truncate.rs` has `truncate_head` (`:149`),
+`truncate_tail` (`:256`), `truncate_line` (`:339`) and `format_size` (`:354`), and its module doc
+states the model as *"`read`/`grep`/`find`/`ls` use head truncation; `bash` uses tail truncation"* —
+there is no middle mode. `grep -rn 'truncate_middle\|chars truncated' crates/ --include='*.rs'` is
+**0 hits**.
+
+**Not a duplicate of `CODE-012`.** That row owns codemode's `truncateOutput`, which is
+**token**-budgeted and emits `…N tokens truncated…` (`extensions/codemode/execute.ts:277`). This one
+is byte-budgeted and emits `…N chars truncated…`. Two different functions with two different markers;
+porting one does not give the other.
+
+**Handoff, not filed here (no MCP id is mine).** cyrup's MCP output cap is still the v2.x shape:
+`crates/cyrup-mcp/src/config.rs:1253` `DEFAULT_MCP_OUTPUT_MAX_BYTES = 50 * 1024` with
+`crates/cyrup-mcp/src/renderers.rs:1533` `truncate_head`. Upstream now truncates the **middle** at
+**20 KiB**. The ledger has no row for that change — `grep -rn 'limitMcpContent\|MCP_OUTPUT_MAX_BYTES'
+crates/cyrup-mcp` is the side that would carry it — so area 13 should pick it up; this row only
+supplies the primitive it needs.
+
+**Fix** — `truncate_middle(content: &str, max_bytes: usize) -> MiddleTruncation` in
+`crates/cyrup-tools/src/truncate.rs`, next to the existing two. Mind the asymmetry: the budget and
+the two half-sizes are bytes (`floor(max/2)` head, `max - floor(max/2)` tail), while `removed_chars`
+is a `chars().count()` over the removed slice.
+
+**Verify** — ASCII input one byte over the budget keeps exactly `floor(max/2)` head bytes and the
+rest as tail; `removed_chars` on multi-byte input is the character count, not the byte count; both
+cut points land on character boundaries for a string of three-byte characters at every offset
+`max-2..max+2`; an input at exactly `max_bytes` returns `truncated: false` and the content unchanged;
+`total_lines` matches the existing line-splitting helper.
+
+## TOOL-056 — `read`'s line-range header is wrong for an explicit JSON `null`
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read) · **Filed** 2026-10-02
+
+**upstream** — `core/tools/renderers/read.ts:28-34` @v1.0.0, from `49681e1b7` *"hide line range for
+full-file read calls with null offset/limit"*:
+
+```ts
+// Strict tool schemas make models send null for omitted optional fields.
+if (args?.offset == null && args?.limit == null) return "";
+const startLine = args.offset ?? 1;
+const endLine = args.limit != null ? startLine + args.limit - 1 : "";
+```
+
+Two of the four rules changed: the opening presence gate and the `endLine` gate moved from
+`=== undefined` / `!== undefined` to **nullish**. Rules 2 (`?? 1`) and 4 (truthiness on the computed
+number) are unchanged. Upstream's own comment names the cause — `read` declares
+`constrainedSampling: { type: "json_schema", strict: "prefer" }` (`core/tools/read.ts:80`), and a
+strict schema makes the model emit `"limit": null` rather than omitting the key.
+
+**cyrup at HEAD** — `crates/cyrup-tui/src/transcript/tool_args.rs:337` `read_line_range` is an
+unusually careful port of the **v0.87.1** rules: its doc comment quotes the four lines verbatim and
+its body implements each separately *because* they disagree on `null` (`:343-350`). That reasoning was
+correct and is now stale — upstream removed the disagreement. Concretely:
+
+| args | pi v1.0.0 | cyrup HEAD |
+|---|---|---|
+| `{"offset": null, "limit": null}` | *(nothing)* | `:1` |
+| `{"offset": null}` | *(nothing)* | `:1` |
+| `{"offset": 10, "limit": null}` | `:10` | `:10-9` |
+
+The third row is the bad one: `limit` is present, so cyrup computes `js_add(10, null) - 1 = 9` and
+renders a **reversed range**, `:10-9`.
+
+**Impact** — low, and stated honestly: it is one decoration on the `read` call header, the file path
+beside it is correct, and nothing downstream reads the string. Likelihood is currently damped because
+cyrup declares `constrainedSampling` for the built-ins only under the experimental flag
+(`TOOL-046`) — so cyrup requests strict schemas less often than pi does, and fewer models send the
+nulls. It rises to the common case when `TOOL-046` lands. `low`, not `medium`: a wrong header
+fragment is not a correctness failure on a path that changes behaviour.
+
+**Fix** — two characters of logic in `read_line_range`: rule 1 becomes "both absent **or** null" and
+rule 3 becomes "`limit` present **and** not null". Keep rules 2 and 4 and the `js_add` arithmetic
+exactly as they are — `{"offset":1,"limit":"5"}` must still render `:1-14`, which the existing
+`read_line_range_ports_all_four_rules` test pins. Replace that test's `null` expectations rather than
+deleting it, and **update the doc comment's quoted TypeScript to the v1.0.0 text**, or the next reader
+re-derives the old rules from the comment.
+
+**Verify** — the three table rows above; plus the unchanged cases: `{}` → nothing,
+`{"offset":10}` → `:10`, `{"offset":10,"limit":5}` → `:10-14`, `{"offset":1,"limit":"5"}` → `:1-14`,
+and a `limit` yielding `0` or `NaN` still dropping the `-<end>` half.
+
+### Orientation — what "deferred tool loading" actually is at v1.0.0
+
+The release post's *"tools load on-demand rather than upfront"* is **one new tool plus one new field
+on the exposure model**, not a provider feature and not a change to the built-in tool set.
+
+**The contract, established from `extensions/tool-search/tool.ts` and `core/agent-session.ts` @v1.0.0:**
+
+1. **What the model sees before a tool loads: nothing at all.** Not the name, not the description,
+   not the schema. A tool is *declared* to the model iff it is in the **active** set
+   (`_applyToolLoadout`, `agent-session.ts:1527`), and only `direct` / `model-only` exposures are
+   declarable (`_isDeclarable`, `:3548`). A `codemode`- or `deferred`-exposure tool is registered and
+   callable but never declared until something activates it. The model's only evidence that such
+   tools exist is the `tool_search` description itself — which deliberately **names no tool and no
+   namespace** (`tool.ts:218-220`: *"It does not list the searchable tools or their namespaces, so it
+   stays the same while tools are registered, for example when MCP servers connect"*). That stability
+   is the point: an MCP server connecting mid-session must not rewrite a declared tool's description
+   and force a redeclaration.
+2. **When the schema is materialized: at registration, not at load.** `createToolSearchDocument`
+   (`tool.ts:108`) walks `tool.parameters` — descriptions, property names, `items`,
+   `anyOf`/`oneOf`/`allOf` — to build the ranker's search text, so the full JSON Schema must already
+   exist in the registry before any search. "Deferred" means **deferred declaration**, not deferred
+   construction. Nothing is fetched or built lazily.
+3. **How loading happens.** `searchAndLoad` (`tool.ts:200`) takes the tools that are
+   `isSearchable` (`:192` — exposure `codemode` or `deferred`) **and not already active**, ranks them
+   with BM25, and calls `setActiveTools([...active, ...matches])`. So loading is an ordinary active-set
+   change: it goes through `setActiveToolsByName` (`agent-session.ts:1488`), is recorded in the
+   transcript as a `toolsAdded` system message, and therefore survives `/tree`, resume and fork on
+   that branch. The result text promises the next call, not this one — *"They are available from your
+   next call"*.
+4. **Interaction with tool filtering.** `--tools` / `defaultTools` / `--exclude-tools` gate it twice:
+   `tool_search` itself is registered with `defaultActive: false`
+   (`extensions/tool-search/index.ts:14`) so it must be named to exist for the model
+   (`"defaultTools": ["+tool_search"]`, `docs/settings.md:54`), and the restored/pending set is
+   filtered by `_isAllowedTool` (`agent-session.ts:1503`). Note that `searchAndLoad`'s own
+   `setActiveTools` call is **not** passed through `_isAllowedTool` — only registry membership and
+   non-`hidden` exposure gate it in `_applyToolLoadout`.
+5. **Interaction with permissions.** None directly: `tool_search` is `exposure: "model-only"`
+   (never callable from another tool) and carries no annotations. Permissions bite at the loaded
+   tool's own call, through the ordinary gate; the relevant new surface there is
+   `ToolDefinition.annotations` (`types.ts:515`), which is filed as `MCP-601`.
+6. **Interaction with MCP direct tools.** The MCP extension chooses a per-server exposure and then
+   activates whichever discovery tool that exposure needs — `codemode` for `codemode`, `tool_search`
+   for `deferred` — in `ensureDiscoveryActive` (`extensions/mcp/index.ts:446-484`), warning once if
+   neither is reachable. So `tool_search` is the *only* path to a `deferred`-exposure MCP tool. That
+   MCP half is `MCP-604`; the host half of the exposure enum is `CODE-005`; the ranker is `CODE-010`.
+   **This area owns the tool itself**, which `CODE-010`'s Fix explicitly hands off.
+
+**Not this feature, checked as instructed:** `fetchDeferred` / `cancelDeferred` / `streamDeferred`
+are deferred **model-response** fetching and are `PROV-040` (`01-cyrup-core-and-provider.md:895`,
+open, low). Nothing in this area touches them. `supports_tool_search`
+(`crates/cyrup-provider/src/api/compat.rs:569`, `:597`) is pi's **provider** flag for the OpenAI
+Responses `tool_search_call`/`tool_search_output` wire pair and is **already ported** — a different
+mechanism from the client-side `tool_search` tool filed here.
+
+### Built-in tool sweep — settled, nothing to file
+
+`packages/coding-agent/src/core/tools/index.ts` is **byte-identical** v0.87.1..v1.0.0
+(`git diff --stat v0.87.1..v1.0.0 -- packages/coding-agent/src/core/tools/index.ts` is empty), so at
+v1.0.0:
+
+* `createAllToolDefinitions` (`index.ts:182-193`) still returns exactly
+  `read, bash, powershell, edit, write, grep, find, ls`, in that order.
+* `createCodingTools` (`:195-202`) is still `read, bash, edit, write`.
+* `createReadOnlyToolDefinitions` / `createReadOnlyTools` are still
+  `read, grep, find, ls`.
+
+**No built-in tool was added, renamed or removed.** `crates/cyrup-tools/src/registry.rs:21`
+`BUILTIN_NAMES` and every assertion in `crates/cyrup-tools/src/tests/builtin_tool_order.rs` remain
+correct at v1.0.0 and need no change. `read.ts`, `edit.ts`, `write.ts`, `grep.ts`, `find.ts`,
+`ls.ts`, `powershell.ts`, `edit-diff.ts`, `path-utils.ts` and `file-mutation-queue.ts` are all
+unchanged in the window — every cited offset in area 04's existing rows is still valid.
+
+The two **new** tools at v1.0.0 are `codemode` (`extensions/codemode/index.ts:33`, area 18) and
+`tool_search` (`extensions/tool-search/index.ts:14`, filed here); the only other new `registerTool`
+sites are the MCP extension's (`extensions/mcp/index.ts:394`, `:401`, `:410`, `:438`) and
+`packages/durable/src/tools/{env,image}.ts`. `git grep -n 'registerTool(' v1.0.0` confirms there are
+no others.
+
+### Read in scope and deliberately NOT filed
+
+1. **`core/tools/renderers/bash.ts` (+55/−? in the window)** — pure refactor. The inline
+   `BashResultRenderComponent` with its three cache fields and its hand-rolled
+   `render`/`invalidate` pair was replaced by the shared `VisualLinePreview` component
+   (`modes/interactive/components/visual-truncate.ts`) plus a `Spacer(1)`, from
+   `b485fa312` *"reduce render cost of theme changes and streaming"*. `BASH_PREVIEW_LINES = 5`, the
+   `keep: "end"` policy and the `... (N earlier lines, <key> to expand)` hint text are all identical
+   before and after. No behavioural delta, so no row; the cyrup side
+   (`crates/cyrup-tui/src/bash.rs`) needs nothing.
+2. **`tool-definition-wrapper.ts`'s `ToolContextFactory` change** — `ctxFactory` went from
+   `() => ExtensionContext` to `(toolCallId, signal) => ExtensionToolContext` (`:5`, `:11`, `:21-27`).
+   That signature exists to give a tool's context the call id and signal it needs for nested calls,
+   which is `CODE-006`'s `ctx.executeTool()`. Not a separate gap.
+3. **`ToolDefinition.annotations` / `ToolInfo.annotations`** (`core/extensions/types.ts:515`,
+   `:2070`) — new in this window, with MCP annotation semantics and the note that *"permission
+   extensions can use them to decide which calls to confirm"*. Owned by `MCP-601`
+   (`13e-mcp-tools.md`), which files the drop end to end including the permission consumption at
+   `:671-672`. No built-in tool declares annotations at v1.0.0, so there is no area-04 half.
+4. **`builtInExtensions` gaining `replaceable: true`** (`extensions/index.ts:9-13`, with the comment
+   *"an extension that registers `codemode`, `tool_search`, or `/mcp` … takes over instead of running
+   alongside the built-in one"*). New at v1.0.0 — v0.87.1's single entry wrote `hidden: true`. This is
+   an extension-loader semantic, area 06, and `EXT-027`'s closure already covers the
+   `hidden` → `builtin` half of the same table; `replaceable` appears nowhere in the ledger. Flagged
+   for area 06's owner rather than filed under a `TOOL-` id.
+5. **The fallback tool-call header gaining its arguments** — `formatToolCallWithArgs`
+   (`core/tools/render-utils.ts:78`, `COLLAPSED_ARGS_CHARS = 100` at `:71`), from `5257d0d5f`, now
+   backs `createCallFallback` (`modes/interactive/components/tool-execution.ts:156`) and the MCP
+   renderer (`extensions/mcp/tools.ts:280`), where cyrup's `render_call_fallback`
+   (`crates/cyrup-tui/src/transcript/tool_builtin.rs:637`) still shows the bold name alone. This was
+   drafted here and **withdrawn in favour of `TUI-138`** (`07-cyrup-tui.md`), which files
+   the same finding against the area that owns the cyrup site. `TUI-138`'s body is complete and
+   correct on both sides; do not refile it here. One cross-reference worth carrying into it: the
+   `tool_search` tool of `TOOL-052` ships no renderer, so it takes this path too — under the current
+   fallback a `tool_search` call renders as the bare word `tool_search` with the query invisible.
 
 ## Coverage
 

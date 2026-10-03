@@ -713,7 +713,7 @@ data only (Copilot Opus 5.5 effort map; image regeneration).
 
 ## Open items
 
-> **Next free id: `PROV-112`** (2026-10-01, after the `EXT-027` closure filed `PROV-102`…`PROV-111`).
+> **Next free id: `PROV-130`** (2026-10-02, after the pi v1.0.0 pass filed `PROV-113`…`PROV-129`; `PROV-112` was never allocated and is still free).
 
 > **This table is the complete open set for area 01 — 41 rows: 40 counted items plus the one
 > `tracker` (`PROV-004`), including the `-S` surface-sweep ids, everything filed on 2026-08-12 and
@@ -960,6 +960,23 @@ data only (Copilot Opus 5.5 effort map; image regeneration).
 | ~~PROV-109~~ | ~~low~~ **CLOSED 2026-10-02** | parity-bug | S | **CLOSED 2026-10-02** (`claude/lows-batch5`): `AuthHelper::apply_auth` (`collection.rs`) now passes `options.env` into the auth resolution (`AuthOverrides.env`, was `None`, as `apply_classifier_auth` does) and sets `request_options.env = merge_env(resolution.env, options.env)` after the headers: the resolution's env first, the request's env winning per key (pi `models.ts:862` @v0.99.2-17; the early-return arms are untouched). Test `collection::tests::apply_auth_merges_the_resolution_env_into_the_request_options` (new stub `FixedEnvAuth`): with no request env the resolution env reaches `out.env`; with one, the merge is resolution-first and `SHARED` ends as the request's value while resolution-only and request-only keys both survive. Written first and RED: the first assertion failed with `left: None, right: Some({"LLAMA_BASE_URL": "http://resolved", ...})`. Not verified end to end through a real llama.cpp provider. Original finding: ~~**NEW 2026-10-01** (filed by the `EXT-027` closure, `claude/llama-cpp-port`). `Models::stream`'s `AuthHelper::apply_auth` (`crates/cyrup-provider/src/collection.rs:918-960`) does not merge the auth resolution's `env` into `request_options.env`, whereas pi's `applyAuth` does (`packages/ai/src/models.ts:481-487`, `:862` @v0.99.2-17) and cyrup's own `Models::classify` path does (`collection.rs:587`, `merge_env` `:988`). A provider whose `WireProvider` re-resolves with an `api_key` override but no `env` (llama.cpp needs `LLAMA_BASE_URL` there) is then "not configured" on that path. The production agent streams through `Provider::stream` directly and is unaffected; found while testing the llama provider and not worked around. **Fix** — set `request_options.env = merge_env(resolution_env, options.env.as_ref())` in `apply_auth` as `classify`'s twin does. **Verify** — a stream through `Models::stream` for a provider that needs a resolved env value.~~ |
 | PROV-110 | low | port-divergence | S | **NEW 2026-10-01** (filed by the `EXT-027` closure, `claude/llama-cpp-port`). The classifier api differs from its TypeScript in four JS-semantics corners, none reachable from a normal `classify`. (1) `OrderedMap` (`crates/cyrup-provider/src/classifier.rs:316`) keeps insertion order but does not reproduce JS's hoisting of integer-like keys (`"1"`, `"2"`) ahead of the others, which changes choice-label assignment only for numeric-string criteria keys given out of ascending order; the state map is `serde_json` with `preserve_order`, which does not hoist either, so the state JSON key order differs for integer-like keys. (2) `JSON.stringify` of state keeps an exact `u64` / `i64` above 2^53 where JS rounds. (3) `answer_from_probabilities` (`crates/cyrup-provider/src/api/llama_cpp_classify.rs:609`) yields NaN or an empty key where pi's non-null assertions would yield `undefined` on a keys / probabilities length mismatch; unreachable, because both come from one label set. (4) The label-token cache is a `OnceCell` per key (`:971`), so a concurrent waiter does not share another caller's in-flight error or cancellation as pi's shared `Promise` does, and `classify_question`'s `try_join!` (`:1013`, `:1152`) drops the sibling request on the first error where pi leaves an orphaned request running. The last is recorded in the source as `[CYRUP-DELTA]` mechanism owned by `EXT-027`; the first three are not forced by Rust and stay on the list. **Fix** — (1) a key-ordering helper that hoists canonical integer keys in ascending order, applied to both maps; (2) a decision whether to emulate; (3) return an error; (4) none needed beyond the delta note. **Verify** — a numeric-keys fixture asserting pi's order. |
 | PROV-111 | low | port-divergence | M | **NEW 2026-10-01** (filed by the `EXT-027` closure, `claude/llama-cpp-port`). `cyrup_provider::RefreshModelsContext` carries only `allow_network`, `force` and `cancel` (`crates/cyrup-provider/src/provider.rs:29-43`), so pi's `credential`, `stored` and `publish` (`packages/ai/src/models.ts:74-90` @v0.99.2-17) reach a provider through a tokio task-local, `ProviderRefreshContext::current()` (`crates/cyrup-ext/src/host/services.rs:343`, `:379`), set only for the duration of the `refresh_models` call by `GuestProviderRegistry` (`crates/cyrup-session-svc/src/guest_providers.rs:422`). It does not cross a `tokio::spawn` made inside `refresh_models`, and it makes the contract invisible to the type system. It was filed rather than tagged `[CYRUP-DELTA]`: the lane did not own `provider.rs`, and nothing about Rust forces it. **Fix** — add `stored` / `credential` / `publisher` fields to `RefreshModelsContext` itself (a handful of struct-literal sites: `collection.rs:635`, `:666`, `guest_providers.rs:416`), delete the task-local, and let `cyrup-llama`'s `ContextRefreshHost` read them from the argument. Only `run_phase` and `ProviderRefreshContext::current` / `scope` change in the engine. **Open question** from the engine lane: is the task-local acceptable until then? **Verify** — `refresh_models` that spawns a task still sees its credential. |
+| PROV-113 | low | not-ported | M | **`StreamOptions.onProviderStreamEvent` and its nine adapter call sites are unported** — pi `packages/ai/src/types.ts:198` (v1.0.0, `002fc8385`) plus `api/simple-options.ts:41` and one `await options?.onProviderStreamEvent?.(…)` per wire api; `grep -rn 'on_provider_stream_event' crates/` at HEAD is empty. Discharges the lead at `01-…:638`. **FILED 2026-10-02**; body below. |
+| PROV-114 | medium | stale-port | S | **Mistral reasoning lowering is pinned to a hardcoded model-id set that pi v1.0.0 deleted** — `thinkingLevelMap`-presence now picks `reasoning_effort` vs `prompt_mode` (`api/mistral-conversations.ts:202-213` @v1.0.0), and reasoning-off sends `effortMap.off`. cyrup `api/mistral_conversations/reasoning.rs:40-50` still matches ids, so cyrup's own `zai-glm-5-3` catalog row gets `prompt_mode`. **FILED 2026-10-02**; body below. |
+| PROV-115 | high | upstream-drift | S | **An empty Mistral text delta opens a text block and splits thinking into two blocks, which Mistral rejects when the transcript is replayed** — pi v1.0.0 guards both sites with `if (!textDelta) continue;` (`api/mistral-conversations.ts:636`, `:678`, `8930b9ec0`). cyrup's `push_text` (`api/mistral_conversations/content.rs`) has no guard, and `zai-glm-5-2`/`zai-glm-5-3` ship in cyrup's Mistral catalog. **FILED 2026-10-02**; body below. |
+| PROV-116 | medium | upstream-drift | S | **`processResponsesStream` has no unfinished-tool-call guard, so a Responses stream that completes with a tool call whose `output_item.done` never arrived hands the agent truncated or duplicated arguments** — pi v1.0.0 throws instead (`api/openai-responses-shared.ts:764-775`, `1b2aa0ca0`). cyrup `api/openai_responses/decoder.rs:203-227` checks only `saw_terminal`. **FILED 2026-10-02**; body below. |
+| PROV-117 | medium | upstream-drift | S | **A loopback OAuth callback that cannot bind aborts `/login` instead of degrading to the manual-paste prompt** — pi v1.0.0 wraps the listener in `.catch(() => undefined)` and `waitForCallbackOrManualInput` runs the paste prompt alone (`auth/oauth/anthropic.ts:148`, `auth/oauth/openai-codex.ts:370`, `auth/oauth/callback-server.ts:155-184`). cyrup's `run_login` propagates the start error with `?` and documents "there is no manual-paste fallback for it" (`auth/oauth/anthropic.rs`). **FILED 2026-10-02**; body below. |
+| PROV-118 | medium | not-ported | L | **"Sign in with ChatGPT" on the `openai` provider is unported** — pi v1.0.0 gives `openai` an `oauth` entry (`providers/openai.ts:12-19`) backed by the new 310-line `auth/oauth/openai-chatgpt.ts`, adds `LoginOptions.getDeviceId` to `OAuthAuth.login` (`auth/types.ts:202-226`), three `subscription_sharing_*` retry literals, and a ChatGPT-usage hint on the limit error. cyrup's `providers/openai.rs` carries an api key only. **FILED 2026-10-02**; body below. |
+| PROV-119 | low | not-ported | M | **Anthropic workload identity federation (OIDC) is unported** — pi v1.0.0 resolves five `ANTHROPIC_*` env vars into an `env`-carried federation config (`providers/anthropic.ts:48-69`) that `api/anthropic-messages.ts:351-379` turns into an SDK `config`, bypassing `assertRequestAuth` (`:614`, `:935`). `grep -rn 'ANTHROPIC_FEDERATION\|ANTHROPIC_ORGANIZATION_ID' crates/` at HEAD is empty. **FILED 2026-10-02**; body below. |
+| PROV-120 | low | not-ported | M | **The Anthropic copy-code (headless) login method and the login-method selector are unported** — pi v1.0.0 prompts `type:"select"` between browser and copy-code login and adds `loginAnthropicCopyCode` against `https://platform.claude.com/oauth/code/callback` (`auth/oauth/anthropic.ts:21`, `:191-230`, `:270-288`). cyrup's `OAuthAuth::login` for anthropic goes straight to the browser flow. **FILED 2026-10-02**; body below. |
+| PROV-121 | low | upstream-drift | S | **Anthropic strict tool use is sent for schemas Anthropic's strict mode rejects with a 400 for the whole request** — pi v1.0.0 threads an `UnsupportedStrictSchemaKeywordCheck` (`api/constrained-sampling.ts:13`, `:56`, `:228`) and supplies an Anthropic predicate over 11 keywords plus a `format`/`minItems` allowlist (`api/anthropic-messages.ts:1550-1583`, applied `:1593`). cyrup's `resolve_json_schema_strict_sampling` takes two arguments and has no hook. **FILED 2026-10-02**; body below. |
+| PROV-122 | low | upstream-drift | S | **`message_delta` does not read `cache_creation.ephemeral_1h_input_tokens`, so one-hour cache writes reported only in deltas are priced at the five-minute rate** — pi v1.0.0 reads it in both places (`api/anthropic-messages.ts:686` and `:843-849`, `667fc3dd3`). cyrup's `apply_message_delta_usage` (`api/anthropic_messages/usage.rs:31-53`) reads only `cache_creation_input_tokens`. Discharges lead (c) at `01-…:636`. **FILED 2026-10-02**; body below. |
+| PROV-123 | low | upstream-drift | S | **The `model.sampling_params` merge moved out of `buildBaseOptions` into the three OpenAI-compatible `buildParams`, so a direct api-level `stream()` now keeps the model's defaults** — pi v1.0.0 `api/openai-completions.ts:999` / `openai-responses.ts:363` / `azure-openai-responses.ts:347` are `Object.assign(params, model.samplingParams, options?.samplingParams)` and `api/simple-options.ts:29` passes `options?.samplingParams` through unmerged (`c01f687e5`, #9506). cyrup keeps the v0.87.1 shape. **FILED 2026-10-02**; body below. |
+| PROV-124 | low | upstream-drift | S | **An unparseable `retry-after` retries immediately instead of falling back to exponential backoff** — pi v1.0.0 gates both header branches on `Number.isFinite` (`utils/provider-retry.ts:55`, `:62`, `2bbfcca43`). cyrup's `retry_delay_ms` substitutes `0.0` for the NaN case on purpose and pins it with `an_unparseable_retry_after_retries_immediately` (`utils/provider_retry.rs`). **FILED 2026-10-02**; body below. |
+| PROV-125 | low | upstream-drift | S | **The z.ai CN endpoint's overflow message `Prompt exceeds max length` is not classified as a context overflow** — pi v1.0.0 adds `/prompt exceeds max length/i` as the second `OVERFLOW_PATTERNS` entry (`utils/overflow.ts:39`, `3dd803d7e`). cyrup's `OVERFLOW_PATTERNS` (`utils/overflow.rs:15-…`) does not carry it, so auto-compaction cannot act on it. **FILED 2026-10-02**; body below. |
+| PROV-126 | low | upstream-drift | S | **Request-header merging is case-sensitive, so a `model.headers` or `options.headers` entry whose casing differs from the builtin default is emitted as a second header instead of overriding it** — pi v1.0.0 made `providerHeadersToRecord` variadic and case-insensitive last-wins with `null` removal (`utils/headers.ts:11-23`). cyrup's `HeaderMap` is `BTreeMap<String, Option<String>>` (`lib.rs:223`) and `build_headers` inserts each overlay under its own spelling (`api/anthropic_messages/headers.rs:189-211`). **FILED 2026-10-02**; body below. |
+| PROV-127 | low | upstream-drift | S | **`AssistantMessage.thinkingLevel` is unmodelled, so the pi level the loop requested is absent from the record and from the JSONL key order** — pi v1.0.0 declares it between `providerThinkingLevel` and `diagnostics` (`types.ts:553-558`). cyrup's `AssistantMessage` has `provider_thinking_level` only (`crates/cyrup-core/src/message/assistant.rs:65`), and its hand-written serializer's field list (`:152`, `:166-192`) has no slot for it. **FILED 2026-10-02**; body below. |
+| PROV-128 | medium | upstream-drift | L | **Image models are a second, parallel registry that pi v1.0.0 deleted — `ModelType`/`AnyModel` have no `Image` variant, so no image model can reach a `Provider` or the `Models` collection** — v1.0.0 folds images into the one provider surface (`createProvider({ images })`, `providers/openrouter.ts:33`; `ModelType = "chat" \| "image" \| "classifier"` and `AnyModel`, `types.ts:1158-1176`) and deletes `images-models.ts`, `providers/openrouter-images.ts` and `builtinImagesProviders`/`builtinImagesModels` (`providers/all.ts:188`). cyrup still ships the whole separate `images::{ImagesProvider, ImagesModels}` tree plus `providers/openrouter_images.rs`, and `AnyModel` is `Chat \| Classifier` (`classifier.rs:204-207`). Discharges post-tag lead (b) at `01-…:637`. **FILED 2026-10-02**; body below. |
+| PROV-129 | low | tooling | M | **`PROV-089`'s named deadline has arrived: `image-models.generated.ts` is deleted at v1.0.0, so `openrouter-images.json` is now generated from a source that exists at no current or future tag** — v1.0.0 replaces it with `IMAGE_MODELS` in `models.generated.ts` (`providers/all.ts:1`) and moves the rows under the `openrouter` provider. cyrup's `xtask/src/main.rs:123` still pins `IMAGES_REV = "v0.87.1"` as the one non-live catalog, with a comment asserting there is no live endpoint. **FILED 2026-10-02**; body below. |
 
 ## PROV-003 — `ApiKeyAuth` has no `login`; `Models` has no `login`/`logout` (OAuth flow half closed)
 
@@ -3266,6 +3283,461 @@ generated catalog.
 **Fix** — thread `supports_openai_grammar_tools` and a `grammar_tool_input_properties` map through `ConvertResponsesToolsOptions`/`convert_responses_messages`; add the `custom` tool arm, the `custom_tool_call(_output)` replay arms (with the `DRIFT-058` same-model namespace gate), and the `custom_tool_call` slot plus `response.custom_tool_call_input.*` decoding.
 
 **Verify** — the custom-tool case of `openai-responses-namespace.test.ts` translated, plus a body-shape test that a grammar-constrained tool is sent as `type:"custom"` under `supportsOpenAIGrammarTools`.
+
+## Findings filed 2026-10-02 — the `v0.87.1..v1.0.0` window in `packages/ai`
+
+pi v1.0.0 (`2026-10-01`). Upstream read only at the tag, with `git -C tmp/pi show v1.0.0:<path>` and
+`git -C tmp/pi diff v0.87.1..v1.0.0 -- packages/ai`; cyrup read at `fe875569`. The window's headline for
+this area is the deletion of the parallel image-model registry (`PROV-128`) and the login surfaces pi
+added beside it (`PROV-117`…`PROV-120`).
+
+## PROV-113 — `onProviderStreamEvent` and its nine adapter call sites are unported
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `002fc8385` ("expose provider stream events to extensions", #9901). `packages/ai/src/types.ts:198` @v1.0.0 adds to `StreamOptions`:
+
+```ts
+onProviderStreamEvent?: (data: unknown, model: Model<Api>) => void | Promise<void>;
+```
+
+with the contract in its doc comment: "each parsed provider stream event before Pi normalization. Event data is adapter-owned and must be treated as read-only. Adapter support is explicit; unsupported adapters do not invoke it." `api/simple-options.ts:41` threads it through `buildBaseOptions`. Nine adapters invoke it, each immediately after parsing one wire event and before any normalization: `api/anthropic-messages.ts:666`, `api/openai-completions.ts:554`, `api/google-generative-ai.ts:107`, `api/google-vertex.ts:116`, `api/bedrock-converse-stream.ts:297`, `api/pi-messages.ts:415`, `api/openai-responses-shared.ts:600` (reached from `openai-responses.ts:195` and `azure-openai-responses.ts:134` via the `onProviderStreamEvent` field on its options bag at `:111`), `api/openai-codex-responses.ts:751` (passed at `:669` and `:1549`), and `api/mistral-conversations.ts:597` (threaded as a parameter from `:153`, declared `:567`).
+
+**cyrup** — `grep -rn 'on_provider_stream_event\|onProviderStreamEvent' crates/ --include='*.rs'` at HEAD returns zero. `StreamOptions` (`crates/cyrup-provider/src/stream.rs`) carries the sibling hooks `on_payload` and `on_response` (the plumbing at `stream.rs:71` and `:120-129`) but no third hook, and `build_base_options` (`utils/simple_options.rs:84-…`) has no field to thread.
+
+**Impact** — nothing; cyrup has no consumer yet. This row exists because the surface is the ai-side half of a two-part feature and because the ledger recorded it as a lead and never as an item: `01-cyrup-core-and-provider.md:638` says of `002fc8385` "`onProviderStreamEvent` / `provider_stream_event` extension event — area 06's surface", and `grep -rn 'provider_stream_event' docs/gap-analysis/06-cyrup-ext.md` is empty, so neither half is filed. File this half here; the `provider_stream_event` extension event and its WIT surface remain area 06's and are still unfiled.
+
+**Fix** — add `on_provider_stream_event: Option<Arc<dyn Fn(&serde_json::Value, &Model) -> BoxFuture<'_, ()> + Send + Sync>>` (or the crate's existing hook shape, matching `on_payload`) to `StreamOptions`; thread it in `build_base_options`; call it at the nine sites above, each on the raw parsed event before the decoder touches it. Match upstream's two invariants: the hook runs before normalization, and an adapter that does not support it simply never calls it.
+
+**Verify** — one unit test per adapter that feeds a two-event canned stream through a loopback and asserts the hook saw both raw events, in order, before the corresponding normalized `StreamEvent`s were emitted. Red at HEAD because the field does not compile.
+
+## PROV-114 — Mistral reasoning lowering is pinned to a hardcoded model-id set pi deleted
+
+**Kind** stale-port · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `dc84c1ac0` ("send requested thinking level to Mistral reasoning models"). pi v1.0.0 deletes `usesReasoningEffort`, `usesPromptModeReasoning` and `mapReasoningEffort` outright and replaces the three with a presence test on the catalog's `thinkingLevelMap` (`api/mistral-conversations.ts:202-213`):
+
+```ts
+// Models with a thinking level map use `reasoning_effort`; other reasoning models use `prompt_mode`.
+const effortMap = model.reasoning ? model.thinkingLevelMap : undefined;
+const reasoningEffort = effortMap ? (reasoning ? (effortMap[reasoning] ?? "high") : (effortMap.off ?? undefined)) : undefined;
+…
+promptMode: model.reasoning && !effortMap && reasoning ? "reasoning" : undefined,
+reasoningEffort: reasoningEffort as MistralReasoningEffort | undefined,
+```
+
+`MistralReasoningEffort` also widens from `"none" | "high"` to `"none" | "low" | "medium" | "high" | "max"` (`:34`).
+
+**cyrup** — `crates/cyrup-provider/src/api/mistral_conversations/reasoning.rs:40-50` is the deleted v0.87.1 shape, closed as `PROV-088` on 2026-09-27:
+
+```rust
+fn uses_reasoning_effort(model: &Model) -> bool {
+    matches!(model.id.as_str(), "mistral-small-2603" | "mistral-small-latest" | "zai-glm-5-2")
+        || model.id.as_str().starts_with("mistral-medium-")
+}
+```
+
+and `lower_reasoning` (`:12-34`) returns `(None, None)` whenever `!reasoning.is_on()`.
+
+**Impact** — two divergences, both demonstrable against catalog data cyrup already ships. (1) `crates/cyrup-provider/src/providers/catalog/mistral.json` carries `zai-glm-5-3` with `reasoning: true` and a `thinkingLevelMap` of `{low, high, max}`, and that id is not in cyrup's `matches!` set, so cyrup sends `prompt_mode: "reasoning"` where pi v1.0.0 sends `reasoning_effort` — the field pi's own commit says `prompt_mode` is "ignored or unsupported" on. Any further Mistral-hosted model that arrives through the live catalog with a map has the same fate. (2) With reasoning off, pi now sends `reasoning_effort: effortMap.off` (`"none"` for every mapped Mistral row cyrup ships); cyrup sends nothing, leaving the server's default in place. The `low`/`medium`/`max` widening is type-level only — `map_reasoning_effort` already returns the map's own string.
+
+**Fix** — replace `uses_reasoning_effort`/`uses_prompt_mode_reasoning` with the presence test, and move the reasoning-off early return so a model with a map still yields `reasoning_effort` from its `off` key. Keep `map_reasoning_effort`'s `?? "high"` fallback: it is unchanged upstream.
+
+**Verify** — table test in `api::mistral_conversations::tests::reasoning` over cyrup's own catalog rows: `zai-glm-5-3` with `reasoning: high` sends `reasoning_effort` and no `prompt_mode`; `magistral-medium-latest` (reasoning, no map) still sends `prompt_mode`; `mistral-medium-latest` with reasoning off sends `reasoning_effort: "none"`. All three red at HEAD. Note that `PROV-088`'s existing test `medium_family_and_glm_use_reasoning_effort_not_prompt_mode` keeps passing under the new rule and should be re-expressed against the map rather than the id list.
+
+## PROV-115 — An empty Mistral text delta splits thinking into two blocks, which Mistral rejects on replay
+
+**Kind** upstream-drift · **Severity** high · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `8930b9ec0` ("ignore empty Mistral content deltas"). pi v1.0.0 adds the same guard at both text-delta sites in `consumeChatStream`, `api/mistral-conversations.ts:634-636` and `:676-678`, with the reason in the comment:
+
+```ts
+// GLM models on Mistral send empty content deltas around thinking and tool calls.
+// Opening a block for them splits thinking into multiple blocks, which Mistral rejects on replay.
+if (!textDelta) continue;
+```
+
+**cyrup** — `crates/cyrup-provider/src/api/mistral_conversations/content.rs` calls `push_text` unguarded at all three text sites (`:92` for string content, `:99` for a string array item, `:126` for a `{type:"text"}` item), and `push_text` opens a block for any delta, empty included: when `dec.current != Some(CurrentKind::Text)` it runs `close_current` — which emits `ThinkingEnd` for an open thinking block — then `dec.push_block(Content::text(""))` and `TextStart`. The thinking branch at `:116-120` *does* skip empty deltas (`if delta.is_empty() { continue; }`), so the splitting comes entirely from the text path. Nothing drops the empty text block later: `blocks.rs:104-131` `close_current` has no emptiness test, and `finalize_tool_blocks`/`finish.rs` do not prune.
+
+**Impact** — the failure pi describes is reproducible on cyrup's own catalog. `crates/cyrup-provider/src/providers/catalog/mistral.json` ships `zai-glm-5-2` and `zai-glm-5-3`, both `reasoning: true`. On a turn where Mistral emits an empty content delta between two thinking deltas, cyrup's assistant message ends up with `thinking`, `text:""`, `thinking` instead of one thinking block. `api/mistral_conversations/messages.rs:65` then replays each thinking block as its own assistant content entry (`"thinking": [{ "type": "text", "text": … }]`), and Mistral rejects that body — so the turn after the split fails, and keeps failing while the message stays in context. That is a conversation-breaking failure on a model cyrup offers, which is why this is the one `high` in the batch.
+
+**Fix** — add `if delta.is_empty() { continue; }` ahead of each of the three `push_text` call sites in `process_content` (pi guards two because its string-content path collapses differently; cyrup's third site needs the same treatment for the same reason). Do not put the guard inside `push_text`: a caller that legitimately wants an empty text block — there is none today — would be silenced invisibly.
+
+**Verify** — `api::mistral_conversations::tests` decode test over a canned stream of `thinking "a"`, `content ""`, `thinking "b"`: the message has exactly one thinking block containing `"ab"` and no text block. Red at HEAD (three blocks). A second test should round-trip that message through `messages.rs` and assert one assistant thinking entry.
+
+## PROV-116 — Responses streams hand the agent unfinished tool calls
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `1b2aa0ca0` ("reject unfinished Responses tool calls instead of running them", fixes #9974). pi v1.0.0 adds, after the terminal-event check in `processResponsesStream` (`api/openai-responses-shared.ts:764-775`):
+
+```ts
+if (output.stopReason === "toolUse") {
+    for (const block of output.content) {
+        if (block.type !== "toolCall") continue;
+        const toolCall = block as StreamingToolCall;
+        if (toolCall.partialJson !== undefined || toolCall.customInput !== undefined) {
+            throw new Error(`OpenAI Responses stream completed with an unfinished tool call: ${toolCall.name} (${toolCall.id})`);
+        }
+    }
+}
+```
+
+The scratch buffers are the liveness marker — a finished call has had `partialJson`/`customInput` deleted. The commit message gives the concrete failure: with a server that omits `output_index`, two parallel calls became three (`echo a`, `echo a`, `echo b`), two sharing an id, and the agent ran all three.
+
+**cyrup** — `crates/cyrup-provider/src/api/openai_responses/decoder.rs:203-227` ends the stream on `saw_terminal` alone and emits `StreamEvent::end_of_stream`. `grep -n 'unfinished' crates/cyrup-provider/src/api/openai_responses/` is empty. The `partial_json` scratch buffer exists and is the right marker: `blocks.rs:27`/`:55` declare it, `events.rs:109-130` accumulate into it, and `events.rs:206-223` is where a completed item replaces it.
+
+**Impact** — the known trigger does not reach cyrup: `crates/cyrup-llama` streams over `openai-completions`, not `openai-responses` (`cyrup-llama/src/provider.rs:5-6`, `model.rs:148`). But the Responses decoder is shared by `openai`, `azure-openai-responses`, `openai-codex`, `opencode` and any OpenAI-compatible relay in the live catalog, and the consequence of the gap is that cyrup executes a tool call whose arguments were truncated mid-JSON or merged from two concurrent calls. For `bash`/`edit`/`write` that is a destructive action with wrong arguments, which is why this is `medium` rather than `low` despite no in-tree reproduction.
+
+**Fix** — in the `end_of_stream` path at `decoder.rs:203-227`, when the resolved stop reason is `ToolUse`, scan the snapshot's tool blocks for a non-empty `partial_json` (and the grammar `custom_input` equivalent once `PROV-101` lands) and route that to the error path with pi's message verbatim. Note the ordering: upstream raises this *after* the terminal-event check, so a truncated stream still reports the truncation, not the unfinished call.
+
+**Verify** — decode test feeding `response.output_item.added` for a function call plus `response.function_call_arguments.delta` and then a terminal `response.completed` with no `output_item.done`: the stream ends in an error whose text is `OpenAI Responses stream completed with an unfinished tool call: <name> (<id>)`, and no tool call reaches the message. Red at HEAD, where the call is emitted with its partial arguments.
+
+## PROV-117 — A loopback bind failure aborts `/login` instead of falling back to manual paste
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `4df157433` ("share OAuth callback server and sign-in page") extracts `auth/oauth/callback-server.ts` (183 lines) and converts four flows to it. Two of them now tolerate a listener that never comes up: `auth/oauth/anthropic.ts:140-148` and `auth/oauth/openai-codex.ts:362-370` both end the `startOAuthCallbackServer({…})` call with `.catch(() => undefined)`, and `waitForCallbackOrManualInput` (`auth/oauth/callback-server.ts:155-184`) takes `callback: OAuthCallbackServer<T> | undefined` and documents the degraded path: "Without a callback server only the manual prompt is used." `openrouter.ts:116` and `radius.ts:153` keep the hard failure.
+
+**cyrup** — `crates/cyrup-provider/src/auth/oauth/anthropic.rs` `run_login` propagates the start error:
+
+```rust
+// `:231` — the verifier doubles as the OAuth state. The port is fixed and pre-registered,
+// so a second concurrent login surfaces as `OAuthError::Listen`, which is upstream's
+// `server.on("error", reject)` (`:150-152`); there is no manual-paste fallback for it.
+let server = CallbackServer::start(config, AnthropicCallbackHandler { … }).await?;
+```
+
+That comment was a correct reading of v0.87.1 and is now stale. The Codex flow in `auth/oauth/openai_codex.rs` has the same shape.
+
+**Impact** — on any host where port 53692 (Anthropic) or 1455 (Codex) is already bound, or where a sandbox refuses the loopback listen, `/login anthropic` and `/login openai-codex` fail outright in cyrup. pi 1.0 shows the authorize URL and the paste prompt, and the login completes. cyrup already has every piece needed for the degraded path — the manual-code prompt, the paste parser, and the redirect-URL validator are all present and tested (`login_completes_via_manual_paste`, `login_accepts_a_pasted_redirect_url_with_the_matching_state`) — they are simply unreachable when the listener does not start.
+
+**Fix** — make the two flows tolerate `CallbackServer::start` failing: hold `Option<CallbackServer>`, skip the `select!` when it is `None` and await the paste prompt alone, and keep the `redirect_uri` the prompt advertises as the constant rather than reading it off the server. Leave openrouter and radius alone — upstream deliberately did. The shared seam is worth extracting at the same time (cyrup's `CallbackServer` already is one), but the behaviour change is the item.
+
+**Verify** — a test that binds the fixed port itself, then runs `login` with a scripted interaction supplying a pasted redirect URL, and asserts the credential is returned. Red at HEAD with `OAuthError::Listen`. One test per flow.
+
+## PROV-118 — "Sign in with ChatGPT" on the `openai` provider is unported
+
+**Kind** not-ported · **Severity** medium · **Effort** L · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `02eed88fd` ("add alternative sign in for the openai provider"). pi v1.0.0 `providers/openai.ts:12-19` gives the plain `openai` provider an OAuth entry beside its api key:
+
+```ts
+oauth: lazyOAuth({ name: "OpenAI (ChatGPT subscription)", isSubscription: true, loginLabel: "Sign in with ChatGPT", load: loadOpenAIChatGPTOAuth }),
+```
+
+The flow is the new `auth/oauth/openai-chatgpt.ts` (310 lines): a public PKCE client with **dynamic client registration** — every login sends `client_id=dynamic_agent_client` and reads the issued client id back out of the callback's `client_id` parameter — against `https://auth.openai.com/api/accounts/authorize` and `…/oauth/token`, `resource=https://api.openai.com/v1`, scope `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct`, a fixed callback on `127.0.0.1:1455/auth/callback`, a three-minute `EXPIRY_MARGIN_MS` on refresh, and a manual-paste branch that validates the pasted URL's origin and path. Four supporting changes land with it:
+
+- `auth/types.ts:202-226` — a new `LoginOptions { getDeviceId?: () => string }` second parameter on `OAuthAuth.login`, for "the stable ID of this app installation, e.g. sent to OpenAI as its agent host ID", which the app creates on first use and must return identically thereafter.
+- `utils/retry.ts:27` adds `subscription_sharing_usage_limit_exceeded` to the NON-retryable limit patterns, and `:99-100` add `subscription_sharing_usage_unavailable` / `subscription_sharing_user_unavailable` to the retryable set (filed separately as `DRIFT-060`, area 12, which owns that list).
+- `api/openai-responses.ts:30-43`, `:222-229` — `isChatGPTSignIn` (provider `openai`, the real OpenAI base URL, and a credential that does not start with `sk-`) and a `Check your ChatGPT usage: https://chatgpt.com/settings/usage` line appended to the limit error.
+- `providers/openai-codex.ts:10` renames the old Codex provider to `OpenAI Codex (legacy)`, which is how the `/login` picker distinguishes the two ChatGPT-backed options.
+
+**cyrup** — `crates/cyrup-provider/src/providers/openai.rs` builds api-key auth only (`:17`, `:30` cite `envApiKeyAuth("OpenAI API key", …)`), `providers/builtin_oauth.rs:95` lists `"openai"` among the providers with no built-in OAuth, and `grep -rn 'openai-chatgpt\|openai_chatgpt\|subscription_sharing\|dynamic_agent_client' crates/` at HEAD is empty. `OAuthAuth::login` (`auth/mod.rs:118-131`) takes `&dyn AuthInteraction` and no options bag, so there is nowhere for a device id to arrive.
+
+**Impact** — a ChatGPT Plus/Pro subscriber cannot reach `api.openai.com` through their subscription in cyrup; the only OpenAI subscription path is the legacy Codex provider against `chatgpt.com/backend-api`. No existing behaviour is wrong, which is why this is `medium` and not higher.
+
+**Fix** — split it. (a) Widen `OAuthAuth::login` with an options parameter carrying `get_device_id`, and give `Models::login` a place to supply it; this is the cross-cutting half and should land first. (b) Port the flow as `auth/oauth/openai_chatgpt.rs` on cyrup's existing `CallbackServer` + `generate_pkce` + manual-paste primitives, including the dynamic-client-registration read-back and the refresh margin. (c) Register it on `providers/openai.rs` with `loginLabel`/`isSubscription`, and remove `"openai"` from `builtin_oauth.rs:95`'s no-OAuth list. (d) The `isChatGPTSignIn` usage hint on the Responses error path. (e) The Codex display-name rename. Land (a) with `PROV-117`, which also touches these flows.
+
+**Verify** — per-part. (a) A `dyn OAuthAuth` test that the device-id closure reaches a flow that asks for one. (b) The full flow against a loopback stand-in for `auth.openai.com`: authorize URL contents, `client_id` read-back from the callback, token exchange, refresh with the margin applied, and the pasted-URL origin/path rejection. (c) `/login` lists "Sign in with ChatGPT" for `openai`. (d) A 429 body containing `subscription_sharing_usage_limit_exceeded` yields an error message ending in the usage URL.
+
+## PROV-119 — Anthropic workload identity federation is unported
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `a9424cd43` ("Anthropic workload identity federation", #10242). `env-api-keys.ts:32-36` @v1.0.0 adds `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`, `ANTHROPIC_IDENTITY_TOKEN_FILE`, `ANTHROPIC_WORKSPACE_ID`. `providers/anthropic.ts:48-69` resolves them **last**, after all three key env vars, and returns them as provider config rather than auth — `return { auth: {}, env: federation, source: "workload identity federation" }` — requiring the first three and treating the last two as optional. `api/anthropic-messages.ts:351-379` `getAnthropicFederation` turns that `env` into an SDK `config` with `authentication: { type: "oidc_federation", identity_token: { source: "file", path } }`, but only for `model.provider === "anthropic"` and only when `hasRequestAuth` is false; `:324-326` splits `hasRequestAuth` out of the old `assertRequestAuth` so the assertion can be skipped (`:614`, `:935`). Two further details: `PiAnthropic` (`:333-338`) overrides `_shouldResolveDefaultCredentials()` to `false` so the SDK's own credential chain never runs behind pi's resolver, and `:1054-1068` caches one client per `[baseUrl, federation]` key and clones it with `withOptions()` per request so the SDK's federated-token cache survives pi's per-request client construction.
+
+**cyrup** — `grep -rn 'ANTHROPIC_FEDERATION\|ANTHROPIC_ORGANIZATION_ID\|ANTHROPIC_IDENTITY_TOKEN' crates/ --include='*.rs'` at HEAD is empty, and `grep -rn -i 'federation' docs/gap-analysis/` is empty. `env_api_keys.rs:39` maps anthropic to `["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]` (the `ANTHROPIC_AUTH_TOKEN` omission is `PROV-021`, still open), and `api/anthropic_messages/headers.rs:81-…` `build_headers` has no third auth branch.
+
+**Impact** — a cyrup run in a CI or Kubernetes workload that authenticates to Anthropic by OIDC federation instead of a key has no path: the five env vars are ignored and the request fails `No API key for provider: anthropic`.
+
+**Fix** — two halves, and the second is the real work. (a) Add the five env constants and the federation arm to anthropic's api-key auth, resolved last and returning the ids in `env` — note this depends on the auth resolution's `env` actually reaching `request_options.env`, which is `PROV-109`, still open; schedule after it. (b) cyrup does not use the Anthropic SDK, so there is no `config` to hand off: the OIDC token-file read, the exchange against Anthropic's federation endpoint, the short-lived access token and its refresh all have to be implemented, plus the per-`[base_url, config]` token cache that `:1049-1067` exists to provide. `PiAnthropic`'s `_shouldResolveDefaultCredentials` override is **not applicable** — cyrup has no SDK credential chain to suppress.
+
+**Verify** — resolution order test: with a key present the federation arm is not taken; with only the three required ids it is, and they arrive in `env`. Wire test against a loopback federation endpoint: one exchange, the access token on the request, a second request inside the token's lifetime reusing the cached token, and a third after expiry re-exchanging.
+
+## PROV-120 — The Anthropic copy-code login method and its selector are unported
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `7a11fe1c7` ("add copy code login method to Anthropic OAuth", #10194). `auth/oauth/anthropic.ts:270-288` @v1.0.0 turns `login` into a chooser:
+
+```ts
+const method = await interaction.prompt({ type: "select", message: "Select Anthropic login method:", options: [
+    { id: "browser", label: "Browser login (default)" },
+    { id: "copy_code", label: "Copy code login (headless)" },
+] });
+```
+
+and `:191-230` adds `loginAnthropicCopyCode`: the same PKCE authorize URL but with `redirect_uri = COPY_CODE_REDIRECT_URI` (`:21`, `https://platform.claude.com/oauth/code/callback`), no listener at all, a `manual_code` prompt placeholdered `code#state`, and the exchange posted against that same redirect URI. An unknown method id throws.
+
+**cyrup** — `crates/cyrup-provider/src/auth/oauth/anthropic.rs:705` `login` is `self.run_login(interaction).await` with no selector, and `run_login` is the single browser-redirect flow. There is no copy-code constant: `grep -n 'oauth/code/callback' crates/` is empty. The primitives are all present and used elsewhere — `AuthPromptKind::Select` with `AuthSelectOption` (`auth/oauth/interaction.rs:18`, `:45`, `:69`), the TUI arm that renders it (`cyrup-tui/src/login_dialog.rs:746`), and `parse_authorization_input`'s `code#state` handling inside this very module.
+
+**Impact** — on a host with no browser and no reachable loopback (a container, a bare SSH session), pi 1.0 offers a flow that needs neither; cyrup's only Anthropic path needs one of the two. Note the overlap with `PROV-117`: that row makes the *existing* flow survive a bind failure, this one adds the flow upstream prefers for that case. Both are worth having, and they should be scheduled together since they edit the same function.
+
+**Fix** — add the two method constants and the copy-code redirect URI; put the `Select` prompt at the top of `login` with upstream's ids, labels and order; implement `login_copy_code` as the authorize-URL notify plus one `manual_code` prompt plus the exchange against the copy-code redirect URI; reject an unknown method id with upstream's message. Reuse `parse_authorization_input` and the existing state-mismatch check unchanged.
+
+**Verify** — `ScriptedInteraction` test choosing `copy_code`, pasting `code#state`, and asserting the exchange body's `redirect_uri` is the copy-code URL and no listener was started; a second choosing `browser` that still reaches the existing redirect flow; a third asserting an unknown id errors. All red at HEAD (no selector prompt is issued, so the scripted answer is never consumed).
+
+## PROV-121 — Anthropic strict tool use has no provider rejected-keyword check
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `295cc72b0` ("send Anthropic tools non-strict when schema has rejected keywords"). `api/constrained-sampling.ts:13` @v1.0.0 adds `export type UnsupportedStrictSchemaKeywordCheck = (key: string, value: unknown) => boolean;` and threads an optional predicate through `makeJsonSchemaNodeStrict` (`:56`, applied `:65-71`, recursed at `:81`, `:89`, `:117`), `makeStrictJsonSchema` (`:129`) and `resolveJsonSchemaStrictSampling` (`:228`). `api/anthropic-messages.ts:1550-1583` supplies the Anthropic predicate: eleven outright-rejected keywords (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `maxItems`, `uniqueItems`, `minContains`, `maxContains`, `minProperties`, `maxProperties`), `minItems` rejected unless it is `0` or `1`, and `format` rejected unless its value is one of ten allowed string formats. `:1593` passes it in `convertTools`. The failure mode in the comment: these keywords make Anthropic "reject the whole request" with a 400.
+
+**cyrup** — `crates/cyrup-provider/src/utils/constrained_sampling.rs:402` is `resolve_json_schema_strict_sampling(tool: &ToolDef, supports_strict_mode: bool)` — two arguments, no hook — and all eight call sites pass two (`api/anthropic_messages/tools.rs:32`, `openai_completions/tools.rs:70`, `openai_responses/tools.rs:45`, `bedrock_converse_stream/convert.rs:347`, `google_generative_ai/tools.rs:30` and `:77`, `mistral_conversations/tools.rs:38`, `cyrup-ext/src/wrapper.rs:530`). `grep -rn 'UnsupportedStrictSchemaKeyword' crates/` is empty.
+
+**Impact** — nothing today, and the body should say so plainly rather than overstate it. The trigger needs a tool with `constrainedSampling.type == "json_schema"` *and* a model with `supports_strict_tools`. cyrup has sixteen Anthropic models with `supportsStrictTools: true` in `providers/catalog/anthropic.json`, but only four built-in tools opt into strict sampling at all — `read`, `write`, `edit` and the shell engine, each returning the single shared `cyrup_core::prefer_strict_tool_sampling()` static — and none of their parameter schemas carries any rejected keyword (`grep -n '"minimum"\|"maximum"\|"maxItems"\|"format"\|"uniqueItems"\|"multipleOf"' crates/cyrup-tools/src/tools/{read,write,edit,bash}.rs` is empty). MCP and extension tools, which can carry arbitrary schemas, do not declare constrained sampling (`grep -rn 'constrained_sampling' crates/cyrup-mcp/src/` is empty). So the hole is latent: it opens the first time a tool with a server-supplied schema opts into strict sampling, and then it is a hard 400 for the whole request rather than a degraded single tool — which is exactly why upstream's `prefer` fallback matters.
+
+**Fix** — add the predicate parameter to `make_json_schema_node_strict`, `make_strict_json_schema` and `resolve_json_schema_strict_sampling` (take `Option<&dyn Fn(&str, &serde_json::Value) -> bool>`), thread `None` at the seven non-Anthropic sites, and supply the Anthropic predicate with the three rules above at `api/anthropic_messages/tools.rs:32`. Keep upstream's error-kind behaviour: a rejected keyword is an `UnsupportedStrictJsonSchema` error, so `prefer` degrades to non-strict and `require` fails the request with the reason.
+
+**Verify** — in `utils::constrained_sampling::tests`, a `prefer` tool whose schema has `{"type":"integer","minimum":1}` resolves to `None` under the Anthropic predicate and to `Some(true)` under `None`; `minItems: 1` is accepted and `minItems: 2` is not; `format: "date"` is accepted and `format: "regex"` is not; the same tool under `require` errors with the keyword in the message. Red at HEAD because the parameter does not compile.
+
+## PROV-122 — One-hour cache writes reported in `message_delta` are priced at the five-minute rate
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `667fc3dd3` ("price Vercel AI Gateway 1-hour cache writes correctly"). pi reads the TTL breakdown in both usage positions at v1.0.0: `api/anthropic-messages.ts:686` on `message_start` (`event.message.usage.cache_creation?.ephemeral_1h_input_tokens || 0`) and `:843-849` on `message_delta`, with the reason in the comment — "Vercel AI Gateway includes the TTL breakdown in deltas, though the SDK only types it on message_start" — cast through an inline type widening because the SDK type lacks the field. `calculateCost` runs immediately after, at `:857-858`.
+
+**cyrup** — `crates/cyrup-provider/src/api/anthropic_messages/usage.rs:7-27` `apply_message_start_usage` reads it (`:21-26`, `cache_creation.ephemeral_1h_input_tokens`, defaulting to `Some(0)`), but `:31-53` `apply_message_delta_usage` updates `input`, `output`, `cache_read`, `cache_write` and `reasoning` and never touches `cache_write_1h` — so a one-hour write that only the delta reports stays at whatever `message_start` seeded, which for a relay that omits it there is `0`.
+
+**Impact** — the one-hour portion is then billed through `cache_write` at the short-cache rate. `PROV-081` closed exactly this shape on the Bedrock decoder (`cacheDetails` with `ttl: "1h"`) and was `low`; this row is its Anthropic-decoder twin and the ledger already called it "a `PROV-081`-class pricing gap" as lead (c) at `01-cyrup-core-and-provider.md:636-638`, which this row discharges. Reach is narrow: cyrup has no `vercel-ai-gateway` provider module (`ls crates/cyrup-provider/src/providers/` has no entry for it), so today the delta path is only taken by Anthropic-compatible relays arriving through the live catalog.
+
+**Fix** — in `apply_message_delta_usage`, add the `cache_creation.ephemeral_1h_input_tokens` read under upstream's `!= null` guard, i.e. assign only when the key is present, so an absent breakdown does not clobber the `message_start` value. Unlike the `message_start` path it must not default to zero.
+
+**Verify** — `api::anthropic_messages::tests::usage` test: a `message_start` with no `cache_creation` followed by a `message_delta` carrying `cache_creation.ephemeral_1h_input_tokens: 1000` yields `cache_write_1h == Some(1000)` and the cost computed with the one-hour rate; a delta with no `cache_creation` leaves the seeded value intact. Red at HEAD on the first case.
+
+## PROV-123 — The `model.sampling_params` merge moved into the adapters
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `c01f687e5` ("apply model samplingParams in direct stream()/complete() calls", closes #9506). The commit message states the defect: "Model-level samplingParams were only merged by streamSimple(). Direct stream()/complete() calls, such as extensions using modelRegistry.complete(), dropped them." The fix **moves** the merge, it does not duplicate it: `api/simple-options.ts:29` now passes `samplingParams: options?.samplingParams` straight through, and the three OpenAI-compatible `buildParams` tails become `Object.assign(params, model.samplingParams, options?.samplingParams)` (`api/openai-completions.ts:999`, `api/openai-responses.ts:363`, `api/azure-openai-responses.ts:347`), with per-request keys still last.
+
+**cyrup** — the v0.87.1 arrangement, and documented as deliberate. `utils/simple_options.rs:64-78` `merge_sampling_params` does the merge and `:103-106` places it in `build_base_options`; `api/openai_completions/params.rs:240-246` applies only `opts.sampling_params` with the comment "The merge with `Model.sampling_params` already happened in `build_base_options`", and `api/openai_responses/params.rs:268-270` and `api/azure_openai_responses.rs:435-436` say the same. `crates/cyrup-provider/src/tests/sampling_params.rs:141` is a test whose doc names "the reason the merge lives in `build_base_options` rather than in each adapter" — upstream has now reversed that reason.
+
+**Impact** — a call that reaches an `ApiImpl::stream` with a hand-built `StreamOptions`, bypassing `build_base_options`, drops the model's sampling defaults. `build_base_options` is public (`lib.rs:202`), so the bypass is reachable by construction; cyrup has no extension-facing `complete`/`stream` surface today (`grep -rn 'fn complete' crates/cyrup-ext/src/` is empty), which is why this is `low` rather than a live defect. It will become one the moment that surface lands, and it is cheaper to move the merge now than to discover it then.
+
+**Fix** — mirror the move exactly: have `build_base_options` copy `options.base.sampling_params` through unchanged, and make `apply_sampling_params` take the model so it can apply `model.sampling_params` then the request's, per key, request last. `merge_sampling_params`' `None`-vs-empty-map distinction stops mattering once the merge is an `Object.assign` equivalent at the point of use, but check the three adapters' empty-map behaviour against upstream before deleting it.
+
+**Verify** — add to `crates/cyrup-provider/src/tests/sampling_params.rs` a case that calls each of the three adapters' param builders with a `StreamOptions::default()` (no `sampling_params`) and a model carrying `{"top_p": 0.5}`, asserting `top_p` is in the body. Red at HEAD. The existing cases that go through `build_base_options` must stay green, and the test at `:141` needs its doc rewritten rather than deleted — it records why the old arrangement existed.
+
+## PROV-124 — An unparseable `retry-after` retries immediately instead of backing off
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `2bbfcca43` ("use exponential backoff when Retry-After is unparseable"). `utils/provider-retry.ts` @v1.0.0 tightens both header branches of `getRetryDelayMs`: `:55` becomes `if (Number.isFinite(value))` for `retry-after-ms` (was `!Number.isNaN`, which let `Infinity` through), and `:62` wraps the `retry-after` branch in `if (Number.isFinite(delayMs))` so a value that is neither a number nor a parseable HTTP-date — `delayMs` is then `NaN` from `Date.parse(…) - Date.now()` — falls through to the exponential ladder below instead of being returned.
+
+**cyrup** — `crates/cyrup-provider/src/utils/provider_retry.rs` `retry_delay_ms` reproduces the old behaviour on purpose, and says so:
+
+```rust
+// Pi's unparseable-date branch yields NaN, which `validateServerRetryDelayMs` passes
+// through (`NaN > max` is false) and `abortableSleep`'s `Math.max(0, NaN)` then floors
+// to an immediate retry. `0.0` reproduces that without importing NaN into the ladder.
+None => parse_http_date_ms(raw).map(|at| (at - now_ms()) as f64).unwrap_or(0.0),
+```
+
+and pins it with `an_unparseable_retry_after_retries_immediately` (`:413`).
+
+**Impact** — a provider that answers a 429 with a malformed `Retry-After` gets `max_retries` immediate retries from cyrup, burning the whole retry budget in microseconds and hammering an endpoint that just asked to be left alone. pi 1.0 waits `0.5·2^n` seconds, capped at 8. No cyrup-reachable provider is known to send a malformed value, which is why this stays `low`.
+
+**Fix** — return the exponential delay when the computed `delay_ms` is not finite, for both headers. In Rust that is: keep `js_parse_float` for `retry-after-ms` but reject non-finite results; and in the `retry-after` branch, fall through to the exponential tail when `parse_http_date_ms` returns `None` rather than substituting `0.0`. The existing comment should be replaced, not amended — it documents behaviour upstream has abandoned.
+
+**Verify** — invert `an_unparseable_retry_after_retries_immediately` into `an_unparseable_retry_after_falls_back_to_exponential_backoff` and add a case for `retry-after-ms: Infinity`. Both red at HEAD.
+
+## PROV-125 — The z.ai CN overflow message is not classified as a context overflow
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `3dd803d7e` ("detect Z.AI CN endpoint context overflow errors"). `utils/overflow.ts:39` @v1.0.0 adds `/prompt exceeds max length/i, // z.ai CN endpoint token overflow` as the second entry of `OVERFLOW_PATTERNS`, and the module doc at `:30` records the CN endpoint's second body shape alongside the first: `{"code":"1261","message":"Prompt exceeds max length"}`.
+
+**cyrup** — `crates/cyrup-provider/src/utils/overflow.rs:15-…` `OVERFLOW_PATTERNS` opens with `r"prompt (?:is )?too long"` (the widened form that closed `PROV-082` on 2026-09-27) and has no `exceeds max length` entry; `grep -rn 'exceeds max length' crates/` at HEAD is empty.
+
+**Impact** — a context overflow from z.ai's CN endpoint is classified as an ordinary provider error, so auto-compaction never fires on it and the turn fails where it would otherwise recover. Same mechanism and same blast radius as `PROV-082`, which was `medium` when the pattern it added was the only one covering z.ai at all; this is a second endpoint's wording, hence `low`.
+
+**Fix** — add the pattern in pi's position (immediately after the Anthropic/z.ai one) with pi's comment, and extend the module doc's z.ai line to name both bodies. `PROV-S03` byte-compared this list against upstream once; preserving order keeps that comparison meaningful.
+
+**Verify** — extend `utils::overflow::tests::zai_prompt_too_long_and_provider_gated_bodyless` (or add a sibling) with a message of `{"code":"1261","message":"Prompt exceeds max length"}` asserted as an overflow. Red at HEAD.
+
+## PROV-126 — Header merging is case-sensitive, so a differently-cased override emits a second header
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `4df157433` and its neighbours rewrite `utils/headers.ts:11-23` @v1.0.0 from a single-map copy into a variadic case-insensitive merge:
+
+```ts
+export function providerHeadersToRecord(...headerSources: (ProviderHeaders | undefined)[]) {
+    const merged = new Map<string, [string, string]>();
+    for (const source of headerSources)
+        for (const [name, value] of Object.entries(source ?? {})) {
+            const normalizedName = name.toLowerCase();
+            merged.delete(normalizedName);
+            if (value !== null) merged.set(normalizedName, [name, value]);
+        }
+    return merged.size > 0 ? Object.fromEntries(merged.values()) : undefined;
+}
+```
+
+Three behaviours fall out, none of which the old object-spread `mergeClientHeaders` had: a later source overrides an earlier one **regardless of casing**; the surviving entry keeps the *last* source's spelling; and a later `null` **removes** an earlier source's header instead of merely failing to set it. `api/anthropic-messages.ts:1045-1051` now calls it with four sources, and `api/llama-cpp-classify.ts:236` with its own list.
+
+**cyrup** — `HeaderMap` is `pub type HeaderMap = std::collections::BTreeMap<String, Option<String>>` (`crates/cyrup-provider/src/lib.rs:223`) — case-sensitive keys — and `api/anthropic_messages/headers.rs:189-211` applies each overlay with `headers.insert(name.clone(), value.clone())`, i.e. under the source's own spelling, in the order auth overlay → `model.headers` → Copilot dynamic → `opts.headers`. The order is right (it is what `PROV-028` and `PROV-095` established); the key normalization is not. The one place cyrup already has the new shape is the classifier api `EXT-027`'s closure ported: `api/llama_cpp_classify.rs:663` `provider_headers_to_record(sources: &[Option<&HeaderMap>])`.
+
+**Impact** — a `model.headers` entry from the live catalog, or an `options.headers` entry from settings, spelled `X-Api-Key` or `Anthropic-Beta` rather than lowercase, does not replace cyrup's lowercase default: both go on the wire. For `x-api-key` that means the default key is still sent and the override silently has no effect; for `anthropic-beta` it means two conflicting beta lists. A `null` intended to suppress a default also misses when the casing differs. All cyrup's own defaults are lowercase, so the trigger is a differently-cased value from catalog or config, which is why this is `low` — but it fails silently, which is the part worth fixing.
+
+**Fix** — give the four wire apis that merge provider headers one shared helper with the semantics above: normalize to lowercase for identity, keep the last writer's spelling for output, and let `None` remove. Generalize `api/llama_cpp_classify.rs:663`'s function into `utils/headers.rs` rather than writing a second one. Leave the merge *order* alone.
+
+**Verify** — unit test on the shared helper for each of the three behaviours; plus an `api::anthropic_messages::tests::headers` case where `model.headers` carries `X-Api-Key` over a lowercase default and exactly one `x-api-key`-identity header with the override's value reaches the request. Red at HEAD (two headers).
+
+## PROV-127 — `AssistantMessage.thinkingLevel` is unmodelled
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `types.ts:553-558` @v1.0.0 adds a second thinking field to `AssistantMessage`, immediately after `providerThinkingLevel` and before `diagnostics`:
+
+```ts
+/** Pi thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. */
+thinkingLevel?: ModelThinkingLevel;
+```
+
+The pair is deliberate: `providerThinkingLevel` records the provider-native effort string actually used, `thinkingLevel` the pi level the loop asked for.
+
+**cyrup** — `crates/cyrup-core/src/message/assistant.rs:54-69` declares `provider_thinking_level: Option<String>` then `diagnostics`, with nothing between; `grep -n 'thinking_level' crates/cyrup-core/src/message/assistant.rs` finds only `provider_thinking_level` (`:65`, `:166`, `:186`, `:246`, `:280`). The hand-written serializer's documented key order (`:152`) is `provider, model, responseModel?, responseId?, providerThinkingLevel?, diagnostics?, usage, stopReason, deferred?, …`, and `len` (`:166-167`) counts the two optional fields it knows about.
+
+**Impact** — the record cannot say what level was requested, only what the provider was told, so a transcript cannot distinguish "the user asked for `high` and the model mapped it to `high`" from "the user asked for `max` and the catalog clamped it". It also puts cyrup's JSONL one key short of pi's for any message pi would stamp — the same class of byte-order divergence `PROV-020` tracks for `toolResult`. No current cyrup behaviour is wrong; the field has no reader.
+
+**Fix** — add `thinking_level: Option<ModelThinkingLevel>` in pi's slot, serialize it as `thinkingLevel` between `providerThinkingLevel` and `diagnostics`, skipped when unset, and widen `len` by one. The producer is the agent loop, not the provider — cyrup's loop already resolves a level per request (the ladder at `cyrup-session-svc/src/session/model.rs`, per `TUI-105`'s closure note), so stamping it is a one-line addition there, and area 03's owner should confirm nothing in its transcript reader assumes the old key set.
+
+**Verify** — serializer test in `assistant.rs`: with `thinking_level: None` the key is absent and the JSON is byte-identical to today; with `Some(Max)` the key appears as `"thinkingLevel":"max"` between `providerThinkingLevel` and `diagnostics`. Round-trip through `cyrup-test-support`'s interop fixtures as `PROV-012` does for `rawStopReason`.
+
+## PROV-128 — Image models are a parallel registry pi v1.0.0 deleted; `AnyModel` has no `Image` variant
+
+**Kind** upstream-drift · **Severity** medium · **Effort** L · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `a328aa89a` ("unify image and classifier models"), the commit post-tag lead (b) at
+`01-cyrup-core-and-provider.md:637` named. v1.0.0 collapses what were three registries into one:
+
+- `types.ts:1096-1176` splits `Model` into a shared `BaseModel<TApi>` (`id`, `name`, `api`, `provider`,
+  `baseUrl`, `input`, `inputLimits?`, `cost`, `headers?`) plus three siblings that carry a `type`
+  discriminant: `Model<Api>` with `type?: "chat"`, `ImageModel<ImageApi>` with `type: "image"`, and
+  `ClassifierModel<ClassifierApi>` with `type: "classifier"`. `ModelTypeMap`, `ModelType` and
+  `AnyModel` (`:1163-1176`) are the union, and `KnownImagesApi`/`ImagesProviderId` are renamed
+  `KnownImageApi`/dropped in favour of the ordinary `ProviderId` (`:31-35`, `:84`, `:622-623`).
+- `models.ts` gives one `Provider` all three operations — `getAllModels()` beside `getModels()`, and
+  `images` / `classifiers` dispatch maps on `createProvider` — with `KNOWN_MODEL_TYPES` and
+  `withKnownModelTypes` (`:116-127`) dropping stored or remote entries whose type this build does not
+  know. `utils/model-operations.ts` (new, 70 lines) holds `getModelType`, `isModelType`, the three
+  `assert*Model` guards and `imageErrorResult`/`classifierErrorResult`.
+- `providers/all.ts` adds `getBuiltinImageModel`, `getBuiltinClassifierModel`,
+  `getBuiltinImageModels`, `getBuiltinClassifierModels` and `getAllBuiltinModels` over the generated
+  `IMAGE_MODELS`/`CLASSIFIER_MODELS` records (`:55-132`), and **deletes** `builtinImagesProviders()`
+  and `builtinImagesModels()` (`:188`, the last 14 lines of the file at v0.87.1).
+- The whole separate images layer is gone: `git cat-file -e v1.0.0:packages/ai/src/images-models.ts`,
+  `…/src/image-models.generated.ts` and `…/src/providers/openrouter-images.ts` all fail. The
+  `openrouter-images` api survives only as a map entry on the ordinary openrouter provider:
+  `providers/openrouter.ts:33` is `images: { "openrouter-images": openrouterImagesApi() }`, with its
+  rows merged into that provider's one `models` array (`:23-27`).
+
+**cyrup** — the classifier half of this unification is ported (`EXT-027`, the llama-cpp port) and the
+image half is not, so cyrup sits exactly half-way:
+
+- `crates/cyrup-provider/src/classifier.rs:43-46` is `enum ModelType { Chat, Classifier }` with
+  `ModelType::ALL` a two-element array (`:50`), and `:204-207` is `enum AnyModel { Chat(Model), Classifier(ClassifierModel) }`.
+  There is no `Image` variant in either, and no `ImageModel` type — `grep -rn 'struct ImageModel' crates/ --include='*.rs'`
+  is empty; the only match is the old-shaped `images::ImagesModel` (`images/mod.rs:48`).
+- `AnyModel`'s own `Deserialize` (`classifier.rs:282-299`) rejects any other type outright:
+  `Some(other) => Err(D::Error::custom(format!("unknown model type: {other}")))`, so `"type":"image"`
+  is an error, not a variant.
+- Images keep their own parallel tree, which is what upstream deleted: `images/mod.rs` declares
+  `ImagesProvider` (`:294`), `ImagesModels` (`:398`) and `create_images_models`, with its own
+  `generate_images` collection method at `:508`; `providers/all.rs:377` `all_images_providers()` and
+  `:383` `default_images_models()` are cited in-file to pi's now-deleted `builtinImagesProviders` /
+  `builtinImagesModels` (`all.ts:125-131`); `providers/openrouter_images.rs:26` is the deleted
+  `openrouterImagesProvider`.
+- The unified `Provider`/collection surface has the classifier leg only: `provider.rs:118`
+  `get_all_models()` defaults to wrapping the chat catalog as `AnyModel::Chat`, `:214` tests for
+  `AnyModel::Classifier`, and `collection.rs:487` is `classify()`. `grep -n 'fn generate_images' crates/cyrup-provider/src/collection.rs`
+  is empty — there is no images leg on the unified collection at all.
+
+**Impact** — bounded today, and the bound is worth stating precisely rather than inflating. Images do
+work in cyrup, through their own collection; nothing a user runs is broken. What is unreachable is the
+unified surface: an image model cannot be registered on a `Provider`, cannot appear in
+`get_all_models()`, cannot be named by `ModelType`, and cannot round-trip through the models store.
+The reachable edge is the pi.dev overlay, which `PROV-099` and post-tag lead (a) establish is served
+cyrup the **newest** catalog revision because of its `cyrup/<version>` User-Agent — so cyrup now
+fetches a schema-v6 catalog in which openrouter's image and classifier rows sit in the same array as
+its chat rows. That degrades gracefully rather than breaking, and by accident rather than by design:
+`remote_catalog.rs:178-187` is a `filter_map` whose last step is `serde_json::from_value::<Model>(…).ok()`,
+so a row missing `reasoning`/`contextWindow`/`maxTokens` is dropped per-row. Upstream's
+`withKnownModelTypes` makes the same drop deliberately. So the cost is silent invisibility of the new
+rows, not a failed parse — `medium`, not `high`.
+
+**Fix** — `L`, and it should be split. Three separable steps, in order: (1) add `ModelType::Image` and
+`AnyModel::Image(ImageModel)`, with `ImageModel` reshaped onto a shared base alongside `Model` and
+`ClassifierModel`, and the `AnyModel` deserializer given the `"image"` arm; (2) hang `images` dispatch
+on the unified `Provider` and add `generate_images` to the unified collection beside `classify`, then
+re-express `providers/openrouter_images.rs` as an `images:` entry on the ordinary `openrouter`
+provider; (3) retire `images::{ImagesProvider, ImagesModels, create_images_models}`,
+`all_images_providers()` and `default_images_models()`, which have no upstream counterpart left.
+Step (1) alone unblocks `PROV-129`. Note two adjacent open items this must not collide with: the
+models-store shape (cyrup splits pi's single `models: AnyModel[]` into a chat `ModelsStoreEntry.models`
+plus `read_classifier_models`/`write_classifier_models`, a divergence `models_store.rs:122-136`
+documents and whose folding is already an **open `EXT-027` follow-up** — images would be a third
+parallel channel on that same seam), and `PROV-104`, which owns the two System One classifier apis.
+
+**Verify** — `AnyModel` deserializes a `"type":"image"` entry into `AnyModel::Image` and
+`ModelType::ALL` has three members; an openrouter provider built from the embedded catalog lists its
+image rows through `get_all_models()` and generates through the unified collection's `generate_images`;
+and a remote catalog mixing chat, image and classifier rows for one provider yields all three rather
+than only the chat rows — that last one is red at HEAD today and is the test that pins the real-world
+edge. Keep a negative control for a type no build knows (`"type":"video"`), which must be dropped at
+the store layer, not error.
+
+## PROV-129 — `PROV-089`'s deadline has arrived: `openrouter-images.json`'s generation source no longer exists
+
+**Kind** tooling · **Severity** low · **Effort** M · **Confidence** confirmed · **Filed** 2026-10-02
+
+**upstream** — `PROV-089`'s closure (2026-09-28) wrote its own expiry condition into the ledger:
+"**Deadline carried forward:** after the next pi tag (post-tag `a328aa89a` deletes
+`image-models.generated.ts`) this catalog becomes `PROV-071`'s class, and `IMAGES_REV` must stay
+`v0.87.1`." That tag is v1.0.0, and the condition is met:
+`git cat-file -e v1.0.0:packages/ai/src/image-models.generated.ts` fails. The rows now live in
+`IMAGE_MODELS` inside `models.generated.ts` (`providers/all.ts:1` imports
+`CLASSIFIER_MODELS, IMAGE_MODELS, MODELS` from it), which is the gitignored generated-data file
+`PROV-071` established is recoverable from no revision — `packages/ai/src/providers/data/` is empty in
+`git ls-tree` at every tag. Upstream reaches them through `getBuiltinImageModels(provider)`
+(`providers/all.ts:112-119`), keyed by the ordinary provider id `openrouter`, not by a separate
+`openrouter-images` provider.
+
+**cyrup** — `xtask/src/main.rs:123` is still `const IMAGES_REV: &str = "v0.87.1"`, and `:135-144`
+keeps `openrouter-images` as the single remaining entry in `CATALOGS` (the pinned, non-live path)
+after `PROV-071` moved the other 38 to `LIVE_CATALOGS`. Its comment states the standing rationale —
+"its rows are the `openrouter` sub-record of `packages/ai/src/image-models.generated.ts`, which is
+still a data literal in git, and `pi.dev/api/models/providers/openrouter-images` is a 404 — there is
+no live endpoint to move it to (PROV-065)" — and the first clause of that is now false. The same
+claim is baked into the generated manifest note (`:1292-1303`) and asserted by
+`xtask::tests::module_paths_default_to_the_provider_models_module` (`:1472`), which pins
+`img.rev(..) == "v0.87.1"`.
+
+**Impact** — no user-visible break: the pin is what `PROV-089` deliberately installed, the 55 rows it
+produced are correct as of v0.87.1, and `gen-catalogs` still reproduces them. What has changed is that
+the pin is now permanent rather than provisional. `openrouter-images.json` is the one catalog with no
+route to a newer row, and the in-tree comment and manifest note now assert a reason that a reader can
+check and find wrong — which is the part most likely to cost someone an hour. `low`, and `tooling`
+rather than `upstream-drift`, because the defect is in the generator's story about itself.
+
+**Fix** — the honest fix is to stop treating `openrouter-images` as a catalog of its own, which is
+`PROV-128` step (1)'s dependency: once an image row can be represented, these 55 rows are
+`openrouter`'s image rows and arrive on the live endpoint cyrup already fetches for that provider
+(`pi.dev/api/models/providers/openrouter`), where they are currently dropped by
+`remote_catalog.rs:186`. That removes the last `CATALOGS` entry, lets `IMAGES_REV` and the
+`CatalogSpec.rev` override delete, and collapses the manifest's pinned/live split. Until `PROV-128`
+lands, the minimum is to correct the comment and manifest note to say the source file is **deleted
+upstream as of v1.0.0** and that `v0.87.1` is now a terminal pin, and to restate the
+`module_paths_default_to_the_provider_models_module` assertion against that fact.
+
+**Verify** — once `PROV-128` step (1) lands: `gen-catalogs` accounts for all 39 catalogs through
+`LIVE_CATALOGS` with `CATALOGS` empty, `openrouter`'s live fetch yields its image rows as
+`AnyModel::Image`, and `gen-catalogs --check` exits 0 with no file read at a self-pinned revision.
+Interim: a test asserting the generator's own note names v1.0.0 as the tag that deleted the source,
+so the next reader is not sent to a file that is not there.
 
 ## Coverage
 

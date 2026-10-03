@@ -65,6 +65,66 @@ upstream conformance cases that transfer verbatim.
 > | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
 > | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
 
+### Items filed 2026-10-02 — `pi-mcp-adapter` `v2.38.0..v5.0.0` and pi `v0.87.1..v1.0.0`
+
+> **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
+> `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
+> [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
+> **Next free id: `MCP-609`.** Upstream was read only through
+> `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
+> `git -C tmp/pi show v1.0.0:<path>` for pi's new `packages/mcp` and
+> `packages/coding-agent/src/extensions/mcp/`; never a working tree. cyrup was read at `fe875569`.
+> **Architecture is not in question and no row below proposes restructuring `cyrup-mcp`:** pi moving
+> MCP into its monorepo as a first-class package is pi arriving where cyrup already is, and `MCP-587`
+> records what that means for citations and nothing else.
+
+One row: the three agent-facing "not available" messages omit the failure reason cyrup already
+stores, so the model is told a server is unavailable without being told why.
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| MCP-605 | low | upstream-drift | S | **The three agent-facing "not available" messages still omit the failure reason cyrup already stores** — `failure-backoff.ts:22 describeFailure` at v5.0.0 renders `failed Ns ago: <reason>`, truncated to 300 chars. **FILED 2026-10-02**; body below. |
+
+#### MCP-605 — the failure reason belongs in the agent-facing backoff messages
+
+**upstream** — `8d5daea` (#706, v3.0.0). New `failure-backoff.ts:22`:
+
+```text
+// Stored failures can hold 8 KiB of stderr; agents see the reason on every blocked call.
+const AGENT_FAILURE_REASON_CHARS = 300;
+/** "failed 12s ago: <reason>" for agent-facing text, or null outside the backoff window. */
+export function describeFailure(state, serverName): string | null {
+  const failedAgo = getFailureAgeSeconds(state, serverName);
+  if (failedAgo === null) return null;
+  const reason = sanitizeTerminalText(state.failureMessages?.get(serverName) ?? "");
+  return reason ? `failed ${failedAgo}s ago: ${truncateAtWord(reason, AGENT_FAILURE_REASON_CHARS)}` : `failed ${failedAgo}s ago`;
+}
+```
+
+It replaces the bare age in three agent-facing strings: `direct-tools.ts`'s
+`MCP server "<name>" not available (<failure>)`, `proxy-modes.ts`'s
+`Server "<name>" not available (last <failure>)` with the fallback `"failed 0s ago"`, and the
+discovery listing's `✗ <name> (<failure>)`. The colon form and the 300-char `truncateAtWord` bound
+are the whole specification.
+
+**cyrup at HEAD** — the three superseded strings are present and pinned:
+`proxy/call.rs:425` and `:645` emit `Server "{name}" not available (last failed {failed_ago}s ago)`
+(pinned at `:1238`), and `proxy/discovery.rs:124` emits `✗ {name} (failed {}s ago)\n`. **The reason
+is already stored and already rendered elsewhere**: `commands.rs:129-131` produces
+`failed {secs}s ago` and `failed {secs}s ago — {reason}` for the status surface, with an em-dash
+rather than upstream's colon. `truncate_at_word` exists at `registration.rs:770`.
+
+**Why it is worth a row despite being `low`.** The model receives "not available (last failed 7s
+ago)" and has nothing to act on — it cannot tell a missing binary from a bad token from a wedged
+handshake, so it retries blindly for the rest of the backoff window. Everything needed is in hand:
+the stored message, the truncation helper, and a sibling renderer. The work is one shared helper and
+three call sites, with the **colon** form for the agent-facing text (`commands.rs`'s em-dash form is
+the TUI surface and stays as it is — do not unify them).
+
+`verify` — a test per call site asserting `failed Ns ago: <reason>`; a test that a reason longer than
+300 characters is truncated at a word boundary; a test that an empty stored reason falls back to
+`failed Ns ago` with no colon.
+
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 
 > **RESOLVED 2026-09-24 (second pass, both sides read at `ea23ca2` / v2.37.0).** install → **`MCP-563`** (absorbs `provisionalInstalls`, `allowInstall` and the `withFileMutationQueue` seam gap); background auth watcher → **`MCP-564`**; the gateway-description and `hasGatewayMode` changes land with the feature each describes (`MCP-561`, `MCP-563`, `MCP-564`) — the description is a pure function of them. From v2.34–v2.37: pre-dispatch argument validation (#602) → **`MCP-579`**; CJK lexical search (#613) → **`MCP-580`**. Full dispositions and table D are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Second pass — 2026-09-24*. The text below is left standing as history.
