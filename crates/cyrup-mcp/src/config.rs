@@ -568,6 +568,18 @@ impl StringRecord {
     pub fn unhashable(&self) -> Option<&str> {
         self.unhashable.as_deref()
     }
+
+    /// Every member exactly as written, non-string ones included — `definition.env` itself.
+    ///
+    /// The one consumer is the metadata-cache identity's literal arm
+    /// (`env: literalEnv ? definition.env : interpolateEnvRecord(definition.env, environment)`,
+    /// `metadata-cache.ts:118`, `MCP-594`). That arm does not call `interpolateEnvRecord`, so it
+    /// does not throw on a member [`Self::values`] could not take: upstream hashes `{"A":1}` as
+    /// `{"A":1}`. Every other reader wants [`Self::values`].
+    #[must_use]
+    pub fn raw(&self) -> &BTreeMap<String, RawJson> {
+        &self.raw
+    }
 }
 
 impl std::ops::Deref for StringRecord {
@@ -796,6 +808,22 @@ pub struct ServerEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub env: Option<StringRecord>,
+    /// `inheritEnv?: boolean` (`types.ts:447` @ v5.0.0, upstream `7a7b01b` / #514) — whether a
+    /// **stdio** child inherits the adapter process environment. Absent and `true` are the same
+    /// thing; only an explicit `false` turns inheritance off.
+    ///
+    /// **Read here by the digest only.** `inheritEnv: false` is not yet honoured at spawn —
+    /// `MCP-553` owns that half, and until it lands a server fenced off from the parent environment
+    /// still receives it. The field is present because the metadata-cache identity hashes
+    /// `definition.inheritEnv !== false` for every stdio server (`metadata-cache.ts:120`,
+    /// `MCP-594`), so without it flipping the key would not evict the server's cached tools and the
+    /// stale list would be served forever (`MCP-595` having removed the age limit).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inherit_env: Option<bool>,
     /// Working directory, `resolveConfigPath`'d (interpolation + `~`); falls back to the session
     /// cwd.
     #[serde(
@@ -2489,6 +2517,7 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
         command,
         args,
         env,
+        inherit_env,
         cwd,
         url,
         headers,
@@ -2520,6 +2549,9 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
         command: command.clone().or(base_entry.command),
         args: args.clone().or(base_entry.args),
         env: env.clone().or(base_entry.env),
+        // Not in the url-switch strip set above: upstream's url arm drops `inheritEnv` with the
+        // rest of the stdio block, and that whole strip set is `MCP-540`'s, not this field's.
+        inherit_env: inherit_env.or(base_entry.inherit_env),
         cwd: cwd.clone().or(base_entry.cwd),
         url: url.clone().or(base_entry.url),
         headers: headers.clone().or(base_entry.headers),

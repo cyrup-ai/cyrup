@@ -1041,7 +1041,17 @@ impl ResolvedIdentity {
     /// `cyrup_config::ConfigDirs::home`.
     pub fn resolve(entry: &ServerEntry, env: &EnvFn, home: &Path) -> McpResult<Self> {
         Ok(Self {
-            env: interpolate_env_record(entry.env.as_ref(), env)?,
+            // `env: literalEnv ? definition.env : interpolateEnvRecord(definition.env, environment)`
+            // (`metadata-cache.ts:118`, MCP-594). The literal arm never calls
+            // `interpolateEnvRecord`, so it cannot throw on a non-string member either — and the
+            // value it hashes is `entry.env` itself, which `server_identity_pre_image` reads back
+            // off the definition. `None` here is therefore "the identity does not use this leg",
+            // not "the definition has no env".
+            env: if identity_literal_env(entry) {
+                None
+            } else {
+                interpolate_env_record(entry.env.as_ref(), env)?
+            },
             cwd: entry
                 .cwd
                 .as_deref()
@@ -1250,12 +1260,35 @@ fn json_quote(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// `literalEnv` as the identity computes it (`metadata-cache.ts:114` @ v5.0.0, MCP-594):
+/// `isBuiltInAgentPlugin(definition, "env") || (isStdio && definition.literalEnv === true)`.
+///
+/// It decides **two** things — whether `env` enters the digest interpolated or verbatim, and the
+/// value of the `literalEnv` member a stdio identity carries — so it is one function and both
+/// readers call it.
+///
+/// # Why the `isBuiltInAgentPlugin` disjunct is not written out
+///
+/// Upstream carries built-in-plugin provenance on a `Symbol` keyed per field (`args`, `env`, `cwd`,
+/// `headers` — `agent-plugin-provenance.ts:3`); cyrup has no such marker, and
+/// [`crate::agent_plugin`] instead sets `literalEnv: true` on the entry it builds. The two models
+/// agree on every entry cyrup can produce: the only entries carrying `literal_env == Some(true)`
+/// from the plugin loader are **stdio** servers (`agent_plugin.rs`'s `translate_stdio_server` sets
+/// it beside a `command`; `translate_http_server` sets neither it nor `env`), so wherever upstream's
+/// first disjunct is true, `isStdio` is true as well and the second one covers it. Separating the
+/// marker from the user-facing field is `MCP-585`, and when it lands the `cwd` and `headers` legs
+/// below gain the same test.
+fn identity_literal_env(entry: &ServerEntry) -> bool {
+    entry.command.is_some() && entry.literal_env == Some(true)
+}
+
 /// `computeServerHash`'s identity object (`metadata-cache.ts:82`).
 ///
-/// **Fifteen fields, and the list is the specification.** Everything is verbatim, including the
-/// fields that are **not** here: `lifecycle`, `idleTimeout`, `requestTimeoutMs` and `debug` are
-/// runtime behaviour, they do not change which tools a server exposes, and hashing them would evict
-/// every cache entry on an unrelated edit.
+/// **Fifteen fields for every definition and two more for a stdio one, and the list is the
+/// specification.** Everything is verbatim, including the fields that are **not** here:
+/// `lifecycle`, `idleTimeout`, `requestTimeoutMs` and `debug` are runtime behaviour, they do not
+/// change which tools a server exposes, and hashing them would evict every cache entry on an
+/// unrelated edit.
 ///
 /// # `socket` is the fifteenth, and it is emitted `undefined` unconditionally
 ///
@@ -1271,10 +1304,11 @@ fn json_quote(s: &str) -> String {
 /// diagnostic, so a `ServerEntry` that reached this function can only ever have had
 /// `socket: undefined` — which is precisely `resolveConfigPath(undefined)`.
 ///
-/// Measured, not argued. Upstream's own digest for the plain-stdio golden fixture below is
-/// `2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4`; before this key landed cyrup
-/// produced `4dd46c1f…`, and deleting upstream's `socket` member from its pre-image yielded cyrup's
-/// byte for byte. The two now agree; `golden_vector_stdio_server` pins it.
+/// Measured, not argued. Upstream's own digest for the plain-stdio golden fixture below was
+/// `2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4` at `v2.26.1`; before this key
+/// landed cyrup produced `4dd46c1f…`, and deleting upstream's `socket` member from its pre-image
+/// yielded cyrup's byte for byte. The two agree, and at `v5.0.0` that same fixture's digest is
+/// `88e9e4de…` — the two stdio keys below, nothing else; `golden_vector_stdio_server` pins it.
 ///
 /// # `requestHeadersCommand` is v2.26.0's addition, and it invalidated every cache entry once
 ///
@@ -1288,14 +1322,44 @@ fn json_quote(s: &str) -> String {
 /// `timeoutMs` each render as `undefined` inside it when they are absent, and
 /// [`stable_stringify`] sorts its four keys just as it sorts the outer ones.
 ///
+/// # `inheritEnv` and `literalEnv` are the sixteenth and seventeenth, and they are STDIO-ONLY
+///
+/// `34df4ed` (#687) spread them in behind `isStdio` (`metadata-cache.ts:120`):
+/// `...(isStdio ? { inheritEnv: definition.inheritEnv !== false, literalEnv } : {})`. For a
+/// definition with no `command` the two keys are **absent from the object**, so they contribute
+/// nothing at all to the pre-image — not even an `undefined` token, unlike every other member here.
+/// That is what keeps the HTTP golden vectors byte-identical across MCP-594 while every stdio
+/// digest moves, and it is the property `golden_vector_http_server` and
+/// `golden_vector_empty_definition` now prove rather than merely assume.
+///
+/// Both are **resolved booleans**, not the raw fields: `inheritEnv` is
+/// `definition.inheritEnv !== false`, so absent and `true` hash alike and only an explicit `false`
+/// differs; `literalEnv` is [`identity_literal_env`]'s answer.
+///
+/// The same commit fixed the `env` leg: the `literalEnv` test used to be the plugin marker alone, so
+/// a user entry with `literalEnv: true` had its `env` **interpolated into the digest** while the
+/// live connection took it verbatim — two configs that behave differently hashing the same. The
+/// literal arm now hashes `definition.env` itself, through
+/// [`crate::config::StringRecord::raw`], non-string members included (the arm never calls
+/// `interpolateEnvRecord`, so there is no throw to inherit).
+///
 /// Returned as the pre-image rather than the digest so a conformance test can assert the bytes —
 /// a hash mismatch tells you nothing about *which* field disagreed.
 #[must_use]
 pub fn server_identity_pre_image(entry: &ServerEntry, resolved: &ResolvedIdentity) -> String {
-    let identity = HashValue::Object(vec![
+    let is_stdio = entry.command.is_some();
+    let literal_env = identity_literal_env(entry);
+    let mut members = vec![
         ("command".to_string(), opt_string(entry.command.as_deref())),
         ("args".to_string(), opt_string_list(entry.args.as_ref())),
-        ("env".to_string(), opt_string_map(resolved.env.as_ref())),
+        (
+            "env".to_string(),
+            if literal_env {
+                raw_string_record(entry.env.as_ref())
+            } else {
+                opt_string_map(resolved.env.as_ref())
+            },
+        ),
         ("cwd".to_string(), opt_string(resolved.cwd.as_deref())),
         // `socket: resolveConfigPath(definition.socket)` (`metadata-cache.ts:89`). Always
         // `undefined`: `to_server_entries` rejects any entry that configures a socket (Cut 3), so
@@ -1339,8 +1403,40 @@ pub fn server_identity_pre_image(entry: &ServerEntry, resolved: &ResolvedIdentit
             "excludeTools".to_string(),
             opt_string_list(entry.exclude_tools.as_ref()),
         ),
-    ]);
-    stable_stringify(&identity)
+    ];
+    if is_stdio {
+        members.push((
+            "inheritEnv".to_string(),
+            HashValue::Bool(entry.inherit_env != Some(false)),
+        ));
+        members.push(("literalEnv".to_string(), HashValue::Bool(literal_env)));
+    }
+    stable_stringify(&HashValue::Object(members))
+}
+
+/// `definition.env` **itself** — the literal arm of `metadata-cache.ts:118` (MCP-594).
+///
+/// Goes through [`crate::config::StringRecord::raw`] rather than its string view, because upstream
+/// hands the raw object to `stableStringify` here and `{"A":1}` hashes as `{"A":1}`. The
+/// [`serde_json::Value`] hop is what turns a [`crate::config::RawJson`] member into a
+/// [`HashValue`]; it cannot fail for a map of parsed JSON, and the fallback keeps the function
+/// total rather than lossy.
+fn raw_string_record(value: Option<&crate::config::StringRecord>) -> HashValue {
+    value.map_or(HashValue::Undefined, |record| {
+        HashValue::Object(
+            record
+                .raw()
+                .iter()
+                .map(|(key, member)| {
+                    (
+                        key.clone(),
+                        serde_json::to_value(member)
+                            .map_or(HashValue::Undefined, HashValue::from_json),
+                    )
+                })
+                .collect(),
+        )
+    })
 }
 
 /// `computeServerHash(definition)` (`metadata-cache.ts:82`) — the 64-hex `configHash` stamped into
@@ -1694,13 +1790,14 @@ mod tests {
                 r#""command":"npx","cwd":"/home/u/work","#,
                 r#""env":{"API_TOKEN":"s3cret","NODE_ENV":"production"},"#,
                 r#""excludeTools":["danger_*"],"exposeResources":false,"headers":undefined,"#,
-                r#""includeTools":undefined,"protocolVersion":undefined,"#,
+                r#""includeTools":undefined,"inheritEnv":true,"literalEnv":false,"#,
+                r#""protocolVersion":undefined,"#,
                 r#""requestHeadersCommand":undefined,"socket":undefined,"url":undefined}"#
             )
         );
         assert_eq!(
             compute_server_hash(&entry, &resolved),
-            "2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4"
+            "88e9e4de41703ec17c2eaf7372dd79f0befb20383d246cd7d80726466e588158"
         );
     }
 
@@ -1762,6 +1859,146 @@ mod tests {
         assert_eq!(
             compute_server_hash(&entry, &resolved),
             "a04128961dff1d77f5ea95dd5ddb01415888636efe2d32cf950c78b34e54c3fa"
+        );
+    }
+
+    /// `MCP-594` — the two stdio-only members `34df4ed` (#687) spread into the identity.
+    ///
+    /// Every constant here is upstream's own, produced by running `v5.0.0`'s
+    /// `computeServerHash` and `stableStringify` on node 22 against a tree materialised from the
+    /// `v5.0.0` tag, with the identity object re-derived from `metadata-cache.ts:109-141` so the
+    /// pre-image could be printed beside the digest (`computeServerHash` returns only the digest);
+    /// the re-derivation was checked against `computeServerHash`'s own output for every case.
+    #[test]
+    fn golden_vector_stdio_inherit_env_and_literal_env() {
+        let hash_of = |json: &str| {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            let resolved = ResolvedIdentity::verbatim(&entry);
+            (server_identity_pre_image(&entry, &resolved), entry)
+        };
+
+        // `inheritEnv: definition.inheritEnv !== false` — absent and `true` are ONE value.
+        let (absent, absent_entry) = hash_of(r#"{ "command": "npx" }"#);
+        let (explicit_true, true_entry) = hash_of(r#"{ "command": "npx", "inheritEnv": true }"#);
+        let (explicit_false, false_entry) = hash_of(r#"{ "command": "npx", "inheritEnv": false }"#);
+        assert_eq!(absent, explicit_true, "`!== false`, not `=== true`");
+        assert_eq!(
+            explicit_true,
+            concat!(
+                r#"{"args":undefined,"auth":undefined,"bearerToken":undefined,"#,
+                r#""bearerTokenEnv":undefined,"command":"npx","cwd":undefined,"#,
+                r#""env":undefined,"excludeTools":undefined,"exposeResources":undefined,"#,
+                r#""headers":undefined,"includeTools":undefined,"inheritEnv":true,"#,
+                r#""literalEnv":false,"protocolVersion":undefined,"#,
+                r#""requestHeadersCommand":undefined,"socket":undefined,"url":undefined}"#
+            )
+        );
+        assert_eq!(
+            compute_server_hash(&true_entry, &ResolvedIdentity::verbatim(&true_entry)),
+            "03a3467c8d7238a64101165af9c7a4b80c0cf551cb74665588ef3207245d4baa"
+        );
+        assert_eq!(
+            compute_server_hash(&absent_entry, &ResolvedIdentity::verbatim(&absent_entry)),
+            "03a3467c8d7238a64101165af9c7a4b80c0cf551cb74665588ef3207245d4baa"
+        );
+
+        // Flipping it to `false` MOVES the digest, which is the whole point: the cached tool list
+        // was discovered under a different child environment.
+        assert_ne!(explicit_true, explicit_false);
+        assert!(explicit_false.contains(r#""inheritEnv":false"#));
+        assert_eq!(
+            compute_server_hash(&false_entry, &ResolvedIdentity::verbatim(&false_entry)),
+            "9e07ef2b4f531bf53aa5cd5cea2042605a63973d49ef79898b6e4cbb302676f6"
+        );
+    }
+
+    /// `literalEnv: true` must keep `$VAR` **unexpanded** in the pre-image, because that is what the
+    /// live connection sends (`secrets.rs`'s literal arm). Before `34df4ed` the digest was computed
+    /// over an interpolated `env` the server never sees, so two configs that behave differently
+    /// hashed the same.
+    #[test]
+    fn literal_env_hashes_the_definition_not_the_interpolation() {
+        let entry: ServerEntry = serde_json::from_str(
+            r#"{ "command": "npx", "env": { "A": "${HOME}/x" }, "literalEnv": true }"#,
+        )
+        .unwrap();
+        let home = Path::new("/home/u");
+        let env: EnvFn =
+            std::sync::Arc::new(|name: &str| (name == "HOME").then(|| "/home/u".to_string()));
+
+        let resolved = ResolvedIdentity::resolve(&entry, &env, home).unwrap();
+        let pre_image = server_identity_pre_image(&entry, &resolved);
+        assert_eq!(
+            pre_image,
+            concat!(
+                r#"{"args":undefined,"auth":undefined,"bearerToken":undefined,"#,
+                r#""bearerTokenEnv":undefined,"command":"npx","cwd":undefined,"#,
+                r#""env":{"A":"${HOME}/x"},"excludeTools":undefined,"#,
+                r#""exposeResources":undefined,"headers":undefined,"includeTools":undefined,"#,
+                r#""inheritEnv":true,"literalEnv":true,"protocolVersion":undefined,"#,
+                r#""requestHeadersCommand":undefined,"socket":undefined,"url":undefined}"#
+            ),
+            "the token survives into the digest"
+        );
+        assert_eq!(
+            compute_server_hash(&entry, &resolved),
+            "111266725036f9f88ae30630f61d508d043999296ed9bc49b078fc9e79268795"
+        );
+
+        // The same `env` WITHOUT `literalEnv` interpolates, and the two digests differ.
+        let interpolated: ServerEntry =
+            serde_json::from_str(r#"{ "command": "npx", "env": { "A": "${HOME}/x" } }"#).unwrap();
+        let resolved_interpolated = ResolvedIdentity::resolve(&interpolated, &env, home).unwrap();
+        let interpolated_pre_image =
+            server_identity_pre_image(&interpolated, &resolved_interpolated);
+        assert!(
+            interpolated_pre_image.contains(r#""env":{"A":"/home/u/x"},"#),
+            "{interpolated_pre_image}"
+        );
+        assert_ne!(pre_image, interpolated_pre_image);
+
+        // The literal arm never calls `interpolateEnvRecord`, so a non-string member does NOT
+        // throw: upstream hashes `{"A":1}` as `{"A":1}` and the entry stays cache-checkable.
+        let non_string: ServerEntry = serde_json::from_str(
+            r#"{ "command": "npx", "env": { "A": 1, "B": "x" }, "literalEnv": true }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            try_compute_server_hash(&non_string, &env, home).unwrap(),
+            "2047af925b44a8b7e835e980dd3ee1a307d3802a1639b0f6564baaaebaeadcec",
+        );
+        // Without `literalEnv` the very same block is upstream's TypeError and the entry is simply
+        // not cache-valid (MCP-145).
+        let non_string_interpolated: ServerEntry =
+            serde_json::from_str(r#"{ "command": "npx", "env": { "A": 1, "B": "x" } }"#).unwrap();
+        assert!(try_compute_server_hash(&non_string_interpolated, &env, home).is_err());
+    }
+
+    /// The two keys are spread in behind `isStdio`, so a definition with no `command` must not
+    /// carry them **at all** — not even as `undefined`. An HTTP entry that sets them is unaffected,
+    /// which is what makes the HTTP golden vectors byte-identical across MCP-594.
+    #[test]
+    fn the_two_new_keys_are_stdio_only() {
+        let entry: ServerEntry = serde_json::from_str(
+            r#"{ "url": "https://a.example/mcp", "inheritEnv": false, "literalEnv": true }"#,
+        )
+        .unwrap();
+        let resolved = ResolvedIdentity::verbatim(&entry);
+        let pre_image = server_identity_pre_image(&entry, &resolved);
+        assert!(!pre_image.contains("inheritEnv"), "{pre_image}");
+        assert!(!pre_image.contains("literalEnv"), "{pre_image}");
+        assert_eq!(
+            compute_server_hash(&entry, &resolved),
+            "4b31711a3be6bf6e72dc900046222a8b33fb1a4ee2575d4a6b0c282d1acdabf2"
+        );
+
+        // And the bare HTTP entry's digest is the one it had before MCP-594.
+        let bare: ServerEntry =
+            serde_json::from_str(r#"{ "url": "https://a.example/mcp" }"#).unwrap();
+        assert_eq!(
+            compute_server_hash(&bare, &ResolvedIdentity::verbatim(&bare)),
+            compute_server_hash(&entry, &resolved),
+            "`inheritEnv`/`literalEnv` on an HTTP entry are not identity"
         );
     }
 
@@ -2111,11 +2348,18 @@ mod tests {
     /// `sha256(preImage) === computeServerHash(definition)` for this and every other fixture before
     /// the `socket` member landed.
     ///
-    /// **Both constants include `socket`**, so they are upstream's, unqualified: `ac61954a…` is the
-    /// digest a stock `pi-mcp-adapter` computes for this definition, and it is the digest cyrup
-    /// computes for it. While the key was missing this vector read
+    /// **Both constants include `socket`**, so they are upstream's, unqualified: the digest here is
+    /// the one a stock `pi-mcp-adapter` computes for this definition, and it is the one cyrup
+    /// computes for it. While the `socket` key was missing this vector read
     /// `c273715eef4b2fb58f5db61d54793b01abd262edd7e59a5c7b189fddf910bd3c`, which differed from
     /// upstream by exactly the `"socket":undefined` member.
+    ///
+    /// **Regenerated at `v5.0.0` for MCP-594**, this definition being a stdio one: it was
+    /// `ac61954adda845c50a6c691e7ac291e2546dfcc6158b8d6a1b7785ce47356de3` before the
+    /// `inheritEnv`/`literalEnv` pair joined the stdio identity. The node run that produced
+    /// `b0b72bf5…` had `HOME=/home/u` in its *process environment* — `os.homedir()` on linux does
+    /// not read `process.env.HOME` set from inside the script, so a run that assigns it there
+    /// resolves `~/work/${HOST}` against the real home and yields a different digest.
     #[test]
     fn the_resolved_identity_golden_vector() {
         let entry: ServerEntry = serde_json::from_str(
@@ -2152,13 +2396,14 @@ mod tests {
                 r#""INTERP":"a.example","MARKER":"!op read x","PLAIN":"p"},"#,
                 r#""excludeTools":["b"],"exposeResources":false,"#,
                 r#""headers":{"X-Host":"a.example","X-Lit":"!keep"},"includeTools":["a"],"#,
+                r#""inheritEnv":true,"literalEnv":false,"#,
                 r#""protocolVersion":undefined,"requestHeadersCommand":undefined,"#,
                 r#""socket":undefined,"url":"https://a.example/mcp"}"#
             )
         );
         assert_eq!(
             try_compute_server_hash(&entry, &vector_env(), &vector_home()).expect("hashable"),
-            "ac61954adda845c50a6c691e7ac291e2546dfcc6158b8d6a1b7785ce47356de3"
+            "b0b72bf51be2fbf515069d5349f17a90381e7d1e2dac774edcaf032a3869673a"
         );
 
         // …and the same definition under `verbatim` is a DIFFERENT digest — which is the whole

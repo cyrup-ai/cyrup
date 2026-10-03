@@ -248,6 +248,26 @@ pub struct ServerEntry {
     /// (MCP-144).
     #[serde(default)]
     pub env: Option<BTreeMap<String, Value>>,
+    /// `inheritEnv?: boolean` (`types.ts:447` @ v5.0.0) — whether a **stdio** child inherits the
+    /// adapter process environment. Absent and `true` are the same thing.
+    ///
+    /// One of the two stdio-only identity keys `34df4ed` (#687) added (`metadata-cache.ts:120`,
+    /// `SUBA-156` / `MCP-594`). This resolver reads it for the digest and nothing else — the child
+    /// environment is the adapter's business, not the allowlist's — but without it every stdio
+    /// entry the writer stamps would fail validation here and `mcp:` selectors would resolve to
+    /// nothing, which is the failure this module's header was written about.
+    #[serde(default, rename = "inheritEnv")]
+    pub inherit_env: Option<bool>,
+    /// `literalEnv?: boolean` (`types.ts:505` @ v5.0.0) — `env` values are already resolved
+    /// literals, so neither interpolation nor the `!`-secret grammar runs on them.
+    ///
+    /// The second of the two stdio-only identity keys, and it also decides how the **`env`** member
+    /// is hashed: `env: literalEnv ? definition.env : interpolateEnvRecord(definition.env, …)`
+    /// (`metadata-cache.ts:118`). Before `34df4ed` the `literalEnv` test was the built-in-plugin
+    /// marker alone, so a user entry setting this had its `env` interpolated into the digest while
+    /// the connection took it verbatim.
+    #[serde(default, rename = "literalEnv")]
+    pub literal_env: Option<bool>,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -314,7 +334,7 @@ pub struct ServerEntry {
 /// harmless for a field nobody hashes and wrong for [`ServerEntry::auth`] and
 /// [`ServerEntry::protocol_version`], which `computeServerHash` folds in verbatim
 /// (`metadata-cache.ts:103-104`): measured on node 22 @ `v2.26.1`, `computeServerHash({command:"x",
-/// auth:null})` is `d5e9d0fe71ad5cc5d6a82b93d537f69ee59809f7f10e1f5c1f26c1d0a97e28e4` over a
+/// auth:null})` is `57e03e32625b22d3a4d3a0c052c24ae9dcfa40759032e5a8285bd9695e93fc54` over a
 /// pre-image carrying `"auth":null`, while the same definition without the key hashes a pre-image
 /// carrying `"auth":undefined`. This reader produced the second for both.
 ///
@@ -1014,7 +1034,16 @@ pub fn server_identity_pre_image_with(
     env: &dyn Fn(&str) -> Option<String>,
     home: &Path,
 ) -> Result<String, IdentityError> {
-    let identity = HashValue::Object(vec![
+    // `const isStdio = !!definition.command` and
+    // `const literalEnv = isBuiltInAgentPlugin(definition, "env") || (isStdio && definition.literalEnv === true)`
+    // (`metadata-cache.ts:113-114` @ v5.0.0). Neither this reader nor `cyrup_mcp` carries upstream's
+    // per-field built-in-plugin `Symbol` — `cyrup_mcp::agent_plugin` sets `literalEnv: true` on the
+    // stdio entry it builds instead, and only on a stdio one — so the second disjunct subsumes the
+    // first for every entry either crate can produce. `cyrup_mcp::dirs::identity_literal_env` is
+    // the writer's copy of this line and the two MUST stay identical.
+    let is_stdio = definition.command.is_some();
+    let literal_env = is_stdio && definition.literal_env == Some(true);
+    let mut members = vec![
         (
             "command".to_string(),
             opt_string(definition.command.as_deref()),
@@ -1025,7 +1054,20 @@ pub fn server_identity_pre_image_with(
         ),
         (
             "env".to_string(),
-            interpolate_env_record(definition.env.as_ref(), env)?,
+            if literal_env {
+                // The literal arm hands `definition.env` straight to `stableStringify`: no
+                // interpolation, no `!`-secret grammar, and — because `interpolateEnvRecord` never
+                // runs — no TypeError to inherit, so `{"A":1}` hashes as `{"A":1}` rather than
+                // making the entry un-hashable.
+                HashValue::from_optional_json(
+                    definition
+                        .env
+                        .clone()
+                        .map(|members| Value::Object(members.into_iter().collect())),
+                )
+            } else {
+                interpolate_env_record(definition.env.as_ref(), env)?
+            },
         ),
         (
             "cwd".to_string(),
@@ -1077,8 +1119,19 @@ pub fn server_identity_pre_image_with(
             "excludeTools".to_string(),
             opt_string_list(definition.exclude_tools.as_ref()),
         ),
-    ]);
-    Ok(stable_stringify(&identity))
+    ];
+    // `...(isStdio ? { inheritEnv: definition.inheritEnv !== false, literalEnv } : {})`
+    // (`metadata-cache.ts:120`). Spread, not assigned: for a definition with no `command` the two
+    // keys are absent from the object entirely and contribute no token at all — which is why an
+    // HTTP entry's digest is unmoved by this change.
+    if is_stdio {
+        members.push((
+            "inheritEnv".to_string(),
+            HashValue::Bool(definition.inherit_env != Some(false)),
+        ));
+        members.push(("literalEnv".to_string(), HashValue::Bool(literal_env)));
+    }
+    Ok(stable_stringify(&HashValue::Object(members)))
 }
 
 /// One of `computeServerHash`'s `throw`s, carrying upstream's own message.
@@ -2516,6 +2569,10 @@ mod tests {
                 ("PLUGIN_DATA".to_string(), Value::String(data)),
             ])),
             cwd: Some(root),
+            // `literalEnv: true` — what the loader injects (`agent-plugin-loader.ts:253`), and
+            // since `34df4ed` (#687) part of the stdio identity, so a fixture that omitted it
+            // would stamp a hash no loader produces (`SUBA-156` / `MCP-594`).
+            literal_env: Some(true),
             ..ServerEntry::default()
         }
     }
@@ -3049,7 +3106,7 @@ mod tests {
         // else, which is exactly the failure mode a reader-versus-writer assertion cannot see.
         assert_eq!(
             compute_mcp_server_hash(&reader).expect("hashable"),
-            "fa28f264c176c38a612395e65601f0646a3faba71cdc834b095c488c9a5bd63c"
+            "0624d8b9746719a7f328339c3cafa04377a8268cd52917d86e64e9f5f484180e"
         );
         // `timeoutMs` renders as a JS number: `2500`, never `2500.0`.
         assert!(pre_image.contains(r#""timeoutMs":2500}"#), "{pre_image}");
@@ -3102,11 +3159,12 @@ mod tests {
             r#""command":"npx","cwd":"/home/u/work","#,
             r#""env":{"API_TOKEN":"s3cret","NODE_ENV":"production"},"#,
             r#""excludeTools":["danger_*"],"exposeResources":false,"headers":undefined,"#,
-            r#""includeTools":undefined,"protocolVersion":undefined,"#,
+            r#""includeTools":undefined,"inheritEnv":true,"literalEnv":false,"#,
+            r#""protocolVersion":undefined,"#,
             r#""requestHeadersCommand":undefined,"socket":undefined,"url":undefined}"#
         );
         const UPSTREAM_DIGEST: &str =
-            "2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4";
+            "88e9e4de41703ec17c2eaf7372dd79f0befb20383d246cd7d80726466e588158";
 
         let ours = server_identity_pre_image(&entry).expect("hashable");
         assert_eq!(
@@ -3378,13 +3436,14 @@ mod tests {
                 r#""command":"npx","cwd":"/home/u/work","#,
                 r#""env":{"API_TOKEN":"s3cret","NODE_ENV":"production"},"#,
                 r#""excludeTools":["danger_*"],"exposeResources":false,"headers":undefined,"#,
-                r#""includeTools":undefined,"protocolVersion":undefined,"#,
+                r#""includeTools":undefined,"inheritEnv":true,"literalEnv":false,"#,
+                r#""protocolVersion":undefined,"#,
                 r#""requestHeadersCommand":undefined,"socket":undefined,"url":undefined}"#
             )
         );
         assert_eq!(
             compute_mcp_server_hash(&entry).expect("hashable"),
-            "2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4"
+            "88e9e4de41703ec17c2eaf7372dd79f0befb20383d246cd7d80726466e588158"
         );
 
         // The HTTP half, which pins the two enum-valued keys and a non-empty `includeTools` next to
@@ -3429,27 +3488,27 @@ mod tests {
         for (json, upstream_digest) in [
             (
                 r#"{"command":"x","env":{}}"#,
-                "1d224401e4ab9a3e11e3490649da48a3fd946b49869464320b97b423c7f2893b",
+                "93046ece6ccae8270acbd385e947016c20760cfe7cacc5f88b20a022d7e143c5",
             ),
             (
                 r#"{"command":"x","auth":null}"#,
-                "d5e9d0fe71ad5cc5d6a82b93d537f69ee59809f7f10e1f5c1f26c1d0a97e28e4",
+                "57e03e32625b22d3a4d3a0c052c24ae9dcfa40759032e5a8285bd9695e93fc54",
             ),
             (
                 r#"{"command":"x","auth":true}"#,
-                "ae49caf49c8f178b01c20e367d4d4bd5efa81862550adefca79f016e243fde43",
+                "fa05f61bc3910c27d1447474b36b01b1110f5766a1fd03bc738003c7112ad27e",
             ),
             (
                 r#"{"command":"x","auth":{"mode":"custom"}}"#,
-                "e20d021bf5d47780b216e45f26e49802817d04ebfc3421ece1bb56f9e7d0aa32",
+                "dabea54780b036066ec368718c772c00e559d294c056bbd7440434bf57876f3d",
             ),
             (
                 r#"{"command":"x","protocolVersion":5}"#,
-                "df7fbe03ab78e1275d5feac1fcd776d4360c04f291ce8a569c6cb65ad241a150",
+                "98edc18400c18cd86ab7a6fbe80ebb1db1bb281a5ec1dfb4d436ea03aff9e6ba",
             ),
             (
                 r#"{"command":"x","protocolVersion":"auto"}"#,
-                "4aa154797d547787f9172441c48461ecaaf4483f8dc0071fb5fd4fc60fc62d2d",
+                "02ef0cb7d90b296d2e0dffcabe2281aa70704ef26f49e12f030af4298fdbf756",
             ),
             (
                 r#"{"url":"https://a.example/mcp","headers":{}}"#,
@@ -3457,7 +3516,7 @@ mod tests {
             ),
             (
                 "{\"command\":\"x\",\"env\":{\"K\":\"café ☃\",\"Q\":\"a\\\"b\\nc\"}}",
-                "c05ec96dfb2a8e5f33558d675c5a4d0d62dfbb41ab77728fe5edb8260a2fd1ec",
+                "c92faa719540b20e1748e4f5d0a658361a97ee09ce816327b67496718ee1f82c",
             ),
         ] {
             let reader: ServerEntry = serde_json::from_str(json).expect("reader entry");
@@ -3480,6 +3539,86 @@ mod tests {
                 compute_server_hash(&writer, &resolved),
                 upstream_digest,
                 "writer disagrees with upstream on {json}"
+            );
+        }
+    }
+
+    /// `SUBA-156` / `MCP-594` — the two stdio-only members `34df4ed` (#687) spread into the
+    /// identity, asserted **reader against writer against upstream** because all three have to
+    /// agree for a cache entry to be usable at all.
+    ///
+    /// Every digest is upstream's own `computeServerHash` at `v5.0.0` on node 22, against a tree
+    /// materialised from the tag.
+    #[test]
+    fn the_two_stdio_identity_keys_agree_reader_writer_and_upstream() {
+        for (json, upstream_digest) in [
+            // absent and `inheritEnv: true` are ONE value: `definition.inheritEnv !== false`.
+            (
+                r#"{"command":"npx"}"#,
+                "03a3467c8d7238a64101165af9c7a4b80c0cf551cb74665588ef3207245d4baa",
+            ),
+            (
+                r#"{"command":"npx","inheritEnv":true}"#,
+                "03a3467c8d7238a64101165af9c7a4b80c0cf551cb74665588ef3207245d4baa",
+            ),
+            // and an explicit `false` moves the digest, which is what evicts the stale tool list.
+            (
+                r#"{"command":"npx","inheritEnv":false}"#,
+                "9e07ef2b4f531bf53aa5cd5cea2042605a63973d49ef79898b6e4cbb302676f6",
+            ),
+            // `literalEnv: true` keeps `${HOME}` unexpanded, because that is what the child gets.
+            (
+                r#"{"command":"npx","env":{"A":"${HOME}/x"},"literalEnv":true}"#,
+                "111266725036f9f88ae30630f61d508d043999296ed9bc49b078fc9e79268795",
+            ),
+            // The literal arm never runs `interpolateEnvRecord`, so a non-string member is NOT the
+            // TypeError it would otherwise be: `{"A":1}` hashes as `{"A":1}`.
+            (
+                r#"{"command":"npx","env":{"A":1,"B":"x"},"literalEnv":true}"#,
+                "2047af925b44a8b7e835e980dd3ee1a307d3802a1639b0f6564baaaebaeadcec",
+            ),
+            // Both keys are spread in behind `isStdio`, so on an HTTP entry they are not identity
+            // at all — the same digest as the bare URL below.
+            (
+                r#"{"url":"https://a.example/mcp","inheritEnv":false,"literalEnv":true}"#,
+                "4b31711a3be6bf6e72dc900046222a8b33fb1a4ee2575d4a6b0c282d1acdabf2",
+            ),
+            (
+                r#"{"url":"https://a.example/mcp"}"#,
+                "4b31711a3be6bf6e72dc900046222a8b33fb1a4ee2575d4a6b0c282d1acdabf2",
+            ),
+        ] {
+            let reader: ServerEntry = serde_json::from_str(json).expect("reader entry");
+            let writer: WriterServerEntry = serde_json::from_str(json).expect("writer entry");
+            let reader_env = |_: &str| None;
+            let writer_env: cyrup_mcp::credentials::EnvFn = std::sync::Arc::new(|_: &str| None);
+            let resolved = ResolvedIdentity::resolve(&writer, &writer_env, Path::new("/home/u"))
+                .expect("the literal arm does not throw");
+
+            let ours = server_identity_pre_image_with(&reader, &reader_env, Path::new("/home/u"))
+                .expect("hashable");
+            assert_eq!(ours, writer_pre_image(&writer, &resolved), "{json}");
+            assert_eq!(
+                compute_mcp_server_hash_with(&reader, &reader_env, Path::new("/home/u"))
+                    .expect("hashable"),
+                upstream_digest,
+                "reader disagrees with upstream on {json}\n  pre-image: {ours}"
+            );
+            assert_eq!(
+                compute_server_hash(&writer, &resolved),
+                upstream_digest,
+                "writer disagrees with upstream on {json}"
+            );
+            // Stdio-only, checked on the pre-image rather than inferred from the digest.
+            assert_eq!(
+                ours.contains("\"inheritEnv\":"),
+                reader.command.is_some(),
+                "{json}"
+            );
+            assert_eq!(
+                ours.contains("\"literalEnv\":"),
+                reader.command.is_some(),
+                "{json}"
             );
         }
     }
@@ -3901,10 +4040,11 @@ mod tests {
             r#""INTERP":"a.example","MARKER":"!op read x","PLAIN":"p"},"#,
             r#""excludeTools":["b"],"exposeResources":false,"#,
             r#""headers":{"X-Host":"a.example","X-Lit":"!keep"},"includeTools":["a"],"#,
+            r#""inheritEnv":true,"literalEnv":false,"#,
             r#""protocolVersion":undefined,"requestHeadersCommand":undefined,"#,
             r#""socket":undefined,"url":"https://a.example/mcp"}"#
         );
-        const DIGEST: &str = "ac61954adda845c50a6c691e7ac291e2546dfcc6158b8d6a1b7785ce47356de3";
+        const DIGEST: &str = "b0b72bf51be2fbf515069d5349f17a90381e7d1e2dac774edcaf032a3869673a";
 
         let reader: ServerEntry = serde_json::from_str(DEFINITION).expect("reader entry");
         let writer: WriterServerEntry = serde_json::from_str(DEFINITION).expect("writer entry");

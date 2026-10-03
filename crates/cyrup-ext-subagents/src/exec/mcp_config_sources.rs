@@ -215,13 +215,17 @@ fn is_request_headers_command(value: &Value) -> bool {
 
 /// A gate-passing raw definition, as the [`ServerEntry`] this crate's resolver consumes.
 ///
-/// The five keys [`ServerEntry`] does not carry (`socket`, `directTools`, `httpTransport`,
-/// `pluginDataDir`, `literalEnv`) are dropped, which is lossless HERE for a stated reason: none of
-/// them is one of `computeMcpServerHash`'s fifteen identity keys except `socket`, and `socket` is
-/// emitted unconditionally as `undefined` by
-/// [`crate::exec::mcp_direct_tools::compute_mcp_server_hash`] because the writer
+/// The keys [`ServerEntry`] does not carry (`socket`, `directTools`, `httpTransport`,
+/// `pluginDataDir`) are dropped, which is lossless HERE for a stated reason: none of them is one of
+/// `computeMcpServerHash`'s identity keys except `socket`, and `socket` is emitted unconditionally
+/// as `undefined` by [`crate::exec::mcp_direct_tools::compute_mcp_server_hash`] because the writer
 /// (`cyrup_mcp::config::to_server_entries`) rejects any entry configuring one. So a definition that
 /// round-trips through [`ServerEntry`] hashes to exactly what it hashed before.
+///
+/// **`literalEnv` used to be on that list and no longer is** (`SUBA-156` / `MCP-594`): `34df4ed`
+/// (#687) made it a member of the stdio identity *and* the switch deciding whether `env` enters the
+/// digest interpolated or verbatim, so dropping it would now move every stdio digest off the
+/// writer's. [`ServerEntry`] carries it, as it does `inheritEnv`.
 fn as_server_entry(value: Value) -> Option<ServerEntry> {
     serde_json::from_value::<ServerEntry>(value).ok()
 }
@@ -804,6 +808,16 @@ fn translate_plugin_stdio_server(
         ),
         env: Some(resolved_env),
         cwd: Some(cwd.to_string_lossy().into_owned()),
+        // `literalEnv: true` (`agent-plugin-loader.ts:253`, injected beside
+        // `markBuiltInAgentPlugin(…, ["args","env","cwd"])`), exactly as
+        // `cyrup_mcp::agent_plugin`'s `translate_stdio_server` injects it.
+        //
+        // **This is identity, not only behaviour** (`SUBA-156` / `MCP-594`): since `34df4ed` (#687)
+        // a stdio server's digest carries `literalEnv` as a member *and* takes its `env` verbatim
+        // when it is set. Omitting it here made this loader's pre-image differ from the adapter's
+        // for every plugin stdio server — in two places at once — so every plugin server's cache
+        // entry failed validation and its `mcp:` selectors resolved to nothing.
+        literal_env: Some(true),
         ..ServerEntry::default()
     })
 }
