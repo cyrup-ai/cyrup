@@ -5,6 +5,41 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-03 (ledger corrections) — pi-1.0 rows reviewed and corrected, 21 rows filed, one closed row, no code moved (`claude/ledger-corrections-pi-1.0.1`)
+
+> **This block sits above the batch-6 block and moves its counts; it is a docs-only change.** The count is
+> whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints: **183 open: 0 critical, 1 high, 29
+> medium, 153 low; 17 trackers; 842 closed; 3 duplicates not counted** (batch 6: 162 open, 24 medium, 137 low,
+> 841 closed). Arithmetic: open 162 + 21 filed = 183; medium 24 + 5 = 29 (`PROV-130`, `PROV-131`, `HERDR-007`,
+> `SUBA-164`, `SUBA-166`); low 137 + 16 = 153; closed 841 + 1 (`DUR-005`) = 842; trackers and duplicates unchanged.
+>
+> * **Reviewed.** About 121 pi-1.0 rows were re-read by six independent readers. About 90 held; about 30 were partly
+>   wrong in their cyrup-side text or fix instruction; **no upstream claim was refuted.** Each correction is an
+>   inline `**CORRECTED 2026-10-03**` note. **No severity, kind or effort column was changed.** Recommended
+>   re-ratings, for the owner (not applied): `MCP-591` medium to high (the untrusted-project `.mcp.json` gate is not
+>   wired; `with_project_trusted` has no production caller); `MCP-602` effort M to S for the fail-closed plus
+>   `Destructive` half; `SUBA-154` and `SUBA-158` medium to low; `SUBA-159` low to medium if the zombie path is
+>   judged reachable; `PROV-114` effort S to M; `PROV-116` and `PROV-117` and `PROV-128` medium to low; `PROV-119`
+>   effort M to L; `AGENT-045` and `AGENT-047` medium to low (or raise `SESS-067` and `TOOL-052`); `SESS-068`
+>   medium to low; `TUI-130` medium to low; `MCP-607` kind to `not-ported`; `MCP-608` status to `missing`.
+> * **Factual corrections worth knowing.** `CFG-101`'s "fail-closed" impact is false: untrusted-project `.mcp.json`
+>   loads today. `MCP-602` is a verified fail-open. `AGENT-046` and `TOOL-054` claimed failure data could not be
+>   carried; `ToolError::details` carries it. `SESS-068`/`SESS-069` need one re-vendor of `template.js`/`.css`, not a
+>   patch (the pins are SHA-checked). `TOOL-056` rests on `TOOL-046`, which is closed. `HARN-001`…`004` and `DUR-003`
+>   were stale against PR #173 and ADR-0029/0030. **`CODE-001` and `CODE-002` rested on a false premise:** `ADR-0012`
+>   was never written, and `deno_core` is already in the tree for `workflowScript`; the engine is now recorded in
+>   `ADR-0031`, and `CODE-001` asks only whether and when to build `codemode`.
+> * **Filed (all `NEW 2026-10-03`; post-pin triage of pi v1.0.1, pi-subagents v0.75.0, herdr v0.9.3,
+>   pi-mcp-adapter).** `01`: `PROV-130`…`PROV-133`. `05`: `CFG-102`. `06`: `EXT-107`. `07`: `TUI-145`, `TUI-146`.
+>   `08`: `SEAM-147`. `09b`: `SUBA-164`…`SUBA-173`. `13`: `MCP-609`…`MCP-611` (outside the count). `16`:
+>   `HERDR-007`, `HERDR-008`. **Closed on filing:** `DUR-005` (`17`; the `cyrup-session` rename-durability fix from
+>   PR #173). **Next free ids:** `PROV-134`, `CFG-103`, `EXT-108`, `TUI-147`, `SEAM-148`, `SUBA-174`, `MCP-612`,
+>   `HERDR-009`, `DUR-006`; the rest are unchanged.
+> * **Not done, and said so.** The pins are not re-pinned (README *Post-pin review*). `code_puppy` (576 commits) and
+>   `code_puppy_core_plugins` (39 commits) are unswept. Several new rows are by reading, not running; each says so.
+
+---
+
 # UPDATE 2026-10-03 (batch 6) — seven rows closed, seven filed (`claude/lows-batch6`)
 
 > **This block sits above the 2026-10-02 pi 1.0 block and corrects its counts by this batch.** The count is

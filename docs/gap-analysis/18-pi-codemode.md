@@ -13,6 +13,25 @@ areas. The catalog gaps codemode's `models` global needs are already filed in ar
 and `PROV-105`; the MCP default-exposure divergence is area 13's, and `CODE-001` records only
 the coupling.
 
+> **CORRECTED 2026-10-03 (file-level; read before `CODE-001` / `CODE-002`).** Three premises in this
+> file were false when written and are corrected in place by CORRECTED notes. (1) **cyrup already
+> embeds a JavaScript engine**: V8 through `deno_core` 0.411, used by the `workflowScript` runtime
+> (`Cargo.toml:403-415`; `crates/cyrup-ext-subagents/src/workflows/scripted/engine.rs:2362-2404`;
+> first added in `8de74602`, 2026-09-08, which is an ancestor of this file's code pin `592bf2c3`). So
+> "nothing of this kind exists anywhere" and "a comment asserting the absence of a JS engine" are
+> wrong. (2) **No `docs/adr/ADR-0012-*.md` file exists.** "ADR-0012 Cut 4" is text in
+> `docs/gap-analysis/MCP-PORT-METHODOLOGY.md` §1.2 (the Cut 4 row, `:67`); `docs/adr/README.md`
+> reserves 0012-0027 for the MCP port and none was written. Every "ADR-0012" below is a dangling
+> reference to that methodology text. (3) **The engine question is decided:**
+> `docs/adr/ADR-0031-one-javascript-engine-deno-core.md` (accepted 2026-10-03) says that if cyrup embeds
+> JavaScript for any purpose it uses `deno_core`, no second engine, and supersedes the "anywhere, for
+> anything" sentence as to scope. It does **not** decide whether or when to build `codemode`. The only
+> open owner decision on `CODE-001` is therefore that one. Also stale: citations of
+> `13-cyrup-mcp.md:493-512` / `:2081` (real: `:588`, `:2064`, `:2152`, `:2148`), the claim that
+> `13e` has 0 hits for "exposure", and the upstream line cites noted on `CODE-008`, `CODE-010` and
+> `CODE-013`. Upstream was re-read at **v1.0.1** (2026-10-03) for the growth notes on `CODE-002`,
+> `CODE-011`, `CODE-012` and `CODE-013`; no other upstream claim in this file changed.
+
 ## Provenance and pins
 
 | side | pin | how obtained |
@@ -76,7 +95,7 @@ codemode**. That is why every row below is a real parity gap rather than a scope
 replacing it: `codemode.mode` (`on` | `only`, `core/settings-manager.ts:101`) decides whether the
 other tools stay declared to the model (`on`, default) or are hidden and reachable only through
 scripts (`only`). What it *does* replace is `pi-mcp-adapter`'s `mcpScript` — cyrup's **ADR-0012
-Cut 4** — which is the decision `CODE-001` exists to surface rather than quietly assume.
+Cut 4** (**CORRECTED 2026-10-03:** no ADR-0012 file exists; this is `MCP-PORT-METHODOLOGY.md` §1.2 Cut 4, and the engine it ruled out is superseded in scope by `docs/adr/ADR-0031-one-javascript-engine-deno-core.md`) — which is the decision `CODE-001` exists to surface rather than quietly assume.
 
 **Three mechanisms codemode needs that are themselves new at v1.0.0** and are not part of
 `packages/codemode`: the five-way `ToolExposure` / `ToolLoadout` / `prepareLoadout` model
@@ -100,13 +119,13 @@ The two catalog gaps codemode's `models` global needs are **already filed**: `PR
 `--include='*.rs'`: `codemode`, `CodemodeSandbox`, `toCodemodeIdentifier`, `renderDeclarations`,
 `schemaToType`, `ToolExposure`, `ToolLoadout`, `ToolNamespace`, `NestedCallRecorder`, `Bm25`. The one
 `quickjs` hit is `crates/cyrup-ext-subagents/src/workflows/scripted/mod.rs:80`, a comment asserting
-the *absence* of a JS engine. Before this file, the ledger had **one** mention of codemode anywhere:
+the *absence* of a JS engine. **CORRECTED 2026-10-03:** that is wrong. The hit is the substring `quickjs` inside `rquickjs` in a comment (`mod.rs:76-84`) that says the Cut-4 CI guard (`rg -qi 'rquickjs|boa_engine|deno_core|v8' crates/cyrup-mcp/Cargo.toml`, `MCP-PORT-METHODOLOGY.md:1382`) is scoped to `crates/cyrup-mcp/Cargo.toml` and was left as written. The same module is cyrup's V8 engine: `deno_core` 0.411.0 at `Cargo.toml:403-415` (used only by `cyrup-ext-subagents` `workflows/scripted/`), with a heap limit, a near-heap-limit callback and `terminate_execution` at `engine.rs:2362-2404`. `wasmtime` is also a dependency (`crates/cyrup-ext/Cargo.toml:29-30`, optional `wasm-host`), but it runs guest WebAssembly extensions, not JavaScript. Before this file, the ledger had **one** mention of codemode anywhere:
 `EXT-092` (`06-cyrup-ext.md`), which lists it among pi's four built-in extensions whose natives must
 override `is_hidden`, and files nothing.
 
 ## Open items
 
-> **Next free id: `CODE-014`** (2026-10-02, after this file filed `CODE-001`…`CODE-013`).
+> **Next free id: `CODE-014`** (2026-10-02, after this file filed `CODE-001`…`CODE-013`). 2026-10-03: unchanged; the ledger-correction pass filed no new row here (corrections are CORRECTED notes on `CODE-001`, `-002`, `-003`, `-006`, `-008`, `-010`, `-011`, `-012`, `-013`).
 
 > The standard `ID | Severity | Kind | Effort | Title` table, as README's *Item format* requires.
 > **This table is the complete open set for area 18** — thirteen rows, no closures, no `-S` series and
@@ -121,19 +140,19 @@ override `is_hidden`, and files nothing.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| CODE-001 | medium | not-ported | L | **DECISION REQUIRED — `packages/codemode` and the `codemode` tool are unported in full, and the port needs an owner decision first** — new at v1.0.0; **ADR-0012 Cut 4** recorded "no JavaScript engine anywhere, for anything", and pi 1.0 makes codemode the default path to MCP tools. **FILED 2026-10-02**; body below. |
-| CODE-002 | low | not-ported | L | **The sandbox host `CodemodeSandbox` is unported** — `runtime/host.ts:285` + `worker.ts` + `prelude-source.ts`: a worker thread running a QuickJS-on-wasm VM whose only imports are a WASI shim and one host-call bridge. Blocked on `CODE-001`. **FILED 2026-10-02**; body below. |
-| CODE-003 | low | not-ported | S | **`parseCodemodeSource()` and `CODEMODE_SOURCE_GRAMMAR` are unported** — the `// @options:` first line and its Lark grammar, `src/source.ts:100`/`:22`. Engine-independent and landable today: cyrup's grammar-constrained sampling already exists. **FILED 2026-10-02**; body below. |
+| CODE-001 | medium | not-ported | L | **DECISION REQUIRED — `packages/codemode` and the `codemode` tool are unported in full, and the port needs an owner decision first** — new at v1.0.0; **ADR-0012 Cut 4** recorded "no JavaScript engine anywhere, for anything", and pi 1.0 makes codemode the default path to MCP tools. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the premise is false. (a) cyrup already embeds V8 via `deno_core` 0.411 (`Cargo.toml:403-415`; `crates/cyrup-ext-subagents/src/workflows/scripted/engine.rs:2362-2404`), so "no JavaScript engine anywhere" is not true of the repository. (b) There is no ADR-0012 file; "ADR-0012 Cut 4" is `MCP-PORT-METHODOLOGY.md` §1.2 (`:67`). (c) The engine is decided by `docs/adr/ADR-0031-one-javascript-engine-deno-core.md`: `deno_core`, no second engine. The open owner decision is only **whether and when to build `codemode`**; options (a)'s `rquickjs`/`wasmtime`+`quickjs-wasi` sub-shapes in the body are rejected by ADR-0031. Severity left as filed (`medium` stays defensible: it still gates a whole upstream subsystem and the unowned MCP default-exposure divergence). |
+| CODE-002 | low | not-ported | L | **The sandbox host `CodemodeSandbox` is unported** — `runtime/host.ts:285` + `worker.ts` + `prelude-source.ts`: a worker thread running a QuickJS-on-wasm VM whose only imports are a WASI shim and one host-call bridge. Blocked on `CODE-001`. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** "a worker thread running a QuickJS-on-wasm VM" describes upstream and is right; but the body's "nothing of this kind exists anywhere" is false: cyrup has a V8/`deno_core` runtime for `workflowScript` (`Cargo.toml:403-415`, `engine.rs:2362-2404`). Per `docs/adr/ADR-0031-one-javascript-engine-deno-core.md`, a cyrup port of this sandbox would run on `deno_core`, not on `wasmtime`+`quickjs-wasi` or `rquickjs`. Honest isolation caveat (ADR-0031 Consequences): upstream's sandbox boundary is WebAssembly (own linear memory, one host import); a `deno_core` isolate is in-process, so a V8 memory-safety bug is a risk upstream's design does not carry. It is bounded by no ambient authority (only injected functions), a heap cap and a kill switch, and is the exposure `workflowScript` already accepts; a separate-process isolate is a later option. pi v1.0.1 growth: `PRELUDE_SOURCE` moved `prelude-source.ts:34` -> `:42`, and the prelude now enforces `MAX_OUTPUT_CHARS = 16 * 1024 * 1024` (`:36`) and `MAX_OUTPUT_ITEMS = 100_000` (`:37`) in `output()` (`:244-248`): a script past either limit throws a `RangeError` and `done()` has already reported the failure, so catching it does not resume output (`319fecb89`, `packages/codemode/CHANGELOG.md` [1.0.1], #10283). The sandbox port must carry these caps. Effort `L` left as filed; the engine choice makes it arguably lower, and that is not re-rated. |
+| CODE-003 | low | not-ported | S | **`parseCodemodeSource()` and `CODEMODE_SOURCE_GRAMMAR` are unported** — the `// @options:` first line and its Lark grammar, `src/source.ts:100`/`:22`. Engine-independent and landable today: cyrup's grammar-constrained sampling already exists. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** upstream cites hold at v1.0.0 (`source.ts` `:11`, `:22`, `:100`). `source.ts` has eight `throw new` sites at v1.0.0 (`:58`, `:64`, `:69`, `:74`, `:81`, `:87`, `:102`, `:112`), not "six"; two share a message, so the number of distinct rejection messages was not re-counted here - enumerate them from source when porting. `ConstrainedSamplingConfig` is at `crates/cyrup-core/src/constrained_sampling.rs:76` (the enum), not `:78`. |
 | CODE-004 | low | not-ported | M | **The declaration renderer is unported** — `renderDeclarations`/`schemaToType`/`renderToolSample`/`renderToolOutputType`/`MCP_TYPESCRIPT_PREAMBLE`/`toCodemodeIdentifier`, `src/declarations.ts:105,228,153,181,18` and `src/identifier.ts:5`. Engine-independent. **FILED 2026-10-02**; body below. |
 | CODE-005 | low | not-ported | L | **The `ToolExposure` / `ToolNamespace` / `ToolLoadout` / `prepareLoadout` model is unported** — `core/extensions/types.ts:509,527,540,552`; five exposures, three of which exist for codemode and MCP. **Shared prerequisite with area 13 and with `TOOL-052` (`04-…`).** **FILED 2026-10-02**; body below. |
-| CODE-006 | low | not-ported | L | **Nested tool calls are unported** — `ctx.executeTool()` (`core/extensions/types.ts:394`), `NestedCallRecorder` and `NESTED_CALL_LIMITS` (`core/nested-tool-calls.ts:47`, `:26`), `nestedCalls` on the tool-result message, `parentToolCallId` on the events. **Shared prerequisite.** **FILED 2026-10-02**; body below. |
+| CODE-006 | low | not-ported | L | **Nested tool calls are unported** — `ctx.executeTool()` (`core/extensions/types.ts:394`), `NestedCallRecorder` and `NESTED_CALL_LIMITS` (`core/nested-tool-calls.ts:47`, `:26`), `nestedCalls` on the tool-result message, `parentToolCallId` on the events. **Shared prerequisite.** **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the body's cite `13-cyrup-mcp.md:2081` for `EventKind::ToolCall::fails_closed()` is `13-cyrup-mcp.md:2148` (line 2081 is blank). |
 | CODE-007 | low | not-ported | M | **The model-facing `codemode` description and its catalog budget are unported** — `createCodemodeDescription` and the round-robin `selectCatalog`, `extensions/codemode/tool.ts:237`/`:211`, plus the `codemode.mode` and `codemode.inlineBudget` settings. **FILED 2026-10-02**; body below. |
-| CODE-008 | low | not-ported | M | **The script `models` globals are unported** — `createModelGlobals` at `extensions/codemode/execute.ts:524`: `getModelsOfType`/`getAvailableOfType`/`getModelOfType`/`classify`/`generateImages`, a 4-call limiter, shape validation, and usage attribution. Depends on `PROV-102` and `PROV-105`. **FILED 2026-10-02**; body below. |
+| CODE-008 | low | not-ported | M | **The script `models` globals are unported** — `createModelGlobals` at `extensions/codemode/execute.ts:524`: `getModelsOfType`/`getAvailableOfType`/`getModelOfType`/`classify`/`generateImages`, a 4-call limiter, shape validation, and usage attribution. Depends on `PROV-102` and `PROV-105`. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** `CodemodeModelRuntime` is `packages/coding-agent/src/extensions/codemode/tool.ts:61-65`, not `:70-74` (same at v1.0.0 and v1.0.1). `execute.ts:524` (`createModelGlobals`) holds. |
 | CODE-009 | low | not-ported | M | **The `codemode-store` session custom entry and its branch-scoped replay are unported** — `extensions/codemode/tool.ts:53` and `readCodemodeStore` at `execute.ts:220`: `store()`/`load()` survive resume and each branch sees only its own path's writes. **FILED 2026-10-02**; body below. |
-| CODE-010 | low | not-ported | M | **The script discovery globals and the BM25 ranker behind them are unported** — `createDiscoveryGlobals` at `execute.ts:451` (`searchTools`/`describeTool`/`describeNamespace`) over `Bm25Ranker` at `extensions/tool-search/tool.ts:119`. **FILED 2026-10-02**; body below. |
-| CODE-011 | low | not-ported | M | **The codemode TUI renderer is unported** — `codemodeRenderers` at `extensions/codemode/renderer.ts:65`: a live nested-call list with per-call status glyph, duration and USD cost, over a collapsed syntax-highlighted script preview. **FILED 2026-10-02**; body below. |
-| CODE-012 | low | not-ported | S | **The script output budget, truncation and temp-file spill are unported** — `DEFAULT_MAX_OUTPUT_TOKENS` 10 000, `truncateOutput` and `spillOutput` at `execute.ts:233`, `:277`, `:262`. **FILED 2026-10-02**; body below. |
-| CODE-013 | low | tooling | M | **Shipping the sandbox runtime in cyrup's build has no counterpart** — `getQuickJSWasmPath()` / `resolveCodemodeWorkerSpecifier()` at `coding-agent/src/config.ts:488`, `:493` resolve a wasm asset and a worker entrypoint per release runtime. **FILED 2026-10-02**; body below. |
+| CODE-010 | low | not-ported | M | **The script discovery globals and the BM25 ranker behind them are unported** — `createDiscoveryGlobals` at `execute.ts:451` (`searchTools`/`describeTool`/`describeNamespace`) over `Bm25Ranker` at `extensions/tool-search/tool.ts:119`. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** `isNamespaceName()` is `extensions/codemode/execute.ts:440`, not `:437` (same at v1.0.0 and v1.0.1). `createDiscoveryGlobals` `:451` holds. |
+| CODE-011 | low | not-ported | M | **The codemode TUI renderer is unported** — `codemodeRenderers` at `extensions/codemode/renderer.ts:65`: a live nested-call list with per-call status glyph, duration and USD cost, over a collapsed syntax-highlighted script preview. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03 (v1.0.1 growth):** `renderer.ts` `codemodeRenderers` `:65` is unchanged at v1.0.1. v1.0.1 adds `pi.registerToolRenderer(resolver)` (`core/extensions/types.ts:1683`, `loader.ts:367`; `packages/coding-agent/CHANGELOG.md` [1.0.1], #10285) and the MCP extension uses it to draw `mcp__<server>__<tool>` calls before their server connects (`extensions/mcp/index.ts:363-366`). A cyrup port that wants parity for resumed sessions needs a renderer-resolver hook for tools that are not registered, in addition to the codemode renderer. |
+| CODE-012 | low | not-ported | S | **The script output budget, truncation and temp-file spill are unported** — `DEFAULT_MAX_OUTPUT_TOKENS` 10 000, `truncateOutput` and `spillOutput` at `execute.ts:233`, `:277`, `:262`. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03 (v1.0.1 growth):** `execute.ts` `:233`, `:262`, `:277` still hold at v1.0.1. v1.0.1 adds a second, sandbox-level output cap beneath this budget: `MAX_OUTPUT_CHARS` 16 Mi and `MAX_OUTPUT_ITEMS` 100 000 in `packages/codemode/src/runtime/prelude-source.ts:36-37` (see `CODE-002`); a script exceeding either fails with a `RangeError` before `truncateOutput` sees the text. The two caps are independent. |
+| CODE-013 | low | tooling | M | **Shipping the sandbox runtime in cyrup's build has no counterpart** — `getQuickJSWasmPath()` / `resolveCodemodeWorkerSpecifier()` at `coding-agent/src/config.ts:488`, `:493` resolve a wasm asset and a worker entrypoint per release runtime. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** at v1.0.0 `getQuickJSWasmPath()` is `config.ts:488`, `setEmbeddedQuickJSWasmPath()` `:483` and `resolveCodemodeWorkerSpecifier()` `:493` (as cited); at v1.0.1 they are `:491`, `:486` and `:496`. `loadQuickJSWasm()` is `packages/codemode/src/wasm.ts:21`, not `:24` (same at both tags). The row's "if `CODE-002` lands on `rquickjs`, this row collapses" branch is moot: per `docs/adr/ADR-0031-one-javascript-engine-deno-core.md` a port would use `deno_core` (already linked, V8 fetched by `rusty_v8`'s build, `Cargo.toml:403-415`), so no wasm artifact is embedded and the open question is only how the V8 prebuilt is provisioned, which `workflowScript` already answers. "Nothing embeds a wasm artifact" for assets remains true. |
 
 ---
 
@@ -147,18 +166,33 @@ window: `git log --oneline v0.87.1..v1.0.0 -- packages/codemode` is 12 commits, 
 `8562bcf66 feat(coding-agent): codemode and MCP`; `git cat-file -e v0.87.1:packages/codemode/src/index.ts`
 fails. The release post names it the first headline feature of 1.0.
 
-**cyrup at HEAD `592bf2c3`** — nothing. `grep -rni 'codemode' crates/ --include='*.rs'` = 0;
+**cyrup at HEAD `592bf2c3`** — nothing **for codemode**. `grep -rni 'codemode' crates/ --include='*.rs'` = 0;
 `CodemodeSandbox`, `toCodemodeIdentifier`, `renderDeclarations`, `schemaToType` = 0 each. The ledger's
 only mention is `EXT-092` (`06-cyrup-ext.md:620`), which lists `codemode` among pi's four built-in
 extensions when arguing about `NativeExtension::is_hidden` — it anticipates a `builtin:codemode`
 native existing one day but files nothing.
 
+> **CORRECTED 2026-10-03 (whole section).** The decision framed below rests on a false premise. cyrup
+> *does* embed a JavaScript engine: V8 via `deno_core` 0.411 for `workflowScript`
+> (`Cargo.toml:403-415`, `engine.rs:2362-2404`, added in `8de74602`, 2026-09-08). There is no
+> `ADR-0012` file (`ls docs/adr | grep 0012` is empty; the cuts' only text is
+> `MCP-PORT-METHODOLOGY.md` §1.2 and `docs/adr/README.md`'s reservation of 0012-0027). The engine
+> question is decided by `docs/adr/ADR-0031-one-javascript-engine-deno-core.md`: `deno_core`, no second
+> engine, the "anywhere, for anything" sentence superseded as to scope. ADR-0031 explicitly leaves
+> open only "whether or when to build `codemode`". Read the options below with that in mind: (a)'s
+> engine is `deno_core`; `rquickjs` and `wasmtime`+`quickjs-wasi` are rejected; the cost of (a) is the
+> sandbox host, prelude, limits and the rows downstream, not a new engine. Option (b) is unchanged.
+> Also reframe the "default path" fact: cyrup ports `pi-mcp-adapter`, which replaces pi's built-in MCP
+> extension, has `mcpScript` off by default (`pi-mcp-adapter` `CHANGELOG.md:60`, `:65` @v5.0.0, `settings.scriptMode`),
+> and states "Pi's `codemode` scripts work with both" (`docs/pi-builtin-comparison.md:18` @v5.0.0). So the
+> default-exposure divergence below is a property of pi's built-in MCP extension, not of the adapter cyrup ports.
+
 **The decision this row exists for, stated plainly.** `docs/gap-analysis/MCP-PORT-METHODOLOGY.md:67`
-and `13-cyrup-mcp.md:493-512` record **ADR-0012 Cut 4** — `pi-mcp-adapter`'s `mcpScript` and its
+and `13-cyrup-mcp.md:493-512` record **ADR-0012 Cut 4** (**CORRECTED 2026-10-03:** `13-cyrup-mcp.md:493-512` is unrelated text; Cut 4 is `13-cyrup-mcp.md:559` (section), `:588` (the 2% size row) and `:2064` (file-table row); and see the section note above - no ADR-0012 file exists) — `pi-mcp-adapter`'s `mcpScript` and its
 JavaScript worker are cut by owner decision, with the consequence written in bold three times across
 the ledger: *"This removes the only JavaScript-engine question in the entire port. No `rquickjs`, no
 vendored C, no `boa`, no JS-in-WASM. **Do not raise a JS engine anywhere, for anything.**"*
-`13-cyrup-mcp.md:2081` lists "a JS engine (`rquickjs` / `boa` / JS-in-WASM), rated a from-zero
+`13-cyrup-mcp.md:2081` (**CORRECTED 2026-10-03:** `:2152`) lists "a JS engine (`rquickjs` / `boa` / JS-in-WASM), rated a from-zero
 critical decision" under prerequisites that **dissolved**, resolved as "Cut 4. Not raised anywhere."
 
 **Three facts that make Cut 4 insufficient to settle codemode, which is why this is a decision and
@@ -178,6 +212,7 @@ not a closure.** It is a severity-bearing row and not a `tracker`: it proposes w
    (`grep -rn 'exposure' crates/cyrup-mcp/src/` = 0; the mcp area files `13b`/`13e` have 0 hits for
    `exposure`), so cyrup's MCP port now diverges from upstream's default on this axis regardless of
    what is decided here. **Area 13 owns that half** — this row only records the coupling.
+   **CORRECTED 2026-10-03:** "`13b`/`13e` have 0 hits" is false for `13e`: `13e-mcp-tools.md` has four hits (`MCP-604`, rows at `:98` and `:286-308`; `13-cyrup-mcp-STATUS.md:459` has one more); `13b` has none. And "area 13 owns that half" has no owning row: `MCP-604` (low) covers only the dependent piece (registering search-mode direct tools at the `deferred` exposure, and it defers the exposure model itself to `CODE-005`), and `autoEnableCodemode` appears in no `13*.md` file. The default-exposure and `autoEnableCodemode` divergence is currently unowned (not filed here; belongs to area 13).
 3. **Non-LLM models.** The release post's framing — "native support for MCP, and non-LLM models like
    Jev and image models" — is, in code, `models.classify()` and `models.generateImages()` reachable
    *from scripts* (`docs/codemode.md`, "Models"). cyrup already has both engines
@@ -205,13 +240,13 @@ sentiment.**
   different language is a different feature, not a port.
 
 **Fix** — get the owner decision, write it as an ADR beside ADR-0012 (amending or confirming Cut 4
-with its new scope), and only then open `CODE-002`. Until then, land the engine-independent rows
+with its new scope), and only then open `CODE-002`. **CORRECTED 2026-10-03:** the ADR is written: `docs/adr/ADR-0031-one-javascript-engine-deno-core.md` (there is no ADR-0012 to sit beside). It settles the engine; what remains for the owner is whether/when to build `codemode`, after which `CODE-002` can open on `deno_core`. Until then, land the engine-independent rows
 (`CODE-003`, `CODE-004`) and the two shared prerequisites (`CODE-005`, `CODE-006`) on their own merit.
 
 **Verify** — the ADR exists and names codemode explicitly; and
 `grep -rn 'rquickjs\|boa_engine\|deno_core\|wasmtime' crates/*/Cargo.toml` agrees with it in either
 direction. The existing in-tree assertion at
-`crates/cyrup-ext-subagents/src/workflows/scripted/mod.rs:80` must be updated or deliberately kept.
+`crates/cyrup-ext-subagents/src/workflows/scripted/mod.rs:80` must be updated or deliberately kept. **CORRECTED 2026-10-03:** that is a comment about the Cut-4 guard's scope (`crates/cyrup-mcp/Cargo.toml` only), not an assertion of absence; it can stay as written (`mod.rs:81-84` says so). The grep already shows `deno_core` (root `Cargo.toml:415`) and `wasmtime` (`cyrup-ext`).
 
 **Severity** — `medium`, not higher and not lower. Nothing in cyrup breaks today: there is no
 codemode tool to fail and no script to run. It is above `low` for one reason only — it gates a whole
@@ -239,6 +274,7 @@ unawaited in-flight calls are aborted through the tool's `signal` and reported `
 `grep -rni 'quickjs' crates/ --include='*.rs'` returns exactly one hit,
 `crates/cyrup-ext-subagents/src/workflows/scripted/mod.rs:80`, which is a comment *asserting the
 absence* of `rquickjs`/`boa_engine`/`deno_core`/`v8`.
+**CORRECTED 2026-10-03:** flatly false. The one hit is `rquickjs` inside a comment about the Cut-4 guard's scope (`mod.rs:76-84`); the same module is a shipped V8 runtime (`deno_core` 0.411, `Cargo.toml:403-415`; isolate with `heap_limits`, near-heap-limit callback and `terminate_execution`, `engine.rs:2362-2404`). Per `docs/adr/ADR-0031-one-javascript-engine-deno-core.md`, the **Fix** below should read `deno_core` where it says `wasmtime` + `quickjs-wasi`: the "separate wasm instance" property is not reproduced (in-process isolate; see the isolation caveat on the row), the interrupt flag becomes `IsolateHandle::terminate_execution`, `memoryLimitBytes` becomes a heap limit with a terminating callback (an out-of-memory script is terminated, not given a catchable `InternalError`), and V8's recursion limit is a catchable `RangeError` as well. Which of upstream's `test/sandbox.test.ts` expectations transfer to V8 was not checked here.
 
 **Fix** — blocked on `CODE-001`. If (a): the faithful shape is `wasmtime` plus the same
 `quickjs-wasi` wasm artifact, because that preserves the two properties the design rests on — the VM
