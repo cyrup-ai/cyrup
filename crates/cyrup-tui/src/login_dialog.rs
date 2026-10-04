@@ -170,7 +170,16 @@ impl LoginDialog {
             confirm_hint: keymap
                 .keys_label(SelectAction::Confirm)
                 .unwrap_or_else(|| "enter".to_string()),
-            launch_browser: std::sync::Arc::new(crate::open_browser::open_browser),
+            // Inert in this crate's test build: the App-level login tests (`tests/login_flow.rs`)
+            // build dialogs through `App` and cannot reach `with_browser_launcher`, so the real
+            // launcher opened a browser tab per OAuth test on a desktop (`open` on macOS; a
+            // headless `xdg-open` fails silently, which hid it). DRIFT-042's recording tests
+            // still replace it explicitly.
+            launch_browser: if cfg!(test) {
+                std::sync::Arc::new(|_: &str| {})
+            } else {
+                std::sync::Arc::new(crate::open_browser::open_browser)
+            },
         }
     }
 
